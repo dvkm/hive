@@ -61,6 +61,7 @@ tasks keep referencing it, there is no hard delete).
 ```json
 {
   "id": "9da7c5527580",
+  "number": 42,
   "project_id": "proj_ab12...",
   "title": "Add dark mode toggle",
   "brief": "User-facing dark mode toggle in settings.",
@@ -82,6 +83,11 @@ tasks keep referencing it, there is no hard delete).
 ```
 `state ∈ {queued, in_progress, needs_decision, in_review, verifying, done, failed, cancelled}`
 `kind ∈ {ship, scout, chore}`
+`number` is a human-friendly, monotonic per-hive counter assigned at creation
+(`MAX(number)+1`, starting at 1) and never reused — it is THE handle people and
+GitHub PR markers use, while the opaque `id` stays the machine key. Assigned by a
+DB trigger so every creation path gets one; existing rows were backfilled in
+`created_at` order. Unique across all tasks.
 `health` is a SERVER-COMPUTED dimension separate from lifecycle `state` — the
 visible symptom that a task pointing at a live agent is actually fine or actually
 stuck. **It is the single source of truth; clients render it, never re-derive
@@ -151,6 +157,7 @@ Types written by the runtime layer (Phase 2b):
 - `recovery_card` — a recovery escalation opened a decision card. `payload: {decision_id, source_task_id}`
 - `ci_status` — reconciler synced CI. `payload: {ci_status}` (`passing|pending|failing`)
 - `pr_merged` — reconciler detected the PR merged. `payload: {pr_url}`
+- `pr_linked` — a marked PR was matched back to this task and its `pr_url` set (by the reconciler's scan or `POST /api/tasks/link-pr`). `payload: {pr_url, via}` (`via ∈ {id, number}` — which half of the marker matched)
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
 - `smoke_passed` / `smoke_failed` — post-deploy smoke result. `payload: {results:[{name,ok,detail}], evidence_id?}`
@@ -349,7 +356,7 @@ cost_usd, calls, unpriced}` (summed cost counts priced rows only).
 
 ### Tasks
 - `GET /api/tasks?state=&project_id=` → `200 [Task, ...]` (newest `updated_at` first; both filters optional)
-- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?}` → `201 Task` (starts in `queued`, writes a `created` event)
+- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event)
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
 - `POST /api/tasks/:id/transition` body `{to (required), reason?, source?}` → `200 Task` | `409` (invalid transition or `done` without evidence) | `404`
@@ -412,6 +419,31 @@ cost_usd, calls, unpriced}` (summed cost counts priced rows only).
   proposal. On any planner failure returns `502` and records a single
   `planner_error` event (no card). The request blocks for the planner run
   (timeout-capped by `HIVE_PLANNER_TIMEOUT_MS`, default 120000).
+
+### PR ↔ task marker (the linking contract)
+Every PR a hive agent opens MUST carry a marker that links it back to its task.
+This is THE contract; the brief instructs agents to it and `hive pr-marker <id>`
+prints it:
+- The PR **title** MUST start with the prefix `[hive-<number>] ` (trailing space
+  included), e.g. `[hive-42] Add dark mode toggle`.
+- The PR **body** MUST include the footer line `hive-task: <id>` on its own line,
+  e.g. `hive-task: 9da7c5527580`.
+
+The `hive-task: <id>` footer is the primary link (the stable, unique machine
+key); the `[hive-<number>]` title is a human-readable fallback matched only when
+the footer is absent. hive links a PR to its task by reading these:
+- **Reconciler scan** (every cycle): for each project with a `repo_path`, runs
+  `gh pr list --state open --json number,title,body,url` in the repo and links any
+  PR carrying a marker to its task — but only when the task has no `pr_url` yet, so
+  an agent-reported PR is never clobbered and re-scanning is idempotent. Writes a
+  `pr_linked` event. Isolated in its own try/catch; a `gh` failure is skipped.
+- **`POST /api/tasks/link-pr`** body `{pr_url (required)}` → `200 {"ok":true, "task_id":"...", "number":42, "linked":<bool>}` | `400` (missing `pr_url`) | `422` (PR carries no hive marker) | `502` (`gh pr view` failed/unparseable)
+  Reads the PR's title/body via `gh pr view <url> --json title,body,url` and links
+  it to the matched task by the same marker rules. `linked` is `false` when the
+  task was already linked (idempotent no-op).
+
+`hive pr-marker <task-id>` (CLI) prints the two marker lines (`title-prefix:` and
+`body-footer:`) for a task so agents don't hand-format them.
 
 ### Review experience (in-review tasks)
 An `in_review` task means the agent finished and opened a PR (or pushed/created a
