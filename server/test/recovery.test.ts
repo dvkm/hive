@@ -137,3 +137,86 @@ test("silent past the nudge cap → fail + decision card", async () => {
   const card = db.query("SELECT * FROM events WHERE task_id = ? AND type = 'recovery_card'").all(id);
   expect(card.length).toBe(1);
 });
+
+// ---- worktree reclaim at death-detection time ----
+
+// A dead agent whose worktree is still on disk with uncommitted work in it.
+function herdrDeadWithWorktree(dirty: boolean) {
+  const calls: string[][] = [];
+  const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x));
+  const exec: Exec = async (argv) => {
+    calls.push(argv);
+    if (argv[0] === "git") {
+      if (has(argv, "worktree", "list")) return OK("worktree /wt/x\nHEAD abc\nbranch refs/heads/hive/x\n");
+      if (has(argv, "status", "--porcelain")) return OK(dirty ? "?? rescued.txt\n" : "");
+      if (has(argv, "rev-parse", "--verify")) return { code: 1, stdout: "", stderr: "" }; // ghost name free
+      return OK();
+    }
+    if (argv.includes("get")) return OK('{"error":{"code":"agent_not_found","message":"gone"}}');
+    if (argv.includes("read")) return OK("pane tail");
+    return OK();
+  };
+  return { herdr: new Herdr(exec, "herdr"), calls };
+}
+
+function taskWithWorktree(db: DB, projectId: string): string {
+  const id = makeTask(db, projectId, { agent: "aw" });
+  db.query("UPDATE tasks SET branch = 'hive/x', worktree_path = '/wt/x' WHERE id = ?").run(id);
+  return id;
+}
+
+const reclaimEvent = (db: DB, id: string, type: string) =>
+  db.query("SELECT payload FROM events WHERE task_id = ? AND type = ?").get(id, type) as { payload: string } | undefined;
+
+test("dead agent → its dirty worktree is reclaimed, WIP preserved on a ghost branch", async () => {
+  const { db, projectId } = freshDb();
+  const id = taskWithWorktree(db, projectId);
+  putEvent(db, id, "spawned");
+  const { herdr, calls } = herdrDeadWithWorktree(true);
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  const ev = reclaimEvent(db, id, "worktree_reclaimed");
+  expect(ev).toBeTruthy();
+  expect(JSON.parse(ev!.payload).ghost_branch).toBe(`ghost-${id}`);
+  expect(calls.some((c) => c.includes("checkout") && c.includes(`ghost-${id}`))).toBe(true);
+  expect(calls.some((c) => c[0] === "git" && c.includes("remove") && c.includes("/wt/x"))).toBe(true);
+  // recovery still ran its normal course
+  expect(getTask(db, id).state).toBe("failed");
+});
+
+test("dead agent → a clean worktree is removed with no ghost branch", async () => {
+  const { db, projectId } = freshDb();
+  const id = taskWithWorktree(db, projectId);
+  putEvent(db, id, "spawned");
+  const { herdr, calls } = herdrDeadWithWorktree(false);
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  expect(JSON.parse(reclaimEvent(db, id, "worktree_reclaimed")!.payload).ghost_branch).toBe(null);
+  expect(calls.some((c) => c.includes("checkout"))).toBe(false);
+});
+
+test("a reclaim failure never derails recovery", async () => {
+  const { db, projectId } = freshDb();
+  const id = taskWithWorktree(db, projectId);
+  putEvent(db, id, "spawned");
+  // dirty, but the ghost commit is rejected → reclaimWorktree throws
+  const exec: Exec = async (argv) => {
+    if (argv[0] === "git") {
+      if (argv.includes("list")) return OK("worktree /wt/x\nHEAD abc\nbranch refs/heads/hive/x\n");
+      if (argv.includes("--porcelain") && argv.includes("status")) return OK("?? a.txt\n");
+      if (argv.includes("commit")) return { code: 1, stdout: "", stderr: "hook rejected" };
+      if (argv.includes("rev-parse")) return { code: 1, stdout: "", stderr: "" };
+      return OK();
+    }
+    if (argv.includes("get")) return OK('{"error":{"code":"agent_not_found"}}');
+    return OK();
+  };
+
+  await reconcileOnce(db, { ...inert, herdr: new Herdr(exec, "herdr") });
+
+  expect(reclaimEvent(db, id, "worktree_reclaim_failed")).toBeTruthy();
+  expect(getTask(db, id).state).toBe("failed"); // recovery completed anyway
+  expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").all(id).length).toBe(1);
+});

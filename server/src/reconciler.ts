@@ -220,6 +220,7 @@ async function recoverDead(db: DB, h: Herdr, taskId: string, target: string): Pr
 
   const tail = await h.read(target, 200);
   attachLog(db, taskId, tail, "agent pane tail at death (stale recovery)");
+  await reclaimDeadWorktree(db, h, task);
   const attempts = requeueDepth(db, task); // requeues already made in this lineage
   writeEvent(db, { task_id: taskId, source: "reconciler", type: "recovery", payload: { decision: "dead", attempts } });
   transition(db, taskId, "failed", { source: "reconciler", reason: "agent vanished; recovered from stale" });
@@ -231,6 +232,40 @@ async function recoverDead(db: DB, h: Herdr, taskId: string, target: string): Pr
     const newId = requeueTask(db, task);
     writeEvent(db, { task_id: taskId, source: "reconciler", type: "requeued", payload: { new_task_id: newId, attempt: attempts + 1 } });
     enqueue(db, { kind: "failed", task_id: taskId, title: `Auto-requeued (attempt ${attempts + 1}): ${task.title}` });
+  }
+}
+
+// Teardown at death-detection time: the dead agent's worktree lingers, and the
+// next spawn on this branch (a manual respawn, or the director answering the
+// recovery card) would collide with it. Reclaim it here, while the pane tail is
+// still fresh, preserving any uncommitted work to a ghost branch.
+// Never fatal: a reclaim failure is recorded and recovery proceeds.
+async function reclaimDeadWorktree(db: DB, h: Herdr, task: any): Promise<void> {
+  if (!task.branch || !task.worktree_path) return;
+  const project = db.query("SELECT repo_path FROM projects WHERE id = ?").get(task.project_id) as
+    | { repo_path: string | null }
+    | undefined;
+  if (!project?.repo_path) return;
+  try {
+    const r = await h.reclaimWorktree({
+      repoPath: project.repo_path,
+      branch: task.branch,
+      taskId: task.id,
+      hintPath: task.worktree_path,
+    });
+    writeEvent(db, {
+      task_id: task.id,
+      source: "reconciler",
+      type: r.reclaimed ? "worktree_reclaimed" : "worktree_reclaim_skipped",
+      payload: { ghost_branch: r.ghost_branch, path: r.path, reason: r.reason },
+    });
+  } catch (e) {
+    writeEvent(db, {
+      task_id: task.id,
+      source: "reconciler",
+      type: "worktree_reclaim_failed",
+      payload: { error: String((e as any)?.message ?? e) },
+    });
   }
 }
 
