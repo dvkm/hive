@@ -10,6 +10,7 @@ import Decisions from "./views/Decisions";
 import Policies from "./views/Policies";
 import Monitors from "./views/Monitors";
 import Learnings from "./views/Learnings";
+import Projects from "./views/Projects";
 
 function ConnDot() {
   const { sse } = useStore();
@@ -82,6 +83,7 @@ export default function App() {
             {decisions.length > 0 && <span className="badge">{decisions.length}</span>}
           </NavLink>
           <NavLink to="/learnings">Learnings</NavLink>
+          <NavLink to="/projects">Projects</NavLink>
           <NavLink to="/policies">Policies</NavLink>
           <NavLink to="/monitors">Monitors</NavLink>
         </nav>
@@ -94,6 +96,7 @@ export default function App() {
           <Route path="/tasks/:id" element={<TaskPage />} />
           <Route path="/decisions" element={<Decisions />} />
           <Route path="/learnings" element={<Learnings />} />
+          <Route path="/projects" element={<Projects />} />
           <Route path="/policies" element={<Policies />} />
           <Route path="/monitors" element={<Monitors />} />
         </Routes>
