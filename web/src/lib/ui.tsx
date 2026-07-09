@@ -1,4 +1,4 @@
-import type { State, CiStatus } from "./api";
+import type { State, CiStatus, Health } from "./api";
 
 export const STATE_LABEL: Record<State, string> = {
   queued: "Queued",
@@ -11,8 +11,25 @@ export const STATE_LABEL: Record<State, string> = {
   cancelled: "Cancelled",
 };
 
-// Agent-status dot color per task state.
-export function StatusDot({ state }: { state: State }) {
+export const HEALTH_LABEL: Record<Health["status"], string> = {
+  healthy: "Healthy",
+  silent: "Silent",
+  stuck: "Stuck",
+  dead: "Agent gone",
+};
+
+// Status dot. When the server reports health, the dot reflects HEALTH (green
+// pulse / amber / orange / red) with the reason as tooltip; otherwise it falls
+// back to the lifecycle-state color.
+export function StatusDot({ state, health }: { state: State; health?: Health | null }) {
+  if (health) {
+    return (
+      <span
+        className={`sdot sdot-h-${health.status}`}
+        title={health.reason ? `${HEALTH_LABEL[health.status]} — ${health.reason}` : HEALTH_LABEL[health.status]}
+      />
+    );
+  }
   return <span className={`sdot sdot-${state}`} title={STATE_LABEL[state]} />;
 }
 

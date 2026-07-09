@@ -12,6 +12,7 @@
   --accent-dim: #2b3b63;
   --green: #46c98b;
   --amber: #e2a542;
+  --orange: #e8863c;
   --red: #ef5d6b;
   --purple: #b07cf0;
   --radius: 9px;
@@ -306,6 +307,157 @@ a {
 }
 .sdot-cancelled {
   background: var(--text-faint);
+}
+
+/* health dots (server-computed; override the state dot on the board) */
+.sdot-h-healthy {
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(70, 201, 139, 0.16);
+  animation: pulse 1.6s infinite;
+}
+.sdot-h-silent {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(226, 165, 66, 0.16);
+}
+.sdot-h-stuck {
+  background: var(--orange);
+  box-shadow: 0 0 0 3px rgba(232, 134, 60, 0.18);
+}
+.sdot-h-dead {
+  background: var(--red);
+  box-shadow: 0 0 0 3px rgba(239, 93, 107, 0.2);
+}
+
+/* board attention line under a card title */
+.card-attn {
+  font-size: 11px;
+  font-weight: 500;
+  margin: 1px 0 2px;
+}
+.attn-silent {
+  color: var(--amber);
+}
+.attn-stuck {
+  color: var(--orange);
+}
+.attn-dead {
+  color: var(--red);
+}
+
+/* per-column attention count in the In Progress header */
+.col-attn {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--orange);
+  padding: 1px 7px;
+  border: 1px solid var(--orange);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+/* needs-attention tray (above the board; collapsed when empty) */
+.attn-tray {
+  margin: 0 0 14px;
+  border: 1px solid var(--orange);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  overflow: hidden;
+}
+.attn-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  background: rgba(232, 134, 60, 0.08);
+  border-bottom: 1px solid var(--border-soft);
+}
+.attn-head-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--orange);
+}
+.attn-body {
+  display: flex;
+  flex-direction: column;
+}
+.attn-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border-soft);
+  font-size: 13px;
+}
+.attn-row:first-child {
+  border-top: none;
+}
+.attn-title {
+  font-weight: 500;
+  color: var(--text);
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 260px;
+}
+.attn-title:hover {
+  text-decoration: underline;
+}
+.attn-reason {
+  color: var(--text-dim);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attn-reason.attn-dead {
+  color: var(--red);
+}
+.attn-reason.attn-stuck {
+  color: var(--orange);
+}
+.attn-age {
+  color: var(--text-faint);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.attn-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* task-page attention banner */
+.health-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 12px 0;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  border-left-width: 3px;
+}
+.health-banner-text {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.health-banner-actions {
+  display: flex;
+  gap: 8px;
+}
+.banner-silent {
+  border-left-color: var(--amber);
+}
+.banner-stuck {
+  border-left-color: var(--orange);
+}
+.banner-dead {
+  border-left-color: var(--red);
 }
 
 /* chips */
