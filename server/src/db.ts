@@ -105,6 +105,19 @@ const MIGRATIONS: string[] = [
     detail TEXT
   );
   `,
+  // v2 — secrets: names/refs only, never values. Values live in the provider
+  // (Keychain / Bitwarden) and are resolved at spawn time.
+  `
+  CREATE TABLE secrets (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    name TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'keychain',
+    ref TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (project_id, name)
+  );
+  `,
 ];
 
 export type DB = Database;
