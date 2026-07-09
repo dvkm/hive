@@ -11,7 +11,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { now, newId, evidenceDir } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { writeEvent, transition, getTask, TERMINAL, type State } from "./state.ts";
+import { writeEvent, transition, getTask, evidenceCount, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { runSmoke, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
@@ -51,6 +51,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
     await syncAgents(db, deps);
   } catch (e) {
     fail("syncAgents", e);
+  }
+  try {
+    await advanceFinished(db, deps);
+  } catch (e) {
+    fail("advanceFinished", e);
   }
   try {
     await syncPRs(db, deps);
@@ -103,6 +108,40 @@ function lastAgentStatus(db: DB, taskId: string): string | null {
     return JSON.parse(r.payload).status ?? null;
   } catch {
     return null;
+  }
+}
+
+// ---- ready-for-review advancement (fixes tasks stuck in in_progress) ----
+// An agent that finished — opened a PR (ship/chore) or wrote its report (scout) —
+// and then went idle/gone used to sit in `in_progress` forever: nothing moved it
+// into the review queue. This is the backstop that unsticks it regardless of
+// agent discipline (the explicit `hive emit <id> ready` path is the clean signal;
+// this catches the agents that just go idle).
+//
+// Trigger: state=in_progress, agent status idle OR gone (NOT working/blocked/
+// unknown — an agent that opens a PR and keeps working still reports `working`),
+// AND a real work product exists (a pr_url, or a scout `report`). Advancing on a
+// single idle read is safe precisely because mid-work reads `working`. Runs
+// BEFORE recoverStale so a handed-off task is never failed/requeued.
+async function advanceFinished(db: DB, _deps: ReconcilerDeps): Promise<void> {
+  const tasks = db
+    .query(`SELECT id, kind, pr_url FROM tasks WHERE state = 'in_progress' AND agent_target IS NOT NULL`)
+    .all() as { id: string; kind: string; pr_url: string | null }[];
+  for (const t of tasks) {
+    const status = lastAgentStatus(db, t.id);
+    if (status !== "idle" && status !== "gone") continue; // working/blocked/unknown → leave it be
+    const hasReport = t.kind === "scout" && evidenceCount(db, t.id, "report") >= 1;
+    if (!t.pr_url && !hasReport) continue; // no product to review → health surfaces it, don't advance
+    writeEvent(db, {
+      task_id: t.id,
+      source: "reconciler",
+      type: "ready_for_review",
+      payload: { pr_url: t.pr_url ?? null, via: status, kind: t.kind },
+    });
+    transition(db, t.id, "in_review", {
+      source: "reconciler",
+      reason: hasReport ? "scout report ready; agent idle" : "PR open; agent idle",
+    });
   }
 }
 
@@ -228,6 +267,11 @@ async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
     .query(`SELECT id, agent_target FROM tasks WHERE agent_target IS NOT NULL AND state IN ${RECOVERABLE}`)
     .all() as { id: string; agent_target: string }[];
   for (const t of tasks) {
+    // A handed-off task (advanceFinished / director moved it to in_review, or it's
+    // verifying) is owned by a human/the merge flow: a gone agent there is expected
+    // (its work is done), so it must NOT be failed/requeued.
+    const cur = getTask(db, t.id);
+    if (cur && (cur.state === "in_review" || cur.state === "verifying")) continue;
     // A vanished agent (syncAgents just recorded `gone`) recovers within THIS
     // cycle — the SPEC requires detecting a ghost within one cycle, not waiting
     // out the stale threshold. The silent path is driven by a `stale` flag,

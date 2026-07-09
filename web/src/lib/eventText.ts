@@ -65,6 +65,8 @@ export function eventText(e: EventLike): string {
       return `CI ${s(p.ci_status)}`;
     case "pr_merged":
       return "PR merged";
+    case "ready_for_review":
+      return s(p.via) === "emit" ? "handed off for review" : "auto-advanced to review (agent idle)";
     case "stale":
       return "agent went silent";
     case "smoke_passed":
@@ -117,6 +119,7 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
   tool_use: "lifecycle",
   agent_turn_end: "lifecycle",
   state_change: "state",
+  ready_for_review: "state",
   "needs-decision": "decision",
   decision_answered: "decision",
   planned: "decision",

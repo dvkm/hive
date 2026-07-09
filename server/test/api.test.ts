@@ -67,6 +67,25 @@ test("transition endpoint enforces the state machine", async () => {
   expect(bad2.status).toBe(409);
 });
 
+test("ready emit records the pr_url and advances in_progress -> in_review", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "ready task" });
+  const id = t.json.id;
+  await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
+
+  const r = await post(`/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/42", note: "PR up" });
+  expect(r.status).toBe(200);
+  expect(r.json.task.state).toBe("in_review");
+  expect(r.json.task.pr_url).toBe("https://gh/pr/42");
+
+  const events = await get(`/api/tasks/${id}/events`);
+  expect(events.json.some((e: any) => e.type === "ready_for_review")).toBe(true);
+
+  // Idempotent: a second ready (task already in_review) acks without erroring.
+  const again = await post(`/api/tasks/${id}/events`, { type: "ready" });
+  expect(again.status).toBe(200);
+  expect(again.json.task.state).toBe("in_review");
+});
+
 test("evidence upload round-trips through /evidence", async () => {
   const form = new FormData();
   form.set("type", "evidence");

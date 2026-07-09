@@ -68,6 +68,16 @@ test("dead: agent gone from herdr", () => {
   expect(h?.reason).toBe("agent gone from herdr");
 });
 
+test("stuck: agent finished (idle) with no PR and no recent activity -> visible in the tray", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId); // in_progress, no pr_url
+  putEvent(db, id, "status", { note: "did the work" }, 30 * 60 * 1000); // 30m old, no PR
+  putEvent(db, id, "agent_status", { status: "idle" }, 30 * 60 * 1000);
+  const h = computeHealth(db, getTask(db, id), Date.now());
+  expect(h?.status).toBe("stuck");
+  expect(needsAttention({ state: "in_progress", health: h })).toBe(true);
+});
+
 test("needsAttention: failed tasks, or dead/stuck in-progress; not healthy/silent/queued", () => {
   expect(needsAttention({ state: "failed" })).toBe(true);
   expect(needsAttention({ state: "in_progress", health: { status: "dead", reason: null, since: "" } })).toBe(true);
