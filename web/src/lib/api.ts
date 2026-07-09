@@ -150,6 +150,17 @@ export interface TaskDetail extends Task {
   decisions: Decision[];
 }
 
+// One enriched row of the activity feed: an event joined to its task + project,
+// plus the evidence url for screenshot/evidence events (null otherwise).
+export interface FeedEvent extends Event {
+  task_title: string;
+  task_kind: Kind;
+  project_id: string;
+  project_name: string;
+  evidence_url: string | null;
+  evidence_kind: Evidence["kind"] | null;
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(BASE + path, {
     ...init,
@@ -173,6 +184,15 @@ export const api = {
     return req<Task[]>(`/api/tasks${p ? "?" + p : ""}`);
   },
   task: (id: string) => req<TaskDetail>(`/api/tasks/${id}`),
+  feed: (q: { since?: string; project?: string; types?: string; limit?: number } = {}) => {
+    const p = new URLSearchParams();
+    if (q.since) p.set("since", q.since);
+    if (q.project) p.set("project", q.project);
+    if (q.types) p.set("types", q.types);
+    if (q.limit) p.set("limit", String(q.limit));
+    const qs = p.toString();
+    return req<{ events: FeedEvent[] }>(`/api/feed${qs ? "?" + qs : ""}`);
+  },
   createTask: (b: { project_id: string; title: string; brief?: string; kind?: Kind }) =>
     req<Task>(`/api/tasks`, { method: "POST", body: JSON.stringify(b) }),
   brief: (id: string) => req<{ task_id: string; brief: string }>(`/api/tasks/${id}/brief`),

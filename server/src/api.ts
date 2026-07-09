@@ -105,6 +105,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       }
       if (m && method === "PUT") return updateProject(db, m[1], await req.json());
 
+      // ---- activity feed (reverse-chronological projection over events) ----
+      if (pathname === "/api/feed" && method === "GET") return listFeed(db, url);
+
       // ---- tasks ----
       if (pathname === "/api/tasks") {
         if (method === "GET") return listTasks(db, url);
@@ -327,6 +330,72 @@ function listTasks(db: DB, url: URL): Response {
     (where.length ? " WHERE " + where.join(" AND ") : "") +
     " ORDER BY updated_at DESC";
   return json(db.query(sql).all(...args).map(parseTask));
+}
+
+// Activity feed: reverse-chronological events across ALL tasks, each enriched
+// with its task title/kind/project (single JOIN query, indexed on events(ts)).
+// Screenshot/evidence events also carry the evidence url via a json_extract join
+// so the web can render thumbnails inline. `?since` (ts), `?project` (id),
+// `?limit` (default 100, capped 500), `?types` (csv of feed categories).
+//
+// ponytail: FEED_CATEGORIES mirrors web/src/lib/eventText.ts. A 5-line map is
+// cheaper to duplicate than to cross the server<-web build seam; keep in sync.
+const FEED_CATEGORIES: Record<string, string[]> = {
+  state: ["state_change"],
+  decision: ["needs-decision", "decision_answered", "planned", "authority_required", "authority_granted"],
+  evidence: ["evidence", "smoke_passed"],
+  incident: ["blocked", "stale", "spawn_error", "smoke_failed", "steer_error", "planner_error", "supervise_error", "authority_denied"],
+  lifecycle: ["created", "spawned", "agent_status", "status", "steer", "note", "ci_status", "pr_merged", "planning"],
+};
+
+function listFeed(db: DB, url: URL): Response {
+  const since = url.searchParams.get("since");
+  const project = url.searchParams.get("project");
+  const typesCsv = url.searchParams.get("types");
+  let limit = parseInt(url.searchParams.get("limit") ?? "100", 10);
+  if (!Number.isFinite(limit) || limit <= 0) limit = 100;
+  limit = Math.min(limit, 500);
+
+  const where: string[] = [];
+  const args: any[] = [];
+  if (since) { where.push("e.ts > ?"); args.push(since); }
+  if (project) { where.push("t.project_id = ?"); args.push(project); }
+  if (typesCsv) {
+    const cats = typesCsv.split(",").map((s) => s.trim()).filter(Boolean);
+    const types = cats.flatMap((c) => FEED_CATEGORIES[c] ?? []);
+    if (types.length === 0) return json({ events: [] }); // filters matched no known category
+    where.push(`e.type IN (${types.map(() => "?").join(",")})`);
+    args.push(...types);
+  }
+
+  const sql =
+    `SELECT e.id, e.task_id, e.ts, e.source, e.type, e.payload,
+            t.title AS task_title, t.kind AS task_kind, t.project_id AS project_id,
+            p.name AS project_name,
+            ev.url AS evidence_url, ev.kind AS evidence_kind
+     FROM events e
+     JOIN tasks t ON t.id = e.task_id
+     JOIN projects p ON p.id = t.project_id
+     LEFT JOIN evidence ev ON ev.id = json_extract(e.payload, '$.evidence_id')` +
+    (where.length ? " WHERE " + where.join(" AND ") : "") +
+    " ORDER BY e.ts DESC, e.id DESC LIMIT ?";
+  args.push(limit);
+
+  const rows = db.query(sql).all(...args).map((r: any) => ({
+    id: r.id,
+    task_id: r.task_id,
+    ts: r.ts,
+    source: r.source,
+    type: r.type,
+    payload: JSON.parse(r.payload || "{}"),
+    task_title: r.task_title,
+    task_kind: r.task_kind,
+    project_id: r.project_id,
+    project_name: r.project_name,
+    evidence_url: r.evidence_url ?? null,
+    evidence_kind: r.evidence_kind ?? null,
+  }));
+  return json({ events: rows });
 }
 
 function getTaskFull(db: DB, id: string): Response {
