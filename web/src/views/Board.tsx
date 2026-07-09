@@ -135,11 +135,13 @@ function BriefBanner() {
   const { decisions, tasks } = useStore();
   const attn = tasks.filter(needsAttention).length;
   const decs = decisions.length;
-  const sig = `${decs}:${attn}`;
+  const review = tasks.filter((t) => t.state === "in_review").length;
+  const sig = `${decs}:${attn}:${review}`;
   const [dismissed, setDismissed] = useState<string>(() => localStorage.getItem(BANNER_DISMISS_KEY) || "");
-  if (decs + attn === 0 || dismissed === sig) return null;
+  if (decs + attn + review === 0 || dismissed === sig) return null;
   const parts: string[] = [];
   if (decs > 0) parts.push(`${decs} decision${decs === 1 ? "" : "s"}`);
+  if (review > 0) parts.push(`${review} to review`);
   if (attn > 0) parts.push(`${attn} need${attn === 1 ? "s" : ""} attention`);
   const dismiss = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -228,7 +230,9 @@ export default function Board() {
         return (
           <section className="column" key={s}>
             <header className="col-head">
-              <span className="col-title">{STATE_LABEL[s]}</span>
+              <span className="col-title" title={s === "in_review" ? "awaiting your review & merge" : undefined}>
+                {STATE_LABEL[s]}
+              </span>
               <div className="col-head-right">
                 {attention > 0 && (
                   <span className="col-attn" title={`${attention} task(s) need attention`}>
