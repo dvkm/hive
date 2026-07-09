@@ -57,14 +57,13 @@ test("backfill assigns numbers to legacy rows in created_at order", () => {
     const db1 = openDb(path);
     const projectId = newId("proj");
     db1.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run(projectId, "p", "{}", now());
-    // 2) Rewind to the pre-number (v10) schema: drop the number column, its index
-    //    and the auto-assign trigger, so re-opening re-runs the real v11 backfill.
-    //    (v10 is duplicate_of, already applied — rewinding past it would re-add an
-    //    existing column, so target v10, not v9.)
+    // 2) Rewind to the pre-number schema: drop the number column, its index and
+    //    the auto-assign trigger, and un-apply v11 so re-opening re-runs the real
+    //    backfill.
     db1.exec("DROP TRIGGER tasks_assign_number");
     db1.exec("DROP INDEX idx_tasks_number");
     db1.exec("ALTER TABLE tasks DROP COLUMN number");
-    db1.exec("PRAGMA user_version = 10");
+    db1.exec("DELETE FROM schema_migrations WHERE name = 'v11-task-numbers'");
     // 3) Insert legacy rows OUT of created_at order.
     const mk = (id: string, created_at: string) =>
       db1.query("INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at) VALUES (?,?,?, 'queued','ship',?,?)")
