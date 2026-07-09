@@ -191,6 +191,11 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
+  spawn: (id: string) =>
+    req<{ ok: boolean; task: Task; agent_target: string }>(`/api/tasks/${id}/spawn`, {
+      method: "POST",
+      body: "{}",
+    }),
 
   decisions: (status: "open" | "answered" | "all" = "open") =>
     req<Decision[]>(`/api/decisions?status=${status}`),
@@ -219,6 +224,8 @@ export const api = {
     req<AuthorityRule>(`/api/authority/rules/${id}`, { method: "PUT", body: JSON.stringify(b) }),
 
   projects: () => req<Project[]>(`/api/projects`),
+  updateProject: (id: string, b: { config?: Project["config"]; name?: string; repo_path?: string | null }) =>
+    req<Project>(`/api/projects/${id}`, { method: "PUT", body: JSON.stringify(b) }),
   // Incidents API is built in parallel; treat absence (404/network) as "not running yet".
   incidents: (status: "open" | "resolved") =>
     req<{ incidents: Incident[] }>(`/api/incidents?status=${status}`),

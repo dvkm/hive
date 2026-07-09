@@ -16,10 +16,26 @@ const COLUMNS: State[] = [
 ];
 
 function Card({ task }: { task: Task }) {
-  const { projects, evidenceCount, lastActivity } = useStore();
+  const { projects, evidenceCount, spawnError, lastActivity } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
   const age = useRelTime(lastActivity[task.id] || task.updated_at);
   const ev = evidenceCount[task.id];
+  const [dispatching, setDispatching] = useState(false);
+
+  const dispatch = async (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (dispatching) return;
+    setDispatching(true);
+    try {
+      await api.spawn(task.id);
+      toast("Agent dispatched");
+    } catch (err) {
+      toast((err as Error).message);
+      setDispatching(false);
+    }
+  };
+
   return (
     <Link to={`/tasks/${task.id}`} className="card">
       <div className="card-top">
@@ -39,10 +55,20 @@ function Card({ task }: { task: Task }) {
             planned
           </span>
         )}
+        {task.state === "queued" && spawnError[task.id] && (
+          <span className="chip chip-error" title="A previous spawn failed; see the task timeline">
+            ⚠ spawn failed
+          </span>
+        )}
         <span className="card-age">{age}</span>
       </div>
       {task.summary && <div className="card-summary">{task.summary}</div>}
       <div className="card-foot">
+        {task.state === "queued" && (
+          <button className="btn btn-mini" onClick={dispatch} disabled={dispatching} title="Spawn an agent for this task now">
+            {dispatching ? "dispatching…" : "dispatch now"}
+          </button>
+        )}
         {task.pr_url && (
           <a
             className="pr"

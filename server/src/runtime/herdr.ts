@@ -86,8 +86,11 @@ export function worktreeRemoveArgv(ref: { workspaceId?: string | null; worktreeP
   return a;
 }
 
-// Parse `herdr worktree create --json`. Field names vary by herdr version, so
-// probe a few plausible keys defensively.
+// Parse `herdr worktree create --json`. herdr 0.7.x wraps the payload in a
+// `{"id":...,"result":{...}}` envelope whose `result.worktree` holds path/branch
+// and `result.workspace.workspace_id` (also `worktree.open_workspace_id`) holds
+// the workspace id used by `worktree remove --workspace`. Field names vary by
+// herdr version, so probe a few plausible keys defensively.
 export function parseWorktreeJson(stdout: string): { path: string | null; branch: string | null; workspaceId: string | null } {
   let obj: any = {};
   try {
@@ -95,20 +98,31 @@ export function parseWorktreeJson(stdout: string): { path: string | null; branch
   } catch {
     return { path: null, branch: null, workspaceId: null };
   }
-  const w = obj.worktree ?? obj.data ?? obj;
+  const r = obj.result ?? obj; // unwrap the 0.7.x CLI envelope
+  const w = r.worktree ?? r.data ?? r;
   return {
-    path: w.path ?? w.worktree_path ?? w.dir ?? w.root ?? null,
+    path: w.path ?? w.worktree_path ?? w.checkout_path ?? w.dir ?? w.root ?? null,
     branch: w.branch ?? w.branch_name ?? null,
-    workspaceId: w.workspace ?? w.workspace_id ?? w.workspaceId ?? w.id ?? null,
+    workspaceId:
+      w.open_workspace_id ??
+      w.workspace ??
+      w.workspace_id ??
+      w.workspaceId ??
+      r.workspace?.workspace_id ??
+      r.workspace?.id ??
+      w.id ??
+      null,
   };
 }
 
-// Map herdr's free-form agent status text onto our small enum.
+// Map herdr's free-form agent status text onto our small enum. herdr 0.7.x
+// returns `agent get` as {"result":{"agent":{"agent_status":"working",...}}}.
 export function parseAgentStatus(stdout: string): AgentStatus {
   const s = stdout.toLowerCase();
   try {
     const obj = JSON.parse(stdout);
-    const v = String(obj.status ?? obj.state ?? "").toLowerCase();
+    const a = obj.result?.agent ?? obj.agent ?? obj;
+    const v = String(a.agent_status ?? a.status ?? a.state ?? "").toLowerCase();
     if (v) return normalizeStatus(v);
   } catch {
     /* not JSON; fall through to substring probing */
