@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import type { Task, Decision, Project, Notification } from "./api";
+import type { Task, Decision, Project, Notification, Event, Evidence } from "./api";
 
 export type SseState = "connecting" | "open" | "reconnecting";
 
@@ -14,8 +14,12 @@ interface Store {
   spawnError: Record<string, boolean>; // task has a spawn_error and no later spawned
   lastActivity: Record<string, string>; // ts of most-recent event per task
   rev: Record<string, number>; // bumps when a task is touched (task pages refetch on change)
+  feedEvents: Event[]; // live events for the activity feed, newest first (capped)
+  evidenceMeta: Record<string, { url: string | null; kind: Evidence["kind"] }>; // by evidence id, for live feed thumbnails
   sse: SseState;
 }
+
+const FEED_CAP = 400;
 
 const Ctx = createContext<Store | null>(null);
 export const useStore = () => {
@@ -35,6 +39,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [spawnError, setSpawnError] = useState<Record<string, boolean>>({});
   const [lastActivity, setLastActivity] = useState<Record<string, string>>({});
   const [rev, setRev] = useState<Record<string, number>>({});
+  const [feedEvents, setFeedEvents] = useState<Event[]>([]);
+  const [evidenceMeta, setEvidenceMeta] = useState<Record<string, { url: string | null; kind: Evidence["kind"] }>>({});
   const [sse, setSse] = useState<SseState>("connecting");
   const bumped = useRef(false);
 
@@ -94,14 +100,17 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           setLastActivity((la) => ({ ...la, [t.id]: t.updated_at }));
           bump(t.id);
         } else if (msg.type === "event") {
-          const ev = msg.event;
+          const ev: Event = msg.event;
           setLastActivity((la) => ({ ...la, [ev.task_id]: ev.ts }));
+          setFeedEvents((prev) => [ev, ...prev].slice(0, FEED_CAP));
           if (ev.type === "spawn_error") setSpawnError((s) => ({ ...s, [ev.task_id]: true }));
           else if (ev.type === "spawned") setSpawnError((s) => ({ ...s, [ev.task_id]: false }));
           bump(ev.task_id);
         } else if (msg.type === "evidence") {
-          const id = msg.evidence.task_id;
+          const evi: Evidence = msg.evidence;
+          const id = evi.task_id;
           setEvidenceCount((c) => ({ ...c, [id]: (c[id] || 0) + 1 }));
+          if (evi.id) setEvidenceMeta((m) => ({ ...m, [evi.id]: { url: evi.url, kind: evi.kind } }));
           bump(id);
         } else if (msg.type === "decision") {
           const d: Decision = msg.decision;
@@ -129,7 +138,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, sse }}>
+    <Ctx.Provider value={{ tasks, projects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, sse }}>
       {children}
     </Ctx.Provider>
   );
