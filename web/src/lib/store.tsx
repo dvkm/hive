@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import type { Task, Decision, Project } from "./api";
+import type { Task, Decision, Project, Notification } from "./api";
 
 export type SseState = "connecting" | "open" | "reconnecting";
 
@@ -8,6 +8,8 @@ interface Store {
   tasks: Task[];
   projects: Project[];
   decisions: Decision[]; // open only
+  notifications: Notification[]; // newest first
+  ackNotifications: () => void;
   evidenceCount: Record<string, number>;
   lastActivity: Record<string, string>; // ts of most-recent event per task
   rev: Record<string, number>; // bumps when a task is touched (task pages refetch on change)
@@ -27,6 +29,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [decisions, setDecisions] = useState<Decision[]>([]);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
   const [evidenceCount, setEvidenceCount] = useState<Record<string, number>>({});
   const [lastActivity, setLastActivity] = useState<Record<string, string>>({});
   const [rev, setRev] = useState<Record<string, number>>({});
@@ -50,7 +53,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     });
     api.decisions("open").then(setDecisions);
     api.projects().then(setProjects).catch(() => setProjects([]));
+    api.notifications().then((n) => setNotifications(n.notifications)).catch(() => setNotifications([]));
   }, []);
+
+  // Mark all as read: optimistic local update + server ack.
+  const ackNotifications = () => {
+    setNotifications((ns) => ns.map((n) => (n.delivered_at ? n : { ...n, delivered_at: new Date().toISOString() })));
+    api.ackNotifications().catch(() => {});
+  };
 
   // SSE. Auto-reconnects (EventSource does this natively; we just reflect state).
   useEffect(() => {
@@ -95,6 +105,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             return d.status === "open" ? [d, ...rest] : rest;
           });
           bump(d.task_id);
+        } else if (msg.type === "notification") {
+          const n: Notification = msg.notification;
+          setNotifications((prev) => (prev.some((x) => x.id === n.id) ? prev : [n, ...prev]));
         }
       };
     };
@@ -109,7 +122,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, decisions, evidenceCount, lastActivity, rev, sse }}>
+    <Ctx.Provider value={{ tasks, projects, decisions, notifications, ackNotifications, evidenceCount, lastActivity, rev, sse }}>
       {children}
     </Ctx.Provider>
   );

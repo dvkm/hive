@@ -157,6 +157,49 @@ values.** Values live only in the provider (macOS Keychain / Bitwarden); the DB
 stores a reference, and the server redacts any known secret value from stored
 event/evidence payloads. Set values with `hive secret set` (reads from stdin).
 
+### Learning (regression ledger)
+```json
+{
+  "id": "lrn_...",
+  "project_id": "proj_...",
+  "title": "post-merge smoke skipped when config.smoke empty",
+  "body": "Root cause + workaround notes.",
+  "source_task_id": "9da7c5527580",
+  "occurrences": 3,
+  "first_seen": "2026-07-08T12:00:00.000Z",
+  "last_seen": "2026-07-09T09:00:00.000Z",
+  "status": "active",
+  "root_cause_task_id": "c21eef921dfd"
+}
+```
+`status ∈ {active, resolved}`. `occurrences` counts how many times the pattern
+recurred (bumped via `/recur`). `source_task_id` (the task that first hit it) and
+`root_cause_task_id` (the chore task opened to fix it, if any) may be null. Active
+learnings for a project are injected into composed briefs (see `/api/tasks/:id/brief`)
+under a "Known failure patterns" section, 10 most recent by `last_seen`.
+
+### Notification
+```json
+{
+  "id": "ntf_...",
+  "ts": "2026-07-09T09:00:00.000Z",
+  "kind": "decision",
+  "task_id": "9da7c5527580",
+  "decision_id": "dec_...",
+  "title": "Decision needed: ship prod?",
+  "body": "Production DB acme-prod-db.",
+  "urgency": "urgent",
+  "delivered_at": "2026-07-09T09:00:00.000Z"
+}
+```
+`kind ∈ {decision, done, failed, incident, stale}`. `urgency ∈ {normal, urgent}`.
+`task_id` / `decision_id` may be null. `delivered_at` is set once David has been
+made aware — urgent notifications push a macOS notification immediately (so it is
+set on creation); normal ones are batched into a single digest every
+`HIVE_DIGEST_MS` (default 30m), or marked when the header bell is opened
+(`POST /api/notifications/ack`). The bell's unread count is the rows where
+`delivered_at` is null.
+
 ---
 
 ## Endpoints
@@ -230,6 +273,21 @@ Behavior by `type`:
 ### Incidents
 - `GET /api/incidents?status=` → `200 {"incidents": [Incident, ...]}` (newest first; `status` filter optional, e.g. `open` / `resolved`)
 
+### Learnings (regression ledger)
+- `GET /api/learnings?project_id=&status=` → `200 [Learning, ...]` (newest `last_seen` first; both filters optional)
+- `POST /api/learnings` body `{project_id (required), title (required), body?, source_task_id?, create_root_cause_task?}` → `201 Learning` | `400` (unknown `project_id`)
+  With `create_root_cause_task: true`, a queued `chore` task is auto-created (brief prefilled from the learning) and its id is set as `root_cause_task_id` — the "unblock now, root-cause later" flow. Broadcasts a `learning` (and, for the auto task, a `task`) SSE message.
+- `GET /api/learnings/:id` → `200 Learning` | `404`
+- `PUT /api/learnings/:id` body `{title?, body?, status?, root_cause_task_id?}` → `200 Learning` | `400` (bad `status`) | `404` (resolve = `status:"resolved"`)
+- `DELETE /api/learnings/:id` → `200 {"ok":true}`
+- `POST /api/learnings/:id/recur` → `200 Learning` | `404`
+  Bumps `occurrences` + refreshes `last_seen` and re-activates the learning (`status:"active"`); the same failure pattern happened again. Broadcasts a `learning` SSE message.
+
+### Notifications
+- `GET /api/notifications?since=` → `200 {"notifications": [Notification, ...], "unread": <n>}` (newest first; `since` is an ISO timestamp filter, else the 100 most recent; `unread` counts rows with `delivered_at` null)
+- `POST /api/notifications/ack` → `200 {"ok":true, "acked": <n>}`
+  Marks all currently-undelivered notifications as seen (`delivered_at` set to now). Called when the header bell dropdown is opened, so those events are not re-pushed by the next digest.
+
 ### Secrets (metadata only)
 Values are never accepted or returned here. Set them with `hive secret set`
 (writes to the provider locally, then registers the reference via `POST`).
@@ -256,6 +314,8 @@ Subsequent messages (broadcast to all clients on every change):
 | evidence | `{"type":"evidence","evidence": Evidence}` | an evidence row is added |
 | decision | `{"type":"decision","decision": Decision}` | a decision is created or answered |
 | incident | `{"type":"incident","incident": Incident}` | a monitor incident opens or resolves |
+| learning | `{"type":"learning","learning": Learning}` | a learning is created, updated, or recurs |
+| notification | `{"type":"notification","notification": Notification}` | a notification is enqueued (urgent ones arrive already `delivered_at`) |
 | reconciler_error | `{"type":"reconciler_error","error":"...","where":"..."}` | a reconciler cycle hit an error (at most once per cycle; no DB row) |
 
 A state change therefore produces both an `event` message (`type:"state_change"`)

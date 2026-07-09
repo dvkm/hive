@@ -59,6 +59,9 @@ bin/hive decision ask <task-id> --title "..." --risk high \
     --option go:Go:"do it" --option wait:Wait:"hold" --recommend go
 bin/hive policy add --title "..." --body "..." [--scope global|project:<id>]
 bin/hive policy list [--scope <s>]
+bin/hive learning add --project <id> --title "..." [--body "..."] [--root-cause]
+bin/hive learning list [--project <id>] [--status active|resolved]
+bin/hive learning recur <learning-id>   # bump occurrences when the pattern recurs
 bin/hive spawn <task-id>                # start a herdr agent for a task
 echo -n "s3cret" | bin/hive secret set --project <id> --name API_KEY
 bin/hive secret list --project <id>

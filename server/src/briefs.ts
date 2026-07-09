@@ -68,5 +68,20 @@ export function composeBrief(db: DB, taskId: string): string {
     );
   }
 
+  // Known failure patterns: active learnings for the project, 10 most recent.
+  const learnings = db
+    .query(
+      "SELECT title, body, occurrences FROM learnings WHERE project_id = ? AND status = 'active' ORDER BY last_seen DESC LIMIT 10"
+    )
+    .all(task.project_id) as { title: string; body: string | null; occurrences: number }[];
+  if (learnings.length) {
+    parts.push(
+      "## Known failure patterns (learn from past regressions)\n" +
+        learnings
+          .map((l) => `### ${l.title} (seen ${l.occurrences}×)\n${l.body?.trim() || ""}`.trimEnd())
+          .join("\n\n")
+    );
+  }
+
   return parts.join("\n\n") + "\n";
 }

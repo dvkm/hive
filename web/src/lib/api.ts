@@ -106,6 +106,31 @@ export interface Incident {
   detail: string;
 }
 
+export interface Learning {
+  id: string;
+  project_id: string;
+  title: string;
+  body: string | null;
+  source_task_id: string | null;
+  occurrences: number;
+  first_seen: string;
+  last_seen: string;
+  status: "active" | "resolved";
+  root_cause_task_id: string | null;
+}
+
+export interface Notification {
+  id: string;
+  ts: string;
+  kind: string;
+  task_id: string | null;
+  decision_id: string | null;
+  title: string;
+  body: string | null;
+  urgency: "normal" | "urgent";
+  delivered_at: string | null;
+}
+
 export interface TaskDetail extends Task {
   events: Event[];
   evidence: Evidence[];
@@ -135,6 +160,8 @@ export const api = {
     return req<Task[]>(`/api/tasks${p ? "?" + p : ""}`);
   },
   task: (id: string) => req<TaskDetail>(`/api/tasks/${id}`),
+  createTask: (b: { project_id: string; title: string; brief?: string; kind?: Kind }) =>
+    req<Task>(`/api/tasks`, { method: "POST", body: JSON.stringify(b) }),
   brief: (id: string) => req<{ task_id: string; brief: string }>(`/api/tasks/${id}/brief`),
   transition: (id: string, to: State, reason?: string) =>
     req<Task>(`/api/tasks/${id}/transition`, {
@@ -170,4 +197,17 @@ export const api = {
   // Incidents API is built in parallel; treat absence (404/network) as "not running yet".
   incidents: (status: "open" | "resolved") =>
     req<{ incidents: Incident[] }>(`/api/incidents?status=${status}`),
+
+  learnings: (q: { project_id?: string; status?: "active" | "resolved" } = {}) => {
+    const p = new URLSearchParams(q as Record<string, string>).toString();
+    return req<Learning[]>(`/api/learnings${p ? "?" + p : ""}`);
+  },
+  createLearning: (b: { project_id: string; title: string; body?: string; create_root_cause_task?: boolean }) =>
+    req<Learning>(`/api/learnings`, { method: "POST", body: JSON.stringify(b) }),
+  updateLearning: (id: string, b: Partial<Pick<Learning, "title" | "body" | "status">>) =>
+    req<Learning>(`/api/learnings/${id}`, { method: "PUT", body: JSON.stringify(b) }),
+  recurLearning: (id: string) => req<Learning>(`/api/learnings/${id}/recur`, { method: "POST", body: "{}" }),
+
+  notifications: () => req<{ notifications: Notification[]; unread: number }>(`/api/notifications`),
+  ackNotifications: () => req<{ ok: boolean; acked: number }>(`/api/notifications/ack`, { method: "POST", body: "{}" }),
 };

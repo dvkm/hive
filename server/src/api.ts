@@ -27,6 +27,7 @@ import {
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
 import { runSmoke } from "./monitors.ts";
+import { enqueue, ackNotifications } from "./notifications.ts";
 
 export interface HandlerDeps {
   herdr?: Herdr; // injectable for tests
@@ -157,6 +158,31 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       // ---- incidents ----
       if (pathname === "/api/incidents" && method === "GET") return listIncidents(db, url);
+
+      // ---- learnings (regression ledger) ----
+      if (pathname === "/api/learnings") {
+        if (method === "GET") return listLearnings(db, url);
+        if (method === "POST") return createLearning(db, await req.json());
+      }
+      m = pathname.match(/^\/api\/learnings\/([^/]+)$/);
+      if (m) {
+        if (method === "GET") {
+          const r = db.query("SELECT * FROM learnings WHERE id = ?").get(m[1]);
+          return r ? json(r) : err("learning not found", 404);
+        }
+        if (method === "PUT") return updateLearning(db, m[1], await req.json());
+        if (method === "DELETE") {
+          db.query("DELETE FROM learnings WHERE id = ?").run(m[1]);
+          return json({ ok: true });
+        }
+      }
+      m = pathname.match(/^\/api\/learnings\/([^/]+)\/recur$/);
+      if (m && method === "POST") return recurLearning(db, m[1]);
+
+      // ---- notifications ----
+      if (pathname === "/api/notifications" && method === "GET") return listNotifications(db, url);
+      if (pathname === "/api/notifications/ack" && method === "POST")
+        return json({ ok: true, acked: ackNotifications(db) });
 
       // ---- secrets (names/metadata only; values live in the provider) ----
       m = pathname.match(/^\/api\/projects\/([^/]+)\/secrets$/);
@@ -394,6 +420,113 @@ function listIncidents(db: DB, url: URL): Response {
   return json({ incidents: rows.map(parseIncident) });
 }
 
+// ---------------------------------------------------------------- learnings (regression ledger)
+function listLearnings(db: DB, url: URL): Response {
+  const projectId = url.searchParams.get("project_id");
+  const status = url.searchParams.get("status");
+  const where: string[] = [];
+  const args: any[] = [];
+  if (projectId) { where.push("project_id = ?"); args.push(projectId); }
+  if (status) { where.push("status = ?"); args.push(status); }
+  const sql =
+    "SELECT * FROM learnings" +
+    (where.length ? " WHERE " + where.join(" AND ") : "") +
+    " ORDER BY last_seen DESC";
+  return json(db.query(sql).all(...args));
+}
+
+// Create a learning. With create_root_cause_task, auto-spawn a queued `chore`
+// task (brief prefilled from the learning) and link it — the "unblock now,
+// root-cause later" flow.
+function createLearning(db: DB, body: any): Response {
+  if (!body?.project_id) return err("project_id is required");
+  if (!body?.title) return err("title is required");
+  if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(body.project_id))
+    return err("unknown project_id", 400);
+  const t = now();
+  const row: any = {
+    id: newId("lrn"),
+    project_id: body.project_id,
+    title: String(body.title),
+    body: body.body ?? null,
+    source_task_id: body.source_task_id ?? null,
+    occurrences: 1,
+    first_seen: t,
+    last_seen: t,
+    status: "active",
+    root_cause_task_id: null,
+  };
+  if (body.create_root_cause_task)
+    row.root_cause_task_id = createRootCauseTask(db, row);
+  db.query(
+    `INSERT INTO learnings (id, project_id, title, body, source_task_id, occurrences,
+      first_seen, last_seen, status, root_cause_task_id) VALUES (?,?,?,?,?,?,?,?,?,?)`
+  ).run(
+    row.id, row.project_id, row.title, row.body, row.source_task_id, row.occurrences,
+    row.first_seen, row.last_seen, row.status, row.root_cause_task_id
+  );
+  broadcast({ type: "learning", learning: row });
+  return json(row, 201);
+}
+
+// Direct insert of a queued chore task (mirrors createIncidentTask). Returns the
+// new task id so the learning can link it.
+function createRootCauseTask(db: DB, learning: any): string {
+  const t = now();
+  const id = newId();
+  const title = `Root cause: ${learning.title}`;
+  const brief = `Automated root-cause task for a recurring failure pattern.\n\n## Learning\n${learning.title}\n\n${learning.body ?? ""}\n\nFind and fix the underlying cause so this stops recurring.`;
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, brief, state, kind, created_at, updated_at)
+     VALUES (?,?,?,?, 'queued', 'chore', ?, ?)`
+  ).run(id, learning.project_id, title, brief, t, t);
+  writeEvent(db, { task_id: id, source: "director", type: "created", payload: { title, learning_id: learning.id } });
+  broadcast({ type: "task", task: getTask(db, id) });
+  return id;
+}
+
+function updateLearning(db: DB, id: string, body: any): Response {
+  const r: any = db.query("SELECT * FROM learnings WHERE id = ?").get(id);
+  if (!r) return err("learning not found", 404);
+  if (body.status && !["active", "resolved"].includes(body.status))
+    return err("status must be 'active' or 'resolved'");
+  const next = {
+    title: body.title ?? r.title,
+    body: body.body ?? r.body,
+    status: body.status ?? r.status,
+    root_cause_task_id: body.root_cause_task_id ?? r.root_cause_task_id,
+  };
+  db.query(
+    "UPDATE learnings SET title = ?, body = ?, status = ?, root_cause_task_id = ? WHERE id = ?"
+  ).run(next.title, next.body, next.status, next.root_cause_task_id, id);
+  const updated = { ...r, ...next };
+  broadcast({ type: "learning", learning: updated });
+  return json(updated);
+}
+
+// Bump occurrences + last_seen: the same failure pattern happened again.
+function recurLearning(db: DB, id: string): Response {
+  const r: any = db.query("SELECT * FROM learnings WHERE id = ?").get(id);
+  if (!r) return err("learning not found", 404);
+  const last_seen = now();
+  db.query(
+    "UPDATE learnings SET occurrences = occurrences + 1, last_seen = ?, status = 'active' WHERE id = ?"
+  ).run(last_seen, id);
+  const updated = { ...r, occurrences: r.occurrences + 1, last_seen, status: "active" };
+  broadcast({ type: "learning", learning: updated });
+  return json(updated);
+}
+
+// ---------------------------------------------------------------- notifications
+function listNotifications(db: DB, url: URL): Response {
+  const since = url.searchParams.get("since");
+  const rows = since
+    ? db.query("SELECT * FROM notifications WHERE ts > ? ORDER BY ts DESC").all(since)
+    : db.query("SELECT * FROM notifications ORDER BY ts DESC LIMIT 100").all();
+  const unread = (db.query("SELECT COUNT(*) AS n FROM notifications WHERE delivered_at IS NULL").get() as { n: number }).n;
+  return json({ notifications: rows, unread });
+}
+
 // ---------------------------------------------------------------- secrets (metadata only)
 function listSecrets(db: DB, projectId: string): Response {
   if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return err("project not found", 404);
@@ -566,6 +699,15 @@ export function createDecision(
     transition(db, d.task_id, "needs_decision", { source: "agent", reason: row.title });
   }
   broadcast({ type: "decision", decision });
+  // Notify: a high-risk decision is urgent (immediate push); others batch.
+  enqueue(db, {
+    kind: "decision",
+    task_id: d.task_id,
+    decision_id: row.id,
+    title: `Decision needed: ${row.title}`,
+    body: row.blast_radius ?? row.context ?? undefined,
+    urgency: (row.risk ?? "").toLowerCase() === "high" ? "urgent" : "normal",
+  });
   return decision;
 }
 

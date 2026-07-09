@@ -12,6 +12,7 @@ import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask } from "./state.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { runSmoke, type MonitorDeps } from "./monitors.ts";
+import { enqueue } from "./notifications.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 
@@ -154,6 +155,8 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
         type: "stale",
         payload: { silent_ms: age, threshold_ms: staleMs },
       });
+      const task = getTask(db, t.id);
+      enqueue(db, { kind: "stale", task_id: t.id, title: `Task stale: ${task?.title ?? t.id}` });
     }
   }
 }

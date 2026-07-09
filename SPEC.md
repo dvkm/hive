@@ -69,7 +69,7 @@ State machine (server-enforced):
 ## Web app (the product)
 
 Views (React + Vite + TS; no UI framework dependency heavier than needed; SSE via EventSource to `/api/stream`):
-1. **Board** — 6 columns (Queued, In Progress, Needs Decision, In Review, Verifying, Done — Done shows last 10). Cards: title, project chip, agent status dot, last-event age, PR + CI badge, evidence count, one-line summary. Click → task page. Live reorder via SSE.
+1. **Board** — 6 columns (Queued, In Progress, Needs Decision, In Review, Verifying, Done — Done shows last 10). Cards: title, project chip, agent status dot, last-event age, PR + CI badge, evidence count, one-line summary. Click → task page. Live reorder via SSE. A prominent **"+ New task"** control (header and/or top of Queued column): project select, title, brief, kind — David queues work directly from the board; it must never require the CLI.
 2. **Task page** — brief, live event timeline, evidence gallery (inline images, test-run summaries, links), decisions (open + history), PR/CI panel, final summary. Actions: send steer message, cancel, approve merge.
 3. **Decision inbox** — open decision cards per product rule 3, newest first, badge count in nav. Radio options + note textarea (draft autosaved via debounced PUT) + Submit button. Submitting dispatches an event to the owning task's agent via `herdr agent send` and archives the card.
 4. **Policies** — list/add/edit/deactivate policies, global and per-project.

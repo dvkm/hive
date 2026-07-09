@@ -118,6 +118,39 @@ const MIGRATIONS: string[] = [
     UNIQUE (project_id, name)
   );
   `,
+  // v3 — regression/learning ledger. Recurring failures become tracked learnings
+  // (injected into future briefs) that can auto-spawn a root-cause chore task.
+  `
+  CREATE TABLE learnings (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    title TEXT NOT NULL,
+    body TEXT,
+    source_task_id TEXT,
+    occurrences INTEGER NOT NULL DEFAULT 1,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    root_cause_task_id TEXT
+  );
+  CREATE INDEX idx_learnings_project ON learnings(project_id, status, last_seen);
+  `,
+  // v4 — notification queue. Notable events enqueue a row; urgent ones push a
+  // macOS notification immediately, normal ones are batched into a digest.
+  `
+  CREATE TABLE notifications (
+    id TEXT PRIMARY KEY,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    task_id TEXT,
+    decision_id TEXT,
+    title TEXT NOT NULL,
+    body TEXT,
+    urgency TEXT NOT NULL DEFAULT 'normal',
+    delivered_at TEXT
+  );
+  CREATE INDEX idx_notifications_ts ON notifications(ts);
+  `,
 ];
 
 export type DB = Database;

@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
+import { enqueue } from "./notifications.ts";
 
 export type Fetcher = (url: string) => Promise<{ status: number; body: string }>;
 
@@ -51,15 +52,6 @@ export async function runCheck(check: Check, fetcher: Fetcher = defaultFetcher):
     return { ok: true, detail: `status ${status}` };
   } catch (e: any) {
     return { ok: false, detail: `request failed: ${e?.message ?? e}` };
-  }
-}
-
-async function macNotify(exec: Exec, title: string, message: string): Promise<void> {
-  try {
-    const q = (s: string) => s.replace(/"/g, '\\"');
-    await exec(["osascript", "-e", `display notification "${q(message)}" with title "${q(title)}"`]);
-  } catch {
-    /* non-fatal: osascript missing / not macOS */
   }
 }
 
@@ -102,7 +94,9 @@ export async function checkProjectMonitors(
       const incident = parseIncident(row);
       broadcast({ type: "incident", incident });
       touched.push(incident);
-      if (notify) await macNotify(exec, `hive: ${mon.name} down`, result.detail);
+      // Incidents are urgent: push immediately (osascript via enqueue).
+      if (notify)
+        enqueue(db, { kind: "incident", title: `Monitor down: ${mon.name}`, body: result.detail, urgency: "urgent" }, { exec });
       if (autoTask) createIncidentTask(db, project.id, mon, result.detail);
     } else if (result.ok && existing) {
       db.query("UPDATE incidents SET status = 'resolved' WHERE id = ?").run(existing.id);

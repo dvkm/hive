@@ -17,6 +17,9 @@ Usage:
         --option key:label:detail  (repeatable)  --recommend <key>
   hive policy add --title <t> --body <s>|--body-file <f> [--scope global|project:<id>]
   hive policy list [--scope <s>]
+  hive learning add --project <id> --title <t> [--body <s>] [--task <src-task-id>] [--root-cause]
+  hive learning list [--project <id>] [--status active|resolved]
+  hive learning recur <learning-id>
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive secret set --project <id> --name <n> [--provider keychain|bitwarden]
         (reads the value from stdin; writes to the provider, stores only a ref)
@@ -190,6 +193,42 @@ async function main() {
       return;
     }
     die(`unknown 'policy' subcommand: ${sub}\n\n${USAGE}`);
+  }
+
+  if (cmd === "learning") {
+    const sub = argv[1];
+    const { _, flags } = parseFlags(argv.slice(2));
+    if (sub === "add") {
+      if (!flags.project) die("--project is required");
+      if (!flags.title) die("--title is required");
+      const l = await api("POST", "/api/learnings", {
+        project_id: flags.project,
+        title: flags.title,
+        body: flags.body,
+        source_task_id: flags.task,
+        create_root_cause_task: !!flags["root-cause"],
+      });
+      console.log(`added learning ${l.id}: ${l.title}` + (l.root_cause_task_id ? `  (root-cause task ${l.root_cause_task_id})` : ""));
+      return;
+    }
+    if (sub === "list") {
+      const qs = new URLSearchParams();
+      if (flags.project) qs.set("project_id", String(flags.project));
+      if (flags.status) qs.set("status", String(flags.status));
+      const learnings = await api("GET", "/api/learnings?" + qs.toString());
+      if (!learnings.length) return console.log("(no learnings)");
+      for (const l of learnings)
+        console.log(`${l.id}  ${l.status.padEnd(8)} ${String(l.occurrences).padStart(3)}×  ${l.title}`);
+      return;
+    }
+    if (sub === "recur") {
+      const id = _[0];
+      if (!id) die("usage: hive learning recur <learning-id>");
+      const l = await api("POST", `/api/learnings/${id}/recur`, {});
+      console.log(`learning ${l.id} now at ${l.occurrences} occurrences`);
+      return;
+    }
+    die(`unknown 'learning' subcommand: ${sub}\n\n${USAGE}`);
   }
 
   if (cmd === "spawn") {
