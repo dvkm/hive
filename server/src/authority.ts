@@ -8,13 +8,48 @@
 // POST /api/tasks/:id/guarded-action endpoint. Evaluation: most-specific active
 // rule wins (project over global, then longer pattern over shorter). Unmatched
 // actions default to `allow` (log-only) so the system is useful before any rule
-// exists.
+// exists — EXCEPT the deny-safe defaults below, which fail closed in code so
+// safety never depends on what is (or isn't) seeded in the DB.
 import type { DB } from "./db.ts";
 import { newId, now } from "./db.ts";
 import { writeEvent } from "./state.ts";
 import { createDecision } from "./api.ts";
 
 const GRANT_TTL_MS = 24 * 60 * 60 * 1000;
+
+// Actions that require an answered decision even with NO matching rule. A fresh
+// install, a wiped DB, or a deleted rule must not silently auto-run `rm -rf`.
+// An explicit rule still wins (a deliberate `command.dangerous* → allow` relaxes
+// this), so it's a default, not a hardcoded policy.
+const DEFAULT_REQUIRE_DECISION = ["command.dangerous*"];
+
+export function defaultEffect(action: string): "allow" | "require_decision" {
+  return DEFAULT_REQUIRE_DECISION.some((p) => patternMatches(p, action)) ? "require_decision" : "allow";
+}
+
+// Seed the standing rules a hive install should always have. Idempotent: skips
+// any global pattern that already exists, so it is safe to run on every boot.
+export function bootstrapAuthority(db: DB): number {
+  const seeds = [
+    {
+      action_pattern: "command.dangerous*",
+      effect: "require_decision",
+      note: "Dangerous commands (rm -rf, force push, DROP, sudo, prod) need the director to approve",
+    },
+  ];
+  let inserted = 0;
+  for (const s of seeds) {
+    const exists = db
+      .query("SELECT 1 FROM authority_rules WHERE project_id IS NULL AND action_pattern = ?")
+      .get(s.action_pattern);
+    if (exists) continue;
+    db.query(
+      "INSERT INTO authority_rules (id, project_id, scope, action_pattern, effect, note, active, created_at) VALUES (?,NULL,'global',?,?,?,1,?)"
+    ).run(newId("aur"), s.action_pattern, s.effect, s.note, now());
+    inserted++;
+  }
+  return inserted;
+}
 
 export interface AuthzInput {
   project_id: string | null;
@@ -121,9 +156,9 @@ export function authorize(db: DB, input: AuthzInput, clock: () => string = now):
   const pending = pendingDecisionFor(db, input);
   if (pending) return { effect: "require_decision", decision_id: pending };
 
-  // 3. Evaluate the rules. No match → default allow (log-only).
+  // 3. Evaluate the rules. No match → the deny-safe default for this action.
   const rule = resolveRule(db, input.project_id, input.action);
-  const effect = rule?.effect ?? "allow";
+  const effect = rule?.effect ?? defaultEffect(input.action);
 
   if (effect === "allow") {
     if (input.task_id)
@@ -149,9 +184,11 @@ export function authorize(db: DB, input: AuthzInput, clock: () => string = now):
   }
 
   // require_decision → open a card naming the exact target and park a pending grant.
+  // A card must hang off a task; with no task_id nobody can answer it, so fail closed.
+  if (!input.task_id) return { effect: "deny", reason: "denied: needs a decision but has no task", rule_id: rule?.id ?? null };
   const title = input.detail?.trim() || `Authorize: ${input.action} on ${input.target}`;
   const decision = createDecision(db, {
-    task_id: input.task_id!,
+    task_id: input.task_id,
     title,
     context:
       `An agent requested authority to run '${input.action}' targeting ${input.target}. ` +

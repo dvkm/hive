@@ -226,6 +226,8 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       m = pathname.match(/^\/api\/decisions\/([^/]+)\/answer$/);
       if (m && method === "POST") return apiAnswerDecision(db, m[1], await req.json());
+      m = pathname.match(/^\/api\/decisions\/([^/]+)\/dismiss$/);
+      if (m && method === "POST") return apiDismissDecision(db, m[1]);
 
       // ---- policies ----
       if (pathname === "/api/policies") {
@@ -438,6 +440,11 @@ function createTask(db: DB, body: any): Response {
 // title prefix. Sets pr_url only when the task isn't already linked, so an
 // agent-reported PR is never clobbered and re-scanning is idempotent. Shared by
 // the reconciler's scan and the POST /api/tasks/link-pr endpoint.
+//
+// Opening the PR is what hands the task to the director: an in-progress task
+// moves to `in_review`, which is the ONLY state POST /merge accepts and the only
+// one the Review lane renders. Without this the Approve & merge button is
+// unreachable. The reconciler re-checks open PRs as a time-based fallback.
 export function linkPrIfMarked(
   db: DB,
   pr: { title?: string | null; body?: string | null; url: string },
@@ -457,8 +464,19 @@ export function linkPrIfMarked(
   if (task.pr_url) return { task_id: task.id, number: task.number, linked: false };
   db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(pr.url, now(), task.id);
   writeEvent(db, { task_id: task.id, source, type: "pr_linked", payload: { pr_url: pr.url, via } });
+  handOffToReview(db, task.id, source);
   broadcastTask(db, getTask(db, task.id));
   return { task_id: task.id, number: task.number, linked: true };
+}
+
+// in_progress → in_review, the hand-off that puts a task in the director's
+// Review lane with an Approve & merge button. No-op from any other state
+// (queued/needs_decision/terminal), so it is safe to call repeatedly.
+export function handOffToReview(db: DB, taskId: string, source: string): boolean {
+  const t: any = getTask(db, taskId);
+  if (!t || t.state !== "in_progress") return false;
+  transition(db, taskId, "in_review", { source, reason: "PR open, awaiting review" });
+  return true;
 }
 
 // POST /api/tasks/link-pr {pr_url} — resolve a PR's marker and link it to its
@@ -531,7 +549,7 @@ function listTasks(db: DB, url: URL): Response {
 // ponytail: FEED_CATEGORIES mirrors web/src/lib/eventText.ts. A 5-line map is
 // cheaper to duplicate than to cross the server<-web build seam; keep in sync.
 const FEED_CATEGORIES: Record<string, string[]> = {
-  state: ["state_change"],
+  state: ["state_change", "ready_for_review"],
   decision: ["needs-decision", "decision_answered", "planned", "authority_required", "authority_granted"],
   evidence: ["evidence", "smoke_passed"],
   incident: ["blocked", "stale", "spawn_error", "smoke_failed", "steer_error", "planner_error", "supervise_error", "authority_denied"],
@@ -933,12 +951,41 @@ function ghMergeFlag(method: string | undefined): string {
   return "--squash";
 }
 
+// A merge failure whose reason looks like a conflict / diverged branch is the
+// agent's to fix, not the captain's: bounce the task back to in_progress with
+// rebase instructions (best-effort send, like request-changes — the event
+// records everything for a respawned agent). Other failures (CI blocked, auth,
+// gh missing) keep the task in_review and just report the reason.
+const MERGE_CONFLICT_RE = /conflict|not mergeable|not an ancestor|fast-forward/i;
+async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason: string): Promise<Response> {
+  const conflict = MERGE_CONFLICT_RE.test(reason);
+  let delivered = false;
+  if (conflict && task.agent_target) {
+    try {
+      const res = await herdr.send(
+        task.agent_target,
+        `hive: merge into '${base}' failed — ${reason}\nRebase your branch '${task.branch}' onto the latest '${base}', resolve the conflicts, rerun the tests, then push.`
+      );
+      delivered = res.code === 0;
+    } catch {
+      delivered = false;
+    }
+  }
+  writeEvent(db, { task_id: task.id, source: "director", type: "merge_failed", payload: { reason, conflict, delivered } });
+  if (conflict) {
+    transition(db, task.id, "in_progress", { source: "director", reason: "merge conflict — agent asked to rebase" });
+    return err(`merge conflict — task sent back to the agent to rebase onto '${base}' (${reason})`, 409);
+  }
+  return err(reason, 409);
+}
+
 // POST /api/tasks/:id/merge — approve & merge an in-review task.
 // PR-backed: `gh pr merge <url> <method>`. Otherwise a local fast-forward of the
 // task branch into the project's default branch. On success: `merged` event,
 // in_review→verifying (triggers smoke), best-effort worktree teardown. On
-// failure (conflict / not fast-forward / CI blocked): 409 with the reason and no
-// state change. Guarded by the `task.merge` standing-authority action.
+// conflict: the task is bounced back to the agent (see mergeFailed); other
+// failures (CI blocked) return 409 with the reason and no state change.
+// Guarded by the `task.merge` standing-authority action.
 async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
@@ -960,8 +1007,7 @@ async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: Hand
     const r = await exec(["gh", "pr", "merge", task.pr_url, flag]);
     if (r.code !== 0) {
       const reason = r.stderr.trim() || r.stdout.trim() || `gh pr merge exited ${r.code}`;
-      writeEvent(db, { task_id: id, source: "director", type: "merge_failed", payload: { reason } });
-      return err(reason, 409);
+      return mergeFailed(db, herdr, task, base, reason);
     }
   } else {
     if (!project?.repo_path) return err("project has no repo_path; cannot merge", 400);
@@ -973,14 +1019,12 @@ async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: Hand
     const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", base, task.branch]);
     if (anc.code !== 0) {
       const reason = `'${base}' is not an ancestor of '${task.branch}'; not a fast-forward (rebase the branch or open a PR)`;
-      writeEvent(db, { task_id: id, source: "director", type: "merge_failed", payload: { reason } });
-      return err(reason, 409);
+      return mergeFailed(db, herdr, task, base, reason);
     }
     const r = await exec(["git", "-C", project.repo_path, "merge", "--ff-only", task.branch]);
     if (r.code !== 0) {
       const reason = r.stderr.trim() || r.stdout.trim() || `git merge --ff-only exited ${r.code}`;
-      writeEvent(db, { task_id: id, source: "director", type: "merge_failed", payload: { reason } });
-      return err(reason, 409);
+      return mergeFailed(db, herdr, task, base, reason);
     }
     method = "local ff-only";
   }
@@ -1091,7 +1135,7 @@ export async function spawnAgent(
       agentArgv: config.agent_argv, // optional per-project override (verbatim)
       // Seed the worktree with hive's Claude Code hook wiring BEFORE the agent
       // starts, so Stop/SubagentStop/PostToolUse reporting is structural.
-      prepareWorktree: (worktreePath) => writeHookSettings(worktreePath, id, hiveUrl),
+      prepareWorktree: (worktreePath) => writeHookSettings(worktreePath, id, hiveUrl, config.command_approval),
     });
   } catch (e: any) {
     writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: String(e?.message ?? e) } });
@@ -1187,16 +1231,66 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, body: any): Promise<R
 // it. Browser verification goes headless instead (BROWSER_VERIFICATION, briefs.ts).
 const DENIED_MCP_SERVERS = ["mcp__claude-in-chrome", "mcp__computer-use"];
 
+// Clearly-safe, read-only / standard-dev tool patterns that must NEVER raise a
+// permission dialog for a spawned worker (no human is at the pane to answer).
+// `deny` still beats `allow`, so the browser-MCP denials above are unaffected.
+// Anything NOT on this list falls through to the PreToolUse classifier hook,
+// which auto-approves other safe commands and escalates risky ones to the
+// authority engine. Kept in lockstep with the SAFE list in hooks/classify.ts.
+const SAFE_TOOL_ALLOWLIST = [
+  "Read",
+  "Grep",
+  "Glob",
+  "NotebookRead",
+  "TodoWrite",
+  "Bash(ls:*)",
+  "Bash(cat:*)",
+  "Bash(pwd)",
+  "Bash(echo:*)",
+  "Bash(head:*)",
+  "Bash(tail:*)",
+  "Bash(wc:*)",
+  "Bash(grep:*)",
+  "Bash(rg:*)",
+  "Bash(find:*)",
+  "Bash(which:*)",
+  "Bash(git status:*)",
+  "Bash(git diff:*)",
+  "Bash(git log:*)",
+  "Bash(git show:*)",
+  "Bash(git branch:*)",
+  "Bash(bun test:*)",
+  "Bash(bun run:*)",
+  "Bash(npm test:*)",
+  "Bash(npm run:*)",
+  "Bash(pnpm test:*)",
+  "Bash(pnpm run:*)",
+  "Bash(yarn test:*)",
+];
+
 // Write hive's Claude Code hook wiring into a spawned worktree. Uses
 // settings.local.json (the per-directory override, gitignored by Claude Code
 // convention) so the agent reports Stop/SubagentStop/PostToolUse to hive
 // without any agent discipline. HIVE_TASK_ID/HIVE_URL reach the hook via the
 // agent's env (`herdr agent start --env`); the hook is a no-op without them.
-function writeHookSettings(worktreePath: string, taskId: string, hiveUrl: string): void {
+// `commandApproval` (project config `command_approval`) governs UNKNOWN commands
+// in the PreToolUse classifier: escalate (default) | allow | prompt.
+function writeHookSettings(
+  worktreePath: string,
+  taskId: string,
+  hiveUrl: string,
+  commandApproval: "escalate" | "allow" | "prompt" = "escalate"
+): void {
   const hook = join(HOOKS_DIR, "hive-hook.sh");
+  const approve = join(HOOKS_DIR, "hive-approve.sh");
   const settings = {
-    permissions: { deny: DENIED_MCP_SERVERS },
+    permissions: { allow: SAFE_TOOL_ALLOWLIST, deny: DENIED_MCP_SERVERS },
     hooks: {
+      // Gate Bash before it runs: safe commands auto-approve, risky ones escalate
+      // to the authority engine so an autonomous worker never hangs on a dialog.
+      PreToolUse: [
+        { matcher: "Bash", hooks: [{ type: "command", command: `${approve} ${commandApproval}` }] },
+      ],
       Stop: [{ hooks: [{ type: "command", command: `${hook} Stop` }] }],
       SubagentStop: [{ hooks: [{ type: "command", command: `${hook} SubagentStop` }] }],
       PostToolUse: [
@@ -1541,6 +1635,29 @@ async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Respon
     return json({ task });
   }
 
+  // --- ready (agent handoff: PR open / report written → into the review queue) ---
+  // The explicit, preferred counterpart to the reconciler's advanceFinished
+  // backstop: an agent that has opened its PR (or written its scout report) emits
+  // this to hand off for review instead of just going idle. Records a pr_url when
+  // supplied and not already linked, then advances in_progress → in_review.
+  if (type === "ready") {
+    const t = getTask(db, taskId);
+    const prUrl = (fields.pr_url ?? fields.url ?? null) as string | null;
+    if (prUrl && !t.pr_url) {
+      db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(prUrl, now(), taskId);
+      writeEvent(db, { task_id: taskId, source, type: "pr_linked", payload: { pr_url: prUrl, via: "ready" } });
+    }
+    if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });
+    if (t.state === "in_progress") {
+      writeEvent(db, { task_id: taskId, source, type: "ready_for_review", payload: { pr_url: prUrl ?? t.pr_url ?? null, via: "emit", kind: t.kind } });
+      const task = transition(db, taskId, "in_review", { source, reason: note ?? "agent handoff: ready for review" });
+      return json({ task });
+    }
+    // Already advanced (the reconciler beat the agent to it) or not in_progress:
+    // ack idempotently rather than erroring on a duplicate handoff.
+    return json({ task: getTask(db, taskId) });
+  }
+
   // --- usage (cost/token analytics) ---
   if (type === "usage") return ingestUsage(db, taskId, fields, source);
 
@@ -1663,11 +1780,21 @@ function serveEvidence(pathname: string): Response {
 }
 
 // ---------------------------------------------------------------- decisions
+// A decision with no options is un-answerable: nothing to click in the inbox
+// and the answer endpoint has no key to validate. Agent/emit paths default to
+// this two-option set rather than silently dropping the signal; the direct
+// POST /api/decisions rejects (400) so a buggy client is told to fix its call.
+const DEFAULT_OPTIONS = [
+  { key: "proceed", label: "Proceed", recommended: true },
+  { key: "dismiss", label: "Dismiss" },
+];
+
 export function createDecision(
   db: DB,
   d: { task_id: string; title: string; context?: string | null; risk?: string | null; blast_radius?: string | null; options?: any[] }
 ): any {
   if (!getTask(db, d.task_id)) throw new Error("unknown task_id");
+  const options = Array.isArray(d.options) && d.options.length ? d.options : DEFAULT_OPTIONS;
   const row = {
     id: newId("dec"),
     task_id: d.task_id,
@@ -1676,7 +1803,7 @@ export function createDecision(
     context: d.context ?? null,
     risk: d.risk ?? null,
     blast_radius: d.blast_radius ?? null,
-    options: JSON.stringify(d.options ?? []),
+    options: JSON.stringify(options),
     status: "open",
     answer_key: null,
     answer_note: null,
@@ -1715,6 +1842,8 @@ export function createDecision(
 function apiCreateDecision(db: DB, body: any): Response {
   if (!body?.task_id) return err("task_id is required");
   if (!body?.title) return err("title is required");
+  if (!Array.isArray(body?.options) || body.options.length === 0)
+    return err("options must be a non-empty array", 400);
   const decision = createDecision(db, {
     task_id: body.task_id,
     title: body.title,
@@ -1781,6 +1910,21 @@ function apiAnswerDecision(db: DB, id: string, body: any): Response {
     transition(db, r.task_id, "in_progress", { source: "director", reason: "decision answered" });
 
   const decision = parseDecision({ ...r, status: "answered", answer_key: answerKey, answer_note: answerNote, answered_at: answeredAt });
+  broadcast({ type: "decision", decision });
+  return json(decision);
+}
+
+// Dismiss: clear a card without answering it (human escape hatch for a card with
+// no usable options, or one that's simply no longer relevant). Expires it and
+// broadcasts so the inbox clears live. No resolver hooks fire — dismissing is
+// explicitly "take no action".
+function apiDismissDecision(db: DB, id: string): Response {
+  const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
+  if (!r) return err("decision not found", 404);
+  if (r.status !== "open") return err(`decision already ${r.status}`, 409);
+  db.query("UPDATE decisions SET status = 'expired' WHERE id = ?").run(id);
+  writeEvent(db, { task_id: r.task_id, source: "director", type: "decision_expired", payload: { decision_id: id, reason: "dismissed" } });
+  const decision = parseDecision({ ...r, status: "expired" });
   broadcast({ type: "decision", decision });
   return json(decision);
 }

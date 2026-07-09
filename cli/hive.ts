@@ -11,8 +11,9 @@ Usage:
   hive serve                              start the daemon
   hive task create --project <id> --title <t> [--brief <file>] [--kind ship|scout|chore]
   hive task list [--state <s>] [--project <id>]
-  hive emit <task-id> <type> [--note <s>] [--file <path>] [--kind <k>] [--source <s>]
-        types: status | evidence | needs-decision | done | blocked | <custom>
+  hive emit <task-id> <type> [--note <s>] [--file <path>] [--kind <k>] [--source <s>] [--pr-url <url>]
+        types: status | evidence | needs-decision | ready | done | blocked | <custom>
+        ready: PR open (or scout report written) → hand off to review (in_progress -> in_review)
   hive decision ask <task-id> --title <t> [--context <s>] [--risk <s>] [--blast <s>]
         --option key:label:detail  (repeatable)  --recommend <key>
   hive policy add --title <t> --body <s>|--body-file <f> [--scope global|project:<id>]
@@ -142,6 +143,7 @@ async function main() {
         source: flags.source,
         title: flags.title,
         context: flags.context,
+        pr_url: flags["pr-url"] ?? flags.url,
       });
     }
     console.log(`emitted '${type}' on ${taskId}` + (result.evidence ? ` (evidence ${result.evidence.id})` : ""));

@@ -67,6 +67,25 @@ test("transition endpoint enforces the state machine", async () => {
   expect(bad2.status).toBe(409);
 });
 
+test("ready emit records the pr_url and advances in_progress -> in_review", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "ready task" });
+  const id = t.json.id;
+  await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
+
+  const r = await post(`/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/42", note: "PR up" });
+  expect(r.status).toBe(200);
+  expect(r.json.task.state).toBe("in_review");
+  expect(r.json.task.pr_url).toBe("https://gh/pr/42");
+
+  const events = await get(`/api/tasks/${id}/events`);
+  expect(events.json.some((e: any) => e.type === "ready_for_review")).toBe(true);
+
+  // Idempotent: a second ready (task already in_review) acks without erroring.
+  const again = await post(`/api/tasks/${id}/events`, { type: "ready" });
+  expect(again.status).toBe(200);
+  expect(again.json.task.state).toBe("in_review");
+});
+
 test("evidence upload round-trips through /evidence", async () => {
   const form = new FormData();
   form.set("type", "evidence");
@@ -154,6 +173,55 @@ test("rejecting an answer_key not in options", async () => {
   });
   const bad = await post(`/api/decisions/${d.json.id}/answer`, { answer_key: "zzz" });
   expect(bad.status).toBe(400);
+});
+
+test("direct POST /api/decisions rejects empty/missing options with 400", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "d-empty" });
+  const missing = await post("/api/decisions", { task_id: t.json.id, title: "no opts" });
+  expect(missing.status).toBe(400);
+  const empty = await post("/api/decisions", { task_id: t.json.id, title: "no opts", options: [] });
+  expect(empty.status).toBe(400);
+});
+
+test("needs-decision emit path defaults options instead of dropping the signal", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "d-emit" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
+  const r = await post(`/api/tasks/${t.json.id}/events`, { type: "needs-decision", title: "should I proceed?" });
+  expect(r.status).toBe(201);
+  const opts = r.json.decision.options;
+  expect(opts.length).toBe(2);
+  expect(opts.map((o: any) => o.key)).toEqual(["proceed", "dismiss"]);
+  // The defaulted card is answerable.
+  const ans = await post(`/api/decisions/${r.json.decision.id}/answer`, { answer_key: "proceed" });
+  expect(ans.status).toBe(200);
+  expect(ans.json.status).toBe("answered");
+});
+
+test("dismiss endpoint expires an open decision and 409s on re-dismiss", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "d-dismiss" });
+  const d = await post("/api/decisions", { task_id: t.json.id, title: "dismiss me", options: [{ key: "a", label: "A" }] });
+  const dis = await post(`/api/decisions/${d.json.id}/dismiss`, {});
+  expect(dis.status).toBe(200);
+  expect(dis.json.status).toBe("expired");
+  // no longer in the open inbox
+  const open = await get("/api/decisions?status=open");
+  expect(open.json.some((x: any) => x.id === d.json.id)).toBe(false);
+  // a decision_expired event was written
+  const evs = await get(`/api/tasks/${t.json.id}/events`);
+  expect(evs.json.some((e: any) => e.type === "decision_expired" && e.payload.decision_id === d.json.id)).toBe(true);
+  // re-dismiss / answer a closed card is rejected
+  const again = await post(`/api/decisions/${d.json.id}/dismiss`, {});
+  expect(again.status).toBe(409);
+});
+
+test("cancelling a task clears its open decisions from the inbox (SSE broadcast + expiry)", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "d-cancel" });
+  const d = await post("/api/decisions", { task_id: t.json.id, title: "orphan?", options: [{ key: "a", label: "A" }] });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "cancelled" });
+  const one = await get(`/api/decisions/${d.json.id}`);
+  expect(one.json.status).toBe("expired");
+  const open = await get("/api/decisions?status=open");
+  expect(open.json.some((x: any) => x.id === d.json.id)).toBe(false);
 });
 
 test("policies CRUD", async () => {
