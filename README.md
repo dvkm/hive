@@ -110,6 +110,16 @@ server/test/ bun test suite
 - **Teardown refuses to destroy work**: `herdr worktree remove` runs only after
   the branch is pushed to origin or merged into the default branch (verified
   with git); otherwise it returns `{removed:false}`.
+- **Dispatcher** (`server/src/dispatcher.ts`, 30s; `HIVE_DISPATCH_MS`) makes hive
+  self-driving: it picks up `queued` tasks and spawns agents so work created in
+  the web UI actually runs instead of sitting in Queued. Opt-in per project
+  (`config.auto_dispatch`, default off); honors `dispatch_kinds`
+  (default `["ship","scout"]`), `max_agents` (default 3, concurrency cap),
+  skips unreviewed `intake_gchat` tasks, runs the `task.dispatch` authority gate,
+  and backs off exponentially on spawn failures. Shares the spawn core with the
+  manual `POST /api/tasks/:id/spawn`. The herdr adapter is verified against a
+  live herdr server — see `docs/runtime.md` and
+  `docs/evidence/herdr-live-verification.txt`.
 - **Reconciler** (`server/src/reconciler.ts`, 60s; `HIVE_RECONCILE_MS`) syncs
   herdr agent status, `gh pr view` CI/merge state, and flags tasks silent past
   `HIVE_STALE_MS` (default 15m) as `stale`. Every cycle is failure-isolated and

@@ -11,6 +11,7 @@ interface Store {
   notifications: Notification[]; // newest first
   ackNotifications: () => void;
   evidenceCount: Record<string, number>;
+  spawnError: Record<string, boolean>; // task has a spawn_error and no later spawned
   lastActivity: Record<string, string>; // ts of most-recent event per task
   rev: Record<string, number>; // bumps when a task is touched (task pages refetch on change)
   sse: SseState;
@@ -31,6 +32,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [decisions, setDecisions] = useState<Decision[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [evidenceCount, setEvidenceCount] = useState<Record<string, number>>({});
+  const [spawnError, setSpawnError] = useState<Record<string, boolean>>({});
   const [lastActivity, setLastActivity] = useState<Record<string, string>>({});
   const [rev, setRev] = useState<Record<string, number>>({});
   const [sse, setSse] = useState<SseState>("connecting");
@@ -46,9 +48,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       // ponytail: N+1 detail fetch to get evidence counts. Localhost, small N.
       // Add a count column / aggregate endpoint if the board ever gets large.
       ts.forEach((t) =>
-        api.task(t.id).then((d) =>
-          setEvidenceCount((c) => ({ ...c, [t.id]: d.evidence.length }))
-        )
+        api.task(t.id).then((d) => {
+          setEvidenceCount((c) => ({ ...c, [t.id]: d.evidence.length }));
+          setSpawnError((s) => ({ ...s, [t.id]: d.events.some((e) => e.type === "spawn_error") && !d.events.some((e) => e.type === "spawned") }));
+        })
       );
     });
     api.decisions("open").then(setDecisions);
@@ -93,6 +96,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         } else if (msg.type === "event") {
           const ev = msg.event;
           setLastActivity((la) => ({ ...la, [ev.task_id]: ev.ts }));
+          if (ev.type === "spawn_error") setSpawnError((s) => ({ ...s, [ev.task_id]: true }));
+          else if (ev.type === "spawned") setSpawnError((s) => ({ ...s, [ev.task_id]: false }));
           bump(ev.task_id);
         } else if (msg.type === "evidence") {
           const id = msg.evidence.task_id;
@@ -122,7 +127,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, decisions, notifications, ackNotifications, evidenceCount, lastActivity, rev, sse }}>
+    <Ctx.Provider value={{ tasks, projects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, sse }}>
       {children}
     </Ctx.Provider>
   );

@@ -103,6 +103,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         const r = db.query("SELECT * FROM projects WHERE id = ?").get(m[1]);
         return r ? json(parseProject(r)) : err("project not found", 404);
       }
+      if (m && method === "PUT") return updateProject(db, m[1], await req.json());
 
       // ---- tasks ----
       if (pathname === "/api/tasks") {
@@ -262,6 +263,18 @@ function createProject(db: DB, body: any): Response {
   return json(parseProject(row), 201);
 }
 
+// Update a project's mutable fields. `config` is REPLACED wholesale (the web UI
+// reads the project, edits keys like auto_dispatch, and writes the object back).
+function updateProject(db: DB, id: string, body: any): Response {
+  const existing: any = db.query("SELECT * FROM projects WHERE id = ?").get(id);
+  if (!existing) return err("project not found", 404);
+  const name = body?.name != null ? String(body.name) : existing.name;
+  const repo_path = body?.repo_path !== undefined ? body.repo_path : existing.repo_path;
+  const config = body?.config !== undefined ? JSON.stringify(body.config) : existing.config;
+  db.query("UPDATE projects SET name = ?, repo_path = ?, config = ? WHERE id = ?").run(name, repo_path, config, id);
+  return json(parseProject(db.query("SELECT * FROM projects WHERE id = ?").get(id)));
+}
+
 // ---------------------------------------------------------------- tasks
 function createTask(db: DB, body: any): Response {
   if (!body?.project_id) return err("project_id is required");
@@ -364,6 +377,27 @@ async function spawnTask(
   if (!project?.repo_path) return err("project has no repo_path; cannot spawn", 400);
   const blocked = authzBlock(db, { project_id: task.project_id, action: "task.spawn", target: task.title, task_id: id });
   if (blocked) return blocked;
+
+  const r = await spawnAgent(db, herdr, id, { hiveUrl: body?.hive_url, supervise: deps.supervise });
+  if (!r.ok) return err(`spawn failed: ${r.error}`, 502);
+  return json({ ok: true, task: getTask(db, id), agent_target: r.agent_target });
+}
+
+// The reusable spawn core, shared by the /spawn endpoint and the dispatcher.
+// Composes the brief, creates the worktree + starts the agent via herdr, writes
+// the `spawned`/`spawn_error` events and the queued->in_progress transition.
+// Assumes callers have already run their own gates (authority, dispatch policy).
+// Returns {ok:false} instead of throwing so the dispatcher can back off.
+export async function spawnAgent(
+  db: DB,
+  herdr: Herdr,
+  id: string,
+  opts: { hiveUrl?: string; supervise?: boolean } = {}
+): Promise<{ ok: true; agent_target: string } | { ok: false; error: string }> {
+  const task = getTask(db, id);
+  if (!task) return { ok: false, error: "task not found" };
+  const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
+  if (!project?.repo_path) return { ok: false, error: "project has no repo_path" };
   const config = JSON.parse(project.config ?? "{}");
 
   // Compose the brief and write it to a file the agent command reads.
@@ -372,7 +406,7 @@ async function spawnTask(
   const briefFile = join(briefDir, `${id}.md`);
   await Bun.write(briefFile, composeBrief(db, id));
 
-  const hiveUrl = body?.hive_url || process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
+  const hiveUrl = opts.hiveUrl || process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
   const env = await resolveProjectSecrets(db, task.project_id);
 
   let result;
@@ -388,7 +422,7 @@ async function spawnTask(
     });
   } catch (e: any) {
     writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: String(e?.message ?? e) } });
-    return err(`spawn failed: ${e?.message ?? e}`, 502);
+    return { ok: false, error: String(e?.message ?? e) };
   }
 
   db.query(
@@ -402,9 +436,9 @@ async function spawnTask(
   });
   if (task.state === "queued") transition(db, id, "in_progress", { source: "herdr", reason: "agent spawned" });
 
-  if (deps.supervise) superviseAgent(db, herdr, id, result.agent_target);
+  if (opts.supervise) superviseAgent(db, herdr, id, result.agent_target);
 
-  return json({ ok: true, task: getTask(db, id), agent_target: result.agent_target });
+  return { ok: true, agent_target: result.agent_target };
 }
 
 // Re-arming supervised wait loop. Each completed wait re-arms; on error the

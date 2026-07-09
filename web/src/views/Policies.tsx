@@ -44,6 +44,7 @@ export default function Policies() {
 
   return (
     <div className="policies">
+      <AutoDispatch />
       <Authority projects={projects} scopeName={scopeName} />
 
       <section className="panel add-policy">
@@ -72,6 +73,48 @@ export default function Policies() {
         {policies.length === 0 && <div className="muted pad">No policies yet.</div>}
       </div>
     </div>
+  );
+}
+
+// Per-project auto-dispatch toggle. When on, the dispatcher auto-spawns agents
+// for that project's queued ship/scout tasks (default off, so nothing spawns
+// without David opting in). Writes project config.auto_dispatch.
+function AutoDispatch() {
+  const [projects, setProjects] = useState<import("../lib/api").Project[]>([]);
+  const load = () => api.projects().then(setProjects).catch(() => setProjects([]));
+  useEffect(() => {
+    load();
+  }, []);
+
+  const toggle = async (p: import("../lib/api").Project) => {
+    const auto_dispatch = !(p.config?.auto_dispatch === true);
+    await api.updateProject(p.id, { config: { ...p.config, auto_dispatch } });
+    toast(auto_dispatch ? "Auto-dispatch on" : "Auto-dispatch off");
+    load();
+  };
+
+  return (
+    <section className="panel authority">
+      <h2>Auto-dispatch</h2>
+      <p className="muted">
+        When on, hive automatically spawns an agent for each queued ship/scout task in the project (subject
+        to the concurrency cap and standing authority). Off by default; intake drafts and chore tasks are
+        never auto-dispatched.
+      </p>
+      <div className="authority-list">
+        {projects.map((p) => (
+          <div key={p.id} className="authority-rule">
+            <span className="chip">{p.name}</span>
+            {p.config?.auto_dispatch === true && <span className="chip effect-allow">on</span>}
+            <div className="spacer" />
+            <button className="link-btn" onClick={() => toggle(p)}>
+              {p.config?.auto_dispatch === true ? "turn off" : "turn on"}
+            </button>
+          </div>
+        ))}
+        {projects.length === 0 && <div className="muted pad">No projects yet.</div>}
+      </div>
+    </section>
   );
 }
 

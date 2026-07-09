@@ -47,6 +47,12 @@ prompt), `plan_intake` (bool; when true, each new intake task auto-triggers a
 planner breakdown), `planner_argv` (string[], the planner command, default
 `["claude","-p"]`), and `playbook` (string, freeform project context injected
 into planner prompts).
+Dispatcher keys (see the Dispatcher section):
+`auto_dispatch` (bool, default `false`; when true the dispatcher auto-spawns
+agents for this project's queued tasks), `dispatch_kinds` (string[], default
+`["ship","scout"]`; which task kinds the dispatcher will auto-spawn — `chore` is
+excluded by default), and `max_agents` (number, default `3`; per-project cap on
+concurrently-running agents).
 
 ### Task
 ```json
@@ -257,6 +263,10 @@ set on creation); normal ones are batched into a single digest every
 - `GET /api/projects` → `200 [Project, ...]` (oldest first)
 - `POST /api/projects` body `{name (required), repo_path?, config?}` → `201 Project`
 - `GET /api/projects/:id` → `200 Project` | `404`
+- `PUT /api/projects/:id` body `{name?, repo_path?, config?}` → `200 Project` | `404`
+  Updates mutable fields. `config` is REPLACED wholesale when present (read the
+  project, edit keys like `auto_dispatch`, write the object back). Used by the
+  Policies-page auto-dispatch toggle.
 
 ### Tasks
 - `GET /api/tasks?state=&project_id=` → `200 [Task, ...]` (newest `updated_at` first; both filters optional)
@@ -458,6 +468,24 @@ killed on timeout). Injectable exec for tests.
   tasks are created `queued` with `source="planner"` and `parent_task_id` → the
   source task, and a `normal` `planned` notification is enqueued. On `reject`
   nothing is created (the `decision_answered` event is the only record).
+
+### Dispatcher (self-driving spawn loop)
+No HTTP endpoints — the dispatcher is a server-internal loop (`server/src/dispatcher.ts`,
+default every 30s, `HIVE_DISPATCH_MS`). It picks up `queued` tasks and spawns a
+herdr agent for each (the same path as `POST /api/tasks/:id/spawn`), gated by:
+project `config.auto_dispatch: true` (default off), `config.dispatch_kinds`
+(default `["ship","scout"]`), `config.max_agents` (default 3, per-project
+concurrency cap), an intake-review gate (`source="intake_gchat"` tasks are
+skipped until a `reviewed` event or a `note` event containing "reviewed"
+exists), and the standing-authority gate. The authority gate calls
+`authorize(action="task.dispatch", target=<title>)`; a `deny` rule blocks the
+auto-spawn (`authority_denied` event) and a `require_decision` rule opens a card
+and parks the task, exactly like the other guarded actions. Spawn failures write
+a single `spawn_error` event and back off exponentially per task
+(`min(30s·2^(n-1), 30m)`); the task stays `queued` with the error visible.
+Manual dispatch (the web "dispatch now" button → `POST /api/tasks/:id/spawn`)
+bypasses these policy gates but still runs the `task.spawn` authority gate. See
+`docs/runtime.md`.
 
 ### Static assets
 - `GET /evidence/<task_id>/<file>` → the raw evidence file (`404` if missing; path traversal rejected `403`).

@@ -112,6 +112,15 @@ export default function TaskPage() {
       setPlanning(false);
     }
   };
+  const dispatch = async () => {
+    if (!t) return;
+    try {
+      await api.spawn(t.id);
+      toast("Agent dispatched");
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  };
 
   return (
     <div className="task">
@@ -237,6 +246,11 @@ export default function TaskPage() {
               Send steer
             </button>
           </div>
+          {t.state === "queued" && (
+            <button className="btn btn-primary" onClick={dispatch}>
+              Dispatch now
+            </button>
+          )}
           <button className="btn" onClick={planBreakdown} disabled={planning}>
             {planning ? "Planning…" : "Plan breakdown"}
           </button>

@@ -1,0 +1,111 @@
+
+===== 0. context =====
+repo: /tmp/hive-herdr-verify  herdr: /opt/homebrew/bin/herdr
+$ herdr status server
+  code=0 stdout=status: running
+version: 0.7.1
+protocol: 14
+compatible: yes
+socket: /Users/david/.config/herdr/herdr.sock stderr=
+$ git -C /tmp/hive-herdr-verify init -q -b main
+  code=0 
+$ git -C /tmp/hive-herdr-verify config user.email test@hive.local
+  code=0 
+$ git -C /tmp/hive-herdr-verify config user.name hive test
+  code=0 
+$ git -C /tmp/hive-herdr-verify add -A
+  code=0 
+$ git -C /tmp/hive-herdr-verify commit -qm init
+  code=0 
+$ git -C /tmp/hive-herdr-verify init -q --bare /tmp/hive-herdr-verify-origin.git
+  code=0 
+$ git -C /tmp/hive-herdr-verify remote add origin /tmp/hive-herdr-verify-origin.git
+  code=0 
+$ git -C /tmp/hive-herdr-verify push -q origin main
+  code=0 
+
+===== PHASE A [sleep script]: spawn (worktree create + agent start) =====
+SpawnResult: {"agent_target":"vfeabd2a","worktree_path":"/Users/david/.herdr/worktrees/hive-herdr-verify/hive-vfeabd2a","branch":"hive/vfeabd2a","workspace_id":"wE"}
+PASS worktree created + workspace_id captured
+
+===== PHASE A [sleep script]: agent list (agent visible) =====
+$ herdr agent list
+  code=0 stdout={"id":"cli:agent:list","result":{"agents":[{"agent":"claude","agent_status":"working","cwd":"/Users/david/projects/firstmate","focused":true,"foreground_cwd":"/Users/david/projects/firstmate","pane_id":"w6:p1","revision":0,"tab_id":"w6:t1","terminal_id":"term_655c21689860aa","workspace_id":"w6"},{"agent_status":"unknown","cwd":"/Users/david/.herdr/worktrees/hive-herdr-verify/hive-vfeabd2a","focused":false,"foreground_cwd":"/Users/david/.herdr/worktrees/hive-herdr-verify/hive-vfeabd2a","name":"vfeabd2a","pane_id":"w6:p2C","revision":0,"tab_id":"w6:t1","terminal_id":"term_6562969088a327c","workspace_id":"w6"}],"type":"agent_list"}} stderr=
+PASS agent 'vfeabd2a' visible in agent list
+
+===== PHASE A [sleep script]: agent get (status readable) =====
+$ herdr agent get vfeabd2a
+  code=0 stdout={"id":"cli:agent:get","result":{"agent":{"agent_status":"unknown","cwd":"/Users/david/.herdr/worktrees/hive-herdr-verify/hive-vfeabd2a","focused":false,"foreground_cwd":"/Users/david/.herdr/worktrees/hive-herdr-verify/hive-vfeabd2a","name":"vfeabd2a","pane_id":"w6:p2C","revision":0,"tab_id":"w6:t1","terminal_id":"term_6562969088a327c","workspace_id":"w6"},"type":"agent_info"}} stderr=
+adapter status(): unknown - PASS
+
+===== PHASE A [sleep script]: agent send (deliver a steer message) =====
+PASS send delivered, code = 0
+
+===== PHASE A [sleep script]: agent wait --status idle (short timeout; proves the blocking wait runs) =====
+wait code: 1 stderr: timed out waiting for agent status change - PASS
+
+===== PHASE A [sleep script]: create UNPUSHED work in the worktree =====
+$ git -C /Users/david/.herdr/worktrees/hive-herdr-verify/hive-vfeabd2a commit --allow-empty -m unpushed work
+  code=0 [hive/vfeabd2a 9e5d504] unpushed work
+
+===== PHASE A [sleep script]: teardown BEFORE push (must REFUSE) =====
+teardown: {"removed":false,"reason":"branch not pushed to origin nor merged; refusing to remove worktree"} - PASS
+
+===== PHASE A [sleep script]: push the branch (simulate merged/pushed) =====
+$ git -C /Users/david/.herdr/worktrees/hive-herdr-verify/hive-vfeabd2a push -u origin hive/vfeabd2a
+  code=0 To /tmp/hive-herdr-verify-origin.git
+ * [new branch]      hive/vfeabd2a -> hive/vfeabd2a
+
+===== PHASE A [sleep script]: teardown AFTER push (must SUCCEED) =====
+teardown: {"removed":true,"reason":"pushed"} - PASS
+
+===== PHASE A [sleep script]: verify worktree gone =====
+$ herdr worktree list --cwd /tmp/hive-herdr-verify --json
+  code=0 stdout={"id":"cli:worktree:list","result":{"source":{"repo_key":"/private/tmp/hive-herdr-verify/.git","repo_name":"hive-herdr-verify","repo_root":"/tmp/hive-herdr-verify","source_checkout_path":"/tmp/hive-herdr-verify","source_workspace_id":"w9"},"type":"worktree_list","worktrees":[{"branch":"main","is_bare":false,"is_detached":false,"is_linked_worktree":false,"is_prunable":false,"label":"hive-herdr-verify","open_workspace_id":"w9","path":"/private/tmp/hive-herdr-verify"}]}} stderr=
+PASS worktree no longer listed
+$ git -C /tmp/hive-herdr-verify init -q -b main
+  code=0 
+$ git -C /tmp/hive-herdr-verify config user.email test@hive.local
+  code=0 
+$ git -C /tmp/hive-herdr-verify config user.name hive test
+  code=0 
+$ git -C /tmp/hive-herdr-verify add -A
+  code=0 
+$ git -C /tmp/hive-herdr-verify commit -qm init
+  code=0 
+$ git -C /tmp/hive-herdr-verify init -q --bare /tmp/hive-herdr-verify-origin.git
+  code=0 
+$ git -C /tmp/hive-herdr-verify remote add origin /tmp/hive-herdr-verify-origin.git
+  code=0 
+$ git -C /tmp/hive-herdr-verify push -q origin main
+  code=0 
+
+===== PHASE B [real claude -p]: spawn (worktree create + agent start) =====
+SpawnResult: {"agent_target":"vf40c07a","worktree_path":"/Users/david/.herdr/worktrees/hive-herdr-verify/hive-vf40c07a","branch":"hive/vf40c07a","workspace_id":"wF"}
+PASS worktree created + workspace_id captured
+
+===== PHASE B [real claude -p]: agent list (agent visible) =====
+$ herdr agent list
+  code=0 stdout={"id":"cli:agent:list","result":{"agents":[{"agent":"claude","agent_status":"working","cwd":"/Users/david/projects/firstmate","focused":true,"foreground_cwd":"/Users/david/projects/firstmate","pane_id":"w6:p1","revision":0,"tab_id":"w6:t1","terminal_id":"term_655c21689860aa","workspace_id":"w6"},{"agent_status":"unknown","cwd":"/Users/david/.herdr/worktrees/hive-herdr-verify/hive-vf40c07a","focused":false,"foreground_cwd":"/Users/david/.herdr/worktrees/hive-herdr-verify/hive-vf40c07a","name":"vf40c07a","pane_id":"w6:p2D","revision":0,"tab_id":"w6:t1","terminal_id":"term_65629693e9eef7e","workspace_id":"w6"},{"agent_status":"unknown","cwd":"/Users/david/.herdr/worktrees/hive-herdr-verify/hive-vfeabd2a","focused":false,"name":"vfeabd2a","pane_id":"w6:p2C","revision":0,"tab_id":"w6:t1","terminal_id":"term_6562969088a327c","workspace_id":"w6"}],"type":"agent_list"}} stderr=
+PASS agent 'vf40c07a' visible in agent list
+
+===== PHASE B [real claude -p]: agent get (status readable) =====
+$ herdr agent get vf40c07a
+  code=0 stdout={"id":"cli:agent:get","result":{"agent":{"agent_status":"unknown","cwd":"/Users/david/.herdr/worktrees/hive-herdr-verify/hive-vf40c07a","focused":false,"foreground_cwd":"/Users/david/.herdr/worktrees/hive-herdr-verify/hive-vf40c07a","name":"vf40c07a","pane_id":"w6:p2D","revision":0,"tab_id":"w6:t1","terminal_id":"term_65629693e9eef7e","workspace_id":"w6"},"type":"agent_info"}} stderr=
+adapter status(): unknown - PASS
+
+===== PHASE B [real claude -p]: agent send (deliver a steer message) =====
+PASS send delivered, code = 0
+
+===== PHASE B [real claude -p]: agent wait --status idle (short timeout; proves the blocking wait runs) =====
+wait code: 0 stderr:  - PASS
+
+===== PHASE B [real claude -p]: cleanup (push empty branch, teardown) =====
+$ git -C /Users/david/.herdr/worktrees/hive-herdr-verify/hive-vf40c07a commit --allow-empty -m cleanup
+  code=0 [hive/vf40c07a db4d48d] cleanup
+$ git -C /Users/david/.herdr/worktrees/hive-herdr-verify/hive-vf40c07a push -u origin hive/vf40c07a
+  code=0 To /tmp/hive-herdr-verify-origin.git
+ * [new branch]      hive/vf40c07a -> hive/vf40c07a
+teardown: {"removed":true,"reason":"pushed"} - PASS
+
+DONE.

@@ -2,6 +2,7 @@
 import { openDb, defaultDbPath } from "./db.ts";
 import { makeHandler } from "./api.ts";
 import { startReconciler } from "./reconciler.ts";
+import { startDispatcher } from "./dispatcher.ts";
 import { checkAllMonitors } from "./monitors.ts";
 import { startDigest, setNotifier } from "./notifications.ts";
 import { startGchatPoll } from "./intake/gchat.ts";
@@ -25,6 +26,11 @@ const reconcileMs = Number(process.env.HIVE_RECONCILE_MS || 60_000);
 const monitorMs = Number(process.env.HIVE_MONITOR_MS || 60_000);
 const staleMs = Number(process.env.HIVE_STALE_MS || 15 * 60 * 1000);
 startReconciler(db, { intervalMs: reconcileMs, staleMs });
+
+// Dispatcher: pick up `queued` tasks in auto-dispatch projects and spawn agents
+// (opt-in per project; the reason web-UI tasks used to sit in Queued forever).
+const dispatchMs = Number(process.env.HIVE_DISPATCH_MS || 30_000);
+startDispatcher(db, { intervalMs: dispatchMs, supervise: true });
 setInterval(() => {
   checkAllMonitors(db).catch((e) => console.error("[hive] monitor cycle crashed:", e));
 }, monitorMs);

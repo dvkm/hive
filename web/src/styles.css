@@ -339,6 +339,10 @@ a {
   color: var(--amber);
   border-color: rgba(226, 165, 66, 0.4);
 }
+.chip-error {
+  color: var(--red);
+  border-color: rgba(239, 93, 107, 0.5);
+}
 .chip-planned {
   color: var(--purple);
   border-color: rgba(155, 125, 214, 0.4);
@@ -601,6 +605,11 @@ a {
   background: transparent;
   border-color: rgba(239, 93, 107, 0.5);
   color: var(--red);
+}
+.btn-mini {
+  padding: 3px 8px;
+  font-size: 11.5px;
+  font-weight: 550;
 }
 .link-btn {
   background: none;
