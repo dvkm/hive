@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import type { Policy } from "../lib/api";
+import type { Policy, AuthorityRule } from "../lib/api";
 import { useStore } from "../lib/store";
 import { toast } from "../lib/ui";
 
@@ -44,6 +44,8 @@ export default function Policies() {
 
   return (
     <div className="policies">
+      <Authority projects={projects} scopeName={scopeName} />
+
       <section className="panel add-policy">
         <h2>Add policy</h2>
         <input placeholder="Title" value={title} onChange={(e) => setTitle(e.target.value)} />
@@ -70,6 +72,97 @@ export default function Policies() {
         {policies.length === 0 && <div className="muted pad">No policies yet.</div>}
       </div>
     </div>
+  );
+}
+
+const EFFECTS = ["allow", "require_decision", "deny"] as const;
+
+function Authority({
+  projects,
+  scopeName,
+}: {
+  projects: { id: string; name: string }[];
+  scopeName: (s: string) => string;
+}) {
+  const [rules, setRules] = useState<AuthorityRule[]>([]);
+  const [pattern, setPattern] = useState("");
+  const [effect, setEffect] = useState<string>("require_decision");
+  const [note, setNote] = useState("");
+  const [project, setProject] = useState("global");
+
+  const load = () => api.authorityRules().then(setRules);
+  useEffect(() => {
+    load();
+  }, []);
+
+  const add = async () => {
+    if (!pattern.trim()) return;
+    await api.createAuthorityRule({
+      project_id: project === "global" ? null : project,
+      action_pattern: pattern.trim(),
+      effect,
+      note: note.trim() || undefined,
+    });
+    setPattern("");
+    setNote("");
+    toast("Authority rule added");
+    load();
+  };
+
+  const deactivate = async (r: AuthorityRule) => {
+    await api.updateAuthorityRule(r.id, { active: !r.active });
+    load();
+  };
+
+  return (
+    <section className="panel authority">
+      <h2>Standing authority</h2>
+      <p className="muted">
+        Grant scoped authority once; the server enforces it before risky actions dispatch. Most-specific
+        active rule wins (project over global, longer pattern over shorter). Unmatched actions default to
+        allow and are logged.
+      </p>
+
+      <div className="row authority-add">
+        <input placeholder="action pattern (e.g. deploy.prod, flag.*)" value={pattern} onChange={(e) => setPattern(e.target.value)} />
+        <select value={effect} onChange={(e) => setEffect(e.target.value)}>
+          {EFFECTS.map((ef) => (
+            <option key={ef} value={ef}>
+              {ef}
+            </option>
+          ))}
+        </select>
+        <select value={project} onChange={(e) => setProject(e.target.value)}>
+          <option value="global">Global</option>
+          {projects.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+        <input placeholder="note (optional)" value={note} onChange={(e) => setNote(e.target.value)} />
+        <button className="btn btn-primary" onClick={add}>
+          Add rule
+        </button>
+      </div>
+
+      <div className="authority-list">
+        {rules.map((r) => (
+          <div key={r.id} className={`authority-rule ${r.active ? "" : "policy-off"}`}>
+            <span className="chip">{scopeName(r.scope)}</span>
+            <code className="authority-pattern">{r.action_pattern}</code>
+            <span className={`chip effect-${r.effect}`}>{r.effect}</span>
+            {r.note && <span className="muted authority-note">{r.note}</span>}
+            {!r.active && <span className="chip chip-off">inactive</span>}
+            <div className="spacer" />
+            <button className="link-btn" onClick={() => deactivate(r)}>
+              {r.active ? "deactivate" : "activate"}
+            </button>
+          </div>
+        ))}
+        {rules.length === 0 && <div className="muted pad">No authority rules yet.</div>}
+      </div>
+    </section>
   );
 }
 

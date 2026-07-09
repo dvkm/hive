@@ -28,6 +28,7 @@ import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
 import { runSmoke } from "./monitors.ts";
 import { enqueue, ackNotifications } from "./notifications.ts";
+import { authorize, resolveGrantForDecision, type AuthzInput } from "./authority.ts";
 
 export interface HandlerDeps {
   herdr?: Herdr; // injectable for tests
@@ -49,6 +50,19 @@ function json(data: unknown, status = 200): Response {
 }
 function err(message: string, status = 400): Response {
   return json({ error: message }, status);
+}
+
+// Standing-authority gate for the internal risky paths (spawn, steer, verify,
+// done). Returns a blocking Response when the action is denied (403) or needs a
+// decision (409 {decision_id}); returns null when it may proceed.
+function authzBlock(db: DB, input: AuthzInput): Response | null {
+  const r = authorize(db, input);
+  if (r.effect === "allow") return null;
+  if (r.effect === "deny") return err(r.reason, 403);
+  return json(
+    { error: "requires a decision", effect: "require_decision", decision_id: r.decision_id },
+    409
+  );
 }
 
 const WEB_DIST = join(import.meta.dir, "..", "..", "web", "dist");
@@ -121,6 +135,8 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (!getTask(db, m[1])) return err("task not found", 404);
         return json({ task_id: m[1], brief: composeBrief(db, m[1]) });
       }
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/guarded-action$/);
+      if (m && method === "POST") return guardedAction(db, m[1], await req.json());
 
       // ---- decisions ----
       if (pathname === "/api/decisions") {
@@ -152,6 +168,20 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (method === "PUT") return updatePolicy(db, m[1], await req.json());
         if (method === "DELETE") {
           db.query("DELETE FROM policies WHERE id = ?").run(m[1]);
+          return json({ ok: true });
+        }
+      }
+
+      // ---- authority rules (standing-authority policy engine) ----
+      if (pathname === "/api/authority/rules") {
+        if (method === "GET") return listAuthorityRules(db, url);
+        if (method === "POST") return createAuthorityRule(db, await req.json());
+      }
+      m = pathname.match(/^\/api\/authority\/rules\/([^/]+)$/);
+      if (m) {
+        if (method === "PUT") return updateAuthorityRule(db, m[1], await req.json());
+        if (method === "DELETE") {
+          db.query("DELETE FROM authority_rules WHERE id = ?").run(m[1]);
           return json({ ok: true });
         }
       }
@@ -289,6 +319,14 @@ function getTaskFull(db: DB, id: string): Response {
 async function doTransition(db: DB, id: string, body: any): Promise<Response> {
   if (!body?.to) return err("'to' state is required");
   const to = body.to as State;
+  // High-blast-radius transitions (post-merge verify, marking done) are gated.
+  if (to === "verifying" || to === "done") {
+    const t = getTask(db, id);
+    if (t) {
+      const blocked = authzBlock(db, { project_id: t.project_id, action: `task.${to === "verifying" ? "verify" : "done"}`, target: t.title, task_id: id });
+      if (blocked) return blocked;
+    }
+  }
   const task = transition(db, id, to, {
     source: body.source ?? "director",
     reason: body.reason,
@@ -315,6 +353,8 @@ async function spawnTask(
   if (!task) return err("task not found", 404);
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   if (!project?.repo_path) return err("project has no repo_path; cannot spawn", 400);
+  const blocked = authzBlock(db, { project_id: task.project_id, action: "task.spawn", target: task.title, task_id: id });
+  if (blocked) return blocked;
   const config = JSON.parse(project.config ?? "{}");
 
   // Compose the brief and write it to a file the agent command reads.
@@ -393,6 +433,8 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, body: any): Promise<R
   if (!task) return err("task not found", 404);
   const message = String(body?.message ?? "");
   if (!message) return err("message is required");
+  const blocked = authzBlock(db, { project_id: task.project_id, action: "task.steer", target: task.title, task_id: id });
+  if (blocked) return blocked;
   const target = task.agent_target;
   writeEvent(db, { task_id: id, source: "director", type: "steer", payload: { message, target } });
 
@@ -643,6 +685,9 @@ async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Respon
 
   // --- done ---
   if (type === "done") {
+    const t = getTask(db, taskId);
+    const blocked = authzBlock(db, { project_id: t.project_id, action: "task.done", target: t.title, task_id: taskId });
+    if (blocked) return blocked;
     if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });
     if (note) db.query("UPDATE tasks SET summary = ? WHERE id = ?").run(note, taskId);
     const task = transition(db, taskId, "done", { source, reason: note ?? undefined });
@@ -765,6 +810,9 @@ function apiAnswerDecision(db: DB, id: string, body: any): Response {
     type: "decision_answered",
     payload: { decision_id: id, answer_key: answerKey, answer_note: answerNote },
   });
+  // If this card gated a standing-authority request, approve → mint the
+  // single-use 24h grant so the agent's retry passes; deny → block it.
+  resolveGrantForDecision(db, id, answerKey);
   // Resume the task if it was parked on this decision. (herdr `agent send` is Phase 2.)
   const task = getTask(db, r.task_id);
   if (task && task.state === "needs_decision")
@@ -773,6 +821,80 @@ function apiAnswerDecision(db: DB, id: string, body: any): Response {
   const decision = parseDecision({ ...r, status: "answered", answer_key: answerKey, answer_note: answerNote, answered_at: answeredAt });
   broadcast({ type: "decision", decision });
   return json(decision);
+}
+
+// ---------------------------------------------------------------- authority (standing-authority engine)
+// Agents call this BEFORE any externally-risky operation they run themselves
+// (deploy, flag flip, destructive op). allow → 200; deny → 403; require_decision
+// → 409 {decision_id} (open a card; the agent waits, then retries the same call).
+function guardedAction(db: DB, taskId: string, body: any): Response {
+  const task = getTask(db, taskId);
+  if (!task) return err("task not found", 404);
+  if (!body?.action) return err("action is required");
+  if (!body?.target) return err("target is required");
+  const r = authorize(db, {
+    project_id: task.project_id,
+    action: String(body.action),
+    target: String(body.target),
+    task_id: taskId,
+    detail: body.detail ?? null,
+  });
+  if (r.effect === "allow") return json({ ok: true, effect: "allow" });
+  if (r.effect === "deny") return json({ ok: false, effect: "deny", error: r.reason }, 403);
+  return json({ ok: false, effect: "require_decision", decision_id: r.decision_id }, 409);
+}
+
+function authorityRow(r: any) {
+  return { ...r, active: !!r.active };
+}
+
+function listAuthorityRules(db: DB, url: URL): Response {
+  const projectId = url.searchParams.get("project_id");
+  const rows = projectId
+    ? db.query("SELECT * FROM authority_rules WHERE project_id = ? ORDER BY created_at").all(projectId)
+    : db.query("SELECT * FROM authority_rules ORDER BY created_at").all();
+  return json(rows.map(authorityRow));
+}
+
+function createAuthorityRule(db: DB, body: any): Response {
+  if (!body?.action_pattern) return err("action_pattern is required");
+  const effect = body.effect ?? "allow";
+  if (!["allow", "require_decision", "deny"].includes(effect))
+    return err("effect must be allow | require_decision | deny");
+  const projectId = body.project_id ?? null;
+  if (projectId && !db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId))
+    return err("unknown project_id", 400);
+  const row = {
+    id: newId("aur"),
+    project_id: projectId,
+    scope: projectId ? `project:${projectId}` : "global",
+    action_pattern: String(body.action_pattern),
+    effect,
+    note: body.note ?? null,
+    active: body.active === false ? 0 : 1,
+    created_at: now(),
+  };
+  db.query(
+    "INSERT INTO authority_rules (id, project_id, scope, action_pattern, effect, note, active, created_at) VALUES (?,?,?,?,?,?,?,?)"
+  ).run(row.id, row.project_id, row.scope, row.action_pattern, row.effect, row.note, row.active, row.created_at);
+  return json(authorityRow(row), 201);
+}
+
+function updateAuthorityRule(db: DB, id: string, body: any): Response {
+  const r: any = db.query("SELECT * FROM authority_rules WHERE id = ?").get(id);
+  if (!r) return err("authority rule not found", 404);
+  if (body.effect && !["allow", "require_decision", "deny"].includes(body.effect))
+    return err("effect must be allow | require_decision | deny");
+  const next = {
+    action_pattern: body.action_pattern ?? r.action_pattern,
+    effect: body.effect ?? r.effect,
+    note: body.note ?? r.note,
+    active: body.active === undefined ? r.active : body.active ? 1 : 0,
+  };
+  db.query(
+    "UPDATE authority_rules SET action_pattern = ?, effect = ?, note = ?, active = ? WHERE id = ?"
+  ).run(next.action_pattern, next.effect, next.note, next.active, id);
+  return json(authorityRow({ ...r, ...next }));
 }
 
 // ---------------------------------------------------------------- policies

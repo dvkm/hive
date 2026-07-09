@@ -20,6 +20,42 @@ Rules:
 - When you hit a decision the director must make, emit \`needs-decision\` and
   stop; do not guess on anything high-risk (prod, feature flags, destructive ops).`;
 
+// Standing-authority section: the active rules (global + project) that govern
+// this agent, plus the exact guarded-action protocol. The server enforces these
+// before risky actions dispatch, so agents never serially ask for permission.
+function standingAuthority(db: DB, projectId: string, taskId: string): string {
+  const rules = db
+    .query(
+      "SELECT action_pattern, effect, note FROM authority_rules " +
+        "WHERE active = 1 AND (project_id IS NULL OR project_id = ?) ORDER BY created_at"
+    )
+    .all(projectId) as { action_pattern: string; effect: string; note: string | null }[];
+
+  const lines = rules.length
+    ? rules.map((r) => `- \`${r.action_pattern}\` → **${r.effect}**${r.note ? ` (${r.note})` : ""}`).join("\n")
+    : "- (no rules yet — unmatched actions default to allow and are logged)";
+
+  return `## Standing authority (server-enforced)
+The director granted standing authority once; the hive server enforces it BEFORE
+risky actions dispatch. Do NOT serially ask for permission. Rules that apply here
+(most-specific wins, project over global, longer pattern over shorter):
+
+${lines}
+
+Before ANY externally-risky operation you run yourself (prod deploy, feature-flag
+flip, destructive op), call the guarded-action gate and act ONLY on its answer:
+
+  curl -sS -X POST "$HIVE_URL/api/tasks/${taskId}/guarded-action" \\
+    -H 'Content-Type: application/json' \\
+    -d '{"action":"deploy","target":"acme-web on PROD","detail":"release v1.2.3"}'
+
+- 200 {"effect":"allow"}         → proceed.
+- 403 {"effect":"deny"}          → STOP. Do not perform it.
+- 409 {"decision_id":"..."}      → a decision card was opened naming the exact
+    target. WAIT for the director to answer, then retry the SAME call verbatim;
+    once approved it passes (a single-use grant is spent).`;
+}
+
 function definitionOfDone(kind: string): string {
   if (kind === "scout") {
     return "## Definition of done\nA written report captured as evidence (kind=report) that answers the question. No code changes required.";
@@ -67,6 +103,10 @@ export function composeBrief(db: DB, taskId: string): string {
         projectPols.map((p) => `### ${p.title}\n${p.body}`).join("\n\n")
     );
   }
+
+  // Standing authority: which scoped rules govern this agent + the guarded-action
+  // protocol it MUST use before any externally-risky operation it runs itself.
+  parts.push(standingAuthority(db, task.project_id, task.id));
 
   // Known failure patterns: active learnings for the project, 10 most recent.
   const learnings = db
