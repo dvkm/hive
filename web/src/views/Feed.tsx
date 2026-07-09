@@ -78,6 +78,7 @@ export default function Feed() {
         return {
           ...e,
           task_id: null,
+          task_number: null,
           task_title: null,
           task_kind: null,
           project_id: pid,
@@ -93,6 +94,7 @@ export default function Feed() {
       const ev = e.payload.evidence_id ? evidenceMeta[String(e.payload.evidence_id)] : undefined;
       return {
         ...e,
+        task_number: t.number,
         task_title: t.title,
         task_kind: t.kind,
         project_id: t.project_id,
@@ -246,6 +248,7 @@ function FeedRow({
       <div className="feed-main">
         <div className="feed-line">
           <span className={`chip chip-kind chip-${r.task_kind}`}>{r.project_name}</span>
+          {r.task_number != null && <span className="feed-num" title="Task number">#{r.task_number}</span>}
           <Link className="feed-task" to={`/tasks/${r.task_id}`} state={{ backgroundLocation: location }}>
             {r.task_title}
           </Link>

@@ -133,14 +133,15 @@ export function ReviewCard({
     <section className="review-card">
       <div className="review-card-head">
         <div className="review-card-title">
+          <span className="card-num" title="Task number">#{task.number}</span>
           <Link to={`/tasks/${task.id}`}>{task.title}</Link>
           {project && <span className="chip">{project.name}</span>}
           <span className={`chip chip-kind chip-${task.kind}`}>{task.kind}</span>
         </div>
         <div className="review-status">
           {task.pr_url ? (
-            <a className="pr" href={task.pr_url} target="_blank" rel="noreferrer">
-              PR {"↗"}
+            <a className="pr" href={task.pr_url} target="_blank" rel="noreferrer" title={`Pull request linked to #${task.number}`}>
+              PR ↔ #{task.number} {"↗"}
             </a>
           ) : (
             <span className="muted mono-sm">branch {task.branch || "?"}</span>

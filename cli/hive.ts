@@ -24,6 +24,7 @@ Usage:
   hive learning list [--project <id>] [--status active|resolved]
   hive learning recur <learning-id>
   hive spawn <task-id>                    spawn a herdr agent for a task
+  hive pr-marker <task-id>                print the PR title prefix + body footer marker for a task
   hive gchat auth [--client-id <id>] [--client-secret <s>] [--self users/<id>] [--port <p>]
         one-time Google Chat OAuth consent; stores the refresh token in the keychain
         (client id/secret also read from GCHAT_CLIENT_ID / GCHAT_CLIENT_SECRET env)
@@ -277,6 +278,18 @@ async function main() {
     if (!taskId) die("usage: hive spawn <task-id>");
     const r = await api("POST", `/api/tasks/${taskId}/spawn`, {});
     console.log(`spawned agent ${r.agent_target} for task ${taskId}`);
+    return;
+  }
+
+  if (cmd === "pr-marker") {
+    const { _ } = parseFlags(argv.slice(1));
+    const taskId = _[0];
+    if (!taskId) die("usage: hive pr-marker <task-id>");
+    const t = await api("GET", `/api/tasks/${taskId}`);
+    const { prTitlePrefix, prBodyFooter } = await import("../server/src/marker.ts");
+    // The prefix already ends with a space; the agent prepends it to the PR title.
+    console.log(`title-prefix: ${prTitlePrefix(t.number)}`);
+    console.log(`body-footer:  ${prBodyFooter(t.id)}`);
     return;
   }
 

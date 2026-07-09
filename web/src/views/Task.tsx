@@ -199,7 +199,8 @@ export function TaskBody({ id }: { id: string }) {
           )}
         </div>
         <h1 className="task-title">
-          <StatusDot state={t.state} health={t.health} /> {t.title}
+          <StatusDot state={t.state} health={t.health} />{" "}
+          <span className="task-num" title="Task number">#{t.number}</span> {t.title}
         </h1>
         <div className="task-sub">
           {project && <span className="chip">{project.name}</span>}
@@ -327,8 +328,8 @@ export function TaskBody({ id }: { id: string }) {
         <section className="panel">
           <h2>PR / CI</h2>
           {t.pr_url ? (
-            <a className="pr pr-lg" href={t.pr_url} target="_blank" rel="noreferrer">
-              View PR
+            <a className="pr pr-lg" href={t.pr_url} target="_blank" rel="noreferrer" title={`Pull request linked to #${t.number}`}>
+              View PR ↔ #{t.number}
             </a>
           ) : (
             <div className="muted">No PR yet</div>
