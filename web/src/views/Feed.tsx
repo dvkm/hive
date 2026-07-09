@@ -3,6 +3,8 @@ import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import type { FeedEvent } from "../lib/api";
 import { useStore } from "../lib/store";
+import { useLightbox } from "../lib/lightbox";
+import type { LightboxImage } from "../lib/lightbox";
 import { eventText, eventCategory, FEED_CATEGORIES } from "../lib/eventText";
 import type { FeedCategory } from "../lib/eventText";
 
@@ -30,6 +32,7 @@ function clockTime(ts: string): string {
 export default function Feed() {
   const { feedEvents, tasks, projects, evidenceMeta } = useStore();
   const location = useLocation();
+  const lightbox = useLightbox();
 
   const [project, setProject] = useState(""); // "" = all projects
   const [cats, setCats] = useState<Set<FeedCategory>>(new Set(ALL_CATS));
@@ -64,9 +67,25 @@ export default function Feed() {
   const seen = useRef<Set<string>>(new Set());
   seen.current = new Set(serverRows.map((r) => r.id));
   const liveRows: FeedEvent[] = feedEvents
-    .filter((e) => !seen.current.has(e.id))
+    .filter((e) => !seen.current.has(e.id) && !seen.current.has(e.id.split(":")[0]))
     .filter((e) => allSelected || cats.has(eventCategory(e.type)))
     .map((e): FeedEvent | null => {
+      // Standalone monitor incidents (no task): enrich from projects directly.
+      if (e.type === "incident") {
+        const pid = String(e.payload.project_id || "");
+        if (project && pid !== project) return null;
+        const p = projects.find((x) => x.id === pid);
+        return {
+          ...e,
+          task_id: null,
+          task_title: null,
+          task_kind: null,
+          project_id: pid,
+          project_name: p?.name ?? "",
+          evidence_url: null,
+          evidence_kind: null,
+        };
+      }
       const t = tasks.find((x) => x.id === e.task_id);
       if (!t) return null;
       if (project && t.project_id !== project) return null;
@@ -111,6 +130,22 @@ export default function Feed() {
   // Index of the first row at/older than the marker: the divider goes above it.
   const markerIdx =
     marker != null ? rows.findIndex((r) => r.ts <= marker) : -1;
+
+  // Clicking a feed thumbnail opens the lightbox over that task's screenshots
+  // among the currently-visible rows, positioned at the clicked one.
+  const openThumb = (row: FeedEvent) => {
+    const shots = rows.filter(
+      (r) => r.task_id && r.task_id === row.task_id && r.evidence_kind === "screenshot" && r.evidence_url
+    );
+    const imgs: LightboxImage[] = shots.map((r) => ({
+      url: r.evidence_url!,
+      caption: String(r.payload.caption || r.task_title || ""),
+      taskId: r.task_id,
+      taskTitle: r.task_title,
+      ts: r.ts,
+    }));
+    lightbox.open(imgs, shots.findIndex((r) => r.id === row.id));
+  };
 
   const now = Date.now();
   let lastBucket = "";
@@ -160,7 +195,7 @@ export default function Feed() {
               {i === markerIdx && markerIdx > 0 && (
                 <div className="feed-lastseen"><span>last seen</span></div>
               )}
-              <FeedRow r={r} location={location} />
+              <FeedRow r={r} location={location} onThumb={() => openThumb(r)} />
             </div>
           );
         })}
@@ -177,8 +212,33 @@ function Stat({ n, label, tone, onClick }: { n: number; label: string; tone: str
   );
 }
 
-function FeedRow({ r, location }: { r: FeedEvent; location: ReturnType<typeof useLocation> }) {
+function FeedRow({
+  r,
+  location,
+  onThumb,
+}: {
+  r: FeedEvent;
+  location: ReturnType<typeof useLocation>;
+  onThumb: () => void;
+}) {
   const cat = eventCategory(r.type);
+
+  // Standalone monitor incident: no task to link to; show the monitor instead.
+  if (r.type === "incident") {
+    return (
+      <div className="feed-row cat-incident">
+        <span className="feed-time" title={r.ts}>{clockTime(r.ts)}</span>
+        <div className="feed-main">
+          <div className="feed-line">
+            {r.project_name && <span className="chip chip-kind">{r.project_name}</span>}
+            <span className="feed-monitor">monitor: {String(r.payload.monitor || "")}</span>
+            <span className="feed-text">{eventText(r)}</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const isScreenshot = r.evidence_kind === "screenshot" && r.evidence_url;
   return (
     <div className={`feed-row cat-${cat}`}>
@@ -192,9 +252,9 @@ function FeedRow({ r, location }: { r: FeedEvent; location: ReturnType<typeof us
           <span className="feed-text">{eventText(r)}</span>
         </div>
         {isScreenshot && (
-          <a className="feed-thumb" href={r.evidence_url!} target="_blank" rel="noreferrer">
+          <button className="feed-thumb" onClick={onThumb} title="Open">
             <img src={r.evidence_url!} alt={String(r.payload.caption || "screenshot")} />
-          </a>
+          </button>
         )}
       </div>
     </div>

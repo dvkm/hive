@@ -126,3 +126,57 @@ test("limit caps the number of rows and is itself capped at 500", async () => {
   expect(big.json.events.length).toBeGreaterThan(0);
   expect(big.json.events.length).toBeLessThanOrEqual(500);
 });
+
+// ---- standalone monitor incidents folded into the feed ----
+let incidentTs = "";
+test("standalone monitor incidents appear in the feed with a type tag", async () => {
+  incidentTs = new Date().toISOString();
+  db.query("INSERT INTO incidents (id, project_id, monitor, ts, status, detail) VALUES (?,?,?,?,?,?)").run(
+    "inc_open1", projectId, "homepage", incidentTs, "open", "expected status 200, got 503"
+  );
+  db.query("INSERT INTO incidents (id, project_id, monitor, ts, status, detail) VALUES (?,?,?,?,?,?)").run(
+    "inc_other", otherProjectId, "otherme", new Date().toISOString(), "open", "down"
+  );
+
+  const { json } = await get("/api/feed");
+  const inc = json.events.find((e: any) => e.id === "inc_open1");
+  expect(inc).toBeTruthy();
+  expect(inc.type).toBe("incident");
+  expect(inc.task_id).toBeNull();
+  expect(inc.source).toBe("monitor");
+  expect(inc.project_name).toBe("feed-proj");
+  expect(inc.payload.monitor).toBe("homepage");
+  expect(inc.payload.status).toBe("open");
+  expect(inc.payload.detail).toContain("503");
+});
+
+test("feed stays reverse-chronological with incidents merged in", async () => {
+  const { json } = await get("/api/feed");
+  const ts = json.events.map((e: any) => e.ts);
+  expect(ts).toEqual([...ts].sort().reverse());
+});
+
+test("incident category includes standalone incidents; other categories exclude them", async () => {
+  const inc = await get("/api/feed?types=incident");
+  expect(inc.json.events.some((e: any) => e.id === "inc_open1")).toBe(true);
+
+  const state = await get("/api/feed?types=state");
+  expect(state.json.events.some((e: any) => e.type === "incident")).toBe(false);
+});
+
+test("project filter scopes incidents too", async () => {
+  const { json } = await get(`/api/feed?project=${projectId}`);
+  expect(json.events.some((e: any) => e.id === "inc_open1")).toBe(true);
+  expect(json.events.some((e: any) => e.id === "inc_other")).toBe(false);
+  expect(json.events.every((e: any) => e.project_id === projectId)).toBe(true);
+});
+
+test("since filter respects incident timestamps", async () => {
+  const cutoff = new Date(Date.parse(incidentTs) - 1000).toISOString();
+  const { json } = await get(`/api/feed?since=${encodeURIComponent(cutoff)}`);
+  expect(json.events.some((e: any) => e.id === "inc_open1")).toBe(true);
+
+  const future = new Date(Date.now() + 60000).toISOString();
+  const later = await get(`/api/feed?since=${encodeURIComponent(future)}`);
+  expect(later.json.events.some((e: any) => e.id === "inc_open1")).toBe(false);
+});
