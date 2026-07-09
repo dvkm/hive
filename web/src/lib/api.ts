@@ -37,6 +37,7 @@ export interface Task {
   summary: string | null;
   source: string | null;
   parent_task_id: string | null;
+  duplicate_of: string | null; // survivor id when cancelled as a duplicate
   health?: Health | null;
   created_at: string;
   updated_at: string;
@@ -361,6 +362,10 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
+  mergeInto: (id: string, target_id: string) =>
+    req<Task>(`/api/tasks/${id}/merge-into`, { method: "POST", body: JSON.stringify({ target_id }) }),
+  duplicates: () =>
+    req<{ clusters: { project_id: string; tasks: Pick<Task, "id" | "title" | "project_id" | "state">[] }[] }>(`/api/tasks/duplicates`),
   diff: (id: string) => req<DiffResult>(`/api/tasks/${id}/diff`),
   merge: (id: string) => req<Task>(`/api/tasks/${id}/merge`, { method: "POST", body: "{}" }),
   requestChanges: (id: string, notes: string) =>
