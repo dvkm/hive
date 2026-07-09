@@ -206,6 +206,12 @@ const MIGRATIONS: string[] = [
   ALTER TABLE tasks ADD COLUMN parent_task_id TEXT;
   CREATE INDEX idx_tasks_parent ON tasks(parent_task_id) WHERE parent_task_id IS NOT NULL;
   `,
+  // v8 — activity feed. A global reverse-chronological projection over events
+  // needs an index on ts alone (idx_events_task is (task_id, ts), useless for a
+  // cross-task ORDER BY ts).
+  `
+  CREATE INDEX idx_events_ts ON events(ts);
+  `,
 ];
 
 export type DB = Database;
