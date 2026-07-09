@@ -225,6 +225,12 @@ const MIGRATIONS: string[] = [
   CREATE INDEX idx_usage_task ON usage(task_id, ts);
   CREATE INDEX idx_usage_ts ON usage(ts);
   `,
+  // v9 — activity feed. A global reverse-chronological projection over events
+  // needs an index on ts alone (idx_events_task is (task_id, ts), useless for a
+  // cross-task ORDER BY ts).
+  `
+  CREATE INDEX idx_events_ts ON events(ts);
+  `,
 ];
 
 export type DB = Database;
