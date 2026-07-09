@@ -11,6 +11,7 @@ import { broadcast } from "./bus.ts";
 import { parseEvent, parseTask } from "./rows.ts";
 import { redact } from "./secrets.ts";
 import { enqueue } from "./notifications.ts";
+import { broadcastTask } from "./health.ts";
 
 export const STATES = [
   "queued",
@@ -35,7 +36,7 @@ const FORWARD: Record<State, State[]> = {
   in_review: ["verifying"],
   verifying: ["done", "in_progress"], // failed smoke checks bounce back
   done: [],
-  failed: [],
+  failed: ["queued"], // re-queue a failed task for another attempt (attention tray)
   cancelled: [],
 };
 
@@ -48,7 +49,10 @@ export function getTask(db: DB, id: string): any | null {
 
 export function canTransition(from: State, to: State): boolean {
   if (!STATES.includes(to)) return false;
-  if (to === "failed" || to === "cancelled") return !TERMINAL.includes(from);
+  if (to === "failed") return !TERMINAL.includes(from);
+  // A failed task can be dismissed to cancelled from the attention tray; any
+  // other non-terminal state can be cancelled too. done/cancelled cannot.
+  if (to === "cancelled") return from !== "done" && from !== "cancelled";
   return FORWARD[from]?.includes(to) ?? false;
 }
 
@@ -114,11 +118,15 @@ export function transition(
     }
   }
 
-  db.query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?").run(
-    to,
-    now(),
-    taskId
-  );
+  // Re-queuing a failed task (attention tray) resets its runtime binding so the
+  // next spawn is clean — a queued task must not point at a dead agent/worktree.
+  if (to === "queued") {
+    db.query(
+      "UPDATE tasks SET state = ?, updated_at = ?, agent_target = NULL, worktree_path = NULL, branch = NULL WHERE id = ?"
+    ).run(to, now(), taskId);
+  } else {
+    db.query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?").run(to, now(), taskId);
+  }
   writeEvent(db, {
     task_id: taskId,
     source,
@@ -126,7 +134,7 @@ export function transition(
     payload: { from, to, reason: opts.reason ?? null },
   });
   const updated = getTask(db, taskId);
-  broadcast({ type: "task", task: updated });
+  broadcastTask(db, updated);
   // Notify on notable terminal-ish outcomes (batched into the digest).
   if (to === "done")
     enqueue(db, { kind: "done", task_id: taskId, title: `Task done: ${task.title}`, body: task.summary ?? undefined });

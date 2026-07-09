@@ -6,17 +6,27 @@
 // Guard: a reconciler failure must never crash the server. Each sub-step is
 // isolated; the whole cycle is wrapped, and at most one `reconciler_error`
 // signal is broadcast per cycle.
+import { join } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
-import { now } from "./db.ts";
+import { now, newId, evidenceDir } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { writeEvent, transition, getTask } from "./state.ts";
+import { writeEvent, transition, getTask, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { runSmoke, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
+import { parseEvidence } from "./rows.ts";
+import { broadcastTask } from "./health.ts";
+import { requeueTask, openRecoveryDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
+const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
+// Auto-requeue at most twice on repeated agent death, then escalate to a card.
+const MAX_AUTO_REQUEUE = 2;
+// Nudge an alive-but-silent agent up to 3 times, then escalate to a card.
+const MAX_SILENT_NUDGES = 3;
 
 export interface ReconcilerDeps {
   herdr?: Herdr;
@@ -52,19 +62,29 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   } catch (e) {
     fail("flagStale", e);
   }
+  try {
+    await recoverStale(db, deps);
+  } catch (e) {
+    fail("recoverStale", e);
+  }
 }
 
 // ---- agent status sync ----
+// Probe every agent-bearing task. A vanished agent is recorded as status
+// `gone` (so health can show "dead" within one cycle); a live status change is
+// recorded as before. Recording is change-gated so the timeline never spams.
 async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
   const h = deps.herdr ?? defaultHerdr;
   const tasks = db
     .query(`SELECT id, agent_target FROM tasks WHERE agent_target IS NOT NULL AND state IN ${NON_TERMINAL}`)
     .all() as { id: string; agent_target: string }[];
   for (const t of tasks) {
-    const status = await h.status(t.agent_target);
-    if (status === "unknown") continue;
-    if (status !== lastAgentStatus(db, t.id)) {
-      writeEvent(db, { task_id: t.id, source: "herdr", type: "agent_status", payload: { status } });
+    const { alive, status } = await h.probe(t.agent_target);
+    const next = alive ? status : "gone";
+    if (next === "unknown") continue; // couldn't determine; leave prior status intact
+    if (next !== lastAgentStatus(db, t.id)) {
+      writeEvent(db, { task_id: t.id, source: "herdr", type: "agent_status", payload: { status: next } });
+      broadcastTask(db, getTask(db, t.id)); // health may have flipped (blocked / gone)
     }
   }
 }
@@ -159,6 +179,127 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
       enqueue(db, { kind: "stale", task_id: t.id, title: `Task stale: ${task?.title ?? t.id}` });
     }
   }
+}
+
+// ---- stale recovery (observed → acted on) ----
+// For each agent-bearing task whose newest event is `stale`, probe the agent
+// and act (SPEC "Stale recovery"):
+//   dead        → capture pane tail as evidence, fail, auto-requeue under a cap
+//                 (MAX_AUTO_REQUEUE) then a decision card.
+//   alive+silent → nudge via `herdr agent send`; after MAX_SILENT_NUDGES, fail
+//                 and open a decision card.
+// Each action re-arms the flow: writing an event resets the task's age, so the
+// next stale flag (one threshold later) drives the next step — that spacing IS
+// the requeue/nudge backoff.
+async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
+  const h = deps.herdr ?? defaultHerdr;
+  const tasks = db
+    .query(`SELECT id, agent_target FROM tasks WHERE agent_target IS NOT NULL AND state IN ${RECOVERABLE}`)
+    .all() as { id: string; agent_target: string }[];
+  for (const t of tasks) {
+    // A vanished agent (syncAgents just recorded `gone`) recovers within THIS
+    // cycle — the SPEC requires detecting a ghost within one cycle, not waiting
+    // out the stale threshold. The silent path is driven by a `stale` flag,
+    // read past agent_status noise so a status sync can't hide the flag.
+    const goneNow = lastAgentStatus(db, t.id) === "gone";
+    const meaningful = db
+      .query("SELECT type FROM events WHERE task_id = ? AND type != 'agent_status' ORDER BY ts DESC LIMIT 1")
+      .get(t.id) as { type: string } | undefined;
+    const staleFlagged = meaningful?.type === "stale";
+    if (!goneNow && !staleFlagged) continue;
+
+    const { alive } = await h.probe(t.agent_target);
+    if (!alive) await recoverDead(db, h, t.id, t.agent_target);
+    else if (staleFlagged) await recoverSilent(db, h, t.id, t.agent_target);
+  }
+}
+
+async function recoverDead(db: DB, h: Herdr, taskId: string, target: string): Promise<void> {
+  const task = getTask(db, taskId);
+  if (!task || TERMINAL.includes(task.state as State)) return;
+
+  const tail = await h.read(target, 200);
+  attachLog(db, taskId, tail, "agent pane tail at death (stale recovery)");
+  const attempts = requeueDepth(db, task); // requeues already made in this lineage
+  writeEvent(db, { task_id: taskId, source: "reconciler", type: "recovery", payload: { decision: "dead", attempts } });
+  transition(db, taskId, "failed", { source: "reconciler", reason: "agent vanished; recovered from stale" });
+
+  if (attempts >= MAX_AUTO_REQUEUE) {
+    openRecoveryDecision(db, task, attempts);
+    enqueue(db, { kind: "failed", task_id: taskId, title: `Recovery cap reached: ${task.title}` });
+  } else {
+    const newId = requeueTask(db, task);
+    writeEvent(db, { task_id: taskId, source: "reconciler", type: "requeued", payload: { new_task_id: newId, attempt: attempts + 1 } });
+    enqueue(db, { kind: "failed", task_id: taskId, title: `Auto-requeued (attempt ${attempts + 1}): ${task.title}` });
+  }
+}
+
+async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string): Promise<void> {
+  const task = getTask(db, taskId);
+  if (!task || TERMINAL.includes(task.state as State)) return;
+
+  const nudges = nudgesSinceActivity(db, taskId);
+  if (nudges >= MAX_SILENT_NUDGES) {
+    writeEvent(db, { task_id: taskId, source: "reconciler", type: "recovery", payload: { decision: "silent-escalate", nudges } });
+    transition(db, taskId, "failed", { source: "reconciler", reason: `agent silent; ${nudges} nudges ignored` });
+    openRecoveryDecision(db, task, requeueDepth(db, task));
+    enqueue(db, { kind: "failed", task_id: taskId, title: `Agent unresponsive: ${task.title}` });
+  } else {
+    const r = await h.send(
+      target,
+      `hive: you've gone quiet. Reply with \`hive emit ${taskId} status --note "..."\` or say what's blocking you.`
+    );
+    writeEvent(db, { task_id: taskId, source: "reconciler", type: "recovery_nudge", payload: { nudge: nudges + 1, delivered: r.code === 0 } });
+    broadcastTask(db, getTask(db, taskId));
+  }
+}
+
+// Pane tail → an evidence row (kind=log) written to the evidence store.
+function attachLog(db: DB, taskId: string, text: string, caption: string): void {
+  const dir = join(evidenceDir(), taskId);
+  mkdirSync(dir, { recursive: true });
+  const name = `${Date.now()}_panetail.log`;
+  const dest = join(dir, name);
+  writeFileSync(dest, text ?? "");
+  const ev = {
+    id: newId("ev"),
+    task_id: taskId,
+    ts: now(),
+    kind: "log",
+    path: dest,
+    url: `/evidence/${taskId}/${name}`,
+    caption,
+    meta: "{}",
+  };
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,?)")
+    .run(ev.id, ev.task_id, ev.ts, ev.kind, ev.path, ev.url, ev.caption, ev.meta);
+  broadcast({ type: "evidence", evidence: parseEvidence(ev) });
+  writeEvent(db, { task_id: taskId, source: "reconciler", type: "evidence", payload: { evidence_id: ev.id, kind: "log", caption } });
+}
+
+// How many times this lineage has already been auto-requeued (walk the
+// source='requeue' / parent_task_id chain back to the original task).
+function requeueDepth(db: DB, task: any): number {
+  let depth = 0;
+  let cur: any = task;
+  while (cur && cur.source === "requeue") {
+    depth++;
+    cur = cur.parent_task_id ? getTask(db, cur.parent_task_id) : null;
+  }
+  return depth;
+}
+
+// Consecutive recovery nudges since the last real activity (stale flags and the
+// nudges themselves don't count as activity, so silence keeps accumulating).
+function nudgesSinceActivity(db: DB, taskId: string): number {
+  const rows = db.query("SELECT type FROM events WHERE task_id = ? ORDER BY ts DESC").all(taskId) as { type: string }[];
+  let n = 0;
+  for (const r of rows) {
+    if (r.type === "recovery_nudge") n++;
+    else if (r.type === "stale" || r.type === "agent_status") continue; // reconciler noise
+    else break; // real activity resets the count
+  }
+  return n;
 }
 
 // Background loop. Started only from index.ts (never in tests).

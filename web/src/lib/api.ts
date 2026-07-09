@@ -14,6 +14,14 @@ export type State =
 export type Kind = "ship" | "scout" | "chore";
 export type CiStatus = "passing" | "failing" | "pending" | null;
 
+// Server-computed health (single source of truth; never re-derived here).
+export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
+export interface Health {
+  status: HealthStatus;
+  reason: string | null;
+  since: string;
+}
+
 export interface Task {
   id: string;
   project_id: string;
@@ -29,6 +37,7 @@ export interface Task {
   summary: string | null;
   source: string | null;
   parent_task_id: string | null;
+  health?: Health | null;
   created_at: string;
   updated_at: string;
 }
@@ -175,6 +184,8 @@ export const api = {
   task: (id: string) => req<TaskDetail>(`/api/tasks/${id}`),
   createTask: (b: { project_id: string; title: string; brief?: string; kind?: Kind }) =>
     req<Task>(`/api/tasks`, { method: "POST", body: JSON.stringify(b) }),
+  updateTask: (id: string, b: { title?: string; brief?: string }) =>
+    req<Task>(`/api/tasks/${id}`, { method: "PUT", body: JSON.stringify(b) }),
   brief: (id: string) => req<{ task_id: string; brief: string }>(`/api/tasks/${id}/brief`),
   transition: (id: string, to: State, reason?: string) =>
     req<Task>(`/api/tasks/${id}/transition`, {
@@ -193,6 +204,16 @@ export const api = {
     }),
   spawn: (id: string) =>
     req<{ ok: boolean; task: Task; agent_target: string }>(`/api/tasks/${id}/spawn`, {
+      method: "POST",
+      body: "{}",
+    }),
+  focusAgent: (id: string) =>
+    req<{ ok: boolean; focused: boolean; target?: string; error?: string }>(`/api/tasks/${id}/focus-agent`, {
+      method: "POST",
+      body: "{}",
+    }),
+  requeue: (id: string) =>
+    req<{ ok: boolean; new_task_id: string }>(`/api/tasks/${id}/requeue`, {
       method: "POST",
       body: "{}",
     }),

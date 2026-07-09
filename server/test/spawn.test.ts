@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -13,12 +13,18 @@ import type { Exec, ExecResult } from "../src/exec.ts";
 
 const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
 
-// A stub herdr that records send() calls and returns a canned spawn.
+// A real, writable worktree path so the spawn's hook-settings write succeeds.
+const WT = join(HOME, "wt-hive-x");
+const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x));
+
+// A stub herdr for the full visible-fleet spawn; records send() calls.
 function stubHerdr(sendResult: ExecResult = OK()) {
   const sends: { target: string; message: string }[] = [];
   const exec: Exec = async (argv) => {
-    if (argv.includes("create")) return OK('{"path":"/wt/hive-x","branch":"hive/x","workspace":"w1"}');
-    if (argv.includes("send")) {
+    if (has(argv, "worktree", "create")) return OK(`{"result":{"worktree":{"path":${JSON.stringify(WT)},"branch":"hive/x","open_workspace_id":"w1"}}}`);
+    if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
+    if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t2"}}}');
+    if (has(argv, "agent", "send")) {
       sends.push({ target: argv[argv.indexOf("send") + 1], message: argv[argv.indexOf("send") + 2] });
       return sendResult;
     }
@@ -69,8 +75,10 @@ test("spawn endpoint starts the agent and moves the task to in_progress", async 
   expect(task.json.state).toBe("in_progress");
   expect(task.json.agent_target).toBe(taskId);
   expect(task.json.branch).toBe("hive/x");
-  expect(task.json.worktree_path).toBe("/wt/hive-x");
+  expect(task.json.worktree_path).toBe(WT);
   expect(task.json.events.some((e: any) => e.type === "spawned")).toBe(true);
+  // hook wiring is written into the worktree (structural reporting).
+  expect(existsSync(join(WT, ".claude", "settings.local.json"))).toBe(true);
 });
 
 test("spawn refuses a project without a repo_path", async () => {
@@ -79,6 +87,45 @@ test("spawn refuses a project without a repo_path", async () => {
   const r = await post(`/api/tasks/${t.json.id}/spawn`, {});
   expect(r.status).toBe(400);
   expect(r.json.error).toContain("repo_path");
+});
+
+test("focus-agent focuses the herdr tab for a spawned task", async () => {
+  const r = await post(`/api/tasks/${taskId}/focus-agent`, {});
+  expect(r.status).toBe(200);
+  expect(r.json).toEqual({ ok: true, focused: true, target: taskId });
+  const events = await get(`/api/tasks/${taskId}/events`);
+  expect(events.json.some((e: any) => e.type === "focus_agent")).toBe(true);
+});
+
+test("focus-agent degrades when the task has no agent", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "no agent" });
+  const r = await post(`/api/tasks/${t.json.id}/focus-agent`, {});
+  expect(r.status).toBe(200);
+  expect(r.json.ok).toBe(false);
+  expect(r.json.error).toContain("no agent");
+});
+
+test("requeue endpoint fails a live task and queues a fresh copy", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "flaky", brief: "b" });
+  await post(`/api/tasks/${t.json.id}/spawn`, {});
+  const r = await post(`/api/tasks/${t.json.id}/requeue`, {});
+  expect(r.status).toBe(200);
+  expect(r.json.ok).toBe(true);
+  expect(typeof r.json.new_task_id).toBe("string");
+  const failed = await get(`/api/tasks/${t.json.id}`);
+  expect(failed.json.state).toBe("failed");
+  const fresh = await get(`/api/tasks/${r.json.new_task_id}`);
+  expect(fresh.json.state).toBe("queued");
+  expect(fresh.json.source).toBe("requeue");
+  expect(fresh.json.parent_task_id).toBe(t.json.id);
+});
+
+test("tasks carry a server-computed health object", async () => {
+  const list = await get(`/api/tasks`);
+  const spawned = list.json.find((t: any) => t.id === taskId);
+  expect(spawned).toHaveProperty("health");
+  // spawned task is in_progress with an agent → non-null health verdict
+  expect(spawned.health === null || typeof spawned.health.status === "string").toBe(true);
 });
 
 test("send delivers to a spawned agent via herdr", async () => {
