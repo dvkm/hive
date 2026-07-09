@@ -388,6 +388,8 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ answer_key, answer_note }),
     }),
+  dismissDecision: (id: string) =>
+    req<Decision>(`/api/decisions/${id}/dismiss`, { method: "POST" }),
 
   policies: () => req<Policy[]>(`/api/policies`),
   createPolicy: (b: { title: string; body: string; scope?: string; active?: boolean }) =>

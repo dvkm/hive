@@ -226,6 +226,8 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       m = pathname.match(/^\/api\/decisions\/([^/]+)\/answer$/);
       if (m && method === "POST") return apiAnswerDecision(db, m[1], await req.json());
+      m = pathname.match(/^\/api\/decisions\/([^/]+)\/dismiss$/);
+      if (m && method === "POST") return apiDismissDecision(db, m[1]);
 
       // ---- policies ----
       if (pathname === "/api/policies") {
@@ -1663,11 +1665,21 @@ function serveEvidence(pathname: string): Response {
 }
 
 // ---------------------------------------------------------------- decisions
+// A decision with no options is un-answerable: nothing to click in the inbox
+// and the answer endpoint has no key to validate. Agent/emit paths default to
+// this two-option set rather than silently dropping the signal; the direct
+// POST /api/decisions rejects (400) so a buggy client is told to fix its call.
+const DEFAULT_OPTIONS = [
+  { key: "proceed", label: "Proceed", recommended: true },
+  { key: "dismiss", label: "Dismiss" },
+];
+
 export function createDecision(
   db: DB,
   d: { task_id: string; title: string; context?: string | null; risk?: string | null; blast_radius?: string | null; options?: any[] }
 ): any {
   if (!getTask(db, d.task_id)) throw new Error("unknown task_id");
+  const options = Array.isArray(d.options) && d.options.length ? d.options : DEFAULT_OPTIONS;
   const row = {
     id: newId("dec"),
     task_id: d.task_id,
@@ -1676,7 +1688,7 @@ export function createDecision(
     context: d.context ?? null,
     risk: d.risk ?? null,
     blast_radius: d.blast_radius ?? null,
-    options: JSON.stringify(d.options ?? []),
+    options: JSON.stringify(options),
     status: "open",
     answer_key: null,
     answer_note: null,
@@ -1715,6 +1727,8 @@ export function createDecision(
 function apiCreateDecision(db: DB, body: any): Response {
   if (!body?.task_id) return err("task_id is required");
   if (!body?.title) return err("title is required");
+  if (!Array.isArray(body?.options) || body.options.length === 0)
+    return err("options must be a non-empty array", 400);
   const decision = createDecision(db, {
     task_id: body.task_id,
     title: body.title,
@@ -1781,6 +1795,21 @@ function apiAnswerDecision(db: DB, id: string, body: any): Response {
     transition(db, r.task_id, "in_progress", { source: "director", reason: "decision answered" });
 
   const decision = parseDecision({ ...r, status: "answered", answer_key: answerKey, answer_note: answerNote, answered_at: answeredAt });
+  broadcast({ type: "decision", decision });
+  return json(decision);
+}
+
+// Dismiss: clear a card without answering it (human escape hatch for a card with
+// no usable options, or one that's simply no longer relevant). Expires it and
+// broadcasts so the inbox clears live. No resolver hooks fire — dismissing is
+// explicitly "take no action".
+function apiDismissDecision(db: DB, id: string): Response {
+  const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
+  if (!r) return err("decision not found", 404);
+  if (r.status !== "open") return err(`decision already ${r.status}`, 409);
+  db.query("UPDATE decisions SET status = 'expired' WHERE id = ?").run(id);
+  writeEvent(db, { task_id: r.task_id, source: "director", type: "decision_expired", payload: { decision_id: id, reason: "dismissed" } });
+  const decision = parseDecision({ ...r, status: "expired" });
   broadcast({ type: "decision", decision });
   return json(decision);
 }
