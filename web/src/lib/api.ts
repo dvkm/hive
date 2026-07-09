@@ -225,6 +225,39 @@ export interface FeedEvent extends Omit<Event, "task_id"> {
   evidence_kind: Evidence["kind"] | null;
 }
 
+// One done-since row in the brief (task + completion metadata).
+export interface BriefDone {
+  id: string;
+  title: string;
+  summary: string | null;
+  project_id: string;
+  project_name: string;
+  done_at: string;
+  evidence_count: number;
+}
+export interface BriefIncident extends Incident {
+  project_name: string;
+}
+export interface BriefIntake extends Task {
+  project_name: string;
+}
+export interface BriefLearning extends Learning {
+  project_name: string;
+}
+// The composed morning brief. Action-state sections (decisions, attention, fleet,
+// intake) are current-state; done/incidents/spend/learnings are windowed by `since`.
+export interface Brief {
+  since: string | null;
+  done: BriefDone[];
+  failed_or_attention: Task[];
+  decisions: Decision[];
+  fleet: Task[];
+  incidents: BriefIncident[];
+  intake: BriefIntake[];
+  spend: { totals: UsageTotals; by_model: (UsageTotals & { model: string })[] };
+  learnings_new: BriefLearning[];
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(BASE + path, {
     ...init,
@@ -355,6 +388,9 @@ export const api = {
 
   search: (q: string, limit = 50) =>
     req<{ hits: SearchHit[] }>(`/api/search?q=${encodeURIComponent(q)}&limit=${limit}`),
+
+  morningBrief: (since?: string) =>
+    req<Brief>(`/api/brief${since ? "?since=" + encodeURIComponent(since) : ""}`),
 
   notifications: () => req<{ notifications: Notification[]; unread: number }>(`/api/notifications`),
   ackNotifications: () => req<{ ok: boolean; acked: number }>(`/api/notifications/ack`, { method: "POST", body: "{}" }),
