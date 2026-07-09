@@ -905,6 +905,9 @@ a {
 .dcard-context {
   color: var(--text-dim);
   margin: 8px 0 16px;
+  /* contexts are composed as line-oriented text (planner breakdowns, guarded
+     action detail); collapsing the newlines turns them into a wall of prose */
+  white-space: pre-wrap;
 }
 
 /* blast radius callout — visually prominent */
@@ -1692,6 +1695,30 @@ a {
 .modal h2 {
   font-size: 16px;
   margin: 0 0 14px;
+}
+.mode-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 14px;
+}
+.mode-tab {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-family: var(--font);
+  font-size: 12px;
+  padding: 5px 12px;
+}
+.mode-tab.on {
+  background: var(--bg);
+  border-color: var(--accent);
+  color: var(--text);
+}
+.fld textarea.braindump {
+  min-height: 160px;
+  line-height: 1.5;
 }
 .fld {
   display: block;

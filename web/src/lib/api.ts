@@ -301,6 +301,8 @@ export const api = {
   },
   createTask: (b: { project_id: string; title: string; brief?: string; kind?: Kind }) =>
     req<Task>(`/api/tasks`, { method: "POST", body: JSON.stringify(b) }),
+  intake: (b: { project_id: string; text: string }) =>
+    req<{ ok: boolean; task: Task }>(`/api/intake`, { method: "POST", body: JSON.stringify(b) }),
   updateTask: (id: string, b: { title?: string; brief?: string }) =>
     req<Task>(`/api/tasks/${id}`, { method: "PUT", body: JSON.stringify(b) }),
   brief: (id: string) => req<{ task_id: string; brief: string }>(`/api/tasks/${id}/brief`),
