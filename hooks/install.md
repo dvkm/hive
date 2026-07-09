@@ -100,3 +100,71 @@ export HIVE_TASK_ID=<some-task-id> HIVE_URL=http://127.0.0.1:4700
 printf '{"transcript_path":"/path/to/transcript.jsonl"}' | hooks/hive-hook.sh Stop
 # then check the task timeline for `assistant_text` / `tool_use` events (source "hook").
 ```
+
+## Command auto-approval (PreToolUse classifier)
+
+`hive-approve.sh` + `classify.ts` are a **PreToolUse** hook that keeps an
+autonomous worker from hanging on a Bash permission dialog. `writeHookSettings`
+wires them into every spawned worktree automatically (alongside the static
+`permissions.allow` list); this section documents the contract.
+
+`classify.ts` (pure, unit-tested in `server/test/classify.test.ts`) sorts a
+command into **safe** / **dangerous** / **unknown**:
+
+- **safe** — read-only / standard-dev (`ls`, `cat`, `grep`, `git status/diff/log`,
+  `bun test`, `bun run`, ...); every shell segment must match the safe allowlist,
+  there must be no dangerous token anywhere, and no command substitution
+  (`$(...)`, backticks) — those escalate.
+- **dangerous** — a destructive denylist (`rm -rf`, `sudo`, `curl … | sh`,
+  `git push --force`, `git reset --hard`, `DROP/TRUNCATE`, `DELETE`/`UPDATE`
+  without `WHERE`, fork bomb, `mkfs`/`dd of=`, device/system writes, `kill`,
+  `terraform apply/destroy`, `kubectl delete`, credential files, ...). Checked
+  against the WHOLE command first, so a dangerous token after `;`/`&&`/`|` still
+  trips it. NEVER auto-allowed.
+- **unknown** — anything not provably safe. Conservative by design: when unsure, a
+  command is not safe.
+
+**PreToolUse output contract** (stdout, exit 0):
+```json
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"..."}}
+```
+`permissionDecision` is `allow` or `deny`. No output + exit 0 = defer to Claude
+Code's normal permission flow. The hook never emits exit 2; any internal error
+exits 0 so the agent is never crashed.
+
+**Routing**: safe → `allow`. dangerous + unknown → `POST guarded-action` (action
+`command.dangerous` vs `command`); the response maps `200 allow`→allow,
+`403 deny`→deny, `409 require_decision`→deny with `escalated to hive decision <id>`
+(retry the same command once the director approves; a single-use grant lets it
+through). **Fail-safe**: hive unreachable → `deny` (2s curl cap).
+
+**`command_approval` policy** (project `config`, passed as the hook argument)
+governs UNKNOWN commands only: `escalate` (default) | `allow` | `prompt`.
+Dangerous always escalates.
+
+### Wiring (settings.local.json)
+
+```json
+{
+  "permissions": { "allow": ["Read", "Bash(git status:*)", "Bash(bun test:*)"], "deny": ["mcp__claude-in-chrome"] },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "/ABSOLUTE/PATH/hooks/hive-approve.sh escalate" } ] }
+    ]
+  }
+}
+```
+
+### Verify
+
+```bash
+chmod +x hooks/hive-approve.sh hooks/classify.ts
+export HIVE_TASK_ID=<task-id> HIVE_URL=http://127.0.0.1:4700
+# safe → allow:
+printf '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}' | hooks/hive-approve.sh escalate
+# dangerous → escalates to guarded-action (deny unless a standing grant/rule allows):
+printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}' | hooks/hive-approve.sh escalate
+```
+
+To actually STOP dangerous commands (not just log them), seed an authority rule:
+`POST /api/authority/rules {"action_pattern":"command.dangerous*","effect":"require_decision"}`.

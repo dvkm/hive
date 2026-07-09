@@ -90,6 +90,19 @@ test("spawned worktree settings deny the interactive-prompt MCP servers", () => 
   expect(settings.hooks.Stop).toBeDefined(); // deny wiring didn't clobber the hooks
 });
 
+// Safe commands must auto-approve without a dialog; risky ones go through the
+// PreToolUse classifier hook to the authority engine.
+test("spawned worktree settings allow safe tools and wire the PreToolUse classifier", () => {
+  const settings = JSON.parse(readFileSync(join(WT, ".claude", "settings.local.json"), "utf8"));
+  expect(settings.permissions.allow).toContain("Read");
+  expect(settings.permissions.allow).toContain("Bash(git status:*)");
+  expect(settings.permissions.allow).toContain("Bash(bun test:*)");
+  const pre = settings.hooks.PreToolUse?.[0];
+  expect(pre.matcher).toBe("Bash");
+  expect(pre.hooks[0].command).toContain("hive-approve.sh");
+  expect(pre.hooks[0].command).toContain("escalate"); // default policy
+});
+
 test("spawn refuses a project without a repo_path", async () => {
   const p = await post("/api/projects", { name: "norepo" });
   const t = await post("/api/tasks", { project_id: p.json.id, title: "x" });
