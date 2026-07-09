@@ -2874,3 +2874,221 @@ a {
 .brief-banner-x:hover {
   color: var(--text);
 }
+
+/* ---- review panel + inline diff viewer (in-review tasks) ---- */
+.review-panel {
+  border-color: var(--accent-dim);
+}
+.review-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.review-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.review-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0 12px;
+  flex-wrap: wrap;
+}
+.wrap-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-left: auto;
+  cursor: pointer;
+}
+.review-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.review-notes textarea {
+  min-height: 80px;
+  resize: vertical;
+}
+.review-notes .btn {
+  align-self: flex-start;
+}
+
+.diff-viewer {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.diff-summary {
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.diff-err {
+  color: var(--red);
+  font-size: 13px;
+}
+.diff-add {
+  color: var(--green);
+}
+.diff-del {
+  color: var(--red);
+}
+.diff-file {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--bg-elev);
+}
+.diff-file-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--bg-elev2);
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  text-align: left;
+}
+.diff-caret {
+  color: var(--text-faint);
+  width: 12px;
+}
+.diff-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.diff-counts {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+}
+.diff-binary {
+  padding: 10px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.diff-body {
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.diff-hunk-head {
+  padding: 3px 10px;
+  color: var(--text-faint);
+  background: var(--bg-elev);
+  border-top: 1px solid var(--border-soft);
+  white-space: pre;
+}
+.diff-line {
+  display: flex;
+  white-space: pre;
+}
+.diff-body.wrap .diff-line {
+  white-space: pre-wrap;
+}
+.diff-body.wrap .dl-text {
+  word-break: break-all;
+}
+.dl-sign {
+  width: 18px;
+  flex: 0 0 18px;
+  text-align: center;
+  color: var(--text-faint);
+  user-select: none;
+}
+.dl-text {
+  flex: 1;
+  padding-right: 10px;
+}
+.dl-add {
+  background: rgba(70, 201, 139, 0.12);
+}
+.dl-add .dl-sign {
+  color: var(--green);
+}
+.dl-del {
+  background: rgba(239, 93, 107, 0.12);
+}
+.dl-del .dl-sign {
+  color: var(--red);
+}
+.diff-trunc {
+  color: var(--amber);
+  font-size: 12.5px;
+  padding: 6px 2px;
+}
+
+/* ---- shared review card (task page, /review queue, brief) ---- */
+.review-card {
+  background: var(--panel);
+  border: 1px solid var(--accent-dim);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.review-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.review-card-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-weight: 600;
+}
+.review-card-title a {
+  color: var(--text);
+}
+.review-summary {
+  color: var(--text-dim);
+  font-size: 13px;
+  margin: 0;
+}
+.mono-sm {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.review-diffstat {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+}
+.diffstat-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0;
+}
+.diffstat-toggle:hover {
+  color: var(--text);
+}

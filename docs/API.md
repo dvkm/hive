@@ -144,6 +144,11 @@ Types written by the runtime layer (Phase 2b):
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
 - `smoke_passed` / `smoke_failed` — post-deploy smoke result. `payload: {results:[{name,ok,detail}], evidence_id?}`
 
+Review events (written by the director path, `source: director`):
+- `merged` — an in-review task was approved & merged. `payload: {method, base, branch, pr_url}`
+- `merge_failed` — a merge attempt failed (conflict / not a fast-forward / gh refused); no state change. `payload: {reason}`
+- `changes_requested` — the captain requested changes; the task returns to `in_progress`. `payload: {notes, delivered}`
+
 Domain-supervisor events (written by the planner, `source: system`):
 - `planning` — a planner run started for the task. `payload: {title}`
 - `planned` — the planner produced a breakdown and opened a decision card.
@@ -374,6 +379,58 @@ cost_usd, calls, unpriced}` (summed cost counts priced rows only).
   proposal. On any planner failure returns `502` and records a single
   `planner_error` event (no card). The request blocks for the planner run
   (timeout-capped by `HIVE_PLANNER_TIMEOUT_MS`, default 120000).
+
+### Review experience (in-review tasks)
+An `in_review` task means the agent finished and opened a PR (or pushed/created a
+branch) and is **awaiting the captain's review & merge** — not busy work. The
+captain reviews the diff and approves/merges, requests changes, or rejects,
+entirely from hive (the task page, the `/review` queue, and the morning brief all
+render the same review card).
+
+- `GET /api/tasks/:id/diff` → `200 DiffResult` | `400` (no branch & no `pr_url`, or project has no `repo_path`) | `404` | `502` (gh/git failed)
+  The task branch's changes. When `pr_url` is set, `gh pr diff <url> --patch`;
+  otherwise `git -C <repo> diff <default_branch>...<branch>` in the project repo.
+  The unified diff is parsed into:
+  ```json
+  {
+    "files": [
+      { "path": "src/a.ts", "additions": 2, "deletions": 1, "binary": false,
+        "hunks": [ { "header": "@@ -1,3 +1,4 @@ ctx", "lines": [
+          { "kind": "ctx", "text": " line1" },
+          { "kind": "del", "text": "line2" },
+          { "kind": "add", "text": "line2 changed" }
+        ] } ] }
+    ],
+    "truncated": false
+  }
+  ```
+  `kind ∈ {add, del, ctx}`. Total parsed lines are capped at 20000; past that
+  `truncated` is `true` and the remaining diff is omitted (view the PR for the
+  full patch). Binary files carry `binary: true` and no hunks.
+
+- `POST /api/tasks/:id/merge` body `{}` → `200 Task` (now `verifying`) | `409` (not `in_review`, or the merge failed: conflict / not a fast-forward / gh refused) | `403` (denied by a `task.merge` authority rule) | `404` | `400` (local merge but no `repo_path`/`branch`)
+  Approve & merge. When `pr_url` is set: `gh pr merge <url> <method>` where
+  `method` is the project's `config.merge_method` (`squash` default, or `merge` /
+  `rebase`). Otherwise a **local fast-forward**: the default branch is
+  fast-forwarded to the task branch tip (`git merge --ff-only`); a non-fast-forward
+  (diverged/conflicting) merge is refused with `409` and no working tree is
+  touched (rebase the branch or open a PR for a squash merge). On success: writes
+  a `merged` event, transitions `in_review → verifying` (which runs the project's
+  post-deploy smoke once), and best-effort removes the task worktree (a teardown
+  failure never fails the merge). On failure: `409` with the reason, a
+  `merge_failed` event, and NO state change. Guarded by the standing-authority
+  gate with action `task.merge`.
+
+- `POST /api/tasks/:id/request-changes` body `{notes (required)}` → `200 {"ok":true, "delivered":<bool>, "task": Task}` (now `in_progress`) | `409` (not `in_review`) | `400` (blank notes) | `404`
+  Bounce the task back to `in_progress` for another pass. Delivers `notes` to the
+  live agent via `herdr agent send` when one is alive (`delivered` reports
+  whether the send landed); either way a `changes_requested` event records the
+  notes so a respawned agent has them. **Reject** is not a separate endpoint — it
+  is `POST /transition {to:"cancelled", reason}` (allowed from `in_review`).
+
+The morning brief (`GET /api/brief`) gains a `to_review` array: the current
+`in_review` tasks (full Task objects with `health`), rendered as review cards
+inline just after `decisions`.
 
 ### Search — `GET /api/search?q=&limit=`
 Global text search across the five text-bearing entities, for the web command
@@ -641,7 +698,9 @@ so the next spawn is clean; writes a `state_change` with the reason), **edit &
 requeue** = `PUT /api/tasks/:id` then the same transition, **cancel** = `POST
 /transition {to:"cancelled"}` (a `failed` task may be dismissed to `cancelled`).
 Unhealthy live rows reuse view-agent / send / requeue. State-machine edges added
-for this: `failed → queued` and `failed → cancelled`.
+for this: `failed → queued` and `failed → cancelled`. The review experience adds
+`in_review → in_progress` (the captain requesting changes; see the Review
+experience section).
 
 ### Static assets
 - `GET /evidence/<task_id>/<file>` → the raw evidence file (`404` if missing; path traversal rejected `403`).

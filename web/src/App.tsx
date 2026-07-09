@@ -10,6 +10,7 @@ import Evidence from "./views/Evidence";
 import TaskPage from "./views/Task";
 import TaskModal from "./views/TaskModal";
 import Decisions from "./views/Decisions";
+import Review from "./views/Review";
 import Policies from "./views/Policies";
 import Monitors from "./views/Monitors";
 import Learnings from "./views/Learnings";
@@ -65,7 +66,8 @@ function Bell() {
 }
 
 export default function App() {
-  const { decisions } = useStore();
+  const { decisions, tasks } = useStore();
+  const reviewCount = tasks.filter((t) => t.state === "in_review").length;
   const location = useLocation();
   // Board card clicks push /tasks/:id with state.backgroundLocation set to the
   // board's location — that keeps the board mounted and rendered underneath
@@ -90,6 +92,10 @@ export default function App() {
             Decisions
             {decisions.length > 0 && <span className="badge">{decisions.length}</span>}
           </NavLink>
+          <NavLink to="/review">
+            Review
+            {reviewCount > 0 && <span className="badge">{reviewCount}</span>}
+          </NavLink>
           <NavLink to="/learnings">Learnings</NavLink>
           <NavLink to="/analytics">Analytics</NavLink>
           <NavLink to="/projects">Projects</NavLink>
@@ -107,6 +113,7 @@ export default function App() {
           <Route path="/evidence" element={<Evidence />} />
           <Route path="/tasks/:id" element={<TaskPage />} />
           <Route path="/decisions" element={<Decisions />} />
+          <Route path="/review" element={<Review />} />
           <Route path="/learnings" element={<Learnings />} />
           <Route path="/analytics" element={<Analytics />} />
           <Route path="/projects" element={<Projects />} />
