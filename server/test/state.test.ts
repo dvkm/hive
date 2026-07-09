@@ -83,6 +83,26 @@ test("any non-terminal state can go to failed/cancelled; terminals cannot", () =
   expect(getTask(db, id).state).toBe("cancelled");
 });
 
+test("a failed task can be re-queued (attention tray), resetting its runtime binding", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  transition(db, id, "in_progress");
+  // bind a runtime agent, then fail it
+  db.query("UPDATE tasks SET agent_target = 'a1', worktree_path = '/wt', branch = 'hive/x' WHERE id = ?").run(id);
+  transition(db, id, "failed", { reason: "agent vanished" });
+  expect(canTransition("failed", "queued")).toBe(true);
+
+  transition(db, id, "queued", { source: "director", reason: "requeued" });
+  const t = getTask(db, id);
+  expect(t.state).toBe("queued");
+  // runtime binding cleared so the next spawn is clean
+  expect(t.agent_target).toBeNull();
+  expect(t.worktree_path).toBeNull();
+  expect(t.branch).toBeNull();
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'state_change' ORDER BY ts DESC LIMIT 1").get(id) as { payload: string };
+  expect(JSON.parse(ev.payload)).toMatchObject({ from: "failed", to: "queued", reason: "requeued" });
+});
+
 test("needs_decision <-> in_progress round trip", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId);

@@ -36,6 +36,71 @@ The spawn itself is the shared `spawnAgent()` core (also used by
 `POST /api/tasks/:id/spawn`), so the auto path and the manual button behave
 identically: worktree create, agent start, `spawned` event, `queued→in_progress`.
 
+## Visible interactive fleet (spawn design)
+
+hive uses herdr the way priortool's `docs/herdr-backend.md` proved it should be
+used: agents are VISIBLE and INTERACTIVE, never invisible one-shot `claude -p`
+processes (the exact failure that killed three real tasks — a one-shot exited
+without reporting, the agent vanished, the board pointed at a ghost). `spawn()`
+(`server/src/runtime/herdr.ts`) does, in order:
+
+1. `herdr worktree create --cwd <repo> --branch hive/<id> --json` — the git
+   worktree (path + branch parsed from the 0.7.x envelope).
+2. **Prepare the worktree** (callback) — writes `.claude/settings.local.json`
+   wiring hive's Stop/SubagentStop/PostToolUse hooks BEFORE the agent starts, so
+   lifecycle reporting is structural, not brief-dependent (`hooks/`).
+3. **Ensure the fleet workspace** — adopt-or-create a dedicated named workspace
+   labelled **`hive-fleet`** (`HIVE_FLEET_LABEL` override), `--no-focus` so a
+   spawn never steals the space the captain is watching. NOT `"hive"`: herdr
+   auto-labels a worktree's own workspace by repo name, and this repo is named
+   `hive`, so `"hive"` would adopt the hive checkout's workspace — the
+   label-collision class priortool's 2026-07-02 self-kill documents.
+4. `herdr tab create --workspace <fleet> --cwd <worktree> --label "<id> <title>"`
+   — one labelled tab per task (this IS the visible "id + title" affordance).
+5. `herdr agent start <id> --workspace <fleet> --tab <tab> --cwd <worktree>
+   --env HIVE_TASK_ID=<id> --env HIVE_URL=... [secrets] --no-focus -- claude
+   "<brief>" --permission-mode acceptEdits` — an INTERACTIVE claude with the
+   composed brief delivered as its first prompt argument (execvp argv after `--`,
+   so a multi-line brief needs no quoting and none of priortool's documented
+   send-text/composer-autocomplete hazard). The agent stays live and tolerates
+   the captain attaching and typing.
+
+**No `agent rename`.** Verified live against herdr 0.7.1: renaming an agent
+changes its resolvable name, after which `agent get <taskId>` returns
+`agent_not_found` — which would make the reconciler read every renamed agent as
+DEAD and false-requeue it. The tab label carries the id+title; the agent keeps
+its canonical `taskId` name so probe/send/focus by `agent_target` keep resolving.
+Per-project `config.agent_argv` overrides the command verbatim (the operator owns
+briefing in that case).
+
+## Stale recovery loop (`server/src/reconciler.ts`)
+
+`syncAgents` probes every agent-bearing task each cycle; a vanished agent is
+recorded as `agent_status: gone` (so health shows `dead` within one cycle).
+`recoverStale` then runs the decision tree for any task whose agent is `gone`
+(recovered the SAME cycle — the SPEC requires catching a ghost within one cycle)
+or whose newest meaningful event is `stale`:
+
+- **Dead** → capture the pane tail (`herdr agent read`) as `log` evidence, mark
+  the task `failed`, and auto-requeue a fresh `source="requeue"` task under a cap
+  of 2 (lineage counted via `parent_task_id`); the 3rd death opens a decision
+  card (`openRecoveryDecision`, answer `requeue` → another fresh task).
+- **Alive but silent** → nudge via `herdr agent send`; after 3 silent cycles,
+  fail + open the same decision card.
+
+The requeue/nudge backoff is the stale threshold itself: each action writes an
+event that resets the task's age, so the next step only fires one threshold
+later. All actions are evented and broadcast over SSE.
+
+### Probe: three death shapes
+
+`herdr agent get` reports a vanished agent inconsistently (all verified live on
+0.7.1), so `Herdr.probe` treats ALL of these as dead while a transient/unparseable
+result stays alive (never a false requeue):
+- `agent_not_found` on **stdout**, exit 0 (a never-known target); and
+- `agent_not_found` on **stderr**, exit 1 (an agent that EXITED); and
+- an agent record present but with a **null `pane_id`** (a just-reaped pane).
+
 ## herdr adapter — verified behavior & quirks
 
 Verified live: worktree create, agent start, `agent list` visibility,
@@ -85,3 +150,16 @@ bun run scripts/herdr-live-verify.ts /tmp/hive-herdr-verify
 Requires a running herdr server (`herdr status` → running) and a git repo with
 an `origin` remote at the given path. The script resets the repo between phases
 and prints a PASS/FAIL line per checked behavior.
+
+The visible-fleet + stale-recovery rework has its own end-to-end harness:
+
+```bash
+bun run scripts/herdr-rework-verify.ts 2>&1 | tee docs/evidence/herdr-rework-verification.txt
+```
+
+It boots a scratch hive server in-process against the real herdr and drives a
+task through the whole new pipeline (interactive claude in the `hive-fleet`
+workspace with a labelled tab, hook wiring + a live hook event) then the full
+recovery loop (agent exits → reconciler fails + auto-requeues twice → the cap
+opens a decision card). The committed transcript is
+`docs/evidence/herdr-rework-verification.txt`.

@@ -3,7 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { api } from "../lib/api";
 import type { Decision, Evidence, TaskDetail } from "../lib/api";
 import { useStore } from "../lib/store";
-import { CiBadge, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { relTime } from "../lib/time";
 
 function EvidenceItem({ e }: { e: Evidence }) {
@@ -127,6 +127,33 @@ export function TaskBody({ id }: { id: string }) {
       toast((e as Error).message);
     }
   };
+  const viewAgent = async () => {
+    try {
+      const r = await api.focusAgent(t.id);
+      toast(r.ok ? "Focused agent tab in herdr" : `Can't focus: ${r.error}`);
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  };
+  const nudge = async () => {
+    try {
+      await api.send(t.id, "hive: status? Reply with what you just did / are doing, or what's blocking you.");
+      toast("Status nudge sent");
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  };
+  const failRequeue = async () => {
+    try {
+      await api.requeue(t.id);
+      toast("Failed & requeued as a fresh task");
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  };
+
+  const health = t.health;
+  const unhealthy = health && health.status !== "healthy";
 
   return (
     <div className="task">
@@ -141,13 +168,37 @@ export function TaskBody({ id }: { id: string }) {
           )}
         </div>
         <h1 className="task-title">
-          <StatusDot state={t.state} /> {t.title}
+          <StatusDot state={t.state} health={t.health} /> {t.title}
         </h1>
         <div className="task-sub">
           {project && <span className="chip">{project.name}</span>}
           <span className={`chip chip-kind chip-${t.kind}`}>{t.kind}</span>
           <span className="chip">{STATE_LABEL[t.state]}</span>
         </div>
+
+        {unhealthy && (
+          <div className={`health-banner banner-${health!.status}`}>
+            <div className="health-banner-text">
+              <strong>{HEALTH_LABEL[health!.status]}</strong>
+              {health!.reason ? ` — ${health!.reason}` : ""} · since {relTime(health!.since)}
+            </div>
+            <div className="health-banner-actions">
+              {t.agent_target && (
+                <button className="btn btn-mini" onClick={viewAgent}>
+                  View agent
+                </button>
+              )}
+              {t.agent_target && (
+                <button className="btn btn-mini" onClick={nudge}>
+                  Nudge
+                </button>
+              )}
+              <button className="btn btn-mini btn-danger" onClick={failRequeue}>
+                Fail + requeue
+              </button>
+            </div>
+          </div>
+        )}
 
         <section className="panel">
           <h2>Brief</h2>
@@ -252,6 +303,11 @@ export function TaskBody({ id }: { id: string }) {
               Send steer
             </button>
           </div>
+          {t.agent_target && (
+            <button className="btn" onClick={viewAgent} title="Focus this agent's tab in herdr">
+              View agent
+            </button>
+          )}
           {t.state === "queued" && (
             <button className="btn btn-primary" onClick={dispatch}>
               Dispatch now

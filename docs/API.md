@@ -71,16 +71,33 @@ concurrently-running agents).
   "summary": "Shipped dark mode toggle; all tests green.",
   "source": null,
   "parent_task_id": null,
+  "health": { "status": "healthy", "reason": null, "since": "..." },
   "created_at": "...",
   "updated_at": "..."
 }
 ```
 `state ∈ {queued, in_progress, needs_decision, in_review, verifying, done, failed, cancelled}`
 `kind ∈ {ship, scout, chore}`
+`health` is a SERVER-COMPUTED dimension separate from lifecycle `state` — the
+visible symptom that a task pointing at a live agent is actually fine or actually
+stuck. **It is the single source of truth; clients render it, never re-derive
+it.** Shape `{status, reason, since}`:
+- `status ∈ {healthy, silent, stuck, dead}`; `reason` is a short human string (or
+  null when healthy); `since` is the ISO ts the current condition began.
+- `null` for `queued`, `done`, `failed`, `cancelled`, and any task with no
+  `agent_target`.
+- Derivation (pure function of events, precedence dead > stuck > silent >
+  healthy): **dead** = `agent_target` set but the reconciler's probe recorded the
+  agent `gone`; **stuck** = herdr reports `blocked` OR a stale-recovery escalation
+  is in flight (newest event `stale`/`recovery_nudge`); **silent** = no activity
+  events past the stale threshold but the agent is still alive; **healthy**
+  otherwise. Every `task` SSE message carries the recomputed `health`.
 `source` is null for director/agent-created tasks, `"intake_gchat"` for a task
 drafted by the Google Chat intake connector (an untrusted, unreviewed external
-message — the web board flags these), or `"planner"` for a task created from an
-approved domain-supervisor breakdown (see the Domain supervisors section). A
+message — the web board flags these), `"planner"` for a task created from an
+approved domain-supervisor breakdown (see the Domain supervisors section), or
+`"requeue"` for a fresh task the stale-recovery loop spun up after an agent died
+(`parent_task_id` → the failed original; see Stale recovery). A
 companion `source_ref` column (not returned) holds the upstream message resource
 name and is uniquely indexed for dedupe.
 `parent_task_id` is null for top-level tasks, or the id of the source task a
@@ -110,9 +127,14 @@ name and is uniquely indexed for dedupe.
 - `blocked` — agent reported blocked. `payload: {note}`
 
 Types written by the runtime layer (Phase 2b):
-- `spawned` — a herdr agent was started. `payload: {agent_target, branch, worktree_path}`
+- `spawned` — a herdr agent was started. `payload: {agent_target, branch, worktree_path, tab_id, label, fleet_workspace_id}`
 - `spawn_error` — spawn failed. `payload: {error}`
-- `agent_status` — herdr agent status changed (via wait loop or reconciler). `payload: {status}` (`idle|working|blocked`)
+- `agent_status` — herdr agent status changed (via wait loop or reconciler). `payload: {status}` (`idle|working|blocked|gone` — `gone` = the reconciler's probe found the agent missing from herdr)
+- `focus_agent` — the director focused the agent's herdr tab ("view agent"). `payload: {target}`
+- `recovery` — a stale-recovery decision was taken. `payload: {decision:"dead"|"silent-escalate", attempts?|nudges?}`
+- `recovery_nudge` — a status nudge was sent to an alive-but-silent agent. `payload: {nudge, delivered}`
+- `requeued` — a failed task was auto-requeued as a fresh task. `payload: {new_task_id, attempt?}`
+- `recovery_card` — a recovery escalation opened a decision card. `payload: {decision_id, source_task_id}`
 - `ci_status` — reconciler synced CI. `payload: {ci_status}` (`passing|pending|failing`)
 - `pr_merged` — reconciler detected the PR merged. `payload: {pr_url}`
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
@@ -279,6 +301,20 @@ set on creation); normal ones are batched into a single digest every
   Creates the herdr worktree (`hive/<task-id>`), starts the agent with `HIVE_TASK_ID`/`HIVE_URL` + the project's resolved secrets in env and the composed brief, sets `agent_target`/`worktree_path`/`branch`, transitions `queued → in_progress`, and writes a `spawned` event.
 - `POST /api/tasks/:id/send` body `{message (required)}` → `200 {"ok":true, "delivered":true, "message":...}` | `404` | `400` (empty message)
   Dispatches the message to the task's live agent via `herdr agent send`. Always records a `steer` event. Degrades gracefully: if the task has no `agent_target` or herdr fails, returns `200 {"ok":false, "delivered":false, "error":"..."}` (never throws) and records a `steer_error` event when herdr itself failed.
+- `PUT /api/tasks/:id` body `{title?, brief?}` → `200 Task` | `404`
+  Updates a task's editable fields. Used by the attention tray's "edit & requeue"
+  flow before it re-queues a failed task.
+- `POST /api/tasks/:id/focus-agent` body `{}` → `200 {"ok":true, "focused":true, "target":"..."}` | `404`
+  The board's "view agent" affordance: focuses the task's herdr tab via
+  `herdr agent focus` so David can watch/attach. Records a `focus_agent` event.
+  Degrades gracefully (never throws): `200 {"ok":false, "focused":false, "error":"..."}`
+  when the task has no agent or herdr fails.
+- `POST /api/tasks/:id/requeue` body `{}` → `200 {"ok":true, "new_task_id":"..."}` | `404`
+  The recovery banner's manual "fail + requeue": fails the task if still live,
+  then creates a FRESH queued copy (`source="requeue"`, `parent_task_id` → the
+  original). Distinct from the attention tray's in-place requeue of an
+  already-failed task (`POST /transition {to:"queued"}`, which reactivates the
+  SAME task and clears its runtime binding).
 - `GET /api/tasks/:id/brief` → `200 {"task_id":"...", "brief":"<multiline string>"}` | `404`
   (task description + definition of done + `hive emit` protocol + active global + project policies + standing-authority section)
 - `POST /api/tasks/:id/guarded-action` body `{action (required), target (required), detail?}` → see below | `404` | `400`
@@ -486,6 +522,33 @@ a single `spawn_error` event and back off exponentially per task
 Manual dispatch (the web "dispatch now" button → `POST /api/tasks/:id/spawn`)
 bypasses these policy gates but still runs the `task.spawn` authority gate. See
 `docs/runtime.md`.
+
+### Stale recovery & the attention tray
+The reconciler (`docs/runtime.md`) turns an observed agent death into action.
+Two kinds of failure, deliberately kept distinct:
+
+- **Infra failure (auto-recovered, bounded).** An agent that vanishes (herdr
+  reports it gone, or it goes stale-and-dead) is auto-recovered: the pane tail is
+  captured as `log` evidence, the task is marked `failed`, and a FRESH
+  `source="requeue"` task is queued (`parent_task_id` → the failed one). This is
+  capped at **2 auto-requeues** per lineage; the third death opens a decision
+  card instead (`recovery_card` event). An alive-but-silent agent is nudged up to
+  3 times, then also escalates to a card.
+- **Terminal failure (human triage).** A task that failed PAST the auto-requeue
+  cap, was cancelled/failed for work reasons, or that the director failed
+  manually, STAYS `failed`. `failed` is not a board column, so these surface ONLY
+  in the web **"needs attention" tray** (failed tasks awaiting triage + live
+  tasks whose health is `dead`/`stuck`). The **dispatcher never picks up `failed`
+  tasks** (it only spawns `queued`), so nothing auto-runs a task a human hasn't
+  re-queued.
+
+Attention-tray actions map to endpoints: **requeue** = `POST /transition
+{to:"queued"}` (reactivates the SAME task, clearing `agent_target`/`worktree_path`/`branch`
+so the next spawn is clean; writes a `state_change` with the reason), **edit &
+requeue** = `PUT /api/tasks/:id` then the same transition, **cancel** = `POST
+/transition {to:"cancelled"}` (a `failed` task may be dismissed to `cancelled`).
+Unhealthy live rows reuse view-agent / send / requeue. State-machine edges added
+for this: `failed → queued` and `failed → cancelled`.
 
 ### Static assets
 - `GET /evidence/<task_id>/<file>` → the raw evidence file (`404` if missing; path traversal rejected `403`).

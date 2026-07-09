@@ -16,16 +16,23 @@ import type { Exec, ExecResult } from "../src/exec.ts";
 
 const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
 
-// A herdr stub whose worktree-create returns a canned worktree; records spawns.
+// A real, writable worktree path so the spawn's hook-settings write succeeds.
+const WT = mkdtempSync(join(tmpdir(), "hive-dispatch-wt-"));
+const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x));
+
+// A herdr stub for the full visible-fleet spawn (worktree + fleet workspace +
+// labelled tab + agent start); records only real worktree spawns.
 function stubHerdr(fail = false) {
   const spawns: string[] = [];
   const exec: Exec = async (argv) => {
-    if (argv.includes("create")) {
+    if (has(argv, "worktree", "create")) {
       if (fail) return { code: 1, stdout: "", stderr: "worktree create boom" };
       spawns.push(argv[argv.indexOf("--cwd") + 1]);
-      return OK('{"result":{"worktree":{"path":"/wt/x","branch":"hive/x","open_workspace_id":"w1"}}}');
+      return OK(`{"result":{"worktree":{"path":${JSON.stringify(WT)},"branch":"hive/x","open_workspace_id":"w1"}}}`);
     }
-    return OK(); // agent start etc.
+    if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
+    if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t2"}}}');
+    return OK(); // agent start / rename etc.
   };
   return { herdr: new Herdr(exec, "herdr"), spawns };
 }

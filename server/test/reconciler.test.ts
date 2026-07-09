@@ -81,12 +81,13 @@ test("flagStale emits one stale event past the threshold, then stops", async () 
 test("reconciler never throws; a failing sub-step broadcasts at most one error", async () => {
   const { db, projectId } = freshDb();
   makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
-  // herdr.status swallows its own errors (returns unknown), so force a throw
-  // from gh instead to exercise the guard.
+  // A live-agent stub keeps syncAgents/recovery inert; force a throw from gh
+  // instead to exercise the failure guard.
+  const aliveHerdr = new Herdr(stub(() => OK('{"result":{"agent":{"agent_status":"working","pane_id":"w1:p1"}}}')), "herdr");
   const boom: Exec = async () => {
     throw new Error("exec exploded");
   };
   // Should resolve, not reject.
-  await reconcileOnce(db, { exec: boom });
+  await reconcileOnce(db, { herdr: aliveHerdr, exec: boom });
   expect(true).toBe(true);
 });
