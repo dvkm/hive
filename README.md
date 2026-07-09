@@ -139,3 +139,19 @@ server/test/ bun test suite
   the connector is a hard no-op until a space is configured. Simplest durable
   home for the allowlist: the existing per-project `config` column (the owning
   project is the target), so no new table or endpoint.
+
+## v3 notes (domain supervisors)
+
+- **On-demand planners** (`server/src/planner.ts`, migration v7). A per-project
+  planner triages a task and proposes a breakdown. hive rejects long-running LLM
+  supervisor sessions (firstmate's failure mode): "persistent" means the ROLE +
+  CONTEXT live in the DB (project config `supervisor_persona`, `playbook`,
+  `plan_intake`, `planner_argv`), while the LLM runs as a short-lived subprocess
+  `claude -p <prompt> --output-format json` (timeout-capped by
+  `HIVE_PLANNER_TIMEOUT_MS`, default 120s; killed on timeout; injectable exec).
+- Triggered by `POST /api/tasks/:id/plan` (manual) or auto on intake when the
+  project sets `config.plan_intake: true`. The result is a `normal`-risk decision
+  card (`approve`/`reject`); on approve the proposed tasks are created `queued`
+  with `source="planner"` and `parent_task_id` linking to the source task.
+  Output is parsed defensively; unparseable output records one `planner_error`
+  event and stops. New event types: `planning`, `planned`, `planner_error`.

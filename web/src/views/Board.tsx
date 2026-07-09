@@ -34,6 +34,11 @@ function Card({ task }: { task: Task }) {
             intake · unreviewed
           </span>
         )}
+        {task.source === "planner" && (
+          <span className="chip chip-planned" title="Created from an approved planner breakdown">
+            planned
+          </span>
+        )}
         <span className="card-age">{age}</span>
       </div>
       {task.summary && <div className="card-summary">{task.summary}</div>}

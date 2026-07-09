@@ -41,6 +41,12 @@ herdr runs, default `["claude","-p",<brief-file>,"--permission-mode","acceptEdit
 and `gchat_spaces` (`[{space, label?}]`, the Google Chat intake allowlist —
 messages in each `spaces/<id>` become draft tasks in THIS project; see Intake
 connectors below).
+Domain-supervisor keys (see the Domain supervisors section):
+`supervisor_persona` (string, freeform planner identity included in every planner
+prompt), `plan_intake` (bool; when true, each new intake task auto-triggers a
+planner breakdown), `planner_argv` (string[], the planner command, default
+`["claude","-p"]`), and `playbook` (string, freeform project context injected
+into planner prompts).
 
 ### Task
 ```json
@@ -58,17 +64,21 @@ connectors below).
   "ci_status": "passing",
   "summary": "Shipped dark mode toggle; all tests green.",
   "source": null,
+  "parent_task_id": null,
   "created_at": "...",
   "updated_at": "..."
 }
 ```
 `state ∈ {queued, in_progress, needs_decision, in_review, verifying, done, failed, cancelled}`
 `kind ∈ {ship, scout, chore}`
-`source` is null for director/agent-created tasks, or `"intake_gchat"` for a task
+`source` is null for director/agent-created tasks, `"intake_gchat"` for a task
 drafted by the Google Chat intake connector (an untrusted, unreviewed external
-message — the web board flags these). A companion `source_ref` column (not
-returned) holds the upstream message resource name and is uniquely indexed for
-dedupe.
+message — the web board flags these), or `"planner"` for a task created from an
+approved domain-supervisor breakdown (see the Domain supervisors section). A
+companion `source_ref` column (not returned) holds the upstream message resource
+name and is uniquely indexed for dedupe.
+`parent_task_id` is null for top-level tasks, or the id of the source task a
+`"planner"` task was broken out of (links a child to its parent).
 
 ### Event
 ```json
@@ -102,6 +112,13 @@ Types written by the runtime layer (Phase 2b):
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
 - `smoke_passed` / `smoke_failed` — post-deploy smoke result. `payload: {results:[{name,ok,detail}], evidence_id?}`
+
+Domain-supervisor events (written by the planner, `source: system`):
+- `planning` — a planner run started for the task. `payload: {title}`
+- `planned` — the planner produced a breakdown and opened a decision card.
+  `payload: {decision_id, source_task_id, proposed_tasks:[{title,brief,kind}], rationale, questions:[]}`
+- `planner_error` — the planner failed (spawn error, non-zero exit, timeout, or
+  unparseable output). A single diagnostic; no retry. `payload: {error}`
 
 Standing-authority events (written by the policy engine, `source: system` unless noted):
 - `authority_logged` — an action was allowed (matched an `allow` rule, defaulted to allow when unmatched, or passed by consuming a grant). `payload: {action, target, effect:"allow", rule_id?, via_grant?}`
@@ -219,8 +236,9 @@ under a "Known failure patterns" section, 10 most recent by `last_seen`.
   "delivered_at": "2026-07-09T09:00:00.000Z"
 }
 ```
-`kind ∈ {decision, done, failed, incident, stale, intake}`. `urgency ∈ {normal, urgent}`.
-(`intake` is a new Google-Chat draft task — always `normal`, batched into the digest.)
+`kind ∈ {decision, done, failed, incident, stale, intake, planned}`. `urgency ∈ {normal, urgent}`.
+(`intake` is a new Google-Chat draft task; `planned` is an approved planner
+breakdown — both always `normal`, batched into the digest.)
 `task_id` / `decision_id` may be null. `delivered_at` is set once David has been
 made aware — urgent notifications push a macOS notification immediately (so it is
 set on creation); normal ones are batched into a single digest every
@@ -270,6 +288,15 @@ set on creation); normal ones are batched into a single digest every
     transitions into `verifying`/`done`) run through the same gate and return the
     same `403` / `409 {decision_id}` shapes when a rule matches.
 
+- `POST /api/tasks/:id/plan` body `{}` → `200 {"ok":true, "decision": Decision}` | `404` | `502 {"ok":false, "error":"..."}`
+  Manually triggers the domain-supervisor planner for any task (see Domain
+  supervisors). Records a `planning` event, runs the planner subprocess, and on
+  success opens a `normal`-risk decision card titled `Proposed breakdown: <title>`
+  with `approve`/`reject` options plus a `planned` event carrying the structured
+  proposal. On any planner failure returns `502` and records a single
+  `planner_error` event (no card). The request blocks for the planner run
+  (timeout-capped by `HIVE_PLANNER_TIMEOUT_MS`, default 120000).
+
 ### Event ingestion — `POST /api/tasks/:id/events`
 The `hive emit` path. Accepts **either** `application/json` **or**
 `multipart/form-data` (multipart is required to upload an evidence file). All
@@ -306,6 +333,11 @@ Behavior by `type`:
   Archives the card (`status=answered`, `answered_at` set), writes a
   `decision_answered` event, and resumes the task (`needs_decision → in_progress`).
   If `answer_note` is omitted, the saved `draft_note` is used.
+  Answering also runs the standing-authority and domain-supervisor resolvers: if
+  the card was an authority request, `approve` mints a single-use grant; if it was
+  a planner breakdown proposal, `approve` creates the proposed tasks as `queued`
+  tasks with `source="planner"` and `parent_task_id` set to the source task (each
+  gets a `created` event), while `reject` creates nothing (event only).
 
 ### Policies
 - `GET /api/policies?scope=` → `200 [Policy, ...]` (oldest first; `scope` filter optional)
@@ -397,6 +429,35 @@ bot messages are skipped; each message is deduped by its resource name (unique
   consent; scope `chat.messages.readonly`).
 - Errors (token expiry, list failure) emit a single diagnostic then stay quiet,
   recovering on the next successful poll — no spam.
+
+### Domain supervisors (on-demand planners)
+A per-project planner that triages a task and proposes a breakdown. hive's core
+design REJECTS long-running LLM supervisor sessions (firstmate's failure mode):
+the supervisor is "persistent" only in that its ROLE and CONTEXT live in the DB
+(the `supervisor_persona`, `playbook`, `plan_intake`, `planner_argv` config
+keys). The LLM itself runs as a short-lived, on-demand subprocess:
+`<planner_argv> <prompt> --output-format json` (default binary `claude -p`,
+timeout-capped by `HIVE_PLANNER_TIMEOUT_MS`, default 120000; the process is
+killed on timeout). Injectable exec for tests.
+
+- Prompt composition (`server/src/planner.ts`, pure function of DB state): the
+  supervisor persona + project playbook + active global/project policies + active
+  learnings + the source task's title/brief + a fixed instruction to return
+  STRICT JSON `{proposed_tasks:[{title,brief,kind}], rationale, questions:[]}`.
+  The source task's text is treated as data, never as instructions to the planner.
+- Parsing is defensive: the JSON object is extracted whether returned raw, inside
+  the claude `--output-format json` envelope (`{result:"..."}`), or wrapped in
+  prose. Unknown `kind` normalizes to `ship`; entries without a title are dropped.
+  Unparseable output records ONE `planner_error` event and stops (no retry storm).
+- Triggers: `POST /api/tasks/:id/plan` (manual, any task) and auto on intake task
+  creation when the owning project sets `config.plan_intake: true`.
+- Result: a `normal`-risk decision card on the source task titled
+  `Proposed breakdown: <title>` (context = rationale + numbered proposed tasks +
+  any planner questions) with options `approve` (recommended) / `reject`, plus a
+  `planned` event carrying the structured proposal. On `approve` the proposed
+  tasks are created `queued` with `source="planner"` and `parent_task_id` → the
+  source task, and a `normal` `planned` notification is enqueued. On `reject`
+  nothing is created (the `decision_answered` event is the only record).
 
 ### Static assets
 - `GET /evidence/<task_id>/<file>` → the raw evidence file (`404` if missing; path traversal rejected `403`).
