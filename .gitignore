@@ -7,3 +7,4 @@ web/dist
 .env.*
 .hive/
 .DS_Store
+.serena/
