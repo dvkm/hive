@@ -285,7 +285,20 @@ export default function Board() {
     if (id) localStorage.setItem(PROJECT_FILTER_KEY, id);
     else localStorage.removeItem(PROJECT_FILTER_KEY);
   };
-  const visible = projectFilter ? tasks.filter((t) => t.project_id === projectFilter) : tasks;
+  // The command palette's "Toggle project filter" action fires this event so the
+  // board picks up the change even when it's already mounted.
+  useEffect(() => {
+    const onSet = (e: Event) => setFilter((e as CustomEvent<string>).detail);
+    window.addEventListener("hive:project-filter", onSet as EventListener);
+    return () => window.removeEventListener("hive:project-filter", onSet as EventListener);
+  }, []);
+  // Instant client-side card filter (title/summary substring), no server call.
+  const [cardFilter, setCardFilter] = useState("");
+  const scoped = projectFilter ? tasks.filter((t) => t.project_id === projectFilter) : tasks;
+  const q = cardFilter.trim().toLowerCase();
+  const visible = q
+    ? scoped.filter((t) => t.title.toLowerCase().includes(q) || (t.summary || "").toLowerCase().includes(q))
+    : scoped;
   const byState = (s: State) => {
     let list = visible.filter((t) => t.state === s);
     // list is already newest-updated first from the API / SSE upserts.
@@ -310,6 +323,18 @@ export default function Board() {
             {p.name}
           </button>
         ))}
+        <input
+          className="board-search"
+          placeholder="Filter cards…"
+          value={cardFilter}
+          onChange={(e) => setCardFilter(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape" && cardFilter) {
+              e.stopPropagation();
+              setCardFilter("");
+            }
+          }}
+        />
       </div>
       <div className="board">
       {COLUMNS.map((s) => {
@@ -350,7 +375,8 @@ export default function Board() {
 
 // Compact create-task form. Esc closes, Cmd/Ctrl+Enter submits. The new task
 // lands in Queued and surfaces live via SSE, so no manual refresh is needed.
-function NewTaskModal({ onClose }: { onClose: () => void }) {
+// Exported so the command palette can open it over any view.
+export function NewTaskModal({ onClose }: { onClose: () => void }) {
   const { projects } = useStore();
   const [project, setProject] = useState("");
   const [title, setTitle] = useState("");

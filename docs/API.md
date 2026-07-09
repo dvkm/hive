@@ -375,6 +375,29 @@ cost_usd, calls, unpriced}` (summed cost counts priced rows only).
   `planner_error` event (no card). The request blocks for the planner run
   (timeout-capped by `HIVE_PLANNER_TIMEOUT_MS`, default 120000).
 
+### Search — `GET /api/search?q=&limit=`
+Global text search across the five text-bearing entities, for the web command
+palette. → `200 {"hits": [SearchHit, ...]}`.
+
+```json
+{ "type": "task", "id": "9da7c5527580", "title": "Add dark mode toggle",
+  "snippet": "User-facing dark mode toggle in settings.",
+  "task_state": "done", "project_id": "proj_ab12..." }
+```
+- `type ∈ {task, decision, learning, policy, project}`. `task_state` and
+  `project_id` are present only on `task` hits; other types omit them.
+- Fields searched per type: task (title, brief, summary), decision (title,
+  context), learning (title, body), policy (title, body), project (name).
+- `snippet` is a ~120-char window around the first body match (empty for
+  project hits, which have no body).
+- Ranking (per entity): exact title match > title prefix > title substring >
+  body-only match; ties break alphabetically by title.
+- `q` is matched case-insensitively; `%`/`_`/`\` are treated literally (not SQL
+  wildcards). An empty/whitespace `q` returns `{"hits": []}`.
+- `limit` defaults to 50 and is capped at 50 (the total returned across all
+  types). Implementation is LIKE-based (no FTS5), suitable for a local
+  single-user DB.
+
 ### Event ingestion — `POST /api/tasks/:id/events`
 The `hive emit` path. Accepts **either** `application/json` **or**
 `multipart/form-data` (multipart is required to upload an evidence file). All
