@@ -75,6 +75,11 @@ function Card({ task }: { task: Task }) {
             intake · unreviewed
           </span>
         )}
+        {task.source === "intake_braindump" && (
+          <span className="chip chip-intake" title="A braindump; Claude is drafting a breakdown to approve">
+            braindump
+          </span>
+        )}
         {task.source === "planner" && (
           <span className="chip chip-planned" title="Created from an approved planner breakdown">
             planned
@@ -89,7 +94,9 @@ function Card({ task }: { task: Task }) {
       </div>
       {task.summary && <div className="card-summary">{task.summary}</div>}
       <div className="card-foot">
-        {task.state === "queued" && (
+        {/* An intake task holds raw input, not a brief: an agent would try to
+            "do" the braindump. Its plan produces the dispatchable tasks. */}
+        {task.state === "queued" && !task.source?.startsWith("intake_") && (
           <button className="btn btn-mini" onClick={dispatch} disabled={dispatching} title="Spawn an agent for this task now">
             {dispatching ? "dispatching…" : "dispatch now"}
           </button>
@@ -251,12 +258,18 @@ export default function Board() {
   );
 }
 
-// Compact create-task form. Esc closes, Cmd/Ctrl+Enter submits. The new task
-// lands in Queued and surfaces live via SSE, so no manual refresh is needed.
+// Intake form. Esc closes, Cmd/Ctrl+Enter submits.
+//
+// Braindump (default): dump unstructured text, the planner drafts a task
+// breakdown and opens a decision card for approval — nothing is queued until
+// the breakdown is approved. Manual: the old title/brief/kind form, which
+// queues a task directly. Both surface live via SSE, so no manual refresh.
 // Exported so the command palette can open it over any view.
 export function NewTaskModal({ onClose }: { onClose: () => void }) {
   const { projects } = useStore();
+  const [mode, setMode] = useState<"braindump" | "manual">("braindump");
   const [project, setProject] = useState("");
+  const [dump, setDump] = useState("");
   const [title, setTitle] = useState("");
   const [brief, setBrief] = useState("");
   const [kind, setKind] = useState<Kind>("ship");
@@ -266,12 +279,19 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
     if (!project && projects.length) setProject(projects[0].id);
   }, [projects, project]);
 
+  const ready = project && (mode === "braindump" ? dump.trim() : title.trim());
+
   const submit = async () => {
-    if (!project || !title.trim() || busy) return;
+    if (!ready || busy) return;
     setBusy(true);
     try {
-      await api.createTask({ project_id: project, title: title.trim(), brief: brief.trim() || undefined, kind });
-      toast("Task queued");
+      if (mode === "braindump") {
+        await api.intake({ project_id: project, text: dump.trim() });
+        toast("Braindump sent — Claude is drafting a breakdown for you to approve");
+      } else {
+        await api.createTask({ project_id: project, title: title.trim(), brief: brief.trim() || undefined, kind });
+        toast("Task queued");
+      }
       onClose();
     } catch (e) {
       toast((e as Error).message);
@@ -288,6 +308,14 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
     <div className="modal-backdrop" onMouseDown={onClose}>
       <div className="modal" onMouseDown={(e) => e.stopPropagation()} onKeyDown={onKey}>
         <h2>New task</h2>
+        <div className="mode-tabs">
+          <button className={`mode-tab ${mode === "braindump" ? "on" : ""}`} onClick={() => setMode("braindump")}>
+            Braindump
+          </button>
+          <button className={`mode-tab ${mode === "manual" ? "on" : ""}`} onClick={() => setMode("manual")}>
+            Manual
+          </button>
+        </div>
         {projects.length === 0 ? (
           <div className="muted">No projects yet. Create one first.</div>
         ) : (
@@ -302,32 +330,55 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
                 ))}
               </select>
             </label>
-            <label className="fld">
-              <span>Title</span>
-              <input autoFocus placeholder="What needs doing" value={title} onChange={(e) => setTitle(e.target.value)} />
-            </label>
-            <label className="fld">
-              <span>Brief</span>
-              <textarea placeholder="Description / definition of done (optional)" value={brief} onChange={(e) => setBrief(e.target.value)} />
-            </label>
-            <label className="fld">
-              <span>Kind</span>
-              <select value={kind} onChange={(e) => setKind(e.target.value as Kind)}>
-                <option value="ship">ship</option>
-                <option value="scout">scout</option>
-                <option value="chore">chore</option>
-              </select>
-            </label>
+            {mode === "braindump" ? (
+              <label className="fld">
+                <span>Braindump</span>
+                <textarea
+                  autoFocus
+                  className="braindump"
+                  placeholder="Dump whatever is in your head. Half-formed is fine. Claude drafts the tasks and you approve them before anything runs."
+                  value={dump}
+                  onChange={(e) => setDump(e.target.value)}
+                />
+              </label>
+            ) : (
+              <>
+                <label className="fld">
+                  <span>Title</span>
+                  <input autoFocus placeholder="What needs doing" value={title} onChange={(e) => setTitle(e.target.value)} />
+                </label>
+                <label className="fld">
+                  <span>Brief</span>
+                  <textarea placeholder="Description / definition of done (optional)" value={brief} onChange={(e) => setBrief(e.target.value)} />
+                </label>
+                <label className="fld">
+                  <span>Kind</span>
+                  <select value={kind} onChange={(e) => setKind(e.target.value as Kind)}>
+                    <option value="ship">ship</option>
+                    <option value="scout">scout</option>
+                    <option value="chore">chore</option>
+                  </select>
+                </label>
+              </>
+            )}
           </>
         )}
         <div className="modal-foot">
-          <span className="muted modal-hint">⌘↵ to queue · Esc to close</span>
+          <span className="muted modal-hint">
+            {mode === "braindump" ? "⌘↵ to send · Esc to close" : "⌘↵ to queue · Esc to close"}
+          </span>
           <div className="spacer" />
           <button className="btn" onClick={onClose}>
             Cancel
           </button>
-          <button className="btn btn-primary" disabled={busy || !title.trim() || !project} onClick={submit}>
-            {busy ? "Queuing…" : "Queue task"}
+          <button className="btn btn-primary" disabled={busy || !ready} onClick={submit}>
+            {mode === "braindump"
+              ? busy
+                ? "Sending…"
+                : "Draft tasks"
+              : busy
+                ? "Queuing…"
+                : "Queue task"}
           </button>
         </div>
       </div>

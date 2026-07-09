@@ -6,9 +6,10 @@
 //     intake drafts and setup tasks never auto-spawn).
 //   - `dispatch_kinds` (default ["ship","scout"]) — chore tasks (usually titled
 //     for a human) are excluded by default.
-//   - source='intake_gchat' tasks are skipped until reviewed (a `reviewed` event
-//     or a `note` event containing the word "reviewed"; the intake connector's
-//     own "UNREVIEWED ..." marker does NOT count — see isReviewed()).
+//   - source='intake_*' tasks (gchat messages, director braindumps) are skipped
+//     until reviewed (a `reviewed` event or a `note` event containing the word
+//     "reviewed"; the intake connector's own "UNREVIEWED ..." marker does NOT
+//     count — see isReviewed()). Intake text is raw input, never a brief.
 //   - `max_agents` (default 3) — concurrency cap per project.
 //   - authority gate: authorize(action="task.dispatch") must resolve to `allow`;
 //     a `deny` or `require_decision` rule blocks the auto-spawn.
@@ -78,7 +79,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
       const kinds = Array.isArray(cfg.dispatch_kinds) ? cfg.dispatch_kinds : DISPATCH_KINDS_DEFAULT;
       if (!kinds.includes(task.kind)) continue; // chore / human-titled tasks excluded
 
-      if (task.source === "intake_gchat" && !isReviewed(db, task.id)) continue; // unreviewed external input
+      if (task.source?.startsWith("intake_") && !isReviewed(db, task.id)) continue; // unreviewed intake
 
       const cap = Number.isFinite(cfg.max_agents) ? Number(cfg.max_agents) : MAX_AGENTS_DEFAULT;
       if (activeFor(task.project_id) >= cap) continue; // concurrency cap
