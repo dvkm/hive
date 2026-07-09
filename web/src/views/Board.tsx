@@ -5,6 +5,7 @@ import { useStore } from "../lib/store";
 import type { Health, Kind, State, Task } from "../lib/api";
 import { CiBadge, HEALTH_LABEL, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
+import { AttentionTray, needsAttention } from "./attention";
 
 // A compact "why this card needs attention" line: e.g. "agent gone" or
 // "no activity 22m". Server-provided reason + live-ticking since-age.
@@ -117,161 +118,37 @@ function Card({ task }: { task: Task }) {
 }
 
 const PROJECT_FILTER_KEY = "hive.board.project";
+const BANNER_DISMISS_KEY = "hive.brief.bannerDismissed";
 
-// Attention-tray eligibility — mirrors the server's needsAttention() rule.
-function needsAttention(t: Task): boolean {
-  if (t.state === "failed") return true;
-  return !!t.health && (t.health.status === "dead" || t.health.status === "stuck");
-}
-
-// One compact tray row for a FAILED task awaiting human triage. Failed tasks are
-// not a board column, so without this tray they vanish entirely.
-function FailedRow({ task }: { task: Task }) {
-  const { projects } = useStore();
-  const project = projects.find((p) => p.id === task.project_id);
-  const age = useRelTime(task.updated_at);
-  const [editing, setEditing] = useState(false);
-  const act = async (fn: () => Promise<unknown>, msg: string) => {
-    try {
-      await fn();
-      toast(msg);
-    } catch (e) {
-      toast((e as Error).message);
-    }
+// Slim, dismissible banner nudging the director to the morning brief when there
+// are brief-worthy items to answer (open decisions or tasks needing attention).
+// Dismissal is keyed on the current item signature, so a fresh decision or a new
+// unhealthy task brings it back rather than staying hidden forever.
+function BriefBanner() {
+  const { decisions, tasks } = useStore();
+  const attn = tasks.filter(needsAttention).length;
+  const decs = decisions.length;
+  const sig = `${decs}:${attn}`;
+  const [dismissed, setDismissed] = useState<string>(() => localStorage.getItem(BANNER_DISMISS_KEY) || "");
+  if (decs + attn === 0 || dismissed === sig) return null;
+  const parts: string[] = [];
+  if (decs > 0) parts.push(`${decs} decision${decs === 1 ? "" : "s"}`);
+  if (attn > 0) parts.push(`${attn} need${attn === 1 ? "s" : ""} attention`);
+  const dismiss = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    localStorage.setItem(BANNER_DISMISS_KEY, sig);
+    setDismissed(sig);
   };
   return (
-    <div className="attn-row">
-      <span className="sdot sdot-failed" />
-      <Link to={`/tasks/${task.id}`} className="attn-title">
-        {task.title}
-      </Link>
-      {project && <span className="chip">{project.name}</span>}
-      <span className="attn-reason">{task.summary || "failed — awaiting triage"}</span>
-      <span className="attn-age">{age}</span>
-      <div className="attn-actions">
-        <button className="btn btn-mini" onClick={() => act(() => api.transition(task.id, "queued", "requeued"), "Re-queued")}>
-          Requeue
-        </button>
-        <button className="btn btn-mini" onClick={() => setEditing(true)}>
-          Edit &amp; requeue
-        </button>
-        <button className="btn btn-mini btn-danger" onClick={() => act(() => api.transition(task.id, "cancelled", "dismissed from tray"), "Cancelled")}>
-          Cancel
-        </button>
-      </div>
-      {editing && <EditRequeueModal task={task} onClose={() => setEditing(false)} />}
-    </div>
-  );
-}
-
-// One compact tray row for a live task whose agent is dead/stuck.
-function UnhealthyRow({ task }: { task: Task }) {
-  const { projects } = useStore();
-  const project = projects.find((p) => p.id === task.project_id);
-  const age = useRelTime(task.health?.since || task.updated_at);
-  const act = async (fn: () => Promise<unknown>, msg: string) => {
-    try {
-      await fn();
-      toast(msg);
-    } catch (e) {
-      toast((e as Error).message);
-    }
-  };
-  const h = task.health!;
-  return (
-    <div className="attn-row">
-      <StatusDot state={task.state} health={task.health} />
-      <Link to={`/tasks/${task.id}`} className="attn-title">
-        {task.title}
-      </Link>
-      {project && <span className="chip">{project.name}</span>}
-      <span className={`attn-reason attn-${h.status}`}>{h.reason || HEALTH_LABEL[h.status]}</span>
-      <span className="attn-age">{age}</span>
-      <div className="attn-actions">
-        {task.agent_target && (
-          <button className="btn btn-mini" onClick={() => act(async () => { const r = await api.focusAgent(task.id); if (!r.ok) throw new Error(r.error); }, "Focused agent tab")}>
-            View agent
-          </button>
-        )}
-        {task.agent_target && (
-          <button className="btn btn-mini" onClick={() => act(() => api.send(task.id, "hive: status? Reply with what you're doing or what's blocking you."), "Nudge sent")}>
-            Nudge
-          </button>
-        )}
-        <button className="btn btn-mini btn-danger" onClick={() => act(() => api.requeue(task.id), "Failed & requeued")}>
-          Fail + requeue
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// Small modal: edit a failed task's brief/title, then re-queue it.
-function EditRequeueModal({ task, onClose }: { task: Task; onClose: () => void }) {
-  const [title, setTitle] = useState(task.title);
-  const [brief, setBrief] = useState(task.brief || "");
-  const [busy, setBusy] = useState(false);
-  const submit = async () => {
-    if (!title.trim() || busy) return;
-    setBusy(true);
-    try {
-      await api.updateTask(task.id, { title: title.trim(), brief });
-      await api.transition(task.id, "queued", "edited & requeued");
-      toast("Edited & re-queued");
-      onClose();
-    } catch (e) {
-      toast((e as Error).message);
-      setBusy(false);
-    }
-  };
-  return (
-    <div className="modal-backdrop" onMouseDown={onClose}>
-      <div className="modal" onMouseDown={(e) => e.stopPropagation()} onKeyDown={(e) => e.key === "Escape" && onClose()}>
-        <h2>Edit &amp; requeue</h2>
-        <label className="fld">
-          <span>Title</span>
-          <input autoFocus value={title} onChange={(e) => setTitle(e.target.value)} />
-        </label>
-        <label className="fld">
-          <span>Brief</span>
-          <textarea value={brief} onChange={(e) => setBrief(e.target.value)} />
-        </label>
-        <div className="modal-foot">
-          <span className="muted modal-hint">Saves the brief, then re-queues</span>
-          <div className="spacer" />
-          <button className="btn" onClick={onClose}>
-            Cancel
-          </button>
-          <button className="btn btn-primary" disabled={busy || !title.trim()} onClick={submit}>
-            {busy ? "Requeuing…" : "Save & requeue"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// Collapsed when empty. Failed tasks (awaiting triage) + dead/stuck live tasks.
-function AttentionTray({ tasks }: { tasks: Task[] }) {
-  const eligible = tasks.filter(needsAttention);
-  if (eligible.length === 0) return null;
-  const failed = eligible.filter((t) => t.state === "failed");
-  const unhealthy = eligible.filter((t) => t.state !== "failed");
-  return (
-    <section className="attn-tray">
-      <header className="attn-head">
-        <span className="attn-head-title">⚠ Needs attention</span>
-        <span className="col-count">{eligible.length}</span>
-      </header>
-      <div className="attn-body">
-        {unhealthy.map((t) => (
-          <UnhealthyRow key={t.id} task={t} />
-        ))}
-        {failed.map((t) => (
-          <FailedRow key={t.id} task={t} />
-        ))}
-      </div>
-    </section>
+    <Link to="/brief" className="brief-banner">
+      <span className="brief-banner-dot">◆</span>
+      <span className="brief-banner-text">Your brief: {parts.join(", ")}</span>
+      <span className="brief-banner-go">Open →</span>
+      <button className="brief-banner-x" onClick={dismiss} title="Dismiss" aria-label="Dismiss">
+        ×
+      </button>
+    </Link>
   );
 }
 
@@ -308,6 +185,7 @@ export default function Board() {
 
   return (
     <div className="board-wrap">
+      <BriefBanner />
       <AttentionTray tasks={visible} />
       <div className="board-switch">
         <span className="board-switch-label">Project</span>
