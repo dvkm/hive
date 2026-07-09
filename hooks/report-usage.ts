@@ -1,0 +1,70 @@
+#!/usr/bin/env bun
+// Claude Code Stop-hook usage reporter -> hive.
+//
+// The Stop-hook JSON payload does NOT carry token counts, but it carries
+// `transcript_path` — a JSONL where every assistant message has a `message.usage`
+// block (input_tokens, output_tokens, cache_read_input_tokens,
+// cache_creation_input_tokens) and `message.model`. We aggregate per model and
+// POST one `usage` event per model to hive's ingestion endpoint.
+//
+// Contract: fail silent, never block the agent. No-op unless HIVE_TASK_ID is set.
+//
+// ponytail: sums the WHOLE transcript on each Stop. Correct for hive's one-shot
+// `claude -p` agents, where Stop fires once. A long interactive session with
+// repeated Stops would double-count; add a per-session line cursor if hooks ever
+// run outside one-shot print mode.
+
+const taskId = process.env.HIVE_TASK_ID;
+if (!taskId) process.exit(0);
+const hiveUrl = process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
+
+let payload: any = {};
+try {
+  payload = JSON.parse((await Bun.stdin.text()) || "{}");
+} catch {
+  process.exit(0);
+}
+const transcript = payload.transcript_path;
+if (!transcript) process.exit(0);
+
+let text = "";
+try {
+  text = await Bun.file(transcript).text();
+} catch {
+  process.exit(0);
+}
+
+type Agg = { input_tokens: number; output_tokens: number; cache_read_tokens: number };
+const perModel: Record<string, Agg> = {};
+for (const line of text.split("\n")) {
+  if (!line.trim()) continue;
+  let row: any;
+  try {
+    row = JSON.parse(line);
+  } catch {
+    continue;
+  }
+  const msg = row?.message;
+  if (row?.type !== "assistant" || !msg?.usage) continue;
+  const u = msg.usage;
+  const model = msg.model || "unknown";
+  const a = (perModel[model] ??= { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 });
+  // Our schema has no cache-write bucket; fold cache_creation into input.
+  a.input_tokens += (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+  a.output_tokens += u.output_tokens || 0;
+  a.cache_read_tokens += u.cache_read_input_tokens || 0;
+}
+
+for (const [model, a] of Object.entries(perModel)) {
+  if (!a.input_tokens && !a.output_tokens && !a.cache_read_tokens) continue;
+  try {
+    await fetch(`${hiveUrl}/api/tasks/${taskId}/events`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(2000),
+      body: JSON.stringify({ type: "usage", source: "hook", model, ...a }),
+    });
+  } catch {
+    /* fail silent */
+  }
+}

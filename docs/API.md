@@ -274,6 +274,31 @@ set on creation); normal ones are batched into a single digest every
 (`POST /api/notifications/ack`). The bell's unread count is the rows where
 `delivered_at` is null.
 
+### Usage (cost/token analytics)
+```json
+{
+  "id": "use_...",
+  "task_id": "9da7c5527580",
+  "ts": "2026-07-09T09:00:00.000Z",
+  "model": "claude-sonnet-4-5",
+  "input_tokens": 12000,
+  "output_tokens": 3400,
+  "cache_read_tokens": 88000,
+  "cost_usd": 0.0774,
+  "source": "agent"
+}
+```
+One row per reported LLM call. `input_tokens` folds in any cache-write tokens
+(the schema has no separate cache-write bucket); `cache_read_tokens` is cache-hit
+input. `source` tags the ingest path (`agent` via the `usage` event, `hook` from
+the Stop-hook transcript reporter). `cost_usd` is computed server-side from the
+price table (`server/src/pricing.ts`, $/MTok per model family, overridable per
+project via `config.pricing`) when the caller doesn't supply it; it is **null**
+for an unpriced (unknown) model — ingestion is never blocked on an unknown model,
+and unpriced rows surface as `"unpriced"` in rollups. Analytics rollups expose
+`totals` shaped `{input_tokens, output_tokens, cache_read_tokens, total_tokens,
+cost_usd, calls, unpriced}` (summed cost counts priced rows only).
+
 ---
 
 ## Endpoints
@@ -350,13 +375,14 @@ recognized fields (JSON keys == form field names):
 
 | field | meaning |
 |-------|---------|
-| `type` (required) | `status` \| `evidence` \| `needs-decision` \| `done` \| `blocked` \| any custom string |
+| `type` (required) | `status` \| `evidence` \| `needs-decision` \| `done` \| `blocked` \| `usage` \| any custom string |
 | `source` | defaults to `agent` |
 | `note` | free text; stored in the event payload / used as caption/summary |
 | `kind` | evidence kind (evidence type only); defaults to `screenshot` if a file is present, else `link`/`log` |
 | `caption` | evidence caption |
 | `url` | evidence URL (for link evidence, no file) |
 | `title`,`context`,`risk`,`blast_radius`,`options` | decision fields (needs-decision type; `options` is a JSON string in multipart) |
+| `model`,`input_tokens`,`output_tokens`,`cache_read_tokens`,`cost_usd` | usage fields (usage type; numbers, or numeric strings in multipart; `cost_usd` optional) |
 | `file` | (multipart only) the uploaded evidence file |
 
 Behavior by `type`:
@@ -366,7 +392,21 @@ Behavior by `type`:
   parks the task in `needs_decision`. → `201 {decision: Decision, task: Task}`
 - `done` → records the `note` as summary + `note` event, then transitions the
   task to `done` (evidence rule enforced). → `200 {task: Task}` | `409`
+- `usage` → inserts a Usage row (cost computed server-side when `cost_usd` is
+  omitted; null for unpriced models) and broadcasts a `usage` SSE message. Writes
+  no timeline event. → `201 {usage: Usage}` | `400` (missing `model`)
 - `status` / `blocked` / custom → writes one event. → `201 {event: Event}`
+
+### Analytics (cost/token)
+- `GET /api/analytics/summary?since=` → `200 {since, totals, by_model, by_project, top_tasks}`
+  Rollups over the usage table. `since` is an optional ISO timestamp lower bound
+  (`ts >= since`); omitted = all time. `totals` is the aggregate totals object
+  (see the Usage shape). `by_model` is `[{model, ...totals}]` and `by_project` is
+  `[{project_id, project_name, ...totals}]`, both ordered by cost then tokens
+  descending. `top_tasks` is the 10 most expensive tasks:
+  `[{task_id, title, project_id, ...totals}]`.
+- `GET /api/tasks/:id/usage` → `200 {task_id, usage:[Usage], totals}` | `404`
+  All usage rows for a task (oldest first) plus the totals object.
 
 ### Decisions
 - `GET /api/decisions?status=open` → `200 [Decision, ...]` (newest first; `status` defaults to `open`; `status=all` returns every decision)
@@ -447,6 +487,7 @@ Subsequent messages (broadcast to all clients on every change):
 | decision | `{"type":"decision","decision": Decision}` | a decision is created or answered |
 | incident | `{"type":"incident","incident": Incident}` | a monitor incident opens or resolves |
 | learning | `{"type":"learning","learning": Learning}` | a learning is created, updated, or recurs |
+| usage | `{"type":"usage","usage": Usage}` | a usage row is ingested (cost/token analytics) |
 | notification | `{"type":"notification","notification": Notification}` | a notification is enqueued (urgent ones arrive already `delivered_at`) |
 | reconciler_error | `{"type":"reconciler_error","error":"...","where":"..."}` | a reconciler cycle hit an error (at most once per cycle; no DB row) |
 
