@@ -38,6 +38,7 @@ import { costUsd } from "./pricing.ts";
 import { taskDiff } from "./diff.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
+import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
 
 export interface HandlerDeps {
   herdr?: Herdr; // injectable for tests
@@ -134,6 +135,10 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       // ---- braindump intake ----
       if (pathname === "/api/intake" && method === "POST") return intake(db, await req.json(), deps);
+
+      // ---- PR → task linking (match an open PR back to its task by marker) ----
+      if (pathname === "/api/tasks/link-pr" && method === "POST")
+        return await linkPrEndpoint(db, await req.json(), deps);
 
       // ---- tasks ----
       if (pathname === "/api/tasks") {
@@ -406,7 +411,10 @@ function createTask(db: DB, body: any): Response {
     row.summary, row.created_at, row.updated_at
   );
   writeEvent(db, { task_id: row.id, source: "director", type: "created", payload: { title: row.title } });
-  broadcastTask(db, row);
+  // Re-read so the assigned `number` (set by the DB trigger) rides on the
+  // returned task and the broadcast payload.
+  const created = getTask(db, row.id);
+  broadcastTask(db, created);
 
   // Duplicate detection. An exact dup of a brand-new (queued, no agent) task is
   // auto-merged with no interruption; anything fuzzier — or an exact dup of a
@@ -422,7 +430,54 @@ function createTask(db: DB, body: any): Response {
     openDuplicateDecision(db, getTask(db, row.id), match);
     return json(taskWithHealth(db, getTask(db, row.id)), 201);
   }
-  return json(taskWithHealth(db, parseTask(row)), 201);
+  return json(taskWithHealth(db, created), 201);
+}
+
+// Link a marked PR back to its task. Matches by the `hive-task: <id>` body
+// footer first (the stable machine key), falling back to the `[hive-<number>]`
+// title prefix. Sets pr_url only when the task isn't already linked, so an
+// agent-reported PR is never clobbered and re-scanning is idempotent. Shared by
+// the reconciler's scan and the POST /api/tasks/link-pr endpoint.
+export function linkPrIfMarked(
+  db: DB,
+  pr: { title?: string | null; body?: string | null; url: string },
+  source: "reconciler" | "director" = "reconciler"
+): { task_id: string; number: number; linked: boolean } | null {
+  const id = taskIdFromBody(pr.body);
+  let task: any = id ? getTask(db, id) : null;
+  let via = "id";
+  if (!task) {
+    const n = taskNumberFromTitle(pr.title);
+    if (n != null) {
+      task = db.query("SELECT * FROM tasks WHERE number = ?").get(n);
+      via = "number";
+    }
+  }
+  if (!task) return null;
+  if (task.pr_url) return { task_id: task.id, number: task.number, linked: false };
+  db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(pr.url, now(), task.id);
+  writeEvent(db, { task_id: task.id, source, type: "pr_linked", payload: { pr_url: pr.url, via } });
+  broadcastTask(db, getTask(db, task.id));
+  return { task_id: task.id, number: task.number, linked: true };
+}
+
+// POST /api/tasks/link-pr {pr_url} — resolve a PR's marker and link it to its
+// task. Reads the PR title/body via `gh pr view` and matches by marker.
+async function linkPrEndpoint(db: DB, body: any, deps: HandlerDeps): Promise<Response> {
+  const prUrl = String(body?.pr_url ?? "").trim();
+  if (!prUrl) return err("pr_url is required");
+  const exec = deps.exec ?? defaultExec;
+  const r = await exec(["gh", "pr", "view", prUrl, "--json", "title,body,url"]);
+  if (r.code !== 0) return err(r.stderr.trim() || r.stdout.trim() || "gh pr view failed", 502);
+  let data: any;
+  try {
+    data = JSON.parse(r.stdout);
+  } catch {
+    return err("could not parse gh pr view output", 502);
+  }
+  const res = linkPrIfMarked(db, { title: data.title, body: data.body, url: data.url || prUrl }, "director");
+  if (!res) return err("PR carries no hive marker (no `hive-task:` footer or `[hive-<n>]` title)", 422);
+  return json({ ok: true, ...res });
 }
 
 // Update a task's editable fields (title / brief). Used by the attention tray's
@@ -510,7 +565,7 @@ function listFeed(db: DB, url: URL): Response {
     }
     const sql =
       `SELECT e.id, e.task_id, e.ts, e.source, e.type, e.payload,
-              t.title AS task_title, t.kind AS task_kind, t.project_id AS project_id,
+              t.number AS task_number, t.title AS task_title, t.kind AS task_kind, t.project_id AS project_id,
               p.name AS project_name,
               ev.url AS evidence_url, ev.kind AS evidence_kind
        FROM events e
@@ -527,6 +582,7 @@ function listFeed(db: DB, url: URL): Response {
       source: r.source,
       type: r.type,
       payload: JSON.parse(r.payload || "{}"),
+      task_number: r.task_number ?? null,
       task_title: r.task_title,
       task_kind: r.task_kind,
       project_id: r.project_id,
@@ -557,6 +613,7 @@ function listFeed(db: DB, url: URL): Response {
       source: "monitor",
       type: "incident",
       payload: { monitor: r.monitor, status: r.status, detail: r.detail, project_id: r.project_id },
+      task_number: null,
       task_title: null,
       task_kind: null,
       project_id: r.project_id,

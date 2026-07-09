@@ -24,6 +24,7 @@ export interface Health {
 
 export interface Task {
   id: string;
+  number: number; // human-friendly monotonic per-hive handle (the opaque `id` stays the machine key)
   project_id: string;
   title: string;
   brief: string;
@@ -242,6 +243,7 @@ export interface AnalyticsSummary {
 // standalone monitor incidents carry type "incident" and a null task_id/title.
 export interface FeedEvent extends Omit<Event, "task_id"> {
   task_id: string | null;
+  task_number: number | null;
   task_title: string | null;
   task_kind: Kind | null;
   project_id: string;

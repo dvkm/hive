@@ -64,6 +64,7 @@ function Card({ task }: { task: Task }) {
     <Link to={`/tasks/${task.id}`} state={{ backgroundLocation: location }} className="card">
       <div className="card-top">
         <StatusDot state={task.state} health={task.health} />
+        <span className="card-num" title="Task number">#{task.number}</span>
         <span className="card-title">{task.title}</span>
       </div>
       {unhealthy && <HealthLine health={health!} />}
@@ -112,9 +113,10 @@ function Card({ task }: { task: Task }) {
             href={task.pr_url}
             target="_blank"
             rel="noreferrer"
+            title={`Pull request linked to #${task.number}`}
             onClick={(e) => e.stopPropagation()}
           >
-            PR
+            PR ↔ #{task.number}
           </a>
         )}
         <CiBadge status={task.ci_status} />
