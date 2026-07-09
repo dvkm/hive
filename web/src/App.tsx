@@ -1,9 +1,11 @@
 import { useState } from "react";
-import { NavLink, Route, Routes } from "react-router-dom";
+import { NavLink, Route, Routes, useLocation } from "react-router-dom";
+import type { Location } from "react-router-dom";
 import { useStore } from "./lib/store";
 import { relTime } from "./lib/time";
 import Board from "./views/Board";
 import TaskPage from "./views/Task";
+import TaskModal from "./views/TaskModal";
 import Decisions from "./views/Decisions";
 import Policies from "./views/Policies";
 import Monitors from "./views/Monitors";
@@ -58,6 +60,13 @@ function Bell() {
 
 export default function App() {
   const { decisions } = useStore();
+  const location = useLocation();
+  // Board card clicks push /tasks/:id with state.backgroundLocation set to the
+  // board's location — that keeps the board mounted and rendered underneath
+  // while a modal Route renders the task on top. Direct loads (deep links,
+  // notifications, refresh) carry no such state, so /tasks/:id just renders
+  // the standalone page as usual.
+  const background = (location.state as { backgroundLocation?: Location } | null)?.backgroundLocation;
   return (
     <div className="app">
       <header className="topbar">
@@ -80,7 +89,7 @@ export default function App() {
         <ConnDot />
       </header>
       <main className="content">
-        <Routes>
+        <Routes location={background || location}>
           <Route path="/" element={<Board />} />
           <Route path="/tasks/:id" element={<TaskPage />} />
           <Route path="/decisions" element={<Decisions />} />
@@ -89,6 +98,11 @@ export default function App() {
           <Route path="/monitors" element={<Monitors />} />
         </Routes>
       </main>
+      {background && (
+        <Routes>
+          <Route path="/tasks/:id" element={<TaskModal />} />
+        </Routes>
+      )}
     </div>
   );
 }
