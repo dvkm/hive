@@ -935,12 +935,41 @@ function ghMergeFlag(method: string | undefined): string {
   return "--squash";
 }
 
+// A merge failure whose reason looks like a conflict / diverged branch is the
+// agent's to fix, not the captain's: bounce the task back to in_progress with
+// rebase instructions (best-effort send, like request-changes — the event
+// records everything for a respawned agent). Other failures (CI blocked, auth,
+// gh missing) keep the task in_review and just report the reason.
+const MERGE_CONFLICT_RE = /conflict|not mergeable|not an ancestor|fast-forward/i;
+async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason: string): Promise<Response> {
+  const conflict = MERGE_CONFLICT_RE.test(reason);
+  let delivered = false;
+  if (conflict && task.agent_target) {
+    try {
+      const res = await herdr.send(
+        task.agent_target,
+        `hive: merge into '${base}' failed — ${reason}\nRebase your branch '${task.branch}' onto the latest '${base}', resolve the conflicts, rerun the tests, then push.`
+      );
+      delivered = res.code === 0;
+    } catch {
+      delivered = false;
+    }
+  }
+  writeEvent(db, { task_id: task.id, source: "director", type: "merge_failed", payload: { reason, conflict, delivered } });
+  if (conflict) {
+    transition(db, task.id, "in_progress", { source: "director", reason: "merge conflict — agent asked to rebase" });
+    return err(`merge conflict — task sent back to the agent to rebase onto '${base}' (${reason})`, 409);
+  }
+  return err(reason, 409);
+}
+
 // POST /api/tasks/:id/merge — approve & merge an in-review task.
 // PR-backed: `gh pr merge <url> <method>`. Otherwise a local fast-forward of the
 // task branch into the project's default branch. On success: `merged` event,
 // in_review→verifying (triggers smoke), best-effort worktree teardown. On
-// failure (conflict / not fast-forward / CI blocked): 409 with the reason and no
-// state change. Guarded by the `task.merge` standing-authority action.
+// conflict: the task is bounced back to the agent (see mergeFailed); other
+// failures (CI blocked) return 409 with the reason and no state change.
+// Guarded by the `task.merge` standing-authority action.
 async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
@@ -962,8 +991,7 @@ async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: Hand
     const r = await exec(["gh", "pr", "merge", task.pr_url, flag]);
     if (r.code !== 0) {
       const reason = r.stderr.trim() || r.stdout.trim() || `gh pr merge exited ${r.code}`;
-      writeEvent(db, { task_id: id, source: "director", type: "merge_failed", payload: { reason } });
-      return err(reason, 409);
+      return mergeFailed(db, herdr, task, base, reason);
     }
   } else {
     if (!project?.repo_path) return err("project has no repo_path; cannot merge", 400);
@@ -975,14 +1003,12 @@ async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: Hand
     const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", base, task.branch]);
     if (anc.code !== 0) {
       const reason = `'${base}' is not an ancestor of '${task.branch}'; not a fast-forward (rebase the branch or open a PR)`;
-      writeEvent(db, { task_id: id, source: "director", type: "merge_failed", payload: { reason } });
-      return err(reason, 409);
+      return mergeFailed(db, herdr, task, base, reason);
     }
     const r = await exec(["git", "-C", project.repo_path, "merge", "--ff-only", task.branch]);
     if (r.code !== 0) {
       const reason = r.stderr.trim() || r.stdout.trim() || `git merge --ff-only exited ${r.code}`;
-      writeEvent(db, { task_id: id, source: "director", type: "merge_failed", payload: { reason } });
-      return err(reason, 409);
+      return mergeFailed(db, herdr, task, base, reason);
     }
     method = "local ff-only";
   }
