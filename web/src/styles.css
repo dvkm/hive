@@ -284,6 +284,22 @@ a {
   font-size: 13.5px;
   line-height: 1.35;
 }
+/* Human-friendly task number (#42): the handle people and PR markers use.
+   Shared across board cards, review cards, the task header, and the feed. */
+.card-num,
+.task-num,
+.feed-num {
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+}
+.card-num {
+  font-size: 12px;
+}
+.feed-num {
+  font-size: 11.5px;
+}
 .card-meta {
   display: flex;
   align-items: center;
@@ -545,6 +561,15 @@ a {
   color: var(--purple);
   border-color: rgba(155, 125, 214, 0.4);
 }
+.chip-duplicate {
+  color: var(--text-dim);
+  border-color: var(--border);
+  text-decoration: none;
+}
+.chip-duplicate:hover {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
 
 /* Breakdown (planner child tasks) */
 .breakdown {
@@ -706,6 +731,153 @@ a {
   color: var(--text-faint);
   font-size: 11.5px;
   white-space: nowrap;
+}
+
+/* transcript bubble — the agent's actual speech */
+.timeline li.tl-text {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+.tl-text-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.tl-text-head .tl-age {
+  margin-left: auto;
+}
+.tl-bubble {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--bg-elev2);
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+/* grouped tool run */
+.timeline li.tl-tools {
+  padding: 0;
+}
+.tl-tools details {
+  width: 100%;
+  padding: 7px 0;
+}
+.tl-tools summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+.tl-tools summary::-webkit-details-marker { display: none; }
+.tl-tools summary::before {
+  content: "▸";
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.tl-tools details[open] summary::before { content: "▾"; }
+.tl-tools-count {
+  color: var(--text-dim);
+  font-weight: 600;
+  font-size: 12.5px;
+  flex-shrink: 0;
+}
+.tl-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex: 1;
+}
+.tl-tools summary .tl-age { margin-left: auto; }
+.chip-tool {
+  background: var(--bg-elev2);
+  color: var(--text-dim);
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.tl-tool-list {
+  list-style: none;
+  margin: 6px 0 2px;
+  padding: 0 0 0 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tl-tool-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  border: none;
+  padding: 0;
+}
+.tl-tool-sum {
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* decision prompt + answer block */
+.timeline li.tl-decision {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  background: var(--bg-elev2);
+  border-radius: 8px;
+  padding: 10px 12px;
+  border-bottom: none;
+  margin: 4px 0;
+}
+.tl-decision-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.tl-decision-head .tl-age { margin-left: auto; }
+.tl-decision-badge {
+  font-weight: 600;
+  font-size: 12.5px;
+  color: var(--amber);
+}
+.tl-decision-q {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+.tl-decision-ctx {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+}
+.tl-decision-opts {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.tl-decision-opts li {
+  font-size: 11.5px;
+  padding: 1px 8px;
+  border-radius: 4px;
+  background: var(--bg-elev1);
+  color: var(--text-dim);
+  border: 1px solid var(--border-soft);
+}
+.tl-decision-opts li.opt-chosen {
+  color: var(--green);
+  border-color: var(--green);
+  font-weight: 600;
+}
+.tl-decision-answer {
+  font-size: 12.5px;
+  color: var(--text);
 }
 
 /* evidence */
@@ -2872,5 +3044,223 @@ a {
   padding: 0 4px;
 }
 .brief-banner-x:hover {
+  color: var(--text);
+}
+
+/* ---- review panel + inline diff viewer (in-review tasks) ---- */
+.review-panel {
+  border-color: var(--accent-dim);
+}
+.review-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.review-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.review-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0 12px;
+  flex-wrap: wrap;
+}
+.wrap-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-left: auto;
+  cursor: pointer;
+}
+.review-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.review-notes textarea {
+  min-height: 80px;
+  resize: vertical;
+}
+.review-notes .btn {
+  align-self: flex-start;
+}
+
+.diff-viewer {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.diff-summary {
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.diff-err {
+  color: var(--red);
+  font-size: 13px;
+}
+.diff-add {
+  color: var(--green);
+}
+.diff-del {
+  color: var(--red);
+}
+.diff-file {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--bg-elev);
+}
+.diff-file-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--bg-elev2);
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  text-align: left;
+}
+.diff-caret {
+  color: var(--text-faint);
+  width: 12px;
+}
+.diff-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.diff-counts {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+}
+.diff-binary {
+  padding: 10px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.diff-body {
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.diff-hunk-head {
+  padding: 3px 10px;
+  color: var(--text-faint);
+  background: var(--bg-elev);
+  border-top: 1px solid var(--border-soft);
+  white-space: pre;
+}
+.diff-line {
+  display: flex;
+  white-space: pre;
+}
+.diff-body.wrap .diff-line {
+  white-space: pre-wrap;
+}
+.diff-body.wrap .dl-text {
+  word-break: break-all;
+}
+.dl-sign {
+  width: 18px;
+  flex: 0 0 18px;
+  text-align: center;
+  color: var(--text-faint);
+  user-select: none;
+}
+.dl-text {
+  flex: 1;
+  padding-right: 10px;
+}
+.dl-add {
+  background: rgba(70, 201, 139, 0.12);
+}
+.dl-add .dl-sign {
+  color: var(--green);
+}
+.dl-del {
+  background: rgba(239, 93, 107, 0.12);
+}
+.dl-del .dl-sign {
+  color: var(--red);
+}
+.diff-trunc {
+  color: var(--amber);
+  font-size: 12.5px;
+  padding: 6px 2px;
+}
+
+/* ---- shared review card (task page, /review queue, brief) ---- */
+.review-card {
+  background: var(--panel);
+  border: 1px solid var(--accent-dim);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.review-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.review-card-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-weight: 600;
+}
+.review-card-title a {
+  color: var(--text);
+}
+.review-summary {
+  color: var(--text-dim);
+  font-size: 13px;
+  margin: 0;
+}
+.mono-sm {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.review-diffstat {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+}
+.diffstat-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0;
+}
+.diffstat-toggle:hover {
   color: var(--text);
 }

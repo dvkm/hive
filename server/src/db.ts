@@ -231,6 +231,33 @@ const MIGRATIONS: string[] = [
   `
   CREATE INDEX idx_events_ts ON events(ts);
   `,
+  // v10 — duplicate-task detection & auto-merge. A task cancelled as a duplicate
+  // keeps a pointer to the survivor it was folded into (never deleted, so history
+  // is preserved). NULL for every non-duplicate task.
+  `
+  ALTER TABLE tasks ADD COLUMN duplicate_of TEXT;
+  `,
+  // v11 — human-friendly task numbers. A monotonic per-hive counter assigned at
+  // creation (the opaque `id` stays the machine key; `number` is the handle
+  // people and GitHub PR markers use). Backfilled in created_at order (id
+  // tiebreak). An AFTER INSERT trigger assigns MAX(number)+1 to any row inserted
+  // without one, so every insert path gets a number for free. UNIQUE guards
+  // against collisions.
+  `
+  ALTER TABLE tasks ADD COLUMN number INTEGER;
+  UPDATE tasks SET number = (
+    SELECT COUNT(*) FROM tasks t2
+    WHERE t2.created_at < tasks.created_at
+       OR (t2.created_at = tasks.created_at AND t2.id <= tasks.id)
+  );
+  CREATE UNIQUE INDEX idx_tasks_number ON tasks(number);
+  CREATE TRIGGER tasks_assign_number AFTER INSERT ON tasks
+  WHEN NEW.number IS NULL
+  BEGIN
+    UPDATE tasks SET number = (SELECT COALESCE(MAX(number), 0) + 1 FROM tasks)
+    WHERE id = NEW.id;
+  END;
+  `,
 ];
 
 export type DB = Database;

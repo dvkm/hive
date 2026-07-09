@@ -26,18 +26,25 @@ import {
   parseIncident,
 } from "./rows.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
+import { cleanupTask } from "./cleanup.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
 import { runSmoke } from "./monitors.ts";
 import { enqueue, ackNotifications } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
 import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.ts";
+import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { costUsd } from "./pricing.ts";
+import { taskDiff } from "./diff.ts";
+import type { Exec } from "./exec.ts";
+import { defaultExec } from "./exec.ts";
+import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
 
 export interface HandlerDeps {
   herdr?: Herdr; // injectable for tests
   supervise?: boolean; // start the herdr wait loop after spawn (true in prod wiring)
   plannerExec?: PlannerExec; // injectable planner subprocess (domain supervisors)
+  exec?: Exec; // injectable gh/git subprocess (diff + merge); tests pass a stub
 }
 
 const VERSION = "0.1.0";
@@ -129,11 +136,21 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // ---- braindump intake ----
       if (pathname === "/api/intake" && method === "POST") return intake(db, await req.json(), deps);
 
+      // ---- PR → task linking (match an open PR back to its task by marker) ----
+      if (pathname === "/api/tasks/link-pr" && method === "POST")
+        return await linkPrEndpoint(db, await req.json(), deps);
+
       // ---- tasks ----
       if (pathname === "/api/tasks") {
         if (method === "GET") return listTasks(db, url);
         if (method === "POST") return createTask(db, await req.json());
       }
+      // Duplicate CLUSTERS among current non-terminal tasks (backfill/UI). Must
+      // precede the /:id route so "duplicates" isn't parsed as a task id.
+      if (pathname === "/api/tasks/duplicates" && method === "GET")
+        return json({ clusters: duplicateClusters(db) });
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/merge-into$/);
+      if (m && method === "POST") return mergeIntoEndpoint(db, m[1], await req.json());
       m = pathname.match(/^\/api\/tasks\/([^/]+)$/);
       if (m && method === "GET") return getTaskFull(db, m[1]);
       if (m && method === "PUT") return updateTask(db, m[1], await req.json());
@@ -164,6 +181,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/requeue$/);
       if (m && method === "POST") return requeueEndpoint(db, m[1]);
 
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/cleanup$/);
+      if (m && method === "POST") return await cleanupEndpoint(db, herdr, m[1]);
+
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/usage$/);
       if (m && method === "GET") return taskUsage(db, m[1]);
 
@@ -172,6 +192,15 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (!getTask(db, m[1])) return err("task not found", 404);
         return json({ task_id: m[1], brief: composeBrief(db, m[1]) });
       }
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/diff$/);
+      if (m && method === "GET") return await taskDiffEndpoint(db, m[1], deps);
+
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/merge$/);
+      if (m && method === "POST") return await mergeTask(db, herdr, m[1], await safeJson(req), deps);
+
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/request-changes$/);
+      if (m && method === "POST") return await requestChanges(db, herdr, m[1], await req.json());
+
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/guarded-action$/);
       if (m && method === "POST") return guardedAction(db, m[1], await req.json());
 
@@ -382,8 +411,73 @@ function createTask(db: DB, body: any): Response {
     row.summary, row.created_at, row.updated_at
   );
   writeEvent(db, { task_id: row.id, source: "director", type: "created", payload: { title: row.title } });
-  broadcastTask(db, row);
-  return json(taskWithHealth(db, parseTask(row)), 201);
+  // Re-read so the assigned `number` (set by the DB trigger) rides on the
+  // returned task and the broadcast payload.
+  const created = getTask(db, row.id);
+  broadcastTask(db, created);
+
+  // Duplicate detection. An exact dup of a brand-new (queued, no agent) task is
+  // auto-merged with no interruption; anything fuzzier — or an exact dup of a
+  // task that's already started — asks the director via a decision card. Safety:
+  // only a queued task with no agent is ever auto-cancelled here.
+  const match = detectDuplicate(db, parseTask(row));
+  if (match) {
+    const safeAuto = row.state === "queued" && !row.agent_target;
+    if (match.tier === "exact" && safeAuto) {
+      mergeInto(db, row.id, match.survivor.id);
+      return json(taskWithHealth(db, getTask(db, row.id)), 201);
+    }
+    openDuplicateDecision(db, getTask(db, row.id), match);
+    return json(taskWithHealth(db, getTask(db, row.id)), 201);
+  }
+  return json(taskWithHealth(db, created), 201);
+}
+
+// Link a marked PR back to its task. Matches by the `hive-task: <id>` body
+// footer first (the stable machine key), falling back to the `[hive-<number>]`
+// title prefix. Sets pr_url only when the task isn't already linked, so an
+// agent-reported PR is never clobbered and re-scanning is idempotent. Shared by
+// the reconciler's scan and the POST /api/tasks/link-pr endpoint.
+export function linkPrIfMarked(
+  db: DB,
+  pr: { title?: string | null; body?: string | null; url: string },
+  source: "reconciler" | "director" = "reconciler"
+): { task_id: string; number: number; linked: boolean } | null {
+  const id = taskIdFromBody(pr.body);
+  let task: any = id ? getTask(db, id) : null;
+  let via = "id";
+  if (!task) {
+    const n = taskNumberFromTitle(pr.title);
+    if (n != null) {
+      task = db.query("SELECT * FROM tasks WHERE number = ?").get(n);
+      via = "number";
+    }
+  }
+  if (!task) return null;
+  if (task.pr_url) return { task_id: task.id, number: task.number, linked: false };
+  db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(pr.url, now(), task.id);
+  writeEvent(db, { task_id: task.id, source, type: "pr_linked", payload: { pr_url: pr.url, via } });
+  broadcastTask(db, getTask(db, task.id));
+  return { task_id: task.id, number: task.number, linked: true };
+}
+
+// POST /api/tasks/link-pr {pr_url} — resolve a PR's marker and link it to its
+// task. Reads the PR title/body via `gh pr view` and matches by marker.
+async function linkPrEndpoint(db: DB, body: any, deps: HandlerDeps): Promise<Response> {
+  const prUrl = String(body?.pr_url ?? "").trim();
+  if (!prUrl) return err("pr_url is required");
+  const exec = deps.exec ?? defaultExec;
+  const r = await exec(["gh", "pr", "view", prUrl, "--json", "title,body,url"]);
+  if (r.code !== 0) return err(r.stderr.trim() || r.stdout.trim() || "gh pr view failed", 502);
+  let data: any;
+  try {
+    data = JSON.parse(r.stdout);
+  } catch {
+    return err("could not parse gh pr view output", 502);
+  }
+  const res = linkPrIfMarked(db, { title: data.title, body: data.body, url: data.url || prUrl }, "director");
+  if (!res) return err("PR carries no hive marker (no `hive-task:` footer or `[hive-<n>]` title)", 422);
+  return json({ ok: true, ...res });
 }
 
 // Update a task's editable fields (title / brief). Used by the attention tray's
@@ -397,6 +491,21 @@ function updateTask(db: DB, id: string, body: any): Response {
   const updated = getTask(db, id);
   broadcastTask(db, updated);
   return json(taskWithHealth(db, updated));
+}
+
+// Manual merge: fold this task into `target_id`, cancelling it as a duplicate.
+// Distinct from POST /merge (the PR/branch merge another crew built). Refuses
+// self-merge and a target that doesn't exist; mergeInto's cancel guards against
+// folding an already-terminal task (409 via the transition error).
+function mergeIntoEndpoint(db: DB, id: string, body: any): Response {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  const targetId = body?.target_id;
+  if (!targetId) return err("target_id is required");
+  if (targetId === id) return err("cannot merge a task into itself");
+  if (!getTask(db, targetId)) return err("target task not found", 404);
+  const cancelled = mergeInto(db, id, targetId);
+  return json(taskWithHealth(db, cancelled));
 }
 
 function listTasks(db: DB, url: URL): Response {
@@ -426,7 +535,7 @@ const FEED_CATEGORIES: Record<string, string[]> = {
   decision: ["needs-decision", "decision_answered", "planned", "authority_required", "authority_granted"],
   evidence: ["evidence", "smoke_passed"],
   incident: ["blocked", "stale", "spawn_error", "smoke_failed", "steer_error", "planner_error", "supervise_error", "authority_denied"],
-  lifecycle: ["created", "spawned", "agent_status", "status", "steer", "note", "ci_status", "pr_merged", "planning"],
+  lifecycle: ["created", "spawned", "agent_status", "status", "steer", "note", "ci_status", "pr_merged", "planning", "assistant_text", "tool_use", "agent_turn_end"],
 };
 
 function listFeed(db: DB, url: URL): Response {
@@ -456,7 +565,7 @@ function listFeed(db: DB, url: URL): Response {
     }
     const sql =
       `SELECT e.id, e.task_id, e.ts, e.source, e.type, e.payload,
-              t.title AS task_title, t.kind AS task_kind, t.project_id AS project_id,
+              t.number AS task_number, t.title AS task_title, t.kind AS task_kind, t.project_id AS project_id,
               p.name AS project_name,
               ev.url AS evidence_url, ev.kind AS evidence_kind
        FROM events e
@@ -473,6 +582,7 @@ function listFeed(db: DB, url: URL): Response {
       source: r.source,
       type: r.type,
       payload: JSON.parse(r.payload || "{}"),
+      task_number: r.task_number ?? null,
       task_title: r.task_title,
       task_kind: r.task_kind,
       project_id: r.project_id,
@@ -503,6 +613,7 @@ function listFeed(db: DB, url: URL): Response {
       source: "monitor",
       type: "incident",
       payload: { monitor: r.monitor, status: r.status, detail: r.detail, project_id: r.project_id },
+      task_number: null,
       task_title: null,
       task_kind: null,
       project_id: r.project_id,
@@ -592,7 +703,15 @@ function brief(db: DB, url: URL): Response {
     .filter((t: any) => !isReviewed(db, t.id))
     .map((t: any) => ({ ...parseTask(t), project_name: t.project_name }));
 
-  // ⑦ spend since — reuse the analytics rollup (totals + by-model for top model).
+  // ⑦ to review — in-review tasks awaiting the captain's review & merge. Full
+  // task objects (with health) so the web renders review cards inline.
+  const to_review = db
+    .query("SELECT * FROM tasks WHERE state = 'in_review' ORDER BY updated_at DESC")
+    .all()
+    .map(parseTask)
+    .map((t: any) => taskWithHealth(db, t));
+
+  // ⑧ spend since — reuse the analytics rollup (totals + by-model for top model).
   const w = since ? " WHERE ts >= ?" : "";
   const a = since ? [since] : [];
   const spend = {
@@ -602,7 +721,7 @@ function brief(db: DB, url: URL): Response {
       .all(...a),
   };
 
-  // ⑧ learnings created/recurred since (last_seen bumps on both create and recur).
+  // ⑨ learnings created/recurred since (last_seen bumps on both create and recur).
   const learnings_new = db
     .query(
       `SELECT l.*, p.name AS project_name FROM learnings l
@@ -619,6 +738,7 @@ function brief(db: DB, url: URL): Response {
     fleet,
     incidents,
     intake,
+    to_review,
     spend,
     learnings_new,
   });
@@ -798,6 +918,122 @@ async function doTransition(db: DB, id: string, body: any): Promise<Response> {
   return json(task);
 }
 
+// ---- review experience: diff / approve+merge / request-changes ----
+
+// GET /api/tasks/:id/diff → the structured branch diff for the review UI.
+async function taskDiffEndpoint(db: DB, id: string, deps: HandlerDeps): Promise<Response> {
+  const r = await taskDiff(db, id, deps.exec ?? defaultExec);
+  return r.ok ? json(r.diff) : err(r.error, r.status);
+}
+
+// Map our merge_method config onto gh's flag. Squash is the default.
+function ghMergeFlag(method: string | undefined): string {
+  if (method === "merge") return "--merge";
+  if (method === "rebase") return "--rebase";
+  return "--squash";
+}
+
+// POST /api/tasks/:id/merge — approve & merge an in-review task.
+// PR-backed: `gh pr merge <url> <method>`. Otherwise a local fast-forward of the
+// task branch into the project's default branch. On success: `merged` event,
+// in_review→verifying (triggers smoke), best-effort worktree teardown. On
+// failure (conflict / not fast-forward / CI blocked): 409 with the reason and no
+// state change. Guarded by the `task.merge` standing-authority action.
+async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps): Promise<Response> {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  if (task.state !== "in_review")
+    return err(`task is '${task.state}', not 'in_review'; only in-review tasks can be merged`, 409);
+
+  const blocked = authzBlock(db, { project_id: task.project_id, action: "task.merge", target: task.title, task_id: id });
+  if (blocked) return blocked;
+
+  const exec = deps.exec ?? defaultExec;
+  const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
+  const config = JSON.parse(project?.config ?? "{}");
+  const base = config.default_branch || "main";
+
+  let method: string;
+  if (task.pr_url) {
+    const flag = ghMergeFlag(config.merge_method);
+    method = `pr ${flag.slice(2)}`;
+    const r = await exec(["gh", "pr", "merge", task.pr_url, flag]);
+    if (r.code !== 0) {
+      const reason = r.stderr.trim() || r.stdout.trim() || `gh pr merge exited ${r.code}`;
+      writeEvent(db, { task_id: id, source: "director", type: "merge_failed", payload: { reason } });
+      return err(reason, 409);
+    }
+  } else {
+    if (!project?.repo_path) return err("project has no repo_path; cannot merge", 400);
+    if (!task.branch) return err("task has no branch and no pr_url; nothing to merge", 400);
+    // Documented safe local merge: fast-forward the default branch to the task
+    // branch tip. Requires the default branch to be an ancestor of the task
+    // branch; a non-fast-forward (diverged / conflicting) merge is refused, no
+    // working tree is touched. Callers wanting a squash merge should use a PR.
+    const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", base, task.branch]);
+    if (anc.code !== 0) {
+      const reason = `'${base}' is not an ancestor of '${task.branch}'; not a fast-forward (rebase the branch or open a PR)`;
+      writeEvent(db, { task_id: id, source: "director", type: "merge_failed", payload: { reason } });
+      return err(reason, 409);
+    }
+    const r = await exec(["git", "-C", project.repo_path, "merge", "--ff-only", task.branch]);
+    if (r.code !== 0) {
+      const reason = r.stderr.trim() || r.stdout.trim() || `git merge --ff-only exited ${r.code}`;
+      writeEvent(db, { task_id: id, source: "director", type: "merge_failed", payload: { reason } });
+      return err(reason, 409);
+    }
+    method = "local ff-only";
+  }
+
+  writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url } });
+  // in_review → verifying (runs post-deploy smoke once).
+  transition(db, id, "verifying", { source: "director", reason: `merged (${method})` });
+  await runSmoke(db, id).catch((e) => console.error("[hive] smoke run failed:", e));
+
+  // Best-effort worktree teardown now the branch is merged. Never fails the
+  // request — a leftover worktree is a cleanup nuisance, not a merge failure.
+  if (task.worktree_path && task.branch && project?.repo_path) {
+    try {
+      await herdr.teardown({
+        repoPath: project.repo_path,
+        branch: task.branch,
+        worktreePath: task.worktree_path,
+        defaultBranch: base,
+      });
+    } catch (e) {
+      console.error(`[hive] teardown after merge failed for ${id}:`, e);
+    }
+  }
+
+  return json(getTask(db, id));
+}
+
+// POST /api/tasks/:id/request-changes body {notes} — bounce an in-review task
+// back to in_progress and deliver the captain's notes to the agent (best-effort
+// send; the `changes_requested` event records the notes either way, so a dead
+// agent gets them when it respawns and re-reads its timeline).
+async function requestChanges(db: DB, herdr: Herdr, id: string, body: any): Promise<Response> {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  if (task.state !== "in_review")
+    return err(`task is '${task.state}', not 'in_review'`, 409);
+  const notes = String(body?.notes ?? "").trim();
+  if (!notes) return err("notes are required");
+
+  let delivered = false;
+  if (task.agent_target) {
+    try {
+      const res = await herdr.send(task.agent_target, `hive: changes requested before merge —\n${notes}`);
+      delivered = res.code === 0;
+    } catch {
+      delivered = false;
+    }
+  }
+  writeEvent(db, { task_id: id, source: "director", type: "changes_requested", payload: { notes, delivered } });
+  const updated = transition(db, id, "in_progress", { source: "director", reason: "changes requested" });
+  return json({ ok: true, delivered, task: updated });
+}
+
 // Spawn a herdr agent for a queued task: create the worktree, start the agent
 // with HIVE_TASK_ID/HIVE_URL + project secrets in env and the composed brief.
 async function spawnTask(
@@ -941,6 +1177,16 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, body: any): Promise<R
   }
 }
 
+// MCP servers whose tools open an interactive Allow/Deny dialog. A spawned
+// worker has no human at its pane, so the dialog blocks the session forever
+// (health=stuck, seen 2026-07-09). A bare `mcp__<server>` deny entry drops every
+// tool of that server from the agent's context — verified live: the denied tools
+// are not merely rejected on call, they never appear, so no dialog can fire.
+// Deny beats allow across all settings scopes, which is why this reaches
+// claude-in-chrome even though the Chrome extension (not .mcp.json) registers
+// it. Browser verification goes headless instead (BROWSER_VERIFICATION, briefs.ts).
+const DENIED_MCP_SERVERS = ["mcp__claude-in-chrome", "mcp__computer-use"];
+
 // Write hive's Claude Code hook wiring into a spawned worktree. Uses
 // settings.local.json (the per-directory override, gitignored by Claude Code
 // convention) so the agent reports Stop/SubagentStop/PostToolUse to hive
@@ -949,6 +1195,7 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, body: any): Promise<R
 function writeHookSettings(worktreePath: string, taskId: string, hiveUrl: string): void {
   const hook = join(HOOKS_DIR, "hive-hook.sh");
   const settings = {
+    permissions: { deny: DENIED_MCP_SERVERS },
     hooks: {
       Stop: [{ hooks: [{ type: "command", command: `${hook} Stop` }] }],
       SubagentStop: [{ hooks: [{ type: "command", command: `${hook} SubagentStop` }] }],
@@ -991,6 +1238,19 @@ function requeueEndpoint(db: DB, id: string): Response {
   const newId = requeueTask(db, getTask(db, id));
   writeEvent(db, { task_id: id, source: "director", type: "requeued", payload: { new_task_id: newId } });
   return json({ ok: true, new_task_id: newId });
+}
+
+// Manual cleanup trigger: force teardown (worktree + herdr session) for a
+// terminal task. Refuses on a live task so an in-flight worktree is never
+// removed out from under a working agent. Backstop for the auto-teardown that
+// fires on the done/cancelled transition and the periodic reaper sweep.
+async function cleanupEndpoint(db: DB, herdr: Herdr, id: string): Promise<Response> {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  if (!TERMINAL.includes(task.state as State))
+    return err("task is not terminal; refusing to clean up a live task", 409);
+  const r = await cleanupTask(db, herdr, id, { force: true });
+  return json({ ok: true, ...r });
 }
 
 // Create a fresh queued copy of a task (source='requeue', parent_task_id → the
@@ -1284,6 +1544,20 @@ async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Respon
   // --- usage (cost/token analytics) ---
   if (type === "usage") return ingestUsage(db, taskId, fields, source);
 
+  // --- transcript + lifecycle (from the Claude Code hooks) ---
+  // assistant_text = the agent's actual output; tool_use = a one-line tool
+  // summary; agent_turn_end = a quiet Stop/SubagentStop heartbeat. These carry a
+  // structured `payload` object (JSON body) rather than a bare `note`.
+  if (type === "assistant_text" || type === "tool_use" || type === "agent_turn_end") {
+    let payload: Record<string, unknown> = {};
+    if (fields.payload && typeof fields.payload === "object") payload = fields.payload;
+    else if (typeof fields.payload === "string") {
+      try { payload = JSON.parse(fields.payload); } catch { /* ignore */ }
+    }
+    const event = writeEvent(db, { task_id: taskId, source, type, payload });
+    return json({ event }, 201);
+  }
+
   // --- status / blocked / generic ---
   const event = writeEvent(db, { task_id: taskId, source, type, payload: { note } });
   return json({ event }, 201);
@@ -1499,6 +1773,8 @@ function apiAnswerDecision(db: DB, id: string, body: any): Response {
   resolvePlanForDecision(db, id, answerKey);
   // If this card was a stale-recovery escalation, `requeue` → fresh task.
   resolveRecoveryForDecision(db, id, answerKey);
+  // If this card was a possible-duplicate card, `merge` → fold + cancel.
+  resolveDuplicateForDecision(db, id, answerKey);
   // Resume the task if it was parked on this decision. (herdr `agent send` is Phase 2.)
   const task = getTask(db, r.task_id);
   if (task && task.state === "needs_decision")

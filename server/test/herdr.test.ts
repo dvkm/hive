@@ -9,6 +9,9 @@ import {
   agentFocusArgv,
   agentReadArgv,
   worktreeRemoveArgv,
+  isWorktreeExistsError,
+  parseExistingWorktreePath,
+  parseWorktreeList,
   workspaceListArgv,
   workspaceCreateArgv,
   tabCreateArgv,
@@ -20,6 +23,8 @@ import {
   parseTabId,
   parseAgentProbe,
   parseAgentStatus,
+  paneSendKeysArgv,
+  parsePaneId,
 } from "../src/runtime/herdr.ts";
 
 // A recording stub: canned results per matched argv, records every call.
@@ -245,4 +250,138 @@ test("teardown accepts a merged branch even when unpushed", async () => {
   const r = await h.teardown({ repoPath: "/repo", branch: "hive/t1", worktreePath: "/wt" });
   expect(r.removed).toBe(true);
   expect(r.reason).toBe("merged");
+});
+
+test("send writes text then submits with an explicit Enter to the pane", async () => {
+  const { exec, calls } = stubExec((argv) => {
+    if (argv.includes("agent") && argv.includes("get"))
+      return OK(JSON.stringify({ result: { agent: { pane_id: "wR:p7", agent_status: "idle" } } }));
+    return OK("ok");
+  });
+  const h = new Herdr(exec, "herdr");
+  await h.send("t1", "hello world");
+  // 1) text is written, 2) pane resolved, 3) Enter submitted to that pane.
+  // calls include the bin name at [0]; assert on the argv tail.
+  expect(calls[0].slice(1)).toEqual(["agent", "send", "t1", "hello world"]);
+  expect(calls.some((c) => c[1] === "agent" && c[2] === "get" && c[3] === "t1")).toBe(true);
+  const enter = calls.find((c) => c[1] === "pane" && c[2] === "send-keys");
+  expect(enter?.slice(1)).toEqual(["pane", "send-keys", "wR:p7", "Enter"]);
+});
+
+test("send still delivers text if the pane can't be resolved (no false throw)", async () => {
+  const { exec, calls } = stubExec((argv) => {
+    if (argv.includes("agent") && argv.includes("get")) return OK("not json");
+    return OK("ok");
+  });
+  const h = new Herdr(exec, "herdr");
+  await h.send("t1", "hi");
+  expect(calls[0].slice(1)).toEqual(["agent", "send", "t1", "hi"]);
+  // pane unresolved → no send-keys, but no throw either.
+  expect(calls.some((c) => c[1] === "pane")).toBe(false);
+});
+
+// ---- leftover-worktree reclaim (respawn on a reused task id) ----
+
+// A tiny world: a leftover worktree for hive/t1 is in the way until something
+// removes it. Models the exact herdr/git surface verified live against 0.7.1 —
+// `worktree create` refusing with the offending path quoted in a JSON error on
+// STDERR (exit 1), and removal going through git, not herdr.
+const WT = "/wt/hive-t1";
+const EXISTS: ExecResult = {
+  code: 1,
+  stdout: "",
+  stderr: `{"error":{"code":"worktree_create_failed","message":"Preparing worktree\\nfatal: '${WT}' already exists"},"id":"cli:worktree:create"}`,
+};
+const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x));
+
+function leftoverWorld(o: { dirty?: boolean; ghosts?: string[]; commitFails?: boolean } = {}) {
+  const calls: string[][] = [];
+  const ghosts = new Set(o.ghosts ?? []);
+  let present = true; // the leftover worktree
+  const exec: Exec = async (argv) => {
+    calls.push(argv);
+    const git = argv[0] === "git";
+    if (argv[0] === "herdr" && has(argv, "worktree", "create"))
+      return present ? EXISTS : OK(`{"result":{"worktree":{"path":"${WT}","branch":"hive/t1","open_workspace_id":"w1"}}}`);
+    if (git && has(argv, "worktree", "list"))
+      return OK(present ? `worktree ${WT}\nHEAD abc123\nbranch refs/heads/hive/t1\n` : "");
+    if (git && has(argv, "status", "--porcelain")) return OK(o.dirty ? " M src/a.ts\n?? new.txt\n" : "");
+    if (git && has(argv, "rev-parse", "--verify"))
+      return ghosts.has(argv[argv.length - 1].replace("refs/heads/", "")) ? OK("sha") : FAIL("");
+    if (git && has(argv, "commit")) return o.commitFails ? FAIL("pre-commit rejected") : OK();
+    if (git && has(argv, "worktree", "remove")) {
+      present = false;
+      return OK();
+    }
+    if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
+    if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t2"}}}');
+    return OK();
+  };
+  return { exec, calls };
+}
+
+const spawnT1 = (h: Herdr) => h.spawn({ taskId: "t1", repoPath: "/repo", hiveUrl: "http://h", title: "T", brief: "b" });
+const idx = (calls: string[][], ...xs: string[]) => calls.findIndex((c) => has(c, ...xs));
+
+test("parses git's already-exists refusals and the porcelain worktree list", () => {
+  expect(isWorktreeExistsError(EXISTS)).toBe(true);
+  expect(isWorktreeExistsError(FAIL("fatal: invalid reference: nope"))).toBe(false);
+  expect(parseExistingWorktreePath(EXISTS.stderr)).toBe(WT);
+  // the branch-in-use form quotes the branch FIRST, then the path
+  expect(parseExistingWorktreePath("fatal: 'hive/x' is already used by worktree at '/wt/other'")).toBe("/wt/other");
+  expect(parseExistingWorktreePath("fatal: some other failure")).toBe(null);
+
+  expect(parseWorktreeList("worktree /a\nHEAD s1\nbranch refs/heads/hive/x\n\nworktree /b\nHEAD s2\ndetached\n")).toEqual([
+    { path: "/a", branch: "hive/x" },
+    { path: "/b", branch: null },
+  ]);
+});
+
+test("spawn removes a CLEAN leftover worktree and retries create", async () => {
+  const { exec, calls } = leftoverWorld({ dirty: false });
+  const r = await spawnT1(new Herdr(exec, "herdr"));
+
+  expect(r.worktree_path).toBe(WT);
+  // create ran twice: refused, reclaimed, succeeded
+  expect(calls.filter((c) => c[0] === "herdr" && has(c, "worktree", "create")).length).toBe(2);
+  expect(calls.some((c) => c[0] === "git" && has(c, "worktree", "remove", "--force", WT))).toBe(true);
+  // nothing to preserve → no ghost branch
+  expect(calls.some((c) => has(c, "checkout", "-b"))).toBe(false);
+});
+
+test("spawn preserves a DIRTY leftover worktree to a ghost branch before removing it", async () => {
+  const { exec, calls } = leftoverWorld({ dirty: true });
+  const r = await spawnT1(new Herdr(exec, "herdr"));
+
+  expect(r.worktree_path).toBe(WT);
+  expect(calls.some((c) => has(c, "checkout", "-b", "ghost-t1"))).toBe(true);
+  expect(calls.some((c) => has(c, "commit", "--no-verify", "hive: WIP rescued from t1"))).toBe(true);
+  // the rescue lands BEFORE the removal, never after
+  expect(idx(calls, "commit", "--no-verify")).toBeLessThan(idx(calls, "worktree", "remove"));
+});
+
+test("a taken ghost branch does not collide: the next free name is used", async () => {
+  const { exec, calls } = leftoverWorld({ dirty: true, ghosts: ["ghost-t1", "ghost-t1-2"] });
+  await spawnT1(new Herdr(exec, "herdr"));
+  expect(calls.some((c) => has(c, "checkout", "-b", "ghost-t1-3"))).toBe(true);
+});
+
+test("a failed WIP rescue NEVER removes the worktree", async () => {
+  const { exec, calls } = leftoverWorld({ dirty: true, commitFails: true });
+  await expect(spawnT1(new Herdr(exec, "herdr"))).rejects.toThrow(/ghost commit failed/);
+  expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(false); // work still on disk
+});
+
+test("an unrelated create failure is never treated as a leftover worktree", async () => {
+  const { exec, calls } = stubExec(() => FAIL('{"error":{"code":"worktree_create_failed","message":"invalid base ref"}}'));
+  await expect(spawnT1(new Herdr(exec, "herdr"))).rejects.toThrow(/worktree create failed/);
+  expect(calls.some((c) => c[0] === "git")).toBe(false); // no reclaim attempted at all
+});
+
+test("reclaim refuses to touch a directory git does not track as a worktree", async () => {
+  // Path in the way, but unregistered: refuse rather than rm -rf something unproven.
+  const { exec, calls } = stubExec((argv) => (has(argv, "worktree", "list") ? OK("") : OK()));
+  const r = await new Herdr(exec, "herdr").reclaimWorktree({ repoPath: "/repo", branch: "hive/t1", taskId: "t1", hintPath: WT });
+  expect(r).toEqual({ reclaimed: false, ghost_branch: null, path: WT, reason: "no registered worktree to reclaim" });
+  expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(false);
 });

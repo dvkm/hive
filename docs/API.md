@@ -61,6 +61,7 @@ tasks keep referencing it, there is no hard delete).
 ```json
 {
   "id": "9da7c5527580",
+  "number": 42,
   "project_id": "proj_ab12...",
   "title": "Add dark mode toggle",
   "brief": "User-facing dark mode toggle in settings.",
@@ -74,6 +75,7 @@ tasks keep referencing it, there is no hard delete).
   "summary": "Shipped dark mode toggle; all tests green.",
   "source": null,
   "parent_task_id": null,
+  "duplicate_of": null,
   "health": { "status": "healthy", "reason": null, "since": "..." },
   "created_at": "...",
   "updated_at": "..."
@@ -81,6 +83,11 @@ tasks keep referencing it, there is no hard delete).
 ```
 `state ∈ {queued, in_progress, needs_decision, in_review, verifying, done, failed, cancelled}`
 `kind ∈ {ship, scout, chore}`
+`number` is a human-friendly, monotonic per-hive counter assigned at creation
+(`MAX(number)+1`, starting at 1) and never reused — it is THE handle people and
+GitHub PR markers use, while the opaque `id` stays the machine key. Assigned by a
+DB trigger so every creation path gets one; existing rows were backfilled in
+`created_at` order. Unique across all tasks.
 `health` is a SERVER-COMPUTED dimension separate from lifecycle `state` — the
 visible symptom that a task pointing at a live agent is actually fine or actually
 stuck. **It is the single source of truth; clients render it, never re-derive
@@ -105,6 +112,10 @@ companion `source_ref` column (not returned) holds the upstream message resource
 name and is uniquely indexed for dedupe.
 `parent_task_id` is null for top-level tasks, or the id of the source task a
 `"planner"` task was broken out of (links a child to its parent).
+`duplicate_of` is null for normal tasks, or the id of the SURVIVOR task this one
+was folded into when it was cancelled as a duplicate (see Duplicate detection
+below). Set only on a `cancelled` task; the survivor keeps working. Tasks are
+never deleted, so the cancelled row + this pointer preserve the full history.
 
 ### Event
 ```json
@@ -117,7 +128,7 @@ name and is uniquely indexed for dedupe.
   "payload": { "note": "extracting the middleware" }
 }
 ```
-`source ∈ {agent, hook, herdr, reconciler, monitor, director, system}`.
+`source ∈ {agent, hook, herdr, reconciler, reaper, monitor, director, system}`.
 `type` is open-ended. Types the server itself writes:
 - `created` — task created. `payload: {title}`
 - `state_change` — every state transition. `payload: {from, to, reason}`
@@ -128,6 +139,12 @@ name and is uniquely indexed for dedupe.
 - `note` — a free note (e.g. a `done` summary). `payload: {note}`
 - `steer` — a steer message was dispatched to the agent. `payload: {message, target}`
 - `blocked` — agent reported blocked. `payload: {note}`
+
+Transcript events (written by the Claude Code hooks, `source: hook` — these fill
+the task timeline with the agent's actual work; see `hooks/install.md`):
+- `assistant_text` — a block of the agent's actual output text. `payload: {text}` (rendered as a transcript bubble)
+- `tool_use` — the agent invoked a tool. `payload: {tool, summary}` where `summary` is a cheap one-line description (the command for Bash, the file_path for Read/Edit, the pattern for Grep — never the full input). The UI groups consecutive `tool_use` events into one "used N tools" row.
+- `agent_turn_end` — a quiet Stop/SubagentStop liveness heartbeat. `payload: {}` (kept for health/reconciler; the timeline hides it)
 
 Types written by the runtime layer (Phase 2b):
 - `spawned` — a herdr agent was started. `payload: {agent_target, branch, worktree_path, tab_id, label, fleet_workspace_id}`
@@ -140,9 +157,17 @@ Types written by the runtime layer (Phase 2b):
 - `recovery_card` — a recovery escalation opened a decision card. `payload: {decision_id, source_task_id}`
 - `ci_status` — reconciler synced CI. `payload: {ci_status}` (`passing|pending|failing`)
 - `pr_merged` — reconciler detected the PR merged. `payload: {pr_url}`
+- `pr_linked` — a marked PR was matched back to this task and its `pr_url` set (by the reconciler's scan or `POST /api/tasks/link-pr`). `payload: {pr_url, via}` (`via ∈ {id, number}` — which half of the marker matched)
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
 - `smoke_passed` / `smoke_failed` — post-deploy smoke result. `payload: {results:[{name,ok,detail}], evidence_id?}`
+- `cleaned_up` — a finished task's runtime was torn down: worktree removed (when its branch was pushed/merged) and herdr session (tab/pane) closed. `payload: {worktree_path, branch, worktree_removed, ghost_branch, session_closed, session_via, tab_id}` (`ghost_branch` non-null when tracked uncommitted work was preserved before removal). Fired on the `done`/`cancelled` transition and by the reaper.
+- `cleanup_skipped` — teardown was refused because the branch is neither pushed nor merged; the worktree and its session are left fully intact so no unmerged work is lost. `payload: {reason, worktree_path, branch}`
+
+Review events (written by the director path, `source: director`):
+- `merged` — an in-review task was approved & merged. `payload: {method, base, branch, pr_url}`
+- `merge_failed` — a merge attempt failed (conflict / not a fast-forward / gh refused); no state change. `payload: {reason}`
+- `changes_requested` — the captain requested changes; the task returns to `in_progress`. `payload: {notes, delivered}`
 
 Domain-supervisor events (written by the planner, `source: system`):
 - `planning` — a planner run started for the task. `payload: {title}`
@@ -150,6 +175,13 @@ Domain-supervisor events (written by the planner, `source: system`):
   `payload: {decision_id, source_task_id, proposed_tasks:[{title,brief,kind}], rationale, questions:[]}`
 - `planner_error` — the planner failed (spawn error, non-zero exit, timeout, or
   unparseable output). A single diagnostic; no retry. `payload: {error}`
+
+Duplicate-detection events (written by the dedup path, `source: system`):
+- `duplicate_merged` — a task was folded into another. Written on BOTH tasks: on
+  the survivor `payload: {duplicate_task_id, title, note?}` (`note` carries the
+  folded brief when it added anything); on the folded task `payload: {duplicate_of}`.
+- `duplicate_suspected` — a near-duplicate opened a decision card on the NEW task.
+  `payload: {decision_id, survivor_id, tier, score}`.
 
 Standing-authority events (written by the policy engine, `source: system` unless noted):
 - `authority_logged` — an action was allowed (matched an `allow` rule, defaulted to allow when unmatched, or passed by consuming a grant). `payload: {action, target, effect:"allow", rule_id?, via_grant?}`
@@ -324,7 +356,7 @@ cost_usd, calls, unpriced}` (summed cost counts priced rows only).
 
 ### Tasks
 - `GET /api/tasks?state=&project_id=` → `200 [Task, ...]` (newest `updated_at` first; both filters optional)
-- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?}` → `201 Task` (starts in `queued`, writes a `created` event)
+- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event)
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
 - `POST /api/tasks/:id/transition` body `{to (required), reason?, source?}` → `200 Task` | `409` (invalid transition or `done` without evidence) | `404`
@@ -347,6 +379,19 @@ cost_usd, calls, unpriced}` (summed cost counts priced rows only).
   original). Distinct from the attention tray's in-place requeue of an
   already-failed task (`POST /transition {to:"queued"}`, which reactivates the
   SAME task and clears its runtime binding).
+- `POST /api/tasks/:id/cleanup` body `{}` → `200 {"ok":true, "cleaned":bool, "worktree":{removed,reason,ghost_branch}|null, "session":{closed,via}}` | `404` | `409` (task not terminal)
+  Manual force-teardown for a **terminal** task (`done`/`cancelled`/`failed`): removes its git worktree and closes its herdr session. Refuses (`409`) on a live task so an in-flight worktree is never pulled out from under a working agent. Keeps every safety guard: the worktree is removed only when its branch is pushed/merged (else `cleanup_skipped`), and any tracked uncommitted work is preserved to a `ghost-<task-id>` branch first. Backstop for the auto-teardown that fires on the `done`/`cancelled` transition and the periodic reaper sweep.
+- `POST /api/tasks/:id/merge-into` body `{target_id (required)}` → `200 Task` (now `cancelled`) | `400` (missing/self `target_id`) | `404` (task or target missing) | `409` (source is already terminal)
+  Manual duplicate merge: fold this task into `target_id` and cancel it as a
+  duplicate. Writes a `duplicate_merged` event on both tasks, sets this task's
+  `duplicate_of` to the target, and cancels it (reason `duplicate of <target>`).
+  Never deletes. **Distinct from `POST /merge`** (the PR/branch approve-and-merge).
+- `GET /api/tasks/duplicates` → `200 {"clusters": [{project_id, tasks:[{id,title,project_id,state,created_at}]}]}`
+  Detected duplicate CLUSTERS among the current non-terminal tasks (queued /
+  in_progress / needs_decision / in_review / verifying), grouped within a project
+  by the same exact/near-title rule the on-create detector uses (union-find; only
+  clusters of size ≥ 2 are returned). For a backfill/triage UI over dups that
+  already exist.
 - `GET /api/tasks/:id/brief` → `200 {"task_id":"...", "brief":"<multiline string>"}` | `404`
   (task description + definition of done + `hive emit` protocol + active global + project policies + standing-authority section)
 - `POST /api/tasks/:id/guarded-action` body `{action (required), target (required), detail?}` → see below | `404` | `400`
@@ -374,6 +419,83 @@ cost_usd, calls, unpriced}` (summed cost counts priced rows only).
   proposal. On any planner failure returns `502` and records a single
   `planner_error` event (no card). The request blocks for the planner run
   (timeout-capped by `HIVE_PLANNER_TIMEOUT_MS`, default 120000).
+
+### PR ↔ task marker (the linking contract)
+Every PR a hive agent opens MUST carry a marker that links it back to its task.
+This is THE contract; the brief instructs agents to it and `hive pr-marker <id>`
+prints it:
+- The PR **title** MUST start with the prefix `[hive-<number>] ` (trailing space
+  included), e.g. `[hive-42] Add dark mode toggle`.
+- The PR **body** MUST include the footer line `hive-task: <id>` on its own line,
+  e.g. `hive-task: 9da7c5527580`.
+
+The `hive-task: <id>` footer is the primary link (the stable, unique machine
+key); the `[hive-<number>]` title is a human-readable fallback matched only when
+the footer is absent. hive links a PR to its task by reading these:
+- **Reconciler scan** (every cycle): for each project with a `repo_path`, runs
+  `gh pr list --state open --json number,title,body,url` in the repo and links any
+  PR carrying a marker to its task — but only when the task has no `pr_url` yet, so
+  an agent-reported PR is never clobbered and re-scanning is idempotent. Writes a
+  `pr_linked` event. Isolated in its own try/catch; a `gh` failure is skipped.
+- **`POST /api/tasks/link-pr`** body `{pr_url (required)}` → `200 {"ok":true, "task_id":"...", "number":42, "linked":<bool>}` | `400` (missing `pr_url`) | `422` (PR carries no hive marker) | `502` (`gh pr view` failed/unparseable)
+  Reads the PR's title/body via `gh pr view <url> --json title,body,url` and links
+  it to the matched task by the same marker rules. `linked` is `false` when the
+  task was already linked (idempotent no-op).
+
+`hive pr-marker <task-id>` (CLI) prints the two marker lines (`title-prefix:` and
+`body-footer:`) for a task so agents don't hand-format them.
+
+### Review experience (in-review tasks)
+An `in_review` task means the agent finished and opened a PR (or pushed/created a
+branch) and is **awaiting the captain's review & merge** — not busy work. The
+captain reviews the diff and approves/merges, requests changes, or rejects,
+entirely from hive (the task page, the `/review` queue, and the morning brief all
+render the same review card).
+
+- `GET /api/tasks/:id/diff` → `200 DiffResult` | `400` (no branch & no `pr_url`, or project has no `repo_path`) | `404` | `502` (gh/git failed)
+  The task branch's changes. When `pr_url` is set, `gh pr diff <url> --patch`;
+  otherwise `git -C <repo> diff <default_branch>...<branch>` in the project repo.
+  The unified diff is parsed into:
+  ```json
+  {
+    "files": [
+      { "path": "src/a.ts", "additions": 2, "deletions": 1, "binary": false,
+        "hunks": [ { "header": "@@ -1,3 +1,4 @@ ctx", "lines": [
+          { "kind": "ctx", "text": " line1" },
+          { "kind": "del", "text": "line2" },
+          { "kind": "add", "text": "line2 changed" }
+        ] } ] }
+    ],
+    "truncated": false
+  }
+  ```
+  `kind ∈ {add, del, ctx}`. Total parsed lines are capped at 20000; past that
+  `truncated` is `true` and the remaining diff is omitted (view the PR for the
+  full patch). Binary files carry `binary: true` and no hunks.
+
+- `POST /api/tasks/:id/merge` body `{}` → `200 Task` (now `verifying`) | `409` (not `in_review`, or the merge failed: conflict / not a fast-forward / gh refused) | `403` (denied by a `task.merge` authority rule) | `404` | `400` (local merge but no `repo_path`/`branch`)
+  Approve & merge. When `pr_url` is set: `gh pr merge <url> <method>` where
+  `method` is the project's `config.merge_method` (`squash` default, or `merge` /
+  `rebase`). Otherwise a **local fast-forward**: the default branch is
+  fast-forwarded to the task branch tip (`git merge --ff-only`); a non-fast-forward
+  (diverged/conflicting) merge is refused with `409` and no working tree is
+  touched (rebase the branch or open a PR for a squash merge). On success: writes
+  a `merged` event, transitions `in_review → verifying` (which runs the project's
+  post-deploy smoke once), and best-effort removes the task worktree (a teardown
+  failure never fails the merge). On failure: `409` with the reason, a
+  `merge_failed` event, and NO state change. Guarded by the standing-authority
+  gate with action `task.merge`.
+
+- `POST /api/tasks/:id/request-changes` body `{notes (required)}` → `200 {"ok":true, "delivered":<bool>, "task": Task}` (now `in_progress`) | `409` (not `in_review`) | `400` (blank notes) | `404`
+  Bounce the task back to `in_progress` for another pass. Delivers `notes` to the
+  live agent via `herdr agent send` when one is alive (`delivered` reports
+  whether the send landed); either way a `changes_requested` event records the
+  notes so a respawned agent has them. **Reject** is not a separate endpoint — it
+  is `POST /transition {to:"cancelled", reason}` (allowed from `in_review`).
+
+The morning brief (`GET /api/brief`) gains a `to_review` array: the current
+`in_review` tasks (full Task objects with `health`), rendered as review cards
+inline just after `decisions`.
 
 ### Search — `GET /api/search?q=&limit=`
 Global text search across the five text-bearing entities, for the web command
@@ -405,9 +527,10 @@ recognized fields (JSON keys == form field names):
 
 | field | meaning |
 |-------|---------|
-| `type` (required) | `status` \| `evidence` \| `needs-decision` \| `done` \| `blocked` \| `usage` \| any custom string |
+| `type` (required) | `status` \| `evidence` \| `needs-decision` \| `done` \| `blocked` \| `usage` \| `assistant_text` \| `tool_use` \| `agent_turn_end` \| any custom string |
 | `source` | defaults to `agent` |
 | `note` | free text; stored in the event payload / used as caption/summary |
+| `payload` | structured event payload object, passed through verbatim for `assistant_text` / `tool_use` / `agent_turn_end` (JSON body) |
 | `kind` | evidence kind (evidence type only); defaults to `screenshot` if a file is present, else `link`/`log` |
 | `caption` | evidence caption |
 | `url` | evidence URL (for link evidence, no file) |
@@ -425,6 +548,8 @@ Behavior by `type`:
 - `usage` → inserts a Usage row (cost computed server-side when `cost_usd` is
   omitted; null for unpriced models) and broadcasts a `usage` SSE message. Writes
   no timeline event. → `201 {usage: Usage}` | `400` (missing `model`)
+- `assistant_text` / `tool_use` / `agent_turn_end` → writes one event with the
+  supplied `payload` preserved verbatim (the transcript hooks' path). → `201 {event: Event}`
 - `status` / `blocked` / custom → writes one event. → `201 {event: Event}`
 
 ### Analytics (cost/token)
@@ -616,6 +741,59 @@ Manual dispatch (the web "dispatch now" button → `POST /api/tasks/:id/spawn`)
 bypasses these policy gates but still runs the `task.spawn` authority gate. See
 `docs/runtime.md`.
 
+### Duplicate detection & auto-merge (`server/src/dedup.ts`)
+Ghost-task recreation and repeated asks produce real duplicate tasks (e.g. two
+"intake form" tasks). Every `POST /api/tasks` runs detection against the existing
+NON-TERMINAL tasks in the SAME project (keyed on task `id`/`title`, never on the
+`number` column). The survivor is always the OLDER task.
+
+- **Normalization / similarity.** Exact = normalized titles equal (trim,
+  lowercase, collapse whitespace, strip trailing punctuation). Near =
+  `titleSimilarity(a,b)` ≥ `0.6`, a pure word-set Jaccard (|A∩B|/|A∪B|) over the
+  normalized title words — no dependencies. `0.8` is the "very strong" mark that
+  flips the decision card's recommended option to *merge*.
+- **Exact duplicate of a brand-new task (queued, no `agent_target`) → auto-merge,
+  no interruption.** The new task is folded into the survivor and cancelled with
+  `duplicate_of` set; both get a `duplicate_merged` event (the survivor's carries
+  the folded brief when it adds anything). The `POST /api/tasks` response is the
+  new task in its resulting `cancelled` state.
+- **Near duplicate (or an exact dup of a task that has already started) → a
+  decision card on the NEW task**, titled `Possible duplicate of "<survivor>"`,
+  options `merge` / `keep-separate` (a `duplicate_suspected` event links it). The
+  new task stays `queued`; nothing is auto-cancelled. Answering `merge` runs the
+  same fold+cancel; `keep-separate` records the decision and leaves both.
+- **Safety.** A task with an `agent_target` or past `queued` is NEVER
+  auto-cancelled — only a brand-new queued task is auto-merged; everything with
+  work in flight goes through the decision card (or the manual `/merge-into`,
+  which still refuses to cancel an already-terminal task).
+
+### Auto-cleanup & the reaper (finished-task teardown)
+Finished tasks get their runtime torn down automatically so orphan worktrees and
+herdr sessions never pile up (`server/src/cleanup.ts`, `server/src/reaper.ts`).
+
+- **On the transition (immediate).** When a task reaches `done` or `cancelled`,
+  the server fires `cleanupTask`: removes its git worktree and closes its herdr
+  session (the labelled tab, or the agent's pane). `failed` is deliberately
+  **excluded** — a failed task may still be auto-requeued/retried, so tearing it
+  down there would race the retry; the dead-agent recovery path already reclaims
+  its worktree, and the reaper is the backstop.
+- **The reaper (backstop, periodic).** `server/src/reaper.ts`, default every 5
+  min (`HIVE_REAP_MS`). Enumerates hive worker worktrees (`git worktree list`
+  across every project repo) and, for each on a `hive/<task-id>` branch whose
+  task id maps to a **terminal** task or to **no task at all**, tears it down.
+  A non-terminal task keeps its worktree (never touched). Isolated try/catch per
+  item; a failure never crashes the server.
+
+**Safety (never destroys work).** Removal keeps `teardown`'s guard: a worktree is
+removed only when its branch is pushed to origin **or** merged into the default
+branch (else the worktree + session are left fully intact and a `cleanup_skipped`
+event records the reason). Even on a safe branch, tracked uncommitted changes are
+first committed to a `ghost-<task-id>` branch (`cleaned_up.ghost_branch`); only
+purely-untracked/ignored artifacts (e.g. `.serena/`, the injected
+`.claude/settings.local.json`) are discarded by the force removal. Ghost branches
+(`ghost-<task-id>`) are never themselves reaped. After a successful removal the
+task's `agent_target`/`worktree_path` are cleared so a re-run is a no-op.
+
 ### Stale recovery & the attention tray
 The reconciler (`docs/runtime.md`) turns an observed agent death into action.
 Two kinds of failure, deliberately kept distinct:
@@ -641,7 +819,9 @@ so the next spawn is clean; writes a `state_change` with the reason), **edit &
 requeue** = `PUT /api/tasks/:id` then the same transition, **cancel** = `POST
 /transition {to:"cancelled"}` (a `failed` task may be dismissed to `cancelled`).
 Unhealthy live rows reuse view-agent / send / requeue. State-machine edges added
-for this: `failed → queued` and `failed → cancelled`.
+for this: `failed → queued` and `failed → cancelled`. The review experience adds
+`in_review → in_progress` (the captain requesting changes; see the Review
+experience section).
 
 ### Static assets
 - `GET /evidence/<task_id>/<file>` → the raw evidence file (`404` if missing; path traversal rejected `403`).

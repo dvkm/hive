@@ -12,7 +12,8 @@
 // refresh + polling. All HTTP goes through an injectable fetch-like so it is
 // unit-tested without touching Google.
 //
-// Config: each project's config may carry `gchat_spaces: [{space, label?}]`.
+// Config: each project's config may carry `gchat_spaces: [{space, label?}]`, or
+// the string "*" to ingest every space the authorized user belongs to.
 // The owning project IS the target project_id, so the allowlist reuses the
 // existing per-project config column (simplest durable home; no new table).
 // Secrets (values in the keychain under the `gchat` namespace, DB stores
@@ -36,7 +37,10 @@ export type FetchLike = typeof fetch;
 export const GCHAT_NS = "gchat"; // keychain project namespace for connector secrets
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const CHAT_API = "https://chat.googleapis.com/v1";
-const SCOPE = "https://www.googleapis.com/auth/chat.messages.readonly";
+const SCOPE = [
+  "https://www.googleapis.com/auth/chat.messages.readonly",
+  "https://www.googleapis.com/auth/chat.spaces.readonly", // spaces.list, for `gchat_spaces: "*"`
+].join(" ");
 export const IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024; // 5MB cap per image
 
@@ -147,6 +151,25 @@ export async function listMessages(
   if (!res.ok) throw new Error(`messages.list ${space} failed: ${res.status}`);
   const data: any = await res.json();
   return data.messages ?? [];
+}
+
+// Enumerate every space the authorized user belongs to (for `gchat_spaces: "*"`).
+// Needs the chat.spaces.readonly scope.
+export async function listSpaces(token: string, fetchImpl: FetchLike): Promise<string[]> {
+  const names: string[] = [];
+  let pageToken = "";
+  do {
+    const params = new URLSearchParams({ pageSize: "1000" });
+    if (pageToken) params.set("pageToken", pageToken);
+    const res = await fetchImpl(`${CHAT_API}/spaces?${params}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error(`spaces.list failed: ${res.status}`);
+    const data: any = await res.json();
+    for (const s of data.spaces ?? []) if (s?.name) names.push(s.name);
+    pageToken = data.nextPageToken ?? "";
+  } while (pageToken);
+  return names;
 }
 
 // ponytail: Google Chat exposes no documented permalink field on a Message.
@@ -275,6 +298,9 @@ export async function pollGchatOnce(db: DB, deps: GchatDeps = {}): Promise<{ cre
 
   const projects = db.query("SELECT id, config FROM projects").all() as { id: string; config: string }[];
   const jobs: { projectId: string; space: string; planIntake: boolean }[] = [];
+  // `gchat_spaces: "*"` means every space the authorized user is in; those
+  // projects can only be expanded once we hold a token (spaces.list).
+  const wildcards: { projectId: string; planIntake: boolean }[] = [];
   for (const p of projects) {
     let cfg: any = {};
     try {
@@ -282,11 +308,15 @@ export async function pollGchatOnce(db: DB, deps: GchatDeps = {}): Promise<{ cre
     } catch {
       cfg = {};
     }
-    const spaces: any[] = cfg.gchat_spaces ?? [];
     const planIntake = cfg.plan_intake === true;
+    if (cfg.gchat_spaces === "*") {
+      wildcards.push({ projectId: p.id, planIntake });
+      continue;
+    }
+    const spaces: any[] = cfg.gchat_spaces ?? [];
     for (const s of spaces) if (s?.space) jobs.push({ projectId: p.id, space: s.space, planIntake });
   }
-  if (jobs.length === 0) return { created: 0, spaces: 0 }; // unconfigured: hard no-op
+  if (jobs.length === 0 && wildcards.length === 0) return { created: 0, spaces: 0 }; // unconfigured: hard no-op
 
   const secrets = deps.secrets ?? (await resolveGchatSecrets(deps.exec ?? defaultExec));
   if (!secrets) {
@@ -303,6 +333,16 @@ export async function pollGchatOnce(db: DB, deps: GchatDeps = {}): Promise<{ cre
   } catch (e) {
     diagOnce("token", log, "access-token refresh failed", e);
     return { created: 0, spaces: jobs.length };
+  }
+
+  if (wildcards.length > 0) {
+    try {
+      const all = await listSpaces(token, fetchImpl);
+      for (const w of wildcards) for (const space of all) jobs.push({ ...w, space });
+      clearDiag("spaces.list");
+    } catch (e) {
+      diagOnce("spaces.list", log, "spaces.list failed (is the chat.spaces.readonly scope granted?)", e);
+    }
   }
 
   let created = 0;
