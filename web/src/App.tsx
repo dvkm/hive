@@ -13,6 +13,7 @@ import Monitors from "./views/Monitors";
 import Learnings from "./views/Learnings";
 import Analytics from "./views/Analytics";
 import Projects from "./views/Projects";
+import Palette from "./views/Palette";
 
 function ConnDot() {
   const { sse } = useStore();
@@ -112,6 +113,7 @@ export default function App() {
           <Route path="/tasks/:id" element={<TaskModal />} />
         </Routes>
       )}
+      <Palette />
     </div>
   );
 }

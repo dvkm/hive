@@ -165,6 +165,16 @@ export interface TaskDetail extends Task {
   decisions: Decision[];
 }
 
+// One global-search hit. task_state/project_id are present only for task hits.
+export interface SearchHit {
+  type: "task" | "decision" | "learning" | "policy" | "project";
+  id: string;
+  title: string;
+  snippet: string;
+  task_state?: State;
+  project_id?: string;
+}
+
 export interface UsageTotals {
   input_tokens: number;
   output_tokens: number;
@@ -322,6 +332,9 @@ export const api = {
     req<AnalyticsSummary>(`/api/analytics/summary${since ? "?since=" + encodeURIComponent(since) : ""}`),
   taskUsage: (id: string) =>
     req<{ task_id: string; usage: UsageRow[]; totals: UsageTotals }>(`/api/tasks/${id}/usage`),
+
+  search: (q: string, limit = 50) =>
+    req<{ hits: SearchHit[] }>(`/api/search?q=${encodeURIComponent(q)}&limit=${limit}`),
 
   notifications: () => req<{ notifications: Notification[]; unread: number }>(`/api/notifications`),
   ackNotifications: () => req<{ ok: boolean; acked: number }>(`/api/notifications/ack`, { method: "POST", body: "{}" }),
