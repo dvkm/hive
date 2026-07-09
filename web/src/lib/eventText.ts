@@ -34,9 +34,23 @@ export function eventText(e: EventLike): string {
     case "evidence":
       return `evidence attached: ${s(p.caption) || s(p.kind) || "item"}`;
     case "needs-decision":
-      return `decision opened: ${s(p.title) || "needs a decision"}`;
-    case "decision_answered":
-      return `decision answered: ${s(p.answer_key) || "answered"}`;
+      return `asked: ${s(p.title) || "needs a decision"}`;
+    case "decision_answered": {
+      const label = s(p.answer_label) || s(p.answer_key) || "answered";
+      const title = s(p.title);
+      return title ? `answered ${title}: ${label}` : `answered: ${label}`;
+    }
+    case "assistant_text": {
+      const first = s(p.text).split("\n").find((l) => l.trim()) || "";
+      return first.length > 140 ? first.slice(0, 139) + "…" : first || "agent output";
+    }
+    case "tool_use": {
+      const tool = s(p.tool) || "tool";
+      const sum = s(p.summary);
+      return sum ? `${tool}: ${sum}` : tool;
+    }
+    case "agent_turn_end":
+      return "agent turn ended";
     case "steer":
       return `steered: “${s(p.message)}”`;
     case "blocked":
@@ -99,6 +113,9 @@ export const FEED_CATEGORIES: { key: FeedCategory; label: string }[] = [
 ];
 
 const CATEGORY_OF: Record<string, FeedCategory> = {
+  assistant_text: "lifecycle",
+  tool_use: "lifecycle",
+  agent_turn_end: "lifecycle",
   state_change: "state",
   "needs-decision": "decision",
   decision_answered: "decision",

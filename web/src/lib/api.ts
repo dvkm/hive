@@ -24,6 +24,7 @@ export interface Health {
 
 export interface Task {
   id: string;
+  number: number; // human-friendly monotonic per-hive handle (the opaque `id` stays the machine key)
   project_id: string;
   title: string;
   brief: string;
@@ -37,6 +38,7 @@ export interface Task {
   summary: string | null;
   source: string | null;
   parent_task_id: string | null;
+  duplicate_of: string | null; // survivor id when cancelled as a duplicate
   health?: Health | null;
   created_at: string;
   updated_at: string;
@@ -174,6 +176,30 @@ export interface TaskDetail extends Task {
   decisions: Decision[];
 }
 
+// Structured branch diff for the in-review review panel (server/src/diff.ts).
+export type DiffLineKind = "add" | "del" | "ctx";
+export interface DiffLine {
+  kind: DiffLineKind;
+  text: string;
+}
+export interface DiffHunk {
+  header: string;
+  lines: DiffLine[];
+}
+export interface DiffFile {
+  path: string;
+  additions: number;
+  deletions: number;
+  binary?: boolean;
+  hunks: DiffHunk[];
+}
+export interface DiffResult {
+  files: DiffFile[];
+  truncated: boolean;
+}
+// Mirrors server/src/diff.ts MAX_DIFF_LINES (used only for the truncation notice).
+export const MAX_DIFF_LINES = 20000;
+
 // One global-search hit. task_state/project_id are present only for task hits.
 export interface SearchHit {
   type: "task" | "decision" | "learning" | "policy" | "project";
@@ -217,6 +243,7 @@ export interface AnalyticsSummary {
 // standalone monitor incidents carry type "incident" and a null task_id/title.
 export interface FeedEvent extends Omit<Event, "task_id"> {
   task_id: string | null;
+  task_number: number | null;
   task_title: string | null;
   task_kind: Kind | null;
   project_id: string;
@@ -254,6 +281,7 @@ export interface Brief {
   fleet: Task[];
   incidents: BriefIncident[];
   intake: BriefIntake[];
+  to_review: Task[];
   spend: { totals: UsageTotals; by_model: (UsageTotals & { model: string })[] };
   learnings_new: BriefLearning[];
 }
@@ -335,6 +363,17 @@ export const api = {
     req<{ ok: boolean; new_task_id: string }>(`/api/tasks/${id}/requeue`, {
       method: "POST",
       body: "{}",
+    }),
+  mergeInto: (id: string, target_id: string) =>
+    req<Task>(`/api/tasks/${id}/merge-into`, { method: "POST", body: JSON.stringify({ target_id }) }),
+  duplicates: () =>
+    req<{ clusters: { project_id: string; tasks: Pick<Task, "id" | "title" | "project_id" | "state">[] }[] }>(`/api/tasks/duplicates`),
+  diff: (id: string) => req<DiffResult>(`/api/tasks/${id}/diff`),
+  merge: (id: string) => req<Task>(`/api/tasks/${id}/merge`, { method: "POST", body: "{}" }),
+  requestChanges: (id: string, notes: string) =>
+    req<{ ok: boolean; delivered: boolean; task: Task }>(`/api/tasks/${id}/request-changes`, {
+      method: "POST",
+      body: JSON.stringify({ notes }),
     }),
 
   decisions: (status: "open" | "answered" | "all" = "open") =>

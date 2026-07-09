@@ -6,6 +6,7 @@ import { useStore } from "../lib/store";
 import { relTime } from "../lib/time";
 import { StatusDot, HEALTH_LABEL } from "../lib/ui";
 import { DecisionCard } from "./DecisionCard";
+import { ReviewCard } from "./ReviewCard";
 import { AttentionRows, needsAttention } from "./attention";
 import { fmtUsd, fmtTokens } from "./Analytics";
 
@@ -60,7 +61,9 @@ export default function Brief() {
   // acting on a tray row updates in place via SSE. The digest sections read the
   // fetched snapshot.
   const [answered, setAnswered] = useState<Set<string>>(new Set());
+  const [reviewed, setReviewed] = useState<Set<string>>(new Set());
   const openDecisions = decisions.filter((d) => !answered.has(d.id));
+  const toReview = tasks.filter((t) => t.state === "in_review" && !reviewed.has(t.id));
   const attention = tasks.filter(needsAttention);
 
   const done = data?.done ?? [];
@@ -72,7 +75,7 @@ export default function Brief() {
   const spendCount = spend ? spend.totals.calls : 0;
 
   const anything =
-    openDecisions.length + attention.length + done.length + fleet.length +
+    openDecisions.length + toReview.length + attention.length + done.length + fleet.length +
     incidents.length + intake.length + spendCount + learnings.length;
 
   return (
@@ -107,6 +110,15 @@ export default function Brief() {
         <div className="brief-decisions">
           {openDecisions.map((d) => (
             <DecisionCard key={d.id} d={d} onDone={(id) => setAnswered((s) => new Set(s).add(id))} />
+          ))}
+        </div>
+      </Section>
+
+      {/* ②a To review — in-review tasks awaiting review & merge (shared card). */}
+      <Section title="To review" count={toReview.length}>
+        <div className="brief-reviews">
+          {toReview.map((t) => (
+            <ReviewCard key={t.id} task={t} onDone={() => setReviewed((s) => new Set(s).add(t.id))} />
           ))}
         </div>
       </Section>

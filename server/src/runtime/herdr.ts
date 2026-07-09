@@ -120,6 +120,25 @@ export function agentSendArgv(target: string, message: string): string[] {
   return ["agent", "send", target, message];
 }
 
+// herdr `agent send` writes literal text into the composer but does NOT submit
+// it — the Enter must be sent separately to the agent's pane (verified live
+// 2026-07-09; also stated by herdr's own help: "agent send writes literal text").
+// Without this a steer sits in the composer forever, which is exactly the bug.
+export function paneSendKeysArgv(paneId: string, key: string): string[] {
+  return ["pane", "send-keys", paneId, key];
+}
+
+// Pull the pane id out of an `agent get` payload so we can address send-keys.
+export function parsePaneId(stdout: string): string | null {
+  try {
+    const obj = JSON.parse(stdout);
+    const a = obj.result?.agent ?? obj.agent ?? obj;
+    return (a?.pane_id as string) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function agentFocusArgv(target: string): string[] {
   return ["agent", "focus", target];
 }
@@ -139,12 +158,61 @@ export function agentGetArgv(target: string): string[] {
   return ["agent", "get", target];
 }
 
+// Does a failed `worktree create` mean "something is already at that path /
+// on that branch"? Verified live against herdr 0.7.1: the JSON error body lands
+// on STDERR with exit 1, but the `agent get` precedent (same body on STDOUT,
+// exit 0) says never trust one stream — probe both. Matched narrowly: a generic
+// `worktree_create_failed` (bad base ref, detached repo) must NOT trigger a
+// reclaim, or an unrelated failure would tear down a live worktree.
+export function isWorktreeExistsError(r: ExecResult): boolean {
+  return /already exists|already used by worktree/.test(`${r.stdout}\n${r.stderr}`);
+}
+
+// Git names the offending worktree inside its refusal, and it is the most
+// direct evidence of what to reclaim:
+//   fatal: '/path/to/wt' already exists
+//   fatal: 'hive/x' is already used by worktree at '/path/to/wt'
+// The second form is checked first: it also quotes the BRANCH before the path.
+export function parseExistingWorktreePath(text: string): string | null {
+  return (
+    /already used by worktree at '([^']+)'/.exec(text)?.[1] ??
+    /'([^']+)'\s+already exists/.exec(text)?.[1] ??
+    null
+  );
+}
+
+// `git worktree list --porcelain` → one record per blank-line-separated block:
+//   worktree /path\nHEAD <sha>\nbranch refs/heads/hive/x
+// A detached worktree has no `branch` line.
+export function parseWorktreeList(porcelain: string): { path: string; branch: string | null }[] {
+  const out: { path: string; branch: string | null }[] = [];
+  for (const block of porcelain.trim().split(/\n\s*\n/)) {
+    const path = /^worktree (.+)$/m.exec(block)?.[1];
+    if (!path) continue;
+    const ref = /^branch (.+)$/m.exec(block)?.[1];
+    out.push({ path, branch: ref ? ref.replace(/^refs\/heads\//, "") : null });
+  }
+  return out;
+}
+
 export function worktreeRemoveArgv(ref: { workspaceId?: string | null; worktreePath?: string }): string[] {
   const a = ["worktree", "remove"];
   if (ref.workspaceId) a.push("--workspace", ref.workspaceId);
   else if (ref.worktreePath) a.push("--cwd", ref.worktreePath);
   a.push("--force", "--json");
   return a;
+}
+
+// Close a whole tab (the one labelled tab per task): takes its pane and the
+// agent inside it with it. herdr has no `agent stop`; the session is the tab.
+export function tabCloseArgv(tabId: string): string[] {
+  return ["tab", "close", tabId];
+}
+
+// Close a single pane directly (fallback when the tab id is unknown but the
+// agent's pane can be resolved via `agent get`).
+export function paneCloseArgv(paneId: string): string[] {
+  return ["pane", "close", paneId];
 }
 
 // Parse `herdr worktree create --json`. herdr 0.7.x wraps the payload in a
@@ -279,7 +347,22 @@ export class Herdr {
     const branch = args.branch || `hive/${args.taskId}`;
     const label = fleetLabel(args.taskId, args.title);
 
-    const create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
+    let create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
+    // A respawn reuses the task id, and so the branch and the worktree path. A
+    // worktree left behind by a dead agent (or by a spawn that created the
+    // worktree and then failed at `agent start`) collides here and, without
+    // this, the dispatcher retries the same task id forever. Reclaim it —
+    // preserving any uncommitted work to a ghost branch — and retry once. Real
+    // commits ride on `branch` and survive the recreate.
+    if (create.code !== 0 && isWorktreeExistsError(create)) {
+      const rec = await this.reclaimWorktree({
+        repoPath: args.repoPath,
+        branch,
+        taskId: args.taskId,
+        hintPath: parseExistingWorktreePath(`${create.stdout}\n${create.stderr}`),
+      });
+      if (rec.reclaimed) create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
+    }
     if (create.code !== 0)
       throw new HerdrError(`worktree create failed: ${create.stderr.trim() || create.stdout.trim()}`);
     const wt = parseWorktreeJson(create.stdout);
@@ -349,8 +432,21 @@ export class Herdr {
     }
   }
 
+  // Steer an agent: write the text, then submit it with an explicit Enter to the
+  // agent's pane (agent send alone leaves the text unsubmitted in the composer).
   async send(target: string, message: string): Promise<ExecResult> {
-    return this.run(agentSendArgv(target, message));
+    const sent = await this.run(agentSendArgv(target, message));
+    try {
+      const got = await this.run(agentGetArgv(target));
+      const paneId = parsePaneId(got.stdout);
+      if (paneId) await this.run(paneSendKeysArgv(paneId, "Enter"));
+    } catch {
+      // Text landed; a swallowed/failed Enter leaves the agent idle, which the
+      // reconciler surfaces as a stalled task rather than a silent drop.
+      // ponytail: single Enter, no verify-and-retry. Add a composer-state read +
+      // Enter-retry (priortool's fm-send pattern) if swallowed-Enter recurs.
+    }
+    return sent;
   }
 
   async focus(target: string): Promise<ExecResult> {
@@ -397,6 +493,79 @@ export class Herdr {
     return alive ? status : "gone";
   }
 
+  // Reclaim a leftover worktree so the branch can be checked out fresh.
+  //
+  // NEVER destroys work: if the worktree is dirty, the uncommitted state is
+  // committed onto a `ghost-<taskId>` branch first, and any failure along that
+  // rescue throws BEFORE the removal, leaving the worktree exactly as found. A
+  // dead one-shot agent really can leave real work behind (2026-07-09).
+  //
+  // Removal goes through git, not herdr: `herdr worktree remove` takes only
+  // `--workspace ID` (verified live against 0.7.1), and a worktree orphaned by
+  // an agent death usually has no surviving herdr workspace to name.
+  async reclaimWorktree(args: {
+    repoPath: string;
+    branch: string;
+    taskId: string;
+    hintPath?: string | null; // the path git named in its refusal, when known
+  }): Promise<{ reclaimed: boolean; ghost_branch: string | null; path: string | null; reason: string }> {
+    const miss = (reason: string, path: string | null = null) => ({ reclaimed: false, ghost_branch: null, path, reason });
+
+    const list = await this.exec(["git", "-C", args.repoPath, "worktree", "list", "--porcelain"]);
+    if (list.code !== 0) return miss("git worktree list failed");
+
+    // Trust the path git named; only fall back to the branch when it named none.
+    // Resolving a hinted path by branch instead could remove a DIFFERENT
+    // worktree and leave the offending one in place.
+    const entries = parseWorktreeList(list.stdout);
+    const wt = args.hintPath
+      ? entries.find((e) => e.path === args.hintPath)
+      : entries.find((e) => e.branch === args.branch);
+    // ponytail: an unregistered directory in the way is left alone — refusing
+    // beats `rm -rf` on a path we cannot prove is ours. Surfaces as spawn_error.
+    if (!wt) return miss("no registered worktree to reclaim", args.hintPath ?? null);
+
+    const status = await this.exec(["git", "-C", wt.path, "status", "--porcelain"]);
+    if (status.code !== 0) return miss("git status failed in worktree", wt.path);
+
+    let ghost: string | null = null;
+    if (status.stdout.trim()) {
+      ghost = await this.freeGhostBranch(args.repoPath, args.taskId);
+      // Branch first, then commit: `hive/<taskId>` keeps pointing at whatever
+      // the agent had already committed, so the recreate resumes from there
+      // while the loose WIP lands on the ghost.
+      const co = await this.exec(["git", "-C", wt.path, "checkout", "-b", ghost]);
+      if (co.code !== 0) throw new HerdrError(`ghost branch ${ghost} checkout failed: ${co.stderr.trim() || co.stdout.trim()}`);
+      const add = await this.exec(["git", "-C", wt.path, "add", "-A"]);
+      if (add.code !== 0) throw new HerdrError(`ghost stage failed: ${add.stderr.trim() || add.stdout.trim()}`);
+      // --no-verify: a repo pre-commit hook must not be able to block a rescue.
+      const commit = await this.exec([
+        "git", "-C", wt.path, "commit", "--no-verify", "-m", `hive: WIP rescued from ${args.taskId}`,
+      ]);
+      if (commit.code !== 0) throw new HerdrError(`ghost commit failed: ${commit.stderr.trim() || commit.stdout.trim()}`);
+    }
+
+    const rm = await this.exec(["git", "-C", args.repoPath, "worktree", "remove", "--force", wt.path]);
+    if (rm.code !== 0) throw new HerdrError(`worktree remove failed: ${rm.stderr.trim() || rm.stdout.trim()}`);
+    return {
+      reclaimed: true,
+      ghost_branch: ghost,
+      path: wt.path,
+      reason: ghost ? `dirty; WIP preserved on ${ghost}` : "clean; removed",
+    };
+  }
+
+  // First unused `ghost-<taskId>[-N]`. A task id can be rescued more than once
+  // (the dispatcher retries on a backoff), so the plain name will be taken.
+  async freeGhostBranch(repoPath: string, taskId: string): Promise<string> {
+    for (let n = 1; n <= 50; n++) {
+      const name = n === 1 ? `ghost-${taskId}` : `ghost-${taskId}-${n}`;
+      const r = await this.exec(["git", "-C", repoPath, "rev-parse", "--verify", "--quiet", `refs/heads/${name}`]);
+      if (r.code !== 0) return name; // no such ref → free
+    }
+    throw new HerdrError(`too many ghost branches for ${taskId}`);
+  }
+
   // Teardown: remove the worktree only after the branch is pushed or merged.
   // Verify with git; refuse (removed:false) otherwise. Never destroys work.
   async teardown(args: {
@@ -435,6 +604,76 @@ export class Herdr {
       if (names.includes(branch)) return { safe: true, reason: "merged" };
     }
     return { safe: false, reason: "branch not pushed to origin nor merged; refusing to remove worktree" };
+  }
+
+  // Cleanup removal for a FINISHED task's worktree. Keeps teardown's guard (only
+  // removes once the branch is pushed/merged, so committed work is safe upstream)
+  // and additionally never drops uncommitted WORK: if the tree carries tracked
+  // modifications, they are preserved to a ghost-<taskId> branch before removal
+  // (reusing reclaimWorktree). Purely-untracked/ignored files (tooling artifacts
+  // like .serena/ or the injected .claude/settings.local.json) are discarded by
+  // the force removal. Removal goes through git, not herdr, because a finished
+  // task's worktree usually has no surviving herdr workspace to name.
+  async cleanupWorktree(args: {
+    repoPath: string;
+    branch: string;
+    worktreePath: string;
+    taskId: string;
+    defaultBranch?: string;
+  }): Promise<{ removed: boolean; reason: string; ghost_branch: string | null }> {
+    const safe = await this.branchIsSafe(args.repoPath, args.branch, args.defaultBranch ?? "main");
+    if (!safe.safe) return { removed: false, reason: safe.reason, ghost_branch: null };
+
+    const status = await this.exec(["git", "-C", args.worktreePath, "status", "--porcelain"]);
+    const trackedDirty =
+      status.code === 0 &&
+      status.stdout.split("\n").some((l) => l.length > 0 && !l.startsWith("??"));
+
+    if (trackedDirty) {
+      // Real uncommitted work on an otherwise-safe branch: preserve, then remove.
+      const rec = await this.reclaimWorktree({
+        repoPath: args.repoPath,
+        branch: args.branch,
+        taskId: args.taskId,
+        hintPath: args.worktreePath,
+      });
+      return {
+        removed: rec.reclaimed,
+        reason: rec.reclaimed ? `${safe.reason}; WIP preserved on ${rec.ghost_branch}` : rec.reason,
+        ghost_branch: rec.ghost_branch,
+      };
+    }
+
+    const rm = await this.exec(["git", "-C", args.repoPath, "worktree", "remove", "--force", args.worktreePath]);
+    if (rm.code !== 0)
+      return { removed: false, reason: `worktree remove failed: ${rm.stderr.trim() || rm.stdout.trim()}`, ghost_branch: null };
+    return { removed: true, reason: safe.reason, ghost_branch: null };
+  }
+
+  // Close a finished task's herdr "session": the labelled tab (which takes its
+  // pane + agent with it), falling back to closing the agent's pane directly.
+  // Best-effort and never throws — a visibility hiccup must not break cleanup.
+  async closeSession(args: {
+    agentTarget?: string | null;
+    tabId?: string | null;
+  }): Promise<{ closed: boolean; via: string | null }> {
+    try {
+      if (args.tabId) {
+        const r = await this.run(tabCloseArgv(args.tabId));
+        if (r.code === 0) return { closed: true, via: `tab ${args.tabId}` };
+      }
+      if (args.agentTarget) {
+        const got = await this.run(agentGetArgv(args.agentTarget));
+        const paneId = parsePaneId(got.stdout);
+        if (paneId) {
+          const r = await this.run(paneCloseArgv(paneId));
+          if (r.code === 0) return { closed: true, via: `pane ${paneId}` };
+        }
+      }
+    } catch {
+      /* best-effort */
+    }
+    return { closed: false, via: null };
   }
 }
 

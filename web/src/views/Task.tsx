@@ -4,10 +4,14 @@ import { api } from "../lib/api";
 import type { Decision, Evidence, TaskDetail } from "../lib/api";
 import { useStore } from "../lib/store";
 import { CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { ReviewCard } from "./ReviewCard";
 import { relTime } from "../lib/time";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
 import { fmtTokens, fmtUsd } from "./Analytics";
+import { buildTimeline } from "../lib/timeline";
+import type { TimelineItem } from "../lib/timeline";
+import { eventText } from "../lib/eventText";
 
 // Compact per-task usage line: tokens + estimated cost, only when usage exists.
 function UsageLine({ id, rev }: { id: string; rev: number }) {
@@ -80,6 +84,91 @@ function DecisionMini({ d }: { d: Decision }) {
   );
 }
 
+// One timeline row, dispatched on the folded item kind. Transcript text and
+// decision prompts render as prominent blocks; grouped tools collapse into an
+// expandable "used N tools" row; everything else stays a quiet one-liner.
+function TimelineRow({ it }: { it: TimelineItem }) {
+  if (it.kind === "text") {
+    return (
+      <li className="tl-text">
+        <div className="tl-text-head">
+          <span className={`src src-${it.source}`}>{it.source}</span>
+          <span className="tl-age" title={it.ts}>{relTime(it.ts)}</span>
+        </div>
+        <div className="tl-bubble">{it.text}</div>
+      </li>
+    );
+  }
+
+  if (it.kind === "tools") {
+    return (
+      <li className="tl-tools">
+        <details>
+          <summary>
+            <span className="tl-tools-count">used {it.tools.length} tool{it.tools.length === 1 ? "" : "s"}</span>
+            <span className="tl-chips">
+              {it.tools.map((tl, i) => (
+                <span key={i} className="chip chip-tool">{tl.tool}</span>
+              ))}
+            </span>
+            <span className="tl-age" title={it.ts}>{relTime(it.ts)}</span>
+          </summary>
+          <ul className="tl-tool-list">
+            {it.tools.map((tl, i) => (
+              <li key={i}>
+                <span className="chip chip-tool">{tl.tool}</span>
+                {tl.summary && <code className="tl-tool-sum">{tl.summary}</code>}
+              </li>
+            ))}
+          </ul>
+        </details>
+      </li>
+    );
+  }
+
+  if (it.kind === "decision") {
+    const d = it.decision;
+    return (
+      <li className="tl-decision">
+        <div className="tl-decision-head">
+          <span className="tl-decision-badge">🔶 {it.open ? "Awaiting your decision" : "Decision requested"}</span>
+          <span className="tl-age" title={it.ts}>{relTime(it.ts)}</span>
+        </div>
+        <div className="tl-decision-q">{d.title}</div>
+        {d.context && <div className="tl-decision-ctx">{d.context}</div>}
+        {d.options && d.options.length > 0 && (
+          <ul className="tl-decision-opts">
+            {d.options.map((o) => (
+              <li key={o.key} className={!it.open && o.key === d.answer_key ? "opt-chosen" : ""}>
+                {o.label || o.key}
+              </li>
+            ))}
+          </ul>
+        )}
+        {it.open ? (
+          <Link className="btn btn-primary btn-mini" to="/decisions">Answer in inbox →</Link>
+        ) : (
+          <div className="tl-decision-answer">
+            ✓ You answered: <strong>{it.answerLabel}</strong>
+            {d.answer_note && <> — {d.answer_note}</>}
+            {d.answered_at && <span className="tl-age"> · {relTime(d.answered_at)}</span>}
+          </div>
+        )}
+      </li>
+    );
+  }
+
+  const ev = it.ev;
+  return (
+    <li>
+      <span className={`src src-${ev.source}`}>{ev.source}</span>
+      <span className="tl-type">{ev.type}</span>
+      <span className="tl-note">{eventText(ev)}</span>
+      <span className="tl-age" title={ev.ts}>{relTime(ev.ts)}</span>
+    </li>
+  );
+}
+
 export default function TaskPage() {
   const { id = "" } = useParams();
   return <TaskBody id={id} />;
@@ -94,6 +183,8 @@ export function TaskBody({ id }: { id: string }) {
   const [err, setErr] = useState<string>("");
   const [steer, setSteer] = useState("");
   const [planning, setPlanning] = useState(false);
+
+  const refresh = () => api.task(id).then(setT).catch(() => {});
 
   useEffect(() => {
     let live = true;
@@ -110,7 +201,7 @@ export function TaskBody({ id }: { id: string }) {
   if (!t) return <div className="pad">Loading…</div>;
 
   const project = projects.find((p) => p.id === t.project_id);
-  const events = [...t.events].sort((a, b) => (a.ts < b.ts ? 1 : -1));
+  const timeline = buildTimeline(t.events, t.decisions);
   const openDecisions = t.decisions.filter((d) => d.status === "open");
   const pastDecisions = t.decisions.filter((d) => d.status !== "open");
   const children = tasks.filter((x) => x.parent_task_id === t.id);
@@ -196,12 +287,22 @@ export function TaskBody({ id }: { id: string }) {
           )}
         </div>
         <h1 className="task-title">
-          <StatusDot state={t.state} health={t.health} /> {t.title}
+          <StatusDot state={t.state} health={t.health} />{" "}
+          <span className="task-num" title="Task number">#{t.number}</span> {t.title}
         </h1>
         <div className="task-sub">
           {project && <span className="chip">{project.name}</span>}
           <span className={`chip chip-kind chip-${t.kind}`}>{t.kind}</span>
           <span className="chip">{STATE_LABEL[t.state]}</span>
+          {t.duplicate_of && (
+            <Link
+              className="chip chip-duplicate"
+              to={`/tasks/${t.duplicate_of}`}
+              title="This task was cancelled as a duplicate; open the task it was folded into"
+            >
+              ⧉ duplicate of {tasks.find((x) => x.id === t.duplicate_of)?.title ?? `#${t.duplicate_of}`}
+            </Link>
+          )}
           <UsageLine id={t.id} rev={rev[t.id] || 0} />
         </div>
 
@@ -228,6 +329,8 @@ export function TaskBody({ id }: { id: string }) {
             </div>
           </div>
         )}
+
+        {t.state === "in_review" && <ReviewCard task={t} onDone={refresh} defaultExpanded />}
 
         <section className="panel">
           <h2>Brief</h2>
@@ -296,23 +399,8 @@ export function TaskBody({ id }: { id: string }) {
         <section className="panel">
           <h2>Timeline</h2>
           <ul className="timeline">
-            {events.map((ev) => (
-              <li key={ev.id}>
-                <span className={`src src-${ev.source}`}>{ev.source}</span>
-                <span className="tl-type">{ev.type}</span>
-                <span className="tl-note">
-                  {(ev.payload?.note as string) ||
-                    (ev.payload?.to
-                      ? `${ev.payload.from} → ${ev.payload.to}`
-                      : "") ||
-                    (ev.payload?.caption as string) ||
-                    (ev.payload?.title as string) ||
-                    ""}
-                </span>
-                <span className="tl-age" title={ev.ts}>
-                  {relTime(ev.ts)}
-                </span>
-              </li>
+            {timeline.map((it) => (
+              <TimelineRow key={it.id} it={it} />
             ))}
           </ul>
         </section>
@@ -322,8 +410,8 @@ export function TaskBody({ id }: { id: string }) {
         <section className="panel">
           <h2>PR / CI</h2>
           {t.pr_url ? (
-            <a className="pr pr-lg" href={t.pr_url} target="_blank" rel="noreferrer">
-              View PR
+            <a className="pr pr-lg" href={t.pr_url} target="_blank" rel="noreferrer" title={`Pull request linked to #${t.number}`}>
+              View PR ↔ #{t.number}
             </a>
           ) : (
             <div className="muted">No PR yet</div>

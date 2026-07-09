@@ -227,24 +227,47 @@ export default function Palette() {
         .sort((a, b) => a.s - b.s)
         .map((x) => x.it);
     }
-    const hitItems: Item[] = hits.map((h) => ({
-      key: `hit:${h.type}:${h.id}`,
-      group: TYPE_GROUP[h.type],
-      icon: TYPE_ICON[h.type],
-      label: h.title || "(untitled)",
-      sub: h.snippet || (h.task_state ? h.task_state : undefined),
-      hint: h.type === "task" ? h.task_state : undefined,
-      run: () => {
-        close();
-        if (h.type === "task") openTask(h.id);
-        else if (h.type === "decision") navigate(`/decisions#dcard-${h.id}`);
-        else if (h.type === "learning") navigate("/learnings");
-        else if (h.type === "policy") navigate("/policies");
-        else if (h.type === "project") navigate("/projects");
-      },
-    }));
-    return [...cmds, ...hitItems];
-  }, [query, core, extra, hits]);
+    // Direct task-number lookup: "#42" or bare "42" jumps straight to that task
+    // (the server search is text-only and never matches the numeric handle).
+    const numItems: Item[] = [];
+    const numMatch = /^#?(\d+)$/.exec(q);
+    if (numMatch) {
+      const n = Number(numMatch[1]);
+      const t = tasks.find((x) => x.number === n);
+      if (t)
+        numItems.push({
+          key: `hit:num:${t.id}`,
+          group: "Tasks",
+          icon: "◱",
+          label: `#${t.number} ${t.title}`,
+          sub: t.state,
+          hint: t.state,
+          run: () => {
+            close();
+            openTask(t.id);
+          },
+        });
+    }
+    const hitItems: Item[] = hits
+      .filter((h) => !(h.type === "task" && numItems.some((n) => n.key === `hit:num:${h.id}`)))
+      .map((h) => ({
+        key: `hit:${h.type}:${h.id}`,
+        group: TYPE_GROUP[h.type],
+        icon: TYPE_ICON[h.type],
+        label: h.title || "(untitled)",
+        sub: h.snippet || (h.task_state ? h.task_state : undefined),
+        hint: h.type === "task" ? h.task_state : undefined,
+        run: () => {
+          close();
+          if (h.type === "task") openTask(h.id);
+          else if (h.type === "decision") navigate(`/decisions#dcard-${h.id}`);
+          else if (h.type === "learning") navigate("/learnings");
+          else if (h.type === "policy") navigate("/policies");
+          else if (h.type === "project") navigate("/projects");
+        },
+      }));
+    return [...numItems, ...cmds, ...hitItems];
+  }, [query, core, extra, hits, tasks]);
 
   useEffect(() => {
     setSel((s) => (s >= items.length ? 0 : s));

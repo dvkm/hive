@@ -2,6 +2,23 @@
 // GET /api/tasks/:id/brief. Pure function of DB state.
 import type { DB } from "./db.ts";
 import { getTask } from "./state.ts";
+import { prTitlePrefix, prBodyFooter } from "./marker.ts";
+
+// The PR marker contract (documented in docs/API.md). Both halves are REQUIRED
+// on any PR the agent opens so hive can link the PR back to this task.
+function prMarkerSection(number: number, id: string): string {
+  return `## Opening a PR (REQUIRED marker)
+When you open the PR for this task — whether via /no-mistakes or directly with
+\`gh pr create\` — it MUST carry the hive marker so the board links the PR back
+to this task automatically:
+
+- The PR **title** MUST start with \`${prTitlePrefix(number)}\` (the space is part of it).
+- The PR **body** MUST include this line on its own (a footer is ideal):
+
+  ${prBodyFooter(id)}
+
+Don't hand-format it — run \`hive pr-marker ${id}\` and paste what it prints.`;
+}
 
 const EMIT_PROTOCOL = `## Reporting protocol (\`hive emit\`)
 You are running under hive. Report progress with the \`hive emit\` CLI so the
@@ -19,6 +36,23 @@ Rules:
 - Scout tasks (knowledge-only) require a written report as evidence.
 - When you hit a decision the director must make, emit \`needs-decision\` and
   stop; do not guess on anything high-risk (prod, feature flags, destructive ops).`;
+
+// Kept in sync with DENIED_MCP_SERVERS in api.ts, which writes the matching
+// permissions.deny into each worktree's .claude/settings.local.json.
+const BROWSER_VERIFICATION = `## Browser verification (headless only)
+The interactive browser MCP servers (claude-in-chrome, computer-use) are DENIED
+in your worktree settings and will not appear in your tool list. They pop an
+Allow/Deny dialog, and nobody is watching your pane, so a call to one used to
+hang the agent forever. Verify web changes headlessly instead:
+
+  curl -sS -i http://127.0.0.1:<port>/<path>        # status, headers, HTML, JSON
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \\
+    --headless --disable-gpu --screenshot=out.png --window-size=1280,800 <url>
+
+If the repo already depends on Playwright or Puppeteer, drive that instead of
+raw Chrome. Attach the result as evidence:
+
+  hive emit <task-id> evidence --file out.png --note "logged-in dashboard"`;
 
 // Standing-authority section: the active rules (global + project) that govern
 // this agent, plus the exact guarded-action protocol. The server enforces these
@@ -85,11 +119,13 @@ export function composeBrief(db: DB, taskId: string): string {
     .all(projectScope) as { title: string; body: string }[];
 
   const parts: string[] = [];
-  parts.push(`# Task: ${task.title}`);
-  parts.push(`Task id: ${task.id}\nKind: ${task.kind}`);
+  parts.push(`# Task #${task.number}: ${task.title}`);
+  parts.push(`Task number: ${task.number}\nTask id: ${task.id}\nKind: ${task.kind}`);
   parts.push(`## Brief\n${task.brief?.trim() || "(no description provided)"}`);
   parts.push(definitionOfDone(task.kind));
   parts.push(EMIT_PROTOCOL);
+  parts.push(prMarkerSection(task.number, task.id));
+  parts.push(BROWSER_VERIFICATION);
 
   if (globals.length) {
     parts.push(
