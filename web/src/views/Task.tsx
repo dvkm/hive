@@ -55,6 +55,12 @@ function DecisionMini({ d }: { d: Decision }) {
 
 export default function TaskPage() {
   const { id = "" } = useParams();
+  return <TaskBody id={id} />;
+}
+
+// The task detail content, shared by the standalone /tasks/:id route and the
+// board modal (see App.tsx / views/TaskModal.tsx).
+export function TaskBody({ id }: { id: string }) {
   const { rev, projects, tasks } = useStore();
   const [t, setT] = useState<TaskDetail | null>(null);
   const [err, setErr] = useState<string>("");
