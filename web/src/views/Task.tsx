@@ -205,6 +205,15 @@ export function TaskBody({ id }: { id: string }) {
           {project && <span className="chip">{project.name}</span>}
           <span className={`chip chip-kind chip-${t.kind}`}>{t.kind}</span>
           <span className="chip">{STATE_LABEL[t.state]}</span>
+          {t.duplicate_of && (
+            <Link
+              className="chip chip-duplicate"
+              to={`/tasks/${t.duplicate_of}`}
+              title="This task was cancelled as a duplicate; open the task it was folded into"
+            >
+              ⧉ duplicate of {tasks.find((x) => x.id === t.duplicate_of)?.title ?? `#${t.duplicate_of}`}
+            </Link>
+          )}
           <UsageLine id={t.id} rev={rev[t.id] || 0} />
         </div>
 

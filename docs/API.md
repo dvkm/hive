@@ -74,6 +74,7 @@ tasks keep referencing it, there is no hard delete).
   "summary": "Shipped dark mode toggle; all tests green.",
   "source": null,
   "parent_task_id": null,
+  "duplicate_of": null,
   "health": { "status": "healthy", "reason": null, "since": "..." },
   "created_at": "...",
   "updated_at": "..."
@@ -105,6 +106,10 @@ companion `source_ref` column (not returned) holds the upstream message resource
 name and is uniquely indexed for dedupe.
 `parent_task_id` is null for top-level tasks, or the id of the source task a
 `"planner"` task was broken out of (links a child to its parent).
+`duplicate_of` is null for normal tasks, or the id of the SURVIVOR task this one
+was folded into when it was cancelled as a duplicate (see Duplicate detection
+below). Set only on a `cancelled` task; the survivor keeps working. Tasks are
+never deleted, so the cancelled row + this pointer preserve the full history.
 
 ### Event
 ```json
@@ -157,6 +162,13 @@ Domain-supervisor events (written by the planner, `source: system`):
   `payload: {decision_id, source_task_id, proposed_tasks:[{title,brief,kind}], rationale, questions:[]}`
 - `planner_error` — the planner failed (spawn error, non-zero exit, timeout, or
   unparseable output). A single diagnostic; no retry. `payload: {error}`
+
+Duplicate-detection events (written by the dedup path, `source: system`):
+- `duplicate_merged` — a task was folded into another. Written on BOTH tasks: on
+  the survivor `payload: {duplicate_task_id, title, note?}` (`note` carries the
+  folded brief when it added anything); on the folded task `payload: {duplicate_of}`.
+- `duplicate_suspected` — a near-duplicate opened a decision card on the NEW task.
+  `payload: {decision_id, survivor_id, tier, score}`.
 
 Standing-authority events (written by the policy engine, `source: system` unless noted):
 - `authority_logged` — an action was allowed (matched an `allow` rule, defaulted to allow when unmatched, or passed by consuming a grant). `payload: {action, target, effect:"allow", rule_id?, via_grant?}`
@@ -356,6 +368,17 @@ cost_usd, calls, unpriced}` (summed cost counts priced rows only).
   SAME task and clears its runtime binding).
 - `POST /api/tasks/:id/cleanup` body `{}` → `200 {"ok":true, "cleaned":bool, "worktree":{removed,reason,ghost_branch}|null, "session":{closed,via}}` | `404` | `409` (task not terminal)
   Manual force-teardown for a **terminal** task (`done`/`cancelled`/`failed`): removes its git worktree and closes its herdr session. Refuses (`409`) on a live task so an in-flight worktree is never pulled out from under a working agent. Keeps every safety guard: the worktree is removed only when its branch is pushed/merged (else `cleanup_skipped`), and any tracked uncommitted work is preserved to a `ghost-<task-id>` branch first. Backstop for the auto-teardown that fires on the `done`/`cancelled` transition and the periodic reaper sweep.
+- `POST /api/tasks/:id/merge-into` body `{target_id (required)}` → `200 Task` (now `cancelled`) | `400` (missing/self `target_id`) | `404` (task or target missing) | `409` (source is already terminal)
+  Manual duplicate merge: fold this task into `target_id` and cancel it as a
+  duplicate. Writes a `duplicate_merged` event on both tasks, sets this task's
+  `duplicate_of` to the target, and cancels it (reason `duplicate of <target>`).
+  Never deletes. **Distinct from `POST /merge`** (the PR/branch approve-and-merge).
+- `GET /api/tasks/duplicates` → `200 {"clusters": [{project_id, tasks:[{id,title,project_id,state,created_at}]}]}`
+  Detected duplicate CLUSTERS among the current non-terminal tasks (queued /
+  in_progress / needs_decision / in_review / verifying), grouped within a project
+  by the same exact/near-title rule the on-create detector uses (union-find; only
+  clusters of size ≥ 2 are returned). For a backfill/triage UI over dups that
+  already exist.
 - `GET /api/tasks/:id/brief` → `200 {"task_id":"...", "brief":"<multiline string>"}` | `404`
   (task description + definition of done + `hive emit` protocol + active global + project policies + standing-authority section)
 - `POST /api/tasks/:id/guarded-action` body `{action (required), target (required), detail?}` → see below | `404` | `400`
@@ -676,6 +699,32 @@ a single `spawn_error` event and back off exponentially per task
 Manual dispatch (the web "dispatch now" button → `POST /api/tasks/:id/spawn`)
 bypasses these policy gates but still runs the `task.spawn` authority gate. See
 `docs/runtime.md`.
+
+### Duplicate detection & auto-merge (`server/src/dedup.ts`)
+Ghost-task recreation and repeated asks produce real duplicate tasks (e.g. two
+"intake form" tasks). Every `POST /api/tasks` runs detection against the existing
+NON-TERMINAL tasks in the SAME project (keyed on task `id`/`title`, never on the
+`number` column). The survivor is always the OLDER task.
+
+- **Normalization / similarity.** Exact = normalized titles equal (trim,
+  lowercase, collapse whitespace, strip trailing punctuation). Near =
+  `titleSimilarity(a,b)` ≥ `0.6`, a pure word-set Jaccard (|A∩B|/|A∪B|) over the
+  normalized title words — no dependencies. `0.8` is the "very strong" mark that
+  flips the decision card's recommended option to *merge*.
+- **Exact duplicate of a brand-new task (queued, no `agent_target`) → auto-merge,
+  no interruption.** The new task is folded into the survivor and cancelled with
+  `duplicate_of` set; both get a `duplicate_merged` event (the survivor's carries
+  the folded brief when it adds anything). The `POST /api/tasks` response is the
+  new task in its resulting `cancelled` state.
+- **Near duplicate (or an exact dup of a task that has already started) → a
+  decision card on the NEW task**, titled `Possible duplicate of "<survivor>"`,
+  options `merge` / `keep-separate` (a `duplicate_suspected` event links it). The
+  new task stays `queued`; nothing is auto-cancelled. Answering `merge` runs the
+  same fold+cancel; `keep-separate` records the decision and leaves both.
+- **Safety.** A task with an `agent_target` or past `queued` is NEVER
+  auto-cancelled — only a brand-new queued task is auto-merged; everything with
+  work in flight goes through the decision card (or the manual `/merge-into`,
+  which still refuses to cancel an already-terminal task).
 
 ### Auto-cleanup & the reaper (finished-task teardown)
 Finished tasks get their runtime torn down automatically so orphan worktrees and
