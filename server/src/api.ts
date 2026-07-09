@@ -904,6 +904,16 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, body: any): Promise<R
   }
 }
 
+// MCP servers whose tools open an interactive Allow/Deny dialog. A spawned
+// worker has no human at its pane, so the dialog blocks the session forever
+// (health=stuck, seen 2026-07-09). A bare `mcp__<server>` deny entry drops every
+// tool of that server from the agent's context — verified live: the denied tools
+// are not merely rejected on call, they never appear, so no dialog can fire.
+// Deny beats allow across all settings scopes, which is why this reaches
+// claude-in-chrome even though the Chrome extension (not .mcp.json) registers
+// it. Browser verification goes headless instead (BROWSER_VERIFICATION, briefs.ts).
+const DENIED_MCP_SERVERS = ["mcp__claude-in-chrome", "mcp__computer-use"];
+
 // Write hive's Claude Code hook wiring into a spawned worktree. Uses
 // settings.local.json (the per-directory override, gitignored by Claude Code
 // convention) so the agent reports Stop/SubagentStop/PostToolUse to hive
@@ -912,6 +922,7 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, body: any): Promise<R
 function writeHookSettings(worktreePath: string, taskId: string, hiveUrl: string): void {
   const hook = join(HOOKS_DIR, "hive-hook.sh");
   const settings = {
+    permissions: { deny: DENIED_MCP_SERVERS },
     hooks: {
       Stop: [{ hooks: [{ type: "command", command: `${hook} Stop` }] }],
       SubagentStop: [{ hooks: [{ type: "command", command: `${hook} SubagentStop` }] }],

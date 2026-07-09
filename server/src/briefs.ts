@@ -20,6 +20,23 @@ Rules:
 - When you hit a decision the director must make, emit \`needs-decision\` and
   stop; do not guess on anything high-risk (prod, feature flags, destructive ops).`;
 
+// Kept in sync with DENIED_MCP_SERVERS in api.ts, which writes the matching
+// permissions.deny into each worktree's .claude/settings.local.json.
+const BROWSER_VERIFICATION = `## Browser verification (headless only)
+The interactive browser MCP servers (claude-in-chrome, computer-use) are DENIED
+in your worktree settings and will not appear in your tool list. They pop an
+Allow/Deny dialog, and nobody is watching your pane, so a call to one used to
+hang the agent forever. Verify web changes headlessly instead:
+
+  curl -sS -i http://127.0.0.1:<port>/<path>        # status, headers, HTML, JSON
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \\
+    --headless --disable-gpu --screenshot=out.png --window-size=1280,800 <url>
+
+If the repo already depends on Playwright or Puppeteer, drive that instead of
+raw Chrome. Attach the result as evidence:
+
+  hive emit <task-id> evidence --file out.png --note "logged-in dashboard"`;
+
 // Standing-authority section: the active rules (global + project) that govern
 // this agent, plus the exact guarded-action protocol. The server enforces these
 // before risky actions dispatch, so agents never serially ask for permission.
@@ -90,6 +107,7 @@ export function composeBrief(db: DB, taskId: string): string {
   parts.push(`## Brief\n${task.brief?.trim() || "(no description provided)"}`);
   parts.push(definitionOfDone(task.kind));
   parts.push(EMIT_PROTOCOL);
+  parts.push(BROWSER_VERIFICATION);
 
   if (globals.length) {
     parts.push(
