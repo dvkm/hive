@@ -150,6 +150,34 @@ export interface TaskDetail extends Task {
   decisions: Decision[];
 }
 
+export interface UsageTotals {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  calls: number;
+  unpriced: number;
+}
+export interface UsageRow {
+  id: string;
+  task_id: string;
+  ts: string;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number | null;
+  source: string;
+}
+export interface AnalyticsSummary {
+  since: string | null;
+  totals: UsageTotals;
+  by_model: (UsageTotals & { model: string })[];
+  by_project: (UsageTotals & { project_id: string; project_name: string })[];
+  top_tasks: (UsageTotals & { task_id: string; title: string; project_id: string })[];
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(BASE + path, {
     ...init,
@@ -239,6 +267,11 @@ export const api = {
   updateLearning: (id: string, b: Partial<Pick<Learning, "title" | "body" | "status">>) =>
     req<Learning>(`/api/learnings/${id}`, { method: "PUT", body: JSON.stringify(b) }),
   recurLearning: (id: string) => req<Learning>(`/api/learnings/${id}/recur`, { method: "POST", body: "{}" }),
+
+  analyticsSummary: (since?: string) =>
+    req<AnalyticsSummary>(`/api/analytics/summary${since ? "?since=" + encodeURIComponent(since) : ""}`),
+  taskUsage: (id: string) =>
+    req<{ task_id: string; usage: UsageRow[]; totals: UsageTotals }>(`/api/tasks/${id}/usage`),
 
   notifications: () => req<{ notifications: Notification[]; unread: number }>(`/api/notifications`),
   ackNotifications: () => req<{ ok: boolean; acked: number }>(`/api/notifications/ack`, { method: "POST", body: "{}" }),

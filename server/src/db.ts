@@ -206,6 +206,25 @@ const MIGRATIONS: string[] = [
   ALTER TABLE tasks ADD COLUMN parent_task_id TEXT;
   CREATE INDEX idx_tasks_parent ON tasks(parent_task_id) WHERE parent_task_id IS NOT NULL;
   `,
+  // v8 — cost/token analytics. One row per reported LLM call. cost_usd is NULL
+  // when the model is unpriced (surfaced as "unpriced"); otherwise computed
+  // server-side from the pricing table (server/src/pricing.ts). source tags the
+  // ingest path ('agent' via hive emit, 'hook' from the Stop-hook transcript).
+  `
+  CREATE TABLE usage (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    ts TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL,
+    source TEXT NOT NULL DEFAULT 'agent'
+  );
+  CREATE INDEX idx_usage_task ON usage(task_id, ts);
+  CREATE INDEX idx_usage_ts ON usage(ts);
+  `,
 ];
 
 export type DB = Database;
