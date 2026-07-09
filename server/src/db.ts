@@ -167,6 +167,38 @@ const MIGRATIONS: string[] = [
     PRIMARY KEY (source, key)
   );
   `,
+  // v6 — standing-authority policy engine. David grants scoped authority once;
+  // the server enforces it before risky actions dispatch. authority_rules match
+  // an action to an effect (allow | require_decision | deny); most-specific
+  // active rule wins (project over global, longer pattern over shorter).
+  // authority_grants are the consumable, single-use grants minted when a
+  // require_decision card is approved (scoped to action+target+task, 24h).
+  `
+  CREATE TABLE authority_rules (
+    id TEXT PRIMARY KEY,
+    project_id TEXT REFERENCES projects(id),   -- NULL = global
+    scope TEXT NOT NULL,                        -- display label: 'global' | 'project:<id>'
+    action_pattern TEXT NOT NULL,              -- glob, '*' wildcard
+    effect TEXT NOT NULL,                       -- allow | require_decision | deny
+    note TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX idx_authority_rules_lookup ON authority_rules(project_id, active);
+
+  CREATE TABLE authority_grants (
+    id TEXT PRIMARY KEY,
+    task_id TEXT,
+    action TEXT NOT NULL,
+    target TEXT NOT NULL,
+    decision_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',     -- pending | granted | denied | consumed
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    consumed_at TEXT
+  );
+  CREATE INDEX idx_authority_grants_lookup ON authority_grants(task_id, action, target, status);
+  `,
 ];
 
 export type DB = Database;

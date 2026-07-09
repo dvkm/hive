@@ -17,6 +17,9 @@ Usage:
         --option key:label:detail  (repeatable)  --recommend <key>
   hive policy add --title <t> --body <s>|--body-file <f> [--scope global|project:<id>]
   hive policy list [--scope <s>]
+  hive authority add --action <pattern> --effect allow|require_decision|deny [--project <id>] [--note <s>]
+  hive authority list [--project <id>]
+  hive authority rm <rule-id>
   hive learning add --project <id> --title <t> [--body <s>] [--task <src-task-id>] [--root-cause]
   hive learning list [--project <id>] [--status active|resolved]
   hive learning recur <learning-id>
@@ -196,6 +199,40 @@ async function main() {
       return;
     }
     die(`unknown 'policy' subcommand: ${sub}\n\n${USAGE}`);
+  }
+
+  if (cmd === "authority") {
+    const sub = argv[1];
+    const { _, flags } = parseFlags(argv.slice(2));
+    if (sub === "add") {
+      if (!flags.action) die("--action is required");
+      if (!flags.effect) die("--effect is required (allow | require_decision | deny)");
+      const r = await api("POST", "/api/authority/rules", {
+        project_id: flags.project,
+        action_pattern: flags.action,
+        effect: flags.effect,
+        note: flags.note,
+      });
+      console.log(`added authority rule ${r.id} [${r.scope}] ${r.action_pattern} -> ${r.effect}`);
+      return;
+    }
+    if (sub === "list") {
+      const qs = new URLSearchParams();
+      if (flags.project) qs.set("project_id", String(flags.project));
+      const rules = await api("GET", "/api/authority/rules?" + qs.toString());
+      if (!rules.length) return console.log("(no authority rules)");
+      for (const r of rules)
+        console.log(`${r.id}  ${r.active ? "on " : "off"} [${r.scope}] ${r.action_pattern.padEnd(18)} -> ${r.effect}`);
+      return;
+    }
+    if (sub === "rm") {
+      const id = _[0];
+      if (!id) die("usage: hive authority rm <rule-id>");
+      await api("DELETE", `/api/authority/rules/${id}`);
+      console.log(`removed authority rule ${id}`);
+      return;
+    }
+    die(`unknown 'authority' subcommand: ${sub}\n\n${USAGE}`);
   }
 
   if (cmd === "learning") {

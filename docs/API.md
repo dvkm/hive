@@ -103,6 +103,12 @@ Types written by the runtime layer (Phase 2b):
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
 - `smoke_passed` / `smoke_failed` — post-deploy smoke result. `payload: {results:[{name,ok,detail}], evidence_id?}`
 
+Standing-authority events (written by the policy engine, `source: system` unless noted):
+- `authority_logged` — an action was allowed (matched an `allow` rule, defaulted to allow when unmatched, or passed by consuming a grant). `payload: {action, target, effect:"allow", rule_id?, via_grant?}`
+- `authority_denied` — an action was blocked by a `deny` rule. `payload: {action, target, rule_id}`
+- `authority_required` — a `require_decision` rule opened a card gating the action. `payload: {action, target, decision_id, rule_id}`
+- `authority_granted` — the director approved the card; a single-use 24h grant was minted (`source: director`). `payload: {action, target, decision_id, expires_at}`
+
 ### Evidence
 ```json
 {
@@ -149,6 +155,18 @@ server-side autosaved draft.
 { "id": "pol_...", "scope": "global", "title": "No em-dashes", "body": "Use commas.", "active": true, "created_at": "...", "updated_at": "..." }
 ```
 `scope` is `"global"` or `"project:<project_id>"`. `active` is a boolean.
+
+### Authority rule (standing-authority policy engine)
+```json
+{ "id": "aur_...", "project_id": null, "scope": "global", "action_pattern": "deploy.prod*", "effect": "require_decision", "note": "confirm exact target", "active": true, "created_at": "..." }
+```
+`project_id` is null for a global rule or a project id for a project-scoped one;
+`scope` is the derived display label (`"global"` | `"project:<id>"`). `effect ∈
+{allow, require_decision, deny}`. `action_pattern` is a glob (`*` wildcard, whole
+string anchored, e.g. `deploy.prod` or `flag.*`). Evaluation for an action:
+most-specific active rule wins (project over global, then longer literal pattern
+over shorter); an unmatched action defaults to `allow` (log-only). See the
+Authority section below.
 
 ### Incident
 ```json
@@ -234,7 +252,23 @@ set on creation); normal ones are batched into a single digest every
 - `POST /api/tasks/:id/send` body `{message (required)}` → `200 {"ok":true, "delivered":true, "message":...}` | `404` | `400` (empty message)
   Dispatches the message to the task's live agent via `herdr agent send`. Always records a `steer` event. Degrades gracefully: if the task has no `agent_target` or herdr fails, returns `200 {"ok":false, "delivered":false, "error":"..."}` (never throws) and records a `steer_error` event when herdr itself failed.
 - `GET /api/tasks/:id/brief` → `200 {"task_id":"...", "brief":"<multiline string>"}` | `404`
-  (task description + definition of done + `hive emit` protocol + active global + project policies)
+  (task description + definition of done + `hive emit` protocol + active global + project policies + standing-authority section)
+- `POST /api/tasks/:id/guarded-action` body `{action (required), target (required), detail?}` → see below | `404` | `400`
+  The gate agents call BEFORE any externally-risky operation they run themselves
+  (prod deploy, feature-flag flip, destructive op). The server evaluates the
+  standing-authority rules for the task's project:
+  - `allow` → `200 {"ok":true, "effect":"allow"}` + an `authority_logged` event. Proceed.
+  - `deny` → `403 {"ok":false, "effect":"deny", "error":"..."}` + an `authority_denied` event. Stop.
+  - `require_decision` → `409 {"ok":false, "effect":"require_decision", "decision_id":"..."}`.
+    A decision card is opened naming the EXACT target (risk `high`, options
+    `approve`/`deny`) and the task is parked in `needs_decision`. The agent waits,
+    then retries the SAME call. Retrying while the card is still open returns the
+    same `decision_id` (no duplicate cards). Once the director answers `approve`,
+    a single-use grant scoped to that exact `action` + `target` + task (expiring
+    24h) is minted; the next identical call passes with `200 allow` and spends the
+    grant. Answering `deny` blocks it. Internal risky paths (`spawn`, `send`,
+    transitions into `verifying`/`done`) run through the same gate and return the
+    same `403` / `409 {decision_id}` shapes when a rule matches.
 
 ### Event ingestion — `POST /api/tasks/:id/events`
 The `hive emit` path. Accepts **either** `application/json` **or**
@@ -279,6 +313,16 @@ Behavior by `type`:
 - `GET /api/policies/:id` → `200 Policy` | `404`
 - `PUT /api/policies/:id` body `{title?, body?, scope?, active?}` → `200 Policy` | `404`
 - `DELETE /api/policies/:id` → `200 {"ok":true}`
+
+### Authority rules (standing-authority policy engine)
+Scoped rules that the server enforces before risky actions dispatch (see the
+`guarded-action` endpoint above and the event types). Grants are internal
+(single-use, minted on card approval); there is no grant endpoint.
+- `GET /api/authority/rules?project_id=` → `200 [AuthorityRule, ...]` (oldest first; `project_id` filter optional)
+- `POST /api/authority/rules` body `{action_pattern (required), effect?, project_id?, note?, active?}` → `201 AuthorityRule` | `400` (bad `effect` / unknown `project_id`)
+  `effect` defaults to `allow`; `scope` is derived from `project_id` (`global` when null).
+- `PUT /api/authority/rules/:id` body `{action_pattern?, effect?, note?, active?}` → `200 AuthorityRule` | `400` (bad `effect`) | `404` (deactivate = `active:false`)
+- `DELETE /api/authority/rules/:id` → `200 {"ok":true}`
 
 ### Incidents
 - `GET /api/incidents?status=` → `200 {"incidents": [Incident, ...]}` (newest first; `status` filter optional, e.g. `open` / `resolved`)

@@ -85,6 +85,17 @@ export interface Policy {
   updated_at: string;
 }
 
+export interface AuthorityRule {
+  id: string;
+  project_id: string | null;
+  scope: string; // "global" | "project:<id>"
+  action_pattern: string;
+  effect: "allow" | "require_decision" | "deny";
+  note: string | null;
+  active: boolean;
+  created_at: string;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -193,6 +204,13 @@ export const api = {
     req<Policy>(`/api/policies`, { method: "POST", body: JSON.stringify(b) }),
   updatePolicy: (id: string, b: Partial<Pick<Policy, "title" | "body" | "scope" | "active">>) =>
     req<Policy>(`/api/policies/${id}`, { method: "PUT", body: JSON.stringify(b) }),
+
+  authorityRules: (project_id?: string) =>
+    req<AuthorityRule[]>(`/api/authority/rules${project_id ? "?project_id=" + project_id : ""}`),
+  createAuthorityRule: (b: { project_id?: string | null; action_pattern: string; effect: string; note?: string }) =>
+    req<AuthorityRule>(`/api/authority/rules`, { method: "POST", body: JSON.stringify(b) }),
+  updateAuthorityRule: (id: string, b: Partial<Pick<AuthorityRule, "action_pattern" | "effect" | "note" | "active">>) =>
+    req<AuthorityRule>(`/api/authority/rules/${id}`, { method: "PUT", body: JSON.stringify(b) }),
 
   projects: () => req<Project[]>(`/api/projects`),
   // Incidents API is built in parallel; treat absence (404/network) as "not running yet".
