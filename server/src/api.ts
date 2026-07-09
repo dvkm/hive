@@ -245,6 +245,7 @@ function createTask(db: DB, body: any): Response {
     pr_url: null,
     ci_status: null,
     summary: null,
+    source: null,
     created_at: t,
     updated_at: t,
   };

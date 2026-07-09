@@ -63,6 +63,7 @@ bin/hive learning add --project <id> --title "..." [--body "..."] [--root-cause]
 bin/hive learning list [--project <id>] [--status active|resolved]
 bin/hive learning recur <learning-id>   # bump occurrences when the pattern recurs
 bin/hive spawn <task-id>                # start a herdr agent for a task
+bin/hive gchat auth                     # one-time Google Chat OAuth consent (intake connector)
 echo -n "s3cret" | bin/hive secret set --project <id> --name API_KEY
 bin/hive secret list --project <id>
 bin/hive secret rm --project <id> --name API_KEY
@@ -125,3 +126,16 @@ server/test/ bun test suite
   `hive secret set|list|rm` (`set` reads the value from stdin).
 - **Hooks** (`hooks/`) POST liveness events to `$HIVE_URL` when `$HIVE_TASK_ID`
   is set; fail silent + fast (2s curl cap). See `hooks/install.md`.
+
+## v2 notes (intake connector)
+
+- **Google Chat intake** (`server/src/intake/gchat.ts`, migration v5) polls the
+  spaces in each project's `config.gchat_spaces` (`[{space, label?}]`) every
+  `HIVE_GCHAT_POLL_MS` (default 60s) and drafts a `queued` ship task per new
+  message, tagged `source: intake_gchat` and marked UNREVIEWED. Message text is
+  untrusted (stored verbatim, never executed). Images (≤5MB, png/jpg/gif/webp)
+  become evidence; messages dedupe by resource name; self/bot messages skip.
+  OAuth (scope `chat.messages.readonly`) is set up once with `hive gchat auth`;
+  the connector is a hard no-op until a space is configured. Simplest durable
+  home for the allowlist: the existing per-project `config` column (the owning
+  project is the target), so no new table or endpoint.

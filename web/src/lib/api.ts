@@ -27,6 +27,7 @@ export interface Task {
   pr_url: string | null;
   ci_status: CiStatus;
   summary: string | null;
+  source: string | null;
   created_at: string;
   updated_at: string;
 }
