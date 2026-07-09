@@ -5,6 +5,7 @@ import { useStore } from "./lib/store";
 import { relTime } from "./lib/time";
 import Board from "./views/Board";
 import Feed from "./views/Feed";
+import Evidence from "./views/Evidence";
 import TaskPage from "./views/Task";
 import TaskModal from "./views/TaskModal";
 import Decisions from "./views/Decisions";
@@ -82,6 +83,7 @@ export default function App() {
             Board
           </NavLink>
           <NavLink to="/feed">Feed</NavLink>
+          <NavLink to="/evidence">Evidence</NavLink>
           <NavLink to="/decisions">
             Decisions
             {decisions.length > 0 && <span className="badge">{decisions.length}</span>}
@@ -99,6 +101,7 @@ export default function App() {
         <Routes location={background || location}>
           <Route path="/" element={<Board />} />
           <Route path="/feed" element={<Feed />} />
+          <Route path="/evidence" element={<Evidence />} />
           <Route path="/tasks/:id" element={<TaskPage />} />
           <Route path="/decisions" element={<Decisions />} />
           <Route path="/learnings" element={<Learnings />} />

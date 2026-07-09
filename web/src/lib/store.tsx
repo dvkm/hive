@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import type { Task, Decision, Project, Notification, Event, Evidence } from "./api";
+import type { Task, Decision, Project, Notification, Event, Evidence, Incident } from "./api";
 
 export type SseState = "connecting" | "open" | "reconnecting";
 
@@ -123,6 +123,19 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           bump(d.task_id);
         } else if (msg.type === "usage") {
           bump(msg.usage.task_id);
+        } else if (msg.type === "incident") {
+          // Fold standalone monitor incidents into the live feed as a synthetic
+          // "incident" event (no task_id). The Feed enriches it from projects.
+          const inc: Incident = msg.incident;
+          const synthetic: Event = {
+            id: inc.id + ":" + inc.status,
+            task_id: "",
+            ts: inc.ts,
+            source: "monitor",
+            type: "incident",
+            payload: { monitor: inc.monitor, status: inc.status, detail: inc.detail, project_id: inc.project_id },
+          };
+          setFeedEvents((prev) => [synthetic, ...prev].slice(0, FEED_CAP));
         } else if (msg.type === "notification") {
           const n: Notification = msg.notification;
           setNotifications((prev) => (prev.some((x) => x.id === n.id) ? prev : [n, ...prev]));

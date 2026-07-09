@@ -5,6 +5,8 @@ import type { Decision, Evidence, TaskDetail } from "../lib/api";
 import { useStore } from "../lib/store";
 import { CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { relTime } from "../lib/time";
+import { useLightbox } from "../lib/lightbox";
+import type { LightboxImage } from "../lib/lightbox";
 import { fmtTokens, fmtUsd } from "./Analytics";
 
 // Compact per-task usage line: tokens + estimated cost, only when usage exists.
@@ -28,20 +30,23 @@ function UsageLine({ id, rev }: { id: string; rev: number }) {
   );
 }
 
-function EvidenceItem({ e }: { e: Evidence }) {
+function EvidenceItem({ e, onOpen }: { e: Evidence; onOpen?: () => void }) {
   if (e.kind === "screenshot" && e.url) {
     return (
-      <a className="ev-img" href={e.url} target="_blank" rel="noreferrer">
+      <button className="ev-img" onClick={onOpen} title="Open">
         <img src={e.url} alt={e.caption || "screenshot"} />
         <span className="ev-cap">{e.caption}</span>
-      </a>
+      </button>
     );
   }
   const href = e.url || undefined;
   const inner = (
     <>
-      <span className={`chip chip-kind`}>{e.kind}</span>
-      <span className="ev-cap">{e.caption || e.path || e.url}</span>
+      <div className="ev-card-head">
+        <span className={`chip chip-kind`}>{e.kind}</span>
+        <span className="ev-cap">{e.caption || e.path || e.url}</span>
+      </div>
+      {e.preview && <pre className="ev-preview">{e.preview}</pre>}
     </>
   );
   return href ? (
@@ -84,6 +89,7 @@ export default function TaskPage() {
 // board modal (see App.tsx / views/TaskModal.tsx).
 export function TaskBody({ id }: { id: string }) {
   const { rev, projects, tasks } = useStore();
+  const lightbox = useLightbox();
   const [t, setT] = useState<TaskDetail | null>(null);
   const [err, setErr] = useState<string>("");
   const [steer, setSteer] = useState("");
@@ -256,16 +262,36 @@ export function TaskBody({ id }: { id: string }) {
           </section>
         )}
 
-        {t.evidence.length > 0 && (
-          <section className="panel">
-            <h2>Evidence ({t.evidence.length})</h2>
-            <div className="ev-gallery">
-              {t.evidence.map((e) => (
-                <EvidenceItem key={e.id} e={e} />
-              ))}
-            </div>
-          </section>
-        )}
+        {t.evidence.length > 0 && (() => {
+          // Image evidence forms one lightbox set; each thumbnail opens at its
+          // own position so the arrows walk the whole task's images.
+          const imgs = t.evidence.filter((e) => e.kind === "screenshot" && e.url);
+          const lb: LightboxImage[] = imgs.map((e) => ({
+            url: e.url!,
+            caption: e.caption,
+            taskId: t.id,
+            taskTitle: t.title,
+            ts: e.ts,
+          }));
+          return (
+            <section className="panel">
+              <h2>Evidence ({t.evidence.length})</h2>
+              <div className="ev-gallery">
+                {t.evidence.map((e) => (
+                  <EvidenceItem
+                    key={e.id}
+                    e={e}
+                    onOpen={
+                      e.kind === "screenshot" && e.url
+                        ? () => lightbox.open(lb, imgs.findIndex((x) => x.id === e.id))
+                        : undefined
+                    }
+                  />
+                ))}
+              </div>
+            </section>
+          );
+        })()}
 
         <section className="panel">
           <h2>Timeline</h2>
