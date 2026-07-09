@@ -13,6 +13,8 @@ Decisions locked 2026-07-08: new system using herdr as agent runtime (D1), SQLit
 5. Supervision is the daemon's job, not an LLM's. Event-driven first (herdr status waits, Claude Code hooks, `hive emit`), plus a coarse time-based reconciler as fallback. No terminal scraping, no busy-signature regexes, ever.
 6. High-risk actions (prod deploys, feature flags, destructive ops) require a decision card that names the exact target before execution.
 7. Action-only surfaces: resolved decisions auto-archive; the inbox only shows what needs David.
+8. Future-proofness over shortcuts. Root-cause fixes, clean seams, boring durable tech. Never skip or shrink work because it "would take too long" — effort cost is not a valid argument in this project, and time estimates are never given. Push through.
+9. Versions ship continuously without waiting for a go-ahead. Each version ends with evidence (green tests, screenshots, a working demo recorded as evidence rows in hive itself), then work proceeds directly to the next version. David is interrupted only by genuine decision cards.
 
 ## Architecture
 
@@ -84,6 +86,27 @@ Design: dark, calm, dense-but-readable. Localhost tool, no auth. Desktop-first.
 ## CLI (`bin/hive`)
 
 `hive serve` (start daemon), `hive task create --project X --title ... [--brief file]`, `hive task list`, `hive emit <task-id> <type> [--note ...] [--file path]`, `hive decision ask <task-id> --title ... --context ... --risk ... --option key:label:detail --recommend key`, `hive policy add|list`, `hive open` (open board in browser). All thin HTTP wrappers; server is the only writer to the DB.
+
+## Secrets management
+
+Hive never invents crypto. A pluggable secrets provider interface with two backends:
+- `keychain` (default): macOS Keychain via the `security` CLI, service-namespaced `hive/<project>/<name>`.
+- `bitwarden`: via `bw` CLI (David's existing vault) for secrets that should live in Bitwarden.
+
+Behavior:
+- `secrets(id, project_id, name, provider, ref, created_at)` — the DB stores ONLY references/names, never values.
+- Injection: at agent spawn, secrets configured for the project are resolved and passed as env vars to `herdr agent start --env`; briefs list available secret NAMES so agents know what exists without seeing where it came from.
+- CLI: `hive secret set|list|rm` (set reads the value from stdin or prompt, writes to the provider, stores the ref).
+- Web UI: secrets page shows names, provider, project scope — values are never displayed nor retrievable through the web app or API. No secret value ever appears in events, evidence, logs, or briefs; the server redacts known secret values from any payload it stores.
+
+## Roadmap (versions ship continuously, evidence-gated, no go-ahead needed)
+
+- **v1** — everything above: server core, state machine, board, task pages, decision inbox (with Submit), policies, herdr runtime, reconciler, hooks, monitors + post-deploy smoke, secrets management, CLI.
+- **v2** — regression/learning ledger (recurring failures become tracked learnings + auto root-cause tasks; "unblock now, root-cause later" as a first-class flow); intake connectors (Google Chat first: stakeholder messages become draft tasks for triage); notification digests (batched, urgent-decision override, macOS push).
+- **v3** — scoped standing-authority policy engine (staging autonomous / prod requires exact-target decision card, enforced server-side before risky actions dispatch); domain supervisors (persistent planner agents per project that triage intake and propose task breakdowns); cost/token analytics per task and per model.
+- **v4** — migrate a real project off priortool end to end (dogfood exit criteria); remote access (tailscale-friendly bind + minimal auth); UI polish pass driven by David's annotations on the live board.
+
+Each version's definition of done: tests green, evidence rows (screenshots + test runs) attached to that version's tracking task in hive itself, then the next version starts immediately.
 
 ## Verification of hive itself
 
