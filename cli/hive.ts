@@ -17,9 +17,14 @@ Usage:
         --option key:label:detail  (repeatable)  --recommend <key>
   hive policy add --title <t> --body <s>|--body-file <f> [--scope global|project:<id>]
   hive policy list [--scope <s>]
+  hive spawn <task-id>                    spawn a herdr agent for a task
+  hive secret set --project <id> --name <n> [--provider keychain|bitwarden]
+        (reads the value from stdin; writes to the provider, stores only a ref)
+  hive secret list --project <id>
+  hive secret rm --project <id> --name <n>
   hive open                               open the board in a browser
 
-Env: HIVE_URL, HIVE_PORT, HIVE_DB`;
+Env: HIVE_URL, HIVE_PORT, HIVE_DB, BW_SESSION`;
 
 // Parse "--flag value" pairs; repeated flags collect into an array. Bare tokens
 // go into positional `_`.
@@ -185,6 +190,55 @@ async function main() {
       return;
     }
     die(`unknown 'policy' subcommand: ${sub}\n\n${USAGE}`);
+  }
+
+  if (cmd === "spawn") {
+    const { _ } = parseFlags(argv.slice(1));
+    const taskId = _[0];
+    if (!taskId) die("usage: hive spawn <task-id>");
+    const r = await api("POST", `/api/tasks/${taskId}/spawn`, {});
+    console.log(`spawned agent ${r.agent_target} for task ${taskId}`);
+    return;
+  }
+
+  if (cmd === "secret") {
+    const sub = argv[1];
+    const { flags } = parseFlags(argv.slice(2));
+    const project = flags.project ? String(flags.project) : "";
+    if (sub === "set") {
+      if (!project) die("--project is required");
+      if (!flags.name) die("--name is required");
+      const name = String(flags.name);
+      const provider = flags.provider ? String(flags.provider) : "keychain";
+      // Read the value from stdin so it never lands in argv / shell history.
+      const value = (await Bun.stdin.text()).replace(/\n$/, "");
+      if (!value) die("no value on stdin (pipe or type the secret, then Ctrl-D)");
+      const { providerFor } = await import("../server/src/secrets.ts");
+      const { ref } = await providerFor(provider).set(project, name, value);
+      const s = await api("POST", `/api/projects/${project}/secrets`, { name, provider, ref });
+      console.log(`stored secret '${name}' [${provider}] for project ${project} (ref kept in provider only)`);
+      return;
+    }
+    if (sub === "list") {
+      if (!project) die("--project is required");
+      const { secrets } = await api("GET", `/api/projects/${project}/secrets`);
+      if (!secrets.length) return console.log("(no secrets)");
+      for (const s of secrets) console.log(`${s.name.padEnd(20)} ${s.provider}`);
+      return;
+    }
+    if (sub === "rm") {
+      if (!project) die("--project is required");
+      if (!flags.name) die("--name is required");
+      const name = String(flags.name);
+      // Best-effort provider delete, then remove the metadata row.
+      const provider = flags.provider ? String(flags.provider) : "keychain";
+      const { providerFor, serviceName } = await import("../server/src/secrets.ts");
+      await providerFor(provider).rm(project, name, serviceName(project, name)).catch(() => {});
+      await api("DELETE", `/api/projects/${project}/secrets/${encodeURIComponent(name)}`);
+      console.log(`removed secret '${name}' for project ${project}`);
+      return;
+    }
+    die(`unknown 'secret' subcommand: ${sub}\n\n${USAGE}`);
   }
 
   if (cmd === "open") {

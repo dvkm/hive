@@ -31,8 +31,13 @@ must be built against this file. Server: `http://127.0.0.1:4700` (override
 }
 ```
 `config` is a free-form object (JSON column). Known keys used elsewhere:
-`default_branch` (string), `deploy_notes` (string), `monitors`
-(`[{name, url, expect_status, expect_substring?, interval_s}]`).
+`default_branch` (string, used as the worktree base + merge target),
+`deploy_notes` (string),
+`monitors` (`[{name, url, expect_status, expect_substring?, interval_s}]`),
+`monitors_auto_task` (bool; a monitor failure auto-creates a `chore` task),
+`smoke` (`[{name, url, expect_status, expect_substring?}]`, run once on
+`verifying`), and `agent_argv` (string[], per-project override of the command
+herdr runs, default `["claude","-p",<brief-file>,"--permission-mode","acceptEdits"]`).
 
 ### Task
 ```json
@@ -76,8 +81,18 @@ must be built against this file. Server: `http://127.0.0.1:4700` (override
 - `needs-decision` — a decision card was opened. `payload: {decision_id, title}`
 - `decision_answered` — `payload: {decision_id, answer_key, answer_note}`
 - `note` — a free note (e.g. a `done` summary). `payload: {note}`
-- `steer` — a steer message (stubbed in Phase 1). `payload: {message, stubbed:true}`
+- `steer` — a steer message was dispatched to the agent. `payload: {message, target}`
 - `blocked` — agent reported blocked. `payload: {note}`
+
+Types written by the runtime layer (Phase 2b):
+- `spawned` — a herdr agent was started. `payload: {agent_target, branch, worktree_path}`
+- `spawn_error` — spawn failed. `payload: {error}`
+- `agent_status` — herdr agent status changed (via wait loop or reconciler). `payload: {status}` (`idle|working|blocked`)
+- `ci_status` — reconciler synced CI. `payload: {ci_status}` (`passing|pending|failing`)
+- `pr_merged` — reconciler detected the PR merged. `payload: {pr_url}`
+- `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
+- `steer_error` — `herdr agent send` failed. `payload: {error}`
+- `smoke_passed` / `smoke_failed` — post-deploy smoke result. `payload: {results:[{name,ok,detail}], evidence_id?}`
 
 ### Evidence
 ```json
@@ -128,9 +143,19 @@ server-side autosaved draft.
 
 ### Incident
 ```json
-{ "id": "...", "project_id": "...", "monitor": "homepage", "ts": "...", "status": "open", "detail": "..." }
+{ "id": "inc_...", "project_id": "...", "monitor": "homepage", "ts": "...", "status": "open", "detail": "expected status 200, got 503" }
 ```
-`status ∈ {open, resolved}`. (No incident endpoints in Phase 1; table exists for Phase 2 monitors.)
+`status ∈ {open, resolved}`. Opened by a monitor failure (once per monitor while
+down), resolved on recovery. See `GET /api/incidents`.
+
+### Secret (metadata only)
+```json
+{ "id": "sec_...", "project_id": "...", "name": "API_KEY", "provider": "keychain", "created_at": "..." }
+```
+`provider ∈ {keychain, bitwarden}`. **The API never returns or accepts secret
+values.** Values live only in the provider (macOS Keychain / Bitwarden); the DB
+stores a reference, and the server redacts any known secret value from stored
+event/evidence payloads. Set values with `hive secret set` (reads from stdin).
 
 ---
 
@@ -150,7 +175,11 @@ server-side autosaved draft.
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
 - `POST /api/tasks/:id/transition` body `{to (required), reason?, source?}` → `200 Task` | `409` (invalid transition or `done` without evidence) | `404`
-- `POST /api/tasks/:id/send` body `{message}` → `200 {"ok":true, "stubbed":true, "message":...}` (Phase 1 stub: records a `steer` event; herdr wiring is Phase 2)
+  When `to` is `verifying`, the project's post-deploy smoke list (`config.smoke`) runs once before the response returns. A smoke failure bounces the task back to `in_progress`, so the returned Task may be `in_progress`, not `verifying`.
+- `POST /api/tasks/:id/spawn` body `{hive_url?}` → `200 {"ok":true, "task": Task, "agent_target":"..."}` | `400` (project has no `repo_path`) | `404` | `502` (herdr spawn failed; a `spawn_error` event is recorded)
+  Creates the herdr worktree (`hive/<task-id>`), starts the agent with `HIVE_TASK_ID`/`HIVE_URL` + the project's resolved secrets in env and the composed brief, sets `agent_target`/`worktree_path`/`branch`, transitions `queued → in_progress`, and writes a `spawned` event.
+- `POST /api/tasks/:id/send` body `{message (required)}` → `200 {"ok":true, "delivered":true, "message":...}` | `404` | `400` (empty message)
+  Dispatches the message to the task's live agent via `herdr agent send`. Always records a `steer` event. Degrades gracefully: if the task has no `agent_target` or herdr fails, returns `200 {"ok":false, "delivered":false, "error":"..."}` (never throws) and records a `steer_error` event when herdr itself failed.
 - `GET /api/tasks/:id/brief` → `200 {"task_id":"...", "brief":"<multiline string>"}` | `404`
   (task description + definition of done + `hive emit` protocol + active global + project policies)
 
@@ -198,6 +227,17 @@ Behavior by `type`:
 - `PUT /api/policies/:id` body `{title?, body?, scope?, active?}` → `200 Policy` | `404`
 - `DELETE /api/policies/:id` → `200 {"ok":true}`
 
+### Incidents
+- `GET /api/incidents?status=` → `200 {"incidents": [Incident, ...]}` (newest first; `status` filter optional, e.g. `open` / `resolved`)
+
+### Secrets (metadata only)
+Values are never accepted or returned here. Set them with `hive secret set`
+(writes to the provider locally, then registers the reference via `POST`).
+- `GET /api/projects/:id/secrets` → `200 {"secrets": [Secret, ...]}` (by name) | `404`
+- `POST /api/projects/:id/secrets` body `{name (required), provider?, ref (required)}` → `201 Secret` | `404`
+  Stores a reference only (upserts by `(project_id, name)`). `provider` defaults to `keychain`.
+- `DELETE /api/projects/:id/secrets/:name` → `200 {"ok":true, "deleted": <n>}`
+
 ### SSE stream — `GET /api/stream`
 `Content-Type: text/event-stream`. Each message is one SSE `data:` line whose
 payload is a JSON object with a `type` discriminator. On connect the server
@@ -215,6 +255,8 @@ Subsequent messages (broadcast to all clients on every change):
 | task | `{"type":"task","task": Task}` | a task is created or its state changes |
 | evidence | `{"type":"evidence","evidence": Evidence}` | an evidence row is added |
 | decision | `{"type":"decision","decision": Decision}` | a decision is created or answered |
+| incident | `{"type":"incident","incident": Incident}` | a monitor incident opens or resolves |
+| reconciler_error | `{"type":"reconciler_error","error":"...","where":"..."}` | a reconciler cycle hit an error (at most once per cycle; no DB row) |
 
 A state change therefore produces both an `event` message (`type:"state_change"`)
 and a `task` message. The client should upsert by `id`. There is no replay/backfill

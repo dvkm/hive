@@ -9,6 +9,7 @@ import type { DB } from "./db.ts";
 import { newId, now } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { parseEvent, parseTask } from "./rows.ts";
+import { redact } from "./secrets.ts";
 
 export const STATES = [
   "queued",
@@ -71,7 +72,7 @@ export function writeEvent(
     ts: now(),
     source: args.source,
     type: args.type,
-    payload: JSON.stringify(args.payload ?? {}),
+    payload: JSON.stringify(redact(args.payload ?? {})),
   };
   db.query(
     "INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)"

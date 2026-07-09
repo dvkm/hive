@@ -6,9 +6,9 @@ state (SQLite), an event-driven timeline, evidence, policies, and a
 server-enforced task state machine. See [SPEC.md](./SPEC.md) for the full
 product spec and [docs/API.md](./docs/API.md) for the HTTP contract.
 
-This repo currently contains **Phase 1: the server core + CLI**. The web app,
-herdr runtime adapter, Claude Code hooks, monitors, and reconciler are later
-phases and are built against `docs/API.md`.
+This repo contains **Phase 1** (server core + CLI) and **Phase 2b** (the runtime
+layer: herdr adapter, reconciler, monitors + post-deploy smoke, secrets, and
+Claude Code hooks). The web app is built separately against `docs/API.md`.
 
 ## Requirements
 
@@ -59,16 +59,22 @@ bin/hive decision ask <task-id> --title "..." --risk high \
     --option go:Go:"do it" --option wait:Wait:"hold" --recommend go
 bin/hive policy add --title "..." --body "..." [--scope global|project:<id>]
 bin/hive policy list [--scope <s>]
+bin/hive spawn <task-id>                # start a herdr agent for a task
+echo -n "s3cret" | bin/hive secret set --project <id> --name API_KEY
+bin/hive secret list --project <id>
+bin/hive secret rm --project <id> --name API_KEY
 bin/hive open
 ```
 
 ## Layout
 
 ```
-server/src/  db.ts state.ts briefs.ts api.ts bus.ts rows.ts index.ts
+server/src/  db.ts state.ts briefs.ts api.ts bus.ts rows.ts exec.ts
+             secrets.ts monitors.ts reconciler.ts runtime/herdr.ts index.ts
 cli/hive.ts  bin/hive        CLI
+hooks/       hive-hook.sh install.md   Claude Code lifecycle hooks
 scripts/     demo-seed.ts
-docs/API.md  the HTTP contract (Phase 2 builds against this)
+docs/API.md  the HTTP contract (the web app builds against this)
 server/test/ bun test suite
 ```
 
@@ -85,11 +91,34 @@ server/test/ bun test suite
   change (there is no `blocked` state; the director decides). `needs-decision` and
   `done` do drive transitions.
 - **Answering a decision** auto-resumes the task (`needs_decision → in_progress`)
-  and records a `decision_answered` event. Dispatching the answer to the live
-  agent (`herdr agent send`) is stubbed until Phase 2.
-- **`/api/tasks/:id/send`** is a stub that records a `steer` event. Real steering
-  needs the herdr adapter (Phase 2).
+  and records a `decision_answered` event.
 - **CORS** is wide open so a Vite dev server on another port can call the API.
 - **SSE** has no backfill on connect: load state via REST, then apply deltas.
 - **Evidence** is copied into `~/.hive/evidence/<task_id>/` and served from
   `/evidence/...`; never local-path-only, never lost to gitignore.
+
+## Phase 2b notes (runtime layer)
+
+- **herdr adapter** (`server/src/runtime/herdr.ts`) is a thin subprocess layer
+  over the `herdr` CLI with an injectable `Exec`, so command construction and
+  teardown safety are unit-tested without a live herdr server. `HERDR_BIN`
+  overrides the binary path.
+- **Teardown refuses to destroy work**: `herdr worktree remove` runs only after
+  the branch is pushed to origin or merged into the default branch (verified
+  with git); otherwise it returns `{removed:false}`.
+- **Reconciler** (`server/src/reconciler.ts`, 60s; `HIVE_RECONCILE_MS`) syncs
+  herdr agent status, `gh pr view` CI/merge state, and flags tasks silent past
+  `HIVE_STALE_MS` (default 15m) as `stale`. Every cycle is failure-isolated and
+  emits at most one `reconciler_error` per cycle; it never crashes the server.
+- **Monitors** (`server/src/monitors.ts`, 60s; `HIVE_MONITOR_MS`) run per-project
+  URL checks from `config.monitors`; failures open incidents + SSE + an
+  `osascript` notification (non-fatal if unavailable) and, behind
+  `config.monitors_auto_task`, an auto `chore` task. Post-deploy smoke
+  (`config.smoke`) runs once on `verifying`: pass → `test_run` evidence,
+  fail → back to `in_progress`.
+- **Secrets** store names/refs only (migration v2). Values live in macOS
+  Keychain (`security`) or Bitwarden (`bw`), resolved at spawn and injected as
+  env; the server redacts known secret values from stored payloads. Manage with
+  `hive secret set|list|rm` (`set` reads the value from stdin).
+- **Hooks** (`hooks/`) POST liveness events to `$HIVE_URL` when `$HIVE_TASK_ID`
+  is set; fail silent + fast (2s curl cap). See `hooks/install.md`.

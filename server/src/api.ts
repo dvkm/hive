@@ -3,7 +3,7 @@
 import { dirname, join, normalize } from "node:path";
 import { mkdirSync } from "node:fs";
 import type { DB } from "./db.ts";
-import { newId, now, evidenceDir } from "./db.ts";
+import { newId, now, evidenceDir, hiveHome } from "./db.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
 import {
   transition,
@@ -11,6 +11,7 @@ import {
   getTask,
   canTransition,
   TransitionError,
+  TERMINAL,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
@@ -21,7 +22,16 @@ import {
   parseEvidence,
   parseDecision,
   parsePolicy,
+  parseIncident,
 } from "./rows.ts";
+import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
+import { resolveProjectSecrets } from "./secrets.ts";
+import { runSmoke } from "./monitors.ts";
+
+export interface HandlerDeps {
+  herdr?: Herdr; // injectable for tests
+  supervise?: boolean; // start the herdr wait loop after spawn (true in prod wiring)
+}
 
 const VERSION = "0.1.0";
 const CORS = {
@@ -42,7 +52,8 @@ function err(message: string, status = 400): Response {
 
 const WEB_DIST = join(import.meta.dir, "..", "..", "web", "dist");
 
-export function makeHandler(db: DB) {
+export function makeHandler(db: DB, deps: HandlerDeps = {}) {
+  const herdr = deps.herdr ?? defaultHerdr;
   return async function handle(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const { pathname } = url;
@@ -95,10 +106,14 @@ export function makeHandler(db: DB) {
         if (method === "POST") return await ingestEvent(db, m[1], req);
       }
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/transition$/);
-      if (m && method === "POST") return doTransition(db, m[1], await req.json());
+      if (m && method === "POST") return await doTransition(db, m[1], await req.json());
+
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/spawn$/);
+      if (m && method === "POST")
+        return await spawnTask(db, herdr, m[1], await safeJson(req), deps);
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/send$/);
-      if (m && method === "POST") return sendSteer(db, m[1], await req.json());
+      if (m && method === "POST") return await sendSteer(db, herdr, m[1], await req.json());
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/brief$/);
       if (m && method === "GET") {
@@ -139,6 +154,18 @@ export function makeHandler(db: DB) {
           return json({ ok: true });
         }
       }
+
+      // ---- incidents ----
+      if (pathname === "/api/incidents" && method === "GET") return listIncidents(db, url);
+
+      // ---- secrets (names/metadata only; values live in the provider) ----
+      m = pathname.match(/^\/api\/projects\/([^/]+)\/secrets$/);
+      if (m) {
+        if (method === "GET") return listSecrets(db, m[1]);
+        if (method === "POST") return createSecret(db, m[1], await req.json());
+      }
+      m = pathname.match(/^\/api\/projects\/([^/]+)\/secrets\/([^/]+)$/);
+      if (m && method === "DELETE") return deleteSecret(db, m[1], decodeURIComponent(m[2]));
 
       // ---- static web app (falls back to a message when not built) ----
       if (method === "GET" && !pathname.startsWith("/api/"))
@@ -232,21 +259,183 @@ function getTaskFull(db: DB, id: string): Response {
   return json({ ...task, events, evidence, decisions });
 }
 
-function doTransition(db: DB, id: string, body: any): Response {
+async function doTransition(db: DB, id: string, body: any): Promise<Response> {
   if (!body?.to) return err("'to' state is required");
-  const task = transition(db, id, body.to as State, {
+  const to = body.to as State;
+  const task = transition(db, id, to, {
     source: body.source ?? "director",
     reason: body.reason,
   });
+  // Post-deploy smoke runs once when a task enters `verifying`. runSmoke may
+  // bounce the task back to in_progress on failure; re-read to reflect that.
+  if (to === "verifying") {
+    await runSmoke(db, id).catch((e) => console.error("[hive] smoke run failed:", e));
+    return json(getTask(db, id));
+  }
   return json(task);
 }
 
-// Steering is a Phase 2 concern (herdr adapter). Stubbed: records an event only.
-function sendSteer(db: DB, id: string, body: any): Response {
-  if (!getTask(db, id)) return err("task not found", 404);
-  const message = body?.message ?? "";
-  writeEvent(db, { task_id: id, source: "director", type: "steer", payload: { message, stubbed: true } });
-  return json({ ok: true, stubbed: true, message });
+// Spawn a herdr agent for a queued task: create the worktree, start the agent
+// with HIVE_TASK_ID/HIVE_URL + project secrets in env and the composed brief.
+async function spawnTask(
+  db: DB,
+  herdr: Herdr,
+  id: string,
+  body: any,
+  deps: HandlerDeps
+): Promise<Response> {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
+  if (!project?.repo_path) return err("project has no repo_path; cannot spawn", 400);
+  const config = JSON.parse(project.config ?? "{}");
+
+  // Compose the brief and write it to a file the agent command reads.
+  const briefDir = join(hiveHome(), "briefs");
+  mkdirSync(briefDir, { recursive: true });
+  const briefFile = join(briefDir, `${id}.md`);
+  await Bun.write(briefFile, composeBrief(db, id));
+
+  const hiveUrl = body?.hive_url || process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
+  const env = await resolveProjectSecrets(db, task.project_id);
+
+  let result;
+  try {
+    result = await herdr.spawn({
+      taskId: id,
+      repoPath: project.repo_path,
+      hiveUrl,
+      briefFile,
+      base: config.default_branch,
+      env,
+      agentArgv: config.agent_argv, // optional per-project override
+    });
+  } catch (e: any) {
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: String(e?.message ?? e) } });
+    return err(`spawn failed: ${e?.message ?? e}`, 502);
+  }
+
+  db.query(
+    "UPDATE tasks SET agent_target = ?, worktree_path = ?, branch = ?, updated_at = ? WHERE id = ?"
+  ).run(result.agent_target, result.worktree_path, result.branch, now(), id);
+  writeEvent(db, {
+    task_id: id,
+    source: "herdr",
+    type: "spawned",
+    payload: { agent_target: result.agent_target, branch: result.branch, worktree_path: result.worktree_path },
+  });
+  if (task.state === "queued") transition(db, id, "in_progress", { source: "herdr", reason: "agent spawned" });
+
+  if (deps.supervise) superviseAgent(db, herdr, id, result.agent_target);
+
+  return json({ ok: true, task: getTask(db, id), agent_target: result.agent_target });
+}
+
+// Re-arming supervised wait loop. Each completed wait re-arms; on error the
+// reconciler's polling is the safety net. Started only in production wiring.
+async function superviseAgent(db: DB, herdr: Herdr, taskId: string, target: string): Promise<void> {
+  const WAIT_MS = 5 * 60 * 1000;
+  // ponytail: sequential loop, one agent per task; fine for a localhost tool.
+  while (true) {
+    const task = getTask(db, taskId);
+    if (!task || TERMINAL.includes(task.state as State)) return;
+    let res;
+    try {
+      res = await herdr.wait(target, "idle", WAIT_MS);
+    } catch (e) {
+      writeEvent(db, { task_id: taskId, source: "herdr", type: "supervise_error", payload: { error: String((e as any)?.message ?? e) } });
+      return; // reconciler takes over
+    }
+    if (res.code !== 0) return; // timeout / not found: fall back to reconciler polling
+    const status = await herdr.status(target);
+    if (status !== "unknown") {
+      const last = db
+        .query("SELECT payload FROM events WHERE task_id = ? AND type = 'agent_status' ORDER BY ts DESC LIMIT 1")
+        .get(taskId) as { payload: string } | undefined;
+      const prev = last ? (JSON.parse(last.payload).status ?? null) : null;
+      if (status !== prev)
+        writeEvent(db, { task_id: taskId, source: "herdr", type: "agent_status", payload: { status } });
+    }
+  }
+}
+
+// Steer a live agent via `herdr agent send`. Degrades gracefully: the event is
+// always recorded; a herdr failure is surfaced in the response, never thrown.
+async function sendSteer(db: DB, herdr: Herdr, id: string, body: any): Promise<Response> {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  const message = String(body?.message ?? "");
+  if (!message) return err("message is required");
+  const target = task.agent_target;
+  writeEvent(db, { task_id: id, source: "director", type: "steer", payload: { message, target } });
+
+  if (!target) return json({ ok: false, delivered: false, error: "task has no agent_target (not spawned)" });
+  try {
+    const res = await herdr.send(target, message);
+    if (res.code !== 0) {
+      const error = res.stderr.trim() || res.stdout.trim() || `herdr send exited ${res.code}`;
+      writeEvent(db, { task_id: id, source: "herdr", type: "steer_error", payload: { error } });
+      return json({ ok: false, delivered: false, error });
+    }
+    return json({ ok: true, delivered: true, message });
+  } catch (e: any) {
+    const error = String(e?.message ?? e);
+    writeEvent(db, { task_id: id, source: "herdr", type: "steer_error", payload: { error } });
+    return json({ ok: false, delivered: false, error });
+  }
+}
+
+// ---------------------------------------------------------------- incidents
+function listIncidents(db: DB, url: URL): Response {
+  const status = url.searchParams.get("status");
+  const rows = status
+    ? db.query("SELECT * FROM incidents WHERE status = ? ORDER BY ts DESC").all(status)
+    : db.query("SELECT * FROM incidents ORDER BY ts DESC").all();
+  return json({ incidents: rows.map(parseIncident) });
+}
+
+// ---------------------------------------------------------------- secrets (metadata only)
+function listSecrets(db: DB, projectId: string): Response {
+  if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return err("project not found", 404);
+  const rows = db
+    .query("SELECT id, project_id, name, provider, created_at FROM secrets WHERE project_id = ? ORDER BY name")
+    .all(projectId);
+  return json({ secrets: rows });
+}
+
+function createSecret(db: DB, projectId: string, body: any): Response {
+  if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return err("project not found", 404);
+  if (!body?.name) return err("name is required");
+  if (!body?.ref) return err("ref is required");
+  const provider = body.provider ?? "keychain";
+  const row = {
+    id: newId("sec"),
+    project_id: projectId,
+    name: String(body.name),
+    provider: String(provider),
+    ref: String(body.ref),
+    created_at: now(),
+  };
+  db.query(
+    "INSERT INTO secrets (id, project_id, name, provider, ref, created_at) VALUES (?,?,?,?,?,?) " +
+      "ON CONFLICT(project_id, name) DO UPDATE SET provider = excluded.provider, ref = excluded.ref"
+  ).run(row.id, row.project_id, row.name, row.provider, row.ref, row.created_at);
+  // Return metadata only, never the ref value in a way tied to a secret value.
+  return json({ id: row.id, project_id: projectId, name: row.name, provider: row.provider, created_at: row.created_at }, 201);
+}
+
+function deleteSecret(db: DB, projectId: string, name: string): Response {
+  const r = db.query("DELETE FROM secrets WHERE project_id = ? AND name = ?").run(projectId, name);
+  return json({ ok: true, deleted: r.changes });
+}
+
+async function safeJson(req: Request): Promise<any> {
+  try {
+    const text = await req.text();
+    return text ? JSON.parse(text) : {};
+  } catch {
+    return {};
+  }
 }
 
 // ---------------------------------------------------------------- event ingestion (`hive emit`)
