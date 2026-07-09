@@ -1067,6 +1067,303 @@ a {
   color: var(--red, #e06464);
 }
 
+/* ---- policies page redesign (pol-* namespace) ---- */
+.pol-page {
+  max-width: 760px;
+}
+.pol-page-head {
+  margin-bottom: 26px;
+}
+.pol-page-head h1 {
+  font-size: 22px;
+  margin: 0 0 6px;
+  letter-spacing: 0.2px;
+}
+.pol-page-head p {
+  margin: 0;
+  max-width: 640px;
+  font-size: 13px;
+}
+
+.pol-section {
+  margin-bottom: 34px;
+}
+.pol-section-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  padding-bottom: 12px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.pol-section-heading {
+  flex: 1;
+  min-width: 0;
+}
+.pol-section-head h2 {
+  font-size: 15px;
+  margin: 0 0 4px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.pol-count {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-faint);
+  background: var(--bg-elev2);
+  border-radius: 10px;
+  padding: 1px 8px;
+}
+.pol-blurb {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  max-width: 620px;
+}
+.pol-when {
+  color: var(--text);
+  font-weight: 550;
+}
+.pol-section-head .btn-new {
+  flex-shrink: 0;
+}
+
+.pol-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* empty states */
+.pol-empty {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  padding: 22px 20px;
+  text-align: center;
+}
+.pol-empty p {
+  margin: 0 auto 14px;
+  max-width: 460px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.pol-empty .btn:last-child {
+  margin: 0 auto;
+}
+
+/* policy cards */
+.pol-card {
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+.pol-inactive {
+  opacity: 0.55;
+}
+.pol-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.pol-card-head .spacer {
+  flex: 1;
+}
+.pol-card-title {
+  font-size: 14px;
+  display: block;
+}
+.pol-card-body {
+  color: var(--text-dim);
+  margin: 5px 0 0;
+  font-size: 12.5px;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* authority rules — read like a sentence */
+.pol-rule {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 10px 13px;
+}
+.pol-rule .spacer {
+  flex: 1;
+  min-width: 8px;
+}
+.pol-rule-pattern {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 2px 7px;
+}
+.pol-rule-arrow {
+  color: var(--text-faint);
+}
+.pol-rule-scope {
+  color: var(--text-faint);
+}
+.pol-rule-note {
+  font-size: 12px;
+  font-style: italic;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pol-rule-pattern,
+.pol-rule .chip {
+  flex-shrink: 0;
+}
+
+/* segmented effect control (modal) */
+.pol-seg {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  overflow: hidden;
+  background: var(--bg);
+}
+.pol-seg-btn {
+  flex: 1;
+  padding: 8px 6px;
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: var(--font);
+  font-size: 12.5px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.pol-seg-btn:last-child {
+  border-right: none;
+}
+.pol-seg-btn:hover {
+  color: var(--text);
+}
+.pol-seg-allow.active {
+  background: rgba(70, 201, 139, 0.16);
+  color: var(--green);
+}
+.pol-seg-require_decision.active {
+  background: rgba(226, 165, 66, 0.16);
+  color: var(--amber);
+}
+.pol-seg-deny.active {
+  background: rgba(239, 93, 107, 0.16);
+  color: var(--red);
+}
+.pol-seg-help {
+  font-size: 12px;
+  margin: 7px 0 0;
+  min-height: 30px;
+}
+.pol-rule-preview {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--bg-elev);
+  margin-bottom: 4px;
+}
+
+/* auto-dispatch switches */
+.pol-caution {
+  margin-bottom: 14px;
+}
+.pol-dispatch-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+.pol-dispatch-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.pol-dispatch-name {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+.pol-dispatch-main .muted {
+  font-size: 12px;
+}
+.pol-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+  flex-shrink: 0;
+  user-select: none;
+}
+.pol-switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.pol-switch-track {
+  width: 38px;
+  height: 22px;
+  border-radius: 12px;
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
+  position: relative;
+  transition: background 0.16s, border-color 0.16s;
+}
+.pol-switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  transition: transform 0.16s, background 0.16s;
+}
+.pol-switch.on .pol-switch-track {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+.pol-switch.on .pol-switch-knob {
+  transform: translateX(16px);
+  background: var(--accent);
+}
+.pol-switch-label {
+  font-size: 12px;
+  color: var(--text-dim);
+  min-width: 20px;
+}
+.pol-switch.on .pol-switch-label {
+  color: var(--accent);
+}
+.pol-switch input:focus-visible + .pol-switch-track {
+  box-shadow: 0 0 0 2px var(--accent-dim);
+}
+
 /* ---- monitors ---- */
 .notice {
   background: rgba(226, 165, 66, 0.1);
