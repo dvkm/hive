@@ -1,7 +1,7 @@
 // HTTP routing for hive. Plain Bun.serve routing by hand (zero deps).
 // The exact request/response contract lives in docs/API.md.
 import { dirname, join, normalize } from "node:path";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir } from "./db.ts";
 import { taskWithHealth, broadcastTask } from "./health.ts";
@@ -115,6 +115,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       // ---- activity feed (reverse-chronological projection over events) ----
       if (pathname === "/api/feed" && method === "GET") return listFeed(db, url);
+
+      // ---- evidence browser (all evidence across tasks, filtered) ----
+      if (pathname === "/api/evidence" && method === "GET") return listEvidence(db, url);
 
       // ---- global search (tasks/decisions/learnings/policies/projects) ----
       if (pathname === "/api/search" && method === "GET") return search(db, url);
@@ -393,46 +396,132 @@ function listFeed(db: DB, url: URL): Response {
   if (!Number.isFinite(limit) || limit <= 0) limit = 100;
   limit = Math.min(limit, 500);
 
-  const where: string[] = [];
-  const args: any[] = [];
-  if (since) { where.push("e.ts > ?"); args.push(since); }
-  if (project) { where.push("t.project_id = ?"); args.push(project); }
-  if (typesCsv) {
-    const cats = typesCsv.split(",").map((s) => s.trim()).filter(Boolean);
-    const types = cats.flatMap((c) => FEED_CATEGORIES[c] ?? []);
-    if (types.length === 0) return json({ events: [] }); // filters matched no known category
-    where.push(`e.type IN (${types.map(() => "?").join(",")})`);
-    args.push(...types);
+  // null cats = every category; otherwise the selected subset. Standalone monitor
+  // incidents (no task_id) are folded in when the "incident" category is in play.
+  const cats = typesCsv ? typesCsv.split(",").map((s) => s.trim()).filter(Boolean) : null;
+  const wantIncidents = !cats || cats.includes("incident");
+  const eventTypes = cats ? cats.flatMap((c) => FEED_CATEGORIES[c] ?? []) : null;
+
+  // ---- task-bound events ----
+  let eventRows: any[] = [];
+  if (!eventTypes || eventTypes.length > 0) {
+    const where: string[] = [];
+    const args: any[] = [];
+    if (since) { where.push("e.ts > ?"); args.push(since); }
+    if (project) { where.push("t.project_id = ?"); args.push(project); }
+    if (eventTypes) {
+      where.push(`e.type IN (${eventTypes.map(() => "?").join(",")})`);
+      args.push(...eventTypes);
+    }
+    const sql =
+      `SELECT e.id, e.task_id, e.ts, e.source, e.type, e.payload,
+              t.title AS task_title, t.kind AS task_kind, t.project_id AS project_id,
+              p.name AS project_name,
+              ev.url AS evidence_url, ev.kind AS evidence_kind
+       FROM events e
+       JOIN tasks t ON t.id = e.task_id
+       JOIN projects p ON p.id = t.project_id
+       LEFT JOIN evidence ev ON ev.id = json_extract(e.payload, '$.evidence_id')` +
+      (where.length ? " WHERE " + where.join(" AND ") : "") +
+      " ORDER BY e.ts DESC, e.id DESC LIMIT ?";
+    args.push(limit);
+    eventRows = db.query(sql).all(...args).map((r: any) => ({
+      id: r.id,
+      task_id: r.task_id,
+      ts: r.ts,
+      source: r.source,
+      type: r.type,
+      payload: JSON.parse(r.payload || "{}"),
+      task_title: r.task_title,
+      task_kind: r.task_kind,
+      project_id: r.project_id,
+      project_name: r.project_name,
+      evidence_url: r.evidence_url ?? null,
+      evidence_kind: r.evidence_kind ?? null,
+    }));
   }
 
+  // ---- standalone monitor incidents (incidents table, no task_id) ----
+  let incidentRows: any[] = [];
+  if (wantIncidents) {
+    const where: string[] = [];
+    const args: any[] = [];
+    if (since) { where.push("i.ts > ?"); args.push(since); }
+    if (project) { where.push("i.project_id = ?"); args.push(project); }
+    const sql =
+      `SELECT i.id, i.project_id, i.monitor, i.ts, i.status, i.detail, p.name AS project_name
+       FROM incidents i
+       JOIN projects p ON p.id = i.project_id` +
+      (where.length ? " WHERE " + where.join(" AND ") : "") +
+      " ORDER BY i.ts DESC LIMIT ?";
+    args.push(limit);
+    incidentRows = db.query(sql).all(...args).map((r: any) => ({
+      id: r.id,
+      task_id: null,
+      ts: r.ts,
+      source: "monitor",
+      type: "incident",
+      payload: { monitor: r.monitor, status: r.status, detail: r.detail, project_id: r.project_id },
+      task_title: null,
+      task_kind: null,
+      project_id: r.project_id,
+      project_name: r.project_name,
+      evidence_url: null,
+      evidence_kind: null,
+    }));
+  }
+
+  // Merge both streams into one reverse-chronological page. Each source is
+  // pre-capped at `limit`, so slicing the sorted merge to `limit` is exact.
+  const rows = [...eventRows, ...incidentRows]
+    .sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : a.id < b.id ? 1 : -1))
+    .slice(0, limit);
+  return json({ events: rows });
+}
+
+// Evidence browser: all evidence across tasks, newest first, joined to its task
+// title/kind + project, with an inline preview for test_run/log. Filters:
+// project, kind, task; cap 100.
+function listEvidence(db: DB, url: URL): Response {
+  const project = url.searchParams.get("project");
+  const kind = url.searchParams.get("kind");
+  const task = url.searchParams.get("task");
+  let limit = parseInt(url.searchParams.get("limit") ?? "100", 10);
+  if (!Number.isFinite(limit) || limit <= 0) limit = 100;
+  limit = Math.min(limit, 100);
+
+  const where: string[] = [];
+  const args: any[] = [];
+  if (project) { where.push("t.project_id = ?"); args.push(project); }
+  if (kind) { where.push("ev.kind = ?"); args.push(kind); }
+  if (task) { where.push("ev.task_id = ?"); args.push(task); }
+
   const sql =
-    `SELECT e.id, e.task_id, e.ts, e.source, e.type, e.payload,
-            t.title AS task_title, t.kind AS task_kind, t.project_id AS project_id,
-            p.name AS project_name,
-            ev.url AS evidence_url, ev.kind AS evidence_kind
-     FROM events e
-     JOIN tasks t ON t.id = e.task_id
-     JOIN projects p ON p.id = t.project_id
-     LEFT JOIN evidence ev ON ev.id = json_extract(e.payload, '$.evidence_id')` +
+    `SELECT ev.*, t.title AS task_title, t.kind AS task_kind,
+            t.project_id AS project_id, p.name AS project_name
+     FROM evidence ev
+     JOIN tasks t ON t.id = ev.task_id
+     JOIN projects p ON p.id = t.project_id` +
     (where.length ? " WHERE " + where.join(" AND ") : "") +
-    " ORDER BY e.ts DESC, e.id DESC LIMIT ?";
+    " ORDER BY ev.ts DESC, ev.id DESC LIMIT ?";
   args.push(limit);
 
   const rows = db.query(sql).all(...args).map((r: any) => ({
     id: r.id,
     task_id: r.task_id,
     ts: r.ts,
-    source: r.source,
-    type: r.type,
-    payload: JSON.parse(r.payload || "{}"),
+    kind: r.kind,
+    path: r.path,
+    url: r.url,
+    caption: r.caption,
+    meta: JSON.parse(r.meta || "{}"),
     task_title: r.task_title,
     task_kind: r.task_kind,
     project_id: r.project_id,
     project_name: r.project_name,
-    evidence_url: r.evidence_url ?? null,
-    evidence_kind: r.evidence_kind ?? null,
+    preview: evidencePreview(r.path, r.kind),
   }));
-  return json({ events: rows });
+  return json({ evidence: rows });
 }
 
 // Global search across the five text-bearing entities. Honest LIKE (not FTS5:
@@ -509,11 +598,33 @@ function search(db: DB, url: URL): Response {
   return json({ hits: out });
 }
 
+// First ~3 non-empty lines of a test_run/log evidence file, so the pass/fail
+// counts are scannable inline without downloading. null for other kinds or an
+// unreadable file.
+// ponytail: reads the whole file; evidence files are small (test output / smoke
+// JSON). Bound the read if logs ever grow large.
+function evidencePreview(path: string | null, kind: string): string | null {
+  if (!path || (kind !== "test_run" && kind !== "log")) return null;
+  try {
+    const lines = readFileSync(path, "utf8")
+      .split("\n")
+      .map((l) => l.trimEnd())
+      .filter((l) => l.trim() !== "");
+    return lines.length ? lines.slice(0, 3).join("\n") : null;
+  } catch {
+    return null;
+  }
+}
+
 function getTaskFull(db: DB, id: string): Response {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
   const events = db.query("SELECT * FROM events WHERE task_id = ? ORDER BY ts").all(id).map(parseEvent);
-  const evidence = db.query("SELECT * FROM evidence WHERE task_id = ? ORDER BY ts").all(id).map(parseEvidence);
+  const evidence = db
+    .query("SELECT * FROM evidence WHERE task_id = ? ORDER BY ts")
+    .all(id)
+    .map(parseEvidence)
+    .map((e: any) => ({ ...e, preview: evidencePreview(e.path, e.kind) }));
   const decisions = db.query("SELECT * FROM decisions WHERE task_id = ? ORDER BY ts").all(id).map(parseDecision);
   return json({ ...taskWithHealth(db, task), events, evidence, decisions });
 }

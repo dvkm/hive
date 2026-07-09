@@ -44,6 +44,25 @@ function addEvidence(taskId: string, kind: string, filename: string, b64: string
   writeEvent(db, { task_id: taskId, source: "agent", type: "evidence", payload: { evidence_id: id, kind, caption } });
 }
 
+// Text evidence (test_run / log) so the inline preview + browser cards render.
+function addTextEvidence(taskId: string, kind: string, filename: string, content: string, caption: string) {
+  const destDir = join(evidenceDir(), taskId);
+  mkdirSync(destDir, { recursive: true });
+  const dest = join(destDir, filename);
+  Bun.write(dest, content);
+  const id = newId("ev");
+  db.query(
+    "INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?, '{}')"
+  ).run(id, taskId, now(), kind, dest, `/evidence/${taskId}/${filename}`, caption);
+  writeEvent(db, { task_id: taskId, source: "agent", type: "evidence", payload: { evidence_id: id, kind, caption } });
+}
+
+function addIncident(projectId: string, monitor: string, status: string, detail: string) {
+  db.query(
+    "INSERT INTO incidents (id, project_id, monitor, ts, status, detail) VALUES (?,?,?,?,?,?)"
+  ).run(newId("inc"), projectId, monitor, now(), status, detail);
+}
+
 // ---- project ----
 const projectId = newId("proj");
 db.query(
@@ -105,6 +124,14 @@ db.query("UPDATE tasks SET pr_url = ?, ci_status = ? WHERE id = ?").run(
   "https://github.com/acme/web/pull/412", "passing", inReview
 );
 addEvidence(inReview, "screenshot", "ratelimit.png", PNG_RED, "Rate limit headers in response");
+addEvidence(inReview, "screenshot", "ratelimit-429.png", PNG_BLUE, "429 returned past the bucket limit");
+addTextEvidence(
+  inReview,
+  "log",
+  "ratelimit.log",
+  "12:01:04 INFO  bucket=api capacity=100 refill=10/s\n12:01:05 WARN  client 10.0.0.4 throttled (0 tokens)\n12:01:05 INFO  returned 429 Too Many Requests\n",
+  "Throttle log excerpt"
+);
 
 // verifying
 const verifying = insertTask(projectId, "Fix checkout total rounding bug", "ship", "Totals off by a cent on multi-item carts.");
@@ -121,7 +148,13 @@ transition(db, doneTask, "in_progress", { source: "herdr" });
 transition(db, doneTask, "in_review", { source: "hook" });
 transition(db, doneTask, "verifying", { source: "hook" });
 addEvidence(doneTask, "screenshot", "darkmode.png", PNG_BLUE, "Dark mode enabled on settings page");
-addEvidence(doneTask, "test_run", "tests.png", PNG_RED, "42 passing, 0 failing");
+addTextEvidence(
+  doneTask,
+  "test_run",
+  "tests.txt",
+  "Test Suites: 8 passed, 8 total\nTests:       42 passed, 42 total\nTime:        3.14 s\nRan all test suites.\n",
+  "42 passing, 0 failing"
+);
 db.query("UPDATE tasks SET summary = ? WHERE id = ?").run("Shipped dark mode toggle; all tests green.", doneTask);
 transition(db, doneTask, "done", { source: "director", reason: "verified" });
 
@@ -139,5 +172,9 @@ const scout = insertTask(projectId, "Research CDN options", "scout", "Compare Cl
 transition(db, scout, "in_progress", { source: "herdr" });
 addEvidence(scout, "report", "cdn-report.png", PNG_BLUE, "CDN comparison report");
 
-console.log(`Seeded project ${projectId} with tasks in every state, 3 policies, 1 open decision, and evidence images.`);
+// ---- standalone monitor incidents (no task) — surface in Monitors + Feed ----
+addIncident(projectId, "homepage", "open", "expected status 200, got 503");
+addIncident(projectId, "checkout-api", "resolved", "request failed: ETIMEDOUT (recovered)");
+
+console.log(`Seeded project ${projectId} with tasks in every state, 3 policies, 1 open decision, evidence images/logs, and 2 monitor incidents.`);
 console.log(`DB: ${process.env.HIVE_DB || "~/.hive/hive.db"}`);
