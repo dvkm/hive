@@ -29,6 +29,11 @@ function Card({ task }: { task: Task }) {
       <div className="card-meta">
         {project && <span className="chip">{project.name}</span>}
         <span className={`chip chip-kind chip-${task.kind}`}>{task.kind}</span>
+        {task.source === "intake_gchat" && (
+          <span className="chip chip-intake" title="Created from a Google Chat message; needs review">
+            intake · unreviewed
+          </span>
+        )}
         <span className="card-age">{age}</span>
       </div>
       {task.summary && <div className="card-summary">{task.summary}</div>}

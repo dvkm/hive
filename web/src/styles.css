@@ -335,6 +335,10 @@ a {
   color: var(--red);
   border-color: rgba(239, 93, 107, 0.4);
 }
+.chip-intake {
+  color: var(--amber);
+  border-color: rgba(226, 165, 66, 0.4);
+}
 
 /* PR + CI */
 .pr {

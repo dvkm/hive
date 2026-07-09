@@ -4,6 +4,7 @@ import { makeHandler } from "./api.ts";
 import { startReconciler } from "./reconciler.ts";
 import { checkAllMonitors } from "./monitors.ts";
 import { startDigest, setNotifier } from "./notifications.ts";
+import { startGchatPoll } from "./intake/gchat.ts";
 import { defaultExec } from "./exec.ts";
 
 const port = Number(process.env.HIVE_PORT || 4700);
@@ -32,5 +33,9 @@ setInterval(() => {
 // and start the batched digest loop (normal -> one digest every HIVE_DIGEST_MS).
 setNotifier(defaultExec);
 startDigest(db);
+
+// Google Chat intake: poll allowlisted spaces (per-project config.gchat_spaces)
+// and draft tasks from stakeholder messages. Hard no-op until configured.
+startGchatPoll(db);
 
 console.log(`[hive] server on http://${server.hostname}:${server.port}  db=${dbPath}`);

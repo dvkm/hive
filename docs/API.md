@@ -36,8 +36,11 @@ must be built against this file. Server: `http://127.0.0.1:4700` (override
 `monitors` (`[{name, url, expect_status, expect_substring?, interval_s}]`),
 `monitors_auto_task` (bool; a monitor failure auto-creates a `chore` task),
 `smoke` (`[{name, url, expect_status, expect_substring?}]`, run once on
-`verifying`), and `agent_argv` (string[], per-project override of the command
-herdr runs, default `["claude","-p",<brief-file>,"--permission-mode","acceptEdits"]`).
+`verifying`), `agent_argv` (string[], per-project override of the command
+herdr runs, default `["claude","-p",<brief-file>,"--permission-mode","acceptEdits"]`),
+and `gchat_spaces` (`[{space, label?}]`, the Google Chat intake allowlist —
+messages in each `spaces/<id>` become draft tasks in THIS project; see Intake
+connectors below).
 
 ### Task
 ```json
@@ -54,12 +57,18 @@ herdr runs, default `["claude","-p",<brief-file>,"--permission-mode","acceptEdit
   "pr_url": "https://github.com/acme/web/pull/1",
   "ci_status": "passing",
   "summary": "Shipped dark mode toggle; all tests green.",
+  "source": null,
   "created_at": "...",
   "updated_at": "..."
 }
 ```
 `state ∈ {queued, in_progress, needs_decision, in_review, verifying, done, failed, cancelled}`
 `kind ∈ {ship, scout, chore}`
+`source` is null for director/agent-created tasks, or `"intake_gchat"` for a task
+drafted by the Google Chat intake connector (an untrusted, unreviewed external
+message — the web board flags these). A companion `source_ref` column (not
+returned) holds the upstream message resource name and is uniquely indexed for
+dedupe.
 
 ### Event
 ```json
@@ -192,7 +201,8 @@ under a "Known failure patterns" section, 10 most recent by `last_seen`.
   "delivered_at": "2026-07-09T09:00:00.000Z"
 }
 ```
-`kind ∈ {decision, done, failed, incident, stale}`. `urgency ∈ {normal, urgent}`.
+`kind ∈ {decision, done, failed, incident, stale, intake}`. `urgency ∈ {normal, urgent}`.
+(`intake` is a new Google-Chat draft task — always `normal`, batched into the digest.)
 `task_id` / `decision_id` may be null. `delivered_at` is set once David has been
 made aware — urgent notifications push a macOS notification immediately (so it is
 set on creation); normal ones are batched into a single digest every
@@ -321,6 +331,28 @@ Subsequent messages (broadcast to all clients on every change):
 A state change therefore produces both an `event` message (`type:"state_change"`)
 and a `task` message. The client should upsert by `id`. There is no replay/backfill
 on connect; load current state via the REST endpoints, then apply stream deltas.
+
+### Intake connectors (Google Chat)
+No HTTP endpoints — the connector is a server-internal poller plus a local CLI
+command. It reads an allowlist of Chat spaces (`config.gchat_spaces` per project)
+and drafts a `ship` task (state `queued`, `source: "intake_gchat"`, title
+`[intake:gchat] <first line>`, full message in the brief) for each new message,
+with a `note` event marking it UNREVIEWED and image attachments (png/jpg/gif/webp,
+≤5MB) attached as `screenshot` evidence. Message text is untrusted: stored
+verbatim, never executed or shell-inlined. Self-authored (`GCHAT_SELF_ID`) and
+bot messages are skipped; each message is deduped by its resource name (unique
+`tasks.source_ref`). Every new intake task enqueues a `normal` notification.
+
+- Poll interval: `HIVE_GCHAT_POLL_MS` (default 60000). Hard no-op until at least
+  one project sets `config.gchat_spaces`.
+- Cursor: `intake_cursors(source, key, cursor)` persists the incremental
+  `createTime` position per `("gchat", <space>)`.
+- Secrets (values in the macOS keychain under `hive/gchat/*`, never in the DB):
+  `GCHAT_CLIENT_ID`, `GCHAT_CLIENT_SECRET`, `GCHAT_REFRESH_TOKEN`, and optional
+  `GCHAT_SELF_ID`. Set them once with `hive gchat auth` (interactive OAuth
+  consent; scope `chat.messages.readonly`).
+- Errors (token expiry, list failure) emit a single diagnostic then stay quiet,
+  recovering on the next successful poll — no spam.
 
 ### Static assets
 - `GET /evidence/<task_id>/<file>` → the raw evidence file (`404` if missing; path traversal rejected `403`).

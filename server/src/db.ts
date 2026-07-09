@@ -151,6 +151,22 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX idx_notifications_ts ON notifications(ts);
   `,
+  // v5 — intake connectors (Google Chat first). Tasks gain a source tag so the
+  // board can flag externally-sourced, unreviewed work; source_ref holds the
+  // upstream resource id (Chat message name) with a unique index for dedupe.
+  // intake_cursors persists the incremental poll position per source+key.
+  `
+  ALTER TABLE tasks ADD COLUMN source TEXT;
+  ALTER TABLE tasks ADD COLUMN source_ref TEXT;
+  CREATE UNIQUE INDEX idx_tasks_source_ref ON tasks(source_ref) WHERE source_ref IS NOT NULL;
+
+  CREATE TABLE intake_cursors (
+    source TEXT NOT NULL,
+    key TEXT NOT NULL,
+    cursor TEXT,
+    PRIMARY KEY (source, key)
+  );
+  `,
 ];
 
 export type DB = Database;

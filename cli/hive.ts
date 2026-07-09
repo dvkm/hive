@@ -21,6 +21,9 @@ Usage:
   hive learning list [--project <id>] [--status active|resolved]
   hive learning recur <learning-id>
   hive spawn <task-id>                    spawn a herdr agent for a task
+  hive gchat auth [--client-id <id>] [--client-secret <s>] [--self users/<id>] [--port <p>]
+        one-time Google Chat OAuth consent; stores the refresh token in the keychain
+        (client id/secret also read from GCHAT_CLIENT_ID / GCHAT_CLIENT_SECRET env)
   hive secret set --project <id> --name <n> [--provider keychain|bitwarden]
         (reads the value from stdin; writes to the provider, stores only a ref)
   hive secret list --project <id>
@@ -278,6 +281,55 @@ async function main() {
       return;
     }
     die(`unknown 'secret' subcommand: ${sub}\n\n${USAGE}`);
+  }
+
+  if (cmd === "gchat") {
+    const sub = argv[1];
+    const { flags } = parseFlags(argv.slice(2));
+    if (sub === "auth") {
+      const clientId = String(flags["client-id"] || process.env.GCHAT_CLIENT_ID || "");
+      const clientSecret = String(flags["client-secret"] || process.env.GCHAT_CLIENT_SECRET || "");
+      if (!clientId || !clientSecret)
+        die("need --client-id and --client-secret (or GCHAT_CLIENT_ID / GCHAT_CLIENT_SECRET env)");
+      const port = Number(flags.port || 4788);
+      const redirectUri = `http://127.0.0.1:${port}`;
+      const { buildAuthUrl, exchangeCode, GCHAT_NS } = await import("../server/src/intake/gchat.ts");
+      const { providerFor } = await import("../server/src/secrets.ts");
+
+      // Capture the OAuth redirect on a throwaway localhost server.
+      const code: string = await new Promise((resolve, reject) => {
+        const srv = Bun.serve({
+          hostname: "127.0.0.1",
+          port,
+          fetch(req) {
+            const c = new URL(req.url).searchParams.get("code");
+            if (c) {
+              setTimeout(() => srv.stop(), 100);
+              resolve(c);
+              return new Response("hive: Google Chat authorized. You can close this tab.", {
+                headers: { "Content-Type": "text/plain" },
+              });
+            }
+            return new Response("waiting for ?code=", { status: 400 });
+          },
+        });
+        console.log(`\nOpen this URL in your browser, grant access, and return here:\n\n${buildAuthUrl(clientId, redirectUri)}\n`);
+        setTimeout(() => { srv.stop(); reject(new Error("timed out waiting for consent")); }, 5 * 60 * 1000);
+      });
+
+      const tokens = await exchangeCode(clientId, clientSecret, code, redirectUri);
+      if (!tokens.refresh_token)
+        die("no refresh_token returned (revoke prior consent at myaccount.google.com and retry — needs prompt=consent)");
+
+      const kc = providerFor("keychain");
+      await kc.set(GCHAT_NS, "GCHAT_CLIENT_ID", clientId);
+      await kc.set(GCHAT_NS, "GCHAT_CLIENT_SECRET", clientSecret);
+      await kc.set(GCHAT_NS, "GCHAT_REFRESH_TOKEN", tokens.refresh_token);
+      if (flags.self) await kc.set(GCHAT_NS, "GCHAT_SELF_ID", String(flags.self));
+      console.log("stored Google Chat credentials in the keychain (hive/gchat/*). Add spaces to a project's config.gchat_spaces to start polling.");
+      return;
+    }
+    die(`unknown 'gchat' subcommand: ${sub}\n\n${USAGE}`);
   }
 
   if (cmd === "open") {
