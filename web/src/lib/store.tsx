@@ -110,6 +110,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             return d.status === "open" ? [d, ...rest] : rest;
           });
           bump(d.task_id);
+        } else if (msg.type === "usage") {
+          bump(msg.usage.task_id);
         } else if (msg.type === "notification") {
           const n: Notification = msg.notification;
           setNotifications((prev) => (prev.some((x) => x.id === n.id) ? prev : [n, ...prev]));

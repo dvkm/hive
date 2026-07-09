@@ -30,6 +30,7 @@ import { runSmoke } from "./monitors.ts";
 import { enqueue, ackNotifications } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, type AuthzInput } from "./authority.ts";
 import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.ts";
+import { costUsd } from "./pricing.ts";
 
 export interface HandlerDeps {
   herdr?: Herdr; // injectable for tests
@@ -133,6 +134,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/send$/);
       if (m && method === "POST") return await sendSteer(db, herdr, m[1], await req.json());
 
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/usage$/);
+      if (m && method === "GET") return taskUsage(db, m[1]);
+
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/brief$/);
       if (m && method === "GET") {
         if (!getTask(db, m[1])) return err("task not found", 404);
@@ -195,6 +199,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
           return json({ ok: true });
         }
       }
+
+      // ---- analytics (cost/token) ----
+      if (pathname === "/api/analytics/summary" && method === "GET") return analyticsSummary(db, url);
 
       // ---- incidents ----
       if (pathname === "/api/incidents" && method === "GET") return listIncidents(db, url);
@@ -737,9 +744,103 @@ async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Respon
     return json({ task });
   }
 
+  // --- usage (cost/token analytics) ---
+  if (type === "usage") return ingestUsage(db, taskId, fields, source);
+
   // --- status / blocked / generic ---
   const event = writeEvent(db, { task_id: taskId, source, type, payload: { note } });
   return json({ event }, 201);
+}
+
+// Record one LLM-call usage row. Fields arrive as numbers (JSON) or strings
+// (multipart), so coerce. cost_usd is computed server-side from the price table
+// (+ per-project config.pricing override) when the caller doesn't supply it;
+// an unpriced model stores cost_usd null and is surfaced as "unpriced".
+function ingestUsage(db: DB, taskId: string, fields: Record<string, any>, source: string): Response {
+  const model = String(fields.model ?? "").trim();
+  if (!model) return err("usage 'model' is required");
+  const int = (v: any) => {
+    const n = Math.round(Number(v));
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
+  const tokens = {
+    input_tokens: int(fields.input_tokens),
+    output_tokens: int(fields.output_tokens),
+    cache_read_tokens: int(fields.cache_read_tokens),
+  };
+  let cost: number | null;
+  if (fields.cost_usd != null && fields.cost_usd !== "") {
+    const c = Number(fields.cost_usd);
+    cost = Number.isFinite(c) ? c : null;
+  } else {
+    const task = getTask(db, taskId);
+    const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+    const overrides = project ? JSON.parse(project.config || "{}").pricing : null;
+    cost = costUsd(model, tokens, overrides);
+  }
+  const row = {
+    id: newId("use"),
+    task_id: taskId,
+    ts: now(),
+    model,
+    ...tokens,
+    cost_usd: cost,
+    source,
+  };
+  db.query(
+    `INSERT INTO usage (id, task_id, ts, model, input_tokens, output_tokens, cache_read_tokens, cost_usd, source)
+     VALUES (?,?,?,?,?,?,?,?,?)`
+  ).run(row.id, row.task_id, row.ts, row.model, row.input_tokens, row.output_tokens, row.cache_read_tokens, row.cost_usd, row.source);
+  broadcast({ type: "usage", usage: row });
+  return json({ usage: row }, 201);
+}
+
+// ---------------------------------------------------------------- analytics (cost/token)
+// Aggregate columns over the `usage` table. `p` is the column-qualifier prefix
+// ("" for a plain scan, "u." when usage is joined as `u`).
+function usageTotals(p = ""): string {
+  return `
+    COALESCE(SUM(${p}input_tokens),0) AS input_tokens,
+    COALESCE(SUM(${p}output_tokens),0) AS output_tokens,
+    COALESCE(SUM(${p}cache_read_tokens),0) AS cache_read_tokens,
+    COALESCE(SUM(${p}input_tokens + ${p}output_tokens + ${p}cache_read_tokens),0) AS total_tokens,
+    COALESCE(SUM(${p}cost_usd),0) AS cost_usd,
+    COUNT(*) AS calls,
+    COALESCE(SUM(CASE WHEN ${p}cost_usd IS NULL THEN 1 ELSE 0 END),0) AS unpriced`;
+}
+
+function analyticsSummary(db: DB, url: URL): Response {
+  const since = url.searchParams.get("since");
+  const w = since ? " WHERE ts >= ?" : "";
+  const a = since ? [since] : [];
+  const totals = db.query(`SELECT ${usageTotals()} FROM usage${w}`).get(...a);
+  const by_model = db
+    .query(`SELECT model, ${usageTotals()} FROM usage${w} GROUP BY model ORDER BY cost_usd DESC, total_tokens DESC`)
+    .all(...a);
+  // Per-project + top tasks join through tasks; qualify the ts filter on usage.
+  const jw = since ? " WHERE u.ts >= ?" : "";
+  const by_project = db
+    .query(
+      `SELECT t.project_id, p.name AS project_name, ${usageTotals("u.")}
+       FROM usage u JOIN tasks t ON u.task_id = t.id JOIN projects p ON t.project_id = p.id${jw}
+       GROUP BY t.project_id ORDER BY cost_usd DESC, total_tokens DESC`
+    )
+    .all(...a);
+  const top_tasks = db
+    .query(
+      `SELECT u.task_id, t.title, t.project_id, ${usageTotals("u.")}
+       FROM usage u JOIN tasks t ON u.task_id = t.id${jw}
+       GROUP BY u.task_id ORDER BY cost_usd DESC, total_tokens DESC LIMIT 10`
+    )
+    .all(...a);
+  return json({ since: since ?? null, totals, by_model, by_project, top_tasks });
+}
+
+function taskUsage(db: DB, taskId: string): Response {
+  if (!getTask(db, taskId)) return err("task not found", 404);
+  const usage = db.query("SELECT * FROM usage WHERE task_id = ? ORDER BY ts").all(taskId);
+  const totals = db.query(`SELECT ${usageTotals()} FROM usage WHERE task_id = ?`).get(taskId);
+  return json({ task_id: taskId, usage, totals });
 }
 
 function serveEvidence(pathname: string): Response {

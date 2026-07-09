@@ -1248,3 +1248,154 @@ a {
   opacity: 1;
   transform: translate(-50%, 0);
 }
+
+/* ---- analytics ---- */
+.analytics {
+  padding: 18px 20px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+.an-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+.an-head h2 {
+  margin: 0;
+  font-size: 16px;
+}
+.an-windows {
+  display: flex;
+  gap: 4px;
+}
+.an-win {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: 5px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.an-win.on {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--text);
+}
+.an-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.an-tile {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+.an-tile-val {
+  font-size: 22px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+.an-tile-label {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-top: 3px;
+}
+.an-tile-sub {
+  color: var(--text-faint);
+  font-size: 11px;
+  margin-top: 2px;
+}
+.an-panel {
+  margin-bottom: 16px;
+}
+.an-panel h3 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+.an-table-wrap {
+  overflow-x: auto;
+}
+.an-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.an-table th {
+  text-align: left;
+  color: var(--text-faint);
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 0 10px 6px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.an-table td {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  vertical-align: middle;
+}
+.an-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.an-table .dim {
+  color: var(--text-dim);
+}
+.an-table .strong {
+  font-weight: 600;
+}
+.an-first {
+  position: relative;
+  min-width: 160px;
+  max-width: 360px;
+}
+.an-bar {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--accent);
+  opacity: 0.55;
+  border-radius: 2px;
+}
+.an-model {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.an-link {
+  color: var(--accent);
+}
+.an-unpriced {
+  background: var(--amber);
+  color: #1a1205;
+  margin-left: 6px;
+}
+
+/* ---- task usage line ---- */
+.task-usage {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-soft);
+}
+.tu-tok {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.tu-cost {
+  color: var(--green);
+  font-weight: 600;
+}
