@@ -20,6 +20,8 @@ import {
   parseTabId,
   parseAgentProbe,
   parseAgentStatus,
+  paneSendKeysArgv,
+  parsePaneId,
 } from "../src/runtime/herdr.ts";
 
 // A recording stub: canned results per matched argv, records every call.
@@ -245,4 +247,32 @@ test("teardown accepts a merged branch even when unpushed", async () => {
   const r = await h.teardown({ repoPath: "/repo", branch: "hive/t1", worktreePath: "/wt" });
   expect(r.removed).toBe(true);
   expect(r.reason).toBe("merged");
+});
+
+test("send writes text then submits with an explicit Enter to the pane", async () => {
+  const { exec, calls } = stubExec((argv) => {
+    if (argv.includes("agent") && argv.includes("get"))
+      return OK(JSON.stringify({ result: { agent: { pane_id: "wR:p7", agent_status: "idle" } } }));
+    return OK("ok");
+  });
+  const h = new Herdr(exec, "herdr");
+  await h.send("t1", "hello world");
+  // 1) text is written, 2) pane resolved, 3) Enter submitted to that pane.
+  // calls include the bin name at [0]; assert on the argv tail.
+  expect(calls[0].slice(1)).toEqual(["agent", "send", "t1", "hello world"]);
+  expect(calls.some((c) => c[1] === "agent" && c[2] === "get" && c[3] === "t1")).toBe(true);
+  const enter = calls.find((c) => c[1] === "pane" && c[2] === "send-keys");
+  expect(enter?.slice(1)).toEqual(["pane", "send-keys", "wR:p7", "Enter"]);
+});
+
+test("send still delivers text if the pane can't be resolved (no false throw)", async () => {
+  const { exec, calls } = stubExec((argv) => {
+    if (argv.includes("agent") && argv.includes("get")) return OK("not json");
+    return OK("ok");
+  });
+  const h = new Herdr(exec, "herdr");
+  await h.send("t1", "hi");
+  expect(calls[0].slice(1)).toEqual(["agent", "send", "t1", "hi"]);
+  // pane unresolved → no send-keys, but no throw either.
+  expect(calls.some((c) => c[1] === "pane")).toBe(false);
 });
