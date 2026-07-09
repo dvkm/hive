@@ -339,6 +339,25 @@ a {
   color: var(--amber);
   border-color: rgba(226, 165, 66, 0.4);
 }
+.chip-planned {
+  color: var(--purple);
+  border-color: rgba(155, 125, 214, 0.4);
+}
+
+/* Breakdown (planner child tasks) */
+.breakdown {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.breakdown li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 
 /* PR + CI */
 .pr {

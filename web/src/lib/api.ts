@@ -28,6 +28,7 @@ export interface Task {
   ci_status: CiStatus;
   summary: string | null;
   source: string | null;
+  parent_task_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -184,6 +185,11 @@ export const api = {
     req<{ ok: boolean; stubbed: boolean; message: string }>(`/api/tasks/${id}/send`, {
       method: "POST",
       body: JSON.stringify({ message }),
+    }),
+  plan: (id: string) =>
+    req<{ ok: boolean; decision?: Decision; error?: string }>(`/api/tasks/${id}/plan`, {
+      method: "POST",
+      body: "{}",
     }),
 
   decisions: (status: "open" | "answered" | "all" = "open") =>

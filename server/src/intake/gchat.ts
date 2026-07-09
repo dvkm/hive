@@ -27,6 +27,7 @@ import { enqueue } from "../notifications.ts";
 import { providerFor } from "../secrets.ts";
 import type { Exec } from "../exec.ts";
 import { defaultExec } from "../exec.ts";
+import { runPlanner, type PlannerExec } from "../planner.ts";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 
@@ -54,6 +55,7 @@ export interface GchatDeps {
   notify?: boolean; // enqueue notifications; default true
   secrets?: GchatSecrets; // bypass keychain resolution (tests)
   intervalMs?: number; // startGchatPoll only
+  plannerExec?: PlannerExec; // domain-supervisor planner (auto-trigger when config.plan_intake)
 }
 
 // ---- module state (mirrors secrets.ts's module-level knownValues) ----
@@ -199,7 +201,9 @@ async function createIntakeTask(
   msg: any,
   token: string,
   fetchImpl: FetchLike,
-  notify: boolean
+  notify: boolean,
+  planIntake: boolean,
+  plannerExec?: PlannerExec
 ): Promise<any | null> {
   const name: string = msg.name;
   if (db.query("SELECT 1 FROM tasks WHERE source_ref = ?").get(name)) return null; // dedupe
@@ -246,6 +250,18 @@ async function createIntakeTask(
   broadcast({ type: "task", task });
   if (notify)
     enqueue(db, { kind: "intake", task_id: id, title: `Intake: ${firstLine}`, body: `From ${sender}` });
+
+  // Domain supervisor: auto-triage this intake task into a proposed breakdown
+  // when the project opted in. ponytail: awaited inline (blocks the poll cycle
+  // for one planner run); fine for a single-user localhost tool. Make it
+  // fire-and-forget if intake volume ever makes the block matter.
+  if (planIntake) {
+    try {
+      await runPlanner(db, id, { exec: plannerExec });
+    } catch (e) {
+      /* runPlanner records its own planner_error event; never fail the intake */
+    }
+  }
   return task;
 }
 
@@ -258,15 +274,17 @@ export async function pollGchatOnce(db: DB, deps: GchatDeps = {}): Promise<{ cre
   const notify = deps.notify ?? true;
 
   const projects = db.query("SELECT id, config FROM projects").all() as { id: string; config: string }[];
-  const jobs: { projectId: string; space: string }[] = [];
+  const jobs: { projectId: string; space: string; planIntake: boolean }[] = [];
   for (const p of projects) {
-    let spaces: any[] = [];
+    let cfg: any = {};
     try {
-      spaces = JSON.parse(p.config || "{}").gchat_spaces ?? [];
+      cfg = JSON.parse(p.config || "{}");
     } catch {
-      spaces = [];
+      cfg = {};
     }
-    for (const s of spaces) if (s?.space) jobs.push({ projectId: p.id, space: s.space });
+    const spaces: any[] = cfg.gchat_spaces ?? [];
+    const planIntake = cfg.plan_intake === true;
+    for (const s of spaces) if (s?.space) jobs.push({ projectId: p.id, space: s.space, planIntake });
   }
   if (jobs.length === 0) return { created: 0, spaces: 0 }; // unconfigured: hard no-op
 
@@ -296,7 +314,7 @@ export async function pollGchatOnce(db: DB, deps: GchatDeps = {}): Promise<{ cre
         const senderType = msg.sender?.type;
         const isSelf = secrets.self && msg.sender?.name === secrets.self;
         if (!isSelf && senderType !== "BOT") {
-          const made = await createIntakeTask(db, job.projectId, job.space, msg, token, fetchImpl, notify);
+          const made = await createIntakeTask(db, job.projectId, job.space, msg, token, fetchImpl, notify, job.planIntake, deps.plannerExec);
           if (made) created++;
         }
         // Advance the cursor even for skipped messages so we never refetch them.

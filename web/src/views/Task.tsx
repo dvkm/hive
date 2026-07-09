@@ -55,10 +55,11 @@ function DecisionMini({ d }: { d: Decision }) {
 
 export default function TaskPage() {
   const { id = "" } = useParams();
-  const { rev, projects } = useStore();
+  const { rev, projects, tasks } = useStore();
   const [t, setT] = useState<TaskDetail | null>(null);
   const [err, setErr] = useState<string>("");
   const [steer, setSteer] = useState("");
+  const [planning, setPlanning] = useState(false);
 
   useEffect(() => {
     let live = true;
@@ -78,6 +79,8 @@ export default function TaskPage() {
   const events = [...t.events].sort((a, b) => (a.ts < b.ts ? 1 : -1));
   const openDecisions = t.decisions.filter((d) => d.status === "open");
   const pastDecisions = t.decisions.filter((d) => d.status !== "open");
+  const children = tasks.filter((x) => x.parent_task_id === t.id);
+  const parent = t.parent_task_id ? tasks.find((x) => x.id === t.parent_task_id) : undefined;
 
   const doTransition = async (to: string) => {
     try {
@@ -97,12 +100,30 @@ export default function TaskPage() {
       toast((e as Error).message);
     }
   };
+  const planBreakdown = async () => {
+    if (planning) return;
+    setPlanning(true);
+    try {
+      const r = await api.plan(t.id);
+      toast(r.ok ? "Breakdown proposed — answer in Decisions" : `Planner failed: ${r.error}`);
+    } catch (e) {
+      toast((e as Error).message);
+    } finally {
+      setPlanning(false);
+    }
+  };
 
   return (
     <div className="task">
       <div className="task-main">
         <div className="crumbs">
           <Link to="/">← Board</Link>
+          {parent && (
+            <>
+              {" · "}
+              <Link to={`/tasks/${parent.id}`}>↰ Parent: {parent.title}</Link>
+            </>
+          )}
         </div>
         <h1 className="task-title">
           <StatusDot state={t.state} /> {t.title}
@@ -117,6 +138,22 @@ export default function TaskPage() {
           <h2>Brief</h2>
           <pre className="brief">{t.brief || "(no brief)"}</pre>
         </section>
+
+        {children.length > 0 && (
+          <section className="panel">
+            <h2>Breakdown ({children.length})</h2>
+            <ul className="breakdown">
+              {children.map((c) => (
+                <li key={c.id}>
+                  <StatusDot state={c.state} />
+                  <Link to={`/tasks/${c.id}`}>{c.title}</Link>
+                  <span className={`chip chip-kind chip-${c.kind}`}>{c.kind}</span>
+                  <span className="chip">{STATE_LABEL[c.state]}</span>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
 
         {(openDecisions.length > 0 || pastDecisions.length > 0) && (
           <section className="panel">
@@ -200,6 +237,9 @@ export default function TaskPage() {
               Send steer
             </button>
           </div>
+          <button className="btn" onClick={planBreakdown} disabled={planning}>
+            {planning ? "Planning…" : "Plan breakdown"}
+          </button>
           <div className="transitions">
             {(NEXT[t.state] || []).map((to) => (
               <button

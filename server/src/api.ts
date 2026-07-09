@@ -29,10 +29,12 @@ import { resolveProjectSecrets } from "./secrets.ts";
 import { runSmoke } from "./monitors.ts";
 import { enqueue, ackNotifications } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, type AuthzInput } from "./authority.ts";
+import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.ts";
 
 export interface HandlerDeps {
   herdr?: Herdr; // injectable for tests
   supervise?: boolean; // start the herdr wait loop after spawn (true in prod wiring)
+  plannerExec?: PlannerExec; // injectable planner subprocess (domain supervisors)
 }
 
 const VERSION = "0.1.0";
@@ -137,6 +139,13 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       }
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/guarded-action$/);
       if (m && method === "POST") return guardedAction(db, m[1], await req.json());
+
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/plan$/);
+      if (m && method === "POST") {
+        if (!getTask(db, m[1])) return err("task not found", 404);
+        const r = await runPlanner(db, m[1], { exec: deps.plannerExec });
+        return r.ok ? json({ ok: true, decision: r.decision }) : json({ ok: false, error: r.error }, 502);
+      }
 
       // ---- decisions ----
       if (pathname === "/api/decisions") {
@@ -813,6 +822,9 @@ function apiAnswerDecision(db: DB, id: string, body: any): Response {
   // If this card gated a standing-authority request, approve → mint the
   // single-use 24h grant so the agent's retry passes; deny → block it.
   resolveGrantForDecision(db, id, answerKey);
+  // If this card was a planner breakdown proposal, approve → create the proposed
+  // child tasks (source='planner', parent_task_id → source); reject → event only.
+  resolvePlanForDecision(db, id, answerKey);
   // Resume the task if it was parked on this decision. (herdr `agent send` is Phase 2.)
   const task = getTask(db, r.task_id);
   if (task && task.state === "needs_decision")

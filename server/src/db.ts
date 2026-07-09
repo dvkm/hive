@@ -199,6 +199,13 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX idx_authority_grants_lookup ON authority_grants(task_id, action, target, status);
   `,
+  // v7 — domain supervisors (on-demand planners). A planner proposes a task
+  // breakdown for a source task; on approval the proposed tasks are created with
+  // source='planner' and parent_task_id linking back to the source task.
+  `
+  ALTER TABLE tasks ADD COLUMN parent_task_id TEXT;
+  CREATE INDEX idx_tasks_parent ON tasks(parent_task_id) WHERE parent_task_id IS NOT NULL;
+  `,
 ];
 
 export type DB = Database;
