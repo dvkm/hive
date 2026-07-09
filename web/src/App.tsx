@@ -12,6 +12,7 @@ import Policies from "./views/Policies";
 import Monitors from "./views/Monitors";
 import Learnings from "./views/Learnings";
 import Analytics from "./views/Analytics";
+import Projects from "./views/Projects";
 
 function ConnDot() {
   const { sse } = useStore();
@@ -86,6 +87,7 @@ export default function App() {
           </NavLink>
           <NavLink to="/learnings">Learnings</NavLink>
           <NavLink to="/analytics">Analytics</NavLink>
+          <NavLink to="/projects">Projects</NavLink>
           <NavLink to="/policies">Policies</NavLink>
           <NavLink to="/monitors">Monitors</NavLink>
         </nav>
@@ -100,6 +102,7 @@ export default function App() {
           <Route path="/decisions" element={<Decisions />} />
           <Route path="/learnings" element={<Learnings />} />
           <Route path="/analytics" element={<Analytics />} />
+          <Route path="/projects" element={<Projects />} />
           <Route path="/policies" element={<Policies />} />
           <Route path="/monitors" element={<Monitors />} />
         </Routes>

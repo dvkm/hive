@@ -96,8 +96,13 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // ---- projects ----
       if (pathname === "/api/projects") {
         if (method === "GET") {
-          const rows = db.query("SELECT * FROM projects ORDER BY created_at").all();
-          return json(rows.map(parseProject));
+          // Archived projects (config.archived === true) are hidden unless
+          // ?archived=all is passed. tasks still reference them; there is no delete.
+          const includeArchived = url.searchParams.get("archived") === "all";
+          const sql = includeArchived
+            ? "SELECT * FROM projects ORDER BY created_at"
+            : "SELECT * FROM projects WHERE COALESCE(json_extract(config, '$.archived'), 0) = 0 ORDER BY created_at";
+          return json(db.query(sql).all().map(parseProject));
         }
         if (method === "POST") return createProject(db, await req.json());
       }

@@ -114,6 +114,12 @@ export interface Project {
     default_branch?: string;
     deploy_notes?: string;
     monitors?: { name: string; url: string; expect_status: number; expect_substring?: string; interval_s: number }[];
+    auto_dispatch?: boolean;
+    dispatch_kinds?: Kind[];
+    max_agents?: number;
+    supervisor_persona?: string;
+    playbook?: string;
+    archived?: boolean;
     [k: string]: unknown;
   };
   created_at: string;
@@ -292,7 +298,10 @@ export const api = {
   updateAuthorityRule: (id: string, b: Partial<Pick<AuthorityRule, "action_pattern" | "effect" | "note" | "active">>) =>
     req<AuthorityRule>(`/api/authority/rules/${id}`, { method: "PUT", body: JSON.stringify(b) }),
 
-  projects: () => req<Project[]>(`/api/projects`),
+  projects: (opts: { archived?: boolean } = {}) =>
+    req<Project[]>(`/api/projects${opts.archived ? "?archived=all" : ""}`),
+  createProject: (b: { name: string; repo_path: string; config?: Project["config"] }) =>
+    req<Project>(`/api/projects`, { method: "POST", body: JSON.stringify(b) }),
   updateProject: (id: string, b: { config?: Project["config"]; name?: string; repo_path?: string | null }) =>
     req<Project>(`/api/projects/${id}`, { method: "PUT", body: JSON.stringify(b) }),
   // Incidents API is built in parallel; treat absence (404/network) as "not running yet".
