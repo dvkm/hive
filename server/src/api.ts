@@ -33,6 +33,7 @@ import { enqueue, ackNotifications } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
 import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.ts";
+import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { costUsd } from "./pricing.ts";
 import { taskDiff } from "./diff.ts";
 import type { Exec } from "./exec.ts";
@@ -139,6 +140,12 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (method === "GET") return listTasks(db, url);
         if (method === "POST") return createTask(db, await req.json());
       }
+      // Duplicate CLUSTERS among current non-terminal tasks (backfill/UI). Must
+      // precede the /:id route so "duplicates" isn't parsed as a task id.
+      if (pathname === "/api/tasks/duplicates" && method === "GET")
+        return json({ clusters: duplicateClusters(db) });
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/merge-into$/);
+      if (m && method === "POST") return mergeIntoEndpoint(db, m[1], await req.json());
       m = pathname.match(/^\/api\/tasks\/([^/]+)$/);
       if (m && method === "GET") return getTaskFull(db, m[1]);
       if (m && method === "PUT") return updateTask(db, m[1], await req.json());
@@ -400,6 +407,21 @@ function createTask(db: DB, body: any): Response {
   );
   writeEvent(db, { task_id: row.id, source: "director", type: "created", payload: { title: row.title } });
   broadcastTask(db, row);
+
+  // Duplicate detection. An exact dup of a brand-new (queued, no agent) task is
+  // auto-merged with no interruption; anything fuzzier — or an exact dup of a
+  // task that's already started — asks the director via a decision card. Safety:
+  // only a queued task with no agent is ever auto-cancelled here.
+  const match = detectDuplicate(db, parseTask(row));
+  if (match) {
+    const safeAuto = row.state === "queued" && !row.agent_target;
+    if (match.tier === "exact" && safeAuto) {
+      mergeInto(db, row.id, match.survivor.id);
+      return json(taskWithHealth(db, getTask(db, row.id)), 201);
+    }
+    openDuplicateDecision(db, getTask(db, row.id), match);
+    return json(taskWithHealth(db, getTask(db, row.id)), 201);
+  }
   return json(taskWithHealth(db, parseTask(row)), 201);
 }
 
@@ -414,6 +436,21 @@ function updateTask(db: DB, id: string, body: any): Response {
   const updated = getTask(db, id);
   broadcastTask(db, updated);
   return json(taskWithHealth(db, updated));
+}
+
+// Manual merge: fold this task into `target_id`, cancelling it as a duplicate.
+// Distinct from POST /merge (the PR/branch merge another crew built). Refuses
+// self-merge and a target that doesn't exist; mergeInto's cancel guards against
+// folding an already-terminal task (409 via the transition error).
+function mergeIntoEndpoint(db: DB, id: string, body: any): Response {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  const targetId = body?.target_id;
+  if (!targetId) return err("target_id is required");
+  if (targetId === id) return err("cannot merge a task into itself");
+  if (!getTask(db, targetId)) return err("target task not found", 404);
+  const cancelled = mergeInto(db, id, targetId);
+  return json(taskWithHealth(db, cancelled));
 }
 
 function listTasks(db: DB, url: URL): Response {
@@ -1679,6 +1716,8 @@ function apiAnswerDecision(db: DB, id: string, body: any): Response {
   resolvePlanForDecision(db, id, answerKey);
   // If this card was a stale-recovery escalation, `requeue` → fresh task.
   resolveRecoveryForDecision(db, id, answerKey);
+  // If this card was a possible-duplicate card, `merge` → fold + cancel.
+  resolveDuplicateForDecision(db, id, answerKey);
   // Resume the task if it was parked on this decision. (herdr `agent send` is Phase 2.)
   const task = getTask(db, r.task_id);
   if (task && task.state === "needs_decision")

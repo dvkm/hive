@@ -231,6 +231,12 @@ const MIGRATIONS: string[] = [
   `
   CREATE INDEX idx_events_ts ON events(ts);
   `,
+  // v10 — duplicate-task detection & auto-merge. A task cancelled as a duplicate
+  // keeps a pointer to the survivor it was folded into (never deleted, so history
+  // is preserved). NULL for every non-duplicate task.
+  `
+  ALTER TABLE tasks ADD COLUMN duplicate_of TEXT;
+  `,
 ];
 
 export type DB = Database;
