@@ -2,6 +2,23 @@
 // GET /api/tasks/:id/brief. Pure function of DB state.
 import type { DB } from "./db.ts";
 import { getTask } from "./state.ts";
+import { prTitlePrefix, prBodyFooter } from "./marker.ts";
+
+// The PR marker contract (documented in docs/API.md). Both halves are REQUIRED
+// on any PR the agent opens so hive can link the PR back to this task.
+function prMarkerSection(number: number, id: string): string {
+  return `## Opening a PR (REQUIRED marker)
+When you open the PR for this task — whether via /no-mistakes or directly with
+\`gh pr create\` — it MUST carry the hive marker so the board links the PR back
+to this task automatically:
+
+- The PR **title** MUST start with \`${prTitlePrefix(number)}\` (the space is part of it).
+- The PR **body** MUST include this line on its own (a footer is ideal):
+
+  ${prBodyFooter(id)}
+
+Don't hand-format it — run \`hive pr-marker ${id}\` and paste what it prints.`;
+}
 
 const EMIT_PROTOCOL = `## Reporting protocol (\`hive emit\`)
 You are running under hive. Report progress with the \`hive emit\` CLI so the
@@ -102,11 +119,12 @@ export function composeBrief(db: DB, taskId: string): string {
     .all(projectScope) as { title: string; body: string }[];
 
   const parts: string[] = [];
-  parts.push(`# Task: ${task.title}`);
-  parts.push(`Task id: ${task.id}\nKind: ${task.kind}`);
+  parts.push(`# Task #${task.number}: ${task.title}`);
+  parts.push(`Task number: ${task.number}\nTask id: ${task.id}\nKind: ${task.kind}`);
   parts.push(`## Brief\n${task.brief?.trim() || "(no description provided)"}`);
   parts.push(definitionOfDone(task.kind));
   parts.push(EMIT_PROTOCOL);
+  parts.push(prMarkerSection(task.number, task.id));
   parts.push(BROWSER_VERIFICATION);
 
   if (globals.length) {

@@ -231,6 +231,28 @@ const MIGRATIONS: string[] = [
   `
   CREATE INDEX idx_events_ts ON events(ts);
   `,
+  // v10 — human-friendly task numbers. A monotonic per-hive counter assigned at
+  // creation (the opaque `id` stays the machine key; `number` is the handle
+  // people and GitHub PR markers use). Existing rows are backfilled in
+  // created_at order (id tiebreak for determinism). An AFTER INSERT trigger
+  // assigns MAX(number)+1 to any row inserted without one, so every insert path
+  // (createTask, intake, planner, requeue, gchat, monitors) gets a number for
+  // free — no per-callsite wiring. UNIQUE guards against collisions.
+  `
+  ALTER TABLE tasks ADD COLUMN number INTEGER;
+  UPDATE tasks SET number = (
+    SELECT COUNT(*) FROM tasks t2
+    WHERE t2.created_at < tasks.created_at
+       OR (t2.created_at = tasks.created_at AND t2.id <= tasks.id)
+  );
+  CREATE UNIQUE INDEX idx_tasks_number ON tasks(number);
+  CREATE TRIGGER tasks_assign_number AFTER INSERT ON tasks
+  WHEN NEW.number IS NULL
+  BEGIN
+    UPDATE tasks SET number = (SELECT COALESCE(MAX(number), 0) + 1 FROM tasks)
+    WHERE id = NEW.id;
+  END;
+  `,
 ];
 
 export type DB = Database;

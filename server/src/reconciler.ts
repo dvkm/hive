@@ -17,7 +17,7 @@ import { runSmoke, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
-import { requeueTask, openRecoveryDecision } from "./api.ts";
+import { requeueTask, openRecoveryDecision, linkPrIfMarked } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 
@@ -56,6 +56,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
     await syncPRs(db, deps);
   } catch (e) {
     fail("syncPRs", e);
+  }
+  try {
+    await linkPRs(db, deps);
+  } catch (e) {
+    fail("linkPRs", e);
   }
   try {
     flagStale(db, deps);
@@ -133,6 +138,32 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
         console.error(`[hive] smoke run failed for ${t.id}:`, e);
       }
     }
+  }
+}
+
+// ---- PR → task linking via gh ----
+// Scan each project's open PRs and link any carrying a hive marker back to its
+// task (by `hive-task: <id>` body footer, falling back to the `[hive-<n>]`
+// title). linkPrIfMarked only sets pr_url when the task isn't already linked, so
+// this is idempotent and never clobbers an agent-reported PR.
+// ponytail: re-lists all open PRs per project every cycle; fine for a localhost
+// tool with a handful of repos. Add a since-cursor if repos ever have many PRs.
+async function linkPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
+  const exec = deps.exec ?? defaultExec;
+  const projects = db
+    .query("SELECT id, repo_path FROM projects WHERE repo_path IS NOT NULL")
+    .all() as { id: string; repo_path: string }[];
+  for (const p of projects) {
+    const r = await exec(["gh", "pr", "list", "--state", "open", "--json", "number,title,body,url"], { cwd: p.repo_path });
+    if (r.code !== 0) continue; // gh unavailable / not a gh repo: skip, retry next cycle
+    let list: any;
+    try {
+      list = JSON.parse(r.stdout);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(list)) continue;
+    for (const pr of list) linkPrIfMarked(db, { title: pr.title, body: pr.body, url: pr.url });
   }
 }
 
