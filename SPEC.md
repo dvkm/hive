@@ -60,6 +60,16 @@ State machine (server-enforced):
 
 ## herdr runtime adapter (`server/src/runtime/herdr.ts`)
 
+Non-negotiable presentation rules (2026-07-09, David): hive uses herdr the way firstmate proved it should be used — agents are VISIBLE and INTERACTIVE, never invisible one-shot processes. Reference: /Users/david/projects/firstmate/docs/herdr-backend.md and AGENTS.md herdr sections.
+- Workers spawn as long-running INTERACTIVE agent sessions (never bare `claude -p` one-shots) in a dedicated, named herdr session/workspace for hive, one labeled tab per task (label = task id + short title), cwd = the task worktree.
+- David can open herdr at any time and see the whole fleet at a glance, attach to any agent, and type into it; hive must tolerate and absorb manual captain interventions (they surface as events).
+- The board links each in-progress task to its agent (a "view agent" affordance that focuses the herdr tab via `herdr agent focus`); agent liveness/status shown on the card comes from herdr integration-reported status.
+- Agent exit is an observable event: the wait/reconcile loop must detect a vanished agent within one cycle and run stale-recovery (below), never leaving a task pointing at a ghost.
+
+## Stale recovery (observed → acted on)
+
+On a stale flag: probe the agent (exists? integration status? pane tail). Dead → mark task failed with reason + captured pane tail as evidence, requeue under backoff (max 2 auto-requeues, then decision card). Alive but silent → send a status nudge via `herdr agent send`; still silent after N cycles (default 3) → decision card. Spawn also auto-installs hive's Claude Code hook wiring into the spawned agent's env so lifecycle reporting is structural, not brief-dependent.
+
 - Spawn: `herdr worktree create --cwd <repo> --branch hive/<task-id> --json` then `herdr agent start <task-id> --cwd <worktree> --env HIVE_TASK_ID=<id> --env HIVE_URL=... --no-focus -- claude -p <brief-file> --permission-mode acceptEdits` (exact argv per-project configurable).
 - Brief composition (`server/src/briefs.ts`): task brief = task description + definition of done + `hive emit` protocol instructions + ALL active global policies + project policies + project playbook. Composed fresh at spawn time.
 - Watch: after spawn, the server runs `herdr agent wait <target> --status blocked|idle|done --timeout <ms>` in a supervised loop (each wait completion re-arms; errors fall back to reconciler polling). Status changes become events.
