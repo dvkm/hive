@@ -545,6 +545,15 @@ a {
   color: var(--purple);
   border-color: rgba(155, 125, 214, 0.4);
 }
+.chip-duplicate {
+  color: var(--text-dim);
+  border-color: var(--border);
+  text-decoration: none;
+}
+.chip-duplicate:hover {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
 
 /* Breakdown (planner child tasks) */
 .breakdown {
