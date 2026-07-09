@@ -4,7 +4,7 @@ import { dirname, join, normalize } from "node:path";
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir } from "./db.ts";
-import { taskWithHealth, broadcastTask } from "./health.ts";
+import { taskWithHealth, broadcastTask, needsAttention } from "./health.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
 import {
   transition,
@@ -30,6 +30,7 @@ import { resolveProjectSecrets } from "./secrets.ts";
 import { runSmoke } from "./monitors.ts";
 import { enqueue, ackNotifications } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, type AuthzInput } from "./authority.ts";
+import { isReviewed } from "./dispatcher.ts";
 import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.ts";
 import { costUsd } from "./pricing.ts";
 
@@ -115,6 +116,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       // ---- activity feed (reverse-chronological projection over events) ----
       if (pathname === "/api/feed" && method === "GET") return listFeed(db, url);
+
+      // ---- morning brief (one composed catch-up view over existing data) ----
+      if (pathname === "/api/brief" && method === "GET") return brief(db, url);
 
       // ---- evidence browser (all evidence across tasks, filtered) ----
       if (pathname === "/api/evidence" && method === "GET") return listEvidence(db, url);
@@ -477,6 +481,110 @@ function listFeed(db: DB, url: URL): Response {
     .sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : a.id < b.id ? 1 : -1))
     .slice(0, limit);
   return json({ events: rows });
+}
+
+// Morning brief: ONE composed catch-up view over existing data (no new tables).
+// "what happened while I was away and what needs me", in priority order. Every
+// section is a plain query over rows the other endpoints already expose; the web
+// renders them with the existing Decisions / attention-tray / card components.
+//
+// `?since` (ISO) scopes the "what changed" sections (done / incidents / spend /
+// learnings). The action-state sections (open decisions, needs-attention, live
+// fleet, unreviewed intake) are current-state, not windowed — they need you now
+// regardless of when you last looked.
+function brief(db: DB, url: URL): Response {
+  const since = url.searchParams.get("since");
+
+  // ① done since — completed tasks with evidence count + summary, keyed on the
+  // state_change→done event ts (the actual completion moment).
+  const done = db
+    .query(
+      `SELECT t.id, t.title, t.summary, t.project_id, p.name AS project_name, sc.ts AS done_at,
+              (SELECT COUNT(*) FROM evidence e WHERE e.task_id = t.id) AS evidence_count
+       FROM tasks t
+       JOIN projects p ON p.id = t.project_id
+       JOIN events sc ON sc.task_id = t.id AND sc.type = 'state_change'
+         AND json_extract(sc.payload, '$.to') = 'done'
+       WHERE t.state = 'done'` + (since ? " AND sc.ts >= ?" : "") +
+      " ORDER BY sc.ts DESC"
+    )
+    .all(...(since ? [since] : []));
+
+  // ② needs attention — failed tasks awaiting triage + live tasks whose health
+  // is dead/stuck. Full task objects (with health) so the web reuses tray rows.
+  // Not windowed: these persist until you act on them.
+  const attnCandidates = db
+    .query(
+      "SELECT * FROM tasks WHERE state = 'failed' OR (agent_target IS NOT NULL AND state IN ('in_progress','needs_decision','in_review','verifying'))"
+    )
+    .all()
+    .map(parseTask)
+    .map((t: any) => taskWithHealth(db, t));
+  const failed_or_attention = attnCandidates.filter((t: any) => needsAttention(t));
+
+  // ③ decisions — open cards ARE the action items (full objects, rendered inline).
+  const decisions = db
+    .query("SELECT * FROM decisions WHERE status = 'open' ORDER BY ts DESC")
+    .all()
+    .map(parseDecision);
+
+  // ④ fleet now — currently live agents (task + health).
+  const fleet = db
+    .query(
+      "SELECT * FROM tasks WHERE agent_target IS NOT NULL AND state IN ('in_progress','needs_decision','in_review','verifying') ORDER BY updated_at DESC"
+    )
+    .all()
+    .map(parseTask)
+    .map((t: any) => taskWithHealth(db, t));
+
+  // ⑤ incidents opened/resolved since.
+  const incidents = db
+    .query(
+      `SELECT i.*, p.name AS project_name FROM incidents i
+       JOIN projects p ON p.id = i.project_id` + (since ? " WHERE i.ts >= ?" : "") +
+      " ORDER BY i.ts DESC"
+    )
+    .all(...(since ? [since] : []));
+
+  // ⑥ intake — unreviewed Google-Chat draft tasks still queued for triage.
+  const intake = db
+    .query(
+      "SELECT t.*, p.name AS project_name FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.source = 'intake_gchat' AND t.state = 'queued' ORDER BY t.created_at DESC"
+    )
+    .all()
+    .filter((t: any) => !isReviewed(db, t.id))
+    .map((t: any) => ({ ...parseTask(t), project_name: t.project_name }));
+
+  // ⑦ spend since — reuse the analytics rollup (totals + by-model for top model).
+  const w = since ? " WHERE ts >= ?" : "";
+  const a = since ? [since] : [];
+  const spend = {
+    totals: db.query(`SELECT ${usageTotals()} FROM usage${w}`).get(...a),
+    by_model: db
+      .query(`SELECT model, ${usageTotals()} FROM usage${w} GROUP BY model ORDER BY cost_usd DESC, total_tokens DESC`)
+      .all(...a),
+  };
+
+  // ⑧ learnings created/recurred since (last_seen bumps on both create and recur).
+  const learnings_new = db
+    .query(
+      `SELECT l.*, p.name AS project_name FROM learnings l
+       JOIN projects p ON p.id = l.project_id` + (since ? " WHERE l.last_seen >= ?" : "") +
+      " ORDER BY l.last_seen DESC"
+    )
+    .all(...(since ? [since] : []));
+
+  return json({
+    since: since ?? null,
+    done,
+    failed_or_attention,
+    decisions,
+    fleet,
+    incidents,
+    intake,
+    spend,
+    learnings_new,
+  });
 }
 
 // Evidence browser: all evidence across tasks, newest first, joined to its task

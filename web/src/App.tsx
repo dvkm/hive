@@ -4,6 +4,7 @@ import type { Location } from "react-router-dom";
 import { useStore } from "./lib/store";
 import { relTime } from "./lib/time";
 import Board from "./views/Board";
+import Brief from "./views/Brief";
 import Feed from "./views/Feed";
 import Evidence from "./views/Evidence";
 import TaskPage from "./views/Task";
@@ -79,6 +80,7 @@ export default function App() {
           <span className="brand-mark">◆</span> hive
         </div>
         <nav className="nav">
+          <NavLink to="/brief">Brief</NavLink>
           <NavLink to="/" end>
             Board
           </NavLink>
@@ -100,6 +102,7 @@ export default function App() {
       <main className="content">
         <Routes location={background || location}>
           <Route path="/" element={<Board />} />
+          <Route path="/brief" element={<Brief />} />
           <Route path="/feed" element={<Feed />} />
           <Route path="/evidence" element={<Evidence />} />
           <Route path="/tasks/:id" element={<TaskPage />} />
