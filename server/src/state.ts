@@ -42,6 +42,18 @@ const FORWARD: Record<State, State[]> = {
 
 export class TransitionError extends Error {}
 
+// Fired after a task reaches an unambiguously-final state (done / cancelled) so
+// the server can auto-tear-down its worktree + herdr session. Kept as an
+// injected hook (set only in production wiring, index.ts) so state.ts stays free
+// of the herdr/subprocess dependency and tests transition without side effects.
+// NOT fired for `failed`: a failed task may still be auto-requeued/retried, and
+// its worktree is handled by the recovery path + the reaper backstop.
+type TerminalHook = (db: DB, taskId: string, to: State) => void;
+let terminalHook: TerminalHook | null = null;
+export function setTerminalHook(fn: TerminalHook | null): void {
+  terminalHook = fn;
+}
+
 export function getTask(db: DB, id: string): any | null {
   const r = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
   return r ? parseTask(r) : null;
@@ -140,5 +152,13 @@ export function transition(
     enqueue(db, { kind: "done", task_id: taskId, title: `Task done: ${task.title}`, body: task.summary ?? undefined });
   else if (to === "failed")
     enqueue(db, { kind: "failed", task_id: taskId, title: `Task failed: ${task.title}`, body: opts.reason ?? undefined });
+  // Auto-teardown on an unambiguously-final state. failed is excluded (still retriable).
+  if ((to === "done" || to === "cancelled") && terminalHook) {
+    try {
+      terminalHook(db, taskId, to);
+    } catch (e) {
+      console.error("[hive] terminal cleanup hook:", e);
+    }
+  }
   return updated;
 }

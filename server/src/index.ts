@@ -3,9 +3,13 @@ import { openDb, defaultDbPath } from "./db.ts";
 import { makeHandler } from "./api.ts";
 import { startReconciler } from "./reconciler.ts";
 import { startDispatcher } from "./dispatcher.ts";
+import { startReaper } from "./reaper.ts";
 import { checkAllMonitors } from "./monitors.ts";
 import { startDigest, setNotifier } from "./notifications.ts";
 import { startGchatPoll } from "./intake/gchat.ts";
+import { setTerminalHook } from "./state.ts";
+import { cleanupTask } from "./cleanup.ts";
+import { herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { defaultExec } from "./exec.ts";
 
 const port = Number(process.env.HIVE_PORT || 4700);
@@ -34,6 +38,15 @@ startDispatcher(db, { intervalMs: dispatchMs, supervise: true });
 setInterval(() => {
   checkAllMonitors(db).catch((e) => console.error("[hive] monitor cycle crashed:", e));
 }, monitorMs);
+
+// Auto-cleanup of finished tasks: tear down worktree + herdr session the moment
+// a task reaches done/cancelled, and a periodic reaper sweep as the backstop for
+// anything skipped/missed. Both guard against losing unmerged/uncommitted work.
+setTerminalHook((db, taskId) => {
+  cleanupTask(db, defaultHerdr, taskId).catch((e) => console.error("[hive] auto-cleanup:", e));
+});
+const reapMs = Number(process.env.HIVE_REAP_MS || 300_000);
+startReaper(db, { intervalMs: reapMs });
 
 // Notification delivery: turn on the osascript sink (urgent -> immediate push)
 // and start the batched digest loop (normal -> one digest every HIVE_DIGEST_MS).

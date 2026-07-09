@@ -26,6 +26,7 @@ import {
   parseIncident,
 } from "./rows.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
+import { cleanupTask } from "./cleanup.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
 import { runSmoke } from "./monitors.ts";
 import { enqueue, ackNotifications } from "./notifications.ts";
@@ -163,6 +164,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/requeue$/);
       if (m && method === "POST") return requeueEndpoint(db, m[1]);
+
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/cleanup$/);
+      if (m && method === "POST") return await cleanupEndpoint(db, herdr, m[1]);
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/usage$/);
       if (m && method === "GET") return taskUsage(db, m[1]);
@@ -1002,6 +1006,19 @@ function requeueEndpoint(db: DB, id: string): Response {
   const newId = requeueTask(db, getTask(db, id));
   writeEvent(db, { task_id: id, source: "director", type: "requeued", payload: { new_task_id: newId } });
   return json({ ok: true, new_task_id: newId });
+}
+
+// Manual cleanup trigger: force teardown (worktree + herdr session) for a
+// terminal task. Refuses on a live task so an in-flight worktree is never
+// removed out from under a working agent. Backstop for the auto-teardown that
+// fires on the done/cancelled transition and the periodic reaper sweep.
+async function cleanupEndpoint(db: DB, herdr: Herdr, id: string): Promise<Response> {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  if (!TERMINAL.includes(task.state as State))
+    return err("task is not terminal; refusing to clean up a live task", 409);
+  const r = await cleanupTask(db, herdr, id, { force: true });
+  return json({ ok: true, ...r });
 }
 
 // Create a fresh queued copy of a task (source='requeue', parent_task_id → the
