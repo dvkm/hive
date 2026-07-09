@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
-import { transition, canTransition, TransitionError, getTask } from "../src/state.ts";
+import { transition, canTransition, TransitionError, getTask, expireOpenDecisions, expireOrphanedDecisions } from "../src/state.ts";
 
 function freshDb(): { db: DB; projectId: string } {
   const db = openDb(":memory:");
@@ -22,6 +22,14 @@ function addEvidence(db: DB, taskId: string, kind = "screenshot") {
   db.query(
     "INSERT INTO evidence (id, task_id, ts, kind) VALUES (?,?,?,?)"
   ).run(newId("ev"), taskId, now(), kind);
+}
+
+function addDecision(db: DB, taskId: string, status = "open"): string {
+  const id = newId("dec");
+  db.query(
+    "INSERT INTO decisions (id, task_id, ts, title, options, status) VALUES (?,?,?,?,?,?)"
+  ).run(id, taskId, now(), "d", '[{"key":"proceed","label":"Proceed"}]', status);
+  return id;
 }
 
 test("valid forward transition writes a state_change event", () => {
@@ -110,4 +118,44 @@ test("needs_decision <-> in_progress round trip", () => {
   transition(db, id, "needs_decision");
   transition(db, id, "in_progress");
   expect(getTask(db, id).state).toBe("in_progress");
+});
+
+test("cancelling a task expires its open decisions + writes decision_expired events", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  const d1 = addDecision(db, id);
+  const d2 = addDecision(db, id);
+  transition(db, id, "cancelled", { reason: "abandon" });
+  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(d1) as any).status).toBe("expired");
+  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(d2) as any).status).toBe("expired");
+  const evts = db.query("SELECT * FROM events WHERE task_id = ? AND type = 'decision_expired'").all(id);
+  expect(evts.length).toBe(2);
+});
+
+test("reaching done also expires open decisions; already-answered ones are untouched", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  const open = addDecision(db, id);
+  const answered = addDecision(db, id, "answered");
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  transition(db, id, "verifying");
+  addEvidence(db, id);
+  transition(db, id, "done");
+  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(open) as any).status).toBe("expired");
+  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(answered) as any).status).toBe("answered");
+});
+
+test("expireOrphanedDecisions backfills open decisions whose task is already terminal (idempotent)", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  const d = addDecision(db, id);
+  // Force the task terminal WITHOUT going through transition() (simulating a legacy row).
+  db.query("UPDATE tasks SET state = 'cancelled' WHERE id = ?").run(id);
+  expect(expireOrphanedDecisions(db)).toBe(1);
+  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(d) as any).status).toBe("expired");
+  // Idempotent: a second pass finds nothing.
+  expect(expireOrphanedDecisions(db)).toBe(0);
+  // Direct helper is also idempotent on an already-expired card.
+  expect(expireOpenDecisions(db, id, "again")).toBe(0);
 });

@@ -2,6 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import type { Decision } from "../lib/api";
+import { riskDisplay } from "../lib/decision";
 import { toast } from "../lib/ui";
 
 // One decision card: options (recommended first), risk/blast radius, autosaved
@@ -48,6 +49,23 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
     }
   };
 
+  // Dismiss: clear the card without answering (always available; the only action
+  // when a card somehow has no options).
+  const dismiss = async () => {
+    setSubmitting(true);
+    try {
+      await api.dismissDecision(d.id);
+      toast("Decision dismissed");
+      onDone(d.id); // optimistic archive
+    } catch (e) {
+      toast((e as Error).message);
+      setSubmitting(false);
+    }
+  };
+
+  const risk = riskDisplay(d.risk);
+  const hasOptions = options.length > 0;
+
   return (
     <article className="dcard" id={`dcard-${d.id}`}>
       <header className="dcard-head">
@@ -59,44 +77,58 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
 
       {d.context && <p className="dcard-context">{d.context}</p>}
 
-      <div className={`blast risk-${d.risk || "unknown"}`}>
+      <div className={`blast ${risk.className}`}>
         <div className="blast-label">
-          Risk: <strong>{d.risk || "unknown"}</strong>
+          Risk: <strong>{risk.label}</strong>
         </div>
         {d.blast_radius && <div className="blast-body">{d.blast_radius}</div>}
       </div>
 
-      <div className="options">
-        {options.map((o) => (
-          <label key={o.key} className={`opt ${choice === o.key ? "opt-sel" : ""}`}>
-            <input
-              type="radio"
-              name={`d-${d.id}`}
-              checked={choice === o.key}
-              onChange={() => setChoice(o.key)}
-            />
-            <div className="opt-body">
-              <div className="opt-label">
-                {o.label}
-                {o.recommended && <span className="rec">Recommended</span>}
-              </div>
-              {o.detail && <div className="opt-detail">{o.detail}</div>}
-            </div>
-          </label>
-        ))}
-      </div>
+      {!hasOptions && (
+        <p className="dcard-context">This decision has no options. Dismiss it to clear the card.</p>
+      )}
 
-      <textarea
-        className="dnote"
-        placeholder="Note (optional, autosaved as you type)…"
-        value={note}
-        onChange={(e) => onNote(e.target.value)}
-      />
+      {hasOptions && (
+        <>
+          <div className="options">
+            {options.map((o) => (
+              <label key={o.key} className={`opt ${choice === o.key ? "opt-sel" : ""}`}>
+                <input
+                  type="radio"
+                  name={`d-${d.id}`}
+                  checked={choice === o.key}
+                  onChange={() => setChoice(o.key)}
+                />
+                <div className="opt-body">
+                  <div className="opt-label">
+                    {o.label}
+                    {o.recommended && <span className="rec">Recommended</span>}
+                  </div>
+                  {o.detail && <div className="opt-detail">{o.detail}</div>}
+                </div>
+              </label>
+            ))}
+          </div>
+
+          <textarea
+            className="dnote"
+            placeholder="Note (optional, autosaved as you type)…"
+            value={note}
+            onChange={(e) => onNote(e.target.value)}
+          />
+        </>
+      )}
+
       <div className="dcard-foot">
         <span className="save-state">{saving ? "saving draft…" : note ? "draft saved" : ""}</span>
-        <button className="btn btn-primary btn-submit" disabled={submitting} onClick={submit}>
-          {submitting ? "Submitting…" : "Submit decision"}
+        <button className="btn" disabled={submitting} onClick={dismiss}>
+          Dismiss
         </button>
+        {hasOptions && (
+          <button className="btn btn-primary btn-submit" disabled={submitting} onClick={submit}>
+            {submitting ? "Submitting…" : "Submit decision"}
+          </button>
+        )}
       </div>
     </article>
   );

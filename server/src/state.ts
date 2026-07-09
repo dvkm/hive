@@ -8,7 +8,7 @@
 import type { DB } from "./db.ts";
 import { newId, now } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { parseEvent, parseTask } from "./rows.ts";
+import { parseEvent, parseTask, parseDecision } from "./rows.ts";
 import { redact } from "./secrets.ts";
 import { enqueue } from "./notifications.ts";
 import { broadcastTask } from "./health.ts";
@@ -100,6 +100,35 @@ export function writeEvent(
   return parsed;
 }
 
+// Expire every still-open decision on a task: its options can no longer be
+// acted on once the task is terminal, and an orphaned open card sits forever in
+// the inbox. Writes a decision_expired event and broadcasts the expired card so
+// the inbox clears live over SSE. Idempotent (only touches status='open' rows).
+export function expireOpenDecisions(db: DB, taskId: string, reason: string): number {
+  const rows = db.query("SELECT * FROM decisions WHERE task_id = ? AND status = 'open'").all(taskId) as any[];
+  for (const r of rows) {
+    db.query("UPDATE decisions SET status = 'expired' WHERE id = ?").run(r.id);
+    writeEvent(db, { task_id: taskId, source: "system", type: "decision_expired", payload: { decision_id: r.id, reason } });
+    broadcast({ type: "decision", decision: parseDecision({ ...r, status: "expired" }) });
+  }
+  return rows.length;
+}
+
+// Backfill/backstop: expire open decisions whose task is already terminal
+// (legacy orphans created before transition-time expiry existed). Idempotent —
+// safe to call on every startup.
+export function expireOrphanedDecisions(db: DB): number {
+  const tasks = db
+    .query(
+      `SELECT DISTINCT d.task_id AS task_id FROM decisions d JOIN tasks t ON t.id = d.task_id
+       WHERE d.status = 'open' AND t.state IN ('done','failed','cancelled')`
+    )
+    .all() as { task_id: string }[];
+  let n = 0;
+  for (const t of tasks) n += expireOpenDecisions(db, t.task_id, "task terminal (backfill)");
+  return n;
+}
+
 // Perform a state transition. Throws TransitionError on invalid transition or
 // when a `done` transition lacks required evidence. Writes a state_change event.
 export function transition(
@@ -148,6 +177,9 @@ export function transition(
   });
   const updated = getTask(db, taskId);
   broadcastTask(db, updated);
+  // A terminal task can no longer act on any open decision — expire them so the
+  // inbox clears and the answer endpoint can't be hit against a dead task.
+  if (TERMINAL.includes(to)) expireOpenDecisions(db, taskId, `task ${to}`);
   // Notify on notable terminal-ish outcomes (batched into the digest).
   if (to === "done")
     enqueue(db, { kind: "done", task_id: taskId, title: `Task done: ${task.title}`, body: task.summary ?? undefined });
