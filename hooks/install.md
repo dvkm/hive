@@ -7,12 +7,31 @@ paths (emit CLI, hooks, reconciler).
 
 ## What they do
 
-`hive-hook.sh <event-label>` POSTs a `status` event (`source: "hook"`) to
-`$HIVE_URL/api/tasks/$HIVE_TASK_ID/events` — but only when `$HIVE_TASK_ID` is
-set. The herdr spawn adapter injects `HIVE_TASK_ID` and `HIVE_URL` into every
-agent it starts (`herdr agent start ... --env HIVE_TASK_ID=<id> --env HIVE_URL=...`),
-so the hooks activate automatically for hive-spawned agents and stay silent
-everywhere else.
+On every fire (`PostToolUse`, `Stop`, `SubagentStop`), `hive-hook.sh <event-label>`
+reads the `transcript_path` from the hook's stdin payload and extracts the agent's
+**new turns since a per-transcript cursor** (`report-transcript.ts`), POSTing them
+to `$HIVE_URL/api/tasks/$HIVE_TASK_ID/events`:
+
+- assistant text blocks → `assistant_text` events (the agent's actual output —
+  rendered as transcript bubbles on the task timeline).
+- assistant `tool_use` blocks → `tool_use` events carrying a cheap one-line
+  `summary` (the command for Bash, the file_path for Read/Edit, the pattern for
+  Grep — never the full input). The UI groups consecutive ones into "used N tools".
+
+On `Stop`/`SubagentStop` it also posts a quiet `agent_turn_end` heartbeat (so the
+reconciler/health still see liveness) and reports token usage (below). This all
+runs only when `$HIVE_TASK_ID` is set — the herdr spawn adapter injects
+`HIVE_TASK_ID` and `HIVE_URL` into every agent it starts
+(`herdr agent start ... --env HIVE_TASK_ID=<id> --env HIVE_URL=...`), so the hooks
+activate automatically for hive-spawned agents and stay silent everywhere else.
+
+**Dedup / cursor**: a sibling `<transcript_path>.hive-cursor` file stores the
+number of transcript lines already processed. Each fire only posts lines past the
+cursor, so nothing double-posts even though `PostToolUse` and `Stop` both read the
+same append-only transcript. If the transcript is truncated/rotated (line count
+drops below the cursor) it resyncs from the start.
+
+There is no more bare `status` "hook: <event>" POST — it was pure timeline noise.
 
 The script fails silent and fast: any error exits 0, curl is capped at 2s, and
 it never blocks the agent.
@@ -76,7 +95,8 @@ chmod +x hooks/hive-hook.sh
 ## Verify
 
 ```bash
-HIVE_TASK_ID=<some-task-id> HIVE_URL=http://127.0.0.1:4700 \
-  echo '{}' | hooks/hive-hook.sh Stop
-# then check the task timeline for a `status` event with source "hook".
+# Point the payload at a real Claude Code transcript JSONL:
+export HIVE_TASK_ID=<some-task-id> HIVE_URL=http://127.0.0.1:4700
+printf '{"transcript_path":"/path/to/transcript.jsonl"}' | hooks/hive-hook.sh Stop
+# then check the task timeline for `assistant_text` / `tool_use` events (source "hook").
 ```
