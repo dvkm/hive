@@ -6,7 +6,8 @@ export type SseState = "connecting" | "open" | "reconnecting";
 
 interface Store {
   tasks: Task[];
-  projects: Project[];
+  projects: Project[]; // unarchived, shared across board/policies/new-task
+  reloadProjects: () => void; // refresh after a project is created/edited/archived
   decisions: Decision[]; // open only
   notifications: Notification[]; // newest first
   ackNotifications: () => void;
@@ -45,6 +46,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const bumped = useRef(false);
 
   const bump = (id: string) => setRev((r) => ({ ...r, [id]: (r[id] || 0) + 1 }));
+  const reloadProjects = () => api.projects().then(setProjects).catch(() => setProjects([]));
 
   // Initial load.
   useEffect(() => {
@@ -61,7 +63,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       );
     });
     api.decisions("open").then(setDecisions);
-    api.projects().then(setProjects).catch(() => setProjects([]));
+    reloadProjects();
     api.notifications().then((n) => setNotifications(n.notifications)).catch(() => setNotifications([]));
   }, []);
 
@@ -138,7 +140,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, sse }}>
+    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, sse }}>
       {children}
     </Ctx.Provider>
   );

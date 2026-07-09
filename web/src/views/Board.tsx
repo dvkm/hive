@@ -116,6 +116,8 @@ function Card({ task }: { task: Task }) {
   );
 }
 
+const PROJECT_FILTER_KEY = "hive.board.project";
+
 // Attention-tray eligibility — mirrors the server's needsAttention() rule.
 function needsAttention(t: Task): boolean {
   if (t.state === "failed") return true;
@@ -274,18 +276,41 @@ function AttentionTray({ tasks }: { tasks: Task[] }) {
 }
 
 export default function Board() {
-  const { tasks } = useStore();
+  const { tasks, projects } = useStore();
   const [adding, setAdding] = useState(false);
+  // Compact project filter (All / per project), persisted across reloads.
+  const [projectFilter, setProjectFilter] = useState<string>(() => localStorage.getItem(PROJECT_FILTER_KEY) || "");
+  const setFilter = (id: string) => {
+    setProjectFilter(id);
+    if (id) localStorage.setItem(PROJECT_FILTER_KEY, id);
+    else localStorage.removeItem(PROJECT_FILTER_KEY);
+  };
+  const visible = projectFilter ? tasks.filter((t) => t.project_id === projectFilter) : tasks;
   const byState = (s: State) => {
-    let list = tasks.filter((t) => t.state === s);
+    let list = visible.filter((t) => t.state === s);
     // list is already newest-updated first from the API / SSE upserts.
     if (s === "done") list = list.slice(0, 10);
     return list;
   };
 
   return (
-    <>
-      <AttentionTray tasks={tasks} />
+    <div className="board-wrap">
+      <AttentionTray tasks={visible} />
+      <div className="board-switch">
+        <span className="board-switch-label">Project</span>
+        <button className={`board-chip ${projectFilter ? "" : "board-chip-on"}`} onClick={() => setFilter("")}>
+          All
+        </button>
+        {projects.map((p) => (
+          <button
+            key={p.id}
+            className={`board-chip ${projectFilter === p.id ? "board-chip-on" : ""}`}
+            onClick={() => setFilter(p.id)}
+          >
+            {p.name}
+          </button>
+        ))}
+      </div>
       <div className="board">
       {COLUMNS.map((s) => {
         const list = byState(s);
@@ -317,9 +342,9 @@ export default function Board() {
           </section>
         );
       })}
-        {adding && <NewTaskModal onClose={() => setAdding(false)} />}
+      {adding && <NewTaskModal onClose={() => setAdding(false)} />}
       </div>
-    </>
+    </div>
   );
 }
 

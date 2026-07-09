@@ -53,6 +53,9 @@ agents for this project's queued tasks), `dispatch_kinds` (string[], default
 `["ship","scout"]`; which task kinds the dispatcher will auto-spawn — `chore` is
 excluded by default), and `max_agents` (number, default `3`; per-project cap on
 concurrently-running agents).
+Lifecycle key: `archived` (bool, default absent/`false`; when `true` the project
+is hidden from the default `GET /api/projects` list and the web Projects view —
+tasks keep referencing it, there is no hard delete).
 
 ### Task
 ```json
@@ -307,7 +310,11 @@ cost_usd, calls, unpriced}` (summed cost counts priced rows only).
 `GET /api/health` → `200 {"ok": true, "version": "0.1.0"}`
 
 ### Projects
-- `GET /api/projects` → `200 [Project, ...]` (oldest first)
+- `GET /api/projects[?archived=all]` → `200 [Project, ...]` (oldest first)
+  Archived projects (`config.archived === true`) are hidden by default; pass
+  `?archived=all` to include them. There is no project delete (tasks reference
+  projects) — set `config.archived: true` to hide one and back to `false`/absent
+  to restore it.
 - `POST /api/projects` body `{name (required), repo_path?, config?}` → `201 Project`
 - `GET /api/projects/:id` → `200 Project` | `404`
 - `PUT /api/projects/:id` body `{name?, repo_path?, config?}` → `200 Project` | `404`
