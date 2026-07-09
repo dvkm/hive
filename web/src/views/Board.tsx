@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
 import type { Kind, State, Task } from "../lib/api";
@@ -20,8 +20,9 @@ function Card({ task }: { task: Task }) {
   const project = projects.find((p) => p.id === task.project_id);
   const age = useRelTime(lastActivity[task.id] || task.updated_at);
   const ev = evidenceCount[task.id];
+  const location = useLocation();
   return (
-    <Link to={`/tasks/${task.id}`} className="card">
+    <Link to={`/tasks/${task.id}`} state={{ backgroundLocation: location }} className="card">
       <div className="card-top">
         <StatusDot state={task.state} />
         <span className="card-title">{task.title}</span>
