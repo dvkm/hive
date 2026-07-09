@@ -10,6 +10,7 @@ import { newId, now } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { parseEvent, parseTask } from "./rows.ts";
 import { redact } from "./secrets.ts";
+import { enqueue } from "./notifications.ts";
 
 export const STATES = [
   "queued",
@@ -126,5 +127,10 @@ export function transition(
   });
   const updated = getTask(db, taskId);
   broadcast({ type: "task", task: updated });
+  // Notify on notable terminal-ish outcomes (batched into the digest).
+  if (to === "done")
+    enqueue(db, { kind: "done", task_id: taskId, title: `Task done: ${task.title}`, body: task.summary ?? undefined });
+  else if (to === "failed")
+    enqueue(db, { kind: "failed", task_id: taskId, title: `Task failed: ${task.title}`, body: opts.reason ?? undefined });
   return updated;
 }

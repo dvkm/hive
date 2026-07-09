@@ -3,6 +3,8 @@ import { openDb, defaultDbPath } from "./db.ts";
 import { makeHandler } from "./api.ts";
 import { startReconciler } from "./reconciler.ts";
 import { checkAllMonitors } from "./monitors.ts";
+import { startDigest, setNotifier } from "./notifications.ts";
+import { defaultExec } from "./exec.ts";
 
 const port = Number(process.env.HIVE_PORT || 4700);
 const dbPath = defaultDbPath();
@@ -25,5 +27,10 @@ startReconciler(db, { intervalMs: reconcileMs, staleMs });
 setInterval(() => {
   checkAllMonitors(db).catch((e) => console.error("[hive] monitor cycle crashed:", e));
 }, monitorMs);
+
+// Notification delivery: turn on the osascript sink (urgent -> immediate push)
+// and start the batched digest loop (normal -> one digest every HIVE_DIGEST_MS).
+setNotifier(defaultExec);
+startDigest(db);
 
 console.log(`[hive] server on http://${server.hostname}:${server.port}  db=${dbPath}`);

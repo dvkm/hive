@@ -1,7 +1,9 @@
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import { api } from "../lib/api";
 import { useStore } from "../lib/store";
-import type { State, Task } from "../lib/api";
-import { CiBadge, STATE_LABEL, StatusDot } from "../lib/ui";
+import type { Kind, State, Task } from "../lib/api";
+import { CiBadge, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 
 const COLUMNS: State[] = [
@@ -51,6 +53,7 @@ function Card({ task }: { task: Task }) {
 
 export default function Board() {
   const { tasks } = useStore();
+  const [adding, setAdding] = useState(false);
   const byState = (s: State) => {
     let list = tasks.filter((t) => t.state === s);
     // list is already newest-updated first from the API / SSE upserts.
@@ -66,7 +69,14 @@ export default function Board() {
           <section className="column" key={s}>
             <header className="col-head">
               <span className="col-title">{STATE_LABEL[s]}</span>
-              <span className="col-count">{list.length}</span>
+              <div className="col-head-right">
+                {s === "queued" && (
+                  <button className="btn btn-primary btn-new" onClick={() => setAdding(true)}>
+                    + New task
+                  </button>
+                )}
+                <span className="col-count">{list.length}</span>
+              </div>
             </header>
             <div className="col-body">
               {list.map((t) => (
@@ -77,6 +87,90 @@ export default function Board() {
           </section>
         );
       })}
+      {adding && <NewTaskModal onClose={() => setAdding(false)} />}
+    </div>
+  );
+}
+
+// Compact create-task form. Esc closes, Cmd/Ctrl+Enter submits. The new task
+// lands in Queued and surfaces live via SSE, so no manual refresh is needed.
+function NewTaskModal({ onClose }: { onClose: () => void }) {
+  const { projects } = useStore();
+  const [project, setProject] = useState("");
+  const [title, setTitle] = useState("");
+  const [brief, setBrief] = useState("");
+  const [kind, setKind] = useState<Kind>("ship");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!project && projects.length) setProject(projects[0].id);
+  }, [projects, project]);
+
+  const submit = async () => {
+    if (!project || !title.trim() || busy) return;
+    setBusy(true);
+    try {
+      await api.createTask({ project_id: project, title: title.trim(), brief: brief.trim() || undefined, kind });
+      toast("Task queued");
+      onClose();
+    } catch (e) {
+      toast((e as Error).message);
+      setBusy(false);
+    }
+  };
+
+  const onKey = (e: React.KeyboardEvent) => {
+    if (e.key === "Escape") onClose();
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit();
+  };
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <div className="modal" onMouseDown={(e) => e.stopPropagation()} onKeyDown={onKey}>
+        <h2>New task</h2>
+        {projects.length === 0 ? (
+          <div className="muted">No projects yet. Create one first.</div>
+        ) : (
+          <>
+            <label className="fld">
+              <span>Project</span>
+              <select value={project} onChange={(e) => setProject(e.target.value)}>
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="fld">
+              <span>Title</span>
+              <input autoFocus placeholder="What needs doing" value={title} onChange={(e) => setTitle(e.target.value)} />
+            </label>
+            <label className="fld">
+              <span>Brief</span>
+              <textarea placeholder="Description / definition of done (optional)" value={brief} onChange={(e) => setBrief(e.target.value)} />
+            </label>
+            <label className="fld">
+              <span>Kind</span>
+              <select value={kind} onChange={(e) => setKind(e.target.value as Kind)}>
+                <option value="ship">ship</option>
+                <option value="scout">scout</option>
+                <option value="chore">chore</option>
+              </select>
+            </label>
+          </>
+        )}
+        <div className="modal-foot">
+          <span className="muted modal-hint">⌘↵ to queue · Esc to close</span>
+          <div className="spacer" />
+          <button className="btn" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="btn btn-primary" disabled={busy || !title.trim() || !project} onClick={submit}>
+            {busy ? "Queuing…" : "Queue task"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
