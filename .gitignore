@@ -1,8 +1,9 @@
 node_modules
 web/dist
-*.db
-*.db-shm
-*.db-wal
-.DS_Store
-
 *.tsbuildinfo
+*.db
+*.db-journal
+.env
+.env.*
+.hive/
+.DS_Store
