@@ -1,0 +1,212 @@
+// Migrations are keyed by name, not array position, and every statement is
+// skipped if its effect is already present. These tests pin the failure mode
+// from 2026-07-09: two branches each appended a migration, the merge renumbered
+// one, and the position counter both skipped a migration and re-ran a different
+// one against a DB that already had its effect.
+import { test, expect } from "bun:test";
+import { openDb, alreadyApplied, MIGRATIONS, CREATES, ADD_COLUMN, type DB } from "../src/db.ts";
+import { Database } from "bun:sqlite";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { rmSync } from "node:fs";
+
+function tmpDb(tag: string): string {
+  return join(tmpdir(), `hive-migrate-${tag}-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+}
+
+function cleanup(path: string) {
+  for (const suffix of ["", "-wal", "-shm"]) rmSync(path + suffix, { force: true });
+}
+
+function columns(db: DB, table: string): string[] {
+  return (db.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((r) => r.name);
+}
+
+// The skip-if-present machinery only works if every statement is one statement
+// that alreadyApplied can recognize, and if no two migrations create the same
+// object. None of that is enforceable at runtime, so enforce it here: a future
+// author who glues statements together, or reuses an object name, fails CI
+// rather than shipping a migration recorded as applied without its effect.
+test("migrations are well-formed", () => {
+  const names = new Set<string>();
+  const created = new Set<string>();
+  for (const m of MIGRATIONS) {
+    expect(names.has(m.name)).toBe(false);
+    names.add(m.name);
+
+    for (const stmt of m.statements) {
+      const create = CREATES.exec(stmt);
+      const add = ADD_COLUMN.exec(stmt);
+
+      // One statement per element. A trigger body is the only legal `;`.
+      const isTrigger = /^\s*CREATE\s+TRIGGER/i.test(stmt);
+      if (!isTrigger && stmt.includes(";")) {
+        throw new Error(`${m.name}: one statement per array element, found ';' in:\n${stmt}`);
+      }
+
+      if (create) {
+        // No two migrations may create the same object: alreadyApplied would
+        // skip the second and still record it applied.
+        const key = `${create[1].toLowerCase()}:${create[2]}`;
+        expect(created.has(key)).toBe(false);
+        created.add(key);
+      } else if (!add) {
+        // alreadyApplied can't detect this statement's effect, so it re-runs on
+        // every heal. Only a backfill may do that, and the heal tests below are
+        // what prove this one is a no-op once applied.
+        expect(stmt).toMatch(/^\s*UPDATE\b/i);
+      }
+    }
+  }
+});
+
+test("alreadyApplied asks the schema, for every statement kind", () => {
+  const db = openDb(":memory:");
+  expect(alreadyApplied(db, "CREATE TABLE tasks (x TEXT)")).toBe(true);
+  expect(alreadyApplied(db, "CREATE TABLE brand_new (x TEXT)")).toBe(false);
+  expect(alreadyApplied(db, "CREATE INDEX idx_events_ts ON events(ts)")).toBe(true);
+  expect(alreadyApplied(db, "CREATE UNIQUE INDEX idx_tasks_number ON tasks(number)")).toBe(true);
+  expect(alreadyApplied(db, "CREATE TRIGGER tasks_assign_number AFTER INSERT ON tasks BEGIN SELECT 1; END")).toBe(true);
+  expect(alreadyApplied(db, "ALTER TABLE tasks ADD COLUMN number INTEGER")).toBe(true);
+  expect(alreadyApplied(db, "ALTER TABLE tasks ADD COLUMN duplicate_of TEXT")).toBe(true);
+  expect(alreadyApplied(db, "ALTER TABLE tasks ADD COLUMN not_there TEXT")).toBe(false);
+  // Type is matched too: an index named after an existing table is not "applied".
+  expect(alreadyApplied(db, "CREATE INDEX tasks ON events(ts)")).toBe(false);
+  expect(alreadyApplied(db, "CREATE TABLE idx_events_ts (x TEXT)")).toBe(false);
+  // Non-DDL always runs: backfills must be written re-runnable.
+  expect(alreadyApplied(db, "UPDATE tasks SET number = 1 WHERE number IS NULL")).toBe(false);
+  db.close();
+});
+
+// Two bun:sqlite behaviours pin migrate()'s choice of executor. Both are silent
+// data loss if we pick wrong, so pin them: a bun upgrade that changes either
+// should fail here, not in a migration.
+test("bun:sqlite: exec() swallows step-time errors unless the statement is trimmed", () => {
+  const dupes = () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t (n INTEGER)");
+    db.exec("INSERT INTO t VALUES (1), (1)");
+    return db;
+  };
+  const stmt = "CREATE UNIQUE INDEX i ON t(n)";
+
+  const loose = dupes();
+  loose.exec(`  ${stmt};\n  `); // trailing whitespace: error swallowed, index not built
+  expect(loose.query("SELECT count(*) AS c FROM sqlite_master WHERE name = 'i'").get()).toEqual({ c: 0 });
+  loose.close();
+
+  const tight = dupes();
+  expect(() => tight.exec(stmt)).toThrow(/UNIQUE/); // what migrate() relies on
+  tight.close();
+});
+
+test("bun:sqlite: prepare() runs only the first statement, exec() runs all", () => {
+  const glued = "ALTER TABLE t ADD COLUMN x TEXT; CREATE INDEX i ON t(x)";
+  const idxCount = (db: Database) =>
+    (db.query("SELECT count(*) AS c FROM sqlite_master WHERE type = 'index'").get() as { c: number }).c;
+
+  const viaPrepare = new Database(":memory:");
+  viaPrepare.exec("CREATE TABLE t (n INTEGER)");
+  viaPrepare.prepare(glued).run();
+  expect(idxCount(viaPrepare)).toBe(0); // second statement silently dropped
+  viaPrepare.close();
+
+  const viaExec = new Database(":memory:");
+  viaExec.exec("CREATE TABLE t (n INTEGER)");
+  viaExec.exec(glued);
+  expect(idxCount(viaExec)).toBe(1);
+  viaExec.close();
+});
+
+test("a DB ahead of the ledger heals instead of crashing", () => {
+  const path = tmpDb("drift");
+  try {
+    // Reproduce the collision: the live DB got the *other* branch's migration
+    // (number) but never got this branch's (duplicate_of), and has no ledger —
+    // exactly what a position-counter DB looks like after a bad merge.
+    const seed = openDb(path);
+    seed.exec("ALTER TABLE tasks DROP COLUMN duplicate_of");
+    seed.exec("DROP TABLE schema_migrations");
+    seed.close();
+
+    // Old code crashed here re-running `ALTER TABLE tasks ADD COLUMN number`.
+    const db = openDb(path);
+    const cols = columns(db, "tasks");
+    expect(cols).toContain("duplicate_of"); // the skipped migration got applied
+    expect(cols.filter((c) => c === "number").length).toBe(1); // the re-run one didn't duplicate
+    db.close();
+  } finally {
+    cleanup(path);
+  }
+});
+
+test("adopting a fully-migrated legacy DB is a no-op that preserves data", () => {
+  const path = tmpDb("legacy");
+  try {
+    const db1 = openDb(path);
+    db1.query("INSERT INTO projects (id, name, config, created_at) VALUES ('p','p','{}','2026-01-01T00:00:00Z')").run();
+    const mk = (id: string, created_at: string) =>
+      db1
+        .query("INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at) VALUES (?,'p',?, 'queued','ship',?,?)")
+        .run(id, id, created_at, created_at);
+    mk("a", "2026-01-01T00:00:00Z");
+    mk("b", "2026-02-02T00:00:00Z");
+    // Delete one so number != row count: a re-run of the v11 backfill would
+    // renumber the survivors. It must not.
+    db1.query("DELETE FROM tasks WHERE id = 'a'").run();
+    mk("c", "2026-03-03T00:00:00Z");
+    const before = db1.query("SELECT id, number FROM tasks ORDER BY id").all();
+    expect(before).toEqual([
+      { id: "b", number: 2 },
+      { id: "c", number: 3 },
+    ]);
+    db1.exec("DROP TABLE schema_migrations"); // pretend it predates the ledger
+    db1.close();
+
+    const db2 = openDb(path);
+    expect(db2.query("SELECT id, number FROM tasks ORDER BY id").all()).toEqual(before);
+    const names = (db2.query("SELECT name FROM schema_migrations").all() as { name: string }[]).map((r) => r.name);
+    expect(names).toContain("v1-initial-schema");
+    expect(names).toContain("v11-task-numbers");
+    db2.close();
+  } finally {
+    cleanup(path);
+  }
+});
+
+// A partially-numbered DB (number column + trigger present, backfill never ran)
+// would make the v11 backfill mint duplicates. The UNIQUE index must reject the
+// migration rather than let openDb commit corrupt numbers.
+test("a partially-numbered DB fails the migration instead of committing duplicates", () => {
+  const path = tmpDb("partial");
+  try {
+    const db1 = openDb(path);
+    db1.query("INSERT INTO projects (id, name, config, created_at) VALUES ('p','p','{}','2026-01-01T00:00:00Z')").run();
+    const mk = (id: string, created_at: string) =>
+      db1
+        .query("INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at) VALUES (?,'p',?, 'queued','ship',?,?)")
+        .run(id, id, created_at, created_at);
+    mk("a", "2026-01-01T00:00:00Z");
+    mk("b", "2026-02-02T00:00:00Z");
+    // Strip the guard rails and null out one number: numbered and un-numbered rows coexist.
+    db1.exec("DROP INDEX idx_tasks_number");
+    db1.query("UPDATE tasks SET number = NULL WHERE id = 'a'").run();
+    db1.exec("DELETE FROM schema_migrations WHERE name = 'v11-task-numbers'");
+    db1.close();
+
+    // Backfill gives 'a' number 1, colliding with nothing... but 'b' keeps 2 and
+    // 'a' would rank 1, so seed a real collision: two rows ranked the same.
+    const raw = new Database(path);
+    raw.query("UPDATE tasks SET number = 1 WHERE id = 'b'").run();
+    raw.close();
+
+    expect(() => openDb(path)).toThrow(/UNIQUE/);
+    // Nothing committed: the ledger still lacks v11.
+    const after = new Database(path);
+    const names = (after.query("SELECT name FROM schema_migrations").all() as { name: string }[]).map((r) => r.name);
+    expect(names).not.toContain("v11-task-numbers");
+    after.close();
+  } finally {
+    cleanup(path);
+  }
+});
