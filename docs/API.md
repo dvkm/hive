@@ -525,6 +525,27 @@ A state change therefore produces both an `event` message (`type:"state_change"`
 and a `task` message. The client should upsert by `id`. There is no replay/backfill
 on connect; load current state via the REST endpoints, then apply stream deltas.
 
+### Braindump intake — `POST /api/intake`
+Body `{project_id (required), text (required)}` → `202 {"ok":true, "task": Task}`
+| `400` (blank text, unknown `project_id`).
+
+The director's braindump path: dump unstructured text instead of hand-writing a
+task. The text is stored verbatim as a `chore` task (state `queued`,
+`source: "intake_braindump"`, title `[braindump] <first line, elided at 72 chars>`,
+full text in the brief) and the domain-supervisor planner is triggered on it, so
+the flow is: braindump → proposed breakdown decision card → `approve` → the
+proposed tasks are queued. Nothing is queued as work until the card is answered.
+
+The planner runs out-of-band (it is a `claude -p` subprocess taking tens of
+seconds), so the response returns `202` immediately and the decision card arrives
+over SSE. A planner failure records a `planner_error` event on the braindump task
+and leaves it `queued` for another `POST /api/tasks/:id/plan`.
+
+On `approve`, the braindump task is transitioned to `cancelled`
+(reason `planned into N task(s)`) — it is a container, not work, and the child
+tasks carry it. Like every `source="intake_*"` task it is never auto-dispatched
+(see Dispatcher) and the board hides its manual "dispatch now" affordance.
+
 ### Intake connectors (Google Chat)
 No HTTP endpoints — the connector is a server-internal poller plus a local CLI
 command. It reads an allowlist of Chat spaces (`config.gchat_spaces` per project)
@@ -566,7 +587,8 @@ killed on timeout). Injectable exec for tests.
   the claude `--output-format json` envelope (`{result:"..."}`), or wrapped in
   prose. Unknown `kind` normalizes to `ship`; entries without a title are dropped.
   Unparseable output records ONE `planner_error` event and stops (no retry storm).
-- Triggers: `POST /api/tasks/:id/plan` (manual, any task) and auto on intake task
+- Triggers: `POST /api/tasks/:id/plan` (manual, any task), `POST /api/intake`
+  (always, the director's braindump), and auto on Google Chat intake task
   creation when the owning project sets `config.plan_intake: true`.
 - Result: a `normal`-risk decision card on the source task titled
   `Proposed breakdown: <title>` (context = rationale + numbered proposed tasks +
@@ -582,9 +604,9 @@ default every 30s, `HIVE_DISPATCH_MS`). It picks up `queued` tasks and spawns a
 herdr agent for each (the same path as `POST /api/tasks/:id/spawn`), gated by:
 project `config.auto_dispatch: true` (default off), `config.dispatch_kinds`
 (default `["ship","scout"]`), `config.max_agents` (default 3, per-project
-concurrency cap), an intake-review gate (`source="intake_gchat"` tasks are
-skipped until a `reviewed` event or a `note` event containing "reviewed"
-exists), and the standing-authority gate. The authority gate calls
+concurrency cap), an intake-review gate (any `source="intake_*"` task — gchat
+messages, director braindumps — is skipped until a `reviewed` event or a `note`
+event containing "reviewed" exists), and the standing-authority gate. The authority gate calls
 `authorize(action="task.dispatch", target=<title>)`; a `deny` rule blocks the
 auto-spawn (`authority_denied` event) and a `require_decision` rule opens a card
 and parks the task, exactly like the other guarded actions. Spawn failures write
