@@ -60,6 +60,15 @@ export interface Evidence {
   url: string | null;
   caption: string | null;
   meta: Record<string, unknown>;
+  preview?: string | null; // first ~3 lines of a test_run/log file (server-provided)
+}
+
+// One evidence row in the browser: the evidence joined to its task + project.
+export interface EvidenceRow extends Evidence {
+  task_title: string;
+  task_kind: Kind;
+  project_id: string;
+  project_name: string;
 }
 
 export interface Option {
@@ -204,10 +213,12 @@ export interface AnalyticsSummary {
 }
 
 // One enriched row of the activity feed: an event joined to its task + project,
-// plus the evidence url for screenshot/evidence events (null otherwise).
-export interface FeedEvent extends Event {
-  task_title: string;
-  task_kind: Kind;
+// plus the evidence url for screenshot/evidence events (null otherwise). Rows for
+// standalone monitor incidents carry type "incident" and a null task_id/title.
+export interface FeedEvent extends Omit<Event, "task_id"> {
+  task_id: string | null;
+  task_title: string | null;
+  task_kind: Kind | null;
   project_id: string;
   project_name: string;
   evidence_url: string | null;
@@ -245,6 +256,15 @@ export const api = {
     if (q.limit) p.set("limit", String(q.limit));
     const qs = p.toString();
     return req<{ events: FeedEvent[] }>(`/api/feed${qs ? "?" + qs : ""}`);
+  },
+  evidence: (q: { project?: string; kind?: string; task?: string; limit?: number } = {}) => {
+    const p = new URLSearchParams();
+    if (q.project) p.set("project", q.project);
+    if (q.kind) p.set("kind", q.kind);
+    if (q.task) p.set("task", q.task);
+    if (q.limit) p.set("limit", String(q.limit));
+    const qs = p.toString();
+    return req<{ evidence: EvidenceRow[] }>(`/api/evidence${qs ? "?" + qs : ""}`);
   },
   createTask: (b: { project_id: string; title: string; brief?: string; kind?: Kind }) =>
     req<Task>(`/api/tasks`, { method: "POST", body: JSON.stringify(b) }),

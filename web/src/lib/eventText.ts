@@ -75,6 +75,10 @@ export function eventText(e: EventLike): string {
       return `steer failed: ${s(p.error)}`;
     case "supervise_error":
       return `supervise error: ${s(p.error)}`;
+    case "incident":
+      return s(p.status) === "resolved"
+        ? `monitor recovered: ${s(p.monitor)}`
+        : `monitor down: ${s(p.monitor)}${s(p.detail) ? ` — ${s(p.detail)}` : ""}`;
     default: {
       const words = e.type.replace(/[_-]+/g, " ");
       const note = s(p.note);
@@ -103,6 +107,7 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
   authority_granted: "decision",
   evidence: "evidence",
   smoke_passed: "evidence",
+  incident: "incident",
   blocked: "incident",
   stale: "incident",
   spawn_error: "incident",
