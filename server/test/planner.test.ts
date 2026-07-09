@@ -9,6 +9,7 @@ process.env.HIVE_HOME = HOME;
 const { openDb } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
 const { composePlannerPrompt, extractPlan, runPlanner } = await import("../src/planner.ts");
+const { isReviewed } = await import("../src/dispatcher.ts");
 import type { PlannerExec } from "../src/planner.ts";
 
 const db = openDb(":memory:");
@@ -160,6 +161,69 @@ test("reject creates no child tasks", async () => {
     (x: any) => x.parent_task_id === t.id
   );
   expect(kids.length).toBe(0);
+});
+
+test("braindump intake -> queued chore + decision card; approve queues children and retires the braindump", async () => {
+  const handler = makeHandler(db, { plannerExec: stubExec(VALID).exec });
+  const s2 = Bun.serve({ port: 0, fetch: handler });
+  const base2 = `http://127.0.0.1:${s2.port}`;
+  try {
+    const res = await fetch(base2 + "/api/intake", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_id: projectId, text: "sso login is a mess\nalso the docs lie" }),
+    });
+    expect(res.status).toBe(202);
+    const { task } = await res.json();
+    expect(task.state).toBe("queued");
+    expect(task.kind).toBe("chore");
+    expect(task.source).toBe("intake_braindump");
+    expect(task.title).toBe("[braindump] sso login is a mess");
+    expect(task.brief).toContain("also the docs lie"); // raw text preserved verbatim
+
+    // the planner runs out-of-band but resolves before the next round-trip
+    const full = (await get(`/api/tasks/${task.id}`)).json;
+    expect(full.decisions.length).toBe(1);
+    const decision = full.decisions[0];
+    expect(decision.title).toContain("Proposed breakdown");
+
+    // never auto-dispatched while the breakdown is unapproved
+    expect(isReviewed(db, task.id)).toBe(false);
+
+    await post(`/api/decisions/${decision.id}/answer`, { answer_key: "approve" });
+    const kids = (await get(`/api/tasks?project_id=${projectId}`)).json.filter(
+      (x: any) => x.parent_task_id === task.id
+    );
+    expect(kids.length).toBe(2);
+    expect(kids.every((k: any) => k.state === "queued")).toBe(true);
+    // the braindump container is retired off the board once its plan is approved
+    expect((await get(`/api/tasks/${task.id}`)).json.state).toBe("cancelled");
+  } finally {
+    s2.stop(true);
+  }
+});
+
+test("braindump intake rejects empty text and unknown projects", async () => {
+  expect((await post("/api/intake", { project_id: projectId, text: "   " })).status).toBe(400);
+  expect((await post("/api/intake", { project_id: "nope", text: "hi" })).status).toBe(400);
+});
+
+test("a long braindump first line is elided into the title", async () => {
+  // via the stubbed handler: the default one would spawn a real `claude -p`
+  const s2 = Bun.serve({ port: 0, fetch: makeHandler(db, { plannerExec: stubExec(VALID).exec }) });
+  try {
+    const long = "a".repeat(200);
+    const res = await fetch(`http://127.0.0.1:${s2.port}/api/intake`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_id: projectId, text: long }),
+    });
+    const { task } = await res.json();
+    expect(task.title).toBe(`[braindump] ${"a".repeat(71)}…`);
+    expect(task.brief).toBe(long); // the full text is never truncated
+  } finally {
+    s2.stop(true);
+  }
 });
 
 test("auto-trigger on intake when project config.plan_intake is set", async () => {

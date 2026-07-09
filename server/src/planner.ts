@@ -15,7 +15,7 @@
 import type { DB } from "./db.ts";
 import { newId, now } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { writeEvent, getTask } from "./state.ts";
+import { writeEvent, getTask, transition } from "./state.ts";
 import { enqueue } from "./notifications.ts";
 import { createDecision } from "./api.ts";
 
@@ -292,6 +292,14 @@ export function resolvePlanForDecision(db: DB, decisionId: string, answerKey: st
     broadcast({ type: "task", task: getTask(db, id) });
     createdIds.push(id);
   }
+  // A braindump is a container, not work: once its plan is approved the child
+  // tasks carry it, so retire the source rather than leave it queued forever.
+  if (source.source === "intake_braindump" && createdIds.length)
+    transition(db, sourceTaskId, "cancelled", {
+      source: "system",
+      reason: `planned into ${createdIds.length} task(s)`,
+    });
+
   enqueue(db, {
     kind: "planned",
     task_id: sourceTaskId,

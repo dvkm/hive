@@ -126,6 +126,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // ---- global search (tasks/decisions/learnings/policies/projects) ----
       if (pathname === "/api/search" && method === "GET") return search(db, url);
 
+      // ---- braindump intake ----
+      if (pathname === "/api/intake" && method === "POST") return intake(db, await req.json(), deps);
+
       // ---- tasks ----
       if (pathname === "/api/tasks") {
         if (method === "GET") return listTasks(db, url);
@@ -307,6 +310,40 @@ function updateProject(db: DB, id: string, body: any): Response {
   const config = body?.config !== undefined ? JSON.stringify(body.config) : existing.config;
   db.query("UPDATE projects SET name = ?, repo_path = ?, config = ? WHERE id = ?").run(name, repo_path, config, id);
   return json(parseProject(db.query("SELECT * FROM projects WHERE id = ?").get(id)));
+}
+
+// ---------------------------------------------------------------- intake
+// Braindump intake: the director dumps unstructured text and the planner turns
+// it into a proposed task breakdown that lands in the decision inbox for
+// approval. The braindump itself is stored as a chore task
+// (source='intake_braindump') so the raw text, the planner run and any
+// planner_error stay durable and inspectable on a task page. The dispatcher
+// never auto-spawns intake tasks; approving the plan retires this one.
+function intake(db: DB, body: any, deps: HandlerDeps): Response {
+  const text = String(body?.text ?? "").trim();
+  if (!body?.project_id) return err("project_id is required");
+  if (!text) return err("text is required");
+  if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(body.project_id))
+    return err("unknown project_id", 400);
+
+  const id = newId();
+  const t = now();
+  // Short enough that "Proposed breakdown: <title>" stays readable on a card.
+  const head = text.split("\n")[0];
+  const title = `[braindump] ${head.length > 72 ? head.slice(0, 71) + "…" : head}`;
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, created_at, updated_at)
+     VALUES (?,?,?,?, 'queued', 'chore', 'intake_braindump', ?, ?)`
+  ).run(id, body.project_id, title, text, t, t);
+  writeEvent(db, { task_id: id, source: "director", type: "created", payload: { title } });
+  const task = getTask(db, id);
+  broadcastTask(db, task);
+
+  // The planner is a `claude -p` subprocess that runs for tens of seconds, so it
+  // must not hold the request open — the decision card arrives over SSE when it
+  // lands, and runPlanner records its own planner_error event on failure.
+  runPlanner(db, id, { exec: deps.plannerExec }).catch(() => {});
+  return json({ ok: true, task }, 202);
 }
 
 // ---------------------------------------------------------------- tasks
