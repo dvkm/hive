@@ -82,6 +82,69 @@ test("flagStale emits one stale event past the threshold, then stops", async () 
 const statusHerdr = (status: string) =>
   new Herdr(stub(() => OK(`{"result":{"agent":{"agent_status":"${status}","pane_id":"w1:p1"}}}`)), "herdr");
 
+// Like statusHerdr, but records `agent send` messages.
+function sendCapturingHerdr(status: string) {
+  const sends: string[] = [];
+  const h = new Herdr(
+    stub((argv) => {
+      if (argv.includes("send")) {
+        sends.push(argv[argv.indexOf("send") + 2]);
+        return OK();
+      }
+      return OK(`{"result":{"agent":{"agent_status":"${status}","pane_id":"w1:p1"}}}`);
+    }),
+    "herdr"
+  );
+  return { h, sends };
+}
+
+test("conflict watchdog: a CONFLICTING PR nudges the agent once per head SHA", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "a1", pr_url: "https://gh/pr/9" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  const { h, sends } = sendCapturingHerdr("idle");
+  const gh = (sha: string): Exec =>
+    stub((argv) => {
+      if (argv[0] === "gh")
+        return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], mergeable: "CONFLICTING", headRefOid: sha }));
+      return OK();
+    });
+
+  await reconcileOnce(db, { herdr: h, exec: gh("sha1") });
+  expect(sends.length).toBe(1);
+  expect(sends[0]).toContain("merge conflicts");
+  expect(sends[0]).toContain("main");
+  expect(getTask(db, id).state).toBe("in_review"); // lifecycle untouched
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_conflict'").all(id) as { payload: string }[];
+  expect(ev.length).toBe(1);
+  expect(JSON.parse(ev[0].payload)).toMatchObject({ head_sha: "sha1", delivered: true });
+
+  // same head SHA next cycle -> no re-nudge
+  await reconcileOnce(db, { herdr: h, exec: gh("sha1") });
+  expect(sends.length).toBe(1);
+
+  // a new push that STILL conflicts -> nudged again
+  await reconcileOnce(db, { herdr: h, exec: gh("sha2") });
+  expect(sends.length).toBe(2);
+});
+
+test("conflict watchdog: a mergeable PR is left alone", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "a1", pr_url: "https://gh/pr/9" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  const { h, sends } = sendCapturingHerdr("idle");
+  const gh: Exec = stub((argv) => {
+    if (argv[0] === "gh")
+      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], mergeable: "MERGEABLE", headRefOid: "sha1" }));
+    return OK();
+  });
+  await reconcileOnce(db, { herdr: h, exec: gh });
+  expect(sends.length).toBe(0);
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_conflict'").all(id).length).toBe(0);
+});
+
 test("advanceFinished: in_progress + pr_url + idle agent -> in_review (+ event)", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { agent_target: "a1", pr_url: "https://gh/pr/1" });

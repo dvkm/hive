@@ -148,12 +148,13 @@ async function advanceFinished(db: DB, _deps: ReconcilerDeps): Promise<void> {
 // ---- PR / CI sync via gh ----
 async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   const exec = deps.exec ?? defaultExec;
+  const h = deps.herdr ?? defaultHerdr;
   const tasks = db
-    .query(`SELECT id, state, pr_url, ci_status FROM tasks WHERE pr_url IS NOT NULL AND state IN ${NON_TERMINAL}`)
-    .all() as { id: string; state: string; pr_url: string; ci_status: string | null }[];
+    .query(`SELECT id, state, pr_url, ci_status, agent_target, project_id FROM tasks WHERE pr_url IS NOT NULL AND state IN ${NON_TERMINAL}`)
+    .all() as { id: string; state: string; pr_url: string; ci_status: string | null; agent_target: string | null; project_id: string }[];
 
   for (const t of tasks) {
-    const r = await exec(["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup"]);
+    const r = await exec(["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup,mergeable,headRefOid"]);
     if (r.code !== 0) continue; // gh unavailable / auth: skip, try next cycle
     let data: any;
     try {
@@ -176,8 +177,52 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       } catch (e) {
         console.error(`[hive] smoke run failed for ${t.id}:`, e);
       }
+    } else if (String(data.mergeable).toUpperCase() === "CONFLICTING") {
+      await nudgeConflict(db, h, t, data.headRefOid ?? null);
     }
   }
+}
+
+// ---- PR conflict watchdog ----
+// A PR GitHub reports CONFLICTING gets its agent told to resolve it — conflict
+// resolution is the agent's job, not the captain's. Deduped per head SHA: one
+// nudge per pushed state of the branch, so a cycle tick never spams but a push
+// that still conflicts re-nudges. Lifecycle is untouched: an in_review task
+// stays reviewable (the merge button's own failure path bounces it if the
+// captain gets there first), and a delivered send flips the agent to `working`,
+// which keeps advanceFinished from churning states.
+async function nudgeConflict(
+  db: DB,
+  h: Herdr,
+  t: { id: string; pr_url: string; agent_target: string | null; project_id: string },
+  headSha: string | null
+): Promise<void> {
+  const last = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_conflict' ORDER BY ts DESC LIMIT 1")
+    .get(t.id) as { payload: string } | undefined;
+  if (last) {
+    try {
+      if ((JSON.parse(last.payload).head_sha ?? null) === headSha) return; // already nudged for this push
+    } catch {}
+  }
+  const project = db.query("SELECT config FROM projects WHERE id = ?").get(t.project_id) as { config: string } | undefined;
+  let base = "main";
+  try {
+    base = JSON.parse(project?.config ?? "{}").default_branch || "main";
+  } catch {}
+  let delivered = false;
+  if (t.agent_target) {
+    try {
+      const r = await h.send(
+        t.agent_target,
+        `hive: your PR ${t.pr_url} has merge conflicts with '${base}'. Fetch and merge the latest 'origin/${base}' into your branch (or rebase onto it), resolve the conflicts, rerun the tests, then push.`
+      );
+      delivered = r.code === 0;
+    } catch {
+      delivered = false;
+    }
+  }
+  writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_conflict", payload: { pr_url: t.pr_url, head_sha: headSha, delivered } });
 }
 
 // ---- PR → task linking via gh ----
