@@ -28,12 +28,18 @@ director's board stays current. Do not wait to be asked for status.
   hive emit <task-id> evidence --file ./screenshot.png --note "caption"
   hive emit <task-id> needs-decision --note "one line summary"   (then open a decision card)
   hive emit <task-id> blocked  --note "why you are stuck"
+  hive emit <task-id> ready    --pr-url <url> --note "PR <url>"   (hand off for review)
   hive emit <task-id> done     --note "final summary"
 
 Rules:
 - A task NEVER reaches Done without evidence. Attach at least one evidence item
   (screenshot, test run, log, report, or link) before emitting \`done\`.
 - Scout tasks (knowledge-only) require a written report as evidence.
+- HAND OFF, don't go idle. When your PR is open and CI is triggered (or, for a
+  scout, your report is attached), emit \`hive emit <task-id> ready --pr-url <url>\`
+  to move the task into the director's review queue. Do NOT just stop and sit
+  idle — that leaves the task looking stuck. (A backstop advances an idle agent
+  that has a PR, but \`ready\` is the clean, immediate handoff.)
 - When you hit a decision the director must make, emit \`needs-decision\` and
   stop; do not guess on anything high-risk (prod, feature flags, destructive ops).`;
 

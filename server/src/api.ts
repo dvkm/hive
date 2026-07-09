@@ -533,7 +533,7 @@ function listTasks(db: DB, url: URL): Response {
 // ponytail: FEED_CATEGORIES mirrors web/src/lib/eventText.ts. A 5-line map is
 // cheaper to duplicate than to cross the server<-web build seam; keep in sync.
 const FEED_CATEGORIES: Record<string, string[]> = {
-  state: ["state_change"],
+  state: ["state_change", "ready_for_review"],
   decision: ["needs-decision", "decision_answered", "planned", "authority_required", "authority_granted"],
   evidence: ["evidence", "smoke_passed"],
   incident: ["blocked", "stale", "spawn_error", "smoke_failed", "steer_error", "planner_error", "supervise_error", "authority_denied"],
@@ -1591,6 +1591,29 @@ async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Respon
     if (note) db.query("UPDATE tasks SET summary = ? WHERE id = ?").run(note, taskId);
     const task = transition(db, taskId, "done", { source, reason: note ?? undefined });
     return json({ task });
+  }
+
+  // --- ready (agent handoff: PR open / report written → into the review queue) ---
+  // The explicit, preferred counterpart to the reconciler's advanceFinished
+  // backstop: an agent that has opened its PR (or written its scout report) emits
+  // this to hand off for review instead of just going idle. Records a pr_url when
+  // supplied and not already linked, then advances in_progress → in_review.
+  if (type === "ready") {
+    const t = getTask(db, taskId);
+    const prUrl = (fields.pr_url ?? fields.url ?? null) as string | null;
+    if (prUrl && !t.pr_url) {
+      db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(prUrl, now(), taskId);
+      writeEvent(db, { task_id: taskId, source, type: "pr_linked", payload: { pr_url: prUrl, via: "ready" } });
+    }
+    if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });
+    if (t.state === "in_progress") {
+      writeEvent(db, { task_id: taskId, source, type: "ready_for_review", payload: { pr_url: prUrl ?? t.pr_url ?? null, via: "emit", kind: t.kind } });
+      const task = transition(db, taskId, "in_review", { source, reason: note ?? "agent handoff: ready for review" });
+      return json({ task });
+    }
+    // Already advanced (the reconciler beat the agent to it) or not in_progress:
+    // ack idempotently rather than erroring on a duplicate handoff.
+    return json({ task: getTask(db, taskId) });
   }
 
   // --- usage (cost/token analytics) ---

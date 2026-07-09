@@ -102,10 +102,12 @@ it.** Shape `{status, reason, since}`:
   `agent_target`.
 - Derivation (pure function of events, precedence dead > stuck > silent >
   healthy): **dead** = `agent_target` set but the reconciler's probe recorded the
-  agent `gone`; **stuck** = herdr reports `blocked` OR a stale-recovery escalation
-  is in flight (newest event `stale`/`recovery_nudge`); **silent** = no activity
-  events past the stale threshold but the agent is still alive; **healthy**
-  otherwise. Every `task` SSE message carries the recomputed `health`.
+  agent `gone`; **stuck** = herdr reports `blocked`, OR a stale-recovery escalation
+  is in flight (newest event `stale`/`recovery_nudge`), OR the agent went `idle` on
+  an `in_progress` task with no `pr_url` and no recent activity (finished-without-a-PR
+  or wedged — surfaced instead of hidden); **silent** = no activity events past the
+  stale threshold but the agent is still alive; **healthy** otherwise. Every `task`
+  SSE message carries the recomputed `health`.
 `source` is null for director/agent-created tasks, `"intake_gchat"` for a task
 drafted by the Google Chat intake connector (an untrusted, unreviewed external
 message — the web board flags these), `"planner"` for a task created from an
@@ -162,6 +164,7 @@ Types written by the runtime layer (Phase 2b):
 - `recovery_card` — a recovery escalation opened a decision card. `payload: {decision_id, source_task_id}`
 - `ci_status` — reconciler synced CI. `payload: {ci_status}` (`passing|pending|failing`)
 - `pr_merged` — reconciler detected the PR merged. `payload: {pr_url}`
+- `ready_for_review` — the task was handed off `in_progress → in_review`, by the agent's `ready` emit or the reconciler's idle/gone backstop. `payload: {pr_url, via, kind}` (`via ∈ {emit, idle, gone}`)
 - `pr_linked` — a marked PR was matched back to this task and its `pr_url` set (by the reconciler's scan or `POST /api/tasks/link-pr`). `payload: {pr_url, via}` (`via ∈ {id, number}` — which half of the marker matched)
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
@@ -465,6 +468,25 @@ captain reviews the diff and approves/merges, requests changes, or rejects,
 entirely from hive (the task page, the `/review` queue, and the morning brief all
 render the same review card).
 
+**How a task reaches `in_review` (the finished-handoff, `in_progress → in_review`):**
+- **Explicit signal (preferred):** the agent emits `ready` (`POST .../events`
+  `{type:"ready", pr_url?}`, i.e. `hive emit <id> ready --pr-url <url>`) once its PR
+  is open (or, for a scout, its report is written). Records `pr_url` when supplied
+  and not already linked, then advances the task. Idempotent — a duplicate `ready`
+  on an already-advanced task just acks (`200`). Writes a `ready_for_review` event.
+- **Reconciler backstop (safety net):** every cycle, an `in_progress` task whose
+  agent is **idle or gone** (NOT `working`/`blocked` — an agent that opened a PR and
+  kept working still reports `working`) and that has a real work product (a `pr_url`,
+  or a scout `report` evidence) is auto-advanced to `in_review` (`ready_for_review`
+  event, `via: idle|gone`). Advancing on a single idle read is safe because mid-work
+  reads `working`; this runs before stale-recovery, so a handed-off task with a gone
+  agent is moved to review rather than failed/requeued. This unsticks finished tasks
+  regardless of whether the agent emitted `ready`.
+- **Finished with NO PR:** an `in_progress` task whose agent went idle with no PR and
+  no recent activity is not auto-advanced (nothing to review) but is made VISIBLE:
+  its `health` becomes `stuck` (reason `finished or stuck: agent idle, no PR`), which
+  surfaces it in the attention tray for the director instead of sitting silently.
+
 - `GET /api/tasks/:id/diff` → `200 DiffResult` | `400` (no branch & no `pr_url`, or project has no `repo_path`) | `404` | `502` (gh/git failed)
   The task branch's changes. When `pr_url` is set, `gh pr diff <url> --patch`;
   otherwise `git -C <repo> diff <default_branch>...<branch>` in the project repo.
@@ -540,9 +562,10 @@ recognized fields (JSON keys == form field names):
 
 | field | meaning |
 |-------|---------|
-| `type` (required) | `status` \| `evidence` \| `needs-decision` \| `done` \| `blocked` \| `usage` \| `assistant_text` \| `tool_use` \| `agent_turn_end` \| any custom string |
+| `type` (required) | `status` \| `evidence` \| `needs-decision` \| `ready` \| `done` \| `blocked` \| `usage` \| `assistant_text` \| `tool_use` \| `agent_turn_end` \| any custom string |
 | `source` | defaults to `agent` |
 | `note` | free text; stored in the event payload / used as caption/summary |
+| `pr_url` | (`ready` type) the opened PR URL; recorded on the task if not already linked |
 | `payload` | structured event payload object, passed through verbatim for `assistant_text` / `tool_use` / `agent_turn_end` (JSON body) |
 | `kind` | evidence kind (evidence type only); defaults to `screenshot` if a file is present, else `link`/`log` |
 | `caption` | evidence caption |
@@ -558,6 +581,10 @@ Behavior by `type`:
   parks the task in `needs_decision`. Missing/empty `options` default to
   `proceed`/`dismiss` (the emit path defaults rather than dropping the agent's
   signal). → `201 {decision: Decision, task: Task}`
+- `ready` → the finished-handoff signal. Records `pr_url` (when supplied and not
+  already linked, writing a `pr_linked` event), then advances `in_progress →
+  in_review` with a `ready_for_review` event. Idempotent: on a task that isn't
+  `in_progress` (already advanced) it acks without transitioning. → `200 {task: Task}`
 - `done` → records the `note` as summary + `note` event, then transitions the
   task to `done` (evidence rule enforced). → `200 {task: Task}` | `409`
 - `usage` → inserts a Usage row (cost computed server-side when `cost_usd` is
