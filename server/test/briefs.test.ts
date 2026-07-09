@@ -36,6 +36,14 @@ test("brief includes task, DoD, emit protocol, and active policies", () => {
   expect(brief).not.toContain("Should not appear.");
 });
 
+test("brief tells the agent to verify browsers headlessly, not via the denied MCPs", () => {
+  const { db, taskId } = setup();
+  const brief = composeBrief(db, taskId);
+  expect(brief).toContain("Browser verification (headless only)");
+  expect(brief).toContain("claude-in-chrome");
+  expect(brief).toContain("--headless");
+});
+
 test("scout brief has a report-based definition of done", () => {
   const { db, taskId } = setup();
   db.query("UPDATE tasks SET kind = 'scout' WHERE id = ?").run(taskId);

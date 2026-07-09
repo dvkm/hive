@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, existsSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -79,6 +79,15 @@ test("spawn endpoint starts the agent and moves the task to in_progress", async 
   expect(task.json.events.some((e: any) => e.type === "spawned")).toBe(true);
   // hook wiring is written into the worktree (structural reporting).
   expect(existsSync(join(WT, ".claude", "settings.local.json"))).toBe(true);
+});
+
+// A worker has no human at its pane: an MCP server that opens an Allow/Deny
+// dialog hangs it forever. The seeded settings must deny those servers.
+test("spawned worktree settings deny the interactive-prompt MCP servers", () => {
+  const settings = JSON.parse(readFileSync(join(WT, ".claude", "settings.local.json"), "utf8"));
+  expect(settings.permissions.deny).toContain("mcp__claude-in-chrome");
+  expect(settings.permissions.deny).toContain("mcp__computer-use");
+  expect(settings.hooks.Stop).toBeDefined(); // deny wiring didn't clobber the hooks
 });
 
 test("spawn refuses a project without a repo_path", async () => {
