@@ -116,6 +116,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // ---- activity feed (reverse-chronological projection over events) ----
       if (pathname === "/api/feed" && method === "GET") return listFeed(db, url);
 
+      // ---- global search (tasks/decisions/learnings/policies/projects) ----
+      if (pathname === "/api/search" && method === "GET") return search(db, url);
+
       // ---- tasks ----
       if (pathname === "/api/tasks") {
         if (method === "GET") return listTasks(db, url);
@@ -430,6 +433,80 @@ function listFeed(db: DB, url: URL): Response {
     evidence_kind: r.evidence_kind ?? null,
   }));
   return json({ events: rows });
+}
+
+// Global search across the five text-bearing entities. Honest LIKE (not FTS5:
+// an FTS virtual table + triggers across five heterogeneous tables doesn't
+// compose cleanly with the append-only migration list, and the DB is a
+// single-user local file). Rank per entity: exact title > title prefix >
+// title contains > body only. Capped at 50 total.
+// ponytail: LIKE scan over a local single-user DB; swap for FTS5 if the
+// tables ever grow past tens of thousands of rows.
+function searchSnippet(text: string | null, q: string, len = 120): string {
+  if (!text) return "";
+  const i = text.toLowerCase().indexOf(q.toLowerCase());
+  if (i < 0) return text.length > len ? text.slice(0, len) + "…" : text;
+  const start = Math.max(0, i - 30);
+  const end = start + len;
+  return (start > 0 ? "…" : "") + text.slice(start, end) + (end < text.length ? "…" : "");
+}
+function titleRank(title: string, q: string): number {
+  const t = (title || "").toLowerCase();
+  const ql = q.toLowerCase();
+  if (t === ql) return 0;
+  if (t.startsWith(ql)) return 1;
+  if (t.includes(ql)) return 2;
+  return 3; // matched in a body field only
+}
+function search(db: DB, url: URL): Response {
+  const q = (url.searchParams.get("q") ?? "").trim();
+  let limit = parseInt(url.searchParams.get("limit") ?? "50", 10);
+  if (!Number.isFinite(limit) || limit <= 0) limit = 50;
+  limit = Math.min(limit, 50);
+  if (!q) return json({ hits: [] });
+
+  const like = "%" + q.replace(/[\\%_]/g, (c) => "\\" + c) + "%";
+  const E = " ESCAPE '\\'";
+  type Hit = {
+    type: string; id: string; title: string; snippet: string;
+    task_state?: string; project_id?: string; _rank: number;
+  };
+  const hits: Hit[] = [];
+  const bodySnippet = (title: string, ...bodies: (string | null)[]) => {
+    for (const b of bodies) if (b && b.toLowerCase().includes(q.toLowerCase())) return searchSnippet(b, q);
+    return searchSnippet(bodies.find((b) => b) ?? title, q);
+  };
+
+  for (const r of db.query(
+    `SELECT id, title, brief, summary, state, project_id FROM tasks
+     WHERE title LIKE ?${E} OR brief LIKE ?${E} OR summary LIKE ?${E}`
+  ).all(like, like, like) as any[]) {
+    hits.push({ type: "task", id: r.id, title: r.title, snippet: bodySnippet(r.title, r.brief, r.summary), task_state: r.state, project_id: r.project_id, _rank: titleRank(r.title, q) });
+  }
+  for (const r of db.query(
+    `SELECT id, title, context FROM decisions WHERE title LIKE ?${E} OR context LIKE ?${E}`
+  ).all(like, like) as any[]) {
+    hits.push({ type: "decision", id: r.id, title: r.title, snippet: bodySnippet(r.title, r.context), _rank: titleRank(r.title, q) });
+  }
+  for (const r of db.query(
+    `SELECT id, title, body, project_id FROM learnings WHERE title LIKE ?${E} OR body LIKE ?${E}`
+  ).all(like, like) as any[]) {
+    hits.push({ type: "learning", id: r.id, title: r.title, snippet: bodySnippet(r.title, r.body), project_id: r.project_id, _rank: titleRank(r.title, q) });
+  }
+  for (const r of db.query(
+    `SELECT id, title, body FROM policies WHERE title LIKE ?${E} OR body LIKE ?${E}`
+  ).all(like, like) as any[]) {
+    hits.push({ type: "policy", id: r.id, title: r.title, snippet: bodySnippet(r.title, r.body), _rank: titleRank(r.title, q) });
+  }
+  for (const r of db.query(
+    `SELECT id, name FROM projects WHERE name LIKE ?${E}`
+  ).all(like) as any[]) {
+    hits.push({ type: "project", id: r.id, title: r.name, snippet: "", _rank: titleRank(r.name, q) });
+  }
+
+  hits.sort((a, b) => a._rank - b._rank || a.title.localeCompare(b.title));
+  const out = hits.slice(0, limit).map(({ _rank, ...h }) => h);
+  return json({ hits: out });
 }
 
 function getTaskFull(db: DB, id: string): Response {
