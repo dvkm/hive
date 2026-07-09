@@ -5,6 +5,28 @@ import type { Decision, Evidence, TaskDetail } from "../lib/api";
 import { useStore } from "../lib/store";
 import { CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { relTime } from "../lib/time";
+import { fmtTokens, fmtUsd } from "./Analytics";
+
+// Compact per-task usage line: tokens + estimated cost, only when usage exists.
+function UsageLine({ id, rev }: { id: string; rev: number }) {
+  const [tot, setTot] = useState<{ total_tokens: number; cost_usd: number; unpriced: number; calls: number } | null>(null);
+  useEffect(() => {
+    let live = true;
+    api.taskUsage(id).then((d) => live && setTot(d.totals)).catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [id, rev]);
+  if (!tot || tot.calls === 0) return null;
+  return (
+    <div className="task-usage" title={`${tot.calls} LLM call(s)`}>
+      <span className="tu-tok">{fmtTokens(tot.total_tokens)} tokens</span>
+      <span className="tu-cost">
+        {tot.unpriced > 0 && tot.cost_usd === 0 ? "unpriced" : `~${fmtUsd(tot.cost_usd)}`}
+      </span>
+    </div>
+  );
+}
 
 function EvidenceItem({ e }: { e: Evidence }) {
   if (e.kind === "screenshot" && e.url) {
@@ -174,6 +196,7 @@ export function TaskBody({ id }: { id: string }) {
           {project && <span className="chip">{project.name}</span>}
           <span className={`chip chip-kind chip-${t.kind}`}>{t.kind}</span>
           <span className="chip">{STATE_LABEL[t.state]}</span>
+          <UsageLine id={t.id} rev={rev[t.id] || 0} />
         </div>
 
         {unhealthy && (

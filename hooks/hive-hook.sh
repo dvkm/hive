@@ -16,12 +16,21 @@
 HIVE_URL="${HIVE_URL:-http://127.0.0.1:4700}"
 EVENT="${1:-Stop}"
 
-# Claude Code passes hook JSON on stdin; drain it, we only need a coarse signal.
-cat >/dev/null 2>&1 || true
+# Claude Code passes hook JSON on stdin; capture it (needed for usage below).
+INPUT="$(cat 2>/dev/null || true)"
 
 curl -s -m 2 -X POST "$HIVE_URL/api/tasks/$HIVE_TASK_ID/events" \
   -H 'Content-Type: application/json' \
   -d "{\"type\":\"status\",\"source\":\"hook\",\"note\":\"hook: $EVENT\"}" \
   >/dev/null 2>&1 || true
+
+# On (Subagent)Stop, also report per-model token usage parsed from the
+# transcript the payload points at. Bun runs the parser (guaranteed present —
+# it runs hive itself). Fail silent, never block.
+if [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SubagentStop" ]; then
+  BUN="$(command -v bun || echo "$HOME/.bun/bin/bun")"
+  DIR="$(cd "$(dirname "$0")" && pwd)"
+  printf '%s' "$INPUT" | "$BUN" "$DIR/report-usage.ts" >/dev/null 2>&1 || true
+fi
 
 exit 0
