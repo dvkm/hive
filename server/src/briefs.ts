@@ -76,6 +76,15 @@ risky actions dispatch. Do NOT serially ask for permission. Rules that apply her
 
 ${lines}
 
+Your shell commands are gated automatically: clearly-safe, read-only / standard
+dev commands (ls, cat, grep, git status/diff/log, bun test, bun run, ...) run
+freely with no dialog, while destructive or unknown commands are routed through
+this same authority engine before they execute. You do not need to pre-clear
+ordinary work — just run it. When a risky command IS gated you'll see the tool
+denied with either "denied by standing authority" or "escalated to hive decision
+<id>"; in the latter case a card is waiting for the director, so re-run the same
+command once it's approved (a single-use grant lets the retry through).
+
 Before ANY externally-risky operation you run yourself (prod deploy, feature-flag
 flip, destructive op), call the guarded-action gate and act ONLY on its answer:
 

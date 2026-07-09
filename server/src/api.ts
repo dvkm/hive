@@ -1091,7 +1091,7 @@ export async function spawnAgent(
       agentArgv: config.agent_argv, // optional per-project override (verbatim)
       // Seed the worktree with hive's Claude Code hook wiring BEFORE the agent
       // starts, so Stop/SubagentStop/PostToolUse reporting is structural.
-      prepareWorktree: (worktreePath) => writeHookSettings(worktreePath, id, hiveUrl),
+      prepareWorktree: (worktreePath) => writeHookSettings(worktreePath, id, hiveUrl, config.command_approval),
     });
   } catch (e: any) {
     writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: String(e?.message ?? e) } });
@@ -1187,16 +1187,66 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, body: any): Promise<R
 // it. Browser verification goes headless instead (BROWSER_VERIFICATION, briefs.ts).
 const DENIED_MCP_SERVERS = ["mcp__claude-in-chrome", "mcp__computer-use"];
 
+// Clearly-safe, read-only / standard-dev tool patterns that must NEVER raise a
+// permission dialog for a spawned worker (no human is at the pane to answer).
+// `deny` still beats `allow`, so the browser-MCP denials above are unaffected.
+// Anything NOT on this list falls through to the PreToolUse classifier hook,
+// which auto-approves other safe commands and escalates risky ones to the
+// authority engine. Kept in lockstep with the SAFE list in hooks/classify.ts.
+const SAFE_TOOL_ALLOWLIST = [
+  "Read",
+  "Grep",
+  "Glob",
+  "NotebookRead",
+  "TodoWrite",
+  "Bash(ls:*)",
+  "Bash(cat:*)",
+  "Bash(pwd)",
+  "Bash(echo:*)",
+  "Bash(head:*)",
+  "Bash(tail:*)",
+  "Bash(wc:*)",
+  "Bash(grep:*)",
+  "Bash(rg:*)",
+  "Bash(find:*)",
+  "Bash(which:*)",
+  "Bash(git status:*)",
+  "Bash(git diff:*)",
+  "Bash(git log:*)",
+  "Bash(git show:*)",
+  "Bash(git branch:*)",
+  "Bash(bun test:*)",
+  "Bash(bun run:*)",
+  "Bash(npm test:*)",
+  "Bash(npm run:*)",
+  "Bash(pnpm test:*)",
+  "Bash(pnpm run:*)",
+  "Bash(yarn test:*)",
+];
+
 // Write hive's Claude Code hook wiring into a spawned worktree. Uses
 // settings.local.json (the per-directory override, gitignored by Claude Code
 // convention) so the agent reports Stop/SubagentStop/PostToolUse to hive
 // without any agent discipline. HIVE_TASK_ID/HIVE_URL reach the hook via the
 // agent's env (`herdr agent start --env`); the hook is a no-op without them.
-function writeHookSettings(worktreePath: string, taskId: string, hiveUrl: string): void {
+// `commandApproval` (project config `command_approval`) governs UNKNOWN commands
+// in the PreToolUse classifier: escalate (default) | allow | prompt.
+function writeHookSettings(
+  worktreePath: string,
+  taskId: string,
+  hiveUrl: string,
+  commandApproval: "escalate" | "allow" | "prompt" = "escalate"
+): void {
   const hook = join(HOOKS_DIR, "hive-hook.sh");
+  const approve = join(HOOKS_DIR, "hive-approve.sh");
   const settings = {
-    permissions: { deny: DENIED_MCP_SERVERS },
+    permissions: { allow: SAFE_TOOL_ALLOWLIST, deny: DENIED_MCP_SERVERS },
     hooks: {
+      // Gate Bash before it runs: safe commands auto-approve, risky ones escalate
+      // to the authority engine so an autonomous worker never hangs on a dialog.
+      PreToolUse: [
+        { matcher: "Bash", hooks: [{ type: "command", command: `${approve} ${commandApproval}` }] },
+      ],
       Stop: [{ hooks: [{ type: "command", command: `${hook} Stop` }] }],
       SubagentStop: [{ hooks: [{ type: "command", command: `${hook} SubagentStop` }] }],
       PostToolUse: [

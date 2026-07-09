@@ -597,6 +597,50 @@ Scoped rules that the server enforces before risky actions dispatch (see the
 - `PUT /api/authority/rules/:id` body `{action_pattern?, effect?, note?, active?}` → `200 AuthorityRule` | `400` (bad `effect`) | `404` (deactivate = `active:false`)
 - `DELETE /api/authority/rules/:id` → `200 {"ok":true}`
 
+### Command auto-approval (spawned agents)
+A spawned worker has no human at its pane, so a Bash permission dialog hangs it
+forever. Three layers keep safe commands flowing and route risky ones through the
+same authority engine (`writeHookSettings` in `api.ts`; `hooks/classify.ts` +
+`hooks/hive-approve.sh`; wired into each worktree's `.claude/settings.local.json`):
+
+1. **Static allowlist** — `permissions.allow` lists clearly-safe tools that never
+   prompt: `Read`, `Grep`, `Glob`, and read-only `Bash(...)` patterns
+   (`ls`, `cat`, `grep`, `git status/diff/log/show/branch`, `bun test`, `bun run`,
+   `npm test/run`, ...). `permissions.deny` (browser MCPs) still wins over allow.
+2. **PreToolUse classifier hook** (`Bash` matcher → `hive-approve.sh <policy>`).
+   `classify.ts` (pure, unit-tested) sorts each command:
+   - **safe** (read-only / standard dev, no dangerous tokens, no `$(...)`/backtick
+     substitution) → emits the PreToolUse **allow** decision, no dialog.
+   - **dangerous** (`rm -rf`, `sudo`, `curl|wget … | sh`, `git push --force`,
+     `git reset --hard`, `DROP/TRUNCATE`, `DELETE FROM`/`UPDATE … SET` without
+     `WHERE`, fork bomb, `mkfs`/`dd of=`, device/system-path writes, `kill`,
+     `terraform apply/destroy`, `kubectl delete`, SSH/AWS credential files, …) →
+     escalates via `POST guarded-action {action:"command.dangerous", target:<cmd>}`.
+     Never auto-allowed, even under `command_approval:"allow"`.
+   - **unknown** (not provably safe) → escalates via `{action:"command", …}`, or is
+     allowed / deferred per the `command_approval` policy below.
+
+   The PreToolUse output schema (stdout, exit 0): `{"hookSpecificOutput":
+   {"hookEventName":"PreToolUse","permissionDecision":"allow"|"deny",
+   "permissionDecisionReason":"..."}}`. On escalation the hook maps the
+   guarded-action result: `200 allow` → allow; `403 deny` → deny (with reason);
+   `409 require_decision` → **deny-for-now** with reason `escalated to hive
+   decision <id>` (a card opens; re-running the same command after the director
+   approves passes once, spending the single-use grant). **Fail-safe**: if hive is
+   unreachable the hook DENIES (2s curl cap) — an unclassified dangerous command
+   is never auto-allowed.
+3. **`command_approval`** (project `config` field) governs UNKNOWN commands only:
+   `"escalate"` (default) → guarded-action; `"allow"` → auto-approve; `"prompt"` →
+   defer to Claude Code's normal dialog. Dangerous always escalates regardless.
+
+**Seeding for real gating**: the authority engine defaults unmatched actions to
+`allow` (log-only), so dangerous commands are *logged* but not *stopped* until a
+rule exists. Seed a standing rule to make them stop, e.g.
+`POST /api/authority/rules {"action_pattern":"command.dangerous*","effect":"require_decision","note":"destructive shell needs director sign-off"}`
+(or `"effect":"deny"` for a hard block). Because dangerous commands carry the
+distinct `command.dangerous` action, this gates them without touching ordinary
+`command` escalations.
+
 ### Incidents
 - `GET /api/incidents?status=` → `200 {"incidents": [Incident, ...]}` (newest first; `status` filter optional, e.g. `open` / `resolved`)
 
