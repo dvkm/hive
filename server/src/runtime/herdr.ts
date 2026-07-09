@@ -120,6 +120,25 @@ export function agentSendArgv(target: string, message: string): string[] {
   return ["agent", "send", target, message];
 }
 
+// herdr `agent send` writes literal text into the composer but does NOT submit
+// it — the Enter must be sent separately to the agent's pane (verified live
+// 2026-07-09; also stated by herdr's own help: "agent send writes literal text").
+// Without this a steer sits in the composer forever, which is exactly the bug.
+export function paneSendKeysArgv(paneId: string, key: string): string[] {
+  return ["pane", "send-keys", paneId, key];
+}
+
+// Pull the pane id out of an `agent get` payload so we can address send-keys.
+export function parsePaneId(stdout: string): string | null {
+  try {
+    const obj = JSON.parse(stdout);
+    const a = obj.result?.agent ?? obj.agent ?? obj;
+    return (a?.pane_id as string) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function agentFocusArgv(target: string): string[] {
   return ["agent", "focus", target];
 }
@@ -349,8 +368,21 @@ export class Herdr {
     }
   }
 
+  // Steer an agent: write the text, then submit it with an explicit Enter to the
+  // agent's pane (agent send alone leaves the text unsubmitted in the composer).
   async send(target: string, message: string): Promise<ExecResult> {
-    return this.run(agentSendArgv(target, message));
+    const sent = await this.run(agentSendArgv(target, message));
+    try {
+      const got = await this.run(agentGetArgv(target));
+      const paneId = parsePaneId(got.stdout);
+      if (paneId) await this.run(paneSendKeysArgv(paneId, "Enter"));
+    } catch {
+      // Text landed; a swallowed/failed Enter leaves the agent idle, which the
+      // reconciler surfaces as a stalled task rather than a silent drop.
+      // ponytail: single Enter, no verify-and-retry. Add a composer-state read +
+      // Enter-retry (firstmate's fm-send pattern) if swallowed-Enter recurs.
+    }
+    return sent;
   }
 
   async focus(target: string): Promise<ExecResult> {
