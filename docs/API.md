@@ -129,6 +129,12 @@ name and is uniquely indexed for dedupe.
 - `steer` — a steer message was dispatched to the agent. `payload: {message, target}`
 - `blocked` — agent reported blocked. `payload: {note}`
 
+Transcript events (written by the Claude Code hooks, `source: hook` — these fill
+the task timeline with the agent's actual work; see `hooks/install.md`):
+- `assistant_text` — a block of the agent's actual output text. `payload: {text}` (rendered as a transcript bubble)
+- `tool_use` — the agent invoked a tool. `payload: {tool, summary}` where `summary` is a cheap one-line description (the command for Bash, the file_path for Read/Edit, the pattern for Grep — never the full input). The UI groups consecutive `tool_use` events into one "used N tools" row.
+- `agent_turn_end` — a quiet Stop/SubagentStop liveness heartbeat. `payload: {}` (kept for health/reconciler; the timeline hides it)
+
 Types written by the runtime layer (Phase 2b):
 - `spawned` — a herdr agent was started. `payload: {agent_target, branch, worktree_path, tab_id, label, fleet_workspace_id}`
 - `spawn_error` — spawn failed. `payload: {error}`
@@ -466,9 +472,10 @@ recognized fields (JSON keys == form field names):
 
 | field | meaning |
 |-------|---------|
-| `type` (required) | `status` \| `evidence` \| `needs-decision` \| `done` \| `blocked` \| `usage` \| any custom string |
+| `type` (required) | `status` \| `evidence` \| `needs-decision` \| `done` \| `blocked` \| `usage` \| `assistant_text` \| `tool_use` \| `agent_turn_end` \| any custom string |
 | `source` | defaults to `agent` |
 | `note` | free text; stored in the event payload / used as caption/summary |
+| `payload` | structured event payload object, passed through verbatim for `assistant_text` / `tool_use` / `agent_turn_end` (JSON body) |
 | `kind` | evidence kind (evidence type only); defaults to `screenshot` if a file is present, else `link`/`log` |
 | `caption` | evidence caption |
 | `url` | evidence URL (for link evidence, no file) |
@@ -486,6 +493,8 @@ Behavior by `type`:
 - `usage` → inserts a Usage row (cost computed server-side when `cost_usd` is
   omitted; null for unpriced models) and broadcasts a `usage` SSE message. Writes
   no timeline event. → `201 {usage: Usage}` | `400` (missing `model`)
+- `assistant_text` / `tool_use` / `agent_turn_end` → writes one event with the
+  supplied `payload` preserved verbatim (the transcript hooks' path). → `201 {event: Event}`
 - `status` / `blocked` / custom → writes one event. → `201 {event: Event}`
 
 ### Analytics (cost/token)

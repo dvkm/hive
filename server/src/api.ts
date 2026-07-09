@@ -443,7 +443,7 @@ const FEED_CATEGORIES: Record<string, string[]> = {
   decision: ["needs-decision", "decision_answered", "planned", "authority_required", "authority_granted"],
   evidence: ["evidence", "smoke_passed"],
   incident: ["blocked", "stale", "spawn_error", "smoke_failed", "steer_error", "planner_error", "supervise_error", "authority_denied"],
-  lifecycle: ["created", "spawned", "agent_status", "status", "steer", "note", "ci_status", "pr_merged", "planning"],
+  lifecycle: ["created", "spawned", "agent_status", "status", "steer", "note", "ci_status", "pr_merged", "planning", "assistant_text", "tool_use", "agent_turn_end"],
 };
 
 function listFeed(db: DB, url: URL): Response {
@@ -1449,6 +1449,20 @@ async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Respon
 
   // --- usage (cost/token analytics) ---
   if (type === "usage") return ingestUsage(db, taskId, fields, source);
+
+  // --- transcript + lifecycle (from the Claude Code hooks) ---
+  // assistant_text = the agent's actual output; tool_use = a one-line tool
+  // summary; agent_turn_end = a quiet Stop/SubagentStop heartbeat. These carry a
+  // structured `payload` object (JSON body) rather than a bare `note`.
+  if (type === "assistant_text" || type === "tool_use" || type === "agent_turn_end") {
+    let payload: Record<string, unknown> = {};
+    if (fields.payload && typeof fields.payload === "object") payload = fields.payload;
+    else if (typeof fields.payload === "string") {
+      try { payload = JSON.parse(fields.payload); } catch { /* ignore */ }
+    }
+    const event = writeEvent(db, { task_id: taskId, source, type, payload });
+    return json({ event }, 201);
+  }
 
   // --- status / blocked / generic ---
   const event = writeEvent(db, { task_id: taskId, source, type, payload: { note } });

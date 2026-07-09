@@ -708,6 +708,153 @@ a {
   white-space: nowrap;
 }
 
+/* transcript bubble — the agent's actual speech */
+.timeline li.tl-text {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+.tl-text-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.tl-text-head .tl-age {
+  margin-left: auto;
+}
+.tl-bubble {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--bg-elev2);
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+/* grouped tool run */
+.timeline li.tl-tools {
+  padding: 0;
+}
+.tl-tools details {
+  width: 100%;
+  padding: 7px 0;
+}
+.tl-tools summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+.tl-tools summary::-webkit-details-marker { display: none; }
+.tl-tools summary::before {
+  content: "▸";
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.tl-tools details[open] summary::before { content: "▾"; }
+.tl-tools-count {
+  color: var(--text-dim);
+  font-weight: 600;
+  font-size: 12.5px;
+  flex-shrink: 0;
+}
+.tl-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex: 1;
+}
+.tl-tools summary .tl-age { margin-left: auto; }
+.chip-tool {
+  background: var(--bg-elev2);
+  color: var(--text-dim);
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.tl-tool-list {
+  list-style: none;
+  margin: 6px 0 2px;
+  padding: 0 0 0 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tl-tool-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  border: none;
+  padding: 0;
+}
+.tl-tool-sum {
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* decision prompt + answer block */
+.timeline li.tl-decision {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  background: var(--bg-elev2);
+  border-radius: 8px;
+  padding: 10px 12px;
+  border-bottom: none;
+  margin: 4px 0;
+}
+.tl-decision-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.tl-decision-head .tl-age { margin-left: auto; }
+.tl-decision-badge {
+  font-weight: 600;
+  font-size: 12.5px;
+  color: var(--amber);
+}
+.tl-decision-q {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+.tl-decision-ctx {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+}
+.tl-decision-opts {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.tl-decision-opts li {
+  font-size: 11.5px;
+  padding: 1px 8px;
+  border-radius: 4px;
+  background: var(--bg-elev1);
+  color: var(--text-dim);
+  border: 1px solid var(--border-soft);
+}
+.tl-decision-opts li.opt-chosen {
+  color: var(--green);
+  border-color: var(--green);
+  font-weight: 600;
+}
+.tl-decision-answer {
+  font-size: 12.5px;
+  color: var(--text);
+}
+
 /* evidence */
 .ev-gallery {
   display: flex;
