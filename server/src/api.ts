@@ -33,11 +33,15 @@ import { authorize, resolveGrantForDecision, type AuthzInput } from "./authority
 import { isReviewed } from "./dispatcher.ts";
 import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.ts";
 import { costUsd } from "./pricing.ts";
+import { taskDiff } from "./diff.ts";
+import type { Exec } from "./exec.ts";
+import { defaultExec } from "./exec.ts";
 
 export interface HandlerDeps {
   herdr?: Herdr; // injectable for tests
   supervise?: boolean; // start the herdr wait loop after spawn (true in prod wiring)
   plannerExec?: PlannerExec; // injectable planner subprocess (domain supervisors)
+  exec?: Exec; // injectable gh/git subprocess (diff + merge); tests pass a stub
 }
 
 const VERSION = "0.1.0";
@@ -172,6 +176,15 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (!getTask(db, m[1])) return err("task not found", 404);
         return json({ task_id: m[1], brief: composeBrief(db, m[1]) });
       }
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/diff$/);
+      if (m && method === "GET") return await taskDiffEndpoint(db, m[1], deps);
+
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/merge$/);
+      if (m && method === "POST") return await mergeTask(db, herdr, m[1], await safeJson(req), deps);
+
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/request-changes$/);
+      if (m && method === "POST") return await requestChanges(db, herdr, m[1], await req.json());
+
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/guarded-action$/);
       if (m && method === "POST") return guardedAction(db, m[1], await req.json());
 
@@ -592,7 +605,15 @@ function brief(db: DB, url: URL): Response {
     .filter((t: any) => !isReviewed(db, t.id))
     .map((t: any) => ({ ...parseTask(t), project_name: t.project_name }));
 
-  // ⑦ spend since — reuse the analytics rollup (totals + by-model for top model).
+  // ⑦ to review — in-review tasks awaiting the captain's review & merge. Full
+  // task objects (with health) so the web renders review cards inline.
+  const to_review = db
+    .query("SELECT * FROM tasks WHERE state = 'in_review' ORDER BY updated_at DESC")
+    .all()
+    .map(parseTask)
+    .map((t: any) => taskWithHealth(db, t));
+
+  // ⑧ spend since — reuse the analytics rollup (totals + by-model for top model).
   const w = since ? " WHERE ts >= ?" : "";
   const a = since ? [since] : [];
   const spend = {
@@ -602,7 +623,7 @@ function brief(db: DB, url: URL): Response {
       .all(...a),
   };
 
-  // ⑧ learnings created/recurred since (last_seen bumps on both create and recur).
+  // ⑨ learnings created/recurred since (last_seen bumps on both create and recur).
   const learnings_new = db
     .query(
       `SELECT l.*, p.name AS project_name FROM learnings l
@@ -619,6 +640,7 @@ function brief(db: DB, url: URL): Response {
     fleet,
     incidents,
     intake,
+    to_review,
     spend,
     learnings_new,
   });
@@ -796,6 +818,122 @@ async function doTransition(db: DB, id: string, body: any): Promise<Response> {
     return json(getTask(db, id));
   }
   return json(task);
+}
+
+// ---- review experience: diff / approve+merge / request-changes ----
+
+// GET /api/tasks/:id/diff → the structured branch diff for the review UI.
+async function taskDiffEndpoint(db: DB, id: string, deps: HandlerDeps): Promise<Response> {
+  const r = await taskDiff(db, id, deps.exec ?? defaultExec);
+  return r.ok ? json(r.diff) : err(r.error, r.status);
+}
+
+// Map our merge_method config onto gh's flag. Squash is the default.
+function ghMergeFlag(method: string | undefined): string {
+  if (method === "merge") return "--merge";
+  if (method === "rebase") return "--rebase";
+  return "--squash";
+}
+
+// POST /api/tasks/:id/merge — approve & merge an in-review task.
+// PR-backed: `gh pr merge <url> <method>`. Otherwise a local fast-forward of the
+// task branch into the project's default branch. On success: `merged` event,
+// in_review→verifying (triggers smoke), best-effort worktree teardown. On
+// failure (conflict / not fast-forward / CI blocked): 409 with the reason and no
+// state change. Guarded by the `task.merge` standing-authority action.
+async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps): Promise<Response> {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  if (task.state !== "in_review")
+    return err(`task is '${task.state}', not 'in_review'; only in-review tasks can be merged`, 409);
+
+  const blocked = authzBlock(db, { project_id: task.project_id, action: "task.merge", target: task.title, task_id: id });
+  if (blocked) return blocked;
+
+  const exec = deps.exec ?? defaultExec;
+  const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
+  const config = JSON.parse(project?.config ?? "{}");
+  const base = config.default_branch || "main";
+
+  let method: string;
+  if (task.pr_url) {
+    const flag = ghMergeFlag(config.merge_method);
+    method = `pr ${flag.slice(2)}`;
+    const r = await exec(["gh", "pr", "merge", task.pr_url, flag]);
+    if (r.code !== 0) {
+      const reason = r.stderr.trim() || r.stdout.trim() || `gh pr merge exited ${r.code}`;
+      writeEvent(db, { task_id: id, source: "director", type: "merge_failed", payload: { reason } });
+      return err(reason, 409);
+    }
+  } else {
+    if (!project?.repo_path) return err("project has no repo_path; cannot merge", 400);
+    if (!task.branch) return err("task has no branch and no pr_url; nothing to merge", 400);
+    // Documented safe local merge: fast-forward the default branch to the task
+    // branch tip. Requires the default branch to be an ancestor of the task
+    // branch; a non-fast-forward (diverged / conflicting) merge is refused, no
+    // working tree is touched. Callers wanting a squash merge should use a PR.
+    const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", base, task.branch]);
+    if (anc.code !== 0) {
+      const reason = `'${base}' is not an ancestor of '${task.branch}'; not a fast-forward (rebase the branch or open a PR)`;
+      writeEvent(db, { task_id: id, source: "director", type: "merge_failed", payload: { reason } });
+      return err(reason, 409);
+    }
+    const r = await exec(["git", "-C", project.repo_path, "merge", "--ff-only", task.branch]);
+    if (r.code !== 0) {
+      const reason = r.stderr.trim() || r.stdout.trim() || `git merge --ff-only exited ${r.code}`;
+      writeEvent(db, { task_id: id, source: "director", type: "merge_failed", payload: { reason } });
+      return err(reason, 409);
+    }
+    method = "local ff-only";
+  }
+
+  writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url } });
+  // in_review → verifying (runs post-deploy smoke once).
+  transition(db, id, "verifying", { source: "director", reason: `merged (${method})` });
+  await runSmoke(db, id).catch((e) => console.error("[hive] smoke run failed:", e));
+
+  // Best-effort worktree teardown now the branch is merged. Never fails the
+  // request — a leftover worktree is a cleanup nuisance, not a merge failure.
+  if (task.worktree_path && task.branch && project?.repo_path) {
+    try {
+      await herdr.teardown({
+        repoPath: project.repo_path,
+        branch: task.branch,
+        worktreePath: task.worktree_path,
+        defaultBranch: base,
+      });
+    } catch (e) {
+      console.error(`[hive] teardown after merge failed for ${id}:`, e);
+    }
+  }
+
+  return json(getTask(db, id));
+}
+
+// POST /api/tasks/:id/request-changes body {notes} — bounce an in-review task
+// back to in_progress and deliver the captain's notes to the agent (best-effort
+// send; the `changes_requested` event records the notes either way, so a dead
+// agent gets them when it respawns and re-reads its timeline).
+async function requestChanges(db: DB, herdr: Herdr, id: string, body: any): Promise<Response> {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  if (task.state !== "in_review")
+    return err(`task is '${task.state}', not 'in_review'`, 409);
+  const notes = String(body?.notes ?? "").trim();
+  if (!notes) return err("notes are required");
+
+  let delivered = false;
+  if (task.agent_target) {
+    try {
+      const res = await herdr.send(task.agent_target, `hive: changes requested before merge —\n${notes}`);
+      delivered = res.code === 0;
+    } catch {
+      delivered = false;
+    }
+  }
+  writeEvent(db, { task_id: id, source: "director", type: "changes_requested", payload: { notes, delivered } });
+  const updated = transition(db, id, "in_progress", { source: "director", reason: "changes requested" });
+  return json({ ok: true, delivered, task: updated });
 }
 
 // Spawn a herdr agent for a queued task: create the worktree, start the agent

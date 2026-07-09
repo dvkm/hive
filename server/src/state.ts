@@ -33,7 +33,8 @@ const FORWARD: Record<State, State[]> = {
   queued: ["in_progress"],
   in_progress: ["needs_decision", "in_review"],
   needs_decision: ["in_progress"],
-  in_review: ["verifying"],
+  in_review: ["verifying", "in_progress"], // in_progress = captain requested changes
+
   verifying: ["done", "in_progress"], // failed smoke checks bounce back
   done: [],
   failed: ["queued"], // re-queue a failed task for another attempt (attention tray)
