@@ -82,6 +82,10 @@ tasks keep referencing it, there is no hard delete).
 }
 ```
 `state ∈ {queued, in_progress, needs_decision, in_review, verifying, done, failed, cancelled}`
+When a task enters a terminal state (`done` / `failed` / `cancelled`), every
+still-`open` decision on it is auto-expired (`status=expired`, a
+`decision_expired` event each, broadcast) — a terminal task can no longer act on
+a card, so it must not linger in the inbox. Legacy orphans are swept on startup.
 `kind ∈ {ship, scout, chore}`
 `number` is a human-friendly, monotonic per-hive counter assigned at creation
 (`MAX(number)+1`, starting at 1) and never reused — it is THE handle people and
@@ -136,6 +140,7 @@ never deleted, so the cancelled row + this pointer preserve the full history.
 - `evidence` — an evidence item was attached. `payload: {evidence_id, kind, caption}`
 - `needs-decision` — a decision card was opened. `payload: {decision_id, title}`
 - `decision_answered` — `payload: {decision_id, answer_key, answer_note}`
+- `decision_expired` — a decision was cleared without an answer: dismissed, or auto-expired because its task went terminal. `payload: {decision_id, reason}` (`reason` ∈ `dismissed` | `task cancelled` | `task done` | `task failed` | `task terminal (backfill)`)
 - `note` — a free note (e.g. a `done` summary). `payload: {note}`
 - `steer` — a steer message was dispatched to the agent. `payload: {message, target}`
 - `blocked` — agent reported blocked. `payload: {note}`
@@ -226,9 +231,17 @@ Standing-authority events (written by the policy engine, `source: system` unless
   "answered_at": null
 }
 ```
-`status ∈ {open, answered, expired}`. `options` is an ordered array; render the
-`recommended: true` option first per product rule 3. `draft_note` is the
-server-side autosaved draft.
+`status ∈ {open, answered, expired}`. `options` is an ordered, **non-empty**
+array; render the `recommended: true` option first per product rule 3.
+`draft_note` is the server-side autosaved draft. A decision is `expired` once it
+was dismissed, or its task went terminal (`done`/`failed`/`cancelled`) — expired
+cards leave the inbox and can no longer be answered.
+
+**Options are never empty.** An optionless card is un-answerable (nothing to
+click, no key to validate). The direct `POST /api/decisions` rejects an empty
+array with `400`; the agent `needs-decision` emit path instead defaults to
+`[{key:"proceed",label:"Proceed",recommended:true},{key:"dismiss",label:"Dismiss"}]`
+so an agent's signal is surfaced rather than silently dropped.
 
 ### Policy
 ```json
@@ -542,7 +555,9 @@ Behavior by `type`:
 - `evidence` → copies the file to `~/.hive/evidence/<task_id>/`, inserts an
   Evidence row, writes an `evidence` event. → `201 {evidence: Evidence, event: Event}`
 - `needs-decision` → creates a Decision (minimal; full cards use `POST /api/decisions`),
-  parks the task in `needs_decision`. → `201 {decision: Decision, task: Task}`
+  parks the task in `needs_decision`. Missing/empty `options` default to
+  `proceed`/`dismiss` (the emit path defaults rather than dropping the agent's
+  signal). → `201 {decision: Decision, task: Task}`
 - `done` → records the `note` as summary + `note` event, then transitions the
   task to `done` (evidence rule enforced). → `200 {task: Task}` | `409`
 - `usage` → inserts a Usage row (cost computed server-side when `cost_usd` is
@@ -565,7 +580,7 @@ Behavior by `type`:
 
 ### Decisions
 - `GET /api/decisions?status=open` → `200 [Decision, ...]` (newest first; `status` defaults to `open`; `status=all` returns every decision)
-- `POST /api/decisions` body `{task_id (required), title (required), context?, risk?, blast_radius?, options?}` → `201 Decision`
+- `POST /api/decisions` body `{task_id (required), title (required), context?, risk?, blast_radius?, options (required, non-empty)}` → `201 Decision` | `400` (missing/empty `options`)
   (also writes a `needs-decision` event and parks the task in `needs_decision` if its current state allows it)
 - `GET /api/decisions/:id` → `200 Decision` | `404`
 - `PUT /api/decisions/:id/draft` body `{draft_note}` → `200 {"ok":true, "id":...}` | `404`
@@ -574,6 +589,13 @@ Behavior by `type`:
   Archives the card (`status=answered`, `answered_at` set), writes a
   `decision_answered` event, and resumes the task (`needs_decision → in_progress`).
   If `answer_note` is omitted, the saved `draft_note` is used.
+- `POST /api/decisions/:id/dismiss` → `200 Decision` (now `expired`) | `404` | `409` (already closed)
+  Clears a card without answering it (the human escape hatch for a card that is
+  no longer relevant, or that somehow has no usable options). Sets
+  `status=expired`, writes a `decision_expired` event (`reason: "dismissed"`),
+  and broadcasts so the inbox clears live. Runs no resolvers — dismissing is
+  explicitly "take no action".
+
   Answering also runs the standing-authority and domain-supervisor resolvers: if
   the card was an authority request, `approve` mints a single-use grant; if it was
   a planner breakdown proposal, `approve` creates the proposed tasks as `queued`

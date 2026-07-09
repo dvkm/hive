@@ -7,7 +7,7 @@ import { startReaper } from "./reaper.ts";
 import { checkAllMonitors } from "./monitors.ts";
 import { startDigest, setNotifier } from "./notifications.ts";
 import { startGchatPoll } from "./intake/gchat.ts";
-import { setTerminalHook } from "./state.ts";
+import { setTerminalHook, expireOrphanedDecisions } from "./state.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { defaultExec } from "./exec.ts";
@@ -16,6 +16,11 @@ const port = Number(process.env.HIVE_PORT || 4700);
 const dbPath = defaultDbPath();
 const db = openDb(dbPath);
 const handle = makeHandler(db, { supervise: true });
+
+// Backfill: expire any open decision whose task is already terminal (legacy
+// orphans predating transition-time expiry). Idempotent.
+const orphaned = expireOrphanedDecisions(db);
+if (orphaned) console.log(`[hive] expired ${orphaned} orphaned open decision(s) on terminal tasks`);
 
 const server = Bun.serve({
   hostname: "127.0.0.1",
