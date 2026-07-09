@@ -117,7 +117,7 @@ name and is uniquely indexed for dedupe.
   "payload": { "note": "extracting the middleware" }
 }
 ```
-`source ∈ {agent, hook, herdr, reconciler, monitor, director, system}`.
+`source ∈ {agent, hook, herdr, reconciler, reaper, monitor, director, system}`.
 `type` is open-ended. Types the server itself writes:
 - `created` — task created. `payload: {title}`
 - `state_change` — every state transition. `payload: {from, to, reason}`
@@ -143,6 +143,8 @@ Types written by the runtime layer (Phase 2b):
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
 - `smoke_passed` / `smoke_failed` — post-deploy smoke result. `payload: {results:[{name,ok,detail}], evidence_id?}`
+- `cleaned_up` — a finished task's runtime was torn down: worktree removed (when its branch was pushed/merged) and herdr session (tab/pane) closed. `payload: {worktree_path, branch, worktree_removed, ghost_branch, session_closed, session_via, tab_id}` (`ghost_branch` non-null when tracked uncommitted work was preserved before removal). Fired on the `done`/`cancelled` transition and by the reaper.
+- `cleanup_skipped` — teardown was refused because the branch is neither pushed nor merged; the worktree and its session are left fully intact so no unmerged work is lost. `payload: {reason, worktree_path, branch}`
 
 Review events (written by the director path, `source: director`):
 - `merged` — an in-review task was approved & merged. `payload: {method, base, branch, pr_url}`
@@ -352,6 +354,8 @@ cost_usd, calls, unpriced}` (summed cost counts priced rows only).
   original). Distinct from the attention tray's in-place requeue of an
   already-failed task (`POST /transition {to:"queued"}`, which reactivates the
   SAME task and clears its runtime binding).
+- `POST /api/tasks/:id/cleanup` body `{}` → `200 {"ok":true, "cleaned":bool, "worktree":{removed,reason,ghost_branch}|null, "session":{closed,via}}` | `404` | `409` (task not terminal)
+  Manual force-teardown for a **terminal** task (`done`/`cancelled`/`failed`): removes its git worktree and closes its herdr session. Refuses (`409`) on a live task so an in-flight worktree is never pulled out from under a working agent. Keeps every safety guard: the worktree is removed only when its branch is pushed/merged (else `cleanup_skipped`), and any tracked uncommitted work is preserved to a `ghost-<task-id>` branch first. Backstop for the auto-teardown that fires on the `done`/`cancelled` transition and the periodic reaper sweep.
 - `GET /api/tasks/:id/brief` → `200 {"task_id":"...", "brief":"<multiline string>"}` | `404`
   (task description + definition of done + `hive emit` protocol + active global + project policies + standing-authority section)
 - `POST /api/tasks/:id/guarded-action` body `{action (required), target (required), detail?}` → see below | `404` | `400`
@@ -672,6 +676,33 @@ a single `spawn_error` event and back off exponentially per task
 Manual dispatch (the web "dispatch now" button → `POST /api/tasks/:id/spawn`)
 bypasses these policy gates but still runs the `task.spawn` authority gate. See
 `docs/runtime.md`.
+
+### Auto-cleanup & the reaper (finished-task teardown)
+Finished tasks get their runtime torn down automatically so orphan worktrees and
+herdr sessions never pile up (`server/src/cleanup.ts`, `server/src/reaper.ts`).
+
+- **On the transition (immediate).** When a task reaches `done` or `cancelled`,
+  the server fires `cleanupTask`: removes its git worktree and closes its herdr
+  session (the labelled tab, or the agent's pane). `failed` is deliberately
+  **excluded** — a failed task may still be auto-requeued/retried, so tearing it
+  down there would race the retry; the dead-agent recovery path already reclaims
+  its worktree, and the reaper is the backstop.
+- **The reaper (backstop, periodic).** `server/src/reaper.ts`, default every 5
+  min (`HIVE_REAP_MS`). Enumerates hive worker worktrees (`git worktree list`
+  across every project repo) and, for each on a `hive/<task-id>` branch whose
+  task id maps to a **terminal** task or to **no task at all**, tears it down.
+  A non-terminal task keeps its worktree (never touched). Isolated try/catch per
+  item; a failure never crashes the server.
+
+**Safety (never destroys work).** Removal keeps `teardown`'s guard: a worktree is
+removed only when its branch is pushed to origin **or** merged into the default
+branch (else the worktree + session are left fully intact and a `cleanup_skipped`
+event records the reason). Even on a safe branch, tracked uncommitted changes are
+first committed to a `ghost-<task-id>` branch (`cleaned_up.ghost_branch`); only
+purely-untracked/ignored artifacts (e.g. `.serena/`, the injected
+`.claude/settings.local.json`) are discarded by the force removal. Ghost branches
+(`ghost-<task-id>`) are never themselves reaped. After a successful removal the
+task's `agent_target`/`worktree_path` are cleared so a re-run is a no-op.
 
 ### Stale recovery & the attention tray
 The reconciler (`docs/runtime.md`) turns an observed agent death into action.

@@ -203,6 +203,18 @@ export function worktreeRemoveArgv(ref: { workspaceId?: string | null; worktreeP
   return a;
 }
 
+// Close a whole tab (the one labelled tab per task): takes its pane and the
+// agent inside it with it. herdr has no `agent stop`; the session is the tab.
+export function tabCloseArgv(tabId: string): string[] {
+  return ["tab", "close", tabId];
+}
+
+// Close a single pane directly (fallback when the tab id is unknown but the
+// agent's pane can be resolved via `agent get`).
+export function paneCloseArgv(paneId: string): string[] {
+  return ["pane", "close", paneId];
+}
+
 // Parse `herdr worktree create --json`. herdr 0.7.x wraps the payload in a
 // `{"id":...,"result":{...}}` envelope whose `result.worktree` holds path/branch
 // and `result.workspace.workspace_id` (also `worktree.open_workspace_id`) holds
@@ -592,6 +604,76 @@ export class Herdr {
       if (names.includes(branch)) return { safe: true, reason: "merged" };
     }
     return { safe: false, reason: "branch not pushed to origin nor merged; refusing to remove worktree" };
+  }
+
+  // Cleanup removal for a FINISHED task's worktree. Keeps teardown's guard (only
+  // removes once the branch is pushed/merged, so committed work is safe upstream)
+  // and additionally never drops uncommitted WORK: if the tree carries tracked
+  // modifications, they are preserved to a ghost-<taskId> branch before removal
+  // (reusing reclaimWorktree). Purely-untracked/ignored files (tooling artifacts
+  // like .serena/ or the injected .claude/settings.local.json) are discarded by
+  // the force removal. Removal goes through git, not herdr, because a finished
+  // task's worktree usually has no surviving herdr workspace to name.
+  async cleanupWorktree(args: {
+    repoPath: string;
+    branch: string;
+    worktreePath: string;
+    taskId: string;
+    defaultBranch?: string;
+  }): Promise<{ removed: boolean; reason: string; ghost_branch: string | null }> {
+    const safe = await this.branchIsSafe(args.repoPath, args.branch, args.defaultBranch ?? "main");
+    if (!safe.safe) return { removed: false, reason: safe.reason, ghost_branch: null };
+
+    const status = await this.exec(["git", "-C", args.worktreePath, "status", "--porcelain"]);
+    const trackedDirty =
+      status.code === 0 &&
+      status.stdout.split("\n").some((l) => l.length > 0 && !l.startsWith("??"));
+
+    if (trackedDirty) {
+      // Real uncommitted work on an otherwise-safe branch: preserve, then remove.
+      const rec = await this.reclaimWorktree({
+        repoPath: args.repoPath,
+        branch: args.branch,
+        taskId: args.taskId,
+        hintPath: args.worktreePath,
+      });
+      return {
+        removed: rec.reclaimed,
+        reason: rec.reclaimed ? `${safe.reason}; WIP preserved on ${rec.ghost_branch}` : rec.reason,
+        ghost_branch: rec.ghost_branch,
+      };
+    }
+
+    const rm = await this.exec(["git", "-C", args.repoPath, "worktree", "remove", "--force", args.worktreePath]);
+    if (rm.code !== 0)
+      return { removed: false, reason: `worktree remove failed: ${rm.stderr.trim() || rm.stdout.trim()}`, ghost_branch: null };
+    return { removed: true, reason: safe.reason, ghost_branch: null };
+  }
+
+  // Close a finished task's herdr "session": the labelled tab (which takes its
+  // pane + agent with it), falling back to closing the agent's pane directly.
+  // Best-effort and never throws — a visibility hiccup must not break cleanup.
+  async closeSession(args: {
+    agentTarget?: string | null;
+    tabId?: string | null;
+  }): Promise<{ closed: boolean; via: string | null }> {
+    try {
+      if (args.tabId) {
+        const r = await this.run(tabCloseArgv(args.tabId));
+        if (r.code === 0) return { closed: true, via: `tab ${args.tabId}` };
+      }
+      if (args.agentTarget) {
+        const got = await this.run(agentGetArgv(args.agentTarget));
+        const paneId = parsePaneId(got.stdout);
+        if (paneId) {
+          const r = await this.run(paneCloseArgv(paneId));
+          if (r.code === 0) return { closed: true, via: `pane ${paneId}` };
+        }
+      }
+    } catch {
+      /* best-effort */
+    }
+    return { closed: false, via: null };
   }
 }
 
