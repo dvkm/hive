@@ -14,7 +14,7 @@ beforeEach(() => resetGchatState());
 
 const SECRETS: GchatSecrets = { clientId: "id", clientSecret: "sec", refreshToken: "rt", self: "users/me" };
 
-function freshDb(gchat_spaces: any[] = [{ space: "spaces/AAA", label: "eng" }]): { db: DB; projectId: string } {
+function freshDb(gchat_spaces: any = [{ space: "spaces/AAA", label: "eng" }]): { db: DB; projectId: string } {
   const db = openDb(":memory:");
   const projectId = newId("proj");
   db.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run(
@@ -173,6 +173,47 @@ test("errors emit a single diagnostic then stay quiet, recovering on success", a
   await pollGchatOnce(db, { fetch: makeFetch({ messages: [] }), secrets: SECRETS, notify: false, log });
   await pollGchatOnce(db, { fetch: failing, secrets: SECRETS, notify: false, log });
   expect(logs.length).toBe(2);
+});
+
+test('gchat_spaces "*" polls every space spaces.list returns, across pages', async () => {
+  const { db } = freshDb("*");
+  let spacePage = 0;
+  // Each space must yield a distinct message name — intake dedupes on it.
+  const f = (async (input: any) => {
+    const u = String(input);
+    if (u.includes("oauth2.googleapis.com/token"))
+      return new Response(JSON.stringify({ access_token: "at", expires_in: 3600 }), { status: 200 });
+    if (u.includes("/v1/spaces?")) {
+      const pages = [
+        { spaces: [{ name: "spaces/AAA" }, { name: "spaces/BBB" }], nextPageToken: "p2" },
+        { spaces: [{ name: "spaces/CCC" }] },
+      ];
+      return new Response(JSON.stringify(pages[spacePage++]), { status: 200 });
+    }
+    if (u.includes("/messages?")) {
+      const space = u.match(/v1\/(spaces\/[^/]+)\/messages/)![1];
+      return new Response(JSON.stringify({ messages: [msg({ name: `${space}/messages/M1.M1` })] }), { status: 200 });
+    }
+    return new Response("{}", { status: 200 });
+  }) as unknown as FetchLike;
+  const r = await pollGchatOnce(db, { fetch: f, secrets: SECRETS, notify: false });
+  expect(r.spaces).toBe(3); // paginated to exhaustion
+  expect(r.created).toBe(3); // one intake task per space
+});
+
+test('gchat_spaces "*" survives a spaces.list failure with one diagnostic', async () => {
+  const { db } = freshDb("*");
+  const logs: string[] = [];
+  const failing = (async (input: any) => {
+    const u = String(input);
+    if (u.includes("oauth2.googleapis.com/token"))
+      return new Response(JSON.stringify({ access_token: "at", expires_in: 3600 }), { status: 200 });
+    return new Response("boom", { status: 500 }); // spaces.list 500s
+  }) as unknown as FetchLike;
+
+  const r = await pollGchatOnce(db, { fetch: failing, secrets: SECRETS, notify: false, log: (m) => logs.push(m) });
+  expect(r).toEqual({ created: 0, spaces: 0 }); // no jobs, no crash
+  expect(logs.length).toBe(1);
 });
 
 test("buildPermalink reconstructs a best-effort room deep-link", () => {
