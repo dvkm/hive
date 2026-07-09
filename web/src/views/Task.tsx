@@ -4,6 +4,7 @@ import { api } from "../lib/api";
 import type { Decision, Evidence, TaskDetail } from "../lib/api";
 import { useStore } from "../lib/store";
 import { CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { ReviewCard } from "./ReviewCard";
 import { relTime } from "../lib/time";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
@@ -94,6 +95,8 @@ export function TaskBody({ id }: { id: string }) {
   const [err, setErr] = useState<string>("");
   const [steer, setSteer] = useState("");
   const [planning, setPlanning] = useState(false);
+
+  const refresh = () => api.task(id).then(setT).catch(() => {});
 
   useEffect(() => {
     let live = true;
@@ -228,6 +231,8 @@ export function TaskBody({ id }: { id: string }) {
             </div>
           </div>
         )}
+
+        {t.state === "in_review" && <ReviewCard task={t} onDone={refresh} defaultExpanded />}
 
         <section className="panel">
           <h2>Brief</h2>
