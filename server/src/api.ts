@@ -1,9 +1,10 @@
 // HTTP routing for hive. Plain Bun.serve routing by hand (zero deps).
 // The exact request/response contract lives in docs/API.md.
 import { dirname, join, normalize } from "node:path";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
-import { newId, now, evidenceDir, hiveHome } from "./db.ts";
+import { newId, now, evidenceDir } from "./db.ts";
+import { taskWithHealth, broadcastTask } from "./health.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
 import {
   transition,
@@ -68,6 +69,7 @@ function authzBlock(db: DB, input: AuthzInput): Response | null {
 }
 
 const WEB_DIST = join(import.meta.dir, "..", "..", "web", "dist");
+const HOOKS_DIR = join(import.meta.dir, "..", "..", "hooks");
 
 export function makeHandler(db: DB, deps: HandlerDeps = {}) {
   const herdr = deps.herdr ?? defaultHerdr;
@@ -112,6 +114,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       }
       m = pathname.match(/^\/api\/tasks\/([^/]+)$/);
       if (m && method === "GET") return getTaskFull(db, m[1]);
+      if (m && method === "PUT") return updateTask(db, m[1], await req.json());
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/events$/);
       if (m) {
@@ -132,6 +135,12 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/send$/);
       if (m && method === "POST") return await sendSteer(db, herdr, m[1], await req.json());
+
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/focus-agent$/);
+      if (m && method === "POST") return await focusAgent(db, herdr, m[1]);
+
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/requeue$/);
+      if (m && method === "POST") return requeueEndpoint(db, m[1]);
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/brief$/);
       if (m && method === "GET") {
@@ -311,8 +320,21 @@ function createTask(db: DB, body: any): Response {
     row.summary, row.created_at, row.updated_at
   );
   writeEvent(db, { task_id: row.id, source: "director", type: "created", payload: { title: row.title } });
-  broadcast({ type: "task", task: row });
-  return json(parseTask(row), 201);
+  broadcastTask(db, row);
+  return json(taskWithHealth(db, parseTask(row)), 201);
+}
+
+// Update a task's editable fields (title / brief). Used by the attention tray's
+// "edit & requeue" flow before it re-queues a failed task.
+function updateTask(db: DB, id: string, body: any): Response {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  const title = body?.title != null ? String(body.title) : task.title;
+  const brief = body?.brief != null ? String(body.brief) : task.brief;
+  db.query("UPDATE tasks SET title = ?, brief = ?, updated_at = ? WHERE id = ?").run(title, brief, now(), id);
+  const updated = getTask(db, id);
+  broadcastTask(db, updated);
+  return json(taskWithHealth(db, updated));
 }
 
 function listTasks(db: DB, url: URL): Response {
@@ -326,7 +348,7 @@ function listTasks(db: DB, url: URL): Response {
     "SELECT * FROM tasks" +
     (where.length ? " WHERE " + where.join(" AND ") : "") +
     " ORDER BY updated_at DESC";
-  return json(db.query(sql).all(...args).map(parseTask));
+  return json(db.query(sql).all(...args).map(parseTask).map((t) => taskWithHealth(db, t)));
 }
 
 function getTaskFull(db: DB, id: string): Response {
@@ -335,7 +357,7 @@ function getTaskFull(db: DB, id: string): Response {
   const events = db.query("SELECT * FROM events WHERE task_id = ? ORDER BY ts").all(id).map(parseEvent);
   const evidence = db.query("SELECT * FROM evidence WHERE task_id = ? ORDER BY ts").all(id).map(parseEvidence);
   const decisions = db.query("SELECT * FROM decisions WHERE task_id = ? ORDER BY ts").all(id).map(parseDecision);
-  return json({ ...task, events, evidence, decisions });
+  return json({ ...taskWithHealth(db, task), events, evidence, decisions });
 }
 
 async function doTransition(db: DB, id: string, body: any): Promise<Response> {
@@ -400,12 +422,9 @@ export async function spawnAgent(
   if (!project?.repo_path) return { ok: false, error: "project has no repo_path" };
   const config = JSON.parse(project.config ?? "{}");
 
-  // Compose the brief and write it to a file the agent command reads.
-  const briefDir = join(hiveHome(), "briefs");
-  mkdirSync(briefDir, { recursive: true });
-  const briefFile = join(briefDir, `${id}.md`);
-  await Bun.write(briefFile, composeBrief(db, id));
-
+  // Compose the brief fresh; it is delivered as the interactive agent's first
+  // prompt (see runtime/herdr.defaultAgentArgv) — no `-p` one-shot.
+  const brief = composeBrief(db, id);
   const hiveUrl = opts.hiveUrl || process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
   const env = await resolveProjectSecrets(db, task.project_id);
 
@@ -415,10 +434,14 @@ export async function spawnAgent(
       taskId: id,
       repoPath: project.repo_path,
       hiveUrl,
-      briefFile,
+      title: task.title,
+      brief,
       base: config.default_branch,
       env,
-      agentArgv: config.agent_argv, // optional per-project override
+      agentArgv: config.agent_argv, // optional per-project override (verbatim)
+      // Seed the worktree with hive's Claude Code hook wiring BEFORE the agent
+      // starts, so Stop/SubagentStop/PostToolUse reporting is structural.
+      prepareWorktree: (worktreePath) => writeHookSettings(worktreePath, id, hiveUrl),
     });
   } catch (e: any) {
     writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: String(e?.message ?? e) } });
@@ -432,7 +455,14 @@ export async function spawnAgent(
     task_id: id,
     source: "herdr",
     type: "spawned",
-    payload: { agent_target: result.agent_target, branch: result.branch, worktree_path: result.worktree_path },
+    payload: {
+      agent_target: result.agent_target,
+      branch: result.branch,
+      worktree_path: result.worktree_path,
+      tab_id: result.tab_id,
+      label: result.label,
+      fleet_workspace_id: result.fleet_workspace_id,
+    },
   });
   if (task.state === "queued") transition(db, id, "in_progress", { source: "herdr", reason: "agent spawned" });
 
@@ -495,6 +525,106 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, body: any): Promise<R
     writeEvent(db, { task_id: id, source: "herdr", type: "steer_error", payload: { error } });
     return json({ ok: false, delivered: false, error });
   }
+}
+
+// Write hive's Claude Code hook wiring into a spawned worktree. Uses
+// settings.local.json (the per-directory override, gitignored by Claude Code
+// convention) so the agent reports Stop/SubagentStop/PostToolUse to hive
+// without any agent discipline. HIVE_TASK_ID/HIVE_URL reach the hook via the
+// agent's env (`herdr agent start --env`); the hook is a no-op without them.
+function writeHookSettings(worktreePath: string, taskId: string, hiveUrl: string): void {
+  const hook = join(HOOKS_DIR, "hive-hook.sh");
+  const settings = {
+    hooks: {
+      Stop: [{ hooks: [{ type: "command", command: `${hook} Stop` }] }],
+      SubagentStop: [{ hooks: [{ type: "command", command: `${hook} SubagentStop` }] }],
+      PostToolUse: [
+        { matcher: "Bash|Write|Edit", hooks: [{ type: "command", command: `${hook} PostToolUse` }] },
+      ],
+    },
+  };
+  const dir = join(worktreePath, ".claude");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "settings.local.json"), JSON.stringify(settings, null, 2));
+}
+
+// "View agent" affordance: focus the task's herdr tab so David can watch/attach.
+async function focusAgent(db: DB, herdr: Herdr, id: string): Promise<Response> {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  if (!task.agent_target) return json({ ok: false, focused: false, error: "task has no agent" });
+  try {
+    const r = await herdr.focus(task.agent_target);
+    if (r.code !== 0) {
+      const error = r.stderr.trim() || r.stdout.trim() || `herdr focus exited ${r.code}`;
+      return json({ ok: false, focused: false, error });
+    }
+    writeEvent(db, { task_id: id, source: "director", type: "focus_agent", payload: { target: task.agent_target } });
+    return json({ ok: true, focused: true, target: task.agent_target });
+  } catch (e: any) {
+    return json({ ok: false, focused: false, error: String(e?.message ?? e) });
+  }
+}
+
+// Manual "fail + requeue" (the recovery banner's override): fail the task if
+// live, then spin up a fresh queued copy. Idempotent on an already-failed task.
+function requeueEndpoint(db: DB, id: string): Response {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  if (!TERMINAL.includes(task.state as State)) {
+    transition(db, id, "failed", { source: "director", reason: "manual fail + requeue" });
+  }
+  const newId = requeueTask(db, getTask(db, id));
+  writeEvent(db, { task_id: id, source: "director", type: "requeued", payload: { new_task_id: newId } });
+  return json({ ok: true, new_task_id: newId });
+}
+
+// Create a fresh queued copy of a task (source='requeue', parent_task_id → the
+// failed original). The lineage links let the recovery loop cap auto-requeues.
+export function requeueTask(db: DB, source: any): string {
+  const id = newId();
+  const t = now();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, created_at, updated_at)
+     VALUES (?,?,?,?, 'queued', ?, 'requeue', ?, ?, ?)`
+  ).run(id, source.project_id, source.title, source.brief ?? null, source.kind, source.id, t, t);
+  writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title: source.title, requeue_of: source.id } });
+  broadcastTask(db, getTask(db, id));
+  return id;
+}
+
+// Open the "recovery cap reached / agent unresponsive" decision card. A
+// `recovery_card` event links it to the source task so answering `requeue`
+// resolves to a fresh task (resolveRecoveryForDecision).
+export function openRecoveryDecision(db: DB, task: any, attempts: number): any {
+  const decision = createDecision(db, {
+    task_id: task.id,
+    title: `Recover failed task: ${task.title}`,
+    context:
+      `The agent for this task could not be kept alive (auto-requeued ${attempts} time(s) without success). ` +
+      `Requeue once more or abandon it?`,
+    risk: "normal",
+    blast_radius: `Task ${task.id} (${task.title}).`,
+    options: [
+      { key: "requeue", label: "Requeue once more", detail: "Create a fresh queued task and try again.", recommended: true },
+      { key: "abandon", label: "Abandon", detail: "Leave the task failed." },
+    ],
+  });
+  writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery_card", payload: { decision_id: decision.id, source_task_id: task.id } });
+  return decision;
+}
+
+// On answering a recovery card: `requeue` → fresh task; anything else → nothing.
+export function resolveRecoveryForDecision(db: DB, decisionId: string, answerKey: string): boolean {
+  const ev = db
+    .query("SELECT payload FROM events WHERE type = 'recovery_card' AND json_extract(payload, '$.decision_id') = ? ORDER BY ts DESC LIMIT 1")
+    .get(decisionId) as { payload: string } | undefined;
+  if (!ev) return false;
+  if (answerKey !== "requeue") return true;
+  const sourceId = JSON.parse(ev.payload).source_task_id;
+  const source = getTask(db, sourceId);
+  if (source) requeueTask(db, source);
+  return true;
 }
 
 // ---------------------------------------------------------------- incidents
@@ -859,6 +989,8 @@ function apiAnswerDecision(db: DB, id: string, body: any): Response {
   // If this card was a planner breakdown proposal, approve → create the proposed
   // child tasks (source='planner', parent_task_id → source); reject → event only.
   resolvePlanForDecision(db, id, answerKey);
+  // If this card was a stale-recovery escalation, `requeue` → fresh task.
+  resolveRecoveryForDecision(db, id, answerKey);
   // Resume the task if it was parked on this decision. (herdr `agent send` is Phase 2.)
   const task = getTask(db, r.task_id);
   if (task && task.state === "needs_decision")
