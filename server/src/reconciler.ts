@@ -11,13 +11,13 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { now, newId, evidenceDir } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { writeEvent, transition, getTask, TERMINAL, type State } from "./state.ts";
+import { writeEvent, transition, getTask, evidenceCount, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { runSmoke, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
-import { requeueTask, openRecoveryDecision, linkPrIfMarked } from "./api.ts";
+import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 
@@ -51,6 +51,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
     await syncAgents(db, deps);
   } catch (e) {
     fail("syncAgents", e);
+  }
+  try {
+    await advanceFinished(db, deps);
+  } catch (e) {
+    fail("advanceFinished", e);
   }
   try {
     await syncPRs(db, deps);
@@ -106,15 +111,50 @@ function lastAgentStatus(db: DB, taskId: string): string | null {
   }
 }
 
+// ---- ready-for-review advancement (fixes tasks stuck in in_progress) ----
+// An agent that finished — opened a PR (ship/chore) or wrote its report (scout) —
+// and then went idle/gone used to sit in `in_progress` forever: nothing moved it
+// into the review queue. This is the backstop that unsticks it regardless of
+// agent discipline (the explicit `hive emit <id> ready` path is the clean signal;
+// this catches the agents that just go idle).
+//
+// Trigger: state=in_progress, agent status idle OR gone (NOT working/blocked/
+// unknown — an agent that opens a PR and keeps working still reports `working`),
+// AND a real work product exists (a pr_url, or a scout `report`). Advancing on a
+// single idle read is safe precisely because mid-work reads `working`. Runs
+// BEFORE recoverStale so a handed-off task is never failed/requeued.
+async function advanceFinished(db: DB, _deps: ReconcilerDeps): Promise<void> {
+  const tasks = db
+    .query(`SELECT id, kind, pr_url FROM tasks WHERE state = 'in_progress' AND agent_target IS NOT NULL`)
+    .all() as { id: string; kind: string; pr_url: string | null }[];
+  for (const t of tasks) {
+    const status = lastAgentStatus(db, t.id);
+    if (status !== "idle" && status !== "gone") continue; // working/blocked/unknown → leave it be
+    const hasReport = t.kind === "scout" && evidenceCount(db, t.id, "report") >= 1;
+    if (!t.pr_url && !hasReport) continue; // no product to review → health surfaces it, don't advance
+    writeEvent(db, {
+      task_id: t.id,
+      source: "reconciler",
+      type: "ready_for_review",
+      payload: { pr_url: t.pr_url ?? null, via: status, kind: t.kind },
+    });
+    transition(db, t.id, "in_review", {
+      source: "reconciler",
+      reason: hasReport ? "scout report ready; agent idle" : "PR open; agent idle",
+    });
+  }
+}
+
 // ---- PR / CI sync via gh ----
 async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   const exec = deps.exec ?? defaultExec;
+  const h = deps.herdr ?? defaultHerdr;
   const tasks = db
-    .query(`SELECT id, state, pr_url, ci_status FROM tasks WHERE pr_url IS NOT NULL AND state IN ${NON_TERMINAL}`)
-    .all() as { id: string; state: string; pr_url: string; ci_status: string | null }[];
+    .query(`SELECT id, state, pr_url, ci_status, agent_target, project_id FROM tasks WHERE pr_url IS NOT NULL AND state IN ${NON_TERMINAL}`)
+    .all() as { id: string; state: string; pr_url: string; ci_status: string | null; agent_target: string | null; project_id: string }[];
 
   for (const t of tasks) {
-    const r = await exec(["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup"]);
+    const r = await exec(["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup,mergeable,headRefOid"]);
     if (r.code !== 0) continue; // gh unavailable / auth: skip, try next cycle
     let data: any;
     try {
@@ -128,6 +168,12 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "ci_status", payload: { ci_status: ci } });
       broadcast({ type: "task", task: getTask(db, t.id) });
     }
+    // Time-based fallback for the link-time hand-off: a task whose PR is open
+    // but is still in_progress (pr_url set by the agent, or linked before this
+    // existed) belongs in the director's Review lane.
+    if (String(data.state).toUpperCase() === "OPEN" && t.state === "in_progress") {
+      if (handOffToReview(db, t.id, "reconciler")) broadcast({ type: "task", task: getTask(db, t.id) });
+    }
     if (String(data.state).toUpperCase() === "MERGED" && t.state === "in_review") {
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_merged", payload: { pr_url: t.pr_url } });
       transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged" });
@@ -137,8 +183,52 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       } catch (e) {
         console.error(`[hive] smoke run failed for ${t.id}:`, e);
       }
+    } else if (String(data.mergeable).toUpperCase() === "CONFLICTING") {
+      await nudgeConflict(db, h, t, data.headRefOid ?? null);
     }
   }
+}
+
+// ---- PR conflict watchdog ----
+// A PR GitHub reports CONFLICTING gets its agent told to resolve it — conflict
+// resolution is the agent's job, not the captain's. Deduped per head SHA: one
+// nudge per pushed state of the branch, so a cycle tick never spams but a push
+// that still conflicts re-nudges. Lifecycle is untouched: an in_review task
+// stays reviewable (the merge button's own failure path bounces it if the
+// captain gets there first), and a delivered send flips the agent to `working`,
+// which keeps advanceFinished from churning states.
+async function nudgeConflict(
+  db: DB,
+  h: Herdr,
+  t: { id: string; pr_url: string; agent_target: string | null; project_id: string },
+  headSha: string | null
+): Promise<void> {
+  const last = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_conflict' ORDER BY ts DESC LIMIT 1")
+    .get(t.id) as { payload: string } | undefined;
+  if (last) {
+    try {
+      if ((JSON.parse(last.payload).head_sha ?? null) === headSha) return; // already nudged for this push
+    } catch {}
+  }
+  const project = db.query("SELECT config FROM projects WHERE id = ?").get(t.project_id) as { config: string } | undefined;
+  let base = "main";
+  try {
+    base = JSON.parse(project?.config ?? "{}").default_branch || "main";
+  } catch {}
+  let delivered = false;
+  if (t.agent_target) {
+    try {
+      const r = await h.send(
+        t.agent_target,
+        `hive: your PR ${t.pr_url} has merge conflicts with '${base}'. Fetch and merge the latest 'origin/${base}' into your branch (or rebase onto it), resolve the conflicts, rerun the tests, then push.`
+      );
+      delivered = r.code === 0;
+    } catch {
+      delivered = false;
+    }
+  }
+  writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_conflict", payload: { pr_url: t.pr_url, head_sha: headSha, delivered } });
 }
 
 // ---- PR → task linking via gh ----
@@ -228,6 +318,11 @@ async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
     .query(`SELECT id, agent_target FROM tasks WHERE agent_target IS NOT NULL AND state IN ${RECOVERABLE}`)
     .all() as { id: string; agent_target: string }[];
   for (const t of tasks) {
+    // A handed-off task (advanceFinished / director moved it to in_review, or it's
+    // verifying) is owned by a human/the merge flow: a gone agent there is expected
+    // (its work is done), so it must NOT be failed/requeued.
+    const cur = getTask(db, t.id);
+    if (cur && (cur.state === "in_review" || cur.state === "verifying")) continue;
     // A vanished agent (syncAgents just recorded `gone`) recovers within THIS
     // cycle — the SPEC requires detecting a ghost within one cycle, not waiting
     // out the stale threshold. The silent path is driven by a `stale` flag,

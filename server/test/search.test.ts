@@ -41,7 +41,7 @@ beforeAll(async () => {
   taskBody = (await post("/api/tasks", { project_id: projectId, title: "unrelated title", brief: "mentions widget deep in the brief text" })).json.id;
 
   // One of every other entity type, all mentioning "widget".
-  await post("/api/decisions", { task_id: taskExact, title: "ship the widget?", context: "context here" });
+  await post("/api/decisions", { task_id: taskExact, title: "ship the widget?", context: "context here", options: [{ key: "yes", label: "Yes" }] });
   await post("/api/learnings", { project_id: projectId, title: "widget flakiness", body: "root cause" });
   await post("/api/policies", { title: "widget policy", body: "always test widgets" });
 });

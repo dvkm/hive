@@ -67,6 +67,15 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   const activity = events.find((e) => e.type !== "stale" && e.type !== "recovery_nudge");
   const activityTs = activity ? activity.ts : (task.updated_at as string);
   const age = nowMs - Date.parse(activityTs);
+  // Finished-without-a-PR (or genuinely stuck): an idle agent (it stopped working)
+  // on an in_progress task that opened no PR and has gone quiet is either done but
+  // never handed off, or wedged. Surface it in the attention tray instead of the
+  // quiet "silent" that hides forever. A PR-bearing idle task is auto-advanced to
+  // in_review by the reconciler, so it never reaches here; scouts hand off via a
+  // report and are advanced too.
+  if (task.state === "in_progress" && task.kind !== "scout" && lastStatus === "idle" && !task.pr_url && age > staleMs()) {
+    return { status: "stuck", reason: "finished or stuck: agent idle, no PR", since: activityTs };
+  }
   if (age > staleMs()) {
     const escalating = latest && latest.type === "stale";
     return {

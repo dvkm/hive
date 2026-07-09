@@ -82,6 +82,10 @@ tasks keep referencing it, there is no hard delete).
 }
 ```
 `state ∈ {queued, in_progress, needs_decision, in_review, verifying, done, failed, cancelled}`
+When a task enters a terminal state (`done` / `failed` / `cancelled`), every
+still-`open` decision on it is auto-expired (`status=expired`, a
+`decision_expired` event each, broadcast) — a terminal task can no longer act on
+a card, so it must not linger in the inbox. Legacy orphans are swept on startup.
 `kind ∈ {ship, scout, chore}`
 `number` is a human-friendly, monotonic per-hive counter assigned at creation
 (`MAX(number)+1`, starting at 1) and never reused — it is THE handle people and
@@ -98,10 +102,12 @@ it.** Shape `{status, reason, since}`:
   `agent_target`.
 - Derivation (pure function of events, precedence dead > stuck > silent >
   healthy): **dead** = `agent_target` set but the reconciler's probe recorded the
-  agent `gone`; **stuck** = herdr reports `blocked` OR a stale-recovery escalation
-  is in flight (newest event `stale`/`recovery_nudge`); **silent** = no activity
-  events past the stale threshold but the agent is still alive; **healthy**
-  otherwise. Every `task` SSE message carries the recomputed `health`.
+  agent `gone`; **stuck** = herdr reports `blocked`, OR a stale-recovery escalation
+  is in flight (newest event `stale`/`recovery_nudge`), OR the agent went `idle` on
+  an `in_progress` task with no `pr_url` and no recent activity (finished-without-a-PR
+  or wedged — surfaced instead of hidden); **silent** = no activity events past the
+  stale threshold but the agent is still alive; **healthy** otherwise. Every `task`
+  SSE message carries the recomputed `health`.
 `source` is null for director/agent-created tasks, `"intake_gchat"` for a task
 drafted by the Google Chat intake connector (an untrusted, unreviewed external
 message — the web board flags these), `"planner"` for a task created from an
@@ -136,6 +142,7 @@ never deleted, so the cancelled row + this pointer preserve the full history.
 - `evidence` — an evidence item was attached. `payload: {evidence_id, kind, caption}`
 - `needs-decision` — a decision card was opened. `payload: {decision_id, title}`
 - `decision_answered` — `payload: {decision_id, answer_key, answer_note}`
+- `decision_expired` — a decision was cleared without an answer: dismissed, or auto-expired because its task went terminal. `payload: {decision_id, reason}` (`reason` ∈ `dismissed` | `task cancelled` | `task done` | `task failed` | `task terminal (backfill)`)
 - `note` — a free note (e.g. a `done` summary). `payload: {note}`
 - `steer` — a steer message was dispatched to the agent. `payload: {message, target}`
 - `blocked` — agent reported blocked. `payload: {note}`
@@ -157,6 +164,8 @@ Types written by the runtime layer (Phase 2b):
 - `recovery_card` — a recovery escalation opened a decision card. `payload: {decision_id, source_task_id}`
 - `ci_status` — reconciler synced CI. `payload: {ci_status}` (`passing|pending|failing`)
 - `pr_merged` — reconciler detected the PR merged. `payload: {pr_url}`
+- `pr_conflict` — reconciler saw the PR CONFLICTING with its base and nudged the agent to resolve (once per head SHA; lifecycle untouched). `payload: {pr_url, head_sha, delivered}`
+- `ready_for_review` — the task was handed off `in_progress → in_review`, by the agent's `ready` emit or the reconciler's idle/gone backstop. `payload: {pr_url, via, kind}` (`via ∈ {emit, idle, gone}`)
 - `pr_linked` — a marked PR was matched back to this task and its `pr_url` set (by the reconciler's scan or `POST /api/tasks/link-pr`). `payload: {pr_url, via}` (`via ∈ {id, number}` — which half of the marker matched)
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
@@ -226,9 +235,17 @@ Standing-authority events (written by the policy engine, `source: system` unless
   "answered_at": null
 }
 ```
-`status ∈ {open, answered, expired}`. `options` is an ordered array; render the
-`recommended: true` option first per product rule 3. `draft_note` is the
-server-side autosaved draft.
+`status ∈ {open, answered, expired}`. `options` is an ordered, **non-empty**
+array; render the `recommended: true` option first per product rule 3.
+`draft_note` is the server-side autosaved draft. A decision is `expired` once it
+was dismissed, or its task went terminal (`done`/`failed`/`cancelled`) — expired
+cards leave the inbox and can no longer be answered.
+
+**Options are never empty.** An optionless card is un-answerable (nothing to
+click, no key to validate). The direct `POST /api/decisions` rejects an empty
+array with `400`; the agent `needs-decision` emit path instead defaults to
+`[{key:"proceed",label:"Proceed",recommended:true},{key:"dismiss",label:"Dismiss"}]`
+so an agent's signal is surfaced rather than silently dropped.
 
 ### Policy
 ```json
@@ -452,6 +469,25 @@ captain reviews the diff and approves/merges, requests changes, or rejects,
 entirely from hive (the task page, the `/review` queue, and the morning brief all
 render the same review card).
 
+**How a task reaches `in_review` (the finished-handoff, `in_progress → in_review`):**
+- **Explicit signal (preferred):** the agent emits `ready` (`POST .../events`
+  `{type:"ready", pr_url?}`, i.e. `hive emit <id> ready --pr-url <url>`) once its PR
+  is open (or, for a scout, its report is written). Records `pr_url` when supplied
+  and not already linked, then advances the task. Idempotent — a duplicate `ready`
+  on an already-advanced task just acks (`200`). Writes a `ready_for_review` event.
+- **Reconciler backstop (safety net):** every cycle, an `in_progress` task whose
+  agent is **idle or gone** (NOT `working`/`blocked` — an agent that opened a PR and
+  kept working still reports `working`) and that has a real work product (a `pr_url`,
+  or a scout `report` evidence) is auto-advanced to `in_review` (`ready_for_review`
+  event, `via: idle|gone`). Advancing on a single idle read is safe because mid-work
+  reads `working`; this runs before stale-recovery, so a handed-off task with a gone
+  agent is moved to review rather than failed/requeued. This unsticks finished tasks
+  regardless of whether the agent emitted `ready`.
+- **Finished with NO PR:** an `in_progress` task whose agent went idle with no PR and
+  no recent activity is not auto-advanced (nothing to review) but is made VISIBLE:
+  its `health` becomes `stuck` (reason `finished or stuck: agent idle, no PR`), which
+  surfaces it in the attention tray for the director instead of sitting silently.
+
 - `GET /api/tasks/:id/diff` → `200 DiffResult` | `400` (no branch & no `pr_url`, or project has no `repo_path`) | `404` | `502` (gh/git failed)
   The task branch's changes. When `pr_url` is set, `gh pr diff <url> --patch`;
   otherwise `git -C <repo> diff <default_branch>...<branch>` in the project repo.
@@ -527,9 +563,10 @@ recognized fields (JSON keys == form field names):
 
 | field | meaning |
 |-------|---------|
-| `type` (required) | `status` \| `evidence` \| `needs-decision` \| `done` \| `blocked` \| `usage` \| `assistant_text` \| `tool_use` \| `agent_turn_end` \| any custom string |
+| `type` (required) | `status` \| `evidence` \| `needs-decision` \| `ready` \| `done` \| `blocked` \| `usage` \| `assistant_text` \| `tool_use` \| `agent_turn_end` \| any custom string |
 | `source` | defaults to `agent` |
 | `note` | free text; stored in the event payload / used as caption/summary |
+| `pr_url` | (`ready` type) the opened PR URL; recorded on the task if not already linked |
 | `payload` | structured event payload object, passed through verbatim for `assistant_text` / `tool_use` / `agent_turn_end` (JSON body) |
 | `kind` | evidence kind (evidence type only); defaults to `screenshot` if a file is present, else `link`/`log` |
 | `caption` | evidence caption |
@@ -542,7 +579,13 @@ Behavior by `type`:
 - `evidence` → copies the file to `~/.hive/evidence/<task_id>/`, inserts an
   Evidence row, writes an `evidence` event. → `201 {evidence: Evidence, event: Event}`
 - `needs-decision` → creates a Decision (minimal; full cards use `POST /api/decisions`),
-  parks the task in `needs_decision`. → `201 {decision: Decision, task: Task}`
+  parks the task in `needs_decision`. Missing/empty `options` default to
+  `proceed`/`dismiss` (the emit path defaults rather than dropping the agent's
+  signal). → `201 {decision: Decision, task: Task}`
+- `ready` → the finished-handoff signal. Records `pr_url` (when supplied and not
+  already linked, writing a `pr_linked` event), then advances `in_progress →
+  in_review` with a `ready_for_review` event. Idempotent: on a task that isn't
+  `in_progress` (already advanced) it acks without transitioning. → `200 {task: Task}`
 - `done` → records the `note` as summary + `note` event, then transitions the
   task to `done` (evidence rule enforced). → `200 {task: Task}` | `409`
 - `usage` → inserts a Usage row (cost computed server-side when `cost_usd` is
@@ -565,7 +608,7 @@ Behavior by `type`:
 
 ### Decisions
 - `GET /api/decisions?status=open` → `200 [Decision, ...]` (newest first; `status` defaults to `open`; `status=all` returns every decision)
-- `POST /api/decisions` body `{task_id (required), title (required), context?, risk?, blast_radius?, options?}` → `201 Decision`
+- `POST /api/decisions` body `{task_id (required), title (required), context?, risk?, blast_radius?, options (required, non-empty)}` → `201 Decision` | `400` (missing/empty `options`)
   (also writes a `needs-decision` event and parks the task in `needs_decision` if its current state allows it)
 - `GET /api/decisions/:id` → `200 Decision` | `404`
 - `PUT /api/decisions/:id/draft` body `{draft_note}` → `200 {"ok":true, "id":...}` | `404`
@@ -574,6 +617,13 @@ Behavior by `type`:
   Archives the card (`status=answered`, `answered_at` set), writes a
   `decision_answered` event, and resumes the task (`needs_decision → in_progress`).
   If `answer_note` is omitted, the saved `draft_note` is used.
+- `POST /api/decisions/:id/dismiss` → `200 Decision` (now `expired`) | `404` | `409` (already closed)
+  Clears a card without answering it (the human escape hatch for a card that is
+  no longer relevant, or that somehow has no usable options). Sets
+  `status=expired`, writes a `decision_expired` event (`reason: "dismissed"`),
+  and broadcasts so the inbox clears live. Runs no resolvers — dismissing is
+  explicitly "take no action".
+
   Answering also runs the standing-authority and domain-supervisor resolvers: if
   the card was an authority request, `approve` mints a single-use grant; if it was
   a planner breakdown proposal, `approve` creates the proposed tasks as `queued`
@@ -596,6 +646,52 @@ Scoped rules that the server enforces before risky actions dispatch (see the
   `effect` defaults to `allow`; `scope` is derived from `project_id` (`global` when null).
 - `PUT /api/authority/rules/:id` body `{action_pattern?, effect?, note?, active?}` → `200 AuthorityRule` | `400` (bad `effect`) | `404` (deactivate = `active:false`)
 - `DELETE /api/authority/rules/:id` → `200 {"ok":true}`
+
+### Command auto-approval (spawned agents)
+A spawned worker has no human at its pane, so a Bash permission dialog hangs it
+forever. Three layers keep safe commands flowing and route risky ones through the
+same authority engine (`writeHookSettings` in `api.ts`; `hooks/classify.ts` +
+`hooks/hive-approve.sh`; wired into each worktree's `.claude/settings.local.json`):
+
+1. **Static allowlist** — `permissions.allow` lists clearly-safe tools that never
+   prompt: `Read`, `Grep`, `Glob`, and read-only `Bash(...)` patterns
+   (`ls`, `cat`, `grep`, `git status/diff/log/show/branch`, `bun test`, `bun run`,
+   `npm test/run`, ...). `permissions.deny` (browser MCPs) still wins over allow.
+2. **PreToolUse classifier hook** (`Bash` matcher → `hive-approve.sh <policy>`).
+   `classify.ts` (pure, unit-tested) sorts each command:
+   - **safe** (read-only / standard dev, no dangerous tokens, no `$(...)`/backtick
+     substitution) → emits the PreToolUse **allow** decision, no dialog.
+   - **dangerous** (`rm -rf`, `sudo`, `curl|wget … | sh`, `git push --force`,
+     `git reset --hard`, `DROP/TRUNCATE`, `DELETE FROM`/`UPDATE … SET` without
+     `WHERE`, fork bomb, `mkfs`/`dd of=`, device/system-path writes, `kill`,
+     `terraform apply/destroy`, `kubectl delete`, SSH/AWS credential files, …) →
+     escalates via `POST guarded-action {action:"command.dangerous", target:<cmd>}`.
+     Never auto-allowed, even under `command_approval:"allow"`.
+   - **unknown** (not provably safe) → escalates via `{action:"command", …}`, or is
+     allowed / deferred per the `command_approval` policy below.
+
+   The PreToolUse output schema (stdout, exit 0): `{"hookSpecificOutput":
+   {"hookEventName":"PreToolUse","permissionDecision":"allow"|"deny",
+   "permissionDecisionReason":"..."}}`. On escalation the hook maps the
+   guarded-action result: `200 allow` → allow; `403 deny` → deny (with reason);
+   `409 require_decision` → **deny-for-now** with reason `escalated to hive
+   decision <id>` (a card opens; re-running the same command after the director
+   approves passes once, spending the single-use grant). **Fail-safe**: if hive is
+   unreachable the hook DENIES (2s curl cap) — an unclassified dangerous command
+   is never auto-allowed.
+3. **`command_approval`** (project `config` field) governs UNKNOWN commands only:
+   `"escalate"` (default) → guarded-action; `"allow"` → auto-approve; `"prompt"` →
+   defer to Claude Code's normal dialog. Dangerous always escalates regardless.
+
+**Deny-safe by default**: the authority engine defaults unmatched actions to
+`allow` (log-only), *except* `command.dangerous*`, which requires a decision even
+with no rule in the DB — safety does not depend on seed state. The daemon also
+bootstraps the matching `command.dangerous* → require_decision` rule on first
+boot (idempotent), so it is visible and editable in the Authority UI. Override it
+like any other rule: `POST /api/authority/rules {"action_pattern":"command.dangerous*","effect":"deny"}`
+for a hard block, or `"effect":"allow"` to deliberately opt out. Because dangerous
+commands carry the distinct `command.dangerous` action, this gates them without
+touching ordinary `command` escalations.
 
 ### Incidents
 - `GET /api/incidents?status=` → `200 {"incidents": [Incident, ...]}` (newest first; `status` filter optional, e.g. `open` / `resolved`)

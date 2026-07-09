@@ -78,6 +78,123 @@ test("flagStale emits one stale event past the threshold, then stops", async () 
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'stale'").all(id).length).toBe(1);
 });
 
+// A herdr whose `agent get` reports a fixed status (agent alive with a pane).
+const statusHerdr = (status: string) =>
+  new Herdr(stub(() => OK(`{"result":{"agent":{"agent_status":"${status}","pane_id":"w1:p1"}}}`)), "herdr");
+
+// Like statusHerdr, but records `agent send` messages.
+function sendCapturingHerdr(status: string) {
+  const sends: string[] = [];
+  const h = new Herdr(
+    stub((argv) => {
+      if (argv.includes("send")) {
+        sends.push(argv[argv.indexOf("send") + 2]);
+        return OK();
+      }
+      return OK(`{"result":{"agent":{"agent_status":"${status}","pane_id":"w1:p1"}}}`);
+    }),
+    "herdr"
+  );
+  return { h, sends };
+}
+
+test("conflict watchdog: a CONFLICTING PR nudges the agent once per head SHA", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "a1", pr_url: "https://gh/pr/9" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  const { h, sends } = sendCapturingHerdr("idle");
+  const gh = (sha: string): Exec =>
+    stub((argv) => {
+      if (argv[0] === "gh")
+        return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], mergeable: "CONFLICTING", headRefOid: sha }));
+      return OK();
+    });
+
+  await reconcileOnce(db, { herdr: h, exec: gh("sha1") });
+  expect(sends.length).toBe(1);
+  expect(sends[0]).toContain("merge conflicts");
+  expect(sends[0]).toContain("main");
+  expect(getTask(db, id).state).toBe("in_review"); // lifecycle untouched
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_conflict'").all(id) as { payload: string }[];
+  expect(ev.length).toBe(1);
+  expect(JSON.parse(ev[0].payload)).toMatchObject({ head_sha: "sha1", delivered: true });
+
+  // same head SHA next cycle -> no re-nudge
+  await reconcileOnce(db, { herdr: h, exec: gh("sha1") });
+  expect(sends.length).toBe(1);
+
+  // a new push that STILL conflicts -> nudged again
+  await reconcileOnce(db, { herdr: h, exec: gh("sha2") });
+  expect(sends.length).toBe(2);
+});
+
+test("conflict watchdog: a mergeable PR is left alone", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "a1", pr_url: "https://gh/pr/9" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  const { h, sends } = sendCapturingHerdr("idle");
+  const gh: Exec = stub((argv) => {
+    if (argv[0] === "gh")
+      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], mergeable: "MERGEABLE", headRefOid: "sha1" }));
+    return OK();
+  });
+  await reconcileOnce(db, { herdr: h, exec: gh });
+  expect(sends.length).toBe(0);
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_conflict'").all(id).length).toBe(0);
+});
+
+test("advanceFinished: in_progress + pr_url + idle agent -> in_review (+ event)", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "a1", pr_url: "https://gh/pr/1" });
+  transition(db, id, "in_progress");
+
+  await reconcileOnce(db, { herdr: statusHerdr("idle"), exec: stub(() => ({ code: 1, stdout: "", stderr: "no gh" })) });
+
+  expect(getTask(db, id).state).toBe("in_review");
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'ready_for_review'").all(id).length).toBe(1);
+});
+
+test("advanceFinished: does NOT advance while the agent is still working", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "a1", pr_url: "https://gh/pr/1" });
+  transition(db, id, "in_progress");
+
+  await reconcileOnce(db, { herdr: statusHerdr("working"), exec: stub(() => ({ code: 1, stdout: "", stderr: "no gh" })) });
+
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'ready_for_review'").all(id).length).toBe(0);
+});
+
+test("advanceFinished: idle agent with NO pr_url is not advanced (stays in_progress)", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "a1" }); // no pr_url
+  transition(db, id, "in_progress");
+
+  // huge staleMs so recovery/stale stay inert; only exercise advanceFinished
+  await reconcileOnce(db, { herdr: statusHerdr("idle"), staleMs: 60 * 60 * 1000, exec: stub(() => ({ code: 1, stdout: "", stderr: "no gh" })) });
+
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'ready_for_review'").all(id).length).toBe(0);
+});
+
+test("advanceFinished: a scout with report evidence + idle agent -> in_review", async () => {
+  const { db, projectId } = freshDb();
+  const id = newId();
+  const t = now();
+  db.query(
+    "INSERT INTO tasks (id, project_id, title, state, kind, agent_target, created_at, updated_at) VALUES (?,?,?,?, 'scout', ?, ?, ?)"
+  ).run(id, projectId, "s", "queued", "a1", t, t);
+  transition(db, id, "in_progress");
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,?)")
+    .run(newId("ev"), id, now(), "report", null, null, "findings", "{}");
+
+  await reconcileOnce(db, { herdr: statusHerdr("idle"), exec: stub(() => ({ code: 1, stdout: "", stderr: "no gh" })) });
+
+  expect(getTask(db, id).state).toBe("in_review");
+});
+
 test("reconciler never throws; a failing sub-step broadcasts at most one error", async () => {
   const { db, projectId } = freshDb();
   makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
