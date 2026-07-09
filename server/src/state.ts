@@ -1,0 +1,129 @@
+// Task state machine + event writing. Server-enforced per SPEC.md.
+//
+// queued -> in_progress -> (needs_decision <-> in_progress) -> in_review
+//        -> verifying -> done
+// Any non-terminal state -> failed | cancelled (with a reason event).
+// Transition to `done` is REJECTED unless >= 1 evidence row exists
+// (scouts additionally require an evidence row of kind = 'report').
+import type { DB } from "./db.ts";
+import { newId, now } from "./db.ts";
+import { broadcast } from "./bus.ts";
+import { parseEvent, parseTask } from "./rows.ts";
+
+export const STATES = [
+  "queued",
+  "in_progress",
+  "needs_decision",
+  "in_review",
+  "verifying",
+  "done",
+  "failed",
+  "cancelled",
+] as const;
+export type State = (typeof STATES)[number];
+
+export const TERMINAL: State[] = ["done", "failed", "cancelled"];
+
+// Allowed "forward" transitions. failed/cancelled are handled separately
+// because they are reachable from any non-terminal state.
+const FORWARD: Record<State, State[]> = {
+  queued: ["in_progress"],
+  in_progress: ["needs_decision", "in_review"],
+  needs_decision: ["in_progress"],
+  in_review: ["verifying"],
+  verifying: ["done", "in_progress"], // failed smoke checks bounce back
+  done: [],
+  failed: [],
+  cancelled: [],
+};
+
+export class TransitionError extends Error {}
+
+export function getTask(db: DB, id: string): any | null {
+  const r = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+  return r ? parseTask(r) : null;
+}
+
+export function canTransition(from: State, to: State): boolean {
+  if (!STATES.includes(to)) return false;
+  if (to === "failed" || to === "cancelled") return !TERMINAL.includes(from);
+  return FORWARD[from]?.includes(to) ?? false;
+}
+
+export function evidenceCount(db: DB, taskId: string, kind?: string): number {
+  const sql = kind
+    ? "SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND kind = ?"
+    : "SELECT COUNT(*) AS n FROM evidence WHERE task_id = ?";
+  const row = kind
+    ? db.query(sql).get(taskId, kind)
+    : db.query(sql).get(taskId);
+  return (row as { n: number }).n;
+}
+
+// Write an append-only event row and broadcast it. Returns the parsed event.
+export function writeEvent(
+  db: DB,
+  args: { task_id: string; source: string; type: string; payload?: unknown }
+): any {
+  const row = {
+    id: newId("evt"),
+    task_id: args.task_id,
+    ts: now(),
+    source: args.source,
+    type: args.type,
+    payload: JSON.stringify(args.payload ?? {}),
+  };
+  db.query(
+    "INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)"
+  ).run(row.id, row.task_id, row.ts, row.source, row.type, row.payload);
+  const parsed = parseEvent(row);
+  broadcast({ type: "event", event: parsed });
+  return parsed;
+}
+
+// Perform a state transition. Throws TransitionError on invalid transition or
+// when a `done` transition lacks required evidence. Writes a state_change event.
+export function transition(
+  db: DB,
+  taskId: string,
+  to: State,
+  opts: { source?: string; reason?: string } = {}
+): any {
+  const task = getTask(db, taskId);
+  if (!task) throw new TransitionError(`unknown task: ${taskId}`);
+  const from = task.state as State;
+  const source = opts.source ?? "director";
+
+  if (from === to) throw new TransitionError(`task already in state '${to}'`);
+  if (!canTransition(from, to)) {
+    throw new TransitionError(`invalid transition: '${from}' -> '${to}'`);
+  }
+
+  if (to === "done") {
+    if (evidenceCount(db, taskId) < 1) {
+      throw new TransitionError(
+        "cannot transition to 'done': task has no evidence"
+      );
+    }
+    if (task.kind === "scout" && evidenceCount(db, taskId, "report") < 1) {
+      throw new TransitionError(
+        "cannot transition to 'done': scout task requires a report evidence"
+      );
+    }
+  }
+
+  db.query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?").run(
+    to,
+    now(),
+    taskId
+  );
+  writeEvent(db, {
+    task_id: taskId,
+    source,
+    type: "state_change",
+    payload: { from, to, reason: opts.reason ?? null },
+  });
+  const updated = getTask(db, taskId);
+  broadcast({ type: "task", task: updated });
+  return updated;
+}

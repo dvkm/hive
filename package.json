@@ -1,0 +1,18 @@
+{
+  "name": "hive",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first orchestration control plane (server core + CLI).",
+  "bin": {
+    "hive": "bin/hive"
+  },
+  "scripts": {
+    "server": "bun run server/src/index.ts",
+    "seed": "bun run scripts/demo-seed.ts",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
