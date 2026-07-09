@@ -109,7 +109,7 @@ test("taskDiff uses git diff base...branch for a branch task, gh for a PR task",
 
 // Build a fresh server whose git/gh + herdr are stubbed. `gitMergeCode` controls
 // the local merge outcome (0 = success, non-zero = conflict).
-function makeServer(opts: { gitMergeCode?: number } = {}) {
+function makeServer(opts: { gitMergeCode?: number; gitMergeStderr?: string } = {}) {
   const db = openDb(":memory:");
   const sends: { target: string; message: string }[] = [];
   const removed: string[] = [];
@@ -117,7 +117,7 @@ function makeServer(opts: { gitMergeCode?: number } = {}) {
     if (has(argv, "git", "merge-base", "--is-ancestor")) return { code: 0, stdout: "", stderr: "" };
     if (has(argv, "git", "merge", "--ff-only")) {
       const code = opts.gitMergeCode ?? 0;
-      return { code, stdout: "", stderr: code ? "CONFLICT (content): merge conflict in x" : "" };
+      return { code, stdout: "", stderr: code ? opts.gitMergeStderr ?? "CONFLICT (content): merge conflict in x" : "" };
     }
     if (has(argv, "git", "diff")) return OK(SAMPLE);
     // herdr worktree/agent plumbing during spawn:
@@ -175,14 +175,32 @@ test("merge success writes a merged event and moves the task to verifying", asyn
   s.server.stop(true);
 });
 
-test("merge failure (conflict) returns 409 and does not change state", async () => {
+test("merge conflict bounces the task back to the agent with rebase instructions", async () => {
   const s = makeServer({ gitMergeCode: 1 });
   const { taskId } = await inReviewTask(s.base);
   const r = await post(s.base, `/api/tasks/${taskId}/merge`, {});
   expect(r.status).toBe(409);
-  expect(r.json.error).toContain("CONFLICT");
+  expect(r.json.error).toContain("sent back to the agent");
   const task = await get(s.base, `/api/tasks/${taskId}`);
-  expect(task.json.state).toBe("in_review"); // unchanged
+  expect(task.json.state).toBe("in_progress"); // bounced, not wedged in review
+  expect(s.sends.at(-1)?.message).toContain("Rebase");
+  const ev = await get(s.base, `/api/tasks/${taskId}/events`);
+  const mf = ev.json.find((e: any) => e.type === "merge_failed");
+  expect(mf.payload.conflict).toBe(true);
+  expect(mf.payload.delivered).toBe(true);
+  s.server.stop(true);
+});
+
+test("non-conflict merge failure returns 409 and does not change state", async () => {
+  const s = makeServer({ gitMergeCode: 128, gitMergeStderr: "fatal: unable to write new index file" });
+  const { taskId } = await inReviewTask(s.base);
+  const sendsBefore = s.sends.length;
+  const r = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("unable to write");
+  const task = await get(s.base, `/api/tasks/${taskId}`);
+  expect(task.json.state).toBe("in_review"); // unchanged, no bounce
+  expect(s.sends.length).toBe(sendsBefore); // agent not pinged
   s.server.stop(true);
 });
 
