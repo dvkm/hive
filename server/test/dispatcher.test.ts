@@ -125,6 +125,15 @@ test("review-parked agents don't consume working slots, but bound overhang at 2x
   expect(spawns.length).toBe(2);
 });
 
+test("tracking-only (source=external) tasks are never auto-dispatched", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId, { source: "external" });
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(0);
+  expect(getTask(db, id).state).toBe("queued");
+});
+
 test("authority deny blocks auto-dispatch", async () => {
   const { db, projectId } = freshDb({ auto_dispatch: true });
   const id = makeTask(db, projectId);

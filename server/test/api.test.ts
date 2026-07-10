@@ -120,6 +120,20 @@ test("checkpoints: emit -> listed open -> ack removes; flag steers; bad verdict 
   expect(fu.json.brief).toContain("per-account locks please");
 });
 
+test("tracking-only tasks move freely (done without evidence)", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "tracked by another agent", source: "external" });
+  expect(t.json.source).toBe("external");
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+  const done = await post(`/api/tasks/${t.json.id}/transition`, { to: "verifying" }); // auto-advance path
+  // no evidence, but external tasks skip the gate
+  expect(["done", "verifying"]).toContain(done.json.state);
+  if (done.json.state === "verifying") {
+    const d2 = await post(`/api/tasks/${t.json.id}/transition`, { to: "done" });
+    expect(d2.json.state).toBe("done");
+  }
+});
+
 test("checkpoints survive task completion; cancelled tasks drop out", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "cp survive" });
   await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });

@@ -81,6 +81,11 @@ function Card({ task }: { task: Task }) {
             braindump
           </span>
         )}
+        {task.source === "external" && (
+          <span className="chip" title="Tracking-only: driven by an outside agent, never auto-dispatched">
+            tracked
+          </span>
+        )}
         {task.source === "planner" && (
           <span className="chip chip-planned" title="Created from an approved planner breakdown">
             planned

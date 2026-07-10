@@ -91,6 +91,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
       if (!kinds.includes(task.kind)) continue; // chore / human-titled tasks excluded
 
       if (task.source?.startsWith("intake_") && !isReviewed(db, task.id)) continue; // unreviewed intake
+      if (task.source === "external") continue; // tracking-only: another agent's kanban entry, never spawned
 
       const cap = Number.isFinite(cfg.max_agents) ? Number(cfg.max_agents) : MAX_AGENTS_DEFAULT;
       if (workingFor(task.project_id) >= cap) continue; // working-concurrency cap
