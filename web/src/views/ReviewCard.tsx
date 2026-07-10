@@ -6,6 +6,63 @@ import { useStore } from "../lib/store";
 import { CiBadge, toast } from "../lib/ui";
 import { MAX_DIFF_LINES } from "../lib/api";
 
+// The agent's structured self-review (latest review_summary event payload).
+// Sections are all optional; strings or {what, why} objects for iffy.
+interface ReviewSummary {
+  done?: string[];
+  iffy?: (string | { what: string; why?: string })[];
+  decisions?: string[];
+  testing?: string[];
+  followups?: string[];
+}
+
+function ReviewSection({
+  tone,
+  icon,
+  title,
+  items,
+}: {
+  tone: string;
+  icon: string;
+  title: string;
+  items?: (string | { what: string; why?: string })[];
+}) {
+  if (!items?.length) return null;
+  return (
+    <div className={`rs-section rs-${tone}`}>
+      <div className="rs-head">
+        <span className="rs-icon">{icon}</span> {title}
+      </div>
+      <ul>
+        {items.map((it, i) =>
+          typeof it === "string" ? (
+            <li key={i}>{it}</li>
+          ) : (
+            <li key={i}>
+              {it.what}
+              {it.why && <span className="rs-why"> — {it.why}</span>}
+            </li>
+          )
+        )}
+      </ul>
+    </div>
+  );
+}
+
+// Structured digest of what the agent did — the thing the director actually
+// reviews. Prose summaries stay available behind a toggle in the parent.
+function ReviewDigest({ r }: { r: ReviewSummary }) {
+  return (
+    <div className="review-digest">
+      <ReviewSection tone="done" icon="✓" title="Done" items={r.done} />
+      <ReviewSection tone="iffy" icon="!" title="Iffy" items={r.iffy} />
+      <ReviewSection tone="decisions" icon="?" title="Decisions" items={r.decisions} />
+      <ReviewSection tone="testing" icon="✚" title="Testing" items={r.testing} />
+      <ReviewSection tone="followups" icon="→" title="Follow-ups" items={r.followups} />
+    </div>
+  );
+}
+
 // One collapsible file in the diff viewer. Sticky header shows path + counts.
 function DiffFileView({ f, wrap }: { f: DiffFile; wrap: boolean }) {
   const [open, setOpen] = useState(true);
@@ -66,15 +123,29 @@ export function ReviewCard({
   const [busy, setBusy] = useState(false);
   const [mode, setMode] = useState<ActionMode>(null);
   const [notes, setNotes] = useState("");
+  const [review, setReview] = useState<ReviewSummary | null>(null);
+  const [showProse, setShowProse] = useState(false);
 
   useEffect(() => {
     let live = true;
     setDiff(null);
     setDiffErr("");
+    setReview(null);
+    setShowProse(false);
     api
       .diff(task.id)
       .then((d) => live && setDiff(d))
       .catch((e) => live && setDiffErr((e as Error).message));
+    // Latest structured self-review, if the agent submitted one.
+    api
+      .task(task.id)
+      .then((t) => {
+        if (!live) return;
+        // events are ts-ascending; take the agent's LATEST self-review
+        const ev = [...(t.events ?? [])].reverse().find((e: any) => e.type === "review_summary");
+        if (ev?.payload && typeof ev.payload === "object") setReview(ev.payload as ReviewSummary);
+      })
+      .catch(() => {});
     return () => {
       live = false;
     };
@@ -150,7 +221,19 @@ export function ReviewCard({
         </div>
       </div>
 
-      {task.summary && <p className="review-summary">{task.summary}</p>}
+      {review ? (
+        <>
+          <ReviewDigest r={review} />
+          {task.summary && (
+            <button className="rs-prose-toggle" onClick={() => setShowProse((x) => !x)}>
+              {showProse ? "hide" : "show"} full summary
+            </button>
+          )}
+          {showProse && task.summary && <p className="review-summary">{task.summary}</p>}
+        </>
+      ) : (
+        task.summary && <p className="review-summary">{task.summary}</p>
+      )}
 
       <div className="review-diffstat">
         {diffErr ? (

@@ -261,8 +261,10 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
   const staleMs = deps.staleMs ?? DEFAULT_STALE_MS;
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
   // Only tasks that are actively worked (an agent could go silent).
+  // needs_decision / in_review are parked on the DIRECTOR — silence there is
+  // expected, and flagging it spawned pointless recovery nudges (2026-07-10).
   const tasks = db
-    .query(`SELECT id FROM tasks WHERE state IN ('in_progress','needs_decision','in_review','verifying')`)
+    .query(`SELECT id FROM tasks WHERE state IN ('in_progress','verifying')`)
     .all() as { id: string }[];
   for (const t of tasks) {
     const last = db

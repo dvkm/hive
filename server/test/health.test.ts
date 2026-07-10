@@ -95,3 +95,18 @@ test("null health for queued and terminal tasks, and for agentless tasks", () =>
   expect(computeHealth(db, getTask(db, makeTask(db, projectId, "done")))).toBeNull();
   expect(computeHealth(db, getTask(db, makeTask(db, projectId, "in_progress", null)))).toBeNull();
 });
+
+test("needs_decision / in_review are waiting on the director — never silent/stuck by age", () => {
+  const { db, projectId } = freshDb();
+  for (const state of ["needs_decision", "in_review"]) {
+    const id = makeTask(db, projectId, state);
+    putEvent(db, id, "status", { note: "handed off" }, 3 * 60 * 60 * 1000); // 3h silent
+    putEvent(db, id, "stale", {}, 60 * 60 * 1000);
+    const h = computeHealth(db, getTask(db, id), Date.now());
+    expect(h?.status).toBe("healthy");
+  }
+  // but a dead agent still shows dead even while parked
+  const id = makeTask(db, projectId, "in_review");
+  putEvent(db, id, "agent_status", { status: "gone" });
+  expect(computeHealth(db, getTask(db, id), Date.now())?.status).toBe("dead");
+});
