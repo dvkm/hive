@@ -70,7 +70,7 @@ function CheckpointRow({
       </div>
       {!acked && (
         <button className="cp-flag" title="Flag: send back to the agent" disabled={busy} onClick={() => setFlagging((f) => !f)}>
-          ⚑
+          ⚑ flag
         </button>
       )}
       {flagging && (

@@ -3385,16 +3385,17 @@ a {
 .cp-flag-note { color: #cf222e; margin-left: 6px; }
 .cp-flag {
   flex: none;
-  border: none;
+  border: 1px solid #cf222e55;
+  border-radius: 6px;
+  padding: 1px 8px;
   background: none;
   color: #cf222e;
-  opacity: 0;
+  opacity: 0.65;
   cursor: pointer;
-  font-size: 14px;
-  transition: opacity 0.15s ease, transform 0.1s ease;
+  font-size: 12px;
+  transition: opacity 0.15s ease, background 0.15s ease;
 }
-.cp-row:hover .cp-flag { opacity: 0.7; }
-.cp-flag:hover { opacity: 1 !important; transform: scale(1.15); }
+.cp-flag:hover { opacity: 1; background: #cf222e1a; }
 .cp-flag-form {
   flex-basis: 100%;
   display: flex;
