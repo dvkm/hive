@@ -1690,6 +1690,35 @@ async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Respon
     return json({ event }, 201);
   }
 
+  // --- review_summary (structured self-review; the review card renders it) ---
+  // Sections arrive top-level (the CLI --json spread) as arrays, or as JSON
+  // strings via multipart. Anything else is dropped; an empty summary is a 400
+  // so a mis-shaped submission fails loudly instead of storing {note:null}.
+  if (type === "review_summary") {
+    const pick = (k: string): unknown[] | undefined => {
+      const v = (fields as any)[k];
+      if (Array.isArray(v)) return v;
+      if (typeof v === "string") {
+        try {
+          const p = JSON.parse(v);
+          return Array.isArray(p) ? p : undefined;
+        } catch {
+          return undefined;
+        }
+      }
+      return undefined;
+    };
+    const payload: Record<string, unknown> = {};
+    for (const k of ["done", "iffy", "decisions", "testing", "followups"]) {
+      const v = pick(k);
+      if (v?.length) payload[k] = v;
+    }
+    if (!Object.keys(payload).length)
+      return err("review_summary needs at least one of done/iffy/decisions/testing/followups (arrays)");
+    const event = writeEvent(db, { task_id: taskId, source, type, payload });
+    return json({ event }, 201);
+  }
+
   // --- status / blocked / generic ---
   const event = writeEvent(db, { task_id: taskId, source, type, payload: { note } });
   return json({ event }, 201);
