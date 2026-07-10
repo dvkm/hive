@@ -116,7 +116,15 @@ new task and keep going:
 Write the brief self-contained: the agent that picks it up has NONE of your
 context. Include file paths, repro steps, and what done looks like. The task is
 linked to you automatically (parent) and the dispatcher schedules it like any
-other — duplicates are auto-detected, so when in doubt, file it.`;
+other — duplicates are auto-detected, so when in doubt, file it.
+
+When you hit a NON-OBVIOUS gotcha (a build quirk, a flaky path, a repo landmine
+that cost you real time), record it so future agents see it in their briefs:
+
+  hive learning add --project ${projectId} --title "one-line pattern" --body "the fix / what to know"
+
+Mechanical failures (spawn/merge/smoke) are recorded automatically — this is
+for the things only you know you tripped on.`;
 }
 
 // Kept in sync with DENIED_MCP_SERVERS in api.ts, which writes the matching

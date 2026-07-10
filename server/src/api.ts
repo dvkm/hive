@@ -17,6 +17,7 @@ import {
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
+import { recordSystemLearning, signature } from "./learn.ts";
 import {
   parseProject,
   parseTask,
@@ -1012,6 +1013,7 @@ async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason
     type: "merge_failed",
     payload: { reason, conflict, delivered, ...(sendError ? { send_error: sendError } : {}) },
   });
+  recordSystemLearning(db, task.project_id, `merge failure: ${signature(reason)}`, reason, task.id);
   if (conflict) {
     transition(db, task.id, "in_progress", { source: "director", reason: "merge conflict — agent asked to rebase" });
     return err(`merge conflict — task sent back to the agent to rebase onto '${base}' (${reason})`, 409);
@@ -1193,6 +1195,7 @@ export async function spawnAgent(
     });
   } catch (e: any) {
     writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: String(e?.message ?? e) } });
+    recordSystemLearning(db, task.project_id, `spawn failure: ${signature(String(e?.message ?? e))}`, String(e?.message ?? e), id);
     return { ok: false, error: String(e?.message ?? e) };
   }
 
