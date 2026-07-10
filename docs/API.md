@@ -7,6 +7,11 @@ must be built against this file. Server: `http://127.0.0.1:4700` (override
 - All request and response bodies are JSON unless noted (evidence upload is
   `multipart/form-data`; the SSE stream is `text/event-stream`; evidence files
   and the static web app are served raw).
+- **File attachments.** `POST /api/tasks`, `PUT /api/tasks/:id` and
+  `POST /api/tasks/:id/send` accept EITHER JSON or `multipart/form-data`. In the
+  multipart form, text fields carry the same names as the JSON keys and any
+  number of files may be sent under the field name `files`. See
+  [Attachments](#attachments).
 - Errors return `{"error": "<message>"}` with a non-2xx status:
   `400` bad input, `404` not found, `409` illegal state transition / already
   answered, `500` internal.
@@ -165,7 +170,7 @@ Types written by the runtime layer (Phase 2b):
 - `ci_status` — reconciler synced CI. `payload: {ci_status}` (`passing|pending|failing`)
 - `pr_merged` — reconciler detected the PR merged. `payload: {pr_url}`
 - `pr_conflict` — reconciler saw the PR CONFLICTING with its base and nudged the agent to resolve (once per head SHA; lifecycle untouched). `payload: {pr_url, head_sha, delivered}`
-- `ready_for_review` — the task was handed off `in_progress → in_review`, by the agent's `ready` emit or the reconciler's idle/gone backstop. `payload: {pr_url, via, kind}` (`via ∈ {emit, idle, gone}`)
+- `ready_for_review` — the task was handed off `in_progress → in_review`: by the agent's `ready` emit, by the herdr supervise loop's push signal (`source: herdr`, the moment herdr reports the agent idle), or by the reconciler's idle/gone poll backstop. `payload: {pr_url, via, kind}` (`via ∈ {emit, idle, gone}`)
 - `pr_linked` — a marked PR was matched back to this task and its `pr_url` set (by the reconciler's scan or `POST /api/tasks/link-pr`). `payload: {pr_url, via}` (`via ∈ {id, number}` — which half of the marker matched)
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
@@ -373,16 +378,17 @@ cost_usd, calls, unpriced}` (summed cost counts priced rows only).
 
 ### Tasks
 - `GET /api/tasks?state=&project_id=` → `200 [Task, ...]` (newest `updated_at` first; both filters optional)
-- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event)
+- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
 - `POST /api/tasks/:id/transition` body `{to (required), reason?, source?}` → `200 Task` | `409` (invalid transition or `done` without evidence) | `404`
   When `to` is `verifying`, the project's post-deploy smoke list (`config.smoke`) runs once before the response returns. A smoke failure bounces the task back to `in_progress`, so the returned Task may be `in_progress`, not `verifying`.
 - `POST /api/tasks/:id/spawn` body `{hive_url?}` → `200 {"ok":true, "task": Task, "agent_target":"..."}` | `400` (project has no `repo_path`) | `404` | `502` (herdr spawn failed; a `spawn_error` event is recorded)
   Creates the herdr worktree (`hive/<task-id>`), starts the agent with `HIVE_TASK_ID`/`HIVE_URL` + the project's resolved secrets in env and the composed brief, sets `agent_target`/`worktree_path`/`branch`, transitions `queued → in_progress`, and writes a `spawned` event.
-- `POST /api/tasks/:id/send` body `{message (required)}` → `200 {"ok":true, "delivered":true, "message":...}` | `404` | `400` (empty message)
-  Dispatches the message to the task's live agent via `herdr agent send`. Always records a `steer` event. Degrades gracefully: if the task has no `agent_target` or herdr fails, returns `200 {"ok":false, "delivered":false, "error":"..."}` (never throws) and records a `steer_error` event when herdr itself failed.
-- `PUT /api/tasks/:id` body `{title?, brief?}` → `200 Task` | `404`
+- `POST /api/tasks/:id/send` body `{message (required)}` (or multipart: `message` + `files`) → `200 {"ok":true, "delivered":true, "message":..., "attachments":[abs paths]}` | `404` | `400` (empty message)
+  Dispatches the message to the task's live agent via `herdr agent send`. Always records a `steer` event (`payload: {message, target, attachments}`). Attached files are saved and their absolute paths appended to the delivered message under an `## Attachments` heading. Degrades gracefully: if the task has no `agent_target` or herdr fails, returns `200 {"ok":false, "delivered":false, "error":"..."}` (never throws, no `attachments` key) and records a `steer_error` event when herdr itself failed.
+- `PUT /api/tasks/:id` body `{title?, brief?}` (or multipart: same fields + `files`) → `200 Task` | `404`
+  Attached files are appended to the resulting `brief` under an `## Attachments` heading.
   Updates a task's editable fields. Used by the attention tray's "edit & requeue"
   flow before it re-queues a failed task.
 - `POST /api/tasks/:id/focus-agent` body `{}` → `200 {"ok":true, "focused":true, "target":"..."}` | `404`
@@ -595,6 +601,33 @@ Behavior by `type`:
   supplied `payload` preserved verbatim (the transcript hooks' path). → `201 {event: Event}`
 - `status` / `blocked` / custom → writes one event. → `201 {event: Event}`
 
+### Attachments
+
+Steer messages and task briefs can carry files (screenshots, mockups, a creds
+JSON). Send the request as `multipart/form-data` instead of JSON: text fields
+keep their JSON key names, and every file goes under the field name `files`
+(repeat it for several). A JSON body still works and attaches nothing.
+
+    curl -X POST "$HIVE_URL/api/tasks/$ID/send" \
+      -F 'message=match this mockup' -F 'files=@mockup.png' -F 'files=@notes.txt'
+
+    curl -X POST "$HIVE_URL/api/tasks" \
+      -F project_id=proj_x -F title='Rebuild the header' \
+      -F 'brief=match the design' -F 'files=@mockup.png'
+
+Files are stored under `$HIVE_HOME/evidence/<task_id>/` (name-collision safe).
+The **absolute path** of each is appended to the steer message / brief under an
+`## Attachments` heading, because agents read files off disk rather than over
+HTTP:
+
+    ## Attachments
+    These files are on disk; read them with the Read tool.
+    - /Users/me/.hive/evidence/tsk_abc/1720598400000_mockup.png
+
+Attachments deliberately do **not** create `Evidence` rows. Evidence gates the
+`done` transition, and a file the director attached as *input* is not proof of
+work. Use `POST /api/tasks/:id/events` with `type=evidence` for that.
+
 ### Analytics (cost/token)
 - `GET /api/analytics/summary?since=` → `200 {since, totals, by_model, by_project, top_tasks}`
   Rollups over the usage table. `since` is an optional ISO timestamp lower bound
@@ -617,7 +650,7 @@ Behavior by `type`:
   Archives the card (`status=answered`, `answered_at` set), writes a
   `decision_answered` event, and resumes the task (`needs_decision → in_progress`).
   If `answer_note` is omitted, the saved `draft_note` is used.
-- `POST /api/decisions/:id/dismiss` → `200 Decision` (now `expired`) | `404` | `409` (already closed)
+- `POST /api/decisions/:id/dismiss` → `200 Decision` (now `expired`) | `404` | `409` (already closed). Dismissing the task's LAST open card resumes a `needs_decision` task to `in_progress` (a parked task with nothing to wait on is stranded); no resolver hooks fire.
   Clears a card without answering it (the human escape hatch for a card that is
   no longer relevant, or that somehow has no usable options). Sets
   `status=expired`, writes a `decision_expired` event (`reason: "dismissed"`),
@@ -824,8 +857,11 @@ No HTTP endpoints — the dispatcher is a server-internal loop (`server/src/disp
 default every 30s, `HIVE_DISPATCH_MS`). It picks up `queued` tasks and spawns a
 herdr agent for each (the same path as `POST /api/tasks/:id/spawn`), gated by:
 project `config.auto_dispatch: true` (default off), `config.dispatch_kinds`
-(default `["ship","scout"]`), `config.max_agents` (default 3, per-project
-concurrency cap), an intake-review gate (any `source="intake_*"` task — gchat
+(default `["ship","scout"]`), `config.max_agents` (default 3, per-project cap on
+WORKING agents — `in_progress`/`needs_decision`; review-parked agents
+(`in_review`/`verifying`) don't consume working slots but bound total live
+agents at `max_agents × 2` so a full review queue slows, not freezes, dispatch),
+an intake-review gate (any `source="intake_*"` task — gchat
 messages, director braindumps — is skipped until a `reviewed` event or a `note`
 event containing "reviewed" exists), and the standing-authority gate. The authority gate calls
 `authorize(action="task.dispatch", target=<title>)`; a `deny` rule blocks the

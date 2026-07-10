@@ -11,7 +11,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { now, newId, evidenceDir } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { writeEvent, transition, getTask, evidenceCount, TERMINAL, type State } from "./state.ts";
+import { writeEvent, transition, getTask, advanceIfFinished, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { runSmoke, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
@@ -125,23 +125,11 @@ function lastAgentStatus(db: DB, taskId: string): string | null {
 // BEFORE recoverStale so a handed-off task is never failed/requeued.
 async function advanceFinished(db: DB, _deps: ReconcilerDeps): Promise<void> {
   const tasks = db
-    .query(`SELECT id, kind, pr_url FROM tasks WHERE state = 'in_progress' AND agent_target IS NOT NULL`)
-    .all() as { id: string; kind: string; pr_url: string | null }[];
+    .query(`SELECT id FROM tasks WHERE state = 'in_progress' AND agent_target IS NOT NULL`)
+    .all() as { id: string }[];
   for (const t of tasks) {
     const status = lastAgentStatus(db, t.id);
-    if (status !== "idle" && status !== "gone") continue; // working/blocked/unknown → leave it be
-    const hasReport = t.kind === "scout" && evidenceCount(db, t.id, "report") >= 1;
-    if (!t.pr_url && !hasReport) continue; // no product to review → health surfaces it, don't advance
-    writeEvent(db, {
-      task_id: t.id,
-      source: "reconciler",
-      type: "ready_for_review",
-      payload: { pr_url: t.pr_url ?? null, via: status, kind: t.kind },
-    });
-    transition(db, t.id, "in_review", {
-      source: "reconciler",
-      reason: hasReport ? "scout report ready; agent idle" : "PR open; agent idle",
-    });
+    if (status) advanceIfFinished(db, t.id, status, "reconciler");
   }
 }
 

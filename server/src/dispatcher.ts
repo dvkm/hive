@@ -30,8 +30,16 @@ const DISPATCH_KINDS_DEFAULT = ["ship", "scout"];
 const MAX_AGENTS_DEFAULT = 3;
 const BACKOFF_BASE_MS = 30_000;
 const BACKOFF_CAP_MS = 30 * 60 * 1000;
-// States that count as "holding an agent slot" for the concurrency cap.
+// States that count as "working" for the max_agents cap. in_review/verifying
+// agents are parked waiting on the DIRECTOR — counting them froze the whole
+// pipeline whenever the review queue filled (seen live 2026-07-10: 3 PRs in
+// review, 25 tasks queued, zero dispatch). They still bound total pipeline
+// depth via REVIEW_OVERHANG below.
+const WORKING_STATES = "('in_progress','needs_decision')";
 const ACTIVE_STATES = "('in_progress','needs_decision','in_review','verifying')";
+// ponytail: fixed 2× multiplier — total live agents (incl. review-parked) may
+// reach max_agents*2 before dispatch pauses; make it config if it ever matters.
+const REVIEW_OVERHANG = 2;
 
 export interface DispatcherDeps {
   herdr?: Herdr;
@@ -50,7 +58,8 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     .map(parseTask);
 
   const projectCache = new Map<string, { repo_path: string | null; config: any } | null>();
-  const activeCount = new Map<string, number>(); // per-project agent slots used
+  const workingCount = new Map<string, number>(); // per-project working slots used
+  const activeCount = new Map<string, number>(); // per-project live agents incl. review-parked
 
   const getProject = (pid: string) => {
     if (!projectCache.has(pid)) {
@@ -59,15 +68,17 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     }
     return projectCache.get(pid)!;
   };
-  const activeFor = (pid: string) => {
-    if (!activeCount.has(pid)) {
+  const countFor = (cache: Map<string, number>, states: string, pid: string) => {
+    if (!cache.has(pid)) {
       const row: any = db
-        .query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND agent_target IS NOT NULL AND state IN ${ACTIVE_STATES}`)
+        .query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND agent_target IS NOT NULL AND state IN ${states}`)
         .get(pid);
-      activeCount.set(pid, row.n as number);
+      cache.set(pid, row.n as number);
     }
-    return activeCount.get(pid)!;
+    return cache.get(pid)!;
   };
+  const workingFor = (pid: string) => countFor(workingCount, WORKING_STATES, pid);
+  const activeFor = (pid: string) => countFor(activeCount, ACTIVE_STATES, pid);
 
   for (const task of queued) {
     try {
@@ -82,7 +93,8 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
       if (task.source?.startsWith("intake_") && !isReviewed(db, task.id)) continue; // unreviewed intake
 
       const cap = Number.isFinite(cfg.max_agents) ? Number(cfg.max_agents) : MAX_AGENTS_DEFAULT;
-      if (activeFor(task.project_id) >= cap) continue; // concurrency cap
+      if (workingFor(task.project_id) >= cap) continue; // working-concurrency cap
+      if (activeFor(task.project_id) >= cap * REVIEW_OVERHANG) continue; // review overhang bound
 
       if (inBackoff(db, task.id, nowMs)) continue; // still cooling down after a spawn failure
 
@@ -95,7 +107,10 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
       if (authz.effect !== "allow") continue; // deny or require_decision blocks the auto-spawn
 
       const r = await spawnAgent(db, h, task.id, { hiveUrl: deps.hiveUrl, supervise: deps.supervise });
-      if (r.ok) activeCount.set(task.project_id, activeFor(task.project_id) + 1);
+      if (r.ok) {
+        workingCount.set(task.project_id, workingFor(task.project_id) + 1);
+        activeCount.set(task.project_id, activeFor(task.project_id) + 1);
+      }
       // On failure spawnAgent already wrote a single spawn_error event; the
       // backoff above governs the next attempt (no immediate retry).
     } catch (e) {

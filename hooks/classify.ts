@@ -42,6 +42,13 @@ const DANGEROUS: [RegExp, string][] = [
   [/\bchown\s+-[a-z]*R\b/i, "recursive chown"],
   [/\b(kill(all)?|pkill)\b/i, "process kill"],
   [/:\s*\(\s*\)\s*\{.*:\s*\|\s*:.*&\s*\}\s*;\s*:/, "fork bomb"],
+  // Types/clicks into whatever has focus on the HUMAN's desktop — seen live
+  // 2026-07-10 (an agent probing Korean IME via System Events keystroke).
+  [/osascript\b[\s\S]*System Events/i, "desktop UI scripting (osascript)"],
+  // Agents answering their own decision cards / minting authority rules defeats
+  // the whole escalation model — attempted live 2026-07-10 (dec_c698522e5c30).
+  [/\/api\/decisions\/[^\s"']+\/(answer|dismiss)/i, "hive decision tampering"],
+  [/\/api\/authority\/rules/i, "hive authority-rule tampering"],
   [/find\b[^\n]*-(delete|exec(dir)?)\b/i, "find with -delete/-exec"],
   [/\b(drop|truncate)\s+(table|database|schema)\b/i, "SQL drop/truncate"],
   [/\bdelete\s+from\b(?![\s\S]*\bwhere\b)/i, "SQL DELETE without WHERE"],
@@ -85,12 +92,139 @@ function segments(command: string): string[] {
     .filter(Boolean);
 }
 
-export function classify(command: string): Classification {
+// ---- sandbox waiver -------------------------------------------------------
+// Destructive ops provably confined to the agent's OWN sandbox (its scratchpad
+// under /tmp, macOS temp dirs, herdr worktrees) are routine cleanup, not
+// incidents — every one used to open a decision card and stall the agent until
+// David answered (4 cards on 2026-07-10 alone, all scratchpad rm / headless-
+// chrome pkill). A waived match downgrades to "unknown", which the authority
+// engine allows-and-logs — never silently, never "safe".
+
+function sandboxRoots(env: Record<string, string | undefined>): string[] {
+  const roots = ["/tmp/", "/private/tmp/", "/var/folders/"];
+  if (env.HOME) roots.push(`${env.HOME}/.herdr/worktrees/`);
+  return roots;
+}
+
+// Substitute $VAR / ${VAR} from a map; unknown vars stay verbatim (and later
+// fail the "no unresolved $" check, keeping the command dangerous).
+function subst(s: string, map: Record<string, string>): string {
+  return s.replace(
+    /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+    (all, a, b) => map[a ?? b] ?? all
+  );
+}
+
+// Variables resolvable statically: HOME/TMPDIR from the hook's env (the agent's
+// own env) plus `VAR=value` assignments made in this same command string.
+function varMap(cmd: string, env: Record<string, string | undefined>): Record<string, string> {
+  const map: Record<string, string> = {};
+  if (env.HOME) map.HOME = env.HOME;
+  if (env.TMPDIR) map.TMPDIR = env.TMPDIR;
+  for (const seg of segments(cmd)) {
+    const m = seg.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=("([^"]*)"|'([^']*)'|\S+)/);
+    if (m) map[m[1]] = subst(m[3] ?? m[4] ?? m[2], map);
+  }
+  return map;
+}
+
+// True iff every target of every `rm` segment resolves to an absolute path
+// inside a sandbox root — no unresolved substitution, no `..`, no relative
+// paths. `rm` reached via xargs/env/etc. never waives (segment must start with rm).
+function rmTargetsSandboxed(cmd: string, env: Record<string, string | undefined>): boolean {
+  const map = varMap(cmd, env);
+  const roots = sandboxRoots(env);
+  const rmSegs = segments(cmd).filter((s) => /^rm\b/.test(s));
+  if (!rmSegs.length) return false;
+  // The whole-string DANGEROUS scan can also fire on an rm hidden in a non-rm
+  // segment (e.g. `xargs rm -rf`); only waive when every firing segment is a
+  // plain rm we can inspect.
+  const rmish = segments(cmd).filter((s) => /(^|[\s;&|(])rm\s+(-[a-z]*\s+)*-[a-z]*[rf]/i.test(s));
+  if (rmish.some((s) => !/^rm\b/.test(s))) return false;
+  for (const seg of rmSegs) {
+    const body = seg.split(/\s+[\d&]*[<>]/)[0]; // drop redirections
+    for (let tok of body.split(/\s+/).slice(1)) {
+      if (tok.startsWith("-")) continue;
+      tok = subst(tok.replace(/["']/g, ""), map);
+      if (!tok) continue;
+      if (/[$`]/.test(tok)) return false; // unresolved substitution
+      if (tok.includes("..")) return false; // path escape
+      if (!tok.startsWith("/")) return false; // relative: can't prove
+      if (!roots.some((r) => tok.startsWith(r))) return false;
+    }
+  }
+  return true;
+}
+
+// True iff every kill/pkill segment targets the agent's own tooling: its shell
+// jobs (`kill %1`), a pidfile in its sandbox (`pkill -F $SCRATCHPAD/x.pid`), a
+// headless browser it launched (--headless / remote-debugging-port), or a
+// process whose match pattern names a sandbox path.
+// ponytail: pattern-based, so `pkill -f remote-debugging-port` could hit a
+// human's debug Chrome too; scope to the agent's own port/profile if that bites.
+function killTargetsSandboxed(cmd: string, env: Record<string, string | undefined>): boolean {
+  const map = varMap(cmd, env);
+  const roots = sandboxRoots(env);
+  const killSegs = segments(cmd).filter((s) => /\b(kill(all)?|pkill)\b/i.test(s));
+  if (!killSegs.length) return false;
+  return killSegs.every((seg) => {
+    const s = subst(seg.replace(/["']/g, ""), map);
+    if (/remote-debugging-port|--headless/.test(s)) return true;
+    if (roots.some((r) => s.includes(r))) return true; // pidfile or pattern in sandbox
+    // `kill %1 [%2 …]` — the shell's own background jobs, nothing else.
+    const body = s.split(/\s+[\d&]*[<>]/)[0];
+    const targets = body.split(/\s+/).slice(1).filter((t) => !t.startsWith("-"));
+    return targets.length > 0 && targets.every((t) => /^%\d+$/.test(t));
+  });
+}
+
+// SQL dangerous rules (DROP/DELETE/UPDATE heuristics) are waived when the only
+// SQL client in the command is sqlite3 operating on a sandboxed DB file — the
+// scratchpad-copy workflow. psql/mysql (server-backed) never waive.
+// ponytail: binds SQL text to the sqlite3 target only by co-occurrence in one
+// command; good enough while psql/mysql are excluded.
+function sqlTargetsSandboxed(cmd: string, env: Record<string, string | undefined>): boolean {
+  if (/\b(psql|mysql)\b/i.test(cmd)) return false;
+  const map = varMap(cmd, env);
+  const roots = sandboxRoots(env);
+  const sqliteSegs = segments(cmd).filter((s) => /^sqlite3\b/.test(s));
+  if (!sqliteSegs.length) return false;
+  return sqliteSegs.every((seg) => {
+    const file = seg
+      .split(/\s+/)
+      .slice(1)
+      .map((t) => subst(t.replace(/["']/g, ""), map))
+      .find((t) => t && !t.startsWith("-"));
+    return !!file && file.startsWith("/") && !file.includes("..") && !/[$`]/.test(file) &&
+      roots.some((r) => file.startsWith(r));
+  });
+}
+
+// A lone `hive emit …` (or the CLI invoked via bun) only POSTs its arguments to
+// hive as JSON — the text is data, never executed. Without this, a status note
+// that MENTIONS a destructive command trips the whole-string scan (seen live
+// 2026-07-10, dec_95135b1837e9). Requires: single segment, no substitution.
+function isHiveEmitDataOnly(cmd: string): boolean {
+  if (/\$\(|`|<\(/.test(cmd)) return false;
+  const segs = segments(cmd);
+  return segs.length === 1 && /^((bun|bunx)\s+\S*hive(\.ts)?\s+|(\.\/)?bin\/hive\s+|hive\s+)emit\b/.test(segs[0]);
+}
+
+export function classify(
+  command: string,
+  env: Record<string, string | undefined> = process.env
+): Classification {
   const cmd = command.trim();
   if (!cmd) return { decision: "safe", reason: "empty command" };
 
+  const emitDataOnly = isHiveEmitDataOnly(cmd);
   for (const [rx, reason] of DANGEROUS) {
-    if (rx.test(cmd)) return { decision: "dangerous", reason };
+    if (!rx.test(cmd)) continue;
+    if (emitDataOnly) continue; // arguments are data, not executed
+    if (reason === "recursive/forced rm" && rmTargetsSandboxed(cmd, env)) continue;
+    if (reason === "process kill" && killTargetsSandboxed(cmd, env)) continue;
+    if (reason.startsWith("SQL ") && sqlTargetsSandboxed(cmd, env)) continue;
+    return { decision: "dangerous", reason };
   }
 
   // Command/process substitution runs code the segment scan can't see, so it
@@ -124,10 +258,10 @@ async function escalate(
   decision: Decision,
   reason: string
 ): Promise<string> {
-  // Distinct action namespace so the authority engine can gate destructive
-  // commands (`command.dangerous`) without touching merely-unrecognized ones
-  // (`command`). `command.dangerous*` is deny-safe by default IN CODE — it needs
-  // a decision with no rule present; unknown commands default-allow (logged).
+  // Distinct action namespace so a standing rule can gate destructive commands
+  // (`command.dangerous`) without touching merely-unrecognized ones (`command`).
+  // `command.dangerous*` is deny-safe by default IN CODE — it requires a decision
+  // with no rule present; unknown commands default-allow (logged).
   const action = decision === "dangerous" ? "command.dangerous" : "command";
   try {
     const res = await fetch(`${hiveUrl}/api/tasks/${taskId}/guarded-action`, {

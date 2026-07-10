@@ -3,7 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { api } from "../lib/api";
 import type { Decision, Evidence, TaskDetail } from "../lib/api";
 import { useStore } from "../lib/store";
-import { CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { Attach, CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { ReviewCard } from "./ReviewCard";
 import { relTime } from "../lib/time";
 import { useLightbox } from "../lib/lightbox";
@@ -182,6 +182,7 @@ export function TaskBody({ id }: { id: string }) {
   const [t, setT] = useState<TaskDetail | null>(null);
   const [err, setErr] = useState<string>("");
   const [steer, setSteer] = useState("");
+  const [steerFiles, setSteerFiles] = useState<File[]>([]);
   const [planning, setPlanning] = useState(false);
 
   const refresh = () => api.task(id).then(setT).catch(() => {});
@@ -218,9 +219,10 @@ export function TaskBody({ id }: { id: string }) {
   const sendSteer = async () => {
     if (!steer.trim()) return;
     try {
-      await api.send(t.id, steer);
-      toast("Steer sent");
+      const r = await api.send(t.id, steer, steerFiles);
+      toast(r.attachments?.length ? `Steer sent with ${r.attachments.length} file(s)` : "Steer sent");
       setSteer("");
+      setSteerFiles([]);
     } catch (e) {
       toast((e as Error).message);
     }
@@ -431,11 +433,13 @@ export function TaskBody({ id }: { id: string }) {
         <section className="panel">
           <h2>Actions</h2>
           <div className="steer">
-            <textarea
-              placeholder="Steer message to the agent…"
-              value={steer}
-              onChange={(e) => setSteer(e.target.value)}
-            />
+            <Attach files={steerFiles} onChange={setSteerFiles}>
+              <textarea
+                placeholder="Steer message to the agent…"
+                value={steer}
+                onChange={(e) => setSteer(e.target.value)}
+              />
+            </Attach>
             <button className="btn" onClick={sendSteer}>
               Send steer
             </button>

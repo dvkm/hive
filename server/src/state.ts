@@ -129,6 +129,30 @@ export function expireOrphanedDecisions(db: DB): number {
   return n;
 }
 
+// The finished-handoff, shared by every herdr-signal path (the reconciler's
+// poll backstop and the supervise wait loop): an agent observed idle/gone on an
+// in_progress task that has a real work product (a pr_url, or a scout report)
+// advances to in_review. Deliberately independent of anything the agent emits.
+// Returns true when the task was advanced.
+export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, source: string): boolean {
+  if (agentStatus !== "idle" && agentStatus !== "gone") return false; // working/blocked/unknown → leave it be
+  const task = getTask(db, taskId);
+  if (!task || task.state !== "in_progress") return false;
+  const hasReport = task.kind === "scout" && evidenceCount(db, taskId, "report") >= 1;
+  if (!task.pr_url && !hasReport) return false; // no product to review → health surfaces it, don't advance
+  writeEvent(db, {
+    task_id: taskId,
+    source,
+    type: "ready_for_review",
+    payload: { pr_url: task.pr_url ?? null, via: agentStatus, kind: task.kind },
+  });
+  transition(db, taskId, "in_review", {
+    source,
+    reason: hasReport ? "scout report ready; agent idle" : "PR open; agent idle",
+  });
+  return true;
+}
+
 // Perform a state transition. Throws TransitionError on invalid transition or
 // when a `done` transition lacks required evidence. Writes a state_change event.
 export function transition(

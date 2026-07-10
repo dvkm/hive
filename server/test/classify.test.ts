@@ -9,7 +9,7 @@ const dangerous = [
   "rm -rf /",
   "rm -rf node_modules",
   "rm -fr build",
-  "cat foo.txt && rm -rf /tmp/x", // dangerous token after a safe one
+  "cat foo.txt && rm -rf /srv/x", // dangerous token after a safe one
   "ls; rm -rf .",
   "sudo rm foo",
   "doas reboot",
@@ -45,6 +45,7 @@ const dangerous = [
   "helm uninstall app",
   "cat ~/.ssh/id_rsa",
   "cat ~/.aws/credentials",
+  `osascript -e 'tell application "System Events" to keystroke "hi"'`,
 ];
 
 const safe = [
@@ -118,4 +119,67 @@ test("git commit / non-force push escalate rather than auto-approve", () => {
 
 test("dev/null and dev/urandom redirects are not treated as device writes", () => {
   expect(classify("bun test > /dev/null 2>&1").decision).toBe("safe");
+});
+
+// Sandbox waiver: destructive ops provably confined to the agent's own
+// scratchpad/tmp/worktree downgrade to "unknown" (allow+log), never "safe" —
+// and anything not provably confined stays "dangerous".
+test("sandbox-scoped rm downgrades to unknown, not dangerous", () => {
+  const env = { HOME: "/Users/you", TMPDIR: "/var/folders/ab/T/" };
+  expect(classify("rm -rf /tmp/build-cache", env).decision).toBe("unknown");
+  expect(classify("rm -f /private/tmp/claude-501/x/scratchpad/copy.db*", env).decision).toBe("unknown");
+  expect(classify("rm -rf /Users/you/.herdr/worktrees/repo/hive-abc", env).decision).toBe("unknown");
+  // same-command variable assignment resolves (the real dec_7ba648202a09 shape)
+  const real = `S=/private/tmp/claude-501/sess/scratchpad\nrm -f "$S/hive-copy.db"*\nsqlite3 /tmp/copy.db ".backup"`;
+  expect(classify(real, env).decision).toBe("unknown");
+  expect(classify('rm -f "$TMPDIR/out.png"', env).decision).toBe("unknown");
+});
+
+test("non-sandbox / unprovable rm stays dangerous", () => {
+  const env = { HOME: "/Users/you" };
+  expect(classify("rm -rf /", env).decision).toBe("dangerous");
+  expect(classify("rm -rf ~/projects", env).decision).toBe("dangerous"); // ~ unexpanded → relative
+  expect(classify("rm -rf $HOME/projects", env).decision).toBe("dangerous");
+  expect(classify("rm -rf /tmp/../etc", env).decision).toBe("dangerous"); // path escape
+  expect(classify("rm -rf $UNSET/x", env).decision).toBe("dangerous"); // unresolved var
+  expect(classify("rm -rf build", env).decision).toBe("dangerous"); // relative
+  expect(classify("ls | xargs rm -rf", env).decision).toBe("dangerous"); // targets unseen
+  expect(classify("sudo rm -rf /tmp/x", env).decision).toBe("dangerous"); // sudo rule still fires
+});
+
+test("agent-tooling kill downgrades to unknown; general kill stays dangerous", () => {
+  const env = { HOME: "/Users/you" };
+  expect(classify('pkill -f "remote-debugging-port=9333"', env).decision).toBe("unknown");
+  expect(classify("pkill -f '/private/tmp/claude-501/sess/prof'", env).decision).toBe("unknown");
+  expect(classify("kill %1 2>/dev/null", env).decision).toBe("unknown"); // own shell job
+  expect(classify("kill %1 %2", env).decision).toBe("unknown");
+  expect(classify("pkill -F /tmp/claude-501/sess/scratchpad/dev.pid", env).decision).toBe("unknown");
+  expect(classify("pkill -f server", env).decision).toBe("dangerous");
+  expect(classify("killall node", env).decision).toBe("dangerous");
+  expect(classify("kill -9 1234", env).decision).toBe("dangerous");
+  expect(classify('kill %1; pkill -f "vite --mode dev"', env).decision).toBe("dangerous"); // pkill part unprovable
+});
+
+test("SQL on a sandboxed sqlite copy downgrades; live/server DBs stay dangerous", () => {
+  const env = { HOME: "/Users/you" };
+  expect(classify('sqlite3 /tmp/claude-501/s/copy.db "update usage set cost=0"', env).decision).toBe("unknown");
+  const heredoc = `S=/private/tmp/claude-501/s/scratchpad\nsqlite3 "$S/copy.db" <<SQL\nupdate usage set cost_usd = 0\nSQL`;
+  expect(classify(heredoc, env).decision).toBe("unknown");
+  expect(classify('sqlite3 /Users/you/.hive/hive.db "update usage set cost=0"', env).decision).toBe("dangerous");
+  expect(classify("psql -c 'UPDATE users SET admin = 1'", env).decision).toBe("dangerous");
+  expect(classify('sqlite3 /tmp/claude-501/x.db "drop table usage"; psql -c "x"', env).decision).toBe("dangerous");
+});
+
+test("hive emit with destructive text in the note is data, not danger", () => {
+  expect(classify('hive emit abc123 status --note "cleaned up with rm -rf /tmp/x"').decision).toBe("unknown");
+  expect(classify('bun cli/hive.ts emit abc123 status --note "pkill -f vite failed"').decision).toBe("unknown");
+  // …but substitution or chaining voids the waiver
+  expect(classify('hive emit abc123 status --note "$(rm -rf /)"').decision).toBe("dangerous");
+  expect(classify('hive emit abc123 status --note "x"; rm -rf /srv', ).decision).toBe("dangerous");
+});
+
+test("hive control-plane tampering is dangerous", () => {
+  expect(classify('curl -X POST "$HIVE_URL/api/decisions/dec_123/answer" -d x').decision).toBe("dangerous");
+  expect(classify("curl $HIVE_URL/api/decisions/dec_9/dismiss").decision).toBe("dangerous");
+  expect(classify('curl -X POST "$HIVE_URL/api/authority/rules" -d x').decision).toBe("dangerous");
 });

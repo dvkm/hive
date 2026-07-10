@@ -23,6 +23,9 @@ Don't hand-format it — run \`hive pr-marker ${id}\` and paste what it prints.`
 const EMIT_PROTOCOL = `## Reporting protocol (\`hive emit\`)
 You are running under hive. Report progress with the \`hive emit\` CLI so the
 director's board stays current. Do not wait to be asked for status.
+If \`hive\` is not on your PATH, run it as \`"$HIVE_CLI"\` (set in your env), e.g.
+\`"$HIVE_CLI" emit <task-id> status --note "..."\` — same for \`hive task create\`
+and \`hive pr-marker\`. Prefer the CLI over raw curl: it attributes what you do.
 
   hive emit <task-id> status   --note "what you just did / are doing"
   hive emit <task-id> evidence --file ./screenshot.png --note "caption"
@@ -41,7 +44,34 @@ Rules:
   idle — that leaves the task looking stuck. (A backstop advances an idle agent
   that has a PR, but \`ready\` is the clean, immediate handoff.)
 - When you hit a decision the director must make, emit \`needs-decision\` and
-  stop; do not guess on anything high-risk (prod, feature flags, destructive ops).`;
+  stop; do not guess on anything high-risk (prod, feature flags, destructive ops).
+- Work ONLY inside your own worktree and scratchpad. NEVER create, edit, or
+  delete files in the project's main checkout, other worktrees, or the human's
+  home — cleanup of your own sandbox is auto-approved; anything outside it is not.
+- Killing processes: prefer \`kill %1\` (your own shell jobs) or a pidfile in your
+  scratchpad (\`... & echo $! > "$SCRATCH/dev.pid"\`, later \`kill $(cat ...)\` /
+  \`pkill -F\`) — those pass the command gate automatically. Broad \`pkill -f <pattern>\`
+  escalates to the director and stalls you.`;
+
+// Agents may fan work out instead of scope-creeping their own task. HIVE_TASK_ID
+// is set in every spawned agent's env, so the CLI auto-attributes the new task
+// (source=agent, parent_task_id → this task).
+function spawnTasksSection(projectId: string): string {
+  return `## Spawning follow-up tasks
+When you discover work that is OUT OF SCOPE for this task — a bug you noticed,
+a missing test, a natural follow-up — do not expand your task. Queue it as a
+new task and keep going:
+
+  hive task create --project ${projectId} \\
+    --title "short imperative title" \\
+    --brief-text "what, where (files/paths), why, and the definition of done" \\
+    --kind ship|scout|chore
+
+Write the brief self-contained: the agent that picks it up has NONE of your
+context. Include file paths, repro steps, and what done looks like. The task is
+linked to you automatically (parent) and the dispatcher schedules it like any
+other — duplicates are auto-detected, so when in doubt, file it.`;
+}
 
 // Kept in sync with DENIED_MCP_SERVERS in api.ts, which writes the matching
 // permissions.deny into each worktree's .claude/settings.local.json.
@@ -139,6 +169,7 @@ export function composeBrief(db: DB, taskId: string): string {
   parts.push(`## Brief\n${task.brief?.trim() || "(no description provided)"}`);
   parts.push(definitionOfDone(task.kind));
   parts.push(EMIT_PROTOCOL);
+  parts.push(spawnTasksSection(task.project_id));
   parts.push(prMarkerSection(task.number, task.id));
   parts.push(BROWSER_VERIFICATION);
 

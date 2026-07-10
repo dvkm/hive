@@ -52,6 +52,24 @@ test("task create + list + get", async () => {
   expect(Array.isArray(one.json.events)).toBe(true);
 });
 
+test("agent-created task carries source + parent_task_id", async () => {
+  const r = await post("/api/tasks", {
+    project_id: projectId,
+    title: "follow-up from agent",
+    source: "agent",
+    parent_task_id: taskId,
+  });
+  expect(r.status).toBe(201);
+  expect(r.json.source).toBe("agent");
+  expect(r.json.parent_task_id).toBe(taskId);
+  const bad = await post("/api/tasks", {
+    project_id: projectId,
+    title: "bad parent",
+    parent_task_id: "nope",
+  });
+  expect(bad.status).toBe(400);
+});
+
 test("event ingestion: status event is recorded", async () => {
   const r = await post(`/api/tasks/${taskId}/events`, { type: "status", note: "working" });
   expect(r.status).toBe(201);
@@ -212,6 +230,22 @@ test("dismiss endpoint expires an open decision and 409s on re-dismiss", async (
   // re-dismiss / answer a closed card is rejected
   const again = await post(`/api/decisions/${d.json.id}/dismiss`, {});
   expect(again.status).toBe(409);
+});
+
+test("dismissing the last open decision resumes a needs_decision task", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "d-resume" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
+  const d1 = await post("/api/decisions", { task_id: t.json.id, title: "gate 1", options: [{ key: "a", label: "A" }] });
+  const d2 = await post("/api/decisions", { task_id: t.json.id, title: "gate 2", options: [{ key: "a", label: "A" }] });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "needs_decision" });
+  // one card still open → stays parked
+  await post(`/api/decisions/${d1.json.id}/dismiss`, {});
+  let cur = await get(`/api/tasks/${t.json.id}`);
+  expect(cur.json.state).toBe("needs_decision");
+  // last card dismissed → resumes
+  await post(`/api/decisions/${d2.json.id}/dismiss`, {});
+  cur = await get(`/api/tasks/${t.json.id}`);
+  expect(cur.json.state).toBe("in_progress");
 });
 
 test("cancelling a task clears its open decisions from the inbox (SSE broadcast + expiry)", async () => {
