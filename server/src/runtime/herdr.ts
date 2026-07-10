@@ -25,11 +25,13 @@ import { join } from "node:path";
 import type { Exec, ExecResult } from "../exec.ts";
 import { defaultExec } from "../exec.ts";
 
-// hive's own bin/ (…/repo/bin from server/src/runtime/), prepended to every
-// spawned agent's PATH so `hive emit` / `hive task create` work from any
-// worktree — without it agents fall back to raw curl and lose CLI
+// Absolute path to the hive CLI (…/repo/bin/hive from server/src/runtime/),
+// handed to every spawned agent as $HIVE_CLI so `"$HIVE_CLI" emit …` works from
+// any worktree — without it agents fall back to raw curl and lose CLI
 // auto-attribution (source=agent, parent task), seen live 2026-07-10.
-const HIVE_BIN_DIR = join(import.meta.dir, "..", "..", "..", "bin");
+// NOT injected via PATH: overriding PATH clobbers the pane shell's user PATH
+// and breaks claude/cargo/pnpm resolution (broke all spawns, 2026-07-10).
+const HIVE_CLI = join(import.meta.dir, "..", "..", "..", "bin", "hive");
 
 export const HERDR_BIN = process.env.HERDR_BIN || "/opt/homebrew/bin/herdr";
 
@@ -118,7 +120,7 @@ export function agentStartArgv(args: {
   if (args.tabId) a.push("--tab", args.tabId);
   a.push("--env", `HIVE_TASK_ID=${args.taskId}`);
   a.push("--env", `HIVE_URL=${args.hiveUrl}`);
-  if (!args.env?.PATH) a.push("--env", `PATH=${HIVE_BIN_DIR}:${process.env.PATH ?? "/usr/bin:/bin"}`);
+  a.push("--env", `HIVE_CLI=${HIVE_CLI}`);
   for (const [k, v] of Object.entries(args.env ?? {})) a.push("--env", `${k}=${v}`);
   a.push("--no-focus", "--", ...args.agentArgv);
   return a;
