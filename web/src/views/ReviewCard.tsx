@@ -8,7 +8,41 @@ import { MAX_DIFF_LINES } from "../lib/api";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
 import { CheckpointList } from "./Checkpoints";
-import type { Event } from "../lib/api";
+import { DecisionCard } from "./DecisionCard";
+import type { Decision, Event } from "../lib/api";
+
+// The request-changes exchange: the director's notes and the agent's replies,
+// in order. Without this, "Request changes" fired into the void — the agent's
+// response only existed in the buried timeline.
+function ChangesThread({ events }: { events: Event[] }) {
+  const firstReq = events.findIndex((e) => e.type === "changes_requested");
+  if (firstReq === -1) return null;
+  const items = events
+    .slice(firstReq)
+    .filter((e) => ["changes_requested", "steer", "status", "note", "ready_for_review"].includes(e.type))
+    .slice(-10);
+  if (!items.length) return null;
+  const text = (e: Event): string => {
+    if (e.type === "changes_requested") return String(e.payload?.notes ?? "");
+    if (e.type === "steer") return String(e.payload?.message ?? "");
+    if (e.type === "ready_for_review") return "ready for review again";
+    return String(e.payload?.note ?? "");
+  };
+  return (
+    <div className="rv-thread">
+      <div className="rv-thread-head">Changes requested — the exchange</div>
+      {items.map((e) => {
+        const mine = e.source === "director";
+        return (
+          <div key={e.id} className={`rv-msg ${mine ? "rv-mine" : "rv-theirs"}`}>
+            <span className="rv-who">{mine ? "you" : "agent"}</span>
+            <span className="rv-text">{text(e)}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 // The agent's structured self-review (latest review_summary event payload).
 // Sections are all optional; strings or {what, why} objects for iffy.
@@ -60,7 +94,7 @@ function ReviewDigest({ r }: { r: ReviewSummary }) {
     <div className="review-digest">
       <ReviewSection tone="done" icon="✓" title="Done" items={r.done} />
       <ReviewSection tone="iffy" icon="!" title="Iffy" items={r.iffy} />
-      <ReviewSection tone="decisions" icon="?" title="Decisions" items={r.decisions} />
+      <ReviewSection tone="decisions" icon="?" title="Decisions made" items={r.decisions} />
       <ReviewSection tone="testing" icon="✚" title="Testing" items={r.testing} />
       <ReviewSection tone="followups" icon="→" title="Follow-ups" items={r.followups} />
     </div>
@@ -131,6 +165,7 @@ export function ReviewCard({
   const [showProse, setShowProse] = useState(false);
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
+  const [openDecisions, setOpenDecisions] = useState<Decision[]>([]);
   const lightbox = useLightbox();
 
   useEffect(() => {
@@ -162,6 +197,7 @@ export function ReviewCard({
         if (ev) setReview(ev.payload as ReviewSummary);
         setEvidence(t.evidence ?? []);
         setEvents(t.events ?? []);
+        setOpenDecisions((t.decisions ?? []).filter((d: Decision) => d.status === "open"));
       })
       .catch(() => {});
     return () => {
@@ -238,6 +274,13 @@ export function ReviewCard({
           <CiBadge status={task.ci_status} />
         </div>
       </div>
+
+      {/* Open decision cards are answerable RIGHT HERE — radios, not text. */}
+      {openDecisions.map((d) => (
+        <DecisionCard key={d.id} d={d} onDone={() => setOpenDecisions((ds) => ds.filter((x) => x.id !== d.id))} />
+      ))}
+
+      <ChangesThread events={events} />
 
       <CheckpointList events={events} />
 
