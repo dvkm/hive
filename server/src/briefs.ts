@@ -23,6 +23,9 @@ Don't hand-format it — run \`hive pr-marker ${id}\` and paste what it prints.`
 const EMIT_PROTOCOL = `## Reporting protocol (\`hive emit\`)
 You are running under hive. Report progress with the \`hive emit\` CLI so the
 director's board stays current. Do not wait to be asked for status.
+If \`hive\` is not on your PATH, run it as \`"$HIVE_CLI"\` (set in your env), e.g.
+\`"$HIVE_CLI" emit <task-id> status --note "..."\` — same for \`hive task create\`
+and \`hive pr-marker\`. Prefer the CLI over raw curl: it attributes what you do.
 
   hive emit <task-id> status   --note "what you just did / are doing"
   hive emit <task-id> evidence --file ./screenshot.png --note "caption"
