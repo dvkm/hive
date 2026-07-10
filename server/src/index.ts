@@ -9,6 +9,7 @@ import { startDigest, setNotifier } from "./notifications.ts";
 import { startGchatPoll } from "./intake/gchat.ts";
 import { startPromoter } from "./promoter.ts";
 import { setTerminalHook, expireOrphanedDecisions } from "./state.ts";
+import { bootstrapAuthority } from "./authority.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { defaultExec } from "./exec.ts";
@@ -17,6 +18,10 @@ const port = Number(process.env.HIVE_PORT || 4700);
 const dbPath = defaultDbPath();
 const db = openDb(dbPath);
 const handle = makeHandler(db, { supervise: true });
+
+// First-run bootstrap: make sure the standing safety rules exist. Idempotent.
+const seeded = bootstrapAuthority(db);
+if (seeded) console.log(`[hive] bootstrapped ${seeded} standing authority rule(s)`);
 
 // Backfill: expire any open decision whose task is already terminal (legacy
 // orphans predating transition-time expiry). Idempotent.

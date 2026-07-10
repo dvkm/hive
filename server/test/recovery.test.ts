@@ -18,7 +18,9 @@ const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
 const gh: Exec = async () => ({ code: 1, stdout: "", stderr: "no gh" }); // PR sync no-op
 
 // A herdr whose `agent get` verdict (dead|alive) is configurable; records sends.
-function herdrProbe(verdict: "dead" | "alive", status = "idle") {
+// `sendLost` reproduces the herdr quirk where `agent send` to a vanished agent
+// exits 0 with an agent_not_found body — the message never landed.
+function herdrProbe(verdict: "dead" | "alive", status = "idle", sendLost = false) {
   const sends: { target: string; message: string }[] = [];
   const exec: Exec = async (argv) => {
     if (argv.includes("get")) {
@@ -29,7 +31,7 @@ function herdrProbe(verdict: "dead" | "alive", status = "idle") {
     if (argv.includes("read")) return OK("... last 200 lines of the dead pane ...");
     if (argv.includes("send")) {
       sends.push({ target: argv[argv.indexOf("send") + 1], message: argv[argv.indexOf("send") + 2] });
-      return OK();
+      return sendLost ? OK('{"error":{"code":"agent_not_found","message":"gone"}}') : OK();
     }
     return OK();
   };
@@ -118,6 +120,34 @@ test("alive but silent → status nudge via herdr agent send", async () => {
   const nudge: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery_nudge'").get(id);
   expect(JSON.parse(nudge.payload).nudge).toBe(1);
   expect(getTask(db, id).state).toBe("in_progress"); // not failed yet
+});
+
+test("a lost nudge (exit 0 + agent_not_found) records delivered:false and doesn't count", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent: "a3b" });
+  putEvent(db, id, "status", { note: "working" });
+  putEvent(db, id, "stale", { silent_ms: 999 });
+  const { herdr } = herdrProbe("alive", "idle", true);
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  const nudge: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery_nudge'").get(id);
+  expect(JSON.parse(nudge.payload)).toMatchObject({ nudge: 1, delivered: false, error: "gone" });
+});
+
+test("undelivered nudges never trip the cap: three lost nudges still nudge, never fail", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent: "a4b" });
+  putEvent(db, id, "status", { note: "working" });
+  for (const n of [1, 2, 3]) putEvent(db, id, "recovery_nudge", { nudge: n, delivered: false });
+  putEvent(db, id, "stale", { silent_ms: 999 });
+  const { herdr, sends } = herdrProbe("alive", "idle", true);
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  expect(sends.length).toBe(1); // still trying, not escalating on nudges that never landed
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'recovery_card'").all(id).length).toBe(0);
 });
 
 test("silent past the nudge cap → fail + decision card", async () => {

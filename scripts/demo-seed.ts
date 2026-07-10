@@ -7,6 +7,7 @@ import { mkdirSync } from "node:fs";
 import { openDb, newId, now, evidenceDir } from "../server/src/db.ts";
 import { transition, writeEvent } from "../server/src/state.ts";
 import { createDecision } from "../server/src/api.ts";
+import { bootstrapAuthority } from "../server/src/authority.ts";
 
 // Two tiny 1x1 PNG placeholders (red, blue) so the evidence gallery renders.
 const PNG_RED =
@@ -171,6 +172,9 @@ transition(db, cancelled, "cancelled", { source: "director", reason: "Out of sco
 const scout = insertTask(projectId, "Research CDN options", "scout", "Compare Cloudflare vs Fastly for our traffic.");
 transition(db, scout, "in_progress", { source: "herdr" });
 addEvidence(scout, "report", "cdn-report.png", PNG_BLUE, "CDN comparison report");
+
+// ---- standing authority rules (same set the daemon bootstraps on boot) ----
+bootstrapAuthority(db);
 
 // ---- standalone monitor incidents (no task) — surface in Monitors + Feed ----
 addIncident(projectId, "homepage", "open", "expected status 200, got 503");

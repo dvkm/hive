@@ -214,6 +214,7 @@ export interface UsageTotals {
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
+  cache_write_tokens: number;
   total_tokens: number;
   cost_usd: number;
   calls: number;
@@ -227,6 +228,7 @@ export interface UsageRow {
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
+  cache_write_tokens: number;
   cost_usd: number | null;
   source: string;
 }
@@ -287,9 +289,14 @@ export interface Brief {
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
+  // A FormData body must set its own Content-Type: the browser adds the
+  // multipart boundary, which we cannot write by hand.
+  const isForm = init?.body instanceof FormData;
   const res = await fetch(BASE + path, {
     ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+    headers: isForm
+      ? init?.headers || {}
+      : { "Content-Type": "application/json", ...(init?.headers || {}) },
   });
   if (!res.ok) {
     let msg = res.statusText;
@@ -301,6 +308,16 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(msg);
   }
   return res.json() as Promise<T>;
+}
+
+// JSON when there's nothing to upload, multipart when there is. The server
+// accepts either on /send, POST /api/tasks and PUT /api/tasks/:id.
+function bodyFor(fields: Record<string, unknown>, files?: File[]): string | FormData {
+  if (!files?.length) return JSON.stringify(fields);
+  const fd = new FormData();
+  for (const [k, v] of Object.entries(fields)) if (v != null) fd.append(k, String(v));
+  for (const f of files) fd.append("files", f);
+  return fd;
 }
 
 // An open (un-acked) build-time checkpoint, as returned by GET /api/checkpoints.
@@ -345,22 +362,23 @@ export const api = {
     const qs = p.toString();
     return req<{ evidence: EvidenceRow[] }>(`/api/evidence${qs ? "?" + qs : ""}`);
   },
-  createTask: (b: { project_id: string; title: string; brief?: string; kind?: Kind }) =>
-    req<Task>(`/api/tasks`, { method: "POST", body: JSON.stringify(b) }),
+  createTask: (b: { project_id: string; title: string; brief?: string; kind?: Kind }, files?: File[]) =>
+    req<Task>(`/api/tasks`, { method: "POST", body: bodyFor(b, files) }),
   intake: (b: { project_id: string; text: string }) =>
     req<{ ok: boolean; task: Task }>(`/api/intake`, { method: "POST", body: JSON.stringify(b) }),
-  updateTask: (id: string, b: { title?: string; brief?: string }) =>
-    req<Task>(`/api/tasks/${id}`, { method: "PUT", body: JSON.stringify(b) }),
+  updateTask: (id: string, b: { title?: string; brief?: string }, files?: File[]) =>
+    req<Task>(`/api/tasks/${id}`, { method: "PUT", body: bodyFor(b, files) }),
   brief: (id: string) => req<{ task_id: string; brief: string }>(`/api/tasks/${id}/brief`),
   transition: (id: string, to: State, reason?: string) =>
     req<Task>(`/api/tasks/${id}/transition`, {
       method: "POST",
       body: JSON.stringify({ to, reason, source: "director" }),
     }),
-  send: (id: string, message: string) =>
-    req<{ ok: boolean; stubbed: boolean; message: string }>(`/api/tasks/${id}/send`, {
+  send: (id: string, message: string, files?: File[]) =>
+    // `attachments` is absent on the no-agent / herdr-error responses.
+    req<{ ok: boolean; delivered: boolean; delivery: "delivered" | "queued" | "failed"; message: string; attachments?: string[]; error?: string }>(`/api/tasks/${id}/send`, {
       method: "POST",
-      body: JSON.stringify({ message }),
+      body: bodyFor({ message }, files),
     }),
   plan: (id: string) =>
     req<{ ok: boolean; decision?: Decision; error?: string }>(`/api/tasks/${id}/plan`, {

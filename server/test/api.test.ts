@@ -231,9 +231,11 @@ test("evidence kind is inferred from the uploaded file's extension", async () =>
 
 test("task reaches done once evidence exists (verifying auto-advances: no smoke configured)", async () => {
   await post(`/api/tasks/${taskId}/transition`, { to: "in_review" });
-  const v = await post(`/api/tasks/${taskId}/transition`, { to: "verifying" });
-  expect(v.status).toBe(200);
-  expect(v.json.state).toBe("done");
+  // verifying with evidence attached and no smoke configured auto-advances
+  // straight to done (smokeThenAdvance) — no separate done transition needed.
+  const done = await post(`/api/tasks/${taskId}/transition`, { to: "verifying" });
+  expect(done.status).toBe(200);
+  expect(done.json.state).toBe("done");
 });
 
 test("decision: create, draft autosave, answer flow", async () => {

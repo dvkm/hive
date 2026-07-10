@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { rmSync } from "node:fs";
 import { openDb, newId, now, type DB } from "../src/db.ts";
-import { getTask } from "../src/state.ts";
+import { getTask, transition } from "../src/state.ts";
 import { linkPrIfMarked } from "../src/api.ts";
 import { reconcileOnce } from "../src/reconciler.ts";
 import { prTitlePrefix, prBodyFooter, prMarker, taskIdFromBody, taskNumberFromTitle } from "../src/marker.ts";
@@ -57,14 +57,14 @@ test("backfill assigns numbers to legacy rows in created_at order", () => {
     const db1 = openDb(path);
     const projectId = newId("proj");
     db1.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run(projectId, "p", "{}", now());
-    // 2) Rewind to the pre-number (v10) schema: drop the number column, its index
-    //    and the auto-assign trigger, so re-opening re-runs the real v11 backfill.
-    //    (v10 is duplicate_of, already applied — rewinding past it would re-add an
-    //    existing column, so target v10, not v9.)
+    // 2) Rewind to the pre-number schema: drop the number column, its index and
+    //    the auto-assign trigger, and un-apply v11 so re-opening re-runs the real
+    //    backfill. Name-keyed migrations mean only v11 replays — later ones stay
+    //    applied, so nothing else needs undoing.
     db1.exec("DROP TRIGGER tasks_assign_number");
     db1.exec("DROP INDEX idx_tasks_number");
     db1.exec("ALTER TABLE tasks DROP COLUMN number");
-    db1.exec("PRAGMA user_version = 10");
+    db1.exec("DELETE FROM schema_migrations WHERE name = 'v11-task-numbers'");
     // 3) Insert legacy rows OUT of created_at order.
     const mk = (id: string, created_at: string) =>
       db1.query("INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at) VALUES (?,?,?, 'queued','ship',?,?)")
@@ -132,6 +132,35 @@ test("linkPrIfMarked returns null when the PR carries no marker", () => {
   const { db, projectId } = freshDb();
   makeTask(db, projectId);
   expect(linkPrIfMarked(db, { title: "plain", body: "plain", url: "https://gh/pr/1" })).toBeNull();
+});
+
+// ---- PR open → in_review hand-off (makes Approve & merge reachable) ----
+
+test("linking a PR to an in-progress task hands it to the director's Review lane", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  transition(db, id, "in_progress", { source: "director" });
+  linkPrIfMarked(db, { title: "t", body: `hive-task: ${id}`, url: "https://gh/pr/9" });
+  expect(getTask(db, id).state).toBe("in_review"); // the only state POST /merge accepts
+});
+
+test("linking a PR does not transition a task that isn't in_progress", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId); // queued
+  linkPrIfMarked(db, { title: "t", body: `hive-task: ${id}`, url: "https://gh/pr/9" });
+  expect(getTask(db, id).state).toBe("queued");
+});
+
+test("reconciler backfills in_progress tasks whose PR is already open", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/6" }); // linked before the hand-off existed
+  transition(db, id, "in_progress", { source: "director" });
+  const gh: Exec = stub((argv) => {
+    if (argv.includes("view")) return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [] }));
+    return { code: 1, stdout: "", stderr: "skip" };
+  });
+  await reconcileOnce(db, { exec: gh });
+  expect(getTask(db, id).state).toBe("in_review");
 });
 
 // ---- reconciler linking with injected gh output ----

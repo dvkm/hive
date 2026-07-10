@@ -86,8 +86,17 @@ server/test/ bun test suite
 
 - **IDs**: tasks use a bare 12-char hex id (clean in `hive/<id>` branch names);
   other rows use short prefixed ids (`proj_`, `evt_`, `ev_`, `dec_`, `pol_`).
-- **Migrations**: an ordered SQL list tracked by `PRAGMA user_version`. Append a
-  block to migrate; never edit an applied one. (No down-migrations; not needed.)
+- **Migrations**: name-keyed, tracked in a `schema_migrations` table, one SQL
+  statement per array element. Append an entry with a fresh `name`; never rename
+  or edit an applied one. (No down-migrations; not needed.) Position-keyed
+  migrations were tried and lost a column: two branches each appended one, the
+  merge renumbered them, and `PRAGMA user_version` both skipped a migration and
+  re-ran a different one. Names survive a merge, and a statement is applied only
+  if the schema is missing what it would create, so a DB that drifted ahead of
+  the ledger heals on the next open instead of crashing. A DB with no ledger
+  re-runs every migration idempotently, which adopts the ledger and backfills
+  whatever the counter skipped. Anything that isn't a `CREATE`/`ALTER` (a
+  backfill `UPDATE`) re-runs on a heal, so write it to be a no-op once applied.
 - **State machine edges beyond the spec's linear chain**: `verifying → in_progress`
   is allowed so a failed post-merge smoke check can bounce a task back (spec's
   monitor section calls for exactly this). `needs_decision ⇄ in_progress` per spec.

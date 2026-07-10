@@ -7,6 +7,11 @@ must be built against this file. Server: `http://127.0.0.1:4700` (override
 - All request and response bodies are JSON unless noted (evidence upload is
   `multipart/form-data`; the SSE stream is `text/event-stream`; evidence files
   and the static web app are served raw).
+- **File attachments.** `POST /api/tasks`, `PUT /api/tasks/:id` and
+  `POST /api/tasks/:id/send` accept EITHER JSON or `multipart/form-data`. In the
+  multipart form, text fields carry the same names as the JSON keys and any
+  number of files may be sent under the field name `files`. See
+  [Attachments](#attachments).
 - Errors return `{"error": "<message>"}` with a non-2xx status:
   `400` bad input, `404` not found, `409` illegal state transition / already
   answered, `500` internal.
@@ -338,20 +343,24 @@ set on creation); normal ones are batched into a single digest every
   "input_tokens": 12000,
   "output_tokens": 3400,
   "cache_read_tokens": 88000,
+  "cache_write_tokens": 4200,
   "cost_usd": 0.0774,
   "source": "agent"
 }
 ```
-One row per reported LLM call. `input_tokens` folds in any cache-write tokens
-(the schema has no separate cache-write bucket); `cache_read_tokens` is cache-hit
-input. `source` tags the ingest path (`agent` via the `usage` event, `hook` from
+One row per reported LLM call. `input_tokens` is fresh (uncached) input;
+`cache_read_tokens` is cache-hit input and `cache_write_tokens` is input written
+to the cache. The three are priced differently — a cache read costs 0.1x fresh
+input and a cache write 1.25x — so they are never summed before pricing.
+`source` tags the ingest path (`agent` via the `usage` event, `hook` from
 the Stop-hook transcript reporter). `cost_usd` is computed server-side from the
 price table (`server/src/pricing.ts`, $/MTok per model family, overridable per
 project via `config.pricing`) when the caller doesn't supply it; it is **null**
 for an unpriced (unknown) model — ingestion is never blocked on an unknown model,
 and unpriced rows surface as `"unpriced"` in rollups. Analytics rollups expose
-`totals` shaped `{input_tokens, output_tokens, cache_read_tokens, total_tokens,
-cost_usd, calls, unpriced}` (summed cost counts priced rows only).
+`totals` shaped `{input_tokens, output_tokens, cache_read_tokens,
+cache_write_tokens, total_tokens, cost_usd, calls, unpriced}` (summed cost counts
+priced rows only).
 
 ---
 
@@ -375,16 +384,24 @@ cost_usd, calls, unpriced}` (summed cost counts priced rows only).
 
 ### Tasks
 - `GET /api/tasks?state=&project_id=` → `200 [Task, ...]` (newest `updated_at` first; both filters optional)
-- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban — never auto-dispatched, never staleness-supervised, exempt from the done-evidence gate, moved freely via transitions (`hive task move <id> <state>`); the board shows a `tracked` chip.
+- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban — never auto-dispatched, never staleness-supervised, exempt from the done-evidence gate, moved freely via transitions (`hive task move <id> <state>`); the board shows a `tracked` chip. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
 - `POST /api/tasks/:id/transition` body `{to (required), reason?, source?}` → `200 Task` | `409` (invalid transition or `done` without evidence) | `404`
   When `to` is `verifying`, the project's post-deploy smoke list (`config.smoke`) runs once before the response returns. A smoke failure bounces the task back to `in_progress`, so the returned Task may be `in_progress`, not `verifying`.
 - `POST /api/tasks/:id/spawn` body `{hive_url?}` → `200 {"ok":true, "task": Task, "agent_target":"..."}` | `400` (project has no `repo_path`) | `404` | `502` (herdr spawn failed; a `spawn_error` event is recorded)
   Creates the herdr worktree (`hive/<task-id>`), starts the agent with `HIVE_TASK_ID`/`HIVE_URL` + the project's resolved secrets in env and the composed brief, sets `agent_target`/`worktree_path`/`branch`, transitions `queued → in_progress`, and writes a `spawned` event.
-- `POST /api/tasks/:id/send` body `{message (required)}` → `200 {"ok":true, "delivered":true, "message":...}` | `404` | `400` (empty message)
-  Dispatches the message to the task's live agent via `herdr agent send`. Always records a `steer` event. Degrades gracefully: if the task has no `agent_target` or herdr fails, returns `200 {"ok":false, "delivered":false, "error":"..."}` (never throws) and records a `steer_error` event when herdr itself failed.
-- `PUT /api/tasks/:id` body `{title?, brief?}` → `200 Task` | `404`
+- `POST /api/tasks/:id/send` body `{message (required)}` (or multipart: `message` + `files`) → `200 {"ok", "delivered", "delivery", "message", "attachments":[abs paths], "error"?}` | `404` | `400` (empty message)
+  Dispatches the message to the task's live agent via `herdr agent send`, and always records one `steer` event (`payload: {message, target, attachments, delivery, ...}`) carrying a **delivery receipt**. Attached files are saved and their absolute paths appended to the delivered message under an `## Attachments` heading; because the paths live in the stored `message`, they ride along when a queued steer is redelivered. `delivery` is one of:
+  - `delivered` — herdr accepted it **and** the agent's pane took the submitting Enter (payload also gets `delivered_at`). Two silent drops count as failures, not deliveries: a send that exits 0 with an `{"error":{"code":"agent_not_found"}}` body, and a pane-less agent, whose composer would hold the text unsubmitted.
+  - `queued` — no `agent_target`, or herdr refused it twice (one automatic retry). The steer is **not dropped**; it is redelivered by whichever of these comes first, and the event's payload then flips to `delivered` with a `delivered_via` recording how:
+    - `delivered_via:"drain"` — the reconciler, on any cycle, finds a queued steer on a task whose agent still probes **alive** and re-sends it. This covers the common case of a herdr socket blip while the agent is alive and working: no respawn is coming, so waiting for one would strand the message until the task ended. Delivery is re-attempted every cycle until it lands; a dead agent is skipped (its steers wait for the next spawn), and a partial drain stops at the first failure so the remainder stay queued **in order**.
+    - `delivered_via:"respawn"` — the next `POST /spawn` of the task prepends every still-queued steer to the agent's brief under "## Steers waiting for you".
+  - `failed` — the task is terminal, so no spawn will ever carry it.
+
+  Never throws. A herdr failure additionally records a `steer_error` event. The timeline renders the receipt (`✓` / `⏳ queued` / `⚠ undelivered`) so a steer never has to be re-sent blind. Besides the respawn drain, the reconciler re-attempts every queued steer each cycle against any still-alive agent (receipt flips with `delivered_via:"drain"`); a successful drain writes no event of its own — the receipt flip is the record, and a fresh event would reset the task's silence clock and mask a mute agent from `stale` detection.
+- `PUT /api/tasks/:id` body `{title?, brief?}` (or multipart: same fields + `files`) → `200 Task` | `404`
+  Attached files are appended to the resulting `brief` under an `## Attachments` heading.
   Updates a task's editable fields. Used by the attention tray's "edit & requeue"
   flow before it re-queues a failed task.
 - `POST /api/tasks/:id/focus-agent` body `{}` → `200 {"ok":true, "focused":true, "target":"..."}` | `404`
@@ -574,7 +591,7 @@ recognized fields (JSON keys == form field names):
 | `caption` | evidence caption |
 | `url` | evidence URL (for link evidence, no file) |
 | `title`,`context`,`risk`,`blast_radius`,`options` | decision fields (needs-decision type; `options` is a JSON string in multipart) |
-| `model`,`input_tokens`,`output_tokens`,`cache_read_tokens`,`cost_usd` | usage fields (usage type; numbers, or numeric strings in multipart; `cost_usd` optional) |
+| `model`,`input_tokens`,`output_tokens`,`cache_read_tokens`,`cache_write_tokens`,`cost_usd` | usage fields (usage type; numbers, or numeric strings in multipart; `cost_usd` optional) |
 | `file` | (multipart only) the uploaded evidence file |
 
 Behavior by `type`:
@@ -596,6 +613,33 @@ Behavior by `type`:
 - `assistant_text` / `tool_use` / `agent_turn_end` → writes one event with the
   supplied `payload` preserved verbatim (the transcript hooks' path). → `201 {event: Event}`
 - `status` / `blocked` / custom → writes one event. → `201 {event: Event}`
+
+### Attachments
+
+Steer messages and task briefs can carry files (screenshots, mockups, a creds
+JSON). Send the request as `multipart/form-data` instead of JSON: text fields
+keep their JSON key names, and every file goes under the field name `files`
+(repeat it for several). A JSON body still works and attaches nothing.
+
+    curl -X POST "$HIVE_URL/api/tasks/$ID/send" \
+      -F 'message=match this mockup' -F 'files=@mockup.png' -F 'files=@notes.txt'
+
+    curl -X POST "$HIVE_URL/api/tasks" \
+      -F project_id=proj_x -F title='Rebuild the header' \
+      -F 'brief=match the design' -F 'files=@mockup.png'
+
+Files are stored under `$HIVE_HOME/evidence/<task_id>/` (name-collision safe).
+The **absolute path** of each is appended to the steer message / brief under an
+`## Attachments` heading, because agents read files off disk rather than over
+HTTP:
+
+    ## Attachments
+    These files are on disk; read them with the Read tool.
+    - /Users/me/.hive/evidence/tsk_abc/1720598400000_mockup.png
+
+Attachments deliberately do **not** create `Evidence` rows. Evidence gates the
+`done` transition, and a file the director attached as *input* is not proof of
+work. Use `POST /api/tasks/:id/events` with `type=evidence` for that.
 
 ### Analytics (cost/token)
 - `GET /api/analytics/summary?since=` → `200 {since, totals, by_model, by_project, top_tasks}`
@@ -685,13 +729,15 @@ same authority engine (`writeHookSettings` in `api.ts`; `hooks/classify.ts` +
    `"escalate"` (default) → guarded-action; `"allow"` → auto-approve; `"prompt"` →
    defer to Claude Code's normal dialog. Dangerous always escalates regardless.
 
-**Seeding for real gating**: the authority engine defaults unmatched actions to
-`allow` (log-only), so dangerous commands are *logged* but not *stopped* until a
-rule exists. Seed a standing rule to make them stop, e.g.
-`POST /api/authority/rules {"action_pattern":"command.dangerous*","effect":"require_decision","note":"destructive shell needs director sign-off"}`
-(or `"effect":"deny"` for a hard block). Because dangerous commands carry the
-distinct `command.dangerous` action, this gates them without touching ordinary
-`command` escalations.
+**Deny-safe by default**: the authority engine defaults unmatched actions to
+`allow` (log-only), *except* `command.dangerous*`, which requires a decision even
+with no rule in the DB — safety does not depend on seed state. The daemon also
+bootstraps the matching `command.dangerous* → require_decision` rule on first
+boot (idempotent), so it is visible and editable in the Authority UI. Override it
+like any other rule: `POST /api/authority/rules {"action_pattern":"command.dangerous*","effect":"deny"}`
+for a hard block, or `"effect":"allow"` to deliberately opt out. Because dangerous
+commands carry the distinct `command.dangerous` action, this gates them without
+touching ordinary `command` escalations.
 
 ### Incidents
 - `GET /api/incidents?status=` → `200 {"incidents": [Incident, ...]}` (newest first; `status` filter optional, e.g. `open` / `resolved`)
