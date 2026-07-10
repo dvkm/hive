@@ -296,6 +296,14 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       END`,
     ],
   },
+  // cache-write tokens get their own bucket. They were folded into input_tokens
+  // and billed at 1x input, but a cache write costs 1.25x. Pre-existing rows keep
+  // the fold-in (0 here); scripts/reprice-usage.ts recomputes their cost_usd
+  // against the corrected price table.
+  {
+    name: "v12-cache-write-tokens",
+    statements: [`ALTER TABLE usage ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0`],
+  },
 ];
 
 export type DB = Database;

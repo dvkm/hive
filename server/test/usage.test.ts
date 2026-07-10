@@ -45,11 +45,23 @@ beforeAll(async () => {
 test("pricing: cost math + unknown-model null path", () => {
   // 1M input + 1M output, sonnet: $3 + $15 = $18
   expect(costUsd("claude-sonnet-4-5", { input_tokens: 1e6, output_tokens: 1e6, cache_read_tokens: 0 })).toBeCloseTo(18, 6);
-  // opus cache-read: 1M * $1.5/MTok = $1.5
-  expect(costUsd("claude-opus-4-1", { input_tokens: 0, output_tokens: 0, cache_read_tokens: 1e6 })).toBeCloseTo(1.5, 6);
+  // opus cache-read is 0.1x input: 1M * $0.50/MTok
+  expect(costUsd("claude-opus-4-8", { input_tokens: 0, output_tokens: 0, cache_read_tokens: 1e6 })).toBeCloseTo(0.5, 6);
   // unknown model -> null (unpriced), never throws
   expect(priceFor("gpt-4o")).toBeNull();
   expect(costUsd("gpt-4o", { input_tokens: 1e6, output_tokens: 1e6, cache_read_tokens: 0 })).toBeNull();
+});
+
+test("pricing: cache tokens are not priced as fresh input", () => {
+  const M = 1e6;
+  const fresh = { input_tokens: M, output_tokens: 0, cache_read_tokens: 0 };
+  // cache read costs 0.1x fresh input; cache write costs 1.25x.
+  expect(costUsd("claude-opus-4-8", fresh)).toBeCloseTo(5, 6);
+  expect(costUsd("claude-opus-4-8", { ...fresh, input_tokens: 0, cache_read_tokens: M })).toBeCloseTo(0.5, 6);
+  expect(costUsd("claude-opus-4-8", { ...fresh, input_tokens: 0, cache_write_tokens: M })).toBeCloseTo(6.25, 6);
+  // an override that omits cache_write still gets the 1.25x default
+  const o = { mymodel: { input: 4, output: 8, cache_read: 0.4 } };
+  expect(costUsd("mymodel", { ...fresh, input_tokens: 0, cache_write_tokens: M }, o)).toBeCloseTo(5, 6);
 });
 
 test("usage ingestion (JSON): cost computed server-side", async () => {
@@ -77,8 +89,22 @@ test("usage ingestion (multipart): string fields coerced", async () => {
   expect(res.status).toBe(201);
   const j = await res.json();
   expect(j.usage.input_tokens).toBe(1_000_000);
-  expect(j.usage.cost_usd).toBeCloseTo(0.8, 6); // haiku input $0.80/MTok
+  expect(j.usage.cost_usd).toBeCloseTo(1, 6); // haiku input $1.00/MTok
   expect(j.usage.source).toBe("hook");
+});
+
+test("usage ingestion: cache_write_tokens round-trip + priced at 1.25x", async () => {
+  const r = await post(`/api/tasks/${taskId}/events`, {
+    type: "usage",
+    model: "claude-opus-4-8",
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 1_000_000,
+    cache_write_tokens: 1_000_000,
+  });
+  expect(r.status).toBe(201);
+  expect(r.json.usage.cache_write_tokens).toBe(1_000_000);
+  expect(r.json.usage.cost_usd).toBeCloseTo(0.5 + 6.25, 6);
 });
 
 test("usage ingestion: unknown model stores cost null (unpriced)", async () => {

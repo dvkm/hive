@@ -59,7 +59,8 @@ test("backfill assigns numbers to legacy rows in created_at order", () => {
     db1.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run(projectId, "p", "{}", now());
     // 2) Rewind to the pre-number schema: drop the number column, its index and
     //    the auto-assign trigger, and un-apply v11 so re-opening re-runs the real
-    //    backfill.
+    //    backfill. Name-keyed migrations mean only v11 replays — later ones stay
+    //    applied, so nothing else needs undoing.
     db1.exec("DROP TRIGGER tasks_assign_number");
     db1.exec("DROP INDEX idx_tasks_number");
     db1.exec("ALTER TABLE tasks DROP COLUMN number");
