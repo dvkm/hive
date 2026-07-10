@@ -37,6 +37,8 @@ Usage:
   hive secret list --project <id>
   hive secret rm --project <id> --name <n>
   hive open                               open the board in a browser
+  hive app                                open the board as a chromeless app window
+        (permanent dock app: Safari > File > Add to Dock, or Chrome > Install hive)
 
 Env: HIVE_URL, HIVE_PORT, HIVE_DB, BW_SESSION`;
 
@@ -405,6 +407,22 @@ async function main() {
     const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
     Bun.spawn([opener, url]);
     console.log(`opening ${url}`);
+    return;
+  }
+
+  // Chromeless app window onto the board (Chrome --app). For a permanent dock
+  // app instead: Safari > File > Add to Dock, or Chrome > Install hive (the
+  // web app ships a PWA manifest + icons, so both install it properly).
+  if (cmd === "app") {
+    const url = BASE + "/";
+    const chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    try {
+      Bun.spawn([chrome, `--app=${url}`], { stdout: "ignore", stderr: "ignore" });
+      console.log(`hive app window on ${url}`);
+    } catch {
+      Bun.spawn(["open", url]);
+      console.log(`Chrome not found — opened ${url} in the default browser`);
+    }
     return;
   }
 

@@ -1,0 +1,13 @@
+{
+  "name": "hive",
+  "short_name": "hive",
+  "description": "Local-first orchestration control plane",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1c1c1e",
+  "theme_color": "#1c1c1e",
+  "icons": [
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
