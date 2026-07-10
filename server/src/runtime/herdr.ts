@@ -460,18 +460,27 @@ export class Herdr {
 
   // Steer an agent: write the text, then submit it with an explicit Enter to the
   // agent's pane (agent send alone leaves the text unsubmitted in the composer).
+  //
+  // The Enter is part of delivery, not a nicety: text parked in a composer was
+  // never received. A pane-less agent (herdr's own signal for "dead", see
+  // parseAgentProbe) or a failed send-keys therefore comes back as a FAILURE, so
+  // callers queue the message instead of reporting it delivered.
   async send(target: string, message: string): Promise<ExecResult> {
     const sent = await this.run(agentSendArgv(target, message));
+    if (sendFailure(sent)) return sent;
     try {
       const got = await this.run(agentGetArgv(target));
       const paneId = parsePaneId(got.stdout);
-      if (paneId) await this.run(paneSendKeysArgv(paneId, "Enter"));
-    } catch {
-      // Text landed; a swallowed/failed Enter leaves the agent idle, which the
-      // reconciler surfaces as a stalled task rather than a silent drop.
-      // ponytail: single Enter, no verify-and-retry. Add a composer-state read +
-      // Enter-retry (firstmate's fm-send pattern) if swallowed-Enter recurs.
+      if (!paneId)
+        return { code: 1, stdout: got.stdout, stderr: "agent has no pane; steer left unsubmitted" };
+      const key = await this.run(paneSendKeysArgv(paneId, "Enter"));
+      if (key.code !== 0)
+        return { code: 1, stdout: key.stdout, stderr: key.stderr.trim() || "send-keys Enter failed" };
+    } catch (e: any) {
+      return { code: 1, stdout: "", stderr: `submit failed: ${String(e?.message ?? e)}` };
     }
+    // ponytail: single Enter, no composer-state verify. Add a read-back +
+    // Enter-retry (firstmate's fm-send pattern) if swallowed-Enter recurs.
     return sent;
   }
 

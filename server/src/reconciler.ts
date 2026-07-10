@@ -13,6 +13,7 @@ import { now, newId, evidenceDir } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
+import { queuedSteers, markSteersDelivered } from "./steer.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
@@ -32,7 +33,7 @@ export interface ReconcilerDeps {
   herdr?: Herdr;
   exec?: Exec; // for `gh`
   staleMs?: number; // default 15m
-  smoke?: MonitorDeps; // deps for runSmoke on merge->verifying
+  smoke?: MonitorDeps; // deps for smokeThenAdvance on merge->verifying
   nowMs?: () => number; // injectable clock (tests)
 }
 
@@ -51,6 +52,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
     await syncAgents(db, deps);
   } catch (e) {
     fail("syncAgents", e);
+  }
+  try {
+    await drainSteers(db, deps);
+  } catch (e) {
+    fail("drainSteers", e);
   }
   try {
     await advanceFinished(db, deps);
@@ -108,6 +114,54 @@ function lastAgentStatus(db: DB, taskId: string): string | null {
     return JSON.parse(r.payload).status ?? null;
   } catch {
     return null;
+  }
+}
+
+// ---- queued-steer drain ----
+// A steer herdr refuses is queued rather than dropped (steer.ts), but until this
+// it was drained ONLY at spawn time. So a socket blip while the agent was alive
+// and working queued the message and then never redelivered it: no respawn was
+// coming, and it sat there until the task ended. Every cycle, re-attempt any
+// queued steer against an agent that still probes alive.
+//
+// Cheap: the queued-steer read is checked BEFORE any probe, so the ordinary case
+// (nothing queued) costs one small query per agent-bearing task and zero herdr
+// calls. Idempotent: a steer stays queued until a send actually lands, so a
+// failure here simply retries next cycle — or rides the next respawn.
+//
+// Deliberately writes no event of its own. The `steer` event's own receipt
+// flipping to delivered IS the record, and a fresh event here would reset the
+// task's silence clock (flagStale reads the newest event), masking a mute agent.
+async function drainSteers(db: DB, deps: ReconcilerDeps): Promise<void> {
+  const h = deps.herdr ?? defaultHerdr;
+  const tasks = db
+    .query(`SELECT id, agent_target FROM tasks WHERE agent_target IS NOT NULL AND state IN ${NON_TERMINAL}`)
+    .all() as { id: string; agent_target: string }[];
+  for (const t of tasks) {
+    const pending = queuedSteers(db, t.id);
+    if (!pending.length) continue; // the common case: no probe, no herdr call
+    // Dead agent → leave them queued; the next spawn's brief carries them. A herdr
+    // hiccup reads as alive+unknown (parseAgentProbe), so the send below is what
+    // actually decides, and it fails safe.
+    if (!(await h.probe(t.agent_target)).alive) continue;
+
+    const delivered: string[] = [];
+    for (const s of pending) {
+      // sendFailure, never the exit code: herdr exits 0 with an agent_not_found
+      // body, which is exactly how a steer disappears without a trace.
+      let failure: string | null;
+      try {
+        failure = sendFailure(await h.send(t.agent_target, s.message));
+      } catch (e: any) {
+        failure = String(e?.message ?? e);
+      }
+      // Stop at the first failure rather than skipping it: the agent went away
+      // mid-drain, and the remaining steers must stay queued IN ORDER so the
+      // respawn brief replays them as the director wrote them.
+      if (failure) break;
+      delivered.push(s.id);
+    }
+    markSteersDelivered(db, delivered, "drain");
   }
 }
 

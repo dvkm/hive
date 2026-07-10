@@ -19,6 +19,9 @@ const sent: string[] = [];
 const exec = async (argv: string[]): Promise<ExecResult> => {
   const i = argv.indexOf("send");
   if (i !== -1 && argv[i + 2] !== undefined) sent.push(argv[i + 2]);
+  // A live agent has a pane; herdr.send() reads it to submit the Enter. Without
+  // this the pane-less path treats every steer as undelivered (delivery receipts).
+  if (argv.includes("get")) return { code: 0, stdout: '{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}', stderr: "" };
   return { code: 0, stdout: "", stderr: "" };
 };
 

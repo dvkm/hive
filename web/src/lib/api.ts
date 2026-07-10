@@ -357,8 +357,8 @@ export const api = {
       body: JSON.stringify({ to, reason, source: "director" }),
     }),
   send: (id: string, message: string, files?: File[]) =>
-    req<{ ok: boolean; stubbed: boolean; message: string; attachments?: string[] }>(`/api/tasks/${id}/send`, {
-      // `attachments` is absent on the no-agent / herdr-error responses.
+    // `attachments` is absent on the no-agent / herdr-error responses.
+    req<{ ok: boolean; delivered: boolean; delivery: "delivered" | "queued" | "failed"; message: string; attachments?: string[]; error?: string }>(`/api/tasks/${id}/send`, {
       method: "POST",
       body: bodyFor({ message }, files),
     }),
