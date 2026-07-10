@@ -310,6 +310,7 @@ export interface Checkpoint {
   ts: string;
   task_number: number;
   task_title: string;
+  task_state: string;
   project_id: string;
   note: string;
 }
@@ -317,7 +318,7 @@ export interface Checkpoint {
 export const api = {
   checkpoints: () => req<{ checkpoints: Checkpoint[] }>(`/api/checkpoints`),
   ackCheckpoint: (taskId: string, eventId: string, verdict: "ok" | "flag", note?: string) =>
-    req<{ ok: boolean; delivered: boolean }>(`/api/tasks/${taskId}/checkpoints/${eventId}/ack`, {
+    req<{ ok: boolean; delivered: boolean; followup_task_id: string | null }>(`/api/tasks/${taskId}/checkpoints/${eventId}/ack`, {
       method: "POST",
       body: JSON.stringify({ verdict, note }),
     }),

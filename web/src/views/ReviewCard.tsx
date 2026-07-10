@@ -7,6 +7,8 @@ import { CiBadge, toast } from "../lib/ui";
 import { MAX_DIFF_LINES } from "../lib/api";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
+import { CheckpointList } from "./Checkpoints";
+import type { Event } from "../lib/api";
 
 // The agent's structured self-review (latest review_summary event payload).
 // Sections are all optional; strings or {what, why} objects for iffy.
@@ -128,6 +130,7 @@ export function ReviewCard({
   const [review, setReview] = useState<ReviewSummary | null>(null);
   const [showProse, setShowProse] = useState(false);
   const [evidence, setEvidence] = useState<Evidence[]>([]);
+  const [events, setEvents] = useState<Event[]>([]);
   const lightbox = useLightbox();
 
   useEffect(() => {
@@ -158,6 +161,7 @@ export function ReviewCard({
           );
         if (ev) setReview(ev.payload as ReviewSummary);
         setEvidence(t.evidence ?? []);
+        setEvents(t.events ?? []);
       })
       .catch(() => {});
     return () => {
@@ -234,6 +238,8 @@ export function ReviewCard({
           <CiBadge status={task.ci_status} />
         </div>
       </div>
+
+      <CheckpointList events={events} />
 
       {review ? (
         <>

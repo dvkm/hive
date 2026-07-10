@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import type { Task, Decision, Project, Notification, Event, Evidence, Incident } from "./api";
+import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Checkpoint } from "./api";
 
 export type SseState = "connecting" | "open" | "reconnecting";
 
@@ -17,6 +17,8 @@ interface Store {
   rev: Record<string, number>; // bumps when a task is touched (task pages refetch on change)
   feedEvents: Event[]; // live events for the activity feed, newest first (capped)
   evidenceMeta: Record<string, { url: string | null; kind: Evidence["kind"] }>; // by evidence id, for live feed thumbnails
+  checkpoints: Checkpoint[]; // open (un-acked) build-time checkpoints, all tasks
+  reloadCheckpoints: () => void;
   sse: SseState;
 }
 
@@ -47,6 +49,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const bump = (id: string) => setRev((r) => ({ ...r, [id]: (r[id] || 0) + 1 }));
   const reloadProjects = () => api.projects().then(setProjects).catch(() => setProjects([]));
+  const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
+  const reloadCheckpoints = () => api.checkpoints().then((r) => setCheckpoints(r.checkpoints)).catch(() => {});
 
   // Initial load.
   useEffect(() => {
@@ -63,6 +67,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       );
     });
     api.decisions("open").then(setDecisions);
+    reloadCheckpoints();
     reloadProjects();
     api.notifications().then((n) => setNotifications(n.notifications)).catch(() => setNotifications([]));
   }, []);
@@ -107,6 +112,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           setFeedEvents((prev) => [ev, ...prev].slice(0, FEED_CAP));
           if (ev.type === "spawn_error") setSpawnError((s) => ({ ...s, [ev.task_id]: true }));
           else if (ev.type === "spawned") setSpawnError((s) => ({ ...s, [ev.task_id]: false }));
+          // Live checkbox list: any checkpoint activity refreshes the open set.
+          if (ev.type === "checkpoint" || ev.type === "checkpoint_ack")
+            api.checkpoints().then((r) => setCheckpoints(r.checkpoints)).catch(() => {});
           bump(ev.task_id);
         } else if (msg.type === "evidence") {
           const evi: Evidence = msg.evidence;
@@ -153,7 +161,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, sse }}>
+    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, sse }}>
       {children}
     </Ctx.Provider>
   );

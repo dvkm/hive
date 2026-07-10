@@ -3444,3 +3444,26 @@ a {
 }
 .rev-ev-chip:hover { background: color-mix(in srgb, currentColor 6%, transparent); }
 .rev-ev-cap { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- checkpoint inbox groups ---- */
+.cp-group { margin: 10px 0 4px; }
+.cp-group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 8px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--border, #3333);
+}
+.cp-approve-all {
+  margin-left: auto;
+  border: 1px solid #2da44e66;
+  border-radius: 6px;
+  background: none;
+  color: #2da44e;
+  font-size: 12px;
+  padding: 1px 9px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.cp-approve-all:hover { background: #2da44e1a; }
