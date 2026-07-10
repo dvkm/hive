@@ -82,7 +82,6 @@ test("argv builders construct the documented herdr commands", () => {
   expect(agentReadArgv("t1")).toEqual(["agent", "read", "t1", "--source", "recent", "--lines", "200"]);
   expect(agentWaitArgv("t1", "idle", 5000)).toEqual(["agent", "wait", "t1", "--status", "idle", "--timeout", "5000"]);
   expect(worktreeRemoveArgv({ workspaceId: "w1" })).toEqual(["worktree", "remove", "--workspace", "w1", "--force", "--json"]);
-  expect(worktreeRemoveArgv({ worktreePath: "/wt" })).toEqual(["worktree", "remove", "--cwd", "/wt", "--force", "--json"]);
 
   expect(fleetLabel("abc123", "Add dark mode toggle")).toBe("abc123 Add dark mode toggle");
 });

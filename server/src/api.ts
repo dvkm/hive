@@ -1036,12 +1036,16 @@ async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: Hand
 
   // Best-effort worktree teardown now the branch is merged. Never fails the
   // request — a leftover worktree is a cleanup nuisance, not a merge failure.
+  // cleanupWorktree (git-based, WIP-preserving), NOT teardown: a merged task's
+  // worktree has no herdr workspace id, and `herdr worktree remove` only
+  // addresses workspaces ("unknown option: --cwd", seen live 2026-07-10).
   if (task.worktree_path && task.branch && project?.repo_path) {
     try {
-      await herdr.teardown({
+      await herdr.cleanupWorktree({
         repoPath: project.repo_path,
         branch: task.branch,
         worktreePath: task.worktree_path,
+        taskId: id,
         defaultBranch: base,
       });
     } catch (e) {

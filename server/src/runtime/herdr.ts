@@ -205,12 +205,11 @@ export function parseWorktreeList(porcelain: string): { path: string; branch: st
   return out;
 }
 
-export function worktreeRemoveArgv(ref: { workspaceId?: string | null; worktreePath?: string }): string[] {
-  const a = ["worktree", "remove"];
-  if (ref.workspaceId) a.push("--workspace", ref.workspaceId);
-  else if (ref.worktreePath) a.push("--cwd", ref.worktreePath);
-  a.push("--force", "--json");
-  return a;
+// herdr worktree remove addresses WORKSPACES only (`--cwd` is not a valid
+// flag here, verified against herdr 0.7.1). Workspace-less removal goes
+// through git — see cleanupWorktree.
+export function worktreeRemoveArgv(ref: { workspaceId: string }): string[] {
+  return ["worktree", "remove", "--workspace", ref.workspaceId, "--force", "--json"];
 }
 
 // Close a whole tab (the one labelled tab per task): takes its pane and the
@@ -578,18 +577,18 @@ export class Herdr {
 
   // Teardown: remove the worktree only after the branch is pushed or merged.
   // Verify with git; refuse (removed:false) otherwise. Never destroys work.
+  // Requires a live herdr workspace id; for merged/finished tasks (workspace
+  // usually gone) use cleanupWorktree, which removes via git.
   async teardown(args: {
     repoPath: string;
     branch: string;
     worktreePath: string;
-    workspaceId?: string | null;
+    workspaceId: string;
     defaultBranch?: string;
   }): Promise<{ removed: boolean; reason: string }> {
     const safe = await this.branchIsSafe(args.repoPath, args.branch, args.defaultBranch ?? "main");
     if (!safe.safe) return { removed: false, reason: safe.reason };
-    const r = await this.run(
-      worktreeRemoveArgv({ workspaceId: args.workspaceId, worktreePath: args.worktreePath })
-    );
+    const r = await this.run(worktreeRemoveArgv({ workspaceId: args.workspaceId }));
     if (r.code !== 0)
       throw new HerdrError(`worktree remove failed: ${r.stderr.trim() || r.stdout.trim()}`);
     return { removed: true, reason: safe.reason };
