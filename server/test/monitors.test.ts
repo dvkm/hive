@@ -109,3 +109,48 @@ test("no smoke config is a no-op", async () => {
   const r = await runSmoke(db, id);
   expect(r).toEqual({ ran: false, passed: false });
 });
+
+test("smokeThenAdvance: passing smoke (or none configured) auto-advances verifying -> done; missing evidence blocks", async () => {
+  const { smokeThenAdvance } = await import("../src/monitors.ts");
+  const evFor = (db: DB, id: string) =>
+    db.query("INSERT INTO evidence (id, task_id, ts, kind, caption, meta) VALUES (?,?,?,?,?,'{}')")
+      .run(newId("ev"), id, now(), "log", "proof");
+
+  // no smoke configured + evidence present -> done
+  {
+    const { db, projectId } = freshDb({});
+    const id = makeTask(db, projectId);
+    transition(db, id, "in_progress"); transition(db, id, "in_review"); transition(db, id, "verifying");
+    evFor(db, id);
+    await smokeThenAdvance(db, id);
+    expect(getTask(db, id).state).toBe("done");
+  }
+  // passing smoke + evidence -> done
+  {
+    const smoke = [{ name: "h", url: "u", expect_status: 200 }];
+    const { db, projectId } = freshDb({ smoke });
+    const id = makeTask(db, projectId);
+    transition(db, id, "in_progress"); transition(db, id, "in_review"); transition(db, id, "verifying");
+    evFor(db, id);
+    await smokeThenAdvance(db, id, { fetch: async () => ({ status: 200, body: "" }) });
+    expect(getTask(db, id).state).toBe("done");
+  }
+  // failing smoke -> bounced to in_progress (unchanged behavior)
+  {
+    const smoke = [{ name: "h", url: "u", expect_status: 200 }];
+    const { db, projectId } = freshDb({ smoke });
+    const id = makeTask(db, projectId);
+    transition(db, id, "in_progress"); transition(db, id, "in_review"); transition(db, id, "verifying");
+    evFor(db, id);
+    await smokeThenAdvance(db, id, { fetch: async () => ({ status: 500, body: "" }) });
+    expect(getTask(db, id).state).toBe("in_progress");
+  }
+  // no evidence -> stays verifying (done gate holds)
+  {
+    const { db, projectId } = freshDb({});
+    const id = makeTask(db, projectId);
+    transition(db, id, "in_progress"); transition(db, id, "in_review"); transition(db, id, "verifying");
+    await smokeThenAdvance(db, id);
+    expect(getTask(db, id).state).toBe("verifying");
+  }
+});
