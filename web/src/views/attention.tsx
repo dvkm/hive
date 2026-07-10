@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
 import type { Task } from "../lib/api";
-import { HEALTH_LABEL, StatusDot, toast } from "../lib/ui";
+import { Attach, HEALTH_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 
 // Attention-tray eligibility — mirrors the server's needsAttention() rule.
@@ -99,12 +99,13 @@ export function UnhealthyRow({ task }: { task: Task }) {
 export function EditRequeueModal({ task, onClose }: { task: Task; onClose: () => void }) {
   const [title, setTitle] = useState(task.title);
   const [brief, setBrief] = useState(task.brief || "");
+  const [files, setFiles] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
   const submit = async () => {
     if (!title.trim() || busy) return;
     setBusy(true);
     try {
-      await api.updateTask(task.id, { title: title.trim(), brief });
+      await api.updateTask(task.id, { title: title.trim(), brief }, files);
       await api.transition(task.id, "queued", "edited & requeued");
       toast("Edited & re-queued");
       onClose();
@@ -121,10 +122,12 @@ export function EditRequeueModal({ task, onClose }: { task: Task; onClose: () =>
           <span>Title</span>
           <input autoFocus value={title} onChange={(e) => setTitle(e.target.value)} />
         </label>
-        <label className="fld">
-          <span>Brief</span>
-          <textarea value={brief} onChange={(e) => setBrief(e.target.value)} />
-        </label>
+        <Attach files={files} onChange={setFiles}>
+          <label className="fld">
+            <span>Brief</span>
+            <textarea value={brief} onChange={(e) => setBrief(e.target.value)} />
+          </label>
+        </Attach>
         <div className="modal-foot">
           <span className="muted modal-hint">Saves the brief, then re-queues</span>
           <div className="spacer" />

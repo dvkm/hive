@@ -1,7 +1,7 @@
 // HTTP routing for hive. Plain Bun.serve routing by hand (zero deps).
 // The exact request/response contract lives in docs/API.md.
 import { dirname, join, normalize } from "node:path";
-import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir } from "./db.ts";
 import { taskWithHealth, broadcastTask, needsAttention } from "./health.ts";
@@ -13,6 +13,7 @@ import {
   canTransition,
   TransitionError,
   TERMINAL,
+  advanceIfFinished,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
@@ -143,7 +144,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // ---- tasks ----
       if (pathname === "/api/tasks") {
         if (method === "GET") return listTasks(db, url);
-        if (method === "POST") return createTask(db, await req.json());
+        if (method === "POST") return await createTask(db, req);
       }
       // Duplicate CLUSTERS among current non-terminal tasks (backfill/UI). Must
       // precede the /:id route so "duplicates" isn't parsed as a task id.
@@ -153,7 +154,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (m && method === "POST") return mergeIntoEndpoint(db, m[1], await req.json());
       m = pathname.match(/^\/api\/tasks\/([^/]+)$/);
       if (m && method === "GET") return getTaskFull(db, m[1]);
-      if (m && method === "PUT") return updateTask(db, m[1], await req.json());
+      if (m && method === "PUT") return await updateTask(db, m[1], req);
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/events$/);
       if (m) {
@@ -173,7 +174,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         return await spawnTask(db, herdr, m[1], await safeJson(req), deps);
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/send$/);
-      if (m && method === "POST") return await sendSteer(db, herdr, m[1], await req.json());
+      if (m && method === "POST") return await sendSteer(db, herdr, m[1], req);
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/focus-agent$/);
       if (m && method === "POST") return await focusAgent(db, herdr, m[1]);
@@ -378,19 +379,33 @@ function intake(db: DB, body: any, deps: HandlerDeps): Response {
 }
 
 // ---------------------------------------------------------------- tasks
-function createTask(db: DB, body: any): Response {
+// Accepts JSON or multipart; attached files are saved under the new task's id
+// and their absolute paths appended to the brief, so the agent that picks the
+// task up can read them.
+async function createTask(db: DB, req: Request): Promise<Response> {
+  const { fields: body, files } = await bodyWithFiles(req);
   if (!body?.project_id) return err("project_id is required");
   if (!body?.title) return err("title is required");
   if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(body.project_id))
     return err("unknown project_id", 400);
   const kind = body.kind ?? "ship";
   if (!["ship", "scout", "chore"].includes(kind)) return err("invalid kind");
+  // Agents may create follow-up tasks (source="agent", parent_task_id → the
+  // spawning task); the dispatcher treats them like director-created tasks.
+  const parent = body.parent_task_id ? String(body.parent_task_id) : null;
+  if (parent && !db.query("SELECT 1 FROM tasks WHERE id = ?").get(parent))
+    return err("unknown parent_task_id", 400);
   const t = now();
+  // Id first: attachments are stored under it, and the brief they extend is
+  // written in the INSERT below (and read by duplicate detection).
+  const id = newId();
+  const { block } = await attachFiles(id, files);
+  const brief = ((body.brief ?? "") + block).trim();
   const row = {
-    id: newId(),
+    id,
     project_id: body.project_id,
     title: String(body.title),
-    brief: body.brief ?? null,
+    brief: brief || null,
     state: "queued",
     kind,
     agent_target: body.agent_target ?? null,
@@ -399,20 +414,26 @@ function createTask(db: DB, body: any): Response {
     pr_url: null,
     ci_status: null,
     summary: null,
-    source: null,
+    source: body.source ? String(body.source) : null,
+    parent_task_id: parent,
     created_at: t,
     updated_at: t,
   };
   db.query(
     `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
-      worktree_path, branch, pr_url, ci_status, summary, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.project_id, row.title, row.brief, row.state, row.kind,
     row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
-    row.summary, row.created_at, row.updated_at
+    row.summary, row.source, row.parent_task_id, row.created_at, row.updated_at
   );
-  writeEvent(db, { task_id: row.id, source: "director", type: "created", payload: { title: row.title } });
+  writeEvent(db, {
+    task_id: row.id,
+    source: row.source === "agent" ? "agent" : "director",
+    type: "created",
+    payload: { title: row.title, ...(parent ? { parent_task_id: parent } : {}) },
+  });
   // Re-read so the assigned `number` (set by the DB trigger) rides on the
   // returned task and the broadcast payload.
   const created = getTask(db, row.id);
@@ -500,11 +521,18 @@ async function linkPrEndpoint(db: DB, body: any, deps: HandlerDeps): Promise<Res
 
 // Update a task's editable fields (title / brief). Used by the attention tray's
 // "edit & requeue" flow before it re-queues a failed task.
-function updateTask(db: DB, id: string, body: any): Response {
+// Accepts JSON or multipart; attached files are appended to the brief the same
+// way task creation does.
+async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
+  const { fields: body, files } = await bodyWithFiles(req);
   const title = body?.title != null ? String(body.title) : task.title;
-  const brief = body?.brief != null ? String(body.brief) : task.brief;
+  const { block } = await attachFiles(id, files);
+  // `base` stays null when the caller sent no brief and the task had none, so a
+  // title-only PUT does not turn a NULL brief into "".
+  const base = body?.brief != null ? String(body.brief) : task.brief;
+  const brief = block ? (base ?? "") + block : base;
   db.query("UPDATE tasks SET title = ?, brief = ?, updated_at = ? WHERE id = ?").run(title, brief, now(), id);
   const updated = getTask(db, id);
   broadcastTask(db, updated);
@@ -1165,10 +1193,19 @@ export async function spawnAgent(
   return { ok: true, agent_target: result.agent_target };
 }
 
-// Re-arming supervised wait loop. Each completed wait re-arms; on error the
-// reconciler's polling is the safety net. Started only in production wiring.
-async function superviseAgent(db: DB, herdr: Herdr, taskId: string, target: string): Promise<void> {
+// Re-arming supervised wait loop: the herdr PUSH channel for "the agent is
+// done". It never relies on anything the agent emits — herdr's own idle signal
+// drives the in_progress → in_review handoff (advanceIfFinished, same logic as
+// the reconciler's poll backstop). A wait timeout re-arms while the agent is
+// alive, so supervision covers tasks longer than one wait window; the loop ends
+// on handoff, death, or a herdr error, and the reconciler's polling is the
+// safety net for everything after. Started only in production wiring; exported
+// for tests.
+export async function superviseAgent(db: DB, herdr: Herdr, taskId: string, target: string): Promise<void> {
   const WAIT_MS = 5 * 60 * 1000;
+  // Idle with nothing to hand off yet (no PR): `wait --status idle` returns
+  // immediately while the agent stays idle, so a bare re-arm would busy-spin.
+  const IDLE_RECHECK_MS = 15_000;
   // ponytail: sequential loop, one agent per task; fine for a localhost tool.
   while (true) {
     const task = getTask(db, taskId);
@@ -1180,7 +1217,13 @@ async function superviseAgent(db: DB, herdr: Herdr, taskId: string, target: stri
       writeEvent(db, { task_id: taskId, source: "herdr", type: "supervise_error", payload: { error: String((e as any)?.message ?? e) } });
       return; // reconciler takes over
     }
-    if (res.code !== 0) return; // timeout / not found: fall back to reconciler polling
+    if (res.code !== 0) {
+      // Timeout (agent still working) or a vanished agent. Re-arm while alive;
+      // a dead agent is the reconciler recovery's job, not ours.
+      const { alive } = await herdr.probe(target);
+      if (!alive) return;
+      continue;
+    }
     const status = await herdr.status(target);
     if (status !== "unknown") {
       const last = db
@@ -1189,21 +1232,30 @@ async function superviseAgent(db: DB, herdr: Herdr, taskId: string, target: stri
       const prev = last ? (JSON.parse(last.payload).status ?? null) : null;
       if (status !== prev)
         writeEvent(db, { task_id: taskId, source: "herdr", type: "agent_status", payload: { status } });
+      // The push-signal payoff: hand off to review the moment herdr says idle,
+      // instead of waiting out the next reconciler cycle.
+      if (advanceIfFinished(db, taskId, status, "herdr")) return; // handed off; done supervising
     }
+    await new Promise((r) => setTimeout(r, IDLE_RECHECK_MS));
   }
 }
 
 // Steer a live agent via `herdr agent send`. Degrades gracefully: the event is
 // always recorded; a herdr failure is surfaced in the response, never thrown.
-async function sendSteer(db: DB, herdr: Herdr, id: string, body: any): Promise<Response> {
+// Accepts JSON or multipart; attached files are saved and their absolute paths
+// appended to the message the agent receives.
+async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
-  const message = String(body?.message ?? "");
-  if (!message) return err("message is required");
+  const { fields, files } = await bodyWithFiles(req);
+  const text = String(fields?.message ?? "");
+  if (!text) return err("message is required");
   const blocked = authzBlock(db, { project_id: task.project_id, action: "task.steer", target: task.title, task_id: id });
   if (blocked) return blocked;
+  const { paths, block } = await attachFiles(id, files);
+  const message = text + block;
   const target = task.agent_target;
-  writeEvent(db, { task_id: id, source: "director", type: "steer", payload: { message, target } });
+  writeEvent(db, { task_id: id, source: "director", type: "steer", payload: { message, target, attachments: paths } });
 
   if (!target) return json({ ok: false, delivered: false, error: "task has no agent_target (not spawned)" });
   try {
@@ -1213,7 +1265,7 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, body: any): Promise<R
       writeEvent(db, { task_id: id, source: "herdr", type: "steer_error", payload: { error } });
       return json({ ok: false, delivered: false, error });
     }
-    return json({ ok: true, delivered: true, message });
+    return json({ ok: true, delivered: true, message, attachments: paths });
   } catch (e: any) {
     const error = String(e?.message ?? e);
     writeEvent(db, { task_id: id, source: "herdr", type: "steer_error", payload: { error } });
@@ -1555,6 +1607,51 @@ async function safeJson(req: Request): Promise<any> {
   }
 }
 
+// ---------------------------------------------------------------- uploads
+// Store an uploaded file under HIVE_HOME evidence storage, namespaced by task.
+// Shared by evidence uploads and by steer/brief attachments. The timestamp
+// prefix is not unique on its own — a multi-file upload saves every file within
+// the same millisecond — so collisions get a counter.
+async function saveUpload(taskId: string, file: File): Promise<{ path: string; url: string }> {
+  const destDir = join(evidenceDir(), taskId);
+  mkdirSync(destDir, { recursive: true });
+  const safeName = file.name.replace(/[^\w.\-]/g, "_") || "file";
+  const stamp = Date.now();
+  let finalName = `${stamp}_${safeName}`;
+  for (let i = 1; existsSync(join(destDir, finalName)); i++) finalName = `${stamp}_${i}_${safeName}`;
+  const dest = join(destDir, finalName);
+  await Bun.write(dest, file);
+  return { path: dest, url: `/evidence/${taskId}/${finalName}` };
+}
+
+// Read a request that may be multipart (text fields + any number of files) or
+// plain JSON, so an endpoint can accept attachments without a separate route.
+async function bodyWithFiles(req: Request): Promise<{ fields: any; files: File[] }> {
+  const ct = req.headers.get("content-type") || "";
+  if (!ct.includes("multipart/form-data")) return { fields: await safeJson(req), files: [] };
+  const form = await req.formData();
+  const fields: Record<string, string> = {};
+  const files: File[] = [];
+  for (const [k, v] of form.entries()) {
+    if (v instanceof File) files.push(v);
+    else fields[k] = String(v);
+  }
+  return { fields, files };
+}
+
+// Save attachments for a task and render the block appended to a steer message
+// or a brief. Agents get absolute paths because they read files off disk, not
+// over HTTP. Deliberately does NOT insert `evidence` rows: evidence gates the
+// `done` transition, and an input the director attached is not proof of work.
+async function attachFiles(taskId: string, files: File[]): Promise<{ paths: string[]; block: string }> {
+  const paths: string[] = [];
+  for (const f of files) paths.push((await saveUpload(taskId, f)).path);
+  const block = paths.length
+    ? `\n\n## Attachments\nThese files are on disk; read them with the Read tool.\n${paths.map((p) => `- ${p}`).join("\n")}`
+    : "";
+  return { paths, block };
+}
+
 // ---------------------------------------------------------------- event ingestion (`hive emit`)
 async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Response> {
   if (!getTask(db, taskId)) return err("task not found", 404);
@@ -1583,14 +1680,9 @@ async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Respon
     let path: string | null = null;
     let servedUrl: string | null = fields.url ?? null;
     if (file) {
-      const destDir = join(evidenceDir(), taskId);
-      mkdirSync(destDir, { recursive: true });
-      const safeName = file.name.replace(/[^\w.\-]/g, "_") || "file";
-      const finalName = `${Date.now()}_${safeName}`;
-      const dest = join(destDir, finalName);
-      await Bun.write(dest, file);
-      path = dest;
-      servedUrl = `/evidence/${taskId}/${finalName}`;
+      const saved = await saveUpload(taskId, file);
+      path = saved.path;
+      servedUrl = saved.url;
     }
     const ev = {
       id: newId("ev"),
@@ -1924,6 +2016,15 @@ function apiDismissDecision(db: DB, id: string): Response {
   if (r.status !== "open") return err(`decision already ${r.status}`, 409);
   db.query("UPDATE decisions SET status = 'expired' WHERE id = ?").run(id);
   writeEvent(db, { task_id: r.task_id, source: "director", type: "decision_expired", payload: { decision_id: id, reason: "dismissed" } });
+  // Resume the task if this was its LAST open card — otherwise it stays parked
+  // in needs_decision with nothing left to wait on (seen live 2026-07-10:
+  // three agents stranded after their moot approval cards were dismissed).
+  const remaining = db
+    .query("SELECT 1 FROM decisions WHERE task_id = ? AND status = 'open' LIMIT 1")
+    .get(r.task_id);
+  const task = getTask(db, r.task_id);
+  if (!remaining && task && task.state === "needs_decision")
+    transition(db, r.task_id, "in_progress", { source: "director", reason: "last open decision dismissed" });
   const decision = parseDecision({ ...r, status: "expired" });
   broadcast({ type: "decision", decision });
   return json(decision);

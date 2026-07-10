@@ -3,7 +3,7 @@ import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
 import type { Health, Kind, State, Task } from "../lib/api";
-import { CiBadge, HEALTH_LABEL, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { Attach, CiBadge, HEALTH_LABEL, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 import { AttentionTray, needsAttention } from "./attention";
 
@@ -278,6 +278,7 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
   const [dump, setDump] = useState("");
   const [title, setTitle] = useState("");
   const [brief, setBrief] = useState("");
+  const [files, setFiles] = useState<File[]>([]);
   const [kind, setKind] = useState<Kind>("ship");
   const [busy, setBusy] = useState(false);
 
@@ -295,8 +296,8 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
         await api.intake({ project_id: project, text: dump.trim() });
         toast("Braindump sent — Claude is drafting a breakdown for you to approve");
       } else {
-        await api.createTask({ project_id: project, title: title.trim(), brief: brief.trim() || undefined, kind });
-        toast("Task queued");
+        await api.createTask({ project_id: project, title: title.trim(), brief: brief.trim() || undefined, kind }, files);
+        toast(files.length ? `Task queued with ${files.length} attachment(s)` : "Task queued");
       }
       onClose();
     } catch (e) {
@@ -353,10 +354,12 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
                   <span>Title</span>
                   <input autoFocus placeholder="What needs doing" value={title} onChange={(e) => setTitle(e.target.value)} />
                 </label>
-                <label className="fld">
-                  <span>Brief</span>
-                  <textarea placeholder="Description / definition of done (optional)" value={brief} onChange={(e) => setBrief(e.target.value)} />
-                </label>
+                <Attach files={files} onChange={setFiles}>
+                  <label className="fld">
+                    <span>Brief</span>
+                    <textarea placeholder="Description / definition of done (optional)" value={brief} onChange={(e) => setBrief(e.target.value)} />
+                  </label>
+                </Attach>
                 <label className="fld">
                   <span>Kind</span>
                   <select value={kind} onChange={(e) => setKind(e.target.value as Kind)}>

@@ -153,7 +153,7 @@ test("tasks carry a server-computed health object", async () => {
 test("send delivers to a spawned agent via herdr", async () => {
   const r = await post(`/api/tasks/${taskId}/send`, { message: "focus on the API" });
   expect(r.status).toBe(200);
-  expect(r.json).toEqual({ ok: true, delivered: true, message: "focus on the API" });
+  expect(r.json).toEqual({ ok: true, delivered: true, message: "focus on the API", attachments: [] });
   expect(sends.at(-1)).toEqual({ target: taskId, message: "focus on the API" });
 });
 

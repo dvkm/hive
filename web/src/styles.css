@@ -3264,3 +3264,60 @@ a {
 .diffstat-toggle:hover {
   color: var(--text);
 }
+
+/* ---- file attachments (steer composer, brief editor) ---- */
+.attach {
+  border: 1px dashed transparent;
+  border-radius: 6px;
+  transition: border-color 0.12s, background 0.12s;
+}
+.attach-over {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+.attach-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.attach-hint {
+  font-size: 12px;
+}
+.attach-list {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.attach-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 6px 3px 8px;
+  font-size: 12px;
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+.attach-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 180px;
+}
+.attach-x {
+  background: none;
+  border: 0;
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.attach-x:hover {
+  color: var(--text);
+}
