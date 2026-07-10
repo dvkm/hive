@@ -51,8 +51,13 @@ export function eventText(e: EventLike): string {
     }
     case "agent_turn_end":
       return "agent turn ended";
-    case "steer":
-      return `steered: “${s(p.message)}”`;
+    case "steer": {
+      // The delivery receipt: David must never wonder whether a steer landed.
+      // Pre-receipt events (no `delivery`) stay bare rather than claim delivery.
+      const badges: Record<string, string> = { delivered: "✓ ", queued: "⏳ queued — ", failed: "⚠ undelivered — " };
+      const badge = badges[s(p.delivery)] ?? "";
+      return `${badge}steered: “${s(p.message)}”`;
+    }
     case "blocked":
       return s(p.note) ? `agent blocked: ${s(p.note)}` : "agent blocked";
     case "spawned":

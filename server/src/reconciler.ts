@@ -12,12 +12,13 @@ import type { DB } from "./db.ts";
 import { now, newId, evidenceDir } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, TERMINAL, type State } from "./state.ts";
-import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
+import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
+import { queuedSteers, markSteersDelivered } from "./steer.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
-import { requeueTask, openRecoveryDecision, linkPrIfMarked } from "./api.ts";
+import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 
@@ -32,7 +33,7 @@ export interface ReconcilerDeps {
   herdr?: Herdr;
   exec?: Exec; // for `gh`
   staleMs?: number; // default 15m
-  smoke?: MonitorDeps; // deps for runSmoke on merge->verifying
+  smoke?: MonitorDeps; // deps for smokeThenAdvance on merge->verifying
   nowMs?: () => number; // injectable clock (tests)
 }
 
@@ -51,6 +52,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
     await syncAgents(db, deps);
   } catch (e) {
     fail("syncAgents", e);
+  }
+  try {
+    await drainSteers(db, deps);
+  } catch (e) {
+    fail("drainSteers", e);
   }
   try {
     await advanceFinished(db, deps);
@@ -111,6 +117,54 @@ function lastAgentStatus(db: DB, taskId: string): string | null {
   }
 }
 
+// ---- queued-steer drain ----
+// A steer herdr refuses is queued rather than dropped (steer.ts), but until this
+// it was drained ONLY at spawn time. So a socket blip while the agent was alive
+// and working queued the message and then never redelivered it: no respawn was
+// coming, and it sat there until the task ended. Every cycle, re-attempt any
+// queued steer against an agent that still probes alive.
+//
+// Cheap: the queued-steer read is checked BEFORE any probe, so the ordinary case
+// (nothing queued) costs one small query per agent-bearing task and zero herdr
+// calls. Idempotent: a steer stays queued until a send actually lands, so a
+// failure here simply retries next cycle — or rides the next respawn.
+//
+// Deliberately writes no event of its own. The `steer` event's own receipt
+// flipping to delivered IS the record, and a fresh event here would reset the
+// task's silence clock (flagStale reads the newest event), masking a mute agent.
+async function drainSteers(db: DB, deps: ReconcilerDeps): Promise<void> {
+  const h = deps.herdr ?? defaultHerdr;
+  const tasks = db
+    .query(`SELECT id, agent_target FROM tasks WHERE agent_target IS NOT NULL AND state IN ${NON_TERMINAL}`)
+    .all() as { id: string; agent_target: string }[];
+  for (const t of tasks) {
+    const pending = queuedSteers(db, t.id);
+    if (!pending.length) continue; // the common case: no probe, no herdr call
+    // Dead agent → leave them queued; the next spawn's brief carries them. A herdr
+    // hiccup reads as alive+unknown (parseAgentProbe), so the send below is what
+    // actually decides, and it fails safe.
+    if (!(await h.probe(t.agent_target)).alive) continue;
+
+    const delivered: string[] = [];
+    for (const s of pending) {
+      // sendFailure, never the exit code: herdr exits 0 with an agent_not_found
+      // body, which is exactly how a steer disappears without a trace.
+      let failure: string | null;
+      try {
+        failure = sendFailure(await h.send(t.agent_target, s.message));
+      } catch (e: any) {
+        failure = String(e?.message ?? e);
+      }
+      // Stop at the first failure rather than skipping it: the agent went away
+      // mid-drain, and the remaining steers must stay queued IN ORDER so the
+      // respawn brief replays them as the director wrote them.
+      if (failure) break;
+      delivered.push(s.id);
+    }
+    markSteersDelivered(db, delivered, "drain");
+  }
+}
+
 // ---- ready-for-review advancement (fixes tasks stuck in in_progress) ----
 // An agent that finished — opened a PR (ship/chore) or wrote its report (scout) —
 // and then went idle/gone used to sit in `in_progress` forever: nothing moved it
@@ -156,6 +210,12 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "ci_status", payload: { ci_status: ci } });
       broadcast({ type: "task", task: getTask(db, t.id) });
     }
+    // Time-based fallback for the link-time hand-off: a task whose PR is open
+    // but is still in_progress (pr_url set by the agent, or linked before this
+    // existed) belongs in the director's Review lane.
+    if (String(data.state).toUpperCase() === "OPEN" && t.state === "in_progress") {
+      if (handOffToReview(db, t.id, "reconciler")) broadcast({ type: "task", task: getTask(db, t.id) });
+    }
     if (String(data.state).toUpperCase() === "MERGED" && t.state === "in_review") {
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_merged", payload: { pr_url: t.pr_url } });
       transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged" });
@@ -199,18 +259,25 @@ async function nudgeConflict(
     base = JSON.parse(project?.config ?? "{}").default_branch || "main";
   } catch {}
   let delivered = false;
+  let error: string | null = null;
   if (t.agent_target) {
     try {
       const r = await h.send(
         t.agent_target,
         `hive: your PR ${t.pr_url} has merge conflicts with '${base}'. Fetch and merge the latest 'origin/${base}' into your branch (or rebase onto it), resolve the conflicts, rerun the tests, then push.`
       );
-      delivered = r.code === 0;
-    } catch {
-      delivered = false;
+      error = sendFailure(r);
+      delivered = error === null;
+    } catch (e: any) {
+      error = String(e?.message ?? e);
     }
   }
-  writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_conflict", payload: { pr_url: t.pr_url, head_sha: headSha, delivered } });
+  writeEvent(db, {
+    task_id: t.id,
+    source: "reconciler",
+    type: "pr_conflict",
+    payload: { pr_url: t.pr_url, head_sha: headSha, delivered, ...(error ? { error } : {}) },
+  });
 }
 
 // ---- PR → task linking via gh ----
@@ -394,11 +461,22 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string): 
     openRecoveryDecision(db, task, requeueDepth(db, task));
     enqueue(db, { kind: "failed", task_id: taskId, title: `Agent unresponsive: ${task.title}` });
   } else {
-    const r = await h.send(
-      target,
-      `hive: you've gone quiet. Reply with \`hive emit ${taskId} status --note "..."\` or say what's blocking you.`
-    );
-    writeEvent(db, { task_id: taskId, source: "reconciler", type: "recovery_nudge", payload: { nudge: nudges + 1, delivered: r.code === 0 } });
+    let error: string | null;
+    try {
+      const r = await h.send(
+        target,
+        `hive: you've gone quiet. Reply with \`hive emit ${taskId} status --note "..."\` or say what's blocking you.`
+      );
+      error = sendFailure(r);
+    } catch (e: any) {
+      error = String(e?.message ?? e);
+    }
+    writeEvent(db, {
+      task_id: taskId,
+      source: "reconciler",
+      type: "recovery_nudge",
+      payload: { nudge: nudges + 1, delivered: error === null, ...(error ? { error } : {}) },
+    });
     broadcastTask(db, getTask(db, taskId));
   }
 }
@@ -440,12 +518,23 @@ function requeueDepth(db: DB, task: any): number {
 
 // Consecutive recovery nudges since the last real activity (stale flags and the
 // nudges themselves don't count as activity, so silence keeps accumulating).
+// Only DELIVERED nudges count toward the escalation: failing a task for "3
+// nudges ignored" when herdr never landed one is a lie. A permanently
+// undeliverable agent is dead, and the dead branch (recoverDead) owns it — this
+// one only ever runs on an agent that probed alive.
 function nudgesSinceActivity(db: DB, taskId: string): number {
-  const rows = db.query("SELECT type FROM events WHERE task_id = ? ORDER BY ts DESC").all(taskId) as { type: string }[];
+  const rows = db.query("SELECT type, payload FROM events WHERE task_id = ? ORDER BY ts DESC").all(taskId) as {
+    type: string;
+    payload: string;
+  }[];
   let n = 0;
   for (const r of rows) {
-    if (r.type === "recovery_nudge") n++;
-    else if (r.type === "stale" || r.type === "agent_status") continue; // reconciler noise
+    if (r.type === "recovery_nudge") {
+      try {
+        if (JSON.parse(r.payload).delivered === false) continue; // never landed; doesn't count
+      } catch {}
+      n++;
+    } else if (r.type === "stale" || r.type === "agent_status") continue; // reconciler noise
     else break; // real activity resets the count
   }
   return n;

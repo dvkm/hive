@@ -34,7 +34,12 @@ try {
   process.exit(0);
 }
 
-type Agg = { input_tokens: number; output_tokens: number; cache_read_tokens: number };
+type Agg = {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+};
 const perModel: Record<string, Agg> = {};
 for (const line of text.split("\n")) {
   if (!line.trim()) continue;
@@ -48,15 +53,20 @@ for (const line of text.split("\n")) {
   if (row?.type !== "assistant" || !msg?.usage) continue;
   const u = msg.usage;
   const model = msg.model || "unknown";
-  const a = (perModel[model] ??= { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 });
-  // Our schema has no cache-write bucket; fold cache_creation into input.
-  a.input_tokens += (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+  const a = (perModel[model] ??= {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 0,
+    cache_write_tokens: 0,
+  });
+  a.input_tokens += u.input_tokens || 0;
   a.output_tokens += u.output_tokens || 0;
   a.cache_read_tokens += u.cache_read_input_tokens || 0;
+  a.cache_write_tokens += u.cache_creation_input_tokens || 0;
 }
 
 for (const [model, a] of Object.entries(perModel)) {
-  if (!a.input_tokens && !a.output_tokens && !a.cache_read_tokens) continue;
+  if (!Object.values(a).some(Boolean)) continue;
   try {
     await fetch(`${hiveUrl}/api/tasks/${taskId}/events`, {
       method: "POST",

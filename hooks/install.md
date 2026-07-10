@@ -166,5 +166,6 @@ printf '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}' | hooks/hive-app
 printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}' | hooks/hive-approve.sh escalate
 ```
 
-To actually STOP dangerous commands (not just log them), seed an authority rule:
-`POST /api/authority/rules {"action_pattern":"command.dangerous*","effect":"require_decision"}`.
+Dangerous commands are STOPPED out of the box: `command.dangerous*` requires a decision by default (deny-safe in code, plus a
+bootstrapped rule); override with
+`POST /api/authority/rules {"action_pattern":"command.dangerous*","effect":"deny"}`.

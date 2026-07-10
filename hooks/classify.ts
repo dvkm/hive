@@ -335,8 +335,8 @@ async function escalate(
 ): Promise<string> {
   // Distinct action namespace so a standing rule can gate destructive commands
   // (`command.dangerous`) without touching merely-unrecognized ones (`command`).
-  // Seed `command.dangerous* → require_decision` (or `deny`) to make dangerous
-  // commands stop; unknown commands default-allow (logged) until a rule exists.
+  // `command.dangerous*` is deny-safe by default IN CODE — it requires a decision
+  // with no rule present; unknown commands default-allow (logged).
   const action = decision === "dangerous" ? "command.dangerous" : "command";
   try {
     const res = await fetch(`${hiveUrl}/api/tasks/${taskId}/guarded-action`, {

@@ -22,6 +22,7 @@ function stubHerdr(sendResult: ExecResult = OK()) {
   const sends: { target: string; message: string }[] = [];
   const exec: Exec = async (argv) => {
     if (has(argv, "worktree", "create")) return OK(`{"result":{"worktree":{"path":${JSON.stringify(WT)},"branch":"hive/x","open_workspace_id":"w1"}}}`);
+    if (has(argv, "agent", "get")) return OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}');
     if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
     if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t2"}}}');
     if (has(argv, "agent", "send")) {
@@ -153,7 +154,7 @@ test("tasks carry a server-computed health object", async () => {
 test("send delivers to a spawned agent via herdr", async () => {
   const r = await post(`/api/tasks/${taskId}/send`, { message: "focus on the API" });
   expect(r.status).toBe(200);
-  expect(r.json).toEqual({ ok: true, delivered: true, message: "focus on the API" });
+  expect(r.json).toEqual({ ok: true, delivered: true, delivery: "delivered", message: "focus on the API", attachments: [] });
   expect(sends.at(-1)).toEqual({ target: taskId, message: "focus on the API" });
 });
 

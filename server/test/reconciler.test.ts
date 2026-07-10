@@ -129,6 +129,28 @@ test("conflict watchdog: a CONFLICTING PR nudges the agent once per head SHA", a
   expect(sends.length).toBe(2);
 });
 
+test("conflict watchdog: a lost nudge (exit 0 + agent_not_found) records delivered:false", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "a1", pr_url: "https://gh/pr/9" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  // `agent send` exits 0 but the agent is gone — the message never landed.
+  const h = new Herdr(
+    stub((argv) => (argv.includes("send") ? OK('{"error":{"code":"agent_not_found","message":"gone"}}') : OK('{"result":{"agent":{"agent_status":"idle","pane_id":"w1:p1"}}}'))),
+    "herdr"
+  );
+  const gh: Exec = stub((argv) =>
+    argv[0] === "gh"
+      ? OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], mergeable: "CONFLICTING", headRefOid: "sha1" }))
+      : OK()
+  );
+
+  await reconcileOnce(db, { herdr: h, exec: gh });
+
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_conflict'").all(id) as { payload: string }[];
+  expect(JSON.parse(ev[0].payload)).toMatchObject({ delivered: false, error: "gone" });
+});
+
 test("conflict watchdog: a mergeable PR is left alone", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { agent_target: "a1", pr_url: "https://gh/pr/9" });

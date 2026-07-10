@@ -69,6 +69,7 @@ export default function Analytics() {
         <Tile label="Input" value={fmtTokens(t.input_tokens)} />
         <Tile label="Output" value={fmtTokens(t.output_tokens)} />
         <Tile label="Cache read" value={fmtTokens(t.cache_read_tokens)} />
+        <Tile label="Cache write" value={fmtTokens(t.cache_write_tokens)} />
       </div>
 
       {t.calls === 0 && <div className="muted pad">No usage recorded in this window.</div>}
@@ -161,7 +162,7 @@ function UsageTable<T extends UsageTotals>({
               <td className="num">{fmtTokens(r.total_tokens)}</td>
               <td className="num dim">{fmtTokens(r.input_tokens)}</td>
               <td className="num dim">{fmtTokens(r.output_tokens)}</td>
-              <td className="num dim">{fmtTokens(r.cache_read_tokens)}</td>
+              <td className="num dim">{fmtTokens(r.cache_read_tokens + r.cache_write_tokens)}</td>
               <td className="num dim">{r.calls}</td>
             </tr>
           ))}

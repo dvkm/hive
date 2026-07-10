@@ -8,7 +8,8 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-authz-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb, newId, now } = await import("../src/db.ts");
-const { authorize, resolveRule, patternMatches, resolveGrantForDecision } = await import("../src/authority.ts");
+const { authorize, resolveRule, patternMatches, resolveGrantForDecision, bootstrapAuthority } =
+  await import("../src/authority.ts");
 const { composeBrief } = await import("../src/briefs.ts");
 const { makeHandler } = await import("../src/api.ts");
 import type { DB } from "../src/db.ts";
@@ -121,6 +122,40 @@ test("summary becomes the card title (truncated); detail stays in context", () =
   const d2: any = db.query("SELECT * FROM decisions WHERE id = ?").get(r2.effect === "require_decision" ? r2.decision_id : "");
   expect(d2.title.length).toBeLessThanOrEqual(110);
   expect(d2.title.endsWith("…")).toBe(true);
+});
+
+// ---------------------------------------------------------------- deny-safe defaults
+test("command.dangerous requires a decision with NO rule in the db", () => {
+  const { db, taskId, projectId } = freshDb();
+  expect(resolveRule(db, projectId, "command.dangerous")).toBeNull(); // nothing seeded
+  const r = authorize(db, { project_id: projectId, action: "command.dangerous", target: "rm -rf /", task_id: taskId });
+  expect(r.effect).toBe("require_decision");
+  const d: any = db.query("SELECT * FROM decisions WHERE id = ?").get(r.effect === "require_decision" ? r.decision_id : "");
+  expect(d.blast_radius).toContain("rm -rf /");
+  // sibling namespaces are untouched: an unknown command still default-allows
+  const { db: db2, taskId: t2, projectId: p2 } = freshDb();
+  expect(authorize(db2, { project_id: p2, action: "command", target: "frobnicate", task_id: t2 }).effect).toBe("allow");
+});
+
+test("an explicit rule still overrides the deny-safe default", () => {
+  const { db, taskId, projectId } = freshDb();
+  addRule(db, { action_pattern: "command.dangerous*", effect: "allow", note: "yolo" });
+  expect(authorize(db, { project_id: projectId, action: "command.dangerous", target: "sudo rm", task_id: taskId }).effect).toBe("allow");
+});
+
+test("require_decision with no task to answer it fails closed (deny, no crash)", () => {
+  const { db, projectId } = freshDb();
+  const r = authorize(db, { project_id: projectId, action: "command.dangerous", target: "rm -rf /", task_id: null });
+  expect(r.effect).toBe("deny");
+});
+
+test("bootstrapAuthority seeds the standing rules and is idempotent", () => {
+  const { db, projectId } = freshDb();
+  expect(bootstrapAuthority(db)).toBe(1);
+  expect(bootstrapAuthority(db)).toBe(0); // second boot is a no-op
+  const rule = resolveRule(db, projectId, "command.dangerous")!;
+  expect(rule.effect).toBe("require_decision");
+  expect(db.query("SELECT COUNT(*) AS n FROM authority_rules").get() as any).toMatchObject({ n: 1 });
 });
 
 // ---------------------------------------------------------------- grants: single-use + expiry
