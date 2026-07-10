@@ -41,7 +41,14 @@ Rules:
   idle — that leaves the task looking stuck. (A backstop advances an idle agent
   that has a PR, but \`ready\` is the clean, immediate handoff.)
 - When you hit a decision the director must make, emit \`needs-decision\` and
-  stop; do not guess on anything high-risk (prod, feature flags, destructive ops).`;
+  stop; do not guess on anything high-risk (prod, feature flags, destructive ops).
+- Work ONLY inside your own worktree and scratchpad. NEVER create, edit, or
+  delete files in the project's main checkout, other worktrees, or the human's
+  home — cleanup of your own sandbox is auto-approved; anything outside it is not.
+- Killing processes: prefer \`kill %1\` (your own shell jobs) or a pidfile in your
+  scratchpad (\`... & echo $! > "$SCRATCH/dev.pid"\`, later \`kill $(cat ...)\` /
+  \`pkill -F\`) — those pass the command gate automatically. Broad \`pkill -f <pattern>\`
+  escalates to the director and stalls you.`;
 
 // Agents may fan work out instead of scope-creeping their own task. HIVE_TASK_ID
 // is set in every spawned agent's env, so the CLI auto-attributes the new task

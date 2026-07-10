@@ -45,6 +45,10 @@ const DANGEROUS: [RegExp, string][] = [
   // Types/clicks into whatever has focus on the HUMAN's desktop — seen live
   // 2026-07-10 (an agent probing Korean IME via System Events keystroke).
   [/osascript\b[\s\S]*System Events/i, "desktop UI scripting (osascript)"],
+  // Agents answering their own decision cards / minting authority rules defeats
+  // the whole escalation model — attempted live 2026-07-10 (dec_c698522e5c30).
+  [/\/api\/decisions\/[^\s"']+\/(answer|dismiss)/i, "hive decision tampering"],
+  [/\/api\/authority\/rules/i, "hive authority-rule tampering"],
   [/find\b[^\n]*-(delete|exec(dir)?)\b/i, "find with -delete/-exec"],
   [/\b(drop|truncate)\s+(table|database|schema)\b/i, "SQL drop/truncate"],
   [/\bdelete\s+from\b(?![\s\S]*\bwhere\b)/i, "SQL DELETE without WHERE"],
@@ -152,9 +156,10 @@ function rmTargetsSandboxed(cmd: string, env: Record<string, string | undefined>
   return true;
 }
 
-// True iff every kill/pkill segment targets the agent's own tooling: a headless
-// browser it launched (--headless / remote-debugging-port) or a process whose
-// match pattern names a sandbox path.
+// True iff every kill/pkill segment targets the agent's own tooling: its shell
+// jobs (`kill %1`), a pidfile in its sandbox (`pkill -F $SCRATCHPAD/x.pid`), a
+// headless browser it launched (--headless / remote-debugging-port), or a
+// process whose match pattern names a sandbox path.
 // ponytail: pattern-based, so `pkill -f remote-debugging-port` could hit a
 // human's debug Chrome too; scope to the agent's own port/profile if that bites.
 function killTargetsSandboxed(cmd: string, env: Record<string, string | undefined>): boolean {
@@ -164,7 +169,34 @@ function killTargetsSandboxed(cmd: string, env: Record<string, string | undefine
   if (!killSegs.length) return false;
   return killSegs.every((seg) => {
     const s = subst(seg.replace(/["']/g, ""), map);
-    return /remote-debugging-port|--headless/.test(s) || roots.some((r) => s.includes(r));
+    if (/remote-debugging-port|--headless/.test(s)) return true;
+    if (roots.some((r) => s.includes(r))) return true; // pidfile or pattern in sandbox
+    // `kill %1 [%2 …]` — the shell's own background jobs, nothing else.
+    const body = s.split(/\s+[\d&]*[<>]/)[0];
+    const targets = body.split(/\s+/).slice(1).filter((t) => !t.startsWith("-"));
+    return targets.length > 0 && targets.every((t) => /^%\d+$/.test(t));
+  });
+}
+
+// SQL dangerous rules (DROP/DELETE/UPDATE heuristics) are waived when the only
+// SQL client in the command is sqlite3 operating on a sandboxed DB file — the
+// scratchpad-copy workflow. psql/mysql (server-backed) never waive.
+// ponytail: binds SQL text to the sqlite3 target only by co-occurrence in one
+// command; good enough while psql/mysql are excluded.
+function sqlTargetsSandboxed(cmd: string, env: Record<string, string | undefined>): boolean {
+  if (/\b(psql|mysql)\b/i.test(cmd)) return false;
+  const map = varMap(cmd, env);
+  const roots = sandboxRoots(env);
+  const sqliteSegs = segments(cmd).filter((s) => /^sqlite3\b/.test(s));
+  if (!sqliteSegs.length) return false;
+  return sqliteSegs.every((seg) => {
+    const file = seg
+      .split(/\s+/)
+      .slice(1)
+      .map((t) => subst(t.replace(/["']/g, ""), map))
+      .find((t) => t && !t.startsWith("-"));
+    return !!file && file.startsWith("/") && !file.includes("..") && !/[$`]/.test(file) &&
+      roots.some((r) => file.startsWith(r));
   });
 }
 
@@ -179,6 +211,7 @@ export function classify(
     if (!rx.test(cmd)) continue;
     if (reason === "recursive/forced rm" && rmTargetsSandboxed(cmd, env)) continue;
     if (reason === "process kill" && killTargetsSandboxed(cmd, env)) continue;
+    if (reason.startsWith("SQL ") && sqlTargetsSandboxed(cmd, env)) continue;
     return { decision: "dangerous", reason };
   }
 
