@@ -27,6 +27,7 @@ import {
   parseIncident,
 } from "./rows.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
+import { queuedSteers, markSteersDelivered, steerPreamble, type Delivery } from "./steer.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
 import { smokeThenAdvance } from "./monitors.ts";
@@ -1159,8 +1160,11 @@ export async function spawnAgent(
   const config = JSON.parse(project.config ?? "{}");
 
   // Compose the brief fresh; it is delivered as the interactive agent's first
-  // prompt (see runtime/herdr.defaultAgentArgv) — no `-p` one-shot.
-  const brief = composeBrief(db, id);
+  // prompt (see runtime/herdr.defaultAgentArgv) — no `-p` one-shot. Steers sent
+  // while the task had no live agent ride along on top, so they reach the fresh
+  // agent instead of vanishing.
+  const pending = queuedSteers(db, id);
+  const brief = steerPreamble(pending) + composeBrief(db, id);
   const hiveUrl = opts.hiveUrl || process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
   const env = await resolveProjectSecrets(db, task.project_id);
 
@@ -1200,6 +1204,9 @@ export async function spawnAgent(
       fleet_workspace_id: result.fleet_workspace_id,
     },
   });
+  // The agent is up and holding the queued steers in its brief — receipt them.
+  // Only now: a failed spawn above leaves them queued for the next attempt.
+  markSteersDelivered(db, pending.map((s) => s.id));
   if (task.state === "queued") transition(db, id, "in_progress", { source: "herdr", reason: "agent spawned" });
 
   if (opts.supervise) superviseAgent(db, herdr, id, result.agent_target);
@@ -1254,10 +1261,22 @@ export async function superviseAgent(db: DB, herdr: Herdr, taskId: string, targe
   }
 }
 
-// Steer a live agent via `herdr agent send`. Degrades gracefully: the event is
-// always recorded; a herdr failure is surfaced in the response, never thrown.
+// One `herdr agent send` attempt. Returns the failure reason, or null if the
+// message landed. Never throws.
+async function sendOnce(herdr: Herdr, target: string, message: string): Promise<string | null> {
+  try {
+    return sendFailure(await herdr.send(target, message));
+  } catch (e: any) {
+    return String(e?.message ?? e);
+  }
+}
+
+// Steer an agent via `herdr agent send`, with a delivery receipt. Every steer is
+// recorded as one `steer` event carrying its own delivery status, and a steer
+// that finds no live agent is QUEUED rather than dropped — the next spawn of the
+// task prepends it to the brief (see spawnAgent). Re-sending is never needed.
 // Accepts JSON or multipart; attached files are saved and their absolute paths
-// appended to the message the agent receives.
+// appended to the message the agent receives (so they ride along on redelivery).
 async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
@@ -1269,21 +1288,26 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
   const { paths, block } = await attachFiles(id, files);
   const message = text + block;
   const target = task.agent_target;
-  writeEvent(db, { task_id: id, source: "director", type: "steer", payload: { message, target, attachments: paths } });
 
-  if (!target) return json({ ok: false, delivered: false, error: "task has no agent_target (not spawned)" });
-  try {
-    const error = sendFailure(await herdr.send(target, message));
-    if (error) {
-      writeEvent(db, { task_id: id, source: "herdr", type: "steer_error", payload: { error } });
-      return json({ ok: false, delivered: false, error });
-    }
-    return json({ ok: true, delivered: true, message, attachments: paths });
-  } catch (e: any) {
-    const error = String(e?.message ?? e);
-    writeEvent(db, { task_id: id, source: "herdr", type: "steer_error", payload: { error } });
-    return json({ ok: false, delivered: false, error });
+  let error: string | null = target ? null : "task has no agent_target (not spawned)";
+  if (target) {
+    // Retry once: a herdr socket hiccup is the common failure, and a resend into
+    // a live composer is idempotent (the Enter is what submits it).
+    error = await sendOnce(herdr, target, message);
+    if (error) error = await sendOnce(herdr, target, message);
+    if (error) writeEvent(db, { task_id: id, source: "herdr", type: "steer_error", payload: { error, target } });
   }
+
+  const delivered = !error;
+  // A terminal task will never be spawned again, so queuing would be a lie.
+  const delivery: Delivery = delivered ? "delivered" : TERMINAL.includes(task.state as State) ? "failed" : "queued";
+  writeEvent(db, {
+    task_id: id,
+    source: "director",
+    type: "steer",
+    payload: { message, target, attachments: paths, delivery, ...(delivered ? { delivered_at: now() } : { error }) },
+  });
+  return json({ ok: delivered, delivered, delivery, message, attachments: paths, ...(error ? { error } : {}) });
 }
 
 // MCP servers whose tools open an interactive Allow/Deny dialog. A spawned

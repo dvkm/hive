@@ -19,6 +19,15 @@ test("decision events read as asked / answered", () => {
   );
 });
 
+// The timeline must show whether a steer actually landed, or it gets re-sent.
+test("steer carries its delivery receipt", () => {
+  const steer = (delivery?: string) => eventText({ type: "steer", payload: { message: "ship it", delivery } });
+  expect(steer("delivered")).toBe("✓ steered: “ship it”");
+  expect(steer("queued")).toBe("⏳ queued — steered: “ship it”");
+  expect(steer("failed")).toBe("⚠ undelivered — steered: “ship it”");
+  expect(steer(undefined)).toBe("steered: “ship it”"); // pre-receipt events stay bare
+});
+
 test("new transcript types are agent-lifecycle for the feed filter", () => {
   expect(eventCategory("assistant_text")).toBe("lifecycle");
   expect(eventCategory("tool_use")).toBe("lifecycle");

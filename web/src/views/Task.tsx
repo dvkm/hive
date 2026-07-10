@@ -220,7 +220,16 @@ export function TaskBody({ id }: { id: string }) {
     if (!steer.trim()) return;
     try {
       const r = await api.send(t.id, steer, steerFiles);
-      toast(r.attachments?.length ? `Steer sent with ${r.attachments.length} file(s)` : "Steer sent");
+      // Never a bare "sent" — a queued steer that read as delivered is what made
+      // David re-send the same message three times.
+      const files = r.attachments?.length ? ` with ${r.attachments.length} file(s)` : "";
+      toast(
+        r.delivered
+          ? `Steer delivered${files}`
+          : r.delivery === "failed"
+            ? `Steer undelivered: ${r.error || "task is finished"}`
+            : `No live agent — steer queued for the next spawn${files}`
+      );
       setSteer("");
       setSteerFiles([]);
     } catch (e) {
