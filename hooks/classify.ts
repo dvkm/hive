@@ -200,6 +200,16 @@ function sqlTargetsSandboxed(cmd: string, env: Record<string, string | undefined
   });
 }
 
+// A lone `hive emit …` (or the CLI invoked via bun) only POSTs its arguments to
+// hive as JSON — the text is data, never executed. Without this, a status note
+// that MENTIONS a destructive command trips the whole-string scan (seen live
+// 2026-07-10, dec_95135b1837e9). Requires: single segment, no substitution.
+function isHiveEmitDataOnly(cmd: string): boolean {
+  if (/\$\(|`|<\(/.test(cmd)) return false;
+  const segs = segments(cmd);
+  return segs.length === 1 && /^((bun|bunx)\s+\S*hive(\.ts)?\s+|(\.\/)?bin\/hive\s+|hive\s+)emit\b/.test(segs[0]);
+}
+
 export function classify(
   command: string,
   env: Record<string, string | undefined> = process.env
@@ -207,8 +217,10 @@ export function classify(
   const cmd = command.trim();
   if (!cmd) return { decision: "safe", reason: "empty command" };
 
+  const emitDataOnly = isHiveEmitDataOnly(cmd);
   for (const [rx, reason] of DANGEROUS) {
     if (!rx.test(cmd)) continue;
+    if (emitDataOnly) continue; // arguments are data, not executed
     if (reason === "recursive/forced rm" && rmTargetsSandboxed(cmd, env)) continue;
     if (reason === "process kill" && killTargetsSandboxed(cmd, env)) continue;
     if (reason.startsWith("SQL ") && sqlTargetsSandboxed(cmd, env)) continue;

@@ -170,6 +170,14 @@ test("SQL on a sandboxed sqlite copy downgrades; live/server DBs stay dangerous"
   expect(classify('sqlite3 /tmp/claude-501/x.db "drop table usage"; psql -c "x"', env).decision).toBe("dangerous");
 });
 
+test("hive emit with destructive text in the note is data, not danger", () => {
+  expect(classify('hive emit abc123 status --note "cleaned up with rm -rf /tmp/x"').decision).toBe("unknown");
+  expect(classify('bun cli/hive.ts emit abc123 status --note "pkill -f vite failed"').decision).toBe("unknown");
+  // …but substitution or chaining voids the waiver
+  expect(classify('hive emit abc123 status --note "$(rm -rf /)"').decision).toBe("dangerous");
+  expect(classify('hive emit abc123 status --note "x"; rm -rf /srv', ).decision).toBe("dangerous");
+});
+
 test("hive control-plane tampering is dangerous", () => {
   expect(classify('curl -X POST "$HIVE_URL/api/decisions/dec_123/answer" -d x').decision).toBe("dangerous");
   expect(classify("curl $HIVE_URL/api/decisions/dec_9/dismiss").decision).toBe("dangerous");
