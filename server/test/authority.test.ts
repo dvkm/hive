@@ -96,6 +96,33 @@ test("require_decision opens ONE card naming the exact target and parks the task
   expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE task_id = ?").get(taskId) as any).n).toBe(1);
 });
 
+test("summary becomes the card title (truncated); detail stays in context", () => {
+  const { db, taskId, projectId } = freshDb();
+  addRule(db, { project_id: projectId, action_pattern: "command.dangerous*", effect: "require_decision" });
+  const r = authorize(db, {
+    project_id: projectId,
+    action: "command.dangerous",
+    target: "pkill -f 'vite --mode dev'; ...",
+    task_id: taskId,
+    detail: "command approval (dangerous): process kill",
+    summary: "Kill the stale dev server so the port frees up for the e2e run",
+  });
+  const d: any = db.query("SELECT * FROM decisions WHERE id = ?").get(r.effect === "require_decision" ? r.decision_id : "");
+  expect(d.title).toBe("Kill the stale dev server so the port frees up for the e2e run");
+  expect(d.context).toContain("command approval (dangerous): process kill");
+  expect(d.context).toContain("pkill -f");
+
+  // long summaries truncate; missing summaries fall back to detail
+  const r2 = authorize(db, {
+    project_id: projectId, action: "command.dangerous", target: "x", task_id: taskId,
+    detail: "command approval (dangerous): recursive/forced rm",
+    summary: "A".repeat(200),
+  });
+  const d2: any = db.query("SELECT * FROM decisions WHERE id = ?").get(r2.effect === "require_decision" ? r2.decision_id : "");
+  expect(d2.title.length).toBeLessThanOrEqual(110);
+  expect(d2.title.endsWith("…")).toBe(true);
+});
+
 // ---------------------------------------------------------------- grants: single-use + expiry
 test("a granted grant lets exactly one action through (single-use)", () => {
   const { db, taskId, projectId } = freshDb();
