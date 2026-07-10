@@ -7,7 +7,7 @@ import { CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../l
 import { ReviewCard } from "./ReviewCard";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
-import { ReportToggle } from "./ReportView";
+import { ReportView } from "./ReportView";
 import { relTime } from "../lib/time";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
@@ -47,13 +47,34 @@ function EvidenceItem({ e, onOpen }: { e: Evidence; onOpen?: () => void }) {
     );
   }
   const href = e.url || undefined;
+  const viewable = !!href && ["report", "log", "test_run"].includes(e.kind);
+  const [open, setOpen] = useState(false);
   const head = (
     <div className="ev-card-head">
       <span className={`chip chip-kind`}>{e.kind}</span>
       <span className="ev-cap">{e.caption || e.path || e.url}</span>
+      {href && (
+        <a className="ev-ext" href={href} target="_blank" rel="noreferrer" title="Open raw file" onClick={(ev) => ev.stopPropagation()}>
+          ↗
+        </a>
+      )}
     </div>
   );
-  const viewable = href && ["report", "log", "test_run"].includes(e.kind);
+  // Clicking a text-evidence card opens the inline viewer; the ↗ opens the raw
+  // file. Link evidence keeps the whole card as an external anchor.
+  if (viewable) {
+    return (
+      <div className={`ev-card ev-viewable ${open ? "ev-open" : ""}`} onClick={() => setOpen((o) => !o)}>
+        {head}
+        {e.preview && !open && <pre className="ev-preview">{e.preview}</pre>}
+        {open && (
+          <div onClick={(ev) => ev.stopPropagation()}>
+            <ReportView url={href!} />
+          </div>
+        )}
+      </div>
+    );
+  }
   return (
     <div className="ev-card">
       {href ? (
@@ -64,7 +85,6 @@ function EvidenceItem({ e, onOpen }: { e: Evidence; onOpen?: () => void }) {
         head
       )}
       {e.preview && <pre className="ev-preview">{e.preview}</pre>}
-      {viewable && <ReportToggle url={href!} label={e.kind === "report" ? "read report" : "view"} />}
     </div>
   );
 }

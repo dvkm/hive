@@ -33,16 +33,3 @@ export function ReportView({ url }: { url: string }) {
   );
 }
 
-// Expandable wrapper: a "view" toggle that mounts ReportView on demand, so
-// lists of evidence don't fetch every file up front.
-export function ReportToggle({ url, label = "view" }: { url: string; label?: string }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <>
-      <button className="report-toggle" onClick={(e) => { e.preventDefault(); e.stopPropagation(); setOpen((o) => !o); }}>
-        {open ? "hide" : label}
-      </button>
-      {open && <ReportView url={url} />}
-    </>
-  );
-}

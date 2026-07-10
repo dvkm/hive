@@ -3535,8 +3535,22 @@ a {
 .report-md p, .report-md ul, .report-md ol { margin: 0.4em 0; }
 .report-md ul, .report-md ol { padding-left: 1.4em; }
 .report-md code { background: color-mix(in srgb, currentColor 10%, transparent); border-radius: 4px; padding: 0 4px; font-size: 0.92em; }
-.report-md pre { background: color-mix(in srgb, currentColor 7%, transparent); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
+.report-md pre { background: color-mix(in srgb, currentColor 7%, transparent); border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; word-break: break-word; }
 .report-md pre code { background: none; padding: 0; }
 .report-md table { border-collapse: collapse; margin: 0.5em 0; display: block; overflow-x: auto; }
 .report-md th, .report-md td { border: 1px solid var(--border, #4443); padding: 4px 9px; }
 .report-md blockquote { border-left: 3px solid var(--border, #666); margin: 0.5em 0; padding: 2px 12px; opacity: 0.85; }
+
+/* clickable text-evidence cards + raw-file affordance */
+.ev-card.ev-viewable { cursor: pointer; }
+.ev-card.ev-viewable:hover { border-color: #d4a72c88; }
+.ev-ext {
+  margin-left: auto;
+  padding: 0 4px;
+  font-size: 13px;
+  opacity: 0.55;
+  text-decoration: none;
+}
+.ev-ext:hover { opacity: 1; }
+button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: pointer; }
+.rev-ev-chip.rev-ev-open { border-color: #d4a72c88; }
