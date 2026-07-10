@@ -21,8 +21,15 @@
 // reject a `--json` flag (only worktree.* accepts it); `agent get` on a missing
 // target exits 0 with `{"error":{"code":"agent_not_found"}}` — aliveness must be
 // PARSED, never inferred from the exit code.
+import { join } from "node:path";
 import type { Exec, ExecResult } from "../exec.ts";
 import { defaultExec } from "../exec.ts";
+
+// hive's own bin/ (…/repo/bin from server/src/runtime/), prepended to every
+// spawned agent's PATH so `hive emit` / `hive task create` work from any
+// worktree — without it agents fall back to raw curl and lose CLI
+// auto-attribution (source=agent, parent task), seen live 2026-07-10.
+const HIVE_BIN_DIR = join(import.meta.dir, "..", "..", "..", "bin");
 
 export const HERDR_BIN = process.env.HERDR_BIN || "/opt/homebrew/bin/herdr";
 
@@ -111,6 +118,7 @@ export function agentStartArgv(args: {
   if (args.tabId) a.push("--tab", args.tabId);
   a.push("--env", `HIVE_TASK_ID=${args.taskId}`);
   a.push("--env", `HIVE_URL=${args.hiveUrl}`);
+  if (!args.env?.PATH) a.push("--env", `PATH=${HIVE_BIN_DIR}:${process.env.PATH ?? "/usr/bin:/bin"}`);
   for (const [k, v] of Object.entries(args.env ?? {})) a.push("--env", `${k}=${v}`);
   a.push("--no-focus", "--", ...args.agentArgv);
   return a;
