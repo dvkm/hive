@@ -12,6 +12,7 @@ import type { DB } from "./db.ts";
 import { newId, now, evidenceDir } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask } from "./state.ts";
+import { recordSystemLearning } from "./learn.ts";
 import { parseIncident, parseProject } from "./rows.ts";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
@@ -172,6 +173,13 @@ export async function runSmoke(db: DB, taskId: string, deps: MonitorDeps = {}): 
     writeEvent(db, { task_id: taskId, source: "system", type: "smoke_passed", payload: { evidence_id: id, results } });
   } else {
     writeEvent(db, { task_id: taskId, source: "system", type: "smoke_failed", payload: { results } });
+    recordSystemLearning(
+      db,
+      task.project_id,
+      `post-merge smoke failed: ${results.filter((r) => !r.ok).map((r) => r.name).join(", ")}`,
+      results.filter((r) => !r.ok).map((r) => `${r.name}: ${r.detail}`).join("\n"),
+      taskId
+    );
     // bounce back so the agent can fix it (verifying -> in_progress is a legal edge)
     if (task.state === "verifying")
       transition(db, taskId, "in_progress", { source: "system", reason: "post-deploy smoke failed" });

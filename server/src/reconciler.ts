@@ -18,6 +18,7 @@ import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
+import { recordSystemLearning } from "./learn.ts";
 import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
@@ -412,6 +413,10 @@ async function recoverDead(db: DB, h: Herdr, taskId: string, target: string): Pr
   } else {
     const newId = requeueTask(db, task);
     writeEvent(db, { task_id: taskId, source: "reconciler", type: "requeued", payload: { new_task_id: newId, attempt: attempts + 1 } });
+    {
+      const t = getTask(db, taskId);
+      if (t) recordSystemLearning(db, t.project_id, "agent died mid-task (auto-requeued)", `Task: ${t.title}`, taskId);
+    }
     enqueue(db, { kind: "failed", task_id: taskId, title: `Auto-requeued (attempt ${attempts + 1}): ${task.title}` });
   }
 }
