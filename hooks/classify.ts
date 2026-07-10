@@ -42,6 +42,9 @@ const DANGEROUS: [RegExp, string][] = [
   [/\bchown\s+-[a-z]*R\b/i, "recursive chown"],
   [/\b(kill(all)?|pkill)\b/i, "process kill"],
   [/:\s*\(\s*\)\s*\{.*:\s*\|\s*:.*&\s*\}\s*;\s*:/, "fork bomb"],
+  // Types/clicks into whatever has focus on the HUMAN's desktop — seen live
+  // 2026-07-10 (an agent probing Korean IME via System Events keystroke).
+  [/osascript\b[\s\S]*System Events/i, "desktop UI scripting (osascript)"],
   [/find\b[^\n]*-(delete|exec(dir)?)\b/i, "find with -delete/-exec"],
   [/\b(drop|truncate)\s+(table|database|schema)\b/i, "SQL drop/truncate"],
   [/\bdelete\s+from\b(?![\s\S]*\bwhere\b)/i, "SQL DELETE without WHERE"],

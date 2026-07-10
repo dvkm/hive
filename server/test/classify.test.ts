@@ -45,6 +45,7 @@ const dangerous = [
   "helm uninstall app",
   "cat ~/.ssh/id_rsa",
   "cat ~/.aws/credentials",
+  `osascript -e 'tell application "System Events" to keystroke "hi"'`,
 ];
 
 const safe = [
