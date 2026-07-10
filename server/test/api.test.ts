@@ -106,13 +106,40 @@ test("checkpoints: emit -> listed open -> ack removes; flag steers; bad verdict 
   open = await get("/api/checkpoints");
   expect(open.json.checkpoints.some((c: any) => c.id === cpId)).toBe(false);
 
-  // flag on a second checkpoint records the ack event (steer degrades gracefully: no agent)
+  // flag while the task is live but agentless: recorded, and (no delivery
+  // possible) routed to a corrective follow-up task
   const e2 = await post(`/api/tasks/${t.json.id}/events`, { type: "checkpoint", note: "global lock for saves" });
   const flag = await post(`/api/tasks/${t.json.id}/checkpoints/${e2.json.event.id}/ack`, { verdict: "flag", note: "per-account locks please" });
   expect(flag.status).toBe(200);
   const evs = await get(`/api/tasks/${t.json.id}/events`);
   expect(evs.json.some((e: any) => e.type === "checkpoint_ack" && e.payload.verdict === "flag" && e.payload.note === "per-account locks please")).toBe(true);
-  expect(evs.json.some((e: any) => e.type === "steer")).toBe(true);
+  expect(flag.json.followup_task_id).toBeTruthy();
+  const fu = await get(`/api/tasks/${flag.json.followup_task_id}`);
+  expect(fu.json.source).toBe("checkpoint_flag");
+  expect(fu.json.parent_task_id).toBe(t.json.id);
+  expect(fu.json.brief).toContain("per-account locks please");
+});
+
+test("checkpoints survive task completion; cancelled tasks drop out", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "cp survive" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
+  const e1 = await post(`/api/tasks/${t.json.id}/events`, { type: "checkpoint", note: "kept a shortcut" });
+  // finish the task (evidence so done passes the gate)
+  await post(`/api/tasks/${t.json.id}/events`, { type: "evidence", kind: "log", note: "proof" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "verifying" }); // auto-advances to done
+  let open = await get("/api/checkpoints");
+  const mine = open.json.checkpoints.find((c: any) => c.id === e1.json.event.id);
+  expect(mine).toBeTruthy();
+  expect(mine.task_state).toBe("done");
+
+  // cancelled task's checkpoints disappear
+  const t2 = await post("/api/tasks", { project_id: projectId, title: "cp cancel" });
+  await post(`/api/tasks/${t2.json.id}/transition`, { to: "in_progress" });
+  const e2 = await post(`/api/tasks/${t2.json.id}/events`, { type: "checkpoint", note: "x" });
+  await post(`/api/tasks/${t2.json.id}/transition`, { to: "cancelled" });
+  open = await get("/api/checkpoints");
+  expect(open.json.checkpoints.some((c: any) => c.id === e2.json.event.id)).toBe(false);
 });
 
 test("event ingestion: status event is recorded", async () => {

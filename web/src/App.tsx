@@ -66,8 +66,9 @@ function Bell() {
 }
 
 export default function App() {
-  const { decisions, tasks } = useStore();
+  const { decisions, tasks, checkpoints } = useStore();
   const reviewCount = tasks.filter((t) => t.state === "in_review").length;
+  const inboxCount = decisions.length + checkpoints.length;
   const location = useLocation();
   // Board card clicks push /tasks/:id with state.backgroundLocation set to the
   // board's location — that keeps the board mounted and rendered underneath
@@ -90,7 +91,7 @@ export default function App() {
           <NavLink to="/evidence">Evidence</NavLink>
           <NavLink to="/decisions">
             Decisions
-            {decisions.length > 0 && <span className="badge">{decisions.length}</span>}
+            {inboxCount > 0 && <span className="badge">{inboxCount}</span>}
           </NavLink>
           <NavLink to="/review">
             Review

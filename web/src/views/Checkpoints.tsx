@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import type { Checkpoint, Event } from "../lib/api";
+import { useStore } from "../lib/store";
 import { toast } from "../lib/ui";
 
 // Live build-time checkboxes: agents emit `checkpoint` events while working;
@@ -36,9 +37,18 @@ function CheckpointRow({
     if (busy) return;
     setBusy(true);
     try {
-      const r = await api.ackCheckpoint(row.task_id, row.id, verdict, verdict === "flag" ? note : undefined);
+      const r = (await api.ackCheckpoint(row.task_id, row.id, verdict, verdict === "flag" ? note : undefined)) as {
+        delivered: boolean;
+        followup_task_id?: string | null;
+      };
       if (verdict === "flag")
-        toast(r.delivered ? "Flag sent to the agent" : "Flagged (agent offline; recorded)");
+        toast(
+          r.delivered
+            ? "Flag sent to the agent"
+            : r.followup_task_id
+              ? "Already shipped — corrective task queued"
+              : "Flagged (recorded)"
+        );
       setFlagging(false);
       setNote("");
       onAcked?.(row.id, verdict);
@@ -129,35 +139,68 @@ export function CheckpointList({ events }: { events: Event[] }) {
   );
 }
 
-// Cross-task inbox section: every un-acked checkpoint on a live task. Sits on
-// the /decisions page so ticking through them is part of inbox zero.
+// Cross-task inbox section: every un-acked checkpoint, grouped per task, with
+// an approve-all per group. Live via the store's SSE-driven checkpoint list.
+// Un-acked checkpoints survive task completion (marked "shipped") — a late
+// flag becomes a corrective follow-up task instead of a dead steer.
 export function CheckpointsInbox() {
-  const [items, setItems] = useState<Checkpoint[] | null>(null);
-  const load = () =>
-    api
-      .checkpoints()
-      .then((r) => setItems(r.checkpoints))
-      .catch(() => setItems([]));
-  useEffect(() => {
-    load();
-    const t = setInterval(load, 30_000);
-    return () => clearInterval(t);
-  }, []);
-  if (!items?.length) return null;
+  const { checkpoints, reloadCheckpoints } = useStore();
+  const [busy, setBusy] = useState(false);
+  if (!checkpoints.length) return null;
+
+  const groups = new Map<string, Checkpoint[]>();
+  for (const c of checkpoints) {
+    const g = groups.get(c.task_id) ?? [];
+    g.push(c);
+    groups.set(c.task_id, g);
+  }
+
+  const approveAll = async (items: Checkpoint[]) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await Promise.all(items.map((c) => api.ackCheckpoint(c.task_id, c.id, "ok")));
+      toast(`Approved ${items.length} checkpoint${items.length === 1 ? "" : "s"}`);
+    } catch (e) {
+      toast((e as Error).message);
+    } finally {
+      setBusy(false);
+      reloadCheckpoints();
+    }
+  };
+
   return (
     <section className="cp-inbox">
       <div className="cp-inbox-head">
-        Checkpoints <span className="cp-count">{items.length}</span>
-        <span className="muted"> — live judgment calls from working agents; tick to approve, flag to steer</span>
+        Checkpoints <span className="cp-count">{checkpoints.length}</span>
+        <span className="muted"> — agents&apos; judgment calls; tick to approve, flag to steer (or spawn a fix if already shipped)</span>
       </div>
-      {items.map((c) => (
-        <CheckpointRow
-          key={c.id}
-          row={{ id: c.id, task_id: c.task_id, ts: c.ts, note: c.note }}
-          taskLabel={`#${c.task_number}`}
-          onAcked={(id) => setItems((xs) => (xs ?? []).filter((x) => x.id !== id))}
-        />
-      ))}
+      {[...groups.values()].map((items) => {
+        const c0 = items[0];
+        const finished = ["done", "failed"].includes(c0.task_state);
+        return (
+          <div className="cp-group" key={c0.task_id}>
+            <div className="cp-group-head">
+              <Link className="cp-task" to={`/tasks/${c0.task_id}`}>
+                #{c0.task_number} {c0.task_title}
+              </Link>
+              {finished && <span className="chip" title="Task already finished — flags spawn a corrective task">shipped</span>}
+              {items.length > 1 && (
+                <button className="cp-approve-all" disabled={busy} onClick={() => approveAll(items)}>
+                  ✓ approve all {items.length}
+                </button>
+              )}
+            </div>
+            {items.map((c) => (
+              <CheckpointRow
+                key={c.id}
+                row={{ id: c.id, task_id: c.task_id, ts: c.ts, note: c.note }}
+                onAcked={() => reloadCheckpoints()}
+              />
+            ))}
+          </div>
+        );
+      })}
     </section>
   );
 }

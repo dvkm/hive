@@ -1258,17 +1258,21 @@ function checkpointNote(payload: string): string {
 }
 
 function listOpenCheckpoints(db: DB): Response {
+  // Un-acked checkpoints stay reviewable AFTER the task finishes — agents
+  // finish faster than the director's attention cycle, and 21 of the first 25
+  // checkpoints vanished unreviewed when this filtered to live states
+  // (2026-07-10). Only cancelled tasks drop out (their calls died with them).
   const rows = db
     .query(
-      `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id
+      `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state
          FROM events e JOIN tasks t ON t.id = e.task_id
         WHERE e.type = 'checkpoint'
-          AND t.state IN ('in_progress','needs_decision','in_review','verifying')
+          AND t.state != 'cancelled'
           AND NOT EXISTS (
             SELECT 1 FROM events a
              WHERE a.task_id = e.task_id AND a.type = 'checkpoint_ack'
                AND json_extract(a.payload, '$.checkpoint_id') = e.id)
-        ORDER BY e.ts DESC`
+        ORDER BY t.number DESC, e.ts ASC`
     )
     .all() as any[];
   return json({
@@ -1278,6 +1282,7 @@ function listOpenCheckpoints(db: DB): Response {
       ts: r.ts,
       task_number: r.number,
       task_title: r.title,
+      task_state: r.state,
       project_id: r.project_id,
       note: checkpointNote(r.payload),
     })),
@@ -1299,17 +1304,46 @@ async function ackCheckpoint(db: DB, herdr: Herdr, taskId: string, eventId: stri
     payload: { checkpoint_id: eventId, verdict, note },
   });
   let delivered = false;
+  let followup_task_id: string | null = null;
   if (verdict === "flag") {
-    const res = await sendSteer(db, herdr, taskId, {
-      message: `Director FLAGGED your checkpoint: "${checkpointNote(ev.payload)}"${note ? ` — ${note}` : ""}. Address this now, before continuing.`,
-    });
-    try {
-      delivered = ((await res.json()) as any).delivered ?? false;
-    } catch {
-      /* response body already consumed elsewhere — delivery state is best-effort */
+    const cpText = checkpointNote(ev.payload);
+    const task = getTask(db, taskId);
+    const live = task && !["done", "cancelled", "failed"].includes(task.state) && task.agent_target;
+    if (live) {
+      const res = await sendSteer(db, herdr, taskId, {
+        message: `Director FLAGGED your checkpoint: "${cpText}"${note ? ` — ${note}` : ""}. Address this now, before continuing.`,
+      });
+      try {
+        delivered = ((await res.json()) as any).delivered ?? false;
+      } catch {
+        /* delivery state is best-effort */
+      }
+    }
+    // Late flag (task finished / agent gone): the work already shipped, so the
+    // correction becomes a queued follow-up task instead of a dead steer. A
+    // live agent with a failed delivery is NOT rerouted — the steer event is
+    // recorded and the agent sees it on its next poll/respawn.
+    if (!live && task) {
+      const fid = newId();
+      const t = now();
+      db.query(
+        `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, created_at, updated_at)
+         VALUES (?,?,?,?, 'queued', 'ship', 'checkpoint_flag', ?, ?, ?)`
+      ).run(
+        fid,
+        task.project_id,
+        `Flagged checkpoint from #${task.number}: ${cpText.slice(0, 80)}`,
+        `The director flagged a checkpoint after task #${task.number} ("${task.title}") had already ${task.state === "done" ? "shipped" : "stopped"}.\n\nCheckpoint (the agent's judgment call): ${cpText}\n\nDirector's flag: ${note ?? "(no note)"}\n\nRevisit that decision in the shipped code and correct it per the director's note. Original task id: ${taskId}.`,
+        taskId,
+        t,
+        t
+      );
+      writeEvent(db, { task_id: fid, source: "director", type: "created", payload: { title: "checkpoint flag follow-up", checkpoint_id: eventId } });
+      broadcastTask(db, getTask(db, fid));
+      followup_task_id = fid;
     }
   }
-  return json({ ok: true, delivered });
+  return json({ ok: true, delivered, followup_task_id });
 }
 
 // MCP servers whose tools open an interactive Allow/Deny dialog. A spawned
