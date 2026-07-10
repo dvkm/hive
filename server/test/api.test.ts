@@ -207,6 +207,28 @@ test("evidence upload round-trips through /evidence", async () => {
   expect(Array.from(bytes)).toEqual([1, 2, 3, 4]);
 });
 
+test("evidence kind is inferred from the uploaded file's extension", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "ev kinds" });
+  const up = async (name: string, type: string) => {
+    const form = new FormData();
+    form.set("type", "evidence");
+    form.set("note", name);
+    form.set("file", new File([new Uint8Array([1])], name, { type }));
+    const res = await fetch(`${BASE}/api/tasks/${t.json.id}/events`, { method: "POST", body: form });
+    return (await res.json()).evidence.kind;
+  };
+  expect(await up("shot.png", "image/png")).toBe("screenshot");
+  expect(await up("report.md", "text/markdown")).toBe("report");
+  expect(await up("data.tsv", "text/tab-separated-values")).toBe("log");
+  // explicit --kind still wins
+  const form = new FormData();
+  form.set("type", "evidence");
+  form.set("kind", "report");
+  form.set("file", new File([new Uint8Array([1])], "notes.txt", { type: "text/plain" }));
+  const res = await fetch(`${BASE}/api/tasks/${t.json.id}/events`, { method: "POST", body: form });
+  expect((await res.json()).evidence.kind).toBe("report");
+});
+
 test("task reaches done once evidence exists (verifying auto-advances: no smoke configured)", async () => {
   await post(`/api/tasks/${taskId}/transition`, { to: "in_review" });
   const v = await post(`/api/tasks/${taskId}/transition`, { to: "verifying" });
