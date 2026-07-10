@@ -178,6 +178,39 @@ test("hive emit with destructive text in the note is data, not danger", () => {
   expect(classify('hive emit abc123 status --note "x"; rm -rf /srv', ).decision).toBe("dangerous");
 });
 
+test("data text (quotes, heredocs) is not scanned as shell — executors still are", () => {
+  const env = { HOME: "/Users/you" };
+  // commit messages / PR comments / grep patterns mentioning rm (live 2026-07-10)
+  expect(classify(`git commit -q -F- <<'MSG'\nmerge: deny-safe rm -rf handling\nMSG`, env).decision).toBe("unknown");
+  expect(classify('gh pr comment 11 --body "covers the sandboxed rm -rf case"', env).decision).toBe("unknown");
+  expect(classify('grep -n "rm -rf" hooks/classify.ts', env).decision).toBe("safe");
+  // executors keep full-text scanning
+  expect(classify('bash -c "rm -rf /"', env).decision).toBe("dangerous");
+  expect(classify("echo 'rm -rf /' | sh", env).decision).toBe("dangerous");
+  expect(classify(`python3 -c 'import os; os.system("x")' && rm -rf /srv`, env).decision).toBe("dangerous");
+  expect(classify("sqlite3 db 'DELETE FROM accounts'", env).decision).toBe("dangerous");
+  expect(classify(`osascript -e 'tell application "System Events" to keystroke "hi"'`, env).decision).toBe("dangerous");
+});
+
+test("container/vcs rm and sandboxed-cwd relative rm are waived", () => {
+  const env = { HOME: "/Users/you" };
+  const wt = "/Users/you/.herdr/worktrees/monorepo/hive-abc";
+  expect(classify("docker rm -f hive62-db", env).decision).toBe("unknown");
+  expect(classify("git rm -rf old/dir", env).decision).toBe("unknown");
+  expect(classify("rm -f lib/contents/mod.rs.tmptest", env, wt).decision).toBe("unknown");
+  expect(classify("rm -f lib/x.tmp", env, "/Users/you/projects/monorepo").decision).toBe("dangerous"); // cwd not sandboxed
+  expect(classify("rm -rf ../other", env, wt).decision).toBe("dangerous"); // escape
+  expect(classify("cd /; rm -rf tmp", env, wt).decision).toBe("dangerous"); // in-command cd voids cwd proof
+  expect(classify("ls | xargs rm -rf", env, wt).decision).toBe("dangerous"); // executor + unseen targets
+});
+
+test("$HIVE_CLI emit with assignments is data-only", () => {
+  expect(
+    classify('export PATH="$HOME/.bun/bin:$PATH"\n"$HIVE_CLI" emit abc status --note "blocked on rm -rf card"').decision
+  ).toBe("unknown");
+  expect(classify('"$HIVE_CLI" emit abc status --note "x"; rm -rf /srv').decision).toBe("dangerous");
+});
+
 test("hive control-plane tampering is dangerous", () => {
   expect(classify('curl -X POST "$HIVE_URL/api/decisions/dec_123/answer" -d x').decision).toBe("dangerous");
   expect(classify("curl $HIVE_URL/api/decisions/dec_9/dismiss").decision).toBe("dangerous");

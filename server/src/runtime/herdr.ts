@@ -288,6 +288,22 @@ export function parseTabId(stdout: string): string | null {
   }
 }
 
+// Did an `agent send` actually land? Same never-trust-the-exit-code quirk as
+// `agent get`: sending to a vanished agent exits 0 with an
+// `{"error":{"code":"agent_not_found"}}` body. Returns the failure reason, or
+// null when the message was delivered. Every caller of Herdr.send must use this
+// instead of `r.code === 0`.
+export function sendFailure(r: ExecResult): string | null {
+  if (r.code !== 0) return r.stderr.trim() || r.stdout.trim() || `herdr send exited ${r.code}`;
+  try {
+    const err = JSON.parse(r.stdout)?.error;
+    if (err) return String(err.message ?? err.code ?? "herdr send failed");
+  } catch {
+    /* non-JSON stdout on exit 0 = delivered */
+  }
+  return null;
+}
+
 // Probe result: is the agent still registered with herdr, and what is its
 // status. `agent get` on a missing target exits 0 with an
 // `{"error":{"code":"agent_not_found"}}` body, so aliveness is parsed, not

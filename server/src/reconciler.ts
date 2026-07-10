@@ -12,7 +12,7 @@ import type { DB } from "./db.ts";
 import { now, newId, evidenceDir } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, TERMINAL, type State } from "./state.ts";
-import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
+import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
 import { runSmoke, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
@@ -205,18 +205,25 @@ async function nudgeConflict(
     base = JSON.parse(project?.config ?? "{}").default_branch || "main";
   } catch {}
   let delivered = false;
+  let error: string | null = null;
   if (t.agent_target) {
     try {
       const r = await h.send(
         t.agent_target,
         `hive: your PR ${t.pr_url} has merge conflicts with '${base}'. Fetch and merge the latest 'origin/${base}' into your branch (or rebase onto it), resolve the conflicts, rerun the tests, then push.`
       );
-      delivered = r.code === 0;
-    } catch {
-      delivered = false;
+      error = sendFailure(r);
+      delivered = error === null;
+    } catch (e: any) {
+      error = String(e?.message ?? e);
     }
   }
-  writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_conflict", payload: { pr_url: t.pr_url, head_sha: headSha, delivered } });
+  writeEvent(db, {
+    task_id: t.id,
+    source: "reconciler",
+    type: "pr_conflict",
+    payload: { pr_url: t.pr_url, head_sha: headSha, delivered, ...(error ? { error } : {}) },
+  });
 }
 
 // ---- PR → task linking via gh ----
@@ -394,11 +401,22 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string): 
     openRecoveryDecision(db, task, requeueDepth(db, task));
     enqueue(db, { kind: "failed", task_id: taskId, title: `Agent unresponsive: ${task.title}` });
   } else {
-    const r = await h.send(
-      target,
-      `hive: you've gone quiet. Reply with \`hive emit ${taskId} status --note "..."\` or say what's blocking you.`
-    );
-    writeEvent(db, { task_id: taskId, source: "reconciler", type: "recovery_nudge", payload: { nudge: nudges + 1, delivered: r.code === 0 } });
+    let error: string | null;
+    try {
+      const r = await h.send(
+        target,
+        `hive: you've gone quiet. Reply with \`hive emit ${taskId} status --note "..."\` or say what's blocking you.`
+      );
+      error = sendFailure(r);
+    } catch (e: any) {
+      error = String(e?.message ?? e);
+    }
+    writeEvent(db, {
+      task_id: taskId,
+      source: "reconciler",
+      type: "recovery_nudge",
+      payload: { nudge: nudges + 1, delivered: error === null, ...(error ? { error } : {}) },
+    });
     broadcastTask(db, getTask(db, taskId));
   }
 }
@@ -440,12 +458,23 @@ function requeueDepth(db: DB, task: any): number {
 
 // Consecutive recovery nudges since the last real activity (stale flags and the
 // nudges themselves don't count as activity, so silence keeps accumulating).
+// Only DELIVERED nudges count toward the escalation: failing a task for "3
+// nudges ignored" when herdr never landed one is a lie. A permanently
+// undeliverable agent is dead, and the dead branch (recoverDead) owns it — this
+// one only ever runs on an agent that probed alive.
 function nudgesSinceActivity(db: DB, taskId: string): number {
-  const rows = db.query("SELECT type FROM events WHERE task_id = ? ORDER BY ts DESC").all(taskId) as { type: string }[];
+  const rows = db.query("SELECT type, payload FROM events WHERE task_id = ? ORDER BY ts DESC").all(taskId) as {
+    type: string;
+    payload: string;
+  }[];
   let n = 0;
   for (const r of rows) {
-    if (r.type === "recovery_nudge") n++;
-    else if (r.type === "stale" || r.type === "agent_status") continue; // reconciler noise
+    if (r.type === "recovery_nudge") {
+      try {
+        if (JSON.parse(r.payload).delivered === false) continue; // never landed; doesn't count
+      } catch {}
+      n++;
+    } else if (r.type === "stale" || r.type === "agent_status") continue; // reconciler noise
     else break; // real activity resets the count
   }
   return n;
