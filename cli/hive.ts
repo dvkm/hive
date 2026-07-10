@@ -9,7 +9,9 @@ const USAGE = `hive — local orchestration control plane
 
 Usage:
   hive serve                              start the daemon
-  hive task create --project <id> --title <t> [--brief <file>] [--kind ship|scout|chore]
+  hive task create --project <id> --title <t> [--brief <file> | --brief-text <s>]
+        [--kind ship|scout|chore] [--parent <task-id>]
+        (under a hive agent, HIVE_TASK_ID makes source=agent + parent automatic)
   hive task list [--state <s>] [--project <id>]
   hive emit <task-id> <type> [--note <s>] [--file <path>] [--kind <k>] [--source <s>] [--pr-url <url>]
         types: status | evidence | needs-decision | ready | done | blocked | <custom>
@@ -93,12 +95,21 @@ async function main() {
     if (sub === "create") {
       if (!flags.project) die("--project is required");
       if (!flags.title) die("--title is required");
-      const brief = flags.brief ? readFileSync(String(flags.brief), "utf8") : undefined;
+      const brief = flags.brief
+        ? readFileSync(String(flags.brief), "utf8")
+        : flags["brief-text"]
+          ? String(flags["brief-text"])
+          : undefined;
+      // Running under a spawned agent (HIVE_TASK_ID set): attribute the task to
+      // the agent and default the parent to the spawning task.
+      const agentTask = process.env.HIVE_TASK_ID;
       const t = await api("POST", "/api/tasks", {
         project_id: flags.project,
         title: flags.title,
         brief,
         kind: flags.kind,
+        parent_task_id: flags.parent ?? agentTask ?? undefined,
+        source: agentTask ? "agent" : undefined,
       });
       console.log(`created task ${t.id}  [${t.state}]  ${t.title}`);
       return;

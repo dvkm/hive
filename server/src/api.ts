@@ -386,6 +386,11 @@ function createTask(db: DB, body: any): Response {
     return err("unknown project_id", 400);
   const kind = body.kind ?? "ship";
   if (!["ship", "scout", "chore"].includes(kind)) return err("invalid kind");
+  // Agents may create follow-up tasks (source="agent", parent_task_id → the
+  // spawning task); the dispatcher treats them like director-created tasks.
+  const parent = body.parent_task_id ? String(body.parent_task_id) : null;
+  if (parent && !db.query("SELECT 1 FROM tasks WHERE id = ?").get(parent))
+    return err("unknown parent_task_id", 400);
   const t = now();
   const row = {
     id: newId(),
@@ -400,20 +405,26 @@ function createTask(db: DB, body: any): Response {
     pr_url: null,
     ci_status: null,
     summary: null,
-    source: null,
+    source: body.source ? String(body.source) : null,
+    parent_task_id: parent,
     created_at: t,
     updated_at: t,
   };
   db.query(
     `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
-      worktree_path, branch, pr_url, ci_status, summary, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.project_id, row.title, row.brief, row.state, row.kind,
     row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
-    row.summary, row.created_at, row.updated_at
+    row.summary, row.source, row.parent_task_id, row.created_at, row.updated_at
   );
-  writeEvent(db, { task_id: row.id, source: "director", type: "created", payload: { title: row.title } });
+  writeEvent(db, {
+    task_id: row.id,
+    source: row.source === "agent" ? "agent" : "director",
+    type: "created",
+    payload: { title: row.title, ...(parent ? { parent_task_id: parent } : {}) },
+  });
   // Re-read so the assigned `number` (set by the DB trigger) rides on the
   // returned task and the broadcast payload.
   const created = getTask(db, row.id);
