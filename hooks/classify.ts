@@ -26,7 +26,7 @@ export interface Classification {
 // Destructive / high-blast patterns. Matched against the whole command string,
 // so chaining (`ok; rm -rf /`) or piping into a shell can't hide them.
 const DANGEROUS: [RegExp, string][] = [
-  [/(^|[\s;&|(])rm\s+(-[a-z]*\s+)*-[a-z]*[rf]/i, "recursive/forced rm"],
+  [/(^|[\s;&|("'])rm\s+(-[a-z]*\s+)*-[a-z]*[rf]/i, "recursive/forced rm"],
   [/(^|[\s;&|(])(sudo|doas)\b/i, "privilege escalation"],
   [/(curl|wget|fetch)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh|python|perl|ruby|node)\b/i, "pipe-to-shell from network"],
   [/git\s+push\b[^\n]*(--force\b|--force-with-lease\b|(^|\s)-f(\s|$))/i, "force push"],
@@ -45,10 +45,6 @@ const DANGEROUS: [RegExp, string][] = [
   // Types/clicks into whatever has focus on the HUMAN's desktop — seen live
   // 2026-07-10 (an agent probing Korean IME via System Events keystroke).
   [/osascript\b[\s\S]*System Events/i, "desktop UI scripting (osascript)"],
-  // Agents answering their own decision cards / minting authority rules defeats
-  // the whole escalation model — attempted live 2026-07-10 (dec_c698522e5c30).
-  [/\/api\/decisions\/[^\s"']+\/(answer|dismiss)/i, "hive decision tampering"],
-  [/\/api\/authority\/rules/i, "hive authority-rule tampering"],
   [/find\b[^\n]*-(delete|exec(dir)?)\b/i, "find with -delete/-exec"],
   [/\b(drop|truncate)\s+(table|database|schema)\b/i, "SQL drop/truncate"],
   [/\bdelete\s+from\b(?![\s\S]*\bwhere\b)/i, "SQL DELETE without WHERE"],
@@ -56,6 +52,16 @@ const DANGEROUS: [RegExp, string][] = [
   [/\bterraform\s+(apply|destroy)\b/i, "terraform apply/destroy"],
   [/\bkubectl\s+delete\b/i, "kubectl delete"],
   [/\bhelm\s+(delete|uninstall)\b/i, "helm delete/uninstall"],
+];
+
+// Rules whose evidence is an ARGUMENT (a URL, a file path) rather than
+// executable shell text — matched against the RAW command, never the
+// data-stripped scan target (the argument is usually quoted).
+const DANGEROUS_RAW: [RegExp, string][] = [
+  // Agents answering their own decision cards / minting authority rules defeats
+  // the whole escalation model — attempted live 2026-07-10 (dec_c698522e5c30).
+  [/\/api\/decisions\/[^\s"']+\/(answer|dismiss)/i, "hive decision tampering"],
+  [/\/api\/authority\/rules/i, "hive authority-rule tampering"],
   [/(id_rsa|id_ed25519|id_ecdsa)\b/i, "private SSH key"],
   [/\.aws\/credentials\b/i, "AWS credentials file"],
   [/\.ssh\/(?!known_hosts\b|config\b)/i, "SSH key material"],
@@ -128,12 +134,19 @@ function varMap(cmd: string, env: Record<string, string | undefined>): Record<st
   return map;
 }
 
-// True iff every target of every `rm` segment resolves to an absolute path
-// inside a sandbox root — no unresolved substitution, no `..`, no relative
-// paths. `rm` reached via xargs/env/etc. never waives (segment must start with rm).
-function rmTargetsSandboxed(cmd: string, env: Record<string, string | undefined>): boolean {
+// True iff every target of every `rm` segment resolves inside a sandbox root —
+// no unresolved substitution, no `..`. Absolute paths must sit under a root;
+// relative paths count only when the hook's reported cwd is itself sandboxed
+// (an agent cleaning a temp file in its own worktree, seen live 2026-07-10,
+// dec_04e587de3ee0). `rm` reached via xargs/env/etc. never waives.
+function rmTargetsSandboxed(
+  cmd: string,
+  env: Record<string, string | undefined>,
+  cwd?: string
+): boolean {
   const map = varMap(cmd, env);
   const roots = sandboxRoots(env);
+  const cwdSandboxed = !!cwd && roots.some((r) => (cwd + "/").startsWith(r));
   const rmSegs = segments(cmd).filter((s) => /^rm\b/.test(s));
   if (!rmSegs.length) return false;
   // The whole-string DANGEROUS scan can also fire on an rm hidden in a non-rm
@@ -141,6 +154,8 @@ function rmTargetsSandboxed(cmd: string, env: Record<string, string | undefined>
   // plain rm we can inspect.
   const rmish = segments(cmd).filter((s) => /(^|[\s;&|(])rm\s+(-[a-z]*\s+)*-[a-z]*[rf]/i.test(s));
   if (rmish.some((s) => !/^rm\b/.test(s))) return false;
+  // An in-command `cd` changes what relative targets mean; keep it provable.
+  if (cwdSandboxed && /(^|[\s;&|(])cd\s/.test(cmd)) return false;
   for (const seg of rmSegs) {
     const body = seg.split(/\s+[\d&]*[<>]/)[0]; // drop redirections
     for (let tok of body.split(/\s+/).slice(1)) {
@@ -149,7 +164,11 @@ function rmTargetsSandboxed(cmd: string, env: Record<string, string | undefined>
       if (!tok) continue;
       if (/[$`]/.test(tok)) return false; // unresolved substitution
       if (tok.includes("..")) return false; // path escape
-      if (!tok.startsWith("/")) return false; // relative: can't prove
+      if (tok.startsWith("~")) return false; // unexpanded home
+      if (!tok.startsWith("/")) {
+        if (!cwdSandboxed) return false; // relative: only provable via sandboxed cwd
+        continue;
+      }
       if (!roots.some((r) => tok.startsWith(r))) return false;
     }
   }
@@ -200,28 +219,82 @@ function sqlTargetsSandboxed(cmd: string, env: Record<string, string | undefined
   });
 }
 
-// A lone `hive emit …` (or the CLI invoked via bun) only POSTs its arguments to
-// hive as JSON — the text is data, never executed. Without this, a status note
-// that MENTIONS a destructive command trips the whole-string scan (seen live
-// 2026-07-10, dec_95135b1837e9). Requires: single segment, no substitution.
+// A lone `hive emit …` (any invocation form, optionally preceded by VAR=
+// assignments) only POSTs its arguments to hive as JSON — the text is data,
+// never executed. Without this, a status note that MENTIONS a destructive
+// command trips the whole-string scan (seen live 2026-07-10, dec_95135b1837e9,
+// dec_358dc21a6e8f). Requires: no substitution anywhere.
 function isHiveEmitDataOnly(cmd: string): boolean {
   if (/\$\(|`|<\(/.test(cmd)) return false;
-  const segs = segments(cmd);
-  return segs.length === 1 && /^((bun|bunx)\s+\S*hive(\.ts)?\s+|(\.\/)?bin\/hive\s+|hive\s+)emit\b/.test(segs[0]);
+  const emitRe = /^("?\$HIVE_CLI"?|(bun|bunx)\s+\S*hive(\.ts)?|(\.\/)?bin\/hive|hive)\s+emit\b/;
+  const assignRe = /^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=/;
+  let sawEmit = false;
+  for (const s of segments(cmd)) {
+    if (emitRe.test(s)) sawEmit = true;
+    else if (!assignRe.test(s)) return false;
+  }
+  return sawEmit;
+}
+
+// ---- data-text stripping --------------------------------------------------
+// Quoted strings and heredoc bodies are DATA to the receiving command (a commit
+// message, a PR comment, a grep pattern) unless something in the command can
+// EXECUTE text (sh -c, eval, xargs, python -c, …). Scanning data as if it were
+// shell caused a steady stream of false decision cards (git commit -F- <<MSG
+// mentioning rm; gh pr comment bodies; grep "rm "). So: when no executor is
+// present, the DANGEROUS scan runs on the command with data text stripped.
+// False executor hits only disable stripping — conservative by construction.
+// ponytail: write-file-then-run-it still evades any Bash-only scan (the Write
+// tool is ungated); this closes the data-text class, not file-mediated exec.
+// Includes the SQL clients and osascript: they EXECUTE their quoted argument,
+// so their commands must be scanned unstripped.
+const EXECUTOR = new RegExp(
+  String.raw`\b(sh|bash|zsh|ksh|dash|eval|source|exec|xargs|sqlite3|psql|mysql|osascript)\b` +
+    String.raw`|\bpython3?\b[^\n|;&]*\s-c\s|\bnode\b[^\n|;&]*\s(-e|--eval)\s|\b(perl|ruby)\b[^\n|;&]*\s-e\s`
+);
+
+export function stripDataText(cmd: string): string {
+  return cmd
+    // heredoc bodies: <<TAG / <<-TAG / <<'TAG' … TAG (start-of-line terminator)
+    .replace(/<<-?\s*(['"]?)(\w+)\1[\s\S]*?\n\2(?=\n|$)/g, "<<HEREDOC_STRIPPED")
+    .replace(/'[^']*'/g, "''")
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""');
+}
+
+// `docker rm` / `podman rm` remove containers, `git rm` stages recoverable
+// deletions — none touch the filesystem the way `rm` does. Waive the rm rule
+// when every rm-matching segment is one of those commands.
+function isContainerOrVcsRm(cmd: string): boolean {
+  const rmish = segments(cmd).filter((s) => /(^|[\s;&|(])rm\s+(-[a-z]*\s+)*-[a-z]*[rf]/i.test(s));
+  return rmish.length > 0 && rmish.every((s) => /^(docker|podman|git)\b/.test(s));
 }
 
 export function classify(
   command: string,
-  env: Record<string, string | undefined> = process.env
+  env: Record<string, string | undefined> = process.env,
+  cwd?: string
 ): Classification {
   const cmd = command.trim();
   if (!cmd) return { decision: "safe", reason: "empty command" };
 
+  // Argument-evidence rules always see the raw command (their match is
+  // usually inside quotes). No waivers apply to them.
+  for (const [rx, reason] of DANGEROUS_RAW) {
+    if (rx.test(cmd)) return { decision: "dangerous", reason };
+  }
+
   const emitDataOnly = isHiveEmitDataOnly(cmd);
+  // No executor and no command substitution → quoted strings / heredoc bodies
+  // are data; scan with them stripped so text ABOUT rm isn't treated AS rm.
+  // Substitution ($(…), backticks, <(…)) executes even inside double quotes,
+  // so its presence forces the full-text scan.
+  const scanTarget =
+    EXECUTOR.test(cmd) || /\$\(|`|<\(/.test(cmd) ? cmd : stripDataText(cmd);
   for (const [rx, reason] of DANGEROUS) {
-    if (!rx.test(cmd)) continue;
+    if (!rx.test(scanTarget)) continue;
     if (emitDataOnly) continue; // arguments are data, not executed
-    if (reason === "recursive/forced rm" && rmTargetsSandboxed(cmd, env)) continue;
+    if (reason === "recursive/forced rm" && (rmTargetsSandboxed(cmd, env, cwd) || isContainerOrVcsRm(cmd)))
+      continue;
     if (reason === "process kill" && killTargetsSandboxed(cmd, env)) continue;
     if (reason.startsWith("SQL ") && sqlTargetsSandboxed(cmd, env)) continue;
     return { decision: "dangerous", reason };
@@ -298,7 +371,11 @@ if (import.meta.main) {
   const command = payload?.tool_input?.command;
   if (typeof command !== "string") process.exit(0); // not a Bash command → defer
 
-  const { decision, reason } = classify(command);
+  const { decision, reason } = classify(
+    command,
+    process.env,
+    typeof payload?.cwd === "string" ? payload.cwd : undefined
+  );
 
   if (decision === "safe") {
     console.log(preToolUseOutput("allow", reason));
