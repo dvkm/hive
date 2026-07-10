@@ -232,6 +232,22 @@ test("dismiss endpoint expires an open decision and 409s on re-dismiss", async (
   expect(again.status).toBe(409);
 });
 
+test("dismissing the last open decision resumes a needs_decision task", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "d-resume" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
+  const d1 = await post("/api/decisions", { task_id: t.json.id, title: "gate 1", options: [{ key: "a", label: "A" }] });
+  const d2 = await post("/api/decisions", { task_id: t.json.id, title: "gate 2", options: [{ key: "a", label: "A" }] });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "needs_decision" });
+  // one card still open → stays parked
+  await post(`/api/decisions/${d1.json.id}/dismiss`, {});
+  let cur = await get(`/api/tasks/${t.json.id}`);
+  expect(cur.json.state).toBe("needs_decision");
+  // last card dismissed → resumes
+  await post(`/api/decisions/${d2.json.id}/dismiss`, {});
+  cur = await get(`/api/tasks/${t.json.id}`);
+  expect(cur.json.state).toBe("in_progress");
+});
+
 test("cancelling a task clears its open decisions from the inbox (SSE broadcast + expiry)", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "d-cancel" });
   const d = await post("/api/decisions", { task_id: t.json.id, title: "orphan?", options: [{ key: "a", label: "A" }] });
