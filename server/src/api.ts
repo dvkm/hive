@@ -176,6 +176,10 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/send$/);
       if (m && method === "POST") return await sendSteer(db, herdr, m[1], await req.json());
 
+      if (pathname === "/api/checkpoints" && method === "GET") return listOpenCheckpoints(db);
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/checkpoints\/([^/]+)\/ack$/);
+      if (m && method === "POST") return await ackCheckpoint(db, herdr, m[1], m[2], await req.json());
+
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/focus-agent$/);
       if (m && method === "POST") return await focusAgent(db, herdr, m[1]);
 
@@ -1234,6 +1238,74 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, body: any): Promise<R
     writeEvent(db, { task_id: id, source: "herdr", type: "steer_error", payload: { error } });
     return json({ ok: false, delivered: false, error });
   }
+}
+
+// ---- checkpoints (live build-time checklist) ----
+// Agents emit `checkpoint` events WHILE building ("assuming X", "took shortcut
+// Y") instead of saving every judgment call for the final review. The director
+// ticks them (ok) or flags them; a flag steers the agent immediately. State is
+// derived purely from events — no table, no migration.
+function checkpointNote(payload: string): string {
+  try {
+    return String(JSON.parse(payload).note ?? "");
+  } catch {
+    return "";
+  }
+}
+
+function listOpenCheckpoints(db: DB): Response {
+  const rows = db
+    .query(
+      `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id
+         FROM events e JOIN tasks t ON t.id = e.task_id
+        WHERE e.type = 'checkpoint'
+          AND t.state IN ('in_progress','needs_decision','in_review','verifying')
+          AND NOT EXISTS (
+            SELECT 1 FROM events a
+             WHERE a.task_id = e.task_id AND a.type = 'checkpoint_ack'
+               AND json_extract(a.payload, '$.checkpoint_id') = e.id)
+        ORDER BY e.ts DESC`
+    )
+    .all() as any[];
+  return json({
+    checkpoints: rows.map((r) => ({
+      id: r.id,
+      task_id: r.task_id,
+      ts: r.ts,
+      task_number: r.number,
+      task_title: r.title,
+      project_id: r.project_id,
+      note: checkpointNote(r.payload),
+    })),
+  });
+}
+
+async function ackCheckpoint(db: DB, herdr: Herdr, taskId: string, eventId: string, body: any): Promise<Response> {
+  const ev: any = db
+    .query("SELECT * FROM events WHERE id = ? AND task_id = ? AND type = 'checkpoint'")
+    .get(eventId, taskId);
+  if (!ev) return err("checkpoint not found", 404);
+  const verdict = body?.verdict;
+  if (verdict !== "ok" && verdict !== "flag") return err("verdict must be 'ok' or 'flag'");
+  const note = body?.note ? String(body.note) : null;
+  writeEvent(db, {
+    task_id: taskId,
+    source: "director",
+    type: "checkpoint_ack",
+    payload: { checkpoint_id: eventId, verdict, note },
+  });
+  let delivered = false;
+  if (verdict === "flag") {
+    const res = await sendSteer(db, herdr, taskId, {
+      message: `Director FLAGGED your checkpoint: "${checkpointNote(ev.payload)}"${note ? ` — ${note}` : ""}. Address this now, before continuing.`,
+    });
+    try {
+      delivered = ((await res.json()) as any).delivered ?? false;
+    } catch {
+      /* response body already consumed elsewhere — delivery state is best-effort */
+    }
+  }
+  return json({ ok: true, delivered });
 }
 
 // MCP servers whose tools open an interactive Allow/Deny dialog. A spawned

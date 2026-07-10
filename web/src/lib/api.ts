@@ -303,7 +303,24 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+// An open (un-acked) build-time checkpoint, as returned by GET /api/checkpoints.
+export interface Checkpoint {
+  id: string;
+  task_id: string;
+  ts: string;
+  task_number: number;
+  task_title: string;
+  project_id: string;
+  note: string;
+}
+
 export const api = {
+  checkpoints: () => req<{ checkpoints: Checkpoint[] }>(`/api/checkpoints`),
+  ackCheckpoint: (taskId: string, eventId: string, verdict: "ok" | "flag", note?: string) =>
+    req<{ ok: boolean; delivered: boolean }>(`/api/tasks/${taskId}/checkpoints/${eventId}/ack`, {
+      method: "POST",
+      body: JSON.stringify({ verdict, note }),
+    }),
   tasks: (q: { state?: State; project_id?: string } = {}) => {
     const p = new URLSearchParams(q as Record<string, string>).toString();
     return req<Task[]>(`/api/tasks${p ? "?" + p : ""}`);

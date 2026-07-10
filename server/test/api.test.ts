@@ -86,6 +86,35 @@ test("review_summary keeps its structured sections; empty submission is rejected
   expect(bad.status).toBe(400);
 });
 
+test("checkpoints: emit -> listed open -> ack removes; flag steers; bad verdict 400", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "cp task" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
+  const e1 = await post(`/api/tasks/${t.json.id}/events`, { type: "checkpoint", note: "assuming KST for defaults" });
+  expect(e1.status).toBe(201);
+  const cpId = e1.json.event.id;
+
+  let open = await get("/api/checkpoints");
+  expect(open.json.checkpoints.some((c: any) => c.id === cpId && c.note.includes("KST"))).toBe(true);
+
+  const bad = await post(`/api/tasks/${t.json.id}/checkpoints/${cpId}/ack`, { verdict: "maybe" });
+  expect(bad.status).toBe(400);
+  const missing = await post(`/api/tasks/${t.json.id}/checkpoints/evt_nope/ack`, { verdict: "ok" });
+  expect(missing.status).toBe(404);
+
+  const ok = await post(`/api/tasks/${t.json.id}/checkpoints/${cpId}/ack`, { verdict: "ok" });
+  expect(ok.status).toBe(200);
+  open = await get("/api/checkpoints");
+  expect(open.json.checkpoints.some((c: any) => c.id === cpId)).toBe(false);
+
+  // flag on a second checkpoint records the ack event (steer degrades gracefully: no agent)
+  const e2 = await post(`/api/tasks/${t.json.id}/events`, { type: "checkpoint", note: "global lock for saves" });
+  const flag = await post(`/api/tasks/${t.json.id}/checkpoints/${e2.json.event.id}/ack`, { verdict: "flag", note: "per-account locks please" });
+  expect(flag.status).toBe(200);
+  const evs = await get(`/api/tasks/${t.json.id}/events`);
+  expect(evs.json.some((e: any) => e.type === "checkpoint_ack" && e.payload.verdict === "flag" && e.payload.note === "per-account locks please")).toBe(true);
+  expect(evs.json.some((e: any) => e.type === "steer")).toBe(true);
+});
+
 test("event ingestion: status event is recorded", async () => {
   const r = await post(`/api/tasks/${taskId}/events`, { type: "status", note: "working" });
   expect(r.status).toBe(201);

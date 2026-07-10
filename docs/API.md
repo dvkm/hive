@@ -154,6 +154,7 @@ the task timeline with the agent's actual work; see `hooks/install.md`):
 - `agent_turn_end` — a quiet Stop/SubagentStop liveness heartbeat. `payload: {}` (kept for health/reconciler; the timeline hides it)
 
 Types written by the runtime layer (Phase 2b):
+- `checkpoint` — a live build-time judgment call from a working agent (`payload: {note}`; `hive emit <id> checkpoint --note "..."`). Non-blocking. The director acknowledges via `POST /api/tasks/:id/checkpoints/:eventId/ack` body `{verdict: "ok"|"flag", note?}` → `200 {ok, delivered}` (a `flag` steers the agent immediately) | `400` | `404`; `checkpoint_ack` events (`payload: {checkpoint_id, verdict, note}`) record the outcome. `GET /api/checkpoints` → `200 {checkpoints: [{id, task_id, ts, task_number, task_title, project_id, note}]}` lists un-acked checkpoints on live tasks (the inbox section).
 - `review_summary` — the agent's structured self-review, submitted before `ready`. `payload: {done?: string[], iffy?: (string|{what,why})[], decisions?: string[], testing?: string[], followups?: string[]}`. The review card renders the latest one as the primary review surface (prose `summary` collapses behind a toggle).
 - `spawned` — a herdr agent was started. `payload: {agent_target, branch, worktree_path, tab_id, label, fleet_workspace_id}`
 - `spawn_error` — spawn failed. `payload: {error}`
