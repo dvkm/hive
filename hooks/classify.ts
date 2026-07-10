@@ -85,12 +85,98 @@ function segments(command: string): string[] {
     .filter(Boolean);
 }
 
-export function classify(command: string): Classification {
+// ---- sandbox waiver -------------------------------------------------------
+// Destructive ops provably confined to the agent's OWN sandbox (its scratchpad
+// under /tmp, macOS temp dirs, herdr worktrees) are routine cleanup, not
+// incidents — every one used to open a decision card and stall the agent until
+// David answered (4 cards on 2026-07-10 alone, all scratchpad rm / headless-
+// chrome pkill). A waived match downgrades to "unknown", which the authority
+// engine allows-and-logs — never silently, never "safe".
+
+function sandboxRoots(env: Record<string, string | undefined>): string[] {
+  const roots = ["/tmp/", "/private/tmp/", "/var/folders/"];
+  if (env.HOME) roots.push(`${env.HOME}/.herdr/worktrees/`);
+  return roots;
+}
+
+// Substitute $VAR / ${VAR} from a map; unknown vars stay verbatim (and later
+// fail the "no unresolved $" check, keeping the command dangerous).
+function subst(s: string, map: Record<string, string>): string {
+  return s.replace(
+    /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+    (all, a, b) => map[a ?? b] ?? all
+  );
+}
+
+// Variables resolvable statically: HOME/TMPDIR from the hook's env (the agent's
+// own env) plus `VAR=value` assignments made in this same command string.
+function varMap(cmd: string, env: Record<string, string | undefined>): Record<string, string> {
+  const map: Record<string, string> = {};
+  if (env.HOME) map.HOME = env.HOME;
+  if (env.TMPDIR) map.TMPDIR = env.TMPDIR;
+  for (const seg of segments(cmd)) {
+    const m = seg.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=("([^"]*)"|'([^']*)'|\S+)/);
+    if (m) map[m[1]] = subst(m[3] ?? m[4] ?? m[2], map);
+  }
+  return map;
+}
+
+// True iff every target of every `rm` segment resolves to an absolute path
+// inside a sandbox root — no unresolved substitution, no `..`, no relative
+// paths. `rm` reached via xargs/env/etc. never waives (segment must start with rm).
+function rmTargetsSandboxed(cmd: string, env: Record<string, string | undefined>): boolean {
+  const map = varMap(cmd, env);
+  const roots = sandboxRoots(env);
+  const rmSegs = segments(cmd).filter((s) => /^rm\b/.test(s));
+  if (!rmSegs.length) return false;
+  // The whole-string DANGEROUS scan can also fire on an rm hidden in a non-rm
+  // segment (e.g. `xargs rm -rf`); only waive when every firing segment is a
+  // plain rm we can inspect.
+  const rmish = segments(cmd).filter((s) => /(^|[\s;&|(])rm\s+(-[a-z]*\s+)*-[a-z]*[rf]/i.test(s));
+  if (rmish.some((s) => !/^rm\b/.test(s))) return false;
+  for (const seg of rmSegs) {
+    const body = seg.split(/\s+[\d&]*[<>]/)[0]; // drop redirections
+    for (let tok of body.split(/\s+/).slice(1)) {
+      if (tok.startsWith("-")) continue;
+      tok = subst(tok.replace(/["']/g, ""), map);
+      if (!tok) continue;
+      if (/[$`]/.test(tok)) return false; // unresolved substitution
+      if (tok.includes("..")) return false; // path escape
+      if (!tok.startsWith("/")) return false; // relative: can't prove
+      if (!roots.some((r) => tok.startsWith(r))) return false;
+    }
+  }
+  return true;
+}
+
+// True iff every kill/pkill segment targets the agent's own tooling: a headless
+// browser it launched (--headless / remote-debugging-port) or a process whose
+// match pattern names a sandbox path.
+// ponytail: pattern-based, so `pkill -f remote-debugging-port` could hit a
+// human's debug Chrome too; scope to the agent's own port/profile if that bites.
+function killTargetsSandboxed(cmd: string, env: Record<string, string | undefined>): boolean {
+  const map = varMap(cmd, env);
+  const roots = sandboxRoots(env);
+  const killSegs = segments(cmd).filter((s) => /\b(kill(all)?|pkill)\b/i.test(s));
+  if (!killSegs.length) return false;
+  return killSegs.every((seg) => {
+    const s = subst(seg.replace(/["']/g, ""), map);
+    return /remote-debugging-port|--headless/.test(s) || roots.some((r) => s.includes(r));
+  });
+}
+
+export function classify(
+  command: string,
+  env: Record<string, string | undefined> = process.env
+): Classification {
   const cmd = command.trim();
   if (!cmd) return { decision: "safe", reason: "empty command" };
 
   for (const [rx, reason] of DANGEROUS) {
-    if (rx.test(cmd)) return { decision: "dangerous", reason };
+    if (!rx.test(cmd)) continue;
+    if (reason === "recursive/forced rm" && rmTargetsSandboxed(cmd, env)) continue;
+    if (reason === "process kill" && killTargetsSandboxed(cmd, env)) continue;
+    return { decision: "dangerous", reason };
   }
 
   // Command/process substitution runs code the segment scan can't see, so it

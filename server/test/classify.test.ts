@@ -9,7 +9,7 @@ const dangerous = [
   "rm -rf /",
   "rm -rf node_modules",
   "rm -fr build",
-  "cat foo.txt && rm -rf /tmp/x", // dangerous token after a safe one
+  "cat foo.txt && rm -rf /srv/x", // dangerous token after a safe one
   "ls; rm -rf .",
   "sudo rm foo",
   "doas reboot",
@@ -118,4 +118,39 @@ test("git commit / non-force push escalate rather than auto-approve", () => {
 
 test("dev/null and dev/urandom redirects are not treated as device writes", () => {
   expect(classify("bun test > /dev/null 2>&1").decision).toBe("safe");
+});
+
+// Sandbox waiver: destructive ops provably confined to the agent's own
+// scratchpad/tmp/worktree downgrade to "unknown" (allow+log), never "safe" —
+// and anything not provably confined stays "dangerous".
+test("sandbox-scoped rm downgrades to unknown, not dangerous", () => {
+  const env = { HOME: "/Users/david", TMPDIR: "/var/folders/ab/T/" };
+  expect(classify("rm -rf /tmp/build-cache", env).decision).toBe("unknown");
+  expect(classify("rm -f /private/tmp/claude-501/x/scratchpad/copy.db*", env).decision).toBe("unknown");
+  expect(classify("rm -rf /Users/david/.herdr/worktrees/repo/hive-abc", env).decision).toBe("unknown");
+  // same-command variable assignment resolves (the real dec_7ba648202a09 shape)
+  const real = `S=/private/tmp/claude-501/sess/scratchpad\nrm -f "$S/hive-copy.db"*\nsqlite3 /tmp/copy.db ".backup"`;
+  expect(classify(real, env).decision).toBe("unknown");
+  expect(classify('rm -f "$TMPDIR/out.png"', env).decision).toBe("unknown");
+});
+
+test("non-sandbox / unprovable rm stays dangerous", () => {
+  const env = { HOME: "/Users/david" };
+  expect(classify("rm -rf /", env).decision).toBe("dangerous");
+  expect(classify("rm -rf ~/projects", env).decision).toBe("dangerous"); // ~ unexpanded → relative
+  expect(classify("rm -rf $HOME/projects", env).decision).toBe("dangerous");
+  expect(classify("rm -rf /tmp/../etc", env).decision).toBe("dangerous"); // path escape
+  expect(classify("rm -rf $UNSET/x", env).decision).toBe("dangerous"); // unresolved var
+  expect(classify("rm -rf build", env).decision).toBe("dangerous"); // relative
+  expect(classify("ls | xargs rm -rf", env).decision).toBe("dangerous"); // targets unseen
+  expect(classify("sudo rm -rf /tmp/x", env).decision).toBe("dangerous"); // sudo rule still fires
+});
+
+test("agent-tooling kill downgrades to unknown; general kill stays dangerous", () => {
+  const env = { HOME: "/Users/david" };
+  expect(classify('pkill -f "remote-debugging-port=9333"', env).decision).toBe("unknown");
+  expect(classify("pkill -f '/private/tmp/claude-501/sess/prof'", env).decision).toBe("unknown");
+  expect(classify("pkill -f server", env).decision).toBe("dangerous");
+  expect(classify("killall node", env).decision).toBe("dangerous");
+  expect(classify("kill -9 1234", env).decision).toBe("dangerous");
 });
