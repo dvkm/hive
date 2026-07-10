@@ -43,6 +43,26 @@ Rules:
 - When you hit a decision the director must make, emit \`needs-decision\` and
   stop; do not guess on anything high-risk (prod, feature flags, destructive ops).`;
 
+// Agents may fan work out instead of scope-creeping their own task. HIVE_TASK_ID
+// is set in every spawned agent's env, so the CLI auto-attributes the new task
+// (source=agent, parent_task_id → this task).
+function spawnTasksSection(projectId: string): string {
+  return `## Spawning follow-up tasks
+When you discover work that is OUT OF SCOPE for this task — a bug you noticed,
+a missing test, a natural follow-up — do not expand your task. Queue it as a
+new task and keep going:
+
+  hive task create --project ${projectId} \\
+    --title "short imperative title" \\
+    --brief-text "what, where (files/paths), why, and the definition of done" \\
+    --kind ship|scout|chore
+
+Write the brief self-contained: the agent that picks it up has NONE of your
+context. Include file paths, repro steps, and what done looks like. The task is
+linked to you automatically (parent) and the dispatcher schedules it like any
+other — duplicates are auto-detected, so when in doubt, file it.`;
+}
+
 // Kept in sync with DENIED_MCP_SERVERS in api.ts, which writes the matching
 // permissions.deny into each worktree's .claude/settings.local.json.
 const BROWSER_VERIFICATION = `## Browser verification (headless only)
@@ -139,6 +159,7 @@ export function composeBrief(db: DB, taskId: string): string {
   parts.push(`## Brief\n${task.brief?.trim() || "(no description provided)"}`);
   parts.push(definitionOfDone(task.kind));
   parts.push(EMIT_PROTOCOL);
+  parts.push(spawnTasksSection(task.project_id));
   parts.push(prMarkerSection(task.number, task.id));
   parts.push(BROWSER_VERIFICATION);
 

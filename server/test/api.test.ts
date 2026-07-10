@@ -52,6 +52,24 @@ test("task create + list + get", async () => {
   expect(Array.isArray(one.json.events)).toBe(true);
 });
 
+test("agent-created task carries source + parent_task_id", async () => {
+  const r = await post("/api/tasks", {
+    project_id: projectId,
+    title: "follow-up from agent",
+    source: "agent",
+    parent_task_id: taskId,
+  });
+  expect(r.status).toBe(201);
+  expect(r.json.source).toBe("agent");
+  expect(r.json.parent_task_id).toBe(taskId);
+  const bad = await post("/api/tasks", {
+    project_id: projectId,
+    title: "bad parent",
+    parent_task_id: "nope",
+  });
+  expect(bad.status).toBe(400);
+});
+
 test("event ingestion: status event is recorded", async () => {
   const r = await post(`/api/tasks/${taskId}/events`, { type: "status", note: "working" });
   expect(r.status).toBe(201);
