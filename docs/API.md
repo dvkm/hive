@@ -165,7 +165,7 @@ Types written by the runtime layer (Phase 2b):
 - `ci_status` — reconciler synced CI. `payload: {ci_status}` (`passing|pending|failing`)
 - `pr_merged` — reconciler detected the PR merged. `payload: {pr_url}`
 - `pr_conflict` — reconciler saw the PR CONFLICTING with its base and nudged the agent to resolve (once per head SHA; lifecycle untouched). `payload: {pr_url, head_sha, delivered}`
-- `ready_for_review` — the task was handed off `in_progress → in_review`, by the agent's `ready` emit or the reconciler's idle/gone backstop. `payload: {pr_url, via, kind}` (`via ∈ {emit, idle, gone}`)
+- `ready_for_review` — the task was handed off `in_progress → in_review`: by the agent's `ready` emit, by the herdr supervise loop's push signal (`source: herdr`, the moment herdr reports the agent idle), or by the reconciler's idle/gone poll backstop. `payload: {pr_url, via, kind}` (`via ∈ {emit, idle, gone}`)
 - `pr_linked` — a marked PR was matched back to this task and its `pr_url` set (by the reconciler's scan or `POST /api/tasks/link-pr`). `payload: {pr_url, via}` (`via ∈ {id, number}` — which half of the marker matched)
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
