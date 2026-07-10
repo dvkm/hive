@@ -7,6 +7,7 @@ import { startReaper } from "./reaper.ts";
 import { checkAllMonitors } from "./monitors.ts";
 import { startDigest, setNotifier } from "./notifications.ts";
 import { startGchatPoll } from "./intake/gchat.ts";
+import { startPromoter } from "./promoter.ts";
 import { setTerminalHook, expireOrphanedDecisions } from "./state.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { herdr as defaultHerdr } from "./runtime/herdr.ts";
@@ -61,5 +62,10 @@ startDigest(db);
 // Google Chat intake: poll allowlisted spaces (per-project config.gchat_spaces)
 // and draft tasks from stakeholder messages. Hard no-op until configured.
 startGchatPoll(db);
+
+// Continuous promotion evaluator: projects with config.promote {from, to} get
+// an evaluation task queued whenever `from` moves ahead of `to`. No-op otherwise.
+const promoteMs = Number(process.env.HIVE_PROMOTE_MS || 30 * 60 * 1000);
+startPromoter(db, { intervalMs: promoteMs });
 
 console.log(`[hive] server on http://${server.hostname}:${server.port}  db=${dbPath}`);
