@@ -13,6 +13,7 @@ import {
   canTransition,
   TransitionError,
   TERMINAL,
+  advanceIfFinished,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
@@ -1149,10 +1150,19 @@ export async function spawnAgent(
   return { ok: true, agent_target: result.agent_target };
 }
 
-// Re-arming supervised wait loop. Each completed wait re-arms; on error the
-// reconciler's polling is the safety net. Started only in production wiring.
-async function superviseAgent(db: DB, herdr: Herdr, taskId: string, target: string): Promise<void> {
+// Re-arming supervised wait loop: the herdr PUSH channel for "the agent is
+// done". It never relies on anything the agent emits — herdr's own idle signal
+// drives the in_progress → in_review handoff (advanceIfFinished, same logic as
+// the reconciler's poll backstop). A wait timeout re-arms while the agent is
+// alive, so supervision covers tasks longer than one wait window; the loop ends
+// on handoff, death, or a herdr error, and the reconciler's polling is the
+// safety net for everything after. Started only in production wiring; exported
+// for tests.
+export async function superviseAgent(db: DB, herdr: Herdr, taskId: string, target: string): Promise<void> {
   const WAIT_MS = 5 * 60 * 1000;
+  // Idle with nothing to hand off yet (no PR): `wait --status idle` returns
+  // immediately while the agent stays idle, so a bare re-arm would busy-spin.
+  const IDLE_RECHECK_MS = 15_000;
   // ponytail: sequential loop, one agent per task; fine for a localhost tool.
   while (true) {
     const task = getTask(db, taskId);
@@ -1164,7 +1174,13 @@ async function superviseAgent(db: DB, herdr: Herdr, taskId: string, target: stri
       writeEvent(db, { task_id: taskId, source: "herdr", type: "supervise_error", payload: { error: String((e as any)?.message ?? e) } });
       return; // reconciler takes over
     }
-    if (res.code !== 0) return; // timeout / not found: fall back to reconciler polling
+    if (res.code !== 0) {
+      // Timeout (agent still working) or a vanished agent. Re-arm while alive;
+      // a dead agent is the reconciler recovery's job, not ours.
+      const { alive } = await herdr.probe(target);
+      if (!alive) return;
+      continue;
+    }
     const status = await herdr.status(target);
     if (status !== "unknown") {
       const last = db
@@ -1173,7 +1189,11 @@ async function superviseAgent(db: DB, herdr: Herdr, taskId: string, target: stri
       const prev = last ? (JSON.parse(last.payload).status ?? null) : null;
       if (status !== prev)
         writeEvent(db, { task_id: taskId, source: "herdr", type: "agent_status", payload: { status } });
+      // The push-signal payoff: hand off to review the moment herdr says idle,
+      // instead of waiting out the next reconciler cycle.
+      if (advanceIfFinished(db, taskId, status, "herdr")) return; // handed off; done supervising
     }
+    await new Promise((r) => setTimeout(r, IDLE_RECHECK_MS));
   }
 }
 
