@@ -819,6 +819,19 @@ killed on timeout). Injectable exec for tests.
   source task, and a `normal` `planned` notification is enqueued. On `reject`
   nothing is created (the `decision_answered` event is the only record).
 
+### Promoter (continuous promote-to-main evaluation)
+No HTTP endpoints — a server-internal loop (`server/src/promoter.ts`, every
+`HIVE_PROMOTE_MS`, default 30m, plus one run ~30s after boot). Projects opt in
+with `config.promote = {from: "staging", to: "main"}`. Whenever `origin/<from>`
+has commits `origin/<to>` lacks, it queues ONE evaluation task
+(`source="promoter"`, `source_ref` = the evaluated head SHA, kind `ship`) that
+the dispatcher spawns like any other. The agent judges readiness (CI, half-
+shipped features, pending migrations) and either opens the Promote PR
+(base `<to>`, head `<from>`; the DIRECTOR merges) or attaches a not-ready
+report and finishes. Dedup: one in-flight evaluation per project, a given head
+SHA is evaluated at most once, and an already-open promote PR suppresses new
+evaluations until it's merged/closed.
+
 ### Dispatcher (self-driving spawn loop)
 No HTTP endpoints — the dispatcher is a server-internal loop (`server/src/dispatcher.ts`,
 default every 30s, `HIVE_DISPATCH_MS`). It picks up `queued` tasks and spawns a
