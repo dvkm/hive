@@ -141,9 +141,17 @@ export function ReviewCard({
       .task(task.id)
       .then((t) => {
         if (!live) return;
-        // events are ts-ascending; take the agent's LATEST self-review
-        const ev = [...(t.events ?? [])].reverse().find((e: any) => e.type === "review_summary");
-        if (ev?.payload && typeof ev.payload === "object") setReview(ev.payload as ReviewSummary);
+        // events are ts-ascending; take the agent's LATEST self-review that
+        // actually carries sections (early buggy submissions stored {note:null})
+        const ev = [...(t.events ?? [])]
+          .reverse()
+          .find(
+            (e: any) =>
+              e.type === "review_summary" &&
+              e.payload &&
+              ["done", "iffy", "decisions", "testing", "followups"].some((k) => (e.payload[k] ?? []).length)
+          );
+        if (ev) setReview(ev.payload as ReviewSummary);
       })
       .catch(() => {});
     return () => {

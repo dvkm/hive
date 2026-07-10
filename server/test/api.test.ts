@@ -70,6 +70,22 @@ test("agent-created task carries source + parent_task_id", async () => {
   expect(bad.status).toBe(400);
 });
 
+test("review_summary keeps its structured sections; empty submission is rejected", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "rs task" });
+  const r = await post(`/api/tasks/${t.json.id}/events`, {
+    type: "review_summary",
+    done: ["fixed the save flow"],
+    iffy: [{ what: "used a global lock", why: "simplest correct option" }],
+    testing: ["bun test green"],
+  });
+  expect(r.status).toBe(201);
+  expect(r.json.event.payload.done).toEqual(["fixed the save flow"]);
+  expect(r.json.event.payload.iffy[0].what).toBe("used a global lock");
+  expect(r.json.event.payload.note).toBeUndefined();
+  const bad = await post(`/api/tasks/${t.json.id}/events`, { type: "review_summary", note: "hi" });
+  expect(bad.status).toBe(400);
+});
+
 test("event ingestion: status event is recorded", async () => {
   const r = await post(`/api/tasks/${taskId}/events`, { type: "status", note: "working" });
   expect(r.status).toBe(201);
