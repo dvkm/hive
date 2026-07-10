@@ -26,7 +26,7 @@ import {
   parsePolicy,
   parseIncident,
 } from "./rows.ts";
-import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
+import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
 import { runSmoke } from "./monitors.ts";
@@ -988,18 +988,25 @@ const MERGE_CONFLICT_RE = /conflict|not mergeable|not an ancestor|fast-forward/i
 async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason: string): Promise<Response> {
   const conflict = MERGE_CONFLICT_RE.test(reason);
   let delivered = false;
+  let sendError: string | null = null;
   if (conflict && task.agent_target) {
     try {
       const res = await herdr.send(
         task.agent_target,
         `hive: merge into '${base}' failed — ${reason}\nRebase your branch '${task.branch}' onto the latest '${base}', resolve the conflicts, rerun the tests, then push.`
       );
-      delivered = res.code === 0;
-    } catch {
-      delivered = false;
+      sendError = sendFailure(res);
+      delivered = sendError === null;
+    } catch (e: any) {
+      sendError = String(e?.message ?? e);
     }
   }
-  writeEvent(db, { task_id: task.id, source: "director", type: "merge_failed", payload: { reason, conflict, delivered } });
+  writeEvent(db, {
+    task_id: task.id,
+    source: "director",
+    type: "merge_failed",
+    payload: { reason, conflict, delivered, ...(sendError ? { send_error: sendError } : {}) },
+  });
   if (conflict) {
     transition(db, task.id, "in_progress", { source: "director", reason: "merge conflict — agent asked to rebase" });
     return err(`merge conflict — task sent back to the agent to rebase onto '${base}' (${reason})`, 409);
@@ -1093,15 +1100,22 @@ async function requestChanges(db: DB, herdr: Herdr, id: string, body: any): Prom
   if (!notes) return err("notes are required");
 
   let delivered = false;
+  let sendError: string | null = null;
   if (task.agent_target) {
     try {
       const res = await herdr.send(task.agent_target, `hive: changes requested before merge —\n${notes}`);
-      delivered = res.code === 0;
-    } catch {
-      delivered = false;
+      sendError = sendFailure(res);
+      delivered = sendError === null;
+    } catch (e: any) {
+      sendError = String(e?.message ?? e);
     }
   }
-  writeEvent(db, { task_id: id, source: "director", type: "changes_requested", payload: { notes, delivered } });
+  writeEvent(db, {
+    task_id: id,
+    source: "director",
+    type: "changes_requested",
+    payload: { notes, delivered, ...(sendError ? { send_error: sendError } : {}) },
+  });
   const updated = transition(db, id, "in_progress", { source: "director", reason: "changes requested" });
   return json({ ok: true, delivered, task: updated });
 }
@@ -1259,9 +1273,8 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
 
   if (!target) return json({ ok: false, delivered: false, error: "task has no agent_target (not spawned)" });
   try {
-    const res = await herdr.send(target, message);
-    if (res.code !== 0) {
-      const error = res.stderr.trim() || res.stdout.trim() || `herdr send exited ${res.code}`;
+    const error = sendFailure(await herdr.send(target, message));
+    if (error) {
       writeEvent(db, { task_id: id, source: "herdr", type: "steer_error", payload: { error } });
       return json({ ok: false, delivered: false, error });
     }
