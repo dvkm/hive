@@ -6,6 +6,7 @@ import { useStore } from "../lib/store";
 import { CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { ReviewCard } from "./ReviewCard";
 import { CheckpointList } from "./Checkpoints";
+import { DecisionCard } from "./DecisionCard";
 import { relTime } from "../lib/time";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
@@ -359,8 +360,10 @@ export function TaskBody({ id }: { id: string }) {
         {(openDecisions.length > 0 || pastDecisions.length > 0) && (
           <section className="panel">
             <h2>Decisions</h2>
+            {/* Open cards are ANSWERABLE here — radios + note + submit, the same
+                component as the inbox, so nobody is bounced to another page. */}
             {openDecisions.map((d) => (
-              <DecisionMini key={d.id} d={d} />
+              <DecisionCard key={d.id} d={d} onDone={() => refresh()} />
             ))}
             {pastDecisions.map((d) => (
               <DecisionMini key={d.id} d={d} />

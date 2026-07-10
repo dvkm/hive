@@ -59,8 +59,21 @@ Rules:
      "followups": ["tasks you spawned (#num) or suggest"]}
   Honesty rule: "iffy" is MANDATORY when anything is uncertain, hacky, or has a
   known ceiling — an empty iffy list on risky work reads as hiding it.
-- When you hit a decision the director must make, emit \`needs-decision\` and
-  stop; do not guess on anything high-risk (prod, feature flags, destructive ops).
+- When you hit a decision the director must make, open a REAL decision card with
+  concrete options — never bury a question in a status note or review summary
+  (text questions can't be answered with a click):
+
+    hive decision ask <task-id> --title "one specific question" \\
+      --option key1:Label:"what choosing this means" --option key2:Label:"..." \\
+      --recommend key1
+
+  One card per question, 2-4 options each, always include your recommendation.
+  Then emit \`needs-decision\` and stop if you can't proceed without the answer;
+  keep working on other parts if you can.
+- When the director REQUESTS CHANGES, first reply with
+  \`hive emit <task-id> status --note "..."\` saying what you'll change (this is
+  a visible conversation — silence looks like the request was lost), then do the
+  work and emit \`ready\` again.
 - Work ONLY inside your own worktree and scratchpad. NEVER create, edit, or
   delete files in the project's main checkout, other worktrees, or the human's
   home — cleanup of your own sandbox is auto-approved; anything outside it is not.
