@@ -263,8 +263,12 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
   // Only tasks that are actively worked (an agent could go silent).
   // needs_decision / in_review are parked on the DIRECTOR — silence there is
   // expected, and flagging it spawned pointless recovery nudges (2026-07-10).
+  // Tracking-only tasks (source='external') are externally driven: not ours to
+  // supervise, so no staleness either.
   const tasks = db
-    .query(`SELECT id FROM tasks WHERE state IN ('in_progress','verifying')`)
+    .query(
+      `SELECT id FROM tasks WHERE state IN ('in_progress','verifying') AND COALESCE(source,'') != 'external'`
+    )
     .all() as { id: string }[];
   for (const t of tasks) {
     const last = db

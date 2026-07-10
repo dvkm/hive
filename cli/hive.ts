@@ -10,8 +10,11 @@ const USAGE = `hive — local orchestration control plane
 Usage:
   hive serve                              start the daemon
   hive task create --project <id> --title <t> [--brief <file> | --brief-text <s>]
-        [--kind ship|scout|chore] [--parent <task-id>]
-        (under a hive agent, HIVE_TASK_ID makes source=agent + parent automatic)
+        [--kind ship|scout|chore] [--parent <task-id>] [--track]
+        (under a hive agent, HIVE_TASK_ID makes source=agent + parent automatic;
+         --track = tracking-only: never auto-dispatched, moves freely, no evidence gate)
+  hive task move <task-id> <state> [--note <s>]   states: queued in_progress needs_decision
+        in_review verifying done failed cancelled
   hive task list [--state <s>] [--project <id>]
   hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>]
         types: status | evidence | needs-decision | ready | done | blocked | review_summary | <custom>
@@ -104,7 +107,9 @@ async function main() {
           ? String(flags["brief-text"])
           : undefined;
       // Running under a spawned agent (HIVE_TASK_ID set): attribute the task to
-      // the agent and default the parent to the spawning task.
+      // the agent and default the parent to the spawning task. --track marks a
+      // tracking-only task (source='external'): never auto-dispatched, moves
+      // freely through states — hive as a kanban for OTHER agents' own work.
       const agentTask = process.env.HIVE_TASK_ID;
       const t = await api("POST", "/api/tasks", {
         project_id: flags.project,
@@ -112,9 +117,17 @@ async function main() {
         brief,
         kind: flags.kind,
         parent_task_id: flags.parent ?? agentTask ?? undefined,
-        source: agentTask ? "agent" : undefined,
+        source: flags.track ? "external" : agentTask ? "agent" : undefined,
       });
       console.log(`created task ${t.id}  [${t.state}]  ${t.title}`);
+      return;
+    }
+    if (sub === "move") {
+      const { _ } = parseFlags(argv.slice(2));
+      const [taskId, to] = _;
+      if (!taskId || !to) die("usage: hive task move <task-id> <state> [--note <s>]");
+      const t = await api("POST", `/api/tasks/${taskId}/transition`, { to, reason: flags.note });
+      console.log(`task ${t.id} -> [${t.state}]  ${t.title}`);
       return;
     }
     if (sub === "list") {
