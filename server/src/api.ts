@@ -1704,7 +1704,14 @@ async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Respon
 
   // --- evidence ---
   if (type === "evidence") {
-    const kind = fields.kind || (file ? "screenshot" : fields.url ? "link" : "log");
+    // Kind inference for uploads: "any file = screenshot" mislabeled agents'
+    // .md reports / .tsv exports as images (broken <img> on review, task #72).
+    const inferKind = (name: string): string => {
+      if (/\.(png|jpe?g|gif|webp|svg)$/i.test(name)) return "screenshot";
+      if (/\.(md|markdown)$/i.test(name)) return "report";
+      return "log";
+    };
+    const kind = fields.kind || (file ? inferKind(file.name) : fields.url ? "link" : "log");
     let path: string | null = null;
     let servedUrl: string | null = fields.url ?? null;
     if (file) {

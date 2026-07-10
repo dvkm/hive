@@ -9,6 +9,7 @@ import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
+import { ReportToggle } from "./ReportView";
 import type { Decision, Event } from "../lib/api";
 
 // The request-changes exchange: the director's notes and the agent's replies,
@@ -321,15 +322,21 @@ export function ReviewCard({
               ))}
               {others.map((e) => {
                 const label = e.caption || e.kind;
-                return e.url ? (
-                  <a key={e.id} className="rev-ev-chip" href={e.url} target="_blank" rel="noreferrer" title={label}>
-                    <span className={`chip chip-kind`}>{e.kind}</span>
-                    <span className="rev-ev-cap">{label}</span>
-                  </a>
-                ) : (
-                  <span key={e.id} className="rev-ev-chip" title={label}>
-                    <span className={`chip chip-kind`}>{e.kind}</span>
-                    <span className="rev-ev-cap">{label}</span>
+                const viewable = e.url && ["report", "log", "test_run"].includes(e.kind);
+                return (
+                  <span key={e.id} className="rev-ev-item">
+                    {e.url ? (
+                      <a className="rev-ev-chip" href={e.url} target="_blank" rel="noreferrer" title={label}>
+                        <span className={`chip chip-kind`}>{e.kind}</span>
+                        <span className="rev-ev-cap">{label}</span>
+                      </a>
+                    ) : (
+                      <span className="rev-ev-chip" title={label}>
+                        <span className={`chip chip-kind`}>{e.kind}</span>
+                        <span className="rev-ev-cap">{label}</span>
+                      </span>
+                    )}
+                    {viewable && <ReportToggle url={e.url!} label={e.kind === "report" ? "read report" : "view"} />}
                   </span>
                 );
               })}

@@ -7,6 +7,7 @@ import { CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../l
 import { ReviewCard } from "./ReviewCard";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
+import { ReportToggle } from "./ReportView";
 import { relTime } from "../lib/time";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
@@ -46,21 +47,25 @@ function EvidenceItem({ e, onOpen }: { e: Evidence; onOpen?: () => void }) {
     );
   }
   const href = e.url || undefined;
-  const inner = (
-    <>
-      <div className="ev-card-head">
-        <span className={`chip chip-kind`}>{e.kind}</span>
-        <span className="ev-cap">{e.caption || e.path || e.url}</span>
-      </div>
-      {e.preview && <pre className="ev-preview">{e.preview}</pre>}
-    </>
+  const head = (
+    <div className="ev-card-head">
+      <span className={`chip chip-kind`}>{e.kind}</span>
+      <span className="ev-cap">{e.caption || e.path || e.url}</span>
+    </div>
   );
-  return href ? (
-    <a className="ev-card" href={href} target="_blank" rel="noreferrer">
-      {inner}
-    </a>
-  ) : (
-    <div className="ev-card">{inner}</div>
+  const viewable = href && ["report", "log", "test_run"].includes(e.kind);
+  return (
+    <div className="ev-card">
+      {href ? (
+        <a className="ev-card-link" href={href} target="_blank" rel="noreferrer">
+          {head}
+        </a>
+      ) : (
+        head
+      )}
+      {e.preview && <pre className="ev-preview">{e.preview}</pre>}
+      {viewable && <ReportToggle url={href!} label={e.kind === "report" ? "read report" : "view"} />}
+    </div>
   );
 }
 
