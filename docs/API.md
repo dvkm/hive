@@ -822,8 +822,11 @@ No HTTP endpoints — the dispatcher is a server-internal loop (`server/src/disp
 default every 30s, `HIVE_DISPATCH_MS`). It picks up `queued` tasks and spawns a
 herdr agent for each (the same path as `POST /api/tasks/:id/spawn`), gated by:
 project `config.auto_dispatch: true` (default off), `config.dispatch_kinds`
-(default `["ship","scout"]`), `config.max_agents` (default 3, per-project
-concurrency cap), an intake-review gate (any `source="intake_*"` task — gchat
+(default `["ship","scout"]`), `config.max_agents` (default 3, per-project cap on
+WORKING agents — `in_progress`/`needs_decision`; review-parked agents
+(`in_review`/`verifying`) don't consume working slots but bound total live
+agents at `max_agents × 2` so a full review queue slows, not freezes, dispatch),
+an intake-review gate (any `source="intake_*"` task — gchat
 messages, director braindumps — is skipped until a `reviewed` event or a `note`
 event containing "reviewed" exists), and the standing-authority gate. The authority gate calls
 `authorize(action="task.dispatch", target=<title>)`; a `deny` rule blocks the
