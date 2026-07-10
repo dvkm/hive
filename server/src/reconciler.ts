@@ -13,7 +13,7 @@ import { now, newId, evidenceDir } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
-import { runSmoke, type MonitorDeps } from "./monitors.ts";
+import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
@@ -161,7 +161,7 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged" });
       // Post-merge smoke runs once on entering verifying.
       try {
-        await runSmoke(db, t.id, deps.smoke ?? {});
+        await smokeThenAdvance(db, t.id, deps.smoke ?? {});
       } catch (e) {
         console.error(`[hive] smoke run failed for ${t.id}:`, e);
       }

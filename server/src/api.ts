@@ -29,7 +29,7 @@ import {
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
-import { runSmoke } from "./monitors.ts";
+import { smokeThenAdvance } from "./monitors.ts";
 import { enqueue, ackNotifications } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
@@ -926,7 +926,7 @@ async function doTransition(db: DB, id: string, body: any): Promise<Response> {
   // Post-deploy smoke runs once when a task enters `verifying`. runSmoke may
   // bounce the task back to in_progress on failure; re-read to reflect that.
   if (to === "verifying") {
-    await runSmoke(db, id).catch((e) => console.error("[hive] smoke run failed:", e));
+    await smokeThenAdvance(db, id).catch((e) => console.error("[hive] smoke run failed:", e));
     return json(getTask(db, id));
   }
   return json(task);
@@ -1028,7 +1028,7 @@ async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: Hand
   writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url } });
   // in_review → verifying (runs post-deploy smoke once).
   transition(db, id, "verifying", { source: "director", reason: `merged (${method})` });
-  await runSmoke(db, id).catch((e) => console.error("[hive] smoke run failed:", e));
+  await smokeThenAdvance(db, id).catch((e) => console.error("[hive] smoke run failed:", e));
 
   // Best-effort worktree teardown now the branch is merged. Never fails the
   // request — a leftover worktree is a cleanup nuisance, not a merge failure.
