@@ -29,7 +29,7 @@ import {
 import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
-import { runSmoke } from "./monitors.ts";
+import { smokeThenAdvance } from "./monitors.ts";
 import { enqueue, ackNotifications } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
@@ -958,7 +958,7 @@ async function doTransition(db: DB, id: string, body: any): Promise<Response> {
   // Post-deploy smoke runs once when a task enters `verifying`. runSmoke may
   // bounce the task back to in_progress on failure; re-read to reflect that.
   if (to === "verifying") {
-    await runSmoke(db, id).catch((e) => console.error("[hive] smoke run failed:", e));
+    await smokeThenAdvance(db, id).catch((e) => console.error("[hive] smoke run failed:", e));
     return json(getTask(db, id));
   }
   return json(task);
@@ -1067,7 +1067,7 @@ async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: Hand
   writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url } });
   // in_review → verifying (runs post-deploy smoke once).
   transition(db, id, "verifying", { source: "director", reason: `merged (${method})` });
-  await runSmoke(db, id).catch((e) => console.error("[hive] smoke run failed:", e));
+  await smokeThenAdvance(db, id).catch((e) => console.error("[hive] smoke run failed:", e));
 
   // Best-effort worktree teardown now the branch is merged. Never fails the
   // request — a leftover worktree is a cleanup nuisance, not a merge failure.
@@ -1776,6 +1776,35 @@ async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Respon
     else if (typeof fields.payload === "string") {
       try { payload = JSON.parse(fields.payload); } catch { /* ignore */ }
     }
+    const event = writeEvent(db, { task_id: taskId, source, type, payload });
+    return json({ event }, 201);
+  }
+
+  // --- review_summary (structured self-review; the review card renders it) ---
+  // Sections arrive top-level (the CLI --json spread) as arrays, or as JSON
+  // strings via multipart. Anything else is dropped; an empty summary is a 400
+  // so a mis-shaped submission fails loudly instead of storing {note:null}.
+  if (type === "review_summary") {
+    const pick = (k: string): unknown[] | undefined => {
+      const v = (fields as any)[k];
+      if (Array.isArray(v)) return v;
+      if (typeof v === "string") {
+        try {
+          const p = JSON.parse(v);
+          return Array.isArray(p) ? p : undefined;
+        } catch {
+          return undefined;
+        }
+      }
+      return undefined;
+    };
+    const payload: Record<string, unknown> = {};
+    for (const k of ["done", "iffy", "decisions", "testing", "followups"]) {
+      const v = pick(k);
+      if (v?.length) payload[k] = v;
+    }
+    if (!Object.keys(payload).length)
+      return err("review_summary needs at least one of done/iffy/decisions/testing/followups (arrays)");
     const event = writeEvent(db, { task_id: taskId, source, type, payload });
     return json({ event }, 201);
   }

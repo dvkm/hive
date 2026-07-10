@@ -13,8 +13,9 @@ Usage:
         [--kind ship|scout|chore] [--parent <task-id>]
         (under a hive agent, HIVE_TASK_ID makes source=agent + parent automatic)
   hive task list [--state <s>] [--project <id>]
-  hive emit <task-id> <type> [--note <s>] [--file <path>] [--kind <k>] [--source <s>] [--pr-url <url>]
-        types: status | evidence | needs-decision | ready | done | blocked | <custom>
+  hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>]
+        types: status | evidence | needs-decision | ready | done | blocked | review_summary | <custom>
+        review_summary: --json review.json with {done[], iffy[], decisions[], testing[], followups[]}
         ready: PR open (or scout report written) → hand off to review (in_progress -> in_review)
   hive decision ask <task-id> --title <t> [--context <s>] [--risk <s>] [--blast <s>]
         --option key:label:detail  (repeatable)  --recommend <key>
@@ -147,6 +148,9 @@ async function main() {
       if (!res.ok) die(`error ${res.status}: ${data.error}`);
       result = data;
     } else {
+      // --json <file> merges a JSON object into the event payload — used for
+      // structured events like review_summary (see the agent brief).
+      const extra = flags.json ? JSON.parse(readFileSync(String(flags.json), "utf8")) : {};
       result = await api("POST", path, {
         type,
         note: flags.note,
@@ -155,6 +159,7 @@ async function main() {
         title: flags.title,
         context: flags.context,
         pr_url: flags["pr-url"] ?? flags.url,
+        ...extra,
       });
     }
     console.log(`emitted '${type}' on ${taskId}` + (result.evidence ? ` (evidence ${result.evidence.id})` : ""));
