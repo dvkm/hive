@@ -151,7 +151,27 @@ test("agent-tooling kill downgrades to unknown; general kill stays dangerous", (
   const env = { HOME: "/Users/you" };
   expect(classify('pkill -f "remote-debugging-port=9333"', env).decision).toBe("unknown");
   expect(classify("pkill -f '/private/tmp/claude-501/sess/prof'", env).decision).toBe("unknown");
+  expect(classify("kill %1 2>/dev/null", env).decision).toBe("unknown"); // own shell job
+  expect(classify("kill %1 %2", env).decision).toBe("unknown");
+  expect(classify("pkill -F /tmp/claude-501/sess/scratchpad/dev.pid", env).decision).toBe("unknown");
   expect(classify("pkill -f server", env).decision).toBe("dangerous");
   expect(classify("killall node", env).decision).toBe("dangerous");
   expect(classify("kill -9 1234", env).decision).toBe("dangerous");
+  expect(classify('kill %1; pkill -f "vite --mode dev"', env).decision).toBe("dangerous"); // pkill part unprovable
+});
+
+test("SQL on a sandboxed sqlite copy downgrades; live/server DBs stay dangerous", () => {
+  const env = { HOME: "/Users/you" };
+  expect(classify('sqlite3 /tmp/claude-501/s/copy.db "update usage set cost=0"', env).decision).toBe("unknown");
+  const heredoc = `S=/private/tmp/claude-501/s/scratchpad\nsqlite3 "$S/copy.db" <<SQL\nupdate usage set cost_usd = 0\nSQL`;
+  expect(classify(heredoc, env).decision).toBe("unknown");
+  expect(classify('sqlite3 /Users/you/.hive/hive.db "update usage set cost=0"', env).decision).toBe("dangerous");
+  expect(classify("psql -c 'UPDATE users SET admin = 1'", env).decision).toBe("dangerous");
+  expect(classify('sqlite3 /tmp/claude-501/x.db "drop table usage"; psql -c "x"', env).decision).toBe("dangerous");
+});
+
+test("hive control-plane tampering is dangerous", () => {
+  expect(classify('curl -X POST "$HIVE_URL/api/decisions/dec_123/answer" -d x').decision).toBe("dangerous");
+  expect(classify("curl $HIVE_URL/api/decisions/dec_9/dismiss").decision).toBe("dangerous");
+  expect(classify('curl -X POST "$HIVE_URL/api/authority/rules" -d x').decision).toBe("dangerous");
 });
