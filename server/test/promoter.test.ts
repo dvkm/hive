@@ -38,6 +38,8 @@ test("queues one evaluation task when `from` is ahead", async () => {
   expect(tasks[0].source_ref).toBe("abc123def");
   expect(tasks[0].title).toContain("staging → main");
   expect(tasks[0].brief).toContain("Do NOT merge it yourself");
+  expect(tasks[0].brief).toContain("test comprehensiveness");
+  expect(tasks[0].brief).toContain("BLOCKS promotion");
 });
 
 test("no task when not ahead, unconfigured, or a promote PR is already open", async () => {
