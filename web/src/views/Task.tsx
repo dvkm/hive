@@ -5,6 +5,7 @@ import type { Decision, Evidence, TaskDetail } from "../lib/api";
 import { useStore } from "../lib/store";
 import { CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { ReviewCard } from "./ReviewCard";
+import { CheckpointList } from "./Checkpoints";
 import { relTime } from "../lib/time";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
@@ -331,6 +332,8 @@ export function TaskBody({ id }: { id: string }) {
         )}
 
         {t.state === "in_review" && <ReviewCard task={t} onDone={refresh} defaultExpanded />}
+
+        <CheckpointList events={t.events} />
 
         <section className="panel">
           <h2>Brief</h2>

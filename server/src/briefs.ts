@@ -66,6 +66,23 @@ Rules:
   \`pkill -F\`) — those pass the command gate automatically. Broad \`pkill -f <pattern>\`
   escalates to the director and stalls you.`;
 
+// Live checklist: judgment calls surface DURING the build (the director ticks
+// or flags them from the board), not as a surprise at review time. Flags come
+// back as steer messages; checkpoints never block.
+const CHECKPOINTS = `## Checkpoints (surface choices WHILE you build)
+Do not save your judgment calls for the final review. The moment you make one —
+an assumption about intent, a shortcut with a ceiling, a pick between real
+alternatives, anything you would later list as "iffy" — emit it and KEEP WORKING:
+
+  hive emit <task-id> checkpoint --note "the choice + why, one line"
+
+Each checkpoint becomes a live checkbox the director ticks (approved) or flags;
+a flag arrives as a steer message — address it when it lands, then continue.
+Checkpoints are non-blocking by design. High-risk calls (prod, destructive,
+feature flags) still go through \`needs-decision\` / the guarded-action gate.
+At handoff, your review_summary "iffy" section should mostly restate checkpoints
+the director has already seen — surprises there mean you checkpointed too little.`;
+
 // Agents may fan work out instead of scope-creeping their own task. HIVE_TASK_ID
 // is set in every spawned agent's env, so the CLI auto-attributes the new task
 // (source=agent, parent_task_id → this task).
@@ -182,6 +199,7 @@ export function composeBrief(db: DB, taskId: string): string {
   parts.push(`## Brief\n${task.brief?.trim() || "(no description provided)"}`);
   parts.push(definitionOfDone(task.kind));
   parts.push(EMIT_PROTOCOL);
+  parts.push(CHECKPOINTS);
   parts.push(spawnTasksSection(task.project_id));
   parts.push(prMarkerSection(task.number, task.id));
   parts.push(BROWSER_VERIFICATION);

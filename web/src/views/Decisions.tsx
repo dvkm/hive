@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { useStore } from "../lib/store";
 import { DecisionCard } from "./DecisionCard";
+import { CheckpointsInbox } from "./Checkpoints";
 
 export default function Decisions() {
   const { decisions } = useStore();
@@ -25,6 +26,7 @@ export default function Decisions() {
 
   return (
     <div className="inbox">
+      <CheckpointsInbox />
       {list.length === 0 && (
         <div className="empty">
           <div className="empty-big">Inbox zero</div>

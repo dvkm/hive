@@ -3322,3 +3322,90 @@ a {
   padding: 2px 0;
   text-decoration: underline;
 }
+
+/* ---- checkpoints: live build-time checkboxes ---- */
+.cp-panel, .cp-inbox {
+  border: 1px solid var(--border, #3333);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  background: color-mix(in srgb, var(--panel, #1c1c1e) 92%, #d4a72c 8%);
+}
+.cp-head, .cp-inbox-head {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  opacity: 0.85;
+  margin-bottom: 8px;
+}
+.cp-count {
+  display: inline-block;
+  background: #d4a72c;
+  color: #1a1a1a;
+  border-radius: 9px;
+  font-size: 11px;
+  padding: 0 7px;
+  margin-left: 6px;
+}
+.cp-row {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 9px;
+  padding: 7px 8px;
+  border-radius: 8px;
+  transition: background 0.15s ease, opacity 0.25s ease;
+}
+.cp-row:hover { background: color-mix(in srgb, currentColor 6%, transparent); }
+.cp-box {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  margin-top: 1px;
+  border: 2px solid #d4a72c;
+  border-radius: 6px;
+  background: transparent;
+  color: #fff;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+}
+.cp-box:hover:not(:disabled) { transform: scale(1.12); background: color-mix(in srgb, #2da44e 25%, transparent); border-color: #2da44e; }
+.cp-row.cp-ok .cp-box { background: #2da44e; border-color: #2da44e; }
+.cp-row.cp-flag .cp-box { background: #cf222e; border-color: #cf222e; }
+.cp-body { flex: 1; min-width: 240px; line-height: 1.45; }
+.cp-task { font-weight: 600; margin-right: 8px; }
+.cp-row.cp-acked { opacity: 0.55; }
+.cp-row.cp-ok .cp-note { text-decoration: line-through; text-decoration-color: #2da44e88; }
+.cp-flag-note { color: #cf222e; margin-left: 6px; }
+.cp-flag {
+  flex: none;
+  border: none;
+  background: none;
+  color: #cf222e;
+  opacity: 0;
+  cursor: pointer;
+  font-size: 14px;
+  transition: opacity 0.15s ease, transform 0.1s ease;
+}
+.cp-row:hover .cp-flag { opacity: 0.7; }
+.cp-flag:hover { opacity: 1 !important; transform: scale(1.15); }
+.cp-flag-form {
+  flex-basis: 100%;
+  display: flex;
+  gap: 8px;
+  margin: 4px 0 2px 29px;
+}
+.cp-flag-form input {
+  flex: 1;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid #cf222e66;
+  background: transparent;
+  color: inherit;
+}
