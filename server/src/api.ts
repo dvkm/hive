@@ -1939,6 +1939,15 @@ function apiDismissDecision(db: DB, id: string): Response {
   if (r.status !== "open") return err(`decision already ${r.status}`, 409);
   db.query("UPDATE decisions SET status = 'expired' WHERE id = ?").run(id);
   writeEvent(db, { task_id: r.task_id, source: "director", type: "decision_expired", payload: { decision_id: id, reason: "dismissed" } });
+  // Resume the task if this was its LAST open card — otherwise it stays parked
+  // in needs_decision with nothing left to wait on (seen live 2026-07-10:
+  // three agents stranded after their moot approval cards were dismissed).
+  const remaining = db
+    .query("SELECT 1 FROM decisions WHERE task_id = ? AND status = 'open' LIMIT 1")
+    .get(r.task_id);
+  const task = getTask(db, r.task_id);
+  if (!remaining && task && task.state === "needs_decision")
+    transition(db, r.task_id, "in_progress", { source: "director", reason: "last open decision dismissed" });
   const decision = parseDecision({ ...r, status: "expired" });
   broadcast({ type: "decision", decision });
   return json(decision);
