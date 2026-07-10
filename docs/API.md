@@ -617,7 +617,7 @@ Behavior by `type`:
   Archives the card (`status=answered`, `answered_at` set), writes a
   `decision_answered` event, and resumes the task (`needs_decision → in_progress`).
   If `answer_note` is omitted, the saved `draft_note` is used.
-- `POST /api/decisions/:id/dismiss` → `200 Decision` (now `expired`) | `404` | `409` (already closed)
+- `POST /api/decisions/:id/dismiss` → `200 Decision` (now `expired`) | `404` | `409` (already closed). Dismissing the task's LAST open card resumes a `needs_decision` task to `in_progress` (a parked task with nothing to wait on is stranded); no resolver hooks fire.
   Clears a card without answering it (the human escape hatch for a card that is
   no longer relevant, or that somehow has no usable options). Sets
   `status=expired`, writes a `decision_expired` event (`reason: "dismissed"`),
