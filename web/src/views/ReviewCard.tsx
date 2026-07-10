@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
-import type { DiffFile, DiffResult, Task } from "../lib/api";
+import type { DiffFile, DiffResult, Evidence, Task } from "../lib/api";
 import { useStore } from "../lib/store";
 import { CiBadge, toast } from "../lib/ui";
 import { MAX_DIFF_LINES } from "../lib/api";
+import { useLightbox } from "../lib/lightbox";
+import type { LightboxImage } from "../lib/lightbox";
 
 // The agent's structured self-review (latest review_summary event payload).
 // Sections are all optional; strings or {what, why} objects for iffy.
@@ -125,6 +127,8 @@ export function ReviewCard({
   const [notes, setNotes] = useState("");
   const [review, setReview] = useState<ReviewSummary | null>(null);
   const [showProse, setShowProse] = useState(false);
+  const [evidence, setEvidence] = useState<Evidence[]>([]);
+  const lightbox = useLightbox();
 
   useEffect(() => {
     let live = true;
@@ -132,6 +136,7 @@ export function ReviewCard({
     setDiffErr("");
     setReview(null);
     setShowProse(false);
+    setEvidence([]);
     api
       .diff(task.id)
       .then((d) => live && setDiff(d))
@@ -152,6 +157,7 @@ export function ReviewCard({
               ["done", "iffy", "decisions", "testing", "followups"].some((k) => (e.payload[k] ?? []).length)
           );
         if (ev) setReview(ev.payload as ReviewSummary);
+        setEvidence(t.evidence ?? []);
       })
       .catch(() => {});
     return () => {
@@ -242,6 +248,45 @@ export function ReviewCard({
       ) : (
         task.summary && <p className="review-summary">{task.summary}</p>
       )}
+
+      {evidence.length > 0 &&
+        (() => {
+          // Screenshots as lightbox thumbnails; everything else (test runs,
+          // logs, reports, links) as compact chips. The proof rides with the
+          // review instead of a click away on the task page.
+          const imgs = evidence.filter((e) => e.kind === "screenshot" && e.url);
+          const lb: LightboxImage[] = imgs.map((e) => ({
+            url: e.url!,
+            caption: e.caption,
+            taskId: task.id,
+            taskTitle: task.title,
+            ts: e.ts,
+          }));
+          const others = evidence.filter((e) => !(e.kind === "screenshot" && e.url));
+          return (
+            <div className="review-evidence">
+              {imgs.map((e, i) => (
+                <button key={e.id} className="rev-thumb" title={e.caption || "screenshot"} onClick={() => lightbox.open(lb, i)}>
+                  <img src={e.url!} alt={e.caption || "screenshot"} />
+                </button>
+              ))}
+              {others.map((e) => {
+                const label = e.caption || e.kind;
+                return e.url ? (
+                  <a key={e.id} className="rev-ev-chip" href={e.url} target="_blank" rel="noreferrer" title={label}>
+                    <span className={`chip chip-kind`}>{e.kind}</span>
+                    <span className="rev-ev-cap">{label}</span>
+                  </a>
+                ) : (
+                  <span key={e.id} className="rev-ev-chip" title={label}>
+                    <span className={`chip chip-kind`}>{e.kind}</span>
+                    <span className="rev-ev-cap">{label}</span>
+                  </span>
+                );
+              })}
+            </div>
+          );
+        })()}
 
       <div className="review-diffstat">
         {diffErr ? (

@@ -37,6 +37,9 @@ and \`hive pr-marker\`. Prefer the CLI over raw curl: it attributes what you do.
 Rules:
 - A task NEVER reaches Done without evidence. Attach at least one evidence item
   (screenshot, test run, log, report, or link) before emitting \`done\`.
+- Attach evidence BEFORE \`ready\`, not just before done — the review card shows
+  it to the director next to your diff. Anything visual gets a screenshot
+  (before/after for changes to existing UI); everything else gets test output.
 - Scout tasks (knowledge-only) require a written report as evidence.
 - HAND OFF, don't go idle. When your PR is open and CI is triggered (or, for a
   scout, your report is attached), emit \`hive emit <task-id> ready --pr-url <url>\`
