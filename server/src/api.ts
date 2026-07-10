@@ -2073,6 +2073,7 @@ function guardedAction(db: DB, taskId: string, body: any): Response {
     target: String(body.target),
     task_id: taskId,
     detail: body.detail ?? null,
+    summary: body.summary ?? null,
   });
   if (r.effect === "allow") return json({ ok: true, effect: "allow" });
   if (r.effect === "deny") return json({ ok: false, effect: "deny", error: r.reason }, 403);

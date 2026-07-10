@@ -330,7 +330,8 @@ async function escalate(
   taskId: string,
   command: string,
   decision: Decision,
-  reason: string
+  reason: string,
+  summary?: string
 ): Promise<string> {
   // Distinct action namespace so a standing rule can gate destructive commands
   // (`command.dangerous`) without touching merely-unrecognized ones (`command`).
@@ -341,7 +342,13 @@ async function escalate(
     const res = await fetch(`${hiveUrl}/api/tasks/${taskId}/guarded-action`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action, target: command, detail: `command approval (${decision}): ${reason}` }),
+      body: JSON.stringify({
+        action,
+        target: command,
+        detail: `command approval (${decision}): ${reason}`,
+        // The Bash tool's own description: the card title reads as intent.
+        summary: summary || undefined,
+      }),
       signal: AbortSignal.timeout(2000),
     });
     const body: any = await res.json().catch(() => ({}));
@@ -400,6 +407,7 @@ if (import.meta.main) {
     if (decision === "dangerous") console.log(preToolUseOutput("deny", `blocked (${reason}); no hive task to authorize`));
     process.exit(0);
   }
-  console.log(await escalate(hiveUrl, taskId, command, decision, reason));
+  const summary = typeof payload?.tool_input?.description === "string" ? payload.tool_input.description : undefined;
+  console.log(await escalate(hiveUrl, taskId, command, decision, reason, summary));
   process.exit(0);
 }

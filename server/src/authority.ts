@@ -22,6 +22,9 @@ export interface AuthzInput {
   target: string;
   task_id?: string | null;
   detail?: string | null;
+  // Plain-English "what this does" (e.g. the Bash tool's own description).
+  // Becomes the card TITLE so the inbox reads as intent, not raw shell.
+  summary?: string | null;
 }
 
 export type AuthzResult =
@@ -148,12 +151,21 @@ export function authorize(db: DB, input: AuthzInput, clock: () => string = now):
     return { effect: "deny", reason, rule_id: rule?.id ?? null };
   }
 
-  // require_decision → open a card naming the exact target and park a pending grant.
-  const title = input.detail?.trim() || `Authorize: ${input.action} on ${input.target}`;
+  // require_decision → open a card naming the exact target and park a pending
+  // grant. Title priority: the caller's plain-English summary of WHAT the
+  // command does (agents' Bash descriptions) > detail (the gate's reason) >
+  // generic — so seven "recursive/forced rm" cards read as seven intents.
+  const summary = input.summary?.trim();
+  const title = summary
+    ? summary.length > 110
+      ? summary.slice(0, 109) + "…"
+      : summary
+    : input.detail?.trim() || `Authorize: ${input.action} on ${input.target}`;
   const decision = createDecision(db, {
     task_id: input.task_id!,
     title,
     context:
+      (summary && input.detail?.trim() ? `${input.detail.trim()}. ` : "") +
       `An agent requested authority to run '${input.action}' targeting ${input.target}. ` +
       `Approving mints a single-use, 24h grant scoped to this exact action + target.`,
     risk: "high",
