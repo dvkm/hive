@@ -1937,6 +1937,12 @@ function serveEvidence(pathname: string): Response {
   if (rel.startsWith("..") || rel.includes("../")) return err("forbidden", 403);
   const filePath = join(evidenceDir(), rel);
   const f = Bun.file(filePath);
+  // Text evidence is UTF-8 (agents write Korean captions/reports); without an
+  // explicit charset the browser guesses and mangles it (seen live 2026-07-10).
+  if (/\.(md|markdown|txt|log|tsv|csv|json|py|ts|js|sh|yaml|yml|toml)$/i.test(rel)) {
+    const mime = /\.(md|markdown)$/i.test(rel) ? "text/markdown" : /\.json$/i.test(rel) ? "application/json" : "text/plain";
+    return new Response(f, { headers: { "Content-Type": `${mime}; charset=utf-8` } });
+  }
   return new Response(f); // Bun serves 404 automatically for missing files via .exists — handled below
 }
 

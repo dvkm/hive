@@ -9,7 +9,42 @@ import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
-import { ReportToggle } from "./ReportView";
+import { ReportView } from "./ReportView";
+
+// One non-image evidence chip. Clicking a text chip expands the inline viewer
+// (full width, below the strip); the ↗ opens the raw file in a tab.
+function EvChip({ e }: { e: Evidence }) {
+  const [open, setOpen] = useState(false);
+  const label = e.caption || e.kind;
+  const viewable = !!e.url && ["report", "log", "test_run"].includes(e.kind);
+  const body = (
+    <>
+      <span className={`chip chip-kind`}>{e.kind}</span>
+      <span className="rev-ev-cap">{label}</span>
+    </>
+  );
+  if (viewable)
+    return (
+      <span className="rev-ev-item">
+        <button className={`rev-ev-chip ${open ? "rev-ev-open" : ""}`} title={label} onClick={() => setOpen((o) => !o)}>
+          {body}
+          <a className="ev-ext" href={e.url!} target="_blank" rel="noreferrer" title="Open raw file" onClick={(ev) => ev.stopPropagation()}>
+            ↗
+          </a>
+        </button>
+        {open && <ReportView url={e.url!} />}
+      </span>
+    );
+  return e.url ? (
+    <a className="rev-ev-chip" href={e.url} target="_blank" rel="noreferrer" title={label}>
+      {body}
+    </a>
+  ) : (
+    <span className="rev-ev-chip" title={label}>
+      {body}
+    </span>
+  );
+}
 import type { Decision, Event } from "../lib/api";
 
 // The request-changes exchange: the director's notes and the agent's replies,
@@ -320,26 +355,9 @@ export function ReviewCard({
                   <img src={e.url!} alt={e.caption || "screenshot"} />
                 </button>
               ))}
-              {others.map((e) => {
-                const label = e.caption || e.kind;
-                const viewable = e.url && ["report", "log", "test_run"].includes(e.kind);
-                return (
-                  <span key={e.id} className="rev-ev-item">
-                    {e.url ? (
-                      <a className="rev-ev-chip" href={e.url} target="_blank" rel="noreferrer" title={label}>
-                        <span className={`chip chip-kind`}>{e.kind}</span>
-                        <span className="rev-ev-cap">{label}</span>
-                      </a>
-                    ) : (
-                      <span className="rev-ev-chip" title={label}>
-                        <span className={`chip chip-kind`}>{e.kind}</span>
-                        <span className="rev-ev-cap">{label}</span>
-                      </span>
-                    )}
-                    {viewable && <ReportToggle url={e.url!} label={e.kind === "report" ? "read report" : "view"} />}
-                  </span>
-                );
-              })}
+              {others.map((e) => (
+                <EvChip key={e.id} e={e} />
+              ))}
             </div>
           );
         })()}
