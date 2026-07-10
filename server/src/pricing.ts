@@ -22,6 +22,10 @@ export interface ModelPrice {
 }
 
 export const PRICES: Record<string, ModelPrice> = {
+  // fable/mythos: $10/$50 per MTok (claude-fable-5; was "unpriced" — the
+  // director's own sessions showed no cost at all, 2026-07-10).
+  fable: { input: 10, output: 50, cache_read: 1, cache_write: 12.5 },
+  mythos: { input: 10, output: 50, cache_read: 1, cache_write: 12.5 },
   opus: { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
   sonnet: { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
   haiku: { input: 1, output: 5, cache_read: 0.1, cache_write: 1.25 },
