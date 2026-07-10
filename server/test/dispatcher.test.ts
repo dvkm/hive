@@ -111,6 +111,20 @@ test("concurrency cap (max_agents) limits new spawns per project", async () => {
   expect(spawns.length).toBe(1);
 });
 
+test("review-parked agents don't consume working slots, but bound overhang at 2x cap", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 2 });
+  // two agents parked in review -> 0 working slots used -> dispatch proceeds
+  makeTask(db, projectId, { state: "in_review", agent_target: "a0" });
+  makeTask(db, projectId, { state: "in_review", agent_target: "a1" });
+  makeTask(db, projectId);
+  makeTask(db, projectId);
+  makeTask(db, projectId);
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr });
+  // working cap 2 allows 2 spawns; total active would hit 2*2=4 -> third stays queued
+  expect(spawns.length).toBe(2);
+});
+
 test("authority deny blocks auto-dispatch", async () => {
   const { db, projectId } = freshDb({ auto_dispatch: true });
   const id = makeTask(db, projectId);
