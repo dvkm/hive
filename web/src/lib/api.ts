@@ -214,6 +214,7 @@ export interface UsageTotals {
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
+  cache_write_tokens: number;
   total_tokens: number;
   cost_usd: number;
   calls: number;
@@ -227,6 +228,7 @@ export interface UsageRow {
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
+  cache_write_tokens: number;
   cost_usd: number | null;
   source: string;
 }

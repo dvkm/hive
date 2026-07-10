@@ -341,20 +341,24 @@ set on creation); normal ones are batched into a single digest every
   "input_tokens": 12000,
   "output_tokens": 3400,
   "cache_read_tokens": 88000,
+  "cache_write_tokens": 4200,
   "cost_usd": 0.0774,
   "source": "agent"
 }
 ```
-One row per reported LLM call. `input_tokens` folds in any cache-write tokens
-(the schema has no separate cache-write bucket); `cache_read_tokens` is cache-hit
-input. `source` tags the ingest path (`agent` via the `usage` event, `hook` from
+One row per reported LLM call. `input_tokens` is fresh (uncached) input;
+`cache_read_tokens` is cache-hit input and `cache_write_tokens` is input written
+to the cache. The three are priced differently — a cache read costs 0.1x fresh
+input and a cache write 1.25x — so they are never summed before pricing.
+`source` tags the ingest path (`agent` via the `usage` event, `hook` from
 the Stop-hook transcript reporter). `cost_usd` is computed server-side from the
 price table (`server/src/pricing.ts`, $/MTok per model family, overridable per
 project via `config.pricing`) when the caller doesn't supply it; it is **null**
 for an unpriced (unknown) model — ingestion is never blocked on an unknown model,
 and unpriced rows surface as `"unpriced"` in rollups. Analytics rollups expose
-`totals` shaped `{input_tokens, output_tokens, cache_read_tokens, total_tokens,
-cost_usd, calls, unpriced}` (summed cost counts priced rows only).
+`totals` shaped `{input_tokens, output_tokens, cache_read_tokens,
+cache_write_tokens, total_tokens, cost_usd, calls, unpriced}` (summed cost counts
+priced rows only).
 
 ---
 
@@ -578,7 +582,7 @@ recognized fields (JSON keys == form field names):
 | `caption` | evidence caption |
 | `url` | evidence URL (for link evidence, no file) |
 | `title`,`context`,`risk`,`blast_radius`,`options` | decision fields (needs-decision type; `options` is a JSON string in multipart) |
-| `model`,`input_tokens`,`output_tokens`,`cache_read_tokens`,`cost_usd` | usage fields (usage type; numbers, or numeric strings in multipart; `cost_usd` optional) |
+| `model`,`input_tokens`,`output_tokens`,`cache_read_tokens`,`cache_write_tokens`,`cost_usd` | usage fields (usage type; numbers, or numeric strings in multipart; `cost_usd` optional) |
 | `file` | (multipart only) the uploaded evidence file |
 
 Behavior by `type`:

@@ -1787,6 +1787,7 @@ function ingestUsage(db: DB, taskId: string, fields: Record<string, any>, source
     input_tokens: int(fields.input_tokens),
     output_tokens: int(fields.output_tokens),
     cache_read_tokens: int(fields.cache_read_tokens),
+    cache_write_tokens: int(fields.cache_write_tokens),
   };
   let cost: number | null;
   if (fields.cost_usd != null && fields.cost_usd !== "") {
@@ -1808,9 +1809,9 @@ function ingestUsage(db: DB, taskId: string, fields: Record<string, any>, source
     source,
   };
   db.query(
-    `INSERT INTO usage (id, task_id, ts, model, input_tokens, output_tokens, cache_read_tokens, cost_usd, source)
-     VALUES (?,?,?,?,?,?,?,?,?)`
-  ).run(row.id, row.task_id, row.ts, row.model, row.input_tokens, row.output_tokens, row.cache_read_tokens, row.cost_usd, row.source);
+    `INSERT INTO usage (id, task_id, ts, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, source)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`
+  ).run(row.id, row.task_id, row.ts, row.model, row.input_tokens, row.output_tokens, row.cache_read_tokens, row.cache_write_tokens, row.cost_usd, row.source);
   broadcast({ type: "usage", usage: row });
   return json({ usage: row }, 201);
 }
@@ -1823,7 +1824,8 @@ function usageTotals(p = ""): string {
     COALESCE(SUM(${p}input_tokens),0) AS input_tokens,
     COALESCE(SUM(${p}output_tokens),0) AS output_tokens,
     COALESCE(SUM(${p}cache_read_tokens),0) AS cache_read_tokens,
-    COALESCE(SUM(${p}input_tokens + ${p}output_tokens + ${p}cache_read_tokens),0) AS total_tokens,
+    COALESCE(SUM(${p}cache_write_tokens),0) AS cache_write_tokens,
+    COALESCE(SUM(${p}input_tokens + ${p}output_tokens + ${p}cache_read_tokens + ${p}cache_write_tokens),0) AS total_tokens,
     COALESCE(SUM(${p}cost_usd),0) AS cost_usd,
     COUNT(*) AS calls,
     COALESCE(SUM(CASE WHEN ${p}cost_usd IS NULL THEN 1 ELSE 0 END),0) AS unpriced`;
