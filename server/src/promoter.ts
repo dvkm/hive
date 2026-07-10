@@ -27,9 +27,15 @@ function promoteBrief(fromB: string, toB: string, ahead: string, sha: string): s
 Steps:
 1. git fetch origin ${fromB} ${toB}, then review \`git log --oneline origin/${toB}..origin/${fromB}\` and the merged PRs it contains.
 2. Check CI is green on origin/${fromB} (gh checks / recent runs).
-3. Look for promotion blockers: half-shipped work (one PR of a multi-PR feature), feature-flag-gated code whose flag story is incomplete, pending DB migrations that need ops coordination, reverts-in-waiting, anything the PR descriptions call out as "do not promote yet".
-4. If READY: open a PR base \`${toB}\` head \`${fromB}\` titled with your hive marker + "Promote: <one-line summary>". Body: one bullet per included PR (number + what it does), plus any notes the director needs before merging. Then \`hive emit <task-id> ready --pr-url <url>\`. Do NOT merge it yourself — the director merges.
-5. If NOT ready: attach a short report as evidence naming exactly which commits/PRs block promotion and what has to happen first, then \`hive emit <task-id> done\`. A new evaluation is queued automatically when ${fromB} moves.
+3. Audit test comprehensiveness for the promoted range — green CI only proves the EXISTING tests pass, not that the changes are covered:
+   - Bug-fix PRs: does a regression test exist that would have CAUGHT the original bug? (look for test files changed alongside the fix; read the test, don't just count it)
+   - Feature PRs: are the new paths exercised — unit tests for logic, at least one e2e (or documented manual verification with evidence) for UI flows?
+   - Smell: source files changed with no test changes anywhere near them.
+   Verdict per PR: covered / partial / uncovered. For every real gap, spawn a follow-up task (\`hive task create\`) with a self-contained brief naming the file, the untested behavior, and the test to write.
+   Blocking rule: an UNCOVERED bug fix, or any gap touching auth, billing, subscriptions/entitlements, or data integrity, BLOCKS promotion. Cosmetic/UI-copy gaps don't block — note them in the PR body.
+4. Look for other promotion blockers: half-shipped work (one PR of a multi-PR feature), feature-flag-gated code whose flag story is incomplete, pending DB migrations that need ops coordination, reverts-in-waiting, anything the PR descriptions call out as "do not promote yet".
+5. If READY: open a PR base \`${toB}\` head \`${fromB}\` titled with your hive marker + "Promote: <one-line summary>". Body: one bullet per included PR (number + what it does), a "Test coverage" section with the per-PR verdicts from step 3 (including gap tasks you spawned), plus any notes the director needs before merging. Then \`hive emit <task-id> ready --pr-url <url>\`. Do NOT merge it yourself — the director merges.
+6. If NOT ready: attach a short report as evidence naming exactly which commits/PRs block promotion (coverage gaps included, with their spawned task ids) and what has to happen first, then \`hive emit <task-id> done\`. A new evaluation is queued automatically when ${fromB} moves.
 
 Evaluated head: ${sha}`;
 }

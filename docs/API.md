@@ -825,10 +825,12 @@ No HTTP endpoints — a server-internal loop (`server/src/promoter.ts`, every
 with `config.promote = {from: "staging", to: "main"}`. Whenever `origin/<from>`
 has commits `origin/<to>` lacks, it queues ONE evaluation task
 (`source="promoter"`, `source_ref` = the evaluated head SHA, kind `ship`) that
-the dispatcher spawns like any other. The agent judges readiness (CI, half-
-shipped features, pending migrations) and either opens the Promote PR
-(base `<to>`, head `<from>`; the DIRECTOR merges) or attaches a not-ready
-report and finishes. Dedup: one in-flight evaluation per project, a given head
+the dispatcher spawns like any other. The agent judges readiness — CI green,
+test comprehensiveness for the promoted range (uncovered bug fixes or gaps in
+auth/billing/data-integrity paths BLOCK promotion; the agent spawns a gap task
+per missing test), half-shipped features, pending migrations — and either opens
+the Promote PR with a per-PR "Test coverage" verdict section (base `<to>`,
+head `<from>`; the DIRECTOR merges) or attaches a not-ready report and finishes. Dedup: one in-flight evaluation per project, a given head
 SHA is evaluated at most once, and an already-open promote PR suppresses new
 evaluations until it's merged/closed.
 
