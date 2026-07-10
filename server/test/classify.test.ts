@@ -133,6 +133,7 @@ test("sandbox-scoped rm downgrades to unknown, not dangerous", () => {
   const real = `S=/private/tmp/claude-501/sess/scratchpad\nrm -f "$S/hive-copy.db"*\nsqlite3 /tmp/copy.db ".backup"`;
   expect(classify(real, env).decision).toBe("unknown");
   expect(classify('rm -f "$TMPDIR/out.png"', env).decision).toBe("unknown");
+  expect(classify("rm -f /tmp/pr_body_$$", env).decision).toBe("unknown"); // $$ = shell PID
 });
 
 test("non-sandbox / unprovable rm stays dangerous", () => {

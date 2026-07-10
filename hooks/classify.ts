@@ -160,7 +160,8 @@ function rmTargetsSandboxed(
     const body = seg.split(/\s+[\d&]*[<>]/)[0]; // drop redirections
     for (let tok of body.split(/\s+/).slice(1)) {
       if (tok.startsWith("-")) continue;
-      tok = subst(tok.replace(/["']/g, ""), map);
+      // $$ is the shell PID — digits, can't escape a directory prefix.
+      tok = subst(tok.replace(/["']/g, "").replace(/\$\$/g, "PID"), map);
       if (!tok) continue;
       if (/[$`]/.test(tok)) return false; // unresolved substitution
       if (tok.includes("..")) return false; // path escape
