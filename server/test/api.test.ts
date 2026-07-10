@@ -166,12 +166,11 @@ test("evidence upload round-trips through /evidence", async () => {
   expect(Array.from(bytes)).toEqual([1, 2, 3, 4]);
 });
 
-test("task reaches done once evidence exists", async () => {
+test("task reaches done once evidence exists (verifying auto-advances: no smoke configured)", async () => {
   await post(`/api/tasks/${taskId}/transition`, { to: "in_review" });
-  await post(`/api/tasks/${taskId}/transition`, { to: "verifying" });
-  const done = await post(`/api/tasks/${taskId}/transition`, { to: "done" });
-  expect(done.status).toBe(200);
-  expect(done.json.state).toBe("done");
+  const v = await post(`/api/tasks/${taskId}/transition`, { to: "verifying" });
+  expect(v.status).toBe(200);
+  expect(v.json.state).toBe("done");
 });
 
 test("decision: create, draft autosave, answer flow", async () => {
