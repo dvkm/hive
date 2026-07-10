@@ -154,6 +154,7 @@ the task timeline with the agent's actual work; see `hooks/install.md`):
 - `agent_turn_end` — a quiet Stop/SubagentStop liveness heartbeat. `payload: {}` (kept for health/reconciler; the timeline hides it)
 
 Types written by the runtime layer (Phase 2b):
+- `review_summary` — the agent's structured self-review, submitted before `ready`. `payload: {done?: string[], iffy?: (string|{what,why})[], decisions?: string[], testing?: string[], followups?: string[]}`. The review card renders the latest one as the primary review surface (prose `summary` collapses behind a toggle).
 - `spawned` — a herdr agent was started. `payload: {agent_target, branch, worktree_path, tab_id, label, fleet_workspace_id}`
 - `spawn_error` — spawn failed. `payload: {error}`
 - `agent_status` — herdr agent status changed (via wait loop or reconciler). `payload: {status}` (`idle|working|blocked|gone` — `gone` = the reconciler's probe found the agent missing from herdr)

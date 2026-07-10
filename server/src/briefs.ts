@@ -43,6 +43,19 @@ Rules:
   to move the task into the director's review queue. Do NOT just stop and sit
   idle — that leaves the task looking stuck. (A backstop advances an idle agent
   that has a PR, but \`ready\` is the clean, immediate handoff.)
+- BEFORE \`ready\`, submit a structured self-review — the director reviews THIS,
+  not your prose, so keep every bullet one tight line:
+
+    hive emit <task-id> review_summary --json review.json
+
+  review.json shape (omit empty sections):
+    {"done": ["what shipped, per change"],
+     "iffy": [{"what": "the shortcut/risk/hack", "why": "why you did it anyway"}],
+     "decisions": ["decisions you made or that were answered, one line each"],
+     "testing": ["what you ran + result (tests, e2e, manual repro)"],
+     "followups": ["tasks you spawned (#num) or suggest"]}
+  Honesty rule: "iffy" is MANDATORY when anything is uncertain, hacky, or has a
+  known ceiling — an empty iffy list on risky work reads as hiding it.
 - When you hit a decision the director must make, emit \`needs-decision\` and
   stop; do not guess on anything high-risk (prod, feature flags, destructive ops).
 - Work ONLY inside your own worktree and scratchpad. NEVER create, edit, or
