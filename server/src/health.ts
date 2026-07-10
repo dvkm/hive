@@ -58,6 +58,13 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   if (lastStatus === "blocked")
     return { status: "stuck", reason: "agent blocked (waiting on you)", since: lastStatusTs };
 
+  // Parked waiting on the DIRECTOR (a decision card or a review), not the
+  // agent: silence is expected, so age-based silent/stuck must not apply
+  // ("stale recovery in progress" on a needs_decision task, 2026-07-10).
+  // dead/blocked above still surface honestly.
+  if (task.state === "needs_decision" || task.state === "in_review")
+    return { status: "healthy", reason: null, since: task.updated_at as string };
+
   const latest = events[0];
   if (latest && latest.type === "recovery_nudge")
     return { status: "stuck", reason: "stale recovery in progress", since: latest.ts };
