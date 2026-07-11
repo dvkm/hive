@@ -865,6 +865,18 @@ killed on timeout). Injectable exec for tests.
   source task, and a `normal` `planned` notification is enqueued. On `reject`
   nothing is created (the `decision_answered` event is the only record).
 
+### Blocked agents (dialog handling)
+When herdr reports an agent `blocked`, the reconciler reads the pane immediately
+(no stale-threshold wait). Interactive dialogs from read-shaped MCP tools
+(`get_*`/`list_*`/`search_*`/`read_*`/`whoami`) are auto-approved with
+"don't ask again" and logged as a `dialog_auto_approved` event; projects extend
+the allowlist with `config.dialog_auto_approve` (array of regex strings matched
+against the dialog text). Anything else opens an URGENT decision card whose
+Approve/Deny answer sends the keystroke to the pane remotely
+(`blocked_card`/`dialog_answered` events); the task parks in `needs_decision`.
+Silent-path diagnosis (auth lost, context exhausted, transient API errors) is
+described in `server/src/diagnose.ts`.
+
 ### Promoter (continuous promote-to-main evaluation)
 No HTTP endpoints — a server-internal loop (`server/src/promoter.ts`, every
 `HIVE_PROMOTE_MS`, default 30m, plus one run ~30s after boot). Projects opt in
