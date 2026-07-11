@@ -1,23 +1,8 @@
 import { useRef, useState, type ReactNode } from "react";
 import type { State, CiStatus, Health } from "./api";
+import { STATE_LABEL, HEALTH_LABEL } from "./labels";
 
-export const STATE_LABEL: Record<State, string> = {
-  queued: "Queued",
-  in_progress: "In Progress",
-  needs_decision: "Needs Decision",
-  in_review: "In Review",
-  verifying: "Verifying",
-  done: "Done",
-  failed: "Failed",
-  cancelled: "Cancelled",
-};
-
-export const HEALTH_LABEL: Record<Health["status"], string> = {
-  healthy: "Healthy",
-  silent: "Silent",
-  stuck: "Stuck",
-  dead: "Agent gone",
-};
+export { STATE_LABEL, HEALTH_LABEL }; // callers keep importing them from here
 
 // Status dot. When the server reports health, the dot reflects HEALTH (green
 // pulse / amber / orange / red) with the reason as tooltip; otherwise it falls

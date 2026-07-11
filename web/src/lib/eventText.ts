@@ -1,6 +1,6 @@
 // Human-readable event sentences, in ONE place so any view can reuse them.
 // Pure: a function of the event alone (type + payload), no React, no store.
-import { STATE_LABEL } from "./ui";
+import { STATE_LABEL } from "./labels"; // not ./ui — that imports react, and the server tests import this file
 import type { State } from "./api";
 
 // The event shape this module needs — a subset of Event / FeedEvent.
