@@ -66,7 +66,7 @@ function Bell() {
 }
 
 export default function App() {
-  const { decisions, tasks, checkpoints } = useStore();
+  const { decisions, tasks, checkpoints, offline, setOffline } = useStore();
   const reviewCount = tasks.filter((t) => t.state === "in_review").length;
   const inboxCount = decisions.length + checkpoints.length;
   const location = useLocation();
@@ -98,6 +98,17 @@ export default function App() {
             {reviewCount > 0 && <span className="badge">{reviewCount}</span>}
           </NavLink>
           <NavLink to="/learnings">Learnings</NavLink>
+          <button
+            className={`offline-toggle ${offline ? "offline-on" : ""}`}
+            title={
+              offline
+                ? "Offline mode is ON: nothing new spawns; agents parked with handoff notes. Click to resume."
+                : "Prepare for losing internet: agents push WIP + write handoff notes and park; nothing new spawns."
+            }
+            onClick={() => setOffline(!offline)}
+          >
+            {offline ? "⏸ offline" : "go offline"}
+          </button>
           <NavLink to="/analytics">Analytics</NavLink>
           <NavLink to="/projects">Projects</NavLink>
           <NavLink to="/policies">Policies</NavLink>

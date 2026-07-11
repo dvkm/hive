@@ -19,6 +19,8 @@ interface Store {
   evidenceMeta: Record<string, { url: string | null; kind: Evidence["kind"] }>; // by evidence id, for live feed thumbnails
   checkpoints: Checkpoint[]; // open (un-acked) build-time checkpoints, all tasks
   reloadCheckpoints: () => void;
+  offline: boolean; // offline mode: fleet drained, nothing new spawns
+  setOffline: (on: boolean) => void;
   sse: SseState;
 }
 
@@ -50,6 +52,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const bump = (id: string) => setRev((r) => ({ ...r, [id]: (r[id] || 0) + 1 }));
   const reloadProjects = () => api.projects().then(setProjects).catch(() => setProjects([]));
   const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
+  const [offline, setOfflineState] = useState(false);
+  const setOffline = (on: boolean) => {
+    setOfflineState(on); // optimistic; SSE confirms
+    api.setOffline(on).catch(() => setOfflineState(!on));
+  };
   const reloadCheckpoints = () => api.checkpoints().then((r) => setCheckpoints(r.checkpoints)).catch(() => {});
 
   // Initial load.
@@ -68,6 +75,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     });
     api.decisions("open").then(setDecisions);
     reloadCheckpoints();
+    api.offline().then((r) => setOfflineState(r.on)).catch(() => {});
     reloadProjects();
     api.notifications().then((n) => setNotifications(n.notifications)).catch(() => setNotifications([]));
   }, []);
@@ -144,6 +152,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             payload: { monitor: inc.monitor, status: inc.status, detail: inc.detail, project_id: inc.project_id },
           };
           setFeedEvents((prev) => [synthetic, ...prev].slice(0, FEED_CAP));
+        } else if (msg.type === "offline") {
+          setOfflineState(!!msg.on);
         } else if (msg.type === "notification") {
           const n: Notification = msg.notification;
           setNotifications((prev) => (prev.some((x) => x.id === n.id) ? prev : [n, ...prev]));
@@ -161,7 +171,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, sse }}>
+    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, offline, setOffline, sse }}>
       {children}
     </Ctx.Provider>
   );

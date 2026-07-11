@@ -333,6 +333,9 @@ export interface Checkpoint {
 }
 
 export const api = {
+  offline: () => req<{ on: boolean }>(`/api/offline`),
+  setOffline: (on: boolean) =>
+    req<{ on: boolean; steered: number }>(`/api/offline`, { method: "POST", body: JSON.stringify({ on }) }),
   checkpoints: () => req<{ checkpoints: Checkpoint[] }>(`/api/checkpoints`),
   ackCheckpoint: (taskId: string, eventId: string, verdict: "ok" | "flag", note?: string) =>
     req<{ ok: boolean; delivered: boolean; followup_task_id: string | null }>(`/api/tasks/${taskId}/checkpoints/${eventId}/ack`, {

@@ -304,7 +304,39 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v12-cache-write-tokens",
     statements: [`ALTER TABLE usage ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0`],
   },
+  // Global key/value settings (first user: offline mode — drain the fleet and
+  // resume later). Kept generic; anything hive-wide and toggleable lives here.
+  {
+    name: "v13-settings",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+    ],
+  },
 ];
+
+// -------------------------------------------------------------- settings
+export function getSetting(db: DB, key: string): string | null {
+  const r = db.query("SELECT value FROM settings WHERE key = ?").get(key) as
+    | { value: string }
+    | undefined;
+  return r?.value ?? null;
+}
+
+export function setSetting(db: DB, key: string, value: string): void {
+  db.query(
+    "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+  ).run(key, value, new Date().toISOString());
+}
+
+// Offline mode: nothing new spawns, network-dependent supervision pauses,
+// working agents were told to park after their current step. See docs/API.md.
+export function isOffline(db: DB): boolean {
+  return getSetting(db, "offline") === "1";
+}
 
 export type DB = Database;
 

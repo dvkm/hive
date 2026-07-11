@@ -3,7 +3,7 @@
 import { dirname, join, normalize } from "node:path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
-import { newId, now, evidenceDir } from "./db.ts";
+import { newId, now, evidenceDir, isOffline, setSetting } from "./db.ts";
 import { taskWithHealth, broadcastTask, needsAttention } from "./health.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
 import {
@@ -179,6 +179,11 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (m && method === "POST") return await sendSteer(db, herdr, m[1], req);
 
       if (pathname === "/api/checkpoints" && method === "GET") return listOpenCheckpoints(db);
+
+      if (pathname === "/api/offline" && method === "GET")
+        return json({ on: isOffline(db) });
+      if (pathname === "/api/offline" && method === "POST")
+        return await setOffline(db, herdr, await req.json());
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/checkpoints\/([^/]+)\/ack$/);
       if (m && method === "POST") return await ackCheckpoint(db, herdr, m[1], m[2], await req.json());
 
@@ -1288,6 +1293,30 @@ async function sendOnce(herdr: Herdr, target: string, message: string): Promise<
 // task prepends it to the brief (see spawnAgent). Re-sending is never needed.
 // Accepts JSON or multipart; attached files are saved and their absolute paths
 // appended to the message the agent receives (so they ride along on redelivery).
+// Programmatic steer for hive's own subsystems (offline prep, checkpoint
+// flags): same delivery-receipt semantics as the HTTP path, no Request object,
+// no authz gate (the server is steering, not an agent).
+async function internalSteer(db: DB, herdr: Herdr, id: string, message: string): Promise<boolean> {
+  const task = getTask(db, id);
+  if (!task) return false;
+  const target = task.agent_target;
+  let error: string | null = target ? null : "task has no agent_target (not spawned)";
+  if (target) {
+    error = await sendOnce(herdr, target, message);
+    if (error) error = await sendOnce(herdr, target, message);
+    if (error) writeEvent(db, { task_id: id, source: "herdr", type: "steer_error", payload: { error, target } });
+  }
+  const delivered = !error;
+  const delivery: Delivery = delivered ? "delivered" : TERMINAL.includes(task.state as State) ? "failed" : "queued";
+  writeEvent(db, {
+    task_id: id,
+    source: "director",
+    type: "steer",
+    payload: { message, target, attachments: [], delivery, ...(delivered ? { delivered_at: now() } : { error }) },
+  });
+  return delivered;
+}
+
 async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
@@ -1319,6 +1348,70 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
     payload: { message, target, attachments: paths, delivery, ...(delivered ? { delivered_at: now() } : { error }) },
   });
   return json({ ok: delivered, delivered, delivery, message, attachments: paths, ...(error ? { error } : {}) });
+}
+
+// ---- offline mode ----
+// "Going offline": drain, don't kill. The flag pauses the dispatcher/promoter
+// (nothing new spawns), the network half of the reconciler (no PR sync, no
+// stale flags, no nudges — offline must not read as failure), monitors, and
+// gchat. Working agents get a PREP steer while the network is still up: push
+// WIP, write a handoff note, finish the current local step, stop. All task
+// state is already durable in SQLite; the handoff notes preserve the in-flight
+// context. Turning the flag off steers parked agents to resume and reopens
+// dispatch.
+async function setOffline(db: DB, herdr: Herdr, body: any): Promise<Response> {
+  const on = !!body?.on;
+  if (on === isOffline(db)) return json({ on, steered: 0 });
+  setSetting(db, "offline", on ? "1" : "0");
+  broadcast({ type: "offline", on });
+
+  const working = db
+    .query(
+      "SELECT id, agent_target FROM tasks WHERE agent_target IS NOT NULL AND state IN ('in_progress','needs_decision')"
+    )
+    .all() as { id: string; agent_target: string }[];
+
+  const prep = (id: string) =>
+    `OFFLINE PREP: this machine is about to lose internet. While the network is still up, do these NOW, in order: ` +
+    `(1) commit your work-in-progress and push your branch (git add -A && git commit && git push -u origin HEAD); ` +
+    `(2) write a handoff note: hive emit ${id} status --note "HANDOFF: <exactly where you are, what's done, verified how, and the precise next step>"; ` +
+    `(3) finish only your current LOCAL step, then stop and wait — no API calls, web fetches, or pushes after that. ` +
+    `You will get a "back online" message when connectivity returns.`;
+  const resume = () =>
+    `Back ONLINE: connectivity is restored. Re-read your last HANDOFF status note and continue the task from exactly where you left off.`;
+
+  let steered = 0;
+  for (const t of working) {
+    try {
+      if (await internalSteer(db, herdr, t.id, on ? prep(t.id) : resume())) steered++;
+    } catch {
+      /* a steer failure queues; the drain/respawn replays it */
+    }
+  }
+
+  enqueue(db, {
+    kind: "offline",
+    title: on ? `Offline mode ON — fleet draining (${steered} agents prepped)` : "Offline mode OFF — fleet resuming",
+    body: on
+      ? "Nothing new will spawn. Agents push WIP + write handoff notes, finish their current step, and park."
+      : "Dispatcher, promoter, monitors, and recovery are back on; parked agents were told to continue.",
+    urgency: "normal",
+  });
+  writeEvent2Offline(db, on, steered);
+  return json({ on, steered });
+}
+
+// A durable record on no particular task: offline toggles matter when reading
+// history ("why did nothing run for six hours?"). Uses the notifications table
+// timestamp via enqueue above; this writes a feed-visible marker too.
+function writeEvent2Offline(db: DB, on: boolean, steered: number): void {
+  try {
+    const anyTask = db.query("SELECT id FROM tasks ORDER BY updated_at DESC LIMIT 1").get() as { id: string } | undefined;
+    if (anyTask)
+      writeEvent(db, { task_id: anyTask.id, source: "director", type: on ? "offline_on" : "offline_off", payload: { steered } });
+  } catch {
+    /* marker only */
+  }
 }
 
 // ---- checkpoints (live build-time checklist) ----
@@ -1387,14 +1480,12 @@ async function ackCheckpoint(db: DB, herdr: Herdr, taskId: string, eventId: stri
     const task = getTask(db, taskId);
     const live = task && !["done", "cancelled", "failed"].includes(task.state) && task.agent_target;
     if (live) {
-      const res = await sendSteer(db, herdr, taskId, {
-        message: `Director FLAGGED your checkpoint: "${cpText}"${note ? ` — ${note}` : ""}. Address this now, before continuing.`,
-      });
-      try {
-        delivered = ((await res.json()) as any).delivered ?? false;
-      } catch {
-        /* delivery state is best-effort */
-      }
+      delivered = await internalSteer(
+        db,
+        herdr,
+        taskId,
+        `Director FLAGGED your checkpoint: "${cpText}"${note ? ` — ${note}` : ""}. Address this now, before continuing.`
+      );
     }
     // Late flag (task finished / agent gone): the work already shipped, so the
     // correction becomes a queued follow-up task instead of a dead steer. A

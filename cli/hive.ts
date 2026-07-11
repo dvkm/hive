@@ -39,6 +39,7 @@ Usage:
         (reads the value from stdin; writes to the provider, stores only a ref)
   hive secret list --project <id>
   hive secret rm --project <id> --name <n>
+  hive offline [on|off]                   drain the fleet before losing internet / resume after
   hive open                               open the board in a browser
   hive app                                open the hive desktop app (native notifications
         + dock badge; build once: cd electron && bun install && bun run build)
@@ -413,6 +414,19 @@ async function main() {
       return;
     }
     die(`unknown 'gchat' subcommand: ${sub}\n\n${USAGE}`);
+  }
+
+  // Offline mode: drain the fleet before losing internet; resume when back.
+  if (cmd === "offline") {
+    const sub = argv[1];
+    if (sub === "on" || sub === "off") {
+      const r = await api("POST", "/api/offline", { on: sub === "on" });
+      console.log(`offline mode ${r.on ? "ON — fleet draining" : "OFF — fleet resuming"} (${r.steered} agents steered)`);
+    } else {
+      const r = await api("GET", "/api/offline");
+      console.log(`offline mode: ${r.on ? "ON" : "off"}`);
+    }
+    return;
   }
 
   if (cmd === "open") {

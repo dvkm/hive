@@ -11,7 +11,7 @@
 // ponytail: single global interval (HIVE_PROMOTE_MS); per-project intervals
 // when someone actually needs them.
 import type { DB } from "./db.ts";
-import { now, newId } from "./db.ts";
+import { now, newId, isOffline } from "./db.ts";
 import { writeEvent, getTask } from "./state.ts";
 import { broadcastTask } from "./health.ts";
 import type { Exec } from "./exec.ts";
@@ -41,6 +41,7 @@ Evaluated head: ${sha}`;
 }
 
 export async function promoteOnce(db: DB, deps: PromoterDeps = {}): Promise<void> {
+  if (isOffline(db)) return; // offline mode: no network, no new evaluations
   const exec = deps.exec ?? defaultExec;
   const projects = db.query("SELECT * FROM projects").all() as any[];
   for (const p of projects) {
