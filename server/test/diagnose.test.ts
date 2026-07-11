@@ -31,6 +31,18 @@ test("diagnoses transient API errors", () => {
   expect(diagnosePane("fetch failed: ETIMEDOUT")?.kind).toBe("api_error");
 });
 
+test("auto-approve: read-shaped MCP tools yes, write tools and file prompts no", () => {
+  const { dialogAutoApprovable } = require("../src/diagnose.ts");
+  expect(dialogAutoApprovable('claude.ai Figma - get_screenshot(nodeId: "466:2445") (MCP)')).toBe(true);
+  expect(dialogAutoApprovable("some-server - list_channels() (MCP)")).toBe(true);
+  expect(dialogAutoApprovable("claude.ai Figma - create_new_file(name: x) (MCP)")).toBe(false);
+  expect(dialogAutoApprovable("Claude requested permissions to edit /x/.git which is a sensitive file.")).toBe(false);
+  // project-extended pattern
+  expect(dialogAutoApprovable("acme - deploy_preview() (MCP)", ["deploy_preview"])).toBe(true);
+  // broken user regex is ignored, not fatal
+  expect(dialogAutoApprovable("anything", ["([bad"]) ).toBe(false);
+});
+
 test("dialog wins over other matches; clean output diagnoses null", () => {
   const both = "API Error: rate limit\n...\nrequested permissions to edit .git\nDo you want to proceed?\n 1. Yes";
   expect(diagnosePane(both)?.kind).toBe("blocked_dialog");

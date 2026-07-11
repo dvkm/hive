@@ -19,7 +19,7 @@ import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
 import { recordSystemLearning } from "./learn.ts";
-import { diagnosePane } from "./diagnose.ts";
+import { diagnosePane, dialogAutoApprovable } from "./diagnose.ts";
 import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
@@ -103,6 +103,16 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
     if (next !== lastAgentStatus(db, t.id)) {
       writeEvent(db, { task_id: t.id, source: "herdr", type: "agent_status", payload: { status: next } });
       broadcastTask(db, getTask(db, t.id)); // health may have flipped (blocked / gone)
+      // React to `blocked` NOW — a dialog freezes the pane, so waiting out the
+      // stale threshold just parks the agent for 15 minutes. Auto-approves
+      // known-safe dialogs; opens the answerable card for the rest.
+      if (next === "blocked") {
+        try {
+          await handleBlockedAgent(db, h, t.id, t.agent_target);
+        } catch (e) {
+          console.error(`[hive] handleBlockedAgent ${t.id}:`, e);
+        }
+      }
     }
   }
 }
@@ -469,7 +479,7 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string): 
   // class has a graceful path. Nudge→fail is only for the truly unexplained.
   const tail = await h.read(target, 200);
   const diag = diagnosePane(tail);
-  if (diag?.kind === "blocked_dialog") return recoverBlockedDialog(db, task, diag.excerpt, tail);
+  if (diag?.kind === "blocked_dialog") return handleBlockedAgent(db, h, taskId, target);
   if (diag?.kind === "auth_lost") return recoverAuthLost(db, task, diag.excerpt, tail);
   if (diag?.kind === "context_full") return recoverContextFull(db, task, tail);
   if (diag?.kind === "api_error") {
@@ -510,6 +520,40 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string): 
     });
     broadcastTask(db, getTask(db, taskId));
   }
+}
+
+// ---- blocked-signal handler (herdr status -> immediate reaction) ----
+// Called the moment syncAgents observes an agent flip to `blocked` (60s worst
+// case), and again from recoverSilent as the backstop. Known-safe dialogs
+// (read-only MCP tools + project config.dialog_auto_approve patterns) are
+// answered automatically with "2" (yes, don't ask again in this worktree) so
+// the same tool never re-prompts; everything else opens the answerable card.
+export async function handleBlockedAgent(db: DB, h: Herdr, taskId: string, target: string): Promise<void> {
+  const task = getTask(db, taskId);
+  if (!task || TERMINAL.includes(task.state as State)) return;
+  const tail = await h.read(target, 200);
+  const diag = diagnosePane(tail);
+  if (diag?.kind !== "blocked_dialog") return; // blocked but no visible dialog: leave to the silent path
+
+  const project = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id) as { config: string } | undefined;
+  let extra: string[] = [];
+  try {
+    extra = JSON.parse(project?.config ?? "{}").dialog_auto_approve ?? [];
+  } catch {
+    /* bad config never breaks recovery */
+  }
+
+  if (dialogAutoApprovable(diag.excerpt, extra)) {
+    const r = await h.answerDialog(target, "2");
+    writeEvent(db, {
+      task_id: taskId,
+      source: "reconciler",
+      type: "dialog_auto_approved",
+      payload: { delivered: r.code === 0, excerpt: diag.excerpt.slice(0, 300) },
+    });
+    return;
+  }
+  await recoverBlockedDialog(db, task, diag.excerpt, tail);
 }
 
 // ---- graceful failure-class handlers (pane-diagnosed) ----
