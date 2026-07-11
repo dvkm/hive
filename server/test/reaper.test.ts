@@ -70,6 +70,9 @@ test("reapOnce reaps a terminal+merged worktree, skips a live one, preserves an 
   expect(db.query("SELECT * FROM events WHERE task_id = 'LIVE'").all().length).toBe(0);
 });
 
+// NOTE: this test PASSES while printing a scary "error: herdr socket blew up" stack.
+// That is reaper.ts's own console.error for the item it caught, not an escaped
+// rejection — bun renders logged Errors with a source excerpt. Expected output.
 test("reapOnce isolates a per-item failure and keeps sweeping", async () => {
   const { db, projectId } = freshDb();
   seedTask(db, projectId, "DONE", "done");
