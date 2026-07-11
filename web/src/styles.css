@@ -3610,3 +3610,23 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
 .attach-x:hover {
   color: var(--text);
 }
+
+/* ---- offline mode toggle ---- */
+.offline-toggle {
+  margin-left: 10px;
+  border: 1px solid var(--border, #3333);
+  border-radius: 999px;
+  background: none;
+  color: var(--muted, #999);
+  font-size: 12px;
+  padding: 2px 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.offline-toggle:hover { border-color: #d4a72c88; color: inherit; }
+.offline-toggle.offline-on {
+  background: #d4a72c;
+  border-color: #d4a72c;
+  color: #1a1a1a;
+  font-weight: 700;
+}

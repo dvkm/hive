@@ -9,7 +9,7 @@
 // On a task entering `verifying` the list runs once: pass -> a test_run evidence
 // row; fail -> the task bounces back to in_progress.
 import type { DB } from "./db.ts";
-import { newId, now, evidenceDir } from "./db.ts";
+import { newId, now, evidenceDir, isOffline } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask } from "./state.ts";
 import { recordSystemLearning } from "./learn.ts";
@@ -127,6 +127,7 @@ function createIncidentTask(db: DB, projectId: string, mon: Check, detail: strin
 // Run all projects' monitors once. Isolated per project so one bad config can't
 // stop the rest.
 export async function checkAllMonitors(db: DB, deps: MonitorDeps = {}): Promise<void> {
+  if (isOffline(db)) return; // offline mode: every URL check would false-alarm
   const projects = db.query("SELECT * FROM projects").all().map(parseProject);
   for (const p of projects) {
     try {

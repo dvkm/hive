@@ -22,6 +22,7 @@
 // behave identically.
 import type { DB } from "./db.ts";
 import { parseTask } from "./rows.ts";
+import { isOffline } from "./db.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
@@ -50,6 +51,7 @@ export interface DispatcherDeps {
 
 // One dispatch pass. Isolated per task so one bad task never stops the rest.
 export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<void> {
+  if (isOffline(db)) return; // offline mode: drain — nothing new spawns
   const h = deps.herdr ?? defaultHerdr;
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
   const queued = db

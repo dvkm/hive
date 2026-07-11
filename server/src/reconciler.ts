@@ -9,7 +9,7 @@
 import { join } from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
-import { now, newId, evidenceDir } from "./db.ts";
+import { now, newId, evidenceDir, isOffline } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
@@ -65,6 +65,10 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   } catch (e) {
     fail("advanceFinished", e);
   }
+  // Offline mode: everything above is local (herdr + sqlite) and keeps state
+  // honest; everything below either needs the network (gh) or would punish
+  // agents for being offline (stale flags, nudges, failure escalation). Stop here.
+  if (isOffline(db)) return;
   try {
     await syncPRs(db, deps);
   } catch (e) {
