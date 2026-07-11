@@ -36,6 +36,7 @@ import { enqueue, ackNotifications } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
 import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.ts";
+import { routeIntakeProject } from "./intake/route.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { costUsd } from "./pricing.ts";
 import { taskDiff } from "./diff.ts";
@@ -369,6 +370,13 @@ function intake(db: DB, body: any, deps: HandlerDeps): Response {
   if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(body.project_id))
     return err("unknown project_id", 400);
 
+  // The caller's project_id is a DEFAULT, not gospel — the web picker defaults to
+  // whatever project is in view. Classify the text against every project's
+  // identifying signals and re-route when a different one clearly matches, so a
+  // corebeat braindump lands in the corebeat repo and not wherever the UI sat.
+  const route = routeIntakeProject(db, text, body.project_id);
+  const projectId = route.project_id;
+
   const id = newId();
   const t = now();
   // Short enough that "Proposed breakdown: <title>" stays readable on a card.
@@ -377,8 +385,18 @@ function intake(db: DB, body: any, deps: HandlerDeps): Response {
   db.query(
     `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, created_at, updated_at)
      VALUES (?,?,?,?, 'queued', 'chore', 'intake_braindump', ?, ?)`
-  ).run(id, body.project_id, title, text, t, t);
+  ).run(id, projectId, title, text, t, t);
   writeEvent(db, { task_id: id, source: "director", type: "created", payload: { title } });
+  if (route.rerouted) {
+    const from: any = db.query("SELECT name FROM projects WHERE id = ?").get(body.project_id);
+    const to: any = db.query("SELECT name FROM projects WHERE id = ?").get(projectId);
+    writeEvent(db, {
+      task_id: id,
+      source: "system",
+      type: "note",
+      payload: { note: `Intake auto-routed from ${from?.name ?? body.project_id} to ${to?.name ?? projectId} (matched: ${route.matched.join(", ")}).` },
+    });
+  }
   const task = getTask(db, id);
   broadcastTask(db, task);
 
