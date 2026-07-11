@@ -103,15 +103,16 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
     if (next !== lastAgentStatus(db, t.id)) {
       writeEvent(db, { task_id: t.id, source: "herdr", type: "agent_status", payload: { status: next } });
       broadcastTask(db, getTask(db, t.id)); // health may have flipped (blocked / gone)
-      // React to `blocked` NOW — a dialog freezes the pane, so waiting out the
-      // stale threshold just parks the agent for 15 minutes. Auto-approves
-      // known-safe dialogs; opens the answerable card for the rest.
-      if (next === "blocked") {
-        try {
-          await handleBlockedAgent(db, h, t.id, t.agent_target);
-        } catch (e) {
-          console.error(`[hive] handleBlockedAgent ${t.id}:`, e);
-        }
+    }
+    // React to `blocked` EVERY cycle, not just on the transition — an agent
+    // already blocked at server start (or re-blocked by a second dialog) must
+    // still be handled. Idempotent: auto-approve unblocks it, and the card path
+    // dedupes on an existing open card.
+    if (next === "blocked") {
+      try {
+        await handleBlockedAgent(db, h, t.id, t.agent_target);
+      } catch (e) {
+        console.error(`[hive] handleBlockedAgent ${t.id}:`, e);
       }
     }
   }
