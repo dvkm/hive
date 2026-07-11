@@ -73,6 +73,14 @@ its canonical `taskId` name so probe/send/focus by `agent_target` keep resolving
 Per-project `config.agent_argv` overrides the command verbatim (the operator owns
 briefing in that case).
 
+**Model pinning.** Every spawned agent gets an explicit `--model` — never the
+CLI default (which can be the priciest tier). Defaults per task kind:
+`ship → opus`, `scout`/`chore` → `sonnet`. Override per project with
+`config.model` (all kinds) or `config.model_by_kind` (e.g.
+`{"ship":"opus","chore":"haiku"}`); `config.agent_argv` bypasses pinning
+entirely. The planner one-shot (`claude -p`) is pinned to `sonnet` unless
+`config.planner_argv` overrides it.
+
 ## Stale recovery loop (`server/src/reconciler.ts`)
 
 `syncAgents` probes every agent-bearing task each cycle; a vanished agent is

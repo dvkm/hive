@@ -323,6 +323,17 @@ function preToolUseOutput(permissionDecision: "allow" | "deny", reason: string):
   });
 }
 
+// Action string for the authority engine. Dangerous commands carry their
+// classifier category as a stable sub-action ("command.dangerous.process-kill")
+// so a standing rule can allow ONE category forever ("Approve & always allow"
+// on the decision card) without relaxing the rest — the deny-safe default
+// `command.dangerous*` still matches every sub-action.
+export function actionFor(decision: Decision, reason: string): string {
+  if (decision !== "dangerous") return "command";
+  const slug = reason.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  return slug ? `command.dangerous.${slug}` : "command.dangerous";
+}
+
 // Ask hive's authority engine to decide a not-safe command. Fail-safe: any
 // unreachability or error DENIES (never auto-allows an unclassified command).
 async function escalate(
@@ -334,10 +345,11 @@ async function escalate(
   summary?: string
 ): Promise<string> {
   // Distinct action namespace so a standing rule can gate destructive commands
-  // (`command.dangerous`) without touching merely-unrecognized ones (`command`).
-  // `command.dangerous*` is deny-safe by default IN CODE — it requires a decision
-  // with no rule present; unknown commands default-allow (logged).
-  const action = decision === "dangerous" ? "command.dangerous" : "command";
+  // (`command.dangerous.*`, category-specific) without touching merely-
+  // unrecognized ones (`command`). `command.dangerous*` is deny-safe by default
+  // IN CODE — it requires a decision with no rule present; unknown commands
+  // default-allow (logged).
+  const action = actionFor(decision, reason);
   try {
     const res = await fetch(`${hiveUrl}/api/tasks/${taskId}/guarded-action`, {
       method: "POST",

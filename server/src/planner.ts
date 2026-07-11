@@ -20,7 +20,9 @@ import { enqueue } from "./notifications.ts";
 import { createDecision } from "./api.ts";
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.HIVE_PLANNER_TIMEOUT_MS || 120_000);
-const DEFAULT_ARGV = ["claude", "-p"];
+// Pinned to sonnet: a breakdown proposal is triage, not deep work, and an
+// unpinned `claude -p` inherits whatever (possibly priciest) default the CLI has.
+const DEFAULT_ARGV = ["claude", "-p", "--model", "sonnet"];
 
 // A planner subprocess runner. Injectable so tests never spawn `claude`. The
 // default implementation kills the process on timeout (hard cap, no runaway).

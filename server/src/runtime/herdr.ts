@@ -55,6 +55,7 @@ export interface SpawnArgs {
   branch?: string; // default hive/<taskId>
   base?: string; // base ref for the worktree
   env?: Record<string, string>; // extra env (secrets), injected as --env K=V
+  model?: string; // claude --model for the default argv (ignored when agentArgv overrides)
   agentArgv?: string[]; // command run inside the agent; per-project override (verbatim)
   // Called after the worktree exists but BEFORE the agent starts, so the caller
   // can seed the worktree (e.g. write .claude hook settings) structurally.
@@ -90,8 +91,10 @@ export function worktreeCreateArgv(repoPath: string, branch: string, base?: stri
 // itself, with no fragile send-text/composer-autocomplete step (the hazard
 // priortool's herdr-backend doc documents). The agent stays live afterward and
 // tolerates the captain attaching and typing.
-export function defaultAgentArgv(brief: string): string[] {
-  return ["claude", brief, "--permission-mode", "acceptEdits"];
+export function defaultAgentArgv(brief: string, model?: string): string[] {
+  const a = ["claude", brief, "--permission-mode", "acceptEdits"];
+  if (model) a.push("--model", model);
+  return a;
 }
 
 export function workspaceListArgv(): string[] {
@@ -176,6 +179,33 @@ export function agentGetArgv(target: string): string[] {
 // reclaim, or an unrelated failure would tear down a live worktree.
 export function isWorktreeExistsError(r: ExecResult): boolean {
   return /already exists|already used by worktree/.test(`${r.stdout}\n${r.stderr}`);
+}
+
+// herdr serializes worktree operations globally; two near-simultaneous spawns
+// (dispatcher + manual /spawn, or spawn racing the reaper) surface as
+// `worktree_operation_in_progress` (seen 3× live). Transient by construction —
+// retried once after a short wait in spawn().
+export function isWorktreeBusyError(r: ExecResult): boolean {
+  return /worktree_operation_in_progress|operation is already in progress/.test(
+    `${r.stdout}\n${r.stderr}`
+  );
+}
+
+// `agent start` failing because the task's previous agent (from a crashed or
+// requeued run) still holds the name — the top recorded spawn failure (seen 9×
+// live). The error body names the stale agent's pane/tab, so it can be closed
+// and the start retried.
+export function isAgentNameTakenError(r: ExecResult): boolean {
+  return /agent_name_taken/.test(`${r.stdout}\n${r.stderr}`);
+}
+
+// Pull the stale agent's tab/pane out of an agent_name_taken error body:
+// "... candidates: terminal_id=… pane_id=wR:p7X workspace_id=wR tab_id=wR:t40 cwd=…"
+export function parseStaleAgentRef(text: string): { tabId: string | null; paneId: string | null } {
+  return {
+    tabId: /\btab_id=([^\s"',}]+)/.exec(text)?.[1] ?? null,
+    paneId: /\bpane_id=([^\s"',}]+)/.exec(text)?.[1] ?? null,
+  };
 }
 
 // Git names the offending worktree inside its refusal, and it is the most
@@ -373,6 +403,12 @@ export class Herdr {
     const label = fleetLabel(args.taskId, args.title);
 
     let create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
+    // herdr runs worktree ops one at a time; a concurrent spawn/cleanup makes
+    // this fail transiently. One short-wait retry clears it.
+    if (create.code !== 0 && isWorktreeBusyError(create)) {
+      await new Promise((r) => setTimeout(r, 2000));
+      create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
+    }
     // A respawn reuses the task id, and so the branch and the worktree path. A
     // worktree left behind by a dead agent (or by a spawn that created the
     // worktree and then failed at `agent start`) collides here and, without
@@ -405,17 +441,24 @@ export class Herdr {
       if (tab.code === 0) tabId = parseTabId(tab.stdout);
     }
 
-    const start = await this.run(
-      agentStartArgv({
-        taskId: args.taskId,
-        worktreePath: wt.path,
-        hiveUrl: args.hiveUrl,
-        env: args.env,
-        agentArgv: args.agentArgv ?? defaultAgentArgv(args.brief),
-        workspaceId: fleetWs,
-        tabId,
-      })
-    );
+    const startArgv = agentStartArgv({
+      taskId: args.taskId,
+      worktreePath: wt.path,
+      hiveUrl: args.hiveUrl,
+      env: args.env,
+      agentArgv: args.agentArgv ?? defaultAgentArgv(args.brief, args.model),
+      workspaceId: fleetWs,
+      tabId,
+    });
+    let start = await this.run(startArgv);
+    // The task's previous agent (crashed run, requeue) can still hold the name.
+    // The error body names its pane/tab: close the stale session and retry once.
+    if (start.code !== 0 && isAgentNameTakenError(start)) {
+      const stale = parseStaleAgentRef(`${start.stdout}\n${start.stderr}`);
+      if (stale.tabId) await this.run(tabCloseArgv(stale.tabId));
+      else if (stale.paneId) await this.run(paneCloseArgv(stale.paneId));
+      if (stale.tabId || stale.paneId) start = await this.run(startArgv);
+    }
     if (start.code !== 0)
       throw new HerdrError(`agent start failed: ${start.stderr.trim() || start.stdout.trim()}`);
 
