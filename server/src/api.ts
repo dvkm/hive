@@ -232,7 +232,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (m && method === "PUT") return saveDraft(db, m[1], await req.json());
 
       m = pathname.match(/^\/api\/decisions\/([^/]+)\/answer$/);
-      if (m && method === "POST") return apiAnswerDecision(db, m[1], await req.json());
+      if (m && method === "POST") return apiAnswerDecision(db, herdr, m[1], await req.json());
       m = pathname.match(/^\/api\/decisions\/([^/]+)\/dismiss$/);
       if (m && method === "POST") return apiDismissDecision(db, m[1]);
 
@@ -1585,6 +1585,34 @@ export function openRecoveryDecision(db: DB, task: any, attempts: number): any {
 }
 
 // On answering a recovery card: `requeue` → fresh task; anything else → nothing.
+// If this card was a blocked-dialog escalation (reconciler recoverBlockedDialog),
+// answering it sends the chosen keystroke to the agent's frozen pane remotely:
+// approve → "1", deny → "3". Fire-and-forget; the outcome event records delivery.
+export function resolveBlockedForDecision(db: DB, herdr: Herdr, decisionId: string, answerKey: string): void {
+  const ev = db
+    .query(
+      `SELECT task_id FROM events WHERE type = 'blocked_card' AND json_extract(payload, '$.decision_id') = ? LIMIT 1`
+    )
+    .get(decisionId) as { task_id: string } | undefined;
+  if (!ev) return;
+  const task = getTask(db, ev.task_id);
+  if (!task?.agent_target) return;
+  const key = answerKey === "approve" ? "1" : "3";
+  herdr
+    .answerDialog(task.agent_target, key)
+    .then((r) => {
+      writeEvent(db, {
+        task_id: task.id,
+        source: "director",
+        type: "dialog_answered",
+        payload: { decision_id: decisionId, key, delivered: r.code === 0, ...(r.code !== 0 ? { error: r.stderr.trim() || r.stdout.trim() } : {}) },
+      });
+    })
+    .catch((e) => {
+      writeEvent(db, { task_id: task.id, source: "director", type: "dialog_answered", payload: { decision_id: decisionId, key, delivered: false, error: String(e?.message ?? e) } });
+    });
+}
+
 export function resolveRecoveryForDecision(db: DB, decisionId: string, answerKey: string): boolean {
   const ev = db
     .query("SELECT payload FROM events WHERE type = 'recovery_card' AND json_extract(payload, '$.decision_id') = ? ORDER BY ts DESC LIMIT 1")
@@ -2158,7 +2186,7 @@ function saveDraft(db: DB, id: string, body: any): Response {
   return json({ ok: true, id });
 }
 
-function apiAnswerDecision(db: DB, id: string, body: any): Response {
+function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
   if (!r) return err("decision not found", 404);
   if (r.status !== "open") return err(`decision already ${r.status}`, 409);
@@ -2188,6 +2216,8 @@ function apiAnswerDecision(db: DB, id: string, body: any): Response {
   resolvePlanForDecision(db, id, answerKey);
   // If this card was a stale-recovery escalation, `requeue` → fresh task.
   resolveRecoveryForDecision(db, id, answerKey);
+  // Blocked-dialog card → answer the pane's dialog with the chosen keystroke.
+  resolveBlockedForDecision(db, herdr, id, answerKey);
   // If this card was a possible-duplicate card, `merge` → fold + cancel.
   resolveDuplicateForDecision(db, id, answerKey);
   // Resume the task if it was parked on this decision. (herdr `agent send` is Phase 2.)
