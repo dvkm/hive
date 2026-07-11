@@ -2,7 +2,7 @@ import { useRef, useState, type ReactNode } from "react";
 import type { State, CiStatus, Health } from "./api";
 import { STATE_LABEL, HEALTH_LABEL } from "./labels";
 
-export { STATE_LABEL, HEALTH_LABEL }; // callers keep importing them from here
+export { STATE_LABEL, HEALTH_LABEL, NEXT } from "./labels"; // callers keep importing them from here
 
 // Status dot. When the server reports health, the dot reflects HEALTH (green
 // pulse / amber / orange / red) with the reason as tooltip; otherwise it falls
@@ -23,15 +23,6 @@ export function CiBadge({ status }: { status: CiStatus }) {
   if (!status) return null;
   return <span className={`ci ci-${status}`}>CI {status}</span>;
 }
-
-// Which transitions the director can trigger from the current state.
-export const NEXT: Partial<Record<State, State[]>> = {
-  queued: ["in_progress", "cancelled"],
-  in_progress: ["in_review", "needs_decision", "failed", "cancelled"],
-  needs_decision: ["in_progress", "cancelled"],
-  in_review: ["verifying", "in_progress", "cancelled"],
-  verifying: ["done", "in_progress", "failed"],
-};
 
 const kb = (n: number) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${Math.round(n / 1024)} KB` : `${(n / 1048576).toFixed(1)} MB`);
 

@@ -20,3 +20,12 @@ export const HEALTH_LABEL: Record<Health["status"], string> = {
   stuck: "Stuck",
   dead: "Agent gone",
 };
+
+// Which transitions the director can trigger from the current state.
+export const NEXT: Partial<Record<State, State[]>> = {
+  queued: ["in_progress", "cancelled"],
+  in_progress: ["in_review", "needs_decision", "failed", "cancelled"],
+  needs_decision: ["in_progress", "cancelled"],
+  in_review: ["verifying", "in_progress", "cancelled"],
+  verifying: ["done", "in_progress", "failed"],
+};
