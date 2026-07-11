@@ -23,7 +23,7 @@ function excerptAround(lines: string[], idx: number, before = 8, after = 4): str
 // screenshots, metadata, searches. Write-shaped MCP tools, sensitive-file
 // prompts, and anything unrecognized still escalate to a card. Projects extend
 // via config.dialog_auto_approve (regex strings, case-insensitive).
-const AUTO_APPROVE_DEFAULT = [/ - (get|list|search|read|whoami)[a-z_]*\(/i];
+const AUTO_APPROVE_DEFAULT = [/ - (get|list|search|read|whoami)[a-z_]*\b/i];
 
 export function dialogAutoApprovable(excerpt: string, extraPatterns: string[] = []): boolean {
   if (AUTO_APPROVE_DEFAULT.some((rx) => rx.test(excerpt))) return true;

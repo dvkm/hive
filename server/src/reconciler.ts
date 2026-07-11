@@ -582,7 +582,11 @@ async function recoverBlockedDialog(db: DB, task: any, excerpt: string, tail: st
     ],
   });
   writeEvent(db, { task_id: task.id, source: "reconciler", type: "blocked_card", payload: { decision_id: d.id } });
-  if (task.state === "in_progress") transition(db, task.id, "needs_decision", { source: "reconciler", reason: "agent blocked on an interactive dialog" });
+  // Re-read: createDecision may already have parked the task, and a redundant
+  // transition throws (crashed the sync loop 2026-07-11).
+  const fresh = getTask(db, task.id);
+  if (fresh?.state === "in_progress")
+    transition(db, task.id, "needs_decision", { source: "reconciler", reason: "agent blocked on an interactive dialog" });
   enqueue(db, { kind: "decision", task_id: task.id, decision_id: d.id, title: `Agent blocked on a dialog: ${task.title}`, urgency: "urgent" });
 }
 
