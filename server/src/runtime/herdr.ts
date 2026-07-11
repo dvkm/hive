@@ -527,12 +527,22 @@ export class Herdr {
     return parseAgentProbe(r.stdout);
   }
 
-  // Pane tail for stale-recovery evidence. Returns whatever herdr produced
-  // (including an error body, which is itself useful evidence of the dead pane).
+  // Pane tail for stale-recovery evidence and dialog diagnosis. herdr wraps
+  // the text in a JSON envelope ({result:{read:{text}}}); return the TEXT —
+  // diagnosis line-splits it, and a one-line JSON blob broke every pattern
+  // match and produced JSON-headed decision cards (2026-07-11). Falls back to
+  // the raw body when unparseable (an error body is itself useful evidence).
   async read(target: string, lines = 200): Promise<string> {
     try {
       const r = await this.run(agentReadArgv(target, lines));
-      return r.stdout || r.stderr || "";
+      const raw = r.stdout || r.stderr || "";
+      try {
+        const text = JSON.parse(raw)?.result?.read?.text;
+        if (typeof text === "string") return text;
+      } catch {
+        /* not an envelope — return as-is */
+      }
+      return raw;
     } catch (e) {
       return `(pane read failed: ${String((e as any)?.message ?? e)})`;
     }
