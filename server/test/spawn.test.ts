@@ -209,3 +209,13 @@ test("secrets API stores names/metadata only (no values)", async () => {
   const del = await fetch(BASE + `/api/projects/${projectId}/secrets/API_KEY`, { method: "DELETE" });
   expect(del.status).toBe(200);
 });
+
+test("modelForTask: per-kind default, config.model, config.model_by_kind override in order", async () => {
+  const { modelForTask } = await import("../src/api.ts");
+  expect(modelForTask({}, "ship")).toBe("opus");
+  expect(modelForTask({}, "scout")).toBe("sonnet");
+  expect(modelForTask({}, "chore")).toBe("sonnet");
+  expect(modelForTask({ model: "haiku" }, "ship")).toBe("haiku");
+  expect(modelForTask({ model: "haiku", model_by_kind: { ship: "opus" } }, "ship")).toBe("opus");
+  expect(modelForTask({ model_by_kind: { ship: "opus" } }, "scout")).toBe("sonnet");
+});

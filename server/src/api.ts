@@ -1157,6 +1157,18 @@ async function spawnTask(
   return json({ ok: true, task: getTask(db, id), agent_target: r.agent_target });
 }
 
+// Model per task kind, always pinned: without an explicit --model the CLI's
+// own default applies, which can be the priciest tier (fable burned $2.2k in
+// 97 sessions, incl. Opus-priced "say hello" health checks). Ship work gets
+// opus; scouts/chores are mechanical enough for sonnet. Per-project overrides:
+// config.model_by_kind = {ship:"opus",...} wins over config.model wins over
+// these defaults. config.agent_argv (verbatim) bypasses this entirely.
+const DEFAULT_MODEL_BY_KIND: Record<string, string> = { ship: "opus", scout: "sonnet", chore: "sonnet" };
+
+export function modelForTask(config: any, kind: string): string {
+  return config?.model_by_kind?.[kind] ?? config?.model ?? DEFAULT_MODEL_BY_KIND[kind] ?? "sonnet";
+}
+
 // The reusable spawn core, shared by the /spawn endpoint and the dispatcher.
 // Composes the brief, creates the worktree + starts the agent via herdr, writes
 // the `spawned`/`spawn_error` events and the queued->in_progress transition.
@@ -1193,6 +1205,7 @@ export async function spawnAgent(
       brief,
       base: config.default_branch,
       env,
+      model: modelForTask(config, task.kind),
       agentArgv: config.agent_argv, // optional per-project override (verbatim)
       // Seed the worktree with hive's Claude Code hook wiring BEFORE the agent
       // starts, so Stop/SubagentStop/PostToolUse reporting is structural.

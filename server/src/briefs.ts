@@ -35,6 +35,10 @@ and \`hive pr-marker\`. Prefer the CLI over raw curl: it attributes what you do.
   hive emit <task-id> done     --note "final summary"
 
 Rules:
+- BEFORE any command expected to run more than a minute (builds, full test
+  suites, e2e, docker up), emit status first, e.g.
+  \`hive emit <task-id> status --note "running e2e (~5m)"\` — a silent long
+  command looks stuck and triggers supervisor nudges (one agent ate 10).
 - A task NEVER reaches Done without evidence. Attach at least one evidence item
   (screenshot, test run, log, report, or link) before emitting \`done\`.
 - Attach evidence BEFORE \`ready\`, not just before done — the review card shows
