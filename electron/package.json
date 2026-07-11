@@ -1,0 +1,28 @@
+{
+  "name": "hive-app",
+  "productName": "hive",
+  "version": "0.1.0",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --mac --dir"
+  },
+  "build": {
+    "appId": "dev.hive.app",
+    "productName": "hive",
+    "directories": {
+      "output": "dist"
+    },
+    "files": ["main.js"],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.png",
+      "identity": null
+    }
+  },
+  "devDependencies": {
+    "electron": "^43.1.0",
+    "electron-builder": "^26.15.3"
+  }
+}

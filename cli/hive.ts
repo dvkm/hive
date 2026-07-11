@@ -40,8 +40,8 @@ Usage:
   hive secret list --project <id>
   hive secret rm --project <id> --name <n>
   hive open                               open the board in a browser
-  hive app                                open the board as a chromeless app window
-        (permanent dock app: Safari > File > Add to Dock, or Chrome > Install hive)
+  hive app                                open the hive desktop app (native notifications
+        + dock badge; build once: cd electron && bun install && bun run build)
 
 Env: HIVE_URL, HIVE_PORT, HIVE_DB, BW_SESSION`;
 
@@ -423,18 +423,25 @@ async function main() {
     return;
   }
 
-  // Chromeless app window onto the board (Chrome --app). For a permanent dock
-  // app instead: Safari > File > Add to Dock, or Chrome > Install hive (the
-  // web app ships a PWA manifest + icons, so both install it properly).
+  // The hive desktop app (Electron: native notifications + dock badge), built
+  // at electron/dist by `bun run build` in electron/. Falls back to a
+  // chromeless Chrome window, then the default browser.
   if (cmd === "app") {
     const url = BASE + "/";
+    const { existsSync } = await import("node:fs");
+    const appPath = new URL("../electron/dist/mac-arm64/hive.app", import.meta.url).pathname;
+    if (existsSync(appPath)) {
+      Bun.spawn(["open", appPath], { stdout: "ignore", stderr: "ignore" });
+      console.log(`opening hive.app (${appPath})`);
+      return;
+    }
     const chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
     try {
       Bun.spawn([chrome, `--app=${url}`], { stdout: "ignore", stderr: "ignore" });
-      console.log(`hive app window on ${url}`);
+      console.log(`hive.app not built (cd electron && bun install && bun run build) — Chrome app window on ${url}`);
     } catch {
       Bun.spawn(["open", url]);
-      console.log(`Chrome not found — opened ${url} in the default browser`);
+      console.log(`opened ${url} in the default browser`);
     }
     return;
   }
