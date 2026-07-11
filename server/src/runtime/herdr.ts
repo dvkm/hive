@@ -487,6 +487,24 @@ export class Herdr {
     return this.run(agentFocusArgv(target));
   }
 
+  // Answer an interactive dialog in the agent's pane by keystroke ("1" to
+  // approve, "3"/"Escape" to deny, etc.). This is how a permission prompt that
+  // froze an autonomous agent gets resolved from the hive board instead of
+  // requiring a human at the tmux pane (2026-07-11: three agents sat blocked on
+  // dialogs for hours and were failed as "silent").
+  async answerDialog(target: string, key: string): Promise<ExecResult> {
+    try {
+      const got = await this.run(agentGetArgv(target));
+      const paneId = parsePaneId(got.stdout);
+      if (!paneId) return { code: 1, stdout: got.stdout, stderr: "agent has no pane" };
+      const sent = await this.run(paneSendKeysArgv(paneId, key));
+      if (sent.code !== 0) return sent;
+      return this.run(paneSendKeysArgv(paneId, "Enter"));
+    } catch (e: any) {
+      return { code: 1, stdout: "", stderr: String(e?.message ?? e) };
+    }
+  }
+
   async wait(target: string, status: AgentStatus, timeoutMs: number): Promise<ExecResult> {
     return this.run(agentWaitArgv(target, status, timeoutMs));
   }

@@ -19,7 +19,8 @@ import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
 import { recordSystemLearning } from "./learn.ts";
-import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview } from "./api.ts";
+import { diagnosePane } from "./diagnose.ts";
+import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 
@@ -390,9 +391,14 @@ async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
     const staleFlagged = meaningful?.type === "stale";
     if (!goneNow && !staleFlagged) continue;
 
-    const { alive } = await h.probe(t.agent_target);
+    const { alive, status } = await h.probe(t.agent_target);
     if (!alive) await recoverDead(db, h, t.id, t.agent_target);
-    else if (staleFlagged) await recoverSilent(db, h, t.id, t.agent_target);
+    else if (staleFlagged) {
+      // Quiet but WORKING is not stuck — long tool runs and big builds are
+      // silent by nature. Only idle/blocked/unknown agents enter recovery.
+      if (status === "working") continue;
+      await recoverSilent(db, h, t.id, t.agent_target);
+    }
   }
 }
 
@@ -459,8 +465,28 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string): 
   const task = getTask(db, taskId);
   if (!task || TERMINAL.includes(task.state as State)) return;
 
+  // Diagnose BEFORE nudging: the pane usually names the problem, and each
+  // class has a graceful path. Nudge→fail is only for the truly unexplained.
+  const tail = await h.read(target, 200);
+  const diag = diagnosePane(tail);
+  if (diag?.kind === "blocked_dialog") return recoverBlockedDialog(db, task, diag.excerpt, tail);
+  if (diag?.kind === "auth_lost") return recoverAuthLost(db, task, diag.excerpt, tail);
+  if (diag?.kind === "context_full") return recoverContextFull(db, task, tail);
+  if (diag?.kind === "api_error") {
+    // Transient (rate limit / network / overload): extend patience instead of
+    // burning a nudge — this event resets the silence clock for one threshold.
+    writeEvent(db, {
+      task_id: taskId,
+      source: "reconciler",
+      type: "recovery",
+      payload: { decision: "transient-api-error", excerpt: diag.excerpt.slice(0, 300) },
+    });
+    return;
+  }
+
   const nudges = nudgesSinceActivity(db, taskId);
   if (nudges >= MAX_SILENT_NUDGES) {
+    attachLog(db, taskId, tail, "agent pane tail at silent-escalation");
     writeEvent(db, { task_id: taskId, source: "reconciler", type: "recovery", payload: { decision: "silent-escalate", nudges } });
     transition(db, taskId, "failed", { source: "reconciler", reason: `agent silent; ${nudges} nudges ignored` });
     openRecoveryDecision(db, task, requeueDepth(db, task));
@@ -483,6 +509,72 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string): 
       payload: { nudge: nudges + 1, delivered: error === null, ...(error ? { error } : {}) },
     });
     broadcastTask(db, getTask(db, taskId));
+  }
+}
+
+// ---- graceful failure-class handlers (pane-diagnosed) ----
+
+// A dialog froze the agent: open ONE answerable card (approve/deny resolve by
+// sending the keystroke to the pane — resolveBlockedForDecision in api.ts).
+// The task parks in needs_decision instead of rotting to failed.
+async function recoverBlockedDialog(db: DB, task: any, excerpt: string, tail: string): Promise<void> {
+  const open = db
+    .query("SELECT 1 FROM decisions WHERE task_id = ? AND status = 'open' AND title LIKE 'Agent blocked on a dialog%' LIMIT 1")
+    .get(task.id);
+  if (open) return; // card already waiting — don't spam
+  attachLog(db, task.id, tail, "agent pane tail: blocked on a dialog");
+  const firstLine = excerpt.split("\n").find((l) => l.trim()) ?? "permission prompt";
+  const d = createDecision(db, {
+    task_id: task.id,
+    title: `Agent blocked on a dialog: ${firstLine.trim().slice(0, 70)}`,
+    context:
+      `The agent's pane is frozen on an interactive prompt. Answering here sends the keystroke to the pane remotely.\n\n${excerpt}`,
+    risk: "medium",
+    blast_radius: `agent ${task.agent_target} (task #${task.number})`,
+    options: [
+      { key: "approve", label: "Approve (option 1)", detail: "Send '1' + Enter to the pane; the agent continues." },
+      { key: "deny", label: "Deny (option 3)", detail: "Send '3' + Enter; the agent is told no and adapts." },
+    ],
+  });
+  writeEvent(db, { task_id: task.id, source: "reconciler", type: "blocked_card", payload: { decision_id: d.id } });
+  if (task.state === "in_progress") transition(db, task.id, "needs_decision", { source: "reconciler", reason: "agent blocked on an interactive dialog" });
+  enqueue(db, { kind: "decision", task_id: task.id, decision_id: d.id, title: `Agent blocked on a dialog: ${task.title}`, urgency: "urgent" });
+}
+
+// Claude Code lost auth: failing or requeuing is pointless (a fresh agent hits
+// the same wall). Urgent-notify the director once per hour and wait.
+async function recoverAuthLost(db: DB, task: any, excerpt: string, tail: string): Promise<void> {
+  writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "auth-lost", excerpt: excerpt.slice(0, 300) } });
+  const recent = db
+    .query("SELECT 1 FROM notifications WHERE kind = 'auth_lost' AND ts > datetime('now', '-60 minutes') LIMIT 1")
+    .get();
+  if (recent) return;
+  attachLog(db, task.id, tail, "agent pane tail: Claude Code auth lost");
+  enqueue(db, {
+    kind: "auth_lost",
+    task_id: task.id,
+    title: "Claude Code auth expired — agents cannot work",
+    body: "An agent pane shows 'Not logged in'. Run /login in any Claude Code session (or fix credentials); affected agents resume on their own.",
+    urgency: "urgent",
+  });
+  recordSystemLearning(db, task.project_id, "Claude Code auth expired mid-fleet", "Agents stall with 'Not logged in · Please run /login'. Fix auth once; do not requeue (a fresh agent hits the same wall).", task.id);
+}
+
+// Context window exhausted: the ONE case where auto-requeue is exactly right —
+// a fresh agent gets a fresh context. Capped by MAX_AUTO_REQUEUE like death.
+async function recoverContextFull(db: DB, task: any, tail: string): Promise<void> {
+  attachLog(db, task.id, tail, "agent pane tail: context window exhausted");
+  const attempts = requeueDepth(db, task);
+  writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "context-full", attempts } });
+  transition(db, task.id, "failed", { source: "reconciler", reason: "context window exhausted" });
+  if (attempts >= MAX_AUTO_REQUEUE) {
+    openRecoveryDecision(db, task, attempts);
+    enqueue(db, { kind: "failed", task_id: task.id, title: `Context exhausted repeatedly — task may be too big: ${task.title}` });
+    recordSystemLearning(db, task.project_id, "task repeatedly exhausts the context window (too big?)", `Task: ${task.title} — consider splitting it.`, task.id);
+  } else {
+    const fresh = requeueTask(db, task);
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "requeued", payload: { new_task_id: fresh, attempt: attempts + 1, reason: "context-full" } });
+    enqueue(db, { kind: "failed", task_id: task.id, title: `Context exhausted — requeued with fresh context: ${task.title}` });
   }
 }
 
