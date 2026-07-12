@@ -63,6 +63,51 @@ test("syncPRs updates ci_status and transitions in_review->verifying on merge", 
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_merged'").all(id).length).toBe(1);
 });
 
+test("syncPRs bounces an in_review task whose CI turned red, steers once per sha", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/2", agent_target: "t-agent" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+
+  const sends: string[] = [];
+  const herdr = new Herdr(
+    stub((argv) => {
+      if (argv.includes("send")) {
+        sends.push(argv[argv.indexOf("send") + 2]);
+        return OK();
+      }
+      if (argv.includes("get")) return OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}');
+      return OK();
+    }),
+    "herdr"
+  );
+  const gh: Exec = stub((argv) => {
+    if (argv[0] === "gh")
+      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "FAILURE" }], headRefOid: "sha-red" }));
+    return OK();
+  });
+  await reconcileOnce(db, { exec: gh, herdr });
+  const task = getTask(db, id);
+  expect(task.state).toBe("in_progress"); // red is not reviewable
+  expect(task.ci_status).toBe("failing");
+  expect(sends.some((s) => s.includes("CI is FAILING"))).toBe(true);
+
+  // same sha next cycle: no re-nudge, and the task stays with the agent
+  const before = sends.length;
+  await reconcileOnce(db, { exec: gh, herdr });
+  expect(sends.length).toBe(before);
+  expect(getTask(db, id).state).toBe("in_progress");
+
+  // checks go green → promoted to review automatically
+  const ghGreen: Exec = stub((argv) => {
+    if (argv[0] === "gh")
+      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-green" }));
+    return OK();
+  });
+  await reconcileOnce(db, { exec: ghGreen, herdr });
+  expect(getTask(db, id).state).toBe("in_review");
+});
+
 test("flagStale emits one stale event past the threshold, then stops", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId);

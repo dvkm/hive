@@ -140,6 +140,10 @@ export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, s
   if (!task || task.state !== "in_progress") return false;
   const hasReport = task.kind === "scout" && evidenceCount(db, taskId, "report") >= 1;
   if (!task.pr_url && !hasReport) return false; // no product to review → health surfaces it, don't advance
+  // Review means CI is green. failing/pending holds here; the reconciler's
+  // syncPRs promotes the moment checks pass (and steers the agent on red).
+  // null = no checks known (repo without CI) — that flows as before.
+  if (task.pr_url && (task.ci_status === "failing" || task.ci_status === "pending")) return false;
   writeEvent(db, {
     task_id: taskId,
     source,

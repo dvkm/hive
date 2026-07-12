@@ -39,6 +39,7 @@ import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { costUsd } from "./pricing.ts";
 import { checkCostGuardrails, resolveCostCapForDecision } from "./costs.ts";
+import { ciStatusOf } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
@@ -185,7 +186,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
             .all(m[1]);
           return json(rows.map(parseEvent));
         }
-        if (method === "POST") return await ingestEvent(db, m[1], req);
+        if (method === "POST") return await ingestEvent(db, m[1], req, deps);
       }
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/transition$/);
       if (m && method === "POST") return await doTransition(db, m[1], await req.json());
@@ -2025,7 +2026,7 @@ async function attachFiles(taskId: string, files: File[]): Promise<{ paths: stri
 }
 
 // ---------------------------------------------------------------- event ingestion (`hive emit`)
-async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Response> {
+async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDeps = {}): Promise<Response> {
   if (!getTask(db, taskId)) return err("task not found", 404);
   const ct = req.headers.get("content-type") || "";
   let fields: Record<string, string> = {};
@@ -2130,6 +2131,39 @@ async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Respon
     }
     if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });
     if (t.state === "in_progress") {
+      // Review means "truly ready for the director to approve & merge" — a red
+      // or still-running CI is not that. Probe the PR's checks NOW (hive's own
+      // ci_status lags a reconciler cycle): failing/pending holds the task
+      // in_progress with the agent; syncPRs promotes it the moment checks go
+      // green and steers the agent if they go red. No checks at all (repo
+      // without CI) and gh trouble both fail OPEN — a broken gh must not
+      // strand every handoff.
+      const pr = prUrl ?? t.pr_url;
+      if (pr) {
+        const exec = deps.exec ?? defaultExec;
+        let ci: string | null = null;
+        const probe = await exec(["gh", "pr", "view", pr, "--json", "statusCheckRollup"]);
+        if (probe.code === 0) {
+          try {
+            ci = ciStatusOf(JSON.parse(probe.stdout || "{}").statusCheckRollup);
+          } catch {
+            ci = null;
+          }
+        }
+        if (ci === "failing" || ci === "pending") {
+          db.query("UPDATE tasks SET ci_status = ?, updated_at = ? WHERE id = ?").run(ci, now(), taskId);
+          writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { pr_url: pr, ci_status: ci } });
+          broadcastTask(db, getTask(db, taskId));
+          return json({
+            held: true,
+            ci_status: ci,
+            message:
+              ci === "failing"
+                ? `CI is FAILING on ${pr} — the handoff is held. Run \`gh pr checks ${pr}\`, fix the failures, push; hive hands off automatically when checks pass.`
+                : `CI is still running on ${pr} — the handoff is held. Stay on the task; hive hands off automatically when checks pass (and steers you if they fail).`,
+          });
+        }
+      }
       writeEvent(db, { task_id: taskId, source, type: "ready_for_review", payload: { pr_url: prUrl ?? t.pr_url ?? null, via: "emit", kind: t.kind } });
       const task = transition(db, taskId, "in_review", { source, reason: note ?? "agent handoff: ready for review" });
       return json({ task });
