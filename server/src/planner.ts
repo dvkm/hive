@@ -25,7 +25,7 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.HIVE_PLANNER_TIMEOUT_MS || 120_000
 // The binary is resolved to an absolute path: the launchd-spawned server has a
 // minimal PATH and a bare "claude" fails with "Executable not found" — every
 // braindump auto-triage died this way (task #131 et al., 2026-07-11).
-function claudeBin(): string {
+export function claudeBin(): string {
   const home = process.env.HOME ?? "";
   for (const p of [
     process.env.HIVE_CLAUDE_BIN,

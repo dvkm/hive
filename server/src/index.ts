@@ -8,6 +8,7 @@ import { checkAllMonitors } from "./monitors.ts";
 import { startDigest, setNotifier } from "./notifications.ts";
 import { startGchatPoll } from "./intake/gchat.ts";
 import { startWatchers } from "./watch.ts";
+import { startAutoReviewer } from "./reviewer.ts";
 import { startPromoter } from "./promoter.ts";
 import { setTerminalHook, expireOrphanedDecisions } from "./state.ts";
 import { bootstrapAuthority } from "./authority.ts";
@@ -82,6 +83,11 @@ startGchatPoll(db);
 // Watchers: poll configured docs/pages (per-project config.watchers) and queue
 // an act-on-change task carrying the diff. Hard no-op until configured.
 startWatchers(db);
+
+// Auto-reviewer: pre-review every task that reaches in_review (sonnet one-shot
+// over the PR diff) and post the result onto the review card. Opt-out per
+// project: config.auto_review = false.
+startAutoReviewer(db);
 
 // Continuous promotion evaluator: projects with config.promote {from, to} get
 // an evaluation task queued whenever `from` moves ahead of `to`. No-op otherwise.
