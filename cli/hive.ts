@@ -425,6 +425,7 @@ async function main() {
   // Autonomy scorecard: is the fleet getting MORE autonomous or less? One
   // number per pain axis, computed straight from the DB (read-only).
   if (cmd === "stats") {
+    const { flags } = parseFlags(argv.slice(1));
     const { Database } = await import("bun:sqlite");
     const { defaultDbPath } = await import("../server/src/db.ts");
     const db = new Database(defaultDbPath(), { readonly: true });
@@ -492,6 +493,7 @@ async function main() {
   //   hive watch rm --project <id> --name <n>
   if (cmd === "watch") {
     const sub = argv[1];
+    const { flags } = parseFlags(argv.slice(2));
     const pid = flags.project ? String(flags.project) : null;
     if (sub === "list") {
       const projects = await api("GET", "/api/projects");
@@ -534,6 +536,7 @@ async function main() {
   //   hive steer-all "message" [--project <id>]
   if (cmd === "steer-all") {
     const message = argv[1];
+    const { flags } = parseFlags(argv.slice(2));
     if (!message) die('usage: hive steer-all "message" [--project <id>]');
     const r = await api("POST", "/api/steer/broadcast", {
       message,
