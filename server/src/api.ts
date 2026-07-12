@@ -1071,12 +1071,37 @@ async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: Hand
 
   let method: string;
   if (task.pr_url) {
-    const flag = ghMergeFlag(config.merge_method);
-    method = `pr ${flag.slice(2)}`;
-    const r = await exec(["gh", "pr", "merge", task.pr_url, flag]);
-    if (r.code !== 0) {
-      const reason = r.stderr.trim() || r.stdout.trim() || `gh pr merge exited ${r.code}`;
-      return mergeFailed(db, herdr, task, base, reason);
+    // A closed or already-merged PR fails `gh pr merge` with an opaque GraphQL
+    // error and used to bounce the agent with a bogus conflict steer (task #90
+    // looped on its replaced PR for hours). Tell the truth instead — and when
+    // GitHub says MERGED, just advance: the work landed, hive's link was stale.
+    const probe = await exec(["gh", "pr", "view", task.pr_url, "--json", "state"]);
+    if (probe.code === 0) {
+      const prState = String(JSON.parse(probe.stdout || "{}").state ?? "").toUpperCase();
+      if (prState === "MERGED") {
+        method = "already merged on GitHub";
+      } else if (prState === "CLOSED") {
+        return mergeFailed(
+          db,
+          herdr,
+          task,
+          base,
+          `PR is CLOSED (not merged): ${task.pr_url}. If the agent replaced it, its 'ready' emit now re-links the task; otherwise re-link via POST /api/tasks/link-pr.`
+        );
+      } else {
+        method = ""; // open: fall through to the real merge below
+      }
+    } else {
+      method = "";
+    }
+    if (!method) {
+      const flag = ghMergeFlag(config.merge_method);
+      method = `pr ${flag.slice(2)}`;
+      const r = await exec(["gh", "pr", "merge", task.pr_url, flag]);
+      if (r.code !== 0) {
+        const reason = r.stderr.trim() || r.stdout.trim() || `gh pr merge exited ${r.code}`;
+        return mergeFailed(db, herdr, task, base, reason);
+      }
     }
   } else {
     if (!project?.repo_path) return err("project has no repo_path; cannot merge", 400);
@@ -2084,9 +2109,19 @@ async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Respon
   if (type === "ready") {
     const t = getTask(db, taskId);
     const prUrl = (fields.pr_url ?? fields.url ?? null) as string | null;
-    if (prUrl && !t.pr_url) {
-      db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(prUrl, now(), taskId);
-      writeEvent(db, { task_id: taskId, source, type: "pr_linked", payload: { pr_url: prUrl, via: "ready" } });
+    // The agent's explicit handoff is AUTHORITATIVE about which PR carries the
+    // work — including when it replaces an earlier PR (closed #161 → rebased
+    // #166, task #90). The old `only if unlinked` guard silently ignored the
+    // new url, so every merge kept hitting the closed PR in a loop. ci_status
+    // resets: it described the old PR.
+    if (prUrl && prUrl !== t.pr_url) {
+      db.query("UPDATE tasks SET pr_url = ?, ci_status = NULL, updated_at = ? WHERE id = ?").run(prUrl, now(), taskId);
+      writeEvent(db, {
+        task_id: taskId,
+        source,
+        type: "pr_linked",
+        payload: { pr_url: prUrl, via: t.pr_url ? "ready_replaced" : "ready", ...(t.pr_url ? { replaced: t.pr_url } : {}) },
+      });
     }
     if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });
     if (t.state === "in_progress") {
