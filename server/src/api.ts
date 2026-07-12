@@ -3,7 +3,7 @@
 import { dirname, join, normalize } from "node:path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
-import { newId, now, evidenceDir, isOffline, setSetting } from "./db.ts";
+import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { taskWithHealth, broadcastTask, needsAttention } from "./health.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
 import {
@@ -84,14 +84,32 @@ function authzBlock(db: DB, input: AuthzInput): Response | null {
 const WEB_DIST = join(import.meta.dir, "..", "..", "web", "dist");
 const HOOKS_DIR = join(import.meta.dir, "..", "..", "hooks");
 
+// Remote requests (a phone on the LAN / Tailscale) must present the API token;
+// loopback (CLI, hooks, agents, the desktop app) stays trustless as before.
+// Accepted as `Authorization: Bearer <t>` or `?token=<t>` — EventSource cannot
+// set headers, so the SSE stream needs the query form. Exported for tests.
+export function remoteAuthOk(db: DB, req: Request, url: URL, ip: string | null): boolean {
+  if (!ip || ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1") return true;
+  const token = getSetting(db, "api_token");
+  if (!token) return false; // bound to LAN with no token minted → locked
+  const presented =
+    req.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim() || url.searchParams.get("token");
+  return presented === token;
+}
+
 export function makeHandler(db: DB, deps: HandlerDeps = {}) {
   const herdr = deps.herdr ?? defaultHerdr;
-  return async function handle(req: Request): Promise<Response> {
+  return async function handle(req: Request, server?: { requestIP?: (r: Request) => { address: string } | null }): Promise<Response> {
     const url = new URL(req.url);
     const { pathname } = url;
     const method = req.method;
 
     if (method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+
+    if (pathname.startsWith("/api/")) {
+      const ip = server?.requestIP?.(req)?.address ?? null;
+      if (!remoteAuthOk(db, req, url, ip)) return err("unauthorized (see `hive remote` for the token)", 401);
+    }
 
     try {
       // ---- SSE stream ----

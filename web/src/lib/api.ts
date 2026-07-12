@@ -2,6 +2,27 @@
 // VITE_HIVE_URL lets you point the dev app at a daemon on another host.
 const BASE = import.meta.env.VITE_HIVE_URL || "";
 
+// Remote access (phone PWA over LAN/Tailscale): the server 401s non-loopback
+// requests without the API token (`hive remote` prints it). Stored once in
+// localStorage; loopback/desktop never sees a 401 so never prompts.
+export function apiToken(): string | null {
+  try {
+    return localStorage.getItem("hive_token");
+  } catch {
+    return null;
+  }
+}
+function authHeaders(): Record<string, string> {
+  const t = apiToken();
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+function promptForToken(): boolean {
+  const t = window.prompt("hive API token (run `hive remote` on the Mac):");
+  if (!t?.trim()) return false;
+  localStorage.setItem("hive_token", t.trim());
+  return true;
+}
+
 export type State =
   | "queued"
   | "in_progress"
@@ -288,16 +309,19 @@ export interface Brief {
   learnings_new: BriefLearning[];
 }
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
+async function req<T>(path: string, init?: RequestInit, retried = false): Promise<T> {
   // A FormData body must set its own Content-Type: the browser adds the
   // multipart boundary, which we cannot write by hand.
   const isForm = init?.body instanceof FormData;
   const res = await fetch(BASE + path, {
     ...init,
     headers: isForm
-      ? init?.headers || {}
-      : { "Content-Type": "application/json", ...(init?.headers || {}) },
+      ? { ...authHeaders(), ...(init?.headers || {}) }
+      : { "Content-Type": "application/json", ...authHeaders(), ...(init?.headers || {}) },
   });
+  if (res.status === 401 && !retried && promptForToken()) {
+    return req<T>(path, init, true); // token just entered — replay once, then reload streams
+  }
   if (!res.ok) {
     let msg = res.statusText;
     try {
