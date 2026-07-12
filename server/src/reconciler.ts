@@ -13,13 +13,13 @@ import { now, newId, evidenceDir, isOffline } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
-import { queuedSteers, markSteersDelivered } from "./steer.ts";
+import { queuedSteers, markSteersDelivered, queueSteerEvent } from "./steer.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
 import { recordSystemLearning } from "./learn.ts";
-import { diagnosePane, dialogAutoApprovable } from "./diagnose.ts";
+import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
 import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
@@ -83,6 +83,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
     await linkPRs(db, deps);
   } catch (e) {
     fail("linkPRs", e);
+  }
+  try {
+    resumeUsageLimited(db, (deps.nowMs ?? (() => Date.now()))());
+  } catch (e) {
+    fail("resumeUsageLimited", e);
   }
   try {
     flagStale(db, deps);
@@ -518,6 +523,54 @@ async function reclaimDeadWorktree(db: DB, h: Herdr, task: any): Promise<void> {
   }
 }
 
+// A usage-limited session is a hard wall with a printed reset time: nudging it
+// re-triggers the same "hit your session limit" reply (one task burned 4 nudges
+// over 47 minutes, then sat ~19h until a manual redispatch — the reset was 7
+// minutes after the last nudge). Park it once with the parsed resume time;
+// resumeUsageLimited() queues the wake-up steer when the clock passes.
+function recoverUsageLimit(db: DB, task: any, excerpt: string): void {
+  const open = db
+    .query(
+      `SELECT 1 FROM events WHERE task_id = ? AND type = 'usage_limit'
+        AND ts > COALESCE((SELECT MAX(ts) FROM events WHERE task_id = ? AND type = 'usage_limit_resumed'), '')
+        LIMIT 1`
+    )
+    .get(task.id, task.id);
+  if (open) return; // already parked on this limit window; stay quiet
+  const resumeAt = parseResetClock(excerpt, Date.now()) ?? new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  writeEvent(db, {
+    task_id: task.id,
+    source: "reconciler",
+    type: "usage_limit",
+    payload: { resume_at: resumeAt, excerpt: excerpt.slice(0, 300) },
+  });
+}
+
+// The wake-up half: once a parked task's resume_at passes, queue a steer (the
+// drain/respawn machinery delivers it) and mark the window resumed. A session
+// answers normally again after its reset — observed live, task #105.
+export function resumeUsageLimited(db: DB, nowMs: number = Date.now()): void {
+  const rows = db
+    .query(
+      `SELECT e.task_id, MAX(e.ts) AS ts, json_extract(e.payload, '$.resume_at') AS resume_at
+         FROM events e JOIN tasks t ON t.id = e.task_id
+        WHERE e.type = 'usage_limit' AND t.state IN ('in_progress', 'needs_decision')
+          AND e.ts > COALESCE((SELECT MAX(ts) FROM events WHERE task_id = e.task_id AND type = 'usage_limit_resumed'), '')
+        GROUP BY e.task_id`
+    )
+    .all() as { task_id: string; resume_at: string | null }[];
+  for (const r of rows) {
+    if (!r.resume_at || Date.parse(r.resume_at) > nowMs) continue;
+    queueSteerEvent(
+      db,
+      r.task_id,
+      "Your usage-limit window has reset — you are unblocked. Re-read your last few steps, emit a status note, and continue the task.",
+      "queued by usage-limit resume"
+    );
+    writeEvent(db, { task_id: r.task_id, source: "reconciler", type: "usage_limit_resumed", payload: { resume_at: r.resume_at } });
+  }
+}
+
 async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string): Promise<void> {
   const task = getTask(db, taskId);
   if (!task || TERMINAL.includes(task.state as State)) return;
@@ -529,6 +582,7 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string): 
   if (diag?.kind === "blocked_dialog") return handleBlockedAgent(db, h, taskId, target);
   if (diag?.kind === "auth_lost") return recoverAuthLost(db, task, diag.excerpt, tail);
   if (diag?.kind === "context_full") return recoverContextFull(db, task, tail);
+  if (diag?.kind === "usage_limit") return recoverUsageLimit(db, task, diag.excerpt);
   if (diag?.kind === "api_error") {
     // Transient (rate limit / network / overload): extend patience instead of
     // burning a nudge — this event resets the silence clock for one threshold.

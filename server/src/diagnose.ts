@@ -6,8 +6,26 @@ export type PaneDiagnosis =
   | { kind: "blocked_dialog"; excerpt: string }
   | { kind: "auth_lost"; excerpt: string }
   | { kind: "context_full"; excerpt: string }
+  | { kind: "usage_limit"; excerpt: string }
   | { kind: "api_error"; excerpt: string }
   | null;
+
+// "You've hit your session limit · resets 4:20pm (America/Los_Angeles)" →
+// the next local occurrence of that clock time, as ISO. The reset is a hard
+// wall nudging can't move (44% of sampled sessions hit it; nudges just
+// re-triggered the same reply, and redispatch came ~19h later by hand).
+// ponytail: assumes the message's timezone is the server's own — hive and its
+// agents run on the same machine.
+export function parseResetClock(text: string, nowMs: number): string | null {
+  const m = /resets\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)/i.exec(text);
+  if (!m) return null;
+  let h = Number(m[1]) % 12;
+  if (m[3].toLowerCase() === "pm") h += 12;
+  const d = new Date(nowMs);
+  d.setHours(h, Number(m[2] ?? 0), 0, 0);
+  if (d.getTime() <= nowMs) d.setDate(d.getDate() + 1);
+  return d.toISOString();
+}
 
 // A few lines of context around the matched line, newest text last.
 function excerptAround(lines: string[], idx: number, before = 8, after = 4): string {
@@ -53,6 +71,9 @@ export function diagnosePane(tail: string): PaneDiagnosis {
 
   const ctx = find(/\/clear to save [\d.]+k tokens|[Cc]ontext (window is )?(low|full)|approaching.*context limit|Conversation compacted/);
   if (ctx !== -1) return { kind: "context_full", excerpt: excerptAround(lines, ctx) };
+
+  const limit = find(/hit your (session|usage|weekly) limit/i);
+  if (limit !== -1) return { kind: "usage_limit", excerpt: excerptAround(lines, limit) };
 
   const api = find(/rate.?limit|overloaded_error|529|API Error|ETIMEDOUT|ENOTFOUND|ECONNRESET|fetch failed|network error|Unable to connect/i);
   if (api !== -1) return { kind: "api_error", excerpt: excerptAround(lines, api) };

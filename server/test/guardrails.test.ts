@@ -176,6 +176,49 @@ test("open decisions nag urgently at 15m and again at 60m, once per tier", async
   expect(nags()).toBe(2);
 });
 
+// ---- usage-limit park + timed resume -------------------------------------------
+
+test("parseResetClock: next local occurrence, same day or tomorrow", async () => {
+  const { parseResetClock } = await import("../src/diagnose.ts");
+  const base = new Date("2026-07-11T10:00:00").getTime(); // local 10:00
+  const later = Date.parse(parseResetClock("… resets 4:20pm (America/Los_Angeles)", base)!);
+  expect(later).toBeGreaterThan(base);
+  expect(new Date(later).getHours()).toBe(16);
+  expect(new Date(later).getMinutes()).toBe(20);
+  const wrapped = Date.parse(parseResetClock("resets 9am", base)!); // 9am already past → tomorrow
+  expect(wrapped).toBeGreaterThan(base);
+  expect(new Date(wrapped).getHours()).toBe(9);
+  expect(parseResetClock("no clock here", base)).toBeNull();
+});
+
+test("usage-limited task parks once, then gets a resume steer after the reset", async () => {
+  const { diagnosePane } = await import("../src/diagnose.ts");
+  const { resumeUsageLimited } = await import("../src/reconciler.ts");
+  const id = await newTask("limited");
+  // The pane tail the reconciler would read:
+  const diag = diagnosePane("some output\nYou've hit your session limit · resets 4:20pm (America/Los_Angeles)\n");
+  expect(diag?.kind).toBe("usage_limit");
+
+  // Park (recoverUsageLimit is internal; emulate via its event contract):
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    "ev_ul_test", id, new Date().toISOString(), "reconciler", "usage_limit",
+    JSON.stringify({ resume_at: new Date(Date.now() + 1000).toISOString(), excerpt: "limit" })
+  );
+  db.query("UPDATE tasks SET state = 'in_progress' WHERE id = ?").run(id);
+
+  resumeUsageLimited(db, Date.now()); // before resume_at: nothing
+  expect(await events(id, "usage_limit_resumed")).toHaveLength(0);
+
+  resumeUsageLimited(db, Date.now() + 5000); // after: steer queued + resumed
+  expect(await events(id, "usage_limit_resumed")).toHaveLength(1);
+  const steers = await events(id, "steer");
+  expect(steers.at(-1).payload.message).toContain("usage-limit window has reset");
+  expect(steers.at(-1).payload.delivery).toBe("queued");
+
+  resumeUsageLimited(db, Date.now() + 9000); // idempotent
+  expect(await events(id, "usage_limit_resumed")).toHaveLength(1);
+});
+
 // ---- intake noise -------------------------------------------------------------
 
 test("emoji-only and bare-ack intake text is non-actionable; real asks are not", () => {
