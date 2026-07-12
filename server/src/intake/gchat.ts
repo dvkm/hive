@@ -175,6 +175,21 @@ export async function listSpaces(token: string, fetchImpl: FetchLike): Promise<s
 // ponytail: Google Chat exposes no documented permalink field on a Message.
 // This reconstructs the web deep-link from the space + message id; the format
 // is best-effort and may need adjustment if Google changes its URL scheme.
+// Chat noise that needs no attention: emoji/punctuation-only messages and bare
+// acknowledgements (Korean + English). Conservative — anything with real words
+// still notifies. Exported for tests.
+const ACKS = new Set([
+  "네", "넵", "예", "응", "ㅇㅋ", "ㅋㅋ", "ㅎㅎ", "감사", "감사합니다", "좋아요", "좋습니다", "알겠습니다",
+  "ok", "okay", "yes", "yep", "thanks", "thankyou", "thx", "cool", "nice", "got it", "gotit",
+]);
+
+export function isNonActionableIntake(text: string): boolean {
+  const stripped = text.replace(/[\p{Extended_Pictographic}\p{P}\p{S}\s]/gu, "");
+  if (!stripped) return true;
+  if (/^[ㅋㅎㅠㅜ]+$/.test(stripped)) return true; // ㅋㅋㅋ / ㅎㅎ / ㅠㅠ laughter & sighs, any length
+  return ACKS.has(stripped.toLowerCase());
+}
+
 export function buildPermalink(msg: any): string {
   const name: string = msg?.name ?? "";
   const spaceId = (msg?.space?.name ?? name.split("/messages/")[0] ?? "").replace("spaces/", "");
@@ -271,7 +286,10 @@ async function createIntakeTask(
 
   const task = getTask(db, id);
   broadcast({ type: "task", task });
-  if (notify)
+  // Emoji-only pings and bare acks ("네!", "👍") made up a large share of the
+  // ~200 intake notifications in a day. The task is still created (the board
+  // and dedup handle it); only the notification is muted.
+  if (notify && !isNonActionableIntake(text))
     enqueue(db, { kind: "intake", task_id: id, title: `Intake: ${firstLine}`, body: `From ${sender}` });
 
   // Domain supervisor: auto-triage this intake task into a proposed breakdown

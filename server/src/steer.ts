@@ -13,8 +13,22 @@
 // the respawn brief carries it.
 import type { DB } from "./db.ts";
 import { now } from "./db.ts";
+import { writeEvent } from "./state.ts";
 
 export type Delivery = "delivered" | "queued" | "failed";
+
+// A programmatic steer recorded QUEUED without touching herdr (callers that
+// have no Herdr handle: cost guardrails, decision-dismiss recovery). Payload
+// shape matches internalSteer's queued path, so drainSteers delivers it to a
+// live agent within a reconciler cycle and a respawn brief carries it otherwise.
+export function queueSteerEvent(db: DB, taskId: string, message: string, reason: string): void {
+  writeEvent(db, {
+    task_id: taskId,
+    source: "system",
+    type: "steer",
+    payload: { message, target: null, attachments: [], delivery: "queued", error: reason },
+  });
+}
 
 export interface QueuedSteer {
   id: string; // event id

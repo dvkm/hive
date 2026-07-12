@@ -65,6 +65,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   } catch (e) {
     fail("advanceFinished", e);
   }
+  try {
+    nagOpenDecisions(db, (deps.nowMs ?? (() => Date.now()))());
+  } catch (e) {
+    fail("nagOpenDecisions", e);
+  }
   // Offline mode: everything above is local (herdr + sqlite) and keeps state
   // honest; everything below either needs the network (gh) or would punish
   // agents for being offline (stale flags, nudges, failure escalation). Stop here.
@@ -341,6 +346,37 @@ export function ciStatusOf(rollup: any): string | null {
 }
 
 // ---- stale detection ----
+// Open decisions age badly: median answer latency was 2.5h and 22 of 95 cards
+// expired unanswered, each stranding whatever waited on it. The first
+// notification rides createDecision; this escalates — an URGENT re-notify (macOS
+// push) at 15m and again at 60m, keyed off prior decision_nag rows so each tier
+// fires once. Exported for tests.
+const NAG_TIERS_MS = [15 * 60 * 1000, 60 * 60 * 1000];
+
+export function nagOpenDecisions(db: DB, nowMs: number = Date.now()): void {
+  const open = db
+    .query("SELECT id, task_id, ts, title FROM decisions WHERE status = 'open'")
+    .all() as { id: string; task_id: string; ts: string; title: string }[];
+  for (const d of open) {
+    const age = nowMs - Date.parse(d.ts);
+    const due = NAG_TIERS_MS.filter((t) => age >= t).length;
+    if (!due) continue;
+    const sent = (
+      db.query("SELECT COUNT(*) AS n FROM notifications WHERE kind = 'decision_nag' AND decision_id = ?").get(d.id) as any
+    ).n as number;
+    if (sent >= due) continue;
+    const mins = Math.round(age / 60000);
+    enqueue(db, {
+      kind: "decision_nag",
+      urgency: "urgent",
+      task_id: d.task_id,
+      decision_id: d.id,
+      title: `Decision waiting ${mins >= 60 ? `${Math.round(mins / 60)}h` : `${mins}m`}: ${d.title}`,
+      body: "An agent may be parked on this. Answer or dismiss it.",
+    });
+  }
+}
+
 function flagStale(db: DB, deps: ReconcilerDeps): void {
   const staleMs = deps.staleMs ?? DEFAULT_STALE_MS;
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
@@ -369,7 +405,13 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
         payload: { silent_ms: age, threshold_ms: staleMs },
       });
       const task = getTask(db, t.id);
-      enqueue(db, { kind: "stale", task_id: t.id, title: `Task stale: ${task?.title ?? t.id}` });
+      // A task can re-stale every cycle-plus-nudge round trip; the same title
+      // notified 8× in a day (seen live). One stale notification per task per
+      // 24h — the event log above still records every occurrence.
+      const recent = db
+        .query("SELECT 1 FROM notifications WHERE kind = 'stale' AND task_id = ? AND ts > ? LIMIT 1")
+        .get(t.id, new Date(nowMs - 24 * 60 * 60 * 1000).toISOString());
+      if (!recent) enqueue(db, { kind: "stale", task_id: t.id, title: `Task stale: ${task?.title ?? t.id}` });
     }
   }
 }
