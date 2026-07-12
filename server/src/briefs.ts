@@ -45,11 +45,12 @@ Rules:
   it to the director next to your diff. Anything visual gets a screenshot
   (before/after for changes to existing UI); everything else gets test output.
 - Scout tasks (knowledge-only) require a written report as evidence.
-- HAND OFF, don't go idle. When your PR is open and CI is triggered (or, for a
-  scout, your report is attached), emit \`hive emit <task-id> ready --pr-url <url>\`
-  to move the task into the director's review queue. Do NOT just stop and sit
-  idle — that leaves the task looking stuck. (A backstop advances an idle agent
-  that has a PR, but \`ready\` is the clean, immediate handoff.)
+- HAND OFF, don't go idle. When your PR is open (or, for a scout, your report
+  is attached), emit \`hive emit <task-id> ready --pr-url <url>\`. Review means
+  CI IS GREEN: if checks are still running or failing, the handoff is HELD and
+  the response tells you — stay on the task. hive moves it to review
+  automatically the moment checks pass, and steers you if they fail; fix and
+  push until green. Never sit idle with red CI.
 - BEFORE \`ready\`, submit a structured self-review — the director reviews THIS,
   not your prose, so keep every bullet one tight line:
 

@@ -242,11 +242,16 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "ci_status", payload: { ci_status: ci } });
       broadcast({ type: "task", task: getTask(db, t.id) });
     }
-    // Time-based fallback for the link-time hand-off: a task whose PR is open
-    // but is still in_progress (pr_url set by the agent, or linked before this
-    // existed) belongs in the director's Review lane.
+    // Time-based fallback for the link-time hand-off — but review means "CI is
+    // green and the director can merge", so failing/pending checks HOLD the
+    // task in_progress (this is also what promotes a held `ready`: the moment
+    // checks pass, the task moves to review; failing checks steer the agent).
     if (String(data.state).toUpperCase() === "OPEN" && t.state === "in_progress") {
-      if (handOffToReview(db, t.id, "reconciler")) broadcast({ type: "task", task: getTask(db, t.id) });
+      if (ci === "failing") {
+        await nudgeCiFailure(db, h, t, data.headRefOid ?? null);
+      } else if (ci !== "pending") {
+        if (handOffToReview(db, t.id, "reconciler")) broadcast({ type: "task", task: getTask(db, t.id) });
+      }
     }
     if (String(data.state).toUpperCase() === "MERGED" && t.state === "in_review") {
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_merged", payload: { pr_url: t.pr_url } });
@@ -257,10 +262,56 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       } catch (e) {
         console.error(`[hive] smoke run failed for ${t.id}:`, e);
       }
+    } else if (ci === "failing" && t.state === "in_review") {
+      // Checks went red AFTER the handoff: red is not reviewable. Send it back
+      // to the agent to iterate; it returns automatically when green.
+      await nudgeCiFailure(db, h, t, data.headRefOid ?? null);
+      transition(db, t.id, "in_progress", { source: "reconciler", reason: "CI failing — returned to the agent to iterate" });
+      broadcast({ type: "task", task: getTask(db, t.id) });
     } else if (String(data.mergeable).toUpperCase() === "CONFLICTING") {
       await nudgeConflict(db, h, t, data.headRefOid ?? null);
     }
   }
+}
+
+// Failing checks put the AGENT back to work — one nudge per pushed head SHA
+// (same dedupe discipline as nudgeConflict), so a red run never spams but a
+// push that still fails re-nudges.
+async function nudgeCiFailure(
+  db: DB,
+  h: Herdr,
+  t: { id: string; pr_url: string; agent_target: string | null },
+  headSha: string | null
+): Promise<void> {
+  const last = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'ci_failure' ORDER BY ts DESC LIMIT 1")
+    .get(t.id) as { payload: string } | undefined;
+  if (last) {
+    try {
+      if ((JSON.parse(last.payload).head_sha ?? null) === headSha) return;
+    } catch {}
+  }
+  let delivered = false;
+  let error: string | null = null;
+  if (t.agent_target) {
+    try {
+      const r = await h.send(
+        t.agent_target,
+        `hive: CI is FAILING on your PR ${t.pr_url}. Run \`gh pr checks ${t.pr_url}\` to see the failures, fix them, and push. ` +
+          `The task returns to review automatically when checks pass — do not emit ready while CI is red.`
+      );
+      error = sendFailure(r);
+      delivered = error === null;
+    } catch (e: any) {
+      error = String(e?.message ?? e);
+    }
+  }
+  writeEvent(db, {
+    task_id: t.id,
+    source: "reconciler",
+    type: "ci_failure",
+    payload: { pr_url: t.pr_url, head_sha: headSha, delivered, ...(error ? { error } : {}) },
+  });
 }
 
 // ---- PR conflict watchdog ----
