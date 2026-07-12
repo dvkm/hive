@@ -70,6 +70,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   } catch (e) {
     fail("nagOpenDecisions", e);
   }
+  try {
+    unparkAnswered(db, (deps.nowMs ?? (() => Date.now()))());
+  } catch (e) {
+    fail("unparkAnswered", e);
+  }
   // Offline mode: everything above is local (herdr + sqlite) and keeps state
   // honest; everything below either needs the network (gh) or would punish
   // agents for being offline (stale flags, nudges, failure escalation). Stop here.
@@ -379,6 +384,40 @@ export function nagOpenDecisions(db: DB, nowMs: number = Date.now()): void {
       title: `Decision waiting ${mins >= 60 ? `${Math.round(mins / 60)}h` : `${mins}m`}: ${d.title}`,
       body: "An agent may be parked on this. Answer or dismiss it.",
     });
+  }
+}
+
+// A task parked in needs_decision with NOTHING open to answer is stuck forever
+// and eats a dispatch slot (needs_decision counts as working): task #96 re-
+// parked itself 16 minutes AFTER its card was answered, and the unpark that
+// rides apiAnswerDecision had already fired into the void. The grace period
+// covers the legitimate emit-needs-decision-then-open-card ordering. Exported
+// for tests.
+const UNPARK_GRACE_MS = 3 * 60 * 1000;
+
+export function unparkAnswered(db: DB, nowMs: number = Date.now()): void {
+  const rows = db
+    .query(
+      `SELECT t.id, t.updated_at FROM tasks t
+        WHERE t.state = 'needs_decision'
+          AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.task_id = t.id AND d.status = 'open')`
+    )
+    .all() as { id: string; updated_at: string }[];
+  for (const r of rows) {
+    if (nowMs - Date.parse(r.updated_at) < UNPARK_GRACE_MS) continue;
+    transition(db, r.id, "in_progress", {
+      source: "reconciler",
+      reason: "needs_decision with no open decision card — unparked",
+    });
+    queueSteerEvent(
+      db,
+      r.id,
+      "You are parked in needs_decision but there is NO open decision card — everything you asked was " +
+        "already answered (or expired). Read the answers in your task feed, act on them, and move the " +
+        "task forward: emit ready (or done with evidence). If you truly need a decision, open a real card.",
+      "queued by needs_decision unpark"
+    );
+    broadcast({ type: "task", task: getTask(db, r.id) });
   }
 }
 
