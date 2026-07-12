@@ -14,6 +14,7 @@ import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent } from "./steer.ts";
+import { isReviewed } from "./dispatcher.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
@@ -75,6 +76,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   } catch (e) {
     fail("unparkAnswered", e);
   }
+  try {
+    remindUnreviewedIntake(db, (deps.nowMs ?? (() => Date.now()))());
+  } catch (e) {
+    fail("remindUnreviewedIntake", e);
+  }
   // Offline mode: everything above is local (herdr + sqlite) and keeps state
   // honest; everything below either needs the network (gh) or would punish
   // agents for being offline (stale flags, nudges, failure escalation). Stop here.
@@ -103,6 +109,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
     await recoverStale(db, deps);
   } catch (e) {
     fail("recoverStale", e);
+  }
+  try {
+    await sweepVerifying(db, deps);
+  } catch (e) {
+    fail("sweepVerifying", e);
   }
 }
 
@@ -262,6 +273,19 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       } catch (e) {
         console.error(`[hive] smoke run failed for ${t.id}:`, e);
       }
+    } else if (String(data.state).toUpperCase() === "CLOSED" && t.state === "in_review") {
+      // Closed-not-merged: nothing reviewable exists. Self-heal instead of
+      // waiting for the director to discover it via a failed merge click.
+      writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_closed", payload: { pr_url: t.pr_url } });
+      queueSteerEvent(
+        db,
+        t.id,
+        `Your PR ${t.pr_url} is CLOSED (not merged), so this task has nothing to review. If you replaced it, ` +
+          `emit ready with the new PR url (that re-links the task); otherwise reopen or recreate the PR.`,
+        "queued by closed-PR bounce"
+      );
+      transition(db, t.id, "in_progress", { source: "reconciler", reason: "PR closed without merging — returned to the agent" });
+      broadcast({ type: "task", task: getTask(db, t.id) });
     } else if (ci === "failing" && t.state === "in_review") {
       // Checks went red AFTER the handoff: red is not reviewable. Send it back
       // to the agent to iterate; it returns automatically when green.
@@ -434,6 +458,72 @@ export function nagOpenDecisions(db: DB, nowMs: number = Date.now()): void {
       decision_id: d.id,
       title: `Decision waiting ${mins >= 60 ? `${Math.round(mins / 60)}h` : `${mins}m`}: ${d.title}`,
       body: "An agent may be parked on this. Answer or dismiss it.",
+    });
+  }
+}
+
+// Verifying watchdog: a task enters `verifying` exactly once (merge time) and
+// smoke runs exactly once — a crash, restart, or the silent evidence-gate catch
+// in smokeThenAdvance leaves it wedged forever with no signal. Sweep: re-run
+// the advance for any verifying task idle past the threshold; if it STILL
+// won't advance (the done gate wants evidence), steer the agent to attach it
+// and tell the director once.
+const VERIFY_WEDGE_MS = 15 * 60 * 1000;
+
+export async function sweepVerifying(db: DB, deps: ReconcilerDeps = {}): Promise<void> {
+  const nowMs = (deps.nowMs ?? (() => Date.now()))();
+  const rows = db
+    .query("SELECT id, title, updated_at FROM tasks WHERE state = 'verifying'")
+    .all() as { id: string; title: string; updated_at: string }[];
+  for (const r of rows) {
+    if (nowMs - Date.parse(r.updated_at) < VERIFY_WEDGE_MS) continue;
+    try {
+      await smokeThenAdvance(db, r.id, deps.smoke ?? {});
+    } catch (e) {
+      console.error(`[hive] verify sweep ${r.id}:`, e);
+    }
+    const after = getTask(db, r.id);
+    if (after?.state !== "verifying") {
+      broadcast({ type: "task", task: after });
+      continue;
+    }
+    const already = db
+      .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'verify_wedged' LIMIT 1")
+      .get(r.id);
+    if (already) continue;
+    writeEvent(db, { task_id: r.id, source: "reconciler", type: "verify_wedged", payload: {} });
+    queueSteerEvent(
+      db,
+      r.id,
+      "Your task is merged but WEDGED in verifying: the done gate needs at least one evidence item and " +
+        "none is attached. Attach proof of the shipped behavior (screenshot/test output/log) with " +
+        "`hive emit <task-id> evidence --file ... --note ...` — the task completes automatically after.",
+      "queued by verify sweep"
+    );
+    enqueue(db, { kind: "stale", task_id: r.id, title: `Wedged in verifying (needs evidence): ${r.title}` });
+  }
+}
+
+// Intake tasks wait for the director's review before dispatch — correct, but a
+// forgotten one rots in `queued` invisibly. One reminder after a day.
+const INTAKE_REMINDER_MS = 24 * 60 * 60 * 1000;
+
+export function remindUnreviewedIntake(db: DB, nowMs: number = Date.now()): void {
+  const rows = db
+    .query(
+      `SELECT id, title, created_at FROM tasks
+        WHERE state = 'queued' AND source LIKE 'intake_%'
+          AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.task_id = tasks.id AND n.kind = 'intake_unreviewed')`
+    )
+    .all() as { id: string; title: string; created_at: string }[];
+  for (const r of rows) {
+    if (nowMs - Date.parse(r.created_at) < INTAKE_REMINDER_MS) continue;
+    if (isReviewed(db, r.id)) continue;
+    enqueue(db, {
+      kind: "intake_unreviewed",
+      task_id: r.id,
+      title: `Intake waiting on review for 24h+: ${r.title.slice(0, 70)}`,
+      body: "It will never dispatch until reviewed (or cancelled).",
     });
   }
 }

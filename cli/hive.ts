@@ -33,6 +33,7 @@ Usage:
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive steer-all "message" [--project <id>]   broadcast a steer to every live agent
   hive remote                             print LAN URL + API token for phone access (PWA)
+  hive stats [--days 7]                   autonomy scorecard (steers, decisions, CI gate, cost)
   hive watch add --project <id> --name <n> --url <u> [--prompt <s>] [--kind <k>] [--interval <min>]
   hive watch list [--project <id>]        poll a doc/page; changes queue an act-on-change task
   hive watch rm --project <id> --name <n>   (Google Docs edit links auto-use the txt export; doc must be link-readable)
@@ -419,6 +420,47 @@ async function main() {
       return;
     }
     die(`unknown 'gchat' subcommand: ${sub}\n\n${USAGE}`);
+  }
+
+  // Autonomy scorecard: is the fleet getting MORE autonomous or less? One
+  // number per pain axis, computed straight from the DB (read-only).
+  if (cmd === "stats") {
+    const { Database } = await import("bun:sqlite");
+    const { defaultDbPath } = await import("../server/src/db.ts");
+    const db = new Database(defaultDbPath(), { readonly: true });
+    const days = Number(flags.days ?? 7);
+    const since = new Date(Date.now() - days * 86400_000).toISOString();
+    const one = (sql: string, ...a: unknown[]) => (db.query(sql).get(...(a as any)) as any) ?? {};
+
+    const spawns = one("SELECT COUNT(*) n FROM events WHERE type='spawned' AND ts > ?", since).n;
+    const spawnErr = one("SELECT COUNT(*) n FROM events WHERE type='spawn_error' AND ts > ?", since).n;
+    const steers = one("SELECT COUNT(*) n FROM events WHERE type='steer' AND ts > ?", since).n;
+    const nudges = one("SELECT COUNT(*) n FROM events WHERE type='recovery_nudge' AND ts > ?", since).n;
+    const done = one("SELECT COUNT(*) n FROM tasks WHERE state='done' AND updated_at > ?", since).n;
+    const dec = one(
+      `SELECT COUNT(*) n, SUM(status='expired') expired,
+              ROUND(AVG(CASE WHEN answered_at IS NOT NULL THEN (julianday(answered_at)-julianday(ts))*24*60 END),0) med_min
+         FROM decisions WHERE ts > ?`, since);
+    const held = one("SELECT COUNT(*) n FROM events WHERE type='ready_held' AND ts > ?", since).n;
+    const bounced = one("SELECT COUNT(*) n FROM events WHERE type IN ('ci_failure','pr_closed') AND ts > ?", since).n;
+    const cost = db.query(
+      "SELECT model, ROUND(SUM(cost_usd),2) c, COUNT(DISTINCT task_id) t FROM usage WHERE ts > ? GROUP BY model ORDER BY c DESC"
+    ).all(since) as any[];
+    const review = one(
+      `SELECT ROUND(AVG((julianday(m.ts)-julianday(r.ts))*24),1) h FROM
+         (SELECT task_id, MIN(ts) ts FROM events WHERE type='ready_for_review' AND ts > ? GROUP BY task_id) r
+         JOIN (SELECT task_id, MIN(ts) ts FROM events WHERE type='merged' GROUP BY task_id) m USING(task_id)`, since);
+
+    console.log(`hive stats — last ${days}d`);
+    console.log(`  shipped:        ${done} tasks done`);
+    console.log(`  spawns:         ${spawns} ok, ${spawnErr} errors${spawns ? ` (${Math.round((100 * spawnErr) / (spawns + spawnErr))}% failure)` : ""}`);
+    console.log(`  intervention:   ${steers} steers, ${nudges} gone-quiet nudges`);
+    console.log(`  decisions:      ${dec.n} opened, ${dec.expired ?? 0} expired, avg answer ${dec.med_min ?? "-"}m`);
+    console.log(`  CI gate:        ${held} handoffs held, ${bounced} bounced out of review`);
+    console.log(`  review->merge:  avg ${review.h ?? "-"}h`);
+    for (const c of cost) console.log(`  cost:           ${c.model}  $${c.c}  (${c.t} tasks)`);
+    console.log(`\nfewer steers/nudges per shipped task = more autonomy. Compare week over week.`);
+    return;
   }
 
   // Phone/tablet access: print the LAN URL + API token for the PWA.

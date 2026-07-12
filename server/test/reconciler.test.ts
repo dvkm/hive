@@ -108,6 +108,51 @@ test("syncPRs bounces an in_review task whose CI turned red, steers once per sha
   expect(getTask(db, id).state).toBe("in_review");
 });
 
+test("syncPRs bounces an in_review task whose PR was closed without merging", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/3", agent_target: "t-agent" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  const gh: Exec = stub((argv) =>
+    argv[0] === "gh" ? OK(JSON.stringify({ state: "CLOSED", statusCheckRollup: [] })) : OK()
+  );
+  const herdr = new Herdr(
+    stub((argv) =>
+      argv.includes("get") ? OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}') : OK()
+    ),
+    "herdr"
+  );
+  await reconcileOnce(db, { exec: gh, herdr });
+  expect(getTask(db, id).state).toBe("in_progress");
+  const steers = db.query("SELECT payload FROM events WHERE task_id = ? AND type='steer'").all(id) as any[];
+  expect(JSON.parse(steers.at(-1).payload).message).toContain("CLOSED (not merged)");
+});
+
+test("sweepVerifying re-runs the advance and flags evidence-wedged tasks once", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { state: "queued" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  transition(db, id, "verifying");
+  db.query("UPDATE tasks SET updated_at = ? WHERE id = ?").run(new Date(Date.now() - 20 * 60 * 1000).toISOString(), id);
+
+  const { sweepVerifying } = await import("../src/reconciler.ts");
+  await sweepVerifying(db, {}); // no evidence: done gate refuses → wedged
+  expect(getTask(db, id).state).toBe("verifying");
+  let wedged = db.query("SELECT * FROM events WHERE task_id = ? AND type='verify_wedged'").all(id);
+  expect(wedged.length).toBe(1);
+  await sweepVerifying(db, {}); // no double-flag
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type='verify_wedged'").all(id).length).toBe(1);
+
+  // evidence attached → the next sweep completes the task
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    newId("evd"), id, now(), "log", "/tmp/x.log", "proof"
+  );
+  db.query("UPDATE tasks SET updated_at = ? WHERE id = ?").run(new Date(Date.now() - 20 * 60 * 1000).toISOString(), id);
+  await sweepVerifying(db, {});
+  expect(getTask(db, id).state).toBe("done");
+});
+
 test("flagStale emits one stale event past the threshold, then stops", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId);
