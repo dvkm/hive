@@ -257,6 +257,25 @@ test("usage-limited task parks once, then gets a resume steer after the reset", 
   expect(await events(id, "usage_limit_resumed")).toHaveLength(1);
 });
 
+// ---- remote token gate ----------------------------------------------------------
+
+test("remote requests need the API token; loopback never does", async () => {
+  const { remoteAuthOk } = await import("../src/api.ts");
+  const { setSetting } = await import("../src/db.ts");
+  const u = new URL("http://x/api/tasks");
+  const r = (auth?: string) => new Request("http://x/api/tasks", auth ? { headers: { authorization: auth } } : {});
+  expect(remoteAuthOk(db, r(), u, "127.0.0.1")).toBe(true);
+  expect(remoteAuthOk(db, r(), u, "::1")).toBe(true);
+  expect(remoteAuthOk(db, r(), u, null)).toBe(true); // no ip info: local test/serve path
+  expect(remoteAuthOk(db, r(), u, "192.168.1.20")).toBe(false); // no token minted → locked
+  setSetting(db, "api_token", "sekrit");
+  expect(remoteAuthOk(db, r("Bearer sekrit"), u, "192.168.1.20")).toBe(true);
+  expect(remoteAuthOk(db, r("Bearer wrong"), u, "192.168.1.20")).toBe(false);
+  expect(remoteAuthOk(db, r(), u, "192.168.1.20")).toBe(false);
+  // EventSource can't set headers → query-param form
+  expect(remoteAuthOk(db, r(), new URL("http://x/api/stream?token=sekrit"), "10.0.0.9")).toBe(true);
+});
+
 // ---- intake noise -------------------------------------------------------------
 
 test("emoji-only and bare-ack intake text is non-actionable; real asks are not", () => {

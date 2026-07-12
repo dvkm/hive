@@ -32,6 +32,7 @@ Usage:
   hive learning recur <learning-id>
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive steer-all "message" [--project <id>]   broadcast a steer to every live agent
+  hive remote                             print LAN URL + API token for phone access (PWA)
   hive watch add --project <id> --name <n> --url <u> [--prompt <s>] [--kind <k>] [--interval <min>]
   hive watch list [--project <id>]        poll a doc/page; changes queue an act-on-change task
   hive watch rm --project <id> --name <n>   (Google Docs edit links auto-use the txt export; doc must be link-readable)
@@ -418,6 +419,29 @@ async function main() {
       return;
     }
     die(`unknown 'gchat' subcommand: ${sub}\n\n${USAGE}`);
+  }
+
+  // Phone/tablet access: print the LAN URL + API token for the PWA.
+  if (cmd === "remote") {
+    const { Database } = await import("bun:sqlite");
+    const { defaultDbPath } = await import("../server/src/db.ts");
+    const db = new Database(defaultDbPath(), { readonly: true });
+    const row = db.query("SELECT value FROM settings WHERE key = 'api_token'").get() as { value: string } | null;
+    if (!row) die("no API token yet — start the server once (it mints one on boot)");
+    const { networkInterfaces } = await import("node:os");
+    const ips = Object.values(networkInterfaces()).flat()
+      .filter((i: any) => i && i.family === "IPv4" && !i.internal)
+      .map((i: any) => i.address);
+    const port = process.env.HIVE_PORT || 4700;
+    console.log(`API token: ${row.value}\n`);
+    if (!ips.length) console.log("no LAN address found — is Wi-Fi/Ethernet up?");
+    for (const ip of ips) console.log(`  http://${ip}:${port}/`);
+    console.log(
+      `\nOn the phone: open the URL in Safari, paste the token when prompted, then Share -> Add to Home Screen.` +
+        `\nServer must be bound to the LAN: HIVE_BIND=0.0.0.0 (add to the LaunchAgent env, then restart).` +
+        `\nPlain HTTP — use only on a trusted LAN or a Tailscale address.`
+    );
+    return;
   }
 
   // Watchers: poll a doc/page and queue an act-on-change task.
