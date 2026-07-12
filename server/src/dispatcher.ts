@@ -90,7 +90,11 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
       if (cfg.auto_dispatch !== true) continue; // opt-in only
 
       const kinds = Array.isArray(cfg.dispatch_kinds) ? cfg.dispatch_kinds : DISPATCH_KINDS_DEFAULT;
-      if (!kinds.includes(task.kind)) continue; // chore / human-titled tasks excluded
+      // A requeue is recovery for work already dispatched once (auto-requeue on
+      // context-full/death, or the director's recovery card) — excluding chores
+      // here stranded every requeued braindump in 'queued' forever ("failed —
+      // awaiting triage" with a successor nobody spawns, task #135).
+      if (!kinds.includes(task.kind) && task.source !== "requeue") continue; // chore / human-titled tasks excluded
 
       if (task.source?.startsWith("intake_") && !isReviewed(db, task.id)) continue; // unreviewed intake
       if (task.source === "external") continue; // tracking-only: another agent's kanban entry, never spawned
