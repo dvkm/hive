@@ -18,8 +18,12 @@ import { getTask, writeEvent } from "./state.ts";
 import { queueSteerEvent } from "./steer.ts";
 import { createDecision } from "./api.ts";
 
-const DEFAULT_WARN_USD = 75;
-const DEFAULT_CAP_USD = 200;
+// OFF by default (David, 2026-07-12): historical usage rows are inflated by the
+// per-Stop cumulative double-count (fixed at ingestion the same day), so
+// spend-sums can't be trusted until the old rows are rebuilt. Enable per
+// project via config.cost_warn_usd / config.cost_cap_usd once numbers verify.
+const DEFAULT_WARN_USD = 0;
+const DEFAULT_CAP_USD = 0;
 const TERMINAL = ["done", "cancelled", "failed"];
 
 function cfgNum(v: unknown, fallback: number): number {

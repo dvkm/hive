@@ -65,8 +65,29 @@ const openDecisions = (taskId: string) =>
 
 // ---- cost guardrails --------------------------------------------------------
 
+// Guardrails are opt-in (defaults 0/off while historical rows stay inflated);
+// these tests exercise a project that opted in.
+let costProjectId = "";
+async function newCostTask(title: string) {
+  if (!costProjectId) {
+    const p = await post("/api/projects", {
+      name: "cost-p",
+      repo_path: "/repo",
+      config: { cost_warn_usd: 75, cost_cap_usd: 200 },
+    });
+    costProjectId = p.json.id;
+  }
+  return (await post("/api/tasks", { project_id: costProjectId, title })).json.id;
+}
+
+test("guardrails are off by default: no warn event without project config", async () => {
+  const id = await newTask("default off");
+  await usage(id, 500);
+  expect(await events(id, "cost_warning")).toHaveLength(0);
+});
+
 test("crossing the warn threshold emits one cost_warning and one queued steer", async () => {
-  const id = await newTask("cost warn");
+  const id = await newCostTask("cost warn");
   await usage(id, 80); // default warn $75
   expect(await events(id, "cost_warning")).toHaveLength(1);
   const steers = await events(id, "steer");
@@ -78,7 +99,7 @@ test("crossing the warn threshold emits one cost_warning and one queued steer", 
 });
 
 test("crossing the cap opens a decision; continue doubles it; wrap_up steers", async () => {
-  const id = await newTask("cost cap");
+  const id = await newCostTask("cost cap");
   await usage(id, 210); // default cap $200
   let cards = openDecisions(id);
   expect(cards).toHaveLength(1);
@@ -97,6 +118,23 @@ test("crossing the cap opens a decision; continue doubles it; wrap_up steers", a
   await post(`/api/decisions/${cards[0].id}/answer`, { answer_key: "wrap_up" });
   const steers = await events(id, "steer");
   expect(steers.at(-1).payload.message).toContain("WRAP UP");
+});
+
+test("usage posts with a session_id upsert: cumulative Stops converge to one row", async () => {
+  const id = await newTask("usage upsert");
+  const send = (tokens: any) =>
+    post(`/api/tasks/${id}/events`, { type: "usage", model: "claude-opus-4-8", session_id: "sess-1", ...tokens });
+  await send({ input_tokens: 100, output_tokens: 50, cache_read_tokens: 1000, cache_write_tokens: 10 });
+  await send({ input_tokens: 200, output_tokens: 90, cache_read_tokens: 3000, cache_write_tokens: 20 });
+  let rows = db.query("SELECT * FROM usage WHERE task_id = ?").all(id) as any[];
+  expect(rows).toHaveLength(1); // converged, not stacked
+  expect(rows[0].input_tokens).toBe(200);
+  // cache tokens priced: 200*5 + 90*25 + 3000*0.5 + 20*6.25 per MTok
+  expect(rows[0].cost_usd).toBeCloseTo((200 * 5 + 90 * 25 + 3000 * 0.5 + 20 * 6.25) / 1e6, 10);
+  // a respawn (new session) gets its own row
+  await post(`/api/tasks/${id}/events`, { type: "usage", model: "claude-opus-4-8", session_id: "sess-2", input_tokens: 7 });
+  rows = db.query("SELECT * FROM usage WHERE task_id = ?").all(id) as any[];
+  expect(rows).toHaveLength(2);
 });
 
 // ---- broadcast steer + policy auto-broadcast --------------------------------

@@ -82,6 +82,17 @@ test("dispatch_kinds default excludes chore tasks", async () => {
   expect(getTask(db, scout).state).toBe("in_progress");
 });
 
+test("a requeued chore IS dispatched (recovery of already-blessed work)", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const requeued = makeTask(db, projectId, { kind: "chore", source: "requeue" });
+  const plainChore = makeTask(db, projectId, { kind: "chore" });
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(1); // only the requeue
+  expect(getTask(db, requeued).state).toBe("in_progress");
+  expect(getTask(db, plainChore).state).toBe("queued");
+});
+
 test("intake_gchat tasks are skipped until reviewed", async () => {
   const { db, projectId } = freshDb({ auto_dispatch: true });
   const id = makeTask(db, projectId, { source: "intake_gchat" });

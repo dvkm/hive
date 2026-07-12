@@ -2159,8 +2159,17 @@ function ingestUsage(db: DB, taskId: string, fields: Record<string, any>, source
     const overrides = project ? JSON.parse(project.config || "{}").pricing : null;
     cost = costUsd(model, tokens, overrides);
   }
+  // Hook totals are CUMULATIVE per session (whole-transcript sums, one Stop per
+  // turn). A session_id makes ingestion an UPSERT — one row per
+  // (task, session, model) that converges on the final total — via a
+  // deterministic id. Without it (older hooks, manual posts) each POST is its
+  // own row, which double-counts interactive sessions.
+  const sessionId = typeof fields.session_id === "string" && fields.session_id ? fields.session_id : null;
+  const id = sessionId
+    ? "use_" + new Bun.CryptoHasher("sha256").update(`${taskId}|${sessionId}|${model}`).digest("hex").slice(0, 16)
+    : newId("use");
   const row = {
-    id: newId("use"),
+    id,
     task_id: taskId,
     ts: now(),
     model,
@@ -2169,7 +2178,7 @@ function ingestUsage(db: DB, taskId: string, fields: Record<string, any>, source
     source,
   };
   db.query(
-    `INSERT INTO usage (id, task_id, ts, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, source)
+    `INSERT OR REPLACE INTO usage (id, task_id, ts, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, source)
      VALUES (?,?,?,?,?,?,?,?,?,?)`
   ).run(row.id, row.task_id, row.ts, row.model, row.input_tokens, row.output_tokens, row.cache_read_tokens, row.cache_write_tokens, row.cost_usd, row.source);
   broadcast({ type: "usage", usage: row });

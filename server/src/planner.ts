@@ -22,7 +22,28 @@ import { createDecision } from "./api.ts";
 const DEFAULT_TIMEOUT_MS = Number(process.env.HIVE_PLANNER_TIMEOUT_MS || 120_000);
 // Pinned to sonnet: a breakdown proposal is triage, not deep work, and an
 // unpinned `claude -p` inherits whatever (possibly priciest) default the CLI has.
-const DEFAULT_ARGV = ["claude", "-p", "--model", "sonnet"];
+// The binary is resolved to an absolute path: the launchd-spawned server has a
+// minimal PATH and a bare "claude" fails with "Executable not found" — every
+// braindump auto-triage died this way (task #131 et al., 2026-07-11).
+function claudeBin(): string {
+  const home = process.env.HOME ?? "";
+  for (const p of [
+    process.env.HIVE_CLAUDE_BIN,
+    Bun.which("claude"),
+    `${home}/.local/bin/claude`,
+    `${home}/.claude/local/claude`,
+    "/opt/homebrew/bin/claude",
+    "/usr/local/bin/claude",
+  ]) {
+    try {
+      if (p && require("node:fs").existsSync(p)) return p;
+    } catch {
+      /* keep looking */
+    }
+  }
+  return "claude"; // last resort: let the spawn error name the real problem
+}
+const DEFAULT_ARGV = [claudeBin(), "-p", "--model", "sonnet"];
 
 // A planner subprocess runner. Injectable so tests never spawn `claude`. The
 // default implementation kills the process on timeout (hard cap, no runaway).

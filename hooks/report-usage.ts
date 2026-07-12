@@ -9,10 +9,12 @@
 //
 // Contract: fail silent, never block the agent. No-op unless HIVE_TASK_ID is set.
 //
-// ponytail: sums the WHOLE transcript on each Stop. Correct for hive's one-shot
-// `claude -p` agents, where Stop fires once. A long interactive session with
-// repeated Stops would double-count; add a per-session line cursor if hooks ever
-// run outside one-shot print mode.
+// Totals are CUMULATIVE for the whole transcript, posted with a session_id (the
+// transcript basename): hive upserts one usage row per (task, session, model),
+// so repeated Stops CONVERGE instead of stacking. The previous version posted a
+// fresh row per Stop — hive agents are interactive (Stop fires every turn), so
+// a 50-turn session billed ~50 cumulative rows and inflated task costs by an
+// order of magnitude (the "cost calculations are wrong" complaint, 2026-07-12).
 
 const taskId = process.env.HIVE_TASK_ID;
 if (!taskId) process.exit(0);
@@ -65,6 +67,10 @@ for (const line of text.split("\n")) {
   a.cache_write_tokens += u.cache_creation_input_tokens || 0;
 }
 
+// The transcript filename is the session uuid — stable across every Stop of
+// this session, distinct across respawns of the same task.
+const sessionId = String(transcript).split("/").pop()?.replace(/\.jsonl$/, "") || null;
+
 for (const [model, a] of Object.entries(perModel)) {
   if (!Object.values(a).some(Boolean)) continue;
   try {
@@ -72,7 +78,7 @@ for (const [model, a] of Object.entries(perModel)) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: AbortSignal.timeout(2000),
-      body: JSON.stringify({ type: "usage", source: "hook", model, ...a }),
+      body: JSON.stringify({ type: "usage", source: "hook", model, session_id: sessionId, ...a }),
     });
   } catch {
     /* fail silent */
