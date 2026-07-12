@@ -1069,7 +1069,15 @@ async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: Hand
     // working tree is touched. Callers wanting a squash merge should use a PR.
     const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", base, task.branch]);
     if (anc.code !== 0) {
-      const reason = `'${base}' is not an ancestor of '${task.branch}'; not a fast-forward (rebase the branch or open a PR)`;
+      // Name the exact commit compared against: this is the primary checkout's
+      // LOCAL base ref, which can be ahead of origin/<base> — an agent rebased
+      // onto origin/main and hit this identical failure twice before digging
+      // out that hive checks a different, unfetchable-by-name ref.
+      const sha = (await exec(["git", "-C", project.repo_path, "rev-parse", "--short", base])).stdout.trim();
+      const reason =
+        `'${base}' (LOCAL ref in the primary checkout${sha ? `, ${sha}` : ""} — may be ahead of origin/${base}) ` +
+        `is not an ancestor of '${task.branch}'; not a fast-forward. Rebase onto that exact commit ` +
+        `(git fetch <primary-checkout> ${base}) or open a PR.`;
       return mergeFailed(db, herdr, task, base, reason);
     }
     const r = await exec(["git", "-C", project.repo_path, "merge", "--ff-only", task.branch]);

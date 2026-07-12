@@ -168,7 +168,13 @@ export function transition(
 
   if (from === to) throw new TransitionError(`task already in state '${to}'`);
   if (!canTransition(from, to)) {
-    throw new TransitionError(`invalid transition: '${from}' -> '${to}'`);
+    // Agents jump straight to done often enough (4/16 sampled sessions) that
+    // the error should teach the path, not just reject.
+    const hint =
+      to === "done" && (from === "in_progress" || from === "in_review")
+        ? " — done is reached via review: emit `ready --pr-url <url>` (in_review), then the director merges (verifying -> done)"
+        : "";
+    throw new TransitionError(`invalid transition: '${from}' -> '${to}'${hint}`);
   }
 
   // Evidence gates apply to hive-driven work. Tracking-only tasks
