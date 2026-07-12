@@ -257,6 +257,34 @@ test("usage-limited task parks once, then gets a resume steer after the reset", 
   expect(await events(id, "usage_limit_resumed")).toHaveLength(1);
 });
 
+// ---- needs_decision unpark ------------------------------------------------------
+
+test("needs_decision with no open card unparks after the grace period", async () => {
+  const { unparkAnswered } = await import("../src/reconciler.ts");
+  const id = await newTask("phantom decision");
+  await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
+  await post(`/api/tasks/${id}/transition`, { to: "needs_decision" }); // no card opened
+  const state = () => (db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state;
+
+  unparkAnswered(db, Date.now()); // inside grace: the card may still be coming
+  expect(state()).toBe("needs_decision");
+  unparkAnswered(db, Date.now() + 4 * 60 * 1000);
+  expect(state()).toBe("in_progress");
+  const steers = await events(id, "steer");
+  expect(steers.at(-1).payload.message).toContain("NO open decision card");
+
+  // With a real open card it stays parked no matter how old.
+  const g = await post(`/api/tasks/${id}/guarded-action`, {
+    action: "command.dangerous.recursive-forced-rm",
+    target: "rm -rf /x",
+    detail: "command approval (dangerous): recursive/forced rm",
+  });
+  expect(g.status).toBe(409);
+  await post(`/api/tasks/${id}/transition`, { to: "needs_decision" });
+  unparkAnswered(db, Date.now() + 60 * 60 * 1000);
+  expect(state()).toBe("needs_decision");
+});
+
 // ---- answer channel -------------------------------------------------------------
 
 test("emit answer writes the event and pushes an urgent notification", async () => {
