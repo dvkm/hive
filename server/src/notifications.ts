@@ -72,6 +72,7 @@ const KIND_LABEL: Record<string, string> = {
   failed: "failed",
   incident: "incident",
   stale: "stale",
+  answer: "answered",
 };
 
 // "2 done, 1 failed, 1 needs decision" — counts by kind, in enqueue order.

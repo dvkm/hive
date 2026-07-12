@@ -78,6 +78,10 @@ Rules:
   \`hive emit <task-id> status --note "..."\` saying what you'll change (this is
   a visible conversation — silence looks like the request was lost), then do the
   work and emit \`ready\` again.
+- When the director's note ASKS A QUESTION, answer it with
+  \`hive emit <task-id> answer --note "the answer"\` — answers are pushed to the
+  director; plain status notes and your pane output are NOT. Never leave a
+  question answered only in prose.
 - Work ONLY inside your own worktree and scratchpad. NEVER create, edit, or
   delete files in the project's main checkout, other worktrees, or the human's
   home — cleanup of your own sandbox is auto-approved; anything outside it is not.

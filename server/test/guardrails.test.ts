@@ -257,6 +257,21 @@ test("usage-limited task parks once, then gets a resume steer after the reset", 
   expect(await events(id, "usage_limit_resumed")).toHaveLength(1);
 });
 
+// ---- answer channel -------------------------------------------------------------
+
+test("emit answer writes the event and pushes an urgent notification", async () => {
+  const id = await newTask("answer me");
+  const r = await post(`/api/tasks/${id}/events`, { type: "answer", note: "AES encrypts only the business registration number" });
+  expect(r.status).toBe(201);
+  const n: any = db
+    .query("SELECT * FROM notifications WHERE kind = 'answer' AND task_id = ?")
+    .get(id);
+  expect(n.urgency).toBe("urgent");
+  expect(n.body).toContain("business registration");
+  const bad = await post(`/api/tasks/${id}/events`, { type: "answer" });
+  expect(bad.status).toBe(400); // an empty answer is a bug, not a reply
+});
+
 // ---- remote token gate ----------------------------------------------------------
 
 test("remote requests need the API token; loopback never does", async () => {
