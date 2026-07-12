@@ -7,6 +7,7 @@ import { startReaper } from "./reaper.ts";
 import { checkAllMonitors } from "./monitors.ts";
 import { startDigest, setNotifier } from "./notifications.ts";
 import { startGchatPoll } from "./intake/gchat.ts";
+import { startWatchers } from "./watch.ts";
 import { startPromoter } from "./promoter.ts";
 import { setTerminalHook, expireOrphanedDecisions } from "./state.ts";
 import { bootstrapAuthority } from "./authority.ts";
@@ -67,6 +68,10 @@ startDigest(db);
 // Google Chat intake: poll allowlisted spaces (per-project config.gchat_spaces)
 // and draft tasks from stakeholder messages. Hard no-op until configured.
 startGchatPoll(db);
+
+// Watchers: poll configured docs/pages (per-project config.watchers) and queue
+// an act-on-change task carrying the diff. Hard no-op until configured.
+startWatchers(db);
 
 // Continuous promotion evaluator: projects with config.promote {from, to} get
 // an evaluation task queued whenever `from` moves ahead of `to`. No-op otherwise.
