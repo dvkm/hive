@@ -32,6 +32,9 @@ Usage:
   hive learning recur <learning-id>
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive steer-all "message" [--project <id>]   broadcast a steer to every live agent
+  hive watch add --project <id> --name <n> --url <u> [--prompt <s>] [--kind <k>] [--interval <min>]
+  hive watch list [--project <id>]        poll a doc/page; changes queue an act-on-change task
+  hive watch rm --project <id> --name <n>   (Google Docs edit links auto-use the txt export; doc must be link-readable)
   hive pr-marker <task-id>                print the PR title prefix + body footer marker for a task
   hive gchat auth [--client-id <id>] [--client-secret <s>] [--self users/<id>] [--port <p>]
         one-time Google Chat OAuth consent; stores the refresh token in the keychain
@@ -415,6 +418,50 @@ async function main() {
       return;
     }
     die(`unknown 'gchat' subcommand: ${sub}\n\n${USAGE}`);
+  }
+
+  // Watchers: poll a doc/page and queue an act-on-change task.
+  //   hive watch add --project <id> --name <n> --url <u> [--prompt <s>] [--kind chore] [--interval <min>]
+  //   hive watch list [--project <id>]
+  //   hive watch rm --project <id> --name <n>
+  if (cmd === "watch") {
+    const sub = argv[1];
+    const pid = flags.project ? String(flags.project) : null;
+    if (sub === "list") {
+      const projects = await api("GET", "/api/projects");
+      for (const p of projects) {
+        if (pid && p.id !== pid) continue;
+        for (const w of p.config?.watchers ?? [])
+          console.log(`${p.name}  ${w.name}  every ${w.interval_minutes ?? 5}m  ${w.url}${w.prompt ? `  — ${w.prompt}` : ""}`);
+      }
+      return;
+    }
+    if (!pid) die("--project is required");
+    const project = await api("GET", `/api/projects/${pid}`);
+    const watchers: any[] = project.config?.watchers ?? [];
+    if (sub === "add") {
+      if (!flags.name || !flags.url) die("usage: hive watch add --project <id> --name <n> --url <u> [--prompt <s>] [--kind <k>] [--interval <min>]");
+      if (watchers.some((w) => w.name === flags.name)) die(`watcher '${flags.name}' already exists on ${project.name}`);
+      watchers.push({
+        name: String(flags.name),
+        url: String(flags.url),
+        ...(flags.prompt ? { prompt: String(flags.prompt) } : {}),
+        ...(flags.kind ? { kind: String(flags.kind) } : {}),
+        ...(flags.interval ? { interval_minutes: Number(flags.interval) } : {}),
+      });
+      await api("PUT", `/api/projects/${pid}`, { config: { ...project.config, watchers } });
+      console.log(`watching '${flags.name}' on ${project.name} (first poll is a baseline; changes queue a ${flags.kind ?? "chore"} task)`);
+      return;
+    }
+    if (sub === "rm") {
+      if (!flags.name) die("usage: hive watch rm --project <id> --name <n>");
+      const next = watchers.filter((w) => w.name !== flags.name);
+      if (next.length === watchers.length) die(`no watcher '${flags.name}' on ${project.name}`);
+      await api("PUT", `/api/projects/${pid}`, { config: { ...project.config, watchers: next } });
+      console.log(`removed watcher '${flags.name}'`);
+      return;
+    }
+    die(`unknown 'watch' subcommand: ${sub}\n\n${USAGE}`);
   }
 
   // Broadcast a steer to every live agent (optionally one project's):
