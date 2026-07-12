@@ -1174,7 +1174,12 @@ async function requestChanges(db: DB, herdr: Herdr, id: string, body: any): Prom
   let sendError: string | null = null;
   if (task.agent_target) {
     try {
-      const res = await herdr.send(task.agent_target, `hive: changes requested before merge —\n${notes}`);
+      const res = await herdr.send(
+        task.agent_target,
+        `hive: changes requested before merge —\n${notes}\n\n` +
+          `If any of the above is a QUESTION, reply with \`hive emit ${id} answer --note "..."\` ` +
+          `(answers are pushed to the director; pane text is not), then make the changes and emit ready again.`
+      );
       sendError = sendFailure(res);
       delivered = sendError === null;
     } catch (e: any) {
@@ -2177,6 +2182,26 @@ async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Respon
     if (!Object.keys(payload).length)
       return err("review_summary needs at least one of done/iffy/decisions/testing/followups (arrays)");
     const event = writeEvent(db, { task_id: taskId, source, type, payload });
+    return json({ event }, 201);
+  }
+
+  // --- answer (agent replying to the director's question) ---
+  // A question in a request-changes note (or steer) deserves a reply that
+  // REACHES the director — agents used to answer in pane text / status notes
+  // that only mirror into the feed, so the answer was never seen (2026-07-12:
+  // a two-paragraph AES explanation surfaced only in the transcript log).
+  // Urgent: the director asked; the reply should land as a push, not a digest.
+  if (type === "answer") {
+    if (!note) return err("answer needs --note (the reply text)");
+    const t = getTask(db, taskId);
+    const event = writeEvent(db, { task_id: taskId, source, type: "answer", payload: { note } });
+    enqueue(db, {
+      kind: "answer",
+      urgency: "urgent",
+      task_id: taskId,
+      title: `Answer on #${t?.number}: ${t?.title?.slice(0, 60) ?? taskId}`,
+      body: note.slice(0, 300),
+    });
     return json({ event }, 201);
   }
 

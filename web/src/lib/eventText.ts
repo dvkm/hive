@@ -58,6 +58,8 @@ export function eventText(e: EventLike): string {
       const badge = badges[s(p.delivery)] ?? "";
       return `${badge}steered: “${s(p.message)}”`;
     }
+    case "answer":
+      return `answered your question: ${s(p.note)}`;
     case "blocked":
       return s(p.note) ? `agent blocked: ${s(p.note)}` : "agent blocked";
     case "spawned":
