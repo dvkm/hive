@@ -245,6 +245,18 @@ export async function runPlanner(db: DB, taskId: string, deps: PlannerDeps = {})
 
 function plannerError(db: DB, taskId: string, error: string): PlanResult {
   writeEvent(db, { task_id: taskId, source: "system", type: "planner_error", payload: { error } });
+  // A config-shaped failure (bad API key, expired auth) makes EVERY planner run
+  // a silent no-op until a human fixes it — 4 sessions died this way with only
+  // a quiet event to show for it. Push, don't log.
+  if (/invalid api key|api key|authentication|unauthorized|401/i.test(error)) {
+    enqueue(db, {
+      kind: "incident",
+      urgency: "urgent",
+      task_id: taskId,
+      title: "Planner cannot run: auth/config failure",
+      body: error.slice(0, 200),
+    });
+  }
   return { ok: false, error };
 }
 

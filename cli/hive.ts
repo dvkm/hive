@@ -31,6 +31,7 @@ Usage:
   hive learning list [--project <id>] [--status active|resolved]
   hive learning recur <learning-id>
   hive spawn <task-id>                    spawn a herdr agent for a task
+  hive steer-all "message" [--project <id>]   broadcast a steer to every live agent
   hive pr-marker <task-id>                print the PR title prefix + body footer marker for a task
   hive gchat auth [--client-id <id>] [--client-secret <s>] [--self users/<id>] [--port <p>]
         one-time Google Chat OAuth consent; stores the refresh token in the keychain
@@ -414,6 +415,19 @@ async function main() {
       return;
     }
     die(`unknown 'gchat' subcommand: ${sub}\n\n${USAGE}`);
+  }
+
+  // Broadcast a steer to every live agent (optionally one project's):
+  //   hive steer-all "message" [--project <id>]
+  if (cmd === "steer-all") {
+    const message = argv[1];
+    if (!message) die('usage: hive steer-all "message" [--project <id>]');
+    const r = await api("POST", "/api/steer/broadcast", {
+      message,
+      ...(flags.project ? { project_id: String(flags.project) } : {}),
+    });
+    console.log(`steered ${r.delivered}/${r.targets} live agents (undelivered are queued for respawn)`);
+    return;
   }
 
   // Offline mode: drain the fleet before losing internet; resume when back.

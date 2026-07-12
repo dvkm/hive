@@ -28,7 +28,7 @@ import {
   parseIncident,
 } from "./rows.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
-import { queuedSteers, markSteersDelivered, steerPreamble, type Delivery } from "./steer.ts";
+import { queuedSteers, markSteersDelivered, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
 import { smokeThenAdvance } from "./monitors.ts";
@@ -38,6 +38,7 @@ import { isReviewed } from "./dispatcher.ts";
 import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { costUsd } from "./pricing.ts";
+import { checkCostGuardrails, resolveCostCapForDecision } from "./costs.ts";
 import { taskDiff } from "./diff.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
@@ -178,6 +179,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/send$/);
       if (m && method === "POST") return await sendSteer(db, herdr, m[1], req);
 
+      if (pathname === "/api/steer/broadcast" && method === "POST")
+        return await broadcastSteer(db, herdr, await req.json());
+
       if (pathname === "/api/checkpoints" && method === "GET") return listOpenCheckpoints(db);
 
       if (pathname === "/api/offline" && method === "GET")
@@ -244,7 +248,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // ---- policies ----
       if (pathname === "/api/policies") {
         if (method === "GET") return listPolicies(db, url);
-        if (method === "POST") return createPolicy(db, await req.json());
+        if (method === "POST") return createPolicy(db, herdr, await req.json());
       }
       m = pathname.match(/^\/api\/policies\/([^/]+)$/);
       if (m) {
@@ -1363,6 +1367,36 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
   return json({ ok: delivered, delivered, delivery, message, attachments: paths, ...(error ? { error } : {}) });
 }
 
+// Broadcast a steer to every task with a live agent (optionally one project's).
+// Replaces the observed copy-paste-to-N-tasks pattern: protocol updates went
+// out by hand to up to 8 agents, three times in one morning. Delivery receipts
+// per task (delivered / queued), same semantics as a single steer.
+async function steerLiveAgents(
+  db: DB,
+  herdr: Herdr,
+  message: string,
+  projectId?: string
+): Promise<{ targets: number; delivered: number; results: { task_id: string; delivered: boolean }[] }> {
+  const rows = db
+    .query(
+      `SELECT id FROM tasks WHERE agent_target IS NOT NULL
+        AND state IN ('in_progress','needs_decision','in_review','verifying')${projectId ? " AND project_id = ?" : ""}`
+    )
+    .all(...(projectId ? [projectId] : [])) as { id: string }[];
+  const results: { task_id: string; delivered: boolean }[] = [];
+  for (const t of rows) {
+    results.push({ task_id: t.id, delivered: await internalSteer(db, herdr, t.id, message) });
+  }
+  return { targets: results.length, delivered: results.filter((r) => r.delivered).length, results };
+}
+
+async function broadcastSteer(db: DB, herdr: Herdr, body: any): Promise<Response> {
+  const message = String(body?.message ?? "").trim();
+  if (!message) return err("message is required");
+  const r = await steerLiveAgents(db, herdr, message, body?.project_id ? String(body.project_id) : undefined);
+  return json({ ok: true, ...r });
+}
+
 // ---- offline mode ----
 // "Going offline": drain, don't kill. The flag pauses the dispatcher/promoter
 // (nothing new spawns), the network half of the reconciler (no PR sync, no
@@ -2131,6 +2165,13 @@ function ingestUsage(db: DB, taskId: string, fields: Record<string, any>, source
      VALUES (?,?,?,?,?,?,?,?,?,?)`
   ).run(row.id, row.task_id, row.ts, row.model, row.input_tokens, row.output_tokens, row.cache_read_tokens, row.cache_write_tokens, row.cost_usd, row.source);
   broadcast({ type: "usage", usage: row });
+  // Cost lands here per turn — the guardrail check belongs where the number is
+  // freshest (warn steer at cost_warn_usd, decision card at cost_cap_usd).
+  try {
+    checkCostGuardrails(db, taskId);
+  } catch (e) {
+    console.error("[hive] cost guardrails:", e);
+  }
   return json({ usage: row }, 201);
 }
 
@@ -2324,6 +2365,8 @@ function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): Respons
   resolveBlockedForDecision(db, herdr, id, answerKey);
   // If this card was a possible-duplicate card, `merge` → fold + cancel.
   resolveDuplicateForDecision(db, id, answerKey);
+  // Cost-cap card → wrap-up steer, or raise the cap and keep going.
+  resolveCostCapForDecision(db, id, answerKey);
   // Resume the task if it was parked on this decision. (herdr `agent send` is Phase 2.)
   const task = getTask(db, r.task_id);
   if (task && task.state === "needs_decision")
@@ -2344,6 +2387,23 @@ function apiDismissDecision(db: DB, id: string): Response {
   if (r.status !== "open") return err(`decision already ${r.status}`, 409);
   db.query("UPDATE decisions SET status = 'expired' WHERE id = ?").run(id);
   writeEvent(db, { task_id: r.task_id, source: "director", type: "decision_expired", payload: { decision_id: id, reason: "dismissed" } });
+  // An authority card's pending grant must die with it: left 'pending', every
+  // retry of the gated command resolves to this expired decision id and the
+  // agent waits on it forever (19 of 28 approval cards expired exactly this way).
+  // Denying makes the retry open a FRESH card; the steer below says don't retry.
+  const wasAuthority = resolveGrantForDecision(db, id, "deny");
+  {
+    const t = getTask(db, r.task_id);
+    if (t && !TERMINAL.includes(t.state as State))
+      queueSteerEvent(
+        db,
+        r.task_id,
+        `The director dismissed your decision card "${r.title}" without answering — it is gone, do not wait ` +
+          `on it or retry the same request. ${wasAuthority ? "The gated command stays unapproved; find another way (or narrow the command so the gate passes). " : ""}` +
+          `Proceed with your best judgment and note the call as a checkpoint.`,
+        "queued by decision dismiss"
+      );
+  }
   // Resume the task if this was its LAST open card — otherwise it stays parked
   // in needs_decision with nothing left to wait on (seen live 2026-07-10:
   // three agents stranded after their moot approval cards were dismissed).
@@ -2434,7 +2494,7 @@ function updateAuthorityRule(db: DB, id: string, body: any): Response {
 }
 
 // ---------------------------------------------------------------- policies
-function createPolicy(db: DB, body: any): Response {
+function createPolicy(db: DB, herdr: Herdr, body: any): Response {
   if (!body?.title) return err("title is required");
   if (!body?.body) return err("body is required");
   const scope = body.scope ?? "global";
@@ -2453,6 +2513,18 @@ function createPolicy(db: DB, body: any): Response {
   db.query(
     "INSERT INTO policies (id, scope, title, body, active, created_at, updated_at) VALUES (?,?,?,?,?,?,?)"
   ).run(row.id, row.scope, row.title, row.body, row.active, row.created_at, row.updated_at);
+  // Live agents' briefs are frozen at spawn; without this every protocol change
+  // was hand-steered to each agent ("your brief predates it", 8 agents × 3
+  // iterations observed). New policy → automatic broadcast to its scope.
+  if (row.active) {
+    const projectId = scope.startsWith("project:") ? scope.slice("project:".length) : undefined;
+    void steerLiveAgents(
+      db,
+      herdr,
+      `Protocol update (a standing policy was just added — it applies to you NOW, your brief predates it):\n### ${row.title}\n${row.body}`,
+      projectId
+    );
+  }
   return json(parsePolicy(row), 201);
 }
 
