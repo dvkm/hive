@@ -27,7 +27,12 @@ import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
 
-const DISPATCH_KINDS_DEFAULT = ["ship", "scout"];
+// Chores included since 2026-07-12: the queue sat at 10 tasks / 1 live agent
+// because 9 were agent-filed follow-up FIXES tagged chore — "chores are titled
+// for a human" stopped being true once agents started fanning out work. The
+// guards that matter stay: auto_dispatch opt-in, intake review, max_agents,
+// authority. Exclude chores per project via config.dispatch_kinds if needed.
+const DISPATCH_KINDS_DEFAULT = ["ship", "scout", "chore"];
 const MAX_AGENTS_DEFAULT = 3;
 const BACKOFF_BASE_MS = 30_000;
 const BACKOFF_CAP_MS = 30 * 60 * 1000;

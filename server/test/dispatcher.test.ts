@@ -71,19 +71,26 @@ test("auto_dispatch on: a queued ship task is spawned and moves to in_progress",
   expect(getTask(db, id).state).toBe("in_progress");
 });
 
-test("dispatch_kinds default excludes chore tasks", async () => {
+test("chores dispatch by default; config.dispatch_kinds can still exclude them", async () => {
   const { db, projectId } = freshDb({ auto_dispatch: true });
   const chore = makeTask(db, projectId, { kind: "chore" });
   const scout = makeTask(db, projectId, { kind: "scout" });
   const { herdr, spawns } = stubHerdr();
   await dispatchOnce(db, { herdr });
-  expect(spawns.length).toBe(1); // only the scout
-  expect(getTask(db, chore).state).toBe("queued");
+  expect(spawns.length).toBe(2);
+  expect(getTask(db, chore).state).toBe("in_progress");
   expect(getTask(db, scout).state).toBe("in_progress");
+
+  const excl = freshDb({ auto_dispatch: true, dispatch_kinds: ["ship", "scout"] });
+  const excluded = makeTask(excl.db, excl.projectId, { kind: "chore" });
+  const s2 = stubHerdr();
+  await dispatchOnce(excl.db, { herdr: s2.herdr });
+  expect(s2.spawns.length).toBe(0);
+  expect(getTask(excl.db, excluded).state).toBe("queued");
 });
 
-test("a requeued chore IS dispatched (recovery of already-blessed work)", async () => {
-  const { db, projectId } = freshDb({ auto_dispatch: true });
+test("a requeue bypasses dispatch_kinds exclusion (recovery of already-blessed work)", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, dispatch_kinds: ["ship"] });
   const requeued = makeTask(db, projectId, { kind: "chore", source: "requeue" });
   const plainChore = makeTask(db, projectId, { kind: "chore" });
   const { herdr, spawns } = stubHerdr();
