@@ -228,3 +228,14 @@ test("actionFor namespaces dangerous commands by classifier category", () => {
   // every category action still matches the deny-safe default pattern
   expect("command.dangerous.process-kill".startsWith("command.dangerous")).toBe(true);
 });
+
+test("force-push to the agent's own task branch is waived; anything else escalates", () => {
+  const env = { HIVE_TASK_ID: "abc123", HOME: "/Users/x" };
+  expect(classify("git push --force origin hive/abc123", env).decision).toBe("unknown");
+  expect(classify("git push --force-with-lease origin HEAD:hive/abc123", env).decision).toBe("unknown");
+  expect(classify("git push -f origin hive/other999", env).decision).toBe("dangerous");
+  expect(classify("git push --force origin main", env).decision).toBe("dangerous");
+  expect(classify("git push --force origin hive/abc123", { HOME: "/Users/x" }).decision).toBe("dangerous");
+  // a second push segment to a different ref must not ride the waiver
+  expect(classify("git push --force origin hive/abc123; git push -f origin main", env).decision).toBe("dangerous");
+});
