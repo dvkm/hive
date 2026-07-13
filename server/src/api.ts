@@ -222,6 +222,11 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/usage$/);
       if (m && method === "GET") return taskUsage(db, m[1]);
 
+      // Live read-only view of the agent's terminal pane (the web UI's
+      // embedded terminal polls this). Input goes through steer as always.
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/pane$/);
+      if (m && method === "GET") return await taskPane(db, herdr, m[1], url);
+
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/brief$/);
       if (m && method === "GET") {
         if (!getTask(db, m[1])) return err("task not found", 404);
@@ -1422,6 +1427,23 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
     payload: { message, target, attachments: paths, delivery, ...(delivered ? { delivered_at: now() } : { error }) },
   });
   return json({ ok: delivered, delivered, delivery, message, attachments: paths, ...(error ? { error } : {}) });
+}
+
+// The agent's pane, as plain text. ANSI/control sequences are stripped
+// server-side so the client renders it in a bare <pre> — good enough to watch
+// an agent work; interaction stays on the steer channel.
+async function taskPane(db: DB, herdr: Herdr, id: string, url: URL): Promise<Response> {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  if (!task.agent_target) return err("task has no agent (not spawned, or already cleaned up)", 404);
+  const lines = Math.min(Math.max(Number(url.searchParams.get("lines")) || 200, 10), 2000);
+  const raw = await herdr.read(task.agent_target, lines);
+  // CSI/OSC escape sequences and stray control chars (keep \n and \t).
+  const text = raw
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, "")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
+  return json({ task_id: id, agent_target: task.agent_target, lines, text, ts: now() });
 }
 
 // Broadcast a steer to every task with a live agent (optionally one project's).
