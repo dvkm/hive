@@ -21,7 +21,7 @@ import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
 import { recordSystemLearning } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
-import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision } from "./api.ts";
+import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 
@@ -114,6 +114,16 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
     await sweepVerifying(db, deps);
   } catch (e) {
     fail("sweepVerifying", e);
+  }
+  try {
+    await autoMergeReady(db, deps);
+  } catch (e) {
+    fail("autoMergeReady", e);
+  }
+  try {
+    autoAnswerStale(db, deps.herdr ?? defaultHerdr, (deps.nowMs ?? (() => Date.now()))());
+  } catch (e) {
+    fail("autoAnswerStale", e);
   }
 }
 
@@ -458,6 +468,109 @@ export function nagOpenDecisions(db: DB, nowMs: number = Date.now()): void {
       decision_id: d.id,
       title: `Decision waiting ${mins >= 60 ? `${Math.round(mins / 60)}h` : `${mins}m`}: ${d.title}`,
       body: "An agent may be parked on this. Answer or dismiss it.",
+    });
+  }
+}
+
+// Auto-merge: the director's review click is predictable when EVERYTHING
+// already says yes — CI green, the auto-reviewer found no risks and no
+// questions, evidence attached, no changes ever requested. For task kinds a
+// project opts into (config.auto_merge = {kinds: ["chore", ...]}), merge
+// those without waiting. Anything contested (caution verdict, risks, red CI,
+// a changes_requested in history) still parks for the human. A notification
+// reports every auto-merge; the existing verifying/smoke gates still run.
+export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise<void> {
+  const h = deps.herdr ?? defaultHerdr;
+  const rows = db
+    .query(
+      `SELECT t.id, t.number, t.title, t.kind, p.config FROM tasks t JOIN projects p ON p.id = t.project_id
+        WHERE t.state = 'in_review' AND t.ci_status = 'passing'`
+    )
+    .all() as { id: string; number: number; title: string; kind: string; config: string }[];
+  for (const r of rows) {
+    let kinds: string[] = [];
+    try {
+      const c = JSON.parse(r.config ?? "{}");
+      kinds = Array.isArray(c.auto_merge?.kinds) ? c.auto_merge.kinds : [];
+    } catch {
+      continue;
+    }
+    if (!kinds.includes(r.kind)) continue;
+    const review: any = db
+      .query("SELECT payload FROM events WHERE task_id = ? AND type = 'auto_review' ORDER BY ts DESC LIMIT 1")
+      .get(r.id);
+    if (!review) continue; // no pre-review yet — wait for it
+    let verdict: any;
+    try {
+      verdict = JSON.parse(review.payload);
+    } catch {
+      continue;
+    }
+    if (verdict.skipped || verdict.verdict !== "looks_good" || verdict.risks?.length || verdict.questions?.length)
+      continue;
+    const contested = db
+      .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'changes_requested' LIMIT 1")
+      .get(r.id);
+    if (contested) continue; // a human pushed back once — never auto-merge this task
+    const evidence = (db.query("SELECT COUNT(*) n FROM evidence WHERE task_id = ?").get(r.id) as any).n;
+    if (!evidence) continue;
+    try {
+      const res = await mergeTask(db, h, r.id, {}, { exec: deps.exec });
+      const ok = res.status === 200;
+      writeEvent(db, { task_id: r.id, source: "reconciler", type: "auto_merged", payload: { ok, status: res.status } });
+      if (ok)
+        enqueue(db, {
+          kind: "auto_merged",
+          task_id: r.id,
+          title: `Auto-merged #${r.number}: ${r.title.slice(0, 70)}`,
+          body: "Green CI, clean pre-review, evidence attached. Now verifying.",
+        });
+    } catch (e) {
+      writeEvent(db, { task_id: r.id, source: "reconciler", type: "auto_merged", payload: { ok: false, error: String((e as any)?.message ?? e) } });
+    }
+  }
+}
+
+// Auto-answer: a decision card that sits past the project's timeout
+// (config.decision_auto_answer_hours, off unless set) and carries a
+// RECOMMENDED option gets answered with that recommendation — except
+// risk='high' cards (authority/prod), which always wait for the human.
+// The notification names what was chosen, so silence is informed consent,
+// not surprise.
+export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()): void {
+  const rows = db
+    .query(
+      `SELECT d.id, d.task_id, d.ts, d.title, d.options, p.config FROM decisions d
+         JOIN tasks t ON t.id = d.task_id JOIN projects p ON p.id = t.project_id
+        WHERE d.status = 'open' AND COALESCE(d.risk, 'normal') != 'high'`
+    )
+    .all() as { id: string; task_id: string; ts: string; title: string; options: string; config: string }[];
+  for (const r of rows) {
+    let hours = 0;
+    try {
+      hours = Number(JSON.parse(r.config ?? "{}").decision_auto_answer_hours) || 0;
+    } catch {
+      continue;
+    }
+    if (hours <= 0) continue;
+    if (nowMs - Date.parse(r.ts) < hours * 3600_000) continue;
+    let rec: any;
+    try {
+      rec = JSON.parse(r.options || "[]").find((o: any) => o.recommended);
+    } catch {
+      continue;
+    }
+    if (!rec?.key) continue;
+    apiAnswerDecision(db, herdr, r.id, {
+      answer_key: rec.key,
+      answer_note: `auto-answered with the recommended option after ${hours}h (project timeout policy — set decision_auto_answer_hours to 0 to disable)`,
+    });
+    enqueue(db, {
+      kind: "auto_answered",
+      task_id: r.task_id,
+      decision_id: r.id,
+      title: `Auto-answered "${rec.label ?? rec.key}": ${r.title.slice(0, 70)}`,
+      body: `Open ${hours}h with a recommendation and no reply.`,
     });
   }
 }

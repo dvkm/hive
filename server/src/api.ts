@@ -1056,7 +1056,7 @@ async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason
 // conflict: the task is bounced back to the agent (see mergeFailed); other
 // failures (CI blocked) return 409 with the reason and no state change.
 // Guarded by the `task.merge` standing-authority action.
-async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps): Promise<Response> {
+export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
   if (task.state !== "in_review")
@@ -2460,7 +2460,7 @@ function saveDraft(db: DB, id: string, body: any): Response {
   return json({ ok: true, id });
 }
 
-function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): Response {
+export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
   if (!r) return err("decision not found", 404);
   if (r.status !== "open") return err(`decision already ${r.status}`, 409);
