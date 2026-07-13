@@ -64,6 +64,13 @@ export async function promoteOnce(db: DB, deps: PromoterDeps = {}): Promise<void
       const n = parseInt(ahead.stdout.trim(), 10);
       if (ahead.code !== 0 || !Number.isFinite(n) || n === 0) continue;
 
+      // The commit count is only a hint: promotion PRs get squash-merged, so
+      // `from`'s commits stay non-ancestors of `to` forever and the count never
+      // returns to 0. The trees are what decides — identical trees = nothing to
+      // promote. (`git diff --quiet` exits 0 when equal, 1 when different.)
+      const diff = await exec(["git", "-C", p.repo_path, "diff", "--quiet", `origin/${toB}`, `origin/${fromB}`]);
+      if (diff.code === 0) continue;
+
       const head = await exec(["git", "-C", p.repo_path, "rev-parse", `origin/${fromB}`]);
       const sha = head.stdout.trim();
       if (head.code !== 0 || !sha) continue;

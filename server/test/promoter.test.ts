@@ -15,9 +15,11 @@ function freshDb(config: any = { promote: { from: "staging", to: "main" } }): { 
 }
 
 // Stub git/gh: `ahead` commits, `sha` head, `openPrs` open promote PRs.
-function stubExec(ahead: number, sha = "abc123def", openPrs = 0): Exec {
+// `treeDiffers` = what `git diff --quiet` reports (1 = trees differ, 0 = identical).
+function stubExec(ahead: number, sha = "abc123def", openPrs = 0, treeDiffers = true): Exec {
   return async (argv) => {
     if (argv.includes("fetch")) return OK();
+    if (argv.includes("diff")) return { code: treeDiffers ? 1 : 0, stdout: "", stderr: "" };
     if (argv.includes("rev-list")) return OK(`${ahead}\n`);
     if (argv.includes("rev-parse")) return OK(`${sha}\n`);
     if (argv[0] === "gh") return OK(JSON.stringify(Array.from({ length: openPrs }, (_, i) => ({ number: i + 1 }))));
@@ -53,6 +55,12 @@ test("no task when not ahead, unconfigured, or a promote PR is already open", as
   const plain = freshDb({}); // no config.promote
   await promoteOnce(plain.db, { exec: stubExec(5) });
   expect(promoterTasks(plain.db, plain.projectId).length).toBe(0);
+});
+
+test("no task when the trees are identical, however many commits `ahead` claims", async () => {
+  const { db, projectId } = freshDb();
+  await promoteOnce(db, { exec: stubExec(28, "squashed", 0, false) });
+  expect(promoterTasks(db, projectId).length).toBe(0);
 });
 
 test("dedup: same head is never re-evaluated; a new head is; in-flight blocks", async () => {
