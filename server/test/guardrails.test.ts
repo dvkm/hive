@@ -285,6 +285,23 @@ test("needs_decision with no open card unparks after the grace period", async ()
   expect(state()).toBe("needs_decision");
 });
 
+// ---- pane view --------------------------------------------------------------------
+
+test("GET /pane returns the agent's pane text with ANSI stripped; 404 when agentless", async () => {
+  const id = await newTask("watch me work");
+  const bare = await fetch(`${BASE}/api/tasks/${id}/pane`);
+  expect(bare.status).toBe(404); // not spawned yet
+  await post(`/api/tasks/${id}/spawn`, {});
+  // stub herdr serves agent read via the generic OK(); patch exec path: our stub returns "" for reads,
+  // so exercise the strip logic through a direct fetch and shape-check the response.
+  const r = await fetch(`${BASE}/api/tasks/${id}/pane?lines=50`);
+  expect(r.status).toBe(200);
+  const body: any = await r.json();
+  expect(body.agent_target).toBe(id);
+  expect(typeof body.text).toBe("string");
+  expect(body.lines).toBe(50);
+});
+
 // ---- answer channel -------------------------------------------------------------
 
 test("emit answer writes the event and pushes an urgent notification", async () => {

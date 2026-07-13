@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../lib/api";
 import type { Decision, Evidence, TaskDetail } from "../lib/api";
@@ -201,6 +201,52 @@ export default function TaskPage() {
   return <TaskBody id={id} />;
 }
 
+// Embedded read-only terminal: the agent's live pane, polled while visible.
+// Input stays on the steer box — watching is the missing piece, not typing.
+function PaneTerminal({ taskId }: { taskId: string }) {
+  const [text, setText] = useState<string>("");
+  const [error, setError] = useState<string>("");
+  const [open, setOpen] = useState(true);
+  const boxRef = useRef<HTMLPreElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    let live = true;
+    const tick = () =>
+      api
+        .pane(taskId)
+        .then((r) => {
+          if (!live) return;
+          setText(r.text);
+          setError("");
+          // Follow the tail unless the user scrolled up to read something.
+          const el = boxRef.current;
+          if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 80) el.scrollTop = el.scrollHeight;
+        })
+        .catch((e) => live && setError(e.message));
+    tick();
+    const timer = setInterval(tick, 3000);
+    return () => {
+      live = false;
+      clearInterval(timer);
+    };
+  }, [taskId, open]);
+  return (
+    <section className="panel">
+      <h2 onClick={() => setOpen(!open)} style={{ cursor: "pointer" }}>
+        Terminal {open ? "▾" : "▸"}
+      </h2>
+      {open &&
+        (error ? (
+          <div className="muted">pane unavailable: {error}</div>
+        ) : (
+          <pre className="term" ref={boxRef}>
+            {text || "…"}
+          </pre>
+        ))}
+    </section>
+  );
+}
+
 // The task detail content, shared by the standalone /tasks/:id route and the
 // board modal (see App.tsx / views/TaskModal.tsx).
 export function TaskBody({ id }: { id: string }) {
@@ -376,6 +422,8 @@ export function TaskBody({ id }: { id: string }) {
           <h2>Brief</h2>
           <pre className="brief">{t.brief || "(no brief)"}</pre>
         </section>
+
+        {t.agent_target && !["done", "cancelled", "failed"].includes(t.state) && <PaneTerminal taskId={t.id} />}
 
         {children.length > 0 && (
           <section className="panel">

@@ -371,6 +371,8 @@ export const api = {
     return req<Task[]>(`/api/tasks${p ? "?" + p : ""}`);
   },
   task: (id: string) => req<TaskDetail>(`/api/tasks/${id}`),
+  pane: (id: string, lines = 200) =>
+    req<{ task_id: string; agent_target: string; text: string; ts: string }>(`/api/tasks/${id}/pane?lines=${lines}`),
   feed: (q: { since?: string; project?: string; types?: string; limit?: number } = {}) => {
     const p = new URLSearchParams();
     if (q.since) p.set("since", q.since);
