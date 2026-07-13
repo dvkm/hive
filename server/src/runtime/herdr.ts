@@ -92,7 +92,13 @@ export function worktreeCreateArgv(repoPath: string, branch: string, base?: stri
 // firstmate's herdr-backend doc documents). The agent stays live afterward and
 // tolerates the captain attaching and typing.
 export function defaultAgentArgv(brief: string, model?: string): string[] {
-  const a = ["claude", brief, "--permission-mode", "acceptEdits"];
+  // auto (was acceptEdits, David 2026-07-12): the model classifier judges each
+  // action instead of prompting — nobody is at a worker's pane to answer, and
+  // acceptEdits still let non-edit dialogs stall sessions. hive's PreToolUse
+  // hook keeps first say on Bash (safe allowlist / authority escalation); auto
+  // covers everything the hook doesn't explicitly decide. Per-project opt-out:
+  // config.agent_argv (verbatim override).
+  const a = ["claude", brief, "--permission-mode", "auto"];
   if (model) a.push("--model", model);
   return a;
 }
