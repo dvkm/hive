@@ -50,7 +50,7 @@ test("argv builders construct the documented herdr commands", () => {
   expect(worktreeCreateArgv("/repo", "hive/abc", "main")).toContain("--base");
 
   // INTERACTIVE claude: the brief is claude's first prompt arg, never `-p`.
-  expect(defaultAgentArgv("do the thing")).toEqual(["claude", "do the thing", "--permission-mode", "acceptEdits"]);
+  expect(defaultAgentArgv("do the thing")).toEqual(["claude", "do the thing", "--permission-mode", "auto"]);
 
   // Fleet workspace + labelled tab builders (JSON is default; no --json flag).
   expect(workspaceListArgv()).toEqual(["workspace", "list"]);
@@ -165,7 +165,7 @@ test("spawn builds the visible interactive fleet: worktree, fleet workspace, lab
   expect(start).toContain("--workspace");
   expect(start).toContain("wF:t2");
   expect(start).toContain("TOKEN=sekret");
-  expect(start.slice(start.indexOf("--") + 1)).toEqual(["claude", "Fix the bug. Definition of done: ...", "--permission-mode", "acceptEdits"]);
+  expect(start.slice(start.indexOf("--") + 1)).toEqual(["claude", "Fix the bug. Definition of done: ...", "--permission-mode", "auto"]);
   expect(start).not.toContain("-p");
   // does NOT rename the agent: rename breaks agent_target resolution (verified
   // live), so the tab label carries the "id + title", not the agent name.
@@ -389,8 +389,8 @@ test("reclaim refuses to touch a directory git does not track as a worktree", as
 });
 
 test("defaultAgentArgv pins the model when one is given", () => {
-  expect(defaultAgentArgv("b", "sonnet")).toEqual(["claude", "b", "--permission-mode", "acceptEdits", "--model", "sonnet"]);
-  expect(defaultAgentArgv("b")).toEqual(["claude", "b", "--permission-mode", "acceptEdits"]); // unpinned stays unpinned
+  expect(defaultAgentArgv("b", "sonnet")).toEqual(["claude", "b", "--permission-mode", "auto", "--model", "sonnet"]);
+  expect(defaultAgentArgv("b")).toEqual(["claude", "b", "--permission-mode", "auto"]); // unpinned stays unpinned
 });
 
 test("spawn passes SpawnArgs.model into the interactive claude argv", async () => {
@@ -404,7 +404,7 @@ test("spawn passes SpawnArgs.model into the interactive claude argv", async () =
   const h = new Herdr(exec, "herdr");
   await h.spawn({ taskId: "m", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b", model: "opus" });
   const start = calls.find((c) => has(c, "agent", "start"))!;
-  expect(start.slice(start.indexOf("--") + 1)).toEqual(["claude", "b", "--permission-mode", "acceptEdits", "--model", "opus"]);
+  expect(start.slice(start.indexOf("--") + 1)).toEqual(["claude", "b", "--permission-mode", "auto", "--model", "opus"]);
 });
 
 test("agent_name_taken error parsing", () => {

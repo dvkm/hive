@@ -59,7 +59,7 @@ without reporting, the agent vanished, the board pointed at a ghost). `spawn()`
    — one labelled tab per task (this IS the visible "id + title" affordance).
 5. `herdr agent start <id> --workspace <fleet> --tab <tab> --cwd <worktree>
    --env HIVE_TASK_ID=<id> --env HIVE_URL=... [secrets] --no-focus -- claude
-   "<brief>" --permission-mode acceptEdits` — an INTERACTIVE claude with the
+   "<brief>" --permission-mode auto` — an INTERACTIVE claude with the
    composed brief delivered as its first prompt argument (execvp argv after `--`,
    so a multi-line brief needs no quoting and none of priortool's documented
    send-text/composer-autocomplete hazard). The agent stays live and tolerates
