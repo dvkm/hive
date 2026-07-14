@@ -471,18 +471,27 @@ async function main() {
   // Expose hive over Tailscale HTTPS (private mesh, real cert → iOS push works).
   // Needs `tailscale up` done once (that's the user's account login).
   if (cmd === "tunnel") {
-    const which = Bun.spawnSync(["which", "tailscale"]);
-    const ts = which.exitCode === 0 ? which.stdout.toString().trim() : "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
     const port = process.env.HIVE_PORT || 4700;
-    const status = Bun.spawnSync([ts, "status"]);
-    if (status.exitCode !== 0) {
-      die(
-        "Tailscale isn't ready. One-time setup:\n" +
-          "  brew install tailscale   (or install the Mac app)\n" +
-          "  tailscale up             (logs into YOUR Tailscale account in the browser)\n" +
-          "Then install Tailscale on your phone, log into the same account, and re-run `hive tunnel`."
-      );
-    }
+    const run = (args: string[]) => {
+      for (const bin of ["tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale"]) {
+        try {
+          const r = Bun.spawnSync([bin, ...args]);
+          if (r.exitCode !== 127) return { ...r, bin };
+        } catch {
+          /* binary not at this path; try next */
+        }
+      }
+      return null;
+    };
+    const setup =
+      "Tailscale isn't set up yet. One-time steps (yours — it's your account):\n" +
+      "  1. Install Tailscale on this Mac (App Store 'Tailscale', or `brew install --cask tailscale`) and log in.\n" +
+      "  2. Install Tailscale on your iPhone and log into the SAME account.\n" +
+      "  3. Re-run `hive tunnel`.";
+    const status = run(["status"]);
+    if (!status) die(setup);
+    if (status.exitCode !== 0) die(status.stderr.toString().includes("Logged out") || status.exitCode === 1 ? setup : status.stderr.toString());
+    const ts = status.bin;
     // `tailscale serve` fronts hive with a Tailscale-managed HTTPS cert on your
     // <machine>.<tailnet>.ts.net name. Backgrounded so it persists.
     const serve = Bun.spawnSync([ts, "serve", "--bg", String(port)]);
