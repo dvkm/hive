@@ -34,7 +34,7 @@ import { cleanupTask } from "./cleanup.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
 import { smokeThenAdvance } from "./monitors.ts";
 import { enqueue, ackNotifications } from "./notifications.ts";
-import { authorize, resolveGrantForDecision, type AuthzInput } from "./authority.ts";
+import { authorize, resolveGrantForDecision, resolveDenyGuardrailForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
 import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
@@ -2586,8 +2586,12 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): 
     payload: { decision_id: id, answer_key: answerKey, answer_note: answerNote },
   });
   // If this card gated a standing-authority request, approve → mint the
-  // single-use 24h grant so the agent's retry passes; deny → block it.
-  resolveGrantForDecision(db, id, answerKey);
+  // single-use 24h grant so the agent's retry passes; deny → block it AND steer
+  // the agent the reason (answerNote), proposing a standing deny rule if this
+  // category keeps getting denied.
+  resolveGrantForDecision(db, id, answerKey, now, answerNote);
+  // Recurring-deny guardrail proposal → mint a project deny rule on "block".
+  resolveDenyGuardrailForDecision(db, id, answerKey);
   // If this card was a planner breakdown proposal, approve → create the proposed
   // child tasks (source='planner', parent_task_id → source); reject → event only.
   resolvePlanForDecision(db, id, answerKey);

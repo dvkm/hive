@@ -345,6 +345,47 @@ test("idle backstop never re-reviews after changes_requested until new evidence 
   expect(advanceIfFinished(db, id, "idle", "test")).toBe(true); // visible new work → review
 });
 
+// ---- deny reason + recurring-deny guardrail ---------------------------------------
+
+test("denying a command card steers the agent the reason; 3rd deny proposes a block-always rule", async () => {
+  const id = await newTask("deny me");
+  await post(`/api/tasks/${id}/spawn`, {});
+  const gate = async () =>
+    (await post(`/api/tasks/${id}/guarded-action`, {
+      action: "command.dangerous.privilege-escalation",
+      target: "sudo rm -rf /etc/x",
+      detail: "command approval (dangerous): privilege escalation",
+    })).json.decision_id;
+
+  // deny #1 with a reason → agent gets a steer carrying it
+  const d1 = await gate();
+  await post(`/api/decisions/${d1}/answer`, { answer_key: "deny", answer_note: "never sudo, ask me to do host changes" });
+  const steers = () => db.query("SELECT payload FROM events WHERE task_id = ? AND type='steer'").all(id).map((e: any) => JSON.parse(e.payload).message);
+  expect(steers().at(-1)).toContain("never sudo");
+  expect(steers().at(-1)).toContain("DENIED");
+
+  // deny #2, #3 → after the 3rd a block-always proposal opens
+  const d2 = await gate();
+  await post(`/api/decisions/${d2}/answer`, { answer_key: "deny" });
+  const d3 = await gate();
+  await post(`/api/decisions/${d3}/answer`, { answer_key: "deny" });
+  const proposal: any = db
+    .query("SELECT * FROM decisions WHERE title LIKE 'Always block%privilege-escalation%' AND status='open'")
+    .get();
+  expect(proposal).toBeTruthy();
+
+  // approving it mints a project deny rule → the category now denies with no card
+  await post(`/api/decisions/${proposal.id}/answer`, { answer_key: "block" });
+  const rule = db.query("SELECT effect FROM authority_rules WHERE action_pattern = 'command.dangerous.privilege-escalation' AND active=1").get() as any;
+  expect(rule.effect).toBe("deny");
+  const blocked = await post(`/api/tasks/${id}/guarded-action`, {
+    action: "command.dangerous.privilege-escalation",
+    target: "sudo whoami",
+    detail: "command approval (dangerous): privilege escalation",
+  });
+  expect(blocked.status).toBe(403); // standing deny, no new card
+});
+
 // ---- command-card context ----------------------------------------------------------
 
 test("command cards carry intent, the literal command, category explanation, and answer semantics", async () => {
