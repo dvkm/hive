@@ -198,6 +198,48 @@ function killTargetsSandboxed(cmd: string, env: Record<string, string | undefine
   });
 }
 
+// `git reset --hard` and `git clean` discard work in the checkout they run in.
+// In the agent's OWN worktree (every ~/.herdr/worktrees/* dir is agent-created
+// and disposable) that's routine branch-syncing — resetting to origin/<branch>
+// before re-checking a PR. The MAIN checkout (~/projects/…) is NOT under a
+// sandbox root, so a reset there stays gated. Provable only when the effective
+// working directory of every such git segment resolves inside a sandbox root:
+// the hook's cwd, updated by any absolute `cd`, or an explicit `git -C <path>`.
+// A relative cd, an unresolved variable, command substitution, or an unknown
+// cwd all fail closed. Force-push is deliberately NOT covered — it mutates a
+// shared remote, a different blast radius.
+export function gitResetInSandbox(
+  cmd: string,
+  env: Record<string, string | undefined>,
+  cwd?: string
+): boolean {
+  if (/\$\(|`|<\(/.test(cmd)) return false; // substitution can move the cwd unseen
+  const map = varMap(cmd, env);
+  const roots = sandboxRoots(env);
+  const isDangerGit = (s: string) =>
+    /^git\s+(-C\s+\S+\s+)?(reset\s+--hard|clean\s+(-[a-z]*\s+)*-[a-z]*[fd])/.test(s);
+  const inSandbox = (dir: string | null | undefined) =>
+    !!dir && dir.startsWith("/") && !dir.includes("..") && !/[$`]/.test(dir) &&
+    roots.some((r) => (dir + "/").startsWith(r));
+  const gitSegs = segments(cmd).filter(isDangerGit);
+  if (!gitSegs.length) return false;
+  let eff = cwd ? subst(cwd, map) : null; // effective cwd, tracked across cd
+  for (const seg of segments(cmd)) {
+    const cd = seg.match(/^cd\s+(\S+)/);
+    if (cd) {
+      const d = subst(cd[1].replace(/["']/g, ""), map);
+      if (!d.startsWith("/")) return false; // relative cd: unresolvable
+      eff = d;
+      continue;
+    }
+    if (!isDangerGit(seg)) continue;
+    const c = seg.match(/^git\s+-C\s+(\S+)/); // -C overrides cwd for this call
+    const dir = c ? subst(c[1].replace(/["']/g, ""), map) : eff;
+    if (!inSandbox(dir)) return false;
+  }
+  return true;
+}
+
 // The agent's OWN per-worktree docker DB (wt.sh up creates `<slug>-mariadb`
 // where slug = the worktree directory name) is a sandbox: seeded from a dump,
 // torn down on cleanup, no shared state. Destructive SQL there is routine
@@ -345,6 +387,8 @@ export function classify(
       continue;
     if (reason === "process kill" && killTargetsSandboxed(cmd, env)) continue;
     if (reason === "force push" && forcePushOwnBranch(cmd, env)) continue;
+    if ((reason.startsWith("hard reset") || reason.startsWith("git clean")) && gitResetInSandbox(cmd, env, cwd))
+      continue;
     if (reason.startsWith("SQL ") && (sqlTargetsSandboxed(cmd, env) || dockerDbTargetsSandboxed(cmd, env, cwd)))
       continue;
     return { decision: "dangerous", reason };
