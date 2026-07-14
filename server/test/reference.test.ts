@@ -31,27 +31,36 @@ function task(db: DB, projectId: string, title: string, brief = ""): string {
 }
 const openCards = (db: DB) => db.query("SELECT * FROM decisions WHERE status = 'open'").all() as any[];
 
-test("addReference stores a pinned fact; listReferences returns it; it's in the brief", () => {
+test("addReference stores a pinned fact; the brief carries the index + a recall pointer", () => {
   const { db, projectId } = freshDb();
   addReference(db, projectId, "Design file", FIGMA);
   expect(listReferences(db, projectId)).toEqual([{ title: "Design file", body: FIGMA }]);
   const id = task(db, projectId, "make market-radar match the design");
   const brief = composeBrief(db, id);
-  expect(brief).toContain("Project reference (durable facts");
-  expect(brief).toContain(FIGMA);
+  expect(brief).toContain("hive recall"); // agents search on demand
+  expect(brief).toContain("Design file"); // the title is indexed
+  expect(brief).toContain(FIGMA); // short body (a URL) shown inline
   // upsert by title: no duplicate row
   addReference(db, projectId, "Design file", FIGMA + "?node-id=1");
   expect(listReferences(db, projectId)).toHaveLength(1);
 });
 
-test("references are separate from failure learnings and never truncated", () => {
+test("a long reference body is indexed by TITLE only (kept out of the brief bulk)", () => {
+  const { db, projectId } = freshDb();
+  const longBody = "This is a long multi-line fact.\n".repeat(20);
+  addReference(db, projectId, "Deploy runbook", longBody);
+  const brief = composeBrief(db, task(db, projectId, "t"));
+  expect(brief).toContain("Deploy runbook"); // title present
+  expect(brief).not.toContain("long multi-line fact"); // body NOT dumped
+});
+
+test("references stay in their own store, separate from failure learnings", () => {
   const { db, projectId } = freshDb();
   const { recordSystemLearning } = require("../src/learn.ts");
   for (let i = 0; i < 15; i++) recordSystemLearning(db, projectId, `failure ${i}`, "b");
   addReference(db, projectId, "Ref A", "https://a");
-  const id = task(db, projectId, "t");
-  const brief = composeBrief(db, id);
-  expect(brief).toContain("Ref A"); // reference always present
+  const brief = composeBrief(db, task(db, projectId, "t"));
+  expect(brief).toContain("Ref A");
   expect(brief).toContain("Known failure patterns");
 });
 
@@ -77,6 +86,30 @@ test("captureRecurringRefs proposes a card for a link in >=3 tasks, once, and sa
   db.query("UPDATE decisions SET status = 'answered' WHERE id = ?").run(cards[0].id);
   captureRecurringRefs(db);
   expect(openCards(db)).toHaveLength(0);
+});
+
+test("knowledgeSearch scopes to a project and AND-matches keywords across kinds", async () => {
+  const { makeHandler } = await import("../src/api.ts");
+  const { db, projectId } = freshDb();
+  addReference(db, projectId, "Design file", FIGMA);
+  const { recordSystemLearning } = require("../src/learn.ts");
+  recordSystemLearning(db, projectId, "migration collation mismatch", "utf8mb4 vs general_ci");
+  db.query("INSERT INTO policies (id, scope, title, body, active, created_at, updated_at) VALUES (?,?,?,?,1,?,?)").run(
+    newId("pol"), `project:${projectId}`, "PR conventions", "PR into staging", now(), now()
+  );
+  const handle = makeHandler(db, {});
+  const search = async (q: string) => {
+    const res = await handle(new Request(`http://x/api/knowledge?project_id=${projectId}&q=${encodeURIComponent(q)}`));
+    return res.json();
+  };
+  expect((await search("figma")).references).toHaveLength(1);
+  expect((await search("migration collation")).learnings).toHaveLength(1); // both terms present
+  expect((await search("migration figma")).learnings).toHaveLength(0); // AND: not both in one row
+  expect((await search("staging")).policies).toHaveLength(1);
+  // task_id resolves the project
+  const tid = task(db, projectId, "t");
+  const byTask = await handle(new Request(`http://x/api/knowledge?task_id=${tid}&q=figma`));
+  expect((await byTask.json()).references).toHaveLength(1);
 });
 
 test("localhost / PR / non-doc links are not captured", () => {

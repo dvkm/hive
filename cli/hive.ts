@@ -30,6 +30,7 @@ Usage:
   hive learning add --project <id> --title <t> [--body <s>] [--task <src-task-id>] [--root-cause]
   hive learning list [--project <id>] [--status active|resolved]
   hive learning recur <learning-id>
+  hive recall <keywords>                  search project knowledge (references, learnings, policies)
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive steer-all "message" [--project <id>]   broadcast a steer to every live agent
   hive remote                             print LAN URL + API token for phone access (PWA)
@@ -486,6 +487,32 @@ async function main() {
         `\nServer must be bound to the LAN: HIVE_BIND=0.0.0.0 (add to the LaunchAgent env, then restart).` +
         `\nPlain HTTP — use only on a trusted LAN or a Tailscale address.`
     );
+    return;
+  }
+
+  // Recall project knowledge (references, learnings, policies) on demand.
+  //   hive recall <keywords>            (project from $HIVE_TASK_ID, or --project)
+  if (cmd === "recall") {
+    const { _, flags } = parseFlags(argv.slice(1));
+    const q = _.join(" ");
+    const qs = new URLSearchParams();
+    if (flags.project) qs.set("project_id", String(flags.project));
+    else if (process.env.HIVE_TASK_ID) qs.set("task_id", process.env.HIVE_TASK_ID);
+    else die("run under a hive task (HIVE_TASK_ID) or pass --project <id>");
+    if (q) qs.set("q", q);
+    const r = await api("GET", "/api/knowledge?" + qs.toString());
+    const show = (label: string, items: any[]) => {
+      if (!items.length) return;
+      console.log(`\n## ${label}`);
+      for (const it of items) console.log(`- ${it.title}${it.body ? `\n  ${String(it.body).replace(/\n/g, "\n  ")}` : ""}`);
+    };
+    if (!r.references.length && !r.learnings.length && !r.policies.length) {
+      console.log(q ? `no project knowledge matches "${q}"` : "no project knowledge stored yet");
+      return;
+    }
+    show("References (durable facts)", r.references);
+    show("Known failure patterns", r.learnings);
+    show("Policies", r.policies);
     return;
   }
 

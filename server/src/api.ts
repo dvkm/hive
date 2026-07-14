@@ -314,6 +314,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (method === "GET") return listLearnings(db, url);
         if (method === "POST") return createLearning(db, await req.json());
       }
+      // Knowledge search: agents recall project references/learnings/policies on
+      // demand instead of carrying the whole store in every brief.
+      if (pathname === "/api/knowledge" && method === "GET") return knowledgeSearch(db, url);
       m = pathname.match(/^\/api\/learnings\/([^/]+)$/);
       if (m) {
         if (method === "GET") {
@@ -1854,6 +1857,42 @@ function listIncidents(db: DB, url: URL): Response {
 }
 
 // ---------------------------------------------------------------- learnings (regression ledger)
+// On-demand knowledge lookup across a project's references, failure learnings,
+// and policies (global + project). `project_id` or `task_id` scopes it; `q` is a
+// space-separated set of keywords, ALL of which must appear (title or body,
+// case-insensitive). No q → return all references + policies (the "what exists"
+// index). LIKE, not FTS — a few hundred rows, keep it boring.
+function knowledgeSearch(db: DB, url: URL): Response {
+  let projectId = url.searchParams.get("project_id");
+  const taskId = url.searchParams.get("task_id");
+  if (!projectId && taskId) {
+    const t: any = db.query("SELECT project_id FROM tasks WHERE id = ?").get(taskId);
+    projectId = t?.project_id ?? null;
+  }
+  if (!projectId) return err("project_id or task_id is required");
+  const terms = (url.searchParams.get("q") ?? "").trim().split(/\s+/).filter(Boolean);
+  const like = (cols: string) =>
+    terms.length ? " AND " + terms.map(() => `(${cols}) LIKE ?`).join(" AND ") : "";
+
+  const refs = db
+    .query(
+      `SELECT title, body FROM learnings WHERE project_id = ? AND kind = 'reference' AND status = 'active'${like("title || ' ' || COALESCE(body,'')")} ORDER BY first_seen`
+    )
+    .all(projectId, ...terms.map((t) => `%${t}%`)) as any[];
+  const learnings = db
+    .query(
+      `SELECT title, body, occurrences FROM learnings WHERE project_id = ? AND kind = 'failure' AND status = 'active'${like("title || ' ' || COALESCE(body,'')")} ORDER BY last_seen DESC LIMIT 20`
+    )
+    .all(projectId, ...terms.map((t) => `%${t}%`)) as any[];
+  const policies = db
+    .query(
+      `SELECT title, body FROM policies WHERE active = 1 AND (scope = 'global' OR scope = ?)${like("title || ' ' || body")} ORDER BY created_at`
+    )
+    .all(`project:${projectId}`, ...terms.map((t) => `%${t}%`)) as any[];
+
+  return json({ query: terms.join(" "), references: refs, learnings, policies });
+}
+
 function listLearnings(db: DB, url: URL): Response {
   const projectId = url.searchParams.get("project_id");
   const status = url.searchParams.get("status");

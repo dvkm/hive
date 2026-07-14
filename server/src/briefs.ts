@@ -260,15 +260,28 @@ export function composeBrief(db: DB, taskId: string): string {
   // protocol it MUST use before any externally-risky operation it runs itself.
   parts.push(standingAuthority(db, task.project_id, task.id));
 
-  // Project reference: durable facts (design files, dashboards, glossary). All
-  // of them, pinned — these answer the questions agents/planner keep asking.
+  // Project reference: durable facts (design files, dashboards, glossary). The
+  // brief carries only the INDEX (titles) so it stays small as the store grows;
+  // the agent pulls the full fact on demand with `hive recall`. Short reference
+  // bodies (a bare URL / one line) are shown inline — no round-trip for those.
   const references = db
     .query("SELECT title, body FROM learnings WHERE project_id = ? AND kind = 'reference' AND status = 'active' ORDER BY first_seen")
     .all(task.project_id) as { title: string; body: string | null }[];
   if (references.length) {
+    const line = (r: { title: string; body: string | null }) => {
+      const b = (r.body ?? "").trim();
+      return b && b.length <= 120 && !b.includes("\n") ? `- **${r.title}** — ${b}` : `- **${r.title}**`;
+    };
     parts.push(
-      "## Project reference (durable facts — do not ask for these)\n" +
-        references.map((r) => `### ${r.title}\n${r.body?.trim() || ""}`.trimEnd()).join("\n\n")
+      `## Project knowledge (search it — DON'T ask the director for what's here)
+This project has stored references, past-failure learnings, and policies. Before
+you assume, guess, or ask the director something a teammate would already know,
+search them:
+
+  hive recall <keywords>          # e.g. hive recall figma design, hive recall migration
+
+Reference facts on file (run \`hive recall\` for the full detail of any):
+${references.map(line).join("\n")}`
     );
   }
 
