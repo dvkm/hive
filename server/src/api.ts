@@ -1828,15 +1828,15 @@ export function openRecoveryDecision(db: DB, task: any, attempts: number): any {
 // If this card was a blocked-dialog escalation (reconciler recoverBlockedDialog),
 // answering it sends the chosen keystroke to the agent's frozen pane remotely:
 // approve → "1", deny → "3". Fire-and-forget; the outcome event records delivery.
-export function resolveBlockedForDecision(db: DB, herdr: Herdr, decisionId: string, answerKey: string): void {
+export function resolveBlockedForDecision(db: DB, herdr: Herdr, decisionId: string, answerKey: string): boolean {
   const ev = db
     .query(
       `SELECT task_id FROM events WHERE type = 'blocked_card' AND json_extract(payload, '$.decision_id') = ? LIMIT 1`
     )
     .get(decisionId) as { task_id: string } | undefined;
-  if (!ev) return;
+  if (!ev) return false;
   const task = getTask(db, ev.task_id);
-  if (!task?.agent_target) return;
+  if (!task?.agent_target) return true; // it WAS a blocked card, just no live agent to key
   const key = answerKey === "approve" ? "1" : "3";
   herdr
     .answerDialog(task.agent_target, key)
@@ -1851,6 +1851,7 @@ export function resolveBlockedForDecision(db: DB, herdr: Herdr, decisionId: stri
     .catch((e) => {
       writeEvent(db, { task_id: task.id, source: "director", type: "dialog_answered", payload: { decision_id: decisionId, key, delivered: false, error: String(e?.message ?? e) } });
     });
+  return true;
 }
 
 export function resolveRecoveryForDecision(db: DB, decisionId: string, answerKey: string): boolean {
@@ -2585,26 +2586,31 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): 
     type: "decision_answered",
     payload: { decision_id: id, answer_key: answerKey, answer_note: answerNote },
   });
-  // If this card gated a standing-authority request, approve → mint the
-  // single-use 24h grant so the agent's retry passes; deny → block it AND steer
-  // the agent the reason (answerNote), proposing a standing deny rule if this
-  // category keeps getting denied.
-  resolveGrantForDecision(db, id, answerKey, now, answerNote);
-  // Recurring-deny guardrail proposal → mint a project deny rule on "block".
-  resolveDenyGuardrailForDecision(db, id, answerKey);
-  // If this card was a planner breakdown proposal, approve → create the proposed
-  // child tasks (source='planner', parent_task_id → source); reject → event only.
-  resolvePlanForDecision(db, id, answerKey);
-  // If this card was a stale-recovery escalation, `requeue` → fresh task.
-  resolveRecoveryForDecision(db, id, answerKey);
-  // Blocked-dialog card → answer the pane's dialog with the chosen keystroke.
-  resolveBlockedForDecision(db, herdr, id, answerKey);
-  // If this card was a possible-duplicate card, `merge` → fold + cancel.
-  resolveDuplicateForDecision(db, id, answerKey);
-  // Cost-cap card → wrap-up steer, or raise the cap and keep going.
-  resolveCostCapForDecision(db, id, answerKey);
-  // Recurring-link capture card → save as a project reference (label from note).
-  resolveRefCaptureForDecision(db, id, answerKey, answerNote);
+  // Each specialized resolver returns true if it OWNED this card (and did its
+  // own agent-facing action). A card no resolver claims is a plain question
+  // from the agent — its answer must be relayed to the agent below, or the
+  // answer never reaches whoever asked (the #163 stall: a live agent parked on
+  // a question, answered in the UI, never told).
+  const claimed = [
+    // approve → mint 24h grant (agent retries); deny → steer the reason.
+    resolveGrantForDecision(db, id, answerKey, now, answerNote),
+    resolveDenyGuardrailForDecision(db, id, answerKey),
+    resolvePlanForDecision(db, id, answerKey),
+    resolveRecoveryForDecision(db, id, answerKey),
+    resolveBlockedForDecision(db, herdr, id, answerKey),
+    resolveDuplicateForDecision(db, id, answerKey),
+    resolveCostCapForDecision(db, id, answerKey),
+    resolveRefCaptureForDecision(db, id, answerKey, answerNote),
+  ].some(Boolean);
+  if (!claimed) {
+    const label = options.find((o) => o.key === answerKey)?.label ?? answerKey;
+    queueSteerEvent(
+      db,
+      r.task_id,
+      `Director answered your decision "${r.title}": ${label}.` + (answerNote ? ` ${answerNote}` : "") + " Proceed on this basis.",
+      "queued by decision answer"
+    );
+  }
   // Resume the task if it was parked on this decision. (herdr `agent send` is Phase 2.)
   const task = getTask(db, r.task_id);
   if (task && task.state === "needs_decision")

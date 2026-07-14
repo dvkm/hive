@@ -345,6 +345,26 @@ test("idle backstop never re-reviews after changes_requested until new evidence 
   expect(advanceIfFinished(db, id, "idle", "test")).toBe(true); // visible new work → review
 });
 
+// ---- generic decision answer reaches the agent -----------------------------------
+
+test("answering a plain question card steers the answer to the live agent", async () => {
+  const id = await newTask("blocked on a question");
+  await post(`/api/tasks/${id}/spawn`, {});
+  // a plain decision (no specialized resolver claims it)
+  const d = await post("/api/decisions", {
+    task_id: id,
+    title: "Flip the runner, or check infra first?",
+    options: [
+      { key: "flip", label: "Flip the runner now" },
+      { key: "cautious", label: "Check AWS prereqs first" },
+    ],
+  });
+  await post(`/api/decisions/${d.json.id}/answer`, { answer_key: "cautious", answer_note: "infra doesn't exist yet; don't deploy" });
+  const steers = db.query("SELECT payload FROM events WHERE task_id = ? AND type='steer'").all(id).map((e: any) => JSON.parse(e.payload).message);
+  expect(steers.at(-1)).toContain("Check AWS prereqs first");
+  expect(steers.at(-1)).toContain("infra doesn't exist yet");
+});
+
 // ---- deny reason + recurring-deny guardrail ---------------------------------------
 
 test("denying a command card steers the agent the reason; 3rd deny proposes a block-always rule", async () => {
