@@ -56,6 +56,10 @@ export function listReferences(db: DB, projectId: string): { title: string; body
 // the agent's own PR links are noise, not durable references.
 const REF_URL = /https?:\/\/[^\s'")<>]+/g;
 function isReferenceUrl(u: string): boolean {
+  // Braindump task TITLES routinely carry a URL truncated with an ellipsis
+  // ("…CoreData-%EA%B3%B5%…"); a broken URL is worse than none, and it also
+  // defeats dedup against the full stored one. Reject anything truncated.
+  if (/[…]|%E2%80%A6|\.\.\.$/.test(u)) return false;
   if (/localhost|127\.0\.0\.1|\.test\b|\.local\b/.test(u)) return false;
   if (/github\.com\/[^/]+\/[^/]+\/(pull|commit|blob|tree)\//.test(u)) return false; // code links churn
   return /figma\.com|docs\.google\.com|notion\.|linear\.app|\.atlassian\.|dashboard|posthog|sheets\.|drive\.google/.test(u);
