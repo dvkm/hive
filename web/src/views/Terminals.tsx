@@ -1,7 +1,7 @@
 // Fleet terminals: every live agent's pane at a glance, plus a status strip.
 // Read-only mini panes (poll the /pane endpoint); click through for the full
 // task page with steer input.
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import type { State } from "../lib/api";
@@ -12,12 +12,20 @@ const ACTIVE: State[] = ["in_progress", "needs_decision", "in_review", "verifyin
 
 function MiniPane({ id }: { id: string }) {
   const [text, setText] = useState("");
+  const ref = useRef<HTMLPreElement>(null);
   useEffect(() => {
     let live = true;
     const tick = () =>
       api
         .pane(id, 60)
-        .then((r) => live && setText(r.text))
+        .then((r) => {
+          if (!live) return;
+          setText(r.text);
+          // Always follow the tail.
+          requestAnimationFrame(() => {
+            if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
+          });
+        })
         .catch(() => live && setText("(pane unavailable)"));
     tick();
     const t = setInterval(tick, 5000);
@@ -26,7 +34,11 @@ function MiniPane({ id }: { id: string }) {
       clearInterval(t);
     };
   }, [id]);
-  return <pre className="term term-mini">{text || "…"}</pre>;
+  return (
+    <pre className="term term-mini" ref={ref}>
+      {text || "…"}
+    </pre>
+  );
 }
 
 export default function Terminals() {

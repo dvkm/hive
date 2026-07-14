@@ -39,6 +39,7 @@ import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { costUsd } from "./pricing.ts";
 import { checkCostGuardrails, resolveCostCapForDecision } from "./costs.ts";
+import { explainCommandDecision } from "./explain.ts";
 import { ciStatusOf } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import type { Exec } from "./exec.ts";
@@ -2588,6 +2589,10 @@ function guardedAction(db: DB, taskId: string, body: any): Response {
   });
   if (r.effect === "allow") return json({ ok: true, effect: "allow" });
   if (r.effect === "deny") return json({ ok: false, effect: "deny", error: r.reason }, 403);
+  // Command cards get an async plain-English explanation appended while open —
+  // never blocks the gate response.
+  if (String(body.action).startsWith("command."))
+    void explainCommandDecision(db, r.decision_id, String(body.target));
   return json({ ok: false, effect: "require_decision", decision_id: r.decision_id }, 409);
 }
 

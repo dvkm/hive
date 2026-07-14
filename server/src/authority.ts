@@ -51,6 +51,37 @@ export function bootstrapAuthority(db: DB): number {
   return inserted;
 }
 
+// Plain-English danger explanations per classifier category — the card reader
+// shouldn't need to parse shell to know what's at stake. Matched by substring
+// against the reason in `detail` ("command approval (dangerous): <reason>").
+const CATEGORY_EXPLAIN: [string, string][] = [
+  ["rm", "Deletes files or directories permanently — no trash, no undo. A wrong path or an empty variable can wipe far more than intended."],
+  ["kill", "Terminates running processes. A broad match can take down your own apps or another agent's server, not just this agent's."],
+  ["force push", "Rewrites the remote branch's history — commits pushed by others (or other agents) on that branch can be lost."],
+  ["hard reset", "Discards uncommitted local changes in the checkout it runs in."],
+  ["git clean", "Deletes untracked files from the working tree — anything not committed is gone."],
+  ["sql", "Modifies or deletes database rows/tables directly. Against a live DB this is customer data."],
+  ["sudo", "Runs with root privileges — can change anything on the machine."],
+  ["pipe-to-shell", "Downloads code from the network and executes it immediately, sight unseen."],
+];
+
+// Structured context for a gated shell command: intent, the literal command,
+// what the category means, and what each answer does.
+function commandContext(input: AuthzInput): string {
+  const reason = input.detail?.replace(/^command approval \((dangerous|unknown)\): /, "") ?? "";
+  const explain = CATEGORY_EXPLAIN.find(([k]) => reason.toLowerCase().includes(k))?.[1];
+  return [
+    `Agent's stated intent: ${input.summary?.trim() || "(the agent gave no description)"}`,
+    ``,
+    `Command it wants to run:`,
+    `  ${input.target.split("\n").join("\n  ")}`,
+    ``,
+    `Why it was gated: ${reason}${explain ? ` — ${explain}` : ""}`,
+    ``,
+    `Approve = this exact command, once (24h grant). Approve & always allow = every '${input.action}' command in this project, from now on. Deny = blocked; the agent is told to find another way.`,
+  ].join("\n");
+}
+
 export interface AuthzInput {
   project_id: string | null;
   action: string;
@@ -218,10 +249,11 @@ export function authorize(db: DB, input: AuthzInput, clock: () => string = now):
   const decision = createDecision(db, {
     task_id: input.task_id,
     title,
-    context:
-      (summary && input.detail?.trim() ? `${input.detail.trim()}. ` : "") +
-      `An agent requested authority to run '${input.action}' targeting ${input.target}. ` +
-      `Approving mints a single-use, 24h grant scoped to this exact action + target.`,
+    context: input.action.startsWith("command.")
+      ? commandContext(input)
+      : (summary && input.detail?.trim() ? `${input.detail.trim()}. ` : "") +
+        `An agent requested authority to run '${input.action}' targeting ${input.target}. ` +
+        `Approving mints a single-use, 24h grant scoped to this exact action + target.`,
     risk: "high",
     blast_radius: `Exact target: ${input.target}`,
     options,

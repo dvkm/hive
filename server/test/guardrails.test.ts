@@ -285,6 +285,46 @@ test("needs_decision with no open card unparks after the grace period", async ()
   expect(state()).toBe("needs_decision");
 });
 
+// ---- command-card context ----------------------------------------------------------
+
+test("command cards carry intent, the literal command, category explanation, and answer semantics", async () => {
+  const id = await newTask("context rich");
+  const g = await post(`/api/tasks/${id}/guarded-action`, {
+    action: "command.dangerous.recursive-forced-rm",
+    target: "rm -rf /some/path",
+    detail: "command approval (dangerous): recursive/forced rm",
+    summary: "Clean the build output directory",
+  });
+  expect(g.status).toBe(409);
+  const d: any = db.query("SELECT context FROM decisions WHERE id = ?").get(g.json.decision_id);
+  expect(d.context).toContain("Clean the build output directory"); // intent
+  expect(d.context).toContain("rm -rf /some/path"); // literal command
+  expect(d.context).toContain("no trash, no undo"); // category explanation
+  expect(d.context).toContain("Approve & always allow"); // answer semantics
+});
+
+test("explainCommandDecision appends the haiku explanation to an OPEN card only", async () => {
+  const { explainCommandDecision } = await import("../src/explain.ts");
+  const id = await newTask("explain me");
+  const g = await post(`/api/tasks/${id}/guarded-action`, {
+    action: "command.dangerous.process-kill",
+    target: "pkill -f something",
+    detail: "command approval (dangerous): process kill",
+  });
+  const did = g.json.decision_id;
+  const stubExec = async () => ({ code: 0, stdout: JSON.stringify({ result: "- kills processes matching 'something'" }), stderr: "" });
+  await explainCommandDecision(db, did, "pkill -f something", { exec: stubExec });
+  const d: any = db.query("SELECT context FROM decisions WHERE id = ?").get(did);
+  expect(d.context).toContain("auto-explained");
+  expect(d.context).toContain("kills processes matching");
+
+  // answered card: enrichment must not rewrite history
+  await post(`/api/decisions/${did}/answer`, { answer_key: "deny" });
+  await explainCommandDecision(db, did, "pkill -f something", { exec: stubExec });
+  const after: any = db.query("SELECT context FROM decisions WHERE id = ?").get(did);
+  expect(after.context).toBe(d.context);
+});
+
 // ---- pane view --------------------------------------------------------------------
 
 test("GET /pane returns the agent's pane text with ANSI stripped; 404 when agentless", async () => {
