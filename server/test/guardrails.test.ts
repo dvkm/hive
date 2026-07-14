@@ -285,6 +285,34 @@ test("needs_decision with no open card unparks after the grace period", async ()
   expect(state()).toBe("needs_decision");
 });
 
+// ---- per-project stack teardown ------------------------------------------------------
+
+test("cleanup runs config.cleanup_argv with {worktree} substituted, exactly once", async () => {
+  const { cleanupTask } = await import("../src/cleanup.ts");
+  const { Herdr } = await import("../src/runtime/herdr.ts");
+  const p = await post("/api/projects", {
+    name: "teardown-p",
+    repo_path: "/repo",
+    config: { cleanup_argv: ["infra/worktree/wt.sh", "down", "{worktree}"] },
+  });
+  const t = await post("/api/tasks", { project_id: p.json.id, title: "with stack" });
+  db.query("UPDATE tasks SET state = 'cancelled', worktree_path = '/wts/hive-x', branch = 'hive/x' WHERE id = ?").run(t.json.id);
+
+  const calls: string[][] = [];
+  const exec = async (argv: string[]) => (calls.push(argv), { code: 0, stdout: "", stderr: "" });
+  const stubHerdr = new Herdr(async () => ({ code: 0, stdout: "", stderr: "" }), "herdr");
+  await cleanupTask(db, stubHerdr, t.json.id, { exec });
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toEqual(["/repo/infra/worktree/wt.sh", "down", "/wts/hive-x"]);
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'stack_teardown'").all(t.json.id);
+  expect(ev).toHaveLength(1);
+
+  // re-running cleanup (reaper backstop) must not re-fire the teardown
+  db.query("UPDATE tasks SET worktree_path = '/wts/hive-x' WHERE id = ?").run(t.json.id);
+  await cleanupTask(db, stubHerdr, t.json.id, { exec, force: true });
+  expect(calls).toHaveLength(1);
+});
+
 // ---- empty-review gates -------------------------------------------------------------
 
 test("emit ready without evidence is held with instructions; passes once evidence exists", async () => {
