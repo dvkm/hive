@@ -13,6 +13,7 @@ export default function Learnings() {
   const [body, setBody] = useState("");
   const [project, setProject] = useState("");
   const [rootCause, setRootCause] = useState(false);
+  const [kind, setKind] = useState<"failure" | "reference">("failure");
 
   const load = () => api.learnings().then(setLearnings);
   useEffect(() => {
@@ -26,11 +27,17 @@ export default function Learnings() {
 
   const add = async () => {
     if (!title.trim() || !project) return;
-    await api.createLearning({ project_id: project, title, body, create_root_cause_task: rootCause });
+    await api.createLearning({
+      project_id: project,
+      title,
+      body,
+      kind,
+      create_root_cause_task: kind === "failure" && rootCause,
+    });
     setTitle("");
     setBody("");
     setRootCause(false);
-    toast(rootCause ? "Learning added + root-cause task queued" : "Learning added");
+    toast(kind === "reference" ? "Reference saved" : rootCause ? "Learning added + root-cause task queued" : "Learning added");
     load();
   };
 
@@ -39,15 +46,32 @@ export default function Learnings() {
     load();
   };
 
-  const active = learnings.filter((l) => l.status === "active");
-  const resolved = learnings.filter((l) => l.status === "resolved");
+  const references = learnings.filter((l) => l.kind === "reference" && l.status === "active");
+  const active = learnings.filter((l) => l.kind !== "reference" && l.status === "active");
+  const resolved = learnings.filter((l) => l.kind !== "reference" && l.status === "resolved");
 
   return (
     <div className="policies">
       <section className="panel add-policy">
-        <h2>Add learning</h2>
-        <input placeholder="Title (the failure pattern)" value={title} onChange={(e) => setTitle(e.target.value)} />
-        <textarea placeholder="What happened, how it was worked around" value={body} onChange={(e) => setBody(e.target.value)} />
+        <h2>Add {kind === "reference" ? "reference" : "learning"}</h2>
+        <div className="row">
+          <label className="ck">
+            <input type="radio" checked={kind === "failure"} onChange={() => setKind("failure")} /> failure pattern
+          </label>
+          <label className="ck">
+            <input type="radio" checked={kind === "reference"} onChange={() => setKind("reference")} /> reference fact
+          </label>
+        </div>
+        <input
+          placeholder={kind === "reference" ? "What it is (e.g. Design file)" : "Title (the failure pattern)"}
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+        />
+        <textarea
+          placeholder={kind === "reference" ? "The fact / link (pinned into every brief)" : "What happened, how it was worked around"}
+          value={body}
+          onChange={(e) => setBody(e.target.value)}
+        />
         <div className="row">
           <select value={project} onChange={(e) => setProject(e.target.value)}>
             {projects.map((p) => (
@@ -56,19 +80,24 @@ export default function Learnings() {
               </option>
             ))}
           </select>
-          <label className="ck">
-            <input type="checkbox" checked={rootCause} onChange={(e) => setRootCause(e.target.checked)} />
-            auto-create root-cause task
-          </label>
+          {kind === "failure" && (
+            <label className="ck">
+              <input type="checkbox" checked={rootCause} onChange={(e) => setRootCause(e.target.checked)} />
+              auto-create root-cause task
+            </label>
+          )}
           <button className="btn btn-primary" onClick={add}>
             Add
           </button>
         </div>
       </section>
 
-      <LearningList title="Active" items={active} projectName={projectName} onResolve={resolve} />
+      {references.length > 0 && (
+        <LearningList title="References (durable facts, pinned into briefs)" items={references} projectName={projectName} onResolve={resolve} />
+      )}
+      <LearningList title="Active failure patterns" items={active} projectName={projectName} onResolve={resolve} />
       {resolved.length > 0 && <LearningList title="Resolved" items={resolved} projectName={projectName} onResolve={resolve} />}
-      {learnings.length === 0 && <div className="muted pad">No learnings yet.</div>}
+      {learnings.length === 0 && <div className="muted pad">No learnings or references yet. Facts you save here (design files, URLs, glossary) are pinned into every agent brief.</div>}
     </div>
   );
 }
@@ -93,7 +122,7 @@ function LearningList({
           <div key={l.id} className={`policy ${l.status === "resolved" ? "policy-off" : ""}`}>
             <div className="policy-head">
               <span className="chip">{projectName(l.project_id)}</span>
-              <span className="chip learn-occ" title="occurrences">{l.occurrences}×</span>
+              {l.kind !== "reference" && <span className="chip learn-occ" title="occurrences">{l.occurrences}×</span>}
               {l.root_cause_task_id && (
                 <Link className="chip learn-link" to={`/tasks/${l.root_cause_task_id}`}>
                   root-cause task →

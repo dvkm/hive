@@ -60,6 +60,10 @@ export function eventText(e: EventLike): string {
     }
     case "answer":
       return `answered your question: ${s(p.note)}`;
+    case "ref_capture_proposed":
+      return `recurring link — save as a project reference? ${s(p.url)}`;
+    case "ref_capture_ignored":
+      return `declined to save link: ${s(p.url)}`;
     case "auto_review": {
       if (s(p.skipped)) return `pre-review skipped (${s(p.skipped)})`;
       const risks = Array.isArray(p.risks) && p.risks.length ? ` — risks: ${(p.risks as string[]).join("; ")}` : "";

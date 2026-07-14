@@ -316,6 +316,14 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       )`,
     ],
   },
+  // Learnings split into kinds: 'failure' (gotchas, occurrence-aged, brief shows
+  // 10 most recent) and 'reference' (durable project facts — design files, URLs,
+  // glossary; ALL pinned into briefs + planner, never truncated). The Figma link
+  // the planner kept asking for is a 'reference', not a rule or a failure.
+  {
+    name: "v14-learning-kind",
+    statements: [`ALTER TABLE learnings ADD COLUMN kind TEXT NOT NULL DEFAULT 'failure'`],
+  },
 ];
 
 // -------------------------------------------------------------- settings
