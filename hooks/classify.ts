@@ -198,6 +198,40 @@ function killTargetsSandboxed(cmd: string, env: Record<string, string | undefine
   });
 }
 
+// The agent's OWN per-worktree docker DB (wt.sh up creates `<slug>-mariadb`
+// where slug = the worktree directory name) is a sandbox: seeded from a dump,
+// torn down on cleanup, no shared state. Destructive SQL there is routine
+// harness work — but only when EVERY sql-client segment is a `docker exec`
+// into a container named `<own-slug>-…`. A mismatched slug (another agent's
+// stack, the human's `monorepo-mariadb`), a bare mysql, or an unresolvable
+// container token all stay gated.
+export function dockerDbTargetsSandboxed(
+  cmd: string,
+  env: Record<string, string | undefined>,
+  cwd?: string
+): boolean {
+  const m = cwd ? /\/worktrees\/[^/]+\/([A-Za-z0-9._-]+)/.exec(cwd) : null;
+  if (!m) return false;
+  const slug = m[1].toLowerCase();
+  const map = varMap(cmd, env);
+  const sqlSegs = segments(cmd).filter((s) => /\b(mysql|mariadb|psql)\b/i.test(s));
+  if (!sqlSegs.length) return false;
+  // Flags that consume the next token, so the container name is found reliably.
+  const VALUE_FLAGS = new Set(["-u", "--user", "-e", "--env", "-w", "--workdir", "--env-file", "--detach-keys"]);
+  return sqlSegs.every((seg) => {
+    const s = subst(seg.replace(/["']/g, ""), map);
+    if (/[$`]/.test(s)) return false; // unresolved substitution
+    const toks = s.trim().split(/\s+/);
+    if (toks[0] !== "docker" || toks[1] !== "exec") return false;
+    let i = 2;
+    while (i < toks.length && toks[i].startsWith("-")) {
+      i += VALUE_FLAGS.has(toks[i]) && !toks[i].includes("=") ? 2 : 1;
+    }
+    const container = toks[i]?.toLowerCase() ?? "";
+    return container.startsWith(`${slug}-`);
+  });
+}
+
 // SQL dangerous rules (DROP/DELETE/UPDATE heuristics) are waived when the only
 // SQL client in the command is sqlite3 operating on a sandboxed DB file — the
 // scratchpad-copy workflow. psql/mysql (server-backed) never waive.
@@ -311,7 +345,8 @@ export function classify(
       continue;
     if (reason === "process kill" && killTargetsSandboxed(cmd, env)) continue;
     if (reason === "force push" && forcePushOwnBranch(cmd, env)) continue;
-    if (reason.startsWith("SQL ") && sqlTargetsSandboxed(cmd, env)) continue;
+    if (reason.startsWith("SQL ") && (sqlTargetsSandboxed(cmd, env) || dockerDbTargetsSandboxed(cmd, env, cwd)))
+      continue;
     return { decision: "dangerous", reason };
   }
 
