@@ -14,6 +14,7 @@ import Review from "./views/Review";
 import Policies from "./views/Policies";
 import Monitors from "./views/Monitors";
 import Learnings from "./views/Learnings";
+import Terminals from "./views/Terminals";
 import Analytics from "./views/Analytics";
 import Projects from "./views/Projects";
 import Palette from "./views/Palette";
@@ -97,6 +98,7 @@ export default function App() {
             Review
             {reviewCount > 0 && <span className="badge">{reviewCount}</span>}
           </NavLink>
+          <NavLink to="/terminals">Terminals</NavLink>
           <NavLink to="/learnings">Learnings</NavLink>
           <button
             className={`offline-toggle ${offline ? "offline-on" : ""}`}
@@ -126,6 +128,7 @@ export default function App() {
           <Route path="/tasks/:id" element={<TaskPage />} />
           <Route path="/decisions" element={<Decisions />} />
           <Route path="/review" element={<Review />} />
+          <Route path="/terminals" element={<Terminals />} />
           <Route path="/learnings" element={<Learnings />} />
           <Route path="/analytics" element={<Analytics />} />
           <Route path="/projects" element={<Projects />} />

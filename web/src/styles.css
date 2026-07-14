@@ -3647,3 +3647,15 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
   max-height: 420px;
   overflow-y: auto;
 }
+
+/* Fleet terminals grid */
+.fleet-strip { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; align-items: center; }
+.fleet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; }
+.fleet-cell { border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: var(--panel); min-width: 0; }
+.fleet-head { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; min-width: 0; }
+.fleet-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.term-mini { max-height: 220px; font-size: 10.5px; line-height: 1.4; }
+
+/* Review CTA truthfulness */
+.review-blocked { margin-top: 8px; font-size: 12.5px; color: var(--muted, #9a9aa2); }
+.review-merge-error { margin-top: 8px; font-size: 12.5px; color: #e5484d; white-space: pre-wrap; }

@@ -246,15 +246,38 @@ export function ReviewCard({
     { files: 0, add: 0, del: 0 }
   );
 
+  const [mergeErr, setMergeErr] = useState<string>("");
+  // The CTA must not promise what the state can't deliver ("Approve & merge"
+  // on red CI / no PR was a lie that failed on click). Scouts have nothing to
+  // merge — accepting the report is the whole review.
+  const isScout = task.kind === "scout";
+  const mergeBlocked = !isScout
+    ? task.ci_status === "failing"
+      ? "CI is failing — the agent has been told to iterate; unlocks when green"
+      : task.ci_status === "pending"
+        ? "CI is still running — wait for green"
+        : !task.pr_url && !task.branch
+          ? "No PR and no branch — nothing to merge"
+          : ""
+    : "";
   const merge = async () => {
     if (busy) return;
     setBusy(true);
+    setMergeErr("");
     try {
-      await api.merge(task.id);
-      toast("Merged → Verifying");
+      if (isScout) {
+        await api.transition(task.id, "verifying");
+        toast("Report accepted");
+      } else {
+        await api.merge(task.id);
+        toast("Merged → Verifying");
+      }
       onDone?.();
     } catch (e) {
-      toast((e as Error).message);
+      // Keep the reason ON the card — a vanishing toast made failed merges
+      // read as "the button silently didn't work".
+      setMergeErr((e as Error).message);
+      toast("Not merged — see the reason on the card");
     } finally {
       setBusy(false);
     }
@@ -395,8 +418,8 @@ export function ReviewCard({
       )}
 
       <div className="review-actions">
-        <button className="btn btn-primary" onClick={merge} disabled={busy}>
-          {busy ? "Working…" : "Approve & merge"}
+        <button className="btn btn-primary" onClick={merge} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
+          {busy ? "Working…" : isScout ? "Accept report" : "Approve & merge"}
         </button>
         <button className="btn" onClick={() => setMode(mode === "changes" ? null : "changes")}>
           Request changes
@@ -405,6 +428,8 @@ export function ReviewCard({
           Reject
         </button>
       </div>
+      {mergeBlocked && <div className="review-blocked">{mergeBlocked}</div>}
+      {mergeErr && <div className="review-merge-error">Merge failed: {mergeErr}</div>}
 
       {mode && (
         <div className="review-notes">
