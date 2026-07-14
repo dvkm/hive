@@ -42,6 +42,78 @@ function PushButton() {
   );
 }
 
+// Mobile navigation: a fixed bottom tab bar (the 4 places you actually live in)
+// plus a "More" sheet for everything else. Hidden on desktop via CSS; the top
+// nav is hidden on mobile. Badges match the desktop nav.
+function MobileNav({
+  inboxCount,
+  reviewCount,
+  offline,
+  setOffline,
+}: {
+  inboxCount: number;
+  reviewCount: number;
+  offline: boolean;
+  setOffline: (v: boolean) => void;
+}) {
+  const [moreOpen, setMoreOpen] = useState(false);
+  const close = () => setMoreOpen(false);
+  const tab = (to: string, label: string, icon: string, badge = 0, end = false) => (
+    <NavLink to={to} end={end} className="mobtab" onClick={close}>
+      <span className="mobtab-icon">{icon}</span>
+      {label}
+      {badge > 0 && <span className="badge mobtab-badge">{badge}</span>}
+    </NavLink>
+  );
+  const more = [
+    ["/brief", "Brief", "📋"],
+    ["/feed", "Feed", "📡"],
+    ["/evidence", "Evidence", "🖼"],
+    ["/learnings", "Learnings", "📚"],
+    ["/analytics", "Analytics", "📊"],
+    ["/projects", "Projects", "📁"],
+    ["/policies", "Policies", "⚖️"],
+    ["/monitors", "Monitors", "❤️"],
+  ] as const;
+  return (
+    <>
+      {moreOpen && (
+        <div className="mobsheet-scrim" onClick={close}>
+          <div className="mobsheet" onClick={(e) => e.stopPropagation()}>
+            <div className="mobsheet-grid">
+              {more.map(([to, label, icon]) => (
+                <NavLink key={to} to={to} className="mobsheet-item" onClick={close}>
+                  <span className="mobsheet-icon">{icon}</span>
+                  {label}
+                </NavLink>
+              ))}
+            </div>
+            <button
+              className={`btn ${offline ? "btn-danger" : ""} mobsheet-offline`}
+              onClick={() => {
+                setOffline(!offline);
+                close();
+              }}
+            >
+              {offline ? "⏸ Offline mode is ON — tap to resume" : "Go offline (drain the fleet)"}
+            </button>
+          </div>
+        </div>
+      )}
+      <nav className="mobnav">
+        {tab("/", "Board", "▦", 0, true)}
+        {tab("/decisions", "Decisions", "◎", inboxCount)}
+        {tab("/review", "Review", "✓", reviewCount)}
+        {tab("/terminals", "Terminals", "▶")}
+        <button className={`mobtab ${moreOpen ? "active" : ""}`} onClick={() => setMoreOpen((v) => !v)}>
+          <span className="mobtab-icon">☰</span>
+          More
+        </button>
+      </nav>
+    </>
+  );
+}
+
 function ConnDot() {
   const { sse } = useStore();
   const label = sse === "open" ? "live" : sse === "connecting" ? "connecting" : "reconnecting";
@@ -143,6 +215,7 @@ export default function App() {
         <Bell />
         <ConnDot />
       </header>
+      <MobileNav inboxCount={inboxCount} reviewCount={reviewCount} offline={offline} setOffline={setOffline} />
       <main className="content">
         <Routes location={background || location}>
           <Route path="/" element={<Board />} />

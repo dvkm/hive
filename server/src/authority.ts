@@ -14,6 +14,7 @@ import type { DB } from "./db.ts";
 import { newId, now } from "./db.ts";
 import { writeEvent } from "./state.ts";
 import { createDecision } from "./api.ts";
+import { queueSteerEvent } from "./steer.ts";
 
 const GRANT_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -280,7 +281,8 @@ export function resolveGrantForDecision(
   db: DB,
   decisionId: string,
   answerKey: string,
-  clock: () => string = now
+  clock: () => string = now,
+  denyNote?: string | null
 ): boolean {
   const g = db
     .query("SELECT * FROM authority_grants WHERE decision_id = ? AND status = 'pending'")
@@ -299,7 +301,81 @@ export function resolveGrantForDecision(
       });
   } else {
     db.query("UPDATE authority_grants SET status = 'denied' WHERE id = ?").run(g.id);
+    // Tell the agent WHY, so it adapts instead of blindly retrying the same
+    // blocked command. The director's note is the reason; without one, a
+    // generic "denied, find another way".
+    if (g.task_id) {
+      const reason = denyNote?.trim();
+      queueSteerEvent(
+        db,
+        g.task_id,
+        `The director DENIED your request to run '${g.action}' (${g.target.split("\n")[0].slice(0, 100)}).` +
+          (reason ? ` Reason: ${reason}` : "") +
+          ` Do not retry the same command — take a different approach that doesn't need it, or checkpoint why you're stuck.`,
+        "queued by command deny"
+      );
+      maybeProposeDenyGuardrail(db, g);
+    }
   }
+  return true;
+}
+
+// A command category the director denies repeatedly is a standing "no" the
+// agents keep rediscovering. After the Nth deny of the same action in a project
+// (across distinct decisions), propose a global-for-the-project deny rule so it
+// never cards again — the deny mirror of "Approve & always allow".
+const DENY_GUARDRAIL_THRESHOLD = 3;
+function maybeProposeDenyGuardrail(db: DB, grant: any): void {
+  if (!grant.action?.startsWith("command.")) return;
+  const projectId = grant.task_id
+    ? (db.query("SELECT project_id FROM tasks WHERE id = ?").get(grant.task_id) as any)?.project_id
+    : null;
+  if (!projectId) return;
+  // Already gated by a rule, or a proposal already exists → nothing to do.
+  if (db.query("SELECT 1 FROM authority_rules WHERE active = 1 AND action_pattern = ? AND (project_id IS NULL OR project_id = ?)").get(grant.action, projectId))
+    return;
+  const denies = (
+    db
+      .query(
+        `SELECT COUNT(DISTINCT ag.decision_id) AS n FROM authority_grants ag
+           JOIN tasks t ON t.id = ag.task_id
+          WHERE ag.action = ? AND ag.status = 'denied' AND t.project_id = ?`
+      )
+      .get(grant.action, projectId) as any
+  ).n as number;
+  if (denies < DENY_GUARDRAIL_THRESHOLD) return;
+  const anchor = db.query("SELECT id FROM tasks WHERE project_id = ? ORDER BY created_at DESC LIMIT 1").get(projectId) as any;
+  if (!anchor) return;
+  if (db.query("SELECT 1 FROM decisions d JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ? AND d.title LIKE ? AND d.status = 'open'").get(projectId, `Always block %${grant.action}%`))
+    return;
+  createDecision(db, {
+    task_id: anchor.id,
+    title: `Always block '${grant.action}'? Denied ${denies}× in this project`,
+    context:
+      `You've denied '${grant.action}' commands ${denies} times. Approving adds a standing project rule ` +
+      `(${grant.action} → deny) so agents are blocked immediately with no card — they'll be told to find ` +
+      `another way. Revocable in Authority.`,
+    risk: "normal",
+    options: [
+      { key: "block", label: "Always block it", detail: `Add a standing deny rule for '${grant.action}'.`, recommended: true },
+      { key: "keep_asking", label: "Keep asking each time", detail: "Leave it as a per-command decision." },
+    ],
+  });
+  writeEvent(db, { task_id: anchor.id, source: "system", type: "deny_guardrail_proposed", payload: { action: grant.action, denies } });
+}
+
+// Answer hook for the deny-guardrail proposal: block → mint a project deny rule.
+export function resolveDenyGuardrailForDecision(db: DB, decisionId: string, answerKey: string): boolean {
+  const d: any = db.query("SELECT task_id, title FROM decisions WHERE id = ?").get(decisionId);
+  if (!d || !/^Always block '/.test(d.title)) return false;
+  if (answerKey !== "block") return true;
+  const action = d.title.match(/^Always block '([^']+)'/)?.[1];
+  const projectId = (db.query("SELECT project_id FROM tasks WHERE id = ?").get(d.task_id) as any)?.project_id;
+  if (!action || !projectId) return true;
+  db.query(
+    "INSERT INTO authority_rules (id, project_id, scope, action_pattern, effect, note, active, created_at) VALUES (?,?,?,?, 'deny', ?, 1, ?)"
+  ).run(newId("aur"), projectId, `project:${projectId}`, action, `Director blocked '${action}' after repeated denials`, now());
+  writeEvent(db, { task_id: d.task_id, source: "director", type: "authority_rule_added", payload: { action, effect: "deny" } });
   return true;
 }
 
