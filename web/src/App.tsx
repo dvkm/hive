@@ -3,6 +3,8 @@ import { NavLink, Route, Routes, useLocation } from "react-router-dom";
 import type { Location } from "react-router-dom";
 import { useStore } from "./lib/store";
 import { relTime } from "./lib/time";
+import { toast } from "./lib/ui";
+import { pushState, enablePush } from "./lib/push";
 import Board from "./views/Board";
 import Brief from "./views/Brief";
 import Feed from "./views/Feed";
@@ -18,6 +20,27 @@ import Terminals from "./views/Terminals";
 import Analytics from "./views/Analytics";
 import Projects from "./views/Projects";
 import Palette from "./views/Palette";
+
+// Enable web-push on this device (phone PWA). Hidden once granted or where
+// unsupported (desktop keeps the osascript notifier). iOS only offers this on
+// an installed PWA over HTTPS.
+function PushButton() {
+  const [state, setState] = useState(pushState());
+  if (state === "granted" || state === "unsupported" || state === "denied") return null;
+  return (
+    <button
+      className="offline-toggle"
+      title="Get hive decisions & answers as notifications on this device"
+      onClick={async () => {
+        const msg = await enablePush();
+        setState(pushState());
+        toast(msg);
+      }}
+    >
+      🔔 notify
+    </button>
+  );
+}
 
 function ConnDot() {
   const { sse } = useStore();
@@ -116,6 +139,7 @@ export default function App() {
           <NavLink to="/policies">Policies</NavLink>
           <NavLink to="/monitors">Monitors</NavLink>
         </nav>
+        <PushButton />
         <Bell />
         <ConnDot />
       </header>
