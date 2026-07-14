@@ -286,10 +286,12 @@ async function main() {
         project_id: flags.project,
         title: flags.title,
         body: flags.body,
+        kind: flags.kind, // "reference" = durable fact pinned into briefs; default = failure pattern
         source_task_id: flags.task,
         create_root_cause_task: !!flags["root-cause"],
       });
-      console.log(`added learning ${l.id}: ${l.title}` + (l.root_cause_task_id ? `  (root-cause task ${l.root_cause_task_id})` : ""));
+      const label = flags.kind === "reference" ? "reference" : "learning";
+      console.log(`added ${label} ${l.id}: ${l.title}` + (l.root_cause_task_id ? `  (root-cause task ${l.root_cause_task_id})` : ""));
       return;
     }
     if (sub === "list") {

@@ -18,7 +18,7 @@ import {
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
-import { recordSystemLearning, signature } from "./learn.ts";
+import { recordSystemLearning, signature, resolveRefCaptureForDecision, addReference, listReferences } from "./learn.ts";
 import {
   parseProject,
   parseTask,
@@ -1876,6 +1876,12 @@ function createLearning(db: DB, body: any): Response {
   if (!body?.title) return err("title is required");
   if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(body.project_id))
     return err("unknown project_id", 400);
+  // Reference facts route to the reference store (pinned into briefs, browsable
+  // under References), not the occurrence-aged failure ledger.
+  if (body.kind === "reference") {
+    const id = addReference(db, body.project_id, String(body.title), body.body ?? null, body.source_task_id ?? null);
+    return json(db.query("SELECT * FROM learnings WHERE id = ?").get(id), 201);
+  }
   const t = now();
   const row: any = {
     id: newId("lrn"),
@@ -2536,6 +2542,8 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): 
   resolveDuplicateForDecision(db, id, answerKey);
   // Cost-cap card → wrap-up steer, or raise the cap and keep going.
   resolveCostCapForDecision(db, id, answerKey);
+  // Recurring-link capture card → save as a project reference (label from note).
+  resolveRefCaptureForDecision(db, id, answerKey, answerNote);
   // Resume the task if it was parked on this decision. (herdr `agent send` is Phase 2.)
   const task = getTask(db, r.task_id);
   if (task && task.state === "needs_decision")

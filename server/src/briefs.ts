@@ -132,6 +132,12 @@ that cost you real time), record it so future agents see it in their briefs:
 
   hive learning add --project ${projectId} --title "one-line pattern" --body "the fix / what to know"
 
+When you discover a DURABLE PROJECT FACT the director would otherwise have to
+repeat (the design file/link, a dashboard URL, a glossary term, an env detail),
+store it as a reference — it gets pinned into every future brief and planner:
+
+  hive learning add --project ${projectId} --kind reference --title "what it is" --body "the fact / link"
+
 Mechanical failures (spawn/merge/smoke) are recorded automatically — this is
 for the things only you know you tripped on.`;
 }
@@ -254,10 +260,22 @@ export function composeBrief(db: DB, taskId: string): string {
   // protocol it MUST use before any externally-risky operation it runs itself.
   parts.push(standingAuthority(db, task.project_id, task.id));
 
-  // Known failure patterns: active learnings for the project, 10 most recent.
+  // Project reference: durable facts (design files, dashboards, glossary). All
+  // of them, pinned — these answer the questions agents/planner keep asking.
+  const references = db
+    .query("SELECT title, body FROM learnings WHERE project_id = ? AND kind = 'reference' AND status = 'active' ORDER BY first_seen")
+    .all(task.project_id) as { title: string; body: string | null }[];
+  if (references.length) {
+    parts.push(
+      "## Project reference (durable facts — do not ask for these)\n" +
+        references.map((r) => `### ${r.title}\n${r.body?.trim() || ""}`.trimEnd()).join("\n\n")
+    );
+  }
+
+  // Known failure patterns: active FAILURE learnings, 10 most recent.
   const learnings = db
     .query(
-      "SELECT title, body, occurrences FROM learnings WHERE project_id = ? AND status = 'active' ORDER BY last_seen DESC LIMIT 10"
+      "SELECT title, body, occurrences FROM learnings WHERE project_id = ? AND kind = 'failure' AND status = 'active' ORDER BY last_seen DESC LIMIT 10"
     )
     .all(task.project_id) as { title: string; body: string | null; occurrences: number }[];
   if (learnings.length) {

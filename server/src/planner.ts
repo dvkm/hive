@@ -18,6 +18,7 @@ import { broadcast } from "./bus.ts";
 import { writeEvent, getTask, transition } from "./state.ts";
 import { enqueue } from "./notifications.ts";
 import { createDecision } from "./api.ts";
+import { listReferences } from "./learn.ts";
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.HIVE_PLANNER_TIMEOUT_MS || 120_000);
 // Pinned to sonnet: a breakdown proposal is triage, not deep work, and an
@@ -105,9 +106,10 @@ export function composePlannerPrompt(db: DB, taskId: string): string {
     .all(`project:${task.project_id}`) as { title: string; body: string }[];
   const learnings = db
     .query(
-      "SELECT title, body, occurrences FROM learnings WHERE project_id = ? AND status = 'active' ORDER BY last_seen DESC LIMIT 10"
+      "SELECT title, body, occurrences FROM learnings WHERE project_id = ? AND kind = 'failure' AND status = 'active' ORDER BY last_seen DESC LIMIT 10"
     )
     .all(task.project_id) as { title: string; body: string | null; occurrences: number }[];
+  const references = listReferences(db, task.project_id);
 
   const parts: string[] = [];
   parts.push(
@@ -122,6 +124,11 @@ export function composePlannerPrompt(db: DB, taskId: string): string {
     parts.push(
       "## Active policies (the work must respect these)\n" +
         pols.map((p) => `### ${p.title}\n${p.body}`).join("\n\n")
+    );
+  if (references.length)
+    parts.push(
+      "## Project reference (durable facts — use these, do NOT ask the director for them)\n" +
+        references.map((r) => `### ${r.title}\n${r.body?.trim() || ""}`.trimEnd()).join("\n\n")
     );
   if (learnings.length)
     parts.push(
