@@ -161,6 +161,25 @@ test("agent-tooling kill downgrades to unknown; general kill stays dangerous", (
   expect(classify('kill %1; pkill -f "vite --mode dev"', env).decision).toBe("dangerous"); // pkill part unprovable
 });
 
+test("destructive SQL against the agent's OWN worktree docker DB downgrades; anything else stays dangerous", () => {
+  const env = { HOME: "/Users/david" };
+  const cwd = "/Users/david/.herdr/worktrees/monorepo/hive-abc123def456";
+  const own = 'docker exec -i hive-abc123def456-mariadb mysql -uroot -proot corebeat -e "DROP TABLE scratch_probe"';
+  expect(classify(own, env, cwd).decision).toBe("unknown"); // waived -> allow-and-log
+  // value-taking flags before the container name still resolve it
+  expect(
+    classify('docker exec -u root -e TZ=UTC hive-abc123def456-mariadb mysql corebeat -e "TRUNCATE TABLE t"', env, cwd).decision
+  ).toBe("unknown");
+  // someone ELSE's stack, the human's dev DB, or no docker at all: gated
+  expect(classify('docker exec hive-ffffffffffff-mariadb mysql -e "DROP TABLE x"', env, cwd).decision).toBe("dangerous");
+  expect(classify('docker exec monorepo-mariadb mysql -e "DROP TABLE x"', env, cwd).decision).toBe("dangerous");
+  expect(classify('mysql -h db.prod -e "DROP TABLE x"', env, cwd).decision).toBe("dangerous");
+  // unresolved container variable: not provable -> gated
+  expect(classify('docker exec "$C" mysql -e "DROP TABLE x"', env, cwd).decision).toBe("dangerous");
+  // no cwd (no worktree identity): gated
+  expect(classify(own, env).decision).toBe("dangerous");
+});
+
 test("SQL on a sandboxed sqlite copy downgrades; live/server DBs stay dangerous", () => {
   const env = { HOME: "/Users/david" };
   expect(classify('sqlite3 /tmp/claude-501/s/copy.db "update usage set cost=0"', env).decision).toBe("unknown");
