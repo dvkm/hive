@@ -218,9 +218,11 @@ function PaneTerminal({ taskId }: { taskId: string }) {
           if (!live) return;
           setText(r.text);
           setError("");
-          // Follow the tail unless the user scrolled up to read something.
-          const el = boxRef.current;
-          if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 80) el.scrollTop = el.scrollHeight;
+          // Always follow the tail — it's a live feed, not a document.
+          requestAnimationFrame(() => {
+            const el = boxRef.current;
+            if (el) el.scrollTop = el.scrollHeight;
+          });
         })
         .catch((e) => live && setError(e.message));
     tick();

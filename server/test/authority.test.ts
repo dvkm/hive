@@ -110,8 +110,11 @@ test("summary becomes the card title (truncated); detail stays in context", () =
   });
   const d: any = db.query("SELECT * FROM decisions WHERE id = ?").get(r.effect === "require_decision" ? r.decision_id : "");
   expect(d.title).toBe("Kill the stale dev server so the port frees up for the e2e run");
-  expect(d.context).toContain("command approval (dangerous): process kill");
+  // Structured command context: reason (with plain-English category explanation),
+  // the literal command, and the intent.
+  expect(d.context).toContain("Why it was gated: process kill");
   expect(d.context).toContain("pkill -f");
+  expect(d.context).toContain("Agent's stated intent: Kill the stale dev server");
 
   // long summaries truncate; missing summaries fall back to detail
   const r2 = authorize(db, {
