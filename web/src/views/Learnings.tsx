@@ -4,7 +4,7 @@ import { api } from "../lib/api";
 import type { Learning } from "../lib/api";
 import { useStore } from "../lib/store";
 import { relTime } from "../lib/time";
-import { toast } from "../lib/ui";
+import { Empty, toast } from "../lib/ui";
 
 export default function Learnings() {
   const { projects } = useStore();
@@ -68,7 +68,12 @@ export default function Learnings() {
 
       <LearningList title="Active" items={active} projectName={projectName} onResolve={resolve} />
       {resolved.length > 0 && <LearningList title="Resolved" items={resolved} projectName={projectName} onResolve={resolve} />}
-      {learnings.length === 0 && <div className="muted pad">No learnings yet.</div>}
+      {learnings.length === 0 && (
+        <Empty
+          title="No learnings yet"
+          hint="Repo landmines agents trip on land here — a build quirk, a flaky path — and get injected into future briefs so nobody pays twice."
+        />
+      )}
     </div>
   );
 }

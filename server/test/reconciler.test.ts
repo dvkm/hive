@@ -5,18 +5,20 @@ import { reconcileOnce, ciStatusOf } from "../src/reconciler.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
-function freshDb(): { db: DB; projectId: string } {
+function freshDb(config: any = {}): { db: DB; projectId: string } {
   const db = openDb(":memory:");
   const projectId = newId("proj");
-  db.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run(projectId, "p", "{}", now());
+  db.query("INSERT INTO projects (id, name, repo_path, config, created_at) VALUES (?,?,?,?,?)").run(
+    projectId, "p", "/repo", JSON.stringify(config), now()
+  );
   return { db, projectId };
 }
-function makeTask(db: DB, projectId: string, extra: Partial<{ agent_target: string; pr_url: string; state: string; ci_status: string }> = {}): string {
+function makeTask(db: DB, projectId: string, extra: Partial<{ agent_target: string; pr_url: string; state: string; ci_status: string; kind: string }> = {}): string {
   const id = newId();
   const t = now();
   db.query(
-    "INSERT INTO tasks (id, project_id, title, state, kind, agent_target, pr_url, ci_status, created_at, updated_at) VALUES (?,?,?,?, 'ship', ?, ?, ?, ?, ?)"
-  ).run(id, projectId, "t", extra.state ?? "queued", extra.agent_target ?? null, extra.pr_url ?? null, extra.ci_status ?? null, t, t);
+    "INSERT INTO tasks (id, project_id, title, state, kind, agent_target, pr_url, ci_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
+  ).run(id, projectId, "t", extra.state ?? "queued", extra.kind ?? "ship", extra.agent_target ?? null, extra.pr_url ?? null, extra.ci_status ?? null, t, t);
   return id;
 }
 const stub = (fn: (argv: string[]) => ExecResult): Exec => async (argv) => fn(argv);
@@ -61,6 +63,140 @@ test("syncPRs updates ci_status and transitions in_review->verifying on merge", 
   expect(task.ci_status).toBe("passing");
   expect(task.state).toBe("verifying");
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_merged'").all(id).length).toBe(1);
+});
+
+test("syncPRs bounces an in_review task whose CI turned red, steers once per sha", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/2", agent_target: "t-agent" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+
+  const sends: string[] = [];
+  const herdr = new Herdr(
+    stub((argv) => {
+      if (argv.includes("send")) {
+        sends.push(argv[argv.indexOf("send") + 2]);
+        return OK();
+      }
+      if (argv.includes("get")) return OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}');
+      return OK();
+    }),
+    "herdr"
+  );
+  const gh: Exec = stub((argv) => {
+    if (argv[0] === "gh")
+      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "FAILURE" }], headRefOid: "sha-red" }));
+    return OK();
+  });
+  await reconcileOnce(db, { exec: gh, herdr });
+  const task = getTask(db, id);
+  expect(task.state).toBe("in_progress"); // red is not reviewable
+  expect(task.ci_status).toBe("failing");
+  expect(sends.some((s) => s.includes("CI is FAILING"))).toBe(true);
+
+  // same sha next cycle: no re-nudge, and the task stays with the agent
+  const before = sends.length;
+  await reconcileOnce(db, { exec: gh, herdr });
+  expect(sends.length).toBe(before);
+  expect(getTask(db, id).state).toBe("in_progress");
+
+  // checks go green → promoted to review automatically
+  const ghGreen: Exec = stub((argv) => {
+    if (argv[0] === "gh")
+      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-green" }));
+    return OK();
+  });
+  await reconcileOnce(db, { exec: ghGreen, herdr });
+  expect(getTask(db, id).state).toBe("in_review");
+});
+
+test("syncPRs bounces an in_review task whose PR was closed without merging", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/3", agent_target: "t-agent" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  const gh: Exec = stub((argv) =>
+    argv[0] === "gh" ? OK(JSON.stringify({ state: "CLOSED", statusCheckRollup: [] })) : OK()
+  );
+  const herdr = new Herdr(
+    stub((argv) =>
+      argv.includes("get") ? OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}') : OK()
+    ),
+    "herdr"
+  );
+  await reconcileOnce(db, { exec: gh, herdr });
+  expect(getTask(db, id).state).toBe("in_progress");
+  const steers = db.query("SELECT payload FROM events WHERE task_id = ? AND type='steer'").all(id) as any[];
+  expect(JSON.parse(steers.at(-1).payload).message).toContain("CLOSED (not merged)");
+});
+
+test("sweepVerifying re-runs the advance and flags evidence-wedged tasks once", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { state: "queued" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  transition(db, id, "verifying");
+  db.query("UPDATE tasks SET updated_at = ? WHERE id = ?").run(new Date(Date.now() - 20 * 60 * 1000).toISOString(), id);
+
+  const { sweepVerifying } = await import("../src/reconciler.ts");
+  await sweepVerifying(db, {}); // no evidence: done gate refuses → wedged
+  expect(getTask(db, id).state).toBe("verifying");
+  let wedged = db.query("SELECT * FROM events WHERE task_id = ? AND type='verify_wedged'").all(id);
+  expect(wedged.length).toBe(1);
+  await sweepVerifying(db, {}); // no double-flag
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type='verify_wedged'").all(id).length).toBe(1);
+
+  // evidence attached → the next sweep completes the task
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    newId("evd"), id, now(), "log", "/tmp/x.log", "proof"
+  );
+  db.query("UPDATE tasks SET updated_at = ? WHERE id = ?").run(new Date(Date.now() - 20 * 60 * 1000).toISOString(), id);
+  await sweepVerifying(db, {});
+  expect(getTask(db, id).state).toBe("done");
+});
+
+test("autoMergeReady merges only opted-in, green, clean-review, uncontested tasks", async () => {
+  const { autoMergeReady } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
+  const mk = (extra: any) => {
+    const id = makeTask(db, projectId, { kind: "chore", ...extra });
+    transition(db, id, "in_progress");
+    transition(db, id, "in_review");
+    db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x' WHERE id = ?").run(id);
+    db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+      newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
+    );
+    return id;
+  };
+  const clean = mk({});
+  const risky = mk({});
+  writeEvent(db, { task_id: clean, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
+  writeEvent(db, { task_id: risky, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: ["a real risk"], questions: [] } });
+  // git merge-base/merge succeed for the local-ff path
+  const git: Exec = stub(() => OK());
+  await autoMergeReady(db, { exec: git });
+  expect(getTask(db, clean).state).toBe("done"); // merged; no smoke configured → straight through verifying
+  expect(getTask(db, risky).state).toBe("in_review"); // risks → human review
+});
+
+test("autoAnswerStale answers timed-out normal-risk cards with the recommendation, never high-risk", async () => {
+  const { autoAnswerStale } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ decision_auto_answer_hours: 4 });
+  const id = makeTask(db, projectId, {});
+  const mkDecision = (risk: string) => {
+    const did = newId("dec");
+    db.query(
+      "INSERT INTO decisions (id, task_id, ts, title, risk, options, status) VALUES (?,?,?,?,?,?, 'open')"
+    ).run(did, id, new Date(Date.now() - 5 * 3600_000).toISOString(), "t?", risk,
+      JSON.stringify([{ key: "go", label: "Go", recommended: true }, { key: "no", label: "No" }]));
+    return did;
+  };
+  const normal = mkDecision("normal");
+  const high = mkDecision("high");
+  const herdr = new Herdr(stub(() => OK()), "herdr");
+  autoAnswerStale(db, herdr, Date.now());
+  expect((db.query("SELECT status, answer_key FROM decisions WHERE id = ?").get(normal) as any).answer_key).toBe("go");
+  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(high) as any).status).toBe("open");
 });
 
 test("flagStale emits one stale event past the threshold, then stops", async () => {

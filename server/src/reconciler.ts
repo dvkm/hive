@@ -13,14 +13,15 @@ import { now, newId, evidenceDir, isOffline } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
-import { queuedSteers, markSteersDelivered } from "./steer.ts";
+import { queuedSteers, markSteersDelivered, queueSteerEvent } from "./steer.ts";
+import { isReviewed } from "./dispatcher.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
 import { recordSystemLearning } from "./learn.ts";
-import { diagnosePane, dialogAutoApprovable } from "./diagnose.ts";
-import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision } from "./api.ts";
+import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
+import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 
@@ -65,6 +66,21 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   } catch (e) {
     fail("advanceFinished", e);
   }
+  try {
+    nagOpenDecisions(db, (deps.nowMs ?? (() => Date.now()))());
+  } catch (e) {
+    fail("nagOpenDecisions", e);
+  }
+  try {
+    unparkAnswered(db, (deps.nowMs ?? (() => Date.now()))());
+  } catch (e) {
+    fail("unparkAnswered", e);
+  }
+  try {
+    remindUnreviewedIntake(db, (deps.nowMs ?? (() => Date.now()))());
+  } catch (e) {
+    fail("remindUnreviewedIntake", e);
+  }
   // Offline mode: everything above is local (herdr + sqlite) and keeps state
   // honest; everything below either needs the network (gh) or would punish
   // agents for being offline (stale flags, nudges, failure escalation). Stop here.
@@ -80,6 +96,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
     fail("linkPRs", e);
   }
   try {
+    resumeUsageLimited(db, (deps.nowMs ?? (() => Date.now()))());
+  } catch (e) {
+    fail("resumeUsageLimited", e);
+  }
+  try {
     flagStale(db, deps);
   } catch (e) {
     fail("flagStale", e);
@@ -88,6 +109,21 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
     await recoverStale(db, deps);
   } catch (e) {
     fail("recoverStale", e);
+  }
+  try {
+    await sweepVerifying(db, deps);
+  } catch (e) {
+    fail("sweepVerifying", e);
+  }
+  try {
+    await autoMergeReady(db, deps);
+  } catch (e) {
+    fail("autoMergeReady", e);
+  }
+  try {
+    autoAnswerStale(db, deps.herdr ?? defaultHerdr, (deps.nowMs ?? (() => Date.now()))());
+  } catch (e) {
+    fail("autoAnswerStale", e);
   }
 }
 
@@ -227,11 +263,16 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "ci_status", payload: { ci_status: ci } });
       broadcast({ type: "task", task: getTask(db, t.id) });
     }
-    // Time-based fallback for the link-time hand-off: a task whose PR is open
-    // but is still in_progress (pr_url set by the agent, or linked before this
-    // existed) belongs in the director's Review lane.
+    // Time-based fallback for the link-time hand-off — but review means "CI is
+    // green and the director can merge", so failing/pending checks HOLD the
+    // task in_progress (this is also what promotes a held `ready`: the moment
+    // checks pass, the task moves to review; failing checks steer the agent).
     if (String(data.state).toUpperCase() === "OPEN" && t.state === "in_progress") {
-      if (handOffToReview(db, t.id, "reconciler")) broadcast({ type: "task", task: getTask(db, t.id) });
+      if (ci === "failing") {
+        await nudgeCiFailure(db, h, t, data.headRefOid ?? null);
+      } else if (ci !== "pending") {
+        if (handOffToReview(db, t.id, "reconciler")) broadcast({ type: "task", task: getTask(db, t.id) });
+      }
     }
     if (String(data.state).toUpperCase() === "MERGED" && t.state === "in_review") {
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_merged", payload: { pr_url: t.pr_url } });
@@ -242,10 +283,69 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       } catch (e) {
         console.error(`[hive] smoke run failed for ${t.id}:`, e);
       }
+    } else if (String(data.state).toUpperCase() === "CLOSED" && t.state === "in_review") {
+      // Closed-not-merged: nothing reviewable exists. Self-heal instead of
+      // waiting for the director to discover it via a failed merge click.
+      writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_closed", payload: { pr_url: t.pr_url } });
+      queueSteerEvent(
+        db,
+        t.id,
+        `Your PR ${t.pr_url} is CLOSED (not merged), so this task has nothing to review. If you replaced it, ` +
+          `emit ready with the new PR url (that re-links the task); otherwise reopen or recreate the PR.`,
+        "queued by closed-PR bounce"
+      );
+      transition(db, t.id, "in_progress", { source: "reconciler", reason: "PR closed without merging — returned to the agent" });
+      broadcast({ type: "task", task: getTask(db, t.id) });
+    } else if (ci === "failing" && t.state === "in_review") {
+      // Checks went red AFTER the handoff: red is not reviewable. Send it back
+      // to the agent to iterate; it returns automatically when green.
+      await nudgeCiFailure(db, h, t, data.headRefOid ?? null);
+      transition(db, t.id, "in_progress", { source: "reconciler", reason: "CI failing — returned to the agent to iterate" });
+      broadcast({ type: "task", task: getTask(db, t.id) });
     } else if (String(data.mergeable).toUpperCase() === "CONFLICTING") {
       await nudgeConflict(db, h, t, data.headRefOid ?? null);
     }
   }
+}
+
+// Failing checks put the AGENT back to work — one nudge per pushed head SHA
+// (same dedupe discipline as nudgeConflict), so a red run never spams but a
+// push that still fails re-nudges.
+async function nudgeCiFailure(
+  db: DB,
+  h: Herdr,
+  t: { id: string; pr_url: string; agent_target: string | null },
+  headSha: string | null
+): Promise<void> {
+  const last = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'ci_failure' ORDER BY ts DESC LIMIT 1")
+    .get(t.id) as { payload: string } | undefined;
+  if (last) {
+    try {
+      if ((JSON.parse(last.payload).head_sha ?? null) === headSha) return;
+    } catch {}
+  }
+  let delivered = false;
+  let error: string | null = null;
+  if (t.agent_target) {
+    try {
+      const r = await h.send(
+        t.agent_target,
+        `hive: CI is FAILING on your PR ${t.pr_url}. Run \`gh pr checks ${t.pr_url}\` to see the failures, fix them, and push. ` +
+          `The task returns to review automatically when checks pass — do not emit ready while CI is red.`
+      );
+      error = sendFailure(r);
+      delivered = error === null;
+    } catch (e: any) {
+      error = String(e?.message ?? e);
+    }
+  }
+  writeEvent(db, {
+    task_id: t.id,
+    source: "reconciler",
+    type: "ci_failure",
+    payload: { pr_url: t.pr_url, head_sha: headSha, delivered, ...(error ? { error } : {}) },
+  });
 }
 
 // ---- PR conflict watchdog ----
@@ -341,6 +441,240 @@ export function ciStatusOf(rollup: any): string | null {
 }
 
 // ---- stale detection ----
+// Open decisions age badly: median answer latency was 2.5h and 22 of 95 cards
+// expired unanswered, each stranding whatever waited on it. The first
+// notification rides createDecision; this escalates — an URGENT re-notify (macOS
+// push) at 15m and again at 60m, keyed off prior decision_nag rows so each tier
+// fires once. Exported for tests.
+const NAG_TIERS_MS = [15 * 60 * 1000, 60 * 60 * 1000];
+
+export function nagOpenDecisions(db: DB, nowMs: number = Date.now()): void {
+  const open = db
+    .query("SELECT id, task_id, ts, title FROM decisions WHERE status = 'open'")
+    .all() as { id: string; task_id: string; ts: string; title: string }[];
+  for (const d of open) {
+    const age = nowMs - Date.parse(d.ts);
+    const due = NAG_TIERS_MS.filter((t) => age >= t).length;
+    if (!due) continue;
+    const sent = (
+      db.query("SELECT COUNT(*) AS n FROM notifications WHERE kind = 'decision_nag' AND decision_id = ?").get(d.id) as any
+    ).n as number;
+    if (sent >= due) continue;
+    const mins = Math.round(age / 60000);
+    enqueue(db, {
+      kind: "decision_nag",
+      urgency: "urgent",
+      task_id: d.task_id,
+      decision_id: d.id,
+      title: `Decision waiting ${mins >= 60 ? `${Math.round(mins / 60)}h` : `${mins}m`}: ${d.title}`,
+      body: "An agent may be parked on this. Answer or dismiss it.",
+    });
+  }
+}
+
+// Auto-merge: the director's review click is predictable when EVERYTHING
+// already says yes — CI green, the auto-reviewer found no risks and no
+// questions, evidence attached, no changes ever requested. For task kinds a
+// project opts into (config.auto_merge = {kinds: ["chore", ...]}), merge
+// those without waiting. Anything contested (caution verdict, risks, red CI,
+// a changes_requested in history) still parks for the human. A notification
+// reports every auto-merge; the existing verifying/smoke gates still run.
+export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise<void> {
+  const h = deps.herdr ?? defaultHerdr;
+  const rows = db
+    .query(
+      `SELECT t.id, t.number, t.title, t.kind, p.config FROM tasks t JOIN projects p ON p.id = t.project_id
+        WHERE t.state = 'in_review' AND t.ci_status = 'passing'`
+    )
+    .all() as { id: string; number: number; title: string; kind: string; config: string }[];
+  for (const r of rows) {
+    let kinds: string[] = [];
+    try {
+      const c = JSON.parse(r.config ?? "{}");
+      kinds = Array.isArray(c.auto_merge?.kinds) ? c.auto_merge.kinds : [];
+    } catch {
+      continue;
+    }
+    if (!kinds.includes(r.kind)) continue;
+    const review: any = db
+      .query("SELECT payload FROM events WHERE task_id = ? AND type = 'auto_review' ORDER BY ts DESC LIMIT 1")
+      .get(r.id);
+    if (!review) continue; // no pre-review yet — wait for it
+    let verdict: any;
+    try {
+      verdict = JSON.parse(review.payload);
+    } catch {
+      continue;
+    }
+    if (verdict.skipped || verdict.verdict !== "looks_good" || verdict.risks?.length || verdict.questions?.length)
+      continue;
+    const contested = db
+      .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'changes_requested' LIMIT 1")
+      .get(r.id);
+    if (contested) continue; // a human pushed back once — never auto-merge this task
+    const evidence = (db.query("SELECT COUNT(*) n FROM evidence WHERE task_id = ?").get(r.id) as any).n;
+    if (!evidence) continue;
+    try {
+      const res = await mergeTask(db, h, r.id, {}, { exec: deps.exec });
+      const ok = res.status === 200;
+      writeEvent(db, { task_id: r.id, source: "reconciler", type: "auto_merged", payload: { ok, status: res.status } });
+      if (ok)
+        enqueue(db, {
+          kind: "auto_merged",
+          task_id: r.id,
+          title: `Auto-merged #${r.number}: ${r.title.slice(0, 70)}`,
+          body: "Green CI, clean pre-review, evidence attached. Now verifying.",
+        });
+    } catch (e) {
+      writeEvent(db, { task_id: r.id, source: "reconciler", type: "auto_merged", payload: { ok: false, error: String((e as any)?.message ?? e) } });
+    }
+  }
+}
+
+// Auto-answer: a decision card that sits past the project's timeout
+// (config.decision_auto_answer_hours, off unless set) and carries a
+// RECOMMENDED option gets answered with that recommendation — except
+// risk='high' cards (authority/prod), which always wait for the human.
+// The notification names what was chosen, so silence is informed consent,
+// not surprise.
+export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()): void {
+  const rows = db
+    .query(
+      `SELECT d.id, d.task_id, d.ts, d.title, d.options, p.config FROM decisions d
+         JOIN tasks t ON t.id = d.task_id JOIN projects p ON p.id = t.project_id
+        WHERE d.status = 'open' AND COALESCE(d.risk, 'normal') != 'high'`
+    )
+    .all() as { id: string; task_id: string; ts: string; title: string; options: string; config: string }[];
+  for (const r of rows) {
+    let hours = 0;
+    try {
+      hours = Number(JSON.parse(r.config ?? "{}").decision_auto_answer_hours) || 0;
+    } catch {
+      continue;
+    }
+    if (hours <= 0) continue;
+    if (nowMs - Date.parse(r.ts) < hours * 3600_000) continue;
+    let rec: any;
+    try {
+      rec = JSON.parse(r.options || "[]").find((o: any) => o.recommended);
+    } catch {
+      continue;
+    }
+    if (!rec?.key) continue;
+    apiAnswerDecision(db, herdr, r.id, {
+      answer_key: rec.key,
+      answer_note: `auto-answered with the recommended option after ${hours}h (project timeout policy — set decision_auto_answer_hours to 0 to disable)`,
+    });
+    enqueue(db, {
+      kind: "auto_answered",
+      task_id: r.task_id,
+      decision_id: r.id,
+      title: `Auto-answered "${rec.label ?? rec.key}": ${r.title.slice(0, 70)}`,
+      body: `Open ${hours}h with a recommendation and no reply.`,
+    });
+  }
+}
+
+// Verifying watchdog: a task enters `verifying` exactly once (merge time) and
+// smoke runs exactly once — a crash, restart, or the silent evidence-gate catch
+// in smokeThenAdvance leaves it wedged forever with no signal. Sweep: re-run
+// the advance for any verifying task idle past the threshold; if it STILL
+// won't advance (the done gate wants evidence), steer the agent to attach it
+// and tell the director once.
+const VERIFY_WEDGE_MS = 15 * 60 * 1000;
+
+export async function sweepVerifying(db: DB, deps: ReconcilerDeps = {}): Promise<void> {
+  const nowMs = (deps.nowMs ?? (() => Date.now()))();
+  const rows = db
+    .query("SELECT id, title, updated_at FROM tasks WHERE state = 'verifying'")
+    .all() as { id: string; title: string; updated_at: string }[];
+  for (const r of rows) {
+    if (nowMs - Date.parse(r.updated_at) < VERIFY_WEDGE_MS) continue;
+    try {
+      await smokeThenAdvance(db, r.id, deps.smoke ?? {});
+    } catch (e) {
+      console.error(`[hive] verify sweep ${r.id}:`, e);
+    }
+    const after = getTask(db, r.id);
+    if (after?.state !== "verifying") {
+      broadcast({ type: "task", task: after });
+      continue;
+    }
+    const already = db
+      .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'verify_wedged' LIMIT 1")
+      .get(r.id);
+    if (already) continue;
+    writeEvent(db, { task_id: r.id, source: "reconciler", type: "verify_wedged", payload: {} });
+    queueSteerEvent(
+      db,
+      r.id,
+      "Your task is merged but WEDGED in verifying: the done gate needs at least one evidence item and " +
+        "none is attached. Attach proof of the shipped behavior (screenshot/test output/log) with " +
+        "`hive emit <task-id> evidence --file ... --note ...` — the task completes automatically after.",
+      "queued by verify sweep"
+    );
+    enqueue(db, { kind: "stale", task_id: r.id, title: `Wedged in verifying (needs evidence): ${r.title}` });
+  }
+}
+
+// Intake tasks wait for the director's review before dispatch — correct, but a
+// forgotten one rots in `queued` invisibly. One reminder after a day.
+const INTAKE_REMINDER_MS = 24 * 60 * 60 * 1000;
+
+export function remindUnreviewedIntake(db: DB, nowMs: number = Date.now()): void {
+  const rows = db
+    .query(
+      `SELECT id, title, created_at FROM tasks
+        WHERE state = 'queued' AND source LIKE 'intake_%'
+          AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.task_id = tasks.id AND n.kind = 'intake_unreviewed')`
+    )
+    .all() as { id: string; title: string; created_at: string }[];
+  for (const r of rows) {
+    if (nowMs - Date.parse(r.created_at) < INTAKE_REMINDER_MS) continue;
+    if (isReviewed(db, r.id)) continue;
+    enqueue(db, {
+      kind: "intake_unreviewed",
+      task_id: r.id,
+      title: `Intake waiting on review for 24h+: ${r.title.slice(0, 70)}`,
+      body: "It will never dispatch until reviewed (or cancelled).",
+    });
+  }
+}
+
+// A task parked in needs_decision with NOTHING open to answer is stuck forever
+// and eats a dispatch slot (needs_decision counts as working): task #96 re-
+// parked itself 16 minutes AFTER its card was answered, and the unpark that
+// rides apiAnswerDecision had already fired into the void. The grace period
+// covers the legitimate emit-needs-decision-then-open-card ordering. Exported
+// for tests.
+const UNPARK_GRACE_MS = 3 * 60 * 1000;
+
+export function unparkAnswered(db: DB, nowMs: number = Date.now()): void {
+  const rows = db
+    .query(
+      `SELECT t.id, t.updated_at FROM tasks t
+        WHERE t.state = 'needs_decision'
+          AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.task_id = t.id AND d.status = 'open')`
+    )
+    .all() as { id: string; updated_at: string }[];
+  for (const r of rows) {
+    if (nowMs - Date.parse(r.updated_at) < UNPARK_GRACE_MS) continue;
+    transition(db, r.id, "in_progress", {
+      source: "reconciler",
+      reason: "needs_decision with no open decision card — unparked",
+    });
+    queueSteerEvent(
+      db,
+      r.id,
+      "You are parked in needs_decision but there is NO open decision card — everything you asked was " +
+        "already answered (or expired). Read the answers in your task feed, act on them, and move the " +
+        "task forward: emit ready (or done with evidence). If you truly need a decision, open a real card.",
+      "queued by needs_decision unpark"
+    );
+    broadcast({ type: "task", task: getTask(db, r.id) });
+  }
+}
+
 function flagStale(db: DB, deps: ReconcilerDeps): void {
   const staleMs = deps.staleMs ?? DEFAULT_STALE_MS;
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
@@ -369,7 +703,13 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
         payload: { silent_ms: age, threshold_ms: staleMs },
       });
       const task = getTask(db, t.id);
-      enqueue(db, { kind: "stale", task_id: t.id, title: `Task stale: ${task?.title ?? t.id}` });
+      // A task can re-stale every cycle-plus-nudge round trip; the same title
+      // notified 8× in a day (seen live). One stale notification per task per
+      // 24h — the event log above still records every occurrence.
+      const recent = db
+        .query("SELECT 1 FROM notifications WHERE kind = 'stale' AND task_id = ? AND ts > ? LIMIT 1")
+        .get(t.id, new Date(nowMs - 24 * 60 * 60 * 1000).toISOString());
+      if (!recent) enqueue(db, { kind: "stale", task_id: t.id, title: `Task stale: ${task?.title ?? t.id}` });
     }
   }
 }
@@ -476,6 +816,54 @@ async function reclaimDeadWorktree(db: DB, h: Herdr, task: any): Promise<void> {
   }
 }
 
+// A usage-limited session is a hard wall with a printed reset time: nudging it
+// re-triggers the same "hit your session limit" reply (one task burned 4 nudges
+// over 47 minutes, then sat ~19h until a manual redispatch — the reset was 7
+// minutes after the last nudge). Park it once with the parsed resume time;
+// resumeUsageLimited() queues the wake-up steer when the clock passes.
+function recoverUsageLimit(db: DB, task: any, excerpt: string): void {
+  const open = db
+    .query(
+      `SELECT 1 FROM events WHERE task_id = ? AND type = 'usage_limit'
+        AND ts > COALESCE((SELECT MAX(ts) FROM events WHERE task_id = ? AND type = 'usage_limit_resumed'), '')
+        LIMIT 1`
+    )
+    .get(task.id, task.id);
+  if (open) return; // already parked on this limit window; stay quiet
+  const resumeAt = parseResetClock(excerpt, Date.now()) ?? new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  writeEvent(db, {
+    task_id: task.id,
+    source: "reconciler",
+    type: "usage_limit",
+    payload: { resume_at: resumeAt, excerpt: excerpt.slice(0, 300) },
+  });
+}
+
+// The wake-up half: once a parked task's resume_at passes, queue a steer (the
+// drain/respawn machinery delivers it) and mark the window resumed. A session
+// answers normally again after its reset — observed live, task #105.
+export function resumeUsageLimited(db: DB, nowMs: number = Date.now()): void {
+  const rows = db
+    .query(
+      `SELECT e.task_id, MAX(e.ts) AS ts, json_extract(e.payload, '$.resume_at') AS resume_at
+         FROM events e JOIN tasks t ON t.id = e.task_id
+        WHERE e.type = 'usage_limit' AND t.state IN ('in_progress', 'needs_decision')
+          AND e.ts > COALESCE((SELECT MAX(ts) FROM events WHERE task_id = e.task_id AND type = 'usage_limit_resumed'), '')
+        GROUP BY e.task_id`
+    )
+    .all() as { task_id: string; resume_at: string | null }[];
+  for (const r of rows) {
+    if (!r.resume_at || Date.parse(r.resume_at) > nowMs) continue;
+    queueSteerEvent(
+      db,
+      r.task_id,
+      "Your usage-limit window has reset — you are unblocked. Re-read your last few steps, emit a status note, and continue the task.",
+      "queued by usage-limit resume"
+    );
+    writeEvent(db, { task_id: r.task_id, source: "reconciler", type: "usage_limit_resumed", payload: { resume_at: r.resume_at } });
+  }
+}
+
 async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string): Promise<void> {
   const task = getTask(db, taskId);
   if (!task || TERMINAL.includes(task.state as State)) return;
@@ -487,6 +875,7 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string): 
   if (diag?.kind === "blocked_dialog") return handleBlockedAgent(db, h, taskId, target);
   if (diag?.kind === "auth_lost") return recoverAuthLost(db, task, diag.excerpt, tail);
   if (diag?.kind === "context_full") return recoverContextFull(db, task, tail);
+  if (diag?.kind === "usage_limit") return recoverUsageLimit(db, task, diag.excerpt);
   if (diag?.kind === "api_error") {
     // Transient (rate limit / network / overload): extend patience instead of
     // burning a nudge — this event resets the silence clock for one threshold.

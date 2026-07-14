@@ -290,3 +290,60 @@ test("guarded-action: deny rule → 403, never passes", async () => {
   expect(r.status).toBe(403);
   expect(r.json.effect).toBe("deny");
 });
+
+// ---------------------------------------------------------------- approve_always
+test("gated commands offer approve_always; answering it mints a standing project rule", () => {
+  const { db, taskId, projectId } = freshDb();
+  const input = { project_id: projectId, action: "command.dangerous.process-kill", target: "pkill -f 'vite --mode dev'", task_id: taskId };
+  const r = authorize(db, input);
+  expect(r.effect).toBe("require_decision");
+  const decisionId = r.effect === "require_decision" ? r.decision_id : "";
+  const d: any = db.query("SELECT * FROM decisions WHERE id = ?").get(decisionId);
+  expect(JSON.parse(d.options).some((o: any) => o.key === "approve_always")).toBe(true);
+
+  resolveGrantForDecision(db, decisionId, "approve_always");
+  // the parked retry passes (single-use grant, same as plain approve)
+  expect(authorize(db, input).effect).toBe("allow");
+  // a DIFFERENT command in the same category now passes via the standing rule
+  const other = authorize(db, { ...input, target: "pkill -f chrome" });
+  expect(other.effect).toBe("allow");
+  // the rule is project-scoped allow on the exact category action
+  const rule: any = db.query("SELECT * FROM authority_rules WHERE action_pattern = ?").get("command.dangerous.process-kill");
+  expect(rule.project_id).toBe(projectId);
+  expect(rule.effect).toBe("allow");
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'authority_rule_minted'").all(taskId).length).toBe(1);
+});
+
+test("approve_always is idempotent across two parked cards of the same category", () => {
+  const { db, taskId, projectId } = freshDb();
+  const base = { project_id: projectId, action: "command.dangerous.recursive-forced-rm", task_id: taskId };
+  const r1 = authorize(db, { ...base, target: "rm -rf /srv/a" });
+  const r2 = authorize(db, { ...base, target: "rm -rf /srv/b" }); // different target → its own card
+  const d1 = r1.effect === "require_decision" ? r1.decision_id : "";
+  const d2 = r2.effect === "require_decision" ? r2.decision_id : "";
+  expect(d1).not.toBe(d2);
+  resolveGrantForDecision(db, d1, "approve_always");
+  resolveGrantForDecision(db, d2, "approve_always");
+  const n = (db.query("SELECT COUNT(*) AS n FROM authority_rules WHERE action_pattern = ?").get("command.dangerous.recursive-forced-rm") as any).n;
+  expect(n).toBe(1);
+});
+
+test("non-command actions do NOT offer approve_always", () => {
+  const { db, taskId, projectId } = freshDb();
+  addRule(db, { project_id: projectId, action_pattern: "deploy.prod*", effect: "require_decision" });
+  const r = authorize(db, { project_id: projectId, action: "deploy.prod", target: "acme-web", task_id: taskId });
+  const decisionId = r.effect === "require_decision" ? r.decision_id : "";
+  const d: any = db.query("SELECT * FROM decisions WHERE id = ?").get(decisionId);
+  expect(JSON.parse(d.options).some((o: any) => o.key === "approve_always")).toBe(false);
+});
+
+test("plain approve never mints a rule (single-use only)", () => {
+  const { db, taskId, projectId } = freshDb();
+  const input = { project_id: projectId, action: "command.dangerous.process-kill", target: "pkill -f x", task_id: taskId };
+  const r = authorize(db, input);
+  resolveGrantForDecision(db, r.effect === "require_decision" ? r.decision_id : "", "approve");
+  expect(authorize(db, input).effect).toBe("allow"); // grant consumed
+  const again = authorize(db, input); // same command again → cards again
+  expect(again.effect).toBe("require_decision");
+  expect(db.query("SELECT COUNT(*) AS n FROM authority_rules").get() as any).toEqual({ n: 0 });
+});

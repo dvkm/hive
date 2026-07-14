@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
-import { api } from "./api";
+import { api, apiToken } from "./api";
 import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Checkpoint } from "./api";
 
 export type SseState = "connecting" | "open" | "reconnecting";
@@ -91,7 +91,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     let es: EventSource;
     let closed = false;
     const connect = () => {
-      es = new EventSource(BASE + "/api/stream");
+      // EventSource cannot set headers; remote (token-gated) access rides the
+      // query param the server accepts for exactly this reason.
+      const token = apiToken();
+      es = new EventSource(BASE + "/api/stream" + (token ? `?token=${encodeURIComponent(token)}` : ""));
       es.onopen = () => setSse("open");
       es.onerror = () => {
         if (!closed) setSse("reconnecting");

@@ -7,6 +7,7 @@ import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
 import { eventText, eventCategory, FEED_CATEGORIES } from "../lib/eventText";
 import type { FeedCategory } from "../lib/eventText";
+import { Empty } from "../lib/ui";
 
 const LAST_SEEN_KEY = "hive.feed.lastSeen";
 const ALL_CATS = new Set<FeedCategory>(FEED_CATEGORIES.map((c) => c.key));
@@ -180,10 +181,10 @@ export default function Feed() {
       </div>
 
       {rows.length === 0 && (
-        <div className="empty">
-          <div className="empty-big">Nothing to catch up on</div>
-          <div className="muted">No activity matches these filters.</div>
-        </div>
+        <Empty
+          title="Nothing to catch up on"
+          hint="This is every event agents emit — status, evidence, decisions, merges. If you expected something here, widen the filters above."
+        />
       )}
 
       <div className="feed-list">

@@ -7,6 +7,8 @@ import { startReaper } from "./reaper.ts";
 import { checkAllMonitors } from "./monitors.ts";
 import { startDigest, setNotifier } from "./notifications.ts";
 import { startGchatPoll } from "./intake/gchat.ts";
+import { startWatchers } from "./watch.ts";
+import { startAutoReviewer } from "./reviewer.ts";
 import { startPromoter } from "./promoter.ts";
 import { setTerminalHook, expireOrphanedDecisions } from "./state.ts";
 import { bootstrapAuthority } from "./authority.ts";
@@ -28,8 +30,18 @@ if (seeded) console.log(`[hive] bootstrapped ${seeded} standing authority rule(s
 const orphaned = expireOrphanedDecisions(db);
 if (orphaned) console.log(`[hive] expired ${orphaned} orphaned open decision(s) on terminal tasks`);
 
+// Mint the remote API token once (phones/tablets present it; loopback never
+// needs it). Shown by `hive remote`.
+{
+  const { getSetting, setSetting } = await import("./db.ts");
+  if (!getSetting(db, "api_token"))
+    setSetting(db, "api_token", new Bun.CryptoHasher("sha256").update(crypto.randomUUID()).digest("hex").slice(0, 32));
+}
+
+// HIVE_BIND=0.0.0.0 exposes the server on the LAN (token-gated). Plain HTTP:
+// fine for a home LAN or a Tailscale interface, not for untrusted networks.
 const server = Bun.serve({
-  hostname: "127.0.0.1",
+  hostname: process.env.HIVE_BIND || "127.0.0.1",
   port,
   idleTimeout: 0, // keep SSE connections open
   fetch: handle,
@@ -67,6 +79,15 @@ startDigest(db);
 // Google Chat intake: poll allowlisted spaces (per-project config.gchat_spaces)
 // and draft tasks from stakeholder messages. Hard no-op until configured.
 startGchatPoll(db);
+
+// Watchers: poll configured docs/pages (per-project config.watchers) and queue
+// an act-on-change task carrying the diff. Hard no-op until configured.
+startWatchers(db);
+
+// Auto-reviewer: pre-review every task that reaches in_review (sonnet one-shot
+// over the PR diff) and post the result onto the review card. Opt-out per
+// project: config.auto_review = false.
+startAutoReviewer(db);
 
 // Continuous promotion evaluator: projects with config.promote {from, to} get
 // an evaluation task queued whenever `from` moves ahead of `to`. No-op otherwise.

@@ -25,6 +25,9 @@ import {
   parseAgentStatus,
   paneSendKeysArgv,
   parsePaneId,
+  parseStaleAgentRef,
+  isAgentNameTakenError,
+  isWorktreeBusyError,
 } from "../src/runtime/herdr.ts";
 
 // A recording stub: canned results per matched argv, records every call.
@@ -47,7 +50,7 @@ test("argv builders construct the documented herdr commands", () => {
   expect(worktreeCreateArgv("/repo", "hive/abc", "main")).toContain("--base");
 
   // INTERACTIVE claude: the brief is claude's first prompt arg, never `-p`.
-  expect(defaultAgentArgv("do the thing")).toEqual(["claude", "do the thing", "--permission-mode", "acceptEdits"]);
+  expect(defaultAgentArgv("do the thing")).toEqual(["claude", "do the thing", "--permission-mode", "auto"]);
 
   // Fleet workspace + labelled tab builders (JSON is default; no --json flag).
   expect(workspaceListArgv()).toEqual(["workspace", "list"]);
@@ -162,7 +165,7 @@ test("spawn builds the visible interactive fleet: worktree, fleet workspace, lab
   expect(start).toContain("--workspace");
   expect(start).toContain("wF:t2");
   expect(start).toContain("TOKEN=sekret");
-  expect(start.slice(start.indexOf("--") + 1)).toEqual(["claude", "Fix the bug. Definition of done: ...", "--permission-mode", "acceptEdits"]);
+  expect(start.slice(start.indexOf("--") + 1)).toEqual(["claude", "Fix the bug. Definition of done: ...", "--permission-mode", "auto"]);
   expect(start).not.toContain("-p");
   // does NOT rename the agent: rename breaks agent_target resolution (verified
   // live), so the tab label carries the "id + title", not the agent name.
@@ -384,3 +387,72 @@ test("reclaim refuses to touch a directory git does not track as a worktree", as
   expect(r).toEqual({ reclaimed: false, ghost_branch: null, path: WT, reason: "no registered worktree to reclaim" });
   expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(false);
 });
+
+test("defaultAgentArgv pins the model when one is given", () => {
+  expect(defaultAgentArgv("b", "sonnet")).toEqual(["claude", "b", "--permission-mode", "auto", "--model", "sonnet"]);
+  expect(defaultAgentArgv("b")).toEqual(["claude", "b", "--permission-mode", "auto"]); // unpinned stays unpinned
+});
+
+test("spawn passes SpawnArgs.model into the interactive claude argv", async () => {
+  const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x));
+  const { exec, calls } = stubExec((argv) => {
+    if (has(argv, "worktree", "create")) return OK('{"result":{"worktree":{"path":"/wt/m","branch":"hive/m","open_workspace_id":"w1"}}}');
+    if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
+    if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t3"}}}');
+    return OK("started");
+  });
+  const h = new Herdr(exec, "herdr");
+  await h.spawn({ taskId: "m", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b", model: "opus" });
+  const start = calls.find((c) => has(c, "agent", "start"))!;
+  expect(start.slice(start.indexOf("--") + 1)).toEqual(["claude", "b", "--permission-mode", "auto", "--model", "opus"]);
+});
+
+test("agent_name_taken error parsing", () => {
+  const body = '{"error":{"code":"agent_name_taken","message":"agent name x is already used; candidates: terminal_id=term_1 pane_id=wR:p7X workspace_id=wR tab_id=wR:t40 cwd=/x"}}';
+  expect(isAgentNameTakenError({ code: 1, stdout: "", stderr: body })).toBe(true);
+  expect(isAgentNameTakenError({ code: 1, stdout: "", stderr: "boom" })).toBe(false);
+  expect(parseStaleAgentRef(body)).toEqual({ tabId: "wR:t40", paneId: "wR:p7X" });
+  expect(parseStaleAgentRef("no ids here")).toEqual({ tabId: null, paneId: null });
+});
+
+test("spawn closes the stale agent's tab and retries once on agent_name_taken", async () => {
+  const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x));
+  let starts = 0;
+  const { exec, calls } = stubExec((argv) => {
+    if (has(argv, "worktree", "create")) return OK('{"result":{"worktree":{"path":"/wt/x","branch":"hive/x","open_workspace_id":"w1"}}}');
+    if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
+    if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t9"}}}');
+    if (has(argv, "agent", "start")) {
+      starts++;
+      if (starts === 1)
+        return FAIL('{"error":{"code":"agent_name_taken","message":"agent name x is already used; candidates: terminal_id=term_1 pane_id=wR:p7X workspace_id=wR tab_id=wR:t40 cwd=/x"}}');
+      return OK("started");
+    }
+    return OK();
+  });
+  const h = new Herdr(exec, "herdr");
+  const res = await h.spawn({ taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b" });
+  expect(res.agent_target).toBe("x");
+  expect(starts).toBe(2);
+  expect(calls.some((c) => has(c, "tab", "close", "wR:t40"))).toBe(true);
+});
+
+test("spawn retries once when herdr's worktree op lock is busy", async () => {
+  const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x));
+  let creates = 0;
+  const { exec } = stubExec((argv) => {
+    if (has(argv, "worktree", "create")) {
+      creates++;
+      if (creates === 1) return FAIL('{"error":{"code":"worktree_operation_in_progress","message":"worktree operation is already in progress"}}');
+      return OK('{"result":{"worktree":{"path":"/wt/y","branch":"hive/y","open_workspace_id":"w1"}}}');
+    }
+    if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
+    if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t4"}}}');
+    return OK("started");
+  });
+  const h = new Herdr(exec, "herdr");
+  const res = await h.spawn({ taskId: "y", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b" });
+  expect(res.worktree_path).toBe("/wt/y");
+  expect(creates).toBe(2);
+  expect(isWorktreeBusyError({ code: 1, stdout: "", stderr: "boom" })).toBe(false);
+}, 10_000);

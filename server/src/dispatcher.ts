@@ -27,7 +27,12 @@ import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
 
-const DISPATCH_KINDS_DEFAULT = ["ship", "scout"];
+// Chores included since 2026-07-12: the queue sat at 10 tasks / 1 live agent
+// because 9 were agent-filed follow-up FIXES tagged chore — "chores are titled
+// for a human" stopped being true once agents started fanning out work. The
+// guards that matter stay: auto_dispatch opt-in, intake review, max_agents,
+// authority. Exclude chores per project via config.dispatch_kinds if needed.
+const DISPATCH_KINDS_DEFAULT = ["ship", "scout", "chore"];
 const MAX_AGENTS_DEFAULT = 3;
 const BACKOFF_BASE_MS = 30_000;
 const BACKOFF_CAP_MS = 30 * 60 * 1000;
@@ -90,7 +95,11 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
       if (cfg.auto_dispatch !== true) continue; // opt-in only
 
       const kinds = Array.isArray(cfg.dispatch_kinds) ? cfg.dispatch_kinds : DISPATCH_KINDS_DEFAULT;
-      if (!kinds.includes(task.kind)) continue; // chore / human-titled tasks excluded
+      // A requeue is recovery for work already dispatched once (auto-requeue on
+      // context-full/death, or the director's recovery card) — excluding chores
+      // here stranded every requeued braindump in 'queued' forever ("failed —
+      // awaiting triage" with a successor nobody spawns, task #135).
+      if (!kinds.includes(task.kind) && task.source !== "requeue") continue; // chore / human-titled tasks excluded
 
       if (task.source?.startsWith("intake_") && !isReviewed(db, task.id)) continue; // unreviewed intake
       if (task.source === "external") continue; // tracking-only: another agent's kanban entry, never spawned

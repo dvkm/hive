@@ -31,6 +31,12 @@ Usage:
   hive learning list [--project <id>] [--status active|resolved]
   hive learning recur <learning-id>
   hive spawn <task-id>                    spawn a herdr agent for a task
+  hive steer-all "message" [--project <id>]   broadcast a steer to every live agent
+  hive remote                             print LAN URL + API token for phone access (PWA)
+  hive stats [--days 7]                   autonomy scorecard (steers, decisions, CI gate, cost)
+  hive watch add --project <id> --name <n> --url <u> [--prompt <s>] [--kind <k>] [--interval <min>]
+  hive watch list [--project <id>]        poll a doc/page; changes queue an act-on-change task
+  hive watch rm --project <id> --name <n>   (Google Docs edit links auto-use the txt export; doc must be link-readable)
   hive pr-marker <task-id>                print the PR title prefix + body footer marker for a task
   hive gchat auth [--client-id <id>] [--client-secret <s>] [--self users/<id>] [--port <p>]
         one-time Google Chat OAuth consent; stores the refresh token in the keychain
@@ -414,6 +420,130 @@ async function main() {
       return;
     }
     die(`unknown 'gchat' subcommand: ${sub}\n\n${USAGE}`);
+  }
+
+  // Autonomy scorecard: is the fleet getting MORE autonomous or less? One
+  // number per pain axis, computed straight from the DB (read-only).
+  if (cmd === "stats") {
+    const { flags } = parseFlags(argv.slice(1));
+    const { Database } = await import("bun:sqlite");
+    const { defaultDbPath } = await import("../server/src/db.ts");
+    const db = new Database(defaultDbPath(), { readonly: true });
+    const days = Number(flags.days ?? 7);
+    const since = new Date(Date.now() - days * 86400_000).toISOString();
+    const one = (sql: string, ...a: unknown[]) => (db.query(sql).get(...(a as any)) as any) ?? {};
+
+    const spawns = one("SELECT COUNT(*) n FROM events WHERE type='spawned' AND ts > ?", since).n;
+    const spawnErr = one("SELECT COUNT(*) n FROM events WHERE type='spawn_error' AND ts > ?", since).n;
+    const steers = one("SELECT COUNT(*) n FROM events WHERE type='steer' AND ts > ?", since).n;
+    const nudges = one("SELECT COUNT(*) n FROM events WHERE type='recovery_nudge' AND ts > ?", since).n;
+    const done = one("SELECT COUNT(*) n FROM tasks WHERE state='done' AND updated_at > ?", since).n;
+    const dec = one(
+      `SELECT COUNT(*) n, SUM(status='expired') expired,
+              ROUND(AVG(CASE WHEN answered_at IS NOT NULL THEN (julianday(answered_at)-julianday(ts))*24*60 END),0) med_min
+         FROM decisions WHERE ts > ?`, since);
+    const held = one("SELECT COUNT(*) n FROM events WHERE type='ready_held' AND ts > ?", since).n;
+    const bounced = one("SELECT COUNT(*) n FROM events WHERE type IN ('ci_failure','pr_closed') AND ts > ?", since).n;
+    const cost = db.query(
+      "SELECT model, ROUND(SUM(cost_usd),2) c, COUNT(DISTINCT task_id) t FROM usage WHERE ts > ? GROUP BY model ORDER BY c DESC"
+    ).all(since) as any[];
+    const review = one(
+      `SELECT ROUND(AVG((julianday(m.ts)-julianday(r.ts))*24),1) h FROM
+         (SELECT task_id, MIN(ts) ts FROM events WHERE type='ready_for_review' AND ts > ? GROUP BY task_id) r
+         JOIN (SELECT task_id, MIN(ts) ts FROM events WHERE type='merged' GROUP BY task_id) m USING(task_id)`, since);
+
+    console.log(`hive stats — last ${days}d`);
+    console.log(`  shipped:        ${done} tasks done`);
+    console.log(`  spawns:         ${spawns} ok, ${spawnErr} errors${spawns ? ` (${Math.round((100 * spawnErr) / (spawns + spawnErr))}% failure)` : ""}`);
+    console.log(`  intervention:   ${steers} steers, ${nudges} gone-quiet nudges`);
+    console.log(`  decisions:      ${dec.n} opened, ${dec.expired ?? 0} expired, avg answer ${dec.med_min ?? "-"}m`);
+    console.log(`  CI gate:        ${held} handoffs held, ${bounced} bounced out of review`);
+    console.log(`  review->merge:  avg ${review.h ?? "-"}h`);
+    for (const c of cost) console.log(`  cost:           ${c.model}  $${c.c}  (${c.t} tasks)`);
+    console.log(`\nfewer steers/nudges per shipped task = more autonomy. Compare week over week.`);
+    return;
+  }
+
+  // Phone/tablet access: print the LAN URL + API token for the PWA.
+  if (cmd === "remote") {
+    const { Database } = await import("bun:sqlite");
+    const { defaultDbPath } = await import("../server/src/db.ts");
+    const db = new Database(defaultDbPath(), { readonly: true });
+    const row = db.query("SELECT value FROM settings WHERE key = 'api_token'").get() as { value: string } | null;
+    if (!row) die("no API token yet — start the server once (it mints one on boot)");
+    const { networkInterfaces } = await import("node:os");
+    const ips = Object.values(networkInterfaces()).flat()
+      .filter((i: any) => i && i.family === "IPv4" && !i.internal)
+      .map((i: any) => i.address);
+    const port = process.env.HIVE_PORT || 4700;
+    console.log(`API token: ${row.value}\n`);
+    if (!ips.length) console.log("no LAN address found — is Wi-Fi/Ethernet up?");
+    for (const ip of ips) console.log(`  http://${ip}:${port}/`);
+    console.log(
+      `\nOn the phone: open the URL in Safari, paste the token when prompted, then Share -> Add to Home Screen.` +
+        `\nServer must be bound to the LAN: HIVE_BIND=0.0.0.0 (add to the LaunchAgent env, then restart).` +
+        `\nPlain HTTP — use only on a trusted LAN or a Tailscale address.`
+    );
+    return;
+  }
+
+  // Watchers: poll a doc/page and queue an act-on-change task.
+  //   hive watch add --project <id> --name <n> --url <u> [--prompt <s>] [--kind chore] [--interval <min>]
+  //   hive watch list [--project <id>]
+  //   hive watch rm --project <id> --name <n>
+  if (cmd === "watch") {
+    const sub = argv[1];
+    const { flags } = parseFlags(argv.slice(2));
+    const pid = flags.project ? String(flags.project) : null;
+    if (sub === "list") {
+      const projects = await api("GET", "/api/projects");
+      for (const p of projects) {
+        if (pid && p.id !== pid) continue;
+        for (const w of p.config?.watchers ?? [])
+          console.log(`${p.name}  ${w.name}  every ${w.interval_minutes ?? 5}m  ${w.url}${w.prompt ? `  — ${w.prompt}` : ""}`);
+      }
+      return;
+    }
+    if (!pid) die("--project is required");
+    const project = await api("GET", `/api/projects/${pid}`);
+    const watchers: any[] = project.config?.watchers ?? [];
+    if (sub === "add") {
+      if (!flags.name || !flags.url) die("usage: hive watch add --project <id> --name <n> --url <u> [--prompt <s>] [--kind <k>] [--interval <min>]");
+      if (watchers.some((w) => w.name === flags.name)) die(`watcher '${flags.name}' already exists on ${project.name}`);
+      watchers.push({
+        name: String(flags.name),
+        url: String(flags.url),
+        ...(flags.prompt ? { prompt: String(flags.prompt) } : {}),
+        ...(flags.kind ? { kind: String(flags.kind) } : {}),
+        ...(flags.interval ? { interval_minutes: Number(flags.interval) } : {}),
+      });
+      await api("PUT", `/api/projects/${pid}`, { config: { ...project.config, watchers } });
+      console.log(`watching '${flags.name}' on ${project.name} (first poll is a baseline; changes queue a ${flags.kind ?? "chore"} task)`);
+      return;
+    }
+    if (sub === "rm") {
+      if (!flags.name) die("usage: hive watch rm --project <id> --name <n>");
+      const next = watchers.filter((w) => w.name !== flags.name);
+      if (next.length === watchers.length) die(`no watcher '${flags.name}' on ${project.name}`);
+      await api("PUT", `/api/projects/${pid}`, { config: { ...project.config, watchers: next } });
+      console.log(`removed watcher '${flags.name}'`);
+      return;
+    }
+    die(`unknown 'watch' subcommand: ${sub}\n\n${USAGE}`);
+  }
+
+  // Broadcast a steer to every live agent (optionally one project's):
+  //   hive steer-all "message" [--project <id>]
+  if (cmd === "steer-all") {
+    const message = argv[1];
+    const { flags } = parseFlags(argv.slice(2));
+    if (!message) die('usage: hive steer-all "message" [--project <id>]');
+    const r = await api("POST", "/api/steer/broadcast", {
+      message,
+      ...(flags.project ? { project_id: String(flags.project) } : {}),
+    });
+    console.log(`steered ${r.delivered}/${r.targets} live agents (undelivered are queued for respawn)`);
+    return;
   }
 
   // Offline mode: drain the fleet before losing internet; resume when back.
