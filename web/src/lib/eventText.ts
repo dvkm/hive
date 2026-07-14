@@ -68,7 +68,9 @@ export function eventText(e: EventLike): string {
     case "auto_review_error":
       return `pre-review failed: ${s(p.error)}`;
     case "ready_held":
-      return `handoff held: CI ${s(p.ci_status)} on ${s(p.pr_url)}`;
+      return s(p.reason) === "no_evidence"
+        ? "handoff held: no evidence attached yet"
+        : `handoff held: CI ${s(p.ci_status)} on ${s(p.pr_url)}`;
     case "ci_failure":
       return `CI failing — agent nudged to fix`;
     case "pr_closed":

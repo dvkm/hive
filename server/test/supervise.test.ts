@@ -20,6 +20,11 @@ function seedTask(db: DB, extra: Partial<{ pr_url: string }> = {}): string {
     "INSERT INTO tasks (id, project_id, title, state, kind, agent_target, pr_url, created_at, updated_at) VALUES (?,?,?,?, 'ship', 'a1', ?, ?, ?)"
   ).run(id, projectId, "t", "queued", extra.pr_url ?? null, t, t);
   transition(db, id, "in_progress");
+  // The idle backstop now refuses evidence-less reviews; these tests exercise
+  // the herdr-signal plumbing, so satisfy the gate.
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    newId("evd"), id, t, "log", "/tmp/x.log", "proof"
+  );
   return id;
 }
 
