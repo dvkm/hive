@@ -12,6 +12,7 @@
 import type { DB } from "./db.ts";
 import { newId, now } from "./db.ts";
 import { broadcast } from "./bus.ts";
+import { pushToAll } from "./push.ts";
 import type { Exec } from "./exec.ts";
 
 export type Urgency = "normal" | "urgent";
@@ -63,6 +64,13 @@ export function enqueue(db: DB, n: NotifInput, deps: { exec?: Exec } = {}): any 
   ).run(row.id, row.ts, row.kind, row.task_id, row.decision_id, row.title, row.body, row.urgency, row.delivered_at);
   broadcast({ type: "notification", notification: row });
   if (urgency === "urgent" && exec) void osaNotify(exec, n.title, n.body ?? "");
+  // Urgent → also push to the phone (PWA web push). Best-effort, never throws.
+  if (urgency === "urgent")
+    void pushToAll(db, {
+      title: n.title,
+      body: n.body ?? null,
+      url: n.task_id ? `/tasks/${n.task_id}` : n.decision_id ? "/decisions" : "/",
+    }).catch(() => {});
   return row;
 }
 

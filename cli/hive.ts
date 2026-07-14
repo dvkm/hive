@@ -33,6 +33,7 @@ Usage:
   hive recall <keywords>                  search project knowledge (references, learnings, policies)
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive steer-all "message" [--project <id>]   broadcast a steer to every live agent
+  hive tunnel                             expose hive to your phone over Tailscale HTTPS (private; enables push)
   hive remote                             print LAN URL + API token for phone access (PWA)
   hive stats [--days 7]                   autonomy scorecard (steers, decisions, CI gate, cost)
   hive watch add --project <id> --name <n> --url <u> [--prompt <s>] [--kind <k>] [--interval <min>]
@@ -464,6 +465,43 @@ async function main() {
     console.log(`  review->merge:  avg ${review.h ?? "-"}h`);
     for (const c of cost) console.log(`  cost:           ${c.model}  $${c.c}  (${c.t} tasks)`);
     console.log(`\nfewer steers/nudges per shipped task = more autonomy. Compare week over week.`);
+    return;
+  }
+
+  // Expose hive over Tailscale HTTPS (private mesh, real cert → iOS push works).
+  // Needs `tailscale up` done once (that's the user's account login).
+  if (cmd === "tunnel") {
+    const which = Bun.spawnSync(["which", "tailscale"]);
+    const ts = which.exitCode === 0 ? which.stdout.toString().trim() : "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
+    const port = process.env.HIVE_PORT || 4700;
+    const status = Bun.spawnSync([ts, "status"]);
+    if (status.exitCode !== 0) {
+      die(
+        "Tailscale isn't ready. One-time setup:\n" +
+          "  brew install tailscale   (or install the Mac app)\n" +
+          "  tailscale up             (logs into YOUR Tailscale account in the browser)\n" +
+          "Then install Tailscale on your phone, log into the same account, and re-run `hive tunnel`."
+      );
+    }
+    // `tailscale serve` fronts hive with a Tailscale-managed HTTPS cert on your
+    // <machine>.<tailnet>.ts.net name. Backgrounded so it persists.
+    const serve = Bun.spawnSync([ts, "serve", "--bg", String(port)]);
+    if (serve.exitCode !== 0) {
+      console.error(serve.stderr.toString());
+      die("`tailscale serve` failed (older Tailscale? try `tailscale serve https / http://127.0.0.1:" + port + "`)");
+    }
+    const dns = Bun.spawnSync([ts, "status", "--json"]);
+    let host = "<machine>.<tailnet>.ts.net";
+    try {
+      host = JSON.parse(dns.stdout.toString()).Self?.DNSName?.replace(/\.$/, "") || host;
+    } catch {}
+    const { Database } = await import("bun:sqlite");
+    const { defaultDbPath } = await import("../server/src/db.ts");
+    const tok = (new Database(defaultDbPath(), { readonly: true }).query("SELECT value FROM settings WHERE key='api_token'").get() as any)?.value;
+    console.log(`hive is now reachable from your phone (Tailscale, private + encrypted):\n\n  https://${host}/\n`);
+    console.log(`API token (paste once in the app): ${tok ?? "(start the server once to mint it)"}\n`);
+    console.log("On the iPhone: open that URL in Safari → Share → Add to Home Screen → open the app → tap 🔔 notify.");
+    console.log("Stop exposing: `tailscale serve --bg=false " + port + "` or `tailscale serve reset`.");
     return;
   }
 

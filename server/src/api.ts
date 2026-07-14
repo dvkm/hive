@@ -40,6 +40,7 @@ import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { costUsd } from "./pricing.ts";
 import { checkCostGuardrails, resolveCostCapForDecision } from "./costs.ts";
+import { vapidPublicKey, saveSubscription, removeSubscription } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { ciStatusOf } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
@@ -202,6 +203,23 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       if (pathname === "/api/steer/broadcast" && method === "POST")
         return await broadcastSteer(db, herdr, await req.json());
+
+      // Web push (mobile PWA). The public VAPID key is not a secret.
+      if (pathname === "/api/push/vapid" && method === "GET")
+        return json({ key: vapidPublicKey(db) });
+      if (pathname === "/api/push/subscribe" && method === "POST") {
+        try {
+          saveSubscription(db, await req.json());
+          return json({ ok: true });
+        } catch (e: any) {
+          return err(String(e?.message ?? e), 400);
+        }
+      }
+      if (pathname === "/api/push/unsubscribe" && method === "POST") {
+        const b: any = await safeJson(req);
+        if (b?.endpoint) removeSubscription(db, b.endpoint);
+        return json({ ok: true });
+      }
 
       if (pathname === "/api/checkpoints" && method === "GET") return listOpenCheckpoints(db);
 

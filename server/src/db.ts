@@ -324,6 +324,21 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v14-learning-kind",
     statements: [`ALTER TABLE learnings ADD COLUMN kind TEXT NOT NULL DEFAULT 'failure'`],
   },
+  // Web-push subscriptions for the mobile PWA (native notifications). Keyed by
+  // the push endpoint (unique per device+browser); replacing a stale one is an
+  // upsert on that key.
+  {
+    name: "v15-push-subscriptions",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS push_subscriptions (
+        endpoint TEXT PRIMARY KEY,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_ok TEXT
+      )`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings

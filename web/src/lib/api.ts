@@ -358,6 +358,9 @@ export interface Checkpoint {
 }
 
 export const api = {
+  token: apiToken,
+  subscribePush: (subscription: unknown) =>
+    req<{ ok: boolean }>(`/api/push/subscribe`, { method: "POST", body: JSON.stringify(subscription) }),
   offline: () => req<{ on: boolean }>(`/api/offline`),
   setOffline: (on: boolean) =>
     req<{ on: boolean; steered: number }>(`/api/offline`, { method: "POST", body: JSON.stringify({ on }) }),
