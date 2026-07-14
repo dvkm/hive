@@ -161,6 +161,25 @@ test("agent-tooling kill downgrades to unknown; general kill stays dangerous", (
   expect(classify('kill %1; pkill -f "vite --mode dev"', env).decision).toBe("dangerous"); // pkill part unprovable
 });
 
+test("git reset --hard / clean inside the agent's own worktree downgrades; the main checkout stays dangerous", () => {
+  const env = { HOME: "/Users/you" };
+  const wt = "/Users/you/.herdr/worktrees/monorepo/hive-4a2ac7fff8cf";
+  // the exact shape from the card: cd into the worktree, then reset --hard
+  const real = `cd ${wt}\ngit reset --hard origin/fm/node-consolidate 2>&1\ngh pr checks https://github.com/x/y/pull/20 2>&1`;
+  expect(classify(real, env, wt).decision).toBe("unknown");
+  // no cd, but the hook cwd IS the worktree
+  expect(classify("git reset --hard origin/main", env, wt).decision).toBe("unknown");
+  // git -C into the worktree resolves regardless of cwd
+  expect(classify(`git -C ${wt} clean -fd`, env, "/tmp").decision).toBe("unknown");
+  // the MAIN checkout is not a sandbox root → stays gated
+  expect(classify("git reset --hard origin/main", env, "/Users/you/projects/monorepo").decision).toBe("dangerous");
+  expect(classify(`cd /Users/you/projects/monorepo\ngit reset --hard`, env, wt).decision).toBe("dangerous");
+  // no cwd, no absolute cd: unprovable → gated
+  expect(classify("git reset --hard origin/main", env).decision).toBe("dangerous");
+  // relative cd: unresolvable → gated
+  expect(classify("cd sub\ngit reset --hard", env, wt).decision).toBe("dangerous");
+});
+
 test("destructive SQL against the agent's OWN worktree docker DB downgrades; anything else stays dangerous", () => {
   const env = { HOME: "/Users/you" };
   const cwd = "/Users/you/.herdr/worktrees/monorepo/hive-abc123def456";
