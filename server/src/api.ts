@@ -14,6 +14,7 @@ import {
   TransitionError,
   TERMINAL,
   advanceIfFinished,
+  evidenceCount,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
@@ -2161,6 +2162,22 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       // green and steers the agent if they go red. No checks at all (repo
       // without CI) and gh trouble both fail OPEN — a broken gh must not
       // strand every handoff.
+      // Evidence gate, same shape as the CI hold: "attach evidence BEFORE
+      // ready" is protocol, and an evidence-less card is an empty review that
+      // wastes the director's queue (#163 landed there twice).
+      const needsReport = t.kind === "scout";
+      const hasProduct = needsReport ? evidenceCount(db, taskId, "report") >= 1 : evidenceCount(db, taskId) >= 1;
+      if (!hasProduct) {
+        writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { reason: "no_evidence" } });
+        broadcastTask(db, getTask(db, taskId));
+        return json({
+          held: true,
+          reason: "no_evidence",
+          message: needsReport
+            ? "Handoff held: scouts hand off a written report. Attach it (hive emit <task-id> evidence --kind report --file report.md), then emit ready again."
+            : "Handoff held: no evidence attached. Attach proof of the behavior (screenshot, test output, log) with `hive emit <task-id> evidence --file ... --note ...`, then emit ready again.",
+        });
+      }
       const pr = prUrl ?? t.pr_url;
       if (pr) {
         const exec = deps.exec ?? defaultExec;

@@ -285,6 +285,38 @@ test("needs_decision with no open card unparks after the grace period", async ()
   expect(state()).toBe("needs_decision");
 });
 
+// ---- empty-review gates -------------------------------------------------------------
+
+test("emit ready without evidence is held with instructions; passes once evidence exists", async () => {
+  const id = await newTask("no empty reviews");
+  await post(`/api/tasks/${id}/spawn`, {});
+  const held = await post(`/api/tasks/${id}/events`, { type: "ready" });
+  expect(held.json.held).toBe(true);
+  expect(held.json.reason).toBe("no_evidence");
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_progress");
+
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    "evd_gate_t", id, new Date().toISOString(), "log", "/tmp/p.log", "proof"
+  );
+  await post(`/api/tasks/${id}/events`, { type: "ready" });
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_review");
+});
+
+test("idle backstop never re-reviews after changes_requested until new evidence arrives", async () => {
+  const { advanceIfFinished, writeEvent, transition } = await import("../src/state.ts");
+  const id = await newTask("acknowledged is not addressed");
+  db.query("UPDATE tasks SET state = 'in_progress', pr_url = 'https://gh/pr/9', ci_status = 'passing' WHERE id = ?").run(id);
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    "evd_cr_1", id, new Date(Date.now() - 60_000).toISOString(), "log", "/tmp/a.log", "old proof"
+  );
+  writeEvent(db, { task_id: id, source: "director", type: "changes_requested", payload: { notes: "there are no evidences" } });
+  expect(advanceIfFinished(db, id, "idle", "test")).toBe(false); // acked+idle ≠ addressed
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    "evd_cr_2", id, new Date(Date.now() + 1000).toISOString(), "log", "/tmp/b.log", "new proof"
+  );
+  expect(advanceIfFinished(db, id, "idle", "test")).toBe(true); // visible new work → review
+});
+
 // ---- command-card context ----------------------------------------------------------
 
 test("command cards carry intent, the literal command, category explanation, and answer semantics", async () => {
