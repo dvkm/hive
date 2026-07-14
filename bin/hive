@@ -1,3 +1,11 @@
-#!/usr/bin/env bun
-// Executable entrypoint for the hive CLI. See cli/hive.ts for the implementation.
-import "../cli/hive.ts";
+#!/bin/sh
+# Executable entrypoint for the hive CLI (implementation: cli/hive.ts).
+# POSIX shim, NOT a bun shebang: spawned agents' Bash tool rarely has bun on
+# PATH, and `#!/usr/bin/env bun` cost 15 of 16 sampled sessions an
+# "env: bun: No such file or directory" round trip on their first $HIVE_CLI
+# call. Resolve bun ourselves, common install paths first.
+for BUN in "$(command -v bun 2>/dev/null)" "$HOME/.bun/bin/bun" /opt/homebrew/bin/bun /usr/local/bin/bun; do
+  [ -n "$BUN" ] && [ -x "$BUN" ] && exec "$BUN" "$(dirname "$0")/../cli/hive.ts" "$@"
+done
+echo "hive: bun not found (looked on PATH, ~/.bun/bin, /opt/homebrew/bin, /usr/local/bin)" >&2
+exit 127

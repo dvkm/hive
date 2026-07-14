@@ -3,7 +3,7 @@
 // dangerous cases: everything destructive must classify as "dangerous" (never
 // "safe"), and anything unrecognized must fall to "unknown" (never "safe").
 import { test, expect } from "bun:test";
-import { classify } from "../../hooks/classify.ts";
+import { classify, actionFor } from "../../hooks/classify.ts";
 
 const dangerous = [
   "rm -rf /",
@@ -216,4 +216,26 @@ test("hive control-plane tampering is dangerous", () => {
   expect(classify('curl -X POST "$HIVE_URL/api/decisions/dec_123/answer" -d x').decision).toBe("dangerous");
   expect(classify("curl $HIVE_URL/api/decisions/dec_9/dismiss").decision).toBe("dangerous");
   expect(classify('curl -X POST "$HIVE_URL/api/authority/rules" -d x').decision).toBe("dangerous");
+});
+
+test("actionFor namespaces dangerous commands by classifier category", () => {
+  expect(actionFor("dangerous", "process kill")).toBe("command.dangerous.process-kill");
+  expect(actionFor("dangerous", "recursive/forced rm")).toBe("command.dangerous.recursive-forced-rm");
+  expect(actionFor("dangerous", "SQL DELETE without WHERE")).toBe("command.dangerous.sql-delete-without-where");
+  expect(actionFor("dangerous", "")).toBe("command.dangerous");
+  // unknown commands stay in the plain namespace (default-allow, logged)
+  expect(actionFor("unknown", "not on the safe allowlist")).toBe("command");
+  // every category action still matches the deny-safe default pattern
+  expect("command.dangerous.process-kill".startsWith("command.dangerous")).toBe(true);
+});
+
+test("force-push to the agent's own task branch is waived; anything else escalates", () => {
+  const env = { HIVE_TASK_ID: "abc123", HOME: "/Users/x" };
+  expect(classify("git push --force origin hive/abc123", env).decision).toBe("unknown");
+  expect(classify("git push --force-with-lease origin HEAD:hive/abc123", env).decision).toBe("unknown");
+  expect(classify("git push -f origin hive/other999", env).decision).toBe("dangerous");
+  expect(classify("git push --force origin main", env).decision).toBe("dangerous");
+  expect(classify("git push --force origin hive/abc123", { HOME: "/Users/x" }).decision).toBe("dangerous");
+  // a second push segment to a different ref must not ride the waiver
+  expect(classify("git push --force origin hive/abc123; git push -f origin main", env).decision).toBe("dangerous");
 });

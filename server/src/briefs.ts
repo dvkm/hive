@@ -35,17 +35,22 @@ and \`hive pr-marker\`. Prefer the CLI over raw curl: it attributes what you do.
   hive emit <task-id> done     --note "final summary"
 
 Rules:
+- BEFORE any command expected to run more than a minute (builds, full test
+  suites, e2e, docker up), emit status first, e.g.
+  \`hive emit <task-id> status --note "running e2e (~5m)"\` — a silent long
+  command looks stuck and triggers supervisor nudges (one agent ate 10).
 - A task NEVER reaches Done without evidence. Attach at least one evidence item
   (screenshot, test run, log, report, or link) before emitting \`done\`.
 - Attach evidence BEFORE \`ready\`, not just before done — the review card shows
   it to the director next to your diff. Anything visual gets a screenshot
   (before/after for changes to existing UI); everything else gets test output.
 - Scout tasks (knowledge-only) require a written report as evidence.
-- HAND OFF, don't go idle. When your PR is open and CI is triggered (or, for a
-  scout, your report is attached), emit \`hive emit <task-id> ready --pr-url <url>\`
-  to move the task into the director's review queue. Do NOT just stop and sit
-  idle — that leaves the task looking stuck. (A backstop advances an idle agent
-  that has a PR, but \`ready\` is the clean, immediate handoff.)
+- HAND OFF, don't go idle. When your PR is open (or, for a scout, your report
+  is attached), emit \`hive emit <task-id> ready --pr-url <url>\`. Review means
+  CI IS GREEN: if checks are still running or failing, the handoff is HELD and
+  the response tells you — stay on the task. hive moves it to review
+  automatically the moment checks pass, and steers you if they fail; fix and
+  push until green. Never sit idle with red CI.
 - BEFORE \`ready\`, submit a structured self-review — the director reviews THIS,
   not your prose, so keep every bullet one tight line:
 
@@ -74,6 +79,10 @@ Rules:
   \`hive emit <task-id> status --note "..."\` saying what you'll change (this is
   a visible conversation — silence looks like the request was lost), then do the
   work and emit \`ready\` again.
+- When the director's note ASKS A QUESTION, answer it with
+  \`hive emit <task-id> answer --note "the answer"\` — answers are pushed to the
+  director; plain status notes and your pane output are NOT. Never leave a
+  question answered only in prose.
 - Work ONLY inside your own worktree and scratchpad. NEVER create, edit, or
   delete files in the project's main checkout, other worktrees, or the human's
   home — cleanup of your own sandbox is auto-approved; anything outside it is not.

@@ -3,7 +3,7 @@
 import { dirname, join, normalize } from "node:path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
-import { newId, now, evidenceDir, isOffline, setSetting } from "./db.ts";
+import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { taskWithHealth, broadcastTask, needsAttention } from "./health.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
 import {
@@ -28,7 +28,7 @@ import {
   parseIncident,
 } from "./rows.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
-import { queuedSteers, markSteersDelivered, steerPreamble, type Delivery } from "./steer.ts";
+import { queuedSteers, markSteersDelivered, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
 import { smokeThenAdvance } from "./monitors.ts";
@@ -39,6 +39,8 @@ import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.
 import { routeIntakeProject } from "./intake/route.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { costUsd } from "./pricing.ts";
+import { checkCostGuardrails, resolveCostCapForDecision } from "./costs.ts";
+import { ciStatusOf } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
@@ -84,14 +86,32 @@ function authzBlock(db: DB, input: AuthzInput): Response | null {
 const WEB_DIST = join(import.meta.dir, "..", "..", "web", "dist");
 const HOOKS_DIR = join(import.meta.dir, "..", "..", "hooks");
 
+// Remote requests (a phone on the LAN / Tailscale) must present the API token;
+// loopback (CLI, hooks, agents, the desktop app) stays trustless as before.
+// Accepted as `Authorization: Bearer <t>` or `?token=<t>` — EventSource cannot
+// set headers, so the SSE stream needs the query form. Exported for tests.
+export function remoteAuthOk(db: DB, req: Request, url: URL, ip: string | null): boolean {
+  if (!ip || ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1") return true;
+  const token = getSetting(db, "api_token");
+  if (!token) return false; // bound to LAN with no token minted → locked
+  const presented =
+    req.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim() || url.searchParams.get("token");
+  return presented === token;
+}
+
 export function makeHandler(db: DB, deps: HandlerDeps = {}) {
   const herdr = deps.herdr ?? defaultHerdr;
-  return async function handle(req: Request): Promise<Response> {
+  return async function handle(req: Request, server?: { requestIP?: (r: Request) => { address: string } | null }): Promise<Response> {
     const url = new URL(req.url);
     const { pathname } = url;
     const method = req.method;
 
     if (method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+
+    if (pathname.startsWith("/api/")) {
+      const ip = server?.requestIP?.(req)?.address ?? null;
+      if (!remoteAuthOk(db, req, url, ip)) return err("unauthorized (see `hive remote` for the token)", 401);
+    }
 
     try {
       // ---- SSE stream ----
@@ -167,7 +187,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
             .all(m[1]);
           return json(rows.map(parseEvent));
         }
-        if (method === "POST") return await ingestEvent(db, m[1], req);
+        if (method === "POST") return await ingestEvent(db, m[1], req, deps);
       }
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/transition$/);
       if (m && method === "POST") return await doTransition(db, m[1], await req.json());
@@ -178,6 +198,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/send$/);
       if (m && method === "POST") return await sendSteer(db, herdr, m[1], req);
+
+      if (pathname === "/api/steer/broadcast" && method === "POST")
+        return await broadcastSteer(db, herdr, await req.json());
 
       if (pathname === "/api/checkpoints" && method === "GET") return listOpenCheckpoints(db);
 
@@ -199,6 +222,11 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/usage$/);
       if (m && method === "GET") return taskUsage(db, m[1]);
+
+      // Live read-only view of the agent's terminal pane (the web UI's
+      // embedded terminal polls this). Input goes through steer as always.
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/pane$/);
+      if (m && method === "GET") return await taskPane(db, herdr, m[1], url);
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/brief$/);
       if (m && method === "GET") {
@@ -245,7 +273,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // ---- policies ----
       if (pathname === "/api/policies") {
         if (method === "GET") return listPolicies(db, url);
-        if (method === "POST") return createPolicy(db, await req.json());
+        if (method === "POST") return createPolicy(db, herdr, await req.json());
       }
       m = pathname.match(/^\/api\/policies\/([^/]+)$/);
       if (m) {
@@ -1051,7 +1079,7 @@ async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason
 // conflict: the task is bounced back to the agent (see mergeFailed); other
 // failures (CI blocked) return 409 with the reason and no state change.
 // Guarded by the `task.merge` standing-authority action.
-async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps): Promise<Response> {
+export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
   if (task.state !== "in_review")
@@ -1067,12 +1095,37 @@ async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: Hand
 
   let method: string;
   if (task.pr_url) {
-    const flag = ghMergeFlag(config.merge_method);
-    method = `pr ${flag.slice(2)}`;
-    const r = await exec(["gh", "pr", "merge", task.pr_url, flag]);
-    if (r.code !== 0) {
-      const reason = r.stderr.trim() || r.stdout.trim() || `gh pr merge exited ${r.code}`;
-      return mergeFailed(db, herdr, task, base, reason);
+    // A closed or already-merged PR fails `gh pr merge` with an opaque GraphQL
+    // error and used to bounce the agent with a bogus conflict steer (task #90
+    // looped on its replaced PR for hours). Tell the truth instead — and when
+    // GitHub says MERGED, just advance: the work landed, hive's link was stale.
+    const probe = await exec(["gh", "pr", "view", task.pr_url, "--json", "state"]);
+    if (probe.code === 0) {
+      const prState = String(JSON.parse(probe.stdout || "{}").state ?? "").toUpperCase();
+      if (prState === "MERGED") {
+        method = "already merged on GitHub";
+      } else if (prState === "CLOSED") {
+        return mergeFailed(
+          db,
+          herdr,
+          task,
+          base,
+          `PR is CLOSED (not merged): ${task.pr_url}. If the agent replaced it, its 'ready' emit now re-links the task; otherwise re-link via POST /api/tasks/link-pr.`
+        );
+      } else {
+        method = ""; // open: fall through to the real merge below
+      }
+    } else {
+      method = "";
+    }
+    if (!method) {
+      const flag = ghMergeFlag(config.merge_method);
+      method = `pr ${flag.slice(2)}`;
+      const r = await exec(["gh", "pr", "merge", task.pr_url, flag]);
+      if (r.code !== 0) {
+        const reason = r.stderr.trim() || r.stdout.trim() || `gh pr merge exited ${r.code}`;
+        return mergeFailed(db, herdr, task, base, reason);
+      }
     }
   } else {
     if (!project?.repo_path) return err("project has no repo_path; cannot merge", 400);
@@ -1083,7 +1136,15 @@ async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: Hand
     // working tree is touched. Callers wanting a squash merge should use a PR.
     const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", base, task.branch]);
     if (anc.code !== 0) {
-      const reason = `'${base}' is not an ancestor of '${task.branch}'; not a fast-forward (rebase the branch or open a PR)`;
+      // Name the exact commit compared against: this is the primary checkout's
+      // LOCAL base ref, which can be ahead of origin/<base> — an agent rebased
+      // onto origin/main and hit this identical failure twice before digging
+      // out that hive checks a different, unfetchable-by-name ref.
+      const sha = (await exec(["git", "-C", project.repo_path, "rev-parse", "--short", base])).stdout.trim();
+      const reason =
+        `'${base}' (LOCAL ref in the primary checkout${sha ? `, ${sha}` : ""} — may be ahead of origin/${base}) ` +
+        `is not an ancestor of '${task.branch}'; not a fast-forward. Rebase onto that exact commit ` +
+        `(git fetch <primary-checkout> ${base}) or open a PR.`;
       return mergeFailed(db, herdr, task, base, reason);
     }
     const r = await exec(["git", "-C", project.repo_path, "merge", "--ff-only", task.branch]);
@@ -1137,7 +1198,12 @@ async function requestChanges(db: DB, herdr: Herdr, id: string, body: any): Prom
   let sendError: string | null = null;
   if (task.agent_target) {
     try {
-      const res = await herdr.send(task.agent_target, `hive: changes requested before merge —\n${notes}`);
+      const res = await herdr.send(
+        task.agent_target,
+        `hive: changes requested before merge —\n${notes}\n\n` +
+          `If any of the above is a QUESTION, reply with \`hive emit ${id} answer --note "..."\` ` +
+          `(answers are pushed to the director; pane text is not), then make the changes and emit ready again.`
+      );
       sendError = sendFailure(res);
       delivered = sendError === null;
     } catch (e: any) {
@@ -1173,6 +1239,18 @@ async function spawnTask(
   const r = await spawnAgent(db, herdr, id, { hiveUrl: body?.hive_url, supervise: deps.supervise });
   if (!r.ok) return err(`spawn failed: ${r.error}`, 502);
   return json({ ok: true, task: getTask(db, id), agent_target: r.agent_target });
+}
+
+// Model per task kind, always pinned: without an explicit --model the CLI's
+// own default applies, which can be the priciest tier (fable burned $2.2k in
+// 97 sessions, incl. Opus-priced "say hello" health checks). Ship work gets
+// opus; scouts/chores are mechanical enough for sonnet. Per-project overrides:
+// config.model_by_kind = {ship:"opus",...} wins over config.model wins over
+// these defaults. config.agent_argv (verbatim) bypasses this entirely.
+const DEFAULT_MODEL_BY_KIND: Record<string, string> = { ship: "opus", scout: "sonnet", chore: "sonnet" };
+
+export function modelForTask(config: any, kind: string): string {
+  return config?.model_by_kind?.[kind] ?? config?.model ?? DEFAULT_MODEL_BY_KIND[kind] ?? "sonnet";
 }
 
 // The reusable spawn core, shared by the /spawn endpoint and the dispatcher.
@@ -1211,6 +1289,7 @@ export async function spawnAgent(
       brief,
       base: config.default_branch,
       env,
+      model: modelForTask(config, task.kind),
       agentArgv: config.agent_argv, // optional per-project override (verbatim)
       // Seed the worktree with hive's Claude Code hook wiring BEFORE the agent
       // starts, so Stop/SubagentStop/PostToolUse reporting is structural.
@@ -1366,6 +1445,53 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
     payload: { message, target, attachments: paths, delivery, ...(delivered ? { delivered_at: now() } : { error }) },
   });
   return json({ ok: delivered, delivered, delivery, message, attachments: paths, ...(error ? { error } : {}) });
+}
+
+// The agent's pane, as plain text. ANSI/control sequences are stripped
+// server-side so the client renders it in a bare <pre> — good enough to watch
+// an agent work; interaction stays on the steer channel.
+async function taskPane(db: DB, herdr: Herdr, id: string, url: URL): Promise<Response> {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  if (!task.agent_target) return err("task has no agent (not spawned, or already cleaned up)", 404);
+  const lines = Math.min(Math.max(Number(url.searchParams.get("lines")) || 200, 10), 2000);
+  const raw = await herdr.read(task.agent_target, lines);
+  // CSI/OSC escape sequences and stray control chars (keep \n and \t).
+  const text = raw
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, "")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
+  return json({ task_id: id, agent_target: task.agent_target, lines, text, ts: now() });
+}
+
+// Broadcast a steer to every task with a live agent (optionally one project's).
+// Replaces the observed copy-paste-to-N-tasks pattern: protocol updates went
+// out by hand to up to 8 agents, three times in one morning. Delivery receipts
+// per task (delivered / queued), same semantics as a single steer.
+async function steerLiveAgents(
+  db: DB,
+  herdr: Herdr,
+  message: string,
+  projectId?: string
+): Promise<{ targets: number; delivered: number; results: { task_id: string; delivered: boolean }[] }> {
+  const rows = db
+    .query(
+      `SELECT id FROM tasks WHERE agent_target IS NOT NULL
+        AND state IN ('in_progress','needs_decision','in_review','verifying')${projectId ? " AND project_id = ?" : ""}`
+    )
+    .all(...(projectId ? [projectId] : [])) as { id: string }[];
+  const results: { task_id: string; delivered: boolean }[] = [];
+  for (const t of rows) {
+    results.push({ task_id: t.id, delivered: await internalSteer(db, herdr, t.id, message) });
+  }
+  return { targets: results.length, delivered: results.filter((r) => r.delivered).length, results };
+}
+
+async function broadcastSteer(db: DB, herdr: Herdr, body: any): Promise<Response> {
+  const message = String(body?.message ?? "").trim();
+  if (!message) return err("message is required");
+  const r = await steerLiveAgents(db, herdr, message, body?.project_id ? String(body.project_id) : undefined);
+  return json({ ok: true, ...r });
 }
 
 // ---- offline mode ----
@@ -1940,7 +2066,7 @@ async function attachFiles(taskId: string, files: File[]): Promise<{ paths: stri
 }
 
 // ---------------------------------------------------------------- event ingestion (`hive emit`)
-async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Response> {
+async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDeps = {}): Promise<Response> {
   if (!getTask(db, taskId)) return err("task not found", 404);
   const ct = req.headers.get("content-type") || "";
   let fields: Record<string, string> = {};
@@ -2029,12 +2155,55 @@ async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Respon
   if (type === "ready") {
     const t = getTask(db, taskId);
     const prUrl = (fields.pr_url ?? fields.url ?? null) as string | null;
-    if (prUrl && !t.pr_url) {
-      db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(prUrl, now(), taskId);
-      writeEvent(db, { task_id: taskId, source, type: "pr_linked", payload: { pr_url: prUrl, via: "ready" } });
+    // The agent's explicit handoff is AUTHORITATIVE about which PR carries the
+    // work — including when it replaces an earlier PR (closed #161 → rebased
+    // #166, task #90). The old `only if unlinked` guard silently ignored the
+    // new url, so every merge kept hitting the closed PR in a loop. ci_status
+    // resets: it described the old PR.
+    if (prUrl && prUrl !== t.pr_url) {
+      db.query("UPDATE tasks SET pr_url = ?, ci_status = NULL, updated_at = ? WHERE id = ?").run(prUrl, now(), taskId);
+      writeEvent(db, {
+        task_id: taskId,
+        source,
+        type: "pr_linked",
+        payload: { pr_url: prUrl, via: t.pr_url ? "ready_replaced" : "ready", ...(t.pr_url ? { replaced: t.pr_url } : {}) },
+      });
     }
     if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });
     if (t.state === "in_progress") {
+      // Review means "truly ready for the director to approve & merge" — a red
+      // or still-running CI is not that. Probe the PR's checks NOW (hive's own
+      // ci_status lags a reconciler cycle): failing/pending holds the task
+      // in_progress with the agent; syncPRs promotes it the moment checks go
+      // green and steers the agent if they go red. No checks at all (repo
+      // without CI) and gh trouble both fail OPEN — a broken gh must not
+      // strand every handoff.
+      const pr = prUrl ?? t.pr_url;
+      if (pr) {
+        const exec = deps.exec ?? defaultExec;
+        let ci: string | null = null;
+        const probe = await exec(["gh", "pr", "view", pr, "--json", "statusCheckRollup"]);
+        if (probe.code === 0) {
+          try {
+            ci = ciStatusOf(JSON.parse(probe.stdout || "{}").statusCheckRollup);
+          } catch {
+            ci = null;
+          }
+        }
+        if (ci === "failing" || ci === "pending") {
+          db.query("UPDATE tasks SET ci_status = ?, updated_at = ? WHERE id = ?").run(ci, now(), taskId);
+          writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { pr_url: pr, ci_status: ci } });
+          broadcastTask(db, getTask(db, taskId));
+          return json({
+            held: true,
+            ci_status: ci,
+            message:
+              ci === "failing"
+                ? `CI is FAILING on ${pr} — the handoff is held. Run \`gh pr checks ${pr}\`, fix the failures, push; hive hands off automatically when checks pass.`
+                : `CI is still running on ${pr} — the handoff is held. Stay on the task; hive hands off automatically when checks pass (and steers you if they fail).`,
+          });
+        }
+      }
       writeEvent(db, { task_id: taskId, source, type: "ready_for_review", payload: { pr_url: prUrl ?? t.pr_url ?? null, via: "emit", kind: t.kind } });
       const task = transition(db, taskId, "in_review", { source, reason: note ?? "agent handoff: ready for review" });
       return json({ task });
@@ -2090,6 +2259,26 @@ async function ingestEvent(db: DB, taskId: string, req: Request): Promise<Respon
     return json({ event }, 201);
   }
 
+  // --- answer (agent replying to the director's question) ---
+  // A question in a request-changes note (or steer) deserves a reply that
+  // REACHES the director — agents used to answer in pane text / status notes
+  // that only mirror into the feed, so the answer was never seen (2026-07-12:
+  // a two-paragraph AES explanation surfaced only in the transcript log).
+  // Urgent: the director asked; the reply should land as a push, not a digest.
+  if (type === "answer") {
+    if (!note) return err("answer needs --note (the reply text)");
+    const t = getTask(db, taskId);
+    const event = writeEvent(db, { task_id: taskId, source, type: "answer", payload: { note } });
+    enqueue(db, {
+      kind: "answer",
+      urgency: "urgent",
+      task_id: taskId,
+      title: `Answer on #${t?.number}: ${t?.title?.slice(0, 60) ?? taskId}`,
+      body: note.slice(0, 300),
+    });
+    return json({ event }, 201);
+  }
+
   // --- status / blocked / generic ---
   const event = writeEvent(db, { task_id: taskId, source, type, payload: { note } });
   return json({ event }, 201);
@@ -2122,8 +2311,17 @@ function ingestUsage(db: DB, taskId: string, fields: Record<string, any>, source
     const overrides = project ? JSON.parse(project.config || "{}").pricing : null;
     cost = costUsd(model, tokens, overrides);
   }
+  // Hook totals are CUMULATIVE per session (whole-transcript sums, one Stop per
+  // turn). A session_id makes ingestion an UPSERT — one row per
+  // (task, session, model) that converges on the final total — via a
+  // deterministic id. Without it (older hooks, manual posts) each POST is its
+  // own row, which double-counts interactive sessions.
+  const sessionId = typeof fields.session_id === "string" && fields.session_id ? fields.session_id : null;
+  const id = sessionId
+    ? "use_" + new Bun.CryptoHasher("sha256").update(`${taskId}|${sessionId}|${model}`).digest("hex").slice(0, 16)
+    : newId("use");
   const row = {
-    id: newId("use"),
+    id,
     task_id: taskId,
     ts: now(),
     model,
@@ -2132,10 +2330,17 @@ function ingestUsage(db: DB, taskId: string, fields: Record<string, any>, source
     source,
   };
   db.query(
-    `INSERT INTO usage (id, task_id, ts, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, source)
+    `INSERT OR REPLACE INTO usage (id, task_id, ts, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, source)
      VALUES (?,?,?,?,?,?,?,?,?,?)`
   ).run(row.id, row.task_id, row.ts, row.model, row.input_tokens, row.output_tokens, row.cache_read_tokens, row.cache_write_tokens, row.cost_usd, row.source);
   broadcast({ type: "usage", usage: row });
+  // Cost lands here per turn — the guardrail check belongs where the number is
+  // freshest (warn steer at cost_warn_usd, decision card at cost_cap_usd).
+  try {
+    checkCostGuardrails(db, taskId);
+  } catch (e) {
+    console.error("[hive] cost guardrails:", e);
+  }
   return json({ usage: row }, 201);
 }
 
@@ -2295,7 +2500,7 @@ function saveDraft(db: DB, id: string, body: any): Response {
   return json({ ok: true, id });
 }
 
-function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): Response {
+export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
   if (!r) return err("decision not found", 404);
   if (r.status !== "open") return err(`decision already ${r.status}`, 409);
@@ -2329,6 +2534,8 @@ function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): Respons
   resolveBlockedForDecision(db, herdr, id, answerKey);
   // If this card was a possible-duplicate card, `merge` → fold + cancel.
   resolveDuplicateForDecision(db, id, answerKey);
+  // Cost-cap card → wrap-up steer, or raise the cap and keep going.
+  resolveCostCapForDecision(db, id, answerKey);
   // Resume the task if it was parked on this decision. (herdr `agent send` is Phase 2.)
   const task = getTask(db, r.task_id);
   if (task && task.state === "needs_decision")
@@ -2349,6 +2556,23 @@ function apiDismissDecision(db: DB, id: string): Response {
   if (r.status !== "open") return err(`decision already ${r.status}`, 409);
   db.query("UPDATE decisions SET status = 'expired' WHERE id = ?").run(id);
   writeEvent(db, { task_id: r.task_id, source: "director", type: "decision_expired", payload: { decision_id: id, reason: "dismissed" } });
+  // An authority card's pending grant must die with it: left 'pending', every
+  // retry of the gated command resolves to this expired decision id and the
+  // agent waits on it forever (19 of 28 approval cards expired exactly this way).
+  // Denying makes the retry open a FRESH card; the steer below says don't retry.
+  const wasAuthority = resolveGrantForDecision(db, id, "deny");
+  {
+    const t = getTask(db, r.task_id);
+    if (t && !TERMINAL.includes(t.state as State))
+      queueSteerEvent(
+        db,
+        r.task_id,
+        `The director dismissed your decision card "${r.title}" without answering — it is gone, do not wait ` +
+          `on it or retry the same request. ${wasAuthority ? "The gated command stays unapproved; find another way (or narrow the command so the gate passes). " : ""}` +
+          `Proceed with your best judgment and note the call as a checkpoint.`,
+        "queued by decision dismiss"
+      );
+  }
   // Resume the task if this was its LAST open card — otherwise it stays parked
   // in needs_decision with nothing left to wait on (seen live 2026-07-10:
   // three agents stranded after their moot approval cards were dismissed).
@@ -2439,7 +2663,7 @@ function updateAuthorityRule(db: DB, id: string, body: any): Response {
 }
 
 // ---------------------------------------------------------------- policies
-function createPolicy(db: DB, body: any): Response {
+function createPolicy(db: DB, herdr: Herdr, body: any): Response {
   if (!body?.title) return err("title is required");
   if (!body?.body) return err("body is required");
   const scope = body.scope ?? "global";
@@ -2458,6 +2682,18 @@ function createPolicy(db: DB, body: any): Response {
   db.query(
     "INSERT INTO policies (id, scope, title, body, active, created_at, updated_at) VALUES (?,?,?,?,?,?,?)"
   ).run(row.id, row.scope, row.title, row.body, row.active, row.created_at, row.updated_at);
+  // Live agents' briefs are frozen at spawn; without this every protocol change
+  // was hand-steered to each agent ("your brief predates it", 8 agents × 3
+  // iterations observed). New policy → automatic broadcast to its scope.
+  if (row.active) {
+    const projectId = scope.startsWith("project:") ? scope.slice("project:".length) : undefined;
+    void steerLiveAgents(
+      db,
+      herdr,
+      `Protocol update (a standing policy was just added — it applies to you NOW, your brief predates it):\n### ${row.title}\n${row.body}`,
+      projectId
+    );
+  }
   return json(parsePolicy(row), 201);
 }
 

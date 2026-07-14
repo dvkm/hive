@@ -19,6 +19,30 @@ export function StatusDot({ state, health }: { state: State; health?: Health | n
   return <span className={`sdot sdot-${state}`} title={STATE_LABEL[state]} />;
 }
 
+// Empty state. Every list view in hive uses this, and the contract is that both
+// halves are mandatory: `title` says what the emptiness MEANS, `hint` says what
+// would fill it. A bare "—" or "Nothing yet" leaves the director guessing
+// whether the system is idle or broken.
+export function Empty({
+  title,
+  hint,
+  compact,
+  action,
+}: {
+  title: string;
+  hint: string;
+  compact?: boolean;
+  action?: ReactNode;
+}) {
+  return (
+    <div className={`empty${compact ? " empty-compact" : ""}`}>
+      <div className="empty-big">{title}</div>
+      <p className="empty-hint">{hint}</p>
+      {action}
+    </div>
+  );
+}
+
 export function CiBadge({ status }: { status: CiStatus }) {
   if (!status) return null;
   return <span className={`ci ci-${status}`}>CI {status}</span>;

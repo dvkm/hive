@@ -140,6 +140,10 @@ export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, s
   if (!task || task.state !== "in_progress") return false;
   const hasReport = task.kind === "scout" && evidenceCount(db, taskId, "report") >= 1;
   if (!task.pr_url && !hasReport) return false; // no product to review → health surfaces it, don't advance
+  // Review means CI is green. failing/pending holds here; the reconciler's
+  // syncPRs promotes the moment checks pass (and steers the agent on red).
+  // null = no checks known (repo without CI) — that flows as before.
+  if (task.pr_url && (task.ci_status === "failing" || task.ci_status === "pending")) return false;
   writeEvent(db, {
     task_id: taskId,
     source,
@@ -168,7 +172,13 @@ export function transition(
 
   if (from === to) throw new TransitionError(`task already in state '${to}'`);
   if (!canTransition(from, to)) {
-    throw new TransitionError(`invalid transition: '${from}' -> '${to}'`);
+    // Agents jump straight to done often enough (4/16 sampled sessions) that
+    // the error should teach the path, not just reject.
+    const hint =
+      to === "done" && (from === "in_progress" || from === "in_review")
+        ? " — done is reached via review: emit `ready --pr-url <url>` (in_review), then the director merges (verifying -> done)"
+        : "";
+    throw new TransitionError(`invalid transition: '${from}' -> '${to}'${hint}`);
   }
 
   // Evidence gates apply to hive-driven work. Tracking-only tasks

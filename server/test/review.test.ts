@@ -109,11 +109,17 @@ test("taskDiff uses git diff base...branch for a branch task, gh for a PR task",
 
 // Build a fresh server whose git/gh + herdr are stubbed. `gitMergeCode` controls
 // the local merge outcome (0 = success, non-zero = conflict).
-function makeServer(opts: { gitMergeCode?: number; gitMergeStderr?: string } = {}) {
+function makeServer(opts: { gitMergeCode?: number; gitMergeStderr?: string; prState?: string; rollup?: any[] } = {}) {
   const db = openDb(":memory:");
   const sends: { target: string; message: string }[] = [];
   const removed: string[] = [];
   const exec: Exec = async (argv) => {
+    if (has(argv, "gh", "pr", "view"))
+      return OK(JSON.stringify({ state: opts.prState ?? "OPEN", statusCheckRollup: opts.rollup ?? [] }));
+    if (has(argv, "gh", "pr", "merge"))
+      return opts.gitMergeCode
+        ? { code: opts.gitMergeCode, stdout: "", stderr: "GraphQL: Pull Request is not mergeable (mergePullRequest)" }
+        : OK();
     if (has(argv, "git", "merge-base", "--is-ancestor")) return { code: 0, stdout: "", stderr: "" };
     if (has(argv, "git", "merge", "--ff-only")) {
       const code = opts.gitMergeCode ?? 0;
@@ -203,6 +209,76 @@ test("non-conflict merge failure returns 409 and does not change state", async (
   expect(task.json.state).toBe("in_review"); // unchanged, no bounce
   expect(s.sends.length).toBe(sendsBefore); // agent not pinged
   s.server.stop(true);
+});
+
+// Drive a task into review via the agent's own handoff, PR attached.
+async function inReviewWithPr(base: string, prUrl: string) {
+  const p = await post(base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(base, "/api/tasks", { project_id: p.json.id, title: "pr task", brief: "b" });
+  await post(base, `/api/tasks/${t.json.id}/spawn`, {});
+  await post(base, `/api/tasks/${t.json.id}/events`, { type: "ready", pr_url: prUrl });
+  return t.json.id as string;
+}
+
+test("a 'ready' with a new PR url re-links the task (replaced PR, the #90 loop)", async () => {
+  const s = makeServer();
+  const id = await inReviewWithPr(s.base, "https://gh/pr/161");
+  let task = await get(s.base, `/api/tasks/${id}`);
+  expect(task.json.pr_url).toBe("https://gh/pr/161");
+  // PR replaced: task bounces to in_progress, agent re-emits ready with the new url
+  await post(s.base, `/api/tasks/${id}/transition`, { to: "in_progress" });
+  await post(s.base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/166" });
+  task = await get(s.base, `/api/tasks/${id}`);
+  expect(task.json.pr_url).toBe("https://gh/pr/166"); // used to stay 161 forever
+  const ev = await get(s.base, `/api/tasks/${id}/events`);
+  const link = ev.json.filter((e: any) => e.type === "pr_linked").at(-1);
+  expect(link.payload.via).toBe("ready_replaced");
+  expect(link.payload.replaced).toBe("https://gh/pr/161");
+});
+
+test("merging a PR GitHub already merged advances to verifying instead of failing", async () => {
+  const s = makeServer({ prState: "MERGED" });
+  const id = await inReviewWithPr(s.base, "https://gh/pr/166");
+  const r = await post(s.base, `/api/tasks/${id}/merge`, {});
+  expect(r.status).toBe(200);
+  expect(r.json.state).toBe("verifying");
+  s.server.stop(true);
+});
+
+test("merging a CLOSED PR fails truthfully, no bogus conflict bounce", async () => {
+  const s = makeServer({ prState: "CLOSED" });
+  const id = await inReviewWithPr(s.base, "https://gh/pr/161");
+  const sendsBefore = s.sends.length;
+  const r = await post(s.base, `/api/tasks/${id}/merge`, {});
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("CLOSED (not merged)");
+  const task = await get(s.base, `/api/tasks/${id}`);
+  expect(task.json.state).toBe("in_review"); // no bounce: nothing for the agent to rebase
+  expect(s.sends.length).toBe(sendsBefore);
+  s.server.stop(true);
+});
+
+test("ready with failing CI is HELD in_progress; with passing CI it hands off", async () => {
+  const failing = makeServer({ rollup: [{ conclusion: "FAILURE" }] });
+  let id = await inReviewWithPr(failing.base, "https://gh/pr/9"); // helper emits ready
+  let task = await get(failing.base, `/api/tasks/${id}`);
+  expect(task.json.state).toBe("in_progress"); // held, not review
+  expect(task.json.ci_status).toBe("failing");
+  const ev = await get(failing.base, `/api/tasks/${id}/events`);
+  expect(ev.json.some((e: any) => e.type === "ready_held")).toBe(true);
+  failing.server.stop(true);
+
+  const green = makeServer({ rollup: [{ conclusion: "SUCCESS" }] });
+  id = await inReviewWithPr(green.base, "https://gh/pr/10");
+  task = await get(green.base, `/api/tasks/${id}`);
+  expect(task.json.state).toBe("in_review");
+  green.server.stop(true);
+
+  const pending = makeServer({ rollup: [{ status: "IN_PROGRESS" }] });
+  id = await inReviewWithPr(pending.base, "https://gh/pr/11");
+  task = await get(pending.base, `/api/tasks/${id}`);
+  expect(task.json.state).toBe("in_progress"); // held while checks run
+  pending.server.stop(true);
 });
 
 test("merge is blocked by a task.merge deny rule (authority gate)", async () => {

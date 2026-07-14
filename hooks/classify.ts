@@ -262,6 +262,19 @@ export function stripDataText(cmd: string): string {
     .replace(/"(?:[^"\\]|\\.)*"/g, '""');
 }
 
+// Force-push is only catastrophic on SHARED refs. An agent force-pushing its
+// OWN task branch (hive/<HIVE_TASK_ID>) is routine PR iteration after a rebase
+// — gating it produced a 5-card storm on one task (2026-07-13, #151: the agent
+// carded four alternate push-recovery plans nobody would answer). Waive when
+// EVERY git-push segment names the agent's own branch; anything else escalates.
+function forcePushOwnBranch(cmd: string, env: Record<string, string | undefined>): boolean {
+  const tid = env.HIVE_TASK_ID;
+  if (!tid) return false;
+  const own = `hive/${tid}`;
+  const pushes = segments(cmd).filter((s) => /git\s+push\b/.test(s));
+  return pushes.length > 0 && pushes.every((s) => s.includes(own));
+}
+
 // `docker rm` / `podman rm` remove containers, `git rm` stages recoverable
 // deletions — none touch the filesystem the way `rm` does. Waive the rm rule
 // when every rm-matching segment is one of those commands.
@@ -297,6 +310,7 @@ export function classify(
     if (reason === "recursive/forced rm" && (rmTargetsSandboxed(cmd, env, cwd) || isContainerOrVcsRm(cmd)))
       continue;
     if (reason === "process kill" && killTargetsSandboxed(cmd, env)) continue;
+    if (reason === "force push" && forcePushOwnBranch(cmd, env)) continue;
     if (reason.startsWith("SQL ") && sqlTargetsSandboxed(cmd, env)) continue;
     return { decision: "dangerous", reason };
   }
@@ -323,6 +337,17 @@ function preToolUseOutput(permissionDecision: "allow" | "deny", reason: string):
   });
 }
 
+// Action string for the authority engine. Dangerous commands carry their
+// classifier category as a stable sub-action ("command.dangerous.process-kill")
+// so a standing rule can allow ONE category forever ("Approve & always allow"
+// on the decision card) without relaxing the rest — the deny-safe default
+// `command.dangerous*` still matches every sub-action.
+export function actionFor(decision: Decision, reason: string): string {
+  if (decision !== "dangerous") return "command";
+  const slug = reason.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  return slug ? `command.dangerous.${slug}` : "command.dangerous";
+}
+
 // Ask hive's authority engine to decide a not-safe command. Fail-safe: any
 // unreachability or error DENIES (never auto-allows an unclassified command).
 async function escalate(
@@ -334,10 +359,11 @@ async function escalate(
   summary?: string
 ): Promise<string> {
   // Distinct action namespace so a standing rule can gate destructive commands
-  // (`command.dangerous`) without touching merely-unrecognized ones (`command`).
-  // `command.dangerous*` is deny-safe by default IN CODE — it requires a decision
-  // with no rule present; unknown commands default-allow (logged).
-  const action = decision === "dangerous" ? "command.dangerous" : "command";
+  // (`command.dangerous.*`, category-specific) without touching merely-
+  // unrecognized ones (`command`). `command.dangerous*` is deny-safe by default
+  // IN CODE — it requires a decision with no rule present; unknown commands
+  // default-allow (logged).
+  const action = actionFor(decision, reason);
   try {
     const res = await fetch(`${hiveUrl}/api/tasks/${taskId}/guarded-action`, {
       method: "POST",

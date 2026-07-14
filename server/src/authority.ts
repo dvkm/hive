@@ -198,6 +198,23 @@ export function authorize(db: DB, input: AuthzInput, clock: () => string = now):
       ? summary.slice(0, 109) + "…"
       : summary
     : input.detail?.trim() || `Authorize: ${input.action} on ${input.target}`;
+  // Gated shell commands get a third answer that mints a standing project rule
+  // for the whole category (the action carries the classifier category, e.g.
+  // `command.dangerous.process-kill`) — approving the same scratch-cleanup /
+  // pkill class one card at a time stalled agents for hours (19 of 28 such
+  // cards expired unanswered). Non-command actions (deploy, flags) stay
+  // one-time-only: "always allow a deploy" is never one click.
+  const options = [
+    { key: "approve", label: "Approve", detail: `Allow '${input.action}' on ${input.target} (one time).` },
+    ...(input.action.startsWith("command.")
+      ? [{
+          key: "approve_always",
+          label: "Approve & always allow",
+          detail: `Allow this once AND add a standing project rule: '${input.action}' → allow. Future commands in this category run without asking. Revocable in Authority.`,
+        }]
+      : []),
+    { key: "deny", label: "Deny", detail: "Block this action.", recommended: true },
+  ];
   const decision = createDecision(db, {
     task_id: input.task_id,
     title,
@@ -207,10 +224,7 @@ export function authorize(db: DB, input: AuthzInput, clock: () => string = now):
       `Approving mints a single-use, 24h grant scoped to this exact action + target.`,
     risk: "high",
     blast_radius: `Exact target: ${input.target}`,
-    options: [
-      { key: "approve", label: "Approve", detail: `Allow '${input.action}' on ${input.target} (one time).` },
-      { key: "deny", label: "Deny", detail: "Block this action.", recommended: true },
-    ],
+    options,
   });
   db.query(
     "INSERT INTO authority_grants (id, task_id, action, target, decision_id, status, created_at) VALUES (?,?,?,?,?, 'pending', ?)"
@@ -226,7 +240,9 @@ export function authorize(db: DB, input: AuthzInput, clock: () => string = now):
 }
 
 // Called when a decision is answered. If it gates a pending authority grant,
-// approve → mint the consumable grant (24h); anything else → deny it.
+// approve → mint the consumable grant (24h); approve_always → the grant PLUS a
+// standing project-scoped allow rule for the action category, so this class of
+// command never cards again; anything else → deny it.
 // Returns true if this decision was an authority card (so the caller can log).
 export function resolveGrantForDecision(
   db: DB,
@@ -238,7 +254,8 @@ export function resolveGrantForDecision(
     .query("SELECT * FROM authority_grants WHERE decision_id = ? AND status = 'pending'")
     .get(decisionId) as any;
   if (!g) return false;
-  if (answerKey === "approve") {
+  if (answerKey === "approve_always") mintCategoryRule(db, g, decisionId, clock);
+  if (answerKey === "approve" || answerKey === "approve_always") {
     const expires = new Date(new Date(clock()).getTime() + GRANT_TTL_MS).toISOString();
     db.query("UPDATE authority_grants SET status = 'granted', expires_at = ? WHERE id = ?").run(expires, g.id);
     if (g.task_id)
@@ -252,6 +269,42 @@ export function resolveGrantForDecision(
     db.query("UPDATE authority_grants SET status = 'denied' WHERE id = ?").run(g.id);
   }
   return true;
+}
+
+// "Approve & always allow": insert an active project-scoped allow rule for the
+// exact action (a stable category string like `command.dangerous.process-kill`).
+// Specificity makes it win over the global `command.dangerous*` require_decision
+// default (project beats global, longer literal beats shorter). Idempotent:
+// answering two parked cards of the same category mints one rule.
+function mintCategoryRule(db: DB, grant: any, decisionId: string, clock: () => string): void {
+  const t = grant.task_id
+    ? (db.query("SELECT project_id FROM tasks WHERE id = ?").get(grant.task_id) as any)
+    : null;
+  const projectId = t?.project_id ?? null;
+  const exists = db
+    .query(
+      "SELECT 1 FROM authority_rules WHERE active = 1 AND action_pattern = ? AND project_id IS ?"
+    )
+    .get(grant.action, projectId);
+  if (exists) return;
+  db.query(
+    "INSERT INTO authority_rules (id, project_id, scope, action_pattern, effect, note, active, created_at) VALUES (?,?,?,?,?,?,1,?)"
+  ).run(
+    newId("aur"),
+    projectId,
+    projectId ? `project:${projectId}` : "global",
+    grant.action,
+    "allow",
+    `always-allow minted from decision ${decisionId} (target was: ${String(grant.target).slice(0, 120)})`,
+    clock()
+  );
+  if (grant.task_id)
+    writeEvent(db, {
+      task_id: grant.task_id,
+      source: "director",
+      type: "authority_rule_minted",
+      payload: { action: grant.action, project_id: projectId, decision_id: decisionId },
+    });
 }
 
 // Applicable active rules for a project (global + project), most-specific first.
