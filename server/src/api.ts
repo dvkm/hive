@@ -30,7 +30,7 @@ import {
 } from "./rows.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
-import { cleanupTask } from "./cleanup.ts";
+import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
 import { smokeThenAdvance } from "./monitors.ts";
 import { enqueue, ackNotifications } from "./notifications.ts";
@@ -1314,9 +1314,17 @@ export async function spawnAgent(
       env,
       model: modelForTask(config, task.kind),
       agentArgv: config.agent_argv, // optional per-project override (verbatim)
-      // Seed the worktree with hive's Claude Code hook wiring BEFORE the agent
-      // starts, so Stop/SubagentStop/PostToolUse reporting is structural.
-      prepareWorktree: (worktreePath) => writeHookSettings(worktreePath, id, hiveUrl, config.command_approval),
+      // Seed the worktree BEFORE the agent starts: hive's Claude Code hook
+      // wiring (structural Stop/SubagentStop/PostToolUse reporting), then the
+      // per-project spawn hook (config.setup_argv, e.g. wt.sh up {worktree}) so
+      // agents don't have to install deps / bring up their stack themselves.
+      prepareWorktree: async (worktreePath) => {
+        writeHookSettings(worktreePath, id, hiveUrl, config.command_approval);
+        await runStackCmd(db, id, config.setup_argv, project.repo_path, worktreePath, defaultExec, {
+          type: "stack_setup",
+          source: "herdr",
+        });
+      },
     });
   } catch (e: any) {
     writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: String(e?.message ?? e) } });
