@@ -788,11 +788,18 @@ same authority engine (`writeHookSettings` in `api.ts`; `hooks/classify.ts` +
    - **safe** (read-only / standard dev, no dangerous tokens, no `$(...)`/backtick
      substitution) → emits the PreToolUse **allow** decision, no dialog.
    - **dangerous** (`rm -rf`, `sudo`, `curl|wget … | sh`, `git push --force`,
-     `git reset --hard`, `DROP/TRUNCATE`, `DELETE FROM`/`UPDATE … SET` without
-     `WHERE`, fork bomb, `mkfs`/`dd of=`, device/system-path writes, `kill`,
-     `terraform apply/destroy`, `kubectl delete`, SSH/AWS credential files, …) →
-     escalates via `POST guarded-action {action:"command.dangerous", target:<cmd>}`.
+     `git reset --hard`, `find … -delete/-exec`, `DROP/TRUNCATE`,
+     `DELETE FROM`/`UPDATE … SET` without `WHERE`, fork bomb, `mkfs`/`dd of=`,
+     device/system-path writes, `kill`, `terraform apply/destroy`,
+     `kubectl delete`, SSH/AWS credential files, …) → escalates via
+     `POST guarded-action {action:"command.dangerous", target:<cmd>}`.
      Never auto-allowed, even under `command_approval:"allow"`.
+     **Sandbox waiver**: a destructive command PROVEN to act only inside the
+     agent's own sandbox (its herdr worktree or a tmp scratchpad) is first
+     downgraded out of `dangerous` to **unknown** (allow-and-log) — this covers
+     `rm -rf`, `kill`/`pkill`, `git reset --hard`/`git clean`, `git push --force`,
+     `find … -delete/-exec`, and sandboxed SQL. Anything unresolvable (a shell
+     var, a `..` escape, an un-sandboxed or unknown path) stays dangerous.
    - **unknown** (not provably safe) → escalates via `{action:"command", …}`, or is
      allowed / deferred per the `command_approval` policy below.
 

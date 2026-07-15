@@ -243,6 +243,25 @@ test("container/vcs rm and sandboxed-cwd relative rm are waived", () => {
   expect(classify("ls | xargs rm -rf", env, wt).decision).toBe("dangerous"); // executor + unseen targets
 });
 
+test("find -delete/-exec inside the agent's own sandbox downgrades; elsewhere stays dangerous", () => {
+  const env = { HOME: "/Users/you" };
+  const wt = "/Users/you/.herdr/worktrees/monorepo/hive-abc";
+  expect(classify(`find ${wt} -name '*.log' -delete`, env).decision).toBe("unknown");
+  expect(classify(`find ${wt} -type f -exec rm {} \\;`, env).decision).toBe("unknown");
+  expect(classify("find . -name '*.log' -delete", env, wt).decision).toBe("unknown"); // relative + sandboxed cwd
+  expect(classify("find /Users/you/projects/monorepo -name '*.log' -delete", env).decision).toBe("dangerous");
+  expect(classify("find . -name '*.log' -delete", env, "/Users/you/projects/monorepo").decision).toBe("dangerous");
+  expect(classify("find . -name '*.log' -delete", env).decision).toBe("dangerous"); // no cwd: unprovable
+  expect(classify(`find ${wt}/../other -name '*.log' -delete`, env).decision).toBe("dangerous"); // escape
+  // Multiple search paths: every leading path must be sandboxed, not just the first.
+  expect(classify(`find ${wt} /Users/you/projects/monorepo -name '*.log' -delete`, env).decision).toBe("dangerous");
+  expect(classify(`find ${wt} ${wt}/sub -name '*.log' -delete`, env).decision).toBe("unknown");
+  // Leading global-option flags must not hide the real search path.
+  expect(classify("find -L /Users/you/projects/monorepo -name '*.ts' -delete", env, wt).decision).toBe("dangerous");
+  expect(classify(`find -L ${wt} -name '*.ts' -delete`, env).decision).toBe("unknown");
+  expect(classify("find -L -delete", env, wt).decision).toBe("unknown"); // globals-only + sandboxed cwd → implicit '.'
+});
+
 test("$HIVE_CLI emit with assignments is data-only", () => {
   expect(
     classify('export PATH="$HOME/.bun/bin:$PATH"\n"$HIVE_CLI" emit abc status --note "blocked on rm -rf card"').decision
