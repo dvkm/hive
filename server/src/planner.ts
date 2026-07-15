@@ -19,6 +19,7 @@ import { writeEvent, getTask, transition } from "./state.ts";
 import { enqueue } from "./notifications.ts";
 import { createDecision } from "./api.ts";
 import { listReferences } from "./learn.ts";
+import { classifyEscalation, factorsFromPlan, type EscalationVerdict } from "./policy.ts";
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.HIVE_PLANNER_TIMEOUT_MS || 120_000);
 // Pinned to sonnet: a breakdown proposal is triage, not deep work, and an
@@ -249,11 +250,20 @@ export async function runPlanner(db: DB, taskId: string, deps: PlannerDeps = {})
   const plan = extractPlan(res.stdout);
   if (!plan) return plannerError(db, taskId, "planner output was not valid JSON with proposed_tasks");
 
+  const policyCount = (
+    db
+      .query(
+        "SELECT COUNT(*) n FROM policies WHERE active = 1 AND (scope = 'global' OR scope = ?)"
+      )
+      .get(`project:${task.project_id}`) as { n: number }
+  ).n;
+  const verdict = classifyEscalation(factorsFromPlan(plan, policyCount > 0));
+
   const decision = createDecision(db, {
     task_id: taskId,
     title: `Proposed breakdown: ${task.title}`,
-    context: renderContext(plan),
-    risk: "normal",
+    context: renderContext(plan, verdict),
+    risk: verdict.risk,
     options: [
       { key: "approve", label: "Approve breakdown", detail: `Create ${plan.proposed_tasks.length} task(s).`, recommended: true },
       { key: "reject", label: "Reject", detail: "Discard the proposal; nothing is created." },
@@ -288,7 +298,7 @@ function plannerError(db: DB, taskId: string, error: string): PlanResult {
   return { ok: false, error };
 }
 
-function renderContext(plan: Plan): string {
+function renderContext(plan: Plan, verdict: EscalationVerdict): string {
   const lines: string[] = [];
   if (plan.rationale) lines.push(plan.rationale, "");
   lines.push(`Proposed tasks (${plan.proposed_tasks.length}):`);
@@ -300,6 +310,7 @@ function renderContext(plan: Plan): string {
     lines.push("", "Open questions:");
     plan.questions.forEach((q) => lines.push(`- ${q}`));
   }
+  lines.push("", `Risk: ${verdict.risk} (${verdict.reason})`);
   return lines.join("\n");
 }
 
