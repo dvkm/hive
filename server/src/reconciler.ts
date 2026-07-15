@@ -262,6 +262,24 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     } catch {
       continue;
     }
+    // Record a new pushed commit as `pr_synchronized` (hive's stand-in for
+    // GitHub's synchronize webhook) so changesRequestUnaddressed can tell "the
+    // agent pushed a fix" from "CI is still green on the same old head". The
+    // first observation is a baseline (no changes_requested exists yet when a PR
+    // is first linked); only a CHANGED head afterward counts as new work.
+    // ponytail: last-seen head is read back from the prior pr_synchronized event
+    // (no task column); a PR reaches review long before any changes_requested,
+    // so the baseline is always in place by the time the guard matters.
+    const headSha: string | null = data.headRefOid ?? null;
+    if (headSha) {
+      const lastSync: any = db
+        .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_synchronized' ORDER BY ts DESC LIMIT 1")
+        .get(t.id);
+      const lastSha = lastSync ? (JSON.parse(lastSync.payload).head_sha ?? null) : null;
+      if (headSha !== lastSha) {
+        writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_synchronized", payload: { head_sha: headSha } });
+      }
+    }
     const ci = ciStatusOf(data.statusCheckRollup);
     if (ci && ci !== t.ci_status) {
       db.query("UPDATE tasks SET ci_status = ?, updated_at = ? WHERE id = ?").run(ci, now(), t.id);

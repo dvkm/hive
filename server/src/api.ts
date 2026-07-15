@@ -16,6 +16,7 @@ import {
   advanceIfFinished,
   evidenceCount,
   evidenceAtSha,
+  changesRequestUnaddressed,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
@@ -577,6 +578,11 @@ export function linkPrIfMarked(
 export function handOffToReview(db: DB, taskId: string, source: string): boolean {
   const t: any = getTask(db, taskId);
   if (!t || t.state !== "in_progress") return false;
+  // #234: the reconciler's CI-green poll used to re-queue a task the director
+  // JUST sent back (changes_requested) 33s later, before any new commit — CI was
+  // still green on the old head. The shared guard blocks re-queue until new work
+  // (a pushed commit / evidence / review_summary) lands after the request.
+  if (changesRequestUnaddressed(db, taskId)) return false;
   transition(db, taskId, "in_review", { source, reason: "PR open, awaiting review" });
   return true;
 }
@@ -1237,11 +1243,15 @@ async function requestChanges(db: DB, herdr: Herdr, id: string, body: any): Prom
       sendError = String(e?.message ?? e);
     }
   }
+  const lastSync: any = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_synchronized' ORDER BY ts DESC LIMIT 1")
+    .get(id);
+  const head_sha: string | null = lastSync ? (JSON.parse(lastSync.payload).head_sha ?? null) : null;
   writeEvent(db, {
     task_id: id,
     source: "director",
     type: "changes_requested",
-    payload: { notes, delivered, ...(sendError ? { send_error: sendError } : {}) },
+    payload: { notes, delivered, head_sha, ...(sendError ? { send_error: sendError } : {}) },
   });
   const updated = transition(db, id, "in_progress", { source: "director", reason: "changes requested" });
   return json({ ok: true, delivered, task: updated });
