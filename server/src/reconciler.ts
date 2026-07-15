@@ -250,8 +250,8 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   const exec = deps.exec ?? defaultExec;
   const h = deps.herdr ?? defaultHerdr;
   const tasks = db
-    .query(`SELECT id, state, pr_url, ci_status, agent_target, project_id FROM tasks WHERE pr_url IS NOT NULL AND state IN ${NON_TERMINAL}`)
-    .all() as { id: string; state: string; pr_url: string; ci_status: string | null; agent_target: string | null; project_id: string }[];
+    .query(`SELECT id, state, pr_url, ci_status, head_sha, agent_target, project_id FROM tasks WHERE pr_url IS NOT NULL AND state IN ${NON_TERMINAL}`)
+    .all() as { id: string; state: string; pr_url: string; ci_status: string | null; head_sha: string | null; agent_target: string | null; project_id: string }[];
 
   for (const t of tasks) {
     const r = await exec(["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup,mergeable,headRefOid"]);
@@ -266,6 +266,10 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     if (ci && ci !== t.ci_status) {
       db.query("UPDATE tasks SET ci_status = ?, updated_at = ? WHERE id = ?").run(ci, now(), t.id);
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "ci_status", payload: { ci_status: ci } });
+      broadcast({ type: "task", task: getTask(db, t.id) });
+    }
+    if (data.headRefOid && data.headRefOid !== t.head_sha) {
+      db.query("UPDATE tasks SET head_sha = ?, updated_at = ? WHERE id = ?").run(data.headRefOid, now(), t.id);
       broadcast({ type: "task", task: getTask(db, t.id) });
     }
     // Time-based fallback for the link-time hand-off — but review means "CI is

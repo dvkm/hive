@@ -7,13 +7,37 @@ import { CiBadge, toast } from "../lib/ui";
 import { MAX_DIFF_LINES } from "../lib/api";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
+import { relTime } from "../lib/time";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
 import { ReportView } from "./ReportView";
 
+// Staleness marker: captured-at time always shows; the commit SHA (recorded
+// by the CLI from the agent's worktree at capture time) compares against the
+// PR's current head so a director never has to trust silently that a
+// screenshot still matches HEAD (task #226).
+function EvAge({ e, headSha }: { e: Evidence; headSha: string | null }) {
+  const sha = typeof e.meta?.commit_sha === "string" ? (e.meta.commit_sha as string) : null;
+  const stale = !!(sha && headSha && sha !== headSha);
+  const title = [
+    `captured ${e.ts}`,
+    sha ? `commit ${sha}` : "commit unknown",
+    stale ? `HEAD is now ${headSha}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <span className={`ev-age ${stale ? "ev-age-stale" : ""}`} title={title}>
+      {stale && "⚠ "}
+      {relTime(e.ts)}
+      {sha && <span className="ev-sha">{sha.slice(0, 7)}</span>}
+    </span>
+  );
+}
+
 // One non-image evidence chip. Clicking a text chip expands the inline viewer
 // (full width, below the strip); the ↗ opens the raw file in a tab.
-function EvChip({ e }: { e: Evidence }) {
+function EvChip({ e, headSha }: { e: Evidence; headSha: string | null }) {
   const [open, setOpen] = useState(false);
   const label = e.caption || e.kind;
   const viewable = !!e.url && ["report", "log", "test_run"].includes(e.kind);
@@ -21,6 +45,7 @@ function EvChip({ e }: { e: Evidence }) {
     <>
       <span className={`chip chip-kind`}>{e.kind}</span>
       <span className="rev-ev-cap">{label}</span>
+      <EvAge e={e} headSha={headSha} />
     </>
   );
   if (viewable)
@@ -376,10 +401,11 @@ export function ReviewCard({
               {imgs.map((e, i) => (
                 <button key={e.id} className="rev-thumb" title={e.caption || "screenshot"} onClick={() => lightbox.open(lb, i)}>
                   <img src={e.url!} alt={e.caption || "screenshot"} />
+                  <EvAge e={e} headSha={task.head_sha} />
                 </button>
               ))}
               {others.map((e) => (
-                <EvChip key={e.id} e={e} />
+                <EvChip key={e.id} e={e} headSha={task.head_sha} />
               ))}
             </div>
           );

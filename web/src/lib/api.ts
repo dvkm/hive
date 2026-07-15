@@ -56,6 +56,7 @@ export interface Task {
   branch: string | null;
   pr_url: string | null;
   ci_status: CiStatus;
+  head_sha: string | null; // PR's current head commit, refreshed by the reconciler's PR poll
   summary: string | null;
   source: string | null;
   parent_task_id: string | null;

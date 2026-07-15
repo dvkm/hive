@@ -3532,6 +3532,7 @@ a {
   margin: 10px 0 4px;
 }
 .rev-thumb {
+  position: relative;
   border: 1px solid var(--border, #3333);
   border-radius: 8px;
   padding: 0;
@@ -3542,6 +3543,29 @@ a {
 }
 .rev-thumb:hover { transform: scale(1.03); box-shadow: 0 2px 12px #0006; }
 .rev-thumb img { display: block; height: 96px; max-width: 220px; object-fit: cover; }
+.rev-thumb .ev-age {
+  position: absolute;
+  left: 4px;
+  bottom: 4px;
+  right: 4px;
+  background: #000a;
+  color: #fff;
+  border-color: transparent;
+}
+.rev-thumb .ev-age-stale { background: #d4a72cdd; color: #1a1200; }
+/* ---- evidence staleness marker (captured-at + commit SHA vs PR head) ---- */
+.ev-age {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted, #888);
+  border: 1px solid transparent;
+  border-radius: 5px;
+  padding: 1px 4px;
+}
+.ev-age-stale { color: #d4a72c; border-color: #d4a72c66; }
+.ev-sha { font-family: var(--mono, monospace); opacity: 0.8; }
 .rev-ev-chip {
   display: inline-flex;
   align-items: center;
