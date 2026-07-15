@@ -32,7 +32,7 @@ import {
 } from "./rows.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
-import { cleanupTask } from "./cleanup.ts";
+import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
 import { smokeThenAdvance } from "./monitors.ts";
 import { enqueue, ackNotifications } from "./notifications.ts";
@@ -42,7 +42,7 @@ import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.
 import { routeIntakeProject } from "./intake/route.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { costUsd } from "./pricing.ts";
-import { checkCostGuardrails, resolveCostCapForDecision } from "./costs.ts";
+import { checkCostGuardrails, resolveCostCapForDecision, taskSpend } from "./costs.ts";
 import { vapidPublicKey, saveSubscription, removeSubscription } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { ciStatusOf } from "./reconciler.ts";
@@ -282,7 +282,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       m = pathname.match(/^\/api\/decisions\/([^/]+)$/);
       if (m && method === "GET") {
         const r = db.query("SELECT * FROM decisions WHERE id = ?").get(m[1]);
-        return r ? json(parseDecision(r)) : err("decision not found", 404);
+        return r ? json(withBundle(db, parseDecision(r))) : err("decision not found", 404);
       }
       m = pathname.match(/^\/api\/decisions\/([^/]+)\/draft$/);
       if (m && method === "PUT") return saveDraft(db, m[1], await req.json());
@@ -807,7 +807,7 @@ function brief(db: DB, url: URL): Response {
   const decisions = db
     .query("SELECT * FROM decisions WHERE status = 'open' ORDER BY ts DESC")
     .all()
-    .map(parseDecision);
+    .map((r) => withBundle(db, parseDecision(r)));
 
   // ④ fleet now — currently live agents (task + health).
   const fleet = db
@@ -1023,7 +1023,7 @@ function getTaskFull(db: DB, id: string): Response {
     .all(id)
     .map(parseEvidence)
     .map((e: any) => ({ ...e, preview: evidencePreview(e.path, e.kind) }));
-  const decisions = db.query("SELECT * FROM decisions WHERE task_id = ? ORDER BY ts").all(id).map(parseDecision);
+  const decisions = db.query("SELECT * FROM decisions WHERE task_id = ? ORDER BY ts").all(id).map((r) => withBundle(db, parseDecision(r)));
   return json({ ...taskWithHealth(db, task), events, evidence, decisions });
 }
 
@@ -1328,9 +1328,17 @@ export async function spawnAgent(
       env,
       model: modelForTask(config, task.kind),
       agentArgv: config.agent_argv, // optional per-project override (verbatim)
-      // Seed the worktree with hive's Claude Code hook wiring BEFORE the agent
-      // starts, so Stop/SubagentStop/PostToolUse reporting is structural.
-      prepareWorktree: (worktreePath) => writeHookSettings(worktreePath, id, hiveUrl, config.command_approval),
+      // Seed the worktree BEFORE the agent starts: hive's Claude Code hook
+      // wiring (structural Stop/SubagentStop/PostToolUse reporting), then the
+      // per-project spawn hook (config.setup_argv, e.g. wt.sh up {worktree}) so
+      // agents don't have to install deps / bring up their stack themselves.
+      prepareWorktree: async (worktreePath) => {
+        writeHookSettings(worktreePath, id, hiveUrl, config.command_approval);
+        await runStackCmd(db, id, config.setup_argv, project.repo_path, worktreePath, defaultExec, {
+          type: "stack_setup",
+          source: "herdr",
+        });
+      },
     });
   } catch (e: any) {
     writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: String(e?.message ?? e) } });
@@ -2565,6 +2573,45 @@ const DEFAULT_OPTIONS = [
   { key: "dismiss", label: "Dismiss" },
 ];
 
+// The context an open card needs to be decided in one pass, derived (never
+// stored) from live tables so it can't go stale: what the director already
+// chose on this project, the concrete artifact (PR/branch) the call affects,
+// and what the task has cost so far. Attached as `bundle` to every OPEN card
+// the client renders. ponytail: "relevant prior" = same-project + most-recent
+// answered, not semantic match — upgrade to title similarity if this gets noisy.
+export function decisionBundle(db: DB, taskId: string, decisionId: string): any {
+  const task = getTask(db, taskId);
+  if (!task) return null;
+  const prior = (
+    db
+      .query(
+        `SELECT dc.id, dc.title, dc.answer_key, dc.answered_at, dc.options
+           FROM decisions dc JOIN tasks t ON t.id = dc.task_id
+          WHERE t.project_id = ? AND dc.status = 'answered' AND dc.id != ?
+          ORDER BY dc.answered_at DESC LIMIT 3`
+      )
+      .all(task.project_id, decisionId) as any[]
+  ).map((r) => {
+    const opts = JSON.parse(r.options || "[]");
+    const chosen = opts.find((o: any) => o.key === r.answer_key);
+    return { id: r.id, title: r.title, answer: chosen?.label ?? r.answer_key ?? null, answered_at: r.answered_at };
+  });
+  return {
+    task_number: task.number ?? null,
+    pr_url: task.pr_url ?? null,
+    branch: task.branch ?? null,
+    spend_usd: +taskSpend(db, taskId).toFixed(2),
+    prior_decisions: prior,
+  };
+}
+
+// Attach the derived bundle to a parsed decision. Cheap enough to run on every
+// open card at fetch/broadcast time; skipped implicitly for terminal cards that
+// callers never pass here.
+export function withBundle(db: DB, d: any): any {
+  return { ...d, bundle: decisionBundle(db, d.task_id, d.id) };
+}
+
 export function createDecision(
   db: DB,
   d: { task_id: string; title: string; context?: string | null; risk?: string | null; blast_radius?: string | null; options?: any[] }
@@ -2595,13 +2642,14 @@ export function createDecision(
     row.blast_radius, row.options, row.status, row.answer_key, row.answer_note,
     row.draft_note, row.answered_at
   );
-  const decision = parseDecision(row);
   writeEvent(db, { task_id: d.task_id, source: "agent", type: "needs-decision", payload: { decision_id: row.id, title: row.title } });
   // Move task into needs_decision if the current state allows it.
   const task = getTask(db, d.task_id);
   if (canTransition(task.state, "needs_decision")) {
     transition(db, d.task_id, "needs_decision", { source: "agent", reason: row.title });
   }
+  // Enrich AFTER the transition so the bundle's spend/PR reflect current state.
+  const decision = withBundle(db, parseDecision(row));
   broadcast({ type: "decision", decision });
   // Notify: a high-risk decision is urgent (immediate push); others batch.
   enqueue(db, {
@@ -2637,7 +2685,7 @@ function listDecisions(db: DB, url: URL): Response {
     status === "all"
       ? db.query("SELECT * FROM decisions ORDER BY ts DESC").all()
       : db.query("SELECT * FROM decisions WHERE status = ? ORDER BY ts DESC").all(status);
-  return json(rows.map(parseDecision));
+  return json(rows.map((r) => withBundle(db, parseDecision(r))));
 }
 
 // Autosave: overwrite draft_note only. Cheap, called on every keystroke (debounced).

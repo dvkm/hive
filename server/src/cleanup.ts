@@ -13,43 +13,48 @@ import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 
-// Per-project stack teardown, run BEFORE the worktree is removed (the command
-// usually needs files inside it, e.g. corebeat's wt.sh). Config:
-//   config.cleanup_argv = ["infra/worktree/wt.sh", "down", "{worktree}"]
-// Relative argv[0] resolves against repo_path; {worktree} substitutes the
-// task's worktree path. Best-effort with a hard timeout — a failed teardown
-// never blocks worktree/session cleanup (256 orphaned docker containers,
-// 2026-07-13, were stacks nothing ever tore down).
-async function runCleanupCmd(
+// Per-project stack lifecycle command. Two symmetric hooks share this runner:
+//   config.setup_argv    = ["infra/worktree/wt.sh", "up",   "{worktree}"]  (spawn time, before agent starts)
+//   config.cleanup_argv  = ["infra/worktree/wt.sh", "down", "{worktree}"]  (before worktree removal)
+// Setup runs AFTER the worktree exists but BEFORE the agent starts (see the
+// worktree-ready callback in api.ts) so agents don't have to install deps /
+// bring up their docker stack themselves; teardown runs BEFORE the worktree is
+// removed (the command usually needs files inside it). Both: relative argv[0]
+// resolves against repo_path, {worktree} substitutes the task's worktree path,
+// best-effort with a hard timeout — a failed hook never blocks spawn nor
+// worktree/session cleanup (256 orphaned docker containers, 2026-07-13, were
+// stacks nothing ever tore down). Emits a stack_setup / stack_teardown event.
+export async function runStackCmd(
   db: DB,
   taskId: string,
   argvTemplate: unknown,
   repoPath: string,
   worktreePath: string,
-  exec: Exec
+  exec: Exec,
+  kind: { type: "stack_setup" | "stack_teardown"; source: string }
 ): Promise<void> {
   if (!Array.isArray(argvTemplate) || !argvTemplate.length) return;
   const argv = argvTemplate.map((a) => String(a).replaceAll("{worktree}", worktreePath));
   if (!argv[0].startsWith("/")) argv[0] = `${repoPath}/${argv[0]}`;
   try {
-    // Exec has no timeout; race one so a hung teardown can't stall the reaper.
+    // Exec has no timeout; race one so a hung hook can't stall the reaper/spawn.
     const r = await Promise.race([
       exec(argv, { cwd: repoPath }),
       new Promise<{ code: number; stdout: string; stderr: string }>((resolve) =>
-        setTimeout(() => resolve({ code: 124, stdout: "", stderr: "cleanup command timed out (120s)" }), 120_000)
+        setTimeout(() => resolve({ code: 124, stdout: "", stderr: `${kind.type} command timed out (120s)` }), 120_000)
       ),
     ]);
     writeEvent(db, {
       task_id: taskId,
-      source: "reaper",
-      type: "stack_teardown",
+      source: kind.source,
+      type: kind.type,
       payload: { argv, ok: r.code === 0, ...(r.code !== 0 ? { error: (r.stderr || r.stdout).slice(0, 300) } : {}) },
     });
   } catch (e: any) {
     writeEvent(db, {
       task_id: taskId,
-      source: "reaper",
-      type: "stack_teardown",
+      source: kind.source,
+      type: kind.type,
       payload: { argv, ok: false, error: String(e?.message ?? e).slice(0, 300) },
     });
   }
@@ -112,7 +117,10 @@ export async function cleanupTask(
     } catch {
       cleanupArgv = undefined;
     }
-    await runCleanupCmd(db, taskId, cleanupArgv, repoPath, task.worktree_path, opts.exec ?? defaultExec);
+    await runStackCmd(db, taskId, cleanupArgv, repoPath, task.worktree_path, opts.exec ?? defaultExec, {
+      type: "stack_teardown",
+      source: "reaper",
+    });
   }
 
   // 1) worktree — guarded removal (branch pushed/merged; uncommitted work preserved).

@@ -1210,6 +1210,56 @@ a {
   background: transparent;
 }
 
+/* bundled decision context: affected PR/branch + spend, and prior answers */
+.dbundle {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.dbundle-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.dbundle-fact {
+  font-size: 12px;
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-dim);
+  background: var(--bg-elev);
+  white-space: nowrap;
+}
+a.dbundle-fact:hover {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+.dbundle-prior {
+  border-left: 2px solid var(--border);
+  padding-left: 12px;
+}
+.dbundle-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  margin-bottom: 5px;
+}
+.dbundle-prior-row {
+  display: flex;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.dbundle-prior-title {
+  color: var(--text-dim);
+}
+.dbundle-prior-answer {
+  color: var(--text);
+  white-space: nowrap;
+}
+
 /* options */
 .options {
   display: flex;

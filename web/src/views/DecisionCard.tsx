@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
-import type { Decision } from "../lib/api";
+import type { Decision, DecisionBundle } from "../lib/api";
 import { riskDisplay } from "../lib/decision";
 import { toast } from "../lib/ui";
 
@@ -84,6 +84,8 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
         {d.blast_radius && <div className="blast-body">{d.blast_radius}</div>}
       </div>
 
+      <DecisionBundleView bundle={d.bundle} />
+
       {!hasOptions && (
         <p className="dcard-context">This decision has no options. Dismiss it to clear the card.</p>
       )}
@@ -132,4 +134,47 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
       </div>
     </article>
   );
+}
+
+// The server-derived context that lets the director decide without opening the
+// task: the affected PR/branch + spend, and how they've answered before on this
+// project. Renders nothing when no bundle is present (older SSE payloads, tests).
+function DecisionBundleView({ bundle }: { bundle?: DecisionBundle | null }) {
+  if (!bundle) return null;
+  const { pr_url, branch, spend_usd, prior_decisions } = bundle;
+  const hasFacts = pr_url || branch || spend_usd > 0;
+  if (!hasFacts && prior_decisions.length === 0) return null;
+
+  return (
+    <div className="dbundle">
+      {hasFacts && (
+        <div className="dbundle-facts">
+          {pr_url && (
+            <a className="dbundle-fact" href={pr_url} target="_blank" rel="noreferrer">
+              {prLabel(pr_url)}
+            </a>
+          )}
+          {branch && !pr_url && <span className="dbundle-fact">{branch}</span>}
+          {spend_usd > 0 && <span className="dbundle-fact">${spend_usd.toFixed(2)} spent</span>}
+        </div>
+      )}
+      {prior_decisions.length > 0 && (
+        <div className="dbundle-prior">
+          <div className="dbundle-label">You've decided before</div>
+          {prior_decisions.map((p) => (
+            <div key={p.id} className="dbundle-prior-row">
+              <span className="dbundle-prior-title">{p.title}</span>
+              {p.answer && <span className="dbundle-prior-answer">→ {p.answer}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// "owner/repo#123" from a GitHub PR URL; the raw URL otherwise.
+function prLabel(url: string): string {
+  const m = url.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+  return m ? `${m[1]}#${m[2]}` : url;
 }
