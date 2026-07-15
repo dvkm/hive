@@ -15,6 +15,7 @@ import {
   TERMINAL,
   advanceIfFinished,
   evidenceCount,
+  evidenceAtSha,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
@@ -1225,7 +1226,10 @@ async function requestChanges(db: DB, herdr: Herdr, id: string, body: any): Prom
         task.agent_target,
         `hive: changes requested before merge —\n${notes}\n\n` +
           `If any of the above is a QUESTION, reply with \`hive emit ${id} answer --note "..."\` ` +
-          `(answers are pushed to the director; pane text is not), then make the changes and emit ready again.`
+          `(answers are pushed to the director; pane text is not), then make the changes and emit ready again.\n\n` +
+          `After you push the fix, RE-CAPTURE evidence against the new commit — a fresh test run or log for ` +
+          `server/back-end changes, a screenshot for UI. The old evidence is now stale and the handoff is HELD ` +
+          `until fresh evidence matches HEAD (hive emit ${id} evidence --file ... --note ...).`
       );
       sendError = sendFailure(res);
       delivered = sendError === null;
@@ -2131,9 +2135,26 @@ async function attachFiles(taskId: string, files: File[]): Promise<{ paths: stri
   return { paths, block };
 }
 
+// The task worktree's current HEAD commit. Evidence is stamped with this SHA at
+// capture time, and the ready gate compares it against attached evidence so a
+// stale screenshot (from before a change-request fix) can't satisfy the handoff.
+// Fails soft (null) when there's no worktree or git can't answer — a broken git
+// must not strand every handoff (same fail-open stance as the CI probe).
+async function headSha(exec: Exec, cwd: string | null): Promise<string | null> {
+  if (!cwd) return null;
+  try {
+    const r = await exec(["git", "rev-parse", "HEAD"], { cwd });
+    const sha = r.code === 0 ? r.stdout.trim() : "";
+    return sha || null;
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------- event ingestion (`hive emit`)
 async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDeps = {}): Promise<Response> {
   if (!getTask(db, taskId)) return err("task not found", 404);
+  const exec = deps.exec ?? defaultExec;
   const ct = req.headers.get("content-type") || "";
   let fields: Record<string, string> = {};
   let file: File | null = null;
@@ -2170,6 +2191,20 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       path = saved.path;
       servedUrl = saved.url;
     }
+    // Tie the artifact to the commit it was captured from: the worktree HEAD at
+    // emit time. The ready gate reads meta.commit_sha to reject stale evidence.
+    let meta = fields.meta ?? "{}";
+    const evTask = getTask(db, taskId);
+    const sha = fields.commit_sha ?? (await headSha(exec, evTask?.worktree_path ?? null));
+    if (sha) {
+      try {
+        const m = JSON.parse(meta);
+        if (m && typeof m === "object" && m.commit_sha == null) m.commit_sha = sha;
+        meta = JSON.stringify(m);
+      } catch {
+        // non-JSON meta: leave it, the sha stamp is best-effort
+      }
+    }
     const ev = {
       id: newId("ev"),
       task_id: taskId,
@@ -2178,7 +2213,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       path,
       url: servedUrl,
       caption: fields.caption ?? note,
-      meta: fields.meta ?? "{}",
+      meta,
     };
     db.query(
       "INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,?)"
@@ -2257,12 +2292,33 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
           reason: "no_evidence",
           message: needsReport
             ? "Handoff held: scouts hand off a written report. Attach it (hive emit <task-id> evidence --kind report --file report.md), then emit ready again."
-            : "Handoff held: no evidence attached. Attach proof of the behavior (screenshot, test output, log) with `hive emit <task-id> evidence --file ... --note ...`, then emit ready again.",
+            : "Handoff held: no evidence attached. Server/back-end changes need a test run or log; UI changes need a screenshot (before/after). Attach it with `hive emit <task-id> evidence --file ... --note ...`, then emit ready again.",
         });
+      }
+      // Freshness gate: the evidence the director sees must reflect the CURRENT
+      // commit. After a change request the agent pushes a fix, so evidence from
+      // an earlier commit is stale (the #223 bug: the screenshot never updated).
+      // Require at least one evidence item tied to HEAD. Scouts hand off a
+      // written report, not commit-bound screenshots, so they're exempt. Fails
+      // open when there's no worktree / git can't resolve HEAD.
+      if (!needsReport) {
+        const head = await headSha(exec, t.worktree_path);
+        if (head && evidenceAtSha(db, taskId, head) < 1) {
+          writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { reason: "stale_evidence", head_sha: head } });
+          broadcastTask(db, getTask(db, taskId));
+          return json({
+            held: true,
+            reason: "stale_evidence",
+            head_sha: head,
+            message:
+              `Handoff held: your attached evidence is from an earlier commit, not the current one (${head.slice(0, 7)}). ` +
+              `Re-capture against the latest commit — a fresh test run or log for server/back-end changes, ` +
+              `a screenshot for UI — and attach it (hive emit ${taskId} evidence --file ... --note ...), then emit ready again.`,
+          });
+        }
       }
       const pr = prUrl ?? t.pr_url;
       if (pr) {
-        const exec = deps.exec ?? defaultExec;
         let ci: string | null = null;
         const probe = await exec(["gh", "pr", "view", pr, "--json", "statusCheckRollup"]);
         if (probe.code === 0) {
