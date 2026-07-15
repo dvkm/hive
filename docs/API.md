@@ -43,6 +43,13 @@ must be built against this file. Server: `http://127.0.0.1:4700` (override
 `smoke` (`[{name, url, expect_status, expect_substring?}]`, run once on
 `verifying`), `agent_argv` (string[], per-project override of the command
 herdr runs, default `["claude","-p",<brief-file>,"--permission-mode","acceptEdits"]`),
+`setup_argv` / `cleanup_argv` (string[], a symmetric per-project stack hook pair —
+`setup_argv` runs at spawn time once the worktree exists but before the agent
+starts, `cleanup_argv` runs before the worktree is removed; relative `argv[0]`
+resolves against the project repo path and `{worktree}` substitutes the task's
+worktree path, e.g. `["infra/worktree/wt.sh","up","{worktree}"]` /
+`[…,"down","{worktree}"]`; both best-effort with a 120s timeout, emitting a
+`stack_setup` / `stack_teardown` event — see the Auto-cleanup section),
 and `gchat_spaces` (`[{space, label?}]`, the Google Chat intake allowlist —
 messages in each `spaces/<id>` become draft tasks in THIS project; see Intake
 connectors below), and `intake_keywords` (`string[]`, domains / links / keywords
@@ -172,6 +179,8 @@ Types written by the runtime layer (Phase 2b):
 - `review_summary` — the agent's structured self-review, submitted before `ready`. `payload: {done?: string[], iffy?: (string|{what,why})[], decisions?: string[], testing?: string[], followups?: string[]}`. The review card renders the latest one as the primary review surface (prose `summary` collapses behind a toggle).
 - `spawned` — a herdr agent was started. `payload: {agent_target, branch, worktree_path, tab_id, label, fleet_workspace_id}`
 - `spawn_error` — spawn failed. `payload: {error}`
+- `stack_setup` — the per-project spawn hook (`config.setup_argv`) ran while preparing the worktree, before the agent started (`source: herdr`). `payload: {argv, ok, error?}` (`error` = first 300 chars of stderr/stdout on failure; best-effort, a failure never blocks the spawn).
+- `stack_teardown` — the per-project teardown hook (`config.cleanup_argv`) ran before the worktree was removed (`source: reaper`). `payload: {argv, ok, error?}` (best-effort, a failure never blocks worktree/session cleanup). Both share `runStackCmd` (`server/src/cleanup.ts`).
 - `agent_status` — herdr agent status changed (via wait loop or reconciler). `payload: {status}` (`idle|working|blocked|gone` — `gone` = the reconciler's probe found the agent missing from herdr)
 - `focus_agent` — the director focused the agent's herdr tab ("view agent"). `payload: {target}`
 - `recovery` — a stale-recovery decision was taken. `payload: {decision:"dead"|"silent-escalate", attempts?|nudges?}`
@@ -996,8 +1005,11 @@ Finished tasks get their runtime torn down automatically so orphan worktrees and
 herdr sessions never pile up (`server/src/cleanup.ts`, `server/src/reaper.ts`).
 
 - **On the transition (immediate).** When a task reaches `done` or `cancelled`,
-  the server fires `cleanupTask`: removes its git worktree and closes its herdr
-  session (the labelled tab, or the agent's pane). `failed` is deliberately
+  the server fires `cleanupTask`: runs the per-project teardown hook
+  (`config.cleanup_argv`, e.g. `wt.sh down {worktree}`) BEFORE removal so it can
+  still see the worktree's files (best-effort, `stack_teardown` event), then
+  removes its git worktree and closes its herdr session (the labelled tab, or the
+  agent's pane). `failed` is deliberately
   **excluded** — a failed task may still be auto-requeued/retried, so tearing it
   down there would race the retry; the dead-agent recovery path already reclaims
   its worktree, and the reaper is the backstop.
