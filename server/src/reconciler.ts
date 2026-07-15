@@ -19,7 +19,7 @@ import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
-import { recordSystemLearning } from "./learn.ts";
+import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
 import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
@@ -80,6 +80,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
     remindUnreviewedIntake(db, (deps.nowMs ?? (() => Date.now()))());
   } catch (e) {
     fail("remindUnreviewedIntake", e);
+  }
+  try {
+    captureRecurringRefs(db);
+  } catch (e) {
+    fail("captureRecurringRefs", e);
   }
   // Offline mode: everything above is local (herdr + sqlite) and keeps state
   // honest; everything below either needs the network (gh) or would punish

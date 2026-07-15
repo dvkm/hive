@@ -14,6 +14,7 @@ import type { DB } from "./db.ts";
 import { newId, now } from "./db.ts";
 import { writeEvent } from "./state.ts";
 import { createDecision } from "./api.ts";
+import { queueSteerEvent } from "./steer.ts";
 
 const GRANT_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -49,6 +50,37 @@ export function bootstrapAuthority(db: DB): number {
     inserted++;
   }
   return inserted;
+}
+
+// Plain-English danger explanations per classifier category — the card reader
+// shouldn't need to parse shell to know what's at stake. Matched by substring
+// against the reason in `detail` ("command approval (dangerous): <reason>").
+const CATEGORY_EXPLAIN: [string, string][] = [
+  ["rm", "Deletes files or directories permanently — no trash, no undo. A wrong path or an empty variable can wipe far more than intended."],
+  ["kill", "Terminates running processes. A broad match can take down your own apps or another agent's server, not just this agent's."],
+  ["force push", "Rewrites the remote branch's history — commits pushed by others (or other agents) on that branch can be lost."],
+  ["hard reset", "Discards uncommitted local changes in the checkout it runs in."],
+  ["git clean", "Deletes untracked files from the working tree — anything not committed is gone."],
+  ["sql", "Modifies or deletes database rows/tables directly. Against a live DB this is customer data."],
+  ["sudo", "Runs with root privileges — can change anything on the machine."],
+  ["pipe-to-shell", "Downloads code from the network and executes it immediately, sight unseen."],
+];
+
+// Structured context for a gated shell command: intent, the literal command,
+// what the category means, and what each answer does.
+function commandContext(input: AuthzInput): string {
+  const reason = input.detail?.replace(/^command approval \((dangerous|unknown)\): /, "") ?? "";
+  const explain = CATEGORY_EXPLAIN.find(([k]) => reason.toLowerCase().includes(k))?.[1];
+  return [
+    `Agent's stated intent: ${input.summary?.trim() || "(the agent gave no description)"}`,
+    ``,
+    `Command it wants to run:`,
+    `  ${input.target.split("\n").join("\n  ")}`,
+    ``,
+    `Why it was gated: ${reason}${explain ? ` — ${explain}` : ""}`,
+    ``,
+    `Approve = this exact command, once (24h grant). Approve & always allow = every '${input.action}' command in this project, from now on. Deny = blocked; the agent is told to find another way.`,
+  ].join("\n");
 }
 
 export interface AuthzInput {
@@ -218,10 +250,11 @@ export function authorize(db: DB, input: AuthzInput, clock: () => string = now):
   const decision = createDecision(db, {
     task_id: input.task_id,
     title,
-    context:
-      (summary && input.detail?.trim() ? `${input.detail.trim()}. ` : "") +
-      `An agent requested authority to run '${input.action}' targeting ${input.target}. ` +
-      `Approving mints a single-use, 24h grant scoped to this exact action + target.`,
+    context: input.action.startsWith("command.")
+      ? commandContext(input)
+      : (summary && input.detail?.trim() ? `${input.detail.trim()}. ` : "") +
+        `An agent requested authority to run '${input.action}' targeting ${input.target}. ` +
+        `Approving mints a single-use, 24h grant scoped to this exact action + target.`,
     risk: "high",
     blast_radius: `Exact target: ${input.target}`,
     options,
@@ -248,7 +281,8 @@ export function resolveGrantForDecision(
   db: DB,
   decisionId: string,
   answerKey: string,
-  clock: () => string = now
+  clock: () => string = now,
+  denyNote?: string | null
 ): boolean {
   const g = db
     .query("SELECT * FROM authority_grants WHERE decision_id = ? AND status = 'pending'")
@@ -267,7 +301,81 @@ export function resolveGrantForDecision(
       });
   } else {
     db.query("UPDATE authority_grants SET status = 'denied' WHERE id = ?").run(g.id);
+    // Tell the agent WHY, so it adapts instead of blindly retrying the same
+    // blocked command. The director's note is the reason; without one, a
+    // generic "denied, find another way".
+    if (g.task_id) {
+      const reason = denyNote?.trim();
+      queueSteerEvent(
+        db,
+        g.task_id,
+        `The director DENIED your request to run '${g.action}' (${g.target.split("\n")[0].slice(0, 100)}).` +
+          (reason ? ` Reason: ${reason}` : "") +
+          ` Do not retry the same command — take a different approach that doesn't need it, or checkpoint why you're stuck.`,
+        "queued by command deny"
+      );
+      maybeProposeDenyGuardrail(db, g);
+    }
   }
+  return true;
+}
+
+// A command category the director denies repeatedly is a standing "no" the
+// agents keep rediscovering. After the Nth deny of the same action in a project
+// (across distinct decisions), propose a global-for-the-project deny rule so it
+// never cards again — the deny mirror of "Approve & always allow".
+const DENY_GUARDRAIL_THRESHOLD = 3;
+function maybeProposeDenyGuardrail(db: DB, grant: any): void {
+  if (!grant.action?.startsWith("command.")) return;
+  const projectId = grant.task_id
+    ? (db.query("SELECT project_id FROM tasks WHERE id = ?").get(grant.task_id) as any)?.project_id
+    : null;
+  if (!projectId) return;
+  // Already gated by a rule, or a proposal already exists → nothing to do.
+  if (db.query("SELECT 1 FROM authority_rules WHERE active = 1 AND action_pattern = ? AND (project_id IS NULL OR project_id = ?)").get(grant.action, projectId))
+    return;
+  const denies = (
+    db
+      .query(
+        `SELECT COUNT(DISTINCT ag.decision_id) AS n FROM authority_grants ag
+           JOIN tasks t ON t.id = ag.task_id
+          WHERE ag.action = ? AND ag.status = 'denied' AND t.project_id = ?`
+      )
+      .get(grant.action, projectId) as any
+  ).n as number;
+  if (denies < DENY_GUARDRAIL_THRESHOLD) return;
+  const anchor = db.query("SELECT id FROM tasks WHERE project_id = ? ORDER BY created_at DESC LIMIT 1").get(projectId) as any;
+  if (!anchor) return;
+  if (db.query("SELECT 1 FROM decisions d JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ? AND d.title LIKE ? AND d.status = 'open'").get(projectId, `Always block %${grant.action}%`))
+    return;
+  createDecision(db, {
+    task_id: anchor.id,
+    title: `Always block '${grant.action}'? Denied ${denies}× in this project`,
+    context:
+      `You've denied '${grant.action}' commands ${denies} times. Approving adds a standing project rule ` +
+      `(${grant.action} → deny) so agents are blocked immediately with no card — they'll be told to find ` +
+      `another way. Revocable in Authority.`,
+    risk: "normal",
+    options: [
+      { key: "block", label: "Always block it", detail: `Add a standing deny rule for '${grant.action}'.`, recommended: true },
+      { key: "keep_asking", label: "Keep asking each time", detail: "Leave it as a per-command decision." },
+    ],
+  });
+  writeEvent(db, { task_id: anchor.id, source: "system", type: "deny_guardrail_proposed", payload: { action: grant.action, denies } });
+}
+
+// Answer hook for the deny-guardrail proposal: block → mint a project deny rule.
+export function resolveDenyGuardrailForDecision(db: DB, decisionId: string, answerKey: string): boolean {
+  const d: any = db.query("SELECT task_id, title FROM decisions WHERE id = ?").get(decisionId);
+  if (!d || !/^Always block '/.test(d.title)) return false;
+  if (answerKey !== "block") return true;
+  const action = d.title.match(/^Always block '([^']+)'/)?.[1];
+  const projectId = (db.query("SELECT project_id FROM tasks WHERE id = ?").get(d.task_id) as any)?.project_id;
+  if (!action || !projectId) return true;
+  db.query(
+    "INSERT INTO authority_rules (id, project_id, scope, action_pattern, effect, note, active, created_at) VALUES (?,?,?,?, 'deny', ?, 1, ?)"
+  ).run(newId("aur"), projectId, `project:${projectId}`, action, `Director blocked '${action}' after repeated denials`, now());
+  writeEvent(db, { task_id: d.task_id, source: "director", type: "authority_rule_added", payload: { action, effect: "deny" } });
   return true;
 }
 

@@ -198,6 +198,82 @@ function killTargetsSandboxed(cmd: string, env: Record<string, string | undefine
   });
 }
 
+// `git reset --hard` and `git clean` discard work in the checkout they run in.
+// In the agent's OWN worktree (every ~/.herdr/worktrees/* dir is agent-created
+// and disposable) that's routine branch-syncing — resetting to origin/<branch>
+// before re-checking a PR. The MAIN checkout (~/projects/…) is NOT under a
+// sandbox root, so a reset there stays gated. Provable only when the effective
+// working directory of every such git segment resolves inside a sandbox root:
+// the hook's cwd, updated by any absolute `cd`, or an explicit `git -C <path>`.
+// A relative cd, an unresolved variable, command substitution, or an unknown
+// cwd all fail closed. Force-push is deliberately NOT covered — it mutates a
+// shared remote, a different blast radius.
+export function gitResetInSandbox(
+  cmd: string,
+  env: Record<string, string | undefined>,
+  cwd?: string
+): boolean {
+  if (/\$\(|`|<\(/.test(cmd)) return false; // substitution can move the cwd unseen
+  const map = varMap(cmd, env);
+  const roots = sandboxRoots(env);
+  const isDangerGit = (s: string) =>
+    /^git\s+(-C\s+\S+\s+)?(reset\s+--hard|clean\s+(-[a-z]*\s+)*-[a-z]*[fd])/.test(s);
+  const inSandbox = (dir: string | null | undefined) =>
+    !!dir && dir.startsWith("/") && !dir.includes("..") && !/[$`]/.test(dir) &&
+    roots.some((r) => (dir + "/").startsWith(r));
+  const gitSegs = segments(cmd).filter(isDangerGit);
+  if (!gitSegs.length) return false;
+  let eff = cwd ? subst(cwd, map) : null; // effective cwd, tracked across cd
+  for (const seg of segments(cmd)) {
+    const cd = seg.match(/^cd\s+(\S+)/);
+    if (cd) {
+      const d = subst(cd[1].replace(/["']/g, ""), map);
+      if (!d.startsWith("/")) return false; // relative cd: unresolvable
+      eff = d;
+      continue;
+    }
+    if (!isDangerGit(seg)) continue;
+    const c = seg.match(/^git\s+-C\s+(\S+)/); // -C overrides cwd for this call
+    const dir = c ? subst(c[1].replace(/["']/g, ""), map) : eff;
+    if (!inSandbox(dir)) return false;
+  }
+  return true;
+}
+
+// The agent's OWN per-worktree docker DB (wt.sh up creates `<slug>-mariadb`
+// where slug = the worktree directory name) is a sandbox: seeded from a dump,
+// torn down on cleanup, no shared state. Destructive SQL there is routine
+// harness work — but only when EVERY sql-client segment is a `docker exec`
+// into a container named `<own-slug>-…`. A mismatched slug (another agent's
+// stack, the human's `monorepo-mariadb`), a bare mysql, or an unresolvable
+// container token all stay gated.
+export function dockerDbTargetsSandboxed(
+  cmd: string,
+  env: Record<string, string | undefined>,
+  cwd?: string
+): boolean {
+  const m = cwd ? /\/worktrees\/[^/]+\/([A-Za-z0-9._-]+)/.exec(cwd) : null;
+  if (!m) return false;
+  const slug = m[1].toLowerCase();
+  const map = varMap(cmd, env);
+  const sqlSegs = segments(cmd).filter((s) => /\b(mysql|mariadb|psql)\b/i.test(s));
+  if (!sqlSegs.length) return false;
+  // Flags that consume the next token, so the container name is found reliably.
+  const VALUE_FLAGS = new Set(["-u", "--user", "-e", "--env", "-w", "--workdir", "--env-file", "--detach-keys"]);
+  return sqlSegs.every((seg) => {
+    const s = subst(seg.replace(/["']/g, ""), map);
+    if (/[$`]/.test(s)) return false; // unresolved substitution
+    const toks = s.trim().split(/\s+/);
+    if (toks[0] !== "docker" || toks[1] !== "exec") return false;
+    let i = 2;
+    while (i < toks.length && toks[i].startsWith("-")) {
+      i += VALUE_FLAGS.has(toks[i]) && !toks[i].includes("=") ? 2 : 1;
+    }
+    const container = toks[i]?.toLowerCase() ?? "";
+    return container.startsWith(`${slug}-`);
+  });
+}
+
 // SQL dangerous rules (DROP/DELETE/UPDATE heuristics) are waived when the only
 // SQL client in the command is sqlite3 operating on a sandboxed DB file — the
 // scratchpad-copy workflow. psql/mysql (server-backed) never waive.
@@ -311,7 +387,10 @@ export function classify(
       continue;
     if (reason === "process kill" && killTargetsSandboxed(cmd, env)) continue;
     if (reason === "force push" && forcePushOwnBranch(cmd, env)) continue;
-    if (reason.startsWith("SQL ") && sqlTargetsSandboxed(cmd, env)) continue;
+    if ((reason.startsWith("hard reset") || reason.startsWith("git clean")) && gitResetInSandbox(cmd, env, cwd))
+      continue;
+    if (reason.startsWith("SQL ") && (sqlTargetsSandboxed(cmd, env) || dockerDbTargetsSandboxed(cmd, env, cwd)))
+      continue;
     return { decision: "dangerous", reason };
   }
 

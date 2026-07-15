@@ -30,8 +30,10 @@ Usage:
   hive learning add --project <id> --title <t> [--body <s>] [--task <src-task-id>] [--root-cause]
   hive learning list [--project <id>] [--status active|resolved]
   hive learning recur <learning-id>
+  hive recall <keywords>                  search project knowledge (references, learnings, policies)
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive steer-all "message" [--project <id>]   broadcast a steer to every live agent
+  hive tunnel                             expose hive to your phone over Tailscale HTTPS (private; enables push)
   hive remote                             print LAN URL + API token for phone access (PWA)
   hive stats [--days 7]                   autonomy scorecard (steers, decisions, CI gate, cost)
   hive watch add --project <id> --name <n> --url <u> [--prompt <s>] [--kind <k>] [--interval <min>]
@@ -286,10 +288,12 @@ async function main() {
         project_id: flags.project,
         title: flags.title,
         body: flags.body,
+        kind: flags.kind, // "reference" = durable fact pinned into briefs; default = failure pattern
         source_task_id: flags.task,
         create_root_cause_task: !!flags["root-cause"],
       });
-      console.log(`added learning ${l.id}: ${l.title}` + (l.root_cause_task_id ? `  (root-cause task ${l.root_cause_task_id})` : ""));
+      const label = flags.kind === "reference" ? "reference" : "learning";
+      console.log(`added ${label} ${l.id}: ${l.title}` + (l.root_cause_task_id ? `  (root-cause task ${l.root_cause_task_id})` : ""));
       return;
     }
     if (sub === "list") {
@@ -464,6 +468,52 @@ async function main() {
     return;
   }
 
+  // Expose hive over Tailscale HTTPS (private mesh, real cert → iOS push works).
+  // Needs `tailscale up` done once (that's the user's account login).
+  if (cmd === "tunnel") {
+    const port = process.env.HIVE_PORT || 4700;
+    const run = (args: string[]) => {
+      for (const bin of ["tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale"]) {
+        try {
+          const r = Bun.spawnSync([bin, ...args]);
+          if (r.exitCode !== 127) return { ...r, bin };
+        } catch {
+          /* binary not at this path; try next */
+        }
+      }
+      return null;
+    };
+    const setup =
+      "Tailscale isn't set up yet. One-time steps (yours — it's your account):\n" +
+      "  1. Install Tailscale on this Mac (App Store 'Tailscale', or `brew install --cask tailscale`) and log in.\n" +
+      "  2. Install Tailscale on your iPhone and log into the SAME account.\n" +
+      "  3. Re-run `hive tunnel`.";
+    const status = run(["status"]);
+    if (!status) die(setup);
+    if (status.exitCode !== 0) die(status.stderr.toString().includes("Logged out") || status.exitCode === 1 ? setup : status.stderr.toString());
+    const ts = status.bin;
+    // `tailscale serve` fronts hive with a Tailscale-managed HTTPS cert on your
+    // <machine>.<tailnet>.ts.net name. Backgrounded so it persists.
+    const serve = Bun.spawnSync([ts, "serve", "--bg", String(port)]);
+    if (serve.exitCode !== 0) {
+      console.error(serve.stderr.toString());
+      die("`tailscale serve` failed (older Tailscale? try `tailscale serve https / http://127.0.0.1:" + port + "`)");
+    }
+    const dns = Bun.spawnSync([ts, "status", "--json"]);
+    let host = "<machine>.<tailnet>.ts.net";
+    try {
+      host = JSON.parse(dns.stdout.toString()).Self?.DNSName?.replace(/\.$/, "") || host;
+    } catch {}
+    const { Database } = await import("bun:sqlite");
+    const { defaultDbPath } = await import("../server/src/db.ts");
+    const tok = (new Database(defaultDbPath(), { readonly: true }).query("SELECT value FROM settings WHERE key='api_token'").get() as any)?.value;
+    console.log(`hive is now reachable from your phone (Tailscale, private + encrypted):\n\n  https://${host}/\n`);
+    console.log(`API token (paste once in the app): ${tok ?? "(start the server once to mint it)"}\n`);
+    console.log("On the iPhone: open that URL in Safari → Share → Add to Home Screen → open the app → tap 🔔 notify.");
+    console.log("Stop exposing: `tailscale serve --bg=false " + port + "` or `tailscale serve reset`.");
+    return;
+  }
+
   // Phone/tablet access: print the LAN URL + API token for the PWA.
   if (cmd === "remote") {
     const { Database } = await import("bun:sqlite");
@@ -484,6 +534,32 @@ async function main() {
         `\nServer must be bound to the LAN: HIVE_BIND=0.0.0.0 (add to the LaunchAgent env, then restart).` +
         `\nPlain HTTP — use only on a trusted LAN or a Tailscale address.`
     );
+    return;
+  }
+
+  // Recall project knowledge (references, learnings, policies) on demand.
+  //   hive recall <keywords>            (project from $HIVE_TASK_ID, or --project)
+  if (cmd === "recall") {
+    const { _, flags } = parseFlags(argv.slice(1));
+    const q = _.join(" ");
+    const qs = new URLSearchParams();
+    if (flags.project) qs.set("project_id", String(flags.project));
+    else if (process.env.HIVE_TASK_ID) qs.set("task_id", process.env.HIVE_TASK_ID);
+    else die("run under a hive task (HIVE_TASK_ID) or pass --project <id>");
+    if (q) qs.set("q", q);
+    const r = await api("GET", "/api/knowledge?" + qs.toString());
+    const show = (label: string, items: any[]) => {
+      if (!items.length) return;
+      console.log(`\n## ${label}`);
+      for (const it of items) console.log(`- ${it.title}${it.body ? `\n  ${String(it.body).replace(/\n/g, "\n  ")}` : ""}`);
+    };
+    if (!r.references.length && !r.learnings.length && !r.policies.length) {
+      console.log(q ? `no project knowledge matches "${q}"` : "no project knowledge stored yet");
+      return;
+    }
+    show("References (durable facts)", r.references);
+    show("Known failure patterns", r.learnings);
+    show("Policies", r.policies);
     return;
   }
 

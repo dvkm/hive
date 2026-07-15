@@ -175,6 +175,7 @@ test("ready emit records the pr_url and advances in_progress -> in_review", asyn
   const t = await post("/api/tasks", { project_id: projectId, title: "ready task" });
   const id = t.json.id;
   await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
+  await post(`/api/tasks/${id}/events`, { type: "evidence", note: "proof", kind: "log" });
 
   const r = await post(`/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/42", note: "PR up" });
   expect(r.status).toBe(200);
