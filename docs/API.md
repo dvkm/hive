@@ -69,6 +69,14 @@ agents for this project's queued tasks), `dispatch_kinds` (string[], default
 `["ship","scout"]`; which task kinds the dispatcher will auto-spawn — `chore` is
 excluded by default), and `max_agents` (number, default `3`; per-project cap on
 concurrently-running agents).
+Worktree stack hooks (symmetric per-project lifecycle commands, both `string[]`,
+`{worktree}` substitutes the task's worktree path, relative `argv[0]` resolves
+against `repo_path`): `setup_argv` (e.g. `["infra/worktree/wt.sh","up","{worktree}"]`,
+run at spawn after the worktree exists but before the agent starts, so agents
+don't install deps / bring up their stack themselves; emits a `stack_setup`
+event) and `cleanup_argv` (e.g. `[...,"down","{worktree}"]`, run before the
+worktree is removed; emits a `stack_teardown` event). Both are best-effort with a
+120s timeout — a failed hook never blocks spawn nor cleanup.
 Lifecycle key: `archived` (bool, default absent/`false`; when `true` the project
 is hidden from the default `GET /api/projects` list and the web Projects view —
 tasks keep referencing it, there is no hard delete).
@@ -339,14 +347,25 @@ event/evidence payloads. Set values with `hive secret set` (reads from stdin).
   "first_seen": "2026-07-08T12:00:00.000Z",
   "last_seen": "2026-07-09T09:00:00.000Z",
   "status": "active",
-  "root_cause_task_id": "c21eef921dfd"
+  "root_cause_task_id": "c21eef921dfd",
+  "kind": "failure"
 }
 ```
 `status ∈ {active, resolved}`. `occurrences` counts how many times the pattern
 recurred (bumped via `/recur`). `source_task_id` (the task that first hit it) and
-`root_cause_task_id` (the chore task opened to fix it, if any) may be null. Active
-learnings for a project are injected into composed briefs (see `/api/tasks/:id/brief`)
-under a "Known failure patterns" section, 10 most recent by `last_seen`.
+`root_cause_task_id` (the chore task opened to fix it, if any) may be null.
+`kind ∈ {failure, reference, decision}` (default `failure`) — the learnings table
+doubles as the project knowledge store:
+- `failure` — the regression ledger. Active ones inject into composed briefs (see
+  `/api/tasks/:id/brief`) under a "Known failure patterns" section, 10 most recent
+  by `last_seen`.
+- `reference` — durable facts, pinned into every brief under a "References" section.
+- `decision` — the answer to a resolved decision card, written back automatically
+  when the director answers a card no resolver claimed (a genuine
+  product/preference question), deduped by `(project_id, title)` so re-asking the
+  same question bumps `occurrences` and refreshes the answer. Active ones inject
+  into briefs under a "Decisions already made (don't re-ask)" section and surface
+  in `hive recall`, so a crew consults the prior ruling before re-raising the card.
 
 ### Notification
 ```json
@@ -468,7 +487,7 @@ priced rows only).
   clusters of size ≥ 2 are returned). For a backfill/triage UI over dups that
   already exist.
 - `GET /api/tasks/:id/brief` → `200 {"task_id":"...", "brief":"<multiline string>"}` | `404`
-  (task description + definition of done + `hive emit` protocol + active global + project policies + standing-authority section)
+  (task description + definition of done + `hive emit` protocol + active global + project policies + standing-authority section + project knowledge: References, "Decisions already made", Known failure patterns)
 - `POST /api/tasks/:id/guarded-action` body `{action (required), target (required), detail?}` → see below | `404` | `400`
   The gate agents call BEFORE any externally-risky operation they run themselves
   (prod deploy, feature-flag flip, destructive op). The server evaluates the

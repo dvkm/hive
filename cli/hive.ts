@@ -569,11 +569,12 @@ async function main() {
       console.log(`\n## ${label}`);
       for (const it of items) console.log(`- ${it.title}${it.body ? `\n  ${String(it.body).replace(/\n/g, "\n  ")}` : ""}`);
     };
-    if (!r.references.length && !r.learnings.length && !r.policies.length) {
+    if (!r.references.length && !r.learnings.length && !r.policies.length && !(r.decisions?.length)) {
       console.log(q ? `no project knowledge matches "${q}"` : "no project knowledge stored yet");
       return;
     }
     show("References (durable facts)", r.references);
+    show("Decisions already made (don't re-ask)", r.decisions ?? []);
     show("Known failure patterns", r.learnings);
     show("Policies", r.policies);
     return;
