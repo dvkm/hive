@@ -78,6 +78,19 @@ function die(msg: string, code = 1): never {
   process.exit(code);
 }
 
+// The commit HEAD was at when evidence was captured, so the review card can
+// flag it stale against the PR's current head (task #226). Best-effort: cwd
+// may not be a git repo (or git may be missing) — evidence still gets filed.
+function gitHeadSha(): string | null {
+  try {
+    const r = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
+    if (r.exitCode !== 0) return null;
+    return r.stdout.toString().trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 async function api(method: string, path: string, body?: unknown): Promise<any> {
   const res = await fetch(BASE + path, {
     method,
@@ -157,6 +170,7 @@ async function main() {
     const [taskId, type] = _;
     if (!taskId || !type) die("usage: hive emit <task-id> <type> [--note ...] [--file path]");
     const path = `/api/tasks/${taskId}/events`;
+    const sha = type === "evidence" ? gitHeadSha() : null;
     let result: any;
     if (flags.file) {
       const form = new FormData();
@@ -165,6 +179,7 @@ async function main() {
       if (flags.note) form.set("note", String(flags.note));
       if (flags.caption) form.set("caption", String(flags.caption));
       if (flags.source) form.set("source", String(flags.source));
+      if (sha) form.set("meta", JSON.stringify({ commit_sha: sha }));
       const file = Bun.file(String(flags.file));
       form.set("file", file);
       const res = await fetch(BASE + path, { method: "POST", body: form });
@@ -183,6 +198,7 @@ async function main() {
         title: flags.title,
         context: flags.context,
         pr_url: flags["pr-url"] ?? flags.url,
+        ...(sha && !extra.meta ? { meta: JSON.stringify({ commit_sha: sha }) } : {}),
         ...extra,
       });
     }

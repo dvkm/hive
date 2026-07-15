@@ -65,6 +65,29 @@ test("syncPRs updates ci_status and transitions in_review->verifying on merge", 
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_merged'").all(id).length).toBe(1);
 });
 
+test("syncPRs persists the PR's head_sha so the review card can flag stale evidence", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/1a" });
+  transition(db, id, "in_progress");
+
+  const gh: Exec = stub((argv) => {
+    if (argv[0] === "gh")
+      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-a" }));
+    return OK();
+  });
+  await reconcileOnce(db, { exec: gh });
+  expect(getTask(db, id).head_sha).toBe("sha-a");
+
+  // a later poll with a new head commit updates it
+  const gh2: Exec = stub((argv) => {
+    if (argv[0] === "gh")
+      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-b" }));
+    return OK();
+  });
+  await reconcileOnce(db, { exec: gh2 });
+  expect(getTask(db, id).head_sha).toBe("sha-b");
+});
+
 test("syncPRs bounces an in_review task whose CI turned red, steers once per sha", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { pr_url: "https://gh/pr/2", agent_target: "t-agent" });

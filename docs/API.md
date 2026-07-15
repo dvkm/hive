@@ -81,6 +81,7 @@ tasks keep referencing it, there is no hard delete).
   "branch": null,
   "pr_url": "https://github.com/acme/web/pull/1",
   "ci_status": "passing",
+  "head_sha": "a1b2c3d...",
   "summary": "Shipped dark mode toggle; all tests green.",
   "source": null,
   "parent_task_id": null,
@@ -96,6 +97,10 @@ still-`open` decision on it is auto-expired (`status=expired`, a
 `decision_expired` event each, broadcast) — a terminal task can no longer act on
 a card, so it must not linger in the inbox. Legacy orphans are swept on startup.
 `kind ∈ {ship, scout, chore}`
+`head_sha` is the PR's current head commit, refreshed by the reconciler's PR
+poll alongside `ci_status`; `null` until the first poll after a PR links. The
+review card compares it against each evidence item's `meta.commit_sha` to flag
+evidence captured against an older commit as stale.
 `number` is a human-friendly, monotonic per-hive counter assigned at creation
 (`MAX(number)+1`, starting at 1) and never reused — it is THE handle people and
 GitHub PR markers use, while the opaque `id` stays the machine key. Assigned by a
@@ -224,6 +229,10 @@ Standing-authority events (written by the policy engine, `source: system` unless
 ```
 `kind ∈ {screenshot, test_run, log, report, link}`. `path` is the local file
 (null for link-only). `url` is the served path (fetch it from the same origin).
+`meta.commit_sha`, when present, is the git HEAD of the agent's worktree at
+capture time — `hive emit ... evidence` fills it in automatically via `git
+rev-parse HEAD` in the CLI's cwd. The review card compares it to the task's
+`head_sha` and marks the item stale when they differ.
 
 ### Decision
 ```json
@@ -594,6 +603,7 @@ recognized fields (JSON keys == form field names):
 | `kind` | evidence kind (evidence type only); defaults to `screenshot` if a file is present, else `link`/`log` |
 | `caption` | evidence caption |
 | `url` | evidence URL (for link evidence, no file) |
+| `meta` | (evidence type) JSON string merged into the Evidence row's `meta`; `hive emit ... evidence` auto-fills `{commit_sha}` from `git rev-parse HEAD` in its cwd |
 | `title`,`context`,`risk`,`blast_radius`,`options` | decision fields (needs-decision type; `options` is a JSON string in multipart) |
 | `model`,`input_tokens`,`output_tokens`,`cache_read_tokens`,`cache_write_tokens`,`cost_usd` | usage fields (usage type; numbers, or numeric strings in multipart; `cost_usd` optional) |
 | `file` | (multipart only) the uploaded evidence file |

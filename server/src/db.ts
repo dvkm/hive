@@ -339,6 +339,13 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       )`,
     ],
   },
+  // The PR's current head commit, refreshed by the reconciler's PR poll
+  // alongside ci_status. Lets the review card flag evidence captured against
+  // an older commit as stale (task #226).
+  {
+    name: "v16-task-head-sha",
+    statements: [`ALTER TABLE tasks ADD COLUMN head_sha TEXT`],
+  },
 ];
 
 // -------------------------------------------------------------- settings
