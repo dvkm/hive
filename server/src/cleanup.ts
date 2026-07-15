@@ -10,6 +10,50 @@ import type { DB } from "./db.ts";
 import { now } from "./db.ts";
 import { getTask, writeEvent, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
+import type { Exec } from "./exec.ts";
+import { defaultExec } from "./exec.ts";
+
+// Per-project stack teardown, run BEFORE the worktree is removed (the command
+// usually needs files inside it, e.g. corebeat's wt.sh). Config:
+//   config.cleanup_argv = ["infra/worktree/wt.sh", "down", "{worktree}"]
+// Relative argv[0] resolves against repo_path; {worktree} substitutes the
+// task's worktree path. Best-effort with a hard timeout — a failed teardown
+// never blocks worktree/session cleanup (256 orphaned docker containers,
+// 2026-07-13, were stacks nothing ever tore down).
+async function runCleanupCmd(
+  db: DB,
+  taskId: string,
+  argvTemplate: unknown,
+  repoPath: string,
+  worktreePath: string,
+  exec: Exec
+): Promise<void> {
+  if (!Array.isArray(argvTemplate) || !argvTemplate.length) return;
+  const argv = argvTemplate.map((a) => String(a).replaceAll("{worktree}", worktreePath));
+  if (!argv[0].startsWith("/")) argv[0] = `${repoPath}/${argv[0]}`;
+  try {
+    // Exec has no timeout; race one so a hung teardown can't stall the reaper.
+    const r = await Promise.race([
+      exec(argv, { cwd: repoPath }),
+      new Promise<{ code: number; stdout: string; stderr: string }>((resolve) =>
+        setTimeout(() => resolve({ code: 124, stdout: "", stderr: "cleanup command timed out (120s)" }), 120_000)
+      ),
+    ]);
+    writeEvent(db, {
+      task_id: taskId,
+      source: "reaper",
+      type: "stack_teardown",
+      payload: { argv, ok: r.code === 0, ...(r.code !== 0 ? { error: (r.stderr || r.stdout).slice(0, 300) } : {}) },
+    });
+  } catch (e: any) {
+    writeEvent(db, {
+      task_id: taskId,
+      source: "reaper",
+      type: "stack_teardown",
+      payload: { argv, ok: false, error: String(e?.message ?? e).slice(0, 300) },
+    });
+  }
+}
 
 export interface CleanupOutcome {
   cleaned: boolean;
@@ -36,7 +80,7 @@ export async function cleanupTask(
   db: DB,
   herdr: Herdr = defaultHerdr,
   taskId: string,
-  opts: { force?: boolean } = {}
+  opts: { force?: boolean; exec?: Exec } = {}
 ): Promise<CleanupOutcome> {
   const noop: CleanupOutcome = { cleaned: false, worktree: null, session: { closed: false, via: null } };
   const task = getTask(db, taskId);
@@ -52,6 +96,23 @@ export async function cleanupTask(
     defaultBranch = JSON.parse(project?.config ?? "{}").default_branch;
   } catch {
     defaultBranch = undefined;
+  }
+
+  // 0) per-project stack teardown (docker etc.) — BEFORE the worktree goes
+  // away, since the command usually lives inside it.
+  // Once per task: a preserved worktree makes cleanupTask re-run every reaper
+  // sweep, and the teardown command must not re-fire forever.
+  const toreDown = db
+    .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'stack_teardown' LIMIT 1")
+    .get(taskId);
+  if (task.worktree_path && repoPath && !toreDown) {
+    let cleanupArgv: unknown;
+    try {
+      cleanupArgv = JSON.parse(project?.config ?? "{}").cleanup_argv;
+    } catch {
+      cleanupArgv = undefined;
+    }
+    await runCleanupCmd(db, taskId, cleanupArgv, repoPath, task.worktree_path, opts.exec ?? defaultExec);
   }
 
   // 1) worktree — guarded removal (branch pushed/merged; uncommitted work preserved).

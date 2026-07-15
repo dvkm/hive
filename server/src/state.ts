@@ -144,6 +144,26 @@ export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, s
   // syncPRs promotes the moment checks pass (and steers the agent on red).
   // null = no checks known (repo without CI) — that flows as before.
   if (task.pr_url && (task.ci_status === "failing" || task.ci_status === "pending")) return false;
+  // The idle backstop must not hand the director an empty review: a PR with no
+  // evidence isn't reviewable (the protocol says attach evidence BEFORE ready;
+  // the agent's explicit `ready` emit is gated the same way elsewhere).
+  if (!hasReport && evidenceCount(db, taskId) < 1) return false;
+  // After a changes-request, mere idleness is NOT "addressed" — an agent that
+  // acknowledges in one turn goes idle and used to bounce straight back into
+  // the review queue (#163: "no evidence" requested, agent acked, re-queued in
+  // seconds). Require visible new work (evidence or a review_summary) newer
+  // than the latest changes_requested before the backstop re-advances.
+  const cr: any = db
+    .query("SELECT MAX(ts) AS ts FROM events WHERE task_id = ? AND type = 'changes_requested'")
+    .get(taskId);
+  if (cr?.ts) {
+    const addressed = db
+      .query(
+        "SELECT 1 FROM events WHERE task_id = ? AND type IN ('review_summary') AND ts > ? UNION SELECT 1 FROM evidence WHERE task_id = ? AND ts > ? LIMIT 1"
+      )
+      .get(taskId, cr.ts, taskId, cr.ts);
+    if (!addressed) return false;
+  }
   writeEvent(db, {
     task_id: taskId,
     source,

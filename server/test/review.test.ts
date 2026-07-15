@@ -216,6 +216,9 @@ async function inReviewWithPr(base: string, prUrl: string) {
   const p = await post(base, "/api/projects", { name: "p", repo_path: "/repo" });
   const t = await post(base, "/api/tasks", { project_id: p.json.id, title: "pr task", brief: "b" });
   await post(base, `/api/tasks/${t.json.id}/spawn`, {});
+  // The evidence gate holds evidence-less handoffs; these tests are about the
+  // PR/CI plumbing, so satisfy it.
+  await post(base, `/api/tasks/${t.json.id}/events`, { type: "evidence", note: "proof", kind: "log" });
   await post(base, `/api/tasks/${t.json.id}/events`, { type: "ready", pr_url: prUrl });
   return t.json.id as string;
 }
@@ -241,7 +244,8 @@ test("merging a PR GitHub already merged advances to verifying instead of failin
   const id = await inReviewWithPr(s.base, "https://gh/pr/166");
   const r = await post(s.base, `/api/tasks/${id}/merge`, {});
   expect(r.status).toBe(200);
-  expect(r.json.state).toBe("verifying");
+  // evidence + no smoke checks configured → verifying auto-advances to done
+  expect(["verifying", "done"]).toContain(r.json.state);
   s.server.stop(true);
 });
 

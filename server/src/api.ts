@@ -14,10 +14,11 @@ import {
   TransitionError,
   TERMINAL,
   advanceIfFinished,
+  evidenceCount,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
-import { recordSystemLearning, signature } from "./learn.ts";
+import { recordSystemLearning, signature, resolveRefCaptureForDecision, addReference, listReferences } from "./learn.ts";
 import {
   parseProject,
   parseTask,
@@ -33,13 +34,15 @@ import { cleanupTask } from "./cleanup.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
 import { smokeThenAdvance } from "./monitors.ts";
 import { enqueue, ackNotifications } from "./notifications.ts";
-import { authorize, resolveGrantForDecision, type AuthzInput } from "./authority.ts";
+import { authorize, resolveGrantForDecision, resolveDenyGuardrailForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
 import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.ts";
 import { routeIntakeProject } from "./intake/route.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { costUsd } from "./pricing.ts";
 import { checkCostGuardrails, resolveCostCapForDecision } from "./costs.ts";
+import { vapidPublicKey, saveSubscription, removeSubscription } from "./push.ts";
+import { explainCommandDecision } from "./explain.ts";
 import { ciStatusOf } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import type { Exec } from "./exec.ts";
@@ -202,6 +205,23 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (pathname === "/api/steer/broadcast" && method === "POST")
         return await broadcastSteer(db, herdr, await req.json());
 
+      // Web push (mobile PWA). The public VAPID key is not a secret.
+      if (pathname === "/api/push/vapid" && method === "GET")
+        return json({ key: vapidPublicKey(db) });
+      if (pathname === "/api/push/subscribe" && method === "POST") {
+        try {
+          saveSubscription(db, await req.json());
+          return json({ ok: true });
+        } catch (e: any) {
+          return err(String(e?.message ?? e), 400);
+        }
+      }
+      if (pathname === "/api/push/unsubscribe" && method === "POST") {
+        const b: any = await safeJson(req);
+        if (b?.endpoint) removeSubscription(db, b.endpoint);
+        return json({ ok: true });
+      }
+
       if (pathname === "/api/checkpoints" && method === "GET") return listOpenCheckpoints(db);
 
       if (pathname === "/api/offline" && method === "GET")
@@ -313,6 +333,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (method === "GET") return listLearnings(db, url);
         if (method === "POST") return createLearning(db, await req.json());
       }
+      // Knowledge search: agents recall project references/learnings/policies on
+      // demand instead of carrying the whole store in every brief.
+      if (pathname === "/api/knowledge" && method === "GET") return knowledgeSearch(db, url);
       m = pathname.match(/^\/api\/learnings\/([^/]+)$/);
       if (m) {
         if (method === "GET") {
@@ -1823,15 +1846,15 @@ export function openRecoveryDecision(db: DB, task: any, attempts: number): any {
 // If this card was a blocked-dialog escalation (reconciler recoverBlockedDialog),
 // answering it sends the chosen keystroke to the agent's frozen pane remotely:
 // approve → "1", deny → "3". Fire-and-forget; the outcome event records delivery.
-export function resolveBlockedForDecision(db: DB, herdr: Herdr, decisionId: string, answerKey: string): void {
+export function resolveBlockedForDecision(db: DB, herdr: Herdr, decisionId: string, answerKey: string): boolean {
   const ev = db
     .query(
       `SELECT task_id FROM events WHERE type = 'blocked_card' AND json_extract(payload, '$.decision_id') = ? LIMIT 1`
     )
     .get(decisionId) as { task_id: string } | undefined;
-  if (!ev) return;
+  if (!ev) return false;
   const task = getTask(db, ev.task_id);
-  if (!task?.agent_target) return;
+  if (!task?.agent_target) return true; // it WAS a blocked card, just no live agent to key
   const key = answerKey === "approve" ? "1" : "3";
   herdr
     .answerDialog(task.agent_target, key)
@@ -1846,6 +1869,7 @@ export function resolveBlockedForDecision(db: DB, herdr: Herdr, decisionId: stri
     .catch((e) => {
       writeEvent(db, { task_id: task.id, source: "director", type: "dialog_answered", payload: { decision_id: decisionId, key, delivered: false, error: String(e?.message ?? e) } });
     });
+  return true;
 }
 
 export function resolveRecoveryForDecision(db: DB, decisionId: string, answerKey: string): boolean {
@@ -1870,6 +1894,42 @@ function listIncidents(db: DB, url: URL): Response {
 }
 
 // ---------------------------------------------------------------- learnings (regression ledger)
+// On-demand knowledge lookup across a project's references, failure learnings,
+// and policies (global + project). `project_id` or `task_id` scopes it; `q` is a
+// space-separated set of keywords, ALL of which must appear (title or body,
+// case-insensitive). No q → return all references + policies (the "what exists"
+// index). LIKE, not FTS — a few hundred rows, keep it boring.
+function knowledgeSearch(db: DB, url: URL): Response {
+  let projectId = url.searchParams.get("project_id");
+  const taskId = url.searchParams.get("task_id");
+  if (!projectId && taskId) {
+    const t: any = db.query("SELECT project_id FROM tasks WHERE id = ?").get(taskId);
+    projectId = t?.project_id ?? null;
+  }
+  if (!projectId) return err("project_id or task_id is required");
+  const terms = (url.searchParams.get("q") ?? "").trim().split(/\s+/).filter(Boolean);
+  const like = (cols: string) =>
+    terms.length ? " AND " + terms.map(() => `(${cols}) LIKE ?`).join(" AND ") : "";
+
+  const refs = db
+    .query(
+      `SELECT title, body FROM learnings WHERE project_id = ? AND kind = 'reference' AND status = 'active'${like("title || ' ' || COALESCE(body,'')")} ORDER BY first_seen`
+    )
+    .all(projectId, ...terms.map((t) => `%${t}%`)) as any[];
+  const learnings = db
+    .query(
+      `SELECT title, body, occurrences FROM learnings WHERE project_id = ? AND kind = 'failure' AND status = 'active'${like("title || ' ' || COALESCE(body,'')")} ORDER BY last_seen DESC LIMIT 20`
+    )
+    .all(projectId, ...terms.map((t) => `%${t}%`)) as any[];
+  const policies = db
+    .query(
+      `SELECT title, body FROM policies WHERE active = 1 AND (scope = 'global' OR scope = ?)${like("title || ' ' || body")} ORDER BY created_at`
+    )
+    .all(`project:${projectId}`, ...terms.map((t) => `%${t}%`)) as any[];
+
+  return json({ query: terms.join(" "), references: refs, learnings, policies });
+}
+
 function listLearnings(db: DB, url: URL): Response {
   const projectId = url.searchParams.get("project_id");
   const status = url.searchParams.get("status");
@@ -1892,6 +1952,12 @@ function createLearning(db: DB, body: any): Response {
   if (!body?.title) return err("title is required");
   if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(body.project_id))
     return err("unknown project_id", 400);
+  // Reference facts route to the reference store (pinned into briefs, browsable
+  // under References), not the occurrence-aged failure ledger.
+  if (body.kind === "reference") {
+    const id = addReference(db, body.project_id, String(body.title), body.body ?? null, body.source_task_id ?? null);
+    return json(db.query("SELECT * FROM learnings WHERE id = ?").get(id), 201);
+  }
   const t = now();
   const row: any = {
     id: newId("lrn"),
@@ -2178,6 +2244,22 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       // green and steers the agent if they go red. No checks at all (repo
       // without CI) and gh trouble both fail OPEN — a broken gh must not
       // strand every handoff.
+      // Evidence gate, same shape as the CI hold: "attach evidence BEFORE
+      // ready" is protocol, and an evidence-less card is an empty review that
+      // wastes the director's queue (#163 landed there twice).
+      const needsReport = t.kind === "scout";
+      const hasProduct = needsReport ? evidenceCount(db, taskId, "report") >= 1 : evidenceCount(db, taskId) >= 1;
+      if (!hasProduct) {
+        writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { reason: "no_evidence" } });
+        broadcastTask(db, getTask(db, taskId));
+        return json({
+          held: true,
+          reason: "no_evidence",
+          message: needsReport
+            ? "Handoff held: scouts hand off a written report. Attach it (hive emit <task-id> evidence --kind report --file report.md), then emit ready again."
+            : "Handoff held: no evidence attached. Attach proof of the behavior (screenshot, test output, log) with `hive emit <task-id> evidence --file ... --note ...`, then emit ready again.",
+        });
+      }
       const pr = prUrl ?? t.pr_url;
       if (pr) {
         const exec = deps.exec ?? defaultExec;
@@ -2522,20 +2604,31 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): 
     type: "decision_answered",
     payload: { decision_id: id, answer_key: answerKey, answer_note: answerNote },
   });
-  // If this card gated a standing-authority request, approve → mint the
-  // single-use 24h grant so the agent's retry passes; deny → block it.
-  resolveGrantForDecision(db, id, answerKey);
-  // If this card was a planner breakdown proposal, approve → create the proposed
-  // child tasks (source='planner', parent_task_id → source); reject → event only.
-  resolvePlanForDecision(db, id, answerKey);
-  // If this card was a stale-recovery escalation, `requeue` → fresh task.
-  resolveRecoveryForDecision(db, id, answerKey);
-  // Blocked-dialog card → answer the pane's dialog with the chosen keystroke.
-  resolveBlockedForDecision(db, herdr, id, answerKey);
-  // If this card was a possible-duplicate card, `merge` → fold + cancel.
-  resolveDuplicateForDecision(db, id, answerKey);
-  // Cost-cap card → wrap-up steer, or raise the cap and keep going.
-  resolveCostCapForDecision(db, id, answerKey);
+  // Each specialized resolver returns true if it OWNED this card (and did its
+  // own agent-facing action). A card no resolver claims is a plain question
+  // from the agent — its answer must be relayed to the agent below, or the
+  // answer never reaches whoever asked (the #163 stall: a live agent parked on
+  // a question, answered in the UI, never told).
+  const claimed = [
+    // approve → mint 24h grant (agent retries); deny → steer the reason.
+    resolveGrantForDecision(db, id, answerKey, now, answerNote),
+    resolveDenyGuardrailForDecision(db, id, answerKey),
+    resolvePlanForDecision(db, id, answerKey),
+    resolveRecoveryForDecision(db, id, answerKey),
+    resolveBlockedForDecision(db, herdr, id, answerKey),
+    resolveDuplicateForDecision(db, id, answerKey),
+    resolveCostCapForDecision(db, id, answerKey),
+    resolveRefCaptureForDecision(db, id, answerKey, answerNote),
+  ].some(Boolean);
+  if (!claimed) {
+    const label = options.find((o) => o.key === answerKey)?.label ?? answerKey;
+    queueSteerEvent(
+      db,
+      r.task_id,
+      `Director answered your decision "${r.title}": ${label}.` + (answerNote ? ` ${answerNote}` : "") + " Proceed on this basis.",
+      "queued by decision answer"
+    );
+  }
   // Resume the task if it was parked on this decision. (herdr `agent send` is Phase 2.)
   const task = getTask(db, r.task_id);
   if (task && task.state === "needs_decision")
@@ -2606,6 +2699,10 @@ function guardedAction(db: DB, taskId: string, body: any): Response {
   });
   if (r.effect === "allow") return json({ ok: true, effect: "allow" });
   if (r.effect === "deny") return json({ ok: false, effect: "deny", error: r.reason }, 403);
+  // Command cards get an async plain-English explanation appended while open —
+  // never blocks the gate response.
+  if (String(body.action).startsWith("command."))
+    void explainCommandDecision(db, r.decision_id, String(body.target));
   return json({ ok: false, effect: "require_decision", decision_id: r.decision_id }, 409);
 }
 

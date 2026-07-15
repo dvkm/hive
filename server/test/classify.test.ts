@@ -161,6 +161,44 @@ test("agent-tooling kill downgrades to unknown; general kill stays dangerous", (
   expect(classify('kill %1; pkill -f "vite --mode dev"', env).decision).toBe("dangerous"); // pkill part unprovable
 });
 
+test("git reset --hard / clean inside the agent's own worktree downgrades; the main checkout stays dangerous", () => {
+  const env = { HOME: "/Users/david" };
+  const wt = "/Users/david/.herdr/worktrees/monorepo/hive-4a2ac7fff8cf";
+  // the exact shape from the card: cd into the worktree, then reset --hard
+  const real = `cd ${wt}\ngit reset --hard origin/fm/node-consolidate 2>&1\ngh pr checks https://github.com/x/y/pull/20 2>&1`;
+  expect(classify(real, env, wt).decision).toBe("unknown");
+  // no cd, but the hook cwd IS the worktree
+  expect(classify("git reset --hard origin/main", env, wt).decision).toBe("unknown");
+  // git -C into the worktree resolves regardless of cwd
+  expect(classify(`git -C ${wt} clean -fd`, env, "/tmp").decision).toBe("unknown");
+  // the MAIN checkout is not a sandbox root → stays gated
+  expect(classify("git reset --hard origin/main", env, "/Users/david/projects/monorepo").decision).toBe("dangerous");
+  expect(classify(`cd /Users/david/projects/monorepo\ngit reset --hard`, env, wt).decision).toBe("dangerous");
+  // no cwd, no absolute cd: unprovable → gated
+  expect(classify("git reset --hard origin/main", env).decision).toBe("dangerous");
+  // relative cd: unresolvable → gated
+  expect(classify("cd sub\ngit reset --hard", env, wt).decision).toBe("dangerous");
+});
+
+test("destructive SQL against the agent's OWN worktree docker DB downgrades; anything else stays dangerous", () => {
+  const env = { HOME: "/Users/david" };
+  const cwd = "/Users/david/.herdr/worktrees/monorepo/hive-abc123def456";
+  const own = 'docker exec -i hive-abc123def456-mariadb mysql -uroot -proot corebeat -e "DROP TABLE scratch_probe"';
+  expect(classify(own, env, cwd).decision).toBe("unknown"); // waived -> allow-and-log
+  // value-taking flags before the container name still resolve it
+  expect(
+    classify('docker exec -u root -e TZ=UTC hive-abc123def456-mariadb mysql corebeat -e "TRUNCATE TABLE t"', env, cwd).decision
+  ).toBe("unknown");
+  // someone ELSE's stack, the human's dev DB, or no docker at all: gated
+  expect(classify('docker exec hive-ffffffffffff-mariadb mysql -e "DROP TABLE x"', env, cwd).decision).toBe("dangerous");
+  expect(classify('docker exec monorepo-mariadb mysql -e "DROP TABLE x"', env, cwd).decision).toBe("dangerous");
+  expect(classify('mysql -h db.prod -e "DROP TABLE x"', env, cwd).decision).toBe("dangerous");
+  // unresolved container variable: not provable -> gated
+  expect(classify('docker exec "$C" mysql -e "DROP TABLE x"', env, cwd).decision).toBe("dangerous");
+  // no cwd (no worktree identity): gated
+  expect(classify(own, env).decision).toBe("dangerous");
+});
+
 test("SQL on a sandboxed sqlite copy downgrades; live/server DBs stay dangerous", () => {
   const env = { HOME: "/Users/david" };
   expect(classify('sqlite3 /tmp/claude-501/s/copy.db "update usage set cost=0"', env).decision).toBe("unknown");

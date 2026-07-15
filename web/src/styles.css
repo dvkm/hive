@@ -3904,3 +3904,59 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
     justify-content: center;
   }
 }
+
+/* ---- Mobile navigation (bottom tab bar + More sheet) ---- */
+.mobnav { display: none; }
+@media (max-width: 768px) {
+  /* Top bar keeps only brand + status; the long nav row is replaced below. */
+  .topbar { gap: 10px; padding: 0 12px; }
+  .topbar .nav { display: none; }
+  .conn { display: none; } /* status lives in the SSE dot; text is noise on mobile */
+
+  .content { padding-bottom: 64px; } /* clear the fixed bottom bar */
+
+  .mobnav {
+    display: flex;
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    height: 58px;
+    padding-bottom: env(safe-area-inset-bottom, 0);
+    background: linear-gradient(180deg, #121826, #0d1017);
+    border-top: 1px solid var(--border);
+    z-index: 50;
+  }
+  .mobtab {
+    flex: 1;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 3px;
+    font-size: 10.5px;
+    color: var(--text-dim);
+    background: none; border: none;
+    position: relative;
+  }
+  .mobtab.active, .mobtab[aria-current="page"] { color: var(--accent); }
+  .mobtab-icon { font-size: 18px; line-height: 1; }
+  .mobtab-badge { position: absolute; top: 4px; right: 50%; margin-right: -22px; }
+
+  .mobsheet-scrim {
+    position: fixed; inset: 0; z-index: 60;
+    background: rgba(0,0,0,0.5);
+    display: flex; align-items: flex-end;
+  }
+  .mobsheet {
+    width: 100%;
+    background: var(--panel, #12151d);
+    border-top-left-radius: 16px; border-top-right-radius: 16px;
+    padding: 18px 16px calc(18px + env(safe-area-inset-bottom, 0));
+    border-top: 1px solid var(--border);
+  }
+  .mobsheet-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px; }
+  .mobsheet-item {
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+    padding: 12px 4px; border-radius: 10px;
+    color: var(--text); font-size: 11px; text-align: center;
+    background: var(--bg-elev, #1a1f2b);
+  }
+  .mobsheet-icon { font-size: 20px; }
+  .mobsheet-offline { width: 100%; }
+}

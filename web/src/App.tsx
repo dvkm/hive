@@ -3,6 +3,8 @@ import { NavLink, Route, Routes, useLocation } from "react-router-dom";
 import type { Location } from "react-router-dom";
 import { useStore } from "./lib/store";
 import { relTime } from "./lib/time";
+import { toast } from "./lib/ui";
+import { pushState, enablePush } from "./lib/push";
 import Board from "./views/Board";
 import Brief from "./views/Brief";
 import Feed from "./views/Feed";
@@ -18,6 +20,99 @@ import Terminals from "./views/Terminals";
 import Analytics from "./views/Analytics";
 import Projects from "./views/Projects";
 import Palette from "./views/Palette";
+
+// Enable web-push on this device (phone PWA). Hidden once granted or where
+// unsupported (desktop keeps the osascript notifier). iOS only offers this on
+// an installed PWA over HTTPS.
+function PushButton() {
+  const [state, setState] = useState(pushState());
+  if (state === "granted" || state === "unsupported" || state === "denied") return null;
+  return (
+    <button
+      className="offline-toggle"
+      title="Get hive decisions & answers as notifications on this device"
+      onClick={async () => {
+        const msg = await enablePush();
+        setState(pushState());
+        toast(msg);
+      }}
+    >
+      🔔 notify
+    </button>
+  );
+}
+
+// Mobile navigation: a fixed bottom tab bar (the 4 places you actually live in)
+// plus a "More" sheet for everything else. Hidden on desktop via CSS; the top
+// nav is hidden on mobile. Badges match the desktop nav.
+function MobileNav({
+  inboxCount,
+  reviewCount,
+  offline,
+  setOffline,
+}: {
+  inboxCount: number;
+  reviewCount: number;
+  offline: boolean;
+  setOffline: (v: boolean) => void;
+}) {
+  const [moreOpen, setMoreOpen] = useState(false);
+  const close = () => setMoreOpen(false);
+  const tab = (to: string, label: string, icon: string, badge = 0, end = false) => (
+    <NavLink to={to} end={end} className="mobtab" onClick={close}>
+      <span className="mobtab-icon">{icon}</span>
+      {label}
+      {badge > 0 && <span className="badge mobtab-badge">{badge}</span>}
+    </NavLink>
+  );
+  const more = [
+    ["/brief", "Brief", "📋"],
+    ["/feed", "Feed", "📡"],
+    ["/evidence", "Evidence", "🖼"],
+    ["/learnings", "Learnings", "📚"],
+    ["/analytics", "Analytics", "📊"],
+    ["/projects", "Projects", "📁"],
+    ["/policies", "Policies", "⚖️"],
+    ["/monitors", "Monitors", "❤️"],
+  ] as const;
+  return (
+    <>
+      {moreOpen && (
+        <div className="mobsheet-scrim" onClick={close}>
+          <div className="mobsheet" onClick={(e) => e.stopPropagation()}>
+            <div className="mobsheet-grid">
+              {more.map(([to, label, icon]) => (
+                <NavLink key={to} to={to} className="mobsheet-item" onClick={close}>
+                  <span className="mobsheet-icon">{icon}</span>
+                  {label}
+                </NavLink>
+              ))}
+            </div>
+            <button
+              className={`btn ${offline ? "btn-danger" : ""} mobsheet-offline`}
+              onClick={() => {
+                setOffline(!offline);
+                close();
+              }}
+            >
+              {offline ? "⏸ Offline mode is ON — tap to resume" : "Go offline (drain the fleet)"}
+            </button>
+          </div>
+        </div>
+      )}
+      <nav className="mobnav">
+        {tab("/", "Board", "▦", 0, true)}
+        {tab("/decisions", "Decisions", "◎", inboxCount)}
+        {tab("/review", "Review", "✓", reviewCount)}
+        {tab("/terminals", "Terminals", "▶")}
+        <button className={`mobtab ${moreOpen ? "active" : ""}`} onClick={() => setMoreOpen((v) => !v)}>
+          <span className="mobtab-icon">☰</span>
+          More
+        </button>
+      </nav>
+    </>
+  );
+}
 
 function ConnDot() {
   const { sse } = useStore();
@@ -116,9 +211,11 @@ export default function App() {
           <NavLink to="/policies">Policies</NavLink>
           <NavLink to="/monitors">Monitors</NavLink>
         </nav>
+        <PushButton />
         <Bell />
         <ConnDot />
       </header>
+      <MobileNav inboxCount={inboxCount} reviewCount={reviewCount} offline={offline} setOffline={setOffline} />
       <main className="content">
         <Routes location={background || location}>
           <Route path="/" element={<Board />} />

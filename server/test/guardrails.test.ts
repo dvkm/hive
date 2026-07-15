@@ -285,6 +285,167 @@ test("needs_decision with no open card unparks after the grace period", async ()
   expect(state()).toBe("needs_decision");
 });
 
+// ---- per-project stack teardown ------------------------------------------------------
+
+test("cleanup runs config.cleanup_argv with {worktree} substituted, exactly once", async () => {
+  const { cleanupTask } = await import("../src/cleanup.ts");
+  const { Herdr } = await import("../src/runtime/herdr.ts");
+  const p = await post("/api/projects", {
+    name: "teardown-p",
+    repo_path: "/repo",
+    config: { cleanup_argv: ["infra/worktree/wt.sh", "down", "{worktree}"] },
+  });
+  const t = await post("/api/tasks", { project_id: p.json.id, title: "with stack" });
+  db.query("UPDATE tasks SET state = 'cancelled', worktree_path = '/wts/hive-x', branch = 'hive/x' WHERE id = ?").run(t.json.id);
+
+  const calls: string[][] = [];
+  const exec = async (argv: string[]) => (calls.push(argv), { code: 0, stdout: "", stderr: "" });
+  const stubHerdr = new Herdr(async () => ({ code: 0, stdout: "", stderr: "" }), "herdr");
+  await cleanupTask(db, stubHerdr, t.json.id, { exec });
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toEqual(["/repo/infra/worktree/wt.sh", "down", "/wts/hive-x"]);
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'stack_teardown'").all(t.json.id);
+  expect(ev).toHaveLength(1);
+
+  // re-running cleanup (reaper backstop) must not re-fire the teardown
+  db.query("UPDATE tasks SET worktree_path = '/wts/hive-x' WHERE id = ?").run(t.json.id);
+  await cleanupTask(db, stubHerdr, t.json.id, { exec, force: true });
+  expect(calls).toHaveLength(1);
+});
+
+// ---- empty-review gates -------------------------------------------------------------
+
+test("emit ready without evidence is held with instructions; passes once evidence exists", async () => {
+  const id = await newTask("no empty reviews");
+  await post(`/api/tasks/${id}/spawn`, {});
+  const held = await post(`/api/tasks/${id}/events`, { type: "ready" });
+  expect(held.json.held).toBe(true);
+  expect(held.json.reason).toBe("no_evidence");
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_progress");
+
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    "evd_gate_t", id, new Date().toISOString(), "log", "/tmp/p.log", "proof"
+  );
+  await post(`/api/tasks/${id}/events`, { type: "ready" });
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_review");
+});
+
+test("idle backstop never re-reviews after changes_requested until new evidence arrives", async () => {
+  const { advanceIfFinished, writeEvent, transition } = await import("../src/state.ts");
+  const id = await newTask("acknowledged is not addressed");
+  db.query("UPDATE tasks SET state = 'in_progress', pr_url = 'https://gh/pr/9', ci_status = 'passing' WHERE id = ?").run(id);
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    "evd_cr_1", id, new Date(Date.now() - 60_000).toISOString(), "log", "/tmp/a.log", "old proof"
+  );
+  writeEvent(db, { task_id: id, source: "director", type: "changes_requested", payload: { notes: "there are no evidences" } });
+  expect(advanceIfFinished(db, id, "idle", "test")).toBe(false); // acked+idle ≠ addressed
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    "evd_cr_2", id, new Date(Date.now() + 1000).toISOString(), "log", "/tmp/b.log", "new proof"
+  );
+  expect(advanceIfFinished(db, id, "idle", "test")).toBe(true); // visible new work → review
+});
+
+// ---- generic decision answer reaches the agent -----------------------------------
+
+test("answering a plain question card steers the answer to the live agent", async () => {
+  const id = await newTask("blocked on a question");
+  await post(`/api/tasks/${id}/spawn`, {});
+  // a plain decision (no specialized resolver claims it)
+  const d = await post("/api/decisions", {
+    task_id: id,
+    title: "Flip the runner, or check infra first?",
+    options: [
+      { key: "flip", label: "Flip the runner now" },
+      { key: "cautious", label: "Check AWS prereqs first" },
+    ],
+  });
+  await post(`/api/decisions/${d.json.id}/answer`, { answer_key: "cautious", answer_note: "infra doesn't exist yet; don't deploy" });
+  const steers = db.query("SELECT payload FROM events WHERE task_id = ? AND type='steer'").all(id).map((e: any) => JSON.parse(e.payload).message);
+  expect(steers.at(-1)).toContain("Check AWS prereqs first");
+  expect(steers.at(-1)).toContain("infra doesn't exist yet");
+});
+
+// ---- deny reason + recurring-deny guardrail ---------------------------------------
+
+test("denying a command card steers the agent the reason; 3rd deny proposes a block-always rule", async () => {
+  const id = await newTask("deny me");
+  await post(`/api/tasks/${id}/spawn`, {});
+  const gate = async () =>
+    (await post(`/api/tasks/${id}/guarded-action`, {
+      action: "command.dangerous.privilege-escalation",
+      target: "sudo rm -rf /etc/x",
+      detail: "command approval (dangerous): privilege escalation",
+    })).json.decision_id;
+
+  // deny #1 with a reason → agent gets a steer carrying it
+  const d1 = await gate();
+  await post(`/api/decisions/${d1}/answer`, { answer_key: "deny", answer_note: "never sudo, ask me to do host changes" });
+  const steers = () => db.query("SELECT payload FROM events WHERE task_id = ? AND type='steer'").all(id).map((e: any) => JSON.parse(e.payload).message);
+  expect(steers().at(-1)).toContain("never sudo");
+  expect(steers().at(-1)).toContain("DENIED");
+
+  // deny #2, #3 → after the 3rd a block-always proposal opens
+  const d2 = await gate();
+  await post(`/api/decisions/${d2}/answer`, { answer_key: "deny" });
+  const d3 = await gate();
+  await post(`/api/decisions/${d3}/answer`, { answer_key: "deny" });
+  const proposal: any = db
+    .query("SELECT * FROM decisions WHERE title LIKE 'Always block%privilege-escalation%' AND status='open'")
+    .get();
+  expect(proposal).toBeTruthy();
+
+  // approving it mints a project deny rule → the category now denies with no card
+  await post(`/api/decisions/${proposal.id}/answer`, { answer_key: "block" });
+  const rule = db.query("SELECT effect FROM authority_rules WHERE action_pattern = 'command.dangerous.privilege-escalation' AND active=1").get() as any;
+  expect(rule.effect).toBe("deny");
+  const blocked = await post(`/api/tasks/${id}/guarded-action`, {
+    action: "command.dangerous.privilege-escalation",
+    target: "sudo whoami",
+    detail: "command approval (dangerous): privilege escalation",
+  });
+  expect(blocked.status).toBe(403); // standing deny, no new card
+});
+
+// ---- command-card context ----------------------------------------------------------
+
+test("command cards carry intent, the literal command, category explanation, and answer semantics", async () => {
+  const id = await newTask("context rich");
+  const g = await post(`/api/tasks/${id}/guarded-action`, {
+    action: "command.dangerous.recursive-forced-rm",
+    target: "rm -rf /some/path",
+    detail: "command approval (dangerous): recursive/forced rm",
+    summary: "Clean the build output directory",
+  });
+  expect(g.status).toBe(409);
+  const d: any = db.query("SELECT context FROM decisions WHERE id = ?").get(g.json.decision_id);
+  expect(d.context).toContain("Clean the build output directory"); // intent
+  expect(d.context).toContain("rm -rf /some/path"); // literal command
+  expect(d.context).toContain("no trash, no undo"); // category explanation
+  expect(d.context).toContain("Approve & always allow"); // answer semantics
+});
+
+test("explainCommandDecision appends the haiku explanation to an OPEN card only", async () => {
+  const { explainCommandDecision } = await import("../src/explain.ts");
+  const id = await newTask("explain me");
+  const g = await post(`/api/tasks/${id}/guarded-action`, {
+    action: "command.dangerous.process-kill",
+    target: "pkill -f something",
+    detail: "command approval (dangerous): process kill",
+  });
+  const did = g.json.decision_id;
+  const stubExec = async () => ({ code: 0, stdout: JSON.stringify({ result: "- kills processes matching 'something'" }), stderr: "" });
+  await explainCommandDecision(db, did, "pkill -f something", { exec: stubExec });
+  const d: any = db.query("SELECT context FROM decisions WHERE id = ?").get(did);
+  expect(d.context).toContain("auto-explained");
+  expect(d.context).toContain("kills processes matching");
+
+  // answered card: enrichment must not rewrite history
+  await post(`/api/decisions/${did}/answer`, { answer_key: "deny" });
+  await explainCommandDecision(db, did, "pkill -f something", { exec: stubExec });
+  const after: any = db.query("SELECT context FROM decisions WHERE id = ?").get(did);
+  expect(after.context).toBe(d.context);
+});
+
 // ---- pane view --------------------------------------------------------------------
 
 test("GET /pane returns the agent's pane text with ANSI stripped; 404 when agentless", async () => {

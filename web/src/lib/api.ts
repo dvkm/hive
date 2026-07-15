@@ -177,6 +177,7 @@ export interface Learning {
   last_seen: string;
   status: "active" | "resolved";
   root_cause_task_id: string | null;
+  kind?: string; // "failure" (default) | "reference"
 }
 
 export interface Notification {
@@ -357,6 +358,9 @@ export interface Checkpoint {
 }
 
 export const api = {
+  token: apiToken,
+  subscribePush: (subscription: unknown) =>
+    req<{ ok: boolean }>(`/api/push/subscribe`, { method: "POST", body: JSON.stringify(subscription) }),
   offline: () => req<{ on: boolean }>(`/api/offline`),
   setOffline: (on: boolean) =>
     req<{ on: boolean; steered: number }>(`/api/offline`, { method: "POST", body: JSON.stringify({ on }) }),
@@ -483,7 +487,7 @@ export const api = {
     const p = new URLSearchParams(q as Record<string, string>).toString();
     return req<Learning[]>(`/api/learnings${p ? "?" + p : ""}`);
   },
-  createLearning: (b: { project_id: string; title: string; body?: string; create_root_cause_task?: boolean }) =>
+  createLearning: (b: { project_id: string; title: string; body?: string; kind?: string; create_root_cause_task?: boolean }) =>
     req<Learning>(`/api/learnings`, { method: "POST", body: JSON.stringify(b) }),
   updateLearning: (id: string, b: Partial<Pick<Learning, "title" | "body" | "status">>) =>
     req<Learning>(`/api/learnings/${id}`, { method: "PUT", body: JSON.stringify(b) }),

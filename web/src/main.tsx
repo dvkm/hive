@@ -4,7 +4,10 @@ import { BrowserRouter } from "react-router-dom";
 import { StoreProvider } from "./lib/store";
 import { LightboxProvider } from "./lib/lightbox";
 import App from "./App";
+import { registerServiceWorker } from "./lib/push";
 import "./styles.css";
+
+void registerServiceWorker(); // PWA install + push delivery (no-op off HTTPS)
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
