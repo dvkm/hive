@@ -45,7 +45,11 @@ must be built against this file. Server: `http://127.0.0.1:4700` (override
 herdr runs, default `["claude","-p",<brief-file>,"--permission-mode","acceptEdits"]`),
 and `gchat_spaces` (`[{space, label?}]`, the Google Chat intake allowlist —
 messages in each `spaces/<id>` become draft tasks in THIS project; see Intake
-connectors below).
+connectors below), and `intake_keywords` (`string[]`, domains / links / keywords
+that mark a braindump as belonging to THIS project — e.g. `["coredata",
+"figma.com/file/…"]`. At `POST /api/intake` the raw text is scored against every
+project's name, repo basename, and these keywords, and the braindump is re-routed
+to the best match when it strictly out-scores the requested project).
 Domain-supervisor keys (see the Domain supervisors section):
 `supervisor_persona` (string, freeform planner identity included in every planner
 prompt), `plan_intake` (bool; when true, each new intake task auto-triggers a
