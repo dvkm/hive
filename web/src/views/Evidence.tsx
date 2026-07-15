@@ -6,6 +6,7 @@ import { useStore } from "../lib/store";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
 import { relTime } from "../lib/time";
+import { Empty } from "../lib/ui";
 
 const KINDS = ["screenshot", "test_run", "log", "report", "link"] as const;
 
@@ -73,10 +74,10 @@ export default function Evidence() {
       </div>
 
       {rows.length === 0 && !loading && (
-        <div className="empty">
-          <div className="empty-big">No evidence</div>
-          <div className="muted">Nothing matches these filters.</div>
-        </div>
+        <Empty
+          title="No evidence"
+          hint="Agents attach screenshots, test runs and reports here as they work — no task reaches Done without one. Widen the filters if you expected something."
+        />
       )}
 
       <div className="evb-grid">

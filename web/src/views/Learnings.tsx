@@ -4,7 +4,7 @@ import { api } from "../lib/api";
 import type { Learning } from "../lib/api";
 import { useStore } from "../lib/store";
 import { relTime } from "../lib/time";
-import { toast } from "../lib/ui";
+import { Empty, toast } from "../lib/ui";
 
 export default function Learnings() {
   const { projects } = useStore();
@@ -97,7 +97,12 @@ export default function Learnings() {
       )}
       <LearningList title="Active failure patterns" items={active} projectName={projectName} onResolve={resolve} />
       {resolved.length > 0 && <LearningList title="Resolved" items={resolved} projectName={projectName} onResolve={resolve} />}
-      {learnings.length === 0 && <div className="muted pad">No learnings or references yet. Facts you save here (design files, URLs, glossary) are pinned into every agent brief.</div>}
+      {learnings.length === 0 && (
+        <Empty
+          title="No learnings or references yet"
+          hint="Repo landmines agents trip on (a build quirk, a flaky path) and durable facts (design files, URLs, glossary) land here and get pinned into every agent brief."
+        />
+      )}
     </div>
   );
 }

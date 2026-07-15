@@ -218,11 +218,9 @@ function PaneTerminal({ taskId }: { taskId: string }) {
           if (!live) return;
           setText(r.text);
           setError("");
-          // Always follow the tail — it's a live feed, not a document.
-          requestAnimationFrame(() => {
-            const el = boxRef.current;
-            if (el) el.scrollTop = el.scrollHeight;
-          });
+          // Follow the tail unless the user scrolled up to read something.
+          const el = boxRef.current;
+          if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 80) el.scrollTop = el.scrollHeight;
         })
         .catch((e) => live && setError(e.message));
     tick();
@@ -234,9 +232,11 @@ function PaneTerminal({ taskId }: { taskId: string }) {
   }, [taskId, open]);
   return (
     <section className="panel">
-      <h2 onClick={() => setOpen(!open)} style={{ cursor: "pointer" }}>
-        Terminal {open ? "▾" : "▸"}
-      </h2>
+      <button className="panel-head panel-toggle" onClick={() => setOpen(!open)} aria-expanded={open}>
+        <span className="panel-caret">{open ? "▾" : "▸"}</span>
+        Terminal
+        <span className="head-count">live</span>
+      </button>
       {open &&
         (error ? (
           <div className="muted">pane unavailable: {error}</div>
@@ -520,45 +520,54 @@ export function TaskBody({ id }: { id: string }) {
           </section>
         )}
 
-        <section className="panel">
-          <h2>Actions</h2>
-          <div className="steer">
-            <Attach files={steerFiles} onChange={setSteerFiles}>
-              <textarea
-                placeholder="Steer message to the agent…"
-                value={steer}
-                onChange={(e) => setSteer(e.target.value)}
-              />
-            </Attach>
-            <button className="btn" onClick={sendSteer}>
-              Send steer
-            </button>
-          </div>
-          {t.agent_target && (
-            <button className="btn" onClick={viewAgent} title="Focus this agent's tab in herdr">
-              View agent
-            </button>
-          )}
-          {t.state === "queued" && (
-            <button className="btn btn-primary" onClick={dispatch}>
-              Dispatch now
-            </button>
-          )}
-          <button className="btn" onClick={planBreakdown} disabled={planning}>
-            {planning ? "Planning…" : "Plan breakdown"}
-          </button>
-          <div className="transitions">
-            {(NEXT[t.state] || []).map((to) => (
-              <button
-                key={to}
-                className={`btn ${to === "cancelled" || to === "failed" ? "btn-danger" : "btn-primary"}`}
-                onClick={() => doTransition(to)}
-              >
-                {STATE_LABEL[to]}
+        {/* One primary per view. A queued task's one obvious action is to
+            dispatch it; for anything already running it's to steer it. Every
+            other control here is neutral, and only the destructive transitions
+            (cancel / fail) get danger styling. */}
+        {(() => {
+          const dispatchIsPrimary = t.state === "queued";
+          return (
+            <section className="panel">
+              <h2>Actions</h2>
+              <div className="steer">
+                <Attach files={steerFiles} onChange={setSteerFiles}>
+                  <textarea
+                    placeholder="Steer message to the agent…"
+                    value={steer}
+                    onChange={(e) => setSteer(e.target.value)}
+                  />
+                </Attach>
+                <button className={`btn ${dispatchIsPrimary ? "" : "btn-primary"}`} onClick={sendSteer}>
+                  Send steer
+                </button>
+              </div>
+              {t.agent_target && (
+                <button className="btn" onClick={viewAgent} title="Focus this agent's tab in herdr">
+                  View agent
+                </button>
+              )}
+              {dispatchIsPrimary && (
+                <button className="btn btn-primary" onClick={dispatch}>
+                  Dispatch now
+                </button>
+              )}
+              <button className="btn" onClick={planBreakdown} disabled={planning}>
+                {planning ? "Planning…" : "Plan breakdown"}
               </button>
-            ))}
-          </div>
-        </section>
+              <div className="transitions">
+                {(NEXT[t.state] || []).map((to) => (
+                  <button
+                    key={to}
+                    className={`btn ${to === "cancelled" || to === "failed" ? "btn-danger" : ""}`}
+                    onClick={() => doTransition(to)}
+                  >
+                    {STATE_LABEL[to]}
+                  </button>
+                ))}
+              </div>
+            </section>
+          );
+        })()}
       </aside>
     </div>
   );

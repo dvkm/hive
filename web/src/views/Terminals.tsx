@@ -6,7 +6,7 @@ import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import type { State } from "../lib/api";
 import { useStore } from "../lib/store";
-import { STATE_LABEL, StatusDot } from "../lib/ui";
+import { Empty, STATE_LABEL, StatusDot } from "../lib/ui";
 
 const ACTIVE: State[] = ["in_progress", "needs_decision", "in_review", "verifying"];
 
@@ -50,6 +50,10 @@ export default function Terminals() {
   const live = tasks.filter((t) => ACTIVE.includes(t.state) && t.agent_target);
   return (
     <div className="pad">
+      <div className="page-head">
+        <h1 className="page-title">Terminals</h1>
+        <p className="page-sub">Every live agent's pane. Click a title to open the task and steer it.</p>
+      </div>
       <div className="fleet-strip">
         {counts.map((c) => (
           <span key={c.state} className="chip">
@@ -60,21 +64,27 @@ export default function Terminals() {
           open decisions: {decisions.length}
         </Link>
       </div>
-      <div className="fleet-grid">
-        {live.map((t) => (
-          <div className="fleet-cell" key={t.id}>
-            <div className="fleet-head">
-              <StatusDot state={t.state} />
-              <Link to={`/tasks/${t.id}`} className="fleet-title">
-                #{t.number} {t.title}
-              </Link>
-              <span className="chip">{STATE_LABEL[t.state]}</span>
-            </div>
-            <MiniPane id={t.id} />
-          </div>
-        ))}
-        {!live.length && <div className="muted pad">No live agents right now.</div>}
-      </div>
+      {live.length === 0 ? (
+        <Empty
+          title="No agents running"
+          hint="Panes appear here the moment a task is dispatched. Dispatch one from the board to watch it work."
+        />
+      ) : (
+        <div className="fleet-grid">
+          {live.map((t) => (
+            <section className="panel fleet-cell" key={t.id}>
+              <header className="fleet-head">
+                <StatusDot state={t.state} />
+                <Link to={`/tasks/${t.id}`} className="fleet-title">
+                  #{t.number} {t.title}
+                </Link>
+                <span className="chip">{STATE_LABEL[t.state]}</span>
+              </header>
+              <MiniPane id={t.id} />
+            </section>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

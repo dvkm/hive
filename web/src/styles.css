@@ -6,8 +6,15 @@
   --border: #232b3a;
   --border-soft: #1c2432;
   --text: #e4e9f1;
-  --text-dim: #9aa7bd;
-  --text-faint: #64708a;
+  --text-dim: #a3b0c6;
+  /* --text-faint was #64708a: only 3.2:1 on --bg-elev2, under the 4.5:1 floor,
+     which is why timestamps/counts/captions read as unreadable smudges. This
+     clears 5:1 on every surface we put it on. */
+  --text-faint: #8492ab;
+  /* aliases for two names used in the sheet that were never defined (they were
+     silently falling back to initial/hardcoded values) */
+  --bg-elev1: var(--bg-elev);
+  --muted: var(--text-dim);
   --accent: #5b8cff;
   --accent-dim: #2b3b63;
   --green: #46c98b;
@@ -19,6 +26,23 @@
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 20px rgba(0, 0, 0, 0.25);
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  /* Spacing scale. Every new//touched rule picks from these instead of inventing
+     an 11px or a 13px. */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+
+  /* Type scale. --t-eyebrow is the uppercase panel/column header. */
+  --t-eyebrow: 11.5px;
+  --t-xs: 11.5px;
+  --t-sm: 12.5px;
+  --t-md: 13.5px;
+  --t-lg: 16px;
+  --t-xl: 22px;
 }
 
 * {
@@ -71,8 +95,20 @@ a {
 }
 .nav {
   display: flex;
-  gap: 4px;
+  gap: var(--s1);
   flex: 1;
+  /* Without min-width:0 a flex item floors at its content width, so this 1055px
+     nav pushed the whole document wider than a phone viewport. It now scrolls
+     inside itself instead of dragging the page sideways. */
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.nav::-webkit-scrollbar {
+  display: none;
+}
+.nav > * {
+  flex-shrink: 0;
 }
 .nav a {
   padding: 6px 12px;
@@ -219,37 +255,34 @@ a {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 11px 13px;
+  gap: var(--s2);
+  padding: var(--s3);
   border-bottom: 1px solid var(--border-soft);
   position: sticky;
   top: 0;
+  background: var(--bg-elev);
+  border-radius: var(--radius) var(--radius) 0 0;
+  z-index: 1;
 }
-.col-title {
-  font-weight: 650;
-  font-size: 12.5px;
-  letter-spacing: 0.4px;
-  text-transform: uppercase;
-  color: var(--text-dim);
+.col-head-right {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  flex-shrink: 0;
 }
 .col-count {
-  font-size: 11px;
+  font-size: var(--t-xs);
   color: var(--text-faint);
   background: var(--bg-elev2);
   border-radius: 10px;
-  padding: 1px 8px;
+  padding: 1px var(--s2);
 }
 .col-body {
-  padding: 10px;
+  padding: var(--s3);
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--s3);
   overflow-y: auto;
-}
-.col-empty {
-  color: var(--text-faint);
-  text-align: center;
-  padding: 10px;
-  font-size: 13px;
 }
 
 /* ---- card ---- */
@@ -627,14 +660,21 @@ a {
 /* ---- task page ---- */
 .task {
   display: grid;
-  grid-template-columns: 1fr 320px;
-  gap: 16px;
-  padding: 20px;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: var(--s4);
+  padding: var(--s5);
   max-width: 1200px;
   margin: 0 auto;
 }
+/* Grid children floor at min-width:auto, so a wide diff / long pre used to shove
+   the main column off the right edge of the page. Neither of these had any rule
+   at all before. */
+.task-main,
+.task-side {
+  min-width: 0;
+}
 .crumbs {
-  margin-bottom: 8px;
+  margin-bottom: var(--s2);
 }
 .crumbs a {
   color: var(--text-dim);
@@ -655,15 +695,56 @@ a {
   background: var(--panel);
   border: 1px solid var(--border-soft);
   border-radius: var(--radius);
-  padding: 14px 16px;
-  margin-bottom: 14px;
+  padding: var(--s4);
+  margin-bottom: var(--s3);
 }
-.panel h2 {
-  font-size: 12px;
+/* One eyebrow header shape, shared by panel titles, board column titles and the
+   terminal panes, so every surface announces itself the same way. */
+.panel h2,
+.col-title,
+.panel-head {
+  font-size: var(--t-eyebrow);
+  font-weight: 650;
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: var(--text-dim);
-  margin: 0 0 10px;
+  margin: 0;
+}
+.panel h2 {
+  margin-bottom: var(--s3);
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  margin-bottom: var(--s3);
+}
+/* a panel header that is also a disclosure control (Terminal) */
+.panel-toggle {
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+}
+.panel-toggle:hover {
+  color: var(--text);
+}
+.panel-caret {
+  color: var(--text-faint);
+  font-size: 10px;
+}
+/* the count/adornment that trails a panel or column title */
+.head-count {
+  font-size: var(--t-xs);
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--text-faint);
+  background: var(--bg-elev2);
+  border-radius: 10px;
+  padding: 1px var(--s2);
 }
 .brief {
   font-family: var(--mono);
@@ -1196,14 +1277,45 @@ a {
   font-size: 14px;
 }
 
+/* ---- empty states ----
+   Every list view uses this. The rule: say what the emptiness MEANS, then what
+   would fill it. "—" tells the director nothing. */
 .empty {
   text-align: center;
-  padding: 60px 20px;
+  padding: var(--s6) var(--s5);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s2);
 }
 .empty-big {
-  font-size: 20px;
+  font-size: var(--t-lg);
   font-weight: 600;
-  margin-bottom: 6px;
+  color: var(--text);
+}
+.empty-hint {
+  font-size: var(--t-md);
+  color: var(--text-dim);
+  max-width: 46ch;
+  line-height: 1.5;
+  margin: 0;
+}
+/* Column-sized variant: a board column is 248px wide and can't afford 32px of
+   padding or a 16px title. */
+.empty-compact {
+  padding: var(--s5) var(--s3);
+  gap: var(--s1);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.012);
+}
+.empty-compact .empty-big {
+  font-size: var(--t-md);
+  color: var(--text-dim);
+}
+.empty-compact .empty-hint {
+  font-size: var(--t-sm);
+  color: var(--text-faint);
 }
 
 /* ---- policies ---- */
@@ -3648,17 +3760,150 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
   overflow-y: auto;
 }
 
-/* Fleet terminals grid */
-.fleet-strip { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; align-items: center; }
-.fleet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; }
-.fleet-cell { border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: var(--panel); min-width: 0; }
-.fleet-head { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; min-width: 0; }
-.fleet-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
-.term-mini { max-height: 220px; font-size: 10.5px; line-height: 1.4; }
+/* Fleet terminals grid. A fleet cell IS a .panel — same chrome, same eyebrow
+   header — so /terminals reads as part of hive and not a bolted-on debug view. */
+.fleet-strip {
+  display: flex;
+  gap: var(--s2);
+  flex-wrap: wrap;
+  margin-bottom: var(--s4);
+  align-items: center;
+}
+.fleet-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: var(--s3);
+}
+.fleet-cell {
+  min-width: 0;
+  margin-bottom: 0;
+}
+.fleet-head {
+  display: flex;
+  gap: var(--s2);
+  align-items: center;
+  margin-bottom: var(--s3);
+  min-width: 0;
+}
+.fleet-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--t-md);
+  font-weight: 600;
+}
+.fleet-title:hover {
+  color: var(--accent);
+}
+.term-mini {
+  max-height: 220px;
+  font-size: 11px;
+  line-height: 1.45;
+}
 
 /* Review CTA truthfulness */
-.review-blocked { margin-top: 8px; font-size: 12.5px; color: var(--muted, #9a9aa2); }
-.review-merge-error { margin-top: 8px; font-size: 12.5px; color: #e5484d; white-space: pre-wrap; }
+.review-blocked {
+  margin-top: var(--s2);
+  font-size: var(--t-sm);
+  color: var(--text-dim);
+}
+.review-merge-error {
+  margin-top: var(--s2);
+  font-size: var(--t-sm);
+  color: var(--red);
+  white-space: pre-wrap;
+}
+
+/* ---- page header: title + one-line "what this view is for" ----
+   Gives the standalone list views (Terminals, Evidence, …) the same top-of-page
+   anchor the Board and Task pages already had. */
+.page-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s3);
+  flex-wrap: wrap;
+  margin-bottom: var(--s4);
+}
+.page-title {
+  font-size: var(--t-lg);
+  font-weight: 650;
+  margin: 0;
+}
+.page-sub {
+  font-size: var(--t-md);
+  color: var(--text-dim);
+  margin: 0;
+}
+
+/* ================================================================
+   Responsive. The sheet had no @media at all, so a phone got the
+   desktop layout and scrolled sideways on every page.
+   ================================================================ */
+@media (max-width: 860px) {
+  .topbar {
+    gap: var(--s3);
+    padding: 0 var(--s3);
+  }
+  .pad {
+    padding: var(--s4) var(--s3);
+  }
+  .inbox {
+    padding: var(--s4) var(--s3);
+    gap: var(--s3);
+  }
+
+  /* Task page: sidebar stops being a sidebar. */
+  .task {
+    grid-template-columns: minmax(0, 1fr);
+    padding: var(--s4) var(--s3);
+    gap: var(--s3);
+  }
+  .task-title {
+    font-size: 19px;
+    /* long braindump titles are one unbreakable URL — let them wrap */
+    align-items: flex-start;
+    word-break: break-word;
+  }
+  .task-sub {
+    flex-wrap: wrap;
+  }
+
+  /* Board: one column per screen, swipe between them. A kanban has to scroll
+     sideways — the point is that the PAGE doesn't, the board does. */
+  .board {
+    grid-auto-columns: minmax(84vw, 1fr);
+    gap: var(--s3);
+    padding: var(--s3);
+    overflow-x: auto;
+    scroll-snap-type: x mandatory;
+    overscroll-behavior-x: contain;
+  }
+  .column {
+    scroll-snap-align: start;
+  }
+  .board-switch {
+    padding: var(--s3) var(--s3) 0;
+  }
+  .board-search {
+    flex: 1;
+    min-width: 120px;
+  }
+
+  .fleet-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .attn-title {
+    max-width: 100%;
+  }
+  .attn-row {
+    flex-wrap: wrap;
+  }
+  .ev-gallery {
+    justify-content: center;
+  }
+}
 
 /* ---- Mobile navigation (bottom tab bar + More sheet) ---- */
 .mobnav { display: none; }

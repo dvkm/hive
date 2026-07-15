@@ -1,23 +1,8 @@
 import { useRef, useState, type ReactNode } from "react";
 import type { State, CiStatus, Health } from "./api";
+import { STATE_LABEL, HEALTH_LABEL } from "./labels";
 
-export const STATE_LABEL: Record<State, string> = {
-  queued: "Queued",
-  in_progress: "In Progress",
-  needs_decision: "Needs Decision",
-  in_review: "In Review",
-  verifying: "Verifying",
-  done: "Done",
-  failed: "Failed",
-  cancelled: "Cancelled",
-};
-
-export const HEALTH_LABEL: Record<Health["status"], string> = {
-  healthy: "Healthy",
-  silent: "Silent",
-  stuck: "Stuck",
-  dead: "Agent gone",
-};
+export { STATE_LABEL, HEALTH_LABEL, NEXT } from "./labels"; // callers keep importing them from here
 
 // Status dot. When the server reports health, the dot reflects HEALTH (green
 // pulse / amber / orange / red) with the reason as tooltip; otherwise it falls
@@ -34,19 +19,34 @@ export function StatusDot({ state, health }: { state: State; health?: Health | n
   return <span className={`sdot sdot-${state}`} title={STATE_LABEL[state]} />;
 }
 
+// Empty state. Every list view in hive uses this, and the contract is that both
+// halves are mandatory: `title` says what the emptiness MEANS, `hint` says what
+// would fill it. A bare "—" or "Nothing yet" leaves the director guessing
+// whether the system is idle or broken.
+export function Empty({
+  title,
+  hint,
+  compact,
+  action,
+}: {
+  title: string;
+  hint: string;
+  compact?: boolean;
+  action?: ReactNode;
+}) {
+  return (
+    <div className={`empty${compact ? " empty-compact" : ""}`}>
+      <div className="empty-big">{title}</div>
+      <p className="empty-hint">{hint}</p>
+      {action}
+    </div>
+  );
+}
+
 export function CiBadge({ status }: { status: CiStatus }) {
   if (!status) return null;
   return <span className={`ci ci-${status}`}>CI {status}</span>;
 }
-
-// Which transitions the director can trigger from the current state.
-export const NEXT: Partial<Record<State, State[]>> = {
-  queued: ["in_progress", "cancelled"],
-  in_progress: ["in_review", "needs_decision", "failed", "cancelled"],
-  needs_decision: ["in_progress", "cancelled"],
-  in_review: ["verifying", "in_progress", "cancelled"],
-  verifying: ["done", "in_progress", "failed"],
-};
 
 const kb = (n: number) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${Math.round(n / 1024)} KB` : `${(n / 1048576).toFixed(1)} MB`);
 

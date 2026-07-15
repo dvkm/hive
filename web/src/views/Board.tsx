@@ -3,7 +3,7 @@ import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
 import type { Health, Kind, State, Task } from "../lib/api";
-import { Attach, CiBadge, HEALTH_LABEL, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { Attach, CiBadge, Empty, HEALTH_LABEL, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 import { AttentionTray, needsAttention } from "./attention";
 
@@ -23,6 +23,36 @@ const COLUMNS: State[] = [
   "verifying",
   "done",
 ];
+
+// What an empty column MEANS, and what puts a card in it. An empty column is
+// the most common thing on this board, so "—" was the most common thing the
+// director saw.
+const COL_EMPTY: Record<string, { title: string; hint: string }> = {
+  queued: {
+    title: "Nothing queued",
+    hint: "New tasks wait here for an agent. Add one, or braindump and approve the breakdown.",
+  },
+  in_progress: {
+    title: "No agents working",
+    hint: "Dispatch a queued task and its agent appears here while it runs.",
+  },
+  needs_decision: {
+    title: "Nothing blocked",
+    hint: "An agent that hits a call only you can make parks here and waits.",
+  },
+  in_review: {
+    title: "Nothing to review",
+    hint: "Agents land here once the PR is open and CI is green. That's your cue to merge.",
+  },
+  verifying: {
+    title: "Nothing verifying",
+    hint: "Merged tasks sit here while post-merge smoke checks run.",
+  },
+  done: {
+    title: "Nothing finished yet",
+    hint: "Tasks arrive once they're merged, verified, and carry evidence.",
+  },
+};
 
 function Card({ task }: { task: Task }) {
   const { projects, evidenceCount, spawnError, lastActivity } = useStore();
@@ -258,7 +288,7 @@ export default function Board() {
               {list.map((t) => (
                 <Card key={t.id} task={t} />
               ))}
-              {list.length === 0 && <div className="col-empty">—</div>}
+              {list.length === 0 && <Empty compact {...COL_EMPTY[s]} />}
             </div>
           </section>
         );

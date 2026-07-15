@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { useStore } from "../lib/store";
+import { Empty } from "../lib/ui";
 import { DecisionCard } from "./DecisionCard";
 import { CheckpointsInbox } from "./Checkpoints";
 
@@ -26,12 +27,20 @@ export default function Decisions() {
 
   return (
     <div className="inbox">
+      <div className="page-head">
+        <h1 className="page-title">Decisions</h1>
+        <p className="page-sub">
+          {list.length === 0
+            ? "Agents are unblocked."
+            : `${list.length} agent${list.length === 1 ? " is" : "s are"} blocked waiting on you.`}
+        </p>
+      </div>
       <CheckpointsInbox />
       {list.length === 0 && (
-        <div className="empty">
-          <div className="empty-big">Inbox zero</div>
-          <div className="muted">No decisions need you right now.</div>
-        </div>
+        <Empty
+          title="Inbox zero"
+          hint="When an agent hits a call only you can make, its question shows up here with options and a recommendation."
+        />
       )}
       {list.map((d) => (
         <DecisionCard key={d.id} d={d} onDone={hide} />
