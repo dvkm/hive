@@ -183,6 +183,7 @@ Types written by the runtime layer (Phase 2b):
 - `pr_conflict` — reconciler saw the PR CONFLICTING with its base and nudged the agent to resolve (once per head SHA; lifecycle untouched). `payload: {pr_url, head_sha, delivered}`
 - `ready_for_review` — the task was handed off `in_progress → in_review`: by the agent's `ready` emit, by the herdr supervise loop's push signal (`source: herdr`, the moment herdr reports the agent idle), or by the reconciler's idle/gone poll backstop. `payload: {pr_url, via, kind}` (`via ∈ {emit, idle, gone}`)
 - `pr_linked` — a marked PR was matched back to this task and its `pr_url` set (by the reconciler's scan or `POST /api/tasks/link-pr`). `payload: {pr_url, via}` (`via ∈ {id, number}` — which half of the marker matched)
+- `pr_synchronized` — the reconciler observed the PR head SHA change (hive's stand-in for GitHub's synchronize webhook). `payload: {head_sha}`. Emitted only when the head differs from the prior `pr_synchronized` (the first observation is a baseline). Used by the re-queue guard to tell "the agent pushed a fix" from "CI is still green on the same old head" after a `changes_requested`.
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
 - `smoke_passed` / `smoke_failed` — post-deploy smoke result. `payload: {results:[{name,ok,detail}], evidence_id?}`
@@ -192,7 +193,7 @@ Types written by the runtime layer (Phase 2b):
 Review events (written by the director path, `source: director`):
 - `merged` — an in-review task was approved & merged. `payload: {method, base, branch, pr_url}`
 - `merge_failed` — a merge attempt failed (conflict / not a fast-forward / gh refused); no state change. `payload: {reason}`
-- `changes_requested` — the captain requested changes; the task returns to `in_progress`. `payload: {notes, delivered}`
+- `changes_requested` — the captain requested changes; the task returns to `in_progress`. `payload: {notes, delivered, head_sha}` (`head_sha` = the PR head at request time, read from the latest `pr_synchronized`; the baseline the re-queue guard compares against, `null` when no `pr_synchronized` existed yet)
 
 Domain-supervisor events (written by the planner, `source: system`):
 - `planning` — a planner run started for the task. `payload: {title}`
@@ -519,6 +520,17 @@ render the same review card).
   no recent activity is not auto-advanced (nothing to review) but is made VISIBLE:
   its `health` becomes `stuck` (reason `finished or stuck: agent idle, no PR`), which
   surfaces it in the attention tray for the director instead of sitting silently.
+
+**Changes-requested re-queue guard:** once the captain requests changes, the task
+must NOT bounce straight back into review until the agent has actually acted. Both
+auto-advance paths (the reconciler's CI-green poll / link-pr handoff and the idle
+backstop) skip a task whose latest `changes_requested` is still unaddressed. "Addressed"
+is a UNION signal recorded after the request: a pushed commit (a `pr_synchronized` on a
+DIFFERENT head than the one stamped into the `changes_requested`), fresh evidence, or a
+fresh `review_summary`. Any one clears the block; commit-only would strand an
+evidence-only request (the director said "there are no evidences") forever. The agent's
+explicit `ready` emit is intentionally NOT guarded — it can legitimately race ahead of
+the reconciler recording `pr_synchronized`.
 
 - `GET /api/tasks/:id/diff` → `200 DiffResult` | `400` (no branch & no `pr_url`, or project has no `repo_path`) | `404` | `502` (gh/git failed)
   The task branch's changes. When `pr_url` is set, `gh pr diff <url> --patch`;

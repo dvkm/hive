@@ -1,0 +1,11 @@
+$ bun run repro_242.ts   # drives the real reconcileOnce() through the corebeat PR #242 timeline
+
+=== corebeat PR #242 timeline — reconciler must not re-queue a sent-back PR ===
+
+t0  poll(CI green @cafe0000)          -> queue state: in_review   (director can now review)
+t1  director requests changes          -> queue state: in_progress   (back with the agent)
+t2  poll(CI green @cafe0000, +33s)     -> queue state: in_progress   <-- guard held: stays with the agent
+t3  poll(CI green @cafe0000 again)     -> queue state: in_progress   (unchanged head != addressed)
+t4  poll(CI green @deadbeef, new push) -> queue state: in_review   <-- new commit landed -> back to review
+
+RESULT: PASS — sent-back PR stayed out of the queue until the agent actually pushed a fix.

@@ -140,6 +140,59 @@ export function expireOrphanedDecisions(db: DB): number {
   return n;
 }
 
+// The one guard against re-queuing a PR whose latest review verdict is "changes
+// requested" before the agent has actually acted (#163, #234). Returns true =
+// still unaddressed = DON'T insert into the review queue. "Addressed" means
+// something new landed after the latest changes_requested: a new commit pushed
+// (the reconciler's `pr_synchronized` event — hive's stand-in for GitHub's
+// synchronize webhook), fresh evidence, or a fresh review_summary. Any of the
+// three clears the block. Callers apply this at every point that inserts into
+// the queue (the idle backstop here, and handOffToReview for the reconciler/
+// link-pr paths), so a bare CI-green poll can no longer bounce a task the
+// director just sent back straight into review with no new work on it.
+export function changesRequestUnaddressed(db: DB, taskId: string): boolean {
+  const cr: any = db
+    .query("SELECT ts, payload FROM events WHERE task_id = ? AND type = 'changes_requested' ORDER BY ts DESC LIMIT 1")
+    .get(taskId);
+  if (!cr?.ts) return false; // never sent back → nothing to guard
+  // Evidence-only / review_summary path: a changes_requested can be evidence-only
+  // (#163), so either of these after the request clears the block immediately.
+  const nonCommit = db
+    .query(
+      `SELECT 1 FROM events WHERE task_id = ? AND type = 'review_summary' AND ts > ?
+       UNION SELECT 1 FROM evidence WHERE task_id = ? AND ts > ? LIMIT 1`
+    )
+    .get(taskId, cr.ts, taskId, cr.ts);
+  if (nonCommit) return false;
+  // Commit signal: the baseline is the head SHA at request time (stamped into the
+  // changes_requested payload; null when no pr_synchronized existed yet). A
+  // pr_synchronized on the SAME head — or the first post-request observation when
+  // the head was unknown — is NOT new work; only a later DIFFERENT head is.
+  let baseline: string | null = null;
+  try {
+    baseline = JSON.parse(cr.payload ?? "{}").head_sha ?? null;
+  } catch {
+    baseline = null;
+  }
+  const syncs = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_synchronized' AND ts > ? ORDER BY ts ASC")
+    .all(taskId, cr.ts) as { payload: string }[];
+  for (const s of syncs) {
+    let sha: string | null = null;
+    try {
+      sha = JSON.parse(s.payload).head_sha ?? null;
+    } catch {
+      sha = null;
+    }
+    if (baseline === null) {
+      baseline = sha; // first observation when head-at-request was unknown
+      continue;
+    }
+    if (sha !== null && sha !== baseline) return false; // genuinely new commit → addressed
+  }
+  return true; // still unaddressed
+}
+
 // The finished-handoff, shared by every herdr-signal path (the reconciler's
 // poll backstop and the supervise wait loop): an agent observed idle/gone on an
 // in_progress task that has a real work product (a pr_url, or a scout report)
@@ -159,22 +212,9 @@ export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, s
   // evidence isn't reviewable (the protocol says attach evidence BEFORE ready;
   // the agent's explicit `ready` emit is gated the same way elsewhere).
   if (!hasReport && evidenceCount(db, taskId) < 1) return false;
-  // After a changes-request, mere idleness is NOT "addressed" — an agent that
-  // acknowledges in one turn goes idle and used to bounce straight back into
-  // the review queue (#163: "no evidence" requested, agent acked, re-queued in
-  // seconds). Require visible new work (evidence or a review_summary) newer
-  // than the latest changes_requested before the backstop re-advances.
-  const cr: any = db
-    .query("SELECT MAX(ts) AS ts FROM events WHERE task_id = ? AND type = 'changes_requested'")
-    .get(taskId);
-  if (cr?.ts) {
-    const addressed = db
-      .query(
-        "SELECT 1 FROM events WHERE task_id = ? AND type IN ('review_summary') AND ts > ? UNION SELECT 1 FROM evidence WHERE task_id = ? AND ts > ? LIMIT 1"
-      )
-      .get(taskId, cr.ts, taskId, cr.ts);
-    if (!addressed) return false;
-  }
+  // After a changes-request, mere idleness is NOT "addressed" (#163). Require
+  // visible new work before re-advancing — the shared guard below.
+  if (changesRequestUnaddressed(db, taskId)) return false;
   writeEvent(db, {
     task_id: taskId,
     source,
