@@ -20,7 +20,7 @@ import {
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
-import { recordSystemLearning, signature, resolveRefCaptureForDecision, addReference, listReferences } from "./learn.ts";
+import { recordSystemLearning, recordDecisionKnowledge, signature, resolveRefCaptureForDecision, addReference, listReferences } from "./learn.ts";
 import {
   parseProject,
   parseTask,
@@ -1948,8 +1948,15 @@ function knowledgeSearch(db: DB, url: URL): Response {
       `SELECT title, body FROM policies WHERE active = 1 AND (scope = 'global' OR scope = ?)${like("title || ' ' || body")} ORDER BY created_at`
     )
     .all(`project:${projectId}`, ...terms.map((t) => `%${t}%`)) as any[];
+  // Answers to past decision cards — so a crew consults the prior ruling before
+  // re-raising the same question.
+  const decisions = db
+    .query(
+      `SELECT title, body, occurrences FROM learnings WHERE project_id = ? AND kind = 'decision' AND status = 'active'${like("title || ' ' || COALESCE(body,'')")} ORDER BY last_seen DESC LIMIT 20`
+    )
+    .all(projectId, ...terms.map((t) => `%${t}%`)) as any[];
 
-  return json({ query: terms.join(" "), references: refs, learnings, policies });
+  return json({ query: terms.join(" "), references: refs, learnings, policies, decisions });
 }
 
 function listLearnings(db: DB, url: URL): Response {
@@ -2742,6 +2749,10 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): 
       `Director answered your decision "${r.title}": ${label}.` + (answerNote ? ` ${answerNote}` : "") + " Proceed on this basis.",
       "queued by decision answer"
     );
+    // A genuine product/preference question (no resolver owned it) is a durable
+    // project fact — persist it so the next crew consults the answer instead of
+    // re-raising the same card.
+    recordDecisionKnowledge(db, id, answerKey, answerNote);
   }
   // Resume the task if it was parked on this decision. (herdr `agent send` is Phase 2.)
   const task = getTask(db, r.task_id);

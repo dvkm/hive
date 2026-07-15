@@ -285,6 +285,27 @@ ${references.map(line).join("\n")}`
     );
   }
 
+  // Answers to past decision cards — so this crew consults the prior ruling
+  // before raising the same question again. Indexed by question (+ a short
+  // answer inline); the full note is one `hive recall` away.
+  const decisions = db
+    .query(
+      "SELECT title, body FROM learnings WHERE project_id = ? AND kind = 'decision' AND status = 'active' ORDER BY last_seen DESC LIMIT 12"
+    )
+    .all(task.project_id) as { title: string; body: string | null }[];
+  if (decisions.length) {
+    const line = (d: { title: string; body: string | null }) => {
+      const a = (d.body ?? "").replace(/\n/g, " ").trim();
+      return a && a.length <= 140 ? `- **${d.title}** — ${a}` : `- **${d.title}**`;
+    };
+    parts.push(
+      `## Decisions already made (don't re-ask — recall, then act)
+The director already answered these for this project. Before you raise a
+decision card, check whether it's already settled here (or via \`hive recall\`):
+${decisions.map(line).join("\n")}`
+    );
+  }
+
   // Known failure patterns: active FAILURE learnings, 10 most recent.
   const learnings = db
     .query(
