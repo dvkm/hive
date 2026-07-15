@@ -79,6 +79,17 @@ export function evidenceCount(db: DB, taskId: string, kind?: string): number {
   return (row as { n: number }).n;
 }
 
+// Count evidence captured from a specific commit SHA (stamped into meta.commit_sha
+// when the agent emits it). Drives the freshness gate: the evidence the director
+// sees must reflect the latest commit, so a handoff after new commits requires
+// re-captured evidence tied to the current HEAD (the #223 stale-screenshot bug).
+export function evidenceAtSha(db: DB, taskId: string, sha: string): number {
+  const row = db
+    .query("SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND json_extract(meta, '$.commit_sha') = ?")
+    .get(taskId, sha);
+  return (row as { n: number }).n;
+}
+
 // Write an append-only event row and broadcast it. Returns the parsed event.
 export function writeEvent(
   db: DB,
