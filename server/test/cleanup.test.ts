@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
 import { transition, setTerminalHook, type State } from "../src/state.ts";
-import { cleanupTask } from "../src/cleanup.ts";
+import { cleanupTask, runStackCmd } from "../src/cleanup.ts";
 import { Herdr, tabCloseArgv, paneCloseArgv } from "../src/runtime/herdr.ts";
 import { makeHandler } from "../src/api.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
@@ -120,6 +120,44 @@ test("cleanupWorktree preserves TRACKED uncommitted work to a ghost before remov
   expect(r.removed).toBe(true);
   expect(r.ghost_branch).toBe("ghost-t1");
   expect(calls.some((c) => has(c, "checkout", "-b", "ghost-t1"))).toBe(true);
+});
+
+// ---- runStackCmd: shared setup/teardown hook runner ----
+
+test("runStackCmd (setup) substitutes {worktree}, resolves relative argv[0], emits stack_setup ok", async () => {
+  const { db, projectId } = freshDb();
+  const id = seedTask(db, projectId, { state: "in_progress" });
+  const { exec, calls } = stubExec(() => OK());
+  await runStackCmd(db, id, ["infra/wt.sh", "up", "{worktree}"], "/repo", "/wt/hive-x", exec, {
+    type: "stack_setup",
+    source: "herdr",
+  });
+  // relative argv[0] -> repo_path prefix; {worktree} substituted
+  expect(calls[0]).toEqual(["/repo/infra/wt.sh", "up", "/wt/hive-x"]);
+  const ev = db.query("SELECT source, payload FROM events WHERE task_id = ? AND type = 'stack_setup'").get(id) as any;
+  expect(ev.source).toBe("herdr");
+  expect(JSON.parse(ev.payload).ok).toBe(true);
+});
+
+test("runStackCmd records ok:false + error when the hook exits non-zero", async () => {
+  const { db, projectId } = freshDb();
+  const id = seedTask(db, projectId, { state: "in_progress" });
+  const { exec } = stubExec(() => FAIL("stack boom"));
+  await runStackCmd(db, id, ["/abs/up.sh"], "/repo", "/wt", exec, { type: "stack_setup", source: "herdr" });
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'stack_setup'").get(id) as any;
+  const p = JSON.parse(ev.payload);
+  expect(p.ok).toBe(false);
+  expect(p.error).toContain("stack boom");
+});
+
+test("runStackCmd is a no-op (no exec, no event) when argv is missing or empty", async () => {
+  const { db, projectId } = freshDb();
+  const id = seedTask(db, projectId, { state: "in_progress" });
+  const { exec, calls } = stubExec(() => OK());
+  await runStackCmd(db, id, undefined, "/repo", "/wt", exec, { type: "stack_setup", source: "herdr" });
+  await runStackCmd(db, id, [], "/repo", "/wt", exec, { type: "stack_setup", source: "herdr" });
+  expect(calls.length).toBe(0);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ?").all(id).length).toBe(0);
 });
 
 // ---- cleanupTask orchestration ----

@@ -116,6 +116,18 @@ export interface Decision {
   answer_note: string | null;
   draft_note: string | null;
   answered_at: string | null;
+  bundle?: DecisionBundle | null;
+}
+
+// Server-derived context bundled onto each open card (see decisionBundle in
+// api.ts): prior director choices on this project, the affected PR/branch, and
+// task spend so far — enough to decide without opening the task.
+export interface DecisionBundle {
+  task_number: number | null;
+  pr_url: string | null;
+  branch: string | null;
+  spend_usd: number;
+  prior_decisions: { id: string; title: string; answer: string | null; answered_at: string | null }[];
 }
 
 export interface Policy {

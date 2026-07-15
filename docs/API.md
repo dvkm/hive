@@ -253,7 +253,16 @@ rev-parse HEAD` in the CLI's cwd. The review card compares it to the task's
   "answer_key": null,
   "answer_note": null,
   "draft_note": null,
-  "answered_at": null
+  "answered_at": null,
+  "bundle": {
+    "task_number": 262,
+    "pr_url": "https://github.com/example-org/hive/pull/42",
+    "branch": "hive/rich-cards",
+    "spend_usd": 3.2,
+    "prior_decisions": [
+      { "id": "dec_...", "title": "Merge strategy?", "answer": "Fast-forward", "answered_at": "..." }
+    ]
+  }
 }
 ```
 `status ∈ {open, answered, expired}`. `options` is an ordered, **non-empty**
@@ -261,6 +270,13 @@ array; render the `recommended: true` option first per product rule 3.
 `draft_note` is the server-side autosaved draft. A decision is `expired` once it
 was dismissed, or its task went terminal (`done`/`failed`/`cancelled`) — expired
 cards leave the inbox and can no longer be answered.
+
+`bundle` is server-**derived** (never stored) context attached to each card as
+it's returned, so the director can decide in one pass without opening the task:
+the affected `pr_url`/`branch`, task `spend_usd` so far, and `prior_decisions` —
+the last 3 answered cards on the same project, each with the option `label` the
+director chose. Computed at fetch/broadcast time so it stays fresh; absent on
+older SSE payloads and terminal-card broadcasts.
 
 **Options are never empty.** An optionless card is un-answerable (nothing to
 click, no key to validate). The direct `POST /api/decisions` rejects an empty
