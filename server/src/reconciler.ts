@@ -24,6 +24,7 @@ import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.
 import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
+import { classifyEscalation } from "./policy.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
 const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
@@ -522,7 +523,6 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     } catch {
       continue;
     }
-    if (!kinds.includes(r.kind)) continue;
     const review: any = db
       .query("SELECT payload FROM events WHERE task_id = ? AND type = 'auto_review' ORDER BY ts DESC LIMIT 1")
       .get(r.id);
@@ -533,8 +533,19 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     } catch {
       continue;
     }
-    if (verdict.skipped || verdict.verdict !== "looks_good" || verdict.risks?.length || verdict.questions?.length)
-      continue;
+    if (verdict.skipped || verdict.verdict !== "looks_good") continue;
+    // Same policy the planner uses for its breakdown cards: a PR merge is
+    // always revertible (reversible=true) and touches the shared main branch
+    // (blastRadius="shared"); the pre-review's own risks/questions are the
+    // ambiguity signal, and the project's auto_merge.kinds allow-list IS the
+    // stored preference — unset/not-listed means "preference unknown".
+    const escalation = classifyEscalation({
+      reversible: true,
+      blastRadius: "shared",
+      ambiguous: Boolean(verdict.risks?.length || verdict.questions?.length),
+      preferenceKnown: kinds.includes(r.kind),
+    });
+    if (escalation.effect !== "auto_handle") continue;
     const contested = db
       .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'changes_requested' LIMIT 1")
       .get(r.id);

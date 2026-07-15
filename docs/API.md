@@ -480,11 +480,21 @@ priced rows only).
 - `POST /api/tasks/:id/plan` body `{}` → `200 {"ok":true, "decision": Decision}` | `404` | `502 {"ok":false, "error":"..."}`
   Manually triggers the domain-supervisor planner for any task (see Domain
   supervisors). Records a `planning` event, runs the planner subprocess, and on
-  success opens a `normal`-risk decision card titled `Proposed breakdown: <title>`
-  with `approve`/`reject` options plus a `planned` event carrying the structured
+  success opens a decision card titled `Proposed breakdown: <title>` with
+  `approve`/`reject` options plus a `planned` event carrying the structured
   proposal. On any planner failure returns `502` and records a single
   `planner_error` event (no card). The request blocks for the planner run
   (timeout-capped by `HIVE_PLANNER_TIMEOUT_MS`, default 120000).
+
+  The card's `risk` is computed, not hardcoded, by `classifyEscalation()`
+  (`server/src/policy.ts`) — the same auto-handle-vs-escalate policy the
+  reconciler's `autoMergeReady` consumes for its own opt-in merge gate, so a
+  plan is judged the same way everywhere instead of per-call-site guesswork:
+  `high` if the proposed work reads as irreversible or prod-facing, `normal`
+  if the planner itself flagged open `questions` (ambiguous) or the project
+  has no active policy for this kind of change (preference unknown), `low`
+  otherwise. The card's context ends with a `Risk: <level> (<reason>)` line so
+  the director sees why.
 
 ### PR ↔ task marker (the linking contract)
 Every PR a hive agent opens MUST carry a marker that links it back to its task.
