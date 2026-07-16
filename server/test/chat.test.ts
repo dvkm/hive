@@ -27,8 +27,13 @@ const ALIVE = () => OK('{"result":{"agent":{"pane_id":"p1","agent_status":"worki
 const briefs: string[] = [];
 const sends: string[] = [];
 const exec: Exec = async (argv) => {
-  if (has(argv, "worktree", "create"))
+  if (has(argv, "worktree", "create")) {
+    // A real worktree create/reclaim takes real time; without the per-thread
+    // spawn lock this window is exactly where a concurrent double-send races
+    // a second spawnAgent for the same task.
+    await new Promise((r) => setTimeout(r, 15));
     return OK(`{"result":{"worktree":{"path":${JSON.stringify(WT)},"branch":"hive/x","open_workspace_id":"w1"}}}`);
+  }
   if (has(argv, "agent", "get")) return ALIVE();
   if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
   if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t2"}}}');
@@ -100,6 +105,29 @@ test("later message is delivered into the live session (not a respawn)", async (
   expect(briefs.length).toBe(before); // no new spawn
   expect(sends.at(-1)).toContain("what's the status?");
   expect(sends.at(-1)).toContain(threadId); // wire prefix tells the session where to reply
+});
+
+test("a concurrent double-send on the same thread spawns only once", async () => {
+  // A message sent right after the UI receives thread_id, before the first
+  // spawn has landed: both requests reach deliverToSupervisor with
+  // agent_target still null. Without per-thread serialization both would
+  // call spawnAgent for the same task, racing worktree create.
+  const thread = createThread(db, { project_id: projectId, title: "race" });
+  const before = briefs.length;
+  const [a, b] = await Promise.all([
+    post("/api/chat/turn", { thread_id: thread.id, text: "message A" }),
+    post("/api/chat/turn", { thread_id: thread.id, text: "message B" }),
+  ]);
+  expect(a.status).toBe(202);
+  expect(b.status).toBe(202);
+  expect(briefs.length).toBe(before + 1); // exactly one spawn, not two
+
+  const deliveries = [a.json.delivery, b.json.delivery].sort();
+  expect(deliveries).toEqual(["delivered", "spawned"]); // winner spawns, waiter delivers into it
+
+  const combined = briefs.at(-1)! + sends.join(" ");
+  expect(combined).toContain("message A"); // whichever one won, neither message is dropped
+  expect(combined).toContain("message B");
 });
 
 test("supervisor posts a reply that lands on the thread + streams", async () => {
