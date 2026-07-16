@@ -274,10 +274,13 @@ export function ReviewCard({
       }
       onDone?.();
     } catch (e) {
+      const msg = (e as Error).message;
       // Keep the reason ON the card — a vanishing toast made failed merges
-      // read as "the button silently didn't work".
-      setMergeErr((e as Error).message);
-      toast("Not merged — see the reason on the card");
+      // read as "the button silently didn't work". But a conflict bounce
+      // moves the task back to in_progress, which unmounts this card before
+      // the error renders — so the toast must carry the reason too.
+      setMergeErr(msg);
+      toast(`Not merged — ${msg}`);
     } finally {
       setBusy(false);
     }

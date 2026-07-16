@@ -1956,6 +1956,9 @@ export function requeueTask(db: DB, source: any): string {
   ).run(id, source.project_id, source.title, source.brief ?? null, source.kind, source.id, t, t);
   writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title: source.title, requeue_of: source.id } });
   broadcastTask(db, getTask(db, id));
+  // Re-broadcast the failed original: its earlier `failed` SSE frame predates
+  // this successor, so clients still show it as awaiting triage without this.
+  broadcastTask(db, getTask(db, source.id));
   return id;
 }
 
