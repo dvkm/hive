@@ -61,6 +61,7 @@ export interface Task {
   source: string | null;
   parent_task_id: string | null;
   duplicate_of: string | null; // survivor id when cancelled as a duplicate
+  depends_on: string[]; // task ids this one is blocked by (unmet until they're done)
   health?: Health | null;
   created_at: string;
   updated_at: string;

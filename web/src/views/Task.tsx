@@ -3,7 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { api } from "../lib/api";
 import type { Decision, Evidence, TaskDetail } from "../lib/api";
 import { useStore } from "../lib/store";
-import { Attach, CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { ReviewCard } from "./ReviewCard";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
@@ -380,6 +380,7 @@ export function TaskBody({ id }: { id: string }) {
           {project && <span className="chip">{project.name}</span>}
           <span className={`chip chip-kind chip-${t.kind}`}>{t.kind}</span>
           <span className="chip">{STATE_LABEL[t.state]}</span>
+          <BlockedBy depends_on={t.depends_on} tasks={tasks} />
           {t.duplicate_of && (
             <Link
               className="chip chip-duplicate"
