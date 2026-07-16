@@ -130,6 +130,31 @@ test("a concurrent double-send on the same thread spawns only once", async () =>
   expect(combined).toContain("message B");
 });
 
+test("a concurrent double-send on a BRAND-NEW chat (no thread_id yet) creates only one thread", async () => {
+  // A UI double-submit on a fresh chat: both requests race in with the same
+  // project_id and no thread_id at all, since the client hasn't received one
+  // back yet. Without dedupe, each independently calls createThread and gets
+  // its own thread.id, so the per-thread spawn lock never sees them as the
+  // same lock target — two threads, two tasks, two spawns for one message.
+  const before = briefs.length;
+  const [a, b] = await Promise.all([
+    post("/api/chat/turn", { project_id: projectId, text: "brand new double-submit" }),
+    post("/api/chat/turn", { project_id: projectId, text: "brand new double-submit" }),
+  ]);
+  expect(a.status).toBe(202);
+  expect(b.status).toBe(202);
+  expect(a.json.thread_id).toBe(b.json.thread_id); // same thread, not two
+  expect(briefs.length).toBe(before + 1); // exactly one spawn, not two
+
+  // Both requests ride the SAME underlying call (not two lock-serialized
+  // calls like the existing-thread race below), so both see its one result.
+  expect(a.json.delivery).toBe("spawned");
+  expect(b.json.delivery).toBe("spawned");
+
+  const thread = (await get(`/api/chat/threads/${a.json.thread_id}`)).json;
+  expect(thread.messages.length).toBe(1); // the duplicate submit did not double-post the message
+});
+
 test("supervisor posts a reply that lands on the thread + streams", async () => {
   const { status, json } = await post(`/api/chat/threads/${threadId}/reply`, { text: "Queued task #12 for the login work. Nothing blocking." });
   expect(status).toBe(200);
