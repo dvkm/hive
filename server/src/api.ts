@@ -49,14 +49,14 @@ import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
 import {
-  runChatTurn,
   createThread,
   getThread,
   listThreads,
   listMessages,
   appendMessage,
-  type ChatAction,
-  type ChatDeps,
+  setThreadTask,
+  composeSupervisorBrief,
+  type ChatThread,
 } from "./chat.ts";
 
 export interface HandlerDeps {
@@ -173,11 +173,15 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // ---- braindump intake ----
       if (pathname === "/api/intake" && method === "POST") return intake(db, await req.json(), deps);
 
-      // ---- director chat (conversational supervisor over hive) ----
+      // ---- director chat (persistent supervisor session over hive) ----
       if (pathname === "/api/chat/turn" && method === "POST")
         return await chatTurn(db, herdr, deps, await req.json());
       if (pathname === "/api/chat/threads" && method === "GET")
         return json(listThreads(db, url.searchParams.get("project_id")));
+      {
+        const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)\/reply$/);
+        if (m && method === "POST") return chatReply(db, m[1], await req.json());
+      }
       {
         const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)$/);
         if (m && method === "GET") {
@@ -483,10 +487,13 @@ function intake(db: DB, body: any, deps: HandlerDeps): Response {
 }
 
 // ---------------------------------------------------------------- chat
-// One director-chat turn: persist the message, run the supervisor subprocess,
-// execute whatever scoped actions it returned (against the SAME handlers the
-// board/CLI use — no duplicated logic, no looser gate), persist the reply, and
-// broadcast both messages over SSE. Reuses the planner subprocess pattern.
+// One director→supervisor turn. NON-BLOCKING by design: persist the message,
+// make sure the thread's persistent supervisor session is live (spawn it on the
+// first message), deliver the message into that session, and return immediately.
+// The supervisor thinks/acts asynchronously and posts its reply back via
+// `hive chat reply <thread>` → POST /reply → SSE, so the director is never
+// blocked waiting on the LLM. The session holds context across turns and
+// coordinates worker agents itself (see composeSupervisorBrief).
 async function chatTurn(db: DB, herdr: Herdr, deps: HandlerDeps, body: any): Promise<Response> {
   const text = String(body?.text ?? "").trim();
   if (!text) return err("text is required");
@@ -495,92 +502,88 @@ async function chatTurn(db: DB, herdr: Herdr, deps: HandlerDeps, body: any): Pro
   if (body?.thread_id && !thread) return err("thread not found", 404);
   if (!thread) {
     const projectId = body?.project_id ? String(body.project_id) : null;
-    if (projectId && !db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId))
-      return err("unknown project_id", 400);
+    if (!projectId) return err("project_id is required to start a chat (the supervisor session runs in the project's repo)");
+    if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return err("unknown project_id", 400);
     thread = createThread(db, {
       project_id: projectId,
       task_id: body?.task_id ? String(body.task_id) : null,
       title: text.split("\n")[0].slice(0, 80),
     });
   }
+  if (!thread.project_id) return err("thread has no project scope; cannot run a supervisor session", 400);
 
-  const history = listMessages(db, thread.id, 20);
   broadcast({ type: "chat_message", message: appendMessage(db, thread.id, "director", text) });
 
-  const chatDeps: ChatDeps = { exec: deps.plannerExec };
-  let parsed;
-  try {
-    parsed = await runChatTurn(
-      db,
-      { projectId: thread.project_id, taskId: thread.task_id, history, text },
-      chatDeps
-    );
-  } catch (e: any) {
-    const errMsg = `I couldn't process that: ${e?.message ?? e}`;
-    broadcast({ type: "chat_message", message: appendMessage(db, thread.id, "assistant", errMsg) });
-    return json({ error: errMsg, thread_id: thread.id }, 502);
-  }
-
-  const results = [];
-  for (const action of parsed.actions) {
-    results.push(await executeChatAction(db, herdr, deps, thread, action));
-  }
-  broadcast({ type: "chat_message", message: appendMessage(db, thread.id, "assistant", parsed.reply, results) });
-  return json({ thread_id: thread.id, reply: parsed.reply, actions: results });
+  // The message the session receives is prefixed so it always knows which thread
+  // to reply to, even mid-conversation.
+  const wire = `[director → chat thread ${thread.id}]\n${text}`;
+  const delivery = await deliverToSupervisor(db, herdr, deps, thread, wire);
+  return json({ thread_id: thread.id, ...delivery }, 202);
 }
 
-// Execute one allow-listed chat action against the existing in-process handlers.
-// The allow-list here — not the model — is the security boundary: only these
-// three shapes exist, and each routes through the same validation/authz as the
-// director- or agent-initiated path (send_steer keeps its task.steer authz gate;
-// merges/destructive have no action at all). Returns a per-action result the UI
-// renders next to the reply.
-async function executeChatAction(
+// Ensure the thread's supervisor agent is live (spawn on first use / respawn if
+// it died), then deliver the director's message into it. A message that arrives
+// before the session is live is queued as a steer and rides along in the spawn
+// brief, so nothing is dropped. Returns a small delivery receipt.
+async function deliverToSupervisor(
   db: DB,
   herdr: Herdr,
   deps: HandlerDeps,
-  thread: { id: string; project_id: string | null },
-  action: ChatAction
-): Promise<any> {
-  try {
-    if (action.type === "create_task") {
-      if (!thread.project_id) return { type: action.type, ok: false, error: "chat has no project scope; cannot create a task" };
-      const res = await createTask(
-        db,
-        jsonReq({ project_id: thread.project_id, title: action.title, brief: action.brief ?? "", kind: action.kind ?? "ship", source: "chat" })
-      );
-      const t = await res.json();
-      if (res.status >= 400) return { type: action.type, ok: false, error: t?.error ?? "create failed" };
-      return { type: action.type, ok: true, task_id: t.id, number: t.number, title: t.title };
-    }
-    if (action.type === "answer_decision") {
-      const res = apiAnswerDecision(db, herdr, action.decision_id, { answer_key: action.answer_key, answer_note: action.note ?? null });
-      const d = await res.json();
-      if (res.status >= 400) return { type: action.type, ok: false, error: d?.error ?? "answer failed" };
-      return { type: action.type, ok: true, decision_id: action.decision_id, answer_key: action.answer_key };
-    }
-    if (action.type === "send_steer") {
-      const res = await sendSteer(db, herdr, action.task_id, jsonReq({ message: action.message }));
-      const s = await res.json();
-      // sendSteer returns 200 even when it queued/failed delivery; a 403/409 is authz.
-      if (res.status >= 400) return { type: action.type, ok: false, error: s?.error ?? "steer blocked", decision_id: s?.decision_id };
-      return { type: action.type, ok: true, task_id: action.task_id, delivery: s?.delivery };
-    }
-    return { type: (action as any).type, ok: false, error: "unknown action" };
-  } catch (e: any) {
-    return { type: (action as any).type, ok: false, error: String(e?.message ?? e) };
+  thread: ChatThread,
+  message: string
+): Promise<{ delivery: string; agent_target?: string; error?: string }> {
+  // Reuse (or create) the backing supervisor task — a plain chore task whose
+  // agent IS the session. source='chat_supervisor' keeps it out of the
+  // dispatcher and the normal board lanes; it is infrastructure, not a deliverable.
+  let taskId = thread.task_id;
+  let task = taskId ? getTask(db, taskId) : null;
+  if (!task) {
+    taskId = newId();
+    const t = now();
+    db.query(
+      `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, created_at, updated_at)
+       VALUES (?,?,?,?, 'in_progress', 'chore', 'chat_supervisor', ?, ?)`
+    ).run(taskId, thread.project_id, `[chat] supervisor: ${thread.title ?? thread.id}`, null, t, t);
+    writeEvent(db, { task_id: taskId, source: "director", type: "created", payload: { title: `[chat] supervisor session`, thread_id: thread.id } });
+    setThreadTask(db, thread.id, taskId);
+    task = getTask(db, taskId);
   }
+
+  // Is the session already live? If so, just send into it (fast path).
+  if (task.agent_target) {
+    const { alive } = await herdr.probe(task.agent_target).catch(() => ({ alive: false }));
+    if (alive) {
+      const error = await sendOnce(herdr, task.agent_target, message);
+      if (!error) {
+        writeEvent(db, { task_id: taskId!, source: "director", type: "steer", payload: { message, target: task.agent_target, delivery: "delivered", delivered_at: now() } });
+        return { delivery: "delivered", agent_target: task.agent_target };
+      }
+      // fall through to respawn on a send failure to a supposedly-live agent
+    }
+  }
+
+  // Not live: queue the message (it rides in the spawn brief) and spawn.
+  queueSteerEvent(db, taskId!, message, "queued for chat supervisor spawn");
+  const thread2 = getThread(db, thread.id)!;
+  const r = await spawnAgent(db, herdr, taskId!, {
+    supervise: false, // a standing session never "finishes into review"
+    briefOverride: composeSupervisorBrief(db, thread2),
+  });
+  if (!r.ok) return { delivery: "failed", error: r.error };
+  return { delivery: "spawned", agent_target: r.agent_target };
 }
 
-// A synthetic in-process JSON Request, so chat can reuse the exact createTask /
-// sendSteer handlers (dedup, attachments, authz all preserved) without a real
-// HTTP round-trip or duplicated insert logic.
-function jsonReq(payload: unknown): Request {
-  return new Request("http://internal/", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+// The supervisor session posts its reply to the director here (via
+// `hive chat reply <thread> "..."`). Loopback-only in practice (agents run on
+// localhost); appends the assistant message and streams it over SSE.
+function chatReply(db: DB, threadId: string, body: any): Response {
+  const thread = getThread(db, threadId);
+  if (!thread) return err("thread not found", 404);
+  const text = String(body?.text ?? "").trim();
+  if (!text) return err("text is required");
+  const message = appendMessage(db, threadId, "assistant", text);
+  broadcast({ type: "chat_message", message });
+  return json({ ok: true, message });
 }
 
 // ---------------------------------------------------------------- tasks
@@ -1410,7 +1413,7 @@ export async function spawnAgent(
   db: DB,
   herdr: Herdr,
   id: string,
-  opts: { hiveUrl?: string; supervise?: boolean } = {}
+  opts: { hiveUrl?: string; supervise?: boolean; briefOverride?: string } = {}
 ): Promise<{ ok: true; agent_target: string } | { ok: false; error: string }> {
   const task = getTask(db, id);
   if (!task) return { ok: false, error: "task not found" };
@@ -1421,9 +1424,11 @@ export async function spawnAgent(
   // Compose the brief fresh; it is delivered as the interactive agent's first
   // prompt (see runtime/herdr.defaultAgentArgv) — no `-p` one-shot. Steers sent
   // while the task had no live agent ride along on top, so they reach the fresh
-  // agent instead of vanishing.
+  // agent instead of vanishing. briefOverride is the persistent-chat supervisor's
+  // bespoke brief (it isn't a normal ship/scout task, so composeBrief's
+  // open-a-PR-and-hand-off protocol doesn't apply).
   const pending = queuedSteers(db, id);
-  const brief = steerPreamble(pending) + composeBrief(db, id);
+  const brief = steerPreamble(pending) + (opts.briefOverride ?? composeBrief(db, id));
   const hiveUrl = opts.hiveUrl || process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
   const env = await resolveProjectSecrets(db, task.project_id);
 
