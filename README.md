@@ -63,6 +63,8 @@ bin/hive learning add --project <id> --title "..." [--body "..."] [--root-cause]
 bin/hive learning list [--project <id>] [--status active|resolved]
 bin/hive learning recur <learning-id>   # bump occurrences when the pattern recurs
 bin/hive spawn <task-id>                # start a herdr agent for a task
+bin/hive chat send [--project <id>|--thread <id>] "..."  # message the persistent chat supervisor
+bin/hive chat close <thread-id>         # end a thread's live session (reclaims its worktree/agent)
 bin/hive gchat auth                     # one-time Google Chat OAuth consent (intake connector)
 echo -n "s3cret" | bin/hive secret set --project <id> --name API_KEY
 bin/hive secret list --project <id>
@@ -176,3 +178,20 @@ server/test/ bun test suite
   with `source="planner"` and `parent_task_id` linking to the source task.
   Output is parsed defensively; unparseable output records one `planner_error`
   event and stops. New event types: `planning`, `planned`, `planner_error`.
+
+## v4 notes (director chat)
+
+- **Persistent supervisor chat** (`server/src/chat.ts`, migration v18). A chat
+  thread is backed by a long-lived herdr agent (an interactive `claude` session,
+  same runtime as a task agent) that stays alive across the conversation, holds
+  context, and coordinates worker agents. This is the deliberate opposite of the
+  v3 planner's short-lived `claude -p` subprocess: the director asked for a live
+  session, so the *session* persists while its history lives in `chat_threads` /
+  `chat_messages`. It still owns no privileged path — coordination goes through
+  the same `$HIVE_CLI` + API + standing-authority gates every hive agent uses.
+- The backing task (`source="chat_supervisor"`) is kept out of the dispatcher and
+  board lanes. `POST /api/chat/turn` is non-blocking (persist → ensure session
+  live → return); the session replies asynchronously via `POST
+  /api/chat/threads/:id/reply`. `POST /api/chat/threads/:id/close` cancels the
+  backing task so the terminal-hook cleanup reclaims its worktree/session; a
+  later message to the same thread spawns a fresh session. See `docs/API.md`.

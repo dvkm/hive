@@ -146,6 +146,40 @@ test("reply to an unknown thread 404s; empty text 400s", async () => {
   expect((await post(`/api/chat/threads/${threadId}/reply`, { text: "" })).status).toBe(400);
 });
 
+test("close ends the live session: backing task transitions to cancelled", async () => {
+  const before = (await get(`/api/chat/threads/${threadId}`)).json;
+  const { status, json } = await post(`/api/chat/threads/${threadId}/close`, {});
+  expect(status).toBe(200);
+  expect(json.thread_id).toBe(threadId);
+  const task = (await get(`/api/tasks/${before.task_id}`)).json;
+  expect(task.state).toBe("cancelled");
+});
+
+test("close is idempotent (closing an already-closed thread is a no-op)", async () => {
+  const { status } = await post(`/api/chat/threads/${threadId}/close`, {});
+  expect(status).toBe(200);
+});
+
+test("closing an unknown thread 404s", async () => {
+  expect((await post("/api/chat/threads/thr_nope/close", {})).status).toBe(404);
+});
+
+test("a message to a closed thread spawns a fresh session, not a resurrection", async () => {
+  const before = (await get(`/api/chat/threads/${threadId}`)).json;
+  const briefsBefore = briefs.length;
+  const { status, json } = await post("/api/chat/turn", { thread_id: threadId, text: "still there?" });
+  expect(status).toBe(202);
+  expect(json.delivery).toBe("spawned"); // fresh task, not "delivered" into the dead one
+  expect(briefs.length).toBe(briefsBefore + 1);
+
+  const after = (await get(`/api/chat/threads/${threadId}`)).json;
+  expect(after.task_id).not.toBe(before.task_id); // new backing task; old one stays cancelled
+  const oldTask = (await get(`/api/tasks/${before.task_id}`)).json;
+  expect(oldTask.state).toBe("cancelled");
+  const newTask = (await get(`/api/tasks/${after.task_id}`)).json;
+  expect(newTask.state).toBe("in_progress");
+});
+
 test("starting a chat with no project is rejected (session needs a repo)", async () => {
   const { status, json } = await post("/api/chat/turn", { text: "hello" });
   expect(status).toBe(400);

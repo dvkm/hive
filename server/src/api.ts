@@ -184,6 +184,10 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (m && method === "POST") return chatReply(db, m[1], await req.json());
       }
       {
+        const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)\/close$/);
+        if (m && method === "POST") return chatClose(db, m[1]);
+      }
+      {
         const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)$/);
         if (m && method === "GET") {
           const thread = getThread(db, m[1]);
@@ -559,7 +563,9 @@ async function deliverToSupervisor(
   // dispatcher and the normal board lanes; it is infrastructure, not a deliverable.
   let taskId = thread.task_id;
   let task = taskId ? getTask(db, taskId) : null;
-  if (!task) {
+  // A closed (terminal — see chatClose) supervisor task is never resurrected;
+  // a message to a closed thread starts a fresh session, same thread.
+  if (!task || TERMINAL.includes(task.state as State)) {
     taskId = newId();
     const t = now();
     db.query(
@@ -605,6 +611,25 @@ function chatReply(db: DB, threadId: string, body: any): Response {
   const message = appendMessage(db, threadId, "assistant", text);
   broadcast({ type: "chat_message", message });
   return json({ ok: true, message });
+}
+
+// End a thread's live supervisor session: cancel its backing task, which fires
+// the terminal hook (state.setTerminalHook -> cleanupTask) and tears down the
+// worktree/session immediately — the reaper sweep is just the backstop for any
+// miss. Without this, a chat's supervisor task stays 'in_progress' forever
+// (supervise:false, dispatcher/reaper skip non-terminal tasks by design) and
+// permanently pins its worktree/session. Idempotent: closing an already-closed
+// or task-less thread is a no-op. The thread + its message history survive —
+// only the live session ends; a later message spawns a fresh one (see
+// deliverToSupervisor).
+function chatClose(db: DB, threadId: string): Response {
+  const thread = getThread(db, threadId);
+  if (!thread) return err("thread not found", 404);
+  const task = thread.task_id ? getTask(db, thread.task_id) : null;
+  if (task && !TERMINAL.includes(task.state as State)) {
+    transition(db, task.id, "cancelled", { source: "director", reason: "chat thread closed" });
+  }
+  return json({ ok: true, thread_id: threadId });
 }
 
 // ---------------------------------------------------------------- tasks

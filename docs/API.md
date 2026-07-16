@@ -431,6 +431,33 @@ and unpriced rows surface as `"unpriced"` in rollups. Analytics rollups expose
 cache_write_tokens, total_tokens, cost_usd, calls, unpriced}` (summed cost counts
 priced rows only).
 
+### ChatThread / ChatMessage (director chat)
+```json
+{
+  "id": "thr_...",
+  "project_id": "proj_ab12...",
+  "task_id": "9da7c5527580",
+  "title": "ship the dark mode toggle",
+  "created_at": "2026-07-09T09:00:00.000Z",
+  "updated_at": "2026-07-09T09:05:00.000Z"
+}
+```
+```json
+{
+  "id": "msg_...",
+  "thread_id": "thr_...",
+  "ts": "2026-07-09T09:05:00.000Z",
+  "role": "director",
+  "text": "ship the dark mode toggle",
+  "actions": []
+}
+```
+`task_id` is the thread's backing supervisor task (null until the session first
+spawns; re-pointed to a fresh task if the thread is closed and later reopened).
+`role` is `director` (operator) or `assistant` (the supervisor session's reply).
+`actions` is a reserved JSON array (currently always empty). See the Director
+chat endpoints below.
+
 ---
 
 ## Endpoints
@@ -797,9 +824,17 @@ same shape as `events`); each thread's `task_id` is its backing supervisor task
   localhost).
 - `GET /api/chat/threads?project_id=` → `200 [ChatThread, ...]` (newest first; `project_id` filter optional)
 - `GET /api/chat/threads/:id` → `200 {...ChatThread, messages:[ChatMessage]}` (oldest→newest) | `404`
+- `POST /api/chat/threads/:id/close` → `200 {ok, thread_id}` | `404` (unknown thread)
+  Ends the thread's live session: cancels its backing supervisor task, which
+  immediately tears down the worktree + herdr session (same terminal-hook path
+  as any other task reaching `cancelled`; the reaper sweep is just the backstop).
+  Idempotent. The thread and its message history are untouched — a later
+  message to the same thread spawns a fresh supervisor task rather than
+  resurrecting the closed one.
 
-CLI: `hive chat send [--project <id>|--thread <id>] "<text>"` (director side) and
-`hive chat reply <thread-id> "<text>"` (the session's reply channel).
+CLI: `hive chat send [--project <id>|--thread <id>] "<text>"` (director side),
+`hive chat reply <thread-id> "<text>"` (the session's reply channel), and
+`hive chat close <thread-id>` (end a thread's live session).
 
 ### Policies
 - `GET /api/policies?scope=` → `200 [Policy, ...]` (oldest first; `scope` filter optional)
@@ -917,6 +952,7 @@ Subsequent messages (broadcast to all clients on every change):
 | incident | `{"type":"incident","incident": Incident}` | a monitor incident opens or resolves |
 | learning | `{"type":"learning","learning": Learning}` | a learning is created, updated, or recurs |
 | usage | `{"type":"usage","usage": Usage}` | a usage row is ingested (cost/token analytics) |
+| chat_message | `{"type":"chat_message","message": ChatMessage}` | a director-chat message is appended (director turn or supervisor reply) |
 | notification | `{"type":"notification","notification": Notification}` | a notification is enqueued (urgent ones arrive already `delivered_at`) |
 | reconciler_error | `{"type":"reconciler_error","error":"...","where":"..."}` | a reconciler cycle hit an error (at most once per cycle; no DB row) |
 
