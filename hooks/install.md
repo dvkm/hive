@@ -116,11 +116,16 @@ command into **safe** / **dangerous** / **unknown**:
   there must be no dangerous token anywhere, and no command substitution
   (`$(...)`, backticks) — those escalate.
 - **dangerous** — a destructive denylist (`rm -rf`, `sudo`, `curl … | sh`,
-  `git push --force`, `git reset --hard`, `DROP/TRUNCATE`, `DELETE`/`UPDATE`
-  without `WHERE`, fork bomb, `mkfs`/`dd of=`, device/system writes, `kill`,
-  `terraform apply/destroy`, `kubectl delete`, credential files, ...). Checked
-  against the WHOLE command first, so a dangerous token after `;`/`&&`/`|` still
-  trips it. NEVER auto-allowed.
+  `git push --force`, `git reset --hard`, `find … -delete/-exec`,
+  `DROP/TRUNCATE`, `DELETE`/`UPDATE` without `WHERE`, fork bomb, `mkfs`/`dd of=`,
+  device/system writes, `kill`, `terraform apply/destroy`, `kubectl delete`,
+  credential files, ...). Checked against the WHOLE command first, so a dangerous
+  token after `;`/`&&`/`|` still trips it. NEVER auto-allowed — **except** a
+  destructive command PROVEN to act only inside the agent's own sandbox (its
+  herdr worktree or a tmp scratchpad), which is downgraded to **unknown**
+  (allow-and-log): `rm -rf`, `kill`/`pkill`, `git reset --hard`/`git clean`,
+  `git push --force`, `find … -delete/-exec`, and sandboxed SQL. Anything
+  unresolvable (a shell var, a `..` escape, an un-sandboxed path) stays dangerous.
 - **unknown** — anything not provably safe. Conservative by design: when unsure, a
   command is not safe.
 

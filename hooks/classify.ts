@@ -72,7 +72,11 @@ const DANGEROUS_RAW: [RegExp, string][] = [
 const SAFE: RegExp[] = [
   /^(ls|pwd|cat|head|tail|wc|stat|file|tree|echo|printf|date|whoami|hostname|uname|id|groups|df|du|ps|uptime|cd|dirname|basename|realpath|readlink|env)\b/,
   /^(which|type|command\s+-v)\b/,
-  /^(grep|egrep|fgrep|rg|ag|find|sort|uniq|cut|nl|diff|comm|jq|column|tr|xxd|md5|md5sum|sha1sum|sha256sum)\b/,
+  /^(grep|egrep|fgrep|rg|ag|sort|uniq|cut|nl|diff|comm|jq|column|tr|xxd|md5|md5sum|sha1sum|sha256sum)\b/,
+  // `find` alone is read-only; -delete/-exec is caught by DANGEROUS above and
+  // must never fall through to "safe" even when the sandbox waiver applies —
+  // a waived match still needs to land on "unknown" (allow-and-log).
+  /^find\b(?![\s\S]*-(delete|exec(dir)?)\b)/,
   /^git\s+(status|diff|log|show|blame|rev-parse|ls-files|ls-tree|describe|shortlog|reflog|cat-file|for-each-ref|symbolic-ref|--version|version)\b/,
   /^git\s+(branch|tag|remote|stash|config|worktree)\s+(-v|--list|-l|--verbose|list|show|--get|--get-all)\b/,
   /^(bun|npm|pnpm|yarn|deno)\s+(test|run|--version)\b/,
@@ -163,6 +167,63 @@ function rmTargetsSandboxed(
       // $$ is the shell PID — digits, can't escape a directory prefix.
       tok = subst(tok.replace(/["']/g, "").replace(/\$\$/g, "PID"), map);
       if (!tok) continue;
+      if (/[$`]/.test(tok)) return false; // unresolved substitution
+      if (tok.includes("..")) return false; // path escape
+      if (tok.startsWith("~")) return false; // unexpanded home
+      if (!tok.startsWith("/")) {
+        if (!cwdSandboxed) return false; // relative: only provable via sandboxed cwd
+        continue;
+      }
+      if (!roots.some((r) => tok.startsWith(r))) return false;
+    }
+  }
+  return true;
+}
+
+// True iff the find TARGET (its first non-flag argument, i.e. the search path —
+// not the -name/-exec pattern) resolves inside a sandbox root for every
+// find-with-delete/-exec segment. Mirrors rmTargetsSandboxed's resolution
+// rules exactly: no unresolved substitution, no `..` escape, no unexpanded
+// `~`, relative only when cwd itself is sandboxed.
+function findDeleteTargetsSandboxed(
+  cmd: string,
+  env: Record<string, string | undefined>,
+  cwd?: string
+): boolean {
+  const map = varMap(cmd, env);
+  const roots = sandboxRoots(env);
+  const cwdSandboxed = !!cwd && roots.some((r) => (cwd + "/").startsWith(r));
+  const findSegs = segments(cmd).filter((s) => /^find\b/.test(s));
+  if (!findSegs.length) return false;
+  const findish = segments(cmd).filter((s) => /find\b[^\n]*-(delete|exec(dir)?)\b/i.test(s));
+  if (findish.some((s) => !/^find\b/.test(s))) return false;
+  if (cwdSandboxed && /(^|[\s;&|(])cd\s/.test(cmd)) return false;
+  for (const seg of findSegs) {
+    const body = seg.split(/\s+[\d&]*[<>]/)[0]; // drop redirections
+    // find [paths...] [expression]: every non-flag token before the first
+    // `-flag` is a search path; find deletes under all of them. Tokens after
+    // the first flag (e.g. -name's pattern) are expression values, not paths.
+    const rest = body.split(/\s+/).slice(1).filter(Boolean);
+    // find's global options legally precede the path list; skip them so the
+    // real search paths still get validated. `-f <path>` is special: its
+    // argument IS a search root and must be collected.
+    const NOARG_GLOBAL = new Set(["-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"]);
+    const VALUE_GLOBAL = new Set(["-D", "-O"]);
+    const paths: string[] = [];
+    for (let i = 0; i < rest.length; ) {
+      const t = rest[i];
+      if (NOARG_GLOBAL.has(t)) { i += 1; continue; }
+      if (VALUE_GLOBAL.has(t)) { i += 2; continue; }
+      if (t === "-f") { if (rest[i + 1] !== undefined) paths.push(rest[i + 1]); i += 2; continue; }
+      if (t.startsWith("-")) break; // first expression predicate
+      paths.push(t);
+      i += 1;
+    }
+    // `find -delete` (or global-flags-only) with no leading path targets `.`.
+    if (!paths.length) paths.push(".");
+    for (const target of paths) {
+      const tok = subst(target.replace(/["']/g, ""), map);
+      if (!tok) return false;
       if (/[$`]/.test(tok)) return false; // unresolved substitution
       if (tok.includes("..")) return false; // path escape
       if (tok.startsWith("~")) return false; // unexpanded home
@@ -375,17 +436,23 @@ export function classify(
 
   const emitDataOnly = isHiveEmitDataOnly(cmd);
   // No executor and no command substitution → quoted strings / heredoc bodies
-  // are data; scan with them stripped so text ABOUT rm isn't treated AS rm.
-  // Substitution ($(…), backticks, <(…)) executes even inside double quotes,
-  // so its presence forces the full-text scan.
+  // are data; scan with them stripped so text ABOUT rm (or find -exec) isn't
+  // treated AS the command. Test EXECUTOR against the STRIPPED text: an executor
+  // word appearing only inside quotes (a commit message mentioning `-exec`,
+  // `bash`, `eval`, …) is prose, not a real executor, so it must not disable
+  // stripping and let the whole-string DANGEROUS scan hit the quoted data.
+  // Substitution ($(…), backticks, <(…)) executes even inside double quotes, so
+  // its presence (checked on the RAW command) still forces the full-text scan.
+  const stripped = stripDataText(cmd);
   const scanTarget =
-    EXECUTOR.test(cmd) || /\$\(|`|<\(/.test(cmd) ? cmd : stripDataText(cmd);
+    EXECUTOR.test(stripped) || /\$\(|`|<\(/.test(cmd) ? cmd : stripped;
   for (const [rx, reason] of DANGEROUS) {
     if (!rx.test(scanTarget)) continue;
     if (emitDataOnly) continue; // arguments are data, not executed
     if (reason === "recursive/forced rm" && (rmTargetsSandboxed(cmd, env, cwd) || isContainerOrVcsRm(cmd)))
       continue;
     if (reason === "process kill" && killTargetsSandboxed(cmd, env)) continue;
+    if (reason === "find with -delete/-exec" && findDeleteTargetsSandboxed(cmd, env, cwd)) continue;
     if (reason === "force push" && forcePushOwnBranch(cmd, env)) continue;
     if ((reason.startsWith("hard reset") || reason.startsWith("git clean")) && gitResetInSandbox(cmd, env, cwd))
       continue;

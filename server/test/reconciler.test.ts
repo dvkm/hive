@@ -65,6 +65,29 @@ test("syncPRs updates ci_status and transitions in_review->verifying on merge", 
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_merged'").all(id).length).toBe(1);
 });
 
+test("syncPRs persists the PR's head_sha so the review card can flag stale evidence", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/1a" });
+  transition(db, id, "in_progress");
+
+  const gh: Exec = stub((argv) => {
+    if (argv[0] === "gh")
+      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-a" }));
+    return OK();
+  });
+  await reconcileOnce(db, { exec: gh });
+  expect(getTask(db, id).head_sha).toBe("sha-a");
+
+  // a later poll with a new head commit updates it
+  const gh2: Exec = stub((argv) => {
+    if (argv[0] === "gh")
+      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-b" }));
+    return OK();
+  });
+  await reconcileOnce(db, { exec: gh2 });
+  expect(getTask(db, id).head_sha).toBe("sha-b");
+});
+
 test("syncPRs bounces an in_review task whose CI turned red, steers once per sha", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { pr_url: "https://gh/pr/2", agent_target: "t-agent" });
@@ -214,6 +237,17 @@ test("flagStale emits one stale event past the threshold, then stops", async () 
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'stale'").all(id).length).toBe(1);
 });
 
+test("flagStale does NOT flag a dep-blocked in_progress task past the threshold", async () => {
+  const { db, projectId } = freshDb();
+  const dep = makeTask(db, projectId, { state: "in_progress" }); // unmet
+  const child = makeTask(db, projectId, { agent_target: "c-agent", state: "in_progress" });
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([dep]), child);
+
+  const future = () => Date.now() + 60 * 60 * 1000;
+  await reconcileOnce(db, { staleMs: 15 * 60 * 1000, nowMs: future, herdr: statusHerdr("idle") });
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'stale'").all(child).length).toBe(0);
+});
+
 // A herdr whose `agent get` reports a fixed status (agent alive with a pane).
 const statusHerdr = (status: string) =>
   new Herdr(stub(() => OK(`{"result":{"agent":{"agent_status":"${status}","pane_id":"w1:p1"}}}`)), "herdr");
@@ -233,6 +267,27 @@ function sendCapturingHerdr(status: string) {
   );
   return { h, sends };
 }
+
+test("advanceFinished holds a task with unmet depends_on in in_progress; releases it when the dep merges", async () => {
+  const { db, projectId } = freshDb();
+  // dep still in progress -> unmet. child is otherwise fully advanceable:
+  // idle agent, pr_url, ci not failing/pending, evidence attached.
+  const dep = makeTask(db, projectId, { state: "in_progress" });
+  const child = makeTask(db, projectId, { agent_target: "c-agent", pr_url: "https://gh/pr/dep", state: "in_progress" });
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([dep]), child);
+  db.query("INSERT INTO evidence (id, task_id, ts, kind) VALUES (?,?,?,?)").run(newId("ev"), child, now(), "log");
+
+  const idle = statusHerdr("idle");
+  const noGh = stub(() => ({ code: 1, stdout: "", stderr: "no gh" }));
+  await reconcileOnce(db, { herdr: idle, exec: noGh });
+  expect(getTask(db, child).state).toBe("in_progress"); // held by the dep gate
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dependency_blocked'").get(child)).toBeTruthy();
+
+  // merge the dependency -> the gate opens and the idle-with-PR task advances
+  db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(dep);
+  await reconcileOnce(db, { herdr: idle, exec: noGh });
+  expect(getTask(db, child).state).toBe("in_review");
+});
 
 test("conflict watchdog: a CONFLICTING PR nudges the agent once per head SHA", async () => {
   const { db, projectId } = freshDb();

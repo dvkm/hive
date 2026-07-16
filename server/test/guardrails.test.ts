@@ -345,6 +345,55 @@ test("idle backstop never re-reviews after changes_requested until new evidence 
   expect(advanceIfFinished(db, id, "idle", "test")).toBe(true); // visible new work → review
 });
 
+test("reconciler handoff never re-queues after changes_requested until a new commit is pushed (#234)", async () => {
+  const { handOffToReview } = await import("../src/api.ts");
+  const { writeEvent } = await import("../src/state.ts");
+  const id = await newTask("CI-green poll must not bounce a sent-back PR");
+  db.query("UPDATE tasks SET state = 'in_progress', pr_url = 'https://gh/pr/242', ci_status = 'passing' WHERE id = ?").run(id);
+  // baseline head known at request time (a pr_synchronized recorded before send-back).
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    "ev_sync_base", id, new Date(Date.now() - 5000).toISOString(), "reconciler", "pr_synchronized", JSON.stringify({ head_sha: "cafe0000" })
+  );
+  // director sends it back — CI is still green on the OLD head (baseline stamped in payload).
+  writeEvent(db, { task_id: id, source: "director", type: "changes_requested", payload: { notes: "purple line on the right", head_sha: "cafe0000" } });
+  expect(handOffToReview(db, id, "reconciler")).toBe(false); // green ≠ addressed
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_progress");
+  // reconciler polls again and re-records the SAME head — still not new work.
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    "ev_sync_same", id, new Date(Date.now() + 500).toISOString(), "reconciler", "pr_synchronized", JSON.stringify({ head_sha: "cafe0000" })
+  );
+  expect(handOffToReview(db, id, "reconciler")).toBe(false); // unchanged head ≠ addressed
+  // agent pushes a fix → reconciler records the new head as pr_synchronized.
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    "ev_sync_242", id, new Date(Date.now() + 1000).toISOString(), "reconciler", "pr_synchronized", JSON.stringify({ head_sha: "deadbeef" })
+  );
+  expect(handOffToReview(db, id, "reconciler")).toBe(true); // new commit → review
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_review");
+});
+
+test("reconciler handoff: post-request baseline pr_synchronized on unchanged head is not new work (#234 race)", async () => {
+  const { handOffToReview } = await import("../src/api.ts");
+  const { writeEvent } = await import("../src/state.ts");
+  const id = await newTask("first pr_synchronized landing after send-back is a baseline");
+  db.query("UPDATE tasks SET state = 'in_progress', pr_url = 'https://gh/pr/243', ci_status = 'passing' WHERE id = ?").run(id);
+  // reached in_review via the ready-emit / linkPrIfMarked path — NO prior pr_synchronized,
+  // so the head at request time is unknown (payload head_sha null).
+  writeEvent(db, { task_id: id, source: "director", type: "changes_requested", payload: { notes: "no evidences", head_sha: null } });
+  expect(handOffToReview(db, id, "reconciler")).toBe(false);
+  // first syncPRs poll records the CURRENT (unchanged) head — this is the baseline, not new work.
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    "ev_sync_base243", id, new Date(Date.now() + 500).toISOString(), "reconciler", "pr_synchronized", JSON.stringify({ head_sha: "0ldhead0" })
+  );
+  expect(handOffToReview(db, id, "reconciler")).toBe(false); // first observation ≠ addressed
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_progress");
+  // only a SECOND, DIFFERENT head is a real push.
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    "ev_sync_new243", id, new Date(Date.now() + 1000).toISOString(), "reconciler", "pr_synchronized", JSON.stringify({ head_sha: "n3whead0" })
+  );
+  expect(handOffToReview(db, id, "reconciler")).toBe(true); // real push → review
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_review");
+});
+
 // ---- generic decision answer reaches the agent -----------------------------------
 
 test("answering a plain question card steers the answer to the live agent", async () => {

@@ -11,7 +11,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { writeEvent, transition, getTask, advanceIfFinished, TERMINAL, type State } from "./state.ts";
+import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent } from "./steer.ts";
 import { isReviewed } from "./dispatcher.ts";
@@ -24,6 +24,7 @@ import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.
 import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
+import { classifyEscalation } from "./policy.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
 const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
@@ -240,6 +241,15 @@ async function advanceFinished(db: DB, _deps: ReconcilerDeps): Promise<void> {
     .query(`SELECT id FROM tasks WHERE state = 'in_progress' AND agent_target IS NOT NULL`)
     .all() as { id: string }[];
   for (const t of tasks) {
+    // Never advance a task past its dependency gate. The dispatcher blocks
+    // auto-spawn, but the manual /spawn endpoint bypasses that — this holds a
+    // blocked task in_progress until its deps merge, surfacing the reason.
+    const task = getTask(db, t.id);
+    const blocking = unmetDeps(db, task);
+    if (blocking.length) {
+      noteDependencyBlock(db, t.id, blocking, "reconciler");
+      continue;
+    }
     const status = lastAgentStatus(db, t.id);
     if (status) advanceIfFinished(db, t.id, status, "reconciler");
   }
@@ -250,8 +260,8 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   const exec = deps.exec ?? defaultExec;
   const h = deps.herdr ?? defaultHerdr;
   const tasks = db
-    .query(`SELECT id, state, pr_url, ci_status, agent_target, project_id FROM tasks WHERE pr_url IS NOT NULL AND state IN ${NON_TERMINAL}`)
-    .all() as { id: string; state: string; pr_url: string; ci_status: string | null; agent_target: string | null; project_id: string }[];
+    .query(`SELECT id, state, pr_url, ci_status, head_sha, agent_target, project_id FROM tasks WHERE pr_url IS NOT NULL AND state IN ${NON_TERMINAL}`)
+    .all() as { id: string; state: string; pr_url: string; ci_status: string | null; head_sha: string | null; agent_target: string | null; project_id: string }[];
 
   for (const t of tasks) {
     const r = await exec(["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup,mergeable,headRefOid"]);
@@ -262,10 +272,32 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     } catch {
       continue;
     }
+    // Record a new pushed commit as `pr_synchronized` (hive's stand-in for
+    // GitHub's synchronize webhook) so changesRequestUnaddressed can tell "the
+    // agent pushed a fix" from "CI is still green on the same old head". The
+    // first observation is a baseline (no changes_requested exists yet when a PR
+    // is first linked); only a CHANGED head afterward counts as new work.
+    // ponytail: last-seen head is read back from the prior pr_synchronized event
+    // (no task column); a PR reaches review long before any changes_requested,
+    // so the baseline is always in place by the time the guard matters.
+    const headSha: string | null = data.headRefOid ?? null;
+    if (headSha) {
+      const lastSync: any = db
+        .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_synchronized' ORDER BY ts DESC LIMIT 1")
+        .get(t.id);
+      const lastSha = lastSync ? (JSON.parse(lastSync.payload).head_sha ?? null) : null;
+      if (headSha !== lastSha) {
+        writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_synchronized", payload: { head_sha: headSha } });
+      }
+    }
     const ci = ciStatusOf(data.statusCheckRollup);
     if (ci && ci !== t.ci_status) {
       db.query("UPDATE tasks SET ci_status = ?, updated_at = ? WHERE id = ?").run(ci, now(), t.id);
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "ci_status", payload: { ci_status: ci } });
+      broadcast({ type: "task", task: getTask(db, t.id) });
+    }
+    if (data.headRefOid && data.headRefOid !== t.head_sha) {
+      db.query("UPDATE tasks SET head_sha = ?, updated_at = ? WHERE id = ?").run(data.headRefOid, now(), t.id);
       broadcast({ type: "task", task: getTask(db, t.id) });
     }
     // Time-based fallback for the link-time hand-off — but review means "CI is
@@ -500,7 +532,6 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     } catch {
       continue;
     }
-    if (!kinds.includes(r.kind)) continue;
     const review: any = db
       .query("SELECT payload FROM events WHERE task_id = ? AND type = 'auto_review' ORDER BY ts DESC LIMIT 1")
       .get(r.id);
@@ -511,8 +542,19 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     } catch {
       continue;
     }
-    if (verdict.skipped || verdict.verdict !== "looks_good" || verdict.risks?.length || verdict.questions?.length)
-      continue;
+    if (verdict.skipped || verdict.verdict !== "looks_good") continue;
+    // Same policy the planner uses for its breakdown cards: a PR merge is
+    // always revertible (reversible=true) and touches the shared main branch
+    // (blastRadius="shared"); the pre-review's own risks/questions are the
+    // ambiguity signal, and the project's auto_merge.kinds allow-list IS the
+    // stored preference — unset/not-listed means "preference unknown".
+    const escalation = classifyEscalation({
+      reversible: true,
+      blastRadius: "shared",
+      ambiguous: Boolean(verdict.risks?.length || verdict.questions?.length),
+      preferenceKnown: kinds.includes(r.kind),
+    });
+    if (escalation.effect !== "auto_handle") continue;
     const contested = db
       .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'changes_requested' LIMIT 1")
       .get(r.id);
@@ -694,6 +736,10 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
     )
     .all() as { id: string }[];
   for (const t of tasks) {
+    // Held by the dependency gate: advanceFinished refuses to advance it and
+    // dependency_blocked is deduped, so it stays intentionally quiet — never
+    // stale (skipping the flag also spares it recoverStale, which the flag drives).
+    if (unmetDeps(db, getTask(db, t.id)).length) continue;
     const last = db
       .query("SELECT ts, type FROM events WHERE task_id = ? ORDER BY ts DESC LIMIT 1")
       .get(t.id) as { ts: string; type: string } | undefined;

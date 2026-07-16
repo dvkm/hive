@@ -223,6 +223,13 @@ test("data text (quotes, heredocs) is not scanned as shell — executors still a
   expect(classify(`git commit -q -F- <<'MSG'\nmerge: deny-safe rm -rf handling\nMSG`, env).decision).toBe("unknown");
   expect(classify('gh pr comment 11 --body "covers the sandboxed rm -rf case"', env).decision).toBe("unknown");
   expect(classify('grep -n "rm -rf" hooks/classify.ts', env).decision).toBe("safe");
+  // a commit message that mentions find's -exec/-delete flag in PROSE must not
+  // trip the dangerous-find rule: `exec` inside quotes is data, not an executor
+  // (regression, task 295 / earlier 02a6b514bed6)
+  expect(classify('git commit -m "classify.ts: waive find -exec inside the agent sandbox"', env).decision).toBe("unknown");
+  expect(classify('git commit -m "document the find -delete sandbox waiver"', env).decision).toBe("unknown");
+  // a real find -exec/-delete (flag OUTSIDE quotes) still classifies dangerous
+  expect(classify("find . -type f -exec rm {} \\;", env).decision).toBe("dangerous");
   // executors keep full-text scanning
   expect(classify('bash -c "rm -rf /"', env).decision).toBe("dangerous");
   expect(classify("echo 'rm -rf /' | sh", env).decision).toBe("dangerous");
@@ -241,6 +248,25 @@ test("container/vcs rm and sandboxed-cwd relative rm are waived", () => {
   expect(classify("rm -rf ../other", env, wt).decision).toBe("dangerous"); // escape
   expect(classify("cd /; rm -rf tmp", env, wt).decision).toBe("dangerous"); // in-command cd voids cwd proof
   expect(classify("ls | xargs rm -rf", env, wt).decision).toBe("dangerous"); // executor + unseen targets
+});
+
+test("find -delete/-exec inside the agent's own sandbox downgrades; elsewhere stays dangerous", () => {
+  const env = { HOME: "/Users/you" };
+  const wt = "/Users/you/.herdr/worktrees/monorepo/hive-abc";
+  expect(classify(`find ${wt} -name '*.log' -delete`, env).decision).toBe("unknown");
+  expect(classify(`find ${wt} -type f -exec rm {} \\;`, env).decision).toBe("unknown");
+  expect(classify("find . -name '*.log' -delete", env, wt).decision).toBe("unknown"); // relative + sandboxed cwd
+  expect(classify("find /Users/you/projects/monorepo -name '*.log' -delete", env).decision).toBe("dangerous");
+  expect(classify("find . -name '*.log' -delete", env, "/Users/you/projects/monorepo").decision).toBe("dangerous");
+  expect(classify("find . -name '*.log' -delete", env).decision).toBe("dangerous"); // no cwd: unprovable
+  expect(classify(`find ${wt}/../other -name '*.log' -delete`, env).decision).toBe("dangerous"); // escape
+  // Multiple search paths: every leading path must be sandboxed, not just the first.
+  expect(classify(`find ${wt} /Users/you/projects/monorepo -name '*.log' -delete`, env).decision).toBe("dangerous");
+  expect(classify(`find ${wt} ${wt}/sub -name '*.log' -delete`, env).decision).toBe("unknown");
+  // Leading global-option flags must not hide the real search path.
+  expect(classify("find -L /Users/you/projects/monorepo -name '*.ts' -delete", env, wt).decision).toBe("dangerous");
+  expect(classify(`find -L ${wt} -name '*.ts' -delete`, env).decision).toBe("unknown");
+  expect(classify("find -L -delete", env, wt).decision).toBe("unknown"); // globals-only + sandboxed cwd → implicit '.'
 });
 
 test("$HIVE_CLI emit with assignments is data-only", () => {
