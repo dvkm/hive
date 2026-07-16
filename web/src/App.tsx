@@ -21,6 +21,7 @@ import Analytics from "./views/Analytics";
 import Projects from "./views/Projects";
 import Palette from "./views/Palette";
 import Chat from "./views/Chat";
+import Supervisors from "./views/Supervisors";
 
 // Enable web-push on this device (phone PWA). Hidden once granted or where
 // unsupported (desktop keeps the osascript notifier). iOS only offers this on
@@ -68,6 +69,7 @@ function MobileNav({
   );
   const more = [
     ["/brief", "Brief", "📋"],
+    ["/supervisors", "Supervisors", "💬"],
     ["/feed", "Feed", "📡"],
     ["/evidence", "Evidence", "🖼"],
     ["/learnings", "Learnings", "📚"],
@@ -194,6 +196,7 @@ export default function App() {
             Review
             {reviewCount > 0 && <span className="badge">{reviewCount}</span>}
           </NavLink>
+          <NavLink to="/supervisors">Supervisors</NavLink>
           <NavLink to="/terminals">Terminals</NavLink>
           <NavLink to="/learnings">Learnings</NavLink>
           <button
@@ -226,6 +229,7 @@ export default function App() {
           <Route path="/tasks/:id" element={<TaskPage />} />
           <Route path="/decisions" element={<Decisions />} />
           <Route path="/review" element={<Review />} />
+          <Route path="/supervisors" element={<Supervisors />} />
           <Route path="/terminals" element={<Terminals />} />
           <Route path="/learnings" element={<Learnings />} />
           <Route path="/analytics" element={<Analytics />} />
