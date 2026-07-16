@@ -1,0 +1,35 @@
+Task #322 — merge_failed reason surfaced end-to-end
+Real hive API (server/src/api.ts mergeFailed()) with git/gh stubbed to fail an
+ff-only merge with a real conflict error. Nothing about health or the feed is faked.
+
+$ POST /api/tasks/:id/merge      # director clicks “Approve & merge”; git merge hits a conflict
+HTTP 409
+{
+  "error": "merge conflict — task sent back to the agent to rebase onto 'main' (fatal: Not possible to fast-forward, aborting. CONFLICT (content): Merge conflict in server/src/health.ts)"
+}
+
+$ GET /api/tasks/:id             # the card the director sees on the board
+{
+  "state": "in_progress",
+  "health": {
+    "status": "stuck",
+    "reason": "merge failed: fatal: Not possible to fast-forward, aborting. CONFLICT (content): Merge conflict in server/src/health.ts",
+    "since": "2026-07-16T09:08:39.508Z"
+  }
+}
+
+$ GET /api/tasks/:id/events      # the merge_failed row the feed renders
+{
+  "type": "merge_failed",
+  "payload": {
+    "reason": "fatal: Not possible to fast-forward, aborting. CONFLICT (content): Merge conflict in server/src/health.ts",
+    "conflict": true,
+    "delivered": true
+  }
+}
+
+agent was told: "hive: merge into 'main' failed — fatal: Not possible to fast-forward, aborting. CONFLICT (content): Merge conflict in server/src/health.ts\nRebase your branch 'hive/x' onto the latest 'main', resolve the conflicts, rerun the tests, then push."
+
+# board URL: http://127.0.0.1:4711/  — task 5f8df6095999
+READY http://127.0.0.1:4711 5f8df6095999 /var/folders/j9/13j0_hzx5rg4qdx4ymzt43d40000gn/T/hive-322-EO9ArV
+[Bun.serve]: request timed out after 10 seconds. Pass `idleTimeout` to configure.

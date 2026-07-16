@@ -77,6 +77,13 @@ export function eventText(e: EventLike): string {
         : `handoff held: CI ${s(p.ci_status)} on ${s(p.pr_url)}`;
     case "ci_failure":
       return `CI failing — agent nudged to fix`;
+    case "merge_failed": {
+      // Same delivery-receipt rule as `steer`: only claim the agent was told
+      // when the send actually landed.
+      if (!p.conflict) return `merge failed: ${s(p.reason)}`;
+      const badge = p.delivered ? "sent back to agent" : "⚠ could not notify agent";
+      return `merge conflict — ${badge}: ${s(p.reason)}`;
+    }
     case "pr_closed":
       return `PR closed without merging — sent back to the agent`;
     case "verify_wedged":
@@ -158,6 +165,7 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
   incident: "incident",
   blocked: "incident",
   stale: "incident",
+  merge_failed: "incident",
   spawn_error: "incident",
   smoke_failed: "incident",
   steer_error: "incident",

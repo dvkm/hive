@@ -134,8 +134,10 @@ DB trigger so every creation path gets one; existing rows were backfilled in
 visible symptom that a task pointing at a live agent is actually fine or actually
 stuck. **It is the single source of truth; clients render it, never re-derive
 it.** Shape `{status, reason, since}`:
-- `status ∈ {healthy, silent, stuck, dead}`; `reason` is a short human string (or
-  null when healthy); `since` is the ISO ts the current condition began.
+- `status ∈ {healthy, silent, stuck, dead}`; `reason` is a human string (or null
+  when healthy) — usually short and fixed, but the `merge_failed` cause below
+  passes through raw git/gh error text, so clients must clamp it; `since` is the
+  ISO ts the current condition began.
 - `null` for `queued`, `done`, `failed`, `cancelled`, and any task with no
   `agent_target`.
 - Derivation (pure function of events, precedence dead > stuck > silent >
@@ -143,7 +145,16 @@ it.** Shape `{status, reason, since}`:
   agent `gone`; **stuck** = herdr reports `blocked`, OR a stale-recovery escalation
   is in flight (newest event `stale`/`recovery_nudge`), OR the agent went `idle` on
   an `in_progress` task with no `pr_url` and no recent activity (finished-without-a-PR
-  or wedged — surfaced instead of hidden); **silent** = no activity events past the
+  or wedged — surfaced instead of hidden), OR an unresolved `merge_failed` within
+  the stale threshold on an `in_progress`/`in_review` task (resolved — and so
+  cleared — by a later `merged`/`pr_merged`, or by a later re-handoff into review
+  (`ready_for_review` or a `state_change` into `in_review`) that is accompanied by
+  a later `pr_synchronized` carrying a head SHA that actually MOVED (the
+  reconciler's first-ever observation of a PR writes one on an unchanged head, so
+  that baseline write does not count); neither re-handoff path can see a base-branch
+  conflict — the reconciler's PR poll fires on green CI alone and the idle backstop
+  on an agent that stopped — so a re-handoff alone is not evidence the agent pushed
+  a fix; `reason` carries the merge error text); **silent** = no activity events past the
   stale threshold but the agent is still alive; **healthy** otherwise. Every `task`
   SSE message carries the recomputed `health`.
 `source` is null for director/agent-created tasks, `"intake_gchat"` for a task
@@ -209,7 +220,7 @@ Types written by the runtime layer (Phase 2b):
 - `pr_conflict` — reconciler saw the PR CONFLICTING with its base and nudged the agent to resolve (once per head SHA; lifecycle untouched). `payload: {pr_url, head_sha, delivered}`
 - `ready_for_review` — the task was handed off `in_progress → in_review`: by the agent's `ready` emit, by the herdr supervise loop's push signal (`source: herdr`, the moment herdr reports the agent idle), or by the reconciler's idle/gone poll backstop. `payload: {pr_url, via, kind}` (`via ∈ {emit, idle, gone}`)
 - `pr_linked` — a marked PR was matched back to this task and its `pr_url` set (by the reconciler's scan or `POST /api/tasks/link-pr`). `payload: {pr_url, via}` (`via ∈ {id, number}` — which half of the marker matched)
-- `pr_synchronized` — the reconciler observed the PR head SHA change (hive's stand-in for GitHub's synchronize webhook). `payload: {head_sha}`. Emitted only when the head differs from the prior `pr_synchronized` (the first observation is a baseline). Used by the re-queue guard to tell "the agent pushed a fix" from "CI is still green on the same old head" after a `changes_requested`.
+- `pr_synchronized` — the reconciler observed the PR head SHA change (hive's stand-in for GitHub's synchronize webhook). `payload: {head_sha}`. Emitted only when the head differs from the prior `pr_synchronized` (the first observation is a baseline). Used to tell "the agent pushed a fix" from "CI is still green on the same old head" — by the re-queue guard after a `changes_requested`, and by `health` to decide whether a re-handoff clears a `merge_failed` reason.
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
 - `smoke_passed` / `smoke_failed` — post-deploy smoke result. `payload: {results:[{name,ok,detail}], evidence_id?}`
@@ -219,7 +230,7 @@ Types written by the runtime layer (Phase 2b):
 
 Review events (written by the director path, `source: director`):
 - `merged` — an in-review task was approved & merged. `payload: {method, base, branch, pr_url}`
-- `merge_failed` — a merge attempt failed (conflict / not a fast-forward / gh refused); no state change. `payload: {reason}`
+- `merge_failed` — a merge attempt failed (conflict / not a fast-forward / gh refused). `payload: {reason, conflict, delivered, send_error?}` — `conflict` = the reason looks like the agent's to fix, which bounces the task back to `in_progress` with rebase instructions (a best-effort send; `delivered` records whether it landed, `send_error` the failure). A non-conflict failure leaves the task `in_review` with `delivered: false`.
 - `changes_requested` — the captain requested changes; the task returns to `in_progress`. `payload: {notes, delivered, head_sha}` (`head_sha` = the PR head at request time, read from the latest `pr_synchronized`; the baseline the re-queue guard compares against, `null` when no `pr_synchronized` existed yet)
 
 Domain-supervisor events (written by the planner, `source: system`):
@@ -654,9 +665,13 @@ the reconciler recording `pr_synchronized`.
   touched (rebase the branch or open a PR for a squash merge). On success: writes
   a `merged` event, transitions `in_review → verifying` (which runs the project's
   post-deploy smoke once), and best-effort removes the task worktree (a teardown
-  failure never fails the merge). On failure: `409` with the reason, a
-  `merge_failed` event, and NO state change. Guarded by the standing-authority
-  gate with action `task.merge`.
+  failure never fails the merge). On failure: `409` with the reason and a
+  `merge_failed` event; a **conflict** (the reason matches conflict / not
+  mergeable / not an ancestor / fast-forward — the agent's to fix) additionally
+  bounces the task `in_review → in_progress` with best-effort rebase
+  instructions, while any other failure leaves the task `in_review`. Either way
+  the reason stays on the card as `health.stuck` until it is resolved or ages out
+  (see `health`). Guarded by the standing-authority gate with action `task.merge`.
 
 - `POST /api/tasks/:id/request-changes` body `{notes (required)}` → `200 {"ok":true, "delivered":<bool>, "task": Task}` (now `in_progress`) | `409` (not `in_review`) | `400` (blank notes) | `404`
   Bounce the task back to `in_progress` for another pass. Delivers `notes` to the

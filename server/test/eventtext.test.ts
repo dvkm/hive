@@ -28,6 +28,16 @@ test("steer carries its delivery receipt", () => {
   expect(steer(undefined)).toBe("steered: “ship it”"); // pre-receipt events stay bare
 });
 
+// `conflict` is a boolean: read it directly, never through s() — s(false) is the
+// non-empty string "false", which would render every failure as a conflict.
+test("merge_failed distinguishes conflict from a plain failure", () => {
+  const mf = (payload: Record<string, unknown>) => eventText({ type: "merge_failed", payload });
+  expect(mf({ reason: "x", conflict: true, delivered: true })).toBe("merge conflict — sent back to agent: x");
+  expect(mf({ reason: "x", conflict: false, delivered: false })).toBe("merge failed: x");
+  // The bounce happens regardless, so an undelivered send must not claim otherwise.
+  expect(mf({ reason: "x", conflict: true, delivered: false })).toBe("merge conflict — ⚠ could not notify agent: x");
+});
+
 test("new transcript types are agent-lifecycle for the feed filter", () => {
   expect(eventCategory("assistant_text")).toBe("lifecycle");
   expect(eventCategory("tool_use")).toBe("lifecycle");
