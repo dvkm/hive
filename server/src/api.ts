@@ -58,7 +58,6 @@ import {
   appendMessage,
   setThreadTask,
   composeSupervisorBrief,
-  type ChatThread,
 } from "./chat.ts";
 
 export interface HandlerDeps {
@@ -519,21 +518,42 @@ async function chatTurn(db: DB, herdr: Herdr, deps: HandlerDeps, body: any): Pro
   // The message the session receives is prefixed so it always knows which thread
   // to reply to, even mid-conversation.
   const wire = `[director → chat thread ${thread.id}]\n${text}`;
-  const delivery = await deliverToSupervisor(db, herdr, deps, thread, wire);
+  const delivery = await withThreadLock(thread.id, () => deliverToSupervisor(db, herdr, deps, thread.id, wire));
   return json({ thread_id: thread.id, ...delivery }, 202);
+}
+
+// Serializes concurrent turns on the same chat thread. Without this, two
+// /api/chat/turn requests arriving before the first spawn lands (an impatient
+// double-send, or a second message sent right after the UI receives
+// thread_id) both see agent_target===null and both call spawnAgent for the
+// same taskId, racing worktree create/reclaim and starting two claude
+// sessions. A waiter runs only after the winner's spawn has landed, so it
+// re-reads fresh state and takes the fast (deliver-into-live-session) path
+// instead of racing it. One process holds the whole thread's traffic, so a
+// promise-chain per thread id is enough — no cross-process lock needed.
+const threadLocks = new Map<string, Promise<unknown>>();
+
+function withThreadLock<T>(threadId: string, fn: () => Promise<T>): Promise<T> {
+  const next = (threadLocks.get(threadId) ?? Promise.resolve()).catch(() => {}).then(fn);
+  threadLocks.set(threadId, next);
+  return next;
 }
 
 // Ensure the thread's supervisor agent is live (spawn on first use / respawn if
 // it died), then deliver the director's message into it. A message that arrives
 // before the session is live is queued as a steer and rides along in the spawn
-// brief, so nothing is dropped. Returns a small delivery receipt.
+// brief, so nothing is dropped. Returns a small delivery receipt. Must run
+// under withThreadLock (re-reads the thread/task fresh, so a serialized
+// waiter observes whatever the prior turn on this thread just did).
 async function deliverToSupervisor(
   db: DB,
   herdr: Herdr,
   deps: HandlerDeps,
-  thread: ChatThread,
+  threadId: string,
   message: string
 ): Promise<{ delivery: string; agent_target?: string; error?: string }> {
+  const thread = getThread(db, threadId)!;
+
   // Reuse (or create) the backing supervisor task — a plain chore task whose
   // agent IS the session. source='chat_supervisor' keeps it out of the
   // dispatcher and the normal board lanes; it is infrastructure, not a deliverable.
@@ -566,10 +586,9 @@ async function deliverToSupervisor(
 
   // Not live: queue the message (it rides in the spawn brief) and spawn.
   queueSteerEvent(db, taskId!, message, "queued for chat supervisor spawn");
-  const thread2 = getThread(db, thread.id)!;
   const r = await spawnAgent(db, herdr, taskId!, {
     supervise: false, // a standing session never "finishes into review"
-    briefOverride: composeSupervisorBrief(db, thread2),
+    briefOverride: composeSupervisorBrief(db, thread),
   });
   if (!r.ok) return { delivery: "failed", error: r.error };
   return { delivery: "spawned", agent_target: r.agent_target };
