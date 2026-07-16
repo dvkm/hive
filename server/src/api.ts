@@ -58,6 +58,7 @@ import {
   appendMessage,
   setThreadTask,
   composeSupervisorBrief,
+  type ChatThread,
 } from "./chat.ts";
 
 export interface HandlerDeps {
@@ -503,27 +504,57 @@ async function chatTurn(db: DB, herdr: Herdr, deps: HandlerDeps, body: any): Pro
   const text = String(body?.text ?? "").trim();
   if (!text) return err("text is required");
 
-  let thread = body?.thread_id ? getThread(db, String(body.thread_id)) : null;
-  if (body?.thread_id && !thread) return err("thread not found", 404);
-  if (!thread) {
-    const projectId = body?.project_id ? String(body.project_id) : null;
-    if (!projectId) return err("project_id is required to start a chat (the supervisor session runs in the project's repo)");
-    if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return err("unknown project_id", 400);
-    thread = createThread(db, {
-      project_id: projectId,
-      task_id: body?.task_id ? String(body.task_id) : null,
-      title: text.split("\n")[0].slice(0, 80),
-    });
+  if (body?.thread_id) {
+    const thread = getThread(db, String(body.thread_id));
+    if (!thread) return err("thread not found", 404);
+    if (!thread.project_id) return err("thread has no project scope; cannot run a supervisor session", 400);
+    return json(await chatTurnOnThread(db, herdr, deps, thread, text), 202);
   }
-  if (!thread.project_id) return err("thread has no project scope; cannot run a supervisor session", 400);
 
+  const projectId = body?.project_id ? String(body.project_id) : null;
+  if (!projectId) return err("project_id is required to start a chat (the supervisor session runs in the project's repo)");
+  if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return err("unknown project_id", 400);
+
+  // A brand-new chat has no thread_id yet, so two concurrent first-messages
+  // (a UI double-submit before the client gets a thread_id back) each used to
+  // call createThread independently, producing two threads/tasks/spawns for
+  // what the user experienced as one message. Dedupe on (project, text): a
+  // genuine double-submit repeats the exact text within the same tick, so the
+  // second request rides the first's in-flight thread-creation + delivery
+  // instead of racing its own.
+  const dedupeKey = `${projectId} ${text}`;
+  let pending = pendingNewChats.get(dedupeKey);
+  if (!pending) {
+    pending = (async () => {
+      const thread = createThread(db, {
+        project_id: projectId,
+        task_id: body?.task_id ? String(body.task_id) : null,
+        title: text.split("\n")[0].slice(0, 80),
+      });
+      return chatTurnOnThread(db, herdr, deps, thread, text);
+    })();
+    pendingNewChats.set(dedupeKey, pending);
+    pending.finally(() => pendingNewChats.delete(dedupeKey)).catch(() => {});
+  }
+  return json(await pending, 202);
+}
+
+const pendingNewChats = new Map<string, Promise<{ thread_id: string; delivery: string; agent_target?: string; error?: string }>>();
+
+async function chatTurnOnThread(
+  db: DB,
+  herdr: Herdr,
+  deps: HandlerDeps,
+  thread: ChatThread,
+  text: string
+): Promise<{ thread_id: string; delivery: string; agent_target?: string; error?: string }> {
   broadcast({ type: "chat_message", message: appendMessage(db, thread.id, "director", text) });
 
   // The message the session receives is prefixed so it always knows which thread
   // to reply to, even mid-conversation.
   const wire = `[director → chat thread ${thread.id}]\n${text}`;
   const delivery = await withThreadLock(thread.id, () => deliverToSupervisor(db, herdr, deps, thread.id, wire));
-  return json({ thread_id: thread.id, ...delivery }, 202);
+  return { thread_id: thread.id, ...delivery };
 }
 
 // Serializes concurrent turns on the same chat thread. Without this, two
