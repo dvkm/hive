@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { api, apiToken } from "./api";
-import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Checkpoint } from "./api";
+import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Checkpoint, ChatMessage } from "./api";
 
 export type SseState = "connecting" | "open" | "reconnecting";
 
@@ -22,6 +22,11 @@ interface Store {
   offline: boolean; // offline mode: fleet drained, nothing new spawns
   setOffline: (on: boolean) => void;
   sse: SseState;
+  // Director chat (persistent supervisor session). Only the open thread's
+  // messages are held; SSE appends live as the supervisor replies.
+  chatThreadId: string | null;
+  chatMessages: ChatMessage[];
+  openChatThread: (id: string | null) => void;
 }
 
 const FEED_CAP = 400;
@@ -58,6 +63,18 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     api.setOffline(on).catch(() => setOfflineState(!on));
   };
   const reloadCheckpoints = () => api.checkpoints().then((r) => setCheckpoints(r.checkpoints)).catch(() => {});
+
+  // Chat: the open thread + its messages. A ref mirrors the id so the SSE
+  // handler (closed over once) knows which thread's messages to append.
+  const [chatThreadId, setChatThreadId] = useState<string | null>(null);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const chatThreadRef = useRef<string | null>(null);
+  const openChatThread = (id: string | null) => {
+    chatThreadRef.current = id;
+    setChatThreadId(id);
+    if (id) api.chatThread(id).then((t) => setChatMessages(t.messages)).catch(() => setChatMessages([]));
+    else setChatMessages([]);
+  };
 
   // Initial load.
   useEffect(() => {
@@ -160,6 +177,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         } else if (msg.type === "notification") {
           const n: Notification = msg.notification;
           setNotifications((prev) => (prev.some((x) => x.id === n.id) ? prev : [n, ...prev]));
+        } else if (msg.type === "chat_message") {
+          const cm: ChatMessage = msg.message;
+          if (cm.thread_id === chatThreadRef.current)
+            setChatMessages((prev) => (prev.some((m) => m.id === cm.id) ? prev : [...prev, cm]));
         }
       };
     };
@@ -174,7 +195,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, offline, setOffline, sse }}>
+    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, offline, setOffline, sse, chatThreadId, chatMessages, openChatThread }}>
       {children}
     </Ctx.Provider>
   );
