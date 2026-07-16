@@ -95,15 +95,23 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
 }
 
 // A task row enriched with its computed health, for API responses + SSE.
+// Failed tasks also carry `requeued_to` (their auto-requeue successor's id, if
+// any) so the attention rule can tell "awaiting triage" from "already retried".
 export function taskWithHealth(db: DB, task: any): any {
-  return { ...task, health: computeHealth(db, task) };
+  const requeued_to =
+    task.state === "failed"
+      ? ((db.query("SELECT id FROM tasks WHERE parent_task_id = ? AND source = 'requeue' LIMIT 1").get(task.id) as any)?.id ?? null)
+      : null;
+  return { ...task, health: computeHealth(db, task), requeued_to };
 }
 
 // "Needs attention" tray eligibility (the single rule; the web mirrors it):
 // a `failed` task awaiting human triage, OR a live task whose agent is dead or
 // stuck. Requires a task already carrying its computed `health` field.
-export function needsAttention(task: { state: string; health?: Health | null }): boolean {
-  if (task.state === "failed") return true;
+// A failed task with a requeue successor was already triaged by the recovery
+// loop — its successor is the live card; showing both read as "stuck forever".
+export function needsAttention(task: { state: string; health?: Health | null; requeued_to?: string | null }): boolean {
+  if (task.state === "failed") return !task.requeued_to;
   return !!task.health && (task.health.status === "dead" || task.health.status === "stuck");
 }
 

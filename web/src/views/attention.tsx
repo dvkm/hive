@@ -9,7 +9,9 @@ import { useRelTime } from "../lib/time";
 // Attention-tray eligibility — mirrors the server's needsAttention() rule.
 // Shared by the board tray and the Morning Brief's "Needs attention" section.
 export function needsAttention(t: Task): boolean {
-  if (t.state === "failed") return true;
+  // A failed task already auto-requeued isn't awaiting triage — the successor
+  // is the live card; only un-requeued failures need a human.
+  if (t.state === "failed") return !t.requeued_to;
   return !!t.health && (t.health.status === "dead" || t.health.status === "stuck");
 }
 

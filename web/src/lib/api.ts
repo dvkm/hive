@@ -61,6 +61,7 @@ export interface Task {
   parent_task_id: string | null;
   duplicate_of: string | null; // survivor id when cancelled as a duplicate
   health?: Health | null;
+  requeued_to?: string | null; // successor id when failed + auto-requeued
   created_at: string;
   updated_at: string;
 }
