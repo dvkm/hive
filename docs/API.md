@@ -80,6 +80,14 @@ worktree is removed; emits a `stack_teardown` event). Both are best-effort with 
 Lifecycle key: `archived` (bool, default absent/`false`; when `true` the project
 is hidden from the default `GET /api/projects` list and the web Projects view —
 tasks keep referencing it, there is no hard delete).
+Worktree stack hooks (symmetric per-project lifecycle commands): `setup_argv`
+(string[], run AFTER the worktree exists but BEFORE the agent starts — e.g.
+`["infra/worktree/wt.sh", "up", "{worktree}"]` — so agents don't bring up their
+stack themselves; emits a `stack_setup` event) and `cleanup_argv` (string[], run
+BEFORE the worktree is removed — e.g. `[..., "down", "{worktree}"]`; emits a
+`stack_teardown` event). Both: relative `argv[0]` resolves against `repo_path`,
+`{worktree}` substitutes the task's worktree path, best-effort with a 120s
+timeout — a failed hook never blocks spawn nor teardown.
 
 ### Task
 ```json
@@ -100,6 +108,7 @@ tasks keep referencing it, there is no hard delete).
   "summary": "Shipped dark mode toggle; all tests green.",
   "source": null,
   "parent_task_id": null,
+  "depends_on": [],
   "duplicate_of": null,
   "health": { "status": "healthy", "reason": null, "since": "..." },
   "created_at": "...",
@@ -206,6 +215,7 @@ Types written by the runtime layer (Phase 2b):
 - `smoke_passed` / `smoke_failed` — post-deploy smoke result. `payload: {results:[{name,ok,detail}], evidence_id?}`
 - `cleaned_up` — a finished task's runtime was torn down: worktree removed (when its branch was pushed/merged) and herdr session (tab/pane) closed. `payload: {worktree_path, branch, worktree_removed, ghost_branch, session_closed, session_via, tab_id}` (`ghost_branch` non-null when tracked uncommitted work was preserved before removal). Fired on the `done`/`cancelled` transition and by the reaper.
 - `cleanup_skipped` — teardown was refused because the branch is neither pushed nor merged; the worktree and its session are left fully intact so no unmerged work is lost. `payload: {reason, worktree_path, branch}`
+- `stack_setup` / `stack_teardown` — a per-project worktree stack hook ran (`config.setup_argv` at spawn, `source: herdr`; `config.cleanup_argv` at teardown, `source: reaper`). `payload: {argv, ok, error?}` (`error` is the trimmed stderr/stdout on failure or a timeout note).
 
 Review events (written by the director path, `source: director`):
 - `merged` — an in-review task was approved & merged. `payload: {method, base, branch, pr_url}`
@@ -229,6 +239,7 @@ Duplicate-detection events (written by the dedup path, `source: system`):
 Standing-authority events (written by the policy engine, `source: system` unless noted):
 - `authority_logged` — an action was allowed (matched an `allow` rule, defaulted to allow when unmatched, or passed by consuming a grant). `payload: {action, target, effect:"allow", rule_id?, via_grant?}`
 - `authority_denied` — an action was blocked by a `deny` rule. `payload: {action, target, rule_id}`
+- `dependency_blocked` — a task's `depends_on` isn't all merged/done, so the dispatcher held its spawn (or the reconciler held its stage). `payload: {note, blocked_by}` (`blocked_by`: `["#<n> <title>", ...]`). Deduped: re-written only when the blocking set changes.
 - `authority_required` — a `require_decision` rule opened a card gating the action. `payload: {action, target, decision_id, rule_id}`
 - `authority_granted` — the director approved the card; a single-use 24h grant was minted (`source: director`). `payload: {action, target, decision_id, expires_at}`
 
@@ -442,7 +453,7 @@ priced rows only).
 
 ### Tasks
 - `GET /api/tasks?state=&project_id=` → `200 [Task, ...]` (newest `updated_at` first; both filters optional)
-- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban — never auto-dispatched, never staleness-supervised, exempt from the done-evidence gate, moved freely via transitions (`hive task move <id> <state>`); the board shows a `tracked` chip. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
+- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher won't spawn — and the reconciler won't advance — the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban — never auto-dispatched, never staleness-supervised, exempt from the done-evidence gate, moved freely via transitions (`hive task move <id> <state>`); the board shows a `tracked` chip. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
 - `POST /api/tasks/:id/transition` body `{to (required), reason?, source?}` → `200 Task` | `409` (invalid transition or `done` without evidence) | `404`

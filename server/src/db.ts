@@ -346,6 +346,13 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v16-task-head-sha",
     statements: [`ALTER TABLE tasks ADD COLUMN head_sha TEXT`],
   },
+  // Task dependencies: a JSON array of task ids this task waits on. The
+  // dispatcher won't spawn — and the reconciler won't advance — a task until
+  // every listed dependency is merged/done (see unmetDeps in state.ts).
+  {
+    name: "v17-task-depends-on",
+    statements: [`ALTER TABLE tasks ADD COLUMN depends_on TEXT`],
+  },
 ];
 
 // -------------------------------------------------------------- settings

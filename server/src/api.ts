@@ -477,6 +477,17 @@ async function createTask(db: DB, req: Request): Promise<Response> {
   const parent = body.parent_task_id ? String(body.parent_task_id) : null;
   if (parent && !db.query("SELECT 1 FROM tasks WHERE id = ?").get(parent))
     return err("unknown parent_task_id", 400);
+  // depends_on: task ids this task waits on (array, or comma-separated string
+  // from the CLI). Validated here so a typo can't block a task forever.
+  const rawDeps = Array.isArray(body.depends_on)
+    ? body.depends_on
+    : body.depends_on
+      ? String(body.depends_on).split(",")
+      : [];
+  const deps = rawDeps.map((d: any) => String(d).trim()).filter(Boolean);
+  for (const d of deps) {
+    if (!db.query("SELECT 1 FROM tasks WHERE id = ?").get(d)) return err(`unknown depends_on task: ${d}`, 400);
+  }
   const t = now();
   // Id first: attachments are stored under it, and the brief they extend is
   // written in the INSERT below (and read by duplicate detection).
@@ -498,17 +509,18 @@ async function createTask(db: DB, req: Request): Promise<Response> {
     summary: null,
     source: body.source ? String(body.source) : null,
     parent_task_id: parent,
+    depends_on: deps.length ? JSON.stringify(deps) : null,
     created_at: t,
     updated_at: t,
   };
   db.query(
     `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
-      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.project_id, row.title, row.brief, row.state, row.kind,
     row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
-    row.summary, row.source, row.parent_task_id, row.created_at, row.updated_at
+    row.summary, row.source, row.parent_task_id, row.depends_on, row.created_at, row.updated_at
   );
   writeEvent(db, {
     task_id: row.id,

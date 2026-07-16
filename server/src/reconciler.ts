@@ -11,7 +11,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { writeEvent, transition, getTask, advanceIfFinished, TERMINAL, type State } from "./state.ts";
+import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent } from "./steer.ts";
 import { isReviewed } from "./dispatcher.ts";
@@ -241,6 +241,15 @@ async function advanceFinished(db: DB, _deps: ReconcilerDeps): Promise<void> {
     .query(`SELECT id FROM tasks WHERE state = 'in_progress' AND agent_target IS NOT NULL`)
     .all() as { id: string }[];
   for (const t of tasks) {
+    // Never advance a task past its dependency gate. The dispatcher blocks
+    // auto-spawn, but the manual /spawn endpoint bypasses that — this holds a
+    // blocked task in_progress until its deps merge, surfacing the reason.
+    const task = getTask(db, t.id);
+    const blocking = unmetDeps(db, task);
+    if (blocking.length) {
+      noteDependencyBlock(db, t.id, blocking, "reconciler");
+      continue;
+    }
     const status = lastAgentStatus(db, t.id);
     if (status) advanceIfFinished(db, t.id, status, "reconciler");
   }
@@ -727,6 +736,10 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
     )
     .all() as { id: string }[];
   for (const t of tasks) {
+    // Held by the dependency gate: advanceFinished refuses to advance it and
+    // dependency_blocked is deduped, so it stays intentionally quiet — never
+    // stale (skipping the flag also spares it recoverStale, which the flag drives).
+    if (unmetDeps(db, getTask(db, t.id)).length) continue;
     const last = db
       .query("SELECT ts, type FROM events WHERE task_id = ? ORDER BY ts DESC LIMIT 1")
       .get(t.id) as { ts: string; type: string } | undefined;

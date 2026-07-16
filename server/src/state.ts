@@ -60,6 +60,51 @@ export function getTask(db: DB, id: string): any | null {
   return r ? parseTask(r) : null;
 }
 
+// A dependency is "met" once its code has landed: PR merged (verifying) or
+// fully done. Every other state — still queued/working/in review, or failed/
+// cancelled — blocks the dependent. Returns the blocking dep rows (id, number,
+// title, state) so callers can name them in a visible 'blocked by task X'.
+// ponytail: a failed dep auto-requeues under a NEW id, so a task depending on
+// the old (now-failed) id blocks until the director edits/cancels it. Visible,
+// not silent — upgrade to re-point deps at the requeue successor if it bites.
+const DEP_MET_STATES = ["verifying", "done"];
+export function unmetDeps(db: DB, task: { depends_on?: string[] } | null | undefined): { id: string; number: number; title: string; state: string }[] {
+  const ids = task?.depends_on ?? [];
+  if (!ids.length) return [];
+  const blocking: { id: string; number: number; title: string; state: string }[] = [];
+  for (const id of ids) {
+    const dep = db.query("SELECT id, number, title, state FROM tasks WHERE id = ?").get(id) as
+      | { id: string; number: number; title: string; state: string }
+      | undefined;
+    // A vanished dependency can never be met, so it stays blocking (visible).
+    if (!dep || !DEP_MET_STATES.includes(dep.state)) blocking.push(dep ?? { id, number: 0, title: "(unknown task)", state: "missing" });
+  }
+  return blocking;
+}
+
+// Record a visible 'blocked by task X' — but only when the blocking set changed
+// since the last such event, so a 30s dispatch loop doesn't spam the timeline.
+// Mirrors the dedup discipline of nudgeConflict/ci_failure in the reconciler.
+export function noteDependencyBlock(
+  db: DB,
+  taskId: string,
+  blocking: { number: number; title: string }[],
+  source: string
+): void {
+  const blocked_by = blocking.map((b) => `#${b.number} ${b.title}`);
+  const note = `blocked by ${blocked_by.join(", ")}`;
+  const last = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'dependency_blocked' ORDER BY ts DESC LIMIT 1")
+    .get(taskId) as { payload: string } | undefined;
+  if (last) {
+    try {
+      if (JSON.parse(last.payload).note === note) return; // same blockers already surfaced
+    } catch {}
+  }
+  writeEvent(db, { task_id: taskId, source, type: "dependency_blocked", payload: { note, blocked_by } });
+  broadcastTask(db, getTask(db, taskId));
+}
+
 export function canTransition(from: State, to: State): boolean {
   if (!STATES.includes(to)) return false;
   if (to === "failed") return !TERMINAL.includes(from);

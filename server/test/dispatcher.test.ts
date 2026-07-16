@@ -44,12 +44,12 @@ function freshDb(config: any = {}): { db: DB; projectId: string } {
     .run(projectId, "p", "/repo", JSON.stringify(config), now());
   return { db, projectId };
 }
-function makeTask(db: DB, projectId: string, extra: Partial<{ kind: string; source: string; state: string; agent_target: string }> = {}): string {
+function makeTask(db: DB, projectId: string, extra: Partial<{ kind: string; source: string; state: string; agent_target: string; depends_on: string[] }> = {}): string {
   const id = newId();
   const t = now();
   db.query(
-    "INSERT INTO tasks (id, project_id, title, state, kind, source, agent_target, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"
-  ).run(id, projectId, "t", extra.state ?? "queued", extra.kind ?? "ship", extra.source ?? null, extra.agent_target ?? null, t, t);
+    "INSERT INTO tasks (id, project_id, title, state, kind, source, agent_target, depends_on, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
+  ).run(id, projectId, "t", extra.state ?? "queued", extra.kind ?? "ship", extra.source ?? null, extra.agent_target ?? null, extra.depends_on ? JSON.stringify(extra.depends_on) : null, t, t);
   return id;
 }
 
@@ -162,6 +162,29 @@ test("authority deny blocks auto-dispatch", async () => {
   expect(spawns.length).toBe(0);
   expect(getTask(db, id).state).toBe("queued");
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'authority_denied'").get(id)).toBeTruthy();
+});
+
+test("unmet depends_on blocks spawn (visible 'blocked by'), met deps let it through", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const dep = makeTask(db, projectId, { state: "in_progress" }); // not merged/done
+  const child = makeTask(db, projectId, { depends_on: [dep] });
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(0);
+  expect(getTask(db, child).state).toBe("queued");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dependency_blocked'").get(child)).toBeTruthy();
+
+  // re-running while still blocked does NOT write a second identical event (dedup)
+  await dispatchOnce(db, { herdr });
+  const blocks = db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'dependency_blocked'").get(child) as { n: number };
+  expect(blocks.n).toBe(1);
+
+  // once the dependency reaches a merged state, the child spawns
+  db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(dep);
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, child).state).toBe("in_progress");
 });
 
 test("spawn failure records one spawn_error and backs off (no retry storm)", async () => {
