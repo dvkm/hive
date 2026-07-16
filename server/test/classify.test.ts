@@ -293,6 +293,30 @@ test("actionFor namespaces dangerous commands by classifier category", () => {
   expect("command.dangerous.process-kill".startsWith("command.dangerous")).toBe(true);
 });
 
+// task 320: a subshell trigger ($(...)) or literal $( text ANYWHERE in the
+// command used to disable data-text stripping for the WHOLE command, so
+// quoted prose elsewhere (unrelated to the subshell) got scanned as literal
+// shell text. stripDataText must scope the raw-vs-stripped decision to the
+// region that actually contains the trigger.
+test("a subshell elsewhere in the command does not unstrip unrelated quoted prose", () => {
+  const env = { HOME: "/Users/david" };
+  // $(...)-wrapped quoted-delimiter heredoc (a `gh pr create --body "$(cat <<'EOF' ... )"` shape);
+  // the heredoc body merely mentions a force-delete-branch example in backticks.
+  const cmd1 = [
+    'gh pr create --title "x" --body "$(cat <<\'EOF\'',
+    "Use `git branch -D` to force-delete a stale local branch as an example.",
+    "EOF",
+    ')"',
+  ].join("\n");
+  expect(classify(cmd1, env).decision).not.toBe("dangerous");
+  // single-quoted --body containing a literal `$(` plus a find delete-flag mention
+  const cmd2 =
+    "hive learning add --project p --title 't' --body 'trigger substring is literal $( plus find delete-exec flag mention'";
+  expect(classify(cmd2, env).decision).not.toBe("dangerous");
+  // a REAL subshell wrapping a real destructive op must still be caught
+  expect(classify('hive emit abc123 status --note "$(rm -rf /)"', env).decision).toBe("dangerous");
+});
+
 test("force-push to the agent's own task branch is waived; anything else escalates", () => {
   const env = { HIVE_TASK_ID: "abc123", HOME: "/Users/x" };
   expect(classify("git push --force origin hive/abc123", env).decision).toBe("unknown");
