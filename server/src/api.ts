@@ -48,6 +48,16 @@ import { taskDiff } from "./diff.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
+import {
+  runChatTurn,
+  createThread,
+  getThread,
+  listThreads,
+  listMessages,
+  appendMessage,
+  type ChatAction,
+  type ChatDeps,
+} from "./chat.ts";
 
 export interface HandlerDeps {
   herdr?: Herdr; // injectable for tests
@@ -162,6 +172,20 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       // ---- braindump intake ----
       if (pathname === "/api/intake" && method === "POST") return intake(db, await req.json(), deps);
+
+      // ---- director chat (conversational supervisor over hive) ----
+      if (pathname === "/api/chat/turn" && method === "POST")
+        return await chatTurn(db, herdr, deps, await req.json());
+      if (pathname === "/api/chat/threads" && method === "GET")
+        return json(listThreads(db, url.searchParams.get("project_id")));
+      {
+        const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)$/);
+        if (m && method === "GET") {
+          const thread = getThread(db, m[1]);
+          if (!thread) return err("thread not found", 404);
+          return json({ ...thread, messages: listMessages(db, m[1]) });
+        }
+      }
 
       // ---- PR → task linking (match an open PR back to its task by marker) ----
       if (pathname === "/api/tasks/link-pr" && method === "POST")
@@ -456,6 +480,107 @@ function intake(db: DB, body: any, deps: HandlerDeps): Response {
   // lands, and runPlanner records its own planner_error event on failure.
   runPlanner(db, id, { exec: deps.plannerExec }).catch(() => {});
   return json({ ok: true, task }, 202);
+}
+
+// ---------------------------------------------------------------- chat
+// One director-chat turn: persist the message, run the supervisor subprocess,
+// execute whatever scoped actions it returned (against the SAME handlers the
+// board/CLI use — no duplicated logic, no looser gate), persist the reply, and
+// broadcast both messages over SSE. Reuses the planner subprocess pattern.
+async function chatTurn(db: DB, herdr: Herdr, deps: HandlerDeps, body: any): Promise<Response> {
+  const text = String(body?.text ?? "").trim();
+  if (!text) return err("text is required");
+
+  let thread = body?.thread_id ? getThread(db, String(body.thread_id)) : null;
+  if (body?.thread_id && !thread) return err("thread not found", 404);
+  if (!thread) {
+    const projectId = body?.project_id ? String(body.project_id) : null;
+    if (projectId && !db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId))
+      return err("unknown project_id", 400);
+    thread = createThread(db, {
+      project_id: projectId,
+      task_id: body?.task_id ? String(body.task_id) : null,
+      title: text.split("\n")[0].slice(0, 80),
+    });
+  }
+
+  const history = listMessages(db, thread.id, 20);
+  broadcast({ type: "chat_message", message: appendMessage(db, thread.id, "director", text) });
+
+  const chatDeps: ChatDeps = { exec: deps.plannerExec };
+  let parsed;
+  try {
+    parsed = await runChatTurn(
+      db,
+      { projectId: thread.project_id, taskId: thread.task_id, history, text },
+      chatDeps
+    );
+  } catch (e: any) {
+    const errMsg = `I couldn't process that: ${e?.message ?? e}`;
+    broadcast({ type: "chat_message", message: appendMessage(db, thread.id, "assistant", errMsg) });
+    return json({ error: errMsg, thread_id: thread.id }, 502);
+  }
+
+  const results = [];
+  for (const action of parsed.actions) {
+    results.push(await executeChatAction(db, herdr, deps, thread, action));
+  }
+  broadcast({ type: "chat_message", message: appendMessage(db, thread.id, "assistant", parsed.reply, results) });
+  return json({ thread_id: thread.id, reply: parsed.reply, actions: results });
+}
+
+// Execute one allow-listed chat action against the existing in-process handlers.
+// The allow-list here — not the model — is the security boundary: only these
+// three shapes exist, and each routes through the same validation/authz as the
+// director- or agent-initiated path (send_steer keeps its task.steer authz gate;
+// merges/destructive have no action at all). Returns a per-action result the UI
+// renders next to the reply.
+async function executeChatAction(
+  db: DB,
+  herdr: Herdr,
+  deps: HandlerDeps,
+  thread: { id: string; project_id: string | null },
+  action: ChatAction
+): Promise<any> {
+  try {
+    if (action.type === "create_task") {
+      if (!thread.project_id) return { type: action.type, ok: false, error: "chat has no project scope; cannot create a task" };
+      const res = await createTask(
+        db,
+        jsonReq({ project_id: thread.project_id, title: action.title, brief: action.brief ?? "", kind: action.kind ?? "ship", source: "chat" })
+      );
+      const t = await res.json();
+      if (res.status >= 400) return { type: action.type, ok: false, error: t?.error ?? "create failed" };
+      return { type: action.type, ok: true, task_id: t.id, number: t.number, title: t.title };
+    }
+    if (action.type === "answer_decision") {
+      const res = apiAnswerDecision(db, herdr, action.decision_id, { answer_key: action.answer_key, answer_note: action.note ?? null });
+      const d = await res.json();
+      if (res.status >= 400) return { type: action.type, ok: false, error: d?.error ?? "answer failed" };
+      return { type: action.type, ok: true, decision_id: action.decision_id, answer_key: action.answer_key };
+    }
+    if (action.type === "send_steer") {
+      const res = await sendSteer(db, herdr, action.task_id, jsonReq({ message: action.message }));
+      const s = await res.json();
+      // sendSteer returns 200 even when it queued/failed delivery; a 403/409 is authz.
+      if (res.status >= 400) return { type: action.type, ok: false, error: s?.error ?? "steer blocked", decision_id: s?.decision_id };
+      return { type: action.type, ok: true, task_id: action.task_id, delivery: s?.delivery };
+    }
+    return { type: (action as any).type, ok: false, error: "unknown action" };
+  } catch (e: any) {
+    return { type: (action as any).type, ok: false, error: String(e?.message ?? e) };
+  }
+}
+
+// A synthetic in-process JSON Request, so chat can reuse the exact createTask /
+// sendSteer handlers (dedup, attachments, authz all preserved) without a real
+// HTTP round-trip or duplicated insert logic.
+function jsonReq(payload: unknown): Request {
+  return new Request("http://internal/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 }
 
 // ---------------------------------------------------------------- tasks

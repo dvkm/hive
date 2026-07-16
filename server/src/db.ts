@@ -339,6 +339,33 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       )`,
     ],
   },
+  // Director chat: conversational surface over hive. A thread is optionally
+  // scoped to a project (and/or a single task); messages are an append-only log
+  // (same shape as `events`) so history persists in the state store. project_id
+  // has no FK — a thread can be project-less (general chat); task_id likewise.
+  {
+    name: "v16-chat",
+    statements: [
+      `CREATE TABLE chat_threads (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        task_id TEXT,
+        title TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE chat_messages (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL REFERENCES chat_threads(id),
+        ts TEXT NOT NULL,
+        role TEXT NOT NULL,
+        text TEXT NOT NULL,
+        actions TEXT NOT NULL DEFAULT '[]'
+      )`,
+      `CREATE INDEX idx_chat_messages_thread ON chat_messages(thread_id, ts)`,
+      `CREATE INDEX idx_chat_threads_project ON chat_threads(project_id, updated_at)`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings
