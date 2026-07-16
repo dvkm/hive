@@ -27,6 +27,9 @@ interface Store {
   chatThreadId: string | null;
   chatMessages: ChatMessage[];
   openChatThread: (id: string | null) => void;
+  // Fan-out for EVERY incoming chat message regardless of the open thread —
+  // the Supervisors board runs one live column per thread. Returns unsubscribe.
+  onChatMessage: (cb: (m: ChatMessage) => void) => () => void;
 }
 
 const FEED_CAP = 400;
@@ -74,6 +77,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setChatThreadId(id);
     if (id) api.chatThread(id).then((t) => setChatMessages(t.messages)).catch(() => setChatMessages([]));
     else setChatMessages([]);
+  };
+  const chatSubs = useRef(new Set<(m: ChatMessage) => void>());
+  const onChatMessage = (cb: (m: ChatMessage) => void) => {
+    chatSubs.current.add(cb);
+    return () => void chatSubs.current.delete(cb);
   };
 
   // Initial load.
@@ -181,6 +189,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           const cm: ChatMessage = msg.message;
           if (cm.thread_id === chatThreadRef.current)
             setChatMessages((prev) => (prev.some((m) => m.id === cm.id) ? prev : [...prev, cm]));
+          chatSubs.current.forEach((cb) => cb(cm));
         }
       };
     };
@@ -195,7 +204,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, offline, setOffline, sse, chatThreadId, chatMessages, openChatThread }}>
+    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, offline, setOffline, sse, chatThreadId, chatMessages, openChatThread, onChatMessage }}>
       {children}
     </Ctx.Provider>
   );

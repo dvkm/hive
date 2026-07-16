@@ -4140,3 +4140,32 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
   .chat-fab { bottom: 70px; } /* clear the mobile bottom nav */
   .chat-panel { width: 100vw; }
 }
+
+/* ---- Supervisors board: one chat column per supervisor session ---- */
+.sup-page { display: flex; flex-direction: column; height: calc(100vh - 64px); }
+.sup-page .page-head { display: flex; align-items: center; gap: 12px; }
+.sup-board {
+  display: flex; gap: 12px; align-items: stretch;
+  flex: 1; min-height: 0;
+  overflow-x: auto; padding-bottom: 8px;
+}
+.sup-col {
+  display: flex; flex-direction: column;
+  flex: 0 0 380px; min-width: 300px; min-height: 0;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--panel);
+}
+.sup-col-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-bottom: 1px solid var(--border);
+}
+.sup-col-title {
+  font-size: var(--t-sm); font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sup-col-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 10px; }
+.sup-col .chat-compose { padding: 8px 10px 10px; }
+.sup-empty { align-self: center; margin: auto; }
+@media (max-width: 700px) {
+  .sup-col { flex-basis: 88vw; }
+}

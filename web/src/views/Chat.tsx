@@ -29,7 +29,7 @@ function MsgActions({ actions }: { actions: ChatMessage["actions"] }) {
   );
 }
 
-function Bubble({ m }: { m: ChatMessage }) {
+export function Bubble({ m }: { m: ChatMessage }) {
   const html =
     m.role === "assistant" ? DOMPurify.sanitize(marked.parse(m.text, { async: false }) as string) : null;
   return (
