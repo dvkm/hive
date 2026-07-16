@@ -26,6 +26,7 @@ import { isOffline } from "./db.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
+import { unmetDeps, noteDependencyBlock } from "./state.ts";
 
 // Chores included since 2026-07-12: the queue sat at 10 tasks / 1 live agent
 // because 9 were agent-filed follow-up FIXES tagged chore — "chores are titled
@@ -117,6 +118,14 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         task_id: task.id,
       });
       if (authz.effect !== "allow") continue; // deny or require_decision blocks the auto-spawn
+
+      // Dependency gate: don't spawn until every depends_on task is merged/done.
+      // Same shape as the authz gate above — skip and surface a visible reason.
+      const blocking = unmetDeps(db, task);
+      if (blocking.length) {
+        noteDependencyBlock(db, task.id, blocking, "dispatcher");
+        continue;
+      }
 
       const r = await spawnAgent(db, h, task.id, { hiveUrl: deps.hiveUrl, supervise: deps.supervise });
       if (r.ok) {

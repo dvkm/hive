@@ -10,7 +10,7 @@ const USAGE = `hive — local orchestration control plane
 Usage:
   hive serve                              start the daemon
   hive task create --project <id> --title <t> [--brief <file> | --brief-text <s>]
-        [--kind ship|scout|chore] [--parent <task-id>] [--track]
+        [--kind ship|scout|chore] [--parent <task-id>] [--depends-on <id,id>] [--track]
         (under a hive agent, HIVE_TASK_ID makes source=agent + parent automatic;
          --track = tracking-only: never auto-dispatched, moves freely, no evidence gate)
   hive task move <task-id> <state> [--note <s>]   states: queued in_progress needs_decision
@@ -139,6 +139,7 @@ async function main() {
         brief,
         kind: flags.kind,
         parent_task_id: flags.parent ?? agentTask ?? undefined,
+        depends_on: flags["depends-on"] ? String(flags["depends-on"]) : undefined,
         source: flags.track ? "external" : agentTask ? "agent" : undefined,
       });
       console.log(`created task ${t.id}  [${t.state}]  ${t.title}`);

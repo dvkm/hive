@@ -28,7 +28,11 @@ web UI now runs instead of sitting in Queued forever. Every gate below must pass
 5. **Authority gate.** `authorize(action="task.dispatch", target=<title>)` must
    resolve to `allow`. A `deny` or `require_decision` standing-authority rule
    blocks the auto-spawn (and, for `require_decision`, opens the usual card).
-6. **Backoff.** On a spawn failure a single `spawn_error` event is written and
+6. **Dependency gate.** A task with unmet `depends_on` (any listed task not yet
+   `verifying`/`done`) is not spawned; a deduped `dependency_blocked` event
+   records the visible "blocked by #N …" reason. The reconciler applies the same
+   gate to stage advancement, so a manually-spawned dependent is held too.
+7. **Backoff.** On a spawn failure a single `spawn_error` event is written and
    the task stays queued; the next attempt waits `min(30s · 2^(n-1), 30m)` where
    `n` is the number of spawn_error events. No retry storm on a broken repo.
 

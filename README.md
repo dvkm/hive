@@ -125,7 +125,9 @@ server/test/ bun test suite
   (`config.auto_dispatch`, default off); honors `dispatch_kinds`
   (default `["ship","scout"]`), `max_agents` (default 3, concurrency cap),
   skips unreviewed `intake_gchat` tasks, runs the `task.dispatch` authority gate,
-  and backs off exponentially on spawn failures. Shares the spawn core with the
+  holds tasks with unmet `depends_on` (a listed task not yet merged/done, with a
+  visible `dependency_blocked` reason), and backs off exponentially on spawn
+  failures. Shares the spawn core with the
   manual `POST /api/tasks/:id/spawn`. The herdr adapter is verified against a
   live herdr server — see `docs/runtime.md` and
   `docs/evidence/herdr-live-verification.txt`.
