@@ -1439,7 +1439,7 @@ export async function spawnAgent(
   db: DB,
   herdr: Herdr,
   id: string,
-  opts: { hiveUrl?: string; supervise?: boolean; briefOverride?: string } = {}
+  opts: { hiveUrl?: string; supervise?: boolean; briefOverride?: string; exec?: Exec } = {}
 ): Promise<{ ok: true; agent_target: string } | { ok: false; error: string }> {
   const task = getTask(db, id);
   if (!task) return { ok: false, error: "task not found" };
@@ -1476,7 +1476,7 @@ export async function spawnAgent(
       // agents don't have to install deps / bring up their stack themselves.
       prepareWorktree: async (worktreePath) => {
         writeHookSettings(worktreePath, id, hiveUrl, config.command_approval);
-        await runStackCmd(db, id, config.setup_argv, project.repo_path, worktreePath, defaultExec, {
+        await runStackCmd(db, id, config.setup_argv, project.repo_path, worktreePath, opts.exec ?? defaultExec, {
           type: "stack_setup",
           source: "herdr",
         });
