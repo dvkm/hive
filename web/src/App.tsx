@@ -20,6 +20,7 @@ import Terminals from "./views/Terminals";
 import Analytics from "./views/Analytics";
 import Projects from "./views/Projects";
 import Palette from "./views/Palette";
+import Chat from "./views/Chat";
 
 // Enable web-push on this device (phone PWA). Hidden once granted or where
 // unsupported (desktop keeps the osascript notifier). iOS only offers this on
@@ -239,6 +240,7 @@ export default function App() {
         </Routes>
       )}
       <Palette />
+      <Chat />
     </div>
   );
 }

@@ -207,6 +207,24 @@ export interface Notification {
   delivered_at: string | null;
 }
 
+// Director chat: a persistent supervisor session over hive (server/src/chat.ts).
+export interface ChatThread {
+  id: string;
+  project_id: string | null;
+  task_id: string | null;
+  title: string | null;
+  created_at: string;
+  updated_at: string;
+}
+export interface ChatMessage {
+  id: string;
+  thread_id: string;
+  ts: string;
+  role: "director" | "assistant";
+  text: string;
+  actions: { label?: string; [k: string]: unknown }[];
+}
+
 export interface TaskDetail extends Task {
   events: Event[];
   evidence: Evidence[];
@@ -518,6 +536,17 @@ export const api = {
 
   morningBrief: (since?: string) =>
     req<Brief>(`/api/brief${since ? "?since=" + encodeURIComponent(since) : ""}`),
+
+  // Director chat (persistent supervisor session).
+  chatThreads: (project_id?: string) =>
+    req<ChatThread[]>(`/api/chat/threads${project_id ? "?project_id=" + project_id : ""}`),
+  chatThread: (id: string) => req<ChatThread & { messages: ChatMessage[] }>(`/api/chat/threads/${id}`),
+  chatTurn: (b: { project_id?: string; thread_id?: string; text: string }) =>
+    req<{ thread_id: string; delivery: "delivered" | "spawned" | "failed"; error?: string }>(`/api/chat/turn`, {
+      method: "POST",
+      body: JSON.stringify(b),
+    }),
+  chatClose: (id: string) => req<{ ok: boolean; thread_id: string }>(`/api/chat/threads/${id}/close`, { method: "POST", body: "{}" }),
 
   notifications: () => req<{ notifications: Notification[]; unread: number }>(`/api/notifications`),
   ackNotifications: () => req<{ ok: boolean; acked: number }>(`/api/notifications/ack`, { method: "POST", body: "{}" }),
