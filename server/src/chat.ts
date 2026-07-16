@@ -137,7 +137,7 @@ You coordinate by spawning and tracking WORKER agents — you don't write code i
 - Create a task (spawns a worker):   ${cli} task create --project ${thread.project_id ?? "<project-id>"} --title "..." --brief-text "..." --kind ship|scout|chore
 - Answer an open decision card:       ${cli} decision ... / POST $HIVE_URL/api/decisions/<id>/answer
 - Read status (tasks/decisions/feed): curl -sS "$HIVE_URL/api/tasks", "$HIVE_URL/api/decisions?status=open", "$HIVE_URL/api/feed"
-- Ask the director a real choice:     ${cli} decision ask ${thread.id === "" ? "" : "<task-id>"} --title "..." --option k:Label:"..." --recommend k
+- Ask the director a real choice:     ${cli} decision ask <task-id> --title "..." --option k:Label:"..." --recommend k
 
 When the director asks for work, create the task(s) and tell them what you queued (with task numbers). When they ask for status, read it from the API and summarize. Report back proactively as workers progress.
 
