@@ -603,6 +603,11 @@ a {
   color: var(--text);
   border-color: var(--text-faint);
 }
+.chip-blocked {
+  color: var(--amber);
+  border-color: rgba(226, 165, 66, 0.5);
+  white-space: nowrap;
+}
 
 /* Breakdown (planner child tasks) */
 .breakdown {
