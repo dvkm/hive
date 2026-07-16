@@ -32,6 +32,8 @@ Usage:
   hive learning recur <learning-id>
   hive recall <keywords>                  search project knowledge (references, learnings, policies)
   hive spawn <task-id>                    spawn a herdr agent for a task
+  hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
+  hive chat reply <thread-id> "<text>"    (supervisor→director) post a reply on a chat thread
   hive steer-all "message" [--project <id>]   broadcast a steer to every live agent
   hive tunnel                             expose hive to your phone over Tailscale HTTPS (private; enables push)
   hive remote                             print LAN URL + API token for phone access (PWA)
@@ -340,6 +342,35 @@ async function main() {
     const r = await api("POST", `/api/tasks/${taskId}/spawn`, {});
     console.log(`spawned agent ${r.agent_target} for task ${taskId}`);
     return;
+  }
+
+  if (cmd === "chat") {
+    const sub = argv[1];
+    const { _, flags } = parseFlags(argv.slice(2));
+    // `hive chat reply <thread-id> <text>` — the supervisor session replies to
+    // the director (the ONLY director-facing channel from a chat agent).
+    if (sub === "reply") {
+      const threadId = _[0];
+      const text = _.slice(1).join(" ").trim() || (flags.text ? String(flags.text) : "");
+      if (!threadId || !text) die('usage: hive chat reply <thread-id> "<text>"');
+      await api("POST", `/api/chat/threads/${threadId}/reply`, { text });
+      console.log(`replied on ${threadId}`);
+      return;
+    }
+    // `hive chat send [--project <id>] [--thread <id>] <text>` — the director
+    // sends a message to the supervisor session (starts one if needed).
+    if (sub === "send") {
+      const text = _.join(" ").trim() || (flags.text ? String(flags.text) : "");
+      if (!text) die('usage: hive chat send [--project <id> | --thread <id>] "<text>"');
+      const r = await api("POST", `/api/chat/turn`, {
+        text,
+        ...(flags.thread ? { thread_id: String(flags.thread) } : {}),
+        ...(flags.project ? { project_id: String(flags.project) } : {}),
+      });
+      console.log(`thread ${r.thread_id}: ${r.delivery}${r.error ? ` (${r.error})` : ""}`);
+      return;
+    }
+    die("usage: hive chat reply <thread-id> <text>  |  hive chat send [--project <id>|--thread <id>] <text>");
   }
 
   if (cmd === "pr-marker") {

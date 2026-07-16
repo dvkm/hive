@@ -767,6 +767,40 @@ work. Use `POST /api/tasks/:id/events` with `type=evidence` for that.
   tasks with `source="planner"` and `parent_task_id` set to the source task (each
   gets a `created` event), while `reject` creates nothing (event only).
 
+### Director chat (persistent supervisor session over hive)
+A chat thread is backed by a **persistent supervisor session** — a long-lived
+herdr agent (an interactive `claude` session, same runtime as a task agent), NOT
+a per-turn subprocess. The session stays alive across the whole conversation,
+holds its own context, and coordinates hive's worker agents on the director's
+behalf ("one supervisor, fans out"). Its coordination actions (creating tasks,
+answering decisions, reading status) go through the SAME `$HIVE_CLI` + API +
+standing-authority gates every hive agent uses — merges/guarded/destructive ops
+are gated identically, and the session has no privileged path around them.
+Conversation history persists in `chat_threads` / `chat_messages` (append-only,
+same shape as `events`); each thread's `task_id` is its backing supervisor task
+(`source='chat_supervisor'`, kept out of the dispatcher and the board lanes).
+
+- `POST /api/chat/turn` body `{text (required), thread_id?, project_id?}` → `202 {thread_id, delivery, agent_target?, error?}` | `400` (empty text / no project scope) | `404` (unknown `thread_id`)
+  Director → supervisor. **Non-blocking by design**: it persists the director
+  message, makes sure the thread's supervisor session is live (spawning it on the
+  first message — `delivery:"spawned"` — or delivering into the running one —
+  `delivery:"delivered"`), and returns immediately. `project_id` is required to
+  start a new thread (the session runs in that project's repo). The message is
+  broadcast over SSE as `{type:"chat_message", message}`. The session thinks/acts
+  asynchronously and posts its reply via the `/reply` endpoint below — the
+  director never blocks on the model. `delivery` is `spawned` | `delivered` |
+  `failed`.
+- `POST /api/chat/threads/:id/reply` body `{text (required)}` → `200 {ok, message}` | `404` (unknown thread) | `400` (empty text)
+  Supervisor → director. The session calls this (via `hive chat reply <thread>
+  "..."`) to post its reply; appends an `assistant` message and streams it over
+  SSE as `{type:"chat_message", message}`. Loopback in practice (agents run on
+  localhost).
+- `GET /api/chat/threads?project_id=` → `200 [ChatThread, ...]` (newest first; `project_id` filter optional)
+- `GET /api/chat/threads/:id` → `200 {...ChatThread, messages:[ChatMessage]}` (oldest→newest) | `404`
+
+CLI: `hive chat send [--project <id>|--thread <id>] "<text>"` (director side) and
+`hive chat reply <thread-id> "<text>"` (the session's reply channel).
+
 ### Policies
 - `GET /api/policies?scope=` → `200 [Policy, ...]` (oldest first; `scope` filter optional)
 - `POST /api/policies` body `{title (required), body (required), scope?, active?}` → `201 Policy` (scope defaults to `global`)

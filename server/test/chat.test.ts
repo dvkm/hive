@@ -1,0 +1,134 @@
+// Director chat backed by a PERSISTENT supervisor session (a herdr agent).
+// The first director message spawns the session; later messages are delivered
+// into the live session; the session replies asynchronously via
+// POST /api/chat/threads/:id/reply. herdr is stubbed (injected exec) so the
+// test never spawns a real agent.
+import { test, expect, beforeAll, afterAll } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const HOME = mkdtempSync(join(tmpdir(), "hive-chat-"));
+process.env.HIVE_HOME = HOME;
+
+const { openDb } = await import("../src/db.ts");
+const { makeHandler } = await import("../src/api.ts");
+const { Herdr } = await import("../src/runtime/herdr.ts");
+const { composeSupervisorBrief, createThread } = await import("../src/chat.ts");
+import type { Exec, ExecResult } from "../src/exec.ts";
+
+const db = openDb(":memory:");
+const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
+const WT = join(HOME, "wt");
+const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x));
+const ALIVE = () => OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}');
+
+// Records every brief an `agent start` received and every `agent send`.
+const briefs: string[] = [];
+const sends: string[] = [];
+const exec: Exec = async (argv) => {
+  if (has(argv, "worktree", "create"))
+    return OK(`{"result":{"worktree":{"path":${JSON.stringify(WT)},"branch":"hive/x","open_workspace_id":"w1"}}}`);
+  if (has(argv, "agent", "get")) return ALIVE();
+  if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
+  if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t2"}}}');
+  if (has(argv, "agent", "start")) {
+    briefs.push(argv[argv.indexOf("--") + 2]); // `-- claude <brief> …`
+    return OK();
+  }
+  if (has(argv, "agent", "send")) {
+    sends.push(argv[argv.indexOf("send") + 2]);
+    return OK();
+  }
+  return OK();
+};
+const herdr = new Herdr(exec, "herdr");
+
+let server: any;
+let BASE = "";
+let projectId = "";
+beforeAll(async () => {
+  server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr }) });
+  BASE = `http://127.0.0.1:${server.port}`;
+  const p = await (await fetch(BASE + "/api/projects", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "acme", repo_path: WT }),
+  })).json();
+  projectId = p.id;
+});
+afterAll(() => server.stop(true));
+
+async function post(path: string, body: unknown) {
+  const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  return { status: res.status, json: await res.json() };
+}
+async function get(path: string) {
+  const res = await fetch(BASE + path);
+  return { status: res.status, json: await res.json() };
+}
+
+let threadId = "";
+
+test("first message spawns a persistent supervisor session (202, non-blocking)", async () => {
+  const { status, json } = await post("/api/chat/turn", { project_id: projectId, text: "spin up the login work" });
+  expect(status).toBe(202);
+  expect(json.delivery).toBe("spawned");
+  expect(json.thread_id).toBeTruthy();
+  threadId = json.thread_id;
+
+  // A backing supervisor task exists, tagged so the dispatcher/board ignore it.
+  const thread = (await get(`/api/chat/threads/${threadId}`)).json;
+  expect(thread.task_id).toBeTruthy();
+  const task = (await get(`/api/tasks/${thread.task_id}`)).json;
+  expect(task.source).toBe("chat_supervisor");
+  // The director message is persisted; the session's reply comes later via /reply.
+  expect(thread.messages.map((m: any) => m.role)).toEqual(["director"]);
+
+  // The spawn brief is the supervisor brief, carrying the thread id + reply verb.
+  expect(briefs.length).toBe(1);
+  expect(briefs[0]).toContain(threadId);
+  expect(briefs[0]).toContain("chat reply");
+  // The first director message rides along in the brief (queued steer).
+  expect(briefs[0]).toContain("spin up the login work");
+});
+
+test("later message is delivered into the live session (not a respawn)", async () => {
+  const before = briefs.length;
+  const { status, json } = await post("/api/chat/turn", { thread_id: threadId, text: "what's the status?" });
+  expect(status).toBe(202);
+  expect(json.delivery).toBe("delivered");
+  expect(briefs.length).toBe(before); // no new spawn
+  expect(sends.at(-1)).toContain("what's the status?");
+  expect(sends.at(-1)).toContain(threadId); // wire prefix tells the session where to reply
+});
+
+test("supervisor posts a reply that lands on the thread + streams", async () => {
+  const { status, json } = await post(`/api/chat/threads/${threadId}/reply`, { text: "Queued task #12 for the login work. Nothing blocking." });
+  expect(status).toBe(200);
+  expect(json.message.role).toBe("assistant");
+
+  const thread = (await get(`/api/chat/threads/${threadId}`)).json;
+  const last = thread.messages.at(-1);
+  expect(last.role).toBe("assistant");
+  expect(last.text).toContain("Queued task #12");
+});
+
+test("reply to an unknown thread 404s; empty text 400s", async () => {
+  expect((await post("/api/chat/threads/thr_nope/reply", { text: "hi" })).status).toBe(404);
+  expect((await post(`/api/chat/threads/${threadId}/reply`, { text: "" })).status).toBe(400);
+});
+
+test("starting a chat with no project is rejected (session needs a repo)", async () => {
+  const { status, json } = await post("/api/chat/turn", { text: "hello" });
+  expect(status).toBe(400);
+  expect(json.error).toContain("project_id is required");
+});
+
+test("composeSupervisorBrief bakes in the thread id, reply verb, and hard limits", () => {
+  const thread = createThread(db, { project_id: projectId, title: "t" });
+  const brief = composeSupervisorBrief(db, thread);
+  expect(brief).toContain(thread.id);
+  expect(brief).toContain(`chat reply ${thread.id}`);
+  expect(brief).toContain("CANNOT merge"); // destructive/guarded excluded
+  expect(brief).toContain("task create"); // coordination via worker tasks
+});
