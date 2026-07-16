@@ -680,6 +680,27 @@ work. Use `POST /api/tasks/:id/events` with `type=evidence` for that.
   tasks with `source="planner"` and `parent_task_id` set to the source task (each
   gets a `created` event), while `reject` creates nothing (event only).
 
+### Director chat (conversational supervisor over hive)
+A director message is routed to a short-lived `claude -p` supervisor subprocess
+(same pattern as the planner — NO persistent in-process LLM session). Live
+project status (recent tasks, open decisions, references) is injected into the
+prompt so read-only questions are answered directly; write intents come back as
+a scoped, server-executed allow-list. Conversation history persists in
+`chat_threads` / `chat_messages` (append-only, same shape as `events`).
+
+- `POST /api/chat/turn` body `{text (required), thread_id?, project_id?, task_id?}` → `200 {thread_id, reply, actions:[result]}` | `400` (empty text) | `404` (unknown `thread_id`) | `502` (subprocess failed — an assistant error message is still persisted)
+  Omit `thread_id` to start a new thread (scoped to `project_id`/`task_id`, titled
+  from the first line). Each turn persists the director message and the assistant
+  reply, and broadcasts both over SSE as `{type:"chat_message", message}`.
+  The supervisor may take these actions ONLY (the server-side allow-list, not the
+  model, is the boundary — unknown shapes are dropped, never executed):
+  - `create_task` → runs `POST /api/tasks` in-process (dedup + authz preserved); needs a project-scoped thread. Result `{type, ok, task_id, number, title}`.
+  - `answer_decision` → runs `POST /api/decisions/:id/answer` in-process (all resolvers fire). Result `{type, ok, decision_id, answer_key}`.
+  - `send_steer` → runs `POST /api/tasks/:id/send` in-process, keeping its `task.steer` standing-authority gate (a `deny`/`require_decision` surfaces as `ok:false` with the `decision_id`). Result `{type, ok, task_id, delivery}`.
+  Merges, guarded/destructive commands, and anything behind `POST /api/tasks/:id/guarded-action` have NO chat action — the supervisor tells the director to use the board's guarded controls instead.
+- `GET /api/chat/threads?project_id=` → `200 [ChatThread, ...]` (newest first; `project_id` filter optional)
+- `GET /api/chat/threads/:id` → `200 {...ChatThread, messages:[ChatMessage]}` (oldest→newest) | `404`
+
 ### Policies
 - `GET /api/policies?scope=` → `200 [Policy, ...]` (oldest first; `scope` filter optional)
 - `POST /api/policies` body `{title (required), body (required), scope?, active?}` → `201 Policy` (scope defaults to `global`)
