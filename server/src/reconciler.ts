@@ -260,8 +260,8 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   const exec = deps.exec ?? defaultExec;
   const h = deps.herdr ?? defaultHerdr;
   const tasks = db
-    .query(`SELECT id, state, pr_url, ci_status, head_sha, agent_target, project_id FROM tasks WHERE pr_url IS NOT NULL AND state IN ${NON_TERMINAL}`)
-    .all() as { id: string; state: string; pr_url: string; ci_status: string | null; head_sha: string | null; agent_target: string | null; project_id: string }[];
+    .query(`SELECT id, state, pr_url, ci_status, head_sha, agent_target, project_id, branch FROM tasks WHERE pr_url IS NOT NULL AND state IN ${NON_TERMINAL}`)
+    .all() as { id: string; state: string; pr_url: string; ci_status: string | null; head_sha: string | null; agent_target: string | null; project_id: string; branch: string | null }[];
 
   for (const t of tasks) {
     const r = await exec(["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup,mergeable,headRefOid"]);
@@ -340,7 +340,7 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       transition(db, t.id, "in_progress", { source: "reconciler", reason: "CI failing — returned to the agent to iterate" });
       broadcast({ type: "task", task: getTask(db, t.id) });
     } else if (String(data.mergeable).toUpperCase() === "CONFLICTING") {
-      await nudgeConflict(db, h, t, data.headRefOid ?? null);
+      await nudgeConflict(db, h, t, data.headRefOid ?? null, exec);
     }
   }
 }
@@ -396,8 +396,9 @@ async function nudgeCiFailure(
 async function nudgeConflict(
   db: DB,
   h: Herdr,
-  t: { id: string; pr_url: string; agent_target: string | null; project_id: string },
-  headSha: string | null
+  t: { id: string; pr_url: string; agent_target: string | null; project_id: string; branch: string | null },
+  headSha: string | null,
+  exec: Exec
 ): Promise<void> {
   const last = db
     .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_conflict' ORDER BY ts DESC LIMIT 1")
@@ -407,11 +408,35 @@ async function nudgeConflict(
       if ((JSON.parse(last.payload).head_sha ?? null) === headSha) return; // already nudged for this push
     } catch {}
   }
-  const project = db.query("SELECT config FROM projects WHERE id = ?").get(t.project_id) as { config: string } | undefined;
+  const project = db.query("SELECT config, repo_path FROM projects WHERE id = ?").get(t.project_id) as
+    | { config: string; repo_path: string | null }
+    | undefined;
   let base = "main";
   try {
     base = JSON.parse(project?.config ?? "{}").default_branch || "main";
   } catch {}
+
+  // GitHub reports CONFLICTING against origin/<base>, which is a DIVERGENT line
+  // from the LOCAL <base> that hive cuts worktrees from and merges back into.
+  // If the branch is already a clean fast-forward onto LOCAL <base>, the
+  // conflict is purely origin/<base>'s divergence — nudging "merge origin/base"
+  // makes the agent pull the stale fork in, pushing a new head that STILL
+  // conflicts, which defeats the per-SHA dedup and loops forever (task #321,
+  // PR #38 got 5+ identical nudges). Suppress the nudge: the director merges
+  // locally. See the origin/main-stale-fork learning.
+  if (project?.repo_path && t.branch) {
+    const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", base, t.branch]);
+    if (anc.code === 0) {
+      writeEvent(db, {
+        task_id: t.id,
+        source: "reconciler",
+        type: "pr_conflict",
+        payload: { pr_url: t.pr_url, head_sha: headSha, delivered: false, suppressed: "local-ff", base },
+      });
+      return;
+    }
+  }
+
   let delivered = false;
   let error: string | null = null;
   if (t.agent_target) {
