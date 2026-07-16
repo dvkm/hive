@@ -339,10 +339,11 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       )`,
     ],
   },
-  // Director chat: conversational surface over hive. A thread is optionally
-  // scoped to a project (and/or a single task); messages are an append-only log
-  // (same shape as `events`) so history persists in the state store. project_id
-  // has no FK — a thread can be project-less (general chat); task_id likewise.
+  // Director chat: a conversational surface backed by a PERSISTENT supervisor
+  // session. A thread is scoped to a project; task_id is the thread's backing
+  // supervisor task (its herdr agent IS the session). Messages are an
+  // append-only log (same shape as `events`) so history persists in the state
+  // store. No FK on project_id/task_id — set structurally by the chat handlers.
   {
     name: "v16-chat",
     statements: [
