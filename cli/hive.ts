@@ -34,6 +34,7 @@ Usage:
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
   hive chat reply <thread-id> "<text>"    (supervisor→director) post a reply on a chat thread
+  hive chat close <thread-id>             end a thread's live session (reclaims its worktree/agent)
   hive steer-all "message" [--project <id>]   broadcast a steer to every live agent
   hive tunnel                             expose hive to your phone over Tailscale HTTPS (private; enables push)
   hive remote                             print LAN URL + API token for phone access (PWA)
@@ -370,7 +371,16 @@ async function main() {
       console.log(`thread ${r.thread_id}: ${r.delivery}${r.error ? ` (${r.error})` : ""}`);
       return;
     }
-    die("usage: hive chat reply <thread-id> <text>  |  hive chat send [--project <id>|--thread <id>] <text>");
+    // `hive chat close <thread-id>` — end the thread's live session so its
+    // worktree/agent gets reclaimed (immediately, then the reaper backstop).
+    if (sub === "close") {
+      const threadId = _[0];
+      if (!threadId) die("usage: hive chat close <thread-id>");
+      await api("POST", `/api/chat/threads/${threadId}/close`, {});
+      console.log(`closed ${threadId}`);
+      return;
+    }
+    die("usage: hive chat reply <thread-id> <text>  |  hive chat send [--project <id>|--thread <id>] <text>  |  hive chat close <thread-id>");
   }
 
   if (cmd === "pr-marker") {
