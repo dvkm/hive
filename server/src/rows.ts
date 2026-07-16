@@ -5,7 +5,8 @@ export function parseProject(r: any) {
 }
 
 export function parseTask(r: any) {
-  return r; // no JSON columns; returned as-is
+  // depends_on is the one JSON column: a (possibly null) array of task ids.
+  return { ...r, depends_on: r.depends_on ? JSON.parse(r.depends_on) : [] };
 }
 
 export function parseEvent(r: any) {

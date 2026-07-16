@@ -56,10 +56,12 @@ export interface Task {
   branch: string | null;
   pr_url: string | null;
   ci_status: CiStatus;
+  head_sha: string | null; // PR's current head commit, refreshed by the reconciler's PR poll
   summary: string | null;
   source: string | null;
   parent_task_id: string | null;
   duplicate_of: string | null; // survivor id when cancelled as a duplicate
+  depends_on: string[]; // task ids this one is blocked by (unmet until they're done)
   health?: Health | null;
   requeued_to?: string | null; // successor id when failed + auto-requeued
   created_at: string;
@@ -116,6 +118,18 @@ export interface Decision {
   answer_note: string | null;
   draft_note: string | null;
   answered_at: string | null;
+  bundle?: DecisionBundle | null;
+}
+
+// Server-derived context bundled onto each open card (see decisionBundle in
+// api.ts): prior director choices on this project, the affected PR/branch, and
+// task spend so far — enough to decide without opening the task.
+export interface DecisionBundle {
+  task_number: number | null;
+  pr_url: string | null;
+  branch: string | null;
+  spend_usd: number;
+  prior_decisions: { id: string; title: string; answer: string | null; answered_at: string | null }[];
 }
 
 export interface Policy {

@@ -44,12 +44,12 @@ function freshDb(config: any = {}): { db: DB; projectId: string } {
     .run(projectId, "p", "/repo", JSON.stringify(config), now());
   return { db, projectId };
 }
-function makeTask(db: DB, projectId: string, extra: Partial<{ kind: string; source: string; state: string; agent_target: string }> = {}): string {
+function makeTask(db: DB, projectId: string, extra: Partial<{ kind: string; source: string; state: string; agent_target: string; depends_on: string[] }> = {}): string {
   const id = newId();
   const t = now();
   db.query(
-    "INSERT INTO tasks (id, project_id, title, state, kind, source, agent_target, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"
-  ).run(id, projectId, "t", extra.state ?? "queued", extra.kind ?? "ship", extra.source ?? null, extra.agent_target ?? null, t, t);
+    "INSERT INTO tasks (id, project_id, title, state, kind, source, agent_target, depends_on, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
+  ).run(id, projectId, "t", extra.state ?? "queued", extra.kind ?? "ship", extra.source ?? null, extra.agent_target ?? null, extra.depends_on ? JSON.stringify(extra.depends_on) : null, t, t);
   return id;
 }
 
@@ -143,6 +143,43 @@ test("review-parked agents don't consume working slots, but bound overhang at 2x
   expect(spawns.length).toBe(2);
 });
 
+test("a slow setup_argv on project A does not delay spawning a queued task on project B", async () => {
+  const db = openDb(":memory:");
+  const projA = newId("proj");
+  const projB = newId("proj");
+  db.query("INSERT INTO projects (id, name, repo_path, config, created_at) VALUES (?,?,?,?,?)")
+    .run(projA, "A", "/repoA", JSON.stringify({ auto_dispatch: true, setup_argv: ["slow.sh", "up", "{worktree}"] }), now());
+  db.query("INSERT INTO projects (id, name, repo_path, config, created_at) VALUES (?,?,?,?,?)")
+    .run(projB, "B", "/repoB", JSON.stringify({ auto_dispatch: true }), now());
+  const a = makeTask(db, projA); // created first: under the old serial loop, A's stuck setup blocked B
+  const b = makeTask(db, projB);
+
+  // A's setup_argv hook blocks until we release it; B has no setup and spawns fast.
+  let releaseSetup!: () => void;
+  const setupGate = new Promise<void>((res) => { releaseSetup = res; });
+  let setupStartedResolve!: () => void;
+  const setupStarted = new Promise<void>((res) => { setupStartedResolve = res; });
+
+  const herdr = stubHerdr().herdr; // handles worktree/workspace/tab/agent-start
+  // deps.exec runs the setup_argv hook; A's blocks until released, B has none.
+  const exec: Exec = async (argv) => {
+    if (argv[0].endsWith("/slow.sh")) { setupStartedResolve(); await setupGate; return OK(); }
+    return OK();
+  };
+
+  const done = dispatchOnce(db, { herdr, exec });
+  await setupStarted; // project A is now stuck inside its setup_argv
+  // Give project B's spawn chain a chance to finish while A stays blocked.
+  for (let i = 0; i < 50 && getTask(db, b).state !== "in_progress"; i++) await new Promise((r) => setTimeout(r, 0));
+
+  expect(getTask(db, b).state).toBe("in_progress"); // B spawned despite A being stuck in setup
+  expect(getTask(db, a).state).toBe("queued"); // A hasn't finished spawning yet (setup still running)
+
+  releaseSetup();
+  await done;
+  expect(getTask(db, a).state).toBe("in_progress"); // A completes once its setup returns
+});
+
 test("tracking-only (source=external) tasks are never auto-dispatched", async () => {
   const { db, projectId } = freshDb({ auto_dispatch: true });
   const id = makeTask(db, projectId, { source: "external" });
@@ -162,6 +199,29 @@ test("authority deny blocks auto-dispatch", async () => {
   expect(spawns.length).toBe(0);
   expect(getTask(db, id).state).toBe("queued");
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'authority_denied'").get(id)).toBeTruthy();
+});
+
+test("unmet depends_on blocks spawn (visible 'blocked by'), met deps let it through", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const dep = makeTask(db, projectId, { state: "in_progress" }); // not merged/done
+  const child = makeTask(db, projectId, { depends_on: [dep] });
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(0);
+  expect(getTask(db, child).state).toBe("queued");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dependency_blocked'").get(child)).toBeTruthy();
+
+  // re-running while still blocked does NOT write a second identical event (dedup)
+  await dispatchOnce(db, { herdr });
+  const blocks = db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'dependency_blocked'").get(child) as { n: number };
+  expect(blocks.n).toBe(1);
+
+  // once the dependency reaches a merged state, the child spawns
+  db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(dep);
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, child).state).toBe("in_progress");
 });
 
 test("spawn failure records one spawn_error and backs off (no retry storm)", async () => {

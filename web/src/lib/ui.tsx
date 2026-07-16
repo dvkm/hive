@@ -48,6 +48,32 @@ export function CiBadge({ status }: { status: CiStatus }) {
   return <span className={`ci ci-${status}`}>CI {status}</span>;
 }
 
+// "Blocked by #N, #M" chip: the dependencies from `depends_on` that aren't
+// done or cancelled yet. Renders nothing once every dependency resolves (or
+// the list is empty). A cancelled dep (e.g. folded into a duplicate) will never
+// reach 'done', so it clears too. An id that resolves to no known task counts
+// as unmet (we can't prove it done) and shows its short id.
+// ponytail: plain span, not a Link — the card wrapping it is already an anchor,
+// and nested anchors are invalid HTML.
+type DepTask = { id: string; number: number; title: string; state: State };
+export function BlockedBy({ depends_on, tasks }: { depends_on: string[]; tasks: DepTask[] }) {
+  const deps = depends_on ?? [];
+  if (!deps.length) return null;
+  const unmet = deps
+    .map((id) => ({ id, t: tasks.find((x) => x.id === id) }))
+    .filter(({ t }) => !t || (t.state !== "done" && t.state !== "cancelled"));
+  if (!unmet.length) return null;
+  const label = unmet.map(({ id, t }) => (t ? `#${t.number}` : id.slice(0, 6))).join(", ");
+  const tip = unmet
+    .map(({ id, t }) => (t ? `#${t.number} ${t.title} (${STATE_LABEL[t.state]})` : `${id} (unknown)`))
+    .join("\n");
+  return (
+    <span className="chip chip-blocked" title={`Blocked by:\n${tip}`}>
+      ⛔ blocked by {label}
+    </span>
+  );
+}
+
 const kb = (n: number) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${Math.round(n / 1024)} KB` : `${(n / 1048576).toFixed(1)} MB`);
 
 // Wraps a composer (steer box, brief textarea) to make it a drop zone, and

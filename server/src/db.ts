@@ -339,13 +339,27 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       )`,
     ],
   },
+  // The PR's current head commit, refreshed by the reconciler's PR poll
+  // alongside ci_status. Lets the review card flag evidence captured against
+  // an older commit as stale (task #226).
+  {
+    name: "v16-task-head-sha",
+    statements: [`ALTER TABLE tasks ADD COLUMN head_sha TEXT`],
+  },
+  // Task dependencies: a JSON array of task ids this task waits on. The
+  // dispatcher won't spawn — and the reconciler won't advance — a task until
+  // every listed dependency is merged/done (see unmetDeps in state.ts).
+  {
+    name: "v17-task-depends-on",
+    statements: [`ALTER TABLE tasks ADD COLUMN depends_on TEXT`],
+  },
   // Director chat: a conversational surface backed by a PERSISTENT supervisor
   // session. A thread is scoped to a project; task_id is the thread's backing
   // supervisor task (its herdr agent IS the session). Messages are an
   // append-only log (same shape as `events`) so history persists in the state
   // store. No FK on project_id/task_id — set structurally by the chat handlers.
   {
-    name: "v16-chat",
+    name: "v18-chat",
     statements: [
       `CREATE TABLE chat_threads (
         id TEXT PRIMARY KEY,

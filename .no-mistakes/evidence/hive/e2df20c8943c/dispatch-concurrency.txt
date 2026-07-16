@@ -1,0 +1,25 @@
+=== Task #285: setup_argv must not stall dispatch across projects ===
+Test: 'a slow setup_argv on project A does not delay spawning a queued task on project B'
+Project A (created first) has a setup_argv hook that blocks; Project B has none.
+
+----- (A) CONTROL: dispatcher forced back to SERIAL (old behavior) -----
+  175 |   expect(getTask(db, b).state).toBe("in_progress"); // B spawned despite A being stuck in setup
+  error: expect(received).toBe(expected)
+  Expected: "in_progress"
+  Received: "queued"
+  (fail) a slow setup_argv on project A does not delay spawning a queued task on project B [70.85ms]
+   0 pass
+   1 fail
+   1 expect() calls
+
+----- (B) ACTUAL: dispatcher dispatches projects CONCURRENTLY (this change) -----
+   1 pass
+   0 fail
+
+----- Full dispatcher + api + herdr suites on the change -----
+   62 pass
+   0 fail
+  Ran 62 tests across 3 files. [1.87s]
+
+Interpretation: the test PASSES only when different projects dispatch concurrently;
+under the old serial loop project B is stranded 'queued' behind A's blocked setup_argv.

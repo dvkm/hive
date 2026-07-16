@@ -160,6 +160,33 @@ test("runStackCmd is a no-op (no exec, no event) when argv is missing or empty",
   expect(db.query("SELECT 1 FROM events WHERE task_id = ?").all(id).length).toBe(0);
 });
 
+test("runStackCmd honors a per-call timeoutMs (setup can outlast teardown's 120s)", async () => {
+  const { db, projectId } = freshDb();
+  const id = seedTask(db, projectId, { state: "in_progress" });
+  // exec that resolves slower than the tiny timeout we pass -> should time out (124).
+  const slowExec: Exec = async () =>
+    new Promise<ExecResult>((r) => setTimeout(() => r(OK()), 50));
+  await runStackCmd(db, id, ["/abs/up.sh"], "/repo", "/wt", slowExec, {
+    type: "stack_setup",
+    source: "herdr",
+    timeoutMs: 10,
+  });
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'stack_setup'").get(id) as any;
+  const p = JSON.parse(ev.payload);
+  expect(p.ok).toBe(false);
+  expect(p.error).toContain("timed out (0s)"); // 10ms -> "0s", proves the message uses timeoutMs not a hardcoded 120
+
+  // Same slow exec, but a generous timeout -> completes ok.
+  const id2 = seedTask(db, projectId, { state: "in_progress" });
+  await runStackCmd(db, id2, ["/abs/up.sh"], "/repo", "/wt", slowExec, {
+    type: "stack_setup",
+    source: "herdr",
+    timeoutMs: 5000,
+  });
+  const ev2 = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'stack_setup'").get(id2) as any;
+  expect(JSON.parse(ev2.payload).ok).toBe(true);
+});
+
 // ---- cleanupTask orchestration ----
 
 // A herdr stub whose branch is treated as merged+clean, so cleanupWorktree removes.

@@ -60,6 +60,51 @@ export function getTask(db: DB, id: string): any | null {
   return r ? parseTask(r) : null;
 }
 
+// A dependency is "met" once its code has landed: PR merged (verifying) or
+// fully done. Every other state — still queued/working/in review, or failed/
+// cancelled — blocks the dependent. Returns the blocking dep rows (id, number,
+// title, state) so callers can name them in a visible 'blocked by task X'.
+// ponytail: a failed dep auto-requeues under a NEW id, so a task depending on
+// the old (now-failed) id blocks until the director edits/cancels it. Visible,
+// not silent — upgrade to re-point deps at the requeue successor if it bites.
+const DEP_MET_STATES = ["verifying", "done"];
+export function unmetDeps(db: DB, task: { depends_on?: string[] } | null | undefined): { id: string; number: number; title: string; state: string }[] {
+  const ids = task?.depends_on ?? [];
+  if (!ids.length) return [];
+  const blocking: { id: string; number: number; title: string; state: string }[] = [];
+  for (const id of ids) {
+    const dep = db.query("SELECT id, number, title, state FROM tasks WHERE id = ?").get(id) as
+      | { id: string; number: number; title: string; state: string }
+      | undefined;
+    // A vanished dependency can never be met, so it stays blocking (visible).
+    if (!dep || !DEP_MET_STATES.includes(dep.state)) blocking.push(dep ?? { id, number: 0, title: "(unknown task)", state: "missing" });
+  }
+  return blocking;
+}
+
+// Record a visible 'blocked by task X' — but only when the blocking set changed
+// since the last such event, so a 30s dispatch loop doesn't spam the timeline.
+// Mirrors the dedup discipline of nudgeConflict/ci_failure in the reconciler.
+export function noteDependencyBlock(
+  db: DB,
+  taskId: string,
+  blocking: { number: number; title: string }[],
+  source: string
+): void {
+  const blocked_by = blocking.map((b) => `#${b.number} ${b.title}`);
+  const note = `blocked by ${blocked_by.join(", ")}`;
+  const last = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'dependency_blocked' ORDER BY ts DESC LIMIT 1")
+    .get(taskId) as { payload: string } | undefined;
+  if (last) {
+    try {
+      if (JSON.parse(last.payload).note === note) return; // same blockers already surfaced
+    } catch {}
+  }
+  writeEvent(db, { task_id: taskId, source, type: "dependency_blocked", payload: { note, blocked_by } });
+  broadcastTask(db, getTask(db, taskId));
+}
+
 export function canTransition(from: State, to: State): boolean {
   if (!STATES.includes(to)) return false;
   if (to === "failed") return !TERMINAL.includes(from);
@@ -76,6 +121,17 @@ export function evidenceCount(db: DB, taskId: string, kind?: string): number {
   const row = kind
     ? db.query(sql).get(taskId, kind)
     : db.query(sql).get(taskId);
+  return (row as { n: number }).n;
+}
+
+// Count evidence captured from a specific commit SHA (stamped into meta.commit_sha
+// when the agent emits it). Drives the freshness gate: the evidence the director
+// sees must reflect the latest commit, so a handoff after new commits requires
+// re-captured evidence tied to the current HEAD (the #223 stale-screenshot bug).
+export function evidenceAtSha(db: DB, taskId: string, sha: string): number {
+  const row = db
+    .query("SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND json_extract(meta, '$.commit_sha') = ?")
+    .get(taskId, sha);
   return (row as { n: number }).n;
 }
 
@@ -129,6 +185,59 @@ export function expireOrphanedDecisions(db: DB): number {
   return n;
 }
 
+// The one guard against re-queuing a PR whose latest review verdict is "changes
+// requested" before the agent has actually acted (#163, #234). Returns true =
+// still unaddressed = DON'T insert into the review queue. "Addressed" means
+// something new landed after the latest changes_requested: a new commit pushed
+// (the reconciler's `pr_synchronized` event — hive's stand-in for GitHub's
+// synchronize webhook), fresh evidence, or a fresh review_summary. Any of the
+// three clears the block. Callers apply this at every point that inserts into
+// the queue (the idle backstop here, and handOffToReview for the reconciler/
+// link-pr paths), so a bare CI-green poll can no longer bounce a task the
+// director just sent back straight into review with no new work on it.
+export function changesRequestUnaddressed(db: DB, taskId: string): boolean {
+  const cr: any = db
+    .query("SELECT ts, payload FROM events WHERE task_id = ? AND type = 'changes_requested' ORDER BY ts DESC LIMIT 1")
+    .get(taskId);
+  if (!cr?.ts) return false; // never sent back → nothing to guard
+  // Evidence-only / review_summary path: a changes_requested can be evidence-only
+  // (#163), so either of these after the request clears the block immediately.
+  const nonCommit = db
+    .query(
+      `SELECT 1 FROM events WHERE task_id = ? AND type = 'review_summary' AND ts > ?
+       UNION SELECT 1 FROM evidence WHERE task_id = ? AND ts > ? LIMIT 1`
+    )
+    .get(taskId, cr.ts, taskId, cr.ts);
+  if (nonCommit) return false;
+  // Commit signal: the baseline is the head SHA at request time (stamped into the
+  // changes_requested payload; null when no pr_synchronized existed yet). A
+  // pr_synchronized on the SAME head — or the first post-request observation when
+  // the head was unknown — is NOT new work; only a later DIFFERENT head is.
+  let baseline: string | null = null;
+  try {
+    baseline = JSON.parse(cr.payload ?? "{}").head_sha ?? null;
+  } catch {
+    baseline = null;
+  }
+  const syncs = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_synchronized' AND ts > ? ORDER BY ts ASC")
+    .all(taskId, cr.ts) as { payload: string }[];
+  for (const s of syncs) {
+    let sha: string | null = null;
+    try {
+      sha = JSON.parse(s.payload).head_sha ?? null;
+    } catch {
+      sha = null;
+    }
+    if (baseline === null) {
+      baseline = sha; // first observation when head-at-request was unknown
+      continue;
+    }
+    if (sha !== null && sha !== baseline) return false; // genuinely new commit → addressed
+  }
+  return true; // still unaddressed
+}
+
 // The finished-handoff, shared by every herdr-signal path (the reconciler's
 // poll backstop and the supervise wait loop): an agent observed idle/gone on an
 // in_progress task that has a real work product (a pr_url, or a scout report)
@@ -148,22 +257,9 @@ export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, s
   // evidence isn't reviewable (the protocol says attach evidence BEFORE ready;
   // the agent's explicit `ready` emit is gated the same way elsewhere).
   if (!hasReport && evidenceCount(db, taskId) < 1) return false;
-  // After a changes-request, mere idleness is NOT "addressed" — an agent that
-  // acknowledges in one turn goes idle and used to bounce straight back into
-  // the review queue (#163: "no evidence" requested, agent acked, re-queued in
-  // seconds). Require visible new work (evidence or a review_summary) newer
-  // than the latest changes_requested before the backstop re-advances.
-  const cr: any = db
-    .query("SELECT MAX(ts) AS ts FROM events WHERE task_id = ? AND type = 'changes_requested'")
-    .get(taskId);
-  if (cr?.ts) {
-    const addressed = db
-      .query(
-        "SELECT 1 FROM events WHERE task_id = ? AND type IN ('review_summary') AND ts > ? UNION SELECT 1 FROM evidence WHERE task_id = ? AND ts > ? LIMIT 1"
-      )
-      .get(taskId, cr.ts, taskId, cr.ts);
-    if (!addressed) return false;
-  }
+  // After a changes-request, mere idleness is NOT "addressed" (#163). Require
+  // visible new work before re-advancing — the shared guard below.
+  if (changesRequestUnaddressed(db, taskId)) return false;
   writeEvent(db, {
     task_id: taskId,
     source,
