@@ -40,6 +40,18 @@ The spawn itself is the shared `spawnAgent()` core (also used by
 `POST /api/tasks/:id/spawn`), so the auto path and the manual button behave
 identically: worktree create, agent start, `spawned` event, `queued→in_progress`.
 
+**Concurrency within a pass.** Queued tasks are grouped by project and the
+projects are dispatched **concurrently**; each project's own tasks stay
+**serial**. `spawnAgent` runs the project's `setup_argv` hook inside the
+worktree-ready callback (up to its 120s timeout, e.g. bringing up a docker
+stack), so a serial across-all-projects loop let one slow setup stall dispatch
+for every other project. Serial *within* a project is deliberate: herdr
+serializes `worktree create` globally, so firing a project's spawns at once
+would `spawn_error` on the create step; the slow `setup_argv` runs after that
+lock releases, so parallelizing across projects is the safe win. The
+per-project count caches (`max_agents` gate) are only ever keyed by a project's
+own id, so concurrent project loops never race on shared state.
+
 ## Visible interactive fleet (spawn design)
 
 hive uses herdr the way priortool's `docs/herdr-backend.md` proved it should be

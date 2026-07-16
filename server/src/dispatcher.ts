@@ -27,6 +27,7 @@ import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
 import { unmetDeps, noteDependencyBlock } from "./state.ts";
+import type { Exec } from "./exec.ts";
 
 // Chores included since 2026-07-12: the queue sat at 10 tasks / 1 live agent
 // because 9 were agent-filed follow-up FIXES tagged chore — "chores are titled
@@ -53,6 +54,7 @@ export interface DispatcherDeps {
   nowMs?: () => number; // injectable clock (tests + backoff)
   supervise?: boolean; // start the herdr wait loop after spawn (prod wiring)
   hiveUrl?: string;
+  exec?: Exec; // injectable subprocess for the setup_argv spawn hook (tests pass a stub)
 }
 
 // One dispatch pass. Isolated per task so one bad task never stops the rest.
@@ -88,56 +90,77 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   const workingFor = (pid: string) => countFor(workingCount, WORKING_STATES, pid);
   const activeFor = (pid: string) => countFor(activeCount, ACTIVE_STATES, pid);
 
-  for (const task of queued) {
-    try {
-      const proj = getProject(task.project_id);
-      if (!proj?.repo_path) continue; // no repo -> can't spawn
-      const cfg = proj.config ?? {};
-      if (cfg.auto_dispatch !== true) continue; // opt-in only
+  // One project's queued tasks, spawned serially. spawnAgent runs the project's
+  // setup_argv hook inside the worktree-ready callback (api.ts), which can take
+  // up to its 120s timeout (e.g. bringing up a docker stack). Kept serial WITHIN
+  // a project because herdr serializes worktree-create globally with only a
+  // single retry — firing a project's spawns concurrently would spawn_error on
+  // the create step. Different projects run concurrently (see below), so a slow
+  // setup on one project no longer stalls dispatch for the others.
+  const dispatchProject = async (tasks: typeof queued) => {
+    for (const task of tasks) {
+      try {
+        const proj = getProject(task.project_id);
+        if (!proj?.repo_path) continue; // no repo -> can't spawn
+        const cfg = proj.config ?? {};
+        if (cfg.auto_dispatch !== true) continue; // opt-in only
 
-      const kinds = Array.isArray(cfg.dispatch_kinds) ? cfg.dispatch_kinds : DISPATCH_KINDS_DEFAULT;
-      // A requeue is recovery for work already dispatched once (auto-requeue on
-      // context-full/death, or the director's recovery card) — excluding chores
-      // here stranded every requeued braindump in 'queued' forever ("failed —
-      // awaiting triage" with a successor nobody spawns, task #135).
-      if (!kinds.includes(task.kind) && task.source !== "requeue") continue; // chore / human-titled tasks excluded
+        const kinds = Array.isArray(cfg.dispatch_kinds) ? cfg.dispatch_kinds : DISPATCH_KINDS_DEFAULT;
+        // A requeue is recovery for work already dispatched once (auto-requeue on
+        // context-full/death, or the director's recovery card) — excluding chores
+        // here stranded every requeued braindump in 'queued' forever ("failed —
+        // awaiting triage" with a successor nobody spawns, task #135).
+        if (!kinds.includes(task.kind) && task.source !== "requeue") continue; // chore / human-titled tasks excluded
 
-      if (task.source?.startsWith("intake_") && !isReviewed(db, task.id)) continue; // unreviewed intake
-      if (task.source === "external") continue; // tracking-only: another agent's kanban entry, never spawned
+        if (task.source?.startsWith("intake_") && !isReviewed(db, task.id)) continue; // unreviewed intake
+        if (task.source === "external") continue; // tracking-only: another agent's kanban entry, never spawned
 
-      const cap = Number.isFinite(cfg.max_agents) ? Number(cfg.max_agents) : MAX_AGENTS_DEFAULT;
-      if (workingFor(task.project_id) >= cap) continue; // working-concurrency cap
-      if (activeFor(task.project_id) >= cap * REVIEW_OVERHANG) continue; // review overhang bound
+        const cap = Number.isFinite(cfg.max_agents) ? Number(cfg.max_agents) : MAX_AGENTS_DEFAULT;
+        if (workingFor(task.project_id) >= cap) continue; // working-concurrency cap
+        if (activeFor(task.project_id) >= cap * REVIEW_OVERHANG) continue; // review overhang bound
 
-      if (inBackoff(db, task.id, nowMs)) continue; // still cooling down after a spawn failure
+        if (inBackoff(db, task.id, nowMs)) continue; // still cooling down after a spawn failure
 
-      const authz = authorize(db, {
-        project_id: task.project_id,
-        action: "task.dispatch",
-        target: task.title,
-        task_id: task.id,
-      });
-      if (authz.effect !== "allow") continue; // deny or require_decision blocks the auto-spawn
+        const authz = authorize(db, {
+          project_id: task.project_id,
+          action: "task.dispatch",
+          target: task.title,
+          task_id: task.id,
+        });
+        if (authz.effect !== "allow") continue; // deny or require_decision blocks the auto-spawn
 
-      // Dependency gate: don't spawn until every depends_on task is merged/done.
-      // Same shape as the authz gate above — skip and surface a visible reason.
-      const blocking = unmetDeps(db, task);
-      if (blocking.length) {
-        noteDependencyBlock(db, task.id, blocking, "dispatcher");
-        continue;
+        // Dependency gate: don't spawn until every depends_on task is merged/done.
+        // Same shape as the authz gate above — skip and surface a visible reason.
+        const blocking = unmetDeps(db, task);
+        if (blocking.length) {
+          noteDependencyBlock(db, task.id, blocking, "dispatcher");
+          continue;
+        }
+
+        const r = await spawnAgent(db, h, task.id, { hiveUrl: deps.hiveUrl, supervise: deps.supervise, exec: deps.exec });
+        if (r.ok) {
+          workingCount.set(task.project_id, workingFor(task.project_id) + 1);
+          activeCount.set(task.project_id, activeFor(task.project_id) + 1);
+        }
+        // On failure spawnAgent already wrote a single spawn_error event; the
+        // backoff above governs the next attempt (no immediate retry).
+      } catch (e) {
+        console.error(`[hive] dispatcher task ${task.id}:`, e);
       }
-
-      const r = await spawnAgent(db, h, task.id, { hiveUrl: deps.hiveUrl, supervise: deps.supervise });
-      if (r.ok) {
-        workingCount.set(task.project_id, workingFor(task.project_id) + 1);
-        activeCount.set(task.project_id, activeFor(task.project_id) + 1);
-      }
-      // On failure spawnAgent already wrote a single spawn_error event; the
-      // backoff above governs the next attempt (no immediate retry).
-    } catch (e) {
-      console.error(`[hive] dispatcher task ${task.id}:`, e);
     }
+  };
+
+  // Group queued tasks by project (order within a project preserved from the
+  // created_at sort) and dispatch the projects concurrently. The count-cache
+  // Maps are only ever touched for a project's own key, so concurrent project
+  // loops never race on shared state.
+  const byProject = new Map<string, typeof queued>();
+  for (const task of queued) {
+    const arr = byProject.get(task.project_id);
+    if (arr) arr.push(task);
+    else byProject.set(task.project_id, [task]);
   }
+  await Promise.all([...byProject.values()].map(dispatchProject));
 }
 
 // An intake task is "reviewed" once the director signals it: either a dedicated
