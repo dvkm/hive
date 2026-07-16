@@ -409,10 +409,11 @@ export class Herdr {
     const label = fleetLabel(args.taskId, args.title);
 
     let create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
-    // herdr runs worktree ops one at a time; a concurrent spawn/cleanup makes
-    // this fail transiently. One short-wait retry clears it.
-    if (create.code !== 0 && isWorktreeBusyError(create)) {
-      await new Promise((r) => setTimeout(r, 2000));
+    // herdr runs worktree ops one at a time; concurrent cross-project spawns
+    // make this fail transiently. Retry with jittered backoff so simultaneous
+    // contenders spread out instead of thundering-herding a single retry.
+    for (let attempt = 1; create.code !== 0 && isWorktreeBusyError(create) && attempt < 5; attempt++) {
+      await new Promise((r) => setTimeout(r, 500 * attempt + Math.random() * 400));
       create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
     }
     // A respawn reuses the task id, and so the branch and the worktree path. A

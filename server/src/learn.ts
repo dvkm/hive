@@ -152,6 +152,57 @@ export function resolveRefCaptureForDecision(db: DB, decisionId: string, answerK
   return true;
 }
 
+// ---- decision knowledge ----------------------------------------------------
+// Resolved decision cards used to vanish: the answer was relayed to the asking
+// agent, then gone. So the next crew hit the same fork and raised the same card,
+// and the director answered it again. Now every answered decision the resolvers
+// DON'T claim (i.e. a genuine product/preference question, not a mechanical
+// grant/recovery/dedup card) is persisted as a durable project preference,
+// deduped by (project, title): re-asking the same question bumps occurrences
+// instead of duplicating. Surfaced in `hive recall` + briefs so crews consult
+// the prior answer before re-raising the card.
+export function recordDecisionKnowledge(
+  db: DB,
+  decisionId: string,
+  answerKey: string,
+  answerNote: string | null
+): void {
+  try {
+    const d: any = db
+      .query("SELECT task_id, title, options FROM decisions WHERE id = ?")
+      .get(decisionId);
+    if (!d) return;
+    const task: any = db.query("SELECT project_id FROM tasks WHERE id = ?").get(d.task_id);
+    if (!task) return;
+    const label =
+      (JSON.parse(d.options || "[]") as { key: string; label: string }[]).find((o) => o.key === answerKey)?.label ??
+      answerKey;
+    const body = `**Answer:** ${label}` + (answerNote?.trim() ? `\n${answerNote.trim()}` : "");
+    const t = now();
+    const existing = db
+      .query("SELECT id, occurrences FROM learnings WHERE project_id = ? AND kind = 'decision' AND title = ? LIMIT 1")
+      .get(task.project_id, d.title) as { id: string; occurrences: number } | undefined;
+    if (existing) {
+      // Same question asked again — refresh the answer and bump the counter.
+      db.query(
+        "UPDATE learnings SET body = ?, occurrences = occurrences + 1, last_seen = ?, status = 'active', source_task_id = ? WHERE id = ?"
+      ).run(body, t, d.task_id, existing.id);
+      broadcast({ type: "learning", learning: { id: existing.id, occurrences: existing.occurrences + 1 } });
+      return;
+    }
+    const id = newId("lrn");
+    db.query(
+      `INSERT INTO learnings (id, project_id, title, body, source_task_id, occurrences,
+        first_seen, last_seen, status, root_cause_task_id, kind)
+       VALUES (?,?,?,?,?,1,?,?, 'active', NULL, 'decision')`
+    ).run(id, task.project_id, d.title, body, d.task_id, t, t);
+    broadcast({ type: "learning", learning: { id, project_id: task.project_id, title: d.title, body, kind: "decision" } });
+  } catch (e) {
+    // A knowledge write must never break answering the decision.
+    console.error("[hive] recordDecisionKnowledge:", e);
+  }
+}
+
 export function recordSystemLearning(
   db: DB,
   projectId: string,

@@ -1,0 +1,20 @@
+=== 1. Create the dependency task (a backend migration, still in progress) ===
+  created d36158629971  #41  state=in_progress  (PR not merged yet)
+
+=== 2. CLI --depends-on typo is rejected at the API boundary (can't block forever) ===
+  POST /api/tasks depends_on=does-not-exist  ->  HTTP 400  {"error":"unknown depends_on task: does-not-exist"}
+
+=== 3. Create the dependent task pointing at the real dep id ===
+  created f93500a99827  #42  state=queued  depends_on=["d36158629971"]
+
+=== 4. Dispatcher runs (auto_dispatch on) — dependency unmet, spawn is GATED ===
+  agents spawned: 0   child state: queued
+  visible timeline status:  "blocked by #41 ship the DB migration"
+
+=== 5. Loop runs again 30s later — event is DEDUPED, no timeline spam ===
+  dependency_blocked events after 2 dispatch passes: 1
+
+=== 6. The migration merges (state -> done). Gate opens, dependent spawns ===
+  agents spawned: 1   child state: in_progress
+
+RESULT: dependency gate held the task while blocked, surfaced a visible reason, then released it on merge. PASS.

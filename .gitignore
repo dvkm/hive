@@ -8,3 +8,5 @@ web/dist
 .hive/
 .DS_Store
 .serena/
+*.key
+*.crt
