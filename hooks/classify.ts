@@ -436,11 +436,16 @@ export function classify(
 
   const emitDataOnly = isHiveEmitDataOnly(cmd);
   // No executor and no command substitution → quoted strings / heredoc bodies
-  // are data; scan with them stripped so text ABOUT rm isn't treated AS rm.
-  // Substitution ($(…), backticks, <(…)) executes even inside double quotes,
-  // so its presence forces the full-text scan.
+  // are data; scan with them stripped so text ABOUT rm (or find -exec) isn't
+  // treated AS the command. Test EXECUTOR against the STRIPPED text: an executor
+  // word appearing only inside quotes (a commit message mentioning `-exec`,
+  // `bash`, `eval`, …) is prose, not a real executor, so it must not disable
+  // stripping and let the whole-string DANGEROUS scan hit the quoted data.
+  // Substitution ($(…), backticks, <(…)) executes even inside double quotes, so
+  // its presence (checked on the RAW command) still forces the full-text scan.
+  const stripped = stripDataText(cmd);
   const scanTarget =
-    EXECUTOR.test(cmd) || /\$\(|`|<\(/.test(cmd) ? cmd : stripDataText(cmd);
+    EXECUTOR.test(stripped) || /\$\(|`|<\(/.test(cmd) ? cmd : stripped;
   for (const [rx, reason] of DANGEROUS) {
     if (!rx.test(scanTarget)) continue;
     if (emitDataOnly) continue; // arguments are data, not executed
