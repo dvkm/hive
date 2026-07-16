@@ -16,6 +16,8 @@ import { defaultExec } from "./exec.ts";
 // Per-project stack lifecycle command. Two symmetric hooks share this runner:
 //   config.setup_argv    = ["infra/worktree/wt.sh", "up",   "{worktree}"]  (spawn time, before agent starts)
 //   config.cleanup_argv  = ["infra/worktree/wt.sh", "down", "{worktree}"]  (before worktree removal)
+// Setup gets its own budget via config.stack_setup_timeout_ms (default 600_000);
+// teardown keeps the short 120s default.
 // Setup runs AFTER the worktree exists but BEFORE the agent starts (see the
 // worktree-ready callback in api.ts) so agents don't have to install deps /
 // bring up their docker stack themselves; teardown runs BEFORE the worktree is
@@ -31,17 +33,25 @@ export async function runStackCmd(
   repoPath: string,
   worktreePath: string,
   exec: Exec,
-  kind: { type: "stack_setup" | "stack_teardown"; source: string }
+  kind: { type: "stack_setup" | "stack_teardown"; source: string; timeoutMs?: number }
 ): Promise<void> {
   if (!Array.isArray(argvTemplate) || !argvTemplate.length) return;
   const argv = argvTemplate.map((a) => String(a).replaceAll("{worktree}", worktreePath));
   if (!argv[0].startsWith("/")) argv[0] = `${repoPath}/${argv[0]}`;
+  // Teardown ('wt.sh down') is quick; setup ('wt.sh up') on a cold worktree
+  // installs deps + brings up docker and routinely runs past 2 min, so it gets
+  // its own (configurable) budget. Timing out setup would start the agent
+  // against a half-ready stack. See config.stack_setup_timeout_ms.
+  const timeoutMs = kind.timeoutMs ?? 120_000;
   try {
     // Exec has no timeout; race one so a hung hook can't stall the reaper/spawn.
     const r = await Promise.race([
       exec(argv, { cwd: repoPath }),
       new Promise<{ code: number; stdout: string; stderr: string }>((resolve) =>
-        setTimeout(() => resolve({ code: 124, stdout: "", stderr: `${kind.type} command timed out (120s)` }), 120_000)
+        setTimeout(
+          () => resolve({ code: 124, stdout: "", stderr: `${kind.type} command timed out (${Math.round(timeoutMs / 1000)}s)` }),
+          timeoutMs
+        )
       ),
     ]);
     writeEvent(db, {
