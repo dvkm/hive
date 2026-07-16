@@ -882,7 +882,7 @@ const FEED_CATEGORIES: Record<string, string[]> = {
   state: ["state_change", "ready_for_review"],
   decision: ["needs-decision", "decision_answered", "planned", "authority_required", "authority_granted"],
   evidence: ["evidence", "smoke_passed"],
-  incident: ["blocked", "stale", "spawn_error", "smoke_failed", "steer_error", "planner_error", "supervise_error", "authority_denied"],
+  incident: ["blocked", "stale", "spawn_error", "smoke_failed", "steer_error", "planner_error", "supervise_error", "authority_denied", "merge_failed"],
   lifecycle: ["created", "spawned", "agent_status", "status", "steer", "note", "ci_status", "pr_merged", "planning", "assistant_text", "tool_use", "agent_turn_end"],
 };
 

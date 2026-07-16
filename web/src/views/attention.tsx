@@ -76,7 +76,9 @@ export function UnhealthyRow({ task }: { task: Task }) {
         {task.title}
       </Link>
       {project && <span className="chip">{project.name}</span>}
-      <span className={`attn-reason attn-${h.status}`}>{h.reason || HEALTH_LABEL[h.status]}</span>
+      <span className={`attn-reason attn-${h.status}`} title={h.reason || HEALTH_LABEL[h.status]}>
+        {h.reason || HEALTH_LABEL[h.status]}
+      </span>
       <span className="attn-age">{age}</span>
       <div className="attn-actions">
         {task.agent_target && (

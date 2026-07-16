@@ -11,8 +11,14 @@ import { AttentionTray, needsAttention } from "./attention";
 // "no activity 22m". Server-provided reason + live-ticking since-age.
 function HealthLine({ health }: { health: Health }) {
   const age = useRelTime(health.since);
-  const text = health.status === "dead" ? "agent gone" : `${health.reason || HEALTH_LABEL[health.status]} ${age}`;
-  return <div className={`card-attn attn-${health.status}`}>{text}</div>;
+  const dead = health.status === "dead";
+  const reason = dead ? "agent gone" : health.reason || HEALTH_LABEL[health.status];
+  return (
+    <div className={`card-attn attn-${health.status}`} title={dead ? reason : `${reason} ${age}`}>
+      <span className="card-attn-reason">{reason}</span>
+      {!dead && <span className="card-attn-age">{age}</span>}
+    </div>
+  );
 }
 
 const COLUMNS: State[] = [

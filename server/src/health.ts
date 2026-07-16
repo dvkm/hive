@@ -21,6 +21,56 @@ export interface Health {
 // Queued / done / failed / cancelled tasks get `null`.
 const HEALTH_STATES = new Set(["in_progress", "needs_decision", "in_review", "verifying"]);
 
+// Did anything after the merge_failed at `sinceTs` actually resolve it?
+// A landed merge (merged/pr_merged) is unambiguous. A re-handoff into review is
+// NOT: neither path that writes one can see a merge conflict, because the
+// conflict is against the BASE branch while the PR stays OPEN with its own
+// checks green. The reconciler's PR poll (handOffToReview → a bare
+// state_change{to:"in_review"}) bounces the task back ~60s later on green CI
+// alone; advanceIfFinished (→ ready_for_review) fires on the next probe tick
+// once the agent is idle, and a conflict-bounced task keeps the pr_url and
+// evidence those gates check — so an agent that never got the rebase steer
+// (a best-effort send, api.ts) still looks "finished". Both therefore need
+// a pushed commit as evidence the agent pushed a fix, mirroring the guard
+// changesRequestUnaddressed applies to the changes_requested bounce. The
+// baseline is the head SHA as of the failure; the reconciler's FIRST-ever
+// observation of a PR writes a pr_synchronized on an unchanged head, so only a
+// LATER, DIFFERENT head counts as new work.
+function headShaOf(e: { payload: string }): string | null {
+  try {
+    return JSON.parse(e.payload).head_sha ?? null;
+  } catch {
+    return null;
+  }
+}
+function pushedSince(events: { type: string; ts: string; payload: string }[], sinceTs: string): boolean {
+  const prior = events.find((e) => e.type === "pr_synchronized" && e.ts <= sinceTs); // DESC → newest at-or-before
+  let baseline = prior ? headShaOf(prior) : null;
+  for (const e of events.filter((x) => x.type === "pr_synchronized" && x.ts > sinceTs).reverse()) {
+    const sha = headShaOf(e);
+    if (baseline === null) {
+      baseline = sha; // head at failure time was unknown → first observation is the baseline
+      continue;
+    }
+    if (sha !== null && sha !== baseline) return true;
+  }
+  return false;
+}
+function mergeFailureResolved(events: { type: string; ts: string; payload: string }[], sinceTs: string): boolean {
+  const after = events.filter((e) => e.ts > sinceTs);
+  if (after.some((e) => e.type === "merged" || e.type === "pr_merged")) return true;
+  if (!pushedSince(events, sinceTs)) return false;
+  return after.some((e) => {
+    if (e.type === "ready_for_review") return true;
+    if (e.type !== "state_change") return false;
+    try {
+      return JSON.parse(e.payload).to === "in_review";
+    } catch {
+      return false;
+    }
+  });
+}
+
 function staleMs(): number {
   return Number(process.env.HIVE_STALE_MS || 15 * 60 * 1000);
 }
@@ -57,6 +107,29 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   if (lastStatus === "gone") return { status: "dead", reason: "agent gone from herdr", since: lastStatusTs };
   if (lastStatus === "blocked")
     return { status: "stuck", reason: "agent blocked (waiting on you)", since: lastStatusTs };
+
+  // A merge_failed event's reason must stay visible past the moment the task
+  // bounces back to in_progress (or stays in_review on a non-conflict
+  // failure) — otherwise it reads as generic recent activity and the reason
+  // vanishes within moments (task #322). Bounded by staleMs() like the rest
+  // of health, and only until something newer actually resolves it (a landed
+  // merge, or a re-handoff carrying evidence the agent pushed a fix).
+  if (task.state === "in_progress" || task.state === "in_review") {
+    const mergeFailedEvent = events.find((e) => e.type === "merge_failed");
+    if (
+      mergeFailedEvent &&
+      nowMs - Date.parse(mergeFailedEvent.ts) < staleMs() &&
+      !mergeFailureResolved(events, mergeFailedEvent.ts)
+    ) {
+      let reason = "merge failed";
+      try {
+        reason = `merge failed: ${JSON.parse(mergeFailedEvent.payload).reason || "unknown error"}`;
+      } catch {
+        /* ignore */
+      }
+      return { status: "stuck", reason, since: mergeFailedEvent.ts };
+    }
+  }
 
   // Parked waiting on the DIRECTOR (a decision card or a review), not the
   // agent: silence is expected, so age-based silent/stuck must not apply
