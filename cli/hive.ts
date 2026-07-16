@@ -10,7 +10,7 @@ const USAGE = `hive — local orchestration control plane
 Usage:
   hive serve                              start the daemon
   hive task create --project <id> --title <t> [--brief <file> | --brief-text <s>]
-        [--kind ship|scout|chore] [--parent <task-id>] [--track]
+        [--kind ship|scout|chore] [--parent <task-id>] [--depends-on <id,id>] [--track]
         (under a hive agent, HIVE_TASK_ID makes source=agent + parent automatic;
          --track = tracking-only: never auto-dispatched, moves freely, no evidence gate)
   hive task move <task-id> <state> [--note <s>]   states: queued in_progress needs_decision
@@ -34,6 +34,7 @@ Usage:
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
   hive chat reply <thread-id> "<text>"    (supervisor→director) post a reply on a chat thread
+  hive chat close <thread-id>             end a thread's live session (reclaims its worktree/agent)
   hive steer-all "message" [--project <id>]   broadcast a steer to every live agent
   hive tunnel                             expose hive to your phone over Tailscale HTTPS (private; enables push)
   hive remote                             print LAN URL + API token for phone access (PWA)
@@ -78,6 +79,19 @@ function parseFlags(argv: string[]): { _: string[]; flags: Record<string, any> }
 function die(msg: string, code = 1): never {
   console.error(msg);
   process.exit(code);
+}
+
+// The commit HEAD was at when evidence was captured, so the review card can
+// flag it stale against the PR's current head (task #226). Best-effort: cwd
+// may not be a git repo (or git may be missing) — evidence still gets filed.
+function gitHeadSha(): string | null {
+  try {
+    const r = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
+    if (r.exitCode !== 0) return null;
+    return r.stdout.toString().trim() || null;
+  } catch {
+    return null;
+  }
 }
 
 async function api(method: string, path: string, body?: unknown): Promise<any> {
@@ -128,6 +142,7 @@ async function main() {
         brief,
         kind: flags.kind,
         parent_task_id: flags.parent ?? agentTask ?? undefined,
+        depends_on: flags["depends-on"] ? String(flags["depends-on"]) : undefined,
         source: flags.track ? "external" : agentTask ? "agent" : undefined,
       });
       console.log(`created task ${t.id}  [${t.state}]  ${t.title}`);
@@ -159,6 +174,7 @@ async function main() {
     const [taskId, type] = _;
     if (!taskId || !type) die("usage: hive emit <task-id> <type> [--note ...] [--file path]");
     const path = `/api/tasks/${taskId}/events`;
+    const sha = type === "evidence" ? gitHeadSha() : null;
     let result: any;
     if (flags.file) {
       const form = new FormData();
@@ -167,6 +183,7 @@ async function main() {
       if (flags.note) form.set("note", String(flags.note));
       if (flags.caption) form.set("caption", String(flags.caption));
       if (flags.source) form.set("source", String(flags.source));
+      if (sha) form.set("meta", JSON.stringify({ commit_sha: sha }));
       const file = Bun.file(String(flags.file));
       form.set("file", file);
       const res = await fetch(BASE + path, { method: "POST", body: form });
@@ -185,6 +202,7 @@ async function main() {
         title: flags.title,
         context: flags.context,
         pr_url: flags["pr-url"] ?? flags.url,
+        ...(sha && !extra.meta ? { meta: JSON.stringify({ commit_sha: sha }) } : {}),
         ...extra,
       });
     }
@@ -353,7 +371,16 @@ async function main() {
       console.log(`thread ${r.thread_id}: ${r.delivery}${r.error ? ` (${r.error})` : ""}`);
       return;
     }
-    die("usage: hive chat reply <thread-id> <text>  |  hive chat send [--project <id>|--thread <id>] <text>");
+    // `hive chat close <thread-id>` — end the thread's live session so its
+    // worktree/agent gets reclaimed (immediately, then the reaper backstop).
+    if (sub === "close") {
+      const threadId = _[0];
+      if (!threadId) die("usage: hive chat close <thread-id>");
+      await api("POST", `/api/chat/threads/${threadId}/close`, {});
+      console.log(`closed ${threadId}`);
+      return;
+    }
+    die("usage: hive chat reply <thread-id> <text>  |  hive chat send [--project <id>|--thread <id>] <text>  |  hive chat close <thread-id>");
   }
 
   if (cmd === "pr-marker") {
@@ -584,11 +611,12 @@ async function main() {
       console.log(`\n## ${label}`);
       for (const it of items) console.log(`- ${it.title}${it.body ? `\n  ${String(it.body).replace(/\n/g, "\n  ")}` : ""}`);
     };
-    if (!r.references.length && !r.learnings.length && !r.policies.length) {
+    if (!r.references.length && !r.learnings.length && !r.policies.length && !(r.decisions?.length)) {
       console.log(q ? `no project knowledge matches "${q}"` : "no project knowledge stored yet");
       return;
     }
     show("References (durable facts)", r.references);
+    show("Decisions already made (don't re-ask)", r.decisions ?? []);
     show("Known failure patterns", r.learnings);
     show("Policies", r.policies);
     return;

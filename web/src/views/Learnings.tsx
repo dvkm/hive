@@ -47,8 +47,9 @@ export default function Learnings() {
   };
 
   const references = learnings.filter((l) => l.kind === "reference" && l.status === "active");
-  const active = learnings.filter((l) => l.kind !== "reference" && l.status === "active");
-  const resolved = learnings.filter((l) => l.kind !== "reference" && l.status === "resolved");
+  const decisions = learnings.filter((l) => l.kind === "decision" && l.status === "active");
+  const active = learnings.filter((l) => l.kind !== "reference" && l.kind !== "decision" && l.status === "active");
+  const resolved = learnings.filter((l) => l.kind !== "reference" && l.kind !== "decision" && l.status === "resolved");
 
   return (
     <div className="policies">
@@ -94,6 +95,9 @@ export default function Learnings() {
 
       {references.length > 0 && (
         <LearningList title="References (durable facts, pinned into briefs)" items={references} projectName={projectName} onResolve={resolve} />
+      )}
+      {decisions.length > 0 && (
+        <LearningList title="Decisions already made (past answers, so crews don't re-ask)" items={decisions} projectName={projectName} onResolve={resolve} />
       )}
       <LearningList title="Active failure patterns" items={active} projectName={projectName} onResolve={resolve} />
       {resolved.length > 0 && <LearningList title="Resolved" items={resolved} projectName={projectName} onResolve={resolve} />}

@@ -28,13 +28,29 @@ web UI now runs instead of sitting in Queued forever. Every gate below must pass
 5. **Authority gate.** `authorize(action="task.dispatch", target=<title>)` must
    resolve to `allow`. A `deny` or `require_decision` standing-authority rule
    blocks the auto-spawn (and, for `require_decision`, opens the usual card).
-6. **Backoff.** On a spawn failure a single `spawn_error` event is written and
+6. **Dependency gate.** A task with unmet `depends_on` (any listed task not yet
+   `verifying`/`done`) is not spawned; a deduped `dependency_blocked` event
+   records the visible "blocked by #N …" reason. The reconciler applies the same
+   gate to stage advancement, so a manually-spawned dependent is held too.
+7. **Backoff.** On a spawn failure a single `spawn_error` event is written and
    the task stays queued; the next attempt waits `min(30s · 2^(n-1), 30m)` where
    `n` is the number of spawn_error events. No retry storm on a broken repo.
 
 The spawn itself is the shared `spawnAgent()` core (also used by
 `POST /api/tasks/:id/spawn`), so the auto path and the manual button behave
 identically: worktree create, agent start, `spawned` event, `queued→in_progress`.
+
+**Concurrency within a pass.** Queued tasks are grouped by project and the
+projects are dispatched **concurrently**; each project's own tasks stay
+**serial**. `spawnAgent` runs the project's `setup_argv` hook inside the
+worktree-ready callback (up to its 120s timeout, e.g. bringing up a docker
+stack), so a serial across-all-projects loop let one slow setup stall dispatch
+for every other project. Serial *within* a project is deliberate: herdr
+serializes `worktree create` globally, so firing a project's spawns at once
+would `spawn_error` on the create step; the slow `setup_argv` runs after that
+lock releases, so parallelizing across projects is the safe win. The
+per-project count caches (`max_agents` gate) are only ever keyed by a project's
+own id, so concurrent project loops never race on shared state.
 
 ## Visible interactive fleet (spawn design)
 
@@ -48,7 +64,14 @@ without reporting, the agent vanished, the board pointed at a ghost). `spawn()`
    worktree (path + branch parsed from the 0.7.x envelope).
 2. **Prepare the worktree** (callback) — writes `.claude/settings.local.json`
    wiring hive's Stop/SubagentStop/PostToolUse hooks BEFORE the agent starts, so
-   lifecycle reporting is structural, not brief-dependent (`hooks/`).
+   lifecycle reporting is structural, not brief-dependent (`hooks/`), then runs
+   the per-project spawn hook `config.setup_argv` (e.g.
+   `["infra/worktree/wt.sh", "up", "{worktree}"]`) so agents don't have to
+   install deps / bring up their stack themselves. It is the symmetric partner of
+   `config.cleanup_argv` (teardown); both share `runStackCmd` in `cleanup.ts`,
+   substitute `{worktree}`, resolve a relative `argv[0]` against `repo_path`, and
+   are best-effort under a 120s timeout (a failed setup emits a `stack_setup`
+   event but never blocks the spawn).
 3. **Ensure the fleet workspace** — adopt-or-create a dedicated named workspace
    labelled **`hive-fleet`** (`HIVE_FLEET_LABEL` override), `--no-focus` so a
    spawn never steals the space the captain is watching. NOT `"hive"`: herdr

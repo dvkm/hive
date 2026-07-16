@@ -15,10 +15,12 @@ import {
   TERMINAL,
   advanceIfFinished,
   evidenceCount,
+  evidenceAtSha,
+  changesRequestUnaddressed,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
-import { recordSystemLearning, signature, resolveRefCaptureForDecision, addReference, listReferences } from "./learn.ts";
+import { recordSystemLearning, recordDecisionKnowledge, signature, resolveRefCaptureForDecision, addReference, listReferences } from "./learn.ts";
 import {
   parseProject,
   parseTask,
@@ -40,7 +42,7 @@ import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.
 import { routeIntakeProject } from "./intake/route.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { costUsd } from "./pricing.ts";
-import { checkCostGuardrails, resolveCostCapForDecision } from "./costs.ts";
+import { checkCostGuardrails, resolveCostCapForDecision, taskSpend } from "./costs.ts";
 import { vapidPublicKey, saveSubscription, removeSubscription } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { ciStatusOf } from "./reconciler.ts";
@@ -56,7 +58,6 @@ import {
   appendMessage,
   setThreadTask,
   composeSupervisorBrief,
-  type ChatThread,
 } from "./chat.ts";
 
 export interface HandlerDeps {
@@ -181,6 +182,10 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       {
         const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)\/reply$/);
         if (m && method === "POST") return chatReply(db, m[1], await req.json());
+      }
+      {
+        const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)\/close$/);
+        if (m && method === "POST") return chatClose(db, m[1]);
       }
       {
         const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)$/);
@@ -308,7 +313,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       m = pathname.match(/^\/api\/decisions\/([^/]+)$/);
       if (m && method === "GET") {
         const r = db.query("SELECT * FROM decisions WHERE id = ?").get(m[1]);
-        return r ? json(parseDecision(r)) : err("decision not found", 404);
+        return r ? json(withBundle(db, parseDecision(r))) : err("decision not found", 404);
       }
       m = pathname.match(/^\/api\/decisions\/([^/]+)\/draft$/);
       if (m && method === "PUT") return saveDraft(db, m[1], await req.json());
@@ -517,27 +522,50 @@ async function chatTurn(db: DB, herdr: Herdr, deps: HandlerDeps, body: any): Pro
   // The message the session receives is prefixed so it always knows which thread
   // to reply to, even mid-conversation.
   const wire = `[director → chat thread ${thread.id}]\n${text}`;
-  const delivery = await deliverToSupervisor(db, herdr, deps, thread, wire);
+  const delivery = await withThreadLock(thread.id, () => deliverToSupervisor(db, herdr, deps, thread.id, wire));
   return json({ thread_id: thread.id, ...delivery }, 202);
+}
+
+// Serializes concurrent turns on the same chat thread. Without this, two
+// /api/chat/turn requests arriving before the first spawn lands (an impatient
+// double-send, or a second message sent right after the UI receives
+// thread_id) both see agent_target===null and both call spawnAgent for the
+// same taskId, racing worktree create/reclaim and starting two claude
+// sessions. A waiter runs only after the winner's spawn has landed, so it
+// re-reads fresh state and takes the fast (deliver-into-live-session) path
+// instead of racing it. One process holds the whole thread's traffic, so a
+// promise-chain per thread id is enough — no cross-process lock needed.
+const threadLocks = new Map<string, Promise<unknown>>();
+
+function withThreadLock<T>(threadId: string, fn: () => Promise<T>): Promise<T> {
+  const next = (threadLocks.get(threadId) ?? Promise.resolve()).catch(() => {}).then(fn);
+  threadLocks.set(threadId, next);
+  return next;
 }
 
 // Ensure the thread's supervisor agent is live (spawn on first use / respawn if
 // it died), then deliver the director's message into it. A message that arrives
 // before the session is live is queued as a steer and rides along in the spawn
-// brief, so nothing is dropped. Returns a small delivery receipt.
+// brief, so nothing is dropped. Returns a small delivery receipt. Must run
+// under withThreadLock (re-reads the thread/task fresh, so a serialized
+// waiter observes whatever the prior turn on this thread just did).
 async function deliverToSupervisor(
   db: DB,
   herdr: Herdr,
   deps: HandlerDeps,
-  thread: ChatThread,
+  threadId: string,
   message: string
 ): Promise<{ delivery: string; agent_target?: string; error?: string }> {
+  const thread = getThread(db, threadId)!;
+
   // Reuse (or create) the backing supervisor task — a plain chore task whose
   // agent IS the session. source='chat_supervisor' keeps it out of the
   // dispatcher and the normal board lanes; it is infrastructure, not a deliverable.
   let taskId = thread.task_id;
   let task = taskId ? getTask(db, taskId) : null;
-  if (!task) {
+  // A closed (terminal — see chatClose) supervisor task is never resurrected;
+  // a message to a closed thread starts a fresh session, same thread.
+  if (!task || TERMINAL.includes(task.state as State)) {
     taskId = newId();
     const t = now();
     db.query(
@@ -564,10 +592,9 @@ async function deliverToSupervisor(
 
   // Not live: queue the message (it rides in the spawn brief) and spawn.
   queueSteerEvent(db, taskId!, message, "queued for chat supervisor spawn");
-  const thread2 = getThread(db, thread.id)!;
   const r = await spawnAgent(db, herdr, taskId!, {
     supervise: false, // a standing session never "finishes into review"
-    briefOverride: composeSupervisorBrief(db, thread2),
+    briefOverride: composeSupervisorBrief(db, thread),
   });
   if (!r.ok) return { delivery: "failed", error: r.error };
   return { delivery: "spawned", agent_target: r.agent_target };
@@ -584,6 +611,25 @@ function chatReply(db: DB, threadId: string, body: any): Response {
   const message = appendMessage(db, threadId, "assistant", text);
   broadcast({ type: "chat_message", message });
   return json({ ok: true, message });
+}
+
+// End a thread's live supervisor session: cancel its backing task, which fires
+// the terminal hook (state.setTerminalHook -> cleanupTask) and tears down the
+// worktree/session immediately — the reaper sweep is just the backstop for any
+// miss. Without this, a chat's supervisor task stays 'in_progress' forever
+// (supervise:false, dispatcher/reaper skip non-terminal tasks by design) and
+// permanently pins its worktree/session. Idempotent: closing an already-closed
+// or task-less thread is a no-op. The thread + its message history survive —
+// only the live session ends; a later message spawns a fresh one (see
+// deliverToSupervisor).
+function chatClose(db: DB, threadId: string): Response {
+  const thread = getThread(db, threadId);
+  if (!thread) return err("thread not found", 404);
+  const task = thread.task_id ? getTask(db, thread.task_id) : null;
+  if (task && !TERMINAL.includes(task.state as State)) {
+    transition(db, task.id, "cancelled", { source: "director", reason: "chat thread closed" });
+  }
+  return json({ ok: true, thread_id: threadId });
 }
 
 // ---------------------------------------------------------------- tasks
@@ -603,6 +649,17 @@ async function createTask(db: DB, req: Request): Promise<Response> {
   const parent = body.parent_task_id ? String(body.parent_task_id) : null;
   if (parent && !db.query("SELECT 1 FROM tasks WHERE id = ?").get(parent))
     return err("unknown parent_task_id", 400);
+  // depends_on: task ids this task waits on (array, or comma-separated string
+  // from the CLI). Validated here so a typo can't block a task forever.
+  const rawDeps = Array.isArray(body.depends_on)
+    ? body.depends_on
+    : body.depends_on
+      ? String(body.depends_on).split(",")
+      : [];
+  const deps = rawDeps.map((d: any) => String(d).trim()).filter(Boolean);
+  for (const d of deps) {
+    if (!db.query("SELECT 1 FROM tasks WHERE id = ?").get(d)) return err(`unknown depends_on task: ${d}`, 400);
+  }
   const t = now();
   // Id first: attachments are stored under it, and the brief they extend is
   // written in the INSERT below (and read by duplicate detection).
@@ -624,17 +681,18 @@ async function createTask(db: DB, req: Request): Promise<Response> {
     summary: null,
     source: body.source ? String(body.source) : null,
     parent_task_id: parent,
+    depends_on: deps.length ? JSON.stringify(deps) : null,
     created_at: t,
     updated_at: t,
   };
   db.query(
     `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
-      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.project_id, row.title, row.brief, row.state, row.kind,
     row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
-    row.summary, row.source, row.parent_task_id, row.created_at, row.updated_at
+    row.summary, row.source, row.parent_task_id, row.depends_on, row.created_at, row.updated_at
   );
   writeEvent(db, {
     task_id: row.id,
@@ -704,6 +762,11 @@ export function linkPrIfMarked(
 export function handOffToReview(db: DB, taskId: string, source: string): boolean {
   const t: any = getTask(db, taskId);
   if (!t || t.state !== "in_progress") return false;
+  // #234: the reconciler's CI-green poll used to re-queue a task the director
+  // JUST sent back (changes_requested) 33s later, before any new commit — CI was
+  // still green on the old head. The shared guard blocks re-queue until new work
+  // (a pushed commit / evidence / review_summary) lands after the request.
+  if (changesRequestUnaddressed(db, taskId)) return false;
   transition(db, taskId, "in_review", { source, reason: "PR open, awaiting review" });
   return true;
 }
@@ -928,7 +991,7 @@ function brief(db: DB, url: URL): Response {
   const decisions = db
     .query("SELECT * FROM decisions WHERE status = 'open' ORDER BY ts DESC")
     .all()
-    .map(parseDecision);
+    .map((r) => withBundle(db, parseDecision(r)));
 
   // ④ fleet now — currently live agents (task + health).
   const fleet = db
@@ -1144,7 +1207,7 @@ function getTaskFull(db: DB, id: string): Response {
     .all(id)
     .map(parseEvidence)
     .map((e: any) => ({ ...e, preview: evidencePreview(e.path, e.kind) }));
-  const decisions = db.query("SELECT * FROM decisions WHERE task_id = ? ORDER BY ts").all(id).map(parseDecision);
+  const decisions = db.query("SELECT * FROM decisions WHERE task_id = ? ORDER BY ts").all(id).map((r) => withBundle(db, parseDecision(r)));
   return json({ ...taskWithHealth(db, task), events, evidence, decisions });
 }
 
@@ -1353,7 +1416,10 @@ async function requestChanges(db: DB, herdr: Herdr, id: string, body: any): Prom
         task.agent_target,
         `hive: changes requested before merge —\n${notes}\n\n` +
           `If any of the above is a QUESTION, reply with \`hive emit ${id} answer --note "..."\` ` +
-          `(answers are pushed to the director; pane text is not), then make the changes and emit ready again.`
+          `(answers are pushed to the director; pane text is not), then make the changes and emit ready again.\n\n` +
+          `After you push the fix, RE-CAPTURE evidence against the new commit — a fresh test run or log for ` +
+          `server/back-end changes, a screenshot for UI. The old evidence is now stale and the handoff is HELD ` +
+          `until fresh evidence matches HEAD (hive emit ${id} evidence --file ... --note ...).`
       );
       sendError = sendFailure(res);
       delivered = sendError === null;
@@ -1361,11 +1427,15 @@ async function requestChanges(db: DB, herdr: Herdr, id: string, body: any): Prom
       sendError = String(e?.message ?? e);
     }
   }
+  const lastSync: any = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_synchronized' ORDER BY ts DESC LIMIT 1")
+    .get(id);
+  const head_sha: string | null = lastSync ? (JSON.parse(lastSync.payload).head_sha ?? null) : null;
   writeEvent(db, {
     task_id: id,
     source: "director",
     type: "changes_requested",
-    payload: { notes, delivered, ...(sendError ? { send_error: sendError } : {}) },
+    payload: { notes, delivered, head_sha, ...(sendError ? { send_error: sendError } : {}) },
   });
   const updated = transition(db, id, "in_progress", { source: "director", reason: "changes requested" });
   return json({ ok: true, delivered, task: updated });
@@ -1413,7 +1483,7 @@ export async function spawnAgent(
   db: DB,
   herdr: Herdr,
   id: string,
-  opts: { hiveUrl?: string; supervise?: boolean; briefOverride?: string } = {}
+  opts: { hiveUrl?: string; supervise?: boolean; briefOverride?: string; exec?: Exec } = {}
 ): Promise<{ ok: true; agent_target: string } | { ok: false; error: string }> {
   const task = getTask(db, id);
   if (!task) return { ok: false, error: "task not found" };
@@ -1450,9 +1520,10 @@ export async function spawnAgent(
       // agents don't have to install deps / bring up their stack themselves.
       prepareWorktree: async (worktreePath) => {
         writeHookSettings(worktreePath, id, hiveUrl, config.command_approval);
-        await runStackCmd(db, id, config.setup_argv, project.repo_path, worktreePath, defaultExec, {
+        await runStackCmd(db, id, config.setup_argv, project.repo_path, worktreePath, opts.exec ?? defaultExec, {
           type: "stack_setup",
           source: "herdr",
+          timeoutMs: Number(config.stack_setup_timeout_ms) || 600_000,
         });
       },
     });
@@ -2067,8 +2138,15 @@ function knowledgeSearch(db: DB, url: URL): Response {
       `SELECT title, body FROM policies WHERE active = 1 AND (scope = 'global' OR scope = ?)${like("title || ' ' || body")} ORDER BY created_at`
     )
     .all(`project:${projectId}`, ...terms.map((t) => `%${t}%`)) as any[];
+  // Answers to past decision cards — so a crew consults the prior ruling before
+  // re-raising the same question.
+  const decisions = db
+    .query(
+      `SELECT title, body, occurrences FROM learnings WHERE project_id = ? AND kind = 'decision' AND status = 'active'${like("title || ' ' || COALESCE(body,'')")} ORDER BY last_seen DESC LIMIT 20`
+    )
+    .all(projectId, ...terms.map((t) => `%${t}%`)) as any[];
 
-  return json({ query: terms.join(" "), references: refs, learnings, policies });
+  return json({ query: terms.join(" "), references: refs, learnings, policies, decisions });
 }
 
 function listLearnings(db: DB, url: URL): Response {
@@ -2272,9 +2350,26 @@ async function attachFiles(taskId: string, files: File[]): Promise<{ paths: stri
   return { paths, block };
 }
 
+// The task worktree's current HEAD commit. Evidence is stamped with this SHA at
+// capture time, and the ready gate compares it against attached evidence so a
+// stale screenshot (from before a change-request fix) can't satisfy the handoff.
+// Fails soft (null) when there's no worktree or git can't answer — a broken git
+// must not strand every handoff (same fail-open stance as the CI probe).
+async function headSha(exec: Exec, cwd: string | null): Promise<string | null> {
+  if (!cwd) return null;
+  try {
+    const r = await exec(["git", "rev-parse", "HEAD"], { cwd });
+    const sha = r.code === 0 ? r.stdout.trim() : "";
+    return sha || null;
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------- event ingestion (`hive emit`)
 async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDeps = {}): Promise<Response> {
   if (!getTask(db, taskId)) return err("task not found", 404);
+  const exec = deps.exec ?? defaultExec;
   const ct = req.headers.get("content-type") || "";
   let fields: Record<string, string> = {};
   let file: File | null = null;
@@ -2311,6 +2406,20 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       path = saved.path;
       servedUrl = saved.url;
     }
+    // Tie the artifact to the commit it was captured from: the worktree HEAD at
+    // emit time. The ready gate reads meta.commit_sha to reject stale evidence.
+    let meta = fields.meta ?? "{}";
+    const evTask = getTask(db, taskId);
+    const sha = fields.commit_sha ?? (await headSha(exec, evTask?.worktree_path ?? null));
+    if (sha) {
+      try {
+        const m = JSON.parse(meta);
+        if (m && typeof m === "object" && m.commit_sha == null) m.commit_sha = sha;
+        meta = JSON.stringify(m);
+      } catch {
+        // non-JSON meta: leave it, the sha stamp is best-effort
+      }
+    }
     const ev = {
       id: newId("ev"),
       task_id: taskId,
@@ -2319,7 +2428,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       path,
       url: servedUrl,
       caption: fields.caption ?? note,
-      meta: fields.meta ?? "{}",
+      meta,
     };
     db.query(
       "INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,?)"
@@ -2398,12 +2507,33 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
           reason: "no_evidence",
           message: needsReport
             ? "Handoff held: scouts hand off a written report. Attach it (hive emit <task-id> evidence --kind report --file report.md), then emit ready again."
-            : "Handoff held: no evidence attached. Attach proof of the behavior (screenshot, test output, log) with `hive emit <task-id> evidence --file ... --note ...`, then emit ready again.",
+            : "Handoff held: no evidence attached. Server/back-end changes need a test run or log; UI changes need a screenshot (before/after). Attach it with `hive emit <task-id> evidence --file ... --note ...`, then emit ready again.",
         });
+      }
+      // Freshness gate: the evidence the director sees must reflect the CURRENT
+      // commit. After a change request the agent pushes a fix, so evidence from
+      // an earlier commit is stale (the #223 bug: the screenshot never updated).
+      // Require at least one evidence item tied to HEAD. Scouts hand off a
+      // written report, not commit-bound screenshots, so they're exempt. Fails
+      // open when there's no worktree / git can't resolve HEAD.
+      if (!needsReport) {
+        const head = await headSha(exec, t.worktree_path);
+        if (head && evidenceAtSha(db, taskId, head) < 1) {
+          writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { reason: "stale_evidence", head_sha: head } });
+          broadcastTask(db, getTask(db, taskId));
+          return json({
+            held: true,
+            reason: "stale_evidence",
+            head_sha: head,
+            message:
+              `Handoff held: your attached evidence is from an earlier commit, not the current one (${head.slice(0, 7)}). ` +
+              `Re-capture against the latest commit — a fresh test run or log for server/back-end changes, ` +
+              `a screenshot for UI — and attach it (hive emit ${taskId} evidence --file ... --note ...), then emit ready again.`,
+          });
+        }
       }
       const pr = prUrl ?? t.pr_url;
       if (pr) {
-        const exec = deps.exec ?? defaultExec;
         let ci: string | null = null;
         const probe = await exec(["gh", "pr", "view", pr, "--json", "statusCheckRollup"]);
         if (probe.code === 0) {
@@ -2640,6 +2770,45 @@ const DEFAULT_OPTIONS = [
   { key: "dismiss", label: "Dismiss" },
 ];
 
+// The context an open card needs to be decided in one pass, derived (never
+// stored) from live tables so it can't go stale: what the director already
+// chose on this project, the concrete artifact (PR/branch) the call affects,
+// and what the task has cost so far. Attached as `bundle` to every OPEN card
+// the client renders. ponytail: "relevant prior" = same-project + most-recent
+// answered, not semantic match — upgrade to title similarity if this gets noisy.
+export function decisionBundle(db: DB, taskId: string, decisionId: string): any {
+  const task = getTask(db, taskId);
+  if (!task) return null;
+  const prior = (
+    db
+      .query(
+        `SELECT dc.id, dc.title, dc.answer_key, dc.answered_at, dc.options
+           FROM decisions dc JOIN tasks t ON t.id = dc.task_id
+          WHERE t.project_id = ? AND dc.status = 'answered' AND dc.id != ?
+          ORDER BY dc.answered_at DESC LIMIT 3`
+      )
+      .all(task.project_id, decisionId) as any[]
+  ).map((r) => {
+    const opts = JSON.parse(r.options || "[]");
+    const chosen = opts.find((o: any) => o.key === r.answer_key);
+    return { id: r.id, title: r.title, answer: chosen?.label ?? r.answer_key ?? null, answered_at: r.answered_at };
+  });
+  return {
+    task_number: task.number ?? null,
+    pr_url: task.pr_url ?? null,
+    branch: task.branch ?? null,
+    spend_usd: +taskSpend(db, taskId).toFixed(2),
+    prior_decisions: prior,
+  };
+}
+
+// Attach the derived bundle to a parsed decision. Cheap enough to run on every
+// open card at fetch/broadcast time; skipped implicitly for terminal cards that
+// callers never pass here.
+export function withBundle(db: DB, d: any): any {
+  return { ...d, bundle: decisionBundle(db, d.task_id, d.id) };
+}
+
 export function createDecision(
   db: DB,
   d: { task_id: string; title: string; context?: string | null; risk?: string | null; blast_radius?: string | null; options?: any[] }
@@ -2670,13 +2839,14 @@ export function createDecision(
     row.blast_radius, row.options, row.status, row.answer_key, row.answer_note,
     row.draft_note, row.answered_at
   );
-  const decision = parseDecision(row);
   writeEvent(db, { task_id: d.task_id, source: "agent", type: "needs-decision", payload: { decision_id: row.id, title: row.title } });
   // Move task into needs_decision if the current state allows it.
   const task = getTask(db, d.task_id);
   if (canTransition(task.state, "needs_decision")) {
     transition(db, d.task_id, "needs_decision", { source: "agent", reason: row.title });
   }
+  // Enrich AFTER the transition so the bundle's spend/PR reflect current state.
+  const decision = withBundle(db, parseDecision(row));
   broadcast({ type: "decision", decision });
   // Notify: a high-risk decision is urgent (immediate push); others batch.
   enqueue(db, {
@@ -2712,7 +2882,7 @@ function listDecisions(db: DB, url: URL): Response {
     status === "all"
       ? db.query("SELECT * FROM decisions ORDER BY ts DESC").all()
       : db.query("SELECT * FROM decisions WHERE status = ? ORDER BY ts DESC").all(status);
-  return json(rows.map(parseDecision));
+  return json(rows.map((r) => withBundle(db, parseDecision(r))));
 }
 
 // Autosave: overwrite draft_note only. Cheap, called on every keystroke (debounced).
@@ -2769,6 +2939,10 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): 
       `Director answered your decision "${r.title}": ${label}.` + (answerNote ? ` ${answerNote}` : "") + " Proceed on this basis.",
       "queued by decision answer"
     );
+    // A genuine product/preference question (no resolver owned it) is a durable
+    // project fact — persist it so the next crew consults the answer instead of
+    // re-raising the same card.
+    recordDecisionKnowledge(db, id, answerKey, answerNote);
   }
   // Resume the task if it was parked on this decision. (herdr `agent send` is Phase 2.)
   const task = getTask(db, r.task_id);

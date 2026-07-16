@@ -3,7 +3,7 @@ import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
 import type { Health, Kind, State, Task } from "../lib/api";
-import { Attach, CiBadge, Empty, HEALTH_LABEL, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 import { AttentionTray, needsAttention } from "./attention";
 
@@ -55,7 +55,7 @@ const COL_EMPTY: Record<string, { title: string; hint: string }> = {
 };
 
 function Card({ task }: { task: Task }) {
-  const { projects, evidenceCount, spawnError, lastActivity } = useStore();
+  const { projects, evidenceCount, spawnError, lastActivity, tasks } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
   const age = useRelTime(lastActivity[task.id] || task.updated_at);
   const ev = evidenceCount[task.id];
@@ -126,6 +126,7 @@ function Card({ task }: { task: Task }) {
             ⚠ spawn failed
           </span>
         )}
+        <BlockedBy depends_on={task.depends_on} tasks={tasks} />
         <span className="card-age">{age}</span>
       </div>
       {task.summary && <div className="card-summary">{task.summary}</div>}

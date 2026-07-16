@@ -43,6 +43,13 @@ must be built against this file. Server: `http://127.0.0.1:4700` (override
 `smoke` (`[{name, url, expect_status, expect_substring?}]`, run once on
 `verifying`), `agent_argv` (string[], per-project override of the command
 herdr runs, default `["claude","-p",<brief-file>,"--permission-mode","acceptEdits"]`),
+`setup_argv` / `cleanup_argv` (string[], a symmetric per-project stack hook pair —
+`setup_argv` runs at spawn time once the worktree exists but before the agent
+starts, `cleanup_argv` runs before the worktree is removed; relative `argv[0]`
+resolves against the project repo path and `{worktree}` substitutes the task's
+worktree path, e.g. `["infra/worktree/wt.sh","up","{worktree}"]` /
+`[…,"down","{worktree}"]`; both best-effort with a 120s timeout, emitting a
+`stack_setup` / `stack_teardown` event — see the Auto-cleanup section),
 and `gchat_spaces` (`[{space, label?}]`, the Google Chat intake allowlist —
 messages in each `spaces/<id>` become draft tasks in THIS project; see Intake
 connectors below), and `intake_keywords` (`string[]`, domains / links / keywords
@@ -62,9 +69,25 @@ agents for this project's queued tasks), `dispatch_kinds` (string[], default
 `["ship","scout"]`; which task kinds the dispatcher will auto-spawn — `chore` is
 excluded by default), and `max_agents` (number, default `3`; per-project cap on
 concurrently-running agents).
+Worktree stack hooks (symmetric per-project lifecycle commands, both `string[]`,
+`{worktree}` substitutes the task's worktree path, relative `argv[0]` resolves
+against `repo_path`): `setup_argv` (e.g. `["infra/worktree/wt.sh","up","{worktree}"]`,
+run at spawn after the worktree exists but before the agent starts, so agents
+don't install deps / bring up their stack themselves; emits a `stack_setup`
+event) and `cleanup_argv` (e.g. `[...,"down","{worktree}"]`, run before the
+worktree is removed; emits a `stack_teardown` event). Both are best-effort with a
+120s timeout — a failed hook never blocks spawn nor cleanup.
 Lifecycle key: `archived` (bool, default absent/`false`; when `true` the project
 is hidden from the default `GET /api/projects` list and the web Projects view —
 tasks keep referencing it, there is no hard delete).
+Worktree stack hooks (symmetric per-project lifecycle commands): `setup_argv`
+(string[], run AFTER the worktree exists but BEFORE the agent starts — e.g.
+`["infra/worktree/wt.sh", "up", "{worktree}"]` — so agents don't bring up their
+stack themselves; emits a `stack_setup` event) and `cleanup_argv` (string[], run
+BEFORE the worktree is removed — e.g. `[..., "down", "{worktree}"]`; emits a
+`stack_teardown` event). Both: relative `argv[0]` resolves against `repo_path`,
+`{worktree}` substitutes the task's worktree path, best-effort with a 120s
+timeout — a failed hook never blocks spawn nor teardown.
 
 ### Task
 ```json
@@ -81,9 +104,11 @@ tasks keep referencing it, there is no hard delete).
   "branch": null,
   "pr_url": "https://github.com/acme/web/pull/1",
   "ci_status": "passing",
+  "head_sha": "a1b2c3d...",
   "summary": "Shipped dark mode toggle; all tests green.",
   "source": null,
   "parent_task_id": null,
+  "depends_on": [],
   "duplicate_of": null,
   "health": { "status": "healthy", "reason": null, "since": "..." },
   "created_at": "...",
@@ -96,6 +121,10 @@ still-`open` decision on it is auto-expired (`status=expired`, a
 `decision_expired` event each, broadcast) — a terminal task can no longer act on
 a card, so it must not linger in the inbox. Legacy orphans are swept on startup.
 `kind ∈ {ship, scout, chore}`
+`head_sha` is the PR's current head commit, refreshed by the reconciler's PR
+poll alongside `ci_status`; `null` until the first poll after a PR links. The
+review card compares it against each evidence item's `meta.commit_sha` to flag
+evidence captured against an older commit as stale.
 `number` is a human-friendly, monotonic per-hive counter assigned at creation
 (`MAX(number)+1`, starting at 1) and never reused — it is THE handle people and
 GitHub PR markers use, while the opaque `id` stays the machine key. Assigned by a
@@ -167,6 +196,8 @@ Types written by the runtime layer (Phase 2b):
 - `review_summary` — the agent's structured self-review, submitted before `ready`. `payload: {done?: string[], iffy?: (string|{what,why})[], decisions?: string[], testing?: string[], followups?: string[]}`. The review card renders the latest one as the primary review surface (prose `summary` collapses behind a toggle).
 - `spawned` — a herdr agent was started. `payload: {agent_target, branch, worktree_path, tab_id, label, fleet_workspace_id}`
 - `spawn_error` — spawn failed. `payload: {error}`
+- `stack_setup` — the per-project spawn hook (`config.setup_argv`) ran while preparing the worktree, before the agent started (`source: herdr`). `payload: {argv, ok, error?}` (`error` = first 300 chars of stderr/stdout on failure; best-effort, a failure never blocks the spawn).
+- `stack_teardown` — the per-project teardown hook (`config.cleanup_argv`) ran before the worktree was removed (`source: reaper`). `payload: {argv, ok, error?}` (best-effort, a failure never blocks worktree/session cleanup). Both share `runStackCmd` (`server/src/cleanup.ts`).
 - `agent_status` — herdr agent status changed (via wait loop or reconciler). `payload: {status}` (`idle|working|blocked|gone` — `gone` = the reconciler's probe found the agent missing from herdr)
 - `focus_agent` — the director focused the agent's herdr tab ("view agent"). `payload: {target}`
 - `recovery` — a stale-recovery decision was taken. `payload: {decision:"dead"|"silent-escalate", attempts?|nudges?}`
@@ -178,16 +209,18 @@ Types written by the runtime layer (Phase 2b):
 - `pr_conflict` — reconciler saw the PR CONFLICTING with its base and nudged the agent to resolve (once per head SHA; lifecycle untouched). `payload: {pr_url, head_sha, delivered}`
 - `ready_for_review` — the task was handed off `in_progress → in_review`: by the agent's `ready` emit, by the herdr supervise loop's push signal (`source: herdr`, the moment herdr reports the agent idle), or by the reconciler's idle/gone poll backstop. `payload: {pr_url, via, kind}` (`via ∈ {emit, idle, gone}`)
 - `pr_linked` — a marked PR was matched back to this task and its `pr_url` set (by the reconciler's scan or `POST /api/tasks/link-pr`). `payload: {pr_url, via}` (`via ∈ {id, number}` — which half of the marker matched)
+- `pr_synchronized` — the reconciler observed the PR head SHA change (hive's stand-in for GitHub's synchronize webhook). `payload: {head_sha}`. Emitted only when the head differs from the prior `pr_synchronized` (the first observation is a baseline). Used by the re-queue guard to tell "the agent pushed a fix" from "CI is still green on the same old head" after a `changes_requested`.
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
 - `smoke_passed` / `smoke_failed` — post-deploy smoke result. `payload: {results:[{name,ok,detail}], evidence_id?}`
 - `cleaned_up` — a finished task's runtime was torn down: worktree removed (when its branch was pushed/merged) and herdr session (tab/pane) closed. `payload: {worktree_path, branch, worktree_removed, ghost_branch, session_closed, session_via, tab_id}` (`ghost_branch` non-null when tracked uncommitted work was preserved before removal). Fired on the `done`/`cancelled` transition and by the reaper.
 - `cleanup_skipped` — teardown was refused because the branch is neither pushed nor merged; the worktree and its session are left fully intact so no unmerged work is lost. `payload: {reason, worktree_path, branch}`
+- `stack_setup` / `stack_teardown` — a per-project worktree stack hook ran (`config.setup_argv` at spawn, `source: herdr`; `config.cleanup_argv` at teardown, `source: reaper`). `payload: {argv, ok, error?}` (`error` is the trimmed stderr/stdout on failure or a timeout note).
 
 Review events (written by the director path, `source: director`):
 - `merged` — an in-review task was approved & merged. `payload: {method, base, branch, pr_url}`
 - `merge_failed` — a merge attempt failed (conflict / not a fast-forward / gh refused); no state change. `payload: {reason}`
-- `changes_requested` — the captain requested changes; the task returns to `in_progress`. `payload: {notes, delivered}`
+- `changes_requested` — the captain requested changes; the task returns to `in_progress`. `payload: {notes, delivered, head_sha}` (`head_sha` = the PR head at request time, read from the latest `pr_synchronized`; the baseline the re-queue guard compares against, `null` when no `pr_synchronized` existed yet)
 
 Domain-supervisor events (written by the planner, `source: system`):
 - `planning` — a planner run started for the task. `payload: {title}`
@@ -206,6 +239,7 @@ Duplicate-detection events (written by the dedup path, `source: system`):
 Standing-authority events (written by the policy engine, `source: system` unless noted):
 - `authority_logged` — an action was allowed (matched an `allow` rule, defaulted to allow when unmatched, or passed by consuming a grant). `payload: {action, target, effect:"allow", rule_id?, via_grant?}`
 - `authority_denied` — an action was blocked by a `deny` rule. `payload: {action, target, rule_id}`
+- `dependency_blocked` — a task's `depends_on` isn't all merged/done, so the dispatcher held its spawn (or the reconciler held its stage). `payload: {note, blocked_by}` (`blocked_by`: `["#<n> <title>", ...]`). Deduped: re-written only when the blocking set changes.
 - `authority_required` — a `require_decision` rule opened a card gating the action. `payload: {action, target, decision_id, rule_id}`
 - `authority_granted` — the director approved the card; a single-use 24h grant was minted (`source: director`). `payload: {action, target, decision_id, expires_at}`
 
@@ -224,6 +258,10 @@ Standing-authority events (written by the policy engine, `source: system` unless
 ```
 `kind ∈ {screenshot, test_run, log, report, link}`. `path` is the local file
 (null for link-only). `url` is the served path (fetch it from the same origin).
+`meta.commit_sha`, when present, is the git HEAD of the agent's worktree at
+capture time — `hive emit ... evidence` fills it in automatically via `git
+rev-parse HEAD` in the CLI's cwd. The review card compares it to the task's
+`head_sha` and marks the item stale when they differ.
 
 ### Decision
 ```json
@@ -243,7 +281,16 @@ Standing-authority events (written by the policy engine, `source: system` unless
   "answer_key": null,
   "answer_note": null,
   "draft_note": null,
-  "answered_at": null
+  "answered_at": null,
+  "bundle": {
+    "task_number": 262,
+    "pr_url": "https://github.com/example-org/hive/pull/42",
+    "branch": "hive/rich-cards",
+    "spend_usd": 3.2,
+    "prior_decisions": [
+      { "id": "dec_...", "title": "Merge strategy?", "answer": "Fast-forward", "answered_at": "..." }
+    ]
+  }
 }
 ```
 `status ∈ {open, answered, expired}`. `options` is an ordered, **non-empty**
@@ -251,6 +298,13 @@ array; render the `recommended: true` option first per product rule 3.
 `draft_note` is the server-side autosaved draft. A decision is `expired` once it
 was dismissed, or its task went terminal (`done`/`failed`/`cancelled`) — expired
 cards leave the inbox and can no longer be answered.
+
+`bundle` is server-**derived** (never stored) context attached to each card as
+it's returned, so the director can decide in one pass without opening the task:
+the affected `pr_url`/`branch`, task `spend_usd` so far, and `prior_decisions` —
+the last 3 answered cards on the same project, each with the option `label` the
+director chose. Computed at fetch/broadcast time so it stays fresh; absent on
+older SSE payloads and terminal-card broadcasts.
 
 **Options are never empty.** An optionless card is un-answerable (nothing to
 click, no key to validate). The direct `POST /api/decisions` rejects an empty
@@ -304,14 +358,25 @@ event/evidence payloads. Set values with `hive secret set` (reads from stdin).
   "first_seen": "2026-07-08T12:00:00.000Z",
   "last_seen": "2026-07-09T09:00:00.000Z",
   "status": "active",
-  "root_cause_task_id": "c21eef921dfd"
+  "root_cause_task_id": "c21eef921dfd",
+  "kind": "failure"
 }
 ```
 `status ∈ {active, resolved}`. `occurrences` counts how many times the pattern
 recurred (bumped via `/recur`). `source_task_id` (the task that first hit it) and
-`root_cause_task_id` (the chore task opened to fix it, if any) may be null. Active
-learnings for a project are injected into composed briefs (see `/api/tasks/:id/brief`)
-under a "Known failure patterns" section, 10 most recent by `last_seen`.
+`root_cause_task_id` (the chore task opened to fix it, if any) may be null.
+`kind ∈ {failure, reference, decision}` (default `failure`) — the learnings table
+doubles as the project knowledge store:
+- `failure` — the regression ledger. Active ones inject into composed briefs (see
+  `/api/tasks/:id/brief`) under a "Known failure patterns" section, 10 most recent
+  by `last_seen`.
+- `reference` — durable facts, pinned into every brief under a "References" section.
+- `decision` — the answer to a resolved decision card, written back automatically
+  when the director answers a card no resolver claimed (a genuine
+  product/preference question), deduped by `(project_id, title)` so re-asking the
+  same question bumps `occurrences` and refreshes the answer. Active ones inject
+  into briefs under a "Decisions already made (don't re-ask)" section and surface
+  in `hive recall`, so a crew consults the prior ruling before re-raising the card.
 
 ### Notification
 ```json
@@ -366,6 +431,33 @@ and unpriced rows surface as `"unpriced"` in rollups. Analytics rollups expose
 cache_write_tokens, total_tokens, cost_usd, calls, unpriced}` (summed cost counts
 priced rows only).
 
+### ChatThread / ChatMessage (director chat)
+```json
+{
+  "id": "thr_...",
+  "project_id": "proj_ab12...",
+  "task_id": "9da7c5527580",
+  "title": "ship the dark mode toggle",
+  "created_at": "2026-07-09T09:00:00.000Z",
+  "updated_at": "2026-07-09T09:05:00.000Z"
+}
+```
+```json
+{
+  "id": "msg_...",
+  "thread_id": "thr_...",
+  "ts": "2026-07-09T09:05:00.000Z",
+  "role": "director",
+  "text": "ship the dark mode toggle",
+  "actions": []
+}
+```
+`task_id` is the thread's backing supervisor task (null until the session first
+spawns; re-pointed to a fresh task if the thread is closed and later reopened).
+`role` is `director` (operator) or `assistant` (the supervisor session's reply).
+`actions` is a reserved JSON array (currently always empty). See the Director
+chat endpoints below.
+
 ---
 
 ## Endpoints
@@ -388,7 +480,7 @@ priced rows only).
 
 ### Tasks
 - `GET /api/tasks?state=&project_id=` → `200 [Task, ...]` (newest `updated_at` first; both filters optional)
-- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban — never auto-dispatched, never staleness-supervised, exempt from the done-evidence gate, moved freely via transitions (`hive task move <id> <state>`); the board shows a `tracked` chip. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
+- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher won't spawn — and the reconciler won't advance — the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban — never auto-dispatched, never staleness-supervised, exempt from the done-evidence gate, moved freely via transitions (`hive task move <id> <state>`); the board shows a `tracked` chip. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
 - `POST /api/tasks/:id/transition` body `{to (required), reason?, source?}` → `200 Task` | `409` (invalid transition or `done` without evidence) | `404`
@@ -433,7 +525,7 @@ priced rows only).
   clusters of size ≥ 2 are returned). For a backfill/triage UI over dups that
   already exist.
 - `GET /api/tasks/:id/brief` → `200 {"task_id":"...", "brief":"<multiline string>"}` | `404`
-  (task description + definition of done + `hive emit` protocol + active global + project policies + standing-authority section)
+  (task description + definition of done + `hive emit` protocol + active global + project policies + standing-authority section + project knowledge: References, "Decisions already made", Known failure patterns)
 - `POST /api/tasks/:id/guarded-action` body `{action (required), target (required), detail?}` → see below | `404` | `400`
   The gate agents call BEFORE any externally-risky operation they run themselves
   (prod deploy, feature-flag flip, destructive op). The server evaluates the
@@ -454,11 +546,21 @@ priced rows only).
 - `POST /api/tasks/:id/plan` body `{}` → `200 {"ok":true, "decision": Decision}` | `404` | `502 {"ok":false, "error":"..."}`
   Manually triggers the domain-supervisor planner for any task (see Domain
   supervisors). Records a `planning` event, runs the planner subprocess, and on
-  success opens a `normal`-risk decision card titled `Proposed breakdown: <title>`
-  with `approve`/`reject` options plus a `planned` event carrying the structured
+  success opens a decision card titled `Proposed breakdown: <title>` with
+  `approve`/`reject` options plus a `planned` event carrying the structured
   proposal. On any planner failure returns `502` and records a single
   `planner_error` event (no card). The request blocks for the planner run
   (timeout-capped by `HIVE_PLANNER_TIMEOUT_MS`, default 120000).
+
+  The card's `risk` is computed, not hardcoded, by `classifyEscalation()`
+  (`server/src/policy.ts`) — the same auto-handle-vs-escalate policy the
+  reconciler's `autoMergeReady` consumes for its own opt-in merge gate, so a
+  plan is judged the same way everywhere instead of per-call-site guesswork:
+  `high` if the proposed work reads as irreversible or prod-facing, `normal`
+  if the planner itself flagged open `questions` (ambiguous) or the project
+  has no active policy for this kind of change (preference unknown), `low`
+  otherwise. The card's context ends with a `Risk: <level> (<reason>)` line so
+  the director sees why.
 
 ### PR ↔ task marker (the linking contract)
 Every PR a hive agent opens MUST carry a marker that links it back to its task.
@@ -510,6 +612,17 @@ render the same review card).
   no recent activity is not auto-advanced (nothing to review) but is made VISIBLE:
   its `health` becomes `stuck` (reason `finished or stuck: agent idle, no PR`), which
   surfaces it in the attention tray for the director instead of sitting silently.
+
+**Changes-requested re-queue guard:** once the captain requests changes, the task
+must NOT bounce straight back into review until the agent has actually acted. Both
+auto-advance paths (the reconciler's CI-green poll / link-pr handoff and the idle
+backstop) skip a task whose latest `changes_requested` is still unaddressed. "Addressed"
+is a UNION signal recorded after the request: a pushed commit (a `pr_synchronized` on a
+DIFFERENT head than the one stamped into the `changes_requested`), fresh evidence, or a
+fresh `review_summary`. Any one clears the block; commit-only would strand an
+evidence-only request (the director said "there are no evidences") forever. The agent's
+explicit `ready` emit is intentionally NOT guarded — it can legitimately race ahead of
+the reconciler recording `pr_synchronized`.
 
 - `GET /api/tasks/:id/diff` → `200 DiffResult` | `400` (no branch & no `pr_url`, or project has no `repo_path`) | `404` | `502` (gh/git failed)
   The task branch's changes. When `pr_url` is set, `gh pr diff <url> --patch`;
@@ -594,6 +707,7 @@ recognized fields (JSON keys == form field names):
 | `kind` | evidence kind (evidence type only); defaults to `screenshot` if a file is present, else `link`/`log` |
 | `caption` | evidence caption |
 | `url` | evidence URL (for link evidence, no file) |
+| `meta` | (evidence type) JSON string merged into the Evidence row's `meta`; `hive emit ... evidence` auto-fills `{commit_sha}` from `git rev-parse HEAD` in its cwd |
 | `title`,`context`,`risk`,`blast_radius`,`options` | decision fields (needs-decision type; `options` is a JSON string in multipart) |
 | `model`,`input_tokens`,`output_tokens`,`cache_read_tokens`,`cache_write_tokens`,`cost_usd` | usage fields (usage type; numbers, or numeric strings in multipart; `cost_usd` optional) |
 | `file` | (multipart only) the uploaded evidence file |
@@ -710,9 +824,17 @@ same shape as `events`); each thread's `task_id` is its backing supervisor task
   localhost).
 - `GET /api/chat/threads?project_id=` → `200 [ChatThread, ...]` (newest first; `project_id` filter optional)
 - `GET /api/chat/threads/:id` → `200 {...ChatThread, messages:[ChatMessage]}` (oldest→newest) | `404`
+- `POST /api/chat/threads/:id/close` → `200 {ok, thread_id}` | `404` (unknown thread)
+  Ends the thread's live session: cancels its backing supervisor task, which
+  immediately tears down the worktree + herdr session (same terminal-hook path
+  as any other task reaching `cancelled`; the reaper sweep is just the backstop).
+  Idempotent. The thread and its message history are untouched — a later
+  message to the same thread spawns a fresh supervisor task rather than
+  resurrecting the closed one.
 
-CLI: `hive chat send [--project <id>|--thread <id>] "<text>"` (director side) and
-`hive chat reply <thread-id> "<text>"` (the session's reply channel).
+CLI: `hive chat send [--project <id>|--thread <id>] "<text>"` (director side),
+`hive chat reply <thread-id> "<text>"` (the session's reply channel), and
+`hive chat close <thread-id>` (end a thread's live session).
 
 ### Policies
 - `GET /api/policies?scope=` → `200 [Policy, ...]` (oldest first; `scope` filter optional)
@@ -746,11 +868,18 @@ same authority engine (`writeHookSettings` in `api.ts`; `hooks/classify.ts` +
    - **safe** (read-only / standard dev, no dangerous tokens, no `$(...)`/backtick
      substitution) → emits the PreToolUse **allow** decision, no dialog.
    - **dangerous** (`rm -rf`, `sudo`, `curl|wget … | sh`, `git push --force`,
-     `git reset --hard`, `DROP/TRUNCATE`, `DELETE FROM`/`UPDATE … SET` without
-     `WHERE`, fork bomb, `mkfs`/`dd of=`, device/system-path writes, `kill`,
-     `terraform apply/destroy`, `kubectl delete`, SSH/AWS credential files, …) →
-     escalates via `POST guarded-action {action:"command.dangerous", target:<cmd>}`.
+     `git reset --hard`, `find … -delete/-exec`, `DROP/TRUNCATE`,
+     `DELETE FROM`/`UPDATE … SET` without `WHERE`, fork bomb, `mkfs`/`dd of=`,
+     device/system-path writes, `kill`, `terraform apply/destroy`,
+     `kubectl delete`, SSH/AWS credential files, …) → escalates via
+     `POST guarded-action {action:"command.dangerous", target:<cmd>}`.
      Never auto-allowed, even under `command_approval:"allow"`.
+     **Sandbox waiver**: a destructive command PROVEN to act only inside the
+     agent's own sandbox (its herdr worktree or a tmp scratchpad) is first
+     downgraded out of `dangerous` to **unknown** (allow-and-log) — this covers
+     `rm -rf`, `kill`/`pkill`, `git reset --hard`/`git clean`, `git push --force`,
+     `find … -delete/-exec`, and sandboxed SQL. Anything unresolvable (a shell
+     var, a `..` escape, an un-sandboxed or unknown path) stays dangerous.
    - **unknown** (not provably safe) → escalates via `{action:"command", …}`, or is
      allowed / deferred per the `command_approval` policy below.
 
@@ -823,6 +952,7 @@ Subsequent messages (broadcast to all clients on every change):
 | incident | `{"type":"incident","incident": Incident}` | a monitor incident opens or resolves |
 | learning | `{"type":"learning","learning": Learning}` | a learning is created, updated, or recurs |
 | usage | `{"type":"usage","usage": Usage}` | a usage row is ingested (cost/token analytics) |
+| chat_message | `{"type":"chat_message","message": ChatMessage}` | a director-chat message is appended (director turn or supervisor reply) |
 | notification | `{"type":"notification","notification": Notification}` | a notification is enqueued (urgent ones arrive already `delivered_at`) |
 | reconciler_error | `{"type":"reconciler_error","error":"...","where":"..."}` | a reconciler cycle hit an error (at most once per cycle; no DB row) |
 
@@ -982,8 +1112,11 @@ Finished tasks get their runtime torn down automatically so orphan worktrees and
 herdr sessions never pile up (`server/src/cleanup.ts`, `server/src/reaper.ts`).
 
 - **On the transition (immediate).** When a task reaches `done` or `cancelled`,
-  the server fires `cleanupTask`: removes its git worktree and closes its herdr
-  session (the labelled tab, or the agent's pane). `failed` is deliberately
+  the server fires `cleanupTask`: runs the per-project teardown hook
+  (`config.cleanup_argv`, e.g. `wt.sh down {worktree}`) BEFORE removal so it can
+  still see the worktree's files (best-effort, `stack_teardown` event), then
+  removes its git worktree and closes its herdr session (the labelled tab, or the
+  agent's pane). `failed` is deliberately
   **excluded** — a failed task may still be auto-requeued/retried, so tearing it
   down there would race the retry; the dead-agent recovery path already reclaims
   its worktree, and the reaper is the backstop.
