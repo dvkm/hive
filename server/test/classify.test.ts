@@ -75,6 +75,24 @@ const safe = [
   "node --version",
   "docker --version",
   "",
+  "gh pr view 42",
+  "gh pr list --state open",
+  "gh pr diff 42",
+  "gh pr checks 42",
+  "gh issue list",
+  "gh run list",
+  "gh workflow view ci.yml",
+  "gh release list",
+  "gh repo view",
+  "gh auth status",
+  "git tag",
+  "git remote",
+  "git stash",
+  '"$HIVE_CLI" emit abc123 status --note "doing the thing"',
+  "hive emit abc123 done --note done",
+  "hive task list",
+  "hive pr-marker abc123",
+  "hive recall some keywords",
 ];
 
 const unknown = [
@@ -88,6 +106,18 @@ const unknown = [
   "git push origin feature", // non-force push → escalate
   "curl https://api.example.com/data", // network read, not piped to shell
   "echo $(base64 -d <<< payload)",
+  "gh pr merge 42", // mutating gh subcommand — must not ride the read-only allowlist
+  "gh pr create --title x",
+  "gh pr comment 42 --body hi",
+  "gh issue close 1",
+  "gh api /repos/x/y/pulls -X POST",
+  "git remote add origin x", // trailing args on a bare-form-safe subcommand
+  "git tag -d v1", // trailing args, not the bare listing form
+  "hive task create --title x", // mutating herdr call — must stay gated
+  "hive task move abc done",
+  "hive decision ask abc --title x",
+  "hive spawn abc",
+  "hive secret set --project x --name y",
 ];
 
 test("dangerous commands never classify as safe", () => {
@@ -210,8 +240,10 @@ test("SQL on a sandboxed sqlite copy downgrades; live/server DBs stay dangerous"
 });
 
 test("hive emit with destructive text in the note is data, not danger", () => {
-  expect(classify('hive emit abc123 status --note "cleaned up with rm -rf /tmp/x"').decision).toBe("unknown");
-  expect(classify('bun cli/hive.ts emit abc123 status --note "pkill -f vite failed"').decision).toBe("unknown");
+  // A lone `hive emit` call is on the SAFE allowlist (herdr reporting calls are
+  // required constantly and only POST to hive's own board); note text is data.
+  expect(classify('hive emit abc123 status --note "cleaned up with rm -rf /tmp/x"').decision).toBe("safe");
+  expect(classify('bun cli/hive.ts emit abc123 status --note "pkill -f vite failed"').decision).toBe("safe");
   // …but substitution or chaining voids the waiver
   expect(classify('hive emit abc123 status --note "$(rm -rf /)"').decision).toBe("dangerous");
   expect(classify('hive emit abc123 status --note "x"; rm -rf /srv', ).decision).toBe("dangerous");
