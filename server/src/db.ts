@@ -353,6 +353,34 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v17-task-depends-on",
     statements: [`ALTER TABLE tasks ADD COLUMN depends_on TEXT`],
   },
+  // Director chat: a conversational surface backed by a PERSISTENT supervisor
+  // session. A thread is scoped to a project; task_id is the thread's backing
+  // supervisor task (its herdr agent IS the session). Messages are an
+  // append-only log (same shape as `events`) so history persists in the state
+  // store. No FK on project_id/task_id — set structurally by the chat handlers.
+  {
+    name: "v18-chat",
+    statements: [
+      `CREATE TABLE chat_threads (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        task_id TEXT,
+        title TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE chat_messages (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL REFERENCES chat_threads(id),
+        ts TEXT NOT NULL,
+        role TEXT NOT NULL,
+        text TEXT NOT NULL,
+        actions TEXT NOT NULL DEFAULT '[]'
+      )`,
+      `CREATE INDEX idx_chat_messages_thread ON chat_messages(thread_id, ts)`,
+      `CREATE INDEX idx_chat_threads_project ON chat_threads(project_id, updated_at)`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings

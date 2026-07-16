@@ -50,6 +50,16 @@ import { taskDiff } from "./diff.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
+import {
+  createThread,
+  getThread,
+  listThreads,
+  listMessages,
+  appendMessage,
+  setThreadTask,
+  composeSupervisorBrief,
+  type ChatThread,
+} from "./chat.ts";
 
 export interface HandlerDeps {
   herdr?: Herdr; // injectable for tests
@@ -164,6 +174,24 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       // ---- braindump intake ----
       if (pathname === "/api/intake" && method === "POST") return intake(db, await req.json(), deps);
+
+      // ---- director chat (persistent supervisor session over hive) ----
+      if (pathname === "/api/chat/turn" && method === "POST")
+        return await chatTurn(db, herdr, deps, await req.json());
+      if (pathname === "/api/chat/threads" && method === "GET")
+        return json(listThreads(db, url.searchParams.get("project_id")));
+      {
+        const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)\/reply$/);
+        if (m && method === "POST") return chatReply(db, m[1], await req.json());
+      }
+      {
+        const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)$/);
+        if (m && method === "GET") {
+          const thread = getThread(db, m[1]);
+          if (!thread) return err("thread not found", 404);
+          return json({ ...thread, messages: listMessages(db, m[1]) });
+        }
+      }
 
       // ---- PR → task linking (match an open PR back to its task by marker) ----
       if (pathname === "/api/tasks/link-pr" && method === "POST")
@@ -458,6 +486,106 @@ function intake(db: DB, body: any, deps: HandlerDeps): Response {
   // lands, and runPlanner records its own planner_error event on failure.
   runPlanner(db, id, { exec: deps.plannerExec }).catch(() => {});
   return json({ ok: true, task }, 202);
+}
+
+// ---------------------------------------------------------------- chat
+// One director→supervisor turn. NON-BLOCKING by design: persist the message,
+// make sure the thread's persistent supervisor session is live (spawn it on the
+// first message), deliver the message into that session, and return immediately.
+// The supervisor thinks/acts asynchronously and posts its reply back via
+// `hive chat reply <thread>` → POST /reply → SSE, so the director is never
+// blocked waiting on the LLM. The session holds context across turns and
+// coordinates worker agents itself (see composeSupervisorBrief).
+async function chatTurn(db: DB, herdr: Herdr, deps: HandlerDeps, body: any): Promise<Response> {
+  const text = String(body?.text ?? "").trim();
+  if (!text) return err("text is required");
+
+  let thread = body?.thread_id ? getThread(db, String(body.thread_id)) : null;
+  if (body?.thread_id && !thread) return err("thread not found", 404);
+  if (!thread) {
+    const projectId = body?.project_id ? String(body.project_id) : null;
+    if (!projectId) return err("project_id is required to start a chat (the supervisor session runs in the project's repo)");
+    if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return err("unknown project_id", 400);
+    thread = createThread(db, {
+      project_id: projectId,
+      task_id: body?.task_id ? String(body.task_id) : null,
+      title: text.split("\n")[0].slice(0, 80),
+    });
+  }
+  if (!thread.project_id) return err("thread has no project scope; cannot run a supervisor session", 400);
+
+  broadcast({ type: "chat_message", message: appendMessage(db, thread.id, "director", text) });
+
+  // The message the session receives is prefixed so it always knows which thread
+  // to reply to, even mid-conversation.
+  const wire = `[director → chat thread ${thread.id}]\n${text}`;
+  const delivery = await deliverToSupervisor(db, herdr, deps, thread, wire);
+  return json({ thread_id: thread.id, ...delivery }, 202);
+}
+
+// Ensure the thread's supervisor agent is live (spawn on first use / respawn if
+// it died), then deliver the director's message into it. A message that arrives
+// before the session is live is queued as a steer and rides along in the spawn
+// brief, so nothing is dropped. Returns a small delivery receipt.
+async function deliverToSupervisor(
+  db: DB,
+  herdr: Herdr,
+  deps: HandlerDeps,
+  thread: ChatThread,
+  message: string
+): Promise<{ delivery: string; agent_target?: string; error?: string }> {
+  // Reuse (or create) the backing supervisor task — a plain chore task whose
+  // agent IS the session. source='chat_supervisor' keeps it out of the
+  // dispatcher and the normal board lanes; it is infrastructure, not a deliverable.
+  let taskId = thread.task_id;
+  let task = taskId ? getTask(db, taskId) : null;
+  if (!task) {
+    taskId = newId();
+    const t = now();
+    db.query(
+      `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, created_at, updated_at)
+       VALUES (?,?,?,?, 'in_progress', 'chore', 'chat_supervisor', ?, ?)`
+    ).run(taskId, thread.project_id, `[chat] supervisor: ${thread.title ?? thread.id}`, null, t, t);
+    writeEvent(db, { task_id: taskId, source: "director", type: "created", payload: { title: `[chat] supervisor session`, thread_id: thread.id } });
+    setThreadTask(db, thread.id, taskId);
+    task = getTask(db, taskId);
+  }
+
+  // Is the session already live? If so, just send into it (fast path).
+  if (task.agent_target) {
+    const { alive } = await herdr.probe(task.agent_target).catch(() => ({ alive: false }));
+    if (alive) {
+      const error = await sendOnce(herdr, task.agent_target, message);
+      if (!error) {
+        writeEvent(db, { task_id: taskId!, source: "director", type: "steer", payload: { message, target: task.agent_target, delivery: "delivered", delivered_at: now() } });
+        return { delivery: "delivered", agent_target: task.agent_target };
+      }
+      // fall through to respawn on a send failure to a supposedly-live agent
+    }
+  }
+
+  // Not live: queue the message (it rides in the spawn brief) and spawn.
+  queueSteerEvent(db, taskId!, message, "queued for chat supervisor spawn");
+  const thread2 = getThread(db, thread.id)!;
+  const r = await spawnAgent(db, herdr, taskId!, {
+    supervise: false, // a standing session never "finishes into review"
+    briefOverride: composeSupervisorBrief(db, thread2),
+  });
+  if (!r.ok) return { delivery: "failed", error: r.error };
+  return { delivery: "spawned", agent_target: r.agent_target };
+}
+
+// The supervisor session posts its reply to the director here (via
+// `hive chat reply <thread> "..."`). Loopback-only in practice (agents run on
+// localhost); appends the assistant message and streams it over SSE.
+function chatReply(db: DB, threadId: string, body: any): Response {
+  const thread = getThread(db, threadId);
+  if (!thread) return err("thread not found", 404);
+  const text = String(body?.text ?? "").trim();
+  if (!text) return err("text is required");
+  const message = appendMessage(db, threadId, "assistant", text);
+  broadcast({ type: "chat_message", message });
+  return json({ ok: true, message });
 }
 
 // ---------------------------------------------------------------- tasks
@@ -1311,7 +1439,7 @@ export async function spawnAgent(
   db: DB,
   herdr: Herdr,
   id: string,
-  opts: { hiveUrl?: string; supervise?: boolean } = {}
+  opts: { hiveUrl?: string; supervise?: boolean; briefOverride?: string } = {}
 ): Promise<{ ok: true; agent_target: string } | { ok: false; error: string }> {
   const task = getTask(db, id);
   if (!task) return { ok: false, error: "task not found" };
@@ -1322,9 +1450,11 @@ export async function spawnAgent(
   // Compose the brief fresh; it is delivered as the interactive agent's first
   // prompt (see runtime/herdr.defaultAgentArgv) — no `-p` one-shot. Steers sent
   // while the task had no live agent ride along on top, so they reach the fresh
-  // agent instead of vanishing.
+  // agent instead of vanishing. briefOverride is the persistent-chat supervisor's
+  // bespoke brief (it isn't a normal ship/scout task, so composeBrief's
+  // open-a-PR-and-hand-off protocol doesn't apply).
   const pending = queuedSteers(db, id);
-  const brief = steerPreamble(pending) + composeBrief(db, id);
+  const brief = steerPreamble(pending) + (opts.briefOverride ?? composeBrief(db, id));
   const hiveUrl = opts.hiveUrl || process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
   const env = await resolveProjectSecrets(db, task.project_id);
 

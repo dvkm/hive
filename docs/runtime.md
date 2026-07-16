@@ -53,11 +53,13 @@ without reporting, the agent vanished, the board pointed at a ghost). `spawn()`
 2. **Prepare the worktree** (callback) — writes `.claude/settings.local.json`
    wiring hive's Stop/SubagentStop/PostToolUse hooks BEFORE the agent starts, so
    lifecycle reporting is structural, not brief-dependent (`hooks/`), then runs
-   the per-project spawn hook (`config.setup_argv`, e.g. `wt.sh up {worktree}`)
-   so agents don't have to install deps / bring up their stack themselves. The
-   hook is best-effort with a hard 120s timeout — a failed setup writes a
-   `stack_setup` event but never blocks the spawn (shared `runStackCmd`,
-   `server/src/cleanup.ts`).
+   the per-project spawn hook `config.setup_argv` (e.g.
+   `["infra/worktree/wt.sh", "up", "{worktree}"]`) so agents don't have to
+   install deps / bring up their stack themselves. It is the symmetric partner of
+   `config.cleanup_argv` (teardown); both share `runStackCmd` in `cleanup.ts`,
+   substitute `{worktree}`, resolve a relative `argv[0]` against `repo_path`, and
+   are best-effort under a 120s timeout (a failed setup emits a `stack_setup`
+   event but never blocks the spawn).
 3. **Ensure the fleet workspace** — adopt-or-create a dedicated named workspace
    labelled **`hive-fleet`** (`HIVE_FLEET_LABEL` override), `--no-focus` so a
    spawn never steals the space the captain is watching. NOT `"hive"`: herdr
