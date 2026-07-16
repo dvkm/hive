@@ -391,12 +391,24 @@ const EXECUTOR = new RegExp(
     String.raw`|\bpython3?\b[^\n|;&]*\s-c\s|\bnode\b[^\n|;&]*\s(-e|--eval)\s|\b(perl|ruby)\b[^\n|;&]*\s-e\s`
 );
 
+// A subshell trigger ($(...), `...`, <(...)) executes even inside double
+// quotes or an unquoted heredoc, so a region containing one must stay raw for
+// the DANGEROUS scan to see. A single-quoted string or a heredoc with a QUOTED
+// delimiter (<<'TAG'/<<"TAG") never expands at all — real shells treat their
+// contents as 100% literal regardless of what punctuation is inside — so those
+// always strip, keeping the decision scoped to the region that actually risks
+// executing instead of flipping stripping off for the whole command (the
+// classify.ts hasSubshell/EXECUTOR gate gotcha, task 320).
+const SUBSHELL = /\$\(|`|<\(/;
+
 export function stripDataText(cmd: string): string {
   return cmd
     // heredoc bodies: <<TAG / <<-TAG / <<'TAG' … TAG (start-of-line terminator)
-    .replace(/<<-?\s*(['"]?)(\w+)\1[\s\S]*?\n\2(?=\n|$)/g, "<<HEREDOC_STRIPPED")
+    .replace(/<<-?\s*(['"]?)(\w+)\1([\s\S]*?)\n\2(?=\n|$)/g, (full, quote, _tag, body) =>
+      !quote && SUBSHELL.test(body) ? full : "<<HEREDOC_STRIPPED"
+    )
     .replace(/'[^']*'/g, "''")
-    .replace(/"(?:[^"\\]|\\.)*"/g, '""');
+    .replace(/"(?:[^"\\]|\\.)*"/g, (full) => (SUBSHELL.test(full) ? full : '""'));
 }
 
 // Force-push is only catastrophic on SHARED refs. An agent force-pushing its
@@ -441,11 +453,12 @@ export function classify(
   // word appearing only inside quotes (a commit message mentioning `-exec`,
   // `bash`, `eval`, …) is prose, not a real executor, so it must not disable
   // stripping and let the whole-string DANGEROUS scan hit the quoted data.
-  // Substitution ($(…), backticks, <(…)) executes even inside double quotes, so
-  // its presence (checked on the RAW command) still forces the full-text scan.
+  // Substitution ($(…), backticks, <(…)) executes even inside double quotes;
+  // stripDataText already keeps any region containing one raw (see SUBSHELL
+  // above), scoped to that region — no need to force the WHOLE command raw
+  // just because a trigger appears somewhere in it.
   const stripped = stripDataText(cmd);
-  const scanTarget =
-    EXECUTOR.test(stripped) || /\$\(|`|<\(/.test(cmd) ? cmd : stripped;
+  const scanTarget = EXECUTOR.test(stripped) ? cmd : stripped;
   for (const [rx, reason] of DANGEROUS) {
     if (!rx.test(scanTarget)) continue;
     if (emitDataOnly) continue; // arguments are data, not executed
