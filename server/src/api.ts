@@ -1479,6 +1479,7 @@ export async function spawnAgent(
         await runStackCmd(db, id, config.setup_argv, project.repo_path, worktreePath, opts.exec ?? defaultExec, {
           type: "stack_setup",
           source: "herdr",
+          timeoutMs: Number(config.stack_setup_timeout_ms) || 600_000,
         });
       },
     });
