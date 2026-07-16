@@ -88,6 +88,22 @@ const SAFE: RegExp[] = [
   /^python[0-9.]*\s+-m\s+(pytest|unittest)\b/,
   /^\S+\s+(--version|--help|-h)\s*$/, // any single `<tool> --version|--help`
   /^(true|false|:)\s*$/,
+  // gh: read-only subcommands only (never merge/close/create/comment/edit/run/etc).
+  /^gh\s+pr\s+(view|list|diff|checks|status)\b/,
+  /^gh\s+issue\s+(view|list|status)\b/,
+  /^gh\s+run\s+(view|list)\b/,
+  /^gh\s+workflow\s+(view|list)\b/,
+  /^gh\s+release\s+(view|list)\b/,
+  /^gh\s+(repo\s+view|auth\s+status)\b/,
+  // git: bare listing forms (no trailing args, so `-D`/`add`/`push` etc. can't hide here).
+  /^git\s+(branch|tag|remote|stash)\s*$/,
+  // hive/herdr CLI: emit is always a data-only POST to hive's own board (see
+  // isHiveEmitDataOnly below, which already waives it from the DANGEROUS scan);
+  // the rest are read-only list/search calls. Mutating calls (task create/move,
+  // decision ask, spawn, secret, authority/policy/learning add, offline, …)
+  // are deliberately NOT here — those still escalate.
+  /^("?\$HIVE_CLI"?|(bun|bunx)\s+\S*hive(\.ts)?|(\.\/)?bin\/hive|hive)\s+emit\b/,
+  /^("?\$HIVE_CLI"?|(bun|bunx)\s+\S*hive(\.ts)?|(\.\/)?bin\/hive|hive)\s+(task\s+list|pr-marker|recall|stats|learning\s+list|authority\s+list|policy\s+list|watch\s+list)\b/,
 ];
 
 // Split a command into segments on shell chaining/pipe operators. Naive (does
