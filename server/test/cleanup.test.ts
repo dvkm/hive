@@ -232,10 +232,13 @@ test("cleanupTask removes a done task's worktree, closes the session, emits clea
   expect(task.agent_target).toBeNull();
 });
 
-test("cleanupTask preserves an UNMERGED worktree: cleanup_skipped, session + worktree kept", async () => {
+test("cleanupTask preserves an UNMERGED worktree but still closes the session (pty released)", async () => {
   const { db, projectId } = freshDb();
   const branch = "hive/CT2";
   const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-CT2" });
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    newId("evt"), id, now(), "herdr", "spawned", JSON.stringify({ tab_id: "wF:t7", agent_target: `agent-${id}` })
+  );
   const calls: string[][] = [];
   const exec: Exec = async (argv) => {
     calls.push(argv);
@@ -248,12 +251,22 @@ test("cleanupTask preserves an UNMERGED worktree: cleanup_skipped, session + wor
   const out = await cleanupTask(db, herdr, id);
   expect(out.cleaned).toBe(false);
   expect(out.worktree?.removed).toBe(false);
-  expect(out.session.closed).toBe(false); // tab kept so the director can push
+  expect(out.session.closed).toBe(true); // tab closed — a kept session pins a pty forever
+  expect(out.session.via).toBe("tab wF:t7");
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'cleanup_skipped'").all(id).length).toBe(1);
-  // nothing removed, binding intact
+  // worktree untouched; agent binding dropped so later sweeps skip the close
   expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(false);
-  const task = db.query("SELECT worktree_path FROM tasks WHERE id = ?").get(id) as any;
+  const task = db.query("SELECT worktree_path, agent_target FROM tasks WHERE id = ?").get(id) as any;
   expect(task.worktree_path).toBe("/wt/hive-CT2");
+  expect(task.agent_target).toBeNull();
+
+  // Second sweep: no herdr call (agent_target cleared) and no duplicate
+  // cleanup_skipped for the same reason.
+  calls.length = 0;
+  const again = await cleanupTask(db, herdr, id);
+  expect(again.cleaned).toBe(false);
+  expect(calls.some((c) => c[0] !== "git")).toBe(false); // only the git safety checks re-ran
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'cleanup_skipped'").all(id).length).toBe(1);
 });
 
 test("cleanupTask on a NON-terminal task is a no-op unless forced", async () => {
