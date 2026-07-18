@@ -1249,6 +1249,17 @@ async function doTransition(db: DB, id: string, body: any): Promise<Response> {
   if (to === "verifying" || to === "done") {
     const t = getTask(db, id);
     if (t) {
+      // A task with a PR must go through POST /merge — a plain move to verifying
+      // skips the actual merge, and the smoke monitor then stamps the task done
+      // with the PR still open (seen live 2026-07-18: task 2ae573b0a229 / PR #281).
+      // /merge handles every PR state: open → merges, MERGED → advances, CLOSED →
+      // merge_failed with re-link guidance. mergeTask calls transition() directly,
+      // so the sanctioned path is unaffected.
+      if (to === "verifying" && t.state === "in_review" && t.pr_url)
+        return err(
+          `task has a PR (${t.pr_url}); use POST /api/tasks/${id}/merge so the PR actually merges — a direct move to 'verifying' skips the merge`,
+          409
+        );
       const blocked = authzBlock(db, { project_id: t.project_id, action: `task.${to === "verifying" ? "verify" : "done"}`, target: t.title, task_id: id });
       if (blocked) return blocked;
     }
