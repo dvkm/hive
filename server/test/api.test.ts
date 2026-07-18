@@ -171,6 +171,19 @@ test("transition endpoint enforces the state machine", async () => {
   expect(bad2.status).toBe(409);
 });
 
+test("in_review task with a PR refuses a direct move to verifying (must use /merge)", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "pr bypass task" });
+  const id = t.json.id;
+  await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
+  await post(`/api/tasks/${id}/events`, { type: "evidence", note: "proof", kind: "log" });
+  await post(`/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/99" });
+
+  const r = await post(`/api/tasks/${id}/transition`, { to: "verifying" });
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("/merge");
+  expect((await get(`/api/tasks/${id}`)).json.state).toBe("in_review");
+});
+
 test("ready emit records the pr_url and advances in_progress -> in_review", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "ready task" });
   const id = t.json.id;
