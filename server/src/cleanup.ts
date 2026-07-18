@@ -149,24 +149,48 @@ export async function cleanupTask(
     }
   }
 
-  // 2) session — close only when there is no worktree to guard OR it was removed.
-  // A preserved (unmerged) worktree keeps its tab so the director can attach,
-  // finish/push the branch, and let a later sweep clean it.
+  // 2) session — close for ANY terminal task, preserved worktree or not. The
+  // worktree + branch stay on disk for the director (`herdr worktree open`
+  // re-attaches on demand), but the live tab must not stay: every kept session
+  // pins a pty forever, and ~160 accumulated tabs exhausted the system pty pool
+  // (kern.tty.ptmx_max=511) and took down all spawning (2026-07-17).
+  // Preserved tasks keep agent_target until the close succeeds, then drop it so
+  // later sweeps skip the herdr call instead of re-closing a dead tab.
   const meta = spawnMeta(db, taskId);
   const preserved = !!worktree && !worktree.removed;
-  let session = { closed: false, via: preserved ? "kept: worktree preserved" : null as string | null };
-  if (!preserved && (task.agent_target || meta.tab_id)) {
+  let session = { closed: false, via: null as string | null };
+  if (preserved ? task.agent_target : task.agent_target || meta.tab_id) {
     session = await herdr.closeSession({ agentTarget: task.agent_target, tabId: meta.tab_id });
   }
 
   // 3) emit + record.
   if (preserved) {
-    writeEvent(db, {
-      task_id: taskId,
-      source: "reaper",
-      type: "cleanup_skipped",
-      payload: { reason: worktree!.reason, worktree_path: task.worktree_path, branch: task.branch },
-    });
+    if (session.closed)
+      db.query("UPDATE tasks SET agent_target = NULL, updated_at = ? WHERE id = ?").run(now(), taskId);
+    // One event per distinct skip reason, not one per reaper sweep: the same
+    // dozen preserved worktrees emitted 2,668 duplicate events in 3 days.
+    const last = db
+      .query("SELECT payload FROM events WHERE task_id = ? AND type = 'cleanup_skipped' ORDER BY ts DESC LIMIT 1")
+      .get(taskId) as { payload: string } | undefined;
+    let lastReason: string | null = null;
+    try {
+      lastReason = last ? (JSON.parse(last.payload).reason ?? null) : null;
+    } catch {
+      /* malformed payload -> treat as new reason */
+    }
+    if (lastReason !== worktree!.reason) {
+      writeEvent(db, {
+        task_id: taskId,
+        source: "reaper",
+        type: "cleanup_skipped",
+        payload: {
+          reason: worktree!.reason,
+          worktree_path: task.worktree_path,
+          branch: task.branch,
+          session_closed: session.closed,
+        },
+      });
+    }
     return { cleaned: false, worktree, session };
   }
 
