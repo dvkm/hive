@@ -528,7 +528,6 @@ async function chatTurn(db: DB, herdr: Herdr, deps: HandlerDeps, body: any): Pro
     pending = (async () => {
       const thread = createThread(db, {
         project_id: projectId,
-        task_id: body?.task_id ? String(body.task_id) : null,
         title: text.split("\n")[0].slice(0, 80),
       });
       return chatTurnOnThread(db, herdr, deps, thread, text);
