@@ -1635,11 +1635,18 @@ export async function spawnAgent(
       // agents don't have to install deps / bring up their stack themselves.
       prepareWorktree: async (worktreePath) => {
         writeHookSettings(worktreePath, id, hiveUrl, config.command_approval);
-        await runStackCmd(db, id, config.setup_argv, project.repo_path, worktreePath, opts.exec ?? defaultExec, {
+        const setup = await runStackCmd(db, id, config.setup_argv, project.repo_path, worktreePath, opts.exec ?? defaultExec, {
           type: "stack_setup",
           source: "herdr",
           timeoutMs: Number(config.stack_setup_timeout_ms) || 600_000,
         });
+        // Unlike teardown, a failed setup ABORTS the spawn: starting an agent
+        // whose deps/stack never came up burns a whole run on confusing
+        // downstream failures. Throwing here surfaces out of herdr.spawn into
+        // the catch below — one spawn_error naming the reason, {ok:false} to the
+        // dispatcher (which backs off), and the queued steers stay queued for
+        // the retry because markSteersDelivered runs only on the success path.
+        if (!setup.ok) throw new Error(`stack setup failed: ${setup.error ?? "unknown error"}`);
       },
     });
   } catch (e: any) {

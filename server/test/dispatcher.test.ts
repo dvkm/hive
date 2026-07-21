@@ -11,6 +11,7 @@ const { openDb, newId, now } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
 const { dispatchOnce, isReviewed, inBackoff } = await import("../src/dispatcher.ts");
 const { writeEvent, getTask } = await import("../src/state.ts");
+const { queuedSteers } = await import("../src/steer.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -178,6 +179,47 @@ test("a slow setup_argv on project A does not delay spawning a queued task on pr
   releaseSetup();
   await done;
   expect(getTask(db, a).state).toBe("in_progress"); // A completes once its setup returns
+});
+
+test("a failing setup_argv aborts the spawn: no agent start, task stays queued, steers stay queued", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, setup_argv: ["wt.sh", "up", "{worktree}"] });
+  const id = makeTask(db, projectId);
+  // A steer waiting for the agent: it must survive an aborted spawn so the
+  // retry re-delivers it (the abort happens before markSteersDelivered).
+  writeEvent(db, { task_id: id, source: "director", type: "steer", payload: { message: "hi", delivery: "queued" } });
+
+  const { herdr } = stubHerdr();
+  // deps.exec runs ONLY the setup_argv hook; make it fail.
+  const exec: Exec = async () => ({ code: 1, stdout: "", stderr: "docker compose up: port 5432 already in use" });
+
+  await dispatchOnce(db, { herdr, exec });
+
+  expect(getTask(db, id).state).toBe("queued"); // not in_progress
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawned'").get(id)).toBeFalsy();
+
+  const err = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'spawn_error'").get(id) as { payload: string };
+  expect(err).toBeTruthy();
+  expect(JSON.parse(err.payload).error).toContain("stack setup failed");
+  expect(JSON.parse(err.payload).error).toContain("port 5432 already in use");
+
+  // the failure itself is on the record for the director...
+  const setup = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'stack_setup'").get(id) as { payload: string };
+  expect(JSON.parse(setup.payload).ok).toBe(false);
+  // ...and the steer is still queued for the retry.
+  expect(queuedSteers(db, id).length).toBe(1);
+});
+
+test("a setup_argv that times out aborts the spawn too", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, setup_argv: ["wt.sh", "up"], stack_setup_timeout_ms: 10 });
+  const id = makeTask(db, projectId);
+  const { herdr } = stubHerdr();
+  const exec: Exec = () => new Promise(() => {}); // hangs forever -> hits the timeout race
+
+  await dispatchOnce(db, { herdr, exec });
+
+  expect(getTask(db, id).state).toBe("queued");
+  const err = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'spawn_error'").get(id) as { payload: string };
+  expect(JSON.parse(err.payload).error).toContain("timed out");
 });
 
 test("tracking-only (source=external) tasks are never auto-dispatched", async () => {
