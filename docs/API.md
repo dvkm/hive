@@ -656,13 +656,38 @@ the reconciler recording `pr_synchronized`.
   `truncated` is `true` and the remaining diff is omitted (view the PR for the
   full patch). Binary files carry `binary: true` and no hunks.
 
-- `POST /api/tasks/:id/merge` body `{}` → `200 Task` (now `verifying`) | `409` (not `in_review`, or the merge failed: conflict / not a fast-forward / gh refused) | `403` (denied by a `task.merge` authority rule) | `404` | `400` (local merge but no `repo_path`/`branch`)
+- `POST /api/tasks/:id/merge` body `{merge_strategy?: "local_ff"}` → `200 Task` (now `verifying`) | `409` (not `in_review`, or the merge failed: conflict / not a fast-forward / gh refused) | `403` (denied by a `task.merge` authority rule) | `404` | `400` (local merge but no `repo_path`/`branch`)
   Approve & merge. When `pr_url` is set: `gh pr merge <url> <method>` where
   `method` is the project's `config.merge_method` (`squash` default, or `merge` /
   `rebase`). Otherwise a **local fast-forward**: the default branch is
-  fast-forwarded to the task branch tip (`git merge --ff-only`); a non-fast-forward
-  (diverged/conflicting) merge is refused with `409` and no working tree is
-  touched (rebase the branch or open a PR for a squash merge). On success: writes
+  fast-forwarded to the task branch tip (`git merge --ff-only`); it is refused
+  with `409`, no working tree touched, if the primary checkout's `HEAD` is not on
+  the default branch (that merge lands on `HEAD`, wherever it points) or the merge
+  is not a fast-forward (diverged/conflicting — rebase the branch or open a PR for
+  a squash merge).
+
+  **Stale-base fallback.** GitHub decides mergeability against `origin/<base>`,
+  which can sit behind the primary checkout's local `<base>`. So when `gh pr merge`
+  fails with a conflict-shaped reason *and* the PR's own state blames the base
+  comparison (`mergeStateStatus` is `DIRTY`/`BEHIND`/`UNKNOWN`, no blocking
+  `reviewDecision`, no failing or running required check) and the project has a
+  `repo_path` and the task a `branch`, hive retries as a local fast-forward onto
+  local `<base>` instead of bouncing the task to the agent — rebasing onto a stale
+  `origin/<base>` would only pull in unrelated history. Branch protection wears the
+  same opaque "not mergeable" reason, so this gate never fires on a protection
+  block. When the gate does not open, the normal `409` / bounce-to-agent behaviour
+  below applies with the `gh pr merge` reason alone; when it opens but the local ff
+  is then refused, the message carries both reasons.
+
+  **`merge_strategy: "local_ff"`** forces the local fast-forward for a PR-backed
+  task, skipping `gh pr merge` and the fallback's review/check gate — an explicit
+  override for a PR whose base comparison is stale while the branch is still a
+  clean ff onto local `<base>`. The PR state probe still runs: a `CLOSED` (not
+  merged) PR is refused, a `MERGED` one just advances the task. The review card
+  surfaces this as a **Force local merge** button next to a failed merge on a
+  PR-backed task, so the escape hatch needs no raw API call.
+
+  On success: writes
   a `merged` event, transitions `in_review → verifying` (which runs the project's
   post-deploy smoke once), and best-effort removes the task worktree (a teardown
   failure never fails the merge). On failure: `409` with the reason and a

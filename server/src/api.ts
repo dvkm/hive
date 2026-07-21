@@ -1327,12 +1327,75 @@ async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason
   return err(reason, 409);
 }
 
+// Fast-forward the project's default branch to the task branch tip, in the
+// primary checkout. Requires the checkout to be ON `base` (git merge --ff-only
+// lands on whatever HEAD is, not on the named ref) and `base` (the LOCAL ref,
+// which can be ahead of origin/<base>) to be an ancestor of `task.branch` — a
+// diverged/conflicting branch is refused, no working tree is touched. Returns
+// null on success, or a failure reason string.
+async function attemptLocalFf(exec: Exec, project: any, task: any, base: string): Promise<string | null> {
+  const head = await exec(["git", "-C", project.repo_path, "symbolic-ref", "--short", "HEAD"]);
+  const current = head.stdout.trim();
+  if (head.code !== 0 || current !== base) {
+    return (
+      `primary checkout's HEAD is on '${current || "a detached commit"}', not '${base}'; ` +
+      `switch the primary checkout to '${base}' before merging.`
+    );
+  }
+  const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", base, task.branch]);
+  if (anc.code !== 0) {
+    // Name the exact commit compared against: this is the primary checkout's
+    // LOCAL base ref, which can be ahead of origin/<base> — an agent rebased
+    // onto origin/main and hit this identical failure twice before digging
+    // out that hive checks a different, unfetchable-by-name ref.
+    const sha = (await exec(["git", "-C", project.repo_path, "rev-parse", "--short", base])).stdout.trim();
+    return (
+      `'${base}' (LOCAL ref in the primary checkout${sha ? `, ${sha}` : ""} — may be ahead of origin/${base}) ` +
+      `is not an ancestor of '${task.branch}'; not a fast-forward. Rebase onto that exact commit ` +
+      `(git fetch <primary-checkout> ${base}) or open a PR.`
+    );
+  }
+  const r = await exec(["git", "-C", project.repo_path, "merge", "--ff-only", task.branch]);
+  if (r.code !== 0) return r.stderr.trim() || r.stdout.trim() || `git merge --ff-only exited ${r.code}`;
+  return null;
+}
+
+// Does the PR's own state say the merge was refused over the base comparison
+// (stale/diverged base) rather than branch protection? GitHub returns the same
+// opaque "Pull Request is not mergeable" for both, so the reason string alone
+// can't authorize a local merge that bypasses required checks/reviews. Only
+// DIRTY/BEHIND/UNKNOWN qualify, and only when neither a required review nor a
+// failing/running required check is the blocker (the rollup mixes CheckRun and
+// StatusContext shapes — ciStatusOf owns that distinction). Anything unknown →
+// false: the local ff is never the safe default here.
+function staleBaseRefusal(prView: any): boolean {
+  const status = String(prView?.mergeStateStatus ?? "").toUpperCase();
+  if (status !== "DIRTY" && status !== "BEHIND" && status !== "UNKNOWN") return false;
+  const review = String(prView?.reviewDecision ?? "").toUpperCase();
+  if (review === "REVIEW_REQUIRED" || review === "CHANGES_REQUESTED") return false;
+  const ci = ciStatusOf(prView?.statusCheckRollup);
+  return ci !== "failing" && ci !== "pending";
+}
+
 // POST /api/tasks/:id/merge — approve & merge an in-review task.
 // PR-backed: `gh pr merge <url> <method>`. Otherwise a local fast-forward of the
 // task branch into the project's default branch. On success: `merged` event,
 // in_review→verifying (triggers smoke), best-effort worktree teardown. On
 // conflict: the task is bounced back to the agent (see mergeFailed); other
 // failures (CI blocked) return 409 with the reason and no state change.
+//
+// body.merge_strategy === "local_ff" forces the local fast-forward path even
+// when task.pr_url is set — the escape hatch for a PR whose base comparison
+// on GitHub is stale (origin/<base> behind the primary checkout's local
+// <base>) while the branch is still a clean ff onto local <base>. It skips
+// `gh pr merge` and the staleBaseRefusal gate (an explicit override is the
+// caller's call to make) but still honours the PR state probe: a CLOSED PR is
+// refused and a MERGED one just advances. The same
+// staleness shape is also detected automatically: if `gh pr merge` fails with
+// a conflict/not-mergeable/not-an-ancestor reason AND the PR's own state says
+// the blocker is the base comparison rather than branch protection, hive tries
+// the local ff before bouncing the task back to the agent (rebasing onto a
+// stale origin/<base> would only make things worse).
 // Guarded by the `task.merge` standing-authority action.
 export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps): Promise<Response> {
   const task = getTask(db, id);
@@ -1347,16 +1410,28 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   const config = JSON.parse(project?.config ?? "{}");
   const base = config.default_branch || "main";
+  const forceLocalFf = body?.merge_strategy === "local_ff";
 
-  let method: string;
+  let method = "";
+  let prView: any = null;
   if (task.pr_url) {
     // A closed or already-merged PR fails `gh pr merge` with an opaque GraphQL
     // error and used to bounce the agent with a bogus conflict steer (task #90
     // looped on its replaced PR for hours). Tell the truth instead — and when
     // GitHub says MERGED, just advance: the work landed, hive's link was stale.
-    const probe = await exec(["gh", "pr", "view", task.pr_url, "--json", "state"]);
+    // Runs on the forced local_ff path too: that override exists for a stale
+    // base comparison, never for landing a rejected PR's branch.
+    const probe = await exec([
+      "gh",
+      "pr",
+      "view",
+      task.pr_url,
+      "--json",
+      "state,mergeStateStatus,reviewDecision,statusCheckRollup",
+    ]);
     if (probe.code === 0) {
-      const prState = String(JSON.parse(probe.stdout || "{}").state ?? "").toUpperCase();
+      prView = JSON.parse(probe.stdout || "{}");
+      const prState = String(prView.state ?? "").toUpperCase();
       if (prState === "MERGED") {
         method = "already merged on GitHub";
       } else if (prState === "CLOSED") {
@@ -1367,47 +1442,46 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
           base,
           `PR is CLOSED (not merged): ${task.pr_url}. If the agent replaced it, its 'ready' emit now re-links the task; otherwise re-link via POST /api/tasks/link-pr.`
         );
-      } else {
-        method = ""; // open: fall through to the real merge below
       }
-    } else {
-      method = "";
     }
-    if (!method) {
+  }
+
+  if (!method) {
+    if (task.pr_url && !forceLocalFf) {
       const flag = ghMergeFlag(config.merge_method);
       method = `pr ${flag.slice(2)}`;
       const r = await exec(["gh", "pr", "merge", task.pr_url, flag]);
       if (r.code !== 0) {
         const reason = r.stderr.trim() || r.stdout.trim() || `gh pr merge exited ${r.code}`;
-        return mergeFailed(db, herdr, task, base, reason);
+        // GitHub's mergeability check compares against origin/<base>, which can
+        // be a stale fork behind the primary checkout's local <base> (task 328).
+        // Rebasing onto that stale fork only pulls in unrelated history — so
+        // before bouncing the agent, check whether the branch is still a clean
+        // ff onto LOCAL <base> and merge that way instead. Gated on the PR's own
+        // state: a protection block (failing checks, missing reviews) wears the
+        // same "not mergeable" reason, and must never be merged around.
+        if (MERGE_CONFLICT_RE.test(reason) && staleBaseRefusal(prView) && project?.repo_path && task.branch) {
+          const ffReason = await attemptLocalFf(exec, project, task, base);
+          if (ffReason === null) {
+            method = "local ff-only (PR merge reported not-mergeable against origin/" + base + ")";
+          } else {
+            return mergeFailed(db, herdr, task, base, `${reason}; local fast-forward also refused: ${ffReason}`);
+          }
+        } else {
+          return mergeFailed(db, herdr, task, base, reason);
+        }
       }
+    } else {
+      if (!project?.repo_path) return err("project has no repo_path; cannot merge", 400);
+      if (!task.branch) return err("task has no branch; nothing to merge", 400);
+      // Documented safe local merge: fast-forward the default branch to the task
+      // branch tip. Requires the default branch to be an ancestor of the task
+      // branch; a non-fast-forward (diverged / conflicting) merge is refused, no
+      // working tree is touched. Callers wanting a squash merge should use a PR.
+      const ffReason = await attemptLocalFf(exec, project, task, base);
+      if (ffReason !== null) return mergeFailed(db, herdr, task, base, ffReason);
+      method = forceLocalFf && task.pr_url ? "local ff-only (forced; PR-backed task)" : "local ff-only";
     }
-  } else {
-    if (!project?.repo_path) return err("project has no repo_path; cannot merge", 400);
-    if (!task.branch) return err("task has no branch and no pr_url; nothing to merge", 400);
-    // Documented safe local merge: fast-forward the default branch to the task
-    // branch tip. Requires the default branch to be an ancestor of the task
-    // branch; a non-fast-forward (diverged / conflicting) merge is refused, no
-    // working tree is touched. Callers wanting a squash merge should use a PR.
-    const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", base, task.branch]);
-    if (anc.code !== 0) {
-      // Name the exact commit compared against: this is the primary checkout's
-      // LOCAL base ref, which can be ahead of origin/<base> — an agent rebased
-      // onto origin/main and hit this identical failure twice before digging
-      // out that hive checks a different, unfetchable-by-name ref.
-      const sha = (await exec(["git", "-C", project.repo_path, "rev-parse", "--short", base])).stdout.trim();
-      const reason =
-        `'${base}' (LOCAL ref in the primary checkout${sha ? `, ${sha}` : ""} — may be ahead of origin/${base}) ` +
-        `is not an ancestor of '${task.branch}'; not a fast-forward. Rebase onto that exact commit ` +
-        `(git fetch <primary-checkout> ${base}) or open a PR.`;
-      return mergeFailed(db, herdr, task, base, reason);
-    }
-    const r = await exec(["git", "-C", project.repo_path, "merge", "--ff-only", task.branch]);
-    if (r.code !== 0) {
-      const reason = r.stderr.trim() || r.stdout.trim() || `git merge --ff-only exited ${r.code}`;
-      return mergeFailed(db, herdr, task, base, reason);
-    }
-    method = "local ff-only";
   }
 
   writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url } });

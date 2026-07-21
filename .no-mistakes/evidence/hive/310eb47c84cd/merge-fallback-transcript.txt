@@ -1,0 +1,44 @@
+Scenario (reproduces task 4d8d5c5c8496 / PR #40): the primary checkout's LOCAL main
+carries a commit that was never pushed, so origin/main on GitHub is a stale fork one
+commit behind. GitHub computes mergeability against that stale fork and refuses; the
+branch is nonetheless a clean fast-forward onto LOCAL main.
+
+$ git -C checkout log --oneline --graph --decorate --all
+  * b045aa2 (hive/final) task work to land
+  * b23053c (HEAD -> main, hive/ui) UI demo task work
+  * 50dc68f (hive/forced) work on hive/forced
+  * 08fe25f (hive/feat) C3 the task's work
+  * b6aedb8 C2 landed locally, never pushed to the fork
+  * 857e7dd (origin/main) C1 base
+
+$ gh pr merge https://github.com/acme/hive/pull/40 --merge   # what GitHub actually says
+  GraphQL: Pull Request is not mergeable (mergePullRequest)
+  exit 1
+
+================================================================================
+BEFORE  (base f900c39) — POST /api/tasks/f5ae92f4a2ce/merge  {}
+================================================================================
+  main before: 6686dda C2 landed locally, never pushed to the fork
+  response:    {"error":"merge conflict — task sent back to the agent to rebase onto 'main' (GraphQL: Pull Request is not mergeable (mergePullRequest))"} [HTTP 409]
+  task state:  in_progress   <-- bounced back to the agent
+  main after:  6686dda C2 landed locally, never pushed to the fork   <-- work did NOT land
+
+================================================================================
+AFTER   (4c14211) — POST /api/tasks/0258cb6ef757/merge  {}
+================================================================================
+  main before: b23053c UI demo task work
+  response:    {"id": "0258cb6ef757", "state": "done"} [HTTP 200]
+  task state:  done   <-- advanced, not bounced
+  main after:  b045aa2 task work to land   <-- work LANDED via local ff
+  merged event: {"method": "local ff-only (PR merge reported not-mergeable against origin/main)", "base": "main", "branch": "hive/final", "pr_url": "https://github.com/acme/hive/pull/40"}
+
+================================================================================
+SAFETY GATE (4c14211) — same stale base, but the PR is ALSO blocked by branch
+protection (a required review is missing). The local ff would succeed; it must
+NOT be used to merge around the protection.
+================================================================================
+  gh pr view --json ... -> {"mergeStateStatus":"BEHIND","reviewDecision":"REVIEW_REQUIRED"}
+  main before: b045aa2 task work to land
+  response:    {"error":"merge conflict — task sent back to the agent to rebase onto 'main' (GraphQL: Pull Request is not mergeable (mergePullRequest))"} [HTTP 409]
+  main after:  b045aa2 task work to land   <-- unchanged: protection NOT bypassed
+  merged events: 0 (none)
