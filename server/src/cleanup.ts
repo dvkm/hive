@@ -23,9 +23,11 @@ import { defaultExec } from "./exec.ts";
 // bring up their docker stack themselves; teardown runs BEFORE the worktree is
 // removed (the command usually needs files inside it). Both: relative argv[0]
 // resolves against repo_path, {worktree} substitutes the task's worktree path,
-// best-effort with a hard timeout — a failed hook never blocks spawn nor
-// worktree/session cleanup (256 orphaned docker containers, 2026-07-13, were
-// stacks nothing ever tore down). Emits a stack_setup / stack_teardown event.
+// run with a hard timeout. Emits a stack_setup / stack_teardown event and
+// returns whether the hook succeeded; the two callers treat that differently:
+// teardown ignores it (a failed 'down' must never block worktree/session
+// cleanup — 256 orphaned docker containers, 2026-07-13, were stacks nothing
+// ever tore down), while setup ABORTS the spawn (see api.ts spawnAgent).
 export async function runStackCmd(
   db: DB,
   taskId: string,
@@ -34,8 +36,8 @@ export async function runStackCmd(
   worktreePath: string,
   exec: Exec,
   kind: { type: "stack_setup" | "stack_teardown"; source: string; timeoutMs?: number }
-): Promise<void> {
-  if (!Array.isArray(argvTemplate) || !argvTemplate.length) return;
+): Promise<{ ok: boolean; error?: string }> {
+  if (!Array.isArray(argvTemplate) || !argvTemplate.length) return { ok: true };
   const argv = argvTemplate.map((a) => String(a).replaceAll("{worktree}", worktreePath));
   if (!argv[0].startsWith("/")) argv[0] = `${repoPath}/${argv[0]}`;
   // Teardown ('wt.sh down') is quick; setup ('wt.sh up') on a cold worktree
@@ -54,19 +56,23 @@ export async function runStackCmd(
         )
       ),
     ]);
+    const error = r.code === 0 ? undefined : (r.stderr || r.stdout).slice(0, 300);
     writeEvent(db, {
       task_id: taskId,
       source: kind.source,
       type: kind.type,
-      payload: { argv, ok: r.code === 0, ...(r.code !== 0 ? { error: (r.stderr || r.stdout).slice(0, 300) } : {}) },
+      payload: { argv, ok: r.code === 0, ...(error ? { error } : {}) },
     });
+    return { ok: r.code === 0, error };
   } catch (e: any) {
+    const error = String(e?.message ?? e).slice(0, 300);
     writeEvent(db, {
       task_id: taskId,
       source: kind.source,
       type: kind.type,
-      payload: { argv, ok: false, error: String(e?.message ?? e).slice(0, 300) },
+      payload: { argv, ok: false, error },
     });
+    return { ok: false, error };
   }
 }
 
