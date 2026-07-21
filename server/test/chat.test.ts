@@ -205,6 +205,30 @@ test("a message to a closed thread spawns a fresh session, not a resurrection", 
   expect(newTask.state).toBe("in_progress");
 });
 
+test("an arbitrary body.task_id cannot hijack an unrelated task as the chat supervisor", async () => {
+  // A caller passing an arbitrary/wrong task_id must not bind the new thread
+  // to that task's real agent (deliverToSupervisor would otherwise treat it
+  // as the supervisor session and could respawn it on a send failure,
+  // clobbering that task's agent/worktree/brief). task_id is undocumented and
+  // unused by the CLI, so chatTurn ignores it outright.
+  const victim = await (await fetch(BASE + "/api/tasks", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project_id: projectId, title: "unrelated ship task" }),
+  })).json();
+  expect(victim.source).not.toBe("chat_supervisor");
+
+  const { status, json } = await post("/api/chat/turn", {
+    project_id: projectId, text: "hijack attempt", task_id: victim.id,
+  });
+  expect(status).toBe(202);
+
+  const thread = (await get(`/api/chat/threads/${json.thread_id}`)).json;
+  expect(thread.task_id).not.toBe(victim.id); // got its own fresh supervisor task, not the victim's
+
+  const victimAfter = (await get(`/api/tasks/${victim.id}`)).json;
+  expect(victimAfter.state).toBe(victim.state); // untouched
+});
+
 test("starting a chat with no project is rejected (session needs a repo)", async () => {
   const { status, json } = await post("/api/chat/turn", { text: "hello" });
   expect(status).toBe(400);
