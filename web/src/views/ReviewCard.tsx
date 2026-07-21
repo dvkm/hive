@@ -285,7 +285,7 @@ export function ReviewCard({
           ? "No PR and no branch — nothing to merge"
           : ""
     : "";
-  const merge = async () => {
+  const merge = async (strategy?: "local_ff") => {
     if (busy) return;
     setBusy(true);
     setMergeErr("");
@@ -294,8 +294,8 @@ export function ReviewCard({
         await api.transition(task.id, "verifying");
         toast("Report accepted");
       } else {
-        await api.merge(task.id);
-        toast("Merged → Verifying");
+        await api.merge(task.id, strategy);
+        toast(strategy ? "Merged locally → Verifying" : "Merged → Verifying");
       }
       onDone?.();
     } catch (e) {
@@ -447,7 +447,7 @@ export function ReviewCard({
       )}
 
       <div className="review-actions">
-        <button className="btn btn-primary" onClick={merge} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
+        <button className="btn btn-primary" onClick={() => merge()} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
           {busy ? "Working…" : isScout ? "Accept report" : "Approve & merge"}
         </button>
         <button className="btn" onClick={() => setMode(mode === "changes" ? null : "changes")}>
@@ -458,7 +458,25 @@ export function ReviewCard({
         </button>
       </div>
       {mergeBlocked && <div className="review-blocked">{mergeBlocked}</div>}
-      {mergeErr && <div className="review-merge-error">Merge failed: {mergeErr}</div>}
+      {mergeErr && (
+        <div className="review-merge-error">
+          Merge failed: {mergeErr}
+          {task.pr_url && !mergeErr.includes("CLOSED (not merged)") && (
+            <button
+              className="btn"
+              style={{ marginLeft: "var(--s2)" }}
+              disabled={busy || !!mergeBlocked}
+              title={
+                mergeBlocked ||
+                "Skip GitHub's PR merge (which compares against origin/main and can be a stale fork) and fast-forward local main directly onto this branch. Only succeeds if the branch is still a clean fast-forward."
+              }
+              onClick={() => merge("local_ff")}
+            >
+              Force local merge
+            </button>
+          )}
+        </div>
+      )}
 
       {mode && (
         <div className="review-notes">

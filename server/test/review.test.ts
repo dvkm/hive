@@ -108,19 +108,44 @@ test("taskDiff uses git diff base...branch for a branch task, gh for a PR task",
 // ---- full server: merge / request-changes / reject / brief ----
 
 // Build a fresh server whose git/gh + herdr are stubbed. `gitMergeCode` controls
-// the local merge outcome (0 = success, non-zero = conflict).
-function makeServer(opts: { gitMergeCode?: number; gitMergeStderr?: string; prState?: string; rollup?: any[] } = {}) {
+// the local ff-only outcome (0 = success, non-zero = conflict); `ghMergeCode`
+// independently controls `gh pr merge` (defaults to mirroring gitMergeCode, so
+// existing PR-merge-failure tests keep both paths failing together).
+function makeServer(
+  opts: {
+    gitMergeCode?: number;
+    gitMergeStderr?: string;
+    ghMergeCode?: number;
+    headBranch?: string;
+    prState?: string;
+    mergeStateStatus?: string;
+    reviewDecision?: string;
+    rollup?: any[];
+  } = {}
+) {
   const db = openDb(":memory:");
   const sends: { target: string; message: string }[] = [];
   const removed: string[] = [];
+  const ghMergeCalls: string[][] = [];
+  // Mutable so a test can reach in_review with green checks and only then flip
+  // the PR's state — the same `gh pr view` stub answers both the ready-time
+  // hand-off and the merge probe, so a pending rollup set up front would hold
+  // the task in_progress and the merge would 409 on the state gate instead.
+  const prView = {
+    state: opts.prState ?? "OPEN",
+    mergeStateStatus: opts.mergeStateStatus ?? "CLEAN",
+    reviewDecision: opts.reviewDecision ?? "",
+    statusCheckRollup: opts.rollup ?? [],
+  };
   const exec: Exec = async (argv) => {
-    if (has(argv, "gh", "pr", "view"))
-      return OK(JSON.stringify({ state: opts.prState ?? "OPEN", statusCheckRollup: opts.rollup ?? [] }));
-    if (has(argv, "gh", "pr", "merge"))
-      return opts.gitMergeCode
-        ? { code: opts.gitMergeCode, stdout: "", stderr: "GraphQL: Pull Request is not mergeable (mergePullRequest)" }
-        : OK();
-    if (has(argv, "git", "merge-base", "--is-ancestor")) return { code: 0, stdout: "", stderr: "" };
+    if (has(argv, "gh", "pr", "view")) return OK(JSON.stringify(prView));
+    if (has(argv, "gh", "pr", "merge")) {
+      ghMergeCalls.push(argv);
+      const code = opts.ghMergeCode ?? opts.gitMergeCode;
+      return code ? { code, stdout: "", stderr: "GraphQL: Pull Request is not mergeable (mergePullRequest)" } : OK();
+    }
+    if (has(argv, "git", "symbolic-ref", "--short", "HEAD")) return OK(`${opts.headBranch ?? "main"}\n`);
+    if (has(argv, "git", "merge-base", "--is-ancestor")) return OK();
     if (has(argv, "git", "merge", "--ff-only")) {
       const code = opts.gitMergeCode ?? 0;
       return { code, stdout: "", stderr: code ? opts.gitMergeStderr ?? "CONFLICT (content): merge conflict in x" : "" };
@@ -148,7 +173,7 @@ function makeServer(opts: { gitMergeCode?: number; gitMergeStderr?: string; prSt
   const herdr = new Herdr(exec, "herdr");
   const server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr, exec }) });
   const base = `http://127.0.0.1:${server.port}`;
-  return { db, server, base, sends, removed };
+  return { db, server, base, sends, removed, ghMergeCalls, prView };
 }
 
 async function post(base: string, path: string, body: unknown) {
@@ -259,6 +284,101 @@ test("merging a CLOSED PR fails truthfully, no bogus conflict bounce", async () 
   const task = await get(s.base, `/api/tasks/${id}`);
   expect(task.json.state).toBe("in_review"); // no bounce: nothing for the agent to rebase
   expect(s.sends.length).toBe(sendsBefore);
+  s.server.stop(true);
+});
+
+test("PR merge fails on a stale base but the branch is a clean local ff → falls back instead of bouncing (task 328)", async () => {
+  // gh pr merge fails "not mergeable" over a stale base; local ff-only stays green (default)
+  const s = makeServer({ ghMergeCode: 1, mergeStateStatus: "BEHIND" });
+  const id = await inReviewWithPr(s.base, "https://gh/pr/328");
+  const r = await post(s.base, `/api/tasks/${id}/merge`, {});
+  expect(r.status).toBe(200);
+  expect(["verifying", "done"]).toContain(r.json.state); // not bounced back to in_progress
+  const ev = await get(s.base, `/api/tasks/${id}/events`);
+  const merged = ev.json.find((e: any) => e.type === "merged");
+  expect(merged.payload.method).toContain("local ff-only");
+  expect(ev.json.some((e: any) => e.type === "merge_failed")).toBe(false);
+  s.server.stop(true);
+});
+
+test("PR merge fails and the local ff also fails (real conflict) → still bounces to the agent", async () => {
+  // both gh and local ff fail
+  const s = makeServer({ ghMergeCode: 1, gitMergeCode: 1, mergeStateStatus: "DIRTY" });
+  const id = await inReviewWithPr(s.base, "https://gh/pr/329");
+  const r = await post(s.base, `/api/tasks/${id}/merge`, {});
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("sent back to the agent");
+  expect(r.json.error).toContain("local fast-forward also refused"); // the actionable ff reason, not just gh's
+  const task = await get(s.base, `/api/tasks/${id}`);
+  expect(task.json.state).toBe("in_progress");
+  s.server.stop(true);
+});
+
+// Branch protection wears the same opaque "not mergeable" reason as a stale
+// base; the local ff must never be used to merge around it. The rollup mixes
+// CheckRun (progress in `status`) and StatusContext (`state`) shapes — both
+// must block. Each case reaches in_review green, then flips the PR state, so
+// the 409 proves the fallback gate refused rather than the in_review gate.
+for (const [label, blocker] of [
+  ["a failing required check", { statusCheckRollup: [{ conclusion: "FAILURE" }] }],
+  ["an errored required check", { statusCheckRollup: [{ conclusion: "ERROR" }] }],
+  ["a cancelled required check", { statusCheckRollup: [{ conclusion: "CANCELLED" }] }],
+  ["a running required StatusContext", { statusCheckRollup: [{ state: "PENDING" }] }],
+  ["a running required CheckRun", { statusCheckRollup: [{ status: "IN_PROGRESS" }] }],
+  ["a queued required CheckRun", { statusCheckRollup: [{ status: "QUEUED" }] }],
+  ["a missing required review", { reviewDecision: "REVIEW_REQUIRED" }],
+  ["a reviewer requesting changes", { reviewDecision: "CHANGES_REQUESTED" }],
+  ["BLOCKED with no detail", { mergeStateStatus: "BLOCKED" }],
+] as const) {
+  test(`PR merge blocked by ${label} → no local ff fallback, no merge`, async () => {
+    const s = makeServer({ ghMergeCode: 1 }); // local ff would succeed
+    const id = await inReviewWithPr(s.base, "https://gh/pr/331");
+    expect((await get(s.base, `/api/tasks/${id}`)).json.state).toBe("in_review");
+    Object.assign(s.prView, { mergeStateStatus: "BEHIND" }, blocker); // stale base + a protection blocker
+    const r = await post(s.base, `/api/tasks/${id}/merge`, {});
+    expect(r.status).toBe(409);
+    expect(r.json.error).not.toContain("not 'in_review'"); // the fallback gate refused, not the state gate
+    const ev = await get(s.base, `/api/tasks/${id}/events`);
+    expect(ev.json.some((e: any) => e.type === "merged")).toBe(false);
+    s.server.stop(true);
+  });
+}
+
+test("merge_strategy: 'local_ff' forces the local path for a PR-backed task, skipping gh pr merge entirely", async () => {
+  const s = makeServer(); // gh pr merge would succeed here too — this proves it's never called
+  const id = await inReviewWithPr(s.base, "https://gh/pr/330");
+  const r = await post(s.base, `/api/tasks/${id}/merge`, { merge_strategy: "local_ff" });
+  expect(r.status).toBe(200);
+  expect(["verifying", "done"]).toContain(r.json.state);
+  expect(s.ghMergeCalls.length).toBe(0);
+  const ev = await get(s.base, `/api/tasks/${id}/events`);
+  const merged = ev.json.find((e: any) => e.type === "merged");
+  expect(merged.payload.method).toContain("local ff-only (forced");
+  s.server.stop(true);
+});
+
+test("merge_strategy: 'local_ff' still refuses a CLOSED PR", async () => {
+  const s = makeServer(); // local ff would succeed — the PR state probe is what refuses
+  const id = await inReviewWithPr(s.base, "https://gh/pr/332");
+  Object.assign(s.prView, { state: "CLOSED" });
+  const r = await post(s.base, `/api/tasks/${id}/merge`, { merge_strategy: "local_ff" });
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("CLOSED (not merged)");
+  const ev = await get(s.base, `/api/tasks/${id}/events`);
+  expect(ev.json.some((e: any) => e.type === "merged")).toBe(false);
+  s.server.stop(true);
+});
+
+// git merge --ff-only lands on whatever HEAD is, not on the named base ref —
+// a checkout parked elsewhere would silently ff that other branch instead.
+test("local ff refuses when the primary checkout is not on the base branch", async () => {
+  const s = makeServer({ headBranch: "some/feature" });
+  const id = await inReviewWithPr(s.base, "https://gh/pr/333");
+  const r = await post(s.base, `/api/tasks/${id}/merge`, { merge_strategy: "local_ff" });
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("some/feature");
+  const ev = await get(s.base, `/api/tasks/${id}/events`);
+  expect(ev.json.some((e: any) => e.type === "merged")).toBe(false);
   s.server.stop(true);
 });
 

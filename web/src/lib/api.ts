@@ -471,7 +471,8 @@ export const api = {
   duplicates: () =>
     req<{ clusters: { project_id: string; tasks: Pick<Task, "id" | "title" | "project_id" | "state">[] }[] }>(`/api/tasks/duplicates`),
   diff: (id: string) => req<DiffResult>(`/api/tasks/${id}/diff`),
-  merge: (id: string) => req<Task>(`/api/tasks/${id}/merge`, { method: "POST", body: "{}" }),
+  merge: (id: string, strategy?: "local_ff") =>
+    req<Task>(`/api/tasks/${id}/merge`, { method: "POST", body: JSON.stringify(strategy ? { merge_strategy: strategy } : {}) }),
   requestChanges: (id: string, notes: string) =>
     req<{ ok: boolean; delivered: boolean; task: Task }>(`/api/tasks/${id}/request-changes`, {
       method: "POST",
