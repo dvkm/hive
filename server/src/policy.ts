@@ -53,6 +53,24 @@ const PROD_RE = /\bprod(uction)?\b|\bdeploy(ment)?\b|\bcustomer data\b/i;
 const SHARED_RE = /\bmigration\b|\bschema\b|\binfra(structure)?\b|\bshared\b|\bpipeline\b/i;
 const IRREVERSIBLE_RE = /\bdrop\s+table\b|\bforce.?push\b|\brm\s+-rf\b|\bdestroy\b|\bdelete\b.*\bpermanent/i;
 
+// Would acting on this option require the DIRECTOR to hand something over
+// (a credential, token, login, file) before the agent can proceed? Auto-answering
+// such an option is worse than useless: the answer arrives with no payload and the
+// agent stays blocked (incident dec_8f964774097e — auto-picked "give me admin
+// credentials", no token attached, director had to intervene anyway).
+//
+// One place, two signals: an explicit `requires_input: true` a caller can set on
+// the option, and a conservative keyword scan of the label+detail so naive cards
+// that never set the flag are still caught. Kept deliberately narrow — matching a
+// credential/attachment ask, not any mention of a word.
+const NEEDS_INPUT_RE =
+  /\b(credential|token|secret|password|passphrase|api[\s-]?key|login credential)s?\b|\b(attach|upload|paste|provide|supply|hand over|send me|give me)\b[^.]*\b(token|key|credential|secret|password|login|file|link|url|access)\b/i;
+
+export function optionNeedsDirectorInput(opt: { label?: string; detail?: string; requires_input?: boolean }): boolean {
+  if (opt?.requires_input === true) return true;
+  return NEEDS_INPUT_RE.test(`${opt?.label ?? ""} ${opt?.detail ?? ""}`);
+}
+
 export function factorsFromPlan(
   plan: { proposed_tasks: { title: string; brief: string }[]; questions: string[] },
   preferenceKnown: boolean

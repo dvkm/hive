@@ -21,7 +21,7 @@ Usage:
         review_summary: --json review.json with {done[], iffy[], decisions[], testing[], followups[]}
         ready: PR open (or scout report written) → hand off to review (in_progress -> in_review)
   hive decision ask <task-id> --title <t> [--context <s>] [--risk <s>] [--blast <s>]
-        --option key:label:detail  (repeatable)  --recommend <key>
+        --option key:label:detail  (repeatable)  --recommend <key>  --needs-input <key>
   hive policy add --title <t> --body <s>|--body-file <f> [--scope global|project:<id>]
   hive policy list [--scope <s>]
   hive authority add --action <pattern> --effect allow|require_decision|deny [--project <id>] [--note <s>]
@@ -219,9 +219,16 @@ async function main() {
       if (!flags.title) die("--title is required");
       const rawOpts = ([] as any[]).concat(flags.option || []);
       const recommend = flags.recommend ? String(flags.recommend) : undefined;
+      const needsInput = new Set(([] as any[]).concat(flags["needs-input"] || []).map(String));
       const options = rawOpts.map((o: string) => {
         const [key, label, ...rest] = String(o).split(":");
-        return { key, label: label ?? key, detail: rest.join(":") || "", recommended: key === recommend };
+        return {
+          key,
+          label: label ?? key,
+          detail: rest.join(":") || "",
+          recommended: key === recommend,
+          ...(needsInput.has(key) ? { requires_input: true } : {}),
+        };
       });
       const d = await api("POST", "/api/decisions", {
         task_id: taskId,

@@ -222,6 +222,37 @@ test("autoAnswerStale answers timed-out normal-risk cards with the recommendatio
   expect((db.query("SELECT status FROM decisions WHERE id = ?").get(high) as any).status).toBe("open");
 });
 
+test("autoAnswerStale skips options that need director-supplied input (flag or keyword), notifies once", async () => {
+  const { autoAnswerStale } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ decision_auto_answer_hours: 4 });
+  const id = makeTask(db, projectId, {});
+  const stale = new Date(Date.now() - 5 * 3600_000).toISOString();
+  const mk = (opts: any[]) => {
+    const did = newId("dec");
+    db.query(
+      "INSERT INTO decisions (id, task_id, ts, title, risk, options, status) VALUES (?,?,?,?,'normal',?, 'open')"
+    ).run(did, id, stale, "creds?", JSON.stringify(opts));
+    return did;
+  };
+  // keyword signal: the incident's exact shape — recommended option asks for a token
+  const byKeyword = mk([
+    { key: "creds", label: "give me admin credentials", detail: "attach a token so I can authenticate", recommended: true },
+    { key: "skip", label: "Skip" },
+  ]);
+  // explicit flag signal
+  const byFlag = mk([
+    { key: "go", label: "Do it", recommended: true, requires_input: true },
+    { key: "no", label: "No" },
+  ]);
+  const herdr = new Herdr(stub(() => OK()), "herdr");
+  autoAnswerStale(db, herdr, Date.now());
+  expect((db.query("SELECT status, answer_key FROM decisions WHERE id = ?").get(byKeyword) as any).status).toBe("open");
+  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(byFlag) as any).status).toBe("open");
+  // notified once per task, not every tick
+  autoAnswerStale(db, herdr, Date.now());
+  expect(db.query("SELECT COUNT(*) n FROM events WHERE task_id = ? AND type = 'auto_answer_skipped'").get(id) as any).toEqual({ n: 1 });
+});
+
 test("flagStale emits one stale event past the threshold, then stops", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId);
