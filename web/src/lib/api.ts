@@ -72,7 +72,7 @@ export interface Event {
   id: string;
   task_id: string;
   ts: string;
-  source: "agent" | "hook" | "herdr" | "reconciler" | "monitor" | "director" | "system";
+  source: "agent" | "hook" | "herdr" | "reconciler" | "monitor" | "director" | "system" | "chat_supervisor" | "unknown";
   type: string;
   payload: Record<string, unknown>;
 }
@@ -118,6 +118,10 @@ export interface Decision {
   answer_note: string | null;
   draft_note: string | null;
   answered_at: string | null;
+  // Who answered (audit trail). director when David clicked in the inbox;
+  // chat_supervisor/agent/system for programmatic callers; unknown if unattributed.
+  answered_by: "director" | "chat_supervisor" | "agent" | "system" | "unknown" | null;
+  answered_actor: string | null;
   bundle?: DecisionBundle | null;
 }
 
@@ -489,7 +493,8 @@ export const api = {
   answerDecision: (id: string, answer_key: string, answer_note?: string) =>
     req<Decision>(`/api/decisions/${id}/answer`, {
       method: "POST",
-      body: JSON.stringify({ answer_key, answer_note }),
+      // The inbox is David's surface — answers from here are the director's.
+      body: JSON.stringify({ answer_key, answer_note, source: "director" }),
     }),
   dismissDecision: (id: string) =>
     req<Decision>(`/api/decisions/${id}/dismiss`, { method: "POST" }),

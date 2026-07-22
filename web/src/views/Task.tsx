@@ -13,6 +13,7 @@ import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
 import { fmtTokens, fmtUsd } from "./Analytics";
 import { buildTimeline } from "../lib/timeline";
+import { ANSWERED_BY_LABEL } from "../lib/labels";
 import type { TimelineItem } from "../lib/timeline";
 import { eventText } from "../lib/eventText";
 
@@ -176,7 +177,12 @@ function TimelineRow({ it }: { it: TimelineItem }) {
           <Link className="btn btn-primary btn-mini" to="/decisions">Answer in inbox →</Link>
         ) : (
           <div className="tl-decision-answer">
-            ✓ You answered: <strong>{it.answerLabel}</strong>
+            {d.answered_by && ANSWERED_BY_LABEL[d.answered_by] ? (
+              <>{ANSWERED_BY_LABEL[d.answered_by]} answered: </>
+            ) : (
+              <>✓ You answered: </>
+            )}
+            <strong>{it.answerLabel}</strong>
             {d.answer_note && <> — {d.answer_note}</>}
             {d.answered_at && <span className="tl-age"> · {relTime(d.answered_at)}</span>}
           </div>

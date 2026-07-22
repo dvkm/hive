@@ -305,6 +305,58 @@ test("decision: create, draft autosave, answer flow", async () => {
   expect(resumed.json.decisions.some((x: any) => x.status === "answered")).toBe(true);
 });
 
+test("answer records the caller identity (source + actor) on row and event", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "who answered" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
+  const d = await post("/api/decisions", {
+    task_id: t.json.id,
+    title: "ship?",
+    options: [{ key: "yes", label: "Yes" }],
+  });
+  const ans = await post(`/api/decisions/${d.json.id}/answer`, {
+    answer_key: "yes",
+    source: "chat_supervisor",
+    actor: "sup-session-42",
+  });
+  expect(ans.status).toBe(200);
+  expect(ans.json.answered_by).toBe("chat_supervisor");
+  expect(ans.json.answered_actor).toBe("sup-session-42");
+
+  // the audit event carries the identity too (not the old hardcoded director)
+  const detail = await get(`/api/tasks/${t.json.id}`);
+  const ev = detail.json.events.find((e: any) => e.type === "decision_answered");
+  expect(ev.source).toBe("chat_supervisor");
+  expect(ev.payload.answered_by).toBe("chat_supervisor");
+  expect(ev.payload.actor).toBe("sup-session-42");
+});
+
+test("answer without a source is recorded as unknown, not director", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "no source" });
+  const d = await post("/api/decisions", {
+    task_id: t.json.id,
+    title: "pick",
+    options: [{ key: "a", label: "A" }],
+  });
+  const ans = await post(`/api/decisions/${d.json.id}/answer`, { answer_key: "a" });
+  expect(ans.status).toBe(200);
+  expect(ans.json.answered_by).toBe("unknown");
+  expect(ans.json.answered_actor).toBe(null);
+});
+
+test("answer with an invalid source is rejected 400", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "bad source" });
+  const d = await post("/api/decisions", {
+    task_id: t.json.id,
+    title: "pick",
+    options: [{ key: "a", label: "A" }],
+  });
+  const bad = await post(`/api/decisions/${d.json.id}/answer`, { answer_key: "a", source: "root" });
+  expect(bad.status).toBe(400);
+  // rejected before it mutates the card
+  const still = await get(`/api/decisions/${d.json.id}`);
+  expect(still.json.status).toBe("open");
+});
+
 test("rejecting an answer_key not in options", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "d2" });
   const d = await post("/api/decisions", {

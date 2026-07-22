@@ -33,6 +33,7 @@ export interface TLDecision {
   answer_key?: string | null;
   answer_note?: string | null;
   answered_at?: string | null;
+  answered_by?: string | null;
   options?: TLOption[];
 }
 
