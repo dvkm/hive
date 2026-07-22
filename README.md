@@ -57,6 +57,9 @@ bin/hive emit <task-id> evidence --file ./shot.png --note "caption"
 bin/hive emit <task-id> done --note "summary"
 bin/hive decision ask <task-id> --title "..." --risk high \
     --option go:Go:"do it" --option wait:Wait:"hold" --recommend go
+bin/hive decision auto-answer <decision-id> --key <option> [--reason "..."]
+    # supervisor self-approval; answers only if the server safety bar clears,
+    # else exits 3 and leaves the card open for the director
 bin/hive policy add --title "..." --body "..." [--scope global|project:<id>]
 bin/hive policy list [--scope <s>]
 bin/hive learning add --project <id> --title "..." [--body "..."] [--root-cause]
@@ -195,3 +198,15 @@ server/test/ bun test suite
   /api/chat/threads/:id/reply`. `POST /api/chat/threads/:id/close` cancels the
   backing task so the terminal-hook cleanup reclaims its worktree/session; a
   later message to the same thread spawns a fresh session. See `docs/API.md`.
+- **Supervisor auto-approve** (`server/src/autoapprove.ts`, task #364). The
+  supervisor may clear a narrow set of safe decision cards itself instead of
+  always waiting on the director, via `hive decision auto-answer <id> --key <opt>`
+  / `POST /api/decisions/:id/auto-answer`. The safety bar is enforced
+  server-side (a worker on loopback gets the same verdict): a CLOSED allow-list
+  of three intrinsically-reversible categories (reference capture,
+  high-confidence duplicate merge, task requeue), gated on the raiser's own
+  `recommended` option, low/normal risk, and a non-prod/shared blast radius; a
+  pending standing-authority command grant is never auto-approvable. Cleared
+  cards write an `auto_approved` audit event tagged `source="chat_supervisor"`;
+  declined cards stay open, log `auto_approve_declined`, and return `403` so the
+  supervisor escalates. Everything else routes to the director as before.

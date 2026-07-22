@@ -43,6 +43,7 @@ import { routeIntakeProject } from "./intake/route.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { costUsd } from "./pricing.ts";
 import { checkCostGuardrails, resolveCostCapForDecision, taskSpend } from "./costs.ts";
+import { evaluateAutoApprove } from "./autoapprove.ts";
 import { vapidPublicKey, saveSubscription, removeSubscription } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { ciStatusOf } from "./reconciler.ts";
@@ -334,6 +335,8 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       m = pathname.match(/^\/api\/decisions\/([^/]+)\/answer$/);
       if (m && method === "POST") return apiAnswerDecision(db, herdr, m[1], await req.json());
+      m = pathname.match(/^\/api\/decisions\/([^/]+)\/auto-answer$/);
+      if (m && method === "POST") return apiAutoAnswerDecision(db, herdr, m[1], await req.json());
       m = pathname.match(/^\/api\/decisions\/([^/]+)\/dismiss$/);
       if (m && method === "POST") return apiDismissDecision(db, m[1]);
 
@@ -892,7 +895,7 @@ function listTasks(db: DB, url: URL): Response {
 // cheaper to duplicate than to cross the server<-web build seam; keep in sync.
 const FEED_CATEGORIES: Record<string, string[]> = {
   state: ["state_change", "ready_for_review"],
-  decision: ["needs-decision", "decision_answered", "planned", "authority_required", "authority_granted"],
+  decision: ["needs-decision", "decision_answered", "planned", "authority_required", "authority_granted", "auto_approved", "auto_approve_declined"],
   evidence: ["evidence", "smoke_passed"],
   incident: ["blocked", "stale", "spawn_error", "smoke_failed", "steer_error", "planner_error", "supervise_error", "authority_denied", "merge_failed"],
   lifecycle: ["created", "spawned", "agent_status", "status", "steer", "note", "ci_status", "pr_merged", "planning", "assistant_text", "tool_use", "agent_turn_end"],
@@ -3135,6 +3138,42 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): 
   const decision = parseDecision({ ...r, status: "answered", answer_key: answerKey, answer_note: answerNote, answered_at: answeredAt, answered_by: answeredBy, answered_actor: answeredActor });
   broadcast({ type: "decision", decision });
   return json(decision);
+}
+
+// The chat supervisor's auto-approve path. Runs the server-enforced bar
+// (evaluateAutoApprove); if it clears, answers the card tagged as
+// source:"chat_supervisor" (so it's forensically distinct from a director click)
+// and writes an `auto_approved` audit event carrying the category + reason.
+// If it doesn't clear, answers NOTHING, leaves the card open for the director,
+// logs `auto_approve_declined`, and returns 403 so the supervisor knows to
+// escalate. The verdict — not the caller's identity — is the gate.
+export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): Response {
+  const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
+  if (!r) return err("decision not found", 404);
+  if (r.status !== "open") return err(`decision already ${r.status}`, 409);
+  const answerKey = body?.answer_key;
+  if (!answerKey) return err("answer_key is required");
+
+  const verdict = evaluateAutoApprove(db, r, answerKey);
+  if (!verdict.allow) {
+    writeEvent(db, {
+      task_id: r.task_id,
+      source: "chat_supervisor",
+      type: "auto_approve_declined",
+      payload: { decision_id: id, answer_key: answerKey, category: verdict.category, reason: verdict.reason },
+    });
+    return json({ effect: "escalate", category: verdict.category, reason: verdict.reason }, 403);
+  }
+
+  // Audit FIRST (who + why), so the record survives even if the answer path
+  // below throws. The supervisor's own note, if any, rides alongside the reason.
+  writeEvent(db, {
+    task_id: r.task_id,
+    source: "chat_supervisor",
+    type: "auto_approved",
+    payload: { decision_id: id, answer_key: answerKey, category: verdict.category, reason: verdict.reason, note: body?.answer_note ?? null },
+  });
+  return apiAnswerDecision(db, herdr, id, { ...body, source: "chat_supervisor" });
 }
 
 // Dismiss: clear a card without answering it (human escape hatch for a card with

@@ -191,6 +191,8 @@ never deleted, so the cancelled row + this pointer preserve the full history.
 - `evidence` — an evidence item was attached. `payload: {evidence_id, kind, caption}`
 - `needs-decision` — a decision card was opened. `payload: {decision_id, title}`
 - `decision_answered` — `payload: {decision_id, answer_key, answer_note, answered_by, actor}`; the event `source` is the answerer identity
+- `auto_approved` — the chat supervisor cleared a card itself via the auto-approve bar. `payload: {decision_id, answer_key, category, reason, note}`. `source: chat_supervisor`
+- `auto_approve_declined` — the auto-approve bar rejected a card; it stays `open` for the director. `payload: {decision_id, answer_key, category, reason}`. `source: chat_supervisor`
 - `decision_expired` — a decision was cleared without an answer: dismissed, or auto-expired because its task went terminal. `payload: {decision_id, reason}` (`reason` ∈ `dismissed` | `task cancelled` | `task done` | `task failed` | `task terminal (backfill)`)
 - `note` — a free note (e.g. a `done` summary). `payload: {note}`
 - `steer` — a steer message was dispatched to the agent. `payload: {message, target}`
@@ -825,13 +827,32 @@ work. Use `POST /api/tasks/:id/events` with `type=evidence` for that.
   (autosave; call debounced on every keystroke; overwrites `draft_note` only)
 - `POST /api/decisions/:id/answer` body `{answer_key (required), answer_note?, source?, actor?}` → `200 Decision` (now `answered`) | `400` (bad key / bad source) | `409` (already answered)
   Archives the card (`status=answered`, `answered_at` set), writes a
-  `decision_answered` event, and resumes the task (`needs_decision → in_progress`).
+  `decision_answered` event (`source: "director"`, `payload.answered_by: "director"`),
+  and resumes the task (`needs_decision → in_progress`).
   If `answer_note` is omitted, the saved `draft_note` is used.
   `source` is the caller identity for the audit trail: `director|chat_supervisor|agent|system|unknown`
   (a present-but-invalid source is `400`; a missing source is recorded as `unknown` — the web
   inbox sends `source:"director"` explicitly). `actor` is an optional free label. Both are
   recorded on the decision (`answered_by`, `answered_actor`) and the `decision_answered` event.
   This is identity only — it grants nothing and triggers no auto-approval.
+- `POST /api/decisions/:id/auto-answer` body `{answer_key (required), answer_note?}` → `200 Decision` (now `answered`) | `400` (missing key) | `403 {effect:"escalate", category, reason}` | `404` | `409` (already answered)
+  The chat supervisor's self-approval path. Runs a **server-enforced** safety bar
+  (`evaluateAutoApprove`) before doing anything — the bar, not the caller's
+  identity, is the gate, so a worker hitting this endpoint on loopback gets the
+  same verdict. The bar is a CLOSED allow-list of three intrinsically-reversible
+  mechanical categories: reference capture (`Save recurring link…` → `save`),
+  high-confidence duplicate merge (a `duplicate_suspected` card → `merge`), and
+  task requeue (a `recovery_card` → `requeue`). It clears only when the chosen key
+  is the raiser's own `recommended` option (also the confidence gate), `risk` is
+  low/normal, and the blast radius names no prod/shared target; a pending
+  standing-authority command grant is a hard structural exclusion (never
+  auto-approvable). On clear it writes an `auto_approved` audit event
+  (`source: "chat_supervisor"`, carrying `category` + `reason`) and then answers
+  the card exactly as `/answer` would, tagged `source: "chat_supervisor"`. On
+  decline it answers NOTHING, leaves the card `open`, writes an
+  `auto_approve_declined` event, and returns `403` so the caller escalates to the
+  director. Everything outside the allow-list (cost caps, PR merges, deny-guardrail
+  policy changes, blocked-pane relays, plain product questions) always declines.
 - `POST /api/decisions/:id/dismiss` → `200 Decision` (now `expired`) | `404` | `409` (already closed). Dismissing the task's LAST open card resumes a `needs_decision` task to `in_progress` (a parked task with nothing to wait on is stranded); no resolver hooks fire.
   Clears a card without answering it (the human escape hatch for a card that is
   no longer relevant, or that somehow has no usable options). Sets
@@ -853,7 +874,10 @@ holds its own context, and coordinates hive's worker agents on the director's
 behalf ("one supervisor, fans out"). Its coordination actions (creating tasks,
 answering decisions, reading status) go through the SAME `$HIVE_CLI` + API +
 standing-authority gates every hive agent uses — merges/guarded/destructive ops
-are gated identically, and the session has no privileged path around them.
+are gated identically, and the session has no privileged path around them. It
+MAY clear a narrow set of safe decision cards itself via
+`POST /api/decisions/:id/auto-answer` (server-enforced allow-list, see Decisions
+above); anything the bar declines it must escalate to the director.
 Conversation history persists in `chat_threads` / `chat_messages` (append-only,
 same shape as `events`); each thread's `task_id` is its backing supervisor task
 (`source='chat_supervisor'`, kept out of the dispatcher and the board lanes).
