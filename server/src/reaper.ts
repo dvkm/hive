@@ -9,6 +9,7 @@
 // Isolated try/catch per item; a failure never crashes the server. Mirrors the
 // reconciler loop pattern.
 import type { DB } from "./db.ts";
+import { setSetting, now } from "./db.ts";
 import { getTask, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, parseWorktreeList } from "./runtime/herdr.ts";
 import { cleanupTask } from "./cleanup.ts";
@@ -69,6 +70,11 @@ export async function reapOnce(db: DB, deps: ReaperDeps = {}): Promise<void> {
   } catch (e) {
     console.error("[hive] reaper agent sweep:", e); // isolated; never crash the sweep
   }
+
+  // Liveness heartbeat, written only once a cycle COMPLETES so a wedged sweep
+  // (e.g. a hung `git worktree list`) ages toward stale instead of a fresh
+  // setInterval tick re-marking it. See dispatcher.ts.
+  setSetting(db, "last_reap_at", now());
 }
 
 // Diff every herdr-visible agent (named by task id) against the DB. A name

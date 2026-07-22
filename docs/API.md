@@ -478,7 +478,9 @@ chat endpoints below.
 ## Endpoints
 
 ### Health
-`GET /api/health` → `200 {"ok": true, "version": "0.1.0"}`
+`GET /api/health` → `200 {"ok": true, "version": "0.1.0", "dispatcher": {"last_run": "<iso>|null", "stale": bool}, "reaper": {"last_run": "<iso>|null", "stale": bool}}`
+
+`dispatcher`/`reaper` report the last time each background loop's cycle completed (heartbeat, written on every completion path — including the offline-drain no-op — so a wedged cycle ages toward stale instead of a fresh tick re-marking it fresh). `stale` flags when a loop has missed ~3 cycles (floored at 5min) — the signal for "loop stopped ticking" vs. "process is up but a background loop silently died" (incident 2026-07-17).
 
 ### Projects
 - `GET /api/projects[?archived=all]` → `200 [Project, ...]` (oldest first)

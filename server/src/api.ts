@@ -85,6 +85,19 @@ function err(message: string, status = 400): Response {
   return json({ error: message }, status);
 }
 
+// Background-loop liveness for /api/health (incident 2026-07-17: the
+// dispatcher stopped ticking for 3.5h with zero outward signal). Threshold is
+// 3 missed cycles, floored at 5min so a loop's own interval never makes it
+// flap stale right before its next tick.
+const STALE_FLOOR_MS = 5 * 60 * 1000;
+const DISPATCH_STALE_MS = Math.max(STALE_FLOOR_MS, Number(process.env.HIVE_DISPATCH_MS || 30_000) * 3);
+const REAP_STALE_MS = Math.max(STALE_FLOOR_MS, Number(process.env.HIVE_REAP_MS || 300_000) * 3);
+function loopLiveness(db: DB, settingKey: string, staleMs: number): { last_run: string | null; stale: boolean } {
+  const lastRun = getSetting(db, settingKey);
+  const ageMs = lastRun ? Date.now() - Date.parse(lastRun) : null;
+  return { last_run: lastRun, stale: ageMs === null || ageMs > staleMs };
+}
+
 // Standing-authority gate for the internal risky paths (spawn, steer, verify,
 // done). Returns a blocking Response when the action is denied (403) or needs a
 // decision (409 {decision_id}); returns null when it may proceed.
@@ -134,7 +147,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       // ---- health ----
       if (pathname === "/api/health" && method === "GET")
-        return json({ ok: true, version: VERSION });
+        return json({ ok: true, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS) });
 
       // ---- evidence static files ----
       if (pathname.startsWith("/evidence/") && method === "GET")

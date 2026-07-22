@@ -22,7 +22,7 @@
 // behave identically.
 import type { DB } from "./db.ts";
 import { parseTask } from "./rows.ts";
-import { isOffline } from "./db.ts";
+import { isOffline, setSetting, now } from "./db.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
@@ -59,7 +59,17 @@ export interface DispatcherDeps {
 
 // One dispatch pass. Isolated per task so one bad task never stops the rest.
 export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<void> {
-  if (isOffline(db)) return; // offline mode: drain — nothing new spawns
+  // Liveness heartbeat, written only once a cycle actually COMPLETES (every
+  // return path below), so /api/health can tell "loop finished, nothing to do"
+  // apart from "loop started but wedged mid-cycle" — a fresh setInterval tick
+  // must not re-mark it fresh while the previous invocation is still hung.
+  // (incident 2026-07-17: the dispatcher went silently dead for 3.5h with no
+  // outward signal — the process kept serving API + reaper.) The isOffline
+  // early return is a legitimate no-op completion, so it heartbeats too.
+  if (isOffline(db)) {
+    setSetting(db, "last_dispatch_at", now());
+    return; // offline mode: drain — nothing new spawns
+  }
   const h = deps.herdr ?? defaultHerdr;
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
   const queued = db
@@ -161,6 +171,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     else byProject.set(task.project_id, [task]);
   }
   await Promise.all([...byProject.values()].map(dispatchProject));
+  setSetting(db, "last_dispatch_at", now()); // cycle completed — refresh heartbeat
 }
 
 // An intake task is "reviewed" once the director signals it: either a dedicated
