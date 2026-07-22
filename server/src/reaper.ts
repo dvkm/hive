@@ -3,8 +3,11 @@
 // list` across every project repo) and, for each whose task id maps to a
 // TERMINAL task (or to no task at all), tears it down — guarded so unmerged or
 // uncommitted work is never lost (see herdr.cleanupWorktree). Live/queued tasks
-// keep their worktree. Isolated try/catch per item; a failure never crashes the
-// server. Mirrors the reconciler loop pattern.
+// keep their worktree. It then separately diffs `herdr agent list` against
+// live DB tasks (sweepOrphanedAgents) to catch sessions the worktree-branch
+// pass can't see — e.g. a task row that no longer exists at all (task #341).
+// Isolated try/catch per item; a failure never crashes the server. Mirrors the
+// reconciler loop pattern.
 import type { DB } from "./db.ts";
 import { getTask, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, parseWorktreeList } from "./runtime/herdr.ts";
@@ -58,6 +61,38 @@ export async function reapOnce(db: DB, deps: ReaperDeps = {}): Promise<void> {
       } catch (e) {
         console.error(`[hive] reaper ${taskId}:`, e); // isolated; never crash the sweep
       }
+    }
+  }
+
+  try {
+    await sweepOrphanedAgents(db, deps);
+  } catch (e) {
+    console.error("[hive] reaper agent sweep:", e); // isolated; never crash the sweep
+  }
+}
+
+// Diff every herdr-visible agent (named by task id) against the DB. A name
+// with no task row at all is a true orphan — the worktree-branch pass above
+// never sees it once its worktree is gone, and it would otherwise sit running
+// forever (exactly what task #341 found: 5 of 6 stale agents had zero
+// corresponding DB task). A name that DOES resolve to a task is left to
+// cleanupTask, which already knows whether that task's worktree/session is
+// safe to close — this never second-guesses a preserved (unmerged) worktree.
+export async function sweepOrphanedAgents(db: DB, deps: ReaperDeps = {}): Promise<void> {
+  const herdr = deps.herdr ?? defaultHerdr;
+  const agents = await herdr.listAgents();
+  for (const a of agents) {
+    try {
+      const task = getTask(db, a.name);
+      if (task && !TERMINAL.includes(task.state as State)) continue; // live task, keep it
+      if (task) {
+        await cleanupTask(db, herdr, a.name, { force: true });
+        continue;
+      }
+      const r = await herdr.closeSession({ agentTarget: a.name, tabId: a.tabId });
+      broadcast({ type: "reaped_orphan_agent", name: a.name, closed: r.closed, via: r.via });
+    } catch (e) {
+      console.error(`[hive] reaper orphan agent ${a.name}:`, e); // isolated; never crash the sweep
     }
   }
 }

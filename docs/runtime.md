@@ -162,8 +162,15 @@ Quirks found and handled:
 - **Removing a worktree does not close its agent pane.** After
   `worktree remove`, the agent's terminal pane can linger in `agent list` as an
   orphan (cwd pointing at the deleted worktree). `herdr pane close <pane_id>`
-  clears it. hive does not need this in normal operation (teardown runs on
-  done/cancelled), but test harnesses should tidy up.
+  clears it. `cleanupTask` always closes the session itself once the worktree
+  is gone, so this is handled in normal operation — but task #341 found it
+  DOES bite when `git worktree remove` fails because the tree was already
+  gone from disk: `cleanupWorktree` used to read that failure as "preserved"
+  and leave the session running forever. Fixed: an "already gone" removal
+  failure now reports `removed: true` (nothing was there to preserve), so the
+  session still closes. The reaper also runs `sweepOrphanedAgents` every
+  cycle, diffing `herdr agent list` against live DB tasks, as a backstop for
+  any agent whose task row no longer exists at all.
 
 - **A freshly-created branch with no commits is "merged"** into its base (it
   points at the same commit), so teardown considers it safe to remove — correct,

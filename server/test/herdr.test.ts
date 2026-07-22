@@ -28,6 +28,9 @@ import {
   parseStaleAgentRef,
   isAgentNameTakenError,
   isWorktreeBusyError,
+  agentListArgv,
+  parseAgentList,
+  isWorktreeAlreadyGoneError,
 } from "../src/runtime/herdr.ts";
 
 // A recording stub: canned results per matched argv, records every call.
@@ -103,6 +106,31 @@ test("workspace/tab parse helpers unwrap the herdr envelopes", () => {
   expect(parseWorkspaceIdByLabel(list, "nope")).toBeNull();
   expect(parseCreatedWorkspaceId('{"result":{"workspace":{"workspace_id":"wG"}}}')).toBe("wG");
   expect(parseTabId('{"result":{"tab":{"tab_id":"wF:t2"}}}')).toBe("wF:t2");
+});
+
+test("agentListArgv + parseAgentList: only named (hive-spawned) agents survive, David's own session is filtered out", () => {
+  expect(agentListArgv()).toEqual(["agent", "list"]);
+  // Real shape from docs/evidence/herdr-live-verification.txt: David's own
+  // interactive session has no `name`; a hive-spawned worker does (= task id).
+  const stdout = JSON.stringify({
+    id: "cli:agent:list",
+    result: {
+      agents: [
+        { agent: "claude", cwd: "/Users/you/projects/priortool", pane_id: "w6:p1", tab_id: "w6:t1", agent_status: "working" },
+        { name: "vfeabd2a", cwd: "/wt/hive-vfeabd2a", pane_id: "w6:p2C", tab_id: "w6:t1", agent_status: "unknown" },
+      ],
+      type: "agent_list",
+    },
+  });
+  expect(parseAgentList(stdout)).toEqual([{ name: "vfeabd2a", tabId: "w6:t1" }]);
+  expect(parseAgentList("garbage")).toEqual([]);
+  expect(parseAgentList('{"result":{"agents":[]}}')).toEqual([]);
+});
+
+test("isWorktreeAlreadyGoneError matches a removal failure with nothing left to preserve", () => {
+  expect(isWorktreeAlreadyGoneError({ code: 1, stdout: "", stderr: "fatal: '/wt/x' is not a working tree" })).toBe(true);
+  expect(isWorktreeAlreadyGoneError({ code: 1, stdout: "", stderr: "No such file or directory" })).toBe(true);
+  expect(isWorktreeAlreadyGoneError({ code: 1, stdout: "", stderr: "fatal: validation failed, cannot remove the current working tree" })).toBe(false);
 });
 
 test("parseAgentProbe detects the two death shapes; conservative otherwise", () => {
