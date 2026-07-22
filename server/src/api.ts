@@ -3044,6 +3044,11 @@ function saveDraft(db: DB, id: string, body: any): Response {
   return json({ ok: true, id });
 }
 
+// Who is allowed to answer a decision. Recorded for audit-trail integrity so a
+// chat-supervisor (or any API caller) answering is not logged as the director.
+// This is identity only — it grants nothing and gates nothing.
+const ANSWER_SOURCES = ["director", "chat_supervisor", "agent", "system", "unknown"] as const;
+
 export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
   if (!r) return err("decision not found", 404);
@@ -3054,17 +3059,25 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): 
   if (options.length && !options.some((o) => o.key === answerKey))
     return err(`answer_key '${answerKey}' is not one of the options`, 400);
 
+  // Caller identity. A missing source is NOT assumed to be the director — the
+  // web UI now sends source:"director" explicitly, so a bare call is a caller
+  // we cannot vouch for ("unknown"). A present-but-invalid source is rejected.
+  const answeredBy = body?.source ?? "unknown";
+  if (!ANSWER_SOURCES.includes(answeredBy))
+    return err(`source '${answeredBy}' is not one of ${ANSWER_SOURCES.join("|")}`, 400);
+  const answeredActor = body?.actor ?? null;
+
   const answeredAt = now();
   const answerNote = body?.answer_note ?? r.draft_note ?? null;
   db.query(
-    "UPDATE decisions SET status = 'answered', answer_key = ?, answer_note = ?, answered_at = ? WHERE id = ?"
-  ).run(answerKey, answerNote, answeredAt, id);
+    "UPDATE decisions SET status = 'answered', answer_key = ?, answer_note = ?, answered_at = ?, answered_by = ?, answered_actor = ? WHERE id = ?"
+  ).run(answerKey, answerNote, answeredAt, answeredBy, answeredActor, id);
 
   writeEvent(db, {
     task_id: r.task_id,
-    source: "director",
+    source: answeredBy,
     type: "decision_answered",
-    payload: { decision_id: id, answer_key: answerKey, answer_note: answerNote },
+    payload: { decision_id: id, answer_key: answerKey, answer_note: answerNote, answered_by: answeredBy, actor: answeredActor },
   });
   // Each specialized resolver returns true if it OWNED this card (and did its
   // own agent-facing action). A card no resolver claims is a plain question
@@ -3098,9 +3111,9 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): 
   // Resume the task if it was parked on this decision. (herdr `agent send` is Phase 2.)
   const task = getTask(db, r.task_id);
   if (task && task.state === "needs_decision")
-    transition(db, r.task_id, "in_progress", { source: "director", reason: "decision answered" });
+    transition(db, r.task_id, "in_progress", { source: answeredBy, reason: "decision answered" });
 
-  const decision = parseDecision({ ...r, status: "answered", answer_key: answerKey, answer_note: answerNote, answered_at: answeredAt });
+  const decision = parseDecision({ ...r, status: "answered", answer_key: answerKey, answer_note: answerNote, answered_at: answeredAt, answered_by: answeredBy, answered_actor: answeredActor });
   broadcast({ type: "decision", decision });
   return json(decision);
 }

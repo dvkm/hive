@@ -655,6 +655,8 @@ export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()
     apiAnswerDecision(db, herdr, r.id, {
       answer_key: rec.key,
       answer_note: `auto-answered with the recommended option after ${hours}h (project timeout policy — set decision_auto_answer_hours to 0 to disable)`,
+      source: "system",
+      actor: "reconciler-auto-answer",
     });
     enqueue(db, {
       kind: "auto_answered",

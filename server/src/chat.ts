@@ -135,7 +135,7 @@ export function composeSupervisorBrief(db: DB, thread: ChatThread): string {
 You coordinate by spawning and tracking WORKER agents — you don't write code in this session. Use the hive CLI (${cli}) and read-only API (\`$HIVE_URL\`):
 
 - Create a task (spawns a worker):   ${cli} task create --project ${thread.project_id ?? "<project-id>"} --title "..." --brief-text "..." --kind ship|scout|chore
-- Answer an open decision card:       ${cli} decision ... / POST $HIVE_URL/api/decisions/<id>/answer
+- Answer an open decision card:       POST $HIVE_URL/api/decisions/<id>/answer with body {"answer_key":"<k>","source":"chat_supervisor","actor":"${thread.id}"} — source attributes it to you, not the director
 - Read status (tasks/decisions/feed): curl -sS "$HIVE_URL/api/tasks", "$HIVE_URL/api/decisions?status=open", "$HIVE_URL/api/feed"
 - Ask the director a real choice:     ${cli} decision ask <task-id> --title "..." --option k:Label:"..." --recommend k
 

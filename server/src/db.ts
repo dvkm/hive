@@ -381,6 +381,18 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       `CREATE INDEX idx_chat_threads_project ON chat_threads(project_id, updated_at)`,
     ],
   },
+  // Who answered a decision. Before this, every answer was logged as the
+  // director — a chat-supervisor or any API caller was indistinguishable from
+  // David in the audit trail. answered_by is the caller identity
+  // (director|chat_supervisor|agent|system|unknown), answered_actor an optional
+  // free label (e.g. the supervisor session id). Audit only, no auto-approve.
+  {
+    name: "v19-decision-caller",
+    statements: [
+      `ALTER TABLE decisions ADD COLUMN answered_by TEXT`,
+      `ALTER TABLE decisions ADD COLUMN answered_actor TEXT`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings

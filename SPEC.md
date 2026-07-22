@@ -41,9 +41,9 @@ herdr agents (worktree-isolated)      Claude Code hooks       reconciler (timer)
 - `tasks(id TEXT pk, project_id, title, brief, state, kind, agent_target, worktree_path, branch, pr_url, ci_status, summary, created_at, updated_at)`
   - `state ∈ {queued, in_progress, needs_decision, in_review, verifying, done, failed, cancelled}`
   - `kind ∈ {ship, scout, chore}` (scout = knowledge only, done requires a report as evidence)
-- `events(id, task_id, ts, source ∈ {agent, hook, herdr, reconciler, monitor, director, system}, type, payload JSON)` — append-only timeline; every state change writes an event.
+- `events(id, task_id, ts, source ∈ {agent, hook, herdr, reconciler, monitor, director, system, chat_supervisor, unknown}, type, payload JSON)` — append-only timeline; every state change writes an event.
 - `evidence(id, task_id, ts, kind ∈ {screenshot, test_run, log, report, link}, path, url, caption, meta JSON)` — files copied into `~/.hive/evidence/<task_id>/`, served at `/evidence/...`. Never local-path-only, never gitignored-and-lost.
-- `decisions(id, task_id, ts, title, context, risk, blast_radius, options JSON [{key,label,detail,recommended}], status ∈ {open, answered, expired}, answer_key, answer_note, draft_note, answered_at)`
+- `decisions(id, task_id, ts, title, context, risk, blast_radius, options JSON [{key,label,detail,recommended}], status ∈ {open, answered, expired}, answer_key, answer_note, draft_note, answered_at, answered_by, answered_actor)` — `answered_by` is the caller identity (`director|chat_supervisor|agent|system|unknown`) and `answered_actor` an optional free label, both recorded for audit-trail integrity.
 - `policies(id, scope ∈ {global, project:<id>}, title, body, active, created_at, updated_at)` — injected into briefs; editable in the web UI.
 - `incidents(id, project_id, monitor, ts, status ∈ {open, resolved}, detail)` — monitor failures; open incidents can auto-create tasks.
 

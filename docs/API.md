@@ -183,14 +183,14 @@ never deleted, so the cancelled row + this pointer preserve the full history.
   "payload": { "note": "extracting the middleware" }
 }
 ```
-`source ∈ {agent, hook, herdr, reconciler, reaper, monitor, director, system}`.
+`source ∈ {agent, hook, herdr, reconciler, reaper, monitor, director, system, chat_supervisor, unknown}`.
 `type` is open-ended. Types the server itself writes:
 - `created` — task created. `payload: {title}`
 - `state_change` — every state transition. `payload: {from, to, reason}`
 - `status` — an agent status note. `payload: {note}`
 - `evidence` — an evidence item was attached. `payload: {evidence_id, kind, caption}`
 - `needs-decision` — a decision card was opened. `payload: {decision_id, title}`
-- `decision_answered` — `payload: {decision_id, answer_key, answer_note}`
+- `decision_answered` — `payload: {decision_id, answer_key, answer_note, answered_by, actor}`; the event `source` is the answerer identity
 - `decision_expired` — a decision was cleared without an answer: dismissed, or auto-expired because its task went terminal. `payload: {decision_id, reason}` (`reason` ∈ `dismissed` | `task cancelled` | `task done` | `task failed` | `task terminal (backfill)`)
 - `note` — a free note (e.g. a `done` summary). `payload: {note}`
 - `steer` — a steer message was dispatched to the agent. `payload: {message, target}`
@@ -293,6 +293,8 @@ rev-parse HEAD` in the CLI's cwd. The review card compares it to the task's
   "answer_note": null,
   "draft_note": null,
   "answered_at": null,
+  "answered_by": null,
+  "answered_actor": null,
   "bundle": {
     "task_number": 262,
     "pr_url": "https://github.com/example-org/hive/pull/42",
@@ -308,7 +310,9 @@ rev-parse HEAD` in the CLI's cwd. The review card compares it to the task's
 array; render the `recommended: true` option first per product rule 3.
 `draft_note` is the server-side autosaved draft. A decision is `expired` once it
 was dismissed, or its task went terminal (`done`/`failed`/`cancelled`) — expired
-cards leave the inbox and can no longer be answered.
+cards leave the inbox and can no longer be answered. `answered_by` is the caller
+identity recorded on answer (`director|chat_supervisor|agent|system|unknown`) and
+`answered_actor` an optional free label; both are `null` until the card is answered.
 
 `bundle` is server-**derived** (never stored) context attached to each card as
 it's returned, so the director can decide in one pass without opening the task:
@@ -817,10 +821,15 @@ work. Use `POST /api/tasks/:id/events` with `type=evidence` for that.
 - `GET /api/decisions/:id` → `200 Decision` | `404`
 - `PUT /api/decisions/:id/draft` body `{draft_note}` → `200 {"ok":true, "id":...}` | `404`
   (autosave; call debounced on every keystroke; overwrites `draft_note` only)
-- `POST /api/decisions/:id/answer` body `{answer_key (required), answer_note?}` → `200 Decision` (now `answered`) | `400` (bad key) | `409` (already answered)
+- `POST /api/decisions/:id/answer` body `{answer_key (required), answer_note?, source?, actor?}` → `200 Decision` (now `answered`) | `400` (bad key / bad source) | `409` (already answered)
   Archives the card (`status=answered`, `answered_at` set), writes a
   `decision_answered` event, and resumes the task (`needs_decision → in_progress`).
   If `answer_note` is omitted, the saved `draft_note` is used.
+  `source` is the caller identity for the audit trail: `director|chat_supervisor|agent|system|unknown`
+  (a present-but-invalid source is `400`; a missing source is recorded as `unknown` — the web
+  inbox sends `source:"director"` explicitly). `actor` is an optional free label. Both are
+  recorded on the decision (`answered_by`, `answered_actor`) and the `decision_answered` event.
+  This is identity only — it grants nothing and triggers no auto-approval.
 - `POST /api/decisions/:id/dismiss` → `200 Decision` (now `expired`) | `404` | `409` (already closed). Dismissing the task's LAST open card resumes a `needs_decision` task to `in_progress` (a parked task with nothing to wait on is stranded); no resolver hooks fire.
   Clears a card without answering it (the human escape hatch for a card that is
   no longer relevant, or that somehow has no usable options). Sets
