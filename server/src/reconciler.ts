@@ -24,7 +24,7 @@ import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.
 import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
-import { classifyEscalation } from "./policy.ts";
+import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
 const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
@@ -633,6 +633,25 @@ export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()
       continue;
     }
     if (!rec?.key) continue;
+    // An auto-answer is only meaningful when acting on the option needs nothing
+    // further from the director. If the recommended option asks them to attach a
+    // credential/token/file, answering it strands the agent — notify once and
+    // leave the card open for a human (incident dec_8f964774097e).
+    if (optionNeedsDirectorInput(rec)) {
+      const already = db
+        .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'auto_answer_skipped' LIMIT 1")
+        .get(r.task_id);
+      if (already) continue;
+      writeEvent(db, { task_id: r.task_id, source: "reconciler", type: "auto_answer_skipped", payload: { decision_id: r.id } });
+      enqueue(db, {
+        kind: "auto_answer_skipped",
+        task_id: r.task_id,
+        decision_id: r.id,
+        title: `Needs you: "${r.title.slice(0, 70)}"`,
+        body: `Open ${hours}h but the recommended option "${rec.label ?? rec.key}" needs you to supply something — not auto-answered.`,
+      });
+      continue;
+    }
     apiAnswerDecision(db, herdr, r.id, {
       answer_key: rec.key,
       answer_note: `auto-answered with the recommended option after ${hours}h (project timeout policy — set decision_auto_answer_hours to 0 to disable)`,
