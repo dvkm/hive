@@ -119,3 +119,29 @@ test("limit is capped at 100", async () => {
   expect(json.evidence.length).toBeLessThanOrEqual(100);
   expect(json.evidence.length).toBeGreaterThan(0);
 });
+
+// Regression: a malformed multipart part (name field, no `filename=`) parses in
+// Bun as a File whose `.name` is undefined and `.size` is 0, which used to crash
+// saveUpload with `undefined is not an object (evaluating 'file.name.replace')`.
+test("empty nameless file part is dropped, event still ingests (no 500)", async () => {
+  const form = new FormData();
+  form.set("type", "evidence");
+  form.set("note", "note-only with a malformed empty file part");
+  form.set("file", new Blob([])); // no filename, zero bytes → File w/ name undefined
+  const res = await fetch(`${BASE}/api/tasks/${taskId}/events`, { method: "POST", body: form });
+  expect(res.status).toBe(201);
+  const body = await res.json();
+  expect(body.evidence.path).toBeNull(); // junk part skipped, ingested as a log
+});
+
+test("nameless file WITH content is saved under a fallback name", async () => {
+  const form = new FormData();
+  form.set("type", "evidence");
+  form.set("kind", "log");
+  form.set("caption", "nameless log");
+  form.set("file", new File(["real log content"], "")); // empty name → parses as undefined
+  const res = await fetch(`${BASE}/api/tasks/${taskId}/events`, { method: "POST", body: form });
+  expect(res.status).toBe(201);
+  const body = await res.json();
+  expect(body.evidence.path).toContain("_file"); // stamped with the fallback name
+});
