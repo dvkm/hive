@@ -44,6 +44,12 @@ test("health endpoint", async () => {
   expect(json.ok).toBe(true);
 });
 
+test("health endpoint reports dispatcher/reaper liveness, stale before any cycle has run", async () => {
+  const { json } = await get("/api/health");
+  expect(json.dispatcher).toEqual({ last_run: null, stale: true });
+  expect(json.reaper).toEqual({ last_run: null, stale: true });
+});
+
 test("task create + list + get", async () => {
   const list = await get("/api/tasks");
   expect(list.json.some((t: any) => t.id === taskId)).toBe(true);

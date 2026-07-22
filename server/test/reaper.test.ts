@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { openDb, newId, now, type DB } from "../src/db.ts";
+import { openDb, newId, now, getSetting, type DB } from "../src/db.ts";
 import { reapOnce, taskIdFromBranch, sweepOrphanedAgents } from "../src/reaper.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
@@ -22,6 +22,16 @@ function seedTask(db: DB, projectId: string, id: string, state: string): void {
      VALUES (?,?,?,?, 'ship', ?, ?, ?, ?, ?)`
   ).run(id, projectId, "t", state, `agent-${id}`, `/wt/hive-${id}`, `hive/${id}`, t, t);
 }
+
+test("reapOnce writes a last_reap_at liveness heartbeat", async () => {
+  const { db } = freshDb();
+  expect(getSetting(db, "last_reap_at")).toBeNull();
+  const herdr = new Herdr(async () => OK(), "herdr");
+  await reapOnce(db, { herdr });
+  const ts = getSetting(db, "last_reap_at");
+  expect(ts).not.toBeNull();
+  expect(Date.now() - Date.parse(ts!)).toBeLessThan(5000);
+});
 
 test("taskIdFromBranch extracts only hive/<id>; ghosts and others are ignored", () => {
   expect(taskIdFromBranch("hive/abc123")).toBe("abc123");

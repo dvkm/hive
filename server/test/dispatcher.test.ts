@@ -7,7 +7,7 @@ import { join } from "node:path";
 const HOME = mkdtempSync(join(tmpdir(), "hive-dispatch-"));
 process.env.HIVE_HOME = HOME;
 
-const { openDb, newId, now } = await import("../src/db.ts");
+const { openDb, newId, now, getSetting } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
 const { dispatchOnce, isReviewed, inBackoff } = await import("../src/dispatcher.ts");
 const { writeEvent, getTask } = await import("../src/state.ts");
@@ -53,6 +53,15 @@ function makeTask(db: DB, projectId: string, extra: Partial<{ kind: string; sour
   ).run(id, projectId, "t", extra.state ?? "queued", extra.kind ?? "ship", extra.source ?? null, extra.agent_target ?? null, extra.depends_on ? JSON.stringify(extra.depends_on) : null, t, t);
   return id;
 }
+
+test("dispatchOnce writes a last_dispatch_at liveness heartbeat even with nothing to do", async () => {
+  const { db } = freshDb({});
+  expect(getSetting(db, "last_dispatch_at")).toBeNull();
+  await dispatchOnce(db, {});
+  const ts = getSetting(db, "last_dispatch_at");
+  expect(ts).not.toBeNull();
+  expect(Date.now() - Date.parse(ts!)).toBeLessThan(5000);
+});
 
 test("auto_dispatch off: queued tasks are NOT spawned", async () => {
   const { db, projectId } = freshDb({}); // no auto_dispatch

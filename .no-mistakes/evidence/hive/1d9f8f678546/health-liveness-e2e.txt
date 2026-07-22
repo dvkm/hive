@@ -1,0 +1,46 @@
+== 1) Fresh process, background loops have NOT ticked yet ==
+GET /api/health
+{
+  "ok": true,
+  "version": "0.1.0",
+  "dispatcher": {
+    "last_run": null,
+    "stale": true
+  },
+  "reaper": {
+    "last_run": null,
+    "stale": true
+  }
+}
+
+== 2) Simulate the 2026-07-17 incident: a background loop runs one cycle ==
+(ran dispatchOnce + reapOnce — each wrote its heartbeat on cycle completion)
+GET /api/health
+{
+  "ok": true,
+  "version": "0.1.0",
+  "dispatcher": {
+    "last_run": "2026-07-22T03:38:11.074Z",
+    "stale": false
+  },
+  "reaper": {
+    "last_run": "2026-07-22T03:38:11.076Z",
+    "stale": false
+  }
+}
+
+== 3) Fast-forward the dispatcher heartbeat ~3 missed cycles into the past ==
+(dispatcher last ran 6min ago > stale threshold; reaper still fresh)
+GET /api/health
+{
+  "ok": true,
+  "version": "0.1.0",
+  "dispatcher": {
+    "last_run": "2026-07-22T03:32:11.077Z",
+    "stale": true
+  },
+  "reaper": {
+    "last_run": "2026-07-22T03:38:11.076Z",
+    "stale": false
+  }
+}
