@@ -38,8 +38,13 @@ export function eventText(e: EventLike): string {
     case "decision_answered": {
       const label = s(p.answer_label) || s(p.answer_key) || "answered";
       const title = s(p.title);
-      return title ? `answered ${title}: ${label}` : `answered: ${label}`;
+      const who = s(p.approved_by) === "chat_supervisor" ? " (supervisor)" : "";
+      return (title ? `answered ${title}: ${label}` : `answered: ${label}`) + who;
     }
+    case "auto_approved":
+      return `supervisor auto-approved: ${s(p.answer_key)}${s(p.reason) ? ` — ${s(p.reason)}` : ""}`;
+    case "auto_approve_declined":
+      return `supervisor escalated to director: ${s(p.reason) || "not auto-approvable"}`;
     case "assistant_text": {
       const first = s(p.text).split("\n").find((l) => l.trim()) || "";
       return first.length > 140 ? first.slice(0, 139) + "…" : first || "agent output";
@@ -157,6 +162,8 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
   ready_for_review: "state",
   "needs-decision": "decision",
   decision_answered: "decision",
+  auto_approved: "decision",
+  auto_approve_declined: "decision",
   planned: "decision",
   authority_required: "decision",
   authority_granted: "decision",

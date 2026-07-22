@@ -22,6 +22,9 @@ Usage:
         ready: PR open (or scout report written) → hand off to review (in_progress -> in_review)
   hive decision ask <task-id> --title <t> [--context <s>] [--risk <s>] [--blast <s>]
         --option key:label:detail  (repeatable)  --recommend <key>  --needs-input <key>
+  hive decision auto-answer <decision-id> --key <option> [--reason <s>]
+        supervisor self-approval: answers ONLY if the server-enforced safety bar
+        clears, else exits 3 and leaves the card open for the director
   hive policy add --title <t> --body <s>|--body-file <f> [--scope global|project:<id>]
   hive policy list [--scope <s>]
   hive authority add --action <pattern> --effect allow|require_decision|deny [--project <id>] [--note <s>]
@@ -239,6 +242,27 @@ async function main() {
         options,
       });
       console.log(`opened decision ${d.id}: ${d.title}`);
+      return;
+    }
+    if (sub === "auto-answer") {
+      const id = _[0];
+      if (!id) die('usage: hive decision auto-answer <decision-id> --key <option> [--reason "..."]');
+      if (!flags.key) die("--key is required");
+      // Not api(): a 403 here means "not auto-approvable, escalate to the
+      // director" — an expected outcome, not a CLI error to die on.
+      const r = await fetch(BASE + `/api/decisions/${id}/auto-answer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answer_key: String(flags.key), answer_note: flags.reason ? String(flags.reason) : undefined }),
+      }).catch((e) => die(`cannot reach hive server at ${BASE} (${e.message}). Is 'hive serve' running?`));
+      const res: any = await r.json();
+      if (r.status === 403 && res.effect === "escalate") {
+        console.log(`escalated ${id} to the director: ${res.reason}`);
+        process.exitCode = 3; // distinct exit code — "not auto-approvable"
+        return;
+      }
+      if (!r.ok) die(`error ${r.status}: ${res.error || JSON.stringify(res)}`);
+      console.log(`auto-approved ${id} (${res.answer_key})`);
       return;
     }
     die(`unknown 'decision' subcommand: ${sub}\n\n${USAGE}`);
