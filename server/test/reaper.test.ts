@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
-import { reapOnce, taskIdFromBranch } from "../src/reaper.ts";
+import { reapOnce, taskIdFromBranch, sweepOrphanedAgents } from "../src/reaper.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -96,4 +96,54 @@ test("reapOnce isolates a per-item failure and keeps sweeping", async () => {
   // BOOM threw, but DONE was still reaped
   expect(removedDone).toBe(true);
   expect(db.query("SELECT * FROM events WHERE task_id = 'DONE' AND type = 'cleaned_up'").all().length).toBe(1);
+});
+
+// ---- sweepOrphanedAgents: diff `herdr agent list` against live DB tasks (task #341) ----
+
+test("sweepOrphanedAgents closes a session with NO matching task row at all", async () => {
+  const { db } = freshDb();
+  const calls: string[][] = [];
+  const listJson = JSON.stringify({ result: { agents: [{ name: "ghost-task-id", tab_id: "wF:t7" }] } });
+  const exec: Exec = async (argv) => {
+    calls.push(argv);
+    if (has(argv, "agent", "list")) return OK(listJson);
+    return OK();
+  };
+  const herdr = new Herdr(exec, "herdr");
+  await sweepOrphanedAgents(db, { herdr });
+  expect(calls.some((c) => has(c, "tab", "close", "wF:t7"))).toBe(true);
+});
+
+test("sweepOrphanedAgents leaves a LIVE task's agent alone", async () => {
+  const { db, projectId } = freshDb();
+  seedTask(db, projectId, "LIVE2", "in_progress");
+  const calls: string[][] = [];
+  const listJson = JSON.stringify({ result: { agents: [{ name: "LIVE2", tab_id: "wF:t8" }] } });
+  const exec: Exec = async (argv) => {
+    calls.push(argv);
+    if (has(argv, "agent", "list")) return OK(listJson);
+    return OK();
+  };
+  const herdr = new Herdr(exec, "herdr");
+  await sweepOrphanedAgents(db, { herdr });
+  expect(calls.some((c) => has(c, "tab", "close"))).toBe(false);
+});
+
+test("sweepOrphanedAgents defers to cleanupTask for a TERMINAL task's lingering agent — an unmerged worktree still keeps its session", async () => {
+  const { db, projectId } = freshDb();
+  seedTask(db, projectId, "TERM1", "done"); // branch hive/TERM1, not merged/pushed below -> cleanupTask preserves it
+  const calls: string[][] = [];
+  const listJson = JSON.stringify({ result: { agents: [{ name: "TERM1", tab_id: "wF:t9" }] } });
+  const exec: Exec = async (argv) => {
+    calls.push(argv);
+    if (has(argv, "agent", "list")) return OK(listJson);
+    if (argv[0] === "git" && argv.includes("ls-remote")) return OK(""); // not pushed
+    if (argv[0] === "git" && argv.includes("--merged")) return OK("* main"); // not merged
+    return OK();
+  };
+  const herdr = new Herdr(exec, "herdr");
+  await sweepOrphanedAgents(db, { herdr });
+  // preserved: the sweep must NOT bypass cleanupTask's guard and close it directly
+  expect(calls.some((c) => has(c, "tab", "close"))).toBe(false);
+  expect(db.query("SELECT * FROM events WHERE task_id = 'TERM1' AND type = 'cleanup_skipped'").all().length).toBe(1);
 });

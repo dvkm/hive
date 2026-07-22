@@ -122,6 +122,40 @@ test("cleanupWorktree preserves TRACKED uncommitted work to a ghost before remov
   expect(calls.some((c) => has(c, "checkout", "-b", "ghost-t1"))).toBe(true);
 });
 
+test("cleanupWorktree treats an already-gone worktree (not a working tree) as removed, not preserved", async () => {
+  const { exec, calls } = stubExec((argv) => {
+    if (argv[0] === "git" && argv.includes("ls-remote")) return OK("sha\trefs/heads/hive/t1"); // pushed
+    if (argv[0] === "git" && has(argv, "status", "--porcelain")) return FAIL("no such file or directory"); // worktree dir gone
+    if (argv[0] === "git" && has(argv, "worktree", "remove")) return FAIL("fatal: '/wt' is not a working tree");
+    return OK();
+  });
+  const h = new Herdr(exec, "herdr");
+  const r = await h.cleanupWorktree({ repoPath: "/repo", branch: "hive/t1", worktreePath: "/wt", taskId: "t1" });
+  expect(r.removed).toBe(true);
+  expect(r.reason).toContain("already gone from disk");
+});
+
+test("cleanupTask closes the session even when the worktree was already gone from disk", async () => {
+  const { db, projectId } = freshDb();
+  const branch = "hive/CT3";
+  const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-CT3" });
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    newId("evt"), id, now(), "herdr", "spawned", JSON.stringify({ tab_id: "wF:t9", agent_target: `agent-${id}` })
+  );
+  const exec: Exec = async (argv) => {
+    if (argv[0] === "git" && argv.includes("ls-remote")) return OK("sha\trefs/heads/" + branch); // pushed
+    if (argv[0] === "git" && has(argv, "status", "--porcelain")) return FAIL("no such file or directory");
+    if (argv[0] === "git" && has(argv, "worktree", "remove")) return FAIL("fatal: '/wt/hive-CT3' is not a working tree");
+    return OK();
+  };
+  const herdr = new Herdr(exec, "herdr");
+
+  const out = await cleanupTask(db, herdr, id);
+  expect(out.cleaned).toBe(true);
+  expect(out.worktree?.removed).toBe(true);
+  expect(out.session.via).toBe("tab wF:t9"); // the session was NOT left dangling
+});
+
 // ---- runStackCmd: shared setup/teardown hook runner ----
 
 test("runStackCmd (setup) substitutes {worktree}, resolves relative argv[0], emits stack_setup ok", async () => {

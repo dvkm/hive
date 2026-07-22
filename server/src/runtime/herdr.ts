@@ -254,6 +254,36 @@ export function tabCloseArgv(tabId: string): string[] {
   return ["tab", "close", tabId];
 }
 
+export function agentListArgv(): string[] {
+  return ["agent", "list"];
+}
+
+// `herdr agent list` (verified live, docs/evidence/herdr-live-verification.txt):
+// {"result":{"agents":[{"agent":"claude","cwd":...,"pane_id":"w6:p1",...},
+// {"name":"<taskId>","cwd":...,"pane_id":"w6:p2C","tab_id":"w6:t1",...}]}}.
+// Only hive-spawned agents carry `name` (agentStartArgv names the agent after
+// the task id) — a bare interactive session (David's own) has none; filter to
+// the named ones so the orphan sweep never touches a human's own pane.
+export function parseAgentList(stdout: string): { name: string; tabId: string | null }[] {
+  try {
+    const obj: any = JSON.parse(stdout);
+    const agents: any[] = obj.result?.agents ?? obj.agents ?? [];
+    return agents
+      .filter((a) => typeof a.name === "string" && a.name)
+      .map((a) => ({ name: a.name as string, tabId: a.tab_id ?? a.tabId ?? null }));
+  } catch {
+    return [];
+  }
+}
+
+// `git worktree remove` failing because the path is no longer a registered
+// working tree at all (already deleted from disk, or its worktree admin data
+// already pruned) — as opposed to a real refusal over dirty/unmerged state.
+// Nothing is lost by treating this as done: there is no tree left to preserve.
+export function isWorktreeAlreadyGoneError(r: ExecResult): boolean {
+  return /is not a working tree|no such file or directory/i.test(`${r.stdout}\n${r.stderr}`);
+}
+
 // Close a single pane directly (fallback when the tab id is unknown but the
 // agent's pane can be resolved via `agent get`).
 export function paneCloseArgv(paneId: string): string[] {
@@ -757,8 +787,15 @@ export class Herdr {
     }
 
     const rm = await this.exec(["git", "-C", args.repoPath, "worktree", "remove", "--force", args.worktreePath]);
-    if (rm.code !== 0)
+    if (rm.code !== 0) {
+      // Task #341: the worktree was already gone from disk (e.g. removed
+      // outside hive) — there's nothing left to preserve, so this must NOT
+      // read as "preserved" to the caller (cleanupTask), or the herdr session
+      // is kept alive forever guarding a tree that no longer exists.
+      if (isWorktreeAlreadyGoneError(rm))
+        return { removed: true, reason: `${safe.reason}; worktree already gone from disk`, ghost_branch: null };
       return { removed: false, reason: `worktree remove failed: ${rm.stderr.trim() || rm.stdout.trim()}`, ghost_branch: null };
+    }
     return { removed: true, reason: safe.reason, ghost_branch: null };
   }
 
@@ -786,6 +823,21 @@ export class Herdr {
       /* best-effort */
     }
     return { closed: false, via: null };
+  }
+
+  // Every hive-spawned agent herdr currently knows about, named by task id
+  // (see agentStartArgv). The reaper diffs this against live DB tasks to sweep
+  // sessions the worktree-branch sweep can't see — e.g. a task row that no
+  // longer exists at all (task #341: 5 of 6 stale agents found manually had
+  // zero corresponding DB task). Never throws: an empty list degrades to "sweep
+  // found nothing this cycle", not a crash.
+  async listAgents(): Promise<{ name: string; tabId: string | null }[]> {
+    try {
+      const r = await this.run(agentListArgv());
+      return parseAgentList(r.stdout);
+    } catch {
+      return [];
+    }
   }
 }
 
