@@ -2477,7 +2477,9 @@ async function safeJson(req: Request): Promise<any> {
 async function saveUpload(taskId: string, file: File): Promise<{ path: string; url: string }> {
   const destDir = join(evidenceDir(), taskId);
   mkdirSync(destDir, { recursive: true });
-  const safeName = file.name.replace(/[^\w.\-]/g, "_") || "file";
+  // A multipart part with a name but no `filename=` parses (in Bun) as a File
+  // whose `.name` is undefined — guard so a malformed part can't crash the save.
+  const safeName = (file.name ?? "").replace(/[^\w.\-]/g, "_") || "file";
   const stamp = Date.now();
   let finalName = `${stamp}_${safeName}`;
   for (let i = 1; existsSync(join(destDir, finalName)); i++) finalName = `${stamp}_${i}_${safeName}`;
@@ -2544,6 +2546,10 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       if (v instanceof File) file = v;
       else fields[k] = String(v);
     }
+    // An empty, nameless part (ad-hoc `curl -F file=...` without `@`, or a Blob
+    // body) parses as a zero-byte File — not a real attachment. Drop it so an
+    // otherwise-valid event still ingests instead of storing junk evidence.
+    if (file && file.size === 0 && !file.name) file = null;
   } else {
     fields = (await req.json()) as any;
   }
