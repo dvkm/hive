@@ -270,6 +270,31 @@ test("data text (quotes, heredocs) is not scanned as shell — executors still a
   expect(classify(`osascript -e 'tell application "System Events" to keystroke "hi"'`, env).decision).toBe("dangerous");
 });
 
+// The data-text fix (EXECUTOR probed on STRIPPED text, PR #38/#46) is not
+// specific to find/rm: a danger keyword from ANY dangerous family, quoted in a
+// commit message / PR body / hive-emit note, must stay data. These lock in the
+// whole class so a future refactor of stripDataText/EXECUTOR can't silently
+// regress the non-find families the earlier tests never exercised.
+test("danger keywords quoted in prose are data across every dangerous family", () => {
+  const env = { HOME: "/Users/david" };
+  // SQL family
+  expect(classify(`git commit -m "add DROP TABLE migration and TRUNCATE cleanup"`, env).decision).not.toBe("dangerous");
+  // process-kill family
+  expect(classify(`git commit -m "guard against kill/pkill of the human process"`, env).decision).not.toBe("dangerous");
+  // force-push family
+  expect(classify(`git commit -m "reject git push --force to shared refs"`, env).decision).not.toBe("dangerous");
+  // world-writable chmod family
+  expect(classify(`git commit -m "note: chmod 777 is world-writable, warn on it"`, env).decision).not.toBe("dangerous");
+  // mkfs/dd mentioned in a data-only hive emit note
+  expect(classify(`hive emit abc123 status --note "the mkfs/dd path is covered"`, env).decision).toBe("safe");
+  // force-delete-branch mentioned in an echoed instruction string
+  expect(classify(`echo "to force-delete a branch run git branch -D name"`, env).decision).toBe("safe");
+  // …and the real unquoted commands of those families still classify dangerous
+  expect(classify(`sqlite3 db 'DROP TABLE t'`, env).decision).toBe("dangerous");
+  expect(classify("git push --force origin main", env).decision).toBe("dangerous");
+  expect(classify("chmod -R 777 /", env).decision).toBe("dangerous");
+});
+
 test("container/vcs rm and sandboxed-cwd relative rm are waived", () => {
   const env = { HOME: "/Users/david" };
   const wt = "/Users/david/.herdr/worktrees/monorepo/hive-abc";
