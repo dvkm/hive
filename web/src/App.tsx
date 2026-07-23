@@ -1,6 +1,20 @@
 import { useState } from "react";
 import { NavLink, Route, Routes, useLocation } from "react-router-dom";
 import type { Location } from "react-router-dom";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import type { IconDefinition } from "@fortawesome/fontawesome-svg-core";
+import {
+  faBell,
+  faClipboard,
+  faComments,
+  faSatelliteDish,
+  faImage,
+  faBookOpen,
+  faChartColumn,
+  faFolder,
+  faScaleBalanced,
+  faHeart,
+} from "@fortawesome/free-solid-svg-icons";
 import { useStore } from "./lib/store";
 import { relTime } from "./lib/time";
 import { toast } from "./lib/ui";
@@ -39,7 +53,7 @@ function PushButton() {
         toast(msg);
       }}
     >
-      🔔 notify
+      <FontAwesomeIcon icon={faBell} /> notify
     </button>
   );
 }
@@ -67,17 +81,17 @@ function MobileNav({
       {badge > 0 && <span className="badge mobtab-badge">{badge}</span>}
     </NavLink>
   );
-  const more = [
-    ["/brief", "Brief", "📋"],
-    ["/supervisors", "Supervisors", "💬"],
-    ["/feed", "Feed", "📡"],
-    ["/evidence", "Evidence", "🖼"],
-    ["/learnings", "Learnings", "📚"],
-    ["/analytics", "Analytics", "📊"],
-    ["/projects", "Projects", "📁"],
-    ["/policies", "Policies", "⚖️"],
-    ["/monitors", "Monitors", "❤️"],
-  ] as const;
+  const more: [string, string, IconDefinition][] = [
+    ["/brief", "Brief", faClipboard],
+    ["/supervisors", "Supervisors", faComments],
+    ["/feed", "Feed", faSatelliteDish],
+    ["/evidence", "Evidence", faImage],
+    ["/learnings", "Learnings", faBookOpen],
+    ["/analytics", "Analytics", faChartColumn],
+    ["/projects", "Projects", faFolder],
+    ["/policies", "Policies", faScaleBalanced],
+    ["/monitors", "Monitors", faHeart],
+  ];
   return (
     <>
       {moreOpen && (
@@ -86,7 +100,7 @@ function MobileNav({
             <div className="mobsheet-grid">
               {more.map(([to, label, icon]) => (
                 <NavLink key={to} to={to} className="mobsheet-item" onClick={close}>
-                  <span className="mobsheet-icon">{icon}</span>
+                  <span className="mobsheet-icon"><FontAwesomeIcon icon={icon} /></span>
                   {label}
                 </NavLink>
               ))}
@@ -144,7 +158,7 @@ function Bell() {
   return (
     <div className="bell-wrap">
       <button className="bell" onClick={toggle} title="Notifications" aria-label="Notifications">
-        <span className="bell-icon">🔔</span>
+        <span className="bell-icon"><FontAwesomeIcon icon={faBell} /></span>
         {unread > 0 && <span className="badge bell-badge">{unread}</span>}
       </button>
       {open && (

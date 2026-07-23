@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import { faDiamond } from "@fortawesome/free-solid-svg-icons";
 import { api } from "../lib/api";
 import type { Decision, Evidence, TaskDetail } from "../lib/api";
 import { useStore } from "../lib/store";
@@ -159,7 +161,7 @@ function TimelineRow({ it }: { it: TimelineItem }) {
     return (
       <li className="tl-decision">
         <div className="tl-decision-head">
-          <span className="tl-decision-badge">🔶 {it.open ? "Awaiting your decision" : "Decision requested"}</span>
+          <span className="tl-decision-badge"><FontAwesomeIcon icon={faDiamond} /> {it.open ? "Awaiting your decision" : "Decision requested"}</span>
           <span className="tl-age" title={it.ts}>{relTime(it.ts)}</span>
         </div>
         <div className="tl-decision-q">{d.title}</div>
