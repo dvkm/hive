@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import { faComment } from "@fortawesome/free-solid-svg-icons";
 import { useStore } from "../lib/store";
 import { api } from "../lib/api";
 import type { ChatMessage } from "../lib/api";
@@ -111,7 +113,7 @@ export default function Chat() {
   if (!open)
     return (
       <button className="chat-fab" title="Chat with the hive supervisor" onClick={() => setOpen(true)}>
-        💬
+        <FontAwesomeIcon icon={faComment} />
       </button>
     );
 
