@@ -65,6 +65,45 @@ test("syncPRs updates ci_status and transitions in_review->verifying on merge", 
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_merged'").all(id).length).toBe(1);
 });
 
+test("syncPRs skips a task that raced ahead to done instead of throwing (task #621)", async () => {
+  const { db, projectId } = freshDb();
+  // The task whose gh call races: another actor (a concurrent /merge, or
+  // autoMergeReady) finishes it to `done` while this cycle's `gh pr view` for
+  // it is in flight.
+  const racer = makeTask(db, projectId, { pr_url: "https://gh/pr/9" });
+  transition(db, racer, "in_progress");
+  transition(db, racer, "in_review");
+  // A second, ordinary task in the same cycle — must still be processed even
+  // though it's iterated after the racer.
+  const other = makeTask(db, projectId, { pr_url: "https://gh/pr/10" });
+  transition(db, other, "in_progress");
+  transition(db, other, "in_review");
+
+  const gh: Exec = stub((argv) => {
+    if (argv[0] !== "gh") return OK();
+    const url = argv[3];
+    if (url === "https://gh/pr/9") {
+      // Simulate the race: land the merge (and its whole downstream
+      // verifying->done trip) mid-await, exactly the gap `syncPRs`'s own
+      // `await exec` leaves open.
+      db.query(
+        "INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,?)"
+      ).run(newId("ev"), racer, now(), "log", "/tmp/x", "/evidence/x", "c", "{}");
+      transition(db, racer, "verifying");
+      transition(db, racer, "done");
+      return OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] }));
+    }
+    return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "FAILURE" }] }));
+  });
+
+  await reconcileOnce(db, { exec: gh });
+
+  expect(getTask(db, racer).state).toBe("done"); // untouched by the stale in_review read
+  // Before the fix, the racer's uncaught "invalid transition: done->verifying"
+  // aborted the whole syncPRs loop, so `other` never got processed this cycle.
+  expect(getTask(db, other).ci_status).toBe("failing");
+});
+
 test("syncPRs persists the PR's head_sha so the review card can flag stale evidence", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { pr_url: "https://gh/pr/1a" });
