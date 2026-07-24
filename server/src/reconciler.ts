@@ -272,6 +272,16 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     } catch {
       continue;
     }
+    // The task's state may have moved on since the SELECT above — a concurrent
+    // POST /merge, autoMergeReady, or an overlapping reconcile cycle can land
+    // while this `await exec` was in flight and advance the task to a terminal
+    // state. Every branch below transitions off the task's state; re-read it
+    // fresh and skip once terminal, rather than trusting the stale `t.state`
+    // snapshot — that stale read is exactly what threw
+    // "invalid transition: 'done' -> 'verifying'" in production (task #621).
+    const live = getTask(db, t.id);
+    if (!live || TERMINAL.includes(live.state as State)) continue;
+    const state: string = live.state;
     // Record a new pushed commit as `pr_synchronized` (hive's stand-in for
     // GitHub's synchronize webhook) so changesRequestUnaddressed can tell "the
     // agent pushed a fix" from "CI is still green on the same old head". The
@@ -304,14 +314,14 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     // green and the director can merge", so failing/pending checks HOLD the
     // task in_progress (this is also what promotes a held `ready`: the moment
     // checks pass, the task moves to review; failing checks steer the agent).
-    if (String(data.state).toUpperCase() === "OPEN" && t.state === "in_progress") {
+    if (String(data.state).toUpperCase() === "OPEN" && state === "in_progress") {
       if (ci === "failing") {
         await nudgeCiFailure(db, h, t, data.headRefOid ?? null);
       } else if (ci !== "pending") {
         if (handOffToReview(db, t.id, "reconciler")) broadcast({ type: "task", task: getTask(db, t.id) });
       }
     }
-    if (String(data.state).toUpperCase() === "MERGED" && t.state === "in_review") {
+    if (String(data.state).toUpperCase() === "MERGED" && state === "in_review") {
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_merged", payload: { pr_url: t.pr_url } });
       transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged" });
       // Post-merge smoke runs once on entering verifying.
@@ -320,7 +330,7 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       } catch (e) {
         console.error(`[hive] smoke run failed for ${t.id}:`, e);
       }
-    } else if (String(data.state).toUpperCase() === "CLOSED" && t.state === "in_review") {
+    } else if (String(data.state).toUpperCase() === "CLOSED" && state === "in_review") {
       // Closed-not-merged: nothing reviewable exists. Self-heal instead of
       // waiting for the director to discover it via a failed merge click.
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_closed", payload: { pr_url: t.pr_url } });
@@ -333,7 +343,7 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       );
       transition(db, t.id, "in_progress", { source: "reconciler", reason: "PR closed without merging — returned to the agent" });
       broadcast({ type: "task", task: getTask(db, t.id) });
-    } else if (ci === "failing" && t.state === "in_review") {
+    } else if (ci === "failing" && state === "in_review") {
       // Checks went red AFTER the handoff: red is not reviewable. Send it back
       // to the agent to iterate; it returns automatically when green.
       await nudgeCiFailure(db, h, t, data.headRefOid ?? null);
