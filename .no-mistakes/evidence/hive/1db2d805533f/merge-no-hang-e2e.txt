@@ -1,0 +1,9 @@
+hung smoke server listening at http://127.0.0.1:58190/ (accepts, never replies)
+task 6fa922941c93 in_review, PR up. Smoke URL is the hung server.
+
+--- POST /api/tasks/6fa922941c93/merge (real defaultFetcher vs hung smoke URL) ---
+HTTP status : 200
+response body: {"id":"6fa922941c93","state":"in_progress"}
+elapsed      : 15005ms  (would hang forever before task #641)
+
+RESULT: real HTTP response returned in 15005ms, state bounced to "in_progress" by the failing smoke check. No 000/timeout hang.

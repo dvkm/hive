@@ -9,6 +9,7 @@ process.env.HIVE_HOME = HOME;
 
 const { openDb } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
+import type { Fetcher } from "../src/monitors.ts";
 
 const db = openDb(":memory:");
 const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
@@ -208,6 +209,47 @@ test("ready emit records the pr_url and advances in_progress -> in_review", asyn
   const again = await post(`/api/tasks/${id}/events`, { type: "ready" });
   expect(again.status).toBe(200);
   expect(again.json.task.state).toBe("in_review");
+});
+
+// POST /merge used to hang forever when the project's post-merge smoke check
+// hit an unreachable/stalled URL: mergeTask awaits smokeThenAdvance
+// synchronously before responding, and the default fetcher had no timeout
+// (task #641, separate from the exec() timeout fixed in #621). deps.fetch was
+// also never threaded through to smokeThenAdvance, so tests/callers had no way
+// to override it either. This proves both are fixed: deps.fetch reaches the
+// smoke check, and a failing check returns promptly rather than hanging.
+test("POST /merge returns instead of hanging when the post-merge smoke check fails", async () => {
+  const OK = (stdout = "") => ({ code: 0, stdout, stderr: "" });
+  const exec = async (argv: string[]) =>
+    argv.includes("gh") && argv.includes("pr") && argv.includes("view") ? OK(JSON.stringify({ state: "MERGED" })) : OK();
+  const smokeFetch: Fetcher = async () => ({ status: 500, body: "down" });
+  const db2 = openDb(":memory:");
+  const srv = Bun.serve({ port: 0, fetch: makeHandler(db2, { exec, fetch: smokeFetch }) });
+  const base2 = `http://127.0.0.1:${srv.port}`;
+  const post2 = async (path: string, body: unknown) => {
+    const res = await fetch(base2 + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    return { status: res.status, json: await res.json() };
+  };
+  try {
+    const p = await post2("/api/projects", {
+      name: "smoke-proj",
+      repo_path: "/tmp/x",
+      config: { smoke: [{ name: "root", url: "http://127.0.0.1:1/", expect_status: 200 }] },
+    });
+    const t = await post2("/api/tasks", { project_id: p.json.id, title: "merge task" });
+    const id = t.json.id;
+    await post2(`/api/tasks/${id}/transition`, { to: "in_progress" });
+    await post2(`/api/tasks/${id}/events`, { type: "evidence", note: "proof", kind: "log" });
+    await post2(`/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/1" });
+
+    const start = Date.now();
+    const merged = await post2(`/api/tasks/${id}/merge`, {});
+    expect(Date.now() - start).toBeLessThan(3000);
+    expect(merged.status).toBe(200);
+    expect(merged.json.state).toBe("in_progress"); // bounced back by the failing smoke check
+  } finally {
+    srv.stop(true);
+  }
 });
 
 test("evidence upload round-trips through /evidence", async () => {

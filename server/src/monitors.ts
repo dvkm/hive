@@ -20,7 +20,7 @@ import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 import { enqueue } from "./notifications.ts";
 
-export type Fetcher = (url: string) => Promise<{ status: number; body: string }>;
+export type Fetcher = (url: string, timeoutMs?: number) => Promise<{ status: number; body: string }>;
 
 export interface Check {
   name: string;
@@ -36,8 +36,15 @@ export interface MonitorDeps {
   notify?: boolean; // default true; disabled in tests
 }
 
-const defaultFetcher: Fetcher = async (url) => {
-  const res = await fetch(url, { redirect: "manual" });
+const DEFAULT_FETCH_TIMEOUT_MS = 15_000;
+
+// Bounded (task #641): a stalled or unreachable smoke/monitor URL used to hang
+// this fetch forever — for smoke checks that wedges the merge request itself,
+// since POST /merge awaits smokeThenAdvance synchronously before responding.
+// Same shape as the exec() timeout fix (task #621) for this separate,
+// previously-unbounded await path.
+export const defaultFetcher: Fetcher = async (url, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS) => {
+  const res = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
   return { status: res.status, body: await res.text() };
 };
 
