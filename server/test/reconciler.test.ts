@@ -318,6 +318,23 @@ test("flagStale does NOT flag a dep-blocked in_progress task past the threshold"
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'stale'").all(child).length).toBe(0);
 });
 
+test("flagStale skips a deferred task (future deferred_until) — no nudge", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "d-agent" });
+  transition(db, id, "in_progress"); // last event is recent
+  const future = () => Date.now() + 60 * 60 * 1000;
+  // deferred well past the reconcile clock's window
+  db.query("UPDATE tasks SET deferred_until = ? WHERE id = ?").run(new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), id);
+
+  await reconcileOnce(db, { staleMs: 15 * 60 * 1000, nowMs: future, herdr: statusHerdr("idle") });
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'stale'").all(id).length).toBe(0);
+
+  // once the defer window passes, staleness resumes (the deadline IS the check-back)
+  db.query("UPDATE tasks SET deferred_until = ? WHERE id = ?").run(new Date(Date.now() - 1000).toISOString(), id);
+  await reconcileOnce(db, { staleMs: 15 * 60 * 1000, nowMs: future, herdr: statusHerdr("idle") });
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'stale'").all(id).length).toBe(1);
+});
+
 // A herdr whose `agent get` reports a fixed status (agent alive with a pane).
 const statusHerdr = (status: string) =>
   new Herdr(stub(() => OK(`{"result":{"agent":{"agent_status":"${status}","pane_id":"w1:p1"}}}`)), "herdr");

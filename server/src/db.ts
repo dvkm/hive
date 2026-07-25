@@ -393,6 +393,17 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       `ALTER TABLE decisions ADD COLUMN answered_actor TEXT`,
     ],
   },
+  // "Deferred, waiting on a human": a task blocked on an OFFLINE human action
+  // (e.g. sudo) answered "Schedule for later" has no state that fits —
+  // in_progress keeps drawing "gone quiet" nudges (task #329 got 9+),
+  // needs_decision is wrong with no open card. deferred_until parks it: the
+  // stale/nudge machinery skips it while the timestamp is in the future, and it
+  // stays in_progress (no state hop). Far-future = indefinite; a real date =
+  // auto-resume then; the director/agent un-defers to resume early.
+  {
+    name: "v20-task-deferred-until",
+    statements: [`ALTER TABLE tasks ADD COLUMN deferred_until TEXT`],
+  },
 ];
 
 // -------------------------------------------------------------- settings
