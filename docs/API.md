@@ -482,9 +482,11 @@ chat endpoints below.
 ## Endpoints
 
 ### Health
-`GET /api/health` → `200 {"ok": true, "version": "0.1.0", "dispatcher": {"last_run": "<iso>|null", "stale": bool}, "reaper": {"last_run": "<iso>|null", "stale": bool}}`
+`GET /api/health` → `200 {"ok": true, "version": "0.1.0", "dispatcher": {"last_run": "<iso>|null", "stale": bool}, "reaper": {"last_run": "<iso>|null", "stale": bool}, "herdr_outage": {"paused_until": "<iso>", "streak": int} | null}`
 
 `dispatcher`/`reaper` report the last time each background loop's cycle completed (heartbeat, written on every completion path — including the offline-drain no-op and the herdr-down cooldown skip — so a wedged cycle ages toward stale instead of a fresh tick re-marking it fresh). `stale` flags when a loop has missed ~3 cycles (floored at 5min) — the signal for "loop stopped ticking" vs. "process is up but a background loop silently died" (incident 2026-07-17).
+
+`herdr_outage` surfaces a sustained herdr-daemon outage. When the dispatcher's circuit breaker is backing off it keeps refreshing `last_dispatch_at`, so `dispatcher` reads healthy even though nothing is spawning for the whole cooldown; this field makes the outage observable instead. It is non-null (`paused_until` = end of the backoff window, `streak` = consecutive outage count) ONLY while the backoff window is still in the future, and `null` otherwise (no outage, or the window has passed).
 
 ### Projects
 - `GET /api/projects[?archived=all]` → `200 [Project, ...]` (oldest first)

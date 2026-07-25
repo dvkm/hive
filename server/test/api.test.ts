@@ -7,7 +7,7 @@ import { join } from "node:path";
 const HOME = mkdtempSync(join(tmpdir(), "hive-test-"));
 process.env.HIVE_HOME = HOME;
 
-const { openDb } = await import("../src/db.ts");
+const { openDb, setSetting } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
 import type { Fetcher } from "../src/monitors.ts";
 
@@ -49,6 +49,22 @@ test("health endpoint reports dispatcher/reaper liveness, stale before any cycle
   const { json } = await get("/api/health");
   expect(json.dispatcher).toEqual({ last_run: null, stale: true });
   expect(json.reaper).toEqual({ last_run: null, stale: true });
+});
+
+test("health endpoint surfaces herdr_outage only during an active backoff window", async () => {
+  // No backoff set → absent (null).
+  expect((await get("/api/health")).json.herdr_outage).toBeNull();
+
+  // Backoff in the future → the outage indicator appears with its streak.
+  setSetting(db, "herdr_outage_streak", "3");
+  setSetting(db, "herdr_backoff_until", new Date(Date.now() + 60_000).toISOString());
+  const active = (await get("/api/health")).json.herdr_outage;
+  expect(active.streak).toBe(3);
+  expect(Date.parse(active.paused_until)).toBeGreaterThan(Date.now());
+
+  // Backoff in the past (daemon recovered) → gone again.
+  setSetting(db, "herdr_backoff_until", new Date(Date.now() - 1_000).toISOString());
+  expect((await get("/api/health")).json.herdr_outage).toBeNull();
 });
 
 test("task create + list + get", async () => {

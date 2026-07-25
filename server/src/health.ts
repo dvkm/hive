@@ -8,6 +8,7 @@
 // the request path. The reconciler is what turns live herdr probes into
 // `agent_status` events (including `gone`), so health reads that recorded truth.
 import type { DB } from "./db.ts";
+import { getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 
 export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
@@ -165,6 +166,18 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
     };
   }
   return { status: "healthy", reason: null, since: activityTs };
+}
+
+// Server-global herdr-outage signal for /api/health. The dispatcher's circuit
+// breaker (hive-682) writes herdr_backoff_until/herdr_outage_streak while the
+// herdr daemon is down and keeps refreshing last_dispatch_at, so the plain
+// dispatcher-liveness check reads "healthy" even though nothing spawns for the
+// whole cooldown. This makes a sustained outage observable: non-null ONLY while
+// the backoff window is still in the future (settings keys absent → null).
+export function herdrOutage(db: DB, nowMs = Date.now()): { paused_until: string; streak: number } | null {
+  const pausedUntil = getSetting(db, "herdr_backoff_until");
+  if (!pausedUntil || nowMs >= Date.parse(pausedUntil)) return null;
+  return { paused_until: pausedUntil, streak: Number(getSetting(db, "herdr_outage_streak") ?? "0") };
 }
 
 // A task row enriched with its computed health, for API responses + SSE.
