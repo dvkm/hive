@@ -4,7 +4,7 @@ import { dirname, join, normalize } from "node:path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
-import { taskWithHealth, broadcastTask, needsAttention } from "./health.ts";
+import { taskWithHealth, broadcastTask, needsAttention, herdrOutage } from "./health.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
 import {
   transition,
@@ -153,7 +153,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       // ---- health ----
       if (pathname === "/api/health" && method === "GET")
-        return json({ ok: true, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS) });
+        return json({ ok: true, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), herdr_outage: herdrOutage(db) });
 
       // ---- evidence static files ----
       if (pathname.startsWith("/evidence/") && method === "GET")

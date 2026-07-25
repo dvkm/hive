@@ -1,0 +1,50 @@
+=== 1) baseline: herdr healthy, no backoff set ===
+GET /api/health ->
+{
+  "ok": true,
+  "version": "0.1.0",
+  "dispatcher": {
+    "last_run": "2026-07-25T19:16:19.209Z",
+    "stale": false
+  },
+  "reaper": {
+    "last_run": "2026-07-25T19:15:00.995Z",
+    "stale": false
+  },
+  "herdr_outage": null
+}
+
+=== 2) active outage: backoff window in the future, streak=3 ===
+GET /api/health ->
+{
+  "ok": true,
+  "version": "0.1.0",
+  "dispatcher": {
+    "last_run": "2026-07-25T19:16:19.209Z",
+    "stale": false
+  },
+  "reaper": {
+    "last_run": "2026-07-25T19:15:00.995Z",
+    "stale": false
+  },
+  "herdr_outage": {
+    "paused_until": "2026-07-25T19:17:40.684Z",
+    "streak": 3
+  }
+}
+
+=== 3) recovered: backoff window now in the past ===
+GET /api/health ->
+{
+  "ok": true,
+  "version": "0.1.0",
+  "dispatcher": {
+    "last_run": "2026-07-25T19:16:19.209Z",
+    "stale": false
+  },
+  "reaper": {
+    "last_run": "2026-07-25T19:15:00.995Z",
+    "stale": false
+  },
+  "herdr_outage": null
+}
