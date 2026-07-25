@@ -45,93 +45,54 @@ export interface ReconcilerDeps {
 const DEFAULT_STALE_MS = 15 * 60 * 1000;
 
 export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<void> {
+  const startedAt = Date.now();
   let errored = false;
+  let steps = 0;
+  let errors = 0;
   const fail = (where: string, e: unknown) => {
+    errors++;
     if (!errored) {
       errored = true;
       console.error(`[hive] reconciler ${where}:`, e);
       broadcast({ type: "reconciler_error", error: String((e as any)?.message ?? e), where });
     }
   };
-  try {
-    await syncAgents(db, deps);
-  } catch (e) {
-    fail("syncAgents", e);
-  }
-  try {
-    await drainSteers(db, deps);
-  } catch (e) {
-    fail("drainSteers", e);
-  }
-  try {
-    await advanceFinished(db, deps);
-  } catch (e) {
-    fail("advanceFinished", e);
-  }
-  try {
-    nagOpenDecisions(db, (deps.nowMs ?? (() => Date.now()))());
-  } catch (e) {
-    fail("nagOpenDecisions", e);
-  }
-  try {
-    unparkAnswered(db, (deps.nowMs ?? (() => Date.now()))());
-  } catch (e) {
-    fail("unparkAnswered", e);
-  }
-  try {
-    remindUnreviewedIntake(db, (deps.nowMs ?? (() => Date.now()))());
-  } catch (e) {
-    fail("remindUnreviewedIntake", e);
-  }
-  try {
-    captureRecurringRefs(db);
-  } catch (e) {
-    fail("captureRecurringRefs", e);
-  }
+  // Runs one labeled sub-step, isolated so a failure never stops the rest of
+  // the cycle; counts toward the run-summary log below.
+  const step = async (where: string, fn: () => unknown) => {
+    steps++;
+    try {
+      await fn();
+    } catch (e) {
+      fail(where, e);
+    }
+  };
+  const logRun = (outcome: string) => {
+    console.log(`[hive] reconciler run: duration_ms=${Date.now() - startedAt} steps=${steps} errors=${errors} outcome=${outcome}`);
+  };
+  await step("syncAgents", () => syncAgents(db, deps));
+  await step("drainSteers", () => drainSteers(db, deps));
+  await step("advanceFinished", () => advanceFinished(db, deps));
+  await step("nagOpenDecisions", () => nagOpenDecisions(db, (deps.nowMs ?? (() => Date.now()))()));
+  await step("unparkAnswered", () => unparkAnswered(db, (deps.nowMs ?? (() => Date.now()))()));
+  await step("remindUnreviewedIntake", () => remindUnreviewedIntake(db, (deps.nowMs ?? (() => Date.now()))()));
+  await step("captureRecurringRefs", () => captureRecurringRefs(db));
   // Offline mode: everything above is local (herdr + sqlite) and keeps state
   // honest; everything below either needs the network (gh) or would punish
   // agents for being offline (stale flags, nudges, failure escalation). Stop here.
-  if (isOffline(db)) return;
-  try {
-    await syncPRs(db, deps);
-  } catch (e) {
-    fail("syncPRs", e);
+  if (isOffline(db)) {
+    logRun("offline");
+    return;
   }
-  try {
-    await linkPRs(db, deps);
-  } catch (e) {
-    fail("linkPRs", e);
-  }
-  try {
-    resumeUsageLimited(db, (deps.nowMs ?? (() => Date.now()))());
-  } catch (e) {
-    fail("resumeUsageLimited", e);
-  }
-  try {
-    flagStale(db, deps);
-  } catch (e) {
-    fail("flagStale", e);
-  }
-  try {
-    await recoverStale(db, deps);
-  } catch (e) {
-    fail("recoverStale", e);
-  }
-  try {
-    await sweepVerifying(db, deps);
-  } catch (e) {
-    fail("sweepVerifying", e);
-  }
-  try {
-    await autoMergeReady(db, deps);
-  } catch (e) {
-    fail("autoMergeReady", e);
-  }
-  try {
-    autoAnswerStale(db, deps.herdr ?? defaultHerdr, (deps.nowMs ?? (() => Date.now()))());
-  } catch (e) {
-    fail("autoAnswerStale", e);
-  }
+  await step("syncPRs", () => syncPRs(db, deps));
+  await step("linkPRs", () => linkPRs(db, deps));
+  await step("resumeUsageLimited", () => resumeUsageLimited(db, (deps.nowMs ?? (() => Date.now()))()));
+  await step("flagStale", () => flagStale(db, deps));
+  await step("recoverStale", () => recoverStale(db, deps));
+  await step("sweepVerifying", () => sweepVerifying(db, deps));
+  await step("autoMergeReady", () => autoMergeReady(db, deps));
+  await step("autoAnswerStale", () => autoAnswerStale(db, deps.herdr ?? defaultHerdr, (deps.nowMs ?? (() => Date.now()))()));
+  logRun(errors > 0 ? "error" : "ok");
 }
 
 // ---- agent status sync ----

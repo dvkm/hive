@@ -66,6 +66,7 @@ export interface DispatcherDeps {
 
 // One dispatch pass. Isolated per task so one bad task never stops the rest.
 export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<void> {
+  const startedAt = Date.now();
   // Liveness heartbeat, written only once a cycle actually COMPLETES (every
   // return path below), so /api/health can tell "loop finished, nothing to do"
   // apart from "loop started but wedged mid-cycle" — a fresh setInterval tick
@@ -75,6 +76,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   // early return is a legitimate no-op completion, so it heartbeats too.
   if (isOffline(db)) {
     setSetting(db, "last_dispatch_at", now());
+    console.log(`[hive] dispatcher run: duration_ms=${Date.now() - startedAt} steps=0 errors=0 outcome=offline`);
     return; // offline mode: drain — nothing new spawns
   }
   const h = deps.herdr ?? defaultHerdr;
@@ -95,6 +97,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     .all()
     .map(parseTask);
 
+  let errors = 0;
   const projectCache = new Map<string, { repo_path: string | null; config: any } | null>();
   const workingCount = new Map<string, number>(); // per-project working slots used
   const activeCount = new Map<string, number>(); // per-project live agents incl. review-parked
@@ -183,6 +186,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         // On failure spawnAgent already wrote a single spawn_error event; the
         // backoff above governs the next attempt (no immediate retry).
       } catch (e) {
+        errors++;
         console.error(`[hive] dispatcher task ${task.id}:`, e);
       }
     }
@@ -200,6 +204,9 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   }
   await Promise.all([...byProject.values()].map(dispatchProject));
   setSetting(db, "last_dispatch_at", now()); // cycle completed — refresh heartbeat
+  console.log(
+    `[hive] dispatcher run: duration_ms=${Date.now() - startedAt} steps=${queued.length} errors=${errors} outcome=${errors > 0 ? "error" : "ok"}`
+  );
 }
 
 // An intake task is "reviewed" once the director signals it: either a dedicated
