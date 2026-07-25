@@ -38,6 +38,17 @@ function stubHerdr(fail = false) {
   return { herdr: new Herdr(exec, "herdr"), spawns };
 }
 
+// herdr control socket down: worktree create fails with a ConnectionRefused body,
+// the signature isHerdrUnreachable keys the global circuit breaker on.
+function stubHerdrUnreachable() {
+  const exec: Exec = async (argv) => {
+    if (has(argv, "worktree", "create"))
+      return { code: 1, stdout: "", stderr: 'Os { code: 61, kind: ConnectionRefused, message: "Connection refused" }' };
+    return OK();
+  };
+  return { herdr: new Herdr(exec, "herdr") };
+}
+
 function freshDb(config: any = {}): { db: DB; projectId: string } {
   const db = openDb(":memory:");
   const projectId = newId("proj");
@@ -301,4 +312,65 @@ test("spawn failure records one spawn_error and backs off (no retry storm)", asy
   await dispatchOnce(db, { herdr, nowMs: clock });
   errs = db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'spawn_error'").get(id) as { n: number };
   expect(errs.n).toBe(2);
+});
+
+test("herdr unreachable: one probe per cycle (not per task) + global cooldown pauses dispatch", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  makeTask(db, projectId);
+  makeTask(db, projectId);
+  makeTask(db, projectId); // 3 queued tasks, same project (serial)
+  const { herdr } = stubHerdrUnreachable();
+  let t = Date.now();
+  const clock = () => t;
+
+  await dispatchOnce(db, { herdr, nowMs: clock });
+  // Only the FIRST task probes the dead daemon; the breaker skips the other two.
+  let errs = db.query("SELECT COUNT(*) AS n FROM events WHERE type = 'spawn_error'").get() as { n: number };
+  expect(errs.n).toBe(1);
+  const infra = db.query("SELECT payload FROM events WHERE type = 'spawn_error'").get() as { payload: string };
+  expect(JSON.parse(infra.payload).infra).toBe("herdr_unreachable");
+  expect(getSetting(db, "herdr_backoff_until")).toBeTruthy();
+
+  // Next cycle within the cooldown: dispatch is skipped entirely (no new probe),
+  // but the liveness heartbeat still advances — a cooling dispatcher isn't wedged.
+  t += 1000;
+  await dispatchOnce(db, { herdr, nowMs: clock });
+  errs = db.query("SELECT COUNT(*) AS n FROM events WHERE type = 'spawn_error'").get() as { n: number };
+  expect(errs.n).toBe(1); // still just the one probe
+  expect(getSetting(db, "last_dispatch_at")).toBeTruthy();
+
+  // After the cooldown elapses, it probes again (streak grows -> longer cooldown).
+  t += 31_000;
+  await dispatchOnce(db, { herdr, nowMs: clock });
+  errs = db.query("SELECT COUNT(*) AS n FROM events WHERE type = 'spawn_error'").get() as { n: number };
+  expect(errs.n).toBe(2);
+});
+
+test("herdr recovers: a successful spawn clears the outage cooldown/streak", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  makeTask(db, projectId);
+  const t = Date.now();
+  const clock = () => t;
+
+  await dispatchOnce(db, { herdr: stubHerdrUnreachable().herdr, nowMs: clock });
+  expect(getSetting(db, "herdr_backoff_until")).toBeTruthy();
+
+  // Cooldown passes, daemon is back: the spawn succeeds and clears the outage.
+  await dispatchOnce(db, { herdr: stubHerdr().herdr, nowMs: () => t + 31_000 });
+  expect(getSetting(db, "herdr_backoff_until")).toBeFalsy();
+  expect(getSetting(db, "herdr_outage_streak")).toBe("0");
+});
+
+test("inBackoff ignores infra-tagged (herdr-down) spawn_errors", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  const t = Date.now();
+
+  // An infra failure alone does NOT put the task in backoff (not its fault).
+  writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "ConnectionRefused", infra: "herdr_unreachable" } });
+  expect(inBackoff(db, id, t)).toBe(false);
+
+  // A genuine (untagged) failure still does.
+  writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "bad base ref" } });
+  expect(inBackoff(db, id, t)).toBe(true);
 });

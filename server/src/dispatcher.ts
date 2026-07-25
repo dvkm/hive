@@ -22,8 +22,8 @@
 // behave identically.
 import type { DB } from "./db.ts";
 import { parseTask } from "./rows.ts";
-import { isOffline, setSetting, now } from "./db.ts";
-import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
+import { isOffline, setSetting, getSetting, now } from "./db.ts";
+import { Herdr, herdr as defaultHerdr, isHerdrUnreachable } from "./runtime/herdr.ts";
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
 import { unmetDeps, noteDependencyBlock } from "./state.ts";
@@ -37,6 +37,13 @@ import type { Exec } from "./exec.ts";
 const DISPATCH_KINDS_DEFAULT = ["ship", "scout", "chore"];
 const MAX_AGENTS_DEFAULT = 3;
 const BACKOFF_BASE_MS = 30_000;
+// Global herdr-daemon-down circuit breaker. When a spawn fails because the herdr
+// control socket is unreachable (not a per-task fault), pause ALL dispatch for a
+// cooldown that grows with consecutive outage cycles, capped low so recovery is
+// detected within minutes. Collapses the 260× ConnectionRefused storm (every
+// queued task pounding a dead daemon) to ~one probe per cooldown.
+const HERDR_OUTAGE_BASE_MS = 30_000;
+const HERDR_OUTAGE_CAP_MS = 5 * 60 * 1000;
 const BACKOFF_CAP_MS = 30 * 60 * 1000;
 // States that count as "working" for the max_agents cap. in_review/verifying
 // agents are parked waiting on the DIRECTOR — counting them froze the whole
@@ -72,6 +79,17 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   }
   const h = deps.herdr ?? defaultHerdr;
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
+
+  // herdr-down circuit breaker: a prior cycle hit an unreachable daemon and set a
+  // global cooldown. Skip dispatch entirely (don't pound the dead socket once per
+  // queued task) but still heartbeat — the dispatcher IS alive, just cooling down,
+  // and /api/health must not read this as a wedged loop.
+  const backoffUntil = getSetting(db, "herdr_backoff_until");
+  if (backoffUntil && nowMs < Date.parse(backoffUntil)) {
+    setSetting(db, "last_dispatch_at", now());
+    return;
+  }
+
   const queued = db
     .query("SELECT * FROM tasks WHERE state = 'queued' ORDER BY created_at ASC")
     .all()
@@ -107,8 +125,13 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   // single retry — firing a project's spawns concurrently would spawn_error on
   // the create step. Different projects run concurrently (see below), so a slow
   // setup on one project no longer stalls dispatch for the others.
+  // Set true the moment any spawn reports the herdr daemon unreachable; every
+  // concurrent project loop bails out so a dead daemon is probed once, not once
+  // per queued task. Single-threaded async makes the check-then-set race-free.
+  let herdrDown = false;
   const dispatchProject = async (tasks: typeof queued) => {
     for (const task of tasks) {
+      if (herdrDown) return; // daemon down this cycle — stop, cooldown already set
       try {
         const proj = getProject(task.project_id);
         if (!proj?.repo_path) continue; // no repo -> can't spawn
@@ -151,6 +174,11 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         if (r.ok) {
           workingCount.set(task.project_id, workingFor(task.project_id) + 1);
           activeCount.set(task.project_id, activeFor(task.project_id) + 1);
+          clearHerdrOutage(db); // daemon answered — reset the outage streak
+        } else if (isHerdrUnreachable(r.error) && !herdrDown) {
+          herdrDown = true; // first hit sets the global cooldown; rest of the cycle bails
+          noteHerdrOutage(db, nowMs);
+          return;
         }
         // On failure spawnAgent already wrote a single spawn_error event; the
         // backoff above governs the next attempt (no immediate retry).
@@ -196,14 +224,45 @@ export function isReviewed(db: DB, taskId: string): boolean {
 
 // Exponential backoff keyed on the count of spawn_error events for the task:
 // delay = min(30s * 2^(n-1), 30m) since the most recent failure. A task with no
-// spawn errors dispatches immediately.
+// spawn errors dispatches immediately. Infra-tagged failures (herdr daemon down)
+// are excluded — they aren't the task's fault, so they must neither escalate its
+// exponential delay nor strand it in backoff once the daemon recovers; the global
+// circuit breaker governs those instead.
 export function inBackoff(db: DB, taskId: string, nowMs: number): boolean {
   const rows = db
-    .query("SELECT ts FROM events WHERE task_id = ? AND type = 'spawn_error' ORDER BY ts DESC")
-    .all(taskId) as { ts: string }[];
-  if (!rows.length) return false;
-  const delay = Math.min(BACKOFF_BASE_MS * 2 ** (rows.length - 1), BACKOFF_CAP_MS);
-  return nowMs - Date.parse(rows[0].ts) < delay;
+    .query("SELECT ts, payload FROM events WHERE task_id = ? AND type = 'spawn_error' ORDER BY ts DESC")
+    .all(taskId) as { ts: string; payload: string }[];
+  const own = rows.filter((r) => {
+    try {
+      return !JSON.parse(r.payload).infra;
+    } catch {
+      return true; // unparseable payload counts as a real failure
+    }
+  });
+  if (!own.length) return false;
+  const delay = Math.min(BACKOFF_BASE_MS * 2 ** (own.length - 1), BACKOFF_CAP_MS);
+  return nowMs - Date.parse(own[0].ts) < delay;
+}
+
+// Global herdr-outage cooldown, mirroring inBackoff's exponential shape but keyed
+// on a settings streak counter instead of per-task events. Grows with consecutive
+// outage cycles, capped low so recovery is picked up within minutes.
+export function noteHerdrOutage(db: DB, nowMs: number): void {
+  const streak = Number(getSetting(db, "herdr_outage_streak") ?? "0") + 1;
+  const delay = Math.min(HERDR_OUTAGE_BASE_MS * 2 ** (streak - 1), HERDR_OUTAGE_CAP_MS);
+  setSetting(db, "herdr_outage_streak", String(streak));
+  setSetting(db, "herdr_backoff_until", new Date(nowMs + delay).toISOString());
+}
+
+// Daemon answered a spawn — clear the outage streak/cooldown so the next failure
+// starts fresh. No-op (no writes) when there was no outage in flight.
+export function clearHerdrOutage(db: DB): void {
+  const streak = getSetting(db, "herdr_outage_streak") ?? "";
+  const backoffUntil = getSetting(db, "herdr_backoff_until") ?? "";
+  if ((streak !== "" && streak !== "0") || backoffUntil !== "") {
+    setSetting(db, "herdr_outage_streak", "0");
+    setSetting(db, "herdr_backoff_until", "");
+  }
 }
 
 // Background loop. Started only from index.ts (never in tests).

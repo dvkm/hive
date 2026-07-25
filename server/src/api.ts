@@ -33,7 +33,7 @@ import {
   parsePolicy,
   parseIncident,
 } from "./rows.ts";
-import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
+import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
@@ -1728,9 +1728,14 @@ export async function spawnAgent(
       },
     });
   } catch (e: any) {
-    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: String(e?.message ?? e) } });
-    recordSystemLearning(db, task.project_id, `spawn failure: ${signature(String(e?.message ?? e))}`, String(e?.message ?? e), id);
-    return { ok: false, error: String(e?.message ?? e) };
+    const msg = String(e?.message ?? e);
+    // Tag herdr-daemon-down failures as infra: the dispatcher backs off globally
+    // (not per-task) and inBackoff excludes them, so an outage doesn't pound the
+    // dead socket once per queued task nor inflate the task's own backoff.
+    const infra = isHerdrUnreachable(msg) ? "herdr_unreachable" : undefined;
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: msg, ...(infra ? { infra } : {}) } });
+    recordSystemLearning(db, task.project_id, `spawn failure: ${signature(msg)}`, msg, id);
+    return { ok: false, error: msg };
   }
 
   db.query(
