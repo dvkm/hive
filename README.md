@@ -132,7 +132,9 @@ server/test/ bun test suite
   skips unreviewed `intake_gchat` tasks, runs the `task.dispatch` authority gate,
   holds tasks with unmet `depends_on` (a listed task not yet merged/done, with a
   visible `dependency_blocked` reason), and backs off exponentially on spawn
-  failures. Shares the spawn core with the
+  failures (per-task, plus a global circuit breaker that pauses all dispatch when
+  the herdr daemon is unreachable so a dead socket isn't pounded once per queued
+  task). Shares the spawn core with the
   manual `POST /api/tasks/:id/spawn`. The herdr adapter is verified against a
   live herdr server — see `docs/runtime.md` and
   `docs/evidence/herdr-live-verification.txt`.

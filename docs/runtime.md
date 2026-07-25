@@ -34,7 +34,23 @@ web UI now runs instead of sitting in Queued forever. Every gate below must pass
    gate to stage advancement, so a manually-spawned dependent is held too.
 7. **Backoff.** On a spawn failure a single `spawn_error` event is written and
    the task stays queued; the next attempt waits `min(30s · 2^(n-1), 30m)` where
-   `n` is the number of spawn_error events. No retry storm on a broken repo.
+   `n` is the number of the task's *own* spawn_error events. No retry storm on a
+   broken repo. Failures tagged `infra: "herdr_unreachable"` (see the circuit
+   breaker below) are excluded from `n` — a daemon outage is not the task's
+   fault, so it neither escalates the task's exponential delay nor strands it in
+   backoff once herdr recovers.
+8. **herdr-down circuit breaker.** A spawn can fail because the herdr control
+   socket itself is unreachable (`ConnectionRefused` / `Os { code: 61 }`,
+   `isHerdrUnreachable()`) rather than for a task-specific reason. Instead of
+   every queued task independently pounding the dead socket (the 260× outage
+   storm), the first such failure in a cycle tags its `spawn_error` event
+   `infra: "herdr_unreachable"`, sets a **global** cooldown
+   (`herdr_backoff_until`, `min(30s · 2^(streak-1), 5m)`), and bails the rest of
+   the cycle. Subsequent cycles skip dispatch entirely while the cooldown holds
+   but still write the `last_dispatch_at` heartbeat so `/api/health` reads the
+   dispatcher as cooling, not wedged. A successful spawn resets the streak. The
+   bound is one probe per project (concurrent in-flight spawns) in the first
+   outage cycle, then fully paused.
 
 The spawn itself is the shared `spawnAgent()` core (also used by
 `POST /api/tasks/:id/spawn`), so the auto path and the manual button behave

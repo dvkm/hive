@@ -208,7 +208,7 @@ Types written by the runtime layer (Phase 2b):
 - `checkpoint` — a live build-time judgment call from a working agent (`payload: {note}`; `hive emit <id> checkpoint --note "..."`). Non-blocking. The director acknowledges via `POST /api/tasks/:id/checkpoints/:eventId/ack` body `{verdict: "ok"|"flag", note?}` → `200 {ok, delivered, followup_task_id}` | `400` | `404`; `checkpoint_ack` events (`payload: {checkpoint_id, verdict, note}`) record the outcome. A `flag` steers a live agent immediately; a flag on a finished/agentless task queues a corrective follow-up task instead (`source="checkpoint_flag"`, parent → the flagged task). `GET /api/checkpoints` → `200 {checkpoints: [{id, task_id, ts, task_number, task_title, task_state, project_id, note}]}` lists ALL un-acked checkpoints — they survive task completion (only `cancelled` drops them) so judgment calls stay reviewable after fast agents finish.
 - `review_summary` — the agent's structured self-review, submitted before `ready`. `payload: {done?: string[], iffy?: (string|{what,why})[], decisions?: string[], testing?: string[], followups?: string[]}`. The review card renders the latest one as the primary review surface (prose `summary` collapses behind a toggle).
 - `spawned` — a herdr agent was started. `payload: {agent_target, branch, worktree_path, tab_id, label, fleet_workspace_id}`
-- `spawn_error` — spawn failed. `payload: {error}`
+- `spawn_error` — spawn failed. `payload: {error, infra?}`. `infra: "herdr_unreachable"` marks a herdr-daemon-down failure (`ConnectionRefused` / `Os { code: 61 }`) rather than a task-specific fault; the dispatcher excludes these from a task's per-task backoff and handles them with a global circuit breaker instead (see `docs/runtime.md`)
 - `stack_setup` — the per-project spawn hook (`config.setup_argv`) ran while preparing the worktree, before the agent started (`source: herdr`). `payload: {argv, ok, error?}` (`error` = first 300 chars of stderr/stdout on failure; best-effort, a failure never blocks the spawn).
 - `stack_teardown` — the per-project teardown hook (`config.cleanup_argv`) ran before the worktree was removed (`source: reaper`). `payload: {argv, ok, error?}` (best-effort, a failure never blocks worktree/session cleanup). Both share `runStackCmd` (`server/src/cleanup.ts`).
 - `agent_status` — herdr agent status changed (via wait loop or reconciler). `payload: {status}` (`idle|working|blocked|gone` — `gone` = the reconciler's probe found the agent missing from herdr)
@@ -484,7 +484,7 @@ chat endpoints below.
 ### Health
 `GET /api/health` → `200 {"ok": true, "version": "0.1.0", "dispatcher": {"last_run": "<iso>|null", "stale": bool}, "reaper": {"last_run": "<iso>|null", "stale": bool}}`
 
-`dispatcher`/`reaper` report the last time each background loop's cycle completed (heartbeat, written on every completion path — including the offline-drain no-op — so a wedged cycle ages toward stale instead of a fresh tick re-marking it fresh). `stale` flags when a loop has missed ~3 cycles (floored at 5min) — the signal for "loop stopped ticking" vs. "process is up but a background loop silently died" (incident 2026-07-17).
+`dispatcher`/`reaper` report the last time each background loop's cycle completed (heartbeat, written on every completion path — including the offline-drain no-op and the herdr-down cooldown skip — so a wedged cycle ages toward stale instead of a fresh tick re-marking it fresh). `stale` flags when a loop has missed ~3 cycles (floored at 5min) — the signal for "loop stopped ticking" vs. "process is up but a background loop silently died" (incident 2026-07-17).
 
 ### Projects
 - `GET /api/projects[?archived=all]` → `200 [Project, ...]` (oldest first)
@@ -1177,7 +1177,10 @@ event containing "reviewed" exists), and the standing-authority gate. The author
 auto-spawn (`authority_denied` event) and a `require_decision` rule opens a card
 and parks the task, exactly like the other guarded actions. Spawn failures write
 a single `spawn_error` event and back off exponentially per task
-(`min(30s·2^(n-1), 30m)`); the task stays `queued` with the error visible.
+(`min(30s·2^(n-1), 30m)`, counting only the task's own non-infra failures); the
+task stays `queued` with the error visible. Herdr-daemon-down failures
+(`infra: "herdr_unreachable"`) instead trip a global circuit breaker that pauses
+all dispatch on a cooldown (see `docs/runtime.md`).
 Manual dispatch (the web "dispatch now" button → `POST /api/tasks/:id/spawn`)
 bypasses these policy gates but still runs the `task.spawn` authority gate. See
 `docs/runtime.md`.

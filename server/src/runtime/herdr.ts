@@ -205,6 +205,16 @@ export function isAgentNameTakenError(r: ExecResult): boolean {
   return /agent_name_taken/.test(`${r.stdout}\n${r.stderr}`);
 }
 
+// The herdr control socket was unreachable — the daemon itself is down/refusing,
+// NOT a task-specific failure (bad base, name taken, pty exhaustion). Surfaces
+// as `ConnectionRefused` / `Os { code: 61 }` (260× live: 3 herdr outage episodes,
+// hive-fleet-down-playbook). Callers treat this as an infra outage: back off
+// globally instead of per-task so a dead daemon isn't pounded once per queued
+// task, and don't let it inflate the failing task's exponential backoff.
+export function isHerdrUnreachable(text: string): boolean {
+  return /ConnectionRefused|Connection refused|ECONNREFUSED|Os \{ code:\s*61/.test(text);
+}
+
 // Pull the stale agent's tab/pane out of an agent_name_taken error body:
 // "... candidates: terminal_id=… pane_id=wR:p7X workspace_id=wR tab_id=wR:t40 cwd=…"
 export function parseStaleAgentRef(text: string): { tabId: string | null; paneId: string | null } {
