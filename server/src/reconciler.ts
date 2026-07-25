@@ -24,6 +24,7 @@ import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.
 import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
+import { captureBranchScope } from "./rebaseGuard.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
@@ -298,6 +299,27 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       const lastSha = lastSync ? (JSON.parse(lastSync.payload).head_sha ?? null) : null;
       if (headSha !== lastSha) {
         writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_synchronized", payload: { head_sha: headSha } });
+      }
+    }
+    // Snapshot the branch's intended scope ONCE, at first sight — before any
+    // no-mistakes CI-monitor rebase can run (a rebase only fires after the PR
+    // falls behind, which is later). mergeTask diffs the branch's final scope
+    // against this to catch a destructive auto-rebase (task #314). One event per
+    // task: the existence check makes this idempotent across cycles.
+    if (t.branch) {
+      const have = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'branch_scope' LIMIT 1").get(t.id);
+      if (!have) {
+        const project = db.query("SELECT config, repo_path FROM projects WHERE id = ?").get(t.project_id) as
+          | { config: string; repo_path: string | null }
+          | undefined;
+        if (project?.repo_path) {
+          let base = "main";
+          try {
+            base = JSON.parse(project.config ?? "{}").default_branch || "main";
+          } catch {}
+          const scope = await captureBranchScope(exec, project.repo_path, base, t.branch);
+          if (scope) writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: scope });
+        }
       }
     }
     const ci = ciStatusOf(data.statusCheckRollup);
