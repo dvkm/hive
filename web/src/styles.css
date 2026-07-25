@@ -607,6 +607,10 @@ a {
   color: var(--purple);
   border-color: rgba(155, 125, 214, 0.4);
 }
+.chip-deferred {
+  color: var(--text-dim);
+  border-color: var(--border);
+}
 .chip-duplicate {
   color: var(--text-dim);
   border-color: var(--border);

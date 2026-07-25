@@ -11,7 +11,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, TERMINAL, type State } from "./state.ts";
+import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent } from "./steer.ts";
 import { isReviewed } from "./dispatcher.ts";
@@ -807,12 +807,16 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
   // needs_decision / in_review are parked on the DIRECTOR — silence there is
   // expected, and flagging it spawned pointless recovery nudges (2026-07-10).
   // Tracking-only tasks (source='external') are externally driven: not ours to
-  // supervise, so no staleness either.
+  // supervise, so no staleness either. A task deferred pending a human action
+  // (deferred_until in the future) is intentionally parked — skip it so the
+  // "gone quiet" nudge/notification never fires (task #679).
+  const nowIso = new Date(nowMs).toISOString();
   const tasks = db
     .query(
-      `SELECT id FROM tasks WHERE state IN ('in_progress','verifying') AND COALESCE(source,'') != 'external'`
+      `SELECT id FROM tasks WHERE state IN ('in_progress','verifying') AND COALESCE(source,'') != 'external'
+         AND (deferred_until IS NULL OR deferred_until <= ?)`
     )
-    .all() as { id: string }[];
+    .all(nowIso) as { id: string }[];
   for (const t of tasks) {
     // Held by the dependency gate: advanceFinished refuses to advance it and
     // dependency_blocked is deduped, so it stays intentionally quiet — never
@@ -864,6 +868,9 @@ async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
     // (its work is done), so it must NOT be failed/requeued.
     const cur = getTask(db, t.id);
     if (cur && (cur.state === "in_review" || cur.state === "verifying")) continue;
+    // Deferred pending a human action: neither nudge nor fail it (the goneNow
+    // branch below would otherwise fail an idle-but-deferred task) — task #679.
+    if (cur && isDeferred(cur)) continue;
     // A vanished agent (syncAgents just recorded `gone`) recovers within THIS
     // cycle — the SPEC requires detecting a ghost within one cycle, not waiting
     // out the stale threshold. The silent path is driven by a `stale` flag,

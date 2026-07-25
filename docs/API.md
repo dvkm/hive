@@ -224,6 +224,8 @@ Types written by the runtime layer (Phase 2b):
 - `pr_linked` — a marked PR was matched back to this task and its `pr_url` set (by the reconciler's scan or `POST /api/tasks/link-pr`). `payload: {pr_url, via}` (`via ∈ {id, number}` — which half of the marker matched)
 - `pr_synchronized` — the reconciler observed the PR head SHA change (hive's stand-in for GitHub's synchronize webhook). `payload: {head_sha}`. Emitted only when the head differs from the prior `pr_synchronized` (the first observation is a baseline). Used to tell "the agent pushed a fix" from "CI is still green on the same old head" — by the re-queue guard after a `changes_requested`, and by `health` to decide whether a re-handoff clears a `merge_failed` reason.
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
+- `deferred` — task parked pending an offline human action; `deferred_until` set (nudges suppressed while future-dated). `payload: {until, note}`
+- `undeferred` — a deferred task was resumed; `deferred_until` cleared. `payload: {note}`
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
 - `smoke_passed` / `smoke_failed` — post-deploy smoke result. `payload: {results:[{name,ok,detail}], evidence_id?}`
 - `cleaned_up` — a finished task's runtime was torn down: worktree removed (when its branch was pushed/merged) and herdr session (tab/pane) closed. `payload: {worktree_path, branch, worktree_removed, ghost_branch, session_closed, session_via, tab_id}` (`ghost_branch` non-null when tracked uncommitted work was preserved before removal). Fired on the `done`/`cancelled` transition and by the reaper.
@@ -760,7 +762,7 @@ recognized fields (JSON keys == form field names):
 
 | field | meaning |
 |-------|---------|
-| `type` (required) | `status` \| `evidence` \| `needs-decision` \| `ready` \| `done` \| `blocked` \| `usage` \| `assistant_text` \| `tool_use` \| `agent_turn_end` \| any custom string |
+| `type` (required) | `status` \| `evidence` \| `needs-decision` \| `ready` \| `done` \| `blocked` \| `deferred` \| `undefer` \| `usage` \| `assistant_text` \| `tool_use` \| `agent_turn_end` \| any custom string |
 | `source` | defaults to `agent` |
 | `note` | free text; stored in the event payload / used as caption/summary |
 | `pr_url` | (`ready` type) the opened PR URL; recorded on the task if not already linked |
@@ -770,6 +772,7 @@ recognized fields (JSON keys == form field names):
 | `url` | evidence URL (for link evidence, no file) |
 | `meta` | (evidence type) JSON string merged into the Evidence row's `meta`; `hive emit ... evidence` auto-fills `{commit_sha}` from `git rev-parse HEAD` in its cwd |
 | `title`,`context`,`risk`,`blast_radius`,`options` | decision fields (needs-decision type; `options` is a JSON string in multipart) |
+| `until`,`days` | (deferred type) auto-resume horizon: an ISO timestamp (`until`) or an integer number of days from now (`days`); neither = indefinite |
 | `model`,`input_tokens`,`output_tokens`,`cache_read_tokens`,`cache_write_tokens`,`cost_usd` | usage fields (usage type; numbers, or numeric strings in multipart; `cost_usd` optional) |
 | `file` | (multipart only) the uploaded evidence file |
 
@@ -791,6 +794,16 @@ Behavior by `type`:
   no timeline event. → `201 {usage: Usage}` | `400` (missing `model`)
 - `assistant_text` / `tool_use` / `agent_turn_end` → writes one event with the
   supplied `payload` preserved verbatim (the transcript hooks' path). → `201 {event: Event}`
+- `deferred` → parks a task waiting on an OFFLINE human action (e.g. sudo). Sets
+  `deferred_until` (from `until`/`days`, else a far-future sentinel = indefinite)
+  and writes a `deferred` event; the task **stays `in_progress`** (no state hop).
+  While `deferred_until` is in the future the stale/nudge machinery skips it, so
+  the "gone quiet" nudge and the director stale notification stop firing. Once
+  the horizon passes, normal staleness resumes (the deadline is the check-back).
+  → `201 {task: Task}`
+- `undefer` → clears `deferred_until` and writes an `undeferred` event; if the
+  task was still deferred, queues a resume steer to the (possibly idle) agent.
+  → `201 {task: Task}`
 - `status` / `blocked` / custom → writes one event. → `201 {event: Event}`
 
 ### Attachments

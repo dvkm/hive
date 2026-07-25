@@ -54,7 +54,7 @@ State machine (server-enforced):
 
 ## Event ingestion (three redundant paths)
 
-1. `hive emit` CLI → `POST /api/tasks/:id/events` — semantic events from agents: `status`, `evidence` (with file upload), `needs-decision` (creates decision row), `done`, `blocked`. Briefs instruct agents to use it.
+1. `hive emit` CLI → `POST /api/tasks/:id/events` — semantic events from agents: `status`, `evidence` (with file upload), `needs-decision` (creates decision row), `done`, `blocked`, `deferred`/`undefer` (park a task waiting on an offline human action, suppressing "gone quiet" nudges; task stays `in_progress`). Briefs instruct agents to use it.
 2. Claude Code hooks (`hooks/`) — Stop/SubagentStop/PostToolUse hooks that POST lifecycle events when `HIVE_TASK_ID` is set in the agent's env. Zero agent discipline required.
 3. Reconciler (in-server, every 60s): `herdr agent list` + `herdr agent get` to sync live agent status; `gh pr view --json` for tasks with a PR to sync CI/merge state; flags tasks silent > configurable threshold with a `stale` event and a director notification.
 

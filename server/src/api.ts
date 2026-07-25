@@ -17,6 +17,9 @@ import {
   evidenceCount,
   evidenceAtSha,
   changesRequestUnaddressed,
+  isDeferred,
+  deferTask,
+  undeferTask,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
@@ -2863,9 +2866,41 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     return json({ event }, 201);
   }
 
+  // --- deferred / undefer (park a task waiting on an OFFLINE human action) ---
+  // A decision answered "Schedule for later" (blocked on e.g. sudo) has no state
+  // that fits: in_progress keeps drawing "gone quiet" nudges (task #329 got 9+),
+  // needs_decision is wrong with no open card. Deferring sets deferred_until so
+  // the stale/nudge machinery skips it; the director (or agent) un-defers to
+  // resume. The task stays in_progress — no state hop (task #679).
+  if (type === "deferred") {
+    const task = deferTask(db, taskId, deferUntil(fields.until, fields.days), { source, note });
+    return json({ task }, 201);
+  }
+  if (type === "undefer") {
+    const wasDeferred = isDeferred(getTask(db, taskId));
+    const task = undeferTask(db, taskId, { source, note });
+    // Nudge the (possibly idle) agent that it's unblocked and should continue.
+    if (wasDeferred)
+      queueSteerEvent(db, taskId, `This task was un-deferred${note ? `: ${note}` : ""} — re-read your last steps, emit a status note, and continue.`, "un-deferred");
+    return json({ task }, 201);
+  }
+
   // --- status / blocked / generic ---
   const event = writeEvent(db, { task_id: taskId, source, type, payload: { note } });
   return json({ event }, 201);
+}
+
+// Horizon for a deferral: an explicit ISO --until, or now + --days, or a
+// far-future sentinel for an indefinite defer (cleared only by un-defer).
+const INDEFINITE_DEFER = "9999-12-31T00:00:00.000Z";
+function deferUntil(until?: string, days?: string): string {
+  if (until) {
+    const t = Date.parse(String(until));
+    if (Number.isFinite(t)) return new Date(t).toISOString();
+  }
+  const n = Number(days);
+  if (Number.isFinite(n) && n > 0) return new Date(Date.now() + n * 86_400_000).toISOString();
+  return INDEFINITE_DEFER;
 }
 
 // Record one LLM-call usage row. Fields arrive as numbers (JSON) or strings

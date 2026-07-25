@@ -105,6 +105,40 @@ export function noteDependencyBlock(
   broadcastTask(db, getTask(db, taskId));
 }
 
+// A task deferred pending an OFFLINE human action (e.g. sudo). It stays
+// in_progress, but the stale/nudge machinery skips it while deferred_until is in
+// the future — that is what stops the endless "gone quiet" nudges (task #329
+// replied 9× to the same nudge). Far-future timestamp = indefinite; a real date
+// = auto-resume then.
+export function isDeferred(
+  task: { deferred_until?: string | null } | null | undefined,
+  nowMs: number = Date.now()
+): boolean {
+  const until = task?.deferred_until;
+  return !!until && Date.parse(until) > nowMs;
+}
+
+export function deferTask(
+  db: DB,
+  taskId: string,
+  until: string,
+  opts: { source?: string; note?: string } = {}
+): any {
+  db.query("UPDATE tasks SET deferred_until = ?, updated_at = ? WHERE id = ?").run(until, now(), taskId);
+  writeEvent(db, { task_id: taskId, source: opts.source ?? "agent", type: "deferred", payload: { until, note: opts.note ?? null } });
+  const t = getTask(db, taskId);
+  broadcastTask(db, t);
+  return t;
+}
+
+export function undeferTask(db: DB, taskId: string, opts: { source?: string; note?: string } = {}): any {
+  db.query("UPDATE tasks SET deferred_until = NULL, updated_at = ? WHERE id = ?").run(now(), taskId);
+  writeEvent(db, { task_id: taskId, source: opts.source ?? "director", type: "undeferred", payload: { note: opts.note ?? null } });
+  const t = getTask(db, taskId);
+  broadcastTask(db, t);
+  return t;
+}
+
 export function canTransition(from: State, to: State): boolean {
   if (!STATES.includes(to)) return false;
   if (to === "failed") return !TERMINAL.includes(from);

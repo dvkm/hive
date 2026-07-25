@@ -133,6 +133,11 @@ function Card({ task }: { task: Task }) {
           </span>
         )}
         <BlockedBy depends_on={task.depends_on} tasks={tasks} />
+        {task.deferred_until && Date.parse(task.deferred_until) > Date.now() && (
+          <span className="chip chip-deferred" title="Deferred pending an offline human action; nudges suppressed">
+            deferred
+          </span>
+        )}
         <span className="card-age">{age}</span>
       </div>
       {task.summary && <div className="card-summary">{task.summary}</div>}

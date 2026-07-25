@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
-import { transition, canTransition, TransitionError, getTask, expireOpenDecisions, expireOrphanedDecisions } from "../src/state.ts";
+import { transition, canTransition, TransitionError, getTask, expireOpenDecisions, expireOrphanedDecisions, isDeferred, deferTask, undeferTask } from "../src/state.ts";
 
 function freshDb(): { db: DB; projectId: string } {
   const db = openDb(":memory:");
@@ -158,4 +158,25 @@ test("expireOrphanedDecisions backfills open decisions whose task is already ter
   expect(expireOrphanedDecisions(db)).toBe(0);
   // Direct helper is also idempotent on an already-expired card.
   expect(expireOpenDecisions(db, id, "again")).toBe(0);
+});
+
+test("defer/undefer parks a task in_progress and toggles isDeferred", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  transition(db, id, "in_progress");
+
+  // indefinite defer (no until) sets a far-future sentinel -> isDeferred true, still in_progress
+  deferTask(db, id, "9999-12-31T00:00:00.000Z", { source: "agent", note: "waiting on David's sudo" });
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(isDeferred(getTask(db, id))).toBe(true);
+  expect(db.query("SELECT COUNT(*) n FROM events WHERE task_id = ? AND type = 'deferred'").get(id) as any).toEqual({ n: 1 });
+
+  // a past deferred_until is NOT deferred (window elapsed)
+  expect(isDeferred({ deferred_until: new Date(Date.now() - 1000).toISOString() })).toBe(false);
+  expect(isDeferred({ deferred_until: null })).toBe(false);
+
+  // undefer clears it
+  undeferTask(db, id, { source: "director" });
+  expect(getTask(db, id).deferred_until).toBeNull();
+  expect(isDeferred(getTask(db, id))).toBe(false);
 });

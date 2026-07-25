@@ -17,8 +17,10 @@ Usage:
         in_review verifying done failed cancelled
   hive task list [--state <s>] [--project <id>]
   hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>]
-        types: status | evidence | needs-decision | ready | done | blocked | review_summary | <custom>
+        types: status | evidence | needs-decision | ready | done | blocked | deferred | undefer | review_summary | <custom>
         review_summary: --json review.json with {done[], iffy[], decisions[], testing[], followups[]}
+        deferred: park a task waiting on an OFFLINE human action (no more "gone quiet" nudges);
+                  [--until <iso>] or [--days <n>] to auto-resume, else indefinite. undefer to resume early.
         ready: PR open (or scout report written) → hand off to review (in_progress -> in_review)
   hive decision ask <task-id> --title <t> [--context <s>] [--risk <s>] [--blast <s>]
         --option key:label:detail  (repeatable)  --recommend <key>  --needs-input <key>
@@ -204,6 +206,8 @@ async function main() {
         source: flags.source,
         title: flags.title,
         context: flags.context,
+        until: flags.until,
+        days: flags.days,
         pr_url: flags["pr-url"] ?? flags.url,
         ...(sha && !extra.meta ? { meta: JSON.stringify({ commit_sha: sha }) } : {}),
         ...extra,
