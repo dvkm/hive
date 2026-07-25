@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
 import { transition, getTask } from "../src/state.ts";
-import { checkProjectMonitors, runCheck, runSmoke, type Fetcher } from "../src/monitors.ts";
+import { checkProjectMonitors, runCheck, runSmoke, defaultFetcher, type Fetcher } from "../src/monitors.ts";
 
 function freshDb(config: any): { db: DB; projectId: string } {
   const db = openDb(":memory:");
@@ -29,6 +29,25 @@ test("runCheck validates status and substring", async () => {
   expect((await runCheck({ name: "h", url: "u", expect_status: 200, expect_substring: "missing" }, ok)).ok).toBe(false);
   const bad: Fetcher = async () => ({ status: 500, body: "" });
   expect((await runCheck({ name: "h", url: "u" }, bad)).ok).toBe(false);
+});
+
+// A stalled or unreachable smoke/monitor URL used to hang this fetch forever —
+// for smoke checks that wedges the merge request itself, since POST /merge
+// awaits smokeThenAdvance synchronously before responding (task #641). This
+// asserts the bound actually fires instead of waiting out the request.
+test("defaultFetcher bounds a hung request with a timeout (task #641)", async () => {
+  const server = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: { data() {}, open() {} }, // accepts the connection, never responds
+  });
+  try {
+    const start = Date.now();
+    await expect(defaultFetcher(`http://127.0.0.1:${server.port}/`, 100)).rejects.toThrow();
+    expect(Date.now() - start).toBeLessThan(2000);
+  } finally {
+    server.stop(true);
+  }
 });
 
 test("monitor failure opens an incident, recovery resolves it", async () => {

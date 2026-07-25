@@ -37,7 +37,7 @@ import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { resolveProjectSecrets } from "./secrets.ts";
-import { smokeThenAdvance } from "./monitors.ts";
+import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
 import { enqueue, ackNotifications } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, resolveDenyGuardrailForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
@@ -71,6 +71,7 @@ export interface HandlerDeps {
   supervise?: boolean; // start the herdr wait loop after spawn (true in prod wiring)
   plannerExec?: PlannerExec; // injectable planner subprocess (domain supervisors)
   exec?: Exec; // injectable gh/git subprocess (diff + merge); tests pass a stub
+  fetch?: Fetcher; // injectable smoke-check fetcher (post-merge); tests pass a stub
 }
 
 const VERSION = "0.1.0";
@@ -245,7 +246,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (method === "POST") return await ingestEvent(db, m[1], req, deps);
       }
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/transition$/);
-      if (m && method === "POST") return await doTransition(db, m[1], await req.json());
+      if (m && method === "POST") return await doTransition(db, m[1], await req.json(), deps);
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/spawn$/);
       if (m && method === "POST")
@@ -1261,7 +1262,7 @@ function getTaskFull(db: DB, id: string): Response {
   return json({ ...taskWithHealth(db, task), events, evidence, decisions });
 }
 
-async function doTransition(db: DB, id: string, body: any): Promise<Response> {
+async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
   if (!body?.to) return err("'to' state is required");
   const to = body.to as State;
   // High-blast-radius transitions (post-merge verify, marking done) are gated.
@@ -1290,7 +1291,7 @@ async function doTransition(db: DB, id: string, body: any): Promise<Response> {
   // Post-deploy smoke runs once when a task enters `verifying`. runSmoke may
   // bounce the task back to in_progress on failure; re-read to reflect that.
   if (to === "verifying") {
-    await smokeThenAdvance(db, id).catch((e) => console.error("[hive] smoke run failed:", e));
+    await smokeThenAdvance(db, id, { fetch: deps.fetch }).catch((e) => console.error("[hive] smoke run failed:", e));
     return json(getTask(db, id));
   }
   return json(task);
@@ -1564,7 +1565,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
   writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url } });
   // in_review → verifying (runs post-deploy smoke once).
   transition(db, id, "verifying", { source: "director", reason: `merged (${method})` });
-  await smokeThenAdvance(db, id).catch((e) => console.error("[hive] smoke run failed:", e));
+  await smokeThenAdvance(db, id, { fetch: deps.fetch }).catch((e) => console.error("[hive] smoke run failed:", e));
 
   // Best-effort worktree teardown now the branch is merged. Never fails the
   // request — a leftover worktree is a cleanup nuisance, not a merge failure.
