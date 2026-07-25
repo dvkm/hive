@@ -664,7 +664,7 @@ the reconciler recording `pr_synchronized`.
   `truncated` is `true` and the remaining diff is omitted (view the PR for the
   full patch). Binary files carry `binary: true` and no hunks.
 
-- `POST /api/tasks/:id/merge` body `{merge_strategy?: "local_ff"}` → `200 Task` (now `verifying`) | `409` (not `in_review`, or the merge failed: conflict / not a fast-forward / gh refused) | `403` (denied by a `task.merge` authority rule) | `404` | `400` (local merge but no `repo_path`/`branch`)
+- `POST /api/tasks/:id/merge` body `{merge_strategy?: "local_ff", override_destructive_check?: boolean}` → `200 Task` (now `verifying`) | `409` (not `in_review`, or the merge failed: conflict / not a fast-forward / gh refused / **destructive auto-rebase**) | `403` (denied by a `task.merge` authority rule) | `404` | `400` (local merge but no `repo_path`/`branch`)
   Approve & merge. When `pr_url` is set: `gh pr merge <url> <method>` where
   `method` is the project's `config.merge_method` (`squash` default, or `merge` /
   `rebase`). Otherwise a **local fast-forward**: the default branch is
@@ -694,6 +694,19 @@ the reconciler recording `pr_synchronized`.
   merged) PR is refused, a `MERGED` one just advances the task. The review card
   surfaces this as a **Force local merge** button next to a failed merge on a
   PR-backed task, so the escape hatch needs no raw API call.
+
+  **Destructive auto-rebase guard.** no-mistakes' CI monitor can auto-rebase a
+  stale branch onto base, "resolve" the conflicts by dropping the intervening
+  commits, and still report green CI (task #314: it reverted an unrelated shipped
+  task's work). Green CI does not catch this. Before merging, hive compares the
+  branch's current authored file-set against a `branch_scope` snapshot the
+  reconciler captured at first sight (pre-rebase); if the branch now authors a
+  file it did not originally *and* base advanced that file since, the merge is
+  refused with `409`, a `merge_blocked_destructive` event is recorded, and the
+  task is bounced to `in_progress` with a steer to re-cut off current base.
+  **`override_destructive_check: true`** skips this guard when the reverts are
+  intentional. The guard is a no-op when no pre-rebase snapshot exists (hive
+  first saw the branch already rebased).
 
   On success: writes
   a `merged` event, transitions `in_review → verifying` (which runs the project's

@@ -48,6 +48,7 @@ import { vapidPublicKey, saveSubscription, removeSubscription } from "./push.ts"
 import { explainCommandDecision } from "./explain.ts";
 import { ciStatusOf } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
+import { detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
@@ -1427,6 +1428,63 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
   const config = JSON.parse(project?.config ?? "{}");
   const base = config.default_branch || "main";
   const forceLocalFf = body?.merge_strategy === "local_ff";
+
+  // Guard against a destructive auto-rebase landing (task #314): a stale branch
+  // that no-mistakes' CI monitor rebased onto base, silently reverting other
+  // tasks' shipped commits, then reported green CI. Compare the branch's final
+  // authored scope against the snapshot taken before any rebase; if it now
+  // reverts base commits outside its original scope, refuse the merge. The
+  // director can override with body.override_destructive_check.
+  if (!body?.override_destructive_check && project?.repo_path && task.branch) {
+    const snapEvent: any = db
+      .query("SELECT payload FROM events WHERE task_id = ? AND type = 'branch_scope' ORDER BY ts ASC LIMIT 1")
+      .get(id);
+    if (snapEvent) {
+      let snapshot: BranchScope | null = null;
+      try {
+        snapshot = JSON.parse(snapEvent.payload);
+      } catch {}
+      if (snapshot) {
+        const regressed = await detectDestructiveRebase(exec, project.repo_path, base, task.branch, snapshot);
+        if (regressed && regressed.length) {
+          const files = regressed.slice(0, 10).join(", ") + (regressed.length > 10 ? `, …(+${regressed.length - 10})` : "");
+          writeEvent(db, {
+            task_id: id,
+            source: "director",
+            type: "merge_blocked_destructive",
+            payload: { base, branch: task.branch, regressed },
+          });
+          recordSystemLearning(
+            db,
+            task.project_id,
+            "destructive auto-rebase blocked at merge",
+            `branch reverts base work outside its scope: ${files}`,
+            id
+          );
+          if (task.agent_target) {
+            await herdr
+              .send(
+                task.agent_target,
+                `hive: merge into '${base}' BLOCKED — your branch '${task.branch}' now reverts commits ` +
+                  `already on '${base}' outside this task's scope (${files}). This is the destructive ` +
+                  `auto-rebase pattern from task #314: an auto-resolve dropped intervening work while CI stayed ` +
+                  `green. Do NOT trust the rebase — abandon this branch and re-cut a clean one off CURRENT ` +
+                  `'${base}', re-apply only your task's change, and push. If those reverts are intentional, the ` +
+                  `director can override.`
+              )
+              .catch(() => {});
+          }
+          transition(db, id, "in_progress", { source: "director", reason: "merge blocked: destructive auto-rebase" });
+          return err(
+            `merge blocked — branch '${task.branch}' reverts base work outside this task's scope (${files}); ` +
+              `the auto-rebase likely dropped intervening commits (task #314). Re-cut off current '${base}', or ` +
+              `merge with override_destructive_check=true if intentional.`,
+            409
+          );
+        }
+      }
+    }
+  }
 
   let method = "";
   let prView: any = null;
