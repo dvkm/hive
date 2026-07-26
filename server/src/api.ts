@@ -313,7 +313,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (m && method === "POST") return await mergeTask(db, herdr, m[1], await safeJson(req), deps);
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/request-changes$/);
-      if (m && method === "POST") return await requestChanges(db, herdr, m[1], await req.json());
+      if (m && method === "POST") return await requestChanges(db, herdr, m[1], await req.json(), deps);
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/guarded-action$/);
       if (m && method === "POST") return guardedAction(db, m[1], await req.json());
@@ -1265,6 +1265,22 @@ function getTaskFull(db: DB, id: string): Response {
 async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
   if (!body?.to) return err("'to' state is required");
   const to = body.to as State;
+  // A reviewer bounce (`hive task move <id> in_progress --note`) IS a
+  // request-changes: it must deliver the note and keep an agent on the task. A
+  // plain transition here dropped the note into the event log, respawned nobody,
+  // and the reconciler's idle-advance backstop flipped the task right back to
+  // in_review — the move looked like it worked but the feedback was lost (#710).
+  // Route it through the same bounce path (records changes_requested, respawns a
+  // dead agent with the note in its brief).
+  if (to === "in_progress") {
+    const t = getTask(db, id);
+    if (t && t.state === "in_review") {
+      const herdr = deps.herdr ?? defaultHerdr;
+      const notes = String(body?.reason ?? "").trim() || "The director moved this back to in_progress for more work.";
+      const { delivered, respawned } = await bounceForChanges(db, herdr, t, notes, deps);
+      return json({ ...getTask(db, id), bounce: { delivered, respawned } });
+    }
+  }
   // High-blast-radius transitions (post-merge verify, marking done) are gated.
   if (to === "verifying" || to === "done") {
     const t = getTask(db, id);
@@ -1589,31 +1605,36 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
   return json(getTask(db, id));
 }
 
-// POST /api/tasks/:id/request-changes body {notes} — bounce an in-review task
-// back to in_progress and deliver the captain's notes to the agent (best-effort
-// send; the `changes_requested` event records the notes either way, so a dead
-// agent gets them when it respawns and re-reads its timeline).
-async function requestChanges(db: DB, herdr: Herdr, id: string, body: any): Promise<Response> {
-  const task = getTask(db, id);
-  if (!task) return err("task not found", 404);
-  if (task.state !== "in_review")
-    return err(`task is '${task.state}', not 'in_review'`, 409);
-  const notes = String(body?.notes ?? "").trim();
-  if (!notes) return err("notes are required");
+// Bounce an in-review task back to in_progress with reviewer feedback, and make
+// sure the feedback actually REACHES an agent. Delivers to the live agent; if
+// none is live (idle/gone, or the send fails) it queues the notes as a steer and
+// RESPAWNS so the fresh agent gets them in its first brief. Records a
+// `changes_requested` event either way — that carries the notes on the timeline
+// AND marks the bounce unaddressed, so the reconciler's idle-advance backstop
+// (advanceIfFinished) can't silently flip the task straight back to in_review
+// before the agent has done the work. That silent revert (#710) made a bounce to
+// a dead agent look like it succeeded when nobody read the note.
+async function bounceForChanges(
+  db: DB,
+  herdr: Herdr,
+  task: any,
+  notes: string,
+  deps: HandlerDeps
+): Promise<{ delivered: boolean; respawned: boolean; sendError: string | null }> {
+  const id = task.id;
+  const msg =
+    `hive: changes requested before merge —\n${notes}\n\n` +
+    `If any of the above is a QUESTION, reply with \`hive emit ${id} answer --note "..."\` ` +
+    `(answers are pushed to the director; pane text is not), then make the changes and emit ready again.\n\n` +
+    `After you push the fix, RE-CAPTURE evidence against the new commit — a fresh test run or log for ` +
+    `server/back-end changes, a screenshot for UI. The old evidence is now stale and the handoff is HELD ` +
+    `until fresh evidence matches HEAD (hive emit ${id} evidence --file ... --note ...).`;
 
   let delivered = false;
   let sendError: string | null = null;
   if (task.agent_target) {
     try {
-      const res = await herdr.send(
-        task.agent_target,
-        `hive: changes requested before merge —\n${notes}\n\n` +
-          `If any of the above is a QUESTION, reply with \`hive emit ${id} answer --note "..."\` ` +
-          `(answers are pushed to the director; pane text is not), then make the changes and emit ready again.\n\n` +
-          `After you push the fix, RE-CAPTURE evidence against the new commit — a fresh test run or log for ` +
-          `server/back-end changes, a screenshot for UI. The old evidence is now stale and the handoff is HELD ` +
-          `until fresh evidence matches HEAD (hive emit ${id} evidence --file ... --note ...).`
-      );
+      const res = await herdr.send(task.agent_target, msg);
       sendError = sendFailure(res);
       delivered = sendError === null;
     } catch (e: any) {
@@ -1630,8 +1651,32 @@ async function requestChanges(db: DB, herdr: Herdr, id: string, body: any): Prom
     type: "changes_requested",
     payload: { notes, delivered, head_sha, ...(sendError ? { send_error: sendError } : {}) },
   });
-  const updated = transition(db, id, "in_progress", { source: "director", reason: "changes requested" });
-  return json({ ok: true, delivered, task: updated });
+  transition(db, id, "in_progress", { source: "director", reason: "changes requested" });
+
+  // No live agent read the notes: queue them and respawn so the fresh agent gets
+  // them in its brief (spawnAgent receipts the steer on success). Without this
+  // the notes sit unread and the task looks reviewed again (#710).
+  let respawned = false;
+  if (!delivered) {
+    queueSteerEvent(db, id, msg, "changes requested; agent not live");
+    const r = await spawnAgent(db, herdr, id, { supervise: deps.supervise });
+    respawned = r.ok;
+    if (r.ok) delivered = true;
+  }
+  return { delivered, respawned, sendError };
+}
+
+// POST /api/tasks/:id/request-changes body {notes} — bounce an in-review task
+// back to in_progress and deliver the captain's notes to the agent.
+async function requestChanges(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  if (task.state !== "in_review")
+    return err(`task is '${task.state}', not 'in_review'`, 409);
+  const notes = String(body?.notes ?? "").trim();
+  if (!notes) return err("notes are required");
+  const { delivered, respawned } = await bounceForChanges(db, herdr, task, notes, deps);
+  return json({ ok: true, delivered, respawned, task: getTask(db, id) });
 }
 
 // Spawn a herdr agent for a queued task: create the worktree, start the agent

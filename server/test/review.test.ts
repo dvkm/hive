@@ -121,6 +121,7 @@ function makeServer(
     mergeStateStatus?: string;
     reviewDecision?: string;
     rollup?: any[];
+    deadAgent?: boolean;
   } = {}
 ) {
   const db = openDb(":memory:");
@@ -159,6 +160,8 @@ function makeServer(
     if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t2"}}}');
     if (has(argv, "agent", "send")) {
       sends.push({ target: argv[argv.indexOf("send") + 1], message: argv[argv.indexOf("send") + 2] });
+      // A vanished agent exits 0 with an agent_not_found body (never trust the code).
+      if (opts.deadAgent) return OK('{"error":{"code":"agent_not_found"}}');
       return OK();
     }
     if (has(argv, "worktree", "remove")) {
@@ -446,6 +449,40 @@ test("request-changes requires notes", async () => {
   const { taskId } = await inReviewTask(s.base);
   const r = await post(s.base, `/api/tasks/${taskId}/request-changes`, { notes: "  " });
   expect(r.status).toBe(400);
+  s.server.stop(true);
+});
+
+// #710: `hive task move <id> in_progress --note` is a reviewer bounce. It must
+// record changes_requested (so the idle-advance backstop can't silently flip the
+// task back to in_review) and deliver the note to the agent, respawning a dead one.
+test("task move to in_progress from in_review records changes_requested and delivers the note", async () => {
+  const s = makeServer();
+  const { taskId } = await inReviewTask(s.base);
+  const r = await post(s.base, `/api/tasks/${taskId}/transition`, { to: "in_progress", reason: "the diff misses site 4" });
+  expect(r.status).toBe(200);
+  expect(r.json.state).toBe("in_progress");
+  expect(r.json.bounce.delivered).toBe(true);
+  expect(s.sends.at(-1)?.message).toContain("the diff misses site 4");
+  const ev = await get(s.base, `/api/tasks/${taskId}/events`);
+  const cr = ev.json.find((e: any) => e.type === "changes_requested");
+  expect(cr.payload.notes).toBe("the diff misses site 4");
+  s.server.stop(true);
+});
+
+test("task move bounce respawns the agent when it has exited, note rides the fresh brief", async () => {
+  const s = makeServer({ deadAgent: true });
+  const { taskId } = await inReviewTask(s.base);
+  const spawnsBefore = s.sends.length;
+  const r = await post(s.base, `/api/tasks/${taskId}/transition`, { to: "in_progress", reason: "fix X" });
+  expect(r.status).toBe(200);
+  expect(r.json.bounce.respawned).toBe(true);
+  // A respawn re-created the worktree/agent; the queued steer was receipted.
+  const ev = await get(s.base, `/api/tasks/${taskId}/events`);
+  expect(ev.json.filter((e: any) => e.type === "spawned").length).toBe(2);
+  const steer = ev.json.find((e: any) => e.type === "steer");
+  expect(steer.payload.delivery).toBe("delivered");
+  expect(steer.payload.message).toContain("fix X");
+  expect(spawnsBefore).toBeGreaterThanOrEqual(0);
   s.server.stop(true);
 });
 

@@ -159,6 +159,9 @@ async function main() {
       if (!taskId || !to) die("usage: hive task move <task-id> <state> [--note <s>]");
       const t = await api("POST", `/api/tasks/${taskId}/transition`, { to, reason: flags.note });
       console.log(`task ${t.id} -> [${t.state}]  ${t.title}`);
+      if (t.bounce?.respawned) console.log(`  respawned the agent with your note in its brief`);
+      else if (t.bounce && !t.bounce.delivered)
+        console.log(`  note recorded but no agent is running — run: hive spawn ${t.id}`);
       return;
     }
     if (sub === "list") {
