@@ -180,6 +180,25 @@ export function herdrOutage(db: DB, nowMs = Date.now()): { paused_until: string;
   return { paused_until: pausedUntil, streak: Number(getSetting(db, "herdr_outage_streak") ?? "0") };
 }
 
+// PTY / herdr-session utilization for /api/health. The pty pool is a hard, low
+// OS cap (macOS kern.tty.ptmx_max=511) and its exhaustion is SILENT — it hit
+// 511/511 twice on 2026-07-25 with no signal, and no new agent could spawn.
+// This makes the number visible before it hits the wall. The reaper records the
+// live pane count each cycle (herdr_pane_count); a leak shows up as this
+// climbing past the working set of ~45-60. null until the first sweep has run.
+// ponytail: cap from env, default the macOS kern.tty.ptmx_max=511; warn at 80%.
+export function sessionUtilization(
+  db: DB
+): { panes: number; max: number; pct: number; warn: boolean; at: string | null } | null {
+  const raw = getSetting(db, "herdr_pane_count");
+  if (raw === null) return null;
+  const panes = Number(raw);
+  const max = Number(process.env.HIVE_PTY_MAX || 511);
+  const warnPct = Number(process.env.HIVE_PTY_WARN_PCT || 0.8);
+  const pct = max > 0 ? panes / max : 0;
+  return { panes, max, pct: Math.round(pct * 100) / 100, warn: pct >= warnPct, at: getSetting(db, "herdr_pane_at") };
+}
+
 // A task row enriched with its computed health, for API responses + SSE.
 // Failed tasks also carry `requeued_to` (their auto-requeue successor's id, if
 // any) so the attention rule can tell "awaiting triage" from "already retried".

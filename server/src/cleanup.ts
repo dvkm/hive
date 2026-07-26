@@ -82,16 +82,19 @@ export interface CleanupOutcome {
   session: { closed: boolean; via: string | null };
 }
 
-// The `spawned` event carries the herdr tab id (the task row does not store it).
-function spawnMeta(db: DB, taskId: string): { tab_id: string | null } {
+// The `spawned` event carries the herdr tab id and the worktree's own workspace
+// id (the task row stores neither). fleet_workspace_id is deliberately NOT
+// returned: it's the shared hive-fleet workspace and must never be closed.
+function spawnMeta(db: DB, taskId: string): { tab_id: string | null; workspace_id: string | null } {
   const r = db
     .query("SELECT payload FROM events WHERE task_id = ? AND type = 'spawned' ORDER BY ts DESC LIMIT 1")
     .get(taskId) as { payload: string } | undefined;
-  if (!r) return { tab_id: null };
+  if (!r) return { tab_id: null, workspace_id: null };
   try {
-    return { tab_id: JSON.parse(r.payload).tab_id ?? null };
+    const p = JSON.parse(r.payload);
+    return { tab_id: p.tab_id ?? null, workspace_id: p.workspace_id ?? null };
   } catch {
-    return { tab_id: null };
+    return { tab_id: null, workspace_id: null };
   }
 }
 
@@ -167,6 +170,14 @@ export async function cleanupTask(
   let session = { closed: false, via: null as string | null };
   if (preserved ? task.agent_target : task.agent_target || meta.tab_id) {
     session = await herdr.closeSession({ agentTarget: task.agent_target, tabId: meta.tab_id });
+    // Also close the worktree's OWN herdr workspace: `worktree create` auto-spawns
+    // it with a live pane the agent never uses (the agent runs in the fleet tab
+    // closed above), and it leaked a pty per task until nothing reaped it
+    // (2026-07-25). Same guard as the session close so it fires once, not on
+    // every preserved-task sweep. Never the fleet workspace — spawnMeta returns
+    // only the worktree's own id. The pane sweep is the backstop for tasks whose
+    // spawned event predates this field.
+    if (meta.workspace_id) await herdr.closeWorkspace(meta.workspace_id);
   }
 
   // 3) emit + record.

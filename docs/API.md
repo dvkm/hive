@@ -482,11 +482,13 @@ chat endpoints below.
 ## Endpoints
 
 ### Health
-`GET /api/health` → `200 {"ok": true, "version": "0.1.0", "dispatcher": {"last_run": "<iso>|null", "stale": bool}, "reaper": {"last_run": "<iso>|null", "stale": bool}, "herdr_outage": {"paused_until": "<iso>", "streak": int} | null}`
+`GET /api/health` → `200 {"ok": true, "version": "0.1.0", "dispatcher": {"last_run": "<iso>|null", "stale": bool}, "reaper": {"last_run": "<iso>|null", "stale": bool}, "herdr_outage": {"paused_until": "<iso>", "streak": int} | null, "sessions": {"panes": int, "max": int, "pct": float, "warn": bool, "at": "<iso>|null"} | null}`
 
 `dispatcher`/`reaper` report the last time each background loop's cycle completed (heartbeat, written on every completion path — including the offline-drain no-op and the herdr-down cooldown skip — so a wedged cycle ages toward stale instead of a fresh tick re-marking it fresh). `stale` flags when a loop has missed ~3 cycles (floored at 5min) — the signal for "loop stopped ticking" vs. "process is up but a background loop silently died" (incident 2026-07-17).
 
 `herdr_outage` surfaces a sustained herdr-daemon outage. When the dispatcher's circuit breaker is backing off it keeps refreshing `last_dispatch_at`, so `dispatcher` reads healthy even though nothing is spawning for the whole cooldown; this field makes the outage observable instead. It is non-null (`paused_until` = end of the backoff window, `streak` = consecutive outage count) ONLY while the backoff window is still in the future, and `null` otherwise (no outage, or the window has passed).
+
+`sessions` surfaces PTY / herdr-session utilization — the pty pool is a hard, low OS cap (macOS `kern.tty.ptmx_max`, 511) whose exhaustion is otherwise SILENT (it hit 511/511 twice on 2026-07-25 and every spawn failed with `openpty: Os { code: 6 }`). `panes` is the live pane count the reaper records each sweep (one pty each), `max` the cap (`HIVE_PTY_MAX`, default 511), `pct` the ratio, and `warn` flips true at ≥80% (`HIVE_PTY_WARN_PCT`) so a leak is visible before it hits the wall. `null` until the first pane sweep has run.
 
 ### Projects
 - `GET /api/projects[?archived=all]` → `200 [Project, ...]` (oldest first)
@@ -1222,7 +1224,11 @@ herdr sessions never pile up (`server/src/cleanup.ts`, `server/src/reaper.ts`).
   (`config.cleanup_argv`, e.g. `wt.sh down {worktree}`) BEFORE removal so it can
   still see the worktree's files (best-effort, `stack_teardown` event), then
   removes its git worktree and closes its herdr session (the labelled tab, or the
-  agent's pane). `failed` is deliberately
+  agent's pane) plus the worktree's OWN herdr workspace — the spare pane
+  `worktree create` auto-spawns but the agent never uses (it runs in the fleet
+  tab), recorded on the `spawned` event as `workspace_id` and closed once here
+  (never the shared fleet workspace). It leaked a pty per task until this closed
+  it (2026-07-25). `failed` is deliberately
   **excluded** — a failed task may still be auto-requeued/retried, so tearing it
   down there would race the retry; the dead-agent recovery path already reclaims
   its worktree, and the reaper is the backstop.
@@ -1231,7 +1237,17 @@ herdr sessions never pile up (`server/src/cleanup.ts`, `server/src/reaper.ts`).
   across every project repo) and, for each on a `hive/<task-id>` branch whose
   task id maps to a **terminal** task or to **no task at all**, tears it down.
   A non-terminal task keeps its worktree (never touched). Isolated try/catch per
-  item; a failure never crashes the server.
+  item; a failure never crashes the server. The same cycle also runs
+  `sweepOrphanedAgents` (diffs `herdr agent list` against live DB tasks, reaping
+  any agent whose task row is gone) and `sweepOrphanedPanes` — the pty-leak
+  backstop: it enumerates every herdr PANE (one pty each), maps each to a task by
+  its cwd basename `hive-<task-id>`, and reclaims the pty of any whose task is
+  terminal or gone by closing the worktree's own workspace or its fleet tab. A
+  pane is kept whenever its task is non-terminal (reads authoritative DB state,
+  not a herdr probe, so a live agent is never closed), and the sweep bails
+  without reaping if the fleet workspace id can't be resolved (so it can never
+  close the whole fleet). It also records the pre-sweep pane count for the
+  `sessions` health gauge.
 
 **Safety (never destroys work).** Removal keeps `teardown`'s guard: a worktree is
 removed only when its branch is pushed to origin **or** merged into the default

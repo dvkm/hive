@@ -31,6 +31,9 @@ import {
   agentListArgv,
   parseAgentList,
   isWorktreeAlreadyGoneError,
+  paneListArgv,
+  parsePaneList,
+  workspaceCloseArgv,
 } from "../src/runtime/herdr.ts";
 
 // A recording stub: canned results per matched argv, records every call.
@@ -125,6 +128,29 @@ test("agentListArgv + parseAgentList: only named (hive-spawned) agents survive, 
   expect(parseAgentList(stdout)).toEqual([{ name: "vfeabd2a", tabId: "w6:t1" }]);
   expect(parseAgentList("garbage")).toEqual([]);
   expect(parseAgentList('{"result":{"agents":[]}}')).toEqual([]);
+});
+
+test("paneListArgv + workspaceCloseArgv + parsePaneList: the pty-leak sweep surface", () => {
+  expect(paneListArgv()).toEqual(["pane", "list"]);
+  expect(workspaceCloseArgv("w11S")).toEqual(["workspace", "close", "w11S"]);
+  // Real shape from `herdr pane list` (live 0.7.1).
+  const stdout = JSON.stringify({
+    id: "cli:pane:list",
+    result: {
+      panes: [
+        { pane_id: "w11S:p1", tab_id: "w11S:t1", workspace_id: "w11S", cwd: "/wt/hive-5ba4edd2f39d", agent_status: "unknown" },
+        { pane_id: "wR:p2", tab_id: "wR:t2", workspace_id: "wR", cwd: "/wt/hive-222a5d0a2b73" },
+        { agent_status: "idle" }, // no pane_id → dropped
+      ],
+      type: "pane_list",
+    },
+  });
+  expect(parsePaneList(stdout)).toEqual([
+    { paneId: "w11S:p1", tabId: "w11S:t1", workspaceId: "w11S", cwd: "/wt/hive-5ba4edd2f39d" },
+    { paneId: "wR:p2", tabId: "wR:t2", workspaceId: "wR", cwd: "/wt/hive-222a5d0a2b73" },
+  ]);
+  expect(parsePaneList("garbage")).toEqual([]);
+  expect(parsePaneList('{"result":{"panes":[]}}')).toEqual([]);
 });
 
 test("isWorktreeAlreadyGoneError matches a removal failure with nothing left to preserve", () => {
