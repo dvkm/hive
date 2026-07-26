@@ -71,6 +71,12 @@ export async function reapOnce(db: DB, deps: ReaperDeps = {}): Promise<void> {
     console.error("[hive] reaper agent sweep:", e); // isolated; never crash the sweep
   }
 
+  try {
+    await sweepOrphanedPanes(db, deps);
+  } catch (e) {
+    console.error("[hive] reaper pane sweep:", e); // isolated; never crash the sweep
+  }
+
   // Liveness heartbeat, written only once a cycle COMPLETES so a wedged sweep
   // (e.g. a hung `git worktree list`) ages toward stale instead of a fresh
   // setInterval tick re-marking it. See dispatcher.ts.
@@ -99,6 +105,77 @@ export async function sweepOrphanedAgents(db: DB, deps: ReaperDeps = {}): Promis
       broadcast({ type: "reaped_orphan_agent", name: a.name, closed: r.closed, via: r.via });
     } catch (e) {
       console.error(`[hive] reaper orphan agent ${a.name}:`, e); // isolated; never crash the sweep
+    }
+  }
+}
+
+// A pane's cwd basename is the worktree dir `hive-<taskId>` (branch
+// hive/<taskId>), the same shape across every project repo. This maps a pane
+// back to its task without a fragile per-repo label scheme; David's own shells
+// and non-hive checkouts have a different cwd and never match, so the sweep
+// never touches them. Task ids are 12 lowercase-hex (db.newId); `{6,}` tolerates
+// any future length while still excluding plain names like `hive-fleet`.
+export function taskIdFromCwd(cwd: string | null): string | null {
+  if (!cwd) return null;
+  const base = (cwd.replace(/\/+$/, "").split("/").pop() ?? "");
+  const m = /^hive-([0-9a-f]{6,})$/.exec(base);
+  return m ? m[1] : null;
+}
+
+// The pty-leak sweep. The leak is held by PANES (one pty each), and the two
+// biggest leak sources are invisible to `agent list`: (1) the per-task workspace
+// `worktree create` auto-spawns, whose lone pane the agent never uses, and (2) a
+// fleet tab whose agent already exited. Both persist after the task is long
+// terminal (2026-07-25: 452 of 511 ptys were day-old sessions of finished
+// tasks). This enumerates every pane, maps it to a task by cwd, and reclaims the
+// pty for any whose task is TERMINAL or gone.
+//
+// SAFETY (the one dangerous regression — closing a live agent): a pane is closed
+// ONLY when the task parsed from its cwd is terminal (done/failed/cancelled) or
+// has no row at all. A live agent belongs, by construction, to a NON-terminal
+// task (it's in an agent-bearing state), so `getTask(...).state` is not in
+// TERMINAL, the `continue` below fires, and its pane is never touched. The
+// decision reads the authoritative DB state, not a herdr probe, so a transient
+// herdr hiccup can't misclassify live work. The vanished-mid-flight case (agent
+// died, task still in_progress) is left to the reconciler on purpose: the sweep
+// keeps that session until the reconciler moves the task terminal, then reaps.
+export async function sweepOrphanedPanes(db: DB, deps: ReaperDeps = {}): Promise<void> {
+  const herdr = deps.herdr ?? defaultHerdr;
+  const panes = await herdr.listPanes();
+  // Record utilization for /api/health BEFORE reaping: this is the pre-sweep
+  // high-water mark, the number that actually approaches the pty wall.
+  setSetting(db, "herdr_pane_count", String(panes.length));
+  setSetting(db, "herdr_pane_at", now());
+
+  // Must know the fleet workspace id before closing anything: without it a fleet
+  // tab would fall into the workspace-close branch below and take the WHOLE fleet
+  // (every live agent) with it. If we can't resolve it (herdr flaky/down), record
+  // the count and skip reaping this cycle — the next cycle retries.
+  const fleetWs = await herdr.fleetWorkspaceId();
+  if (!fleetWs) return;
+
+  for (const p of panes) {
+    const taskId = taskIdFromCwd(p.cwd);
+    if (!taskId) continue; // not a hive-managed pane
+    try {
+      const task = getTask(db, taskId);
+      if (task && !TERMINAL.includes(task.state as State)) continue; // live — keep
+
+      if (fleetWs && p.workspaceId === fleetWs) {
+        // Fleet tab of a terminal/orphan task: close the tab, NOT the shared
+        // fleet workspace (that would kill every live agent).
+        if (p.tabId) {
+          const r = await herdr.closeSession({ agentTarget: taskId, tabId: p.tabId });
+          if (r.closed) broadcast({ type: "reaped_orphan_pane", task_id: taskId, via: r.via });
+        }
+      } else if (p.workspaceId && p.workspaceId !== fleetWs) {
+        // The worktree's own workspace: close it whole (its single pane is the
+        // leaked pty). Guarded above so the fleet workspace is never closed here.
+        const r = await herdr.closeWorkspace(p.workspaceId);
+        if (r.code === 0) broadcast({ type: "reaped_orphan_pane", task_id: taskId, via: `workspace ${p.workspaceId}` });
+      }
+    } catch (e) {
+      console.error(`[hive] reaper orphan pane ${taskId}:`, e); // isolated; never crash the sweep
     }
   }
 }

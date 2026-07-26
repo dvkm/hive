@@ -188,6 +188,22 @@ Quirks found and handled:
   cycle, diffing `herdr agent list` against live DB tasks, as a backstop for
   any agent whose task row no longer exists at all.
 
+- **The pty pool is a hard, low OS cap (macOS `kern.tty.ptmx_max`, 511) and a
+  dead pane has no agent.** `agent list` is blind to a leaked pane, so it hit
+  511/511 twice on 2026-07-25 (every spawn failing `openpty: Os { code: 6 }`)
+  from two sources: the per-task workspace `worktree create` auto-spawns (its
+  lone pane never used, since the agent runs in the shared fleet tab) and fleet
+  tabs whose agent already exited. The reaper's `sweepOrphanedPanes` closes them:
+  it enumerates `herdr pane list` (one pty each), maps each pane to a task by cwd
+  basename `hive-<task-id>`, and reclaims the pty of any whose task is terminal
+  or gone — the worktree's own workspace via `workspace close <id>` (a
+  terminal-UI op that leaves the checkout on disk untouched, NOT `worktree
+  remove`), a fleet tab via `pane close`. It resolves the fleet workspace id
+  READ-ONLY first and bails if it can't, so it can never close the shared fleet.
+  Live tasks are kept by construction (the decision reads DB state, never a herdr
+  probe). Utilization surfaces on `/api/health` as `sessions` (warn at 80% of
+  `HIVE_PTY_MAX`).
+
 - **A freshly-created branch with no commits is "merged"** into its base (it
   points at the same commit), so teardown considers it safe to remove — correct,
   since there is no work to lose. The refuse path triggers only once the agent

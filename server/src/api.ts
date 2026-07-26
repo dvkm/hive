@@ -4,7 +4,7 @@ import { dirname, join, normalize } from "node:path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
-import { taskWithHealth, broadcastTask, needsAttention, herdrOutage } from "./health.ts";
+import { taskWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
 import {
   transition,
@@ -153,7 +153,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       // ---- health ----
       if (pathname === "/api/health" && method === "GET")
-        return json({ ok: true, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), herdr_outage: herdrOutage(db) });
+        return json({ ok: true, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
 
       // ---- evidence static files ----
       if (pathname.startsWith("/evidence/") && method === "GET")
@@ -1752,6 +1752,10 @@ export async function spawnAgent(
       tab_id: result.tab_id,
       label: result.label,
       fleet_workspace_id: result.fleet_workspace_id,
+      // The worktree's OWN workspace (distinct from the fleet). `worktree create`
+      // auto-spawns it with a live pane/pty that the agent never uses, so cleanup
+      // must close it or it leaks a pty forever (2026-07-25).
+      workspace_id: result.workspace_id,
     },
   });
   // The agent is up and holding the queued steers in its brief — receipt them.

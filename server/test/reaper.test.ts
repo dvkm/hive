@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, getSetting, type DB } from "../src/db.ts";
-import { reapOnce, taskIdFromBranch, sweepOrphanedAgents } from "../src/reaper.ts";
+import { reapOnce, taskIdFromBranch, taskIdFromCwd, sweepOrphanedAgents, sweepOrphanedPanes } from "../src/reaper.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -137,6 +137,106 @@ test("sweepOrphanedAgents leaves a LIVE task's agent alone", async () => {
   const herdr = new Herdr(exec, "herdr");
   await sweepOrphanedAgents(db, { herdr });
   expect(calls.some((c) => has(c, "tab", "close"))).toBe(false);
+});
+
+// ---- taskIdFromCwd: map a herdr pane back to its task by worktree dir ----
+
+test("taskIdFromCwd extracts hive-<hexid> from a worktree cwd; ignores non-hive dirs", () => {
+  expect(taskIdFromCwd("/Users/you/.herdr/worktrees/hive/hive-5ba4edd2f39d")).toBe("5ba4edd2f39d");
+  expect(taskIdFromCwd("/wt/hive-222a5d0a2b73/")).toBe("222a5d0a2b73"); // trailing slash tolerated
+  expect(taskIdFromCwd("/Users/you/projects/hive")).toBeNull(); // David's own checkout
+  expect(taskIdFromCwd("/Users/you/projects/notes")).toBeNull();
+  expect(taskIdFromCwd("/wt/ghost-5ba4edd2f39d")).toBeNull(); // ghost branch dir, not a live session
+  expect(taskIdFromCwd(null)).toBeNull();
+});
+
+// ---- sweepOrphanedPanes: the pty-leak sweep, keyed on PANES not agents ----
+
+// One fleet workspace (wR, label hive-fleet) plus worktree workspaces. Panes:
+//   TERM fleet tab      -> close the tab (never the fleet workspace)
+//   LIVE fleet tab      -> keep
+//   TERM worktree ws    -> close the whole workspace
+//   LIVE worktree ws    -> keep
+//   orphan worktree ws  -> no task row -> close the whole workspace
+//   David's own pane    -> cwd not hive-<hex> -> untouched
+function paneWorld() {
+  const closed: string[][] = [];
+  const paneJson = JSON.stringify({
+    result: {
+      panes: [
+        { pane_id: "wR:p1", tab_id: "wR:t1", workspace_id: "wR", cwd: "/wt/hive-aaaaaaaaaaaa" },
+        { pane_id: "wR:p2", tab_id: "wR:t2", workspace_id: "wR", cwd: "/wt/hive-bbbbbbbbbbbb" },
+        { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", cwd: "/wt/hive-cccccccccccc" },
+        { pane_id: "w2:p1", tab_id: "w2:t1", workspace_id: "w2", cwd: "/wt/hive-dddddddddddd" },
+        { pane_id: "w3:p1", tab_id: "w3:t1", workspace_id: "w3", cwd: "/wt/hive-eeeeeeeeeeee" },
+        { pane_id: "w4:p1", tab_id: "w4:t1", workspace_id: "w4", cwd: "/Users/you/projects/foo" },
+      ],
+    },
+  });
+  const wsJson = JSON.stringify({ result: { workspaces: [{ workspace_id: "wR", label: "hive-fleet" }] } });
+  const exec: Exec = async (argv) => {
+    if (has(argv, "pane", "list")) return OK(paneJson);
+    if (has(argv, "workspace", "list")) return OK(wsJson);
+    if (has(argv, "tab", "close") || has(argv, "workspace", "close")) {
+      closed.push(argv);
+      return OK();
+    }
+    return OK();
+  };
+  return { herdr: new Herdr(exec, "herdr"), closed };
+}
+
+test("sweepOrphanedPanes reaps terminal + orphan panes, keeps live ones, never closes the fleet workspace", async () => {
+  const { db, projectId } = freshDb();
+  seedTask(db, projectId, "aaaaaaaaaaaa", "done"); // fleet tab, terminal -> close tab
+  seedTask(db, projectId, "bbbbbbbbbbbb", "in_progress"); // fleet tab, live -> keep
+  seedTask(db, projectId, "cccccccccccc", "failed"); // worktree ws, terminal -> close ws
+  seedTask(db, projectId, "dddddddddddd", "in_progress"); // worktree ws, live -> keep
+  // eeeeeeeeeeee: no task row at all -> orphan -> close ws
+
+  const { herdr, closed } = paneWorld();
+  await sweepOrphanedPanes(db, { herdr });
+
+  // terminal fleet tab closed by TAB (not workspace)
+  expect(closed.some((c) => has(c, "tab", "close", "wR:t1"))).toBe(true);
+  // terminal + orphan worktree workspaces closed WHOLE
+  expect(closed.some((c) => has(c, "workspace", "close", "w1"))).toBe(true);
+  expect(closed.some((c) => has(c, "workspace", "close", "w3"))).toBe(true);
+  // SAFETY: the shared fleet workspace is NEVER closed
+  expect(closed.some((c) => has(c, "workspace", "close", "wR"))).toBe(false);
+  // SAFETY: live tasks' panes are never touched (fleet tab wR:t2, worktree ws w2)
+  expect(closed.some((c) => has(c, "tab", "close", "wR:t2"))).toBe(false);
+  expect(closed.some((c) => has(c, "workspace", "close", "w2"))).toBe(false);
+  // David's own pane (w4) untouched
+  expect(closed.some((c) => c.includes("w4") || c.includes("w4:t1"))).toBe(false);
+});
+
+test("sweepOrphanedPanes closes NOTHING when the fleet workspace id can't be resolved (never risk the whole fleet)", async () => {
+  const { db, projectId } = freshDb();
+  seedTask(db, projectId, "cccccccccccc", "done"); // would-be reap target
+  const closed: string[][] = [];
+  const paneJson = JSON.stringify({
+    result: { panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", cwd: "/wt/hive-cccccccccccc" }] },
+  });
+  const exec: Exec = async (argv) => {
+    if (has(argv, "pane", "list")) return OK(paneJson);
+    if (has(argv, "workspace", "list")) return OK("{}"); // fleet label not found → null
+    if (has(argv, "tab", "close") || has(argv, "workspace", "close")) { closed.push(argv); return OK(); }
+    return OK();
+  };
+  const herdr = new Herdr(exec, "herdr");
+  await sweepOrphanedPanes(db, { herdr });
+  expect(closed.length).toBe(0); // no fleet id → skip reaping entirely
+  expect(getSetting(db, "herdr_pane_count")).toBe("1"); // still records the count
+});
+
+test("sweepOrphanedPanes records pre-sweep pane count for /api/health", async () => {
+  const { db, projectId } = freshDb();
+  seedTask(db, projectId, "aaaaaaaaaaaa", "done");
+  const { herdr } = paneWorld();
+  await sweepOrphanedPanes(db, { herdr });
+  expect(getSetting(db, "herdr_pane_count")).toBe("6"); // all 6 live panes, counted before reaping
+  expect(getSetting(db, "herdr_pane_at")).not.toBeNull();
 });
 
 test("sweepOrphanedAgents defers to cleanupTask for a TERMINAL task's lingering agent — an unmerged worktree still keeps its session", async () => {

@@ -268,6 +268,49 @@ export function agentListArgv(): string[] {
   return ["agent", "list"];
 }
 
+// Every pane herdr holds open — one pty each. The pty leak (2026-07-25, 511/511
+// twice) is held by PANES, and a dead pane has no agent, so `agent list` (which
+// the old sweep watched) is blind to it. This is what the pane sweep and the
+// health gauge count.
+export function paneListArgv(): string[] {
+  return ["pane", "list"];
+}
+
+// Close a whole herdr workspace (its tabs + panes + ptys) WITHOUT removing the
+// git worktree — verified live against 0.7.1: `workspace close` is a terminal-UI
+// op, the checkout on disk is untouched (`herdr worktree open` re-attaches on
+// demand). This is how the orphaned per-task worktree workspace that
+// `worktree create` auto-spawns gets its pty back; NEVER use `worktree remove`
+// for this (that one deletes the checkout).
+export function workspaceCloseArgv(workspaceId: string): string[] {
+  return ["workspace", "close", workspaceId];
+}
+
+export interface PaneInfo {
+  paneId: string;
+  tabId: string | null;
+  workspaceId: string | null;
+  cwd: string | null;
+}
+
+// `herdr pane list` → {"result":{"panes":[{pane_id,tab_id,workspace_id,cwd,...}]}}.
+export function parsePaneList(stdout: string): PaneInfo[] {
+  try {
+    const obj: any = JSON.parse(stdout);
+    const panes: any[] = obj.result?.panes ?? obj.panes ?? [];
+    return panes
+      .filter((p) => typeof p.pane_id === "string" && p.pane_id)
+      .map((p) => ({
+        paneId: p.pane_id as string,
+        tabId: p.tab_id ?? p.tabId ?? null,
+        workspaceId: p.workspace_id ?? p.workspaceId ?? null,
+        cwd: p.cwd ?? null,
+      }));
+  } catch {
+    return [];
+  }
+}
+
 // `herdr agent list` (verified live, docs/evidence/herdr-live-verification.txt):
 // {"result":{"agents":[{"agent":"claude","cwd":...,"pane_id":"w6:p1",...},
 // {"name":"<taskId>","cwd":...,"pane_id":"w6:p2C","tab_id":"w6:t1",...}]}}.
@@ -847,6 +890,38 @@ export class Herdr {
       return parseAgentList(r.stdout);
     } catch {
       return [];
+    }
+  }
+
+  // Every pane herdr holds — one pty each. The pane sweep (reaper.ts) diffs this
+  // against live DB tasks to reclaim leaked ptys that `agent list` can't see
+  // (dead panes, orphaned worktree workspaces). Never throws: an empty list
+  // degrades to "nothing to sweep", not a crash.
+  async listPanes(): Promise<PaneInfo[]> {
+    try {
+      const r = await this.run(paneListArgv());
+      return parsePaneList(r.stdout);
+    } catch {
+      return [];
+    }
+  }
+
+  // Close a worktree's own herdr workspace (reclaims its pty) without touching
+  // the checkout. Best-effort; a stale/already-closed id just returns non-zero.
+  async closeWorkspace(workspaceId: string): Promise<ExecResult> {
+    return this.run(workspaceCloseArgv(workspaceId));
+  }
+
+  // Resolve the shared fleet workspace id READ-ONLY (never creates it, unlike
+  // ensureFleetWorkspace). The pane sweep needs it to tell a fleet tab (close
+  // the tab) from a worktree's own workspace (close the whole workspace), and to
+  // guarantee it never `workspace close`s the fleet itself. null if absent.
+  async fleetWorkspaceId(): Promise<string | null> {
+    try {
+      const list = await this.run(workspaceListArgv());
+      return parseWorkspaceIdByLabel(list.stdout, FLEET_LABEL);
+    } catch {
+      return null;
     }
   }
 }

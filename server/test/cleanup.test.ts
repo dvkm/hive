@@ -303,6 +303,37 @@ test("cleanupTask preserves an UNMERGED worktree but still closes the session (p
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'cleanup_skipped'").all(id).length).toBe(1);
 });
 
+test("cleanupTask also closes the worktree's OWN herdr workspace (the auto-spawned pty), once", async () => {
+  const { db, projectId } = freshDb();
+  const branch = "hive/CT3";
+  // Unmerged/preserved: the worktree stays on disk, but the session AND the
+  // worktree's own workspace are still released (both pin a pty).
+  const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-CT3" });
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    newId("evt"), id, now(), "herdr", "spawned",
+    JSON.stringify({ tab_id: "wF:t3", agent_target: `agent-${id}`, workspace_id: "wKT3", fleet_workspace_id: "wR" })
+  );
+  const calls: string[][] = [];
+  const exec: Exec = async (argv) => {
+    calls.push(argv);
+    if (argv[0] === "git" && argv.includes("--merged")) return OK("* main"); // not merged
+    if (argv[0] === "git" && argv.includes("ls-remote")) return OK(""); // not pushed
+    return OK();
+  };
+  const herdr = new Herdr(exec, "herdr");
+
+  const out = await cleanupTask(db, herdr, id);
+  expect(out.session.closed).toBe(true);
+  // the worktree's own workspace is closed — NOT the shared fleet workspace (wR)
+  expect(calls.some((c) => has(c, "workspace", "close", "wKT3"))).toBe(true);
+  expect(calls.some((c) => has(c, "workspace", "close", "wR"))).toBe(false);
+
+  // second sweep: binding cleared, so no repeat workspace/tab close
+  calls.length = 0;
+  await cleanupTask(db, herdr, id);
+  expect(calls.some((c) => c[0] !== "git")).toBe(false);
+});
+
 test("cleanupTask on a NON-terminal task is a no-op unless forced", async () => {
   const { db, projectId } = freshDb();
   const id = seedTask(db, projectId, { state: "in_progress" });

@@ -67,6 +67,25 @@ test("health endpoint surfaces herdr_outage only during an active backoff window
   expect((await get("/api/health")).json.herdr_outage).toBeNull();
 });
 
+test("health endpoint exposes pty/session utilization once the reaper has counted", async () => {
+  // Absent until the first pane sweep records a count.
+  expect((await get("/api/health")).json.sessions).toBeNull();
+
+  // Healthy working set: below the warn threshold.
+  setSetting(db, "herdr_pane_count", "60");
+  setSetting(db, "herdr_pane_at", new Date().toISOString());
+  const ok = (await get("/api/health")).json.sessions;
+  expect(ok.panes).toBe(60);
+  expect(ok.max).toBe(511);
+  expect(ok.warn).toBe(false);
+
+  // Approaching the wall: warn flips on past 80% of the cap.
+  setSetting(db, "herdr_pane_count", "450");
+  const hot = (await get("/api/health")).json.sessions;
+  expect(hot.panes).toBe(450);
+  expect(hot.warn).toBe(true);
+});
+
 test("task create + list + get", async () => {
   const list = await get("/api/tasks");
   expect(list.json.some((t: any) => t.id === taskId)).toBe(true);
