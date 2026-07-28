@@ -773,6 +773,7 @@ a {
   border-radius: 10px;
   padding: 1px var(--s2);
 }
+/* the task-detail Brief panel's pre block (not the /brief page — that's .brief-page) */
 .brief {
   font-family: var(--mono);
   font-size: 12.5px;
