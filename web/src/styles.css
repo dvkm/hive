@@ -3006,6 +3006,12 @@ a.dbundle-fact:hover {
   max-width: 820px;
   margin: 0 auto;
   padding: 28px 24px 80px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
 }
 .brief-top {
   display: flex;
