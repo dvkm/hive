@@ -3,7 +3,7 @@
 // notification stream and a dock badge counting open decisions + checkpoints.
 // The server itself stays the LaunchAgent (dev.hive.server); this app is a
 // client only and reconnects politely when the daemon is down.
-const { app, BrowserWindow, Notification, shell } = require("electron");
+const { app, BrowserWindow, Notification, shell, screen } = require("electron");
 const http = require("node:http");
 
 const BASE = process.env.HIVE_URL || "http://127.0.0.1:4700";
@@ -12,9 +12,17 @@ const SMOKE = !!process.env.HIVE_SMOKE; // load, print ok, quit — used by CI/v
 let win = null;
 
 function createWindow() {
+  // Clamp the initial size to the display's work area. At a fixed 1440x920 the
+  // window is taller/wider than a small laptop screen (e.g. 1440x900), so its
+  // resize edges fall off-screen and can't be grabbed — it reads as "can't
+  // resize the window." Fitting the work area keeps every edge reachable.
+  const { width: aw, height: ah } = screen.getPrimaryDisplay().workAreaSize;
   win = new BrowserWindow({
-    width: 1440,
-    height: 920,
+    width: Math.min(1440, aw),
+    height: Math.min(920, ah),
+    minWidth: 640,
+    minHeight: 480,
+    resizable: true,
     titleBarStyle: "hiddenInset",
     backgroundColor: "#1c1c1e",
     webPreferences: { contextIsolation: true },
