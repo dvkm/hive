@@ -1,14 +1,20 @@
 import { useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { useStore } from "../lib/store";
+import { useProjectFilter, inProjectFilter } from "../lib/projectFilter";
 import { Empty } from "../lib/ui";
 import { DecisionCard } from "./DecisionCard";
 import { CheckpointsInbox } from "./Checkpoints";
 
 export default function Decisions() {
-  const { decisions } = useStore();
+  const { decisions, tasks } = useStore();
+  const projectFilter = useProjectFilter();
   const [hidden, setHidden] = useState<Set<string>>(new Set());
-  const list = decisions.filter((d) => !hidden.has(d.id));
+  // Decisions carry task_id, not project_id — resolve the project via the task.
+  const taskProject = new Map(tasks.map((t) => [t.id, t.project_id]));
+  const list = decisions.filter(
+    (d) => !hidden.has(d.id) && inProjectFilter(taskProject.get(d.task_id), projectFilter)
+  );
   const hide = (id: string) => setHidden((h) => new Set(h).add(id));
 
   // Scroll to and briefly highlight a card when arrived from the palette

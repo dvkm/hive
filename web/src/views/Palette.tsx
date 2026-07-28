@@ -5,6 +5,7 @@ import { api } from "../lib/api";
 import type { SearchHit } from "../lib/api";
 import { useStore } from "../lib/store";
 import { toast } from "../lib/ui";
+import { setProjectFilter } from "../lib/projectFilter";
 import { NewTaskModal } from "./Board";
 
 // Cmd+K / "/" command palette + global search, mounted once over every view.
@@ -179,7 +180,7 @@ export default function Palette() {
         label: "Toggle project filter → All",
         run: () => {
           close();
-          window.dispatchEvent(new CustomEvent("hive:project-filter", { detail: "" }));
+          setProjectFilter("");
           navigate("/");
         },
       },
@@ -190,7 +191,7 @@ export default function Palette() {
         label: `Toggle project filter → ${p.name}`,
         run: () => {
           close();
-          window.dispatchEvent(new CustomEvent("hive:project-filter", { detail: p.id }));
+          setProjectFilter(p.id);
           navigate("/");
         },
       })),
