@@ -84,6 +84,11 @@ a {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
+/* Electron: clear the macOS traffic lights (hiddenInset) that float over the
+   top-left. ~78px covers the three buttons plus breathing room. */
+.electron .topbar {
+  padding-left: 84px;
+}
 .brand {
   font-weight: 650;
   letter-spacing: 0.3px;
