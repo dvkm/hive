@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useStore } from "../lib/store";
+import { useProjectFilter, inProjectFilter } from "../lib/projectFilter";
 import { Empty } from "../lib/ui";
 import { ReviewCard } from "./ReviewCard";
 
@@ -8,8 +9,11 @@ import { ReviewCard } from "./ReviewCard";
 // review & merge". Cards self-remove once acted on (merge/request-changes/reject).
 export default function Review() {
   const { tasks } = useStore();
+  const projectFilter = useProjectFilter();
   const [hidden, setHidden] = useState<Set<string>>(new Set());
-  const list = tasks.filter((t) => t.state === "in_review" && !hidden.has(t.id));
+  const list = tasks.filter(
+    (t) => t.state === "in_review" && !hidden.has(t.id) && inProjectFilter(t.project_id, projectFilter)
+  );
   const hide = (id: string) => setHidden((h) => new Set(h).add(id));
 
   return (

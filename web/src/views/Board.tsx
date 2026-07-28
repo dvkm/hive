@@ -5,6 +5,7 @@ import { useStore } from "../lib/store";
 import type { Health, Kind, State, Task } from "../lib/api";
 import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
+import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
 import { AttentionTray, needsAttention } from "./attention";
 
 // A compact "why this card needs attention" line: e.g. "agent gone" or
@@ -173,7 +174,6 @@ function Card({ task }: { task: Task }) {
   );
 }
 
-const PROJECT_FILTER_KEY = "hive.board.project";
 const BANNER_DISMISS_KEY = "hive.brief.bannerDismissed";
 
 // Slim, dismissible banner nudging the director to the morning brief when there
@@ -213,20 +213,10 @@ function BriefBanner() {
 export default function Board() {
   const { tasks, projects } = useStore();
   const [adding, setAdding] = useState(false);
-  // Compact project filter (All / per project), persisted across reloads.
-  const [projectFilter, setProjectFilter] = useState<string>(() => localStorage.getItem(PROJECT_FILTER_KEY) || "");
-  const setFilter = (id: string) => {
-    setProjectFilter(id);
-    if (id) localStorage.setItem(PROJECT_FILTER_KEY, id);
-    else localStorage.removeItem(PROJECT_FILTER_KEY);
-  };
-  // The command palette's "Toggle project filter" action fires this event so the
-  // board picks up the change even when it's already mounted.
-  useEffect(() => {
-    const onSet = (e: Event) => setFilter((e as CustomEvent<string>).detail);
-    window.addEventListener("hive:project-filter", onSet as EventListener);
-    return () => window.removeEventListener("hive:project-filter", onSet as EventListener);
-  }, []);
+  // Compact project filter (All / per project), shared across board/inboxes and
+  // persisted across reloads. Setting it broadcasts to every mounted view.
+  const projectFilter = useProjectFilter();
+  const setFilter = setProjectFilter;
   // Instant client-side card filter (title/summary substring), no server call.
   const [cardFilter, setCardFilter] = useState("");
   const scoped = projectFilter ? tasks.filter((t) => t.project_id === projectFilter) : tasks;

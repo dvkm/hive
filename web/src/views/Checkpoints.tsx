@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import type { Checkpoint, Event } from "../lib/api";
 import { useStore } from "../lib/store";
+import { useProjectFilter, inProjectFilter } from "../lib/projectFilter";
 import { toast } from "../lib/ui";
 
 // Live build-time checkboxes: agents emit `checkpoint` events while working;
@@ -145,11 +146,13 @@ export function CheckpointList({ events }: { events: Event[] }) {
 // flag becomes a corrective follow-up task instead of a dead steer.
 export function CheckpointsInbox() {
   const { checkpoints, reloadCheckpoints } = useStore();
+  const projectFilter = useProjectFilter();
   const [busy, setBusy] = useState(false);
-  if (!checkpoints.length) return null;
+  const scoped = checkpoints.filter((c) => inProjectFilter(c.project_id, projectFilter));
+  if (!scoped.length) return null;
 
   const groups = new Map<string, Checkpoint[]>();
-  for (const c of checkpoints) {
+  for (const c of scoped) {
     const g = groups.get(c.task_id) ?? [];
     g.push(c);
     groups.set(c.task_id, g);
@@ -172,7 +175,7 @@ export function CheckpointsInbox() {
   return (
     <section className="cp-inbox">
       <div className="cp-inbox-head">
-        Checkpoints <span className="cp-count">{checkpoints.length}</span>
+        Checkpoints <span className="cp-count">{scoped.length}</span>
         <span className="muted"> — agents&apos; judgment calls; tick to approve, flag to steer (or spawn a fix if already shipped)</span>
       </div>
       {[...groups.values()].map((items) => {
