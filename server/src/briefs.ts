@@ -29,7 +29,7 @@ and \`hive pr-marker\`. Prefer the CLI over raw curl: it attributes what you do.
 
   hive emit <task-id> status   --note "what you just did / are doing"
   hive emit <task-id> evidence --file ./screenshot.png --note "caption"
-  hive emit <task-id> needs-decision --note "one line summary"   (then open a decision card)
+  hive decision ask <task-id> --title "..." --option k:label:detail ...   (opens a card AND parks the task — see below)
   hive emit <task-id> blocked  --note "why you are stuck"
   hive emit <task-id> ready    --pr-url <url> --note "PR <url>"   (hand off for review)
   hive emit <task-id> done     --note "final summary"
@@ -73,8 +73,10 @@ Rules:
       --recommend key1
 
   One card per question, 2-4 options each, always include your recommendation.
-  Then emit \`needs-decision\` and stop if you can't proceed without the answer;
-  keep working on other parts if you can.
+  \`hive decision ask\` already parks the task in \`needs_decision\` — don't also
+  emit \`needs-decision\` for the same question, it opens a second, redundant
+  card (two entries for one decision). Stop and wait for the answer if you
+  can't proceed without it; keep working on other parts if you can.
 - When the director REQUESTS CHANGES, first reply with
   \`hive emit <task-id> status --note "..."\` saying what you'll change (this is
   a visible conversation — silence looks like the request was lost), then do the
@@ -104,7 +106,7 @@ alternatives, anything you would later list as "iffy" — emit it and KEEP WORKI
 Each checkpoint becomes a live checkbox the director ticks (approved) or flags;
 a flag arrives as a steer message — address it when it lands, then continue.
 Checkpoints are non-blocking by design. High-risk calls (prod, destructive,
-feature flags) still go through \`needs-decision\` / the guarded-action gate.
+feature flags) still go through \`hive decision ask\` / the guarded-action gate.
 At handoff, your review_summary "iffy" section should mostly restate checkpoints
 the director has already seen — surprises there mean you checkpointed too little.`;
 
