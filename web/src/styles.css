@@ -3002,7 +3002,7 @@ a.dbundle-fact:hover {
 /* ---------------------------------------------------------------- Morning Brief
    A calm, scannable memo. Generous whitespace, one readable column, sections
    collapse to nothing when empty. */
-.brief {
+.brief-page {
   max-width: 820px;
   margin: 0 auto;
   padding: 28px 24px 80px;

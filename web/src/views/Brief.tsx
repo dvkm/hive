@@ -79,7 +79,7 @@ export default function Brief() {
     incidents.length + intake.length + spendCount + learnings.length;
 
   return (
-    <div className="brief">
+    <div className="brief-page">
       <header className="brief-top">
         <div>
           <h1 className="brief-title">Morning brief</h1>
