@@ -5,6 +5,7 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { splitAttachments } from "../../web/src/lib/attachments.ts";
 
 const HOME = mkdtempSync(join(tmpdir(), "hive-attach-test-"));
 process.env.HIVE_HOME = HOME;
@@ -169,6 +170,47 @@ test("attachments do not count as evidence", async () => {
   const done = await postJson(`/api/tasks/${taskId}/transition`, { to: "done" });
   expect(done.status).toBe(409);
   expect(done.json.error).toContain("no evidence");
+});
+
+// The task detail view lifts the paths back out of the brief to show the
+// images. If the server's block format and the web parser drift, the director
+// sees a wall of absolute paths instead of their screenshots — so assert the
+// round trip, including that the URL the <img> hits serves the real bytes.
+test("brief attachment block round-trips into displayable attachments", async () => {
+  const r = await postForm(
+    "/api/tasks",
+    { project_id: projectId, title: "Round trip", brief: "match the design" },
+    [png("mock.png"), png("creds.json")]
+  );
+  const { body, files } = splitAttachments(r.json.brief);
+  expect(body).toBe("match the design");
+  expect(files).toHaveLength(2);
+  expect(files[0].name).toBe("mock.png"); // the storage timestamp prefix is not shown
+  expect(files[0].image).toBe(true);
+  expect(files[1].image).toBe(false); // .json is a file chip, not a broken <img>
+
+  const res = await fetch(BASE + files[0].url);
+  expect(res.status).toBe(200);
+  expect([...new Uint8Array(await res.arrayBuffer())]).toEqual([137, 80, 78, 71]);
+});
+
+// A second upload appends a second block; both must surface.
+test("attachments from a later edit surface too", async () => {
+  const taskId = (await postJson("/api/tasks", { project_id: projectId, title: "Two rounds" })).json.id;
+  for (const n of ["one.png", "two.png"]) {
+    const fd = new FormData();
+    fd.append("files", png(n));
+    await fetch(`${BASE}/api/tasks/${taskId}`, { method: "PUT", body: fd });
+  }
+  const task = await (await fetch(`${BASE}/api/tasks/${taskId}`)).json();
+  const { body, files } = splitAttachments(task.brief);
+  expect(files.map((f) => f.name)).toEqual(["one.png", "two.png"]);
+  expect(body).toBe("");
+});
+
+test("a brief with no attachments is left alone", () => {
+  expect(splitAttachments("just a brief")).toEqual({ body: "just a brief", files: [] });
+  expect(splitAttachments(null)).toEqual({ body: "", files: [] });
 });
 
 // Two files uploaded in the same millisecond must not overwrite each other.

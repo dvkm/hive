@@ -1,4 +1,4 @@
-import { useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { State, CiStatus, Health } from "./api";
 import { STATE_LABEL, HEALTH_LABEL } from "./labels";
 
@@ -76,10 +76,22 @@ export function BlockedBy({ depends_on, tasks }: { depends_on: string[]; tasks: 
 
 const kb = (n: number) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${Math.round(n / 1024)} KB` : `${(n / 1048576).toFixed(1)} MB`);
 
+// A pasted screenshot is always named "image.png", so the name alone can't tell
+// two of them apart — show what you actually staged.
+function Thumb({ file }: { file: File }) {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!file.type.startsWith("image/")) return;
+    const u = URL.createObjectURL(file);
+    setUrl(u);
+    return () => URL.revokeObjectURL(u);
+  }, [file]);
+  return url ? <img className="attach-thumb" src={url} alt="" /> : null;
+}
+
 // Wraps a composer (steer box, brief textarea) to make it a drop zone, and
 // renders the picker + the list of staged files beneath it. Controlled: the
 // caller owns `files` and clears them once the request succeeds.
-// ponytail: no clipboard paste — the brief asks for picker + drag-drop.
 export function Attach({
   files,
   onChange,
@@ -109,13 +121,20 @@ export function Attach({
         setOver(false);
         add(e.dataTransfer.files);
       }}
+      // Paste bubbles up from the textarea inside. Only swallow the event when
+      // the clipboard actually carried files, so pasting text still types.
+      onPaste={(e) => {
+        if (!e.clipboardData.files.length) return;
+        e.preventDefault();
+        add(e.clipboardData.files);
+      }}
     >
       {children}
       <div className="attach-bar">
         <button type="button" className="btn" onClick={() => input.current?.click()}>
           Attach files
         </button>
-        <span className="muted attach-hint">or drop them here</span>
+        <span className="muted attach-hint">or drop / paste them here</span>
         <input
           ref={input}
           type="file"
@@ -131,6 +150,7 @@ export function Attach({
         <ul className="attach-list">
           {files.map((f, i) => (
             <li key={i} className="attach-chip">
+              <Thumb file={f} />
               <span className="attach-name" title={f.name}>
                 {f.name}
               </span>
