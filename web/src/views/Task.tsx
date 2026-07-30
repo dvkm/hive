@@ -5,6 +5,7 @@ import { faDiamond } from "@fortawesome/free-solid-svg-icons";
 import { api } from "../lib/api";
 import type { Decision, Evidence, TaskDetail } from "../lib/api";
 import { useStore } from "../lib/store";
+import { splitAttachments } from "../lib/attachments";
 import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { ReviewCard } from "./ReviewCard";
 import { CheckpointList } from "./Checkpoints";
@@ -290,6 +291,9 @@ export function TaskBody({ id }: { id: string }) {
   const pastDecisions = t.decisions.filter((d) => d.status !== "open");
   const children = tasks.filter((x) => x.parent_task_id === t.id);
   const parent = t.parent_task_id ? tasks.find((x) => x.id === t.parent_task_id) : undefined;
+  // Attached files live in the brief as absolute paths (that's what the agent
+  // reads); show them as a gallery instead and keep the paths out of the prose.
+  const { body: briefBody, files: attachments } = splitAttachments(t.brief);
 
   const doTransition = async (to: string) => {
     try {
@@ -431,8 +435,38 @@ export function TaskBody({ id }: { id: string }) {
 
         <section className="panel">
           <h2>Brief</h2>
-          <pre className="brief">{t.brief || "(no brief)"}</pre>
+          <pre className="brief">{briefBody || "(no brief)"}</pre>
         </section>
+
+        {attachments.length > 0 && (() => {
+          // Attached images share one lightbox set, same as evidence.
+          const imgs = attachments.filter((a) => a.image);
+          const lb: LightboxImage[] = imgs.map((a) => ({ url: a.url, caption: a.name, taskId: t.id, taskTitle: t.title }));
+          return (
+            <section className="panel">
+              <h2>Attachments ({attachments.length})</h2>
+              <div className="ev-gallery">
+                {attachments.map((a) =>
+                  a.image ? (
+                    <button key={a.path} className="ev-img" title={a.name} onClick={() => lightbox.open(lb, imgs.indexOf(a))}>
+                      <img src={a.url} alt={a.name} />
+                      <span className="ev-cap">{a.name}</span>
+                    </button>
+                  ) : (
+                    <div key={a.path} className="ev-card">
+                      <a className="ev-card-link" href={a.url} target="_blank" rel="noreferrer">
+                        <div className="ev-card-head">
+                          <span className="chip chip-kind">file</span>
+                          <span className="ev-cap">{a.name}</span>
+                        </div>
+                      </a>
+                    </div>
+                  )
+                )}
+              </div>
+            </section>
+          );
+        })()}
 
         {t.agent_target && !["done", "cancelled", "failed"].includes(t.state) && <PaneTerminal taskId={t.id} />}
 

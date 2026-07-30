@@ -3805,6 +3805,13 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
   border: 1px solid var(--border);
   border-radius: 999px;
 }
+.attach-thumb {
+  width: 22px;
+  height: 22px;
+  object-fit: cover;
+  border-radius: 3px;
+  margin-left: -4px;
+}
 .attach-name {
   overflow: hidden;
   text-overflow: ellipsis;
