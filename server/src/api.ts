@@ -399,8 +399,8 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         }
         if (method === "PUT") return updateLearning(db, m[1], await req.json());
         if (method === "DELETE") {
-          const r: any = db.query("SELECT root_cause_task_id FROM learnings WHERE id = ?").get(m[1]);
-          cancelQueuedRootCauseTask(db, r?.root_cause_task_id ?? null, "root-cause learning deleted");
+          const r: any = db.query("SELECT id, root_cause_task_id FROM learnings WHERE id = ?").get(m[1]);
+          cancelQueuedRootCauseTask(db, r, "root-cause learning deleted");
           db.query("DELETE FROM learnings WHERE id = ?").run(m[1]);
           return json({ ok: true });
         }
@@ -2517,10 +2517,25 @@ function createRootCauseTask(db: DB, learning: any): string {
 // Retract the chore a learning auto-spawned when that learning stops justifying
 // it (recategorized off 'failure', or deleted): an untouched queued one is a
 // bogus dispatch waiting to happen. A task already picked up (or finished) is
-// left alone — don't yank live work. Reports whether it actually cancelled, so
-// callers only drop the link when the task really went away.
-function cancelQueuedRootCauseTask(db: DB, taskId: string | null, reason: string): boolean {
+// left alone — don't yank live work. Only a task hive spawned for *this*
+// learning qualifies, proven by createRootCauseTask's `created` event:
+// root_cause_task_id is also settable by hand through PUT, and cancelling a
+// director's own queued work is worse than the bogus chore this guards against.
+// Reports whether it actually cancelled, so callers only drop the link when the
+// task really went away.
+function cancelQueuedRootCauseTask(
+  db: DB,
+  learning: { id: string; root_cause_task_id: string | null } | null | undefined,
+  reason: string
+): boolean {
+  const taskId = learning?.root_cause_task_id;
   if (!taskId || getTask(db, taskId)?.state !== "queued") return false;
+  const spawned = db
+    .query(
+      "SELECT 1 FROM events WHERE task_id = ? AND type = 'created' AND json_extract(payload, '$.learning_id') = ? LIMIT 1"
+    )
+    .get(taskId, learning!.id);
+  if (!spawned) return false;
   try {
     transition(db, taskId, "cancelled", { source: "director", reason });
     return true;
@@ -2542,9 +2557,12 @@ function updateLearning(db: DB, id: string, body: any): Response {
   if (!r) return err("learning not found", 404);
   if (body.status && !["active", "resolved"].includes(body.status))
     return err("status must be 'active' or 'resolved'");
-  if (body.kind !== undefined && r.kind === "decision")
+  // Only an actual change is a recategorization: a read-modify-write client
+  // echoing the row's own kind back must not trip either fence.
+  const recategorizing = body.kind !== undefined && body.kind !== r.kind;
+  if (recategorizing && r.kind === "decision")
     return err("decision learnings are managed automatically and cannot be recategorized");
-  if (body.kind !== undefined && !CREATABLE_KINDS.has(body.kind))
+  if (recategorizing && !CREATABLE_KINDS.has(body.kind))
     return err("kind must be 'failure' or 'reference'");
   const next = {
     title: body.title ?? r.title,
@@ -2554,8 +2572,8 @@ function updateLearning(db: DB, id: string, body: any): Response {
     root_cause_task_id: body.root_cause_task_id ?? r.root_cause_task_id,
   };
   if (
-    body.kind !== undefined && body.kind !== r.kind && r.kind === "failure" &&
-    cancelQueuedRootCauseTask(db, r.root_cause_task_id, `learning recategorized from failure to ${body.kind}`)
+    recategorizing && r.kind === "failure" &&
+    cancelQueuedRootCauseTask(db, r, `learning recategorized from failure to ${body.kind}`)
   )
     next.root_cause_task_id = null;
   db.query(

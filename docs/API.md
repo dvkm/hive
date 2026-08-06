@@ -1019,9 +1019,10 @@ touching ordinary `command` escalations.
 - `POST /api/learnings` body `{project_id (required), title (required), kind (required: "failure" | "reference"), body?, source_task_id?, create_root_cause_task?}` → `201 Learning` | `400` (unknown `project_id`, or missing/invalid `kind` — no silent default)
   With `create_root_cause_task: true` (only valid for `kind:"failure"`, else `400`), a queued `chore` task is auto-created (brief prefilled from the learning) and its id is set as `root_cause_task_id` — the "unblock now, root-cause later" flow. Broadcasts a `learning` (and, for the auto task, a `task`) SSE message.
 - `GET /api/learnings/:id` → `200 Learning` | `404`
-- `PUT /api/learnings/:id` body `{title?, body?, status?, kind?, root_cause_task_id?}` → `200 Learning` | `400` (bad `status`, or `kind` outside `"failure" | "reference"`) | `404` (resolve = `status:"resolved"`; `kind` is correctable here — e.g. a misfiled `failure` reclassified to `reference`)
-  Correcting `kind` off `"failure"` cancels the linked root-cause task and clears `root_cause_task_id` — but only while that task is still `queued`; one already dispatched is left untouched.
+- `PUT /api/learnings/:id` body `{title?, body?, status?, kind?, root_cause_task_id?}` → `200 Learning` | `400` (bad `status`; `kind` outside `"failure" | "reference"`; or any `kind` change on a `"decision"` row, which the decision path owns) | `404` (resolve = `status:"resolved"`; `kind` is correctable here — e.g. a misfiled `failure` reclassified to `reference`. A `kind` equal to the stored one is a no-op, not an error)
+  Correcting `kind` off `"failure"` cancels the linked root-cause task and clears `root_cause_task_id` — but only a still-`queued` task that hive auto-spawned for this learning; one already dispatched, or one linked by hand via `root_cause_task_id`, is left untouched.
 - `DELETE /api/learnings/:id` → `200 {"ok":true}`
+  Same retraction as above: an auto-spawned root-cause task still sitting `queued` is cancelled with the learning that justified it.
 - `POST /api/learnings/:id/recur` → `200 Learning` | `404`
   Bumps `occurrences` + refreshes `last_seen` and re-activates the learning (`status:"active"`); the same failure pattern happened again. Broadcasts a `learning` SSE message.
 
