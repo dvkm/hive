@@ -399,6 +399,8 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         }
         if (method === "PUT") return updateLearning(db, m[1], await req.json());
         if (method === "DELETE") {
+          const r: any = db.query("SELECT root_cause_task_id FROM learnings WHERE id = ?").get(m[1]);
+          cancelQueuedRootCauseTask(db, r?.root_cause_task_id ?? null, "root-cause learning deleted");
           db.query("DELETE FROM learnings WHERE id = ?").run(m[1]);
           return json({ ok: true });
         }
@@ -2512,16 +2514,36 @@ function createRootCauseTask(db: DB, learning: any): string {
   return id;
 }
 
+// Retract the chore a learning auto-spawned when that learning stops justifying
+// it (recategorized off 'failure', or deleted): an untouched queued one is a
+// bogus dispatch waiting to happen. A task already picked up (or finished) is
+// left alone — don't yank live work. Reports whether it actually cancelled, so
+// callers only drop the link when the task really went away.
+function cancelQueuedRootCauseTask(db: DB, taskId: string | null, reason: string): boolean {
+  if (!taskId || getTask(db, taskId)?.state !== "queued") return false;
+  try {
+    transition(db, taskId, "cancelled", { source: "director", reason });
+    return true;
+  } catch (e) {
+    console.error("[hive] cancel root-cause task:", e);
+    return false;
+  }
+}
+
 // kind is correctable here (unlike create, which requires it explicit) — a
 // misfiled 'failure' that was actually a routine reference note would
 // otherwise sit in the ledger, pinned into every brief, for the project's life.
-// The same two kinds as create: 'decision' rows are authoritative director
-// rulings written only by recordDecisionKnowledge, not promotable from a PUT.
+// The same two kinds as create, in both directions: 'decision' rows are
+// authoritative director rulings owned by recordDecisionKnowledge, so a PUT can
+// neither promote into that set nor demote a ruling out of it (which would drop
+// it from the decisions brief and re-ask the same question as a fresh row).
 function updateLearning(db: DB, id: string, body: any): Response {
   const r: any = db.query("SELECT * FROM learnings WHERE id = ?").get(id);
   if (!r) return err("learning not found", 404);
   if (body.status && !["active", "resolved"].includes(body.status))
     return err("status must be 'active' or 'resolved'");
+  if (body.kind !== undefined && r.kind === "decision")
+    return err("decision learnings are managed automatically and cannot be recategorized");
   if (body.kind !== undefined && !CREATABLE_KINDS.has(body.kind))
     return err("kind must be 'failure' or 'reference'");
   const next = {
@@ -2531,23 +2553,11 @@ function updateLearning(db: DB, id: string, body: any): Response {
     kind: body.kind ?? r.kind,
     root_cause_task_id: body.root_cause_task_id ?? r.root_cause_task_id,
   };
-  // Correcting a failure to something else retracts the chore it auto-spawned:
-  // an untouched queued one is a bogus dispatch waiting to happen. A task
-  // already picked up (or finished) is left alone — don't yank live work.
   if (
     body.kind !== undefined && body.kind !== r.kind && r.kind === "failure" &&
-    r.root_cause_task_id && getTask(db, r.root_cause_task_id)?.state === "queued"
-  ) {
-    try {
-      transition(db, r.root_cause_task_id, "cancelled", {
-        source: "director",
-        reason: `learning recategorized from failure to ${body.kind}`,
-      });
-      next.root_cause_task_id = null;
-    } catch (e) {
-      console.error("[hive] cancel root-cause task on kind correction:", e);
-    }
-  }
+    cancelQueuedRootCauseTask(db, r.root_cause_task_id, `learning recategorized from failure to ${body.kind}`)
+  )
+    next.root_cause_task_id = null;
   db.query(
     "UPDATE learnings SET title = ?, body = ?, status = ?, kind = ?, root_cause_task_id = ? WHERE id = ?"
   ).run(next.title, next.body, next.status, next.kind, next.root_cause_task_id, id);
