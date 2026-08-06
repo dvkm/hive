@@ -2534,17 +2534,18 @@ function updateLearning(db: DB, id: string, body: any): Response {
   // Correcting a failure to something else retracts the chore it auto-spawned:
   // an untouched queued one is a bogus dispatch waiting to happen. A task
   // already picked up (or finished) is left alone — don't yank live work.
-  if (body.kind !== undefined && body.kind !== r.kind && r.kind === "failure" && r.root_cause_task_id) {
-    if (getTask(db, r.root_cause_task_id)?.state === "queued") {
-      try {
-        transition(db, r.root_cause_task_id, "cancelled", {
-          source: "director",
-          reason: `learning recategorized from failure to ${body.kind}`,
-        });
-      } catch (e) {
-        console.error("[hive] cancel root-cause task on kind correction:", e);
-      }
+  if (
+    body.kind !== undefined && body.kind !== r.kind && r.kind === "failure" &&
+    r.root_cause_task_id && getTask(db, r.root_cause_task_id)?.state === "queued"
+  ) {
+    try {
+      transition(db, r.root_cause_task_id, "cancelled", {
+        source: "director",
+        reason: `learning recategorized from failure to ${body.kind}`,
+      });
       next.root_cause_task_id = null;
+    } catch (e) {
+      console.error("[hive] cancel root-cause task on kind correction:", e);
     }
   }
   db.query(
