@@ -351,7 +351,7 @@ async function main() {
         project_id: flags.project,
         title: flags.title,
         body: flags.body,
-        kind: flags.kind, // "reference" = durable fact pinned into briefs; default = failure pattern
+        kind: flags.kind, // "failure" | "reference" — required, validated above, no default
         source_task_id: flags.task,
         create_root_cause_task: !!flags["root-cause"],
       });

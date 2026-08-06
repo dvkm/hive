@@ -103,15 +103,14 @@ test("kind is required — no silent default to failure (task #904)", async () =
   expect(badKind.status).toBe(400);
 });
 
-test("create_root_cause_task is a no-op for kind='reference' (a fact, not a regression)", async () => {
+test("create_root_cause_task is rejected for kind='reference' (a fact, not a regression)", async () => {
   const c = await post("/api/learnings", {
     project_id: projectId,
     title: "recurring watcher triage summary",
     kind: "reference",
     create_root_cause_task: true,
   });
-  expect(c.status).toBe(201);
-  expect(c.json.root_cause_task_id ?? null).toBeNull();
+  expect(c.status).toBe(400);
 });
 
 test("PUT can recategorize a misfiled kind after the fact", async () => {
@@ -127,6 +126,41 @@ test("PUT can recategorize a misfiled kind after the fact", async () => {
 
   const badKind = await put(`/api/learnings/${id}`, { kind: "nope" });
   expect(badKind.status).toBe(400);
+  // 'decision' rows are written only by the decision path, never promoted via PUT
+  const decisionKind = await put(`/api/learnings/${id}`, { kind: "decision" });
+  expect(decisionKind.status).toBe(400);
+});
+
+test("recategorizing off 'failure' cancels the still-queued root-cause task", async () => {
+  const c = await post("/api/learnings", {
+    project_id: projectId,
+    title: "bogus root cause from a routine summary",
+    kind: "failure",
+    create_root_cause_task: true,
+  });
+  const taskId = c.json.root_cause_task_id;
+  expect(taskId).toBeTruthy();
+
+  const upd = await put(`/api/learnings/${c.json.id}`, { kind: "reference" });
+  expect(upd.status).toBe(200);
+  expect(upd.json.root_cause_task_id).toBeNull();
+  expect((await get(`/api/learnings/${c.json.id}`)).json.root_cause_task_id).toBeNull();
+  expect((await get(`/api/tasks/${taskId}`)).json.state).toBe("cancelled");
+});
+
+test("recategorizing leaves an already-dispatched root-cause task alone", async () => {
+  const c = await post("/api/learnings", {
+    project_id: projectId,
+    title: "real regression, agent already on it",
+    kind: "failure",
+    create_root_cause_task: true,
+  });
+  const taskId = c.json.root_cause_task_id;
+  await post(`/api/tasks/${taskId}/transition`, { to: "in_progress" });
+
+  const upd = await put(`/api/learnings/${c.json.id}`, { kind: "reference" });
+  expect(upd.json.root_cause_task_id).toBe(taskId);
+  expect((await get(`/api/tasks/${taskId}`)).json.state).toBe("in_progress");
 });
 
 test("active learnings are injected into composed briefs, capped at 10", async () => {
