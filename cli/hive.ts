@@ -32,7 +32,8 @@ Usage:
   hive authority add --action <pattern> --effect allow|require_decision|deny [--project <id>] [--note <s>]
   hive authority list [--project <id>]
   hive authority rm <rule-id>
-  hive learning add --project <id> --title <t> [--body <s>] [--task <src-task-id>] [--root-cause]
+  hive learning add --project <id> --title <t> --kind failure|reference
+        [--body <s>] [--task <src-task-id>] [--root-cause]  (root-cause: failure only, auto-spawns a chore task)
   hive learning list [--project <id>] [--status active|resolved]
   hive learning recur <learning-id>
   hive recall <keywords>                  search project knowledge (references, learnings, policies)
@@ -342,6 +343,10 @@ async function main() {
     if (sub === "add") {
       if (!flags.project) die("--project is required");
       if (!flags.title) die("--title is required");
+      if (flags.kind !== "failure" && flags.kind !== "reference")
+        die("--kind is required: failure|reference (a routine/recurring summary is 'reference', not 'failure' — no default, pick one)");
+      if (flags["root-cause"] && flags.kind !== "failure")
+        die("--root-cause only applies to --kind failure (it auto-spawns a root-cause chore task)");
       const l = await api("POST", "/api/learnings", {
         project_id: flags.project,
         title: flags.title,

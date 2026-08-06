@@ -2446,12 +2446,20 @@ function listLearnings(db: DB, url: URL): Response {
   return json(db.query(sql).all(...args));
 }
 
+// A learning that silently defaulted to kind='failure' when the caller forgot
+// --kind used to pollute the "Known failure patterns" brief section forever
+// (task #904/corebeat #901: a routine watcher-summary auto-spawned a bogus
+// root-cause chore). kind is now required, not inferred.
+const CREATABLE_KINDS = new Set(["failure", "reference"]);
+
 // Create a learning. With create_root_cause_task, auto-spawn a queued `chore`
 // task (brief prefilled from the learning) and link it — the "unblock now,
-// root-cause later" flow.
+// root-cause later" flow. Only kind='failure' may spawn one: a reference/typo
+// kind describes no regression to root-cause.
 function createLearning(db: DB, body: any): Response {
   if (!body?.project_id) return err("project_id is required");
   if (!body?.title) return err("title is required");
+  if (!CREATABLE_KINDS.has(body.kind)) return err("kind is required: 'failure' or 'reference'", 400);
   if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(body.project_id))
     return err("unknown project_id", 400);
   // Reference facts route to the reference store (pinned into briefs, browsable
@@ -2472,15 +2480,16 @@ function createLearning(db: DB, body: any): Response {
     last_seen: t,
     status: "active",
     root_cause_task_id: null,
+    kind: "failure",
   };
   if (body.create_root_cause_task)
     row.root_cause_task_id = createRootCauseTask(db, row);
   db.query(
     `INSERT INTO learnings (id, project_id, title, body, source_task_id, occurrences,
-      first_seen, last_seen, status, root_cause_task_id) VALUES (?,?,?,?,?,?,?,?,?,?)`
+      first_seen, last_seen, status, root_cause_task_id, kind) VALUES (?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.project_id, row.title, row.body, row.source_task_id, row.occurrences,
-    row.first_seen, row.last_seen, row.status, row.root_cause_task_id
+    row.first_seen, row.last_seen, row.status, row.root_cause_task_id, row.kind
   );
   broadcast({ type: "learning", learning: row });
   return json(row, 201);
@@ -2502,20 +2511,28 @@ function createRootCauseTask(db: DB, learning: any): string {
   return id;
 }
 
+// kind is correctable here (unlike create, which requires it explicit) — a
+// misfiled 'failure' that was actually a routine reference note would
+// otherwise sit in the ledger, pinned into every brief, for the project's life.
+const CORRECTABLE_KINDS = new Set(["failure", "reference", "decision"]);
+
 function updateLearning(db: DB, id: string, body: any): Response {
   const r: any = db.query("SELECT * FROM learnings WHERE id = ?").get(id);
   if (!r) return err("learning not found", 404);
   if (body.status && !["active", "resolved"].includes(body.status))
     return err("status must be 'active' or 'resolved'");
+  if (body.kind !== undefined && !CORRECTABLE_KINDS.has(body.kind))
+    return err("kind must be 'failure', 'reference', or 'decision'");
   const next = {
     title: body.title ?? r.title,
     body: body.body ?? r.body,
     status: body.status ?? r.status,
+    kind: body.kind ?? r.kind,
     root_cause_task_id: body.root_cause_task_id ?? r.root_cause_task_id,
   };
   db.query(
-    "UPDATE learnings SET title = ?, body = ?, status = ?, root_cause_task_id = ? WHERE id = ?"
-  ).run(next.title, next.body, next.status, next.root_cause_task_id, id);
+    "UPDATE learnings SET title = ?, body = ?, status = ?, kind = ?, root_cause_task_id = ? WHERE id = ?"
+  ).run(next.title, next.body, next.status, next.kind, next.root_cause_task_id, id);
   const updated = { ...r, ...next };
   broadcast({ type: "learning", learning: updated });
   return json(updated);

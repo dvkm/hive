@@ -50,7 +50,7 @@ beforeAll(async () => {
   });
   await fetch(BASE + "/api/learnings", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ project_id: projectId, title: "flaky smoke on empty list", body: "guard empty" }),
+    body: JSON.stringify({ project_id: projectId, title: "flaky smoke on empty list", body: "guard empty", kind: "failure" }),
   });
 });
 afterAll(() => server.stop(true));
