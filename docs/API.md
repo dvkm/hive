@@ -384,8 +384,10 @@ event/evidence payloads. Set values with `hive secret set` (reads from stdin).
 `status ∈ {active, resolved}`. `occurrences` counts how many times the pattern
 recurred (bumped via `/recur`). `source_task_id` (the task that first hit it) and
 `root_cause_task_id` (the chore task opened to fix it, if any) may be null.
-`kind ∈ {failure, reference, decision}` (default `failure`) — the learnings table
-doubles as the project knowledge store:
+`kind ∈ {failure, reference, decision}` — required (no default) on create, which
+accepts `failure` or `reference` only; `decision` rows are written by the server
+itself. A misfiled `failure`/`reference` is correctable later via `PUT`. The
+learnings table doubles as the project knowledge store:
 - `failure` — the regression ledger. Active ones inject into composed briefs (see
   `/api/tasks/:id/brief`) under a "Known failure patterns" section, 10 most recent
   by `last_seen`.
