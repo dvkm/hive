@@ -344,7 +344,7 @@ async function main() {
       if (!flags.project) die("--project is required");
       if (!flags.title) die("--title is required");
       if (flags.kind !== "failure" && flags.kind !== "reference")
-        die("--kind is required: failure|reference (a routine/recurring summary is 'reference', not 'failure' — no default, pick one)");
+        die("--kind is required: failure|reference (no silent default — pick one)");
       if (flags["root-cause"] && flags.kind !== "failure")
         die("--root-cause only applies to --kind failure (it auto-spawns a root-cause chore task)");
       const l = await api("POST", "/api/learnings", {
