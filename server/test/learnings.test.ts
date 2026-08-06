@@ -43,7 +43,7 @@ beforeAll(async () => {
 });
 
 test("learning CRUD + list filters", async () => {
-  const c = await post("/api/learnings", { project_id: projectId, title: "flaky migration", body: "PRAGMA order" });
+  const c = await post("/api/learnings", { project_id: projectId, title: "flaky migration", body: "PRAGMA order", kind: "failure" });
   expect(c.status).toBe(201);
   expect(c.json.occurrences).toBe(1);
   expect(c.json.status).toBe("active");
@@ -65,7 +65,7 @@ test("learning CRUD + list filters", async () => {
 });
 
 test("recur bumps occurrences + last_seen and reactivates", async () => {
-  const c = await post("/api/learnings", { project_id: projectId, title: "n+1 query" });
+  const c = await post("/api/learnings", { project_id: projectId, title: "n+1 query", kind: "failure" });
   const id = c.json.id;
   const before = c.json.last_seen;
 
@@ -84,6 +84,7 @@ test("create_root_cause_task auto-spawns a queued chore task and links it", asyn
     project_id: projectId,
     title: "prod deploy skipped smoke",
     body: "smoke list was empty",
+    kind: "failure",
     create_root_cause_task: true,
   });
   expect(c.json.root_cause_task_id).toBeTruthy();
@@ -94,6 +95,40 @@ test("create_root_cause_task auto-spawns a queued chore task and links it", asyn
   expect(task.json.brief).toContain("prod deploy skipped smoke");
 });
 
+test("kind is required — no silent default to failure (task #904)", async () => {
+  const noKind = await post("/api/learnings", { project_id: projectId, title: "some summary" });
+  expect(noKind.status).toBe(400);
+
+  const badKind = await post("/api/learnings", { project_id: projectId, title: "some summary", kind: "bogus" });
+  expect(badKind.status).toBe(400);
+});
+
+test("create_root_cause_task is a no-op for kind='reference' (a fact, not a regression)", async () => {
+  const c = await post("/api/learnings", {
+    project_id: projectId,
+    title: "recurring watcher triage summary",
+    kind: "reference",
+    create_root_cause_task: true,
+  });
+  expect(c.status).toBe(201);
+  expect(c.json.root_cause_task_id ?? null).toBeNull();
+});
+
+test("PUT can recategorize a misfiled kind after the fact", async () => {
+  const c = await post("/api/learnings", { project_id: projectId, title: "misfiled as failure", kind: "failure" });
+  const id = c.json.id;
+
+  const upd = await put(`/api/learnings/${id}`, { kind: "reference" });
+  expect(upd.status).toBe(200);
+  expect(upd.json.kind).toBe("reference");
+
+  const reread = await get(`/api/learnings/${id}`);
+  expect(reread.json.kind).toBe("reference");
+
+  const badKind = await put(`/api/learnings/${id}`, { kind: "nope" });
+  expect(badKind.status).toBe(400);
+});
+
 test("active learnings are injected into composed briefs, capped at 10", async () => {
   // fresh project + task so we control the learning set
   const p = await post("/api/projects", { name: "brief-proj", repo_path: "/tmp/y" });
@@ -101,9 +136,9 @@ test("active learnings are injected into composed briefs, capped at 10", async (
   const t = await post("/api/tasks", { project_id: pid, title: "do work" });
 
   for (let i = 0; i < 12; i++)
-    await post("/api/learnings", { project_id: pid, title: `pattern ${i}`, body: `body ${i}` });
+    await post("/api/learnings", { project_id: pid, title: `pattern ${i}`, body: `body ${i}`, kind: "failure" });
   // one resolved learning must NOT appear
-  const resolvedL = await post("/api/learnings", { project_id: pid, title: "already fixed" });
+  const resolvedL = await post("/api/learnings", { project_id: pid, title: "already fixed", kind: "failure" });
   await put(`/api/learnings/${resolvedL.json.id}`, { status: "resolved" });
 
   const brief = composeBrief(db, t.json.id);

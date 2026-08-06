@@ -1016,10 +1016,10 @@ touching ordinary `command` escalations.
 
 ### Learnings (regression ledger)
 - `GET /api/learnings?project_id=&status=` → `200 [Learning, ...]` (newest `last_seen` first; both filters optional)
-- `POST /api/learnings` body `{project_id (required), title (required), body?, source_task_id?, create_root_cause_task?}` → `201 Learning` | `400` (unknown `project_id`)
-  With `create_root_cause_task: true`, a queued `chore` task is auto-created (brief prefilled from the learning) and its id is set as `root_cause_task_id` — the "unblock now, root-cause later" flow. Broadcasts a `learning` (and, for the auto task, a `task`) SSE message.
+- `POST /api/learnings` body `{project_id (required), title (required), kind (required: "failure" | "reference"), body?, source_task_id?, create_root_cause_task?}` → `201 Learning` | `400` (unknown `project_id`, or missing/invalid `kind` — no silent default)
+  With `create_root_cause_task: true` (only meaningful for `kind:"failure"`), a queued `chore` task is auto-created (brief prefilled from the learning) and its id is set as `root_cause_task_id` — the "unblock now, root-cause later" flow. Broadcasts a `learning` (and, for the auto task, a `task`) SSE message.
 - `GET /api/learnings/:id` → `200 Learning` | `404`
-- `PUT /api/learnings/:id` body `{title?, body?, status?, root_cause_task_id?}` → `200 Learning` | `400` (bad `status`) | `404` (resolve = `status:"resolved"`)
+- `PUT /api/learnings/:id` body `{title?, body?, status?, kind?, root_cause_task_id?}` → `200 Learning` | `400` (bad `status` or `kind`) | `404` (resolve = `status:"resolved"`; `kind` is correctable here — e.g. a misfiled `failure` reclassified to `reference`)
 - `DELETE /api/learnings/:id` → `200 {"ok":true}`
 - `POST /api/learnings/:id/recur` → `200 Learning` | `404`
   Bumps `occurrences` + refreshes `last_seen` and re-activates the learning (`status:"active"`); the same failure pattern happened again. Broadcasts a `learning` SSE message.
