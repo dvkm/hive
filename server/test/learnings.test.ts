@@ -35,6 +35,10 @@ async function put(path: string, body: unknown) {
   });
   return { status: res.status, json: await res.json() };
 }
+async function del(path: string) {
+  const res = await fetch(BASE + path, { method: "DELETE" });
+  return { status: res.status, json: await res.json() };
+}
 
 let projectId = "";
 beforeAll(async () => {
@@ -146,6 +150,53 @@ test("recategorizing off 'failure' cancels the still-queued root-cause task", as
   expect(upd.json.root_cause_task_id).toBeNull();
   expect((await get(`/api/learnings/${c.json.id}`)).json.root_cause_task_id).toBeNull();
   expect((await get(`/api/tasks/${taskId}`)).json.state).toBe("cancelled");
+});
+
+test("PUT cannot demote a 'decision' ruling out of the decisions set", async () => {
+  const t = Date.now();
+  db.query(
+    `INSERT INTO learnings (id, project_id, title, body, source_task_id, occurrences,
+      first_seen, last_seen, status, root_cause_task_id, kind)
+     VALUES ('lrn_dec_test', ?, 'ship behind a flag?', '**Answer:** yes', NULL, 1, ?, ?, 'active', NULL, 'decision')`
+  ).run(projectId, t, t);
+
+  const demote = await put(`/api/learnings/lrn_dec_test`, { kind: "failure" });
+  expect(demote.status).toBe(400);
+  expect((await get(`/api/learnings/lrn_dec_test`)).json.kind).toBe("decision");
+
+  // non-kind edits on a decision row still work
+  const retitle = await put(`/api/learnings/lrn_dec_test`, { status: "resolved" });
+  expect(retitle.status).toBe(200);
+  expect(retitle.json.kind).toBe("decision");
+});
+
+test("deleting a learning cancels its still-queued root-cause task", async () => {
+  const c = await post("/api/learnings", {
+    project_id: projectId,
+    title: "misfiled failure the director just deletes",
+    kind: "failure",
+    create_root_cause_task: true,
+  });
+  const taskId = c.json.root_cause_task_id;
+  expect(taskId).toBeTruthy();
+
+  expect((await del(`/api/learnings/${c.json.id}`)).status).toBe(200);
+  expect((await get(`/api/learnings/${c.json.id}`)).status).toBe(404);
+  expect((await get(`/api/tasks/${taskId}`)).json.state).toBe("cancelled");
+});
+
+test("deleting a learning leaves an already-dispatched root-cause task alone", async () => {
+  const c = await post("/api/learnings", {
+    project_id: projectId,
+    title: "real regression deleted mid-flight",
+    kind: "failure",
+    create_root_cause_task: true,
+  });
+  const taskId = c.json.root_cause_task_id;
+  await post(`/api/tasks/${taskId}/transition`, { to: "in_progress" });
+
+  await del(`/api/learnings/${c.json.id}`);
+  expect((await get(`/api/tasks/${taskId}`)).json.state).toBe("in_progress");
 });
 
 test("recategorizing leaves an already-dispatched root-cause task alone", async () => {
