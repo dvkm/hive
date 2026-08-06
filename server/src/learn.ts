@@ -212,8 +212,12 @@ export function recordSystemLearning(
 ): void {
   try {
     const t = now();
+    // Scoped to the failure ledger: a same-titled row of another kind (e.g. this
+    // signature recategorized to 'reference' by a director) must not swallow a
+    // genuine recurrence — that would retire the pattern from "Known failure
+    // patterns" for good and silently bump a pinned reference instead.
     const existing = db
-      .query("SELECT id, occurrences FROM learnings WHERE project_id = ? AND title = ? LIMIT 1")
+      .query("SELECT id, occurrences FROM learnings WHERE project_id = ? AND kind = 'failure' AND title = ? LIMIT 1")
       .get(projectId, title) as { id: string; occurrences: number } | undefined;
     if (existing) {
       db.query(
@@ -233,13 +237,14 @@ export function recordSystemLearning(
       last_seen: t,
       status: "active",
       root_cause_task_id: null,
+      kind: "failure",
     };
     db.query(
       `INSERT INTO learnings (id, project_id, title, body, source_task_id, occurrences,
-        first_seen, last_seen, status, root_cause_task_id) VALUES (?,?,?,?,?,?,?,?,?,?)`
+        first_seen, last_seen, status, root_cause_task_id, kind) VALUES (?,?,?,?,?,?,?,?,?,?,?)`
     ).run(
       row.id, row.project_id, row.title, row.body, row.source_task_id, row.occurrences,
-      row.first_seen, row.last_seen, row.status, row.root_cause_task_id
+      row.first_seen, row.last_seen, row.status, row.root_cause_task_id, row.kind
     );
     broadcast({ type: "learning", learning: row });
   } catch (e) {

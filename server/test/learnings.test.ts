@@ -9,6 +9,7 @@ process.env.HIVE_HOME = HOME;
 const { openDb } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
 const { composeBrief } = await import("../src/briefs.ts");
+const { recordSystemLearning } = await import("../src/learn.ts");
 
 const db = openDb(":memory:");
 const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
@@ -168,6 +169,11 @@ test("PUT cannot demote a 'decision' ruling out of the decisions set", async () 
   const retitle = await put(`/api/learnings/lrn_dec_test`, { status: "resolved" });
   expect(retitle.status).toBe(200);
   expect(retitle.json.kind).toBe("decision");
+
+  // a read-modify-write client echoing the unchanged kind back is not a recategorization
+  const echo = await put(`/api/learnings/lrn_dec_test`, { title: "ship behind a flag??", kind: "decision" });
+  expect(echo.status).toBe(200);
+  expect(echo.json.kind).toBe("decision");
 });
 
 test("deleting a learning cancels its still-queued root-cause task", async () => {
@@ -212,6 +218,35 @@ test("recategorizing leaves an already-dispatched root-cause task alone", async 
   const upd = await put(`/api/learnings/${c.json.id}`, { kind: "reference" });
   expect(upd.json.root_cause_task_id).toBe(taskId);
   expect((await get(`/api/tasks/${taskId}`)).json.state).toBe("in_progress");
+});
+
+test("recategorizing never cancels a hand-linked root-cause task hive did not spawn", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "director's own root-cause work" });
+  const c = await post("/api/learnings", { project_id: projectId, title: "linked by hand", kind: "failure" });
+  const linked = await put(`/api/learnings/${c.json.id}`, { root_cause_task_id: t.json.id });
+  expect(linked.json.root_cause_task_id).toBe(t.json.id);
+
+  const upd = await put(`/api/learnings/${c.json.id}`, { kind: "reference" });
+  expect(upd.json.kind).toBe("reference");
+  expect(upd.json.root_cause_task_id).toBe(t.json.id);
+  expect((await get(`/api/tasks/${t.json.id}`)).json.state).toBe("queued");
+});
+
+test("a recurrence after recategorization re-files as a failure, not a bump of the reference", async () => {
+  const title = "agent died mid-task (auto-requeued)";
+  const c = await post("/api/learnings", { project_id: projectId, title, kind: "failure" });
+  await put(`/api/learnings/${c.json.id}`, { kind: "reference" });
+
+  recordSystemLearning(db, projectId, title, "it happened again", null);
+
+  const rows: any[] = db
+    .query("SELECT id, kind, occurrences FROM learnings WHERE project_id = ? AND title = ?")
+    .all(projectId, title);
+  expect(rows).toHaveLength(2);
+  const ref = rows.find((r) => r.kind === "reference");
+  expect(ref.id).toBe(c.json.id);
+  expect(ref.occurrences).toBe(1); // the corrected row stays corrected
+  expect(rows.find((r) => r.kind === "failure")).toBeTruthy();
 });
 
 test("active learnings are injected into composed briefs, capped at 10", async () => {
