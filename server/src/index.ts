@@ -1,6 +1,6 @@
 // hive daemon entrypoint. Bun.serve on 127.0.0.1:4700 (override HIVE_PORT).
 import { openDb, defaultDbPath } from "./db.ts";
-import { makeHandler, notifyManagerOfEvent } from "./api.ts";
+import { makeHandler, notifyManagerOfEvent, sweepManagerInboxes, wakeDueManagers } from "./api.ts";
 import { startReconciler } from "./reconciler.ts";
 import { startDispatcher } from "./dispatcher.ts";
 import { startReaper } from "./reaper.ts";
@@ -71,6 +71,15 @@ setTerminalHook((db, taskId) => {
 // Close the autonomous management loop: meaningful descendant events wake the
 // chat supervisor that delegated the work, including after nested follow-ups.
 setEventHook((db, event) => notifyManagerOfEvent(db, defaultHerdr, { supervise: true }, event));
+sweepManagerInboxes(db, defaultHerdr, { supervise: true })
+  .then((count) => {
+    if (count) console.log(`[hive] woke ${count} project manager(s) for inbox sweep`);
+  })
+  .catch((e) => console.error("[hive] manager inbox sweep:", e));
+const managerWakeMs = Number(process.env.HIVE_MANAGER_WAKE_MS || 30_000);
+setInterval(() => {
+  wakeDueManagers(db, defaultHerdr, { supervise: true }).catch((e) => console.error("[hive] scheduled manager wakeup:", e));
+}, managerWakeMs);
 const reapMs = Number(process.env.HIVE_REAP_MS || 300_000);
 startReaper(db, { intervalMs: reapMs });
 

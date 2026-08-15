@@ -69,6 +69,7 @@ agents for this project's queued tasks), `dispatch_kinds` (string[], default
 `["ship","scout"]`; which task kinds the dispatcher will auto-spawn — `chore` is
 excluded by default), and `max_agents` (number, default `3`; per-project cap on
 concurrently-running agents).
+Supervisor key: `autonomy_profile` (`"conservative" | "balanced" | "autopilot"`, default `"balanced"`). Conservative leaves every checkpoint and decision to the director. Balanced may acknowledge reversible checkpoints and use only the server's closed safe-decision allow-list. Autopilot may also answer a raiser-recommended low/normal-risk technical choice after the server excludes authority grants and production/shared blast radius. No profile bypasses standing-authority gates.
 Worktree stack hooks (symmetric per-project lifecycle commands, both `string[]`,
 `{worktree}` substitutes the task's worktree path, relative `argv[0]` resolves
 against `repo_path`): `setup_argv` (e.g. `["infra/worktree/wt.sh","up","{worktree}"]`,
@@ -205,7 +206,7 @@ the task timeline with the agent's actual work; see `hooks/install.md`):
 - `agent_turn_end` — a quiet Stop/SubagentStop liveness heartbeat. `payload: {}` (kept for health/reconciler; the timeline hides it)
 
 Types written by the runtime layer (Phase 2b):
-- `checkpoint` — a live build-time judgment call from a working agent (`payload: {note}`; `hive emit <id> checkpoint --note "..."`). Non-blocking. The director acknowledges via `POST /api/tasks/:id/checkpoints/:eventId/ack` body `{verdict: "ok"|"flag", note?}` → `200 {ok, delivered, followup_task_id}` | `400` | `404`; `checkpoint_ack` events (`payload: {checkpoint_id, verdict, note}`) record the outcome. A `flag` steers a live agent immediately; a flag on a finished/agentless task queues a corrective follow-up task instead (`source="checkpoint_flag"`, parent → the flagged task). `GET /api/checkpoints` → `200 {checkpoints: [{id, task_id, ts, task_number, task_title, task_state, project_id, note}]}` lists ALL un-acked checkpoints — they survive task completion (only `cancelled` drops them) so judgment calls stay reviewable after fast agents finish.
+- `checkpoint` — a live build-time judgment call from a working agent (`payload: {note}`; `hive emit <id> checkpoint --note "..."`). Non-blocking. Acknowledgment uses `POST /api/tasks/:id/checkpoints/:eventId/ack` body `{verdict: "ok"|"flag", note?, source?: "director"|"chat_supervisor", actor?}` → `200 {ok, delivered, followup_task_id}` | `400` | `404`; `checkpoint_ack` events (`payload: {checkpoint_id, verdict, note, actor}`) record the outcome and their event source records who acted. A `flag` steers a live agent immediately; a flag on a finished/agentless task queues a corrective follow-up task instead (`source="checkpoint_flag"`, parent → the flagged task). `GET /api/checkpoints[?project_id=<id>]` → `200 {checkpoints: [{id, task_id, ts, task_number, task_title, task_state, project_id, note}]}` lists un-acked checkpoints, optionally scoped to one project. They survive task completion (only `cancelled` drops them) so judgment calls stay reviewable after fast agents finish.
 - `review_summary` — the agent's structured self-review, submitted before `ready`. `payload: {done?: string[], iffy?: (string|{what,why})[], decisions?: string[], testing?: string[], followups?: string[]}`. The review card renders the latest one as the primary review surface (prose `summary` collapses behind a toggle).
 - `spawned` — a herdr agent was started. `payload: {agent_target, branch, worktree_path, tab_id, label, fleet_workspace_id}`
 - `spawn_error` — spawn failed. `payload: {error, infra?}`. `infra: "herdr_unreachable"` marks a herdr-daemon-down failure (`ConnectionRefused` / `Os { code: 61 }`) rather than a task-specific fault; the dispatcher excludes these from a task's per-task backoff and handles them with a global circuit breaker instead (see `docs/runtime.md`)
@@ -850,7 +851,7 @@ work. Use `POST /api/tasks/:id/events` with `type=evidence` for that.
   All usage rows for a task (oldest first) plus the totals object.
 
 ### Decisions
-- `GET /api/decisions?status=open` → `200 [Decision, ...]` (newest first; `status` defaults to `open`; `status=all` returns every decision)
+- `GET /api/decisions?status=open[&project_id=<id>]` → `200 [Decision, ...]` (newest first; `status` defaults to `open`; `status=all` returns every decision; `project_id` optionally scopes the list)
 - `POST /api/decisions` body `{task_id (required), title (required), context?, risk?, blast_radius?, options (required, non-empty)}` → `201 Decision` | `400` (missing/empty `options`)
   (also writes a `needs-decision` event and parks the task in `needs_decision` if its current state allows it)
 - `GET /api/decisions/:id` → `200 Decision` | `404`
@@ -909,13 +910,16 @@ are gated identically, and the session has no privileged path around them. It
 MAY clear a narrow set of mechanical decision cards itself via
 `POST /api/decisions/:id/auto-answer` (server-enforced allow-list, see Decisions
 above), and may answer low/normal-risk reversible technical choices through the
-normal audited answer endpoint after reasoning or a team discussion. It must
+normal audited answer endpoint after reasoning or a team discussion when the
+project uses the `autopilot` profile. `balanced` is limited to the safe
+auto-answer endpoint; `conservative` leaves both decisions and checkpoints to
+the director. It must
 escalate unknown director intent or product preference, meaningful cost,
 prod/shared destructive state, safety-policy changes, dangerous-command grants,
 and inputs only the director can supply.
 Conversation history persists in `chat_threads` / `chat_messages` (append-only,
 same shape as `events`); each thread's `task_id` is its backing supervisor task
-(`source='chat_supervisor'`, kept out of the dispatcher and the board lanes).
+(`source='chat_supervisor'`, kept out of the dispatcher and the board lanes). The thread is also the durable run ledger: `objective`, `acceptance_criteria[]`, `phase`, `next_action`, `waiting_on`, `wakeup_at`, `outcome`, and `completed_at` survive supervisor restarts.
 
 The supervisor task is also the root of an automatic management loop. Tasks it
 creates inherit `parent_task_id=$HIVE_TASK_ID`; nested agent follow-ups preserve
@@ -944,7 +948,12 @@ top-level outcome before reporting completion.
   SSE as `{type:"chat_message", message}`. Loopback in practice (agents run on
   localhost).
 - `GET /api/chat/threads?project_id=` → `200 [ChatThread, ...]` (newest first; `project_id` filter optional)
-- `GET /api/chat/threads/:id` → `200 {...ChatThread, messages:[ChatMessage]}` (oldest→newest) | `404`
+- `GET /api/chat/threads/:id` → `200 {...ChatThread, messages:[ChatMessage], meetings:[ManagerMeeting], verifications:[ManagerVerification], retrospectives:[ManagerRetrospective]}` | `404`. Messages are oldest first. Management records are newest first; repeated meeting stages collapse to the latest card for each `meeting_id`.
+- `PUT /api/chat/threads/:id/run` body `{objective?, acceptance_criteria?: string[], phase?, next_action?, waiting_on?, wakeup_at?, outcome?, source?}` → `200 ChatThread` | `400` | `404` | `409`. `phase` is `intake|planning|executing|waiting|verifying|complete|stopped`. Completing a run is rejected unless the newest verification passed and a retrospective exists. A successful update writes a `manager_update` event on the supervisor task. Waiting runs with a due `wakeup_at` are resumed by the daemon (`HIVE_MANAGER_WAKE_MS`, 30 seconds by default).
+- `POST /api/chat/threads/:id/meetings` body `{stage: "proposal"|"critique"|"decided", meeting_id?, topic?, participants?: string[], summary?, decision?}` → `201/200 ManagerMeeting` | `400` | `404` | `409`. Proposal requires a topic and 2 to 3 worker task ids owned by this manager. Hive sends the agenda to each participant. Critique sends the competing-proposal summary back once. Decided records and broadcasts the conclusion, ending the meeting.
+- `POST /api/chat/threads/:id/verifications` body `{status: "started"|"passed"|"failed", method, result?, target_task_ids?: string[], evidence_ids?: string[], replay_of?}` → `201 ManagerVerification` | `400` | `404` | `409`. A passing result requires a concrete result plus evidence ids from the run's project. Failure moves the ledger back to executing with corrective work as the next action.
+- `POST /api/chat/threads/:id/verifications/:eventId/replay` body `{}` → `202 {verification, delivery, agent_target?, error?}` | `404` | `409`. It records a fresh started attempt, wakes the persistent supervisor with the prior method/result and current acceptance criteria, and asks it to compare the current integrated state.
+- `POST /api/chat/threads/:id/retrospectives` body `{summary, worked?: string[], problems?: string[], lessons?: string[]}` → `201 ManagerRetrospective` | `400` | `404` | `409`. The record is append-only and is required before completing the run.
 - `POST /api/chat/threads/:id/close` → `200 {ok, thread_id}` | `404` (unknown thread)
   Ends the thread's live session: cancels its backing supervisor task, which
   immediately tears down the worktree + herdr session (same terminal-hook path
@@ -953,9 +962,7 @@ top-level outcome before reporting completion.
   message to the same thread spawns a fresh supervisor task rather than
   resurrecting the closed one.
 
-CLI: `hive chat send [--project <id>|--thread <id>] "<text>"` (director side),
-`hive chat reply <thread-id> "<text>"` (the session's reply channel), and
-`hive chat close <thread-id>` (end a thread's live session).
+CLI: `hive chat send`, `reply`, and `close` handle the conversation lifecycle. `hive chat update` maintains the run ledger; `meeting` records and dispatches bounded proposal, critique, and decision stages; `verify` records evidence-backed attempts; `retrospect` records the completion review.
 
 ### Policies
 - `GET /api/policies?scope=` → `200 [Policy, ...]` (oldest first; `scope` filter optional)

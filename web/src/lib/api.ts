@@ -171,6 +171,7 @@ export interface Project {
     max_agents?: number;
     supervisor_persona?: string;
     playbook?: string;
+    autonomy_profile?: "conservative" | "balanced" | "autopilot";
     archived?: boolean;
     [k: string]: unknown;
   };
@@ -218,8 +219,50 @@ export interface ChatThread {
   project_id: string | null;
   task_id: string | null;
   title: string | null;
+  objective: string | null;
+  acceptance_criteria: string[];
+  phase: "intake" | "planning" | "executing" | "waiting" | "verifying" | "complete" | "stopped";
+  next_action: string | null;
+  waiting_on: string | null;
+  wakeup_at: string | null;
+  outcome: string | null;
+  completed_at: string | null;
   created_at: string;
   updated_at: string;
+  meetings?: ManagerMeeting[];
+  verifications?: ManagerVerification[];
+  retrospectives?: ManagerRetrospective[];
+}
+export interface ManagerMeeting {
+  event_id: string;
+  ts: string;
+  meeting_id: string;
+  stage: "proposal" | "critique" | "decided";
+  topic: string;
+  participants: string[];
+  summary: string | null;
+  decision: string | null;
+  delivered: number;
+}
+export interface ManagerVerification {
+  event_id: string;
+  ts: string;
+  verification_id: string;
+  status: "started" | "passed" | "failed";
+  method: string;
+  result: string | null;
+  target_task_ids: string[];
+  evidence_ids: string[];
+  replay_of: string | null;
+}
+export interface ManagerRetrospective {
+  event_id: string;
+  ts: string;
+  retrospective_id: string;
+  summary: string;
+  worked: string[];
+  problems: string[];
+  lessons: string[];
 }
 export interface ChatMessage {
   id: string;
@@ -554,6 +597,10 @@ export const api = {
       body: JSON.stringify(b),
     }),
   chatClose: (id: string) => req<{ ok: boolean; thread_id: string }>(`/api/chat/threads/${id}/close`, { method: "POST", body: "{}" }),
+  updateChatRun: (id: string, b: Partial<Pick<ChatThread, "objective" | "acceptance_criteria" | "phase" | "next_action" | "waiting_on" | "wakeup_at" | "outcome">>) =>
+    req<ChatThread>(`/api/chat/threads/${id}/run`, { method: "PUT", body: JSON.stringify({ ...b, source: "director" }) }),
+  replayVerification: (threadId: string, eventId: string) =>
+    req<{ verification: ManagerVerification; delivery: "delivered" | "spawned" | "failed"; error?: string }>(`/api/chat/threads/${threadId}/verifications/${eventId}/replay`, { method: "POST", body: "{}" }),
 
   notifications: () => req<{ notifications: Notification[]; unread: number }>(`/api/notifications`),
   ackNotifications: () => req<{ ok: boolean; acked: number }>(`/api/notifications/ack`, { method: "POST", body: "{}" }),

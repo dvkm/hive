@@ -9,6 +9,7 @@ process.env.HIVE_HOME = HOME;
 
 const { openDb, setSetting } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
+const { createThread } = await import("../src/chat.ts");
 import type { Fetcher } from "../src/monitors.ts";
 
 const db = openDb(":memory:");
@@ -160,6 +161,34 @@ test("checkpoints: emit -> listed open -> ack removes; flag steers; bad verdict 
   expect(fu.json.source).toBe("checkpoint_flag");
   expect(fu.json.parent_task_id).toBe(t.json.id);
   expect(fu.json.brief).toContain("per-account locks please");
+
+  const e3 = await post(`/api/tasks/${t.json.id}/events`, { type: "checkpoint", note: "kept the existing route shape" });
+  const checkpointManager = createThread(db, { project_id: projectId });
+  const supervisorAck = await post(`/api/tasks/${t.json.id}/checkpoints/${e3.json.event.id}/ack`, {
+    verdict: "ok",
+    source: "chat_supervisor",
+    actor: checkpointManager.id,
+  });
+  expect(supervisorAck.status).toBe(200);
+  const afterSupervisorAck = await get(`/api/tasks/${t.json.id}/events`);
+  const audit = afterSupervisorAck.json.find((e: any) => e.type === "checkpoint_ack" && e.payload.checkpoint_id === e3.json.event.id);
+  expect(audit.source).toBe("chat_supervisor");
+  expect(audit.payload.actor).toBe(checkpointManager.id);
+
+  const e4 = await post(`/api/tasks/${t.json.id}/events`, { type: "checkpoint", note: "still open after invalid caller" });
+  const invalidSource = await post(`/api/tasks/${t.json.id}/checkpoints/${e4.json.event.id}/ack`, {
+    verdict: "ok",
+    source: "impersonator",
+  });
+  expect(invalidSource.status).toBe(400);
+  open = await get(`/api/checkpoints?project_id=${projectId}`);
+  expect(open.json.checkpoints.some((c: any) => c.id === e4.json.event.id)).toBe(true);
+
+  const otherProject = await post("/api/projects", { name: "checkpoint filter", repo_path: "/tmp/filter" });
+  const otherTask = await post("/api/tasks", { project_id: otherProject.json.id, title: "other project checkpoint" });
+  const otherCheckpoint = await post(`/api/tasks/${otherTask.json.id}/events`, { type: "checkpoint", note: "other project" });
+  open = await get(`/api/checkpoints?project_id=${projectId}`);
+  expect(open.json.checkpoints.some((c: any) => c.id === otherCheckpoint.json.event.id)).toBe(false);
 });
 
 test("tracking-only tasks move freely (done without evidence)", async () => {
@@ -362,6 +391,18 @@ test("decision: create, draft autosave, answer flow", async () => {
   const open = await get("/api/decisions?status=open");
   expect(open.json.some((x: any) => x.id === decisionId)).toBe(true);
 
+  const otherProject = await post("/api/projects", { name: "decision filter", repo_path: "/tmp/decision-filter" });
+  const otherTask = await post("/api/tasks", { project_id: otherProject.json.id, title: "other project decision" });
+  const otherDecision = await post("/api/decisions", {
+    task_id: otherTask.json.id,
+    title: "Other project choice",
+    options: [{ key: "yes", label: "Yes" }],
+  });
+  const projectOpen = await get(`/api/decisions?status=open&project_id=${projectId}`);
+  expect(projectOpen.json.some((x: any) => x.id === decisionId)).toBe(true);
+  expect(projectOpen.json.some((x: any) => x.id === otherDecision.json.id)).toBe(false);
+  await post(`/api/decisions/${otherDecision.json.id}/dismiss`, {});
+
   // draft autosave
   const draft = await fetch(`${BASE}/api/decisions/${decisionId}/draft`, {
     method: "PUT",
@@ -389,28 +430,32 @@ test("decision: create, draft autosave, answer flow", async () => {
 });
 
 test("answer records the caller identity (source + actor) on row and event", async () => {
-  const t = await post("/api/tasks", { project_id: projectId, title: "who answered" });
+  const p = await post("/api/projects", { name: "autopilot identity", repo_path: "/tmp/identity", config: { autonomy_profile: "autopilot" } });
+  const manager = createThread(db, { project_id: p.json.id });
+  const t = await post("/api/tasks", { project_id: p.json.id, title: "who answered" });
   await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
   const d = await post("/api/decisions", {
     task_id: t.json.id,
     title: "ship?",
-    options: [{ key: "yes", label: "Yes" }],
+    risk: "low",
+    blast_radius: "one local task",
+    options: [{ key: "yes", label: "Yes", recommended: true }],
   });
   const ans = await post(`/api/decisions/${d.json.id}/answer`, {
     answer_key: "yes",
     source: "chat_supervisor",
-    actor: "sup-session-42",
+    actor: manager.id,
   });
   expect(ans.status).toBe(200);
   expect(ans.json.answered_by).toBe("chat_supervisor");
-  expect(ans.json.answered_actor).toBe("sup-session-42");
+  expect(ans.json.answered_actor).toBe(manager.id);
 
   // the audit event carries the identity too (not the old hardcoded director)
   const detail = await get(`/api/tasks/${t.json.id}`);
   const ev = detail.json.events.find((e: any) => e.type === "decision_answered");
   expect(ev.source).toBe("chat_supervisor");
   expect(ev.payload.answered_by).toBe("chat_supervisor");
-  expect(ev.payload.actor).toBe("sup-session-42");
+  expect(ev.payload.actor).toBe(manager.id);
 });
 
 test("answer without a source is recorded as unknown, not director", async () => {
