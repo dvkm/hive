@@ -46,7 +46,7 @@ import { routeIntakeProject } from "./intake/route.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { costUsd } from "./pricing.ts";
 import { checkCostGuardrails, resolveCostCapForDecision, taskSpend } from "./costs.ts";
-import { evaluateAutoApprove } from "./autoapprove.ts";
+import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
 import { vapidPublicKey, saveSubscription, removeSubscription } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { ciStatusOf } from "./reconciler.ts";
@@ -64,6 +64,11 @@ import {
   setThreadTask,
   composeSupervisorBrief,
   managingThreadForTask,
+  updateThreadRun,
+  supervisorArtifacts,
+  projectAutonomyProfile,
+  SUPERVISOR_PHASES,
+  AUTONOMY_PROFILES,
   type ChatThread,
 } from "./chat.ts";
 
@@ -209,11 +214,31 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (m && method === "POST") return chatClose(db, m[1]);
       }
       {
+        const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)\/run$/);
+        if (m && method === "PUT") return updateSupervisorRun(db, m[1], await req.json());
+      }
+      {
+        const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)\/meetings$/);
+        if (m && method === "POST") return await recordManagerMeeting(db, herdr, m[1], await req.json());
+      }
+      {
+        const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)\/verifications$/);
+        if (m && method === "POST") return recordManagerVerification(db, m[1], await req.json());
+      }
+      {
+        const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)\/verifications\/([^/]+)\/replay$/);
+        if (m && method === "POST") return await replayManagerVerification(db, herdr, deps, m[1], m[2]);
+      }
+      {
+        const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)\/retrospectives$/);
+        if (m && method === "POST") return recordManagerRetrospective(db, m[1], await req.json());
+      }
+      {
         const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)$/);
         if (m && method === "GET") {
           const thread = getThread(db, m[1]);
           if (!thread) return err("thread not found", 404);
-          return json({ ...thread, messages: listMessages(db, m[1]) });
+          return json({ ...thread, ...supervisorArtifacts(db, m[1]), messages: listMessages(db, m[1]) });
         }
       }
 
@@ -276,7 +301,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         return json({ ok: true });
       }
 
-      if (pathname === "/api/checkpoints" && method === "GET") return listOpenCheckpoints(db);
+      if (pathname === "/api/checkpoints" && method === "GET") return listOpenCheckpoints(db, url);
 
       if (pathname === "/api/offline" && method === "GET")
         return json({ on: isOffline(db) });
@@ -458,6 +483,8 @@ function updateProject(db: DB, id: string, body: any): Response {
   if (!existing) return err("project not found", 404);
   const name = body?.name != null ? String(body.name) : existing.name;
   const repo_path = body?.repo_path !== undefined ? body.repo_path : existing.repo_path;
+  if (body?.config?.autonomy_profile != null && !AUTONOMY_PROFILES.includes(body.config.autonomy_profile))
+    return err(`autonomy_profile must be one of ${AUTONOMY_PROFILES.join("|")}`);
   const config = body?.config !== undefined ? JSON.stringify(body.config) : existing.config;
   db.query("UPDATE projects SET name = ?, repo_path = ?, config = ? WHERE id = ?").run(name, repo_path, config, id);
   return json(parseProject(db.query("SELECT * FROM projects WHERE id = ?").get(id)));
@@ -544,7 +571,7 @@ async function chatTurn(db: DB, herdr: Herdr, deps: HandlerDeps, body: any): Pro
   // genuine double-submit repeats the exact text within the same tick, so the
   // second request rides the first's in-flight thread-creation + delivery
   // instead of racing its own.
-  const dedupeKey = `${projectId} ${text}`;
+  const dedupeKey = `${projectId}\0${text}`;
   let pending = pendingNewChats.get(dedupeKey);
   if (!pending) {
     pending = (async () => {
@@ -657,6 +684,7 @@ async function deliverToSupervisor(
 // state_change, ready_for_review + state_change) into one steer instead of
 // making the manager react twice to one fact.
 const MANAGER_EVENT_TYPES = new Set([
+  "checkpoint",
   "needs-decision",
   "blocked",
   "blocked_card",
@@ -709,6 +737,34 @@ function managerEventLine(db: DB, event: any): string {
   return `- #${task?.number ?? "?"} ${task?.title ?? event.task_id} [${task?.state ?? "unknown"}]: ${event.type}${suffix}`;
 }
 
+function activeManagerForProject(db: DB, projectId: string): ChatThread | null {
+  return (
+    (db
+      .query(
+        `SELECT c.* FROM chat_threads c
+           JOIN tasks t ON t.id = c.task_id
+          WHERE c.project_id = ? AND t.source = 'chat_supervisor'
+            AND t.state NOT IN ('done', 'failed', 'cancelled')
+          ORDER BY c.updated_at DESC LIMIT 1`
+      )
+      .get(projectId) as ChatThread | undefined) ?? null
+  );
+}
+
+function activeManager(db: DB): ChatThread | null {
+  return (
+    (db
+      .query(
+        `SELECT c.* FROM chat_threads c
+           JOIN tasks t ON t.id = c.task_id
+          WHERE t.source = 'chat_supervisor'
+            AND t.state NOT IN ('done', 'failed', 'cancelled')
+          ORDER BY c.updated_at DESC LIMIT 1`
+      )
+      .get() as ChatThread | undefined) ?? null
+  );
+}
+
 async function flushManagerUpdate(threadId: string): Promise<void> {
   const pending = pendingManagerUpdates.get(threadId);
   if (!pending) return;
@@ -718,12 +774,23 @@ async function flushManagerUpdate(threadId: string): Promise<void> {
   const manager = getTask(pending.db, current.task_id);
   if (!manager || TERMINAL.includes(manager.state as State)) return; // explicitly closed thread
   const lines = pending.events.slice(-20).map((event) => managerEventLine(pending.db, event));
+  const projectIds = [
+    ...new Set(
+      pending.events
+        .map((event) => getTask(pending.db, event.task_id)?.project_id)
+        .filter((projectId): projectId is string => !!projectId)
+    ),
+  ];
   const message = [
     `[hive manager wakeup]`,
     `Worker state changed under the top-level ask you own:`,
     ...lines,
     ``,
     `Inspect the affected tasks and current team state now. Act on anything you can resolve: coordinate peers, answer a reversible technical decision, revise or add work, or verify completion. Escalate to the director only at the decision boundary in your manager brief.`,
+    ...projectIds.map(
+      (projectId) =>
+        `Also sweep GET $HIVE_URL/api/checkpoints?project_id=${projectId} and $HIVE_URL/api/decisions?status=open&project_id=${projectId}. For a safe checkpoint, POST its ack endpoint with {"verdict":"ok","source":"chat_supervisor","actor":"${current.id}"}. Read the task context first; leave risky, ambiguous, preference-based, and merge items for the director.`
+    ),
   ].join("\n");
   await withThreadLock(threadId, () => deliverToSupervisor(pending.db, pending.herdr, pending.deps, threadId, message));
 }
@@ -732,7 +799,7 @@ export function notifyManagerOfEvent(db: DB, herdr: Herdr, deps: HandlerDeps, ev
   if (!managerEventRelevant(event)) return;
   const origin = getTask(db, event.task_id);
   if (!origin || origin.source === "chat_supervisor") return;
-  const thread = managingThreadForTask(db, event.task_id);
+  const thread = managingThreadForTask(db, event.task_id) ?? activeManagerForProject(db, origin.project_id) ?? activeManager(db);
   if (!thread?.task_id) return;
   if (event.type === "steer" && event.payload?.from_task_id === thread.task_id) return;
 
@@ -745,6 +812,114 @@ export function notifyManagerOfEvent(db: DB, herdr: Herdr, deps: HandlerDeps, ev
     flushManagerUpdate(thread.id).catch((e) => console.error(`[hive] manager wakeup ${thread.id}:`, e));
   });
   pendingManagerUpdates.set(thread.id, { db, herdr, deps, events: [event] });
+}
+
+function projectInboxCounts(db: DB, projectId: string): { checkpoints: number; decisions: number; reviews: number; attention: number } {
+  const checkpoints = Number(
+    (db
+      .query(
+        `SELECT COUNT(*) AS n FROM events e JOIN tasks t ON t.id = e.task_id
+          WHERE e.type = 'checkpoint' AND t.project_id = ? AND t.state != 'cancelled'
+            AND NOT EXISTS (
+              SELECT 1 FROM events a
+               WHERE a.task_id = e.task_id AND a.type = 'checkpoint_ack'
+                 AND json_extract(a.payload, '$.checkpoint_id') = e.id)`
+      )
+      .get(projectId) as { n: number }).n
+  );
+  const decisions = Number(
+    (db
+      .query("SELECT COUNT(*) AS n FROM decisions d JOIN tasks t ON t.id = d.task_id WHERE d.status = 'open' AND t.project_id = ?")
+      .get(projectId) as { n: number }).n
+  );
+  const reviews = Number(
+    (db.query("SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND state = 'in_review'").get(projectId) as { n: number }).n
+  );
+  const tasks = db.query("SELECT * FROM tasks WHERE project_id = ?").all(projectId).map((task) => taskWithHealth(db, parseTask(task)));
+  const attention = tasks.filter(needsAttention).length;
+  return { checkpoints, decisions, reviews, attention };
+}
+
+// One startup pass handles inbox items created before manager wakeups existed.
+// New items are event-driven through notifyManagerOfEvent, including work that
+// was not originally delegated by the current project manager.
+export async function sweepManagerInboxes(db: DB, herdr: Herdr, deps: HandlerDeps): Promise<number> {
+  const active = db
+    .query(
+      `SELECT c.* FROM chat_threads c
+         JOIN tasks t ON t.id = c.task_id
+        WHERE t.source = 'chat_supervisor' AND t.state NOT IN ('done', 'failed', 'cancelled')
+        ORDER BY c.updated_at DESC`
+    )
+    .all() as ChatThread[];
+  if (!active.length) return 0;
+  const byProject = new Map(active.filter((thread) => thread.project_id).map((thread) => [thread.project_id!, thread]));
+  const fallback = active[0];
+  const assignments = new Map<string, { thread: ChatThread; projects: { id: string; name: string; counts: ReturnType<typeof projectInboxCounts> }[] }>();
+  for (const project of db.query("SELECT id, name FROM projects ORDER BY created_at").all() as { id: string; name: string }[]) {
+    const counts = projectInboxCounts(db, project.id);
+    const total = counts.checkpoints + counts.decisions + counts.reviews + counts.attention;
+    if (!total) continue;
+    const thread = byProject.get(project.id) ?? fallback;
+    const assignment = assignments.get(thread.id) ?? { thread, projects: [] };
+    assignment.projects.push({ id: project.id, name: project.name, counts });
+    assignments.set(thread.id, assignment);
+  }
+  let notified = 0;
+  for (const { thread, projects } of assignments.values()) {
+    const total = projects.reduce(
+      (sum, project) => sum + project.counts.checkpoints + project.counts.decisions + project.counts.reviews + project.counts.attention,
+      0
+    );
+    const message = [
+      `[hive manager wakeup]`,
+      `Project inbox sweep: ${total} open item${total === 1 ? "" : "s"} across ${projects.length} project${projects.length === 1 ? "" : "s"}:`,
+      ...projects.map(({ id, name, counts }) => `- ${name} (${id}): ${counts.checkpoints} checkpoints, ${counts.decisions} decisions, ${counts.reviews} reviews, ${counts.attention} failed or stuck tasks`),
+      `Inspect every listed project inbox now and work through every low-risk item allowed by your manager brief. Read each item's task context before acting. Create corrective workers in that item's project. Leave merges and any risky, ambiguous, or preference-based choice for the director.`,
+      ...projects.map(({ id }) => `Use GET $HIVE_URL/api/checkpoints?project_id=${id} and $HIVE_URL/api/decisions?status=open&project_id=${id}.`),
+      `For a safe checkpoint, POST its ack endpoint with {"verdict":"ok","source":"chat_supervisor","actor":"${thread.id}"}.`,
+    ].join("\n");
+    await withThreadLock(thread.id, () => deliverToSupervisor(db, herdr, deps, thread.id, message));
+    notified++;
+  }
+  return notified;
+}
+
+// Resume waiting runs whose durable wakeup time has arrived. Clear the cursor
+// before delivery so overlapping timer ticks cannot wake the same run twice;
+// deliverToSupervisor durably queues the message when a session must respawn.
+export async function wakeDueManagers(db: DB, herdr: Herdr, deps: HandlerDeps): Promise<number> {
+  const due = db
+    .query(
+      `SELECT c.id FROM chat_threads c JOIN tasks t ON t.id = c.task_id
+       WHERE c.phase = 'waiting' AND c.wakeup_at IS NOT NULL AND c.wakeup_at <= ?
+         AND t.source = 'chat_supervisor' AND t.state NOT IN ('done','failed','cancelled')
+       ORDER BY c.wakeup_at ASC`
+    )
+    .all(now()) as { id: string }[];
+  for (const { id } of due) {
+    const thread = getThread(db, id)!;
+    const updated = updateThreadRun(db, id, {
+      phase: "executing",
+      next_action: thread.waiting_on ? `Resume after waiting on: ${thread.waiting_on}` : "Resume the manager loop",
+      waiting_on: null,
+      wakeup_at: null,
+    })!;
+    writeEvent(db, {
+      task_id: updated.task_id!,
+      source: "system",
+      type: "manager_update",
+      payload: { thread_id: id, phase: "executing", wakeup_due: true, next_action: updated.next_action },
+    });
+    broadcast({ type: "chat_thread", thread: updated });
+    await withThreadLock(id, () => deliverToSupervisor(db, herdr, deps, id, [
+      `[hive manager wakeup]`,
+      `The scheduled wait has ended for: ${thread.objective ?? thread.title ?? id}`,
+      thread.waiting_on ? `You were waiting on: ${thread.waiting_on}` : "",
+      `Resume the run now, inspect current team state and inboxes, and update the ledger before stopping again.`,
+    ].filter(Boolean).join("\n")));
+  }
+  return due.length;
 }
 
 // The supervisor session posts its reply to the director here (via
@@ -777,6 +952,209 @@ function chatClose(db: DB, threadId: string): Response {
     transition(db, task.id, "cancelled", { source: "director", reason: "chat thread closed" });
   }
   return json({ ok: true, thread_id: threadId });
+}
+
+function stringList(value: any, limit = 20): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map(String).map((item) => item.trim()).filter(Boolean).slice(0, limit);
+}
+
+function updateSupervisorRun(db: DB, threadId: string, body: any): Response {
+  const thread = getThread(db, threadId);
+  if (!thread) return err("thread not found", 404);
+  if (body?.phase !== undefined && !SUPERVISOR_PHASES.includes(body.phase))
+    return err(`phase must be one of ${SUPERVISOR_PHASES.join("|")}`);
+  if (body?.acceptance_criteria != null && !Array.isArray(body.acceptance_criteria))
+    return err("acceptance_criteria must be an array");
+  if (body?.wakeup_at && !Number.isFinite(Date.parse(body.wakeup_at)))
+    return err("wakeup_at must be an ISO timestamp");
+
+  const patch: any = {};
+  for (const key of ["objective", "phase", "next_action", "waiting_on", "wakeup_at", "outcome"])
+    if (body?.[key] !== undefined) patch[key] = body[key] == null ? null : String(body[key]).trim() || null;
+  if (body?.acceptance_criteria !== undefined) patch.acceptance_criteria = stringList(body.acceptance_criteria);
+  if (patch.phase && patch.phase !== "complete") patch.completed_at = null;
+
+  if (patch.phase === "complete") {
+    const artifacts = supervisorArtifacts(db, threadId);
+    if (artifacts.verifications[0]?.status !== "passed")
+      return err("run completion requires the latest verification attempt to pass", 409);
+    if (!artifacts.retrospectives.length)
+      return err("run completion requires a recorded retrospective", 409);
+    patch.completed_at = now();
+    patch.next_action = null;
+    patch.waiting_on = null;
+    patch.wakeup_at = null;
+  }
+
+  const updated = updateThreadRun(db, threadId, patch)!;
+  if (updated.task_id)
+    writeEvent(db, {
+      task_id: updated.task_id,
+      source: body?.source === "director" ? "director" : "chat_supervisor",
+      type: "manager_update",
+      payload: { thread_id: threadId, ...patch },
+    });
+  broadcast({ type: "chat_thread", thread: updated });
+  return json(updated);
+}
+
+async function recordManagerMeeting(db: DB, herdr: Herdr, threadId: string, body: any): Promise<Response> {
+  const thread = getThread(db, threadId);
+  if (!thread) return err("thread not found", 404);
+  if (!thread.task_id) return err("supervisor session has not started", 409);
+  const stage = String(body?.stage ?? "");
+  if (!["proposal", "critique", "decided"].includes(stage)) return err("stage must be proposal|critique|decided");
+
+  let meetingId = body?.meeting_id ? String(body.meeting_id) : newId("meet");
+  let topic = String(body?.topic ?? "").trim();
+  let participants = stringList(body?.participants, 3);
+  if (stage === "proposal") {
+    if (!topic) return err("topic is required");
+    if (participants.length < 2 || participants.length > 3) return err("proposal stage requires 2-3 participant task ids");
+    for (const id of participants) {
+      const owner = managingThreadForTask(db, id);
+      if (!getTask(db, id) || owner?.id !== threadId) return err(`participant ${id} is not a worker managed by this thread`, 409);
+    }
+  } else {
+    const prior = db
+      .query("SELECT payload FROM events WHERE type = 'manager_meeting' AND json_extract(payload, '$.thread_id') = ? AND json_extract(payload, '$.meeting_id') = ? ORDER BY ts DESC, rowid DESC LIMIT 1")
+      .get(threadId, meetingId) as { payload: string } | undefined;
+    if (!prior) return err("meeting not found", 404);
+    const previous = JSON.parse(prior.payload || "{}");
+    topic ||= previous.topic;
+    participants = participants.length ? participants : stringList(previous.participants, 3);
+  }
+
+  const summary = String(body?.summary ?? "").trim() || null;
+  const decision = String(body?.decision ?? "").trim() || null;
+  if (stage === "critique" && !summary) return err("critique stage requires summary");
+  if (stage === "decided" && !decision) return err("decided stage requires decision");
+
+  const message = stage === "proposal"
+    ? `Bounded team meeting: ${topic}\nGive an independent proposal with risks and concrete evidence. Send it to manager task ${thread.task_id} with: hive task send ${thread.task_id} "<proposal>".`
+    : stage === "critique"
+      ? `Bounded team meeting critique: ${topic}\nCompeting proposals: ${summary}\nSend one concise correction or critique to manager task ${thread.task_id}.`
+      : `Bounded team meeting concluded: ${topic}\nDecision: ${decision}${summary ? `\nRationale: ${summary}` : ""}\nProceed on this basis.`;
+  let delivered = 0;
+  for (const id of participants) if (await internalSteer(db, herdr, id, message)) delivered++;
+
+  const event = writeEvent(db, {
+    task_id: thread.task_id,
+    source: "chat_supervisor",
+    type: "manager_meeting",
+    payload: { thread_id: threadId, meeting_id: meetingId, stage, topic, participants, summary, decision, delivered },
+  });
+  return json({ ...event.payload, event_id: event.id, ts: event.ts }, stage === "proposal" ? 201 : 200);
+}
+
+function recordManagerVerification(db: DB, threadId: string, body: any): Response {
+  const thread = getThread(db, threadId);
+  if (!thread) return err("thread not found", 404);
+  if (!thread.task_id) return err("supervisor session has not started", 409);
+  const status = String(body?.status ?? "");
+  if (!["started", "passed", "failed"].includes(status)) return err("status must be started|passed|failed");
+  const method = String(body?.method ?? "").trim();
+  if (!method) return err("method is required");
+  const result = String(body?.result ?? "").trim() || null;
+  const targetTaskIds = stringList(body?.target_task_ids);
+  const evidenceIds = stringList(body?.evidence_ids);
+  for (const id of targetTaskIds) {
+    const target = getTask(db, id);
+    if (!target || target.project_id !== thread.project_id) return err(`target task is outside this run's project: ${id}`, 409);
+  }
+  if (status === "passed") {
+    if (!result) return err("passed verification requires result");
+    if (!evidenceIds.length) return err("passed verification requires evidence_ids");
+    for (const id of evidenceIds)
+      if (!db.query("SELECT 1 FROM evidence e JOIN tasks t ON t.id = e.task_id WHERE e.id = ? AND t.project_id = ?").get(id, thread.project_id))
+        return err(`evidence is unknown or outside this run's project: ${id}`);
+  }
+  const verificationId = newId("verify");
+  const event = writeEvent(db, {
+    task_id: thread.task_id,
+    source: "chat_supervisor",
+    type: "manager_verification",
+    payload: {
+      thread_id: threadId,
+      verification_id: verificationId,
+      status,
+      method,
+      result,
+      target_task_ids: targetTaskIds,
+      evidence_ids: evidenceIds,
+      replay_of: body?.replay_of ? String(body.replay_of) : null,
+    },
+  });
+  const next = status === "failed"
+    ? { phase: "executing" as const, next_action: `Correct failed verification: ${result ?? method}` }
+    : { phase: "verifying" as const, next_action: status === "passed" ? "Record the run retrospective" : `Run verification: ${method}` };
+  const updated = updateThreadRun(db, threadId, next)!;
+  broadcast({ type: "chat_thread", thread: updated });
+  return json({ ...event.payload, event_id: event.id, ts: event.ts }, 201);
+}
+
+async function replayManagerVerification(db: DB, herdr: Herdr, deps: HandlerDeps, threadId: string, eventId: string): Promise<Response> {
+  const thread = getThread(db, threadId);
+  if (!thread?.task_id) return err(thread ? "supervisor session has not started" : "thread not found", thread ? 409 : 404);
+  const row = db
+    .query("SELECT payload FROM events WHERE id = ? AND type = 'manager_verification' AND json_extract(payload, '$.thread_id') = ?")
+    .get(eventId, threadId) as { payload: string } | undefined;
+  if (!row) return err("verification not found", 404);
+  const prior = JSON.parse(row.payload || "{}");
+  const verificationId = newId("verify");
+  const event = writeEvent(db, {
+    task_id: thread.task_id,
+    source: "director",
+    type: "manager_verification",
+    payload: {
+      thread_id: threadId,
+      verification_id: verificationId,
+      status: "started",
+      method: prior.method,
+      result: null,
+      target_task_ids: prior.target_task_ids ?? [],
+      evidence_ids: [],
+      replay_of: prior.verification_id ?? eventId,
+    },
+  });
+  const updated = updateThreadRun(db, threadId, { phase: "verifying", next_action: `Replay verification: ${prior.method}` })!;
+  broadcast({ type: "chat_thread", thread: updated });
+  const message = [
+    `[hive manager wakeup]`,
+    `Replay verification requested for the top-level outcome.`,
+    `Method: ${prior.method}`,
+    `Prior result: ${prior.result ?? "none"}`,
+    `Target tasks: ${(prior.target_task_ids ?? []).join(", ") || "derive from the run"}`,
+    `Acceptance criteria: ${thread.acceptance_criteria.join("; ") || "derive and record them first"}`,
+    `Run the same independent check against the current integrated state, compare it with the prior result, and record a passed or failed verification with replay_of=${prior.verification_id ?? eventId}.`,
+  ].join("\n");
+  const delivery = await withThreadLock(threadId, () => deliverToSupervisor(db, herdr, deps, threadId, message));
+  return json({ verification: { ...event.payload, event_id: event.id, ts: event.ts }, ...delivery }, 202);
+}
+
+function recordManagerRetrospective(db: DB, threadId: string, body: any): Response {
+  const thread = getThread(db, threadId);
+  if (!thread) return err("thread not found", 404);
+  if (!thread.task_id) return err("supervisor session has not started", 409);
+  const summary = String(body?.summary ?? "").trim();
+  if (!summary) return err("summary is required");
+  const event = writeEvent(db, {
+    task_id: thread.task_id,
+    source: "chat_supervisor",
+    type: "manager_retrospective",
+    payload: {
+      thread_id: threadId,
+      retrospective_id: newId("retro"),
+      summary,
+      worked: stringList(body?.worked),
+      problems: stringList(body?.problems),
+      lessons: stringList(body?.lessons),
+    },
+  });
+  const updated = updateThreadRun(db, threadId, { phase: "verifying", next_action: "Close the run with its verified outcome" })!;
+  broadcast({ type: "chat_thread", thread: updated });
+  return json({ ...event.payload, event_id: event.id, ts: event.ts }, 201);
 }
 
 // ---------------------------------------------------------------- tasks
@@ -2166,24 +2544,26 @@ function checkpointNote(payload: string): string {
   }
 }
 
-function listOpenCheckpoints(db: DB): Response {
+function listOpenCheckpoints(db: DB, url: URL): Response {
   // Un-acked checkpoints stay reviewable AFTER the task finishes — agents
   // finish faster than the director's attention cycle, and 21 of the first 25
   // checkpoints vanished unreviewed when this filtered to live states
   // (2026-07-10). Only cancelled tasks drop out (their calls died with them).
+  const projectId = url.searchParams.get("project_id");
   const rows = db
     .query(
       `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state
          FROM events e JOIN tasks t ON t.id = e.task_id
         WHERE e.type = 'checkpoint'
           AND t.state != 'cancelled'
+          AND (? IS NULL OR t.project_id = ?)
           AND NOT EXISTS (
             SELECT 1 FROM events a
              WHERE a.task_id = e.task_id AND a.type = 'checkpoint_ack'
                AND json_extract(a.payload, '$.checkpoint_id') = e.id)
         ORDER BY t.number DESC, e.ts ASC`
     )
-    .all() as any[];
+    .all(projectId, projectId) as any[];
   return json({
     checkpoints: rows.map((r) => ({
       id: r.id,
@@ -2205,25 +2585,34 @@ async function ackCheckpoint(db: DB, herdr: Herdr, taskId: string, eventId: stri
   if (!ev) return err("checkpoint not found", 404);
   const verdict = body?.verdict;
   if (verdict !== "ok" && verdict !== "flag") return err("verdict must be 'ok' or 'flag'");
+  const source = body?.source ?? "director";
+  if (source !== "director" && source !== "chat_supervisor")
+    return err("source must be 'director' or 'chat_supervisor'");
+  const actor = body?.actor ? String(body.actor) : null;
+  const task = getTask(db, taskId);
+  if (source === "chat_supervisor") {
+    if (!actor || !getThread(db, actor)) return err("chat_supervisor checkpoint actions require a valid thread actor", 403);
+    if (projectAutonomyProfile(db, task?.project_id ?? null) === "conservative")
+      return err("project autonomy is conservative; checkpoint requires the director", 403);
+  }
   const note = body?.note ? String(body.note) : null;
   writeEvent(db, {
     task_id: taskId,
-    source: "director",
+    source,
     type: "checkpoint_ack",
-    payload: { checkpoint_id: eventId, verdict, note },
+    payload: { checkpoint_id: eventId, verdict, note, actor },
   });
   let delivered = false;
   let followup_task_id: string | null = null;
   if (verdict === "flag") {
     const cpText = checkpointNote(ev.payload);
-    const task = getTask(db, taskId);
     const live = task && !["done", "cancelled", "failed"].includes(task.state) && task.agent_target;
     if (live) {
       delivered = await internalSteer(
         db,
         herdr,
         taskId,
-        `Director FLAGGED your checkpoint: "${cpText}"${note ? ` — ${note}` : ""}. Address this now, before continuing.`
+        `${source === "chat_supervisor" ? "The project supervisor" : "Director"} FLAGGED your checkpoint: "${cpText}"${note ? ` — ${note}` : ""}. Address this now, before continuing.`
       );
     }
     // Late flag (task finished / agent gone): the work already shipped, so the
@@ -2240,12 +2629,12 @@ async function ackCheckpoint(db: DB, herdr: Herdr, taskId: string, eventId: stri
         fid,
         task.project_id,
         `Flagged checkpoint from #${task.number}: ${cpText.slice(0, 80)}`,
-        `The director flagged a checkpoint after task #${task.number} ("${task.title}") had already ${task.state === "done" ? "shipped" : "stopped"}.\n\nCheckpoint (the agent's judgment call): ${cpText}\n\nDirector's flag: ${note ?? "(no note)"}\n\nRevisit that decision in the shipped code and correct it per the director's note. Original task id: ${taskId}.`,
+        `${source === "chat_supervisor" ? "The project supervisor" : "The director"} flagged a checkpoint after task #${task.number} ("${task.title}") had already ${task.state === "done" ? "shipped" : "stopped"}.\n\nCheckpoint (the agent's judgment call): ${cpText}\n\nFlag: ${note ?? "(no note)"}\n\nRevisit that decision in the shipped code and correct it per the flag. Original task id: ${taskId}.`,
         taskId,
         t,
         t
       );
-      writeEvent(db, { task_id: fid, source: "director", type: "created", payload: { title: "checkpoint flag follow-up", checkpoint_id: eventId } });
+      writeEvent(db, { task_id: fid, source, type: "created", payload: { title: "checkpoint flag follow-up", checkpoint_id: eventId, actor } });
       broadcastTask(db, getTask(db, fid));
       followup_task_id = fid;
     }
@@ -3308,8 +3697,12 @@ function apiCreateDecision(db: DB, body: any): Response {
 
 function listDecisions(db: DB, url: URL): Response {
   const status = url.searchParams.get("status") ?? "open";
-  const rows =
-    status === "all"
+  const projectId = url.searchParams.get("project_id");
+  const rows = projectId
+    ? status === "all"
+      ? db.query("SELECT d.* FROM decisions d JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ? ORDER BY d.ts DESC").all(projectId)
+      : db.query("SELECT d.* FROM decisions d JOIN tasks t ON t.id = d.task_id WHERE d.status = ? AND t.project_id = ? ORDER BY d.ts DESC").all(status, projectId)
+    : status === "all"
       ? db.query("SELECT * FROM decisions ORDER BY ts DESC").all()
       : db.query("SELECT * FROM decisions WHERE status = ? ORDER BY ts DESC").all(status);
   return json(rows.map((r) => withBundle(db, parseDecision(r))));
@@ -3328,7 +3721,7 @@ function saveDraft(db: DB, id: string, body: any): Response {
 // This is identity only — it grants nothing and gates nothing.
 const ANSWER_SOURCES = ["director", "chat_supervisor", "agent", "system", "unknown"] as const;
 
-export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): Response {
+export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, supervisorVerified = false): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
   if (!r) return err("decision not found", 404);
   if (r.status !== "open") return err(`decision already ${r.status}`, 409);
@@ -3345,6 +3738,16 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): 
   if (!ANSWER_SOURCES.includes(answeredBy))
     return err(`source '${answeredBy}' is not one of ${ANSWER_SOURCES.join("|")}`, 400);
   const answeredActor = body?.actor ?? null;
+  if (answeredBy === "chat_supervisor" && !supervisorVerified) {
+    if (!answeredActor || !getThread(db, String(answeredActor)))
+      return err("chat_supervisor decision answers require a valid thread actor", 403);
+    const task = getTask(db, r.task_id);
+    const autonomy = projectAutonomyProfile(db, task?.project_id ?? null);
+    if (autonomy === "conservative") return err("project autonomy is conservative; decision requires the director", 403);
+    if (autonomy === "balanced") return err("balanced autonomy may only use the safe auto-answer endpoint", 403);
+    const verdict = evaluateAutopilotApprove(db, r, answerKey);
+    if (!verdict.allow) return json({ effect: "escalate", category: verdict.category, reason: verdict.reason }, 403);
+  }
 
   const answeredAt = now();
   const answerNote = body?.answer_note ?? r.draft_note ?? null;
@@ -3411,6 +3814,17 @@ export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: an
   const answerKey = body?.answer_key;
   if (!answerKey) return err("answer_key is required");
 
+  const task = getTask(db, r.task_id);
+  if (projectAutonomyProfile(db, task?.project_id ?? null) === "conservative") {
+    writeEvent(db, {
+      task_id: r.task_id,
+      source: "chat_supervisor",
+      type: "auto_approve_declined",
+      payload: { decision_id: id, answer_key: answerKey, category: "autonomy", reason: "project autonomy is conservative; decision requires the director" },
+    });
+    return json({ effect: "escalate", category: "autonomy", reason: "project autonomy is conservative; decision requires the director" }, 403);
+  }
+
   const verdict = evaluateAutoApprove(db, r, answerKey);
   if (!verdict.allow) {
     writeEvent(db, {
@@ -3430,7 +3844,7 @@ export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: an
     type: "auto_approved",
     payload: { decision_id: id, answer_key: answerKey, category: verdict.category, reason: verdict.reason, note: body?.answer_note ?? null },
   });
-  return apiAnswerDecision(db, herdr, id, { ...body, source: "chat_supervisor" });
+  return apiAnswerDecision(db, herdr, id, { ...body, source: "chat_supervisor" }, true);
 }
 
 // Dismiss: clear a card without answering it (human escape hatch for a card with

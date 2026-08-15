@@ -40,6 +40,14 @@ Usage:
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
   hive chat reply <thread-id> "<text>"    (supervisor→director) post a reply on a chat thread
+  hive chat update <thread-id> [--phase <phase>] [--objective <text>] [--criterion <text> ...]
+        [--next <text>] [--waiting <text>] [--wakeup <iso>] [--outcome <text>]
+  hive chat meeting <thread-id> --stage proposal|critique|decided [--meeting <id>]
+        [--topic <text>] [--participants <task-id,...>] [--summary <text>] [--decision <text>]
+  hive chat verify <thread-id> --status started|passed|failed --method <text>
+        [--result <text>] [--tasks <task-id,...>] [--evidence <evidence-id,...>] [--replay-of <id>]
+  hive chat retrospect <thread-id> --summary <text> [--worked <text> ...]
+        [--problem <text> ...] [--lesson <text> ...]
   hive chat close <thread-id>             end a thread's live session (reclaims its worktree/agent)
   hive steer-all "message" [--project <id>]   broadcast a steer to every live agent
   hive tunnel                             expose hive to your phone over Tailscale HTTPS (private; enables push)
@@ -418,6 +426,64 @@ async function main() {
         ...(flags.project ? { project_id: String(flags.project) } : {}),
       });
       console.log(`thread ${r.thread_id}: ${r.delivery}${r.error ? ` (${r.error})` : ""}`);
+      return;
+    }
+    if (sub === "update") {
+      const threadId = _[0];
+      if (!threadId) die("usage: hive chat update <thread-id> [--phase ...]");
+      const criteria = flags.criterion == null ? undefined : ([] as any[]).concat(flags.criterion).map(String);
+      const r = await api("PUT", `/api/chat/threads/${threadId}/run`, {
+        phase: flags.phase,
+        objective: flags.objective,
+        acceptance_criteria: criteria,
+        next_action: flags.next,
+        waiting_on: flags.waiting,
+        wakeup_at: flags.wakeup,
+        outcome: flags.outcome,
+      });
+      console.log(`run ${threadId}: ${r.phase}${r.next_action ? ` → ${r.next_action}` : ""}`);
+      return;
+    }
+    if (sub === "meeting") {
+      const threadId = _[0];
+      if (!threadId || !flags.stage) die("usage: hive chat meeting <thread-id> --stage proposal|critique|decided ...");
+      const participants = flags.participants ? String(flags.participants).split(",").filter(Boolean) : undefined;
+      const r = await api("POST", `/api/chat/threads/${threadId}/meetings`, {
+        meeting_id: flags.meeting,
+        stage: flags.stage,
+        topic: flags.topic,
+        participants,
+        summary: flags.summary,
+        decision: flags.decision,
+      });
+      console.log(`meeting ${r.meeting_id}: ${r.stage} (${r.delivered}/${r.participants.length} notified)`);
+      return;
+    }
+    if (sub === "verify") {
+      const threadId = _[0];
+      if (!threadId || !flags.status || !flags.method) die("usage: hive chat verify <thread-id> --status started|passed|failed --method <text> ...");
+      const r = await api("POST", `/api/chat/threads/${threadId}/verifications`, {
+        status: flags.status,
+        method: flags.method,
+        result: flags.result,
+        target_task_ids: flags.tasks ? String(flags.tasks).split(",").filter(Boolean) : undefined,
+        evidence_ids: flags.evidence ? String(flags.evidence).split(",").filter(Boolean) : undefined,
+        replay_of: flags["replay-of"],
+      });
+      console.log(`verification ${r.verification_id}: ${r.status}`);
+      return;
+    }
+    if (sub === "retrospect") {
+      const threadId = _[0];
+      if (!threadId || !flags.summary) die("usage: hive chat retrospect <thread-id> --summary <text> ...");
+      const many = (value: any) => value == null ? [] : ([] as any[]).concat(value).map(String);
+      const r = await api("POST", `/api/chat/threads/${threadId}/retrospectives`, {
+        summary: flags.summary,
+        worked: many(flags.worked),
+        problems: many(flags.problem),
+        lessons: many(flags.lesson),
+      });
+      console.log(`retrospective ${r.retrospective_id} recorded`);
       return;
     }
     // `hive chat close <thread-id>` — end the thread's live session so its

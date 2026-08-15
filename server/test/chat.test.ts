@@ -12,7 +12,7 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-chat-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb } = await import("../src/db.ts");
-const { makeHandler, notifyManagerOfEvent } = await import("../src/api.ts");
+const { makeHandler, notifyManagerOfEvent, sweepManagerInboxes } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { composeSupervisorBrief, createThread, managingThreadForTask } = await import("../src/chat.ts");
 const { composeBrief } = await import("../src/briefs.ts");
@@ -133,6 +133,7 @@ test("descendant worker events wake the manager once with a batched update", asy
   try {
     writeEvent(db, { task_id: worker.id, source: "agent", type: "blocked", payload: { note: "need the session contract" } });
     writeEvent(db, { task_id: followup.id, source: "system", type: "smoke_failed", payload: { note: "expired session still accepted" } });
+    writeEvent(db, { task_id: worker.id, source: "agent", type: "checkpoint", payload: { note: "kept the existing cookie format" } });
     await new Promise((r) => setTimeout(r, 20));
   } finally {
     setEventHook(null);
@@ -142,7 +143,43 @@ test("descendant worker events wake the manager once with a batched update", asy
   expect(sends.at(-1)).toContain("[hive manager wakeup]");
   expect(sends.at(-1)).toContain("implement login");
   expect(sends.at(-1)).toContain("verify login edge cases");
+  expect(sends.at(-1)).toContain("checkpoint");
   expect(sends.at(-1)).toContain("Act on anything you can resolve");
+});
+
+test("project inbox events fall back to the active manager when that project has no manager", async () => {
+  const otherProject = (await post("/api/projects", {
+    name: "other project",
+    repo_path: WT,
+  })).json;
+  const unrelated = (await post("/api/tasks", {
+    project_id: otherProject.id,
+    title: "older project work",
+  })).json;
+  const before = sends.length;
+  const checkpoint = writeEvent(db, {
+    task_id: unrelated.id,
+    source: "agent",
+    type: "checkpoint",
+    payload: { note: "used the established cache key" },
+  });
+  notifyManagerOfEvent(db, herdr, {}, checkpoint);
+  await new Promise((r) => setTimeout(r, 20));
+
+  expect(sends.length).toBe(before + 1);
+  expect(sends.at(-1)).toContain("older project work");
+  expect(sends.at(-1)).toContain(`/api/checkpoints?project_id=${otherProject.id}`);
+});
+
+test("startup inbox sweep wakes one active manager per project with actionable counts", async () => {
+  const before = sends.length;
+  const notified = await sweepManagerInboxes(db, herdr, {});
+  expect(notified).toBe(1);
+  expect(sends.length).toBe(before + 1);
+  expect(sends.at(-1)).toContain("Project inbox sweep:");
+  expect(sends.at(-1)).toContain("across 2 projects");
+  expect(sends.at(-1)).toContain("checkpoints");
+  expect(sends.at(-1)).toContain(`\"source\":\"chat_supervisor\"`);
 });
 
 test("a concurrent double-send on the same thread spawns only once", async () => {
@@ -283,4 +320,6 @@ test("composeSupervisorBrief bakes in the thread id, reply verb, and hard limits
   expect(brief).toContain("automatic manager loop");
   expect(brief).toContain("bounded meeting");
   expect(brief).toContain("independently check the integrated result");
+  expect(brief).toContain("Acknowledge a safe checkpoint");
+  expect(brief).toContain("whole current-project inbox");
 });

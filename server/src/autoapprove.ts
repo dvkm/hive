@@ -39,37 +39,27 @@ function hasDecisionEvent(db: DB, type: string, decisionId: string): boolean {
   );
 }
 
-// `d` is a raw decisions row (options is a JSON string) OR a parsed decision
-// (options is an array) — handle both so callers don't have to normalize.
-export function evaluateAutoApprove(db: DB, d: any, answerKey: string): AutoApproveVerdict {
+function safetyBar(db: DB, d: any, answerKey: string): AutoApproveVerdict | null {
   const options: any[] = Array.isArray(d.options) ? d.options : JSON.parse(d.options || "[]");
   const chosen = options.find((o) => o.key === answerKey);
   const no = (category: string, reason: string): AutoApproveVerdict => ({ allow: false, category, reason });
-
-  // Hard structural exclusion: a card gating a dangerous shell-command grant
-  // (rm, force-push, sudo, kill, SQL, …). Never auto-approvable, by category —
-  // this is the side door the standing-authority gate exists to close.
   if (db.query("SELECT 1 FROM authority_grants WHERE decision_id = ? AND status = 'pending'").get(d.id))
     return no("authority", "gates a standing-authority command grant — always the director's call");
-
-  // Only the raiser's own recommendation may be auto-selected. Doubles as the
-  // confidence gate (dedup recommends `merge` only above its similarity bar).
   if (!chosen?.recommended) return no("*", "only the raiser's recommended option can be auto-approved");
-
-  // Never override a card the raiser rated above 'normal'. risk is free-text, so
-  // treat anything that isn't explicitly low/normal as excluded (authority cards
-  // are always 'high', so this is a second, category-independent backstop).
-  // No leading `risk &&`: an absent/blank rating is NOT "low or normal", so it
-  // must also escalate. (All three allow-list raisers set risk="normal", so this
-  // is behaviour-preserving today; it closes the gap for any future category
-  // that forgets to rate itself.)
   const risk = String(d.risk ?? "").toLowerCase();
   if (risk !== "low" && risk !== "normal") return no("*", `risk '${d.risk ?? "(none)"}' is above the auto-approve bar`);
-
-  // Prod / shared-infra blast radius always escalates, whatever the category.
   const blast = String(d.blast_radius ?? "");
   if (PROD_RE.test(blast) || SHARED_RE.test(blast))
     return no("*", "prod/shared blast radius — always the director's call");
+  return null;
+}
+
+// `d` is a raw decisions row (options is a JSON string) OR a parsed decision
+// (options is an array) — handle both so callers don't have to normalize.
+export function evaluateAutoApprove(db: DB, d: any, answerKey: string): AutoApproveVerdict {
+  const no = (category: string, reason: string): AutoApproveVerdict => ({ allow: false, category, reason });
+  const blocked = safetyBar(db, d, answerKey);
+  if (blocked) return blocked;
 
   // ---- the closed allow-list ------------------------------------------------
   // Reference capture: worst case is a stale, trivially-editable reference.
@@ -89,4 +79,14 @@ export function evaluateAutoApprove(db: DB, d: any, answerKey: string): AutoAppr
   // precedent-based path (auto-approve any category the director answered the
   // same way before) — add that here if these three prove too narrow.
   return no("*", "not an auto-approvable category — routing to the director");
+}
+
+// Autopilot may resolve an uncategorized technical decision, but it still must
+// clear the same structural risk bar as the closed balanced allow-list.
+export function evaluateAutopilotApprove(db: DB, d: any, answerKey: string): AutoApproveVerdict {
+  return safetyBar(db, d, answerKey) ?? {
+    allow: true,
+    category: "autopilot_reasoned",
+    reason: "recommended low/normal-risk choice with no authority or production blast radius",
+  };
 }

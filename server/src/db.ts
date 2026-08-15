@@ -404,6 +404,22 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v20-task-deferred-until",
     statements: [`ALTER TABLE tasks ADD COLUMN deferred_until TEXT`],
   },
+  // A director-chat thread is one top-level supervisor run. Keep its current
+  // objective and control-loop cursor on the thread; meetings, verification
+  // attempts, and retrospectives stay append-only task events.
+  {
+    name: "v21-supervisor-run-ledger",
+    statements: [
+      `ALTER TABLE chat_threads ADD COLUMN objective TEXT`,
+      `ALTER TABLE chat_threads ADD COLUMN acceptance_criteria TEXT NOT NULL DEFAULT '[]'`,
+      `ALTER TABLE chat_threads ADD COLUMN phase TEXT NOT NULL DEFAULT 'intake'`,
+      `ALTER TABLE chat_threads ADD COLUMN next_action TEXT`,
+      `ALTER TABLE chat_threads ADD COLUMN waiting_on TEXT`,
+      `ALTER TABLE chat_threads ADD COLUMN wakeup_at TEXT`,
+      `ALTER TABLE chat_threads ADD COLUMN outcome TEXT`,
+      `ALTER TABLE chat_threads ADD COLUMN completed_at TEXT`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings
