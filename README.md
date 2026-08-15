@@ -51,6 +51,7 @@ and brief composition.
 
 ```bash
 bin/hive task create --project <id> --title "..." [--brief file.md] [--kind ship|scout|chore]
+bin/hive task send <task-id> "..."    # attributed peer message when run by an agent
 bin/hive task list [--state <s>] [--project <id>]
 bin/hive emit <task-id> status --note "..."
 bin/hive emit <task-id> evidence --file ./shot.png --note "caption"
@@ -127,7 +128,8 @@ server/test/ bun test suite
 - **Dispatcher** (`server/src/dispatcher.ts`, 30s; `HIVE_DISPATCH_MS`) makes hive
   self-driving: it picks up `queued` tasks and spawns agents so work created in
   the web UI actually runs instead of sitting in Queued. Opt-in per project
-  (`config.auto_dispatch`, default off); honors `dispatch_kinds`
+  (`config.auto_dispatch`, default off), except tasks explicitly delegated by an
+  active chat manager; honors `dispatch_kinds`
   (default `["ship","scout"]`), `max_agents` (default 3, concurrency cap),
   skips unreviewed `intake_gchat` tasks, runs the `task.dispatch` authority gate,
   holds tasks with unmet `depends_on` (a listed task not yet merged/done, with a
@@ -200,6 +202,15 @@ server/test/ bun test suite
   /api/chat/threads/:id/reply`. `POST /api/chat/threads/:id/close` cancels the
   backing task so the terminal-hook cleanup reclaims its worktree/session; a
   later message to the same thread spawns a fresh session. See `docs/API.md`.
+- **Automatic manager loop.** Tasks created by the supervisor are linked to its
+  backing task, and nested follow-ups preserve that ancestry. Meaningful worker
+  events (blockers, decisions, peer messages, review handoffs, failures,
+  verification, and completion) are batched and pushed into the supervisor's
+  live session, which re-plans and acts without another director turn. Workers
+  use `hive task send <task-id> "..."` for attributed, durable peer messages.
+  The manager brief includes a bounded proposal → critique → synthesis meeting
+  protocol and requires independent integrated verification before it reports
+  the top-level ask complete.
 - **Supervisor auto-approve** (`server/src/autoapprove.ts`, task #364). The
   supervisor may clear a narrow set of safe decision cards itself instead of
   always waiting on the director, via `hive decision auto-answer <id> --key <opt>`

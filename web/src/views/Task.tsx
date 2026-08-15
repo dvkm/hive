@@ -376,7 +376,7 @@ export function TaskBody({ id }: { id: string }) {
     <div className="task">
       <div className="task-main">
         <div className="crumbs">
-          <Link to="/">← Board</Link>
+          <Link to="/work">← Work</Link>
           {parent && (
             <>
               {" · "}

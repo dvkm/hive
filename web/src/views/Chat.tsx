@@ -51,13 +51,14 @@ export function Bubble({ m }: { m: ChatMessage }) {
   );
 }
 
-export default function Chat() {
+export default function Chat({ embedded = false }: { embedded?: boolean }) {
   const { projects, chatThreadId, chatMessages, openChatThread } = useStore();
-  const [open, setOpen] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [project, setProject] = useState<string>(() => localStorage.getItem(LS_PROJECT) || "");
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const open = embedded || drawerOpen;
 
   // Default the project once projects load; keep the last-used one across reloads.
   useEffect(() => {
@@ -112,14 +113,21 @@ export default function Chat() {
 
   if (!open)
     return (
-      <button className="chat-fab" title="Chat with the hive supervisor" onClick={() => setOpen(true)}>
+      <button className="chat-fab" title="Message your Hive manager" aria-label="Message your Hive manager" onClick={() => setDrawerOpen(true)}>
         <FontAwesomeIcon icon={faComment} />
       </button>
     );
 
-  return (
-    <div className="chat-panel">
-      <header className="chat-head">
+  const conversation = (
+    <div className={embedded ? "manager-chat" : "chat-panel"}>
+      <header className={embedded ? "manager-head" : "chat-head"}>
+        {embedded && (
+          <div className="manager-heading">
+            <div className="manager-eyebrow">Your Hive manager</div>
+            <h1>What should the team accomplish?</h1>
+            <p>Set the outcome. Your manager plans the work, delegates it, keeps agents moving, and brings back the decisions that need you.</p>
+          </div>
+        )}
         <select className="chat-proj" value={project} onChange={(e) => setProject(e.target.value)}>
           {projects.map((p) => (
             <option key={p.id} value={p.id}>
@@ -132,21 +140,37 @@ export default function Chat() {
             ✎
           </button>
           {chatThreadId && (
-            <button className="chat-iconbtn" title="End this supervisor session" onClick={closeThread}>
+            <button className="chat-iconbtn" title="End this manager session" onClick={closeThread}>
               ⏹
             </button>
           )}
-          <button className="chat-iconbtn" title="Close panel" onClick={() => setOpen(false)}>
-            ✕
-          </button>
+          {!embedded && (
+            <button className="chat-iconbtn" title="Close panel" onClick={() => setDrawerOpen(false)}>
+              ✕
+            </button>
+          )}
         </div>
       </header>
       <div className="chat-scroll" ref={scrollRef}>
         {chatMessages.length === 0 && (
-          <div className="chat-empty muted">
-            {project
-              ? "Ask the supervisor to spin up work, check status, or answer a decision. It coordinates the fleet for you."
-              : "Add a project first — the supervisor session runs in a project's repo."}
+          <div className={embedded ? "manager-empty" : "chat-empty muted"}>
+            {project ? (
+              embedded ? (
+                <>
+                  <div className="manager-empty-title">Start with the result you want.</div>
+                  <div className="manager-empty-copy">You can be broad. The manager will turn it into tasks and coordinate the team.</div>
+                  <div className="manager-prompts">
+                    {["Plan and build the next release", "Check the team and unblock anything stuck", "Summarize progress and tell me what needs my input"].map((prompt) => (
+                      <button key={prompt} onClick={() => setText(prompt)}>{prompt}</button>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                "Ask the manager to start work, check progress, or resolve a blocker."
+              )
+            ) : (
+              "Add a project first. The manager works inside a project's repository."
+            )}
           </div>
         )}
         {chatMessages.map((m) => (
@@ -156,7 +180,7 @@ export default function Chat() {
       </div>
       <div className="chat-compose">
         <textarea
-          placeholder="Message the supervisor…"
+          placeholder="Tell your manager what outcome you want…"
           value={text}
           disabled={!project}
           onChange={(e) => setText(e.target.value)}
@@ -173,4 +197,6 @@ export default function Chat() {
       </div>
     </div>
   );
+
+  return embedded ? <div className="manager-page">{conversation}</div> : conversation;
 }

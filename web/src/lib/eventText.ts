@@ -61,6 +61,8 @@ export function eventText(e: EventLike): string {
       // Pre-receipt events (no `delivery`) stay bare rather than claim delivery.
       const badges: Record<string, string> = { delivered: "✓ ", queued: "⏳ queued — ", failed: "⚠ undelivered — " };
       const badge = badges[s(p.delivery)] ?? "";
+      if (p.from_task_id)
+        return `${badge}teammate #${s(p.from_task_number) || "?"}: “${s(p.original_message) || s(p.message)}”`;
       return `${badge}steered: “${s(p.message)}”`;
     }
     case "answer":

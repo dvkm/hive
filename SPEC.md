@@ -15,6 +15,7 @@ Decisions locked 2026-07-08: new system using herdr as agent runtime (D1), SQLit
 7. Action-only surfaces: resolved decisions auto-archive; the inbox only shows what needs David.
 8. Future-proofness over shortcuts. Root-cause fixes, clean seams, boring durable tech. Never skip or shrink work because it "would take too long" — effort cost is not a valid argument in this project, and time estimates are never given. Push through.
 9. Versions ship continuously without waiting for a go-ahead. Each version ends with evidence (green tests, screenshots, a working demo recorded as evidence rows in hive itself), then work proceeds directly to the next version. David is interrupted only by genuine decision cards.
+10. Top-level asks are loops, not queues. The director talks to one manager; work delegated by that manager and every nested follow-up routes meaningful events back to it until the integrated outcome is independently verified. Workers coordinate directly through durable, attributed messages; consequential disagreements use a bounded propose/critique/synthesize meeting rather than serial director mediation.
 
 ## Architecture
 

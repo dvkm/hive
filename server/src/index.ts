@@ -1,6 +1,6 @@
 // hive daemon entrypoint. Bun.serve on 127.0.0.1:4700 (override HIVE_PORT).
 import { openDb, defaultDbPath } from "./db.ts";
-import { makeHandler } from "./api.ts";
+import { makeHandler, notifyManagerOfEvent } from "./api.ts";
 import { startReconciler } from "./reconciler.ts";
 import { startDispatcher } from "./dispatcher.ts";
 import { startReaper } from "./reaper.ts";
@@ -10,7 +10,7 @@ import { startGchatPoll } from "./intake/gchat.ts";
 import { startWatchers } from "./watch.ts";
 import { startAutoReviewer } from "./reviewer.ts";
 import { startPromoter } from "./promoter.ts";
-import { setTerminalHook, expireOrphanedDecisions } from "./state.ts";
+import { setEventHook, setTerminalHook, expireOrphanedDecisions } from "./state.ts";
 import { bootstrapAuthority } from "./authority.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { herdr as defaultHerdr } from "./runtime/herdr.ts";
@@ -68,6 +68,9 @@ setInterval(() => {
 setTerminalHook((db, taskId) => {
   cleanupTask(db, defaultHerdr, taskId).catch((e) => console.error("[hive] auto-cleanup:", e));
 });
+// Close the autonomous management loop: meaningful descendant events wake the
+// chat supervisor that delegated the work, including after nested follow-ups.
+setEventHook((db, event) => notifyManagerOfEvent(db, defaultHerdr, { supervise: true }, event));
 const reapMs = Number(process.env.HIVE_REAP_MS || 300_000);
 startReaper(db, { intervalMs: reapMs });
 

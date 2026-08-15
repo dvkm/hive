@@ -12,6 +12,7 @@ import type { DB } from "../src/db.ts";
 const { dispatchOnce, isReviewed, inBackoff } = await import("../src/dispatcher.ts");
 const { writeEvent, getTask } = await import("../src/state.ts");
 const { queuedSteers } = await import("../src/steer.ts");
+const { createThread } = await import("../src/chat.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -56,12 +57,12 @@ function freshDb(config: any = {}): { db: DB; projectId: string } {
     .run(projectId, "p", "/repo", JSON.stringify(config), now());
   return { db, projectId };
 }
-function makeTask(db: DB, projectId: string, extra: Partial<{ kind: string; source: string; state: string; agent_target: string; depends_on: string[] }> = {}): string {
+function makeTask(db: DB, projectId: string, extra: Partial<{ kind: string; source: string; state: string; agent_target: string; depends_on: string[]; parent_task_id: string }> = {}): string {
   const id = newId();
   const t = now();
   db.query(
-    "INSERT INTO tasks (id, project_id, title, state, kind, source, agent_target, depends_on, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
-  ).run(id, projectId, "t", extra.state ?? "queued", extra.kind ?? "ship", extra.source ?? null, extra.agent_target ?? null, extra.depends_on ? JSON.stringify(extra.depends_on) : null, t, t);
+    "INSERT INTO tasks (id, project_id, title, state, kind, source, agent_target, depends_on, parent_task_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+  ).run(id, projectId, "t", extra.state ?? "queued", extra.kind ?? "ship", extra.source ?? null, extra.agent_target ?? null, extra.depends_on ? JSON.stringify(extra.depends_on) : null, extra.parent_task_id ?? null, t, t);
   return id;
 }
 
@@ -81,6 +82,28 @@ test("auto_dispatch off: queued tasks are NOT spawned", async () => {
   await dispatchOnce(db, { herdr });
   expect(spawns.length).toBe(0);
   expect(getTask(db, id).state).toBe("queued");
+});
+
+test("an active chat manager's delegated task dispatches even when project auto_dispatch is off", async () => {
+  const { db, projectId } = freshDb({ max_agents: 1 });
+  const managerId = makeTask(db, projectId, { source: "chat_supervisor", state: "in_progress", agent_target: "manager" });
+  createThread(db, { project_id: projectId, task_id: managerId, title: "ship login" });
+  const workerId = makeTask(db, projectId, { source: "agent", parent_task_id: managerId });
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr });
+
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, workerId).state).toBe("in_progress");
+
+  const closed = freshDb({});
+  const closedManager = makeTask(closed.db, closed.projectId, { source: "chat_supervisor", state: "cancelled" });
+  createThread(closed.db, { project_id: closed.projectId, task_id: closedManager, title: "closed" });
+  const parked = makeTask(closed.db, closed.projectId, { source: "agent", parent_task_id: closedManager });
+  const closedHerdr = stubHerdr();
+  await dispatchOnce(closed.db, { herdr: closedHerdr.herdr });
+  expect(closedHerdr.spawns.length).toBe(0);
+  expect(getTask(closed.db, parked).state).toBe("queued");
 });
 
 test("auto_dispatch on: a queued ship task is spawned and moves to in_progress", async () => {

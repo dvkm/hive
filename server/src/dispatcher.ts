@@ -2,8 +2,9 @@
 // every 30s, HIVE_DISPATCH_MS) that picks up `queued` tasks and spawns a herdr
 // agent for each, subject to opt-in project policy and safety gates:
 //
-//   - per-project config `auto_dispatch: true` is REQUIRED (default off, so
-//     intake drafts and setup tasks never auto-spawn).
+//   - per-project config `auto_dispatch: true` is required for ordinary queued
+//     work (default off, so intake drafts/setup tasks never auto-spawn). Tasks
+//     explicitly delegated by an active chat manager bypass this one toggle.
 //   - `dispatch_kinds` (default ["ship","scout"]) — chore tasks (usually titled
 //     for a human) are excluded by default.
 //   - source='intake_*' tasks (gchat messages, director braindumps) are skipped
@@ -27,13 +28,14 @@ import { Herdr, herdr as defaultHerdr, isHerdrUnreachable } from "./runtime/herd
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
 import { unmetDeps, noteDependencyBlock } from "./state.ts";
+import { managingThreadForTask } from "./chat.ts";
 import type { Exec } from "./exec.ts";
 
 // Chores included since 2026-07-12: the queue sat at 10 tasks / 1 live agent
 // because 9 were agent-filed follow-up FIXES tagged chore — "chores are titled
 // for a human" stopped being true once agents started fanning out work. The
-// guards that matter stay: auto_dispatch opt-in, intake review, max_agents,
-// authority. Exclude chores per project via config.dispatch_kinds if needed.
+// guards that matter stay: manager delegation/auto_dispatch, intake review,
+// max_agents, authority. Exclude chores per project via config.dispatch_kinds.
 const DISPATCH_KINDS_DEFAULT = ["ship", "scout", "chore"];
 const MAX_AGENTS_DEFAULT = 3;
 const BACKOFF_BASE_MS = 30_000;
@@ -112,7 +114,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   const countFor = (cache: Map<string, number>, states: string, pid: string) => {
     if (!cache.has(pid)) {
       const row: any = db
-        .query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND agent_target IS NOT NULL AND state IN ${states}`)
+        .query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND agent_target IS NOT NULL AND COALESCE(source, '') != 'chat_supervisor' AND state IN ${states}`)
         .get(pid);
       cache.set(pid, row.n as number);
     }
@@ -139,7 +141,13 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         const proj = getProject(task.project_id);
         if (!proj?.repo_path) continue; // no repo -> can't spawn
         const cfg = proj.config ?? {};
-        if (cfg.auto_dispatch !== true) continue; // opt-in only
+        // A manager-created task is an explicit delegation from the director's
+        // live supervisor, not unreviewed ambient intake. It dispatches even
+        // when the project's generic queue auto-dispatch toggle is off.
+        const managed = managingThreadForTask(db, task.id);
+        const manager = managed?.task_id ? db.query("SELECT state FROM tasks WHERE id = ?").get(managed.task_id) as { state: string } | undefined : null;
+        const managerDelegated = !!manager && !["done", "failed", "cancelled"].includes(manager.state);
+        if (cfg.auto_dispatch !== true && !managerDelegated) continue;
 
         const kinds = Array.isArray(cfg.dispatch_kinds) ? cfg.dispatch_kinds : DISPATCH_KINDS_DEFAULT;
         // A requeue is recovery for work already dispatched once (auto-requeue on

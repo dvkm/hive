@@ -63,6 +63,7 @@ import {
   appendMessage,
   setThreadTask,
   composeSupervisorBrief,
+  managingThreadForTask,
   type ChatThread,
 } from "./chat.ts";
 
@@ -649,6 +650,101 @@ async function deliverToSupervisor(
   });
   if (!r.ok) return { delivery: "failed", error: r.error };
   return { delivery: "spawned", agent_target: r.agent_target };
+}
+
+// Meaningful worker events wake the manager session that delegated the task.
+// One microtask folds synchronous multi-event transitions (needs-decision +
+// state_change, ready_for_review + state_change) into one steer instead of
+// making the manager react twice to one fact.
+const MANAGER_EVENT_TYPES = new Set([
+  "needs-decision",
+  "blocked",
+  "blocked_card",
+  "dependency_blocked",
+  "ready_for_review",
+  "ready_held",
+  "answer",
+  "auto_review",
+  "auto_review_error",
+  "changes_requested",
+  "ci_failure",
+  "pr_closed",
+  "pr_conflict",
+  "pr_merged",
+  "merge_failed",
+  "auto_merged",
+  "smoke_failed",
+  "smoke_passed",
+  "verify_wedged",
+  "spawn_error",
+  "planner_error",
+  "stale",
+  "recovery",
+  "requeued",
+  "usage_limit",
+]);
+
+type ManagerPending = {
+  db: DB;
+  herdr: Herdr;
+  deps: HandlerDeps;
+  events: any[];
+};
+const pendingManagerUpdates = new Map<string, ManagerPending>();
+
+function managerEventRelevant(event: any): boolean {
+  if (event.type === "state_change")
+    return ["needs_decision", "in_review", "verifying", "done", "failed", "cancelled"].includes(event.payload?.to);
+  // Peer-to-peer messages are copied to the manager. Messages sent BY the
+  // manager are excluded later so its own coordination does not echo back.
+  if (event.type === "steer") return !!event.payload?.from_task_id;
+  return MANAGER_EVENT_TYPES.has(event.type);
+}
+
+function managerEventLine(db: DB, event: any): string {
+  const task = getTask(db, event.task_id);
+  const p = event.payload ?? {};
+  const detail = p.note ?? p.title ?? p.error ?? p.reason ?? p.original_message ?? p.message ?? p.decision ?? p.to ?? p.ci_status ?? "";
+  const suffix = detail ? ` — ${String(detail).replace(/\s+/g, " ").slice(0, 180)}` : "";
+  return `- #${task?.number ?? "?"} ${task?.title ?? event.task_id} [${task?.state ?? "unknown"}]: ${event.type}${suffix}`;
+}
+
+async function flushManagerUpdate(threadId: string): Promise<void> {
+  const pending = pendingManagerUpdates.get(threadId);
+  if (!pending) return;
+  pendingManagerUpdates.delete(threadId);
+  const current = getThread(pending.db, threadId);
+  if (!current?.task_id) return;
+  const manager = getTask(pending.db, current.task_id);
+  if (!manager || TERMINAL.includes(manager.state as State)) return; // explicitly closed thread
+  const lines = pending.events.slice(-20).map((event) => managerEventLine(pending.db, event));
+  const message = [
+    `[hive manager wakeup]`,
+    `Worker state changed under the top-level ask you own:`,
+    ...lines,
+    ``,
+    `Inspect the affected tasks and current team state now. Act on anything you can resolve: coordinate peers, answer a reversible technical decision, revise or add work, or verify completion. Escalate to the director only at the decision boundary in your manager brief.`,
+  ].join("\n");
+  await withThreadLock(threadId, () => deliverToSupervisor(pending.db, pending.herdr, pending.deps, threadId, message));
+}
+
+export function notifyManagerOfEvent(db: DB, herdr: Herdr, deps: HandlerDeps, event: any): void {
+  if (!managerEventRelevant(event)) return;
+  const origin = getTask(db, event.task_id);
+  if (!origin || origin.source === "chat_supervisor") return;
+  const thread = managingThreadForTask(db, event.task_id);
+  if (!thread?.task_id) return;
+  if (event.type === "steer" && event.payload?.from_task_id === thread.task_id) return;
+
+  const existing = pendingManagerUpdates.get(thread.id);
+  if (existing) {
+    existing.events.push(event);
+    return;
+  }
+  queueMicrotask(() => {
+    flushManagerUpdate(thread.id).catch((e) => console.error(`[hive] manager wakeup ${thread.id}:`, e));
+  });
+  pendingManagerUpdates.set(thread.id, { db, herdr, deps, events: [event] });
 }
 
 // The supervisor session posts its reply to the director here (via
@@ -1906,10 +2002,16 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
   const { fields, files } = await bodyWithFiles(req);
   const text = String(fields?.message ?? "");
   if (!text) return err("message is required");
+  const fromTaskId = fields?.from_task_id ? String(fields.from_task_id) : null;
+  const sender = fromTaskId ? getTask(db, fromTaskId) : null;
+  if (fromTaskId && !sender) return err("unknown from_task_id", 400);
+  if (sender && sender.project_id !== task.project_id) return err("teammates must belong to the same project", 400);
   const blocked = authzBlock(db, { project_id: task.project_id, action: "task.steer", target: task.title, task_id: id });
   if (blocked) return blocked;
   const { paths, block } = await attachFiles(id, files);
-  const message = text + block;
+  const message = sender
+    ? `[teammate #${sender.number} ${sender.title} | task ${sender.id}]\n${text}\n\nReply with: "$HIVE_CLI" task send ${sender.id} "<your reply>"${block}`
+    : text + block;
   const target = task.agent_target;
 
   let error: string | null = target ? null : "task has no agent_target (not spawned)";
@@ -1926,9 +2028,16 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
   const delivery: Delivery = delivered ? "delivered" : TERMINAL.includes(task.state as State) ? "failed" : "queued";
   writeEvent(db, {
     task_id: id,
-    source: "director",
+    source: sender ? "agent" : "director",
     type: "steer",
-    payload: { message, target, attachments: paths, delivery, ...(delivered ? { delivered_at: now() } : { error }) },
+    payload: {
+      message,
+      target,
+      attachments: paths,
+      delivery,
+      ...(sender ? { from_task_id: sender.id, from_task_number: sender.number, original_message: text } : {}),
+      ...(delivered ? { delivered_at: now() } : { error }),
+    },
   });
   return json({ ok: delivered, delivered, delivery, message, attachments: paths, ...(error ? { error } : {}) });
 }

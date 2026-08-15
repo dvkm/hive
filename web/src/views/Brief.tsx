@@ -82,9 +82,9 @@ export default function Brief() {
     <div className="brief">
       <header className="brief-top">
         <div>
-          <h1 className="brief-title">Morning brief</h1>
+          <h1 className="brief-title">Inbox</h1>
           <div className="brief-since muted">
-            Since {since ? relTime(since) : "the beginning"}
+            What needs you, plus changes since {since ? relTime(since) : "the beginning"}
           </div>
         </div>
         <label className="brief-picker">

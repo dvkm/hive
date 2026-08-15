@@ -199,7 +199,7 @@ function BriefBanner() {
     setDismissed(sig);
   };
   return (
-    <Link to="/brief" className="brief-banner">
+    <Link to="/inbox" className="brief-banner">
       <span className="brief-banner-dot">◆</span>
       <span className="brief-banner-text">Your brief: {parts.join(", ")}</span>
       <span className="brief-banner-go">Open →</span>

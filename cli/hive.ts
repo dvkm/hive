@@ -13,6 +13,7 @@ Usage:
         [--kind ship|scout|chore] [--parent <task-id>] [--depends-on <id,id>] [--track]
         (under a hive agent, HIVE_TASK_ID makes source=agent + parent automatic;
          --track = tracking-only: never auto-dispatched, moves freely, no evidence gate)
+  hive task send <task-id> <message>   attributed teammate message under a hive agent
   hive task move <task-id> <state> [--note <s>]   states: queued in_progress needs_decision
         in_review verifying done failed cancelled
   hive task list [--state <s>] [--project <id>]
@@ -127,7 +128,7 @@ async function main() {
 
   if (cmd === "task") {
     const sub = argv[1];
-    const { flags } = parseFlags(argv.slice(2));
+    const { _, flags } = parseFlags(argv.slice(2));
     if (sub === "create") {
       if (!flags.project) die("--project is required");
       if (!flags.title) die("--title is required");
@@ -153,8 +154,18 @@ async function main() {
       console.log(`created task ${t.id}  [${t.state}]  ${t.title}`);
       return;
     }
+    if (sub === "send") {
+      const taskId = _[0];
+      const text = _.slice(1).join(" ").trim() || (flags.text ? String(flags.text) : "");
+      if (!taskId || !text) die('usage: hive task send <task-id> "<message>"');
+      const r = await api("POST", `/api/tasks/${taskId}/send`, {
+        message: text,
+        from_task_id: process.env.HIVE_TASK_ID || undefined,
+      });
+      console.log(`message to ${taskId}: ${r.delivery}`);
+      return;
+    }
     if (sub === "move") {
-      const { _ } = parseFlags(argv.slice(2));
       const [taskId, to] = _;
       if (!taskId || !to) die("usage: hive task move <task-id> <state> [--note <s>]");
       const t = await api("POST", `/api/tasks/${taskId}/transition`, { to, reason: flags.note });

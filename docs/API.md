@@ -512,8 +512,9 @@ chat endpoints below.
   When `to` is `verifying`, the project's post-deploy smoke list (`config.smoke`) runs once before the response returns. A smoke failure bounces the task back to `in_progress`, so the returned Task may be `in_progress`, not `verifying`.
 - `POST /api/tasks/:id/spawn` body `{hive_url?}` → `200 {"ok":true, "task": Task, "agent_target":"..."}` | `400` (project has no `repo_path`) | `404` | `502` (herdr spawn failed; a `spawn_error` event is recorded)
   Creates the herdr worktree (`hive/<task-id>`), starts the agent with `HIVE_TASK_ID`/`HIVE_URL` + the project's resolved secrets in env and the composed brief, sets `agent_target`/`worktree_path`/`branch`, transitions `queued → in_progress`, and writes a `spawned` event.
-- `POST /api/tasks/:id/send` body `{message (required)}` (or multipart: `message` + `files`) → `200 {"ok", "delivered", "delivery", "message", "attachments":[abs paths], "error"?}` | `404` | `400` (empty message)
+- `POST /api/tasks/:id/send` body `{message (required), from_task_id?}` (or multipart: `message` + `files` + `from_task_id?`) → `200 {"ok", "delivered", "delivery", "message", "attachments":[abs paths], "error"?}` | `404` | `400` (empty message, unknown sender, or cross-project teammate)
   Dispatches the message to the task's live agent via `herdr agent send`, and always records one `steer` event (`payload: {message, target, attachments, delivery, ...}`) carrying a **delivery receipt**. Attached files are saved and their absolute paths appended to the delivered message under an `## Attachments` heading; because the paths live in the stored `message`, they ride along when a queued steer is redelivered. `delivery` is one of:
+  When `from_task_id` is present (the CLI supplies `$HIVE_TASK_ID` for `hive task send`), the sender must exist in the same project. The delivered text names the teammate task and includes an exact reply command; the event is attributed to `source:"agent"` with `from_task_id`, `from_task_number`, and the unwrapped `original_message` for UI display. Peer messages under a managed chat ancestry also wake the owning supervisor, except for messages the supervisor itself sent.
   - `delivered` — herdr accepted it **and** the agent's pane took the submitting Enter (payload also gets `delivered_at`). Two silent drops count as failures, not deliveries: a send that exits 0 with an `{"error":{"code":"agent_not_found"}}` body, and a pane-less agent, whose composer would hold the text unsubmitted.
   - `queued` — no `agent_target`, or herdr refused it twice (one automatic retry). The steer is **not dropped**; it is redelivered by whichever of these comes first, and the event's payload then flips to `delivered` with a `delivered_via` recording how:
     - `delivered_via:"drain"` — the reconciler, on any cycle, finds a queued steer on a task whose agent still probes **alive** and re-sends it. This covers the common case of a herdr socket blip while the agent is alive and working: no respawn is coming, so waiting for one would strand the message until the task ended. Delivery is re-attempted every cycle until it lands; a dead agent is skipped (its steers wait for the next spawn), and a partial drain stops at the first failure so the remainder stay queued **in order**.
@@ -905,12 +906,27 @@ behalf ("one supervisor, fans out"). Its coordination actions (creating tasks,
 answering decisions, reading status) go through the SAME `$HIVE_CLI` + API +
 standing-authority gates every hive agent uses — merges/guarded/destructive ops
 are gated identically, and the session has no privileged path around them. It
-MAY clear a narrow set of safe decision cards itself via
+MAY clear a narrow set of mechanical decision cards itself via
 `POST /api/decisions/:id/auto-answer` (server-enforced allow-list, see Decisions
-above); anything the bar declines it must escalate to the director.
+above), and may answer low/normal-risk reversible technical choices through the
+normal audited answer endpoint after reasoning or a team discussion. It must
+escalate unknown director intent or product preference, meaningful cost,
+prod/shared destructive state, safety-policy changes, dangerous-command grants,
+and inputs only the director can supply.
 Conversation history persists in `chat_threads` / `chat_messages` (append-only,
 same shape as `events`); each thread's `task_id` is its backing supervisor task
 (`source='chat_supervisor'`, kept out of the dispatcher and the board lanes).
+
+The supervisor task is also the root of an automatic management loop. Tasks it
+creates inherit `parent_task_id=$HIVE_TASK_ID`; nested agent follow-ups preserve
+the chain. Hive walks that ancestry for meaningful events, batches synchronous
+transition bursts, and pushes one `[hive manager wakeup]` steer into the current
+supervisor session. The wake set covers blockers, decisions, peer messages,
+review handoffs, CI/merge/smoke results, recovery, failures, and terminal state
+changes. An explicitly closed thread is not respawned by a child event. The
+manager brief requires it to act on each wakeup, use bounded proposal → critique
+→ synthesis meetings where useful, and independently verify the integrated
+top-level outcome before reporting completion.
 
 - `POST /api/chat/turn` body `{text (required), thread_id?, project_id?}` → `202 {thread_id, delivery, agent_target?, error?}` | `400` (empty text / no project scope) | `404` (unknown `thread_id`)
   Director → supervisor. **Non-blocking by design**: it persists the director
