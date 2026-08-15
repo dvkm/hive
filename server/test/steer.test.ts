@@ -108,6 +108,31 @@ test("a delivered steer is receipted and not replayed into a later spawn", async
   expect(briefs.at(-1)).not.toContain("Steers waiting for you");
 });
 
+test("a teammate message is attributed, replyable, and uses the durable steer path", async () => {
+  const sender = await newTask("API worker");
+  const recipient = await newTask("UI worker");
+  await post(`/api/tasks/${recipient}/spawn`, {});
+
+  const r = await post(`/api/tasks/${recipient}/send`, {
+    message: "Can the response include session_expires_at?",
+    from_task_id: sender,
+  });
+  expect(r.status).toBe(200);
+  expect(r.json.delivery).toBe("delivered");
+  expect(sends.at(-1)).toContain("[teammate #");
+  expect(sends.at(-1)).toContain("API worker");
+  expect(sends.at(-1)).toContain("session_expires_at");
+  expect(sends.at(-1)).toContain(`task send ${sender}`);
+
+  const event = (await steerEvents(recipient)).at(-1);
+  expect(event.source).toBe("agent");
+  expect(event.payload.from_task_id).toBe(sender);
+
+  const bad = await post(`/api/tasks/${recipient}/send`, { message: "spoof", from_task_id: "missing" });
+  expect(bad.status).toBe(400);
+  expect(bad.json.error).toContain("unknown from_task_id");
+});
+
 // herdr exits 0 with an error body when the agent is gone — the silent drop.
 test("an exit-0 agent_not_found body is a failure, not a delivery", () => {
   expect(sendFailure(OK('{"error":{"code":"agent_not_found"}}'))).toBe("agent_not_found");

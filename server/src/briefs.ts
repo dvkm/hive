@@ -3,6 +3,7 @@
 import type { DB } from "./db.ts";
 import { getTask } from "./state.ts";
 import { prTitlePrefix, prBodyFooter } from "./marker.ts";
+import { managingThreadForTask } from "./chat.ts";
 
 // The PR marker contract (documented in docs/API.md). Both halves are REQUIRED
 // on any PR the agent opens so hive can link the PR back to this task.
@@ -144,6 +145,27 @@ Mechanical failures (spawn/merge/smoke) are recorded automatically — this is
 for the things only you know you tripped on.`;
 }
 
+function teamSection(db: DB, taskId: string): string | null {
+  const thread = managingThreadForTask(db, taskId);
+  if (!thread?.task_id) return null;
+  const task = getTask(db, taskId)!;
+  return `## Your team
+This task belongs to a top-level ask managed by supervisor task \`${thread.task_id}\`.
+The manager is automatically notified about blockers, decisions, peer messages,
+review handoffs, failures, and completions. Keep working without waiting for it,
+but use the team instead of escalating routine uncertainty to the director:
+
+  hive task send ${thread.task_id} "what you need, what you tried, and your recommendation"
+  hive task list --project ${task.project_id}   # find a peer's task id
+  hive task send <peer-task-id> "specific question or interface proposal"
+
+Messages are durable and attributed to your task. When a teammate messages you,
+reply with \`hive task send <their-task-id> "..."\`. Ask peers for missing
+context, coordinate shared interfaces before coding across the seam, and report
+the resolution to the manager. Do not run open-ended chat; one concrete question,
+answer, and next action is usually enough.`;
+}
+
 // Kept in sync with DENIED_MCP_SERVERS in api.ts, which writes the matching
 // permissions.deny into each worktree's .claude/settings.local.json.
 const BROWSER_VERIFICATION = `## Browser verification (headless only)
@@ -242,6 +264,8 @@ export function composeBrief(db: DB, taskId: string): string {
   parts.push(EMIT_PROTOCOL);
   parts.push(CHECKPOINTS);
   parts.push(spawnTasksSection(task.project_id));
+  const team = teamSection(db, taskId);
+  if (team) parts.push(team);
   parts.push(prMarkerSection(task.number, task.id));
   parts.push(BROWSER_VERIFICATION);
 

@@ -85,6 +85,19 @@ test("dead agent → capture pane tail, fail, auto-requeue (attempt 1)", async (
   expect(JSON.parse(requeued.payload).attempt).toBe(1);
 });
 
+test("an idle or vanished chat supervisor is not failed by worker stale recovery", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { source: "chat_supervisor", agent: "manager" });
+  putEvent(db, id, "spawned");
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(id)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery'").get(id)).toBeFalsy();
+});
+
 test("requeue cap reached → decision card, no further auto-requeue", async () => {
   const { db, projectId } = freshDb();
   const orig = makeTask(db, projectId); // source null

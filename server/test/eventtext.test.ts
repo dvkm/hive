@@ -26,6 +26,10 @@ test("steer carries its delivery receipt", () => {
   expect(steer("queued")).toBe("⏳ queued — steered: “ship it”");
   expect(steer("failed")).toBe("⚠ undelivered — steered: “ship it”");
   expect(steer(undefined)).toBe("steered: “ship it”"); // pre-receipt events stay bare
+  expect(eventText({
+    type: "steer",
+    payload: { message: "wrapped wire text", original_message: "which response shape?", from_task_id: "a", from_task_number: 12, delivery: "delivered" },
+  })).toBe("✓ teammate #12: “which response shape?”");
 });
 
 // `conflict` is a boolean: read it directly, never through s() — s(false) is the

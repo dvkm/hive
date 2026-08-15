@@ -21,9 +21,13 @@ type Item = {
 };
 
 const NAV: { label: string; path: string }[] = [
-  { label: "Board", path: "/" },
-  { label: "Feed", path: "/feed" },
-  { label: "Decisions", path: "/decisions" },
+  { label: "Manager", path: "/" },
+  { label: "Work", path: "/work" },
+  { label: "Inbox", path: "/inbox" },
+  { label: "Activity", path: "/feed" },
+  { label: "Evidence", path: "/evidence" },
+  { label: "Agent sessions", path: "/supervisors" },
+  { label: "Terminals", path: "/terminals" },
   { label: "Learnings", path: "/learnings" },
   { label: "Analytics", path: "/analytics" },
   { label: "Projects", path: "/projects" },
@@ -181,7 +185,7 @@ export default function Palette() {
         run: () => {
           close();
           setProjectFilter("");
-          navigate("/");
+          navigate("/work");
         },
       },
       ...projects.map((p) => ({
@@ -192,7 +196,7 @@ export default function Palette() {
         run: () => {
           close();
           setProjectFilter(p.id);
-          navigate("/");
+          navigate("/work");
         },
       })),
       ...tasks

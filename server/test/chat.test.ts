@@ -12,9 +12,11 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-chat-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb } = await import("../src/db.ts");
-const { makeHandler } = await import("../src/api.ts");
+const { makeHandler, notifyManagerOfEvent } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
-const { composeSupervisorBrief, createThread } = await import("../src/chat.ts");
+const { composeSupervisorBrief, createThread, managingThreadForTask } = await import("../src/chat.ts");
+const { composeBrief } = await import("../src/briefs.ts");
+const { setEventHook, writeEvent } = await import("../src/state.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
 
 const db = openDb(":memory:");
@@ -105,6 +107,42 @@ test("later message is delivered into the live session (not a respawn)", async (
   expect(briefs.length).toBe(before); // no new spawn
   expect(sends.at(-1)).toContain("what's the status?");
   expect(sends.at(-1)).toContain(threadId); // wire prefix tells the session where to reply
+});
+
+test("descendant worker events wake the manager once with a batched update", async () => {
+  const thread = (await get(`/api/chat/threads/${threadId}`)).json;
+  const worker = (await post("/api/tasks", {
+    project_id: projectId,
+    title: "implement login",
+    source: "agent",
+    parent_task_id: thread.task_id,
+  })).json;
+  const followup = (await post("/api/tasks", {
+    project_id: projectId,
+    title: "verify login edge cases",
+    source: "agent",
+    parent_task_id: worker.id,
+  })).json;
+
+  expect(managingThreadForTask(db, followup.id)?.id).toBe(threadId);
+  expect(composeBrief(db, followup.id)).toContain(`supervisor task \`${thread.task_id}\``);
+  expect(composeBrief(db, followup.id)).toContain("hive task send");
+
+  const before = sends.length;
+  setEventHook((hookDb, event) => notifyManagerOfEvent(hookDb, herdr, {}, event));
+  try {
+    writeEvent(db, { task_id: worker.id, source: "agent", type: "blocked", payload: { note: "need the session contract" } });
+    writeEvent(db, { task_id: followup.id, source: "system", type: "smoke_failed", payload: { note: "expired session still accepted" } });
+    await new Promise((r) => setTimeout(r, 20));
+  } finally {
+    setEventHook(null);
+  }
+
+  expect(sends.length).toBe(before + 1);
+  expect(sends.at(-1)).toContain("[hive manager wakeup]");
+  expect(sends.at(-1)).toContain("implement login");
+  expect(sends.at(-1)).toContain("verify login edge cases");
+  expect(sends.at(-1)).toContain("Act on anything you can resolve");
 });
 
 test("a concurrent double-send on the same thread spawns only once", async () => {
@@ -242,4 +280,7 @@ test("composeSupervisorBrief bakes in the thread id, reply verb, and hard limits
   expect(brief).toContain(`chat reply ${thread.id}`);
   expect(brief).toContain("CANNOT merge"); // destructive/guarded excluded
   expect(brief).toContain("task create"); // coordination via worker tasks
+  expect(brief).toContain("automatic manager loop");
+  expect(brief).toContain("bounded meeting");
+  expect(brief).toContain("independently check the integrated result");
 });

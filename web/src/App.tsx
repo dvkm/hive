@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { NavLink, Route, Routes, useLocation } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import { Navigate, NavLink, Route, Routes, useLocation } from "react-router-dom";
 import type { Location } from "react-router-dom";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import type { IconDefinition } from "@fortawesome/fontawesome-svg-core";
@@ -36,6 +36,7 @@ import Projects from "./views/Projects";
 import Palette from "./views/Palette";
 import Chat from "./views/Chat";
 import Supervisors from "./views/Supervisors";
+import { needsAttention } from "./views/attention";
 
 // Enable web-push on this device (phone PWA). Hidden once granted or where
 // unsupported (desktop keeps the osascript notifier). iOS only offers this on
@@ -58,17 +59,72 @@ function PushButton() {
   );
 }
 
-// Mobile navigation: a fixed bottom tab bar (the 4 places you actually live in)
-// plus a "More" sheet for everything else. Hidden on desktop via CSS; the top
-// nav is hidden on mobile. Badges match the desktop nav.
+const SECONDARY_NAV: { label: string; items: [string, string, IconDefinition][] }[] = [
+  {
+    label: "Observe",
+    items: [
+      ["/feed", "Activity", faSatelliteDish],
+      ["/evidence", "Evidence", faImage],
+      ["/supervisors", "Agent sessions", faComments],
+      ["/terminals", "Terminals", faClipboard],
+    ],
+  },
+  {
+    label: "Improve",
+    items: [
+      ["/learnings", "Learnings", faBookOpen],
+      ["/analytics", "Analytics", faChartColumn],
+      ["/monitors", "Monitors", faHeart],
+    ],
+  },
+  {
+    label: "Configure",
+    items: [
+      ["/projects", "Projects", faFolder],
+      ["/policies", "Policies", faScaleBalanced],
+    ],
+  },
+];
+
+function SecondaryNav() {
+  const location = useLocation();
+  const detailsRef = useRef<HTMLDetailsElement>(null);
+  const active = SECONDARY_NAV.some(({ items }) => items.some(([to]) => location.pathname.startsWith(to)));
+  useEffect(() => {
+    if (detailsRef.current) detailsRef.current.open = false;
+  }, [location.pathname]);
+  const close = (event: React.MouseEvent<HTMLAnchorElement>) => {
+    const details = event.currentTarget.closest("details");
+    if (details) details.open = false;
+  };
+  return (
+    <details ref={detailsRef} className={`more-menu ${active ? "more-menu-active" : ""}`}>
+      <summary>More <span aria-hidden="true">⌄</span></summary>
+      <div className="more-popover">
+        {SECONDARY_NAV.map((group) => (
+          <div className="more-group" key={group.label}>
+            <div className="more-group-label">{group.label}</div>
+            {group.items.map(([to, label, icon]) => (
+              <NavLink key={to} to={to} onClick={close}>
+                <FontAwesomeIcon icon={icon} />
+                {label}
+              </NavLink>
+            ))}
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+// Mobile navigation mirrors the three things the director actually does:
+// direct the manager, watch work, and clear items that need human attention.
 function MobileNav({
   inboxCount,
-  reviewCount,
   offline,
   setOffline,
 }: {
   inboxCount: number;
-  reviewCount: number;
   offline: boolean;
   setOffline: (v: boolean) => void;
 }) {
@@ -81,17 +137,7 @@ function MobileNav({
       {badge > 0 && <span className="badge mobtab-badge">{badge}</span>}
     </NavLink>
   );
-  const more: [string, string, IconDefinition][] = [
-    ["/brief", "Brief", faClipboard],
-    ["/supervisors", "Supervisors", faComments],
-    ["/feed", "Feed", faSatelliteDish],
-    ["/evidence", "Evidence", faImage],
-    ["/learnings", "Learnings", faBookOpen],
-    ["/analytics", "Analytics", faChartColumn],
-    ["/projects", "Projects", faFolder],
-    ["/policies", "Policies", faScaleBalanced],
-    ["/monitors", "Monitors", faHeart],
-  ];
+  const more = SECONDARY_NAV.flatMap(({ items }) => items);
   return (
     <>
       {moreOpen && (
@@ -118,10 +164,9 @@ function MobileNav({
         </div>
       )}
       <nav className="mobnav">
-        {tab("/", "Board", "▦", 0, true)}
-        {tab("/decisions", "Decisions", "◎", inboxCount)}
-        {tab("/review", "Review", "✓", reviewCount)}
-        {tab("/terminals", "Terminals", "▶")}
+        {tab("/", "Manager", "◆", 0, true)}
+        {tab("/work", "Work", "▦")}
+        {tab("/inbox", "Inbox", "◎", inboxCount)}
         <button className={`mobtab ${moreOpen ? "active" : ""}`} onClick={() => setMoreOpen((v) => !v)}>
           <span className="mobtab-icon">☰</span>
           More
@@ -181,7 +226,7 @@ function Bell() {
 export default function App() {
   const { decisions, tasks, checkpoints, offline, setOffline } = useStore();
   const reviewCount = tasks.filter((t) => t.state === "in_review").length;
-  const inboxCount = decisions.length + checkpoints.length;
+  const inboxCount = decisions.length + checkpoints.length + reviewCount + tasks.filter(needsAttention).length;
   const location = useLocation();
   // Board card clicks push /tasks/:id with state.backgroundLocation set to the
   // board's location — that keeps the board mounted and rendered underneath
@@ -189,55 +234,47 @@ export default function App() {
   // notifications, refresh) carry no such state, so /tasks/:id just renders
   // the standalone page as usual.
   const background = (location.state as { backgroundLocation?: Location } | null)?.backgroundLocation;
+  const managerIsRendered = (background || location).pathname === "/";
   return (
     <div className="app">
       <header className="topbar">
-        <div className="brand">
+        <NavLink className="brand" to="/">
           <span className="brand-mark">◆</span> hive
-        </div>
+        </NavLink>
         <nav className="nav">
-          <NavLink to="/brief">Brief</NavLink>
           <NavLink to="/" end>
-            Board
+            Manager
           </NavLink>
-          <NavLink to="/feed">Feed</NavLink>
-          <NavLink to="/evidence">Evidence</NavLink>
-          <NavLink to="/decisions">
-            Decisions
+          <NavLink to="/work">Work</NavLink>
+          <NavLink to="/inbox">
+            Inbox
             {inboxCount > 0 && <span className="badge">{inboxCount}</span>}
           </NavLink>
-          <NavLink to="/review">
-            Review
-            {reviewCount > 0 && <span className="badge">{reviewCount}</span>}
-          </NavLink>
-          <NavLink to="/supervisors">Supervisors</NavLink>
-          <NavLink to="/terminals">Terminals</NavLink>
-          <NavLink to="/learnings">Learnings</NavLink>
-          <button
-            className={`offline-toggle ${offline ? "offline-on" : ""}`}
-            title={
-              offline
-                ? "Offline mode is ON: nothing new spawns; agents parked with handoff notes. Click to resume."
-                : "Prepare for losing internet: agents push WIP + write handoff notes and park; nothing new spawns."
-            }
-            onClick={() => setOffline(!offline)}
-          >
-            {offline ? "⏸ offline" : "go offline"}
-          </button>
-          <NavLink to="/analytics">Analytics</NavLink>
-          <NavLink to="/projects">Projects</NavLink>
-          <NavLink to="/policies">Policies</NavLink>
-          <NavLink to="/monitors">Monitors</NavLink>
+          <SecondaryNav />
         </nav>
+        <button
+          className={`offline-toggle ${offline ? "offline-on" : ""}`}
+          title={
+            offline
+              ? "Offline mode is ON: nothing new spawns; agents parked with handoff notes. Click to resume."
+              : "Prepare for losing internet: agents push WIP + write handoff notes and park; nothing new spawns."
+          }
+          onClick={() => setOffline(!offline)}
+        >
+          {offline ? "⏸ offline" : "go offline"}
+        </button>
         <PushButton />
         <Bell />
         <ConnDot />
       </header>
-      <MobileNav inboxCount={inboxCount} reviewCount={reviewCount} offline={offline} setOffline={setOffline} />
+      <MobileNav inboxCount={inboxCount} offline={offline} setOffline={setOffline} />
       <main className="content">
         <Routes location={background || location}>
-          <Route path="/" element={<Board />} />
-          <Route path="/brief" element={<Brief />} />
+          <Route path="/" element={<Chat embedded />} />
+          <Route path="/work" element={<Board />} />
+          <Route path="/board" element={<Navigate replace to="/work" />} />
+          <Route path="/inbox" element={<Brief />} />
+          <Route path="/brief" element={<Navigate replace to="/inbox" />} />
           <Route path="/feed" element={<Feed />} />
           <Route path="/evidence" element={<Evidence />} />
           <Route path="/tasks/:id" element={<TaskPage />} />
@@ -258,7 +295,7 @@ export default function App() {
         </Routes>
       )}
       <Palette />
-      <Chat />
+      {!managerIsRendered && <Chat />}
     </div>
   );
 }

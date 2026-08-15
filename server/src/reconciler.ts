@@ -767,14 +767,15 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
   // Only tasks that are actively worked (an agent could go silent).
   // needs_decision / in_review are parked on the DIRECTOR — silence there is
   // expected, and flagging it spawned pointless recovery nudges (2026-07-10).
-  // Tracking-only tasks (source='external') are externally driven: not ours to
-  // supervise, so no staleness either. A task deferred pending a human action
+  // Tracking-only tasks are externally driven, and chat supervisors are
+  // intentionally idle between turns/wakeups: neither gets worker staleness.
+  // A task deferred pending a human action
   // (deferred_until in the future) is intentionally parked — skip it so the
   // "gone quiet" nudge/notification never fires (task #679).
   const nowIso = new Date(nowMs).toISOString();
   const tasks = db
     .query(
-      `SELECT id FROM tasks WHERE state IN ('in_progress','verifying') AND COALESCE(source,'') != 'external'
+      `SELECT id FROM tasks WHERE state IN ('in_progress','verifying') AND COALESCE(source,'') NOT IN ('external','chat_supervisor')
          AND (deferred_until IS NULL OR deferred_until <= ?)`
     )
     .all(nowIso) as { id: string }[];
@@ -821,7 +822,7 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
 async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
   const h = deps.herdr ?? defaultHerdr;
   const tasks = db
-    .query(`SELECT id, agent_target FROM tasks WHERE agent_target IS NOT NULL AND state IN ${RECOVERABLE}`)
+    .query(`SELECT id, agent_target FROM tasks WHERE agent_target IS NOT NULL AND COALESCE(source, '') != 'chat_supervisor' AND state IN ${RECOVERABLE}`)
     .all() as { id: string; agent_target: string }[];
   for (const t of tasks) {
     // A handed-off task (advanceFinished / director moved it to in_review, or it's

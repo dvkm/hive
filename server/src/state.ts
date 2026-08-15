@@ -55,6 +55,15 @@ export function setTerminalHook(fn: TerminalHook | null): void {
   terminalHook = fn;
 }
 
+// Fired for every durable task event. Production uses this to wake the chat
+// supervisor when one of its workers reaches a meaningful milestone; tests
+// leave it unset so event writes stay side-effect free.
+type EventHook = (db: DB, event: any) => void;
+let eventHook: EventHook | null = null;
+export function setEventHook(fn: EventHook | null): void {
+  eventHook = fn;
+}
+
 export function getTask(db: DB, id: string): any | null {
   const r = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
   return r ? parseTask(r) : null;
@@ -187,6 +196,13 @@ export function writeEvent(
   ).run(row.id, row.task_id, row.ts, row.source, row.type, row.payload);
   const parsed = parseEvent(row);
   broadcast({ type: "event", event: parsed });
+  if (eventHook) {
+    try {
+      eventHook(db, parsed);
+    } catch (e) {
+      console.error("[hive] event hook:", e);
+    }
+  }
   return parsed;
 }
 

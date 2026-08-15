@@ -14,6 +14,9 @@ web UI now runs instead of sitting in Queued forever. Every gate below must pass
 1. **`config.auto_dispatch: true`** on the owning project. Default **off** — so
    intake drafts, planner setup tasks, and anything queued for triage never
    auto-spawn. Toggle per project on the Policies page (writes project config).
+   Exception: a queued task descended from an active chat-supervisor task is an
+   explicit manager delegation and dispatches with this toggle off. It still
+   passes every kind, concurrency, authority, dependency, and backoff gate.
 2. **`config.dispatch_kinds`** (default `["ship","scout"]`). `chore` tasks are
    excluded by default (they are usually titled for a human).
 3. **Intake review gate.** A task with `source="intake_gchat"` is skipped until
@@ -22,9 +25,10 @@ web UI now runs instead of sitting in Queued forever. Every gate below must pass
    `UNREVIEWED …` note does **not** count (the token `unreviewed` is stripped
    before the substring test). The manual "dispatch now" button bypasses the
    dispatcher entirely, so clicking it *is* the human review for a one-off.
-4. **`config.max_agents`** (default 3). Concurrency cap per project, counting
+4. **`config.max_agents`** (default 3). Worker concurrency cap per project, counting
    tasks currently holding an agent (`agent_target` set and state in
-   in_progress / needs_decision / in_review / verifying).
+   in_progress / needs_decision / in_review / verifying). The chat-supervisor
+   manager session does not consume a worker slot.
 5. **Authority gate.** `authorize(action="task.dispatch", target=<title>)` must
    resolve to `allow`. A `deny` or `require_decision` standing-authority rule
    blocks the auto-spawn (and, for `require_decision`, opens the usual card).
@@ -138,6 +142,12 @@ or whose newest meaningful event is `stale`:
 The requeue/nudge backoff is the stale threshold itself: each action writes an
 event that resets the task's age, so the next step only fires one threshold
 later. All actions are evented and broadcast over SSE.
+
+Persistent chat-supervisor tasks are excluded from worker staleness and stale
+recovery: idle is their normal state between director turns and manager
+wakeups. A later director turn or descendant event probes the session and
+respawns it if needed, preserving the thread rather than failing/requeueing the
+manager as project work.
 
 ### Probe: three death shapes
 
