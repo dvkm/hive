@@ -124,6 +124,17 @@ export interface Decision {
   answered_by: "director" | "chat_supervisor" | "agent" | "system" | "unknown" | null;
   answered_actor: string | null;
   bundle?: DecisionBundle | null;
+  plan?: DecisionPlan | null;
+}
+
+// Structured planner breakdown behind a "Proposed breakdown: …" decision, so
+// the card can render an actual checklist + question inputs instead of the
+// flattened `context` text. Null for every other kind of decision.
+export interface DecisionPlan {
+  proposed_tasks: { title: string; brief: string; kind: Kind }[];
+  rationale: string;
+  questions: string[];
+  reason: string;
 }
 
 // Server-derived context bundled onto each open card (see decisionBundle in
@@ -534,11 +545,11 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ draft_note }),
     }),
-  answerDecision: (id: string, answer_key: string, answer_note?: string) =>
+  answerDecision: (id: string, answer_key: string, answer_note?: string, selected_indices?: number[]) =>
     req<Decision>(`/api/decisions/${id}/answer`, {
       method: "POST",
       // The inbox is David's surface — answers from here are the director's.
-      body: JSON.stringify({ answer_key, answer_note, source: "director" }),
+      body: JSON.stringify({ answer_key, answer_note, selected_indices, source: "director" }),
     }),
   dismissDecision: (id: string) =>
     req<Decision>(`/api/decisions/${id}/dismiss`, { method: "POST" }),

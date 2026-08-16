@@ -17,7 +17,8 @@ import { newId, now } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { writeEvent, getTask, transition } from "./state.ts";
 import { enqueue } from "./notifications.ts";
-import { createDecision } from "./api.ts";
+import { createDecision, withBundle } from "./api.ts";
+import { parseDecision } from "./rows.ts";
 import { listReferences } from "./learn.ts";
 import { classifyEscalation, factorsFromPlan, type EscalationVerdict } from "./policy.ts";
 
@@ -276,9 +277,14 @@ export async function runPlanner(db: DB, taskId: string, deps: PlannerDeps = {})
     task_id: taskId,
     source: "system",
     type: "planned",
-    payload: { decision_id: decision.id, source_task_id: taskId, proposed_tasks: plan.proposed_tasks, rationale: plan.rationale, questions: plan.questions },
+    payload: { decision_id: decision.id, source_task_id: taskId, proposed_tasks: plan.proposed_tasks, rationale: plan.rationale, questions: plan.questions, reason: verdict.reason },
   });
-  return { ok: true, decision };
+  const refreshed = withBundle(
+    db,
+    parseDecision(db.query("SELECT * FROM decisions WHERE id = ?").get(decision.id))
+  );
+  broadcast({ type: "decision", decision: refreshed });
+  return { ok: true, decision: refreshed };
 }
 
 function plannerError(db: DB, taskId: string, error: string): PlanResult {
@@ -320,27 +326,64 @@ function renderContext(plan: Plan, verdict: EscalationVerdict): string {
 // `approve` creates the proposed tasks as queued tasks linked to the source
 // (source='planner', parent_task_id). `reject` does nothing but the recorded
 // decision_answered event. Returns true if it WAS a planner card.
-export function resolvePlanForDecision(db: DB, decisionId: string, answerKey: string): boolean {
+function plannedEventPayload(db: DB, taskId: string, decisionId: string): any | null {
   const ev = db
-    .query("SELECT payload FROM events WHERE type = 'planned' AND json_extract(payload, '$.decision_id') = ? ORDER BY ts DESC LIMIT 1")
-    .get(decisionId) as { payload: string } | undefined;
-  if (!ev) return false;
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'planned' AND json_extract(payload, '$.decision_id') = ? ORDER BY ts DESC LIMIT 1")
+    .get(taskId, decisionId) as { payload: string } | undefined;
+  return ev ? JSON.parse(ev.payload) : null;
+}
+
+// The structured proposal behind a planner-breakdown decision, attached to the
+// Decision as `plan` (see withBundle) so the frontend can render an actual
+// checklist + question inputs instead of the flattened `context` text. Null
+// for any decision that isn't a planner card.
+export function decisionPlan(
+  db: DB,
+  taskId: string,
+  decisionId: string
+): { proposed_tasks: ProposedTask[]; rationale: string; questions: string[]; reason: string } | null {
+  const payload = plannedEventPayload(db, taskId, decisionId);
+  if (!payload) return null;
+  return { proposed_tasks: payload.proposed_tasks ?? [], rationale: payload.rationale ?? "", questions: payload.questions ?? [], reason: payload.reason ?? "" };
+}
+
+export function selectedPlanIndices(proposedCount: number, selectedIndices?: unknown[]): number[] {
+  const indices = selectedIndices ?? Array.from({ length: proposedCount }, (_, i) => i);
+  return [...new Set(indices)].filter(
+    (i): i is number => typeof i === "number" && Number.isInteger(i) && i >= 0 && i < proposedCount
+  );
+}
+
+export function resolvePlanForDecision(
+  db: DB,
+  taskId: string,
+  decisionId: string,
+  answerKey: string,
+  selectedIndices?: unknown[],
+  answerNote?: string | null
+): boolean {
+  const payload = plannedEventPayload(db, taskId, decisionId);
+  if (!payload) return false;
   if (answerKey !== "approve") return true; // reject: event-only (decision_answered already recorded)
 
-  const payload = JSON.parse(ev.payload);
   const sourceTaskId: string = payload.source_task_id;
-  const proposed: ProposedTask[] = payload.proposed_tasks ?? [];
+  const allProposed: ProposedTask[] = payload.proposed_tasks ?? [];
+  const proposed = selectedPlanIndices(allProposed.length, selectedIndices).map((i) => allProposed[i]);
   const source = getTask(db, sourceTaskId);
   if (!source) return true;
+  const directorNotes = answerNote?.trim();
 
   const createdIds: string[] = [];
   for (const p of proposed) {
     const id = newId();
     const t = now();
+    const brief = directorNotes
+      ? [p.brief, `Director notes:\n${directorNotes}`].filter(Boolean).join("\n\n")
+      : p.brief;
     db.query(
       `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, created_at, updated_at)
        VALUES (?,?,?,?, 'queued', ?, 'planner', ?, ?, ?)`
-    ).run(id, source.project_id, p.title, p.brief || null, p.kind, sourceTaskId, t, t);
+    ).run(id, source.project_id, p.title, brief || null, p.kind, sourceTaskId, t, t);
     writeEvent(db, { task_id: id, source: "system", type: "created", payload: { title: p.title, parent_task_id: sourceTaskId } });
     broadcast({ type: "task", task: getTask(db, id) });
     createdIds.push(id);

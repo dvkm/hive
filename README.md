@@ -179,12 +179,17 @@ server/test/ bun test suite
   `plan_intake`, `planner_argv`), while the LLM runs as a short-lived subprocess
   `claude -p <prompt> --output-format json` (timeout-capped by
   `HIVE_PLANNER_TIMEOUT_MS`, default 120s; killed on timeout; injectable exec).
-- Triggered by `POST /api/tasks/:id/plan` (manual) or auto on intake when the
-  project sets `config.plan_intake: true`. The result is a `normal`-risk decision
-  card (`approve`/`reject`); on approve the proposed tasks are created `queued`
-  with `source="planner"` and `parent_task_id` linking to the source task.
+- Triggered by `POST /api/tasks/:id/plan` (manual), every director braindump, or
+  connector intake when the project sets `config.plan_intake: true`. The result
+  is a risk-scored decision card (`approve`/`reject`) with proposed tasks as a
+  checklist, open questions as answer fields, and the scoring reason in the risk
+  detail. Every task starts checked; on approve only the checked tasks are
+  created `queued` with
+  `source="planner"` and `parent_task_id` linking to the source task. Question
+  answers and the optional note are copied into each created task's brief.
   Output is parsed defensively; unparseable output records one `planner_error`
-  event and stops. New event types: `planning`, `planned`, `planner_error`.
+  event and stops. New event types: `planning`, `planned`, `planner_error`. See
+  `docs/API.md` for the API contract.
 
 ## v4 notes (director chat)
 

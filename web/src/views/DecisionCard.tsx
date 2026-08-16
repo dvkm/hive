@@ -1,7 +1,7 @@
-import { useMemo, useRef, useState } from "react";
+import { useId, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
-import type { Decision, DecisionBundle } from "../lib/api";
+import type { Decision, DecisionBundle, DecisionPlan } from "../lib/api";
 import { riskDisplay } from "../lib/decision";
 import { toast } from "../lib/ui";
 
@@ -16,6 +16,24 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
   const [saving, setSaving] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout>>();
+
+  // Planner breakdown cards: which proposed tasks are checked (all, by default)
+  // and a free-text answer per open question, folded into the note on submit.
+  const [excluded, setExcluded] = useState<Set<number>>(() => new Set());
+  const selected = new Set(d.plan?.proposed_tasks.map((_, i) => i).filter((i) => !excluded.has(i)) ?? []);
+  const toggleTask = (i: number) =>
+    setExcluded((s) => {
+      const next = new Set(s);
+      next.has(i) ? next.delete(i) : next.add(i);
+      return next;
+    });
+  const [answers, setAnswers] = useState<string[]>([]);
+  const setAnswer = (i: number, v: string) =>
+    setAnswers((a) => {
+      const next = [...a];
+      next[i] = v;
+      return next;
+    });
 
   // Options: recommended first (product rule 3).
   const options = useMemo(
@@ -40,7 +58,15 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
     if (!choice) return;
     setSubmitting(true);
     try {
-      await api.answerDecision(d.id, choice, note || undefined);
+      // Question answers ride along as a labeled block ahead of the free-text
+      // note — there's no separate field for them on the decision.
+      const qa = (d.plan?.questions ?? [])
+        .map((q, i) => (answers[i]?.trim() ? `Q: ${q}\nA: ${answers[i].trim()}` : null))
+        .filter(Boolean)
+        .join("\n\n");
+      const combinedNote = [qa, note].filter(Boolean).join("\n\n") || undefined;
+      const selectedIndices = d.plan ? [...selected].sort((a, b) => a - b) : undefined;
+      await api.answerDecision(d.id, choice, combinedNote, selectedIndices);
       toast("Decision submitted");
       onDone(d.id); // optimistic archive
     } catch (e) {
@@ -64,6 +90,7 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
   };
 
   const risk = riskDisplay(d.risk);
+  const riskDetail = d.blast_radius || d.plan?.reason;
   const hasOptions = options.length > 0;
 
   return (
@@ -75,13 +102,17 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
         </Link>
       </header>
 
-      {d.context && <p className="dcard-context">{d.context}</p>}
+      {d.plan ? (
+        <PlanView decisionId={d.id} plan={d.plan} selected={selected} onToggle={toggleTask} answers={answers} onAnswer={setAnswer} />
+      ) : (
+        d.context && <p className="dcard-context">{d.context}</p>
+      )}
 
       <div className={`blast ${risk.className}`}>
         <div className="blast-label">
           Risk: <strong>{risk.label}</strong>
         </div>
-        {d.blast_radius && <div className="blast-body">{d.blast_radius}</div>}
+        {riskDetail && <div className="blast-body">{riskDetail}</div>}
       </div>
 
       <DecisionBundleView bundle={d.bundle} />
@@ -93,23 +124,26 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
       {hasOptions && (
         <>
           <div className="options">
-            {options.map((o) => (
-              <label key={o.key} className={`opt ${choice === o.key ? "opt-sel" : ""}`}>
-                <input
-                  type="radio"
-                  name={`d-${d.id}`}
-                  checked={choice === o.key}
-                  onChange={() => setChoice(o.key)}
-                />
-                <div className="opt-body">
-                  <div className="opt-label">
-                    {o.label}
-                    {o.recommended && <span className="rec">Recommended</span>}
+            {options.map((o) => {
+              const detail = d.plan && o.key === "approve" ? `Create ${selected.size} task(s).` : o.detail;
+              return (
+                <label key={o.key} className={`opt ${choice === o.key ? "opt-sel" : ""}`}>
+                  <input
+                    type="radio"
+                    name={`d-${d.id}`}
+                    checked={choice === o.key}
+                    onChange={() => setChoice(o.key)}
+                  />
+                  <div className="opt-body">
+                    <div className="opt-label">
+                      {o.label}
+                      {o.recommended && <span className="rec">Recommended</span>}
+                    </div>
+                    {detail && <div className="opt-detail">{detail}</div>}
                   </div>
-                  {o.detail && <div className="opt-detail">{o.detail}</div>}
-                </div>
-              </label>
-            ))}
+                </label>
+              );
+            })}
           </div>
 
           <textarea
@@ -127,13 +161,90 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
           Dismiss
         </button>
         {hasOptions && (
-          <button className="btn btn-primary btn-submit" disabled={submitting} onClick={submit}>
+          <button className="btn btn-primary btn-submit" disabled={submitting || !!(d.plan && choice === "approve" && selected.size === 0)} onClick={submit}>
             {submitting ? "Submitting…" : "Submit decision"}
           </button>
         )}
       </div>
     </article>
   );
+}
+
+// A planner breakdown: proposed tasks as a checklist (uncheck to exclude one
+// from "Approve breakdown") and open questions as inline answer fields, in
+// place of the old plain-text dump of both under `context`.
+function PlanView({
+  decisionId,
+  plan,
+  selected,
+  onToggle,
+  answers,
+  onAnswer,
+}: {
+  decisionId: string;
+  plan: DecisionPlan;
+  selected: Set<number>;
+  onToggle: (i: number) => void;
+  answers: string[];
+  onAnswer: (i: number, v: string) => void;
+}) {
+  const instanceId = useId();
+
+  return (
+    <div className="dplan">
+      {plan.rationale && <p className="dcard-context">{plan.rationale}</p>}
+
+      {plan.proposed_tasks.length > 0 && (
+        <div className="dplan-section">
+          <div className="dplan-label">
+            Proposed tasks ({selected.size}/{plan.proposed_tasks.length} selected)
+          </div>
+          <div className="options">
+            {plan.proposed_tasks.map((t, i) => (
+              <label key={i} className={`opt ${selected.has(i) ? "opt-sel" : ""}`}>
+                <input type="checkbox" checked={selected.has(i)} onChange={() => onToggle(i)} />
+                <div className="opt-body">
+                  <div className="opt-label">
+                    {t.title}
+                    <span className={`chip chip-kind chip-${t.kind}`}>{t.kind}</span>
+                  </div>
+                  {t.brief && <div className="opt-detail">{firstLine(t.brief)}</div>}
+                </div>
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {plan.questions.length > 0 && (
+        <div className="dplan-section">
+          <div className="dplan-label">Open questions</div>
+          <div className="dplan-questions">
+            {plan.questions.map((q, i) => (
+              <div key={i} className="pquestion">
+                <div className="pquestion-text">
+                  <label htmlFor={`${instanceId}-d-${decisionId}-question-${i}`}>{q}</label>
+                </div>
+                <input
+                  id={`${instanceId}-d-${decisionId}-question-${i}`}
+                  className="pquestion-input"
+                  type="text"
+                  placeholder="Your answer…"
+                  value={answers[i] ?? ""}
+                  onChange={(e) => onAnswer(i, e.target.value)}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function firstLine(s: string): string {
+  const line = s.split("\n")[0];
+  return line.length > 200 ? line.slice(0, 200) + "…" : line;
 }
 
 // The server-derived context that lets the director decide without opening the
