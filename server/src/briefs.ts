@@ -133,7 +133,7 @@ other — duplicates are auto-detected, so when in doubt, file it.
 When you hit a NON-OBVIOUS gotcha (a build quirk, a flaky path, a repo landmine
 that cost you real time), record it so future agents see it in their briefs:
 
-  hive learning add --project ${projectId} --title "one-line pattern" --body "the fix / what to know"
+  hive learning add --project ${projectId} --kind failure --title "one-line pattern" --body "the fix / what to know"
 
 When you discover a DURABLE PROJECT FACT the director would otherwise have to
 repeat (the design file/link, a dashboard URL, a glossary term, an env detail),

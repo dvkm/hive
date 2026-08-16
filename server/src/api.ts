@@ -425,6 +425,8 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         }
         if (method === "PUT") return updateLearning(db, m[1], await req.json());
         if (method === "DELETE") {
+          const r: any = db.query("SELECT id, root_cause_task_id FROM learnings WHERE id = ?").get(m[1]);
+          cancelQueuedRootCauseTask(db, r, "root-cause learning deleted");
           db.query("DELETE FROM learnings WHERE id = ?").run(m[1]);
           return json({ ok: true });
         }
@@ -2944,17 +2946,26 @@ function listLearnings(db: DB, url: URL): Response {
   return json(db.query(sql).all(...args));
 }
 
+// A learning that silently defaulted to kind='failure' when the caller forgot
+// --kind used to pollute the "Known failure patterns" brief section forever
+// (task #904/acme #901: a routine watcher-summary auto-spawned a bogus
+// root-cause chore). kind is now required, not inferred.
+const CREATABLE_KINDS = new Set(["failure", "reference"]);
+
 // Create a learning. With create_root_cause_task, auto-spawn a queued `chore`
 // task (brief prefilled from the learning) and link it — the "unblock now,
-// root-cause later" flow.
+// root-cause later" flow. Only kind='failure' may spawn one: a reference/typo
+// kind describes no regression to root-cause.
 function createLearning(db: DB, body: any): Response {
   if (!body?.project_id) return err("project_id is required");
   if (!body?.title) return err("title is required");
+  if (!CREATABLE_KINDS.has(body.kind)) return err("kind is required: 'failure' or 'reference'", 400);
   if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(body.project_id))
     return err("unknown project_id", 400);
   // Reference facts route to the reference store (pinned into briefs, browsable
   // under References), not the occurrence-aged failure ledger.
   if (body.kind === "reference") {
+    if (body.create_root_cause_task) return err("create_root_cause_task only applies to kind 'failure'", 400);
     const id = addReference(db, body.project_id, String(body.title), body.body ?? null, body.source_task_id ?? null);
     return json(db.query("SELECT * FROM learnings WHERE id = ?").get(id), 201);
   }
@@ -2970,15 +2981,16 @@ function createLearning(db: DB, body: any): Response {
     last_seen: t,
     status: "active",
     root_cause_task_id: null,
+    kind: body.kind,
   };
   if (body.create_root_cause_task)
     row.root_cause_task_id = createRootCauseTask(db, row);
   db.query(
     `INSERT INTO learnings (id, project_id, title, body, source_task_id, occurrences,
-      first_seen, last_seen, status, root_cause_task_id) VALUES (?,?,?,?,?,?,?,?,?,?)`
+      first_seen, last_seen, status, root_cause_task_id, kind) VALUES (?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.project_id, row.title, row.body, row.source_task_id, row.occurrences,
-    row.first_seen, row.last_seen, row.status, row.root_cause_task_id
+    row.first_seen, row.last_seen, row.status, row.root_cause_task_id, row.kind
   );
   broadcast({ type: "learning", learning: row });
   return json(row, 201);
@@ -3000,20 +3012,71 @@ function createRootCauseTask(db: DB, learning: any): string {
   return id;
 }
 
+// Retract the chore a learning auto-spawned when that learning stops justifying
+// it (recategorized off 'failure', or deleted): an untouched queued one is a
+// bogus dispatch waiting to happen. A task already picked up (or finished) is
+// left alone — don't yank live work. Only a task hive spawned for *this*
+// learning qualifies, proven by createRootCauseTask's `created` event:
+// root_cause_task_id is also settable by hand through PUT, and cancelling a
+// director's own queued work is worse than the bogus chore this guards against.
+// Reports whether it actually cancelled, so callers only drop the link when the
+// task really went away.
+function cancelQueuedRootCauseTask(
+  db: DB,
+  learning: { id: string; root_cause_task_id: string | null } | null | undefined,
+  reason: string
+): boolean {
+  const taskId = learning?.root_cause_task_id;
+  if (!taskId || getTask(db, taskId)?.state !== "queued") return false;
+  const spawned = db
+    .query(
+      "SELECT 1 FROM events WHERE task_id = ? AND type = 'created' AND json_extract(payload, '$.learning_id') = ? LIMIT 1"
+    )
+    .get(taskId, learning!.id);
+  if (!spawned) return false;
+  try {
+    transition(db, taskId, "cancelled", { source: "director", reason });
+    return true;
+  } catch (e) {
+    console.error("[hive] cancel root-cause task:", e);
+    return false;
+  }
+}
+
+// kind is correctable here (unlike create, which requires it explicit) — a
+// misfiled 'failure' that was actually a routine reference note would
+// otherwise sit in the ledger, pinned into every brief, for the project's life.
+// The same two kinds as create, in both directions: 'decision' rows are
+// authoritative director rulings owned by recordDecisionKnowledge, so a PUT can
+// neither promote into that set nor demote a ruling out of it (which would drop
+// it from the decisions brief and re-ask the same question as a fresh row).
 function updateLearning(db: DB, id: string, body: any): Response {
   const r: any = db.query("SELECT * FROM learnings WHERE id = ?").get(id);
   if (!r) return err("learning not found", 404);
   if (body.status && !["active", "resolved"].includes(body.status))
     return err("status must be 'active' or 'resolved'");
+  // Only an actual change is a recategorization: a read-modify-write client
+  // echoing the row's own kind back must not trip either fence.
+  const recategorizing = body.kind !== undefined && body.kind !== r.kind;
+  if (recategorizing && r.kind === "decision")
+    return err("decision learnings are managed automatically and cannot be recategorized");
+  if (recategorizing && !CREATABLE_KINDS.has(body.kind))
+    return err("kind must be 'failure' or 'reference'");
   const next = {
     title: body.title ?? r.title,
     body: body.body ?? r.body,
     status: body.status ?? r.status,
+    kind: body.kind ?? r.kind,
     root_cause_task_id: body.root_cause_task_id ?? r.root_cause_task_id,
   };
+  if (
+    recategorizing && r.kind === "failure" &&
+    cancelQueuedRootCauseTask(db, r, `learning recategorized from failure to ${body.kind}`)
+  )
+    next.root_cause_task_id = null;
   db.query(
-    "UPDATE learnings SET title = ?, body = ?, status = ?, root_cause_task_id = ? WHERE id = ?"
-  ).run(next.title, next.body, next.status, next.root_cause_task_id, id);
+    "UPDATE learnings SET title = ?, body = ?, status = ?, kind = ?, root_cause_task_id = ? WHERE id = ?"
+  ).run(next.title, next.body, next.status, next.kind, next.root_cause_task_id, id);
   const updated = { ...r, ...next };
   broadcast({ type: "learning", learning: updated });
   return json(updated);

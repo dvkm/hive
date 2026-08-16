@@ -63,7 +63,7 @@ bin/hive decision auto-answer <decision-id> --key <option> [--reason "..."]
     # else exits 3 and leaves the card open for the director
 bin/hive policy add --title "..." --body "..." [--scope global|project:<id>]
 bin/hive policy list [--scope <s>]
-bin/hive learning add --project <id> --title "..." [--body "..."] [--root-cause]
+bin/hive learning add --project <id> --title "..." --kind failure|reference [--body "..."] [--root-cause]
 bin/hive learning list [--project <id>] [--status active|resolved]
 bin/hive learning recur <learning-id>   # bump occurrences when the pattern recurs
 bin/hive spawn <task-id>                # start a herdr agent for a task
