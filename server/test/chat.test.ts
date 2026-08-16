@@ -319,6 +319,27 @@ test("an arbitrary body.task_id cannot hijack an unrelated task as the chat supe
   expect(victimAfter.state).toBe(victim.state); // untouched
 });
 
+test("Chief of Staff is one durable cross-project thread backed by the hive coordinator repo", async () => {
+  const before = briefs.length;
+  const { status, json } = await post("/api/chat/turn", { scope: "chief", text: "remember the portfolio and handle the details" });
+  expect(status).toBe(202);
+  expect(json.delivery).toBe("spawned");
+
+  const thread = (await get(`/api/chat/threads/${json.thread_id}`)).json;
+  expect(thread.project_id).toBeNull();
+  const task = (await get(`/api/tasks/${thread.task_id}`)).json;
+  expect(task.project_id).toBe(projectId);
+  expect(task.title).toContain("Chief of Staff");
+  expect(briefs.length).toBe(before + 1);
+  expect(briefs.at(-1)).toContain("Chief of Staff");
+  expect(briefs.at(-1)).toContain("Memory and attention");
+  expect(briefs.at(-1)).toContain("every project");
+
+  const followup = await post("/api/chat/turn", { thread_id: thread.id, text: "where did I leave off?" });
+  expect(followup.status).toBe(202);
+  expect(followup.json.delivery).toBe("delivered");
+});
+
 test("starting a chat with no project is rejected (session needs a repo)", async () => {
   const { status, json } = await post("/api/chat/turn", { text: "hello" });
   expect(status).toBe(400);

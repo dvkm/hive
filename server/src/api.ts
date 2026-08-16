@@ -558,13 +558,14 @@ async function chatTurn(db: DB, herdr: Herdr, deps: HandlerDeps, body: any): Pro
   if (body?.thread_id) {
     const thread = getThread(db, String(body.thread_id));
     if (!thread) return err("thread not found", 404);
-    if (!thread.project_id) return err("thread has no project scope; cannot run a supervisor session", 400);
     return json(await chatTurnOnThread(db, herdr, deps, thread, text), 202);
   }
 
-  const projectId = body?.project_id ? String(body.project_id) : null;
-  if (!projectId) return err("project_id is required to start a chat (the supervisor session runs in the project's repo)");
-  if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return err("unknown project_id", 400);
+  const chief = body?.scope === "chief";
+  const projectId = chief ? null : body?.project_id ? String(body.project_id) : null;
+  if (!chief && !projectId) return err("project_id is required to start a chat (the supervisor session runs in the project's repo)");
+  if (projectId && !db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return err("unknown project_id", 400);
+  if (chief && !coordinatorProjectId(db)) return err("at least one project with a repository is required", 400);
 
   // A brand-new chat has no thread_id yet, so two concurrent first-messages
   // (a UI double-submit before the client gets a thread_id back) each used to
@@ -573,7 +574,7 @@ async function chatTurn(db: DB, herdr: Herdr, deps: HandlerDeps, body: any): Pro
   // genuine double-submit repeats the exact text within the same tick, so the
   // second request rides the first's in-flight thread-creation + delivery
   // instead of racing its own.
-  const dedupeKey = `${projectId}\0${text}`;
+  const dedupeKey = `${projectId ?? "chief"}\0${text}`;
   let pending = pendingNewChats.get(dedupeKey);
   if (!pending) {
     pending = (async () => {
@@ -647,13 +648,15 @@ async function deliverToSupervisor(
   // A closed (terminal — see chatClose) supervisor task is never resurrected;
   // a message to a closed thread starts a fresh session, same thread.
   if (!task || TERMINAL.includes(task.state as State)) {
+    const runtimeProjectId = thread.project_id ?? coordinatorProjectId(db);
+    if (!runtimeProjectId) return { delivery: "failed", error: "no project repository is available for the Chief of Staff session" };
     taskId = newId();
     const t = now();
     db.query(
       `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, created_at, updated_at)
        VALUES (?,?,?,?, 'in_progress', 'chore', 'chat_supervisor', ?, ?)`
-    ).run(taskId, thread.project_id, `[chat] supervisor: ${thread.title ?? thread.id}`, null, t, t);
-    writeEvent(db, { task_id: taskId, source: "director", type: "created", payload: { title: `[chat] supervisor session`, thread_id: thread.id } });
+    ).run(taskId, runtimeProjectId, `[chat] ${thread.project_id ? "supervisor" : "Chief of Staff"}: ${thread.title ?? thread.id}`, null, t, t);
+    writeEvent(db, { task_id: taskId, source: "director", type: "created", payload: { title: `[chat] ${thread.project_id ? "supervisor" : "Chief of Staff"} session`, thread_id: thread.id } });
     setThreadTask(db, thread.id, taskId);
     task = getTask(db, taskId);
   }
@@ -679,6 +682,18 @@ async function deliverToSupervisor(
   });
   if (!r.ok) return { delivery: "failed", error: r.error };
   return { delivery: "spawned", agent_target: r.agent_target };
+}
+
+function coordinatorProjectId(db: DB): string | null {
+  const row = db
+    .query(
+      `SELECT id FROM projects
+       WHERE repo_path IS NOT NULL AND COALESCE(json_extract(config, '$.archived'), 0) = 0
+       ORDER BY CASE WHEN lower(name) = 'hive' THEN 0 ELSE 1 END, created_at
+       LIMIT 1`
+    )
+    .get() as { id: string } | undefined;
+  return row?.id ?? null;
 }
 
 // Meaningful worker events wake the manager session that delegated the task.
@@ -753,6 +768,20 @@ function activeManagerForProject(db: DB, projectId: string): ChatThread | null {
   );
 }
 
+function activeChiefOfStaff(db: DB): ChatThread | null {
+  return (
+    (db
+      .query(
+        `SELECT c.* FROM chat_threads c
+           JOIN tasks t ON t.id = c.task_id
+          WHERE c.project_id IS NULL AND t.source = 'chat_supervisor'
+            AND t.state NOT IN ('done', 'failed', 'cancelled')
+          ORDER BY c.updated_at DESC LIMIT 1`
+      )
+      .get() as ChatThread | undefined) ?? null
+  );
+}
+
 function activeManager(db: DB): ChatThread | null {
   return (
     (db
@@ -801,7 +830,7 @@ export function notifyManagerOfEvent(db: DB, herdr: Herdr, deps: HandlerDeps, ev
   if (!managerEventRelevant(event)) return;
   const origin = getTask(db, event.task_id);
   if (!origin || origin.source === "chat_supervisor") return;
-  const thread = managingThreadForTask(db, event.task_id) ?? activeManagerForProject(db, origin.project_id) ?? activeManager(db);
+  const thread = managingThreadForTask(db, event.task_id) ?? activeChiefOfStaff(db) ?? activeManagerForProject(db, origin.project_id) ?? activeManager(db);
   if (!thread?.task_id) return;
   if (event.type === "steer" && event.payload?.from_task_id === thread.task_id) return;
 
@@ -855,14 +884,15 @@ export async function sweepManagerInboxes(db: DB, herdr: Herdr, deps: HandlerDep
     )
     .all() as ChatThread[];
   if (!active.length) return 0;
+  const chief = active.find((thread) => !thread.project_id);
   const byProject = new Map(active.filter((thread) => thread.project_id).map((thread) => [thread.project_id!, thread]));
-  const fallback = active[0];
+  const fallback = chief ?? active[0];
   const assignments = new Map<string, { thread: ChatThread; projects: { id: string; name: string; counts: ReturnType<typeof projectInboxCounts> }[] }>();
   for (const project of db.query("SELECT id, name FROM projects ORDER BY created_at").all() as { id: string; name: string }[]) {
     const counts = projectInboxCounts(db, project.id);
     const total = counts.checkpoints + counts.decisions + counts.reviews + counts.attention;
     if (!total) continue;
-    const thread = byProject.get(project.id) ?? fallback;
+    const thread = chief ?? byProject.get(project.id) ?? fallback;
     const assignment = assignments.get(thread.id) ?? { thread, projects: [] };
     assignment.projects.push({ id: project.id, name: project.name, counts });
     assignments.set(thread.id, assignment);
