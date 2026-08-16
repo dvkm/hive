@@ -12,12 +12,10 @@ import { eventText } from "../lib/eventText";
 import { STATE_LABEL } from "../lib/labels";
 import { StatusDot, toast } from "../lib/ui";
 
-// Director chat: a single PERSISTENT panel (a floating drawer, not a route) so
-// it's reachable from anywhere in hive. It talks to the supervisor session
-// backend (POST /api/chat/turn); the supervisor's replies — and the director's
-// own echoed messages — arrive live over SSE via the store. Resulting work
-// (tasks created, decisions answered) shows up live on the board/inbox as usual;
-// here it surfaces as the supervisor's reply plus any action chips on a message.
+// One portfolio-wide Chief of Staff conversation appears on the home route and
+// in a persistent drawer elsewhere. Its replies and the director's echoed
+// messages arrive live over SSE; detailed supervisor activity stays behind the
+// home view's progressive disclosure.
 
 const CHIEF_LAST_SEEN = "hive.chief.lastSeen";
 

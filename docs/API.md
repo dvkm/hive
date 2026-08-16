@@ -474,7 +474,7 @@ priced rows only).
 ```json
 {
   "id": "thr_...",
-  "project_id": "proj_ab12...",
+  "project_id": null,
   "task_id": "9da7c5527580",
   "title": "ship the dark mode toggle",
   "created_at": "2026-07-09T09:00:00.000Z",
@@ -491,8 +491,7 @@ priced rows only).
   "actions": []
 }
 ```
-`task_id` is the thread's backing supervisor task (null until the session first
-spawns; re-pointed to a fresh task if the thread is closed and later reopened).
+`project_id` is a project id for a project-scoped supervisor thread or `null` for the single portfolio-wide Chief of Staff thread. `task_id` is the thread's backing supervisor task (null until the session first spawns; re-pointed to a fresh task if the thread is closed and later reopened). A Chief of Staff task runs from the active Hive project repository when one exists, otherwise from the earliest active project with a repository.
 `role` is `director` (operator) or `assistant` (the supervisor session's reply).
 `actions` is a reserved JSON array (currently always empty). See the Director
 chat endpoints below.
@@ -754,9 +753,7 @@ the reconciler recording `pr_synchronized`.
   notes so a respawned agent has them. **Reject** is not a separate endpoint — it
   is `POST /transition {to:"cancelled", reason}` (allowed from `in_review`).
 
-The morning brief (`GET /api/brief`) gains a `to_review` array: the current
-`in_review` tasks (full Task objects with `health`), rendered as review cards
-inline just after `decisions`.
+`GET /api/brief[?since=<iso>]` returns `{since, done, director_required_task_ids, failed_or_attention, decisions, fleet, incidents, intake, to_review, spend, learnings_new}`. `director_required_task_ids` is the unique set of task ids for open decisions the target project's autonomy profile does not allow a supervisor to answer, plus open checkpoints in conservative projects. `done` excludes `chat_supervisor` infrastructure tasks. `to_review` contains the current `in_review` tasks as full Task objects with `health`; `done`, incidents, spend, and learnings are windowed by `since`, while action-state sections remain current.
 
 ### Search — `GET /api/search?q=&limit=`
 Global text search across the five text-bearing entities, for the web command
@@ -928,20 +925,12 @@ work. Use `POST /api/tasks/:id/events` with `type=evidence` for that.
   `queued` tasks with `source="planner"` and `parent_task_id` set to the source
   task (each gets a `created` event), while `reject` creates nothing (event only).
 
-### Director chat (persistent supervisor session over hive)
-A chat thread is backed by a **persistent supervisor session** — a long-lived
-herdr agent (an interactive `claude` session, same runtime as a task agent), NOT
-a per-turn subprocess. The session stays alive across the whole conversation,
-holds its own context, and coordinates hive's worker agents on the director's
-behalf ("one supervisor, fans out"). Its coordination actions (creating tasks,
-answering decisions, reading status) go through the SAME `$HIVE_CLI` + API +
-standing-authority gates every hive agent uses — merges/guarded/destructive ops
-are gated identically, and the session has no privileged path around them. It
-MAY clear a narrow set of mechanical decision cards itself via
+### Director chat (persistent supervisors and Chief of Staff)
+A chat thread is backed by a **persistent supervisor session**, a long-lived herdr agent (an interactive `claude` session, same runtime as a task agent), not a per-turn subprocess. A project-scoped thread coordinates one project. The single thread with `project_id: null` is the portfolio-wide Chief of Staff used by the default web home and drawer; it retains the same conversation across project switches and receives manager wakeups across the portfolio. Its coordination actions (creating tasks, answering decisions, reading status) go through the same `$HIVE_CLI` + API + standing-authority gates every hive agent uses. Merges, guarded operations, and destructive operations are gated identically, and the session has no privileged path around them. It may clear a narrow set of mechanical decision cards itself via
 `POST /api/decisions/:id/auto-answer` (server-enforced allow-list, see Decisions
 above), and may answer low/normal-risk reversible technical choices through the
 normal audited answer endpoint after reasoning or a team discussion when the
-project uses the `autopilot` profile. `balanced` is limited to the safe
+project uses the `autopilot` profile. The Chief of Staff evaluates the target project's current profile before every action. `balanced` is limited to the safe
 auto-answer endpoint; `conservative` leaves both decisions and checkpoints to
 the director. It must
 escalate unknown director intent or product preference, meaningful cost,
@@ -955,33 +944,37 @@ The supervisor task is also the root of an automatic management loop. Tasks it
 creates inherit `parent_task_id=$HIVE_TASK_ID`; nested agent follow-ups preserve
 the chain. Hive walks that ancestry for meaningful events, batches synchronous
 transition bursts, and pushes one `[hive manager wakeup]` steer into the current
-supervisor session. The wake set covers blockers, decisions, peer messages,
+supervisor session. When an active Chief of Staff exists, it takes priority over project-scoped fallback managers for otherwise unowned worker events and inbox sweeps. The wake set covers blockers, decisions, peer messages,
 review handoffs, CI/merge/smoke results, recovery, failures, and terminal state
 changes. An explicitly closed thread is not respawned by a child event. The
 manager brief requires it to act on each wakeup, use bounded proposal → critique
 → synthesis meetings where useful, and independently verify the integrated
 top-level outcome before reporting completion.
 
-- `POST /api/chat/turn` body `{text (required), thread_id?, project_id?}` → `202 {thread_id, delivery, agent_target?, error?}` | `400` (empty text / no project scope) | `404` (unknown `thread_id`)
+- `POST /api/chat/turn` body `{text (required), thread_id?, project_id?, scope?: "chief"}` → `202 {thread_id, delivery, agent_target?, error?}` | `400` (empty text, missing project scope, or no active project repository for Chief of Staff) | `404` (unknown `thread_id`)
   Director → supervisor. **Non-blocking by design**: it persists the director
   message, makes sure the thread's supervisor session is live (spawning it on the
   first message — `delivery:"spawned"` — or delivering into the running one —
   `delivery:"delivered"`), and returns immediately. `project_id` is required to
-  start a new thread (the session runs in that project's repo). The message is
+  start a new project-scoped thread (the session runs in that project's repo). The message is
   broadcast over SSE as `{type:"chat_message", message}`. The session thinks/acts
   asynchronously and posts its reply via the `/reply` endpoint below — the
   director never blocks on the model. `delivery` is `spawned` | `delivered` |
-  `failed`.
+  `failed`. With `scope:"chief"`, `project_id` is ignored and the existing global
+  thread is reused or created with `project_id:null`; the session requires at
+  least one unarchived project with a repository and uses the Hive project first
+  when available. Without `scope:"chief"`, `project_id` remains required to
+  start a new project-scoped thread.
 - `POST /api/chat/threads/:id/reply` body `{text (required)}` → `200 {ok, message}` | `404` (unknown thread) | `400` (empty text)
   Supervisor → director. The session calls this (via `hive chat reply <thread>
   "..."`) to post its reply; appends an `assistant` message and streams it over
   SSE as `{type:"chat_message", message}`. Loopback in practice (agents run on
   localhost).
-- `GET /api/chat/threads?project_id=` → `200 [ChatThread, ...]` (newest first; `project_id` filter optional)
+- `GET /api/chat/threads?project_id=` → `200 [ChatThread, ...]` (newest first; `project_id` filter optional). An unfiltered response includes the global Chief of Staff thread; the query parameter filters to an exact project id.
 - `GET /api/chat/threads/:id` → `200 {...ChatThread, messages:[ChatMessage], meetings:[ManagerMeeting], verifications:[ManagerVerification], retrospectives:[ManagerRetrospective]}` | `404`. Messages are oldest first. Management records are newest first; repeated meeting stages collapse to the latest card for each `meeting_id`.
 - `PUT /api/chat/threads/:id/run` body `{objective?, acceptance_criteria?: string[], phase?, next_action?, waiting_on?, wakeup_at?, outcome?, source?}` → `200 ChatThread` | `400` | `404` | `409`. `phase` is `intake|planning|executing|waiting|verifying|complete|stopped`. Completing a run is rejected unless the newest verification passed and a retrospective exists. A successful update writes a `manager_update` event on the supervisor task. Waiting runs with a due `wakeup_at` are resumed by the daemon (`HIVE_MANAGER_WAKE_MS`, 30 seconds by default).
 - `POST /api/chat/threads/:id/meetings` body `{stage: "proposal"|"critique"|"decided", meeting_id?, topic?, participants?: string[], summary?, decision?}` → `201/200 ManagerMeeting` | `400` | `404` | `409`. Proposal requires a topic and 2 to 3 worker task ids owned by this manager. Hive sends the agenda to each participant. Critique sends the competing-proposal summary back once. Decided records and broadcasts the conclusion, ending the meeting.
-- `POST /api/chat/threads/:id/verifications` body `{status: "started"|"passed"|"failed", method, result?, target_task_ids?: string[], evidence_ids?: string[], replay_of?}` → `201 ManagerVerification` | `400` | `404` | `409`. A passing result requires a concrete result plus evidence ids from the run's project. Failure moves the ledger back to executing with corrective work as the next action.
+- `POST /api/chat/threads/:id/verifications` body `{status: "started"|"passed"|"failed", method, result?, target_task_ids?: string[], evidence_ids?: string[], replay_of?}` → `201 ManagerVerification` | `400` | `404` | `409`. A passing result requires a concrete result plus evidence ids from the run's project. This validation is still project-scoped: because a Chief of Staff thread has `project_id:null`, it cannot currently accept project task targets or evidence for a passing verification. Failure moves the ledger back to executing with corrective work as the next action.
 - `POST /api/chat/threads/:id/verifications/:eventId/replay` body `{}` → `202 {verification, delivery, agent_target?, error?}` | `404` | `409`. It records a fresh started attempt, wakes the persistent supervisor with the prior method/result and current acceptance criteria, and asks it to compare the current integrated state.
 - `POST /api/chat/threads/:id/retrospectives` body `{summary, worked?: string[], problems?: string[], lessons?: string[]}` → `201 ManagerRetrospective` | `400` | `404` | `409`. The record is append-only and is required before completing the run.
 - `POST /api/chat/threads/:id/close` → `200 {ok, thread_id}` | `404` (unknown thread)
