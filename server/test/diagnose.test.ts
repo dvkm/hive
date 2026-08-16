@@ -35,6 +35,14 @@ history and other repositories.
 
 ←/→ to change usage · Enter to continue · Esc to cancel`;
   expect(diagnosePane(tail)?.kind).toBe("auto_mode_setup");
+  expect(
+    diagnosePane(`Set up auto mode for your environment?
+Auto mode lets Claude act without asking first.
+❯ 1. Set it up
+  2. Not now
+  3. Don't show again
+Enter to confirm · Esc to cancel`)?.kind
+  ).toBe("auto_mode_setup");
 });
 
 test("diagnoses lost auth (the real /login loop)", () => {
