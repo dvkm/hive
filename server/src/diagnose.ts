@@ -3,6 +3,7 @@
 // failure class gets graceful handling instead of nudge→fail (2026-07-11: all
 // seven "silent" failures were really dialogs, lost auth, or a full context).
 export type PaneDiagnosis =
+  | { kind: "auto_mode_setup"; excerpt: string }
   | { kind: "trust_dialog"; excerpt: string }
   | { kind: "blocked_dialog"; excerpt: string }
   | { kind: "auth_lost"; excerpt: string }
@@ -64,6 +65,9 @@ export function diagnosePane(tail: string): PaneDiagnosis {
   };
 
   // Order matters: a dialog is the most specific, actionable state.
+  const autoMode = find(/Set up auto mode for your environment\?/i);
+  if (autoMode !== -1 && /Also scan shell history/i.test(tail))
+    return { kind: "auto_mode_setup", excerpt: excerptAround(lines, autoMode, 4, 14) };
   const trust = find(/Quick safety check:|Yes, I trust this folder/i);
   if (trust !== -1 && /Quick safety check:/i.test(tail) && /Yes, I trust this folder/i.test(tail))
     return { kind: "trust_dialog", excerpt: excerptAround(lines, trust, 12, 6) };

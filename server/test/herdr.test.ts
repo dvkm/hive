@@ -338,6 +338,18 @@ test("send refuses to type into an unknown shell pane", async () => {
   expect(calls.some((c) => c[1] === "pane")).toBe(false);
 });
 
+test("answerDialog sends Escape without submitting Enter", async () => {
+  const { exec, calls } = stubExec((argv) => {
+    if (argv.includes("agent") && argv.includes("get"))
+      return OK('{"result":{"agent":{"pane_id":"wR:p7","agent_status":"done"}}}');
+    return OK("ok");
+  });
+  const h = new Herdr(exec, "herdr");
+  await h.answerDialog("t1", "Escape");
+  const keys = calls.filter((c) => c[1] === "pane" && c[2] === "send-keys").map((c) => c[4]);
+  expect(keys).toEqual(["Escape"]);
+});
+
 // ---- leftover-worktree reclaim (respawn on a reused task id) ----
 
 // A tiny world: a leftover worktree for hive/t1 is in the way until something

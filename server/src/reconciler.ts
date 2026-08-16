@@ -113,9 +113,10 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
       broadcastTask(db, getTask(db, t.id)); // health may have flipped (blocked / gone)
     }
     // React to dialogs EVERY cycle, not just on a status transition. Claude's
-    // startup trust dialog reports `idle`, while tool permission dialogs report
-    // `blocked`. Idempotent: a handled dialog disappears from the pane.
-    if (next === "blocked" || next === "idle") {
+    // startup trust dialog reports `idle`, auto-mode setup reports `done`, and
+    // tool permission dialogs report `blocked`. Idempotent: a handled dialog
+    // disappears from the pane.
+    if (next === "blocked" || next === "idle" || next === "done") {
       try {
         await handleBlockedAgent(db, h, t.id, t.agent_target);
       } catch (e) {
@@ -1024,6 +1025,16 @@ export async function handleBlockedAgent(db: DB, h: Herdr, taskId: string, targe
   if (!task || TERMINAL.includes(task.state as State)) return;
   const tail = await h.read(target, 200);
   const diag = diagnosePane(tail);
+  if (diag?.kind === "auto_mode_setup") {
+    const r = await h.answerDialog(target, "Escape");
+    writeEvent(db, {
+      task_id: taskId,
+      source: "reconciler",
+      type: "dialog_auto_declined",
+      payload: { delivered: r.code === 0, kind: "auto_mode_setup", excerpt: diag.excerpt.slice(0, 300) },
+    });
+    return;
+  }
   if (diag?.kind === "trust_dialog") {
     const r = await h.answerDialog(target, "1");
     writeEvent(db, {

@@ -21,6 +21,22 @@ Enter to confirm · Esc to cancel`;
   expect(diagnosePane(tail)?.kind).toBe("trust_dialog");
 });
 
+test("diagnoses Claude's auto-mode environment scan separately", () => {
+  const tail = `Set up auto mode for your environment?
+
+Claude Code reads this project, your recent Claude sessions, and optionally your shell
+history and other repositories.
+
+  How you use Claude here    ◀ Mixed ▶
+❯ Also scan shell history    [ ]
+  Also scan your other repos [ ]
+
+  Continue
+
+←/→ to change usage · Enter to continue · Esc to cancel`;
+  expect(diagnosePane(tail)?.kind).toBe("auto_mode_setup");
+});
+
 test("diagnoses lost auth (the real /login loop)", () => {
   const tail = `⎿  Not logged in · Please run /login
 ✻ Cogitated for 0s
