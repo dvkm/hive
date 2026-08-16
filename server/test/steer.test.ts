@@ -147,7 +147,7 @@ test("a send to a pane-less agent is a failure, not a silent delivery", async ()
     has(argv, "agent", "get") ? OK('{"result":{"agent":{"pane_id":null}}}') : OK();
   const r = await new Herdr(exec, "herdr").send("t1", "ship it");
   expect(r.code).not.toBe(0);
-  expect(r.stderr).toContain("no pane");
+  expect(r.stderr).toContain("not active");
 });
 
 test("a failing herdr send retries once, then queues the steer", async () => {

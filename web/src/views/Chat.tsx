@@ -54,13 +54,26 @@ export function Bubble({ m }: { m: ChatMessage }) {
   );
 }
 
-const VISIBLE_MANAGER_EVENTS = new Set(["tool_use", "assistant_text", "status", "spawned"]);
+const VISIBLE_MANAGER_EVENTS = new Set([
+  "steer",
+  "spawned",
+  "agent_status",
+  "assistant_text",
+  "tool_use",
+  "agent_turn_end",
+  "needs-decision",
+  "auto_approved",
+  "auto_approve_declined",
+  "spawn_error",
+  "steer_error",
+]);
 
 function ManagerActivity({
   thread,
   events,
   tasks,
   awaiting,
+  managerTask,
   project,
   onRefresh,
   onProjectsRefresh,
@@ -69,20 +82,22 @@ function ManagerActivity({
   events: Event[];
   tasks: Task[];
   awaiting: boolean;
+  managerTask: Task | null;
   project: Project | undefined;
   onRefresh: () => void;
   onProjectsRefresh: () => void;
 }) {
   const taskId = thread?.task_id ?? null;
   const status = String(events.find((e) => e.type === "agent_status")?.payload.status ?? "");
-  const working = awaiting || status === "working";
+  const stopped = !!managerTask && ["done", "failed", "cancelled"].includes(managerTask.state);
+  const working = !stopped && (awaiting || status === "working");
   const [savingProfile, setSavingProfile] = useState(false);
   const [replaying, setReplaying] = useState<string | null>(null);
   const delegated = tasks
     .filter((t) => t.parent_task_id === taskId && t.source !== "chat_supervisor")
     .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
     .slice(0, 6);
-  const activity = events.filter((e) => VISIBLE_MANAGER_EVENTS.has(e.type)).slice(0, 5);
+  const activity = events.filter((e) => VISIBLE_MANAGER_EVENTS.has(e.type)).slice(0, 12);
   const meeting = thread?.meetings?.[0];
   const verification = thread?.verifications?.[0];
   const retrospective = thread?.retrospectives?.[0];
@@ -124,7 +139,7 @@ function ManagerActivity({
         <span>Manager activity</span>
         <span className={`manager-live ${working ? "manager-live-working" : ""}`}>
           <span className="manager-live-dot" />
-          {!taskId ? "not started" : working ? "working" : "watching"}
+          {!taskId ? "not started" : stopped ? "stopped" : working ? "working" : "watching"}
         </span>
       </div>
 
@@ -196,7 +211,7 @@ function ManagerActivity({
       )}
 
       <section className="manager-activity-section">
-        <h2>Recent actions</h2>
+        <h2>Trajectory</h2>
         {activity.length === 0 ? (
           <p className="manager-activity-empty">{taskId ? "Waiting for the next action." : "Start a conversation to create a manager session."}</p>
         ) : (
@@ -206,7 +221,7 @@ function ManagerActivity({
                 <span className="manager-event-dot" />
                 <div>
                   <div className="manager-event-text" title={eventText(e)}>{eventText(e)}</div>
-                  <time title={e.ts}>{relTime(e.ts)}</time>
+                  <div className="manager-event-meta"><span>{e.type.replace(/[_-]+/g, " ")}</span><time title={e.ts}>{relTime(e.ts)}</time></div>
                 </div>
               </div>
             ))}
@@ -241,6 +256,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [managerTaskId, setManagerTaskId] = useState<string | null>(null);
+  const [managerTask, setManagerTask] = useState<Task | null>(null);
   const [managerThread, setManagerThread] = useState<ChatThread | null>(null);
   const [managerEvents, setManagerEvents] = useState<Event[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -292,10 +308,19 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
   useEffect(() => {
     let live = true;
     if (!managerTaskId) {
+      setManagerTask(null);
       setManagerEvents([]);
       return;
     }
-    api.task(managerTaskId).then((d) => live && setManagerEvents(d.events)).catch(() => live && setManagerEvents([]));
+    api.task(managerTaskId).then((d) => {
+      if (!live) return;
+      setManagerTask(d);
+      setManagerEvents(d.events);
+    }).catch(() => {
+      if (!live) return;
+      setManagerTask(null);
+      setManagerEvents([]);
+    });
     return () => {
       live = false;
     };
@@ -334,7 +359,8 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
   };
 
   // Supervisor is thinking whenever the last thing said was the director's.
-  const awaiting = chatMessages.length > 0 && chatMessages[chatMessages.length - 1].role === "director";
+  const managerStopped = !!managerTask && ["done", "failed", "cancelled"].includes(managerTask.state);
+  const awaiting = !managerStopped && chatMessages.length > 0 && chatMessages[chatMessages.length - 1].role === "director";
   const activityEvents = useMemo(() => {
     const rows = new Map(managerEvents.map((e) => [e.id, e]));
     for (const e of feedEvents) if (e.task_id === managerTaskId) rows.set(e.id, e);
@@ -428,7 +454,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
             </button>
           </div>
         </div>
-        {embedded && <ManagerActivity thread={managerThread} events={activityEvents} tasks={tasks} awaiting={awaiting} project={projects.find((p) => p.id === project)} onRefresh={refreshManager} onProjectsRefresh={reloadProjects} />}
+        {embedded && <ManagerActivity thread={managerThread} events={activityEvents} tasks={tasks} awaiting={awaiting} managerTask={managerTask} project={projects.find((p) => p.id === project)} onRefresh={refreshManager} onProjectsRefresh={reloadProjects} />}
       </div>
     </div>
   );

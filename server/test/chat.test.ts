@@ -23,11 +23,11 @@ const db = openDb(":memory:");
 const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
 const WT = join(HOME, "wt");
 const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x));
-const ALIVE = () => OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}');
 
 // Records every brief an `agent start` received and every `agent send`.
 const briefs: string[] = [];
 const sends: string[] = [];
+let probeStatus = "working";
 const exec: Exec = async (argv) => {
   if (has(argv, "worktree", "create")) {
     // A real worktree create/reclaim takes real time; without the per-thread
@@ -36,7 +36,8 @@ const exec: Exec = async (argv) => {
     await new Promise((r) => setTimeout(r, 15));
     return OK(`{"result":{"worktree":{"path":${JSON.stringify(WT)},"branch":"hive/x","open_workspace_id":"w1"}}}`);
   }
-  if (has(argv, "agent", "get")) return ALIVE();
+  if (has(argv, "agent", "get"))
+    return OK(`{"result":{"agent":{"pane_id":"p1","agent_status":"${probeStatus}"}}}`);
   if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
   if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t2"}}}');
   if (has(argv, "agent", "start")) {
@@ -107,6 +108,20 @@ test("later message is delivered into the live session (not a respawn)", async (
   expect(briefs.length).toBe(before); // no new spawn
   expect(sends.at(-1)).toContain("what's the status?");
   expect(sends.at(-1)).toContain(threadId); // wire prefix tells the session where to reply
+});
+
+test("a leftover shell pane is respawned instead of receiving the director message", async () => {
+  const before = briefs.length;
+  probeStatus = "unknown";
+  try {
+    const { status, json } = await post("/api/chat/turn", { thread_id: threadId, text: "resume the sweep" });
+    expect(status).toBe(202);
+    expect(json.delivery).toBe("spawned");
+    expect(briefs.length).toBe(before + 1);
+    expect(briefs.at(-1)).toContain("resume the sweep");
+  } finally {
+    probeStatus = "working";
+  }
 });
 
 test("descendant worker events wake the manager once with a batched update", async () => {
