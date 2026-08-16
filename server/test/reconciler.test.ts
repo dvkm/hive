@@ -47,6 +47,26 @@ test("syncAgents writes an agent_status event only when the status changes", asy
   expect(events.length).toBe(1);
 });
 
+test("syncAgents accepts the safe workspace trust prompt for an idle spawned agent", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  const keys: string[] = [];
+  const herdr = new Herdr(stub((argv) => {
+    if (argv.includes("read"))
+      return OK(JSON.stringify({ result: { read: { text: "Quick safety check: Is this a project you trust?\n❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm · Esc to cancel" } } }));
+    if (argv.includes("send-keys")) {
+      keys.push(argv.at(-1)!);
+      return OK();
+    }
+    return OK('{"result":{"agent":{"agent_status":"idle","pane_id":"w1:p1"}}}');
+  }), "herdr");
+
+  await reconcileOnce(db, { herdr, staleMs: 60 * 60 * 1000, exec: stub(() => ({ code: 1, stdout: "", stderr: "no gh" })) });
+
+  expect(keys).toEqual(["1", "Enter"]);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dialog_auto_approved'").get(id)).toBeTruthy();
+});
+
 test("syncPRs updates ci_status and transitions in_review->verifying on merge", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { pr_url: "https://gh/pr/1" });

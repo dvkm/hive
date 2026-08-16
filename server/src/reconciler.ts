@@ -112,11 +112,10 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
       writeEvent(db, { task_id: t.id, source: "herdr", type: "agent_status", payload: { status: next } });
       broadcastTask(db, getTask(db, t.id)); // health may have flipped (blocked / gone)
     }
-    // React to `blocked` EVERY cycle, not just on the transition — an agent
-    // already blocked at server start (or re-blocked by a second dialog) must
-    // still be handled. Idempotent: auto-approve unblocks it, and the card path
-    // dedupes on an existing open card.
-    if (next === "blocked") {
+    // React to dialogs EVERY cycle, not just on a status transition. Claude's
+    // startup trust dialog reports `idle`, while tool permission dialogs report
+    // `blocked`. Idempotent: a handled dialog disappears from the pane.
+    if (next === "blocked" || next === "idle") {
       try {
         await handleBlockedAgent(db, h, t.id, t.agent_target);
       } catch (e) {
@@ -1025,6 +1024,16 @@ export async function handleBlockedAgent(db: DB, h: Herdr, taskId: string, targe
   if (!task || TERMINAL.includes(task.state as State)) return;
   const tail = await h.read(target, 200);
   const diag = diagnosePane(tail);
+  if (diag?.kind === "trust_dialog") {
+    const r = await h.answerDialog(target, "1");
+    writeEvent(db, {
+      task_id: taskId,
+      source: "reconciler",
+      type: "dialog_auto_approved",
+      payload: { delivered: r.code === 0, kind: "workspace_trust", excerpt: diag.excerpt.slice(0, 300) },
+    });
+    return;
+  }
   if (diag?.kind !== "blocked_dialog") return; // blocked but no visible dialog: leave to the silent path
 
   const project = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id) as { config: string } | undefined;

@@ -3,6 +3,7 @@
 // failure class gets graceful handling instead of nudge→fail (2026-07-11: all
 // seven "silent" failures were really dialogs, lost auth, or a full context).
 export type PaneDiagnosis =
+  | { kind: "trust_dialog"; excerpt: string }
   | { kind: "blocked_dialog"; excerpt: string }
   | { kind: "auth_lost"; excerpt: string }
   | { kind: "context_full"; excerpt: string }
@@ -63,6 +64,9 @@ export function diagnosePane(tail: string): PaneDiagnosis {
   };
 
   // Order matters: a dialog is the most specific, actionable state.
+  const trust = find(/Quick safety check:|Yes, I trust this folder/i);
+  if (trust !== -1 && /Quick safety check:/i.test(tail) && /Yes, I trust this folder/i.test(tail))
+    return { kind: "trust_dialog", excerpt: excerptAround(lines, trust, 12, 6) };
   const dialog = find(/Do you want to proceed\?|Esc to cancel|requested permissions to/i);
   if (dialog !== -1) return { kind: "blocked_dialog", excerpt: excerptAround(lines, dialog, 12, 6) };
 

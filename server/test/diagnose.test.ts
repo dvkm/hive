@@ -13,6 +13,14 @@ test("diagnoses a permission dialog (the real Figma MCP hang)", () => {
   expect(d && "excerpt" in d && d.excerpt).toContain("Do you want to proceed?");
 });
 
+test("diagnoses Claude's workspace trust dialog separately", () => {
+  const tail = `Quick safety check: Is this a project you created or one you trust?
+❯ 1. Yes, I trust this folder
+  2. No, exit
+Enter to confirm · Esc to cancel`;
+  expect(diagnosePane(tail)?.kind).toBe("trust_dialog");
+});
+
 test("diagnoses lost auth (the real /login loop)", () => {
   const tail = `⎿  Not logged in · Please run /login
 ✻ Cogitated for 0s
