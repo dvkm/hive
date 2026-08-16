@@ -132,6 +132,8 @@ test("brief composes every section from existing data", async () => {
   expect(json.decisions.length).toBe(1);
   expect(json.decisions[0].title).toBe("Ship prod now?");
   expect(json.decisions[0].options.length).toBe(2);
+  expect(json.director_required_task_ids).toContain(fleetId);
+  expect(json.director_required_task_ids).not.toContain(failedId);
 
   // fleet: the live healthy agent, with computed health
   const live = json.fleet.find((t: any) => t.id === fleetId);
@@ -179,6 +181,49 @@ test("since window scopes the 'what changed' sections but not action-state ones"
   expect(json.intake.length).toBe(1);
 });
 
+test("Chief briefing leaves operational work to the manager and counts only enforced director boundaries", async () => {
+  const balancedTask = (await post("/api/tasks", { project_id: projectId, title: "Capture the recurring reference" })).json.id;
+  await post("/api/decisions", {
+    task_id: balancedTask,
+    title: "Save recurring link as a project reference? docs",
+    risk: "low",
+    blast_radius: "one project reference",
+    options: [{ key: "save", label: "Save", recommended: true }, { key: "skip", label: "Skip" }],
+  });
+  await post(`/api/tasks/${balancedTask}/events`, { type: "checkpoint", note: "Reused the existing reference format" });
+
+  const conservativeProject = (await post("/api/projects", {
+    name: "conservative-project",
+    repo_path: "/tmp/conservative",
+    config: { autonomy_profile: "conservative" },
+  })).json.id;
+  const conservativeTask = (await post("/api/tasks", { project_id: conservativeProject, title: "Conservative choice" })).json.id;
+  await post("/api/decisions", {
+    task_id: conservativeTask,
+    title: "Save recurring link as a project reference? conservative",
+    risk: "low",
+    blast_radius: "one project reference",
+    options: [{ key: "save", label: "Save", recommended: true }, { key: "skip", label: "Skip" }],
+  });
+  await post(`/api/tasks/${conservativeTask}/events`, { type: "checkpoint", note: "Used the established route" });
+
+  const { json } = await get("/api/brief");
+  expect(json.director_required_task_ids).toContain(fleetId);
+  expect(json.director_required_task_ids).toContain(conservativeTask);
+  expect(json.director_required_task_ids).not.toContain(balancedTask);
+  expect(json.director_required_task_ids).not.toContain(failedId);
+});
+
+test("done-since is based on completion events, not later task edits", async () => {
+  await sleep(10);
+  const afterCompletion = new Date().toISOString();
+  await sleep(10);
+  db.query("UPDATE tasks SET title = ?, updated_at = ? WHERE id = ?").run("Edited shipped task", now(), doneNew);
+
+  const { json } = await get(`/api/brief?since=${encodeURIComponent(afterCompletion)}`);
+  expect(json.done.some((task: any) => task.id === doneNew)).toBe(false);
+});
+
 test("empty brief on a fresh DB has all sections empty", async () => {
   const fresh = openDb(":memory:");
   const srv = Bun.serve({ port: 0, fetch: makeHandler(fresh) });
@@ -186,6 +231,7 @@ test("empty brief on a fresh DB has all sections empty", async () => {
     const res = await fetch(`http://127.0.0.1:${srv.port}/api/brief`);
     const json = await res.json();
     expect(json.done).toEqual([]);
+    expect(json.director_required_task_ids).toEqual([]);
     expect(json.failed_or_attention).toEqual([]);
     expect(json.decisions).toEqual([]);
     expect(json.fleet).toEqual([]);

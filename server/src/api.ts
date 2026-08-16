@@ -578,10 +578,12 @@ async function chatTurn(db: DB, herdr: Herdr, deps: HandlerDeps, body: any): Pro
   let pending = pendingNewChats.get(dedupeKey);
   if (!pending) {
     pending = (async () => {
-      const thread = createThread(db, {
-        project_id: projectId,
-        title: text.split("\n")[0].slice(0, 80),
-      });
+      const thread =
+        (chief ? listThreads(db).find((candidate) => candidate.project_id === null) : null) ??
+        createThread(db, {
+          project_id: projectId,
+          title: text.split("\n")[0].slice(0, 80),
+        });
       return chatTurnOnThread(db, herdr, deps, thread, text);
     })();
     pendingNewChats.set(dedupeKey, pending);
@@ -1527,7 +1529,7 @@ function brief(db: DB, url: URL): Response {
        JOIN projects p ON p.id = t.project_id
        JOIN events sc ON sc.task_id = t.id AND sc.type = 'state_change'
          AND json_extract(sc.payload, '$.to') = 'done'
-       WHERE t.state = 'done'` + (since ? " AND sc.ts >= ?" : "") +
+       WHERE t.state = 'done' AND COALESCE(t.source, '') != 'chat_supervisor'` + (since ? " AND sc.ts >= ?" : "") +
       " ORDER BY sc.ts DESC"
     )
     .all(...(since ? [since] : []));
@@ -1549,6 +1551,25 @@ function brief(db: DB, url: URL): Response {
     .query("SELECT * FROM decisions WHERE status = 'open' ORDER BY ts DESC")
     .all()
     .map((r) => withBundle(db, parseDecision(r)));
+
+  const directorRequiredTaskIds = new Set(
+    decisions
+      .filter((decision: any) => {
+        const task = getTask(db, decision.task_id);
+        const autonomy = projectAutonomyProfile(db, task?.project_id ?? null);
+        if (autonomy === "conservative") return true;
+        const recommended = decision.options.find((option: any) => option.recommended);
+        if (!recommended) return true;
+        return !(autonomy === "autopilot"
+          ? evaluateAutopilotApprove(db, decision, recommended.key)
+          : evaluateAutoApprove(db, decision, recommended.key)).allow;
+      })
+      .map((decision: any) => decision.task_id)
+  );
+  for (const checkpoint of openCheckpointRows(db, null)) {
+    if (projectAutonomyProfile(db, checkpoint.project_id) === "conservative")
+      directorRequiredTaskIds.add(checkpoint.task_id);
+  }
 
   // ④ fleet now — currently live agents (task + health).
   const fleet = db
@@ -1607,6 +1628,7 @@ function brief(db: DB, url: URL): Response {
   return json({
     since: since ?? null,
     done,
+    director_required_task_ids: [...directorRequiredTaskIds],
     failed_or_attention,
     decisions,
     fleet,
@@ -2576,13 +2598,12 @@ function checkpointNote(payload: string): string {
   }
 }
 
-function listOpenCheckpoints(db: DB, url: URL): Response {
+function openCheckpointRows(db: DB, projectId: string | null): any[] {
   // Un-acked checkpoints stay reviewable AFTER the task finishes — agents
   // finish faster than the director's attention cycle, and 21 of the first 25
   // checkpoints vanished unreviewed when this filtered to live states
   // (2026-07-10). Only cancelled tasks drop out (their calls died with them).
-  const projectId = url.searchParams.get("project_id");
-  const rows = db
+  return db
     .query(
       `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state
          FROM events e JOIN tasks t ON t.id = e.task_id
@@ -2596,6 +2617,10 @@ function listOpenCheckpoints(db: DB, url: URL): Response {
         ORDER BY t.number DESC, e.ts ASC`
     )
     .all(projectId, projectId) as any[];
+}
+
+function listOpenCheckpoints(db: DB, url: URL): Response {
+  const rows = openCheckpointRows(db, url.searchParams.get("project_id"));
   return json({
     checkpoints: rows.map((r) => ({
       id: r.id,

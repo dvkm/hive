@@ -392,6 +392,7 @@ export interface BriefLearning extends Learning {
 export interface Brief {
   since: string | null;
   done: BriefDone[];
+  director_required_task_ids: string[];
   failed_or_attention: Task[];
   decisions: Decision[];
   fleet: Task[];
