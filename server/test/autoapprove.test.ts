@@ -133,6 +133,23 @@ test("apiAutoAnswerDecision: safe card is answered, resolver runs, audit trail r
   expect(JSON.parse(answered.payload).answered_by).toBe("chat_supervisor");
 });
 
+test("apiAutoAnswerDecision: malformed body is rejected before audit", async () => {
+  const d = createDecision(db, {
+    task_id: taskId,
+    title: "Save recurring link as a project reference? https://invalid.example",
+    risk: "normal",
+    options: [{ key: "save", label: "Save as reference", recommended: true }, { key: "ignore", label: "ignore" }],
+  });
+  const note = apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "save", answer_note: 123 });
+  expect(note.status).toBe(400);
+  expect(await note.json()).toEqual({ error: "answer_note must be a string" });
+  const indices = apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "save", selected_indices: "[]" });
+  expect(indices.status).toBe(400);
+  expect(await indices.json()).toEqual({ error: "selected_indices must be an array of indices" });
+  expect((db.query("SELECT status FROM decisions WHERE id=?").get(d.id) as any).status).toBe("open");
+  expect(db.query("SELECT 1 FROM events WHERE type='auto_approved' AND json_extract(payload,'$.decision_id')=?").get(d.id)).toBeFalsy();
+});
+
 test("apiAutoAnswerDecision: unsafe card is left OPEN and escalated with a reason", async () => {
   const d = createDecision(db, {
     task_id: taskId,

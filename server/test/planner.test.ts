@@ -10,6 +10,8 @@ const { openDb } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
 const { composePlannerPrompt, extractPlan, runPlanner } = await import("../src/planner.ts");
 const { isReviewed } = await import("../src/dispatcher.ts");
+const { addClient, removeClient } = await import("../src/bus.ts");
+const { writeEvent } = await import("../src/state.ts");
 import type { PlannerExec } from "../src/planner.ts";
 
 const db = openDb(":memory:");
@@ -133,6 +135,7 @@ test("plan endpoint -> decision card; approve creates linked child tasks", async
     const r = await (await fetch(base2 + `/api/tasks/${t.id}/plan`, { method: "POST", body: "{}" })).json();
     expect(r.ok).toBe(true);
     expect(r.decision.title).toContain("Proposed breakdown");
+    expect(r.decision.plan.proposed_tasks.length).toBe(2);
     // planning + planned events present
     const full = (await get(`/api/tasks/${t.id}`)).json;
     const types = full.events.map((e: any) => e.type);
@@ -148,9 +151,76 @@ test("plan endpoint -> decision card; approve creates linked child tasks", async
     expect(kids.every((k: any) => k.source === "planner")).toBe(true);
     expect(kids.every((k: any) => k.state === "queued")).toBe(true);
     expect(kids.map((k: any) => k.title).sort()).toEqual(["Design schema", "Research competitors"]);
+    expect(kids.find((k: any) => k.title === "Design schema").brief).toBe("users + steps tables");
   } finally {
     s2.stop(true);
   }
+});
+
+test("decision exposes structured plan for the UI checklist", async () => {
+  const t = await mkTask();
+  const messages: any[] = [];
+  const client = { id: "planner-test", send: (data: string) => messages.push(JSON.parse(data)) };
+  addClient(client);
+  const r = await runPlanner(db, t.id, { exec: stubExec(VALID).exec }).finally(() => removeClient(client));
+  expect(r.decision!.plan.proposed_tasks.map((p: any) => p.title)).toEqual(["Design schema", "Research competitors"]);
+  const published = messages.filter((m) => m.type === "decision" && m.decision.id === r.decision!.id);
+  expect(published[published.length - 1].decision.plan.questions).toEqual(["Which auth provider?"]);
+  const unrelated = await mkTask("Unrelated plan");
+  const foreignEvent = writeEvent(db, {
+    task_id: unrelated.id,
+    source: "system",
+    type: "planned",
+    payload: { decision_id: r.decision!.id, proposed_tasks: [{ title: "Wrong task", brief: "", kind: "chore" }] },
+  });
+  db.query("UPDATE events SET ts = ? WHERE id = ?").run("9999-12-31T23:59:59.999Z", foreignEvent.id);
+  const decision = (await get(`/api/decisions/${r.decision!.id}`)).json;
+  expect(decision.plan.proposed_tasks.map((p: any) => p.title)).toEqual(["Design schema", "Research competitors"]);
+  expect(decision.plan.questions).toEqual(["Which auth provider?"]);
+  expect(decision.plan.rationale).toContain("parallel");
+  expect(decision.plan.reason).toBeTruthy();
+  const notification = db.query("SELECT body FROM notifications WHERE decision_id = ?").get(r.decision!.id) as { body: string };
+  expect(notification.body).toContain("Proposed tasks");
+  // a non-planner card has no plan
+  const other = await post("/api/decisions", { task_id: t.id, title: "unrelated", options: [{ key: "ok", label: "OK" }] });
+  expect(other.json.plan).toBeNull();
+});
+
+test("selected_indices on approve creates each valid checked task once", async () => {
+  const t = await mkTask();
+  const r = await runPlanner(db, t.id, { exec: stubExec(VALID).exec });
+  await post(`/api/decisions/${r.decision!.id}/answer`, {
+    answer_key: "approve",
+    answer_note: "Q: Which auth provider?\nA: Use Clerk",
+    selected_indices: [1, 1, -1, 2, 0.5, "0"],
+  });
+  const kids = (await get(`/api/tasks?project_id=${projectId}`)).json.filter(
+    (x: any) => x.parent_task_id === t.id
+  );
+  expect(kids.length).toBe(1);
+  expect(kids[0].title).toBe("Research competitors");
+  expect(kids[0].brief).toBe("survey 3 tools\n\nDirector notes:\nQ: Which auth provider?\nA: Use Clerk");
+});
+
+test("approve rejects malformed inputs or empty planner selections", async () => {
+  const t = await mkTask();
+  const r = await runPlanner(db, t.id, { exec: stubExec(VALID).exec });
+  const malformedNote = await post(`/api/decisions/${r.decision!.id}/answer`, { answer_key: "approve", answer_note: 123 });
+  expect(malformedNote.status).toBe(400);
+  expect(malformedNote.json.error).toContain("answer_note must be a string");
+  expect((await get(`/api/decisions/${r.decision!.id}`)).json.status).toBe("open");
+  const malformed = await post(`/api/decisions/${r.decision!.id}/answer`, { answer_key: "approve", selected_indices: "[]" });
+  expect(malformed.status).toBe(400);
+  expect(malformed.json.error).toContain("array of indices");
+  expect((await get(`/api/decisions/${r.decision!.id}`)).json.status).toBe("open");
+  const answer = await post(`/api/decisions/${r.decision!.id}/answer`, { answer_key: "approve", selected_indices: [] });
+  expect(answer.status).toBe(400);
+  expect(answer.json.error).toContain("reject");
+  expect((await get(`/api/decisions/${r.decision!.id}`)).json.status).toBe("open");
+  const kids = (await get(`/api/tasks?project_id=${projectId}`)).json.filter(
+    (x: any) => x.parent_task_id === t.id
+  );
+  expect(kids.length).toBe(0);
 });
 
 test("reject creates no child tasks", async () => {

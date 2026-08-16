@@ -41,7 +41,7 @@ import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
 import { enqueue, ackNotifications } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, resolveDenyGuardrailForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
-import { runPlanner, resolvePlanForDecision, type PlannerExec } from "./planner.ts";
+import { runPlanner, resolvePlanForDecision, decisionPlan, selectedPlanIndices, type PlannerExec } from "./planner.ts";
 import { routeIntakeProject } from "./intake/route.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { costUsd } from "./pricing.ts";
@@ -3684,11 +3684,12 @@ export function decisionBundle(db: DB, taskId: string, decisionId: string): any 
   };
 }
 
-// Attach the derived bundle to a parsed decision. Cheap enough to run on every
-// open card at fetch/broadcast time; skipped implicitly for terminal cards that
-// callers never pass here.
+// Attach the derived bundle (and, for planner-breakdown cards, the structured
+// plan) to a parsed decision. Cheap enough to run on every open card at
+// fetch/broadcast time; skipped implicitly for terminal cards that callers
+// never pass here.
 export function withBundle(db: DB, d: any): any {
-  return { ...d, bundle: decisionBundle(db, d.task_id, d.id) };
+  return { ...d, bundle: decisionBundle(db, d.task_id, d.id), plan: decisionPlan(db, d.task_id, d.id) };
 }
 
 export function createDecision(
@@ -3784,6 +3785,14 @@ function saveDraft(db: DB, id: string, body: any): Response {
 // This is identity only — it grants nothing and gates nothing.
 const ANSWER_SOURCES = ["director", "chat_supervisor", "agent", "system", "unknown"] as const;
 
+function decisionAnswerBodyError(body: any): string | null {
+  if (body?.answer_note !== undefined && typeof body.answer_note !== "string")
+    return "answer_note must be a string";
+  if (body?.selected_indices !== undefined && !Array.isArray(body.selected_indices))
+    return "selected_indices must be an array of indices";
+  return null;
+}
+
 export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, supervisorVerified = false): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
   if (!r) return err("decision not found", 404);
@@ -3793,6 +3802,9 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
   const options: any[] = JSON.parse(r.options || "[]");
   if (options.length && !options.some((o) => o.key === answerKey))
     return err(`answer_key '${answerKey}' is not one of the options`, 400);
+  const bodyError = decisionAnswerBodyError(body);
+  if (bodyError) return err(bodyError, 400);
+  const submittedAnswerNote = body?.answer_note;
 
   // Caller identity. A missing source is NOT assumed to be the director — the
   // web UI now sends source:"director" explicitly, so a bare call is a caller
@@ -3812,8 +3824,13 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     if (!verdict.allow) return json({ effect: "escalate", category: verdict.category, reason: verdict.reason }, 403);
   }
 
+  const plan = decisionPlan(db, r.task_id, id);
+  const selectedIndices = body?.selected_indices;
+  if (plan && answerKey === "approve" && selectedPlanIndices(plan.proposed_tasks.length, selectedIndices).length === 0)
+    return err("Cannot approve a planner breakdown with no tasks; answer 'reject' instead.", 400);
+
   const answeredAt = now();
-  const answerNote = body?.answer_note ?? r.draft_note ?? null;
+  const answerNote = submittedAnswerNote ?? r.draft_note ?? null;
   db.query(
     "UPDATE decisions SET status = 'answered', answer_key = ?, answer_note = ?, answered_at = ?, answered_by = ?, answered_actor = ? WHERE id = ?"
   ).run(answerKey, answerNote, answeredAt, answeredBy, answeredActor, id);
@@ -3833,7 +3850,7 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     // approve → mint 24h grant (agent retries); deny → steer the reason.
     resolveGrantForDecision(db, id, answerKey, now, answerNote),
     resolveDenyGuardrailForDecision(db, id, answerKey),
-    resolvePlanForDecision(db, id, answerKey),
+    resolvePlanForDecision(db, r.task_id, id, answerKey, selectedIndices, answerNote),
     resolveRecoveryForDecision(db, id, answerKey),
     resolveBlockedForDecision(db, herdr, id, answerKey),
     resolveDuplicateForDecision(db, id, answerKey),
@@ -3876,6 +3893,8 @@ export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: an
   if (r.status !== "open") return err(`decision already ${r.status}`, 409);
   const answerKey = body?.answer_key;
   if (!answerKey) return err("answer_key is required");
+  const bodyError = decisionAnswerBodyError(body);
+  if (bodyError) return err(bodyError, 400);
 
   const task = getTask(db, r.task_id);
   if (projectAutonomyProfile(db, task?.project_id ?? null) === "conservative") {

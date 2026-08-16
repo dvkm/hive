@@ -241,7 +241,7 @@ Review events (written by the director path, `source: director`):
 Domain-supervisor events (written by the planner, `source: system`):
 - `planning` — a planner run started for the task. `payload: {title}`
 - `planned` — the planner produced a breakdown and opened a decision card.
-  `payload: {decision_id, source_task_id, proposed_tasks:[{title,brief,kind}], rationale, questions:[]}`
+  `payload: {decision_id, source_task_id, proposed_tasks:[{title,brief,kind}], rationale, questions:[], reason}`
 - `planner_error` — the planner failed (spawn error, non-zero exit, timeout, or
   unparseable output). A single diagnostic; no retry. `payload: {error}`
 
@@ -308,7 +308,8 @@ rev-parse HEAD` in the CLI's cwd. The review card compares it to the task's
     "prior_decisions": [
       { "id": "dec_...", "title": "Merge strategy?", "answer": "Fast-forward", "answered_at": "..." }
     ]
-  }
+  },
+  "plan": null
 }
 ```
 `status ∈ {open, answered, expired}`. `options` is an ordered, **non-empty**
@@ -325,6 +326,22 @@ the affected `pr_url`/`branch`, task `spend_usd` so far, and `prior_decisions` �
 the last 3 answered cards on the same project, each with the option `label` the
 director chose. Computed at fetch/broadcast time so it stays fresh; absent on
 older SSE payloads and terminal-card broadcasts.
+
+`plan` is likewise derived (from the `planned` event, keyed by `decision_id`) —
+non-null only for a planner breakdown card produced by
+`POST /api/tasks/:id/plan` or an intake trigger:
+```json
+"plan": {
+  "proposed_tasks": [{ "title": "Design schema", "brief": "users + steps tables", "kind": "ship" }],
+  "rationale": "Split design from research so they proceed in parallel.",
+  "questions": ["Which auth provider?"],
+  "reason": "Multiple independent workstreams need director approval."
+}
+```
+It exposes the proposal and scoring reason without requiring clients to parse
+the flattened text in `context` (which still carries the same content for
+search/notification consumers). See `selected_indices` on
+`POST /api/decisions/:id/answer` below.
 
 **Options are never empty.** An optionless card is un-answerable (nothing to
 click, no key to validate). The direct `POST /api/decisions` rejects an empty
@@ -588,8 +605,9 @@ chat endpoints below.
   `high` if the proposed work reads as irreversible or prod-facing, `normal`
   if the planner itself flagged open `questions` (ambiguous) or the project
   has no active policy for this kind of change (preference unknown), `low`
-  otherwise. The card's context ends with a `Risk: <level> (<reason>)` line so
-  the director sees why.
+  otherwise. The flattened context ends with a `Risk: <level> (<reason>)` line
+  for non-structured consumers; `plan.reason` supplies the web card's risk
+  detail.
 
 ### PR ↔ task marker (the linking contract)
 Every PR a hive agent opens MUST carry a marker that links it back to its task.
@@ -859,17 +877,27 @@ work. Use `POST /api/tasks/:id/events` with `type=evidence` for that.
 - `GET /api/decisions/:id` → `200 Decision` | `404`
 - `PUT /api/decisions/:id/draft` body `{draft_note}` → `200 {"ok":true, "id":...}` | `404`
   (autosave; call debounced on every keystroke; overwrites `draft_note` only)
-- `POST /api/decisions/:id/answer` body `{answer_key (required), answer_note?, source?, actor?}` → `200 Decision` (now `answered`) | `400` (bad key / bad source) | `409` (already answered)
+- `POST /api/decisions/:id/answer` body `{answer_key (required), answer_note?, selected_indices?, source?, actor?}` → `200 Decision` (now `answered`) | `400` (bad key/source, malformed note/selection, or empty planner selection) | `409` (already answered)
   Archives the card (`status=answered`, `answered_at` set), writes a
   `decision_answered` event (`source: "director"`, `payload.answered_by: "director"`),
   and resumes the task (`needs_decision → in_progress`).
-  If `answer_note` is omitted, the saved `draft_note` is used.
+  If `answer_note` is omitted, the saved `draft_note` is used. When approving a
+  planner breakdown, a non-empty answer note is appended to every created task's
+  brief under `Director notes:`; the web card includes answered open questions
+  in this note.
+  `selected_indices` only applies to a planner-breakdown card (one with `plan`,
+  see below) answered `approve`: an array of indices into `plan.proposed_tasks`
+  to create, allowing a subset instead of all-or-nothing. Omit it to create every
+  proposed task (unchanged behavior for non-UI callers). Duplicate, non-integer,
+  and out-of-range indices are ignored; if no valid tasks remain, approval
+  returns `400` and the card stays open so the caller can answer `reject`
+  instead.
   `source` is the caller identity for the audit trail: `director|chat_supervisor|agent|system|unknown`
   (a present-but-invalid source is `400`; a missing source is recorded as `unknown` — the web
   inbox sends `source:"director"` explicitly). `actor` is an optional free label. Both are
   recorded on the decision (`answered_by`, `answered_actor`) and the `decision_answered` event.
   This is identity only — it grants nothing and triggers no auto-approval.
-- `POST /api/decisions/:id/auto-answer` body `{answer_key (required), answer_note?}` → `200 Decision` (now `answered`) | `400` (missing key) | `403 {effect:"escalate", category, reason}` | `404` | `409` (already answered)
+- `POST /api/decisions/:id/auto-answer` body `{answer_key (required), answer_note?}` → `200 Decision` (now `answered`) | `400` (missing key or malformed answer payload) | `403 {effect:"escalate", category, reason}` | `404` | `409` (already answered)
   The chat supervisor's self-approval path. Runs a **server-enforced** safety bar
   (`evaluateAutoApprove`) before doing anything — the bar, not the caller's
   identity, is the gate, so a worker hitting this endpoint on loopback gets the
@@ -896,9 +924,9 @@ work. Use `POST /api/tasks/:id/events` with `type=evidence` for that.
 
   Answering also runs the standing-authority and domain-supervisor resolvers: if
   the card was an authority request, `approve` mints a single-use grant; if it was
-  a planner breakdown proposal, `approve` creates the proposed tasks as `queued`
-  tasks with `source="planner"` and `parent_task_id` set to the source task (each
-  gets a `created` event), while `reject` creates nothing (event only).
+  a planner breakdown proposal, `approve` creates the selected proposed tasks as
+  `queued` tasks with `source="planner"` and `parent_task_id` set to the source
+  task (each gets a `created` event), while `reject` creates nothing (event only).
 
 ### Director chat (persistent supervisor session over hive)
 A chat thread is backed by a **persistent supervisor session** — a long-lived
@@ -1101,7 +1129,8 @@ task. The text is stored verbatim as a `chore` task (state `queued`,
 `source: "intake_braindump"`, title `[braindump] <first line, elided at 72 chars>`,
 full text in the brief) and the domain-supervisor planner is triggered on it, so
 the flow is: braindump → proposed breakdown decision card → `approve` → the
-proposed tasks are queued. Nothing is queued as work until the card is answered.
+checked proposed tasks are queued. All start checked, and nothing is queued as
+work until the card is answered.
 
 The planner runs out-of-band (it is a `claude -p` subprocess taking tens of
 seconds), so the response returns `202` immediately and the decision card arrives
@@ -1157,12 +1186,15 @@ killed on timeout). Injectable exec for tests.
 - Triggers: `POST /api/tasks/:id/plan` (manual, any task), `POST /api/intake`
   (always, the director's braindump), and auto on Google Chat intake task
   creation when the owning project sets `config.plan_intake: true`.
-- Result: a `normal`-risk decision card on the source task titled
-  `Proposed breakdown: <title>` (context = rationale + numbered proposed tasks +
-  any planner questions) with options `approve` (recommended) / `reject`, plus a
-  `planned` event carrying the structured proposal. On `approve` the proposed
-  tasks are created `queued` with `source="planner"` and `parent_task_id` → the
-  source task, and a `normal` `planned` notification is enqueued. On `reject`
+- Result: a policy-scored decision card on the source task titled `Proposed
+  breakdown: <title>` with options `approve` (recommended) / `reject`, plus a
+  `planned` event carrying the structured proposal and scoring reason. The
+  structured proposal is returned as `Decision.plan`, while the flattened
+  context remains available to non-UI consumers. On `approve` the selected tasks
+  are created `queued` with `source="planner"` and `parent_task_id` → the source
+  task, and question answers plus any optional note are appended to their briefs.
+  All tasks are checked by default, including for callers that omit
+  `selected_indices`. A `normal` `planned` notification is enqueued. On `reject`
   nothing is created (the `decision_answered` event is the only record).
 
 ### Blocked agents (dialog handling)

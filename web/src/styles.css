@@ -1118,7 +1118,8 @@ a {
 .add-policy textarea,
 .add-policy input,
 .policy textarea,
-.policy input {
+.policy input,
+.pquestion-input {
   width: 100%;
   background: var(--bg);
   border: 1px solid var(--border);
@@ -1243,6 +1244,32 @@ a {
   /* contexts are composed as line-oriented text (planner breakdowns, guarded
      action detail); collapsing the newlines turns them into a wall of prose */
   white-space: pre-wrap;
+}
+
+/* planner breakdown: proposed-task checklist + open-question inputs, in place
+   of the old plain-text dump under .dcard-context */
+.dplan {
+  margin-bottom: 16px;
+}
+.dplan-section + .dplan-section {
+  margin-top: 16px;
+}
+.dplan-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+.dplan-questions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.pquestion-text {
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 5px;
 }
 
 /* blast radius callout — visually prominent */
