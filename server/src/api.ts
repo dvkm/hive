@@ -698,7 +698,8 @@ function coordinatorProjectId(db: DB): string | null {
   return row?.id ?? null;
 }
 
-// Meaningful worker events wake the manager session that delegated the task.
+// Meaningful worker events wake the manager that owns the task. Without managed
+// ancestry, an active Chief of Staff is the portfolio-wide fallback.
 // One microtask folds synchronous multi-event transitions (needs-decision +
 // state_change, ready_for_review + state_change) into one steer instead of
 // making the manager react twice to one fact.
@@ -875,7 +876,7 @@ function projectInboxCounts(db: DB, projectId: string): { checkpoints: number; d
 
 // One startup pass handles inbox items created before manager wakeups existed.
 // New items are event-driven through notifyManagerOfEvent, including work that
-// was not originally delegated by the current project manager.
+// was not originally delegated by an active manager.
 export async function sweepManagerInboxes(db: DB, herdr: Herdr, deps: HandlerDeps): Promise<number> {
   const active = db
     .query(

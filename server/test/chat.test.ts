@@ -58,7 +58,7 @@ let projectId = "";
 beforeAll(async () => {
   server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr }) });
   BASE = `http://127.0.0.1:${server.port}`;
-  const p = await (await fetch(BASE + "/api/projects", {
+  const p: any = await (await fetch(BASE + "/api/projects", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: "acme", repo_path: WT }),
   })).json();
@@ -66,11 +66,11 @@ beforeAll(async () => {
 });
 afterAll(() => server.stop(true));
 
-async function post(path: string, body: unknown) {
+async function post(path: string, body: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   return { status: res.status, json: await res.json() };
 }
-async function get(path: string) {
+async function get(path: string): Promise<{ status: number; json: any }> {
   const res = await fetch(BASE + path);
   return { status: res.status, json: await res.json() };
 }
@@ -301,7 +301,7 @@ test("an arbitrary body.task_id cannot hijack an unrelated task as the chat supe
   // as the supervisor session and could respawn it on a send failure,
   // clobbering that task's agent/worktree/brief). task_id is undocumented and
   // unused by the CLI, so chatTurn ignores it outright.
-  const victim = await (await fetch(BASE + "/api/tasks", {
+  const victim: any = await (await fetch(BASE + "/api/tasks", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_id: projectId, title: "unrelated ship task" }),
   })).json();
