@@ -1,6 +1,6 @@
 # Hive v1 — Specification
 
-Hive is a local-first orchestration control plane. David (the director) delegates work to AI agents and interacts only through a kanban web app and a decision inbox. Hive owns durable state, event-driven supervision, evidence, policies, and verification. It is a NEW system: it borrows ideas from priortool (worktree isolation, evidence-gated done, option-menu decisions) and sideproj (annotate/respond loop, SSE, action-only surfaces) but shares no code with them.
+Hive is a local-first orchestration control plane. David (the director) sets direction through one persistent, cross-project Chief of Staff and uses the work board and inbox when he needs detail or must make a consequential decision. Hive owns durable state, event-driven supervision, evidence, policies, and verification. It is a NEW system: it borrows ideas from priortool (worktree isolation, evidence-gated done, option-menu decisions) and sideproj (annotate/respond loop, SSE, action-only surfaces) but shares no code with them.
 
 Decisions locked 2026-07-08: new system using herdr as agent runtime (D1), SQLite state store (D2), v1 includes smoke checks + health monitors (D3-B), build approved (D4-A).
 
@@ -15,7 +15,7 @@ Decisions locked 2026-07-08: new system using herdr as agent runtime (D1), SQLit
 7. Action-only surfaces: resolved decisions auto-archive; the inbox only shows what needs David.
 8. Future-proofness over shortcuts. Root-cause fixes, clean seams, boring durable tech. Never skip or shrink work because it "would take too long" — effort cost is not a valid argument in this project, and time estimates are never given. Push through.
 9. Versions ship continuously without waiting for a go-ahead. Each version ends with evidence (green tests, screenshots, a working demo recorded as evidence rows in hive itself), then work proceeds directly to the next version. David is interrupted only by genuine decision cards.
-10. Top-level asks are loops, not queues. The director talks to one manager; work delegated by that manager and every nested follow-up routes meaningful events back to it until the integrated outcome is independently verified. Workers coordinate directly through durable, attributed messages; consequential disagreements use a bounded propose/critique/synthesize meeting rather than serial director mediation.
+10. Top-level asks are loops, not queues. The director talks to one Chief of Staff whose durable conversation and run ledger persist across project switches. It restores context on re-entry, coordinates delegated work through independently verified completion, handles low-risk actions under each target project's autonomy profile, and escalates only consequential decisions. Workers coordinate directly through durable, attributed messages; consequential disagreements use a bounded propose/critique/synthesize meeting rather than serial director mediation.
 
 ## Architecture
 
@@ -24,7 +24,7 @@ herdr agents (worktree-isolated)      Claude Code hooks       reconciler (timer)
         \                                    |                      /
          \-- hive emit CLI (HTTP) --->  hive-server (Bun + SQLite + SSE)
                                              |
-                          web app (kanban board / task pages / decision inbox)
+                          web app (Chief of Staff home / work / inbox)
                           monitors (URL smoke checks -> incidents)
 ```
 
@@ -80,11 +80,12 @@ On a stale flag: probe the agent (exists? integration status? pane tail). Dead �
 ## Web app (the product)
 
 Views (React + Vite + TS; no UI framework dependency heavier than needed; SSE via EventSource to `/api/stream`):
-1. **Board** — 6 columns (Queued, In Progress, Needs Decision, In Review, Verifying, Done — Done shows last 10). Cards: title, project chip, agent status dot, last-event age, PR + CI badge, evidence count, one-line summary. Click → task page. Live reorder via SSE. A prominent **"+ New task"** control (header and/or top of Queued column) with two modes: **Braindump** (default: project select + one textarea; the planner drafts a breakdown that David approves on a decision card before anything is queued) and **Manual** (project select, title, brief, kind — queues directly). David queues work directly from the board; it must never require the CLI.
-2. **Task page** — brief, live event timeline, evidence gallery (inline images, test-run summaries, links), decisions (open + history), PR/CI panel, final summary. Actions: send steer message, cancel, approve merge.
-3. **Decision inbox** — open decision cards per product rule 3, newest first, badge count in nav. Radio options + note textarea (draft autosaved via debounced PUT) + Submit button. Submitting dispatches an event to the owning task's agent via `herdr agent send` and archives the card.
-4. **Policies** — list/add/edit/deactivate policies, global and per-project.
-5. **Monitors** — per-project monitor status, incident history, open incidents highlighted.
+1. **Chief of Staff home** — the default route restores one durable conversation across every project and gives a concise re-entry briefing: the current objective and next action, consequential decision items that require the director, work being handled, and completions since the last visit. The detailed run ledger, management records, event trajectory, and delegated work remain accessible under a "Behind the scenes" disclosure.
+2. **Board** — 6 columns (Queued, In Progress, Needs Decision, In Review, Verifying, Done — Done shows last 10). Cards: title, project chip, agent status dot, last-event age, PR + CI badge, evidence count, one-line summary. Click → task page. Live reorder via SSE. A prominent **"+ New task"** control (header and/or top of Queued column) with two modes: **Braindump** (default: project select + one textarea; the planner drafts a breakdown that David approves on a decision card before anything is queued) and **Manual** (project select, title, brief, kind — queues directly). David queues work directly from the board; it must never require the CLI.
+3. **Task page** — brief, live event timeline, evidence gallery (inline images, test-run summaries, links), decisions (open + history), PR/CI panel, final summary. Actions: send steer message, cancel, approve merge.
+4. **Decision inbox** — open decision cards per product rule 3, newest first, badge count in nav. Radio options + note textarea (draft autosaved via debounced PUT) + Submit button. Submitting dispatches an event to the owning task's agent via `herdr agent send` and archives the card.
+5. **Policies** — list/add/edit/deactivate policies, global and per-project.
+6. **Monitors** — per-project monitor status, incident history, open incidents highlighted.
 
 Design: dark, calm, dense-but-readable. Localhost tool, no auth. Desktop-first.
 

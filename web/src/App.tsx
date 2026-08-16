@@ -164,7 +164,7 @@ function MobileNav({
         </div>
       )}
       <nav className="mobnav">
-        {tab("/", "Manager", "◆", 0, true)}
+        {tab("/", "Chief", "◆", 0, true)}
         {tab("/work", "Work", "▦")}
         {tab("/inbox", "Inbox", "◎", inboxCount)}
         <button className={`mobtab ${moreOpen ? "active" : ""}`} onClick={() => setMoreOpen((v) => !v)}>
@@ -243,7 +243,7 @@ export default function App() {
         </NavLink>
         <nav className="nav">
           <NavLink to="/" end>
-            Manager
+            Chief of Staff
           </NavLink>
           <NavLink to="/work">Work</NavLink>
           <NavLink to="/inbox">

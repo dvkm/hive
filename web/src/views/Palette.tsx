@@ -21,7 +21,7 @@ type Item = {
 };
 
 const NAV: { label: string; path: string }[] = [
-  { label: "Manager", path: "/" },
+  { label: "Chief of Staff", path: "/" },
   { label: "Work", path: "/work" },
   { label: "Inbox", path: "/inbox" },
   { label: "Activity", path: "/feed" },
