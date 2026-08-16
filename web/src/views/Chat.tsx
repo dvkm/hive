@@ -6,20 +6,18 @@ import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faComment } from "@fortawesome/free-solid-svg-icons";
 import { useStore } from "../lib/store";
 import { api } from "../lib/api";
-import type { ChatMessage, ChatThread, Event, Project, Task } from "../lib/api";
+import type { Brief, ChatMessage, ChatThread, Event, Task } from "../lib/api";
 import { relTime } from "../lib/time";
 import { eventText } from "../lib/eventText";
 import { STATE_LABEL } from "../lib/labels";
 import { StatusDot, toast } from "../lib/ui";
 
-// Director chat: a single PERSISTENT panel (a floating drawer, not a route) so
-// it's reachable from anywhere in hive. It talks to the supervisor session
-// backend (POST /api/chat/turn); the supervisor's replies — and the director's
-// own echoed messages — arrive live over SSE via the store. Resulting work
-// (tasks created, decisions answered) shows up live on the board/inbox as usual;
-// here it surfaces as the supervisor's reply plus any action chips on a message.
+// One portfolio-wide Chief of Staff conversation appears on the home route and
+// in a persistent drawer elsewhere. Its replies and the director's echoed
+// messages arrive live over SSE; detailed supervisor activity stays behind the
+// home view's progressive disclosure.
 
-const LS_PROJECT = "hive_chat_project";
+const CHIEF_LAST_SEEN = "hive.chief.lastSeen";
 
 function MsgActions({ actions }: { actions: ChatMessage["actions"] }) {
   if (!actions?.length) return null;
@@ -74,49 +72,27 @@ function ManagerActivity({
   tasks,
   awaiting,
   managerTask,
-  project,
   onRefresh,
-  onProjectsRefresh,
 }: {
   thread: ChatThread | null;
   events: Event[];
   tasks: Task[];
   awaiting: boolean;
   managerTask: Task | null;
-  project: Project | undefined;
   onRefresh: () => void;
-  onProjectsRefresh: () => void;
 }) {
   const taskId = thread?.task_id ?? null;
   const status = String(events.find((e) => e.type === "agent_status")?.payload.status ?? "");
   const stopped = !!managerTask && ["done", "failed", "cancelled"].includes(managerTask.state);
   const working = !stopped && (awaiting || status === "working");
-  const [savingProfile, setSavingProfile] = useState(false);
   const [replaying, setReplaying] = useState<string | null>(null);
-  const delegated = tasks
-    .filter((t) => t.parent_task_id === taskId && t.source !== "chat_supervisor")
+  const delegated = (taskId ? tasks.filter((t) => t.parent_task_id === taskId && t.source !== "chat_supervisor") : [])
     .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
     .slice(0, 6);
   const activity = events.filter((e) => VISIBLE_MANAGER_EVENTS.has(e.type)).slice(0, 12);
   const meeting = thread?.meetings?.[0];
   const verification = thread?.verifications?.[0];
   const retrospective = thread?.retrospectives?.[0];
-  const autonomy = project?.config.autonomy_profile ?? "balanced";
-
-  const setAutonomy = async (profile: "conservative" | "balanced" | "autopilot") => {
-    if (!project || savingProfile) return;
-    setSavingProfile(true);
-    try {
-      await api.updateProject(project.id, { config: { ...project.config, autonomy_profile: profile } });
-      toast(`Autonomy set to ${profile}`);
-      onProjectsRefresh();
-      onRefresh();
-    } catch (e: any) {
-      toast(e?.message ?? "Could not update autonomy");
-    } finally {
-      setSavingProfile(false);
-    }
-  };
 
   const replay = async () => {
     if (!thread || !verification || replaying) return;
@@ -134,9 +110,9 @@ function ManagerActivity({
   };
 
   return (
-    <aside className="manager-activity" aria-label="Manager activity">
+    <aside className="manager-activity" aria-label="Chief of Staff activity">
       <div className="manager-activity-head">
-        <span>Manager activity</span>
+        <span>Chief of Staff activity</span>
         <span className={`manager-live ${working ? "manager-live-working" : ""}`}>
           <span className="manager-live-dot" />
           {!taskId ? "not started" : stopped ? "stopped" : working ? "working" : "watching"}
@@ -167,18 +143,6 @@ function ManagerActivity({
             {thread.outcome && <div className="manager-run-field"><span>Outcome</span><p>{thread.outcome}</p></div>}
           </div>
         )}
-      </section>
-
-      <section className="manager-activity-section">
-        <h2>Autonomy</h2>
-        <select className="manager-autonomy" value={autonomy} disabled={!project || savingProfile} onChange={(e) => setAutonomy(e.target.value as any)}>
-          <option value="conservative">Conservative</option>
-          <option value="balanced">Balanced</option>
-          <option value="autopilot">Autopilot</option>
-        </select>
-        <p className="manager-autonomy-help">
-          {autonomy === "conservative" ? "Plans and delegates. You resolve every checkpoint and decision." : autonomy === "balanced" ? "Handles safe checkpoints and narrow reversible decisions." : "Handles recommended low-risk engineering choices. Guarded actions still require authority."}
-        </p>
       </section>
 
       {(meeting || verification || retrospective) && (
@@ -249,10 +213,62 @@ function ManagerActivity({
   );
 }
 
+function ChiefBriefing({
+  thread,
+  awaiting,
+  managerTask,
+}: {
+  thread: ChatThread | null;
+  awaiting: boolean;
+  managerTask: Task | null;
+}) {
+  const { tasks } = useStore();
+  const [since] = useState(() => localStorage.getItem(CHIEF_LAST_SEEN));
+  const [brief, setBrief] = useState<Brief | null>(null);
+  useEffect(() => {
+    let live = true;
+    api.morningBrief(since ?? undefined).then((result) => live && setBrief(result)).catch(() => live && setBrief(null));
+    localStorage.setItem(CHIEF_LAST_SEEN, new Date().toISOString());
+    return () => {
+      live = false;
+    };
+  }, [since]);
+
+  const attentionCount = brief?.director_required_task_ids.length ?? 0;
+  const working = tasks.filter((task) => task.source !== "chat_supervisor" && ["in_progress", "needs_decision", "in_review", "verifying"].includes(task.state));
+  const finishedCount = since ? brief?.done.length ?? 0 : 0;
+  const stopped = !!managerTask && ["done", "failed", "cancelled"].includes(managerTask.state);
+
+  return (
+    <section className="chief-briefing" aria-label="Re-entry briefing">
+      <div className="chief-briefing-copy">
+        <div className="manager-eyebrow">Your briefing</div>
+        <h2>{thread?.objective || "Tell Hive the outcome you want."}</h2>
+        <p>
+          {thread?.waiting_on
+            ? `Waiting on ${thread.waiting_on}`
+            : thread?.next_action || thread?.outcome || "Your Chief of Staff will remember the context and coordinate the work."}
+        </p>
+      </div>
+      <div className="chief-briefing-stats">
+        <Link className={attentionCount ? "chief-stat chief-stat-attention" : "chief-stat"} to="/inbox">
+          <strong>{attentionCount}</strong>
+          <span>{attentionCount === 1 ? "thing needs you" : "things need you"}</span>
+        </Link>
+        <div className="chief-stat"><strong>{working.length}</strong><span>being handled</span></div>
+        <div className="chief-stat"><strong>{finishedCount}</strong><span>finished since last visit</span></div>
+      </div>
+      <div className={`chief-status ${awaiting ? "chief-status-working" : ""}`}>
+        <span className="manager-live-dot" />
+        {!thread ? "Ready for direction" : stopped ? "Session stopped" : awaiting ? "Chief of Staff is working" : "Watching the portfolio"}
+      </div>
+    </section>
+  );
+}
+
 export default function Chat({ embedded = false }: { embedded?: boolean }) {
-  const { projects, reloadProjects, tasks, feedEvents, chatThreadId, chatMessages, openChatThread } = useStore();
+  const { projects, tasks, feedEvents, chatThreadId, chatMessages, openChatThread } = useStore();
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [project, setProject] = useState<string>(() => localStorage.getItem(LS_PROJECT) || "");
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [managerTaskId, setManagerTaskId] = useState<string | null>(null);
@@ -270,23 +286,14 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
     }).catch(() => {});
   }, [chatThreadId]);
 
-  // Default the project once projects load; keep the last-used one across reloads.
+  // There is one durable Chief of Staff thread across every project. Reopen it
+  // wherever the panel appears so switching pages never switches managers.
   useEffect(() => {
-    if (!projects.length) return;
-    if (!project || !projects.some((p) => p.id === project)) setProject(projects[0].id);
-  }, [projects]);
-  useEffect(() => {
-    if (project) localStorage.setItem(LS_PROJECT, project);
-  }, [project]);
-
-  // When the panel opens (or the project changes), resume the project's most
-  // recent thread. No thread yet → a blank conversation the first message starts.
-  useEffect(() => {
-    if (!open || !project) return;
+    if (!open || !projects.length) return;
     api
-      .chatThreads(project)
+      .chatThreads()
       .then((ts) => {
-        const latest = ts[0] ?? null;
+        const latest = ts.find((thread) => !thread.project_id) ?? null;
         setManagerThread(latest);
         setManagerTaskId(latest?.task_id ?? null);
         openChatThread(latest?.id ?? null);
@@ -296,7 +303,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
         setManagerTaskId(null);
         openChatThread(null);
       });
-  }, [open, project]);
+  }, [open, projects.length]);
 
   useEffect(() => {
     if (!open || !chatThreadId) return;
@@ -333,12 +340,12 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
 
   const send = async () => {
     const body = text.trim();
-    if (!body || sending || !project) return;
+    if (!body || sending || !projects.length) return;
     setSending(true);
     setText("");
     try {
-      const r = await api.chatTurn(chatThreadId ? { thread_id: chatThreadId, text: body } : { project_id: project, text: body });
-      if (r.delivery === "failed") toast(`Supervisor unavailable: ${r.error ?? "spawn failed"}`);
+      const r = await api.chatTurn(chatThreadId ? { thread_id: chatThreadId, text: body } : { scope: "chief", text: body });
+      if (r.delivery === "failed") toast(`Chief of Staff unavailable: ${r.error ?? "spawn failed"}`);
       // First message of a new thread: adopt the id so SSE replies land here.
       if (r.thread_id !== chatThreadId) openChatThread(r.thread_id);
       api.chatThread(r.thread_id).then((thread) => { setManagerThread(thread); setManagerTaskId(thread.task_id); }).catch(() => {});
@@ -348,14 +355,6 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
     } finally {
       setSending(false);
     }
-  };
-
-  const closeThread = async () => {
-    if (!chatThreadId) return;
-    await api.chatClose(chatThreadId).catch(() => {});
-    setManagerThread(null);
-    setManagerTaskId(null);
-    openChatThread(null);
   };
 
   // Supervisor is thinking whenever the last thing said was the director's.
@@ -369,7 +368,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
 
   if (!open)
     return (
-      <button className="chat-fab" title="Message your Hive manager" aria-label="Message your Hive manager" onClick={() => setDrawerOpen(true)}>
+      <button className="chat-fab" title="Message your Chief of Staff" aria-label="Message your Chief of Staff" onClick={() => setDrawerOpen(true)}>
         <FontAwesomeIcon icon={faComment} />
       </button>
     );
@@ -379,27 +378,12 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
       <header className={embedded ? "manager-head" : "chat-head"}>
         {embedded && (
           <div className="manager-heading">
-            <div className="manager-eyebrow">Your Hive manager</div>
-            <h1>What should the team accomplish?</h1>
-            <p>Set the outcome. Your manager plans the work, delegates it, keeps agents moving, and brings back the decisions that need you.</p>
+            <div className="manager-eyebrow">Your Chief of Staff</div>
+            <h1>Set direction. Hive handles the details.</h1>
+            <p>One persistent agent remembers where you left off, coordinates every project, and brings back only consequential decisions.</p>
           </div>
         )}
-        <select className="chat-proj" value={project} onChange={(e) => setProject(e.target.value)}>
-          {projects.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name}
-            </option>
-          ))}
-        </select>
         <div className="chat-head-actions">
-          <button className="chat-iconbtn" title="New conversation" onClick={() => { setManagerThread(null); setManagerTaskId(null); openChatThread(null); }}>
-            ✎
-          </button>
-          {chatThreadId && (
-            <button className="chat-iconbtn" title="End this manager session" onClick={closeThread}>
-              ⏹
-            </button>
-          )}
           {!embedded && (
             <button className="chat-iconbtn" title="Close panel" onClick={() => setDrawerOpen(false)}>
               ✕
@@ -408,26 +392,27 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
         </div>
       </header>
       <div className={embedded ? "manager-body" : "chat-body"}>
+        {embedded && <ChiefBriefing thread={managerThread} awaiting={awaiting} managerTask={managerTask} />}
         <div className={embedded ? "manager-conversation" : undefined}>
           <div className="chat-scroll" ref={scrollRef}>
             {chatMessages.length === 0 && (
               <div className={embedded ? "manager-empty" : "chat-empty muted"}>
-                {project ? (
+                {projects.length ? (
                   embedded ? (
                     <>
                       <div className="manager-empty-title">Start with the result you want.</div>
-                      <div className="manager-empty-copy">You can be broad. The manager will turn it into tasks and coordinate the team.</div>
+                      <div className="manager-empty-copy">You can stay high level. Your Chief of Staff will recover context, route the work, and follow through.</div>
                       <div className="manager-prompts">
-                        {["Plan and build the next release", "Check the team and unblock anything stuck", "Summarize progress and tell me what needs my input"].map((prompt) => (
+                        {["Catch me up", "Handle everything low risk", "What decisions actually need me?"].map((prompt) => (
                           <button key={prompt} onClick={() => setText(prompt)}>{prompt}</button>
                         ))}
                       </div>
                     </>
                   ) : (
-                    "Ask the manager to start work, check progress, or resolve a blocker."
+                    "Ask your Chief of Staff to start work, catch you up, or resolve a blocker."
                   )
                 ) : (
-                  "Add a project first. The manager works inside a project's repository."
+                  "Add a project first. The Chief of Staff needs one repository to run from."
                 )}
               </div>
             )}
@@ -438,9 +423,9 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
           </div>
           <div className="chat-compose">
             <textarea
-              placeholder="Tell your manager what outcome you want…"
+              placeholder="What outcome do you want?"
               value={text}
-              disabled={!project}
+              disabled={!projects.length}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
@@ -449,12 +434,17 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
                 }
               }}
             />
-            <button className="btn btn-primary" onClick={send} disabled={sending || !text.trim() || !project}>
+            <button className="btn btn-primary" onClick={send} disabled={sending || !text.trim() || !projects.length}>
               Send
             </button>
           </div>
         </div>
-        {embedded && <ManagerActivity thread={managerThread} events={activityEvents} tasks={tasks} awaiting={awaiting} managerTask={managerTask} project={projects.find((p) => p.id === project)} onRefresh={refreshManager} onProjectsRefresh={reloadProjects} />}
+        {embedded && (
+          <details className="chief-details">
+            <summary>Behind the scenes</summary>
+            <ManagerActivity thread={managerThread} events={activityEvents} tasks={tasks} awaiting={awaiting} managerTask={managerTask} onRefresh={refreshManager} />
+          </details>
+        )}
       </div>
     </div>
   );

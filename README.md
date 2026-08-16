@@ -1,10 +1,6 @@
 # hive
 
-Local-first orchestration control plane. David delegates work to AI agents and
-interacts only through a kanban board and a decision inbox. hive owns durable
-state (SQLite), an event-driven timeline, evidence, policies, and a
-server-enforced task state machine. See [SPEC.md](./SPEC.md) for the full
-product spec and [docs/API.md](./docs/API.md) for the HTTP contract.
+Local-first orchestration control plane built around one persistent Chief of Staff. The default web home restores the durable cross-project conversation, summarizes where work stopped and what changed since the last visit, and keeps detailed supervisor activity behind a "Behind the scenes" disclosure. hive owns durable state (SQLite), an event-driven timeline, evidence, policies, and a server-enforced task state machine. See [SPEC.md](./SPEC.md) for the full product spec and [docs/API.md](./docs/API.md) for the HTTP contract.
 
 This repo contains **Phase 1** (server core + CLI) and **Phase 2b** (the runtime
 layer: herdr adapter, reconciler, monitors + post-deploy smoke, secrets, and
@@ -193,29 +189,14 @@ server/test/ bun test suite
 
 ## v4 notes (director chat)
 
-- **Persistent supervisor chat** (`server/src/chat.ts`, migration v18). A chat
-  thread is backed by a long-lived herdr agent (an interactive `claude` session,
-  same runtime as a task agent) that stays alive across the conversation, holds
-  context, and coordinates worker agents. This is the deliberate opposite of the
-  v3 planner's short-lived `claude -p` subprocess: the director asked for a live
-  session, so the *session* persists while its history lives in `chat_threads` /
-  `chat_messages`. It still owns no privileged path — coordination goes through
-  the same `$HIVE_CLI` + API + standing-authority gates every hive agent uses.
+- **Persistent Chief of Staff chat** (`server/src/chat.ts`, migration v18). The web home and global drawer reuse one portfolio-wide thread whose conversation and run ledger survive project switches and session respawns. A long-lived herdr agent holds the live context and coordinates worker agents across projects. Project-scoped supervisor threads remain available through the API and CLI. Neither kind owns a privileged path: coordination goes through the same `$HIVE_CLI` + API + standing-authority gates every hive agent uses. See `docs/API.md` for the session contract.
 - The backing task (`source="chat_supervisor"`) is kept out of the dispatcher and
   board lanes. `POST /api/chat/turn` is non-blocking (persist → ensure session
   live → return); the session replies asynchronously via `POST
   /api/chat/threads/:id/reply`. `POST /api/chat/threads/:id/close` cancels the
   backing task so the terminal-hook cleanup reclaims its worktree/session; a
   later message to the same thread spawns a fresh session. See `docs/API.md`.
-- **Automatic manager loop.** Tasks created by the supervisor are linked to its
-  backing task, and nested follow-ups preserve that ancestry. Meaningful worker
-  events (blockers, decisions, peer messages, review handoffs, failures,
-  verification, and completion) are batched and pushed into the supervisor's
-  live session, which re-plans and acts without another director turn. Workers
-  use `hive task send <task-id> "..."` for attributed, durable peer messages.
-  The manager brief includes a bounded proposal → critique → synthesis meeting
-  protocol and requires independent integrated verification before it reports
-  the top-level ask complete.
+- **Automatic manager loop.** Tasks created by the supervisor are linked to its backing task, and nested follow-ups preserve that ancestry. Meaningful worker events (blockers, decisions, peer messages, review handoffs, failures, verification, and completion) are batched and pushed into the global Chief of Staff when it is active, so it can re-plan and act without another director turn. It applies each target project's autonomy profile before handling low-risk work or escalating a consequential decision. Workers use `hive task send <task-id> "..."` for attributed, durable peer messages. The manager brief includes a bounded proposal → critique → synthesis meeting protocol and requires independent integrated verification before it reports the top-level ask complete.
 - **Supervisor auto-approve** (`server/src/autoapprove.ts`, task #364). The
   supervisor may clear a narrow set of safe decision cards itself instead of
   always waiting on the director, via `hive decision auto-answer <id> --key <opt>`

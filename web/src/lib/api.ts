@@ -392,6 +392,7 @@ export interface BriefLearning extends Learning {
 export interface Brief {
   since: string | null;
   done: BriefDone[];
+  director_required_task_ids: string[];
   failed_or_attention: Task[];
   decisions: Decision[];
   fleet: Task[];
@@ -598,11 +599,11 @@ export const api = {
   morningBrief: (since?: string) =>
     req<Brief>(`/api/brief${since ? "?since=" + encodeURIComponent(since) : ""}`),
 
-  // Director chat (persistent supervisor session).
+  // Director chat (persistent project supervisor or global Chief of Staff session).
   chatThreads: (project_id?: string) =>
     req<ChatThread[]>(`/api/chat/threads${project_id ? "?project_id=" + project_id : ""}`),
   chatThread: (id: string) => req<ChatThread & { messages: ChatMessage[] }>(`/api/chat/threads/${id}`),
-  chatTurn: (b: { project_id?: string; thread_id?: string; text: string }) =>
+  chatTurn: (b: { project_id?: string; thread_id?: string; scope?: "chief"; text: string }) =>
     req<{ thread_id: string; delivery: "delivered" | "spawned" | "failed"; error?: string }>(`/api/chat/turn`, {
       method: "POST",
       body: JSON.stringify(b),

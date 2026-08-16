@@ -58,7 +58,7 @@ let projectId = "";
 beforeAll(async () => {
   server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr }) });
   BASE = `http://127.0.0.1:${server.port}`;
-  const p = await (await fetch(BASE + "/api/projects", {
+  const p: any = await (await fetch(BASE + "/api/projects", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: "acme", repo_path: WT }),
   })).json();
@@ -66,11 +66,11 @@ beforeAll(async () => {
 });
 afterAll(() => server.stop(true));
 
-async function post(path: string, body: unknown) {
+async function post(path: string, body: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   return { status: res.status, json: await res.json() };
 }
-async function get(path: string) {
+async function get(path: string): Promise<{ status: number; json: any }> {
   const res = await fetch(BASE + path);
   return { status: res.status, json: await res.json() };
 }
@@ -301,7 +301,7 @@ test("an arbitrary body.task_id cannot hijack an unrelated task as the chat supe
   // as the supervisor session and could respawn it on a send failure,
   // clobbering that task's agent/worktree/brief). task_id is undocumented and
   // unused by the CLI, so chatTurn ignores it outright.
-  const victim = await (await fetch(BASE + "/api/tasks", {
+  const victim: any = await (await fetch(BASE + "/api/tasks", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_id: projectId, title: "unrelated ship task" }),
   })).json();
@@ -317,6 +317,42 @@ test("an arbitrary body.task_id cannot hijack an unrelated task as the chat supe
 
   const victimAfter = (await get(`/api/tasks/${victim.id}`)).json;
   expect(victimAfter.state).toBe(victim.state); // untouched
+});
+
+test("Chief of Staff is one durable cross-project thread backed by the hive coordinator repo", async () => {
+  const before = briefs.length;
+  const [first, second] = await Promise.all([
+    post("/api/chat/turn", { scope: "chief", text: "remember the portfolio and handle the details" }),
+    post("/api/chat/turn", { scope: "chief", text: "also restore where I left off" }),
+  ]);
+  expect(first.status).toBe(202);
+  expect(second.status).toBe(202);
+  expect(first.json.thread_id).toBe(second.json.thread_id);
+  expect([first.json.delivery, second.json.delivery].sort()).toEqual(["delivered", "spawned"]);
+
+  const thread = (await get(`/api/chat/threads/${first.json.thread_id}`)).json;
+  expect(thread.project_id).toBeNull();
+  const messages = thread.messages.map((message: any) => message.text);
+  expect(messages).toHaveLength(2);
+  expect(messages).toEqual(expect.arrayContaining([
+    "remember the portfolio and handle the details",
+    "also restore where I left off",
+  ]));
+  const task = (await get(`/api/tasks/${thread.task_id}`)).json;
+  expect(task.project_id).toBe(projectId);
+  expect(task.title).toContain("Chief of Staff");
+  expect(briefs.length).toBe(before + 1);
+  expect(briefs.at(-1)).toContain("Chief of Staff");
+  expect(briefs.at(-1)).toContain("Memory and attention");
+  expect(briefs.at(-1)).toContain("every project");
+  expect(briefs.at(-1)).toContain("target project's current autonomy profile");
+  expect(briefs.at(-1)).not.toContain("The autonomy profile is `balanced`");
+
+  const followup = await post("/api/chat/turn", { scope: "chief", text: "where did I leave off?" });
+  expect(followup.status).toBe(202);
+  expect(followup.json.delivery).toBe("delivered");
+  expect(followup.json.thread_id).toBe(thread.id);
+  expect((await get("/api/chat/threads")).json.filter((candidate: any) => candidate.project_id === null)).toHaveLength(1);
 });
 
 test("starting a chat with no project is rejected (session needs a repo)", async () => {
