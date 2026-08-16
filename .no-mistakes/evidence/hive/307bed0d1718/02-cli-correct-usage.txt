@@ -1,0 +1,25 @@
+=== the watcher, now with the required --kind: routine summary files as a reference ===
+$ hive learning add --project $PROJ --kind reference --title 'feedback-doc watcher cycle 27: no new items' --body 'routine triage summary, nothing to act on'
+added reference lrn_8cf2a53012ab: feedback-doc watcher cycle 27: no new items
+[exit 0]
+
+=== --root-cause on a reference is rejected up front (it spawns a regression chore) ===
+$ hive learning add --project $PROJ --kind reference --title 'feedback-doc watcher cycle 31: 2 items triaged' --root-cause
+--root-cause only applies to --kind failure (it auto-spawns a root-cause chore task)
+[exit 1]
+
+=== a genuine regression: --kind failure --root-cause still spawns the chore ===
+$ hive learning add --project $PROJ --kind failure --title 'ingest worker drops rows on retry' --body 'batch cursor not reset' --root-cause
+added learning lrn_d6de97179f03: ingest worker drops rows on retry  (root-cause task e4fa44a4b5de)
+[exit 0]
+
+=== ledger + tasks ===
+$ hive learning list --project $PROJ
+lrn_d6de97179f03  active     1×  ingest worker drops rows on retry
+lrn_8cf2a53012ab  active     1×  feedback-doc watcher cycle 27: no new items
+[exit 0]
+
+$ hive task list --project $PROJ
+e4fa44a4b5de  queued         chore  Root cause: ingest worker drops rows on retry
+[exit 0]
+

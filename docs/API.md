@@ -385,8 +385,10 @@ event/evidence payloads. Set values with `hive secret set` (reads from stdin).
 `status ∈ {active, resolved}`. `occurrences` counts how many times the pattern
 recurred (bumped via `/recur`). `source_task_id` (the task that first hit it) and
 `root_cause_task_id` (the chore task opened to fix it, if any) may be null.
-`kind ∈ {failure, reference, decision}` (default `failure`) — the learnings table
-doubles as the project knowledge store:
+`kind ∈ {failure, reference, decision}` — required (no default) on create, which
+accepts `failure` or `reference` only; `decision` rows are written by the server
+itself. A misfiled `failure`/`reference` is correctable later via `PUT`. The
+learnings table doubles as the project knowledge store:
 - `failure` — the regression ledger. Active ones inject into composed briefs (see
   `/api/tasks/:id/brief`) under a "Known failure patterns" section, 10 most recent
   by `last_seen`.
@@ -1039,11 +1041,13 @@ touching ordinary `command` escalations.
 
 ### Learnings (regression ledger)
 - `GET /api/learnings?project_id=&status=` → `200 [Learning, ...]` (newest `last_seen` first; both filters optional)
-- `POST /api/learnings` body `{project_id (required), title (required), body?, source_task_id?, create_root_cause_task?}` → `201 Learning` | `400` (unknown `project_id`)
-  With `create_root_cause_task: true`, a queued `chore` task is auto-created (brief prefilled from the learning) and its id is set as `root_cause_task_id` — the "unblock now, root-cause later" flow. Broadcasts a `learning` (and, for the auto task, a `task`) SSE message.
+- `POST /api/learnings` body `{project_id (required), title (required), kind (required: "failure" | "reference"), body?, source_task_id?, create_root_cause_task?}` → `201 Learning` | `400` (unknown `project_id`, or missing/invalid `kind` — no silent default)
+  With `create_root_cause_task: true` (only valid for `kind:"failure"`, else `400`), a queued `chore` task is auto-created (brief prefilled from the learning) and its id is set as `root_cause_task_id` — the "unblock now, root-cause later" flow. Broadcasts a `learning` (and, for the auto task, a `task`) SSE message.
 - `GET /api/learnings/:id` → `200 Learning` | `404`
-- `PUT /api/learnings/:id` body `{title?, body?, status?, root_cause_task_id?}` → `200 Learning` | `400` (bad `status`) | `404` (resolve = `status:"resolved"`)
+- `PUT /api/learnings/:id` body `{title?, body?, status?, kind?, root_cause_task_id?}` → `200 Learning` | `400` (bad `status`; `kind` outside `"failure" | "reference"`; or any `kind` change on a `"decision"` row, which the decision path owns) | `404` (resolve = `status:"resolved"`; `kind` is correctable here — e.g. a misfiled `failure` reclassified to `reference`. A `kind` equal to the stored one is a no-op, not an error)
+  Correcting `kind` off `"failure"` cancels the linked root-cause task and clears `root_cause_task_id` — but only a still-`queued` task that hive auto-spawned for this learning; one already dispatched, or one linked by hand via `root_cause_task_id`, is left untouched.
 - `DELETE /api/learnings/:id` → `200 {"ok":true}`
+  Same retraction as above: an auto-spawned root-cause task still sitting `queued` is cancelled with the learning that justified it.
 - `POST /api/learnings/:id/recur` → `200 Learning` | `404`
   Bumps `occurrences` + refreshes `last_seen` and re-activates the learning (`status:"active"`); the same failure pattern happened again. Broadcasts a `learning` SSE message.
 
