@@ -6,12 +6,11 @@ import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faComment } from "@fortawesome/free-solid-svg-icons";
 import { useStore } from "../lib/store";
 import { api } from "../lib/api";
-import type { ChatMessage, ChatThread, Event, Task } from "../lib/api";
+import type { Brief, ChatMessage, ChatThread, Event, Task } from "../lib/api";
 import { relTime } from "../lib/time";
 import { eventText } from "../lib/eventText";
 import { STATE_LABEL } from "../lib/labels";
 import { StatusDot, toast } from "../lib/ui";
-import { needsAttention } from "./attention";
 
 // Director chat: a single PERSISTENT panel (a floating drawer, not a route) so
 // it's reachable from anywhere in hive. It talks to the supervisor session
@@ -225,19 +224,21 @@ function ChiefBriefing({
   awaiting: boolean;
   managerTask: Task | null;
 }) {
-  const { tasks, decisions, checkpoints } = useStore();
+  const { tasks } = useStore();
   const [since] = useState(() => localStorage.getItem(CHIEF_LAST_SEEN));
-  useEffect(() => localStorage.setItem(CHIEF_LAST_SEEN, new Date().toISOString()), []);
+  const [brief, setBrief] = useState<Brief | null>(null);
+  useEffect(() => {
+    let live = true;
+    api.morningBrief(since ?? undefined).then((result) => live && setBrief(result)).catch(() => live && setBrief(null));
+    localStorage.setItem(CHIEF_LAST_SEEN, new Date().toISOString());
+    return () => {
+      live = false;
+    };
+  }, [since]);
 
-  const attentionTaskIds = new Set([
-    ...decisions.map((decision) => decision.task_id),
-    ...checkpoints.map((checkpoint) => checkpoint.task_id),
-    ...tasks.filter((task) => task.state === "in_review" || needsAttention(task)).map((task) => task.id),
-  ]);
+  const attentionCount = brief?.director_required_task_ids.length ?? 0;
   const working = tasks.filter((task) => task.source !== "chat_supervisor" && ["in_progress", "needs_decision", "in_review", "verifying"].includes(task.state));
-  const finished = since
-    ? tasks.filter((task) => task.source !== "chat_supervisor" && task.state === "done" && task.updated_at > since)
-    : [];
+  const finishedCount = since ? brief?.done.length ?? 0 : 0;
   const stopped = !!managerTask && ["done", "failed", "cancelled"].includes(managerTask.state);
 
   return (
@@ -252,12 +253,12 @@ function ChiefBriefing({
         </p>
       </div>
       <div className="chief-briefing-stats">
-        <Link className={attentionTaskIds.size ? "chief-stat chief-stat-attention" : "chief-stat"} to="/inbox">
-          <strong>{attentionTaskIds.size}</strong>
-          <span>{attentionTaskIds.size === 1 ? "thing needs you" : "things need you"}</span>
+        <Link className={attentionCount ? "chief-stat chief-stat-attention" : "chief-stat"} to="/inbox">
+          <strong>{attentionCount}</strong>
+          <span>{attentionCount === 1 ? "thing needs you" : "things need you"}</span>
         </Link>
         <div className="chief-stat"><strong>{working.length}</strong><span>being handled</span></div>
-        <div className="chief-stat"><strong>{finished.length}</strong><span>finished since last visit</span></div>
+        <div className="chief-stat"><strong>{finishedCount}</strong><span>finished since last visit</span></div>
       </div>
       <div className={`chief-status ${awaiting ? "chief-status-working" : ""}`}>
         <span className="manager-live-dot" />
