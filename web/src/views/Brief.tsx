@@ -118,8 +118,9 @@ export default function Brief() {
       {/* ② Needs attention — reuses the board's tray rows. */}
       <Section title="Needs attention" count={attention.length}>
         <div className="brief-attn">
-          <AttentionRows tasks={attention} />
+          <AttentionRows tasks={attention.slice(0, 1)} />
         </div>
+        {attention.length > 1 && <div className="brief-queue-note">Next issue appears after this one.</div>}
       </Section>
 
       {data && (
