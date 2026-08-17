@@ -1,6 +1,6 @@
 # Hive v1 — Specification
 
-Hive is a local-first orchestration control plane. David (the director) sets direction through one persistent, cross-project Chief of Staff and uses the work board and inbox when he needs detail or must make a consequential decision. Hive owns durable state, event-driven supervision, evidence, policies, and verification. It is a NEW system: it borrows ideas from firstmate (worktree isolation, evidence-gated done, option-menu decisions) and lavish (annotate/respond loop, SSE, action-only surfaces) but shares no code with them.
+Hive is a local-first orchestration control plane. David (the director) sets direction through one persistent, cross-project Chief of Staff and opens the focused Needs you queue or secondary operational views only when he needs detail or must act. Hive owns durable state, event-driven supervision, evidence, policies, and verification. It is a NEW system: it borrows ideas from firstmate (worktree isolation, evidence-gated done, option-menu decisions) and lavish (annotate/respond loop, SSE, action-only surfaces) but shares no code with them.
 
 Decisions locked 2026-07-08: new system using herdr as agent runtime (D1), SQLite state store (D2), v1 includes smoke checks + health monitors (D3-B), build approved (D4-A).
 
@@ -12,7 +12,7 @@ Decisions locked 2026-07-08: new system using herdr as agent runtime (D1), SQLit
 4. Standing preferences are policies stored in the DB and injected into every agent brief automatically. Nothing is repeated because a context window compacted.
 5. Supervision is the daemon's job, not an LLM's. Event-driven first (herdr status waits, Claude Code hooks, `hive emit`), plus a coarse time-based reconciler as fallback. No terminal scraping, no busy-signature regexes, ever.
 6. High-risk actions (prod deploys, feature flags, destructive ops) require a decision card that names the exact target before execution.
-7. Action-only surfaces: resolved decisions auto-archive; the inbox only shows what needs David.
+7. Action-only surfaces: resolved decisions auto-archive; Needs you contains only open decisions, checkpoints, reviews, and untriaged failed or unhealthy work.
 8. Future-proofness over shortcuts. Root-cause fixes, clean seams, boring durable tech. Never skip or shrink work because it "would take too long" — effort cost is not a valid argument in this project, and time estimates are never given. Push through.
 9. Versions ship continuously without waiting for a go-ahead. Each version ends with evidence (green tests, screenshots, a working demo recorded as evidence rows in hive itself), then work proceeds directly to the next version. David is interrupted only by genuine decision cards.
 10. Top-level asks are loops, not queues. The director talks to one Chief of Staff whose durable conversation and run ledger persist across project switches. It restores context on re-entry, coordinates delegated work through independently verified completion, handles low-risk actions under each target project's autonomy profile, and escalates only consequential decisions. Workers coordinate directly through durable, attributed messages; consequential disagreements use a bounded propose/critique/synthesize meeting rather than serial director mediation.
@@ -24,7 +24,7 @@ herdr agents (worktree-isolated)      Claude Code hooks       reconciler (timer)
         \                                    |                      /
          \-- hive emit CLI (HTTP) --->  hive-server (Bun + SQLite + SSE)
                                              |
-                          web app (Chief of Staff home / work / inbox)
+                          web app (Chief of Staff home / Needs you / Browse)
                           monitors (URL smoke checks -> incidents)
 ```
 
@@ -80,14 +80,16 @@ On a stale flag: probe the agent (exists? integration status? pane tail). Dead �
 ## Web app (the product)
 
 Views (React + Vite + TS; no UI framework dependency heavier than needed; SSE via EventSource to `/api/stream`):
-1. **Chief of Staff home** — the default route restores one durable conversation across every project and gives a concise re-entry briefing: the current objective and next action, consequential decision items that require the director, work being handled, and completions since the last visit. The Chief stays silent during routine progress, bundles genuinely consequential questions into one message, and renders them as answerable decision cards instead of prose checklists. The detailed run ledger, management records, event trajectory, and delegated work remain accessible under a "Behind the scenes" disclosure.
+1. **Chief of Staff home**: the default route restores one durable conversation across every project, with a short re-entry briefing above the current director/Chief exchange. Earlier messages collapse behind a history control, detailed agent activity stays under an "Activity and agent details" disclosure, and each consequential question appears as one answerable decision card instead of a prose checklist.
 2. **Board** — 6 columns (Queued, In Progress, Needs Decision, In Review, Verifying, Done — Done shows last 10). Cards: title, project chip, agent status dot, last-event age, PR + CI badge, evidence count, one-line summary. Click → task page. Live reorder via SSE. A prominent **"+ New task"** control (header and/or top of Queued column) with two modes: **Braindump** (default: project select + one textarea; the planner drafts a breakdown that David approves on a decision card before anything is queued) and **Manual** (project select, title, brief, kind — queues directly). David queues work directly from the board; it must never require the CLI.
 3. **Task page** — brief, live event timeline, evidence gallery (inline images, test-run summaries, links), decisions (open + history), PR/CI panel, final summary. Actions: send steer message, cancel, approve merge.
-4. **Decision inbox** — open decision cards per product rule 3, newest first, badge count in nav. Radio options + note textarea (draft autosaved via debounced PUT) + Submit button. Submitting dispatches an event to the owning task's agent via `herdr agent send` and archives the card.
+4. **Needs you**: one shared action queue for open decisions, unacknowledged checkpoints, tasks awaiting review, failed tasks awaiting triage, and dead or stuck work. The top bar and mobile navigation show its total count. Decisions, checkpoints, and reviews are presented one at a time, with review evidence and diffs behind a disclosure. The same page keeps completions, fleet status, incidents, intake, spend, and learnings under an activity-summary disclosure. Decision notes autosave via debounced PUT; submitting dispatches an event to the owning task's agent via `herdr agent send` and archives the card.
 5. **Policies** — list/add/edit/deactivate policies, global and per-project.
 6. **Monitors** — per-project monitor status, incident history, open incidents highlighted.
 
-Design: dark, calm, dense-but-readable. Localhost tool, no auth. Desktop-first.
+Navigation: a universal search/command trigger, a concise Needs you indicator, and one Browse menu keep every operational view available without placing them beside the current conversation.
+
+Design: dark, calm, conversational, and focused. Localhost tool, no auth. Desktop-first.
 
 ## Monitors (D3-B)
 
@@ -113,7 +115,7 @@ Behavior:
 
 ## Roadmap (versions ship continuously, evidence-gated, no go-ahead needed)
 
-- **v1** — everything above: server core, state machine, board, task pages, decision inbox (with Submit), policies, herdr runtime, reconciler, hooks, monitors + post-deploy smoke, secrets management, CLI.
+- **v1**: everything above: server core, state machine, board, task pages, Needs you queue (with decision Submit), policies, herdr runtime, reconciler, hooks, monitors + post-deploy smoke, secrets management, CLI.
 - **v2** — regression/learning ledger (recurring failures become tracked learnings + auto root-cause tasks; "unblock now, root-cause later" as a first-class flow); intake connectors (Google Chat first: stakeholder messages become draft tasks for triage); notification digests (batched, urgent-decision override, macOS push).
 - **v3** — scoped standing-authority policy engine (staging autonomous / prod requires exact-target decision card, enforced server-side before risky actions dispatch); domain supervisors (persistent planner agents per project that triage intake and propose task breakdowns); cost/token analytics per task and per model.
 - **v4** — migrate a real project off firstmate end to end (dogfood exit criteria); remote access (tailscale-friendly bind + minimal auth); UI polish pass driven by David's annotations on the live board.

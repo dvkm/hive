@@ -633,11 +633,7 @@ the footer is absent. hive links a PR to its task by reading these:
 `body-footer:`) for a task so agents don't hand-format them.
 
 ### Review experience (in-review tasks)
-An `in_review` task means the agent finished and opened a PR (or pushed/created a
-branch) and is **awaiting the captain's review & merge** — not busy work. The
-captain reviews the diff and approves/merges, requests changes, or rejects,
-entirely from hive (the task page, the `/review` queue, and the morning brief all
-render the same review card).
+An `in_review` task means the agent finished and opened a PR (or pushed/created a branch) and is **awaiting the captain's review & merge**: not busy work. The captain reviews the diff and approves/merges, requests changes, or rejects, entirely from hive (the task page, the `/review` queue, and the Needs you view all render the same review card).
 
 **How a task reaches `in_review` (the finished-handoff, `in_progress → in_review`):**
 - **Explicit signal (preferred):** the agent emits `ready` (`POST .../events`

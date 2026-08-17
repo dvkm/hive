@@ -3,17 +3,11 @@ import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
 import type { Task } from "../lib/api";
+import { taskNeedsAttention } from "../lib/needsYou";
 import { Attach, HEALTH_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 
-// Attention-tray eligibility — mirrors the server's needsAttention() rule.
-// Shared by the board tray and the Morning Brief's "Needs attention" section.
-export function needsAttention(t: Task): boolean {
-  // A failed task already auto-requeued isn't awaiting triage — the successor
-  // is the live card; only un-requeued failures need a human.
-  if (t.state === "failed") return !t.requeued_to;
-  return !!t.health && (t.health.status === "dead" || t.health.status === "stuck");
-}
+export { taskNeedsAttention as needsAttention } from "../lib/needsYou";
 
 // One compact tray row for a FAILED task awaiting human triage. Failed tasks are
 // not a board column, so without this tray they vanish entirely.
@@ -148,7 +142,7 @@ export function EditRequeueModal({ task, onClose }: { task: Task; onClose: () =>
 }
 
 // The two row kinds, split failed vs live-unhealthy. Reused by the board tray
-// (wrapped in its own section header) and the brief's attention section.
+// (wrapped in its own section header) and the Needs you attention section.
 export function AttentionRows({ tasks }: { tasks: Task[] }) {
   const failed = tasks.filter((t) => t.state === "failed");
   const unhealthy = tasks.filter((t) => t.state !== "failed");
@@ -166,7 +160,7 @@ export function AttentionRows({ tasks }: { tasks: Task[] }) {
 
 // Collapsed when empty. Failed tasks (awaiting triage) + dead/stuck live tasks.
 export function AttentionTray({ tasks }: { tasks: Task[] }) {
-  const eligible = tasks.filter(needsAttention);
+  const eligible = tasks.filter(taskNeedsAttention);
   if (eligible.length === 0) return null;
   return (
     <section className="attn-tray">

@@ -176,8 +176,8 @@ function Card({ task }: { task: Task }) {
 
 const BANNER_DISMISS_KEY = "hive.brief.bannerDismissed";
 
-// Slim, dismissible banner nudging the director to the morning brief when there
-// are brief-worthy items to answer (open decisions or tasks needing attention).
+// Slim, dismissible banner nudging the director to Needs you when there are
+// actionable decisions, reviews, or tasks needing attention.
 // Dismissal is keyed on the current item signature, so a fresh decision or a new
 // unhealthy task brings it back rather than staying hidden forever.
 function BriefBanner() {
