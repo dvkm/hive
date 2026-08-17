@@ -373,7 +373,7 @@ export function TaskBody({ id }: { id: string }) {
   const unhealthy = health && health.status !== "healthy";
 
   return (
-    <div className="task">
+    <div className={`task ${t.state === "in_review" ? "task-reviewing" : ""}`}>
       <div className="task-main">
         <div className="crumbs">
           <Link to="/work">← Work</Link>
@@ -384,26 +384,30 @@ export function TaskBody({ id }: { id: string }) {
             </>
           )}
         </div>
-        <h1 className="task-title">
-          <StatusDot state={t.state} health={t.health} />{" "}
-          <span className="task-num" title="Task number">#{t.number}</span> {t.title}
-        </h1>
-        <div className="task-sub">
-          {project && <span className="chip">{project.name}</span>}
-          <span className={`chip chip-kind chip-${t.kind}`}>{t.kind}</span>
-          <span className="chip">{STATE_LABEL[t.state]}</span>
-          <BlockedBy depends_on={t.depends_on} tasks={tasks} />
-          {t.duplicate_of && (
-            <Link
-              className="chip chip-duplicate"
-              to={`/tasks/${t.duplicate_of}`}
-              title="This task was cancelled as a duplicate; open the task it was folded into"
-            >
-              ⧉ duplicate of {tasks.find((x) => x.id === t.duplicate_of)?.title ?? `#${t.duplicate_of}`}
-            </Link>
-          )}
-          <UsageLine id={t.id} rev={rev[t.id] || 0} />
-        </div>
+        {t.state !== "in_review" && (
+          <>
+            <h1 className="task-title">
+              <StatusDot state={t.state} health={t.health} />{" "}
+              <span className="task-num" title="Task number">#{t.number}</span> {t.title}
+            </h1>
+            <div className="task-sub">
+              {project && <span className="chip">{project.name}</span>}
+              <span className={`chip chip-kind chip-${t.kind}`}>{t.kind}</span>
+              <span className="chip">{STATE_LABEL[t.state]}</span>
+              <BlockedBy depends_on={t.depends_on} tasks={tasks} />
+              {t.duplicate_of && (
+                <Link
+                  className="chip chip-duplicate"
+                  to={`/tasks/${t.duplicate_of}`}
+                  title="This task was cancelled as a duplicate; open the task it was folded into"
+                >
+                  ⧉ duplicate of {tasks.find((x) => x.id === t.duplicate_of)?.title ?? `#${t.duplicate_of}`}
+                </Link>
+              )}
+              <UsageLine id={t.id} rev={rev[t.id] || 0} />
+            </div>
+          </>
+        )}
 
         {unhealthy && (
           <div className={`health-banner banner-${health!.status}`}>
@@ -431,7 +435,7 @@ export function TaskBody({ id }: { id: string }) {
 
         {t.state === "in_review" && <ReviewCard task={t} onDone={refresh} />}
 
-        <CheckpointList events={t.events} />
+        {t.state !== "in_review" && <CheckpointList events={t.events} />}
 
         <section className="panel">
           <h2>Brief</h2>
@@ -541,7 +545,7 @@ export function TaskBody({ id }: { id: string }) {
         </section>
       </div>
 
-      <aside className="task-side">
+      {t.state !== "in_review" && <aside className="task-side">
         <section className="panel">
           <h2>PR / CI</h2>
           {t.pr_url ? (
@@ -611,7 +615,7 @@ export function TaskBody({ id }: { id: string }) {
             </section>
           );
         })()}
-      </aside>
+      </aside>}
     </div>
   );
 }
