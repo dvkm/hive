@@ -352,7 +352,54 @@ test("Chief of Staff is one durable cross-project thread backed by the hive coor
   expect(followup.status).toBe(202);
   expect(followup.json.delivery).toBe("delivered");
   expect(followup.json.thread_id).toBe(thread.id);
+  expect(sends.at(-1)).toContain("[chief reply policy]");
+  expect(sends.at(-1)).toContain("--decision <id>");
   expect((await get("/api/chat/threads")).json.filter((candidate: any) => candidate.project_id === null)).toHaveLength(1);
+});
+
+test("Chief suppresses routine wakeup chatter after it has already replied", async () => {
+  const chief = (await get("/api/chat/threads")).json.find((candidate: any) => candidate.project_id === null);
+  const first = await post(`/api/chat/threads/${chief.id}/reply`, { text: "I am handling the portfolio." });
+  expect(first.status).toBe(200);
+  const before = (await get(`/api/chat/threads/${chief.id}`)).json.messages.length;
+
+  const { status, json } = await post(`/api/chat/threads/${chief.id}/reply`, { text: "Another routine progress update." });
+  expect(status).toBe(200);
+  expect(json.suppressed).toBe(true);
+  expect((await get(`/api/chat/threads/${chief.id}`)).json.messages).toHaveLength(before);
+});
+
+test("Chief bundles real decisions into actionable message data and does not resend them", async () => {
+  const chief = (await get("/api/chat/threads")).json.find((candidate: any) => candidate.project_id === null);
+  const worker = (await post("/api/tasks", { project_id: projectId, title: "Choose launch mode" })).json;
+  const decision = (await post("/api/decisions", {
+    task_id: worker.id,
+    title: "Which launch mode should we use?",
+    options: [
+      { key: "safe", label: "Safe rollout", recommended: true },
+      { key: "fast", label: "Fast rollout" },
+    ],
+  })).json;
+  await post("/api/chat/turn", { thread_id: chief.id, text: "Anything you actually need from me?" });
+
+  const reply = await post(`/api/chat/threads/${chief.id}/reply`, {
+    text: "I need one call from you.",
+    decision_ids: [decision.id],
+  });
+  expect(reply.status).toBe(200);
+  expect(reply.json.message.actions).toEqual([
+    { type: "decision", decision_id: decision.id, label: "Which launch mode should we use?" },
+  ]);
+
+  await post("/api/chat/turn", { thread_id: chief.id, text: "Do you still need anything from me?" });
+  const before = (await get(`/api/chat/threads/${chief.id}`)).json.messages.length;
+
+  const duplicate = await post(`/api/chat/threads/${chief.id}/reply`, {
+    text: "Reminder about that same decision.",
+    decision_ids: [decision.id],
+  });
+  expect(duplicate.json.suppressed).toBe(true);
+  expect((await get(`/api/chat/threads/${chief.id}`)).json.messages).toHaveLength(before);
 });
 
 test("starting a chat with no project is rejected (session needs a repo)", async () => {
@@ -373,4 +420,12 @@ test("composeSupervisorBrief bakes in the thread id, reply verb, and hard limits
   expect(brief).toContain("independently check the integrated result");
   expect(brief).toContain("Acknowledge a safe checkpoint");
   expect(brief).toContain("whole current-project inbox");
+});
+
+test("Chief brief requires quiet bundled decision cards", () => {
+  const thread = createThread(db, { project_id: null, title: "quiet chief" });
+  const brief = composeSupervisorBrief(db, thread);
+  expect(brief).toContain("Silence is the default");
+  expect(brief).toContain("--decision <decision-id>");
+  expect(brief).toContain("Do not send the director a progress message or task list");
 });

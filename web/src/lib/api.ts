@@ -281,7 +281,7 @@ export interface ChatMessage {
   ts: string;
   role: "director" | "assistant";
   text: string;
-  actions: { label?: string; [k: string]: unknown }[];
+  actions: { type?: "decision"; decision_id?: string; label?: string; [k: string]: unknown }[];
 }
 
 export interface TaskDetail extends Task {
