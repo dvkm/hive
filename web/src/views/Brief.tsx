@@ -3,7 +3,6 @@ import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import type { Brief } from "../lib/api";
 import { useStore } from "../lib/store";
-import { relTime } from "../lib/time";
 import { StatusDot, HEALTH_LABEL } from "../lib/ui";
 import { DecisionCard } from "./DecisionCard";
 import { ReviewCard } from "./ReviewCard";
@@ -74,31 +73,21 @@ export default function Brief() {
   const spend = data?.spend;
   const spendCount = spend ? spend.totals.calls : 0;
 
-  const anything =
-    openDecisions.length + toReview.length + attention.length + done.length + fleet.length +
-    incidents.length + intake.length + spendCount + learnings.length;
+  const actionCount = openDecisions.length + toReview.length + attention.length;
+  const hasDigest = done.length + fleet.length + incidents.length + intake.length + spendCount + learnings.length > 0;
 
   return (
     <div className="brief-page">
       <header className="brief-top">
         <div>
-          <h1 className="brief-title">Inbox</h1>
+          <h1 className="brief-title">Needs you</h1>
           <div className="brief-since muted">
-            What needs you, plus changes since {since ? relTime(since) : "the beginning"}
+            Only decisions and approvals Hive cannot finish without you.
           </div>
         </div>
-        <label className="brief-picker">
-          <span className="muted">Since</span>
-          <input
-            type="datetime-local"
-            value={since ? toLocalInput(since) : ""}
-            max={toLocalInput(new Date().toISOString())}
-            onChange={(e) => setSince(e.target.value ? new Date(e.target.value).toISOString() : undefined)}
-          />
-        </label>
       </header>
 
-      {data && anything === 0 && (
+      {data && actionCount === 0 && (
         <div className="brief-quiet">
           <div className="empty-big">All quiet.</div>
           <div className="muted">Nothing needs you.</div>
@@ -108,18 +97,16 @@ export default function Brief() {
       {/* ① Decisions waiting — answerable right here (reuses the inbox card). */}
       <Section title="Decisions waiting" count={openDecisions.length}>
         <div className="brief-decisions">
-          {openDecisions.map((d) => (
-            <DecisionCard key={d.id} d={d} onDone={(id) => setAnswered((s) => new Set(s).add(id))} />
-          ))}
+          {openDecisions[0] && <DecisionCard d={openDecisions[0]} onDone={(id) => setAnswered((s) => new Set(s).add(id))} />}
+          {openDecisions.length > 1 && <div className="brief-queue-note">Next decision appears after this one.</div>}
         </div>
       </Section>
 
       {/* ②a To review — in-review tasks awaiting review & merge (shared card). */}
       <Section title="To review" count={toReview.length}>
         <div className="brief-reviews">
-          {toReview.map((t) => (
-            <ReviewCard key={t.id} task={t} onDone={() => setReviewed((s) => new Set(s).add(t.id))} />
-          ))}
+          {toReview[0] && <ReviewCard task={toReview[0]} onDone={() => setReviewed((s) => new Set(s).add(toReview[0].id))} />}
+          {toReview.length > 1 && <div className="brief-queue-note">Next review appears after this one.</div>}
         </div>
       </Section>
 
@@ -130,104 +117,97 @@ export default function Brief() {
         </div>
       </Section>
 
-      {/* ③ Done, with evidence-count chips linking to the task modal. */}
-      <Section title="Done" count={done.length}>
-        <ul className="brief-list">
-          {done.map((t) => (
-            <li key={t.id} className="brief-done-row">
-              <Link className="brief-done-title" to={`/tasks/${t.id}`} state={{ backgroundLocation: location }}>
-                {t.title}
-              </Link>
-              <span className="chip">{t.project_name}</span>
-              {t.summary && <span className="brief-done-summary muted">{t.summary}</span>}
-              <Link
-                className="brief-evc"
-                to={`/tasks/${t.id}`}
-                state={{ backgroundLocation: location }}
-                title="Evidence"
-              >
-                ◱ {t.evidence_count}
-              </Link>
-            </li>
-          ))}
-        </ul>
-      </Section>
+      {data && hasDigest && (
+        <details className="brief-digest">
+          <summary>
+            <span>Activity summary</span>
+            <small>Done, fleet, incidents, and more</small>
+          </summary>
+          <div className="brief-digest-body">
+            <label className="brief-picker">
+              <span className="muted">Since</span>
+              <input
+                type="datetime-local"
+                value={since ? toLocalInput(since) : ""}
+                max={toLocalInput(new Date().toISOString())}
+                onChange={(e) => setSince(e.target.value ? new Date(e.target.value).toISOString() : undefined)}
+              />
+            </label>
 
-      {/* ④ Fleet now — live agents + health. */}
-      <Section title="Fleet now" count={fleet.length}>
-        <ul className="brief-list">
-          {fleet.map((t) => (
-            <li key={t.id} className="brief-fleet-row">
-              <StatusDot state={t.state} health={t.health} />
-              <Link className="brief-fleet-title" to={`/tasks/${t.id}`} state={{ backgroundLocation: location }}>
-                {t.title}
-              </Link>
-              <span className={`brief-health attn-${t.health?.status ?? "healthy"}`}>
-                {t.health ? t.health.reason || HEALTH_LABEL[t.health.status] : "working"}
-              </span>
-            </li>
-          ))}
-        </ul>
-      </Section>
+            <Section title="Done" count={done.length}>
+              <ul className="brief-list">
+                {done.map((t) => (
+                  <li key={t.id} className="brief-done-row">
+                    <Link className="brief-done-title" to={`/tasks/${t.id}`} state={{ backgroundLocation: location }}>{t.title}</Link>
+                    <span className="chip">{t.project_name}</span>
+                    {t.summary && <span className="brief-done-summary muted">{t.summary}</span>}
+                    <Link className="brief-evc" to={`/tasks/${t.id}`} state={{ backgroundLocation: location }} title="Evidence">◱ {t.evidence_count}</Link>
+                  </li>
+                ))}
+              </ul>
+            </Section>
 
-      {/* ⑤ Incidents opened/resolved in the window. */}
-      <Section title="Incidents" count={incidents.length}>
-        <ul className="brief-list">
-          {incidents.map((i) => (
-            <li key={i.id} className={`brief-incident inc-${i.status}`}>
-              <span className={`brief-inc-status inc-${i.status}`}>{i.status}</span>
-              <span className="brief-inc-monitor">{i.project_name} · {i.monitor}</span>
-              <span className="muted">{i.detail}</span>
-            </li>
-          ))}
-        </ul>
-      </Section>
+            <Section title="Fleet now" count={fleet.length}>
+              <ul className="brief-list">
+                {fleet.map((t) => (
+                  <li key={t.id} className="brief-fleet-row">
+                    <StatusDot state={t.state} health={t.health} />
+                    <Link className="brief-fleet-title" to={`/tasks/${t.id}`} state={{ backgroundLocation: location }}>{t.title}</Link>
+                    <span className={`brief-health attn-${t.health?.status ?? "healthy"}`}>{t.health ? t.health.reason || HEALTH_LABEL[t.health.status] : "working"}</span>
+                  </li>
+                ))}
+              </ul>
+            </Section>
 
-      {/* ⑥ New intake awaiting review. */}
-      <Section title="New intake" count={intake.length}>
-        <ul className="brief-list">
-          {intake.map((t) => (
-            <li key={t.id} className="brief-intake-row">
-              <span className="chip chip-intake">unreviewed</span>
-              <Link className="brief-intake-title" to={`/tasks/${t.id}`} state={{ backgroundLocation: location }}>
-                {t.title}
-              </Link>
-              <span className="chip">{t.project_name}</span>
-            </li>
-          ))}
-        </ul>
-      </Section>
+            <Section title="Incidents" count={incidents.length}>
+              <ul className="brief-list">
+                {incidents.map((i) => (
+                  <li key={i.id} className={`brief-incident inc-${i.status}`}>
+                    <span className={`brief-inc-status inc-${i.status}`}>{i.status}</span>
+                    <span className="brief-inc-monitor">{i.project_name} · {i.monitor}</span>
+                    <span className="muted">{i.detail}</span>
+                  </li>
+                ))}
+              </ul>
+            </Section>
 
-      {/* ⑦ Spend — total + top model. */}
-      {spend && spendCount > 0 && (
-        <section className="brief-section">
-          <h2 className="brief-h">Spend</h2>
-          <div className="brief-spend">
-            <span className="brief-spend-total">{fmtUsd(spend.totals.cost_usd)}</span>
-            <span className="muted">
-              {fmtTokens(spend.totals.total_tokens)} tokens · {spend.totals.calls} calls
-            </span>
-            {spend.by_model[0] && (
-              <span className="brief-spend-model">
-                top: {spend.by_model[0].model} ({fmtUsd(spend.by_model[0].cost_usd)})
-              </span>
+            <Section title="New intake" count={intake.length}>
+              <ul className="brief-list">
+                {intake.map((t) => (
+                  <li key={t.id} className="brief-intake-row">
+                    <span className="chip chip-intake">unreviewed</span>
+                    <Link className="brief-intake-title" to={`/tasks/${t.id}`} state={{ backgroundLocation: location }}>{t.title}</Link>
+                    <span className="chip">{t.project_name}</span>
+                  </li>
+                ))}
+              </ul>
+            </Section>
+
+            {spend && spendCount > 0 && (
+              <section className="brief-section">
+                <h2 className="brief-h">Spend</h2>
+                <div className="brief-spend">
+                  <span className="brief-spend-total">{fmtUsd(spend.totals.cost_usd)}</span>
+                  <span className="muted">{fmtTokens(spend.totals.total_tokens)} tokens · {spend.totals.calls} calls</span>
+                  {spend.by_model[0] && <span className="brief-spend-model">top: {spend.by_model[0].model} ({fmtUsd(spend.by_model[0].cost_usd)})</span>}
+                </div>
+              </section>
             )}
-          </div>
-        </section>
-      )}
 
-      {/* ⑧ New learnings. */}
-      <Section title="New learnings" count={learnings.length}>
-        <ul className="brief-list">
-          {learnings.map((l) => (
-            <li key={l.id} className="brief-learning-row">
-              <Link className="brief-learning-title" to="/learnings">{l.title}</Link>
-              <span className="chip">{l.project_name}</span>
-              {l.occurrences > 1 && <span className="muted">×{l.occurrences}</span>}
-            </li>
-          ))}
-        </ul>
-      </Section>
+            <Section title="New learnings" count={learnings.length}>
+              <ul className="brief-list">
+                {learnings.map((l) => (
+                  <li key={l.id} className="brief-learning-row">
+                    <Link className="brief-learning-title" to="/learnings">{l.title}</Link>
+                    <span className="chip">{l.project_name}</span>
+                    {l.occurrences > 1 && <span className="muted">×{l.occurrences}</span>}
+                  </li>
+                ))}
+              </ul>
+            </Section>
+          </div>
+        </details>
+      )}
     </div>
   );
 }

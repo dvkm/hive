@@ -36,7 +36,6 @@ import Projects from "./views/Projects";
 import Palette from "./views/Palette";
 import Chat from "./views/Chat";
 import Supervisors from "./views/Supervisors";
-import { needsAttention } from "./views/attention";
 
 // Enable web-push on this device (phone PWA). Hidden once granted or where
 // unsupported (desktop keeps the osascript notifier). iOS only offers this on
@@ -60,6 +59,13 @@ function PushButton() {
 }
 
 const SECONDARY_NAV: { label: string; items: [string, string, IconDefinition][] }[] = [
+  {
+    label: "Focus",
+    items: [
+      ["/work", "Work", faClipboard],
+      ["/inbox", "Needs you", faBell],
+    ],
+  },
   {
     label: "Observe",
     items: [
@@ -86,7 +92,7 @@ const SECONDARY_NAV: { label: string; items: [string, string, IconDefinition][] 
   },
 ];
 
-function SecondaryNav() {
+function SecondaryNav({ offline, setOffline }: { offline: boolean; setOffline: (v: boolean) => void }) {
   const location = useLocation();
   const detailsRef = useRef<HTMLDetailsElement>(null);
   const active = SECONDARY_NAV.some(({ items }) => items.some(([to]) => location.pathname.startsWith(to)));
@@ -99,7 +105,7 @@ function SecondaryNav() {
   };
   return (
     <details ref={detailsRef} className={`more-menu ${active ? "more-menu-active" : ""}`}>
-      <summary>More <span aria-hidden="true">⌄</span></summary>
+      <summary>Browse <span aria-hidden="true">⌄</span></summary>
       <div className="more-popover">
         {SECONDARY_NAV.map((group) => (
           <div className="more-group" key={group.label}>
@@ -112,6 +118,18 @@ function SecondaryNav() {
             ))}
           </div>
         ))}
+        <div className="more-system-actions">
+          <PushButton />
+          <button
+            className={`offline-toggle ${offline ? "offline-on" : ""}`}
+            onClick={() => {
+              setOffline(!offline);
+              if (detailsRef.current) detailsRef.current.open = false;
+            }}
+          >
+            {offline ? "Resume Hive" : "Go offline"}
+          </button>
+        </div>
       </div>
     </details>
   );
@@ -164,9 +182,9 @@ function MobileNav({
         </div>
       )}
       <nav className="mobnav">
-        {tab("/", "Chief", "◆", 0, true)}
+        {tab("/", "Home", "◆", 0, true)}
+        {tab("/inbox", "Needs you", "◎", inboxCount)}
         {tab("/work", "Work", "▦")}
-        {tab("/inbox", "Inbox", "◎", inboxCount)}
         <button className={`mobtab ${moreOpen ? "active" : ""}`} onClick={() => setMoreOpen((v) => !v)}>
           <span className="mobtab-icon">☰</span>
           More
@@ -180,9 +198,9 @@ function ConnDot() {
   const { sse } = useStore();
   const label = sse === "open" ? "live" : sse === "connecting" ? "connecting" : "reconnecting";
   return (
-    <span className={`conn conn-${sse}`} title={`SSE ${label}`}>
+    <span className={`conn conn-${sse}`} title={`SSE ${label}`} aria-label={`Hive is ${label}`}>
       <span className="conn-dot" />
-      {label}
+      <span className="conn-label">{label}</span>
     </span>
   );
 }
@@ -224,9 +242,8 @@ function Bell() {
 }
 
 export default function App() {
-  const { decisions, tasks, checkpoints, offline, setOffline } = useStore();
-  const reviewCount = tasks.filter((t) => t.state === "in_review").length;
-  const inboxCount = decisions.length + checkpoints.length + reviewCount + tasks.filter(needsAttention).length;
+  const { decisions, offline, setOffline } = useStore();
+  const inboxCount = decisions.length;
   const location = useLocation();
   // Board card clicks push /tasks/:id with state.backgroundLocation set to the
   // board's location — that keeps the board mounted and rendered underneath
@@ -241,29 +258,21 @@ export default function App() {
         <NavLink className="brand" to="/">
           <span className="brand-mark">◆</span> hive
         </NavLink>
-        <nav className="nav">
-          <NavLink to="/" end>
-            Chief of Staff
-          </NavLink>
-          <NavLink to="/work">Work</NavLink>
-          <NavLink to="/inbox">
-            Inbox
+        <button
+          className="command-trigger"
+          onClick={() => window.dispatchEvent(new Event("hive:palette"))}
+          aria-label="Search Hive or run a command"
+        >
+          <span>Search or jump to anything</span>
+          <kbd>⌘K</kbd>
+        </button>
+        <nav className="nav" aria-label="Workspace">
+          <NavLink className="needs-you-link" to="/inbox">
+            <span>{inboxCount > 0 ? "Needs you" : "All clear"}</span>
             {inboxCount > 0 && <span className="badge">{inboxCount}</span>}
           </NavLink>
-          <SecondaryNav />
+          <SecondaryNav offline={offline} setOffline={setOffline} />
         </nav>
-        <button
-          className={`offline-toggle ${offline ? "offline-on" : ""}`}
-          title={
-            offline
-              ? "Offline mode is ON: nothing new spawns; agents parked with handoff notes. Click to resume."
-              : "Prepare for losing internet: agents push WIP + write handoff notes and park; nothing new spawns."
-          }
-          onClick={() => setOffline(!offline)}
-        >
-          {offline ? "⏸ offline" : "go offline"}
-        </button>
-        <PushButton />
         <Bell />
         <ConnDot />
       </header>

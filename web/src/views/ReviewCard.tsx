@@ -367,26 +367,29 @@ export function ReviewCard({
         <DecisionCard key={d.id} d={d} onDone={() => setOpenDecisions((ds) => ds.filter((x) => x.id !== d.id))} />
       ))}
 
-      <ChangesThread events={events} />
+      <details className="review-details" open={defaultExpanded}>
+        <summary>Review details</summary>
+        <div className="review-details-body">
+          <ChangesThread events={events} />
 
-      <CheckpointList events={events} />
+          <CheckpointList events={events} />
 
-      {review ? (
-        <>
-          <ReviewDigest r={review} />
-          {task.summary && (
-            <button className="rs-prose-toggle" onClick={() => setShowProse((x) => !x)}>
-              {showProse ? "hide" : "show"} full summary
-            </button>
+          {review ? (
+            <>
+              <ReviewDigest r={review} />
+              {task.summary && (
+                <button className="rs-prose-toggle" onClick={() => setShowProse((x) => !x)}>
+                  {showProse ? "hide" : "show"} full summary
+                </button>
+              )}
+              {showProse && task.summary && <p className="review-summary">{task.summary}</p>}
+            </>
+          ) : (
+            task.summary && <p className="review-summary">{task.summary}</p>
           )}
-          {showProse && task.summary && <p className="review-summary">{task.summary}</p>}
-        </>
-      ) : (
-        task.summary && <p className="review-summary">{task.summary}</p>
-      )}
 
-      {evidence.length > 0 &&
-        (() => {
+          {evidence.length > 0 &&
+            (() => {
           // Screenshots as lightbox thumbnails; everything else (test runs,
           // logs, reports, links) as compact chips. The proof rides with the
           // review instead of a click away on the task page.
@@ -412,39 +415,41 @@ export function ReviewCard({
               ))}
             </div>
           );
-        })()}
+            })()}
 
-      <div className="review-diffstat">
-        {diffErr ? (
-          <span className="diff-err">Could not load diff: {diffErr}</span>
-        ) : !diff ? (
-          <span className="muted">Loading diff{"…"}</span>
-        ) : stat && stat.files > 0 ? (
-          <button className="diffstat-toggle" onClick={() => setExpanded((x) => !x)}>
-            <span className="diff-caret">{expanded ? "▾" : "▸"}</span>
-            {stat.files} file{stat.files === 1 ? "" : "s"}{" "}
-            <span className="diff-add">+{stat.add}</span> <span className="diff-del">{"−"}{stat.del}</span>
-          </button>
-        ) : (
-          <span className="muted">No changes to show.</span>
-        )}
-        {expanded && diff && diff.files.length > 0 && (
-          <label className="wrap-toggle">
-            <input type="checkbox" checked={wrap} onChange={(e) => setWrap(e.target.checked)} /> wrap
-          </label>
-        )}
-      </div>
+          <div className="review-diffstat">
+            {diffErr ? (
+              <span className="diff-err">Could not load diff: {diffErr}</span>
+            ) : !diff ? (
+              <span className="muted">Loading diff{"…"}</span>
+            ) : stat && stat.files > 0 ? (
+              <button className="diffstat-toggle" onClick={() => setExpanded((x) => !x)}>
+                <span className="diff-caret">{expanded ? "▾" : "▸"}</span>
+                {stat.files} file{stat.files === 1 ? "" : "s"}{" "}
+                <span className="diff-add">+{stat.add}</span> <span className="diff-del">{"−"}{stat.del}</span>
+              </button>
+            ) : (
+              <span className="muted">No changes to show.</span>
+            )}
+            {expanded && diff && diff.files.length > 0 && (
+              <label className="wrap-toggle">
+                <input type="checkbox" checked={wrap} onChange={(e) => setWrap(e.target.checked)} /> wrap
+              </label>
+            )}
+          </div>
 
-      {expanded && diff && (
-        <div className="diff-viewer">
-          {diff.files.map((f) => (
-            <DiffFileView key={f.path} f={f} wrap={wrap} />
-          ))}
-          {diff.truncated && (
-            <div className="diff-trunc">Diff truncated (over {MAX_DIFF_LINES.toLocaleString()} lines). View the full diff in the PR.</div>
+          {expanded && diff && (
+            <div className="diff-viewer">
+              {diff.files.map((f) => (
+                <DiffFileView key={f.path} f={f} wrap={wrap} />
+              ))}
+              {diff.truncated && (
+                <div className="diff-trunc">Diff truncated (over {MAX_DIFF_LINES.toLocaleString()} lines). View the full diff in the PR.</div>
+              )}
+            </div>
           )}
         </div>
-      )}
+      </details>
 
       <div className="review-actions">
         <button className="btn btn-primary" onClick={() => merge()} disabled={busy || !!mergeBlocked} title={mergeBlocked}>

@@ -1,6 +1,6 @@
 # hive
 
-Local-first orchestration control plane built around one persistent Chief of Staff. The default web home restores the durable cross-project conversation, summarizes where work stopped and what changed since the last visit, and keeps detailed supervisor activity behind a "Behind the scenes" disclosure. hive owns durable state (SQLite), an event-driven timeline, evidence, policies, and a server-enforced task state machine. See [SPEC.md](./SPEC.md) for the full product spec and [docs/API.md](./docs/API.md) for the HTTP contract.
+Local-first orchestration control plane built around one persistent Chief of Staff. The default web home shows a compact briefing, the current exchange, and one consequential decision at a time. Earlier conversation and detailed agent activity stay behind progressive disclosure, while search and a single Browse menu keep operational views available without competing for attention. hive owns durable state (SQLite), an event-driven timeline, evidence, policies, and a server-enforced task state machine. See [SPEC.md](./SPEC.md) for the full product spec and [docs/API.md](./docs/API.md) for the HTTP contract.
 
 This repo contains **Phase 1** (server core + CLI) and **Phase 2b** (the runtime
 layer: herdr adapter, reconciler, monitors + post-deploy smoke, secrets, and

@@ -270,15 +270,17 @@ function DecisionBundleView({ bundle }: { bundle?: DecisionBundle | null }) {
         </div>
       )}
       {prior_decisions.length > 0 && (
-        <div className="dbundle-prior">
-          <div className="dbundle-label">You've decided before</div>
-          {prior_decisions.map((p) => (
-            <div key={p.id} className="dbundle-prior-row">
-              <span className="dbundle-prior-title">{p.title}</span>
-              {p.answer && <span className="dbundle-prior-answer">→ {p.answer}</span>}
-            </div>
-          ))}
-        </div>
+        <details className="dbundle-prior">
+          <summary>Past decisions ({prior_decisions.length})</summary>
+          <div className="dbundle-prior-list">
+            {prior_decisions.map((p) => (
+              <div key={p.id} className="dbundle-prior-row">
+                <span className="dbundle-prior-title">{p.title}</span>
+                {p.answer && <span className="dbundle-prior-answer">→ {p.answer}</span>}
+              </div>
+            ))}
+          </div>
+        </details>
       )}
     </div>
   );
