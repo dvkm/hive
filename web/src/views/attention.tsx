@@ -142,7 +142,7 @@ export function EditRequeueModal({ task, onClose }: { task: Task; onClose: () =>
 }
 
 // The two row kinds, split failed vs live-unhealthy. Reused by the board tray
-// (wrapped in its own section header) and the brief's attention section.
+// (wrapped in its own section header) and the Needs you attention section.
 export function AttentionRows({ tasks }: { tasks: Task[] }) {
   const failed = tasks.filter((t) => t.state === "failed");
   const unhealthy = tasks.filter((t) => t.state !== "failed");
