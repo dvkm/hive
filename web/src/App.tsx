@@ -169,15 +169,18 @@ function MobileNav({
                 </NavLink>
               ))}
             </div>
-            <button
-              className={`btn ${offline ? "btn-danger" : ""} mobsheet-offline`}
-              onClick={() => {
-                setOffline(!offline);
-                close();
-              }}
-            >
-              {offline ? "⏸ Offline mode is ON — tap to resume" : "Go offline (drain the fleet)"}
-            </button>
+            <div className="mobsheet-actions">
+              <PushButton />
+              <button
+                className={`btn ${offline ? "btn-danger" : ""} mobsheet-offline`}
+                onClick={() => {
+                  setOffline(!offline);
+                  close();
+                }}
+              >
+                {offline ? "⏸ Offline mode is ON — tap to resume" : "Go offline (drain the fleet)"}
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -242,8 +245,8 @@ function Bell() {
 }
 
 export default function App() {
-  const { decisions, offline, setOffline } = useStore();
-  const inboxCount = decisions.length;
+  const { needsYou, offline, setOffline } = useStore();
+  const inboxCount = needsYou.length;
   const location = useLocation();
   // Board card clicks push /tasks/:id with state.backgroundLocation set to the
   // board's location — that keeps the board mounted and rendered underneath

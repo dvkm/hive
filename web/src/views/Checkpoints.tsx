@@ -144,15 +144,16 @@ export function CheckpointList({ events }: { events: Event[] }) {
 // an approve-all per group. Live via the store's SSE-driven checkpoint list.
 // Un-acked checkpoints survive task completion (marked "shipped") — a late
 // flag becomes a corrective follow-up task instead of a dead steer.
-export function CheckpointsInbox() {
+export function CheckpointsInbox({ limit, heading = true }: { limit?: number; heading?: boolean } = {}) {
   const { checkpoints, reloadCheckpoints } = useStore();
   const projectFilter = useProjectFilter();
   const [busy, setBusy] = useState(false);
   const scoped = checkpoints.filter((c) => inProjectFilter(c.project_id, projectFilter));
   if (!scoped.length) return null;
+  const visible = limit ? scoped.slice(0, limit) : scoped;
 
   const groups = new Map<string, Checkpoint[]>();
-  for (const c of scoped) {
+  for (const c of visible) {
     const g = groups.get(c.task_id) ?? [];
     g.push(c);
     groups.set(c.task_id, g);
@@ -174,10 +175,12 @@ export function CheckpointsInbox() {
 
   return (
     <section className="cp-inbox">
-      <div className="cp-inbox-head">
-        Checkpoints <span className="cp-count">{scoped.length}</span>
-        <span className="muted"> — agents&apos; judgment calls; tick to approve, flag to steer (or spawn a fix if already shipped)</span>
-      </div>
+      {heading && (
+        <div className="cp-inbox-head">
+          Checkpoints <span className="cp-count">{scoped.length}</span>
+          <span className="muted"> — agents&apos; judgment calls; tick to approve, flag to steer (or spawn a fix if already shipped)</span>
+        </div>
+      )}
       {[...groups.values()].map((items) => {
         const c0 = items[0];
         const finished = ["done", "failed"].includes(c0.task_state);

@@ -6,7 +6,8 @@ import { useStore } from "../lib/store";
 import { StatusDot, HEALTH_LABEL } from "../lib/ui";
 import { DecisionCard } from "./DecisionCard";
 import { ReviewCard } from "./ReviewCard";
-import { AttentionRows, needsAttention } from "./attention";
+import { AttentionRows } from "./attention";
+import { CheckpointsInbox } from "./Checkpoints";
 import { fmtUsd, fmtTokens } from "./Analytics";
 
 const LAST_SEEN_KEY = "hive.brief.lastSeen";
@@ -34,7 +35,7 @@ function toLocalInput(iso: string): string {
 }
 
 export default function Brief() {
-  const { decisions, tasks } = useStore();
+  const { needsYou } = useStore();
   const location = useLocation();
 
   // Default the window to the last time the brief was viewed (localStorage, same
@@ -61,9 +62,10 @@ export default function Brief() {
   // fetched snapshot.
   const [answered, setAnswered] = useState<Set<string>>(new Set());
   const [reviewed, setReviewed] = useState<Set<string>>(new Set());
-  const openDecisions = decisions.filter((d) => !answered.has(d.id));
-  const toReview = tasks.filter((t) => t.state === "in_review" && !reviewed.has(t.id));
-  const attention = tasks.filter(needsAttention);
+  const openDecisions = needsYou.flatMap((item) => item.kind === "decision" && !answered.has(item.id) ? [item.decision] : []);
+  const checkpoints = needsYou.flatMap((item) => item.kind === "checkpoint" ? [item.checkpoint] : []);
+  const toReview = needsYou.flatMap((item) => item.kind === "review" && !reviewed.has(item.id) ? [item.task] : []);
+  const attention = needsYou.flatMap((item) => item.kind === "attention" ? [item.task] : []);
 
   const done = data?.done ?? [];
   const fleet = data?.fleet ?? [];
@@ -73,8 +75,7 @@ export default function Brief() {
   const spend = data?.spend;
   const spendCount = spend ? spend.totals.calls : 0;
 
-  const actionCount = openDecisions.length + toReview.length + attention.length;
-  const hasDigest = done.length + fleet.length + incidents.length + intake.length + spendCount + learnings.length > 0;
+  const actionCount = openDecisions.length + checkpoints.length + toReview.length + attention.length;
 
   return (
     <div className="brief-page">
@@ -82,7 +83,7 @@ export default function Brief() {
         <div>
           <h1 className="brief-title">Needs you</h1>
           <div className="brief-since muted">
-            Only decisions and approvals Hive cannot finish without you.
+            Decisions, approvals, and issues Hive cannot finish without you.
           </div>
         </div>
       </header>
@@ -102,6 +103,11 @@ export default function Brief() {
         </div>
       </Section>
 
+      <Section title="Checkpoints" count={checkpoints.length}>
+        <CheckpointsInbox limit={1} heading={false} />
+        {checkpoints.length > 1 && <div className="brief-queue-note">Next checkpoint appears after this one.</div>}
+      </Section>
+
       {/* ②a To review — in-review tasks awaiting review & merge (shared card). */}
       <Section title="To review" count={toReview.length}>
         <div className="brief-reviews">
@@ -117,7 +123,7 @@ export default function Brief() {
         </div>
       </Section>
 
-      {data && hasDigest && (
+      {data && (
         <details className="brief-digest">
           <summary>
             <span>Activity summary</span>
