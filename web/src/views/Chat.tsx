@@ -245,7 +245,7 @@ function ChiefBriefing({
   awaiting: boolean;
   managerTask: Task | null;
 }) {
-  const { tasks } = useStore();
+  const { tasks, needsYou } = useStore();
   const [since] = useState(() => localStorage.getItem(CHIEF_LAST_SEEN));
   const [brief, setBrief] = useState<Brief | null>(null);
   useEffect(() => {
@@ -257,19 +257,19 @@ function ChiefBriefing({
     };
   }, [since]);
 
-  const attentionCount = brief?.director_required_task_ids.length ?? 0;
+  const attentionCount = needsYou.length;
   const working = tasks.filter((task) => task.source !== "chat_supervisor" && ["in_progress", "needs_decision", "in_review", "verifying"].includes(task.state));
   const finishedCount = since ? brief?.done.length ?? 0 : 0;
   const stopped = !!managerTask && ["done", "failed", "cancelled"].includes(managerTask.state);
   const headline = !brief
     ? "Getting you caught up…"
     : attentionCount > 0
-      ? `${attentionCount} ${attentionCount === 1 ? "decision needs" : "decisions need"} your call.`
+      ? `${attentionCount} ${attentionCount === 1 ? "thing needs" : "things need"} your attention.`
       : awaiting
         ? "Hive is handling it."
         : "You're caught up.";
   const detail = attentionCount > 0
-    ? "Everything else keeps moving while your Chief waits for this decision."
+    ? "Everything else keeps moving while your Chief waits for your call."
     : thread?.next_action || thread?.outcome || thread?.objective || "Tell Hive the outcome you want. Your Chief of Staff will coordinate the rest.";
 
   return (
@@ -281,7 +281,7 @@ function ChiefBriefing({
       </div>
       <div className="chief-briefing-foot">
         <div className="chief-briefing-facts">
-          {attentionCount > 0 && <Link to="/inbox">Review {attentionCount === 1 ? "decision" : "decisions"}</Link>}
+          {attentionCount > 0 && <Link to="/inbox">Review {attentionCount === 1 ? "item" : "items"}</Link>}
           <Link to="/work">{working.length} in motion</Link>
           {finishedCount > 0 && <span>{finishedCount} finished</span>}
         </div>

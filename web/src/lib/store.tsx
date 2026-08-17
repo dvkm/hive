@@ -1,6 +1,8 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { api, apiToken } from "./api";
 import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Checkpoint, ChatMessage } from "./api";
+import { getNeedsYouItems } from "./needsYou";
+import type { NeedsYouItem } from "./needsYou";
 
 export type SseState = "connecting" | "open" | "reconnecting";
 
@@ -19,6 +21,7 @@ interface Store {
   evidenceMeta: Record<string, { url: string | null; kind: Evidence["kind"] }>; // by evidence id, for live feed thumbnails
   checkpoints: Checkpoint[]; // open (un-acked) build-time checkpoints, all tasks
   reloadCheckpoints: () => void;
+  needsYou: NeedsYouItem[];
   offline: boolean; // offline mode: fleet drained, nothing new spawns
   setOffline: (on: boolean) => void;
   sse: SseState;
@@ -60,6 +63,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const bump = (id: string) => setRev((r) => ({ ...r, [id]: (r[id] || 0) + 1 }));
   const reloadProjects = () => api.projects().then(setProjects).catch(() => setProjects([]));
   const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
+  const needsYou = getNeedsYouItems(decisions, tasks, checkpoints);
   const [offline, setOfflineState] = useState(false);
   const setOffline = (on: boolean) => {
     setOfflineState(on); // optimistic; SSE confirms
@@ -220,7 +224,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, offline, setOffline, sse, chatThreadId, chatMessages, openChatThread, onChatMessage }}>
+    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, needsYou, offline, setOffline, sse, chatThreadId, chatMessages, openChatThread, onChatMessage }}>
       {children}
     </Ctx.Provider>
   );
