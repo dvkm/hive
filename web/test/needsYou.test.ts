@@ -10,7 +10,7 @@ test("needs-you queue includes every actionable item", () => {
   const items = getNeedsYouItems(
     [decision],
     [
-      task("review-1", "in_review"),
+      task("review-1", "in_review", { health: { status: "dead", reason: null, since: "now" } }),
       task("failed-1", "failed"),
       task("requeued-1", "failed", { requeued_to: "successor" }),
       task("stuck-1", "in_progress", { health: { status: "stuck", reason: null, since: "now" } }),
