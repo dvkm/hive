@@ -23,7 +23,7 @@ type Item = {
 const NAV: { label: string; path: string }[] = [
   { label: "Chief of Staff", path: "/" },
   { label: "Work", path: "/work" },
-  { label: "Inbox", path: "/inbox" },
+  { label: "Needs you", path: "/inbox" },
   { label: "Activity", path: "/feed" },
   { label: "Evidence", path: "/evidence" },
   { label: "Agent sessions", path: "/supervisors" },
@@ -103,8 +103,13 @@ export default function Palette() {
         setOpen(true);
       }
     };
+    const onOpen = () => setOpen(true);
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("hive:palette", onOpen);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("hive:palette", onOpen);
+    };
   }, [open]);
 
   // Lock background scroll + focus the input while open.
