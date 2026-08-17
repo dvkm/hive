@@ -999,9 +999,7 @@ function chatReply(db: DB, threadId: string, body: any): Response {
         .map((action) => action.decision_id as string)
     )
   );
-  const freshActions = last?.role === "assistant"
-    ? actions.filter((action) => !surfaced.has(action.decision_id))
-    : actions;
+  const freshActions = actions.filter((action) => !surfaced.has(action.decision_id));
   const newlyCompleted =
     thread.phase === "complete" && !!thread.completed_at && (!last || thread.completed_at > last.ts);
 
@@ -1009,7 +1007,12 @@ function chatReply(db: DB, threadId: string, body: any): Response {
   // replied once, only a newly surfaced decision or newly completed outcome
   // may create another message. Routine wakeup chatter is still recorded in
   // the run ledger and activity stream, but never becomes chat spam.
-  if (!thread.project_id && last?.role === "assistant" && !freshActions.length && !newlyCompleted)
+  const repeatedDecisionRequest = requestedDecisionIds.length > 0 && !freshActions.length;
+  if (
+    !thread.project_id &&
+    !newlyCompleted &&
+    (repeatedDecisionRequest || (last?.role === "assistant" && !freshActions.length))
+  )
     return json({ ok: true, suppressed: true });
 
   const message = appendMessage(db, threadId, "assistant", text, freshActions);

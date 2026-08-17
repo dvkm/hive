@@ -391,11 +391,15 @@ test("Chief bundles real decisions into actionable message data and does not res
     { type: "decision", decision_id: decision.id, label: "Which launch mode should we use?" },
   ]);
 
+  await post("/api/chat/turn", { thread_id: chief.id, text: "Do you still need anything from me?" });
+  const before = (await get(`/api/chat/threads/${chief.id}`)).json.messages.length;
+
   const duplicate = await post(`/api/chat/threads/${chief.id}/reply`, {
     text: "Reminder about that same decision.",
     decision_ids: [decision.id],
   });
   expect(duplicate.json.suppressed).toBe(true);
+  expect((await get(`/api/chat/threads/${chief.id}`)).json.messages).toHaveLength(before);
 });
 
 test("starting a chat with no project is rejected (session needs a repo)", async () => {

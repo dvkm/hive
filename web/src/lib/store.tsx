@@ -72,10 +72,25 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [chatThreadId, setChatThreadId] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const chatThreadRef = useRef<string | null>(null);
+  const hydrateChatDecisions = (messages: ChatMessage[]) => {
+    const decisionIds = new Set(
+      messages.flatMap((message) => message.actions)
+        .filter((action) => action.type === "decision" && typeof action.decision_id === "string")
+        .map((action) => action.decision_id as string)
+    );
+    if (decisionIds.size)
+      api.decisions("open").then((open) => setDecisions((prev) => [
+        ...open.filter((decision) => decisionIds.has(decision.id)),
+        ...prev.filter((decision) => !decisionIds.has(decision.id)),
+      ])).catch(() => {});
+  };
   const openChatThread = (id: string | null) => {
     chatThreadRef.current = id;
     setChatThreadId(id);
-    if (id) api.chatThread(id).then((t) => setChatMessages(t.messages)).catch(() => setChatMessages([]));
+    if (id) api.chatThread(id).then((t) => {
+      setChatMessages(t.messages);
+      hydrateChatDecisions(t.messages);
+    }).catch(() => setChatMessages([]));
     else setChatMessages([]);
   };
   const chatSubs = useRef(new Set<(m: ChatMessage) => void>());
@@ -187,6 +202,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           setNotifications((prev) => (prev.some((x) => x.id === n.id) ? prev : [n, ...prev]));
         } else if (msg.type === "chat_message") {
           const cm: ChatMessage = msg.message;
+          hydrateChatDecisions([cm]);
           if (cm.thread_id === chatThreadRef.current)
             setChatMessages((prev) => (prev.some((m) => m.id === cm.id) ? prev : [...prev, cm]));
           chatSubs.current.forEach((cb) => cb(cm));
