@@ -387,8 +387,9 @@ export interface BriefIntake extends Task {
 export interface BriefLearning extends Learning {
   project_name: string;
 }
-// The composed morning brief. Action-state sections (decisions, attention, fleet,
-// intake) are current-state; done/incidents/spend/learnings are windowed by `since`.
+// The composed re-entry and activity snapshot. Action-state sections (decisions,
+// attention, fleet, intake) are current-state; done/incidents/spend/learnings are
+// windowed by `since`.
 export interface Brief {
   since: string | null;
   done: BriefDone[];

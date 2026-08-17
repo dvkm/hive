@@ -200,7 +200,7 @@ function DiffFileView({ f, wrap }: { f: DiffFile; wrap: boolean }) {
 type ActionMode = null | "changes" | "reject";
 
 // The one review surface, shared by the task page, the /review queue, and the
-// morning brief. Renders: title/project/summary, PR+CI status, a compact diff
+// Needs you view. Renders: title/project/summary, PR+CI status, a compact diff
 // stat with an expandable inline diff, and the three primary actions
 // (approve & merge, request changes, reject). `onDone` lets the parent hide or
 // refresh the card after an action resolves.

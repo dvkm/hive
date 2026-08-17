@@ -135,8 +135,8 @@ function SecondaryNav({ offline, setOffline }: { offline: boolean; setOffline: (
   );
 }
 
-// Mobile navigation mirrors the three things the director actually does:
-// direct the manager, watch work, and clear items that need human attention.
+// Mobile navigation keeps the home exchange, Needs you queue, work board, and
+// secondary operational views within one tap.
 function MobileNav({
   inboxCount,
   offline,

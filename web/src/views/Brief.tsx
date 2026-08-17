@@ -38,9 +38,9 @@ export default function Brief() {
   const { needsYou } = useStore();
   const location = useLocation();
 
-  // Default the window to the last time the brief was viewed (localStorage, same
-  // pattern as the feed's last-seen). Read the stored marker now, then stamp this
-  // visit so next time the window starts where this one opened.
+  // Default the activity-summary window to the last time Needs you was viewed
+  // (localStorage, same pattern as the feed's last-seen). Read the stored marker
+  // now, then stamp this visit so next time the window starts where this one opened.
   const marker = useMemo(() => localStorage.getItem(LAST_SEEN_KEY), []);
   useEffect(() => {
     localStorage.setItem(LAST_SEEN_KEY, new Date().toISOString());
@@ -57,9 +57,8 @@ export default function Brief() {
     };
   }, [since]);
 
-  // The two interactive sections read from the live store so answering a card or
-  // acting on a tray row updates in place via SSE. The digest sections read the
-  // fetched snapshot.
+  // Action sections read from the live store so handling an item updates in
+  // place via SSE. The disclosed activity summary reads the fetched snapshot.
   const [answered, setAnswered] = useState<Set<string>>(new Set());
   const [reviewed, setReviewed] = useState<Set<string>>(new Set());
   const openDecisions = needsYou.flatMap((item) => item.kind === "decision" && !answered.has(item.id) ? [item.decision] : []);
@@ -95,7 +94,7 @@ export default function Brief() {
         </div>
       )}
 
-      {/* ① Decisions waiting — answerable right here (reuses the inbox card). */}
+      {/* ① Decisions waiting, answerable here with the shared decision card. */}
       <Section title="Decisions waiting" count={openDecisions.length}>
         <div className="brief-decisions">
           {openDecisions[0] && <DecisionCard d={openDecisions[0]} onDone={(id) => setAnswered((s) => new Set(s).add(id))} />}
