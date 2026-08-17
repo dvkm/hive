@@ -30,14 +30,14 @@ function MsgActions({ actions }: { actions: ChatMessage["actions"] }) {
   const cards = decisionIds
     .map((id) => decisions.find((decision) => decision.id === id))
     .filter((decision): decision is Decision => !!decision && !hidden.has(decision.id));
+  const visibleCard = cards[0];
   const passive = actions.filter((action) => action.type !== "decision");
   return (
     <>
-      {cards.length > 0 && (
+      {visibleCard && (
         <div className="chat-decision-actions">
-          {cards.map((decision) => (
-            <DecisionCard key={decision.id} d={decision} onDone={(id) => setHidden((current) => new Set(current).add(id))} />
-          ))}
+          {cards.length > 1 && <div className="chat-decision-queue">Decision 1 of {cards.length}</div>}
+          <DecisionCard key={visibleCard.id} d={visibleCard} onDone={(id) => setHidden((current) => new Set(current).add(id))} />
         </div>
       )}
       {passive.length > 0 && (
@@ -50,13 +50,18 @@ function MsgActions({ actions }: { actions: ChatMessage["actions"] }) {
 }
 
 export function Bubble({ m }: { m: ChatMessage }) {
-  const hasDecision = m.actions?.some((action) => action.type === "decision");
+  const { decisions } = useStore();
+  const hasDecision = m.actions?.some((action) =>
+    action.type === "decision" && action.decision_id && decisions.some((decision) => decision.id === action.decision_id)
+  );
   const html =
     m.role === "assistant" ? DOMPurify.sanitize(marked.parse(m.text, { async: false }) as string) : null;
   return (
     <div className={`chat-msg chat-${m.role}${hasDecision ? " chat-has-decision" : ""}`}>
       <div className="chat-bubble">
-        {html != null ? (
+        {hasDecision ? (
+          <div className="chat-decision-intro">One decision needs your call.</div>
+        ) : html != null ? (
           <div className="chat-md" dangerouslySetInnerHTML={{ __html: html }} />
         ) : (
           <div className="chat-text">{m.text}</div>
@@ -240,7 +245,7 @@ function ChiefBriefing({
   awaiting: boolean;
   managerTask: Task | null;
 }) {
-  const { tasks } = useStore();
+  const { tasks, needsYou } = useStore();
   const [since] = useState(() => localStorage.getItem(CHIEF_LAST_SEEN));
   const [brief, setBrief] = useState<Brief | null>(null);
   useEffect(() => {
@@ -252,41 +257,47 @@ function ChiefBriefing({
     };
   }, [since]);
 
-  const attentionCount = brief?.director_required_task_ids.length ?? 0;
+  const attentionCount = needsYou.length;
   const working = tasks.filter((task) => task.source !== "chat_supervisor" && ["in_progress", "needs_decision", "in_review", "verifying"].includes(task.state));
   const finishedCount = since ? brief?.done.length ?? 0 : 0;
   const stopped = !!managerTask && ["done", "failed", "cancelled"].includes(managerTask.state);
+  const headline = !brief
+    ? "Getting you caught up…"
+    : attentionCount > 0
+      ? `${attentionCount} ${attentionCount === 1 ? "thing needs" : "things need"} your attention.`
+      : awaiting
+        ? "Hive is handling it."
+        : "You're caught up.";
+  const detail = attentionCount > 0
+    ? "Everything else keeps moving while your Chief waits for your call."
+    : thread?.next_action || thread?.outcome || thread?.objective || "Tell Hive the outcome you want. Your Chief of Staff will coordinate the rest.";
 
   return (
     <section className="chief-briefing" aria-label="Re-entry briefing">
       <div className="chief-briefing-copy">
-        <div className="manager-eyebrow">Your briefing</div>
-        <h2>{thread?.objective || "Tell Hive the outcome you want."}</h2>
-        <p>
-          {thread?.waiting_on
-            ? `Waiting on ${thread.waiting_on}`
-            : thread?.next_action || thread?.outcome || "Your Chief of Staff will remember the context and coordinate the work."}
-        </p>
+        <div className="manager-eyebrow">Briefing</div>
+        <h2>{headline}</h2>
+        <p>{detail}</p>
       </div>
-      <div className="chief-briefing-stats">
-        <Link className={attentionCount ? "chief-stat chief-stat-attention" : "chief-stat"} to="/inbox">
-          <strong>{attentionCount}</strong>
-          <span>{attentionCount === 1 ? "thing needs you" : "things need you"}</span>
-        </Link>
-        <div className="chief-stat"><strong>{working.length}</strong><span>being handled</span></div>
-        <div className="chief-stat"><strong>{finishedCount}</strong><span>finished since last visit</span></div>
-      </div>
-      <div className={`chief-status ${awaiting ? "chief-status-working" : ""}`}>
-        <span className="manager-live-dot" />
-        {!thread ? "Ready for direction" : stopped ? "Session stopped" : awaiting ? "Chief of Staff is working" : "Watching the portfolio"}
+      <div className="chief-briefing-foot">
+        <div className="chief-briefing-facts">
+          {attentionCount > 0 && <Link to="/inbox">Review {attentionCount === 1 ? "item" : "items"}</Link>}
+          <Link to="/work">{working.length} in motion</Link>
+          {finishedCount > 0 && <span>{finishedCount} finished</span>}
+        </div>
+        <div className={`chief-status ${awaiting ? "chief-status-working" : ""}`}>
+          <span className="manager-live-dot" />
+          {!thread ? "Ready" : stopped ? "Stopped" : awaiting ? "Working" : "Watching"}
+        </div>
       </div>
     </section>
   );
 }
 
 export default function Chat({ embedded = false }: { embedded?: boolean }) {
-  const { projects, tasks, feedEvents, chatThreadId, chatMessages, openChatThread } = useStore();
+  const { projects, tasks, decisions, feedEvents, chatThreadId, chatMessages, openChatThread } = useStore();
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [managerTaskId, setManagerTaskId] = useState<string | null>(null);
@@ -351,11 +362,6 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
     };
   }, [managerTaskId]);
 
-  // Stick to the bottom as messages stream in.
-  useEffect(() => {
-    if (open) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [chatMessages, open]);
-
   const send = async () => {
     const body = text.trim();
     if (!body || sending || !projects.length) return;
@@ -383,6 +389,41 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
     for (const e of feedEvents) if (e.task_id === managerTaskId) rows.set(e.id, e);
     return [...rows.values()].sort((a, b) => b.ts.localeCompare(a.ts));
   }, [managerEvents, feedEvents, managerTaskId]);
+  const focusedMessages = useMemo(() => {
+    const openDecisionIds = new Set(decisions.map((decision) => decision.id));
+    const ids = new Set<string>();
+    const lastDirector = [...chatMessages].reverse().find((message) => message.role === "director");
+    const lastAssistant = [...chatMessages].reverse().find((message) => message.role === "assistant");
+    const openDecisionMessage = [...chatMessages].reverse().find((message) =>
+      message.actions?.some((action) => action.type === "decision" && action.decision_id && openDecisionIds.has(action.decision_id))
+    );
+    if (lastDirector) ids.add(lastDirector.id);
+    if (lastAssistant) ids.add(lastAssistant.id);
+    if (openDecisionMessage) ids.add(openDecisionMessage.id);
+    return chatMessages.filter((message) => ids.has(message.id));
+  }, [chatMessages, decisions]);
+  const hiddenMessageCount = chatMessages.length - focusedMessages.length;
+  const visibleMessages = historyOpen ? chatMessages : focusedMessages;
+  const focusedDecisionMessageId = focusedMessages.find((message) =>
+    message.actions?.some((action) => action.type === "decision" && action.decision_id && decisions.some((decision) => decision.id === action.decision_id))
+  )?.id ?? null;
+
+  // An actionable card should open at its question, not scrolled to its footer.
+  // Ordinary replies stay pinned to the newest message.
+  useEffect(() => {
+    const scroll = scrollRef.current;
+    if (!open || !scroll) return;
+    if (historyOpen) {
+      scroll.scrollTo({ top: 0 });
+      return;
+    }
+    if (focusedDecisionMessageId && chatMessages.at(-1)?.role !== "director") {
+      const decision = scroll.querySelector<HTMLElement>(".chat-has-decision");
+      if (decision) scroll.scrollTop += decision.getBoundingClientRect().top - scroll.getBoundingClientRect().top;
+      return;
+    }
+    scroll.scrollTo({ top: scroll.scrollHeight });
+  }, [visibleMessages, open, historyOpen, focusedDecisionMessageId, chatMessages]);
 
   if (!open)
     return (
@@ -396,9 +437,14 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
       <header className={embedded ? "manager-head" : "chat-head"}>
         {embedded && (
           <div className="manager-heading">
-            <div className="manager-eyebrow">Your Chief of Staff</div>
-            <h1>Set direction. Hive handles the details.</h1>
-            <p>One persistent agent remembers where you left off, coordinates every project, and brings back only consequential decisions.</p>
+            <div>
+              <div className="manager-eyebrow">Chief of Staff</div>
+              <h1>{awaiting ? "Working on it." : "What should Hive handle?"}</h1>
+            </div>
+            <div className={`chief-presence ${awaiting ? "chief-presence-working" : ""}`}>
+              <span className="manager-live-dot" />
+              {awaiting ? "Coordinating" : "Ready"}
+            </div>
           </div>
         )}
         <div className="chat-head-actions">
@@ -413,6 +459,11 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
         {embedded && <ChiefBriefing thread={managerThread} awaiting={awaiting} managerTask={managerTask} />}
         <div className={embedded ? "manager-conversation" : undefined}>
           <div className="chat-scroll" ref={scrollRef}>
+            {hiddenMessageCount > 0 && (
+              <button className="chat-history-toggle" onClick={() => setHistoryOpen((current) => !current)}>
+                {historyOpen ? "Show current conversation" : `${hiddenMessageCount} earlier ${hiddenMessageCount === 1 ? "message" : "messages"}`}
+              </button>
+            )}
             {chatMessages.length === 0 && (
               <div className={embedded ? "manager-empty" : "chat-empty muted"}>
                 {projects.length ? (
@@ -421,7 +472,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
                       <div className="manager-empty-title">Start with the result you want.</div>
                       <div className="manager-empty-copy">You can stay high level. Your Chief of Staff will recover context, route the work, and follow through.</div>
                       <div className="manager-prompts">
-                        {["Catch me up", "Handle everything low risk", "What decisions actually need me?"].map((prompt) => (
+                        {["Give me the brief", "Handle the low-risk work", "What needs my decision?"].map((prompt) => (
                           <button key={prompt} onClick={() => setText(prompt)}>{prompt}</button>
                         ))}
                       </div>
@@ -434,14 +485,14 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
                 )}
               </div>
             )}
-            {chatMessages.map((m) => (
+            {visibleMessages.map((m) => (
               <Bubble key={m.id} m={m} />
             ))}
             {awaiting && <div className="chat-typing muted">manager is working…</div>}
           </div>
           <div className="chat-compose">
             <textarea
-              placeholder="What outcome do you want?"
+              placeholder="Tell Hive the outcome you want…"
               value={text}
               disabled={!projects.length}
               onChange={(e) => setText(e.target.value)}
@@ -459,7 +510,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
         </div>
         {embedded && (
           <details className="chief-details">
-            <summary>Behind the scenes</summary>
+            <summary>Activity and agent details</summary>
             <ManagerActivity thread={managerThread} events={activityEvents} tasks={tasks} awaiting={awaiting} managerTask={managerTask} onRefresh={refreshManager} />
           </details>
         )}
