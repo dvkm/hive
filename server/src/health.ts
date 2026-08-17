@@ -212,10 +212,12 @@ export function taskWithHealth(db: DB, task: any): any {
 
 // "Needs attention" tray eligibility (the single rule; the web mirrors it):
 // a `failed` task awaiting human triage, OR a live task whose agent is dead or
-// stuck. Requires a task already carrying its computed `health` field.
+// stuck and is not already waiting for a decision or review. Requires a task
+// already carrying its computed `health` field.
 // A failed task with a requeue successor was already triaged by the recovery
 // loop — its successor is the live card; showing both read as "stuck forever".
 export function needsAttention(task: { state: string; health?: Health | null; requeued_to?: string | null }): boolean {
+  if (task.state === "in_review" || task.state === "needs_decision") return false;
   if (task.state === "failed") return !task.requeued_to;
   return !!task.health && (task.health.status === "dead" || task.health.status === "stuck");
 }
