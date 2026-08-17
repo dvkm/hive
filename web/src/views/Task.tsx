@@ -370,7 +370,9 @@ export function TaskBody({ id }: { id: string }) {
   };
 
   const health = t.health;
-  const unhealthy = health && health.status !== "healthy";
+  // A review has already left the agent's hands. A gone worker is expected at
+  // this point, not a recovery action for the director.
+  const unhealthy = t.state !== "in_review" && health && health.status !== "healthy";
 
   return (
     <div className={`task ${t.state === "in_review" ? "task-reviewing" : ""}`}>
