@@ -641,6 +641,9 @@ async function deliverToSupervisor(
   message: string
 ): Promise<{ delivery: string; agent_target?: string; error?: string }> {
   const thread = getThread(db, threadId)!;
+  const wireMessage = thread.project_id
+    ? message
+    : `${message}\n\n[chief reply policy]\nWork silently. Do not send acknowledgments, progress updates, task lists, or wakeup summaries. If director input is genuinely required, send one short bundled reply with up to five \`--decision <id>\` flags so Hive renders answerable cards. Otherwise reply only with a direct answer or the final verified outcome.`;
 
   // Reuse (or create) the backing supervisor task — a plain chore task whose
   // agent IS the session. source='chat_supervisor' keeps it out of the
@@ -667,9 +670,9 @@ async function deliverToSupervisor(
   if (task.agent_target) {
     const { alive } = await herdr.probe(task.agent_target).catch(() => ({ alive: false }));
     if (alive) {
-      const error = await sendOnce(herdr, task.agent_target, message);
+      const error = await sendOnce(herdr, task.agent_target, wireMessage);
       if (!error) {
-        writeEvent(db, { task_id: taskId!, source: "director", type: "steer", payload: { message, target: task.agent_target, delivery: "delivered", delivered_at: now() } });
+        writeEvent(db, { task_id: taskId!, source: "director", type: "steer", payload: { message: wireMessage, target: task.agent_target, delivery: "delivered", delivered_at: now() } });
         return { delivery: "delivered", agent_target: task.agent_target };
       }
       // fall through to respawn on a send failure to a supposedly-live agent
@@ -677,7 +680,7 @@ async function deliverToSupervisor(
   }
 
   // Not live: queue the message (it rides in the spawn brief) and spawn.
-  queueSteerEvent(db, taskId!, message, "queued for chat supervisor spawn");
+  queueSteerEvent(db, taskId!, wireMessage, "queued for chat supervisor spawn");
   const r = await spawnAgent(db, herdr, taskId!, {
     supervise: false, // a standing session never "finishes into review"
     briefOverride: composeSupervisorBrief(db, thread),
@@ -965,7 +968,51 @@ function chatReply(db: DB, threadId: string, body: any): Response {
   if (!thread) return err("thread not found", 404);
   const text = String(body?.text ?? "").trim();
   if (!text) return err("text is required");
-  const message = appendMessage(db, threadId, "assistant", text);
+  const requestedDecisionIds = stringList(
+    body?.decision_ids === undefined ? [] : ([] as any[]).concat(body.decision_ids),
+    6
+  );
+  if (requestedDecisionIds.length > 5) return err("at most 5 decisions may be attached to one reply");
+
+  const actions: { type: "decision"; decision_id: string; label: string }[] = [];
+  for (const decisionId of [...new Set(requestedDecisionIds)]) {
+    const decision = db
+      .query(
+        `SELECT d.id, d.title, d.status, t.project_id
+           FROM decisions d JOIN tasks t ON t.id = d.task_id
+          WHERE d.id = ?`
+      )
+      .get(decisionId) as { id: string; title: string; status: string; project_id: string } | undefined;
+    if (!decision) return err(`decision not found: ${decisionId}`, 404);
+    if (thread.project_id && decision.project_id !== thread.project_id)
+      return err(`decision is outside this chat's project: ${decisionId}`, 403);
+    if (decision.status === "open")
+      actions.push({ type: "decision", decision_id: decision.id, label: decision.title });
+  }
+
+  const messages = listMessages(db, threadId);
+  const last = messages.at(-1);
+  const surfaced = new Set(
+    messages.flatMap((message) =>
+      message.actions
+        .filter((action) => action?.type === "decision" && typeof action.decision_id === "string")
+        .map((action) => action.decision_id as string)
+    )
+  );
+  const freshActions = last?.role === "assistant"
+    ? actions.filter((action) => !surfaced.has(action.decision_id))
+    : actions;
+  const newlyCompleted =
+    thread.phase === "complete" && !!thread.completed_at && (!last || thread.completed_at > last.ts);
+
+  // A portfolio Chief works silently between director turns. After it has
+  // replied once, only a newly surfaced decision or newly completed outcome
+  // may create another message. Routine wakeup chatter is still recorded in
+  // the run ledger and activity stream, but never becomes chat spam.
+  if (!thread.project_id && last?.role === "assistant" && !freshActions.length && !newlyCompleted)
+    return json({ ok: true, suppressed: true });
+
+  const message = appendMessage(db, threadId, "assistant", text, freshActions);
   broadcast({ type: "chat_message", message });
   return json({ ok: true, message });
 }

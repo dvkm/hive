@@ -4244,6 +4244,11 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
   font-size: var(--t-xs); padding: 2px 7px; border-radius: 20px;
   background: var(--bg-elev); border: 1px solid var(--border); color: var(--text-dim);
 }
+.chat-has-decision { width: min(720px, 100%); max-width: 100%; }
+.chat-has-decision .chat-bubble { width: 100%; }
+.chat-decision-actions { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.chat-decision-actions .dcard { padding: 14px; box-shadow: none; }
+.chat-decision-actions .dcard-head h2 { font-size: var(--t-md); }
 .chat-typing { font-size: var(--t-xs); font-style: italic; padding-left: 4px; }
 
 .chat-compose {
