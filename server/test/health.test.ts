@@ -78,10 +78,12 @@ test("stuck: agent finished (idle) with no PR and no recent activity -> visible 
   expect(needsAttention({ state: "in_progress", health: h })).toBe(true);
 });
 
-test("needsAttention: failed tasks, or dead/stuck in-progress; not healthy/silent/queued", () => {
+test("needsAttention: failed or unhealthy active tasks, excluding separate action queues", () => {
   expect(needsAttention({ state: "failed" })).toBe(true);
   expect(needsAttention({ state: "in_progress", health: { status: "dead", reason: null, since: "" } })).toBe(true);
   expect(needsAttention({ state: "in_progress", health: { status: "stuck", reason: null, since: "" } })).toBe(true);
+  expect(needsAttention({ state: "in_review", health: { status: "dead", reason: null, since: "" } })).toBe(false);
+  expect(needsAttention({ state: "needs_decision", health: { status: "stuck", reason: null, since: "" } })).toBe(false);
   // silent is surfaced on the card, but not urgent enough for the tray
   expect(needsAttention({ state: "in_progress", health: { status: "silent", reason: null, since: "" } })).toBe(false);
   expect(needsAttention({ state: "in_progress", health: { status: "healthy", reason: null, since: "" } })).toBe(false);
