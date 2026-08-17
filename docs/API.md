@@ -493,8 +493,7 @@ priced rows only).
 ```
 `project_id` is a project id for a project-scoped supervisor thread or `null` for the single portfolio-wide Chief of Staff thread. `task_id` is the thread's backing supervisor task (null until the session first spawns; re-pointed to a fresh task if the thread is closed and later reopened). A Chief of Staff task runs from the active Hive project repository when one exists, otherwise from the earliest active project with a repository.
 `role` is `director` (operator) or `assistant` (the supervisor session's reply).
-`actions` is a reserved JSON array (currently always empty). See the Director
-chat endpoints below.
+`actions` is empty unless an assistant reply attaches open decisions. Each attached decision is `{type:"decision", decision_id, label}`; the web app renders the referenced open decision as an answerable card. See the Director chat endpoints below.
 
 ---
 
