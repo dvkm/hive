@@ -1585,8 +1585,8 @@ function brief(db: DB, url: URL): Response {
     )
     .all(...(since ? [since] : []));
 
-  // ② needs attention — failed tasks awaiting triage + live tasks whose health
-  // is dead/stuck. Full task objects (with health) so the web reuses tray rows.
+  // ② needs attention uses the shared eligibility rule over full task objects
+  // (with health), so the web can reuse the tray rows.
   // Not windowed: these persist until you act on them.
   const attnCandidates = db
     .query(

@@ -97,7 +97,7 @@ export default function Brief() {
       {/* ① Decisions waiting, answerable here with the shared decision card. */}
       <Section title="Decisions waiting" count={openDecisions.length}>
         <div className="brief-decisions">
-          {openDecisions[0] && <DecisionCard d={openDecisions[0]} onDone={(id) => setAnswered((s) => new Set(s).add(id))} />}
+          {openDecisions[0] && <DecisionCard key={openDecisions[0].id} d={openDecisions[0]} onDone={(id) => setAnswered((s) => new Set(s).add(id))} />}
           {openDecisions.length > 1 && <div className="brief-queue-note">Next decision appears after this one.</div>}
         </div>
       </Section>
@@ -118,8 +118,9 @@ export default function Brief() {
       {/* ② Needs attention — reuses the board's tray rows. */}
       <Section title="Needs attention" count={attention.length}>
         <div className="brief-attn">
-          <AttentionRows tasks={attention} />
+          <AttentionRows tasks={attention.slice(0, 1)} />
         </div>
+        {attention.length > 1 && <div className="brief-queue-note">Next issue appears after this one.</div>}
       </Section>
 
       {data && (
