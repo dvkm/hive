@@ -6,11 +6,12 @@ import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faComment } from "@fortawesome/free-solid-svg-icons";
 import { useStore } from "../lib/store";
 import { api } from "../lib/api";
-import type { Brief, ChatMessage, ChatThread, Event, Task } from "../lib/api";
+import type { Brief, ChatMessage, ChatThread, Decision, Event, Task } from "../lib/api";
 import { relTime } from "../lib/time";
 import { eventText } from "../lib/eventText";
 import { STATE_LABEL } from "../lib/labels";
 import { StatusDot, toast } from "../lib/ui";
+import { DecisionCard } from "./DecisionCard";
 
 // One portfolio-wide Chief of Staff conversation appears on the home route and
 // in a persistent drawer elsewhere. Its replies and the director's echoed
@@ -20,23 +21,40 @@ import { StatusDot, toast } from "../lib/ui";
 const CHIEF_LAST_SEEN = "hive.chief.lastSeen";
 
 function MsgActions({ actions }: { actions: ChatMessage["actions"] }) {
+  const { decisions } = useStore();
+  const [hidden, setHidden] = useState<Set<string>>(new Set());
   if (!actions?.length) return null;
+  const decisionIds = actions
+    .filter((action) => action.type === "decision" && typeof action.decision_id === "string")
+    .map((action) => action.decision_id as string);
+  const cards = decisionIds
+    .map((id) => decisions.find((decision) => decision.id === id))
+    .filter((decision): decision is Decision => !!decision && !hidden.has(decision.id));
+  const passive = actions.filter((action) => action.type !== "decision");
   return (
-    <div className="chat-actions">
-      {actions.map((a, i) => (
-        <span key={i} className="chat-action-chip">
-          {a.label ?? JSON.stringify(a)}
-        </span>
-      ))}
-    </div>
+    <>
+      {cards.length > 0 && (
+        <div className="chat-decision-actions">
+          {cards.map((decision) => (
+            <DecisionCard key={decision.id} d={decision} onDone={(id) => setHidden((current) => new Set(current).add(id))} />
+          ))}
+        </div>
+      )}
+      {passive.length > 0 && (
+        <div className="chat-actions">
+          {passive.map((action, i) => <span key={i} className="chat-action-chip">{action.label ?? JSON.stringify(action)}</span>)}
+        </div>
+      )}
+    </>
   );
 }
 
 export function Bubble({ m }: { m: ChatMessage }) {
+  const hasDecision = m.actions?.some((action) => action.type === "decision");
   const html =
     m.role === "assistant" ? DOMPurify.sanitize(marked.parse(m.text, { async: false }) as string) : null;
   return (
-    <div className={`chat-msg chat-${m.role}`}>
+    <div className={`chat-msg chat-${m.role}${hasDecision ? " chat-has-decision" : ""}`}>
       <div className="chat-bubble">
         {html != null ? (
           <div className="chat-md" dangerouslySetInnerHTML={{ __html: html }} />
