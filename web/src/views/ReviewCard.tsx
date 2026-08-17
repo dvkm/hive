@@ -105,14 +105,20 @@ function ChangesThread({ events }: { events: Event[] }) {
   );
 }
 
+type ReviewItem = string | { what: string; why?: string };
+
 // The agent's structured self-review (latest review_summary event payload).
 // Sections are all optional; strings or {what, why} objects for iffy.
 interface ReviewSummary {
   done?: string[];
-  iffy?: (string | { what: string; why?: string })[];
+  iffy?: ReviewItem[];
   decisions?: string[];
   testing?: string[];
   followups?: string[];
+}
+
+function reviewItemText(item: ReviewItem): string {
+  return typeof item === "string" ? item : item.what;
 }
 
 function ReviewSection({
@@ -124,7 +130,7 @@ function ReviewSection({
   tone: string;
   icon: string;
   title: string;
-  items?: (string | { what: string; why?: string })[];
+  items?: ReviewItem[];
 }) {
   if (!items?.length) return null;
   return (
@@ -148,15 +154,15 @@ function ReviewSection({
   );
 }
 
-// Structured digest of what the agent did — the thing the director actually
-// reviews. Prose summaries stay available behind a toggle in the parent.
-function ReviewDigest({ r }: { r: ReviewSummary }) {
+// The audit stays complete, but it is deliberately plain and subordinate to
+// the recommendation shown on the card itself.
+function ReviewAudit({ r }: { r: ReviewSummary }) {
   return (
-    <div className="review-digest">
-      <ReviewSection tone="done" icon="✓" title="Done" items={r.done} />
-      <ReviewSection tone="iffy" icon="!" title="Iffy" items={r.iffy} />
-      <ReviewSection tone="decisions" icon="?" title="Decisions made" items={r.decisions} />
-      <ReviewSection tone="testing" icon="✚" title="Testing" items={r.testing} />
+    <div className="review-audit">
+      <ReviewSection tone="done" icon="✓" title="Completed" items={r.done} />
+      <ReviewSection tone="iffy" icon="!" title="Caveats" items={r.iffy} />
+      <ReviewSection tone="decisions" icon="?" title="Judgment calls" items={r.decisions} />
+      <ReviewSection tone="testing" icon="✚" title="Checks" items={r.testing} />
       <ReviewSection tone="followups" icon="→" title="Follow-ups" items={r.followups} />
     </div>
   );
@@ -207,23 +213,20 @@ type ActionMode = null | "changes" | "reject";
 export function ReviewCard({
   task,
   onDone,
-  defaultExpanded = false,
 }: {
   task: Task;
   onDone?: () => void;
-  defaultExpanded?: boolean;
 }) {
   const { projects } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
   const [diff, setDiff] = useState<DiffResult | null>(null);
   const [diffErr, setDiffErr] = useState("");
-  const [expanded, setExpanded] = useState(defaultExpanded);
+  const [expanded, setExpanded] = useState(false);
   const [wrap, setWrap] = useState(false);
   const [busy, setBusy] = useState(false);
   const [mode, setMode] = useState<ActionMode>(null);
   const [notes, setNotes] = useState("");
   const [review, setReview] = useState<ReviewSummary | null>(null);
-  const [showProse, setShowProse] = useState(false);
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
   const [openDecisions, setOpenDecisions] = useState<Decision[]>([]);
@@ -234,7 +237,6 @@ export function ReviewCard({
     setDiff(null);
     setDiffErr("");
     setReview(null);
-    setShowProse(false);
     setEvidence([]);
     api
       .diff(task.id)
@@ -285,6 +287,22 @@ export function ReviewCard({
           ? "No PR and no branch — nothing to merge"
           : ""
     : "";
+  const caveats = review?.iffy ?? [];
+  const recommendation = openDecisions.length
+    ? "Make the open decision first"
+    : mergeBlocked
+      ? "Wait to merge"
+      : isScout
+        ? "Accept this report"
+        : "Approve and merge";
+  const recommendationReason = openDecisions.length
+    ? `${openDecisions.length} decision${openDecisions.length === 1 ? "" : "s"} still need your judgment.`
+    : mergeBlocked ||
+      (isScout
+        ? "Hive finished the research and submitted its evidence."
+        : task.ci_status === "passing"
+          ? "CI passed and Hive found no blocking issue."
+          : "Hive completed its review and is ready for your approval.");
   const merge = async (strategy?: "local_ff") => {
     if (busy) return;
     setBusy(true);
@@ -344,11 +362,15 @@ export function ReviewCard({
   return (
     <section className="review-card">
       <div className="review-card-head">
-        <div className="review-card-title">
-          <span className="card-num" title="Task number">#{task.number}</span>
-          <Link to={`/tasks/${task.id}`}>{task.title}</Link>
-          {project && <span className="chip">{project.name}</span>}
-          <span className={`chip chip-kind chip-${task.kind}`}>{task.kind}</span>
+        <div className="review-card-heading">
+          <div className="review-card-meta">
+            <span className="card-num" title="Task number">#{task.number}</span>
+            {project && <span>{project.name}</span>}
+            <span>{task.kind}</span>
+          </div>
+          <h3 className="review-card-title">
+            <Link to={`/tasks/${task.id}`}>{task.title}</Link>
+          </h3>
         </div>
         <div className="review-status">
           {task.pr_url ? (
@@ -367,26 +389,87 @@ export function ReviewCard({
         <DecisionCard key={d.id} d={d} onDone={() => setOpenDecisions((ds) => ds.filter((x) => x.id !== d.id))} />
       ))}
 
-      <details className="review-details" open={defaultExpanded}>
-        <summary>Review details</summary>
+      <div className="review-recommendation">
+        <span className="review-recommendation-label">Hive recommends</span>
+        <strong>{recommendation}</strong>
+        <p>{recommendationReason}</p>
+        {caveats[0] && (
+          <div className="review-caveat">
+            <span>Watch</span>
+            <span className="review-caveat-text">{reviewItemText(caveats[0])}</span>
+            {caveats.length > 1 && <small>+{caveats.length - 1} more</small>}
+          </div>
+        )}
+      </div>
+
+      <div className="review-actions">
+        <button className="btn btn-primary" onClick={() => merge()} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
+          {busy ? "Working…" : isScout ? "Accept report" : "Approve & merge"}
+        </button>
+        <button className="btn" onClick={() => setMode(mode === "changes" ? null : "changes")}>
+          Request changes
+        </button>
+        <button className="btn btn-danger" onClick={() => setMode(mode === "reject" ? null : "reject")}>
+          Reject
+        </button>
+      </div>
+      {mergeBlocked && <div className="review-blocked">{mergeBlocked}</div>}
+      {mergeErr && (
+        <div className="review-merge-error">
+          Merge failed: {mergeErr}
+          {task.pr_url && !mergeErr.includes("CLOSED (not merged)") && (
+            <button
+              className="btn"
+              style={{ marginLeft: "var(--s2)" }}
+              disabled={busy || !!mergeBlocked}
+              title={
+                mergeBlocked ||
+                "Skip GitHub's PR merge (which compares against origin/main and can be a stale fork) and fast-forward local main directly onto this branch. Only succeeds if the branch is still a clean fast-forward."
+              }
+              onClick={() => merge("local_ff")}
+            >
+              Force local merge
+            </button>
+          )}
+        </div>
+      )}
+
+      {mode && (
+        <div className="review-notes">
+          <textarea
+            placeholder={
+              mode === "changes"
+                ? "What needs to change before merge? (sent to the agent)"
+                : "Why reject this? (recorded as the cancellation reason)"
+            }
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            autoFocus
+          />
+          <button
+            className={`btn ${mode === "reject" ? "btn-danger" : "btn-primary"}`}
+            onClick={mode === "changes" ? requestChanges : reject}
+            disabled={!notes.trim() || busy}
+          >
+            {mode === "changes" ? "Send & return to In Progress" : "Reject & cancel task"}
+          </button>
+        </div>
+      )}
+
+      <details className="review-details">
+        <summary>
+          <span>Why Hive recommends this</span>
+          <small>
+            {review?.done?.length ?? 0} completed · {caveats.length} caveat{caveats.length === 1 ? "" : "s"} · {evidence.length} evidence
+          </small>
+        </summary>
         <div className="review-details-body">
           <ChangesThread events={events} />
 
           <CheckpointList events={events} />
 
-          {review ? (
-            <>
-              <ReviewDigest r={review} />
-              {task.summary && (
-                <button className="rs-prose-toggle" onClick={() => setShowProse((x) => !x)}>
-                  {showProse ? "hide" : "show"} full summary
-                </button>
-              )}
-              {showProse && task.summary && <p className="review-summary">{task.summary}</p>}
-            </>
-          ) : (
-            task.summary && <p className="review-summary">{task.summary}</p>
-          )}
+          {review ? <ReviewAudit r={review} /> : task.summary && <p className="review-summary">{task.summary}</p>}
+          {review && task.summary && <p className="review-summary">{task.summary}</p>}
 
           {evidence.length > 0 &&
             (() => {
@@ -450,60 +533,6 @@ export function ReviewCard({
           )}
         </div>
       </details>
-
-      <div className="review-actions">
-        <button className="btn btn-primary" onClick={() => merge()} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
-          {busy ? "Working…" : isScout ? "Accept report" : "Approve & merge"}
-        </button>
-        <button className="btn" onClick={() => setMode(mode === "changes" ? null : "changes")}>
-          Request changes
-        </button>
-        <button className="btn btn-danger" onClick={() => setMode(mode === "reject" ? null : "reject")}>
-          Reject
-        </button>
-      </div>
-      {mergeBlocked && <div className="review-blocked">{mergeBlocked}</div>}
-      {mergeErr && (
-        <div className="review-merge-error">
-          Merge failed: {mergeErr}
-          {task.pr_url && !mergeErr.includes("CLOSED (not merged)") && (
-            <button
-              className="btn"
-              style={{ marginLeft: "var(--s2)" }}
-              disabled={busy || !!mergeBlocked}
-              title={
-                mergeBlocked ||
-                "Skip GitHub's PR merge (which compares against origin/main and can be a stale fork) and fast-forward local main directly onto this branch. Only succeeds if the branch is still a clean fast-forward."
-              }
-              onClick={() => merge("local_ff")}
-            >
-              Force local merge
-            </button>
-          )}
-        </div>
-      )}
-
-      {mode && (
-        <div className="review-notes">
-          <textarea
-            placeholder={
-              mode === "changes"
-                ? "What needs to change before merge? (sent to the agent)"
-                : "Why reject this? (recorded as the cancellation reason)"
-            }
-            value={notes}
-            onChange={(e) => setNotes(e.target.value)}
-            autoFocus
-          />
-          <button
-            className={`btn ${mode === "reject" ? "btn-danger" : "btn-primary"}`}
-            onClick={mode === "changes" ? requestChanges : reject}
-            disabled={!notes.trim() || busy}
-          >
-            {mode === "changes" ? "Send & return to In Progress" : "Reject & cancel task"}
-          </button>
-        </div>
-      )}
     </section>
   );
 }

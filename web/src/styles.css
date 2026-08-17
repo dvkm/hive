@@ -3420,7 +3420,7 @@ a.dbundle-fact:hover {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin: 4px 0 12px;
+  margin: 0;
   flex-wrap: wrap;
 }
 .wrap-toggle {
@@ -3566,11 +3566,11 @@ a.dbundle-fact:hover {
   background: var(--panel);
   border: 1px solid var(--accent-dim);
   border-radius: var(--radius);
-  padding: 14px 16px;
+  padding: 18px;
   margin-bottom: 14px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 14px;
 }
 .review-card-head {
   display: flex;
@@ -3579,15 +3579,82 @@ a.dbundle-fact:hover {
   gap: 12px;
   flex-wrap: wrap;
 }
-.review-card-title {
+.review-card-heading {
+  min-width: 0;
+}
+.review-card-meta {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   flex-wrap: wrap;
-  font-weight: 600;
+  margin-bottom: 5px;
+  color: var(--text-faint);
+  font-size: var(--t-xs);
+  text-transform: capitalize;
+}
+.review-card-meta > * + *::before {
+  content: "·";
+  margin-right: 7px;
+  color: var(--text-faint);
+}
+.review-card-title {
+  margin: 0;
+  font-size: var(--t-lg);
+  line-height: 1.3;
+  font-weight: 650;
 }
 .review-card-title a {
   color: var(--text);
+}
+.review-recommendation {
+  padding: 16px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  background: var(--bg-elev);
+}
+.review-recommendation-label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--accent);
+  font-size: var(--t-eyebrow);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.review-recommendation > strong {
+  display: block;
+  font-size: 19px;
+  line-height: 1.3;
+}
+.review-recommendation > p {
+  margin: 5px 0 0;
+  color: var(--text-dim);
+  font-size: var(--t-sm);
+}
+.review-caveat {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-soft);
+  color: var(--text-dim);
+  font-size: var(--t-sm);
+}
+.review-caveat > :first-child {
+  flex: none;
+  color: var(--yellow);
+  font-weight: 650;
+}
+.review-caveat-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.review-caveat small {
+  flex: none;
+  color: var(--text-faint);
 }
 .review-details {
   border: 1px solid var(--border-soft);
@@ -3595,11 +3662,17 @@ a.dbundle-fact:hover {
   background: var(--bg-elev);
 }
 .review-details > summary {
-  padding: 9px 11px;
+  padding: 10px 12px;
   color: var(--text-dim);
   cursor: pointer;
   font-size: var(--t-sm);
   font-weight: 600;
+}
+.review-details > summary small {
+  float: right;
+  margin-left: 12px;
+  color: var(--text-faint);
+  font-weight: 400;
 }
 .review-details-body {
   display: flex;
@@ -3639,18 +3712,15 @@ a.dbundle-fact:hover {
   color: var(--text);
 }
 
-/* ---- structured review digest (review_summary event) ---- */
-.review-digest {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+/* ---- structured review audit (review_summary event) ---- */
+.review-audit {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 14px 24px;
   margin: 10px 0 4px;
 }
 .rs-section {
-  border-left: 3px solid var(--border, #444);
-  padding: 6px 10px;
-  border-radius: 0 6px 6px 0;
-  background: color-mix(in srgb, var(--rs-tint, #888) 7%, transparent);
+  min-width: 0;
 }
 .rs-section .rs-head {
   font-size: 12px;
@@ -3663,15 +3733,7 @@ a.dbundle-fact:hover {
   gap: 6px;
 }
 .rs-section .rs-icon {
-  display: inline-flex;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  align-items: center;
-  justify-content: center;
-  font-size: 10px;
-  background: var(--rs-tint, #888);
-  color: #fff;
+  color: var(--rs-tint, var(--text-faint));
 }
 .rs-section ul {
   margin: 4px 0 2px;
@@ -3682,20 +3744,11 @@ a.dbundle-fact:hover {
   line-height: 1.45;
 }
 .rs-why { opacity: 0.65; }
-.rs-done { --rs-tint: #2da44e; border-left-color: #2da44e; }
-.rs-iffy { --rs-tint: #d4a72c; border-left-color: #d4a72c; }
-.rs-decisions { --rs-tint: #8250df; border-left-color: #8250df; }
-.rs-testing { --rs-tint: #0969da; border-left-color: #0969da; }
-.rs-followups { --rs-tint: #6e7781; border-left-color: #6e7781; }
-.rs-prose-toggle {
-  background: none;
-  border: none;
-  color: var(--muted, #888);
-  font-size: 12px;
-  cursor: pointer;
-  padding: 2px 0;
-  text-decoration: underline;
-}
+.rs-done { --rs-tint: #2da44e; }
+.rs-iffy { --rs-tint: #d4a72c; }
+.rs-decisions { --rs-tint: #8250df; }
+.rs-testing { --rs-tint: #0969da; }
+.rs-followups { --rs-tint: #6e7781; }
 
 /* ---- checkpoints: live build-time checkboxes ---- */
 .cp-panel, .cp-inbox {

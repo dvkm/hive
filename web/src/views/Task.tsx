@@ -429,7 +429,7 @@ export function TaskBody({ id }: { id: string }) {
           </div>
         )}
 
-        {t.state === "in_review" && <ReviewCard task={t} onDone={refresh} defaultExpanded />}
+        {t.state === "in_review" && <ReviewCard task={t} onDone={refresh} />}
 
         <CheckpointList events={t.events} />
 
