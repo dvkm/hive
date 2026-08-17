@@ -1327,7 +1327,7 @@ Two kinds of failure, deliberately kept distinct:
   cap, was cancelled/failed for work reasons, or that the director failed
   manually, STAYS `failed`. `failed` is not a board column, so these surface ONLY
   in the web **"needs attention" tray** (failed tasks awaiting triage + live
-  tasks whose health is `dead`/`stuck`). The **dispatcher never picks up `failed`
+  `dead`/`stuck` tasks not parked in review or decision state). The **dispatcher never picks up `failed`
   tasks** (it only spawns `queued`), so nothing auto-runs a task a human hasn't
   re-queued.
 
