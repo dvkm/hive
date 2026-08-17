@@ -949,7 +949,10 @@ review handoffs, CI/merge/smoke results, recovery, failures, and terminal state
 changes. An explicitly closed thread is not respawned by a child event. The
 manager brief requires it to act on each wakeup, use bounded proposal → critique
 → synthesis meetings where useful, and independently verify the integrated
-top-level outcome before reporting completion.
+top-level outcome before reporting completion. The Chief works silently between
+director turns: routine wakeup replies are suppressed after its first response.
+It may send one additional message only for newly surfaced decision cards or a
+newly completed outcome.
 
 - `POST /api/chat/turn` body `{text (required), thread_id?, project_id?, scope?: "chief"}` → `202 {thread_id, delivery, agent_target?, error?}` | `400` (empty text, missing project scope, or no active project repository for Chief of Staff) | `404` (unknown `thread_id`)
   Director → supervisor. **Non-blocking by design**: it persists the director
@@ -965,11 +968,14 @@ top-level outcome before reporting completion.
   least one unarchived project with a repository and uses the Hive project first
   when available. Without `scope:"chief"`, `project_id` remains required to
   start a new project-scoped thread.
-- `POST /api/chat/threads/:id/reply` body `{text (required)}` → `200 {ok, message}` | `404` (unknown thread) | `400` (empty text)
+- `POST /api/chat/threads/:id/reply` body `{text (required), decision_ids?: string[]}` → `200 {ok, message}` or `200 {ok, suppressed:true}` | `403` (decision outside a project-scoped thread) | `404` (unknown thread or decision) | `400` (empty text or more than five decisions)
   Supervisor → director. The session calls this (via `hive chat reply <thread>
-  "..."`) to post its reply; appends an `assistant` message and streams it over
-  SSE as `{type:"chat_message", message}`. Loopback in practice (agents run on
-  localhost).
+  "..." [--decision <id> ...]`) to post its reply. Open, in-scope decision ids
+  become structured message actions rendered as full decision cards in chat.
+  The Chief deduplicates already surfaced cards and suppresses routine replies
+  after an assistant message unless the run has newly completed. Appended
+  messages stream over SSE as `{type:"chat_message", message}`. Loopback in
+  practice (agents run on localhost).
 - `GET /api/chat/threads?project_id=` → `200 [ChatThread, ...]` (newest first; `project_id` filter optional). An unfiltered response includes the global Chief of Staff thread; the query parameter filters to an exact project id.
 - `GET /api/chat/threads/:id` → `200 {...ChatThread, messages:[ChatMessage], meetings:[ManagerMeeting], verifications:[ManagerVerification], retrospectives:[ManagerRetrospective]}` | `404`. Messages are oldest first. Management records are newest first; repeated meeting stages collapse to the latest card for each `meeting_id`.
 - `PUT /api/chat/threads/:id/run` body `{objective?, acceptance_criteria?: string[], phase?, next_action?, waiting_on?, wakeup_at?, outcome?, source?}` → `200 ChatThread` | `400` | `404` | `409`. `phase` is `intake|planning|executing|waiting|verifying|complete|stopped`. Completing a run is rejected unless the newest verification passed and a retrospective exists. A successful update writes a `manager_update` event on the supervisor task. Waiting runs with a due `wakeup_at` are resumed by the daemon (`HIVE_MANAGER_WAKE_MS`, 30 seconds by default).

@@ -40,7 +40,8 @@ Usage:
   hive recall <keywords>                  search project knowledge (references, learnings, policies)
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
-  hive chat reply <thread-id> "<text>"    (supervisor→director) post a reply on a chat thread
+  hive chat reply <thread-id> "<text>" [--decision <id> ...]
+                                              post one reply with actionable decision cards
   hive chat update <thread-id> [--phase <phase>] [--objective <text>] [--criterion <text> ...]
         [--next <text>] [--waiting <text>] [--wakeup <iso>] [--outcome <text>]
   hive chat meeting <thread-id> --stage proposal|critique|decided [--meeting <id>]
@@ -416,8 +417,9 @@ async function main() {
       const threadId = _[0];
       const text = _.slice(1).join(" ").trim() || (flags.text ? String(flags.text) : "");
       if (!threadId || !text) die('usage: hive chat reply <thread-id> "<text>"');
-      await api("POST", `/api/chat/threads/${threadId}/reply`, { text });
-      console.log(`replied on ${threadId}`);
+      const decisionIds = flags.decision == null ? [] : ([] as any[]).concat(flags.decision).map(String);
+      const r = await api("POST", `/api/chat/threads/${threadId}/reply`, { text, decision_ids: decisionIds });
+      console.log(r.suppressed ? `suppressed routine reply on ${threadId}` : `replied on ${threadId}`);
       return;
     }
     // `hive chat send [--project <id>] [--thread <id>] <text>` — the director
