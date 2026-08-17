@@ -796,6 +796,10 @@ a {
 .task-side {
   min-width: 0;
 }
+.task-reviewing {
+  grid-template-columns: minmax(0, 1fr);
+  max-width: 900px;
+}
 .crumbs {
   margin-bottom: var(--s2);
 }
