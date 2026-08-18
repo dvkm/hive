@@ -501,7 +501,7 @@ export const api = {
     }),
   understandingQuizzes: () => req<{ quizzes: UnderstandingQuiz[] }>(`/api/understanding-quizzes`),
   answerUnderstandingQuiz: (taskId: string, answerKey: string) =>
-    req<{ ok: boolean; correct: boolean; explanation: string | null }>(`/api/tasks/${taskId}/understanding-quiz/answer`, {
+    req<{ ok: boolean; correct: boolean; explanation: string | null; quiz?: Pick<UnderstandingQuiz, "question" | "options"> }>(`/api/tasks/${taskId}/understanding-quiz/answer`, {
       method: "POST",
       body: JSON.stringify({ answer_key: answerKey, source: "director" }),
     }),

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
 import type { UnderstandingQuiz as Quiz } from "../lib/api";
 import { toast } from "../lib/ui";
@@ -14,21 +14,43 @@ export function UnderstandingQuiz({
   onPassed?: (explanation: string | null) => void;
   onDeferred?: () => void;
 }) {
+  const [currentQuiz, setCurrentQuiz] = useState(quiz);
   const [answer, setAnswer] = useState("");
   const [busy, setBusy] = useState(false);
-  const [wrong, setWrong] = useState(false);
+  const [feedback, setFeedback] = useState("");
+  const [round, setRound] = useState(0);
   const [showEscape, setShowEscape] = useState(false);
+  const optionSignature = currentQuiz.options.map((option) => `${option.key}:${option.label}`).join("|");
+  const options = useMemo(() => {
+    const shuffled = [...currentQuiz.options];
+    for (let i = shuffled.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    return shuffled;
+  }, [currentQuiz.question, optionSignature, round]);
+
+  useEffect(() => {
+    if (quiz.question === currentQuiz.question) return;
+    setCurrentQuiz(quiz);
+    setAnswer("");
+    setFeedback("");
+    setRound((value) => value + 1);
+  }, [quiz.question]);
 
   const submit = async () => {
     if (!answer || busy) return;
     setBusy(true);
     try {
-      const result = await api.answerUnderstandingQuiz(quiz.task_id, answer);
+      const result = await api.answerUnderstandingQuiz(currentQuiz.task_id, answer);
       if (result.correct) {
         toast("Understanding confirmed");
         onPassed?.(result.explanation);
       } else {
-        setWrong(true);
+        setFeedback(result.explanation || "Review the explanation and apply the idea again.");
+        if (result.quiz) setCurrentQuiz({ task_id: currentQuiz.task_id, ...result.quiz });
+        setAnswer("");
+        setRound((value) => value + 1);
       }
     } catch (error) {
       toast((error as Error).message);
@@ -54,9 +76,10 @@ export function UnderstandingQuiz({
   return (
     <section className="understanding-quiz">
       <div className="understanding-quiz-label">Before you approve</div>
-      <h4>{quiz.question}</h4>
+      {feedback && <p className="understanding-quiz-wrong">Not quite. {feedback} Try this from another angle.</p>}
+      <h4>{currentQuiz.question}</h4>
       <div className="understanding-quiz-options">
-        {quiz.options.map((option) => (
+        {options.map((option) => (
           <label key={option.key} className={answer === option.key ? "selected" : ""}>
             <input
               type="radio"
@@ -65,14 +88,12 @@ export function UnderstandingQuiz({
               checked={answer === option.key}
               onChange={() => {
                 setAnswer(option.key);
-                setWrong(false);
               }}
             />
             <span>{option.label}</span>
           </label>
         ))}
       </div>
-      {wrong && <p className="understanding-quiz-wrong">Not quite. Try again.</p>}
       <div className="understanding-quiz-actions">
         <button className="btn btn-primary" disabled={!answer || busy} onClick={submit}>
           {busy ? "Checking…" : "Check answer"}

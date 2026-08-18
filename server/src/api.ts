@@ -2853,18 +2853,40 @@ function normalizeUnderstandingCheck(value: unknown): UnderstandingCheck | null 
   return { question, options, answerKey, explanation };
 }
 
-function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; check: UnderstandingCheck } | null {
+function normalizeUnderstandingChecks(understanding: unknown): UnderstandingCheck[] {
+  if (!understanding || typeof understanding !== "object" || Array.isArray(understanding)) return [];
+  const raw = understanding as Record<string, unknown>;
+  const values = Array.isArray(raw.checks) ? raw.checks : raw.check ? [raw.check] : [];
+  return values.flatMap((value) => {
+    const check = normalizeUnderstandingCheck(value);
+    return check ? [check] : [];
+  }).slice(0, 3);
+}
+
+function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; checks: UnderstandingCheck[] } | null {
   const row: any = db
     .query("SELECT id, payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY ts DESC, rowid DESC LIMIT 1")
     .get(taskId);
   if (!row) return null;
   try {
     const payload = JSON.parse(row.payload);
-    const check = normalizeUnderstandingCheck(payload?.understanding?.check);
-    return check ? { reviewEventId: row.id, check } : null;
+    const checks = normalizeUnderstandingChecks(payload?.understanding);
+    return checks.length ? { reviewEventId: row.id, checks } : null;
   } catch {
     return null;
   }
+}
+
+function understandingAttemptCount(db: DB, taskId: string, reviewEventId: string): number {
+  const row = db
+    .query("SELECT count(*) AS n FROM events WHERE task_id = ? AND type = 'understanding_quiz_attempt' AND json_extract(payload, '$.review_event_id') = ?")
+    .get(taskId, reviewEventId) as { n: number };
+  return row.n;
+}
+
+function activeUnderstandingCheck(db: DB, taskId: string, quiz: { reviewEventId: string; checks: UnderstandingCheck[] }): UnderstandingCheck {
+  const offset = [...quiz.reviewEventId].reduce((sum, char) => sum + char.charCodeAt(0), 0) % quiz.checks.length;
+  return quiz.checks[(offset + understandingAttemptCount(db, taskId, quiz.reviewEventId)) % quiz.checks.length];
 }
 
 function understandingQuizStatus(db: DB, taskId: string, reviewEventId: string): "required" | "deferred" | "passed" {
@@ -2897,10 +2919,11 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
   const quizzes = rows.flatMap((row) => {
     let payload: any;
     try { payload = JSON.parse(row.payload); } catch { return []; }
-    const check = normalizeUnderstandingCheck(payload?.understanding?.check);
-    if (!check) return [];
+    const checks = normalizeUnderstandingChecks(payload?.understanding);
+    if (!checks.length) return [];
     const status = understandingQuizStatus(db, row.task_id, row.id);
     if (status === "passed") return [];
+    const check = activeUnderstandingCheck(db, row.task_id, { reviewEventId: row.id, checks });
     return [{
       id: row.id,
       task_id: row.task_id,
@@ -2927,17 +2950,24 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   const quiz = latestUnderstandingQuiz(db, taskId);
   if (!quiz) return err("understanding check not found", 404);
   const status = understandingQuizStatus(db, taskId, quiz.reviewEventId);
-  if (status === "passed") return json({ ok: true, correct: true, explanation: quiz.check.explanation ?? null });
+  const check = activeUnderstandingCheck(db, taskId, quiz);
+  if (status === "passed") return json({ ok: true, correct: true, explanation: check.explanation ?? null });
   const answerKey = typeof body?.answer_key === "string" ? body.answer_key : "";
-  if (!quiz.check.options.some((option) => option.key === answerKey)) return err("answer_key must match a quiz option");
-  if (answerKey !== quiz.check.answerKey) {
+  if (!check.options.some((option) => option.key === answerKey)) return err("answer_key must match a quiz option");
+  if (answerKey !== check.answerKey) {
     writeEvent(db, {
       task_id: taskId,
       source: "director",
       type: "understanding_quiz_attempt",
       payload: { review_event_id: quiz.reviewEventId, answer_key: answerKey, correct: false },
     });
-    return json({ ok: false, correct: false });
+    const next = activeUnderstandingCheck(db, taskId, quiz);
+    return json({
+      ok: false,
+      correct: false,
+      explanation: check.explanation ?? null,
+      quiz: { question: next.question, options: next.options },
+    });
   }
   writeEvent(db, {
     task_id: taskId,
@@ -2945,7 +2975,7 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
     type: "understanding_quiz_passed",
     payload: { review_event_id: quiz.reviewEventId, answer_key: answerKey },
   });
-  return json({ ok: true, correct: true, explanation: quiz.check.explanation ?? null });
+  return json({ ok: true, correct: true, explanation: check.explanation ?? null });
 }
 
 function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
@@ -3902,8 +3932,19 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         const affectedAreas = rawUnderstanding.affected_areas.map((value: unknown) => text(value)).filter(Boolean).slice(0, 5);
         if (affectedAreas.length) understanding.affected_areas = affectedAreas;
       }
+      const rawChecks = Array.isArray(rawUnderstanding.checks) ? rawUnderstanding.checks : [];
+      const checks = rawChecks.flatMap((value: unknown) => {
+        const check = normalizeUnderstandingCheck(value);
+        return check ? [{
+          question: check.question,
+          options: check.options,
+          answer_key: check.answerKey,
+          ...(check.explanation ? { explanation: check.explanation } : {}),
+        }] : [];
+      }).slice(0, 3);
+      if (checks.length) understanding.checks = checks;
       const rawCheck = rawUnderstanding.check;
-      if (rawCheck && typeof rawCheck === "object" && !Array.isArray(rawCheck)) {
+      if (!checks.length && rawCheck && typeof rawCheck === "object" && !Array.isArray(rawCheck)) {
         const check = normalizeUnderstandingCheck(rawCheck);
         if (check) understanding.check = {
           question: check.question,

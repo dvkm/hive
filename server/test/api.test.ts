@@ -133,6 +133,19 @@ test("review_summary keeps its structured sections; empty submission is rejected
         answer_key: "new",
         explanation: "The queue preserves the latest accepted edit.",
       },
+      checks: [
+        {
+          question: "Which edit wins in the queue?",
+          options: [{ key: "old", label: "The oldest one." }, { key: "new", label: "The newest one." }],
+          answer_key: "new",
+          explanation: "The queue preserves the latest accepted edit.",
+        },
+        {
+          question: "What happens after a newer edit arrives?",
+          options: [{ key: "replace", label: "It replaces the queued edit." }, { key: "ignore", label: "It is ignored." }],
+          answer_key: "replace",
+        },
+      ],
     },
   });
   expect(r.status).toBe(201);
@@ -141,11 +154,9 @@ test("review_summary keeps its structured sections; empty submission is rejected
   expect(r.json.event.payload.understanding.walkthrough).toEqual(["An edit enters the queue.", "The newest edit wins."]);
   expect(r.json.event.payload.understanding.affected_areas).toEqual(["Draft editor", "Offline saves"]);
   expect(r.json.event.payload.understanding.risk_assessment).toBe("The queue is covered, but browser shutdown can still interrupt a save.");
-  expect(r.json.event.payload.understanding.check.options).toEqual([
-    { key: "old", label: "The oldest one." },
-    { key: "new", label: "The newest one." },
-  ]);
-  expect(r.json.event.payload.understanding.check.answer_key).toBe("new");
+  expect(r.json.event.payload.understanding.checks).toHaveLength(2);
+  expect(r.json.event.payload.understanding.checks[1].answer_key).toBe("replace");
+  expect(r.json.event.payload.understanding.check).toBeUndefined();
   expect(r.json.event.payload.note).toBeUndefined();
   const bad = await post(`/api/tasks/${t.json.id}/events`, { type: "review_summary", note: "hi" });
   expect(bad.status).toBe(400);
