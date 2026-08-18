@@ -275,7 +275,10 @@ test("autoMergeReady merges only opted-in, green, clean-review, uncontested task
   writeEvent(db, { task_id: clean, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
   writeEvent(db, { task_id: risky, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: ["a real risk"], questions: [] } });
   // primary checkout sits on the base branch; git merge-base/merge succeed for the local-ff path
-  const git: Exec = stub((argv) => (argv.includes("symbolic-ref") ? OK("main\n") : OK()));
+  const git: Exec = stub((argv) => {
+    if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
+    return argv.includes("symbolic-ref") ? OK("main\n") : OK();
+  });
   await autoMergeReady(db, { exec: git });
   expect(getTask(db, clean).state).toBe("done"); // merged; no smoke configured → straight through verifying
   expect(getTask(db, risky).state).toBe("in_review"); // risks → human review

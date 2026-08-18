@@ -36,6 +36,7 @@ function seed(): { db: DB; taskId: string } {
 const destructiveExec: Exec = stub((argv) => {
   if (argv.includes("diff") && argv.includes("--name-only")) return OK("health.ts\nsrc/task.ts\n");
   if (argv[3] === "log") return OK(argv[argv.length - 1] === "health.ts" ? "abc base commit\n" : "");
+  if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
   if (argv.includes("symbolic-ref")) return OK("main\n"); // primary checkout is on base
   return OK(); // merge-base --is-ancestor / merge --ff-only succeed
 });
