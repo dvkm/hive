@@ -73,11 +73,11 @@ Rules:
          "options": [{"key": "a", "label": "..."}, {"key": "b", "label": "..."}],
          "answer_key": "a",
          "explanation": "why the answer is right"}}}
-  \`understanding.check\` is REQUIRED for every mergeable change. It is the
-  director's approval gate, so use 2-4 plausible options that test the core idea.
-  Keep the whole packet short and teach only the background needed for this
-  change. Omit it only for report-only work. Do not build a separate explainer
-  UI or simulation unless asked.
+  \`understanding.check\` is REQUIRED for every review, including report-only
+  work. It is the director's approval gate, so use 2-4 plausible options that
+  test the core idea. For a report, use the packet to explain its thesis,
+  evidence chain, and implications, then test one decision-relevant takeaway.
+  Keep the whole packet short and teach only the background needed.
   Honesty rule: "iffy" is MANDATORY when anything is uncertain, hacky, or has a
   known ceiling — an empty iffy list on risky work reads as hiding it.
 - When you hit a decision the director must make, open a REAL decision card with

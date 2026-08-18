@@ -550,6 +550,29 @@ test("merge refuses report-only scout tasks", async () => {
   s.server.stop(true);
 });
 
+test("report acceptance requires its understanding quiz", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "explain findings", kind: "scout" });
+  await post(s.base, `/api/tasks/${t.json.id}/spawn`, {});
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+
+  let accept = await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "verifying" });
+  expect(accept.status).toBe(409);
+  expect(accept.json.error).toContain("Understanding check required");
+
+  await addQuiz(s.base, t.json.id);
+  accept = await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "verifying" });
+  expect(accept.status).toBe(409);
+  expect(accept.json.error).toContain("Pass the understanding check");
+
+  await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "tests", source: "director" });
+  accept = await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "verifying" });
+  expect(accept.status).toBe(200);
+  expect(["verifying", "done"]).toContain(accept.json.state);
+  s.server.stop(true);
+});
+
 test("request-changes returns the task to in_progress, sends notes, records an event", async () => {
   const s = makeServer();
   const { taskId } = await inReviewTask(s.base);
