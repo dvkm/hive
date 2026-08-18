@@ -44,6 +44,14 @@ test("brief tells the agent to verify browsers headlessly, not via the denied MC
   expect(brief).toContain("--headless");
 });
 
+test("brief excludes project bookkeeping from understanding quizzes", () => {
+  const { db, taskId } = setup();
+  const brief = composeBrief(db, taskId);
+  expect(brief).toContain("Every question must test a mental model");
+  expect(brief).toContain("Never quiz project bookkeeping");
+  expect(brief).toContain("cannot be reframed as a transferable scenario, omit it");
+});
+
 test("scout brief has a report-based definition of done", () => {
   const { db, taskId } = setup();
   db.query("UPDATE tasks SET kind = 'scout' WHERE id = ?").run(taskId);
