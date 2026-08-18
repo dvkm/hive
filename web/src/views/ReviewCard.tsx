@@ -107,6 +107,14 @@ function ChangesThread({ events }: { events: Event[] }) {
 
 type ReviewItem = string | { what: string; why?: string };
 
+interface UnderstandingPacket {
+  background?: string;
+  essence?: string;
+  walkthrough?: string[];
+  participate?: string;
+  check?: { question: string; answer: string };
+}
+
 // The agent's structured self-review (latest review_summary event payload).
 // Sections are all optional; strings or {what, why} objects for iffy.
 interface ReviewSummary {
@@ -115,10 +123,53 @@ interface ReviewSummary {
   decisions?: string[];
   testing?: string[];
   followups?: string[];
+  understanding?: UnderstandingPacket;
 }
 
 function reviewItemText(item: ReviewItem): string {
   return typeof item === "string" ? item : item.what;
+}
+
+function ReviewUnderstanding({ packet }: { packet: UnderstandingPacket }) {
+  const hasContent = packet.background || packet.essence || packet.walkthrough?.length || packet.participate || packet.check;
+  if (!hasContent) return null;
+  return (
+    <section className="review-understanding">
+      <div className="understanding-eyebrow">Mental model</div>
+      <div className="understanding-grid">
+        {packet.background && (
+          <div>
+            <b>Before</b>
+            <p>{packet.background}</p>
+          </div>
+        )}
+        {packet.essence && (
+          <div>
+            <b>Core idea</b>
+            <p>{packet.essence}</p>
+          </div>
+        )}
+      </div>
+      {packet.walkthrough?.length && (
+        <div className="understanding-walkthrough">
+          <b>How it works</b>
+          <ol>{packet.walkthrough.map((step, i) => <li key={i}>{step}</li>)}</ol>
+        </div>
+      )}
+      {packet.participate && (
+        <div className="understanding-participate">
+          <b>What this opens up</b>
+          <p>{packet.participate}</p>
+        </div>
+      )}
+      {packet.check && (
+        <details className="understanding-check">
+          <summary>Quick self-check: {packet.check.question}</summary>
+          <p>{packet.check.answer}</p>
+        </details>
+      )}
+    </section>
+  );
 }
 
 function ReviewSection({
@@ -255,7 +306,8 @@ export function ReviewCard({
             (e: any) =>
               e.type === "review_summary" &&
               e.payload &&
-              ["done", "iffy", "decisions", "testing", "followups"].some((k) => (e.payload[k] ?? []).length)
+              (["done", "iffy", "decisions", "testing", "followups"].some((k) => (e.payload[k] ?? []).length) ||
+                (e.payload.understanding && typeof e.payload.understanding === "object"))
           );
         if (ev) setReview(ev.payload as ReviewSummary);
         setEvidence(t.evidence ?? []);
@@ -459,12 +511,16 @@ export function ReviewCard({
 
       <details className="review-details">
         <summary>
-          <span>Why Hive recommends this</span>
+          <span>{review?.understanding ? "Understand this change" : "Why Hive recommends this"}</span>
           <small>
-            {review?.done?.length ?? 0} completed · {caveats.length} caveat{caveats.length === 1 ? "" : "s"} · {evidence.length} evidence
+            {review?.understanding
+              ? `mental model · ${evidence.length} evidence`
+              : `${review?.done?.length ?? 0} completed · ${caveats.length} caveat${caveats.length === 1 ? "" : "s"} · ${evidence.length} evidence`}
           </small>
         </summary>
         <div className="review-details-body">
+          {review?.understanding && <ReviewUnderstanding packet={review.understanding} />}
+
           <ChangesThread events={events} />
 
           <CheckpointList events={events} />

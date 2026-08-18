@@ -120,10 +120,19 @@ test("review_summary keeps its structured sections; empty submission is rejected
     done: ["fixed the save flow"],
     iffy: [{ what: "used a global lock", why: "simplest correct option" }],
     testing: ["bun test green"],
+    understanding: {
+      background: "Saves used one shared queue.",
+      essence: "The queue now preserves the newest edit.",
+      walkthrough: ["An edit enters the queue.", 42, "The newest edit wins."],
+      participate: "We can now consider offline saves.",
+      check: { question: "Which edit wins?", answer: "The newest one." },
+    },
   });
   expect(r.status).toBe(201);
   expect(r.json.event.payload.done).toEqual(["fixed the save flow"]);
   expect(r.json.event.payload.iffy[0].what).toBe("used a global lock");
+  expect(r.json.event.payload.understanding.walkthrough).toEqual(["An edit enters the queue.", "The newest edit wins."]);
+  expect(r.json.event.payload.understanding.check.answer).toBe("The newest one.");
   expect(r.json.event.payload.note).toBeUndefined();
   const bad = await post(`/api/tasks/${t.json.id}/events`, { type: "review_summary", note: "hi" });
   expect(bad.status).toBe(400);

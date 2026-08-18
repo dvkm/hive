@@ -3717,8 +3717,32 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       const v = pick(k);
       if (v?.length) payload[k] = v;
     }
+    let rawUnderstanding: any = (fields as any).understanding;
+    if (typeof rawUnderstanding === "string") {
+      try { rawUnderstanding = JSON.parse(rawUnderstanding); } catch { rawUnderstanding = null; }
+    }
+    if (rawUnderstanding && typeof rawUnderstanding === "object" && !Array.isArray(rawUnderstanding)) {
+      const text = (value: unknown, max = 600) =>
+        typeof value === "string" && value.trim() ? value.trim().slice(0, max) : undefined;
+      const understanding: Record<string, unknown> = {};
+      for (const key of ["background", "essence", "participate"]) {
+        const value = text(rawUnderstanding[key]);
+        if (value) understanding[key] = value;
+      }
+      if (Array.isArray(rawUnderstanding.walkthrough)) {
+        const walkthrough = rawUnderstanding.walkthrough.map((value: unknown) => text(value)).filter(Boolean).slice(0, 4);
+        if (walkthrough.length) understanding.walkthrough = walkthrough;
+      }
+      const rawCheck = rawUnderstanding.check;
+      if (rawCheck && typeof rawCheck === "object" && !Array.isArray(rawCheck)) {
+        const question = text(rawCheck.question, 300);
+        const answer = text(rawCheck.answer);
+        if (question && answer) understanding.check = { question, answer };
+      }
+      if (Object.keys(understanding).length) payload.understanding = understanding;
+    }
     if (!Object.keys(payload).length)
-      return err("review_summary needs at least one of done/iffy/decisions/testing/followups (arrays)");
+      return err("review_summary needs a structured review section");
     const event = writeEvent(db, { task_id: taskId, source, type, payload });
     return json({ event }, 201);
   }
