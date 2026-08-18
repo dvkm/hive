@@ -103,6 +103,10 @@ export function eventText(e: EventLike): string {
       return `spawn failed: ${s(p.error)}`;
     case "agent_status":
       return `agent ${s(p.status) || "status changed"}`;
+    case "dialog_auto_approved":
+      return s(p.kind) === "workspace_trust" ? "accepted the workspace trust prompt" : "approved a safe agent dialog";
+    case "dialog_auto_declined":
+      return "dismissed an optional agent dialog";
     case "ci_status":
       return `CI ${s(p.ci_status)}`;
     case "pr_merged":

@@ -50,6 +50,24 @@ test("stuck: herdr reports the agent blocked", () => {
   expect(h?.status).toBe("stuck");
 });
 
+test("healthy: a successfully handled dialog clears the stale blocked probe", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  putEvent(db, id, "agent_status", { status: "blocked" });
+  putEvent(db, id, "dialog_auto_approved", { delivered: true, kind: "workspace_trust" });
+  const h = computeHealth(db, getTask(db, id));
+  expect(h?.status).toBe("healthy");
+});
+
+test("stuck: a dialog that could not be handled does not clear the blocked probe", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  putEvent(db, id, "agent_status", { status: "blocked" });
+  putEvent(db, id, "dialog_auto_approved", { delivered: false, kind: "workspace_trust" });
+  const h = computeHealth(db, getTask(db, id));
+  expect(h?.status).toBe("stuck");
+});
+
 test("stuck: stale-recovery escalation in progress", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId);
