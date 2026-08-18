@@ -115,6 +115,10 @@ test("agent-created task carries source + parent_task_id", async () => {
 
 test("review_summary keeps its structured sections; empty submission is rejected", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "rs task" });
+  const longQuestion = "cms-e2e.yml requires VITE_CMS_URL to use host.docker.internal:5175 rather than localhost:5175, even though both names can sound like the same Vite server. Given the reasoning that made this task's WEB_URL override safe, why would replacing host.docker.internal with localhost break this suite when the browser runs from a separate Docker container?";
+  const longOption = "Because localhost is resolved by the process using it. From the Playwright container it points back to that container, not to the host machine running Vite, while host.docker.internal provides the route back to the host. The WEB_URL override compared two host-reachable preview endpoints, so it did not cross that container boundary.";
+  expect(longQuestion.length).toBeGreaterThan(300);
+  expect(longOption.length).toBeGreaterThan(300);
   const r = await post(`/api/tasks/${t.json.id}/events`, {
     type: "review_summary",
     done: ["fixed the save flow"],
@@ -136,8 +140,8 @@ test("review_summary keeps its structured sections; empty submission is rejected
       },
       checks: [
         {
-          question: "Which edit wins in the queue?",
-          options: [{ key: "old", label: "The oldest one." }, { key: "new", label: "The newest one." }],
+          question: longQuestion,
+          options: [{ key: "old", label: longOption }, { key: "new", label: "The newest one." }],
           answer_key: "new",
           explanation: "The queue preserves the latest accepted edit.",
         },
@@ -157,6 +161,8 @@ test("review_summary keeps its structured sections; empty submission is rejected
   expect(r.json.event.payload.understanding.affected_areas).toEqual(["Draft editor", "Offline saves"]);
   expect(r.json.event.payload.understanding.risk_assessment).toBe("The queue is covered, but browser shutdown can still interrupt a save.");
   expect(r.json.event.payload.understanding.checks).toHaveLength(2);
+  expect(r.json.event.payload.understanding.checks[0].question).toBe(longQuestion);
+  expect(r.json.event.payload.understanding.checks[0].options[0].label).toBe(longOption);
   expect(r.json.event.payload.understanding.checks[1].answer_key).toBe("replace");
   expect(r.json.event.payload.understanding.check).toBeUndefined();
   expect(r.json.event.payload.note).toBeUndefined();

@@ -82,6 +82,7 @@ Rules:
   scenario, never superficial rewordings. Each needs 2-4 plausible options and
   a short teaching explanation. Hive rotates questions
   after a miss and shuffles option order, so never depend on answer position.
+  Keep each question and option complete and under 500 characters.
   For a report, make the packet read like a compact impact
   analysis: background = why the report was commissioned and relevant prior
   context, scope = investigation boundaries, essence = headline finding,
