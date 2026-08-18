@@ -437,4 +437,6 @@ test("Chief brief requires quiet bundled decision cards", () => {
   expect(brief).toContain("Silence is the default");
   expect(brief).toContain("--decision <decision-id>");
   expect(brief).toContain("Do not send the director a progress message or task list");
+  expect(brief).toContain("core intuition");
+  expect(brief).toContain("shared mental model");
 });

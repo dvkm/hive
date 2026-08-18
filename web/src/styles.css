@@ -3691,6 +3691,58 @@ a.dbundle-fact:hover {
   font-size: 13px;
   margin: 0;
 }
+.review-understanding {
+  padding: 14px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-elev) 84%, var(--accent) 16%);
+}
+.understanding-eyebrow {
+  margin-bottom: 10px;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.understanding-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px 24px;
+}
+.review-understanding b {
+  display: block;
+  margin-bottom: 3px;
+  font-size: 12px;
+}
+.review-understanding p {
+  margin: 0;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+.understanding-walkthrough,
+.understanding-participate,
+.understanding-check {
+  margin-top: 14px;
+}
+.understanding-walkthrough ol {
+  margin: 4px 0 0;
+  padding-left: 20px;
+}
+.understanding-walkthrough li {
+  margin: 4px 0;
+  line-height: 1.45;
+}
+.understanding-check {
+  color: var(--text-dim);
+  font-size: var(--t-sm);
+}
+.understanding-check summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.understanding-check p {
+  margin-top: 7px;
+}
 .mono-sm {
   font-family: var(--mono);
   font-size: 12px;
