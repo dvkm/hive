@@ -3746,6 +3746,34 @@ a.dbundle-fact:hover {
   padding-left: 10px;
   border-left: 3px solid var(--accent);
 }
+.report-audit {
+  border-top: 1px solid var(--border-soft);
+}
+.report-audit > summary {
+  padding: 11px 2px 0;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: var(--t-sm);
+  font-weight: 600;
+}
+.report-audit > summary small {
+  float: right;
+  color: var(--text-faint);
+  font-weight: 400;
+}
+.report-audit-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  padding-top: var(--s3);
+}
+.report-audit-flat,
+.report-audit-body-flat {
+  display: contents;
+}
+.report-audit-flat > summary {
+  display: none;
+}
 .understanding-check {
   color: var(--text-dim);
   font-size: var(--t-sm);
