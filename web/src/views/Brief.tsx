@@ -5,7 +5,7 @@ import type { Brief } from "../lib/api";
 import { useStore } from "../lib/store";
 import { StatusDot, HEALTH_LABEL } from "../lib/ui";
 import { DecisionCard } from "./DecisionCard";
-import { ReviewCard } from "./ReviewCard";
+import { ReviewAudit, ReviewCard, ReviewUnderstanding } from "./ReviewCard";
 import { AttentionRows } from "./attention";
 import { CheckpointsInbox } from "./Checkpoints";
 import { UnderstandingQuiz } from "./UnderstandingQuiz";
@@ -108,6 +108,22 @@ export default function Brief() {
         {quizzes[0] && (
           <div className="brief-quiz">
             <Link to={`/tasks/${quizzes[0].task_id}`}>#{quizzes[0].task_number} {quizzes[0].task_title}</Link>
+            <details className="review-details" open>
+              <summary>
+                <span>{quizzes[0].task_kind === "scout" ? "Explain report" : "Understand this change"}</span>
+                <small>Read before answering</small>
+              </summary>
+              <div className="review-details-body">
+                {quizzes[0].report.understanding && (
+                  <ReviewUnderstanding
+                    packet={quizzes[0].report.understanding}
+                    report={quizzes[0].task_kind === "scout"}
+                    caveats={quizzes[0].report.iffy}
+                  />
+                )}
+                <ReviewAudit r={quizzes[0].report} />
+              </div>
+            </details>
             <UnderstandingQuiz
               quiz={quizzes[0]}
               onPassed={() => {

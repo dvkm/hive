@@ -473,6 +473,39 @@ export interface Checkpoint {
   note: string;
 }
 
+export type ReviewItem = string | { what: string; why?: string };
+
+export interface UnderstandingPacket {
+  background?: string;
+  scope?: string;
+  essence?: string;
+  walkthrough?: string[];
+  affected_areas?: string[];
+  risk_assessment?: string;
+  participate?: string;
+  check?: {
+    question: string;
+    options: { key: string; label: string }[];
+    answer_key: string;
+    explanation?: string;
+  };
+  checks?: {
+    question: string;
+    options: { key: string; label: string }[];
+    answer_key: string;
+    explanation?: string;
+  }[];
+}
+
+export interface ReviewSummary {
+  done?: string[];
+  iffy?: ReviewItem[];
+  decisions?: string[];
+  testing?: string[];
+  followups?: string[];
+  understanding?: UnderstandingPacket;
+}
+
 export interface UnderstandingQuiz {
   id: string;
   task_id: string;
@@ -480,7 +513,9 @@ export interface UnderstandingQuiz {
   task_number: number;
   task_title: string;
   task_state: State;
+  task_kind: Kind;
   project_id: string;
+  report: ReviewSummary;
   question: string;
   options: { key: string; label: string }[];
   completed?: number;

@@ -2921,7 +2921,7 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
   const projectId = url.searchParams.get("project_id");
   const rows = db
     .query(
-      `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state
+      `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state, t.kind
          FROM events e JOIN tasks t ON t.id = e.task_id
         WHERE e.type = 'review_summary'
           AND t.state != 'cancelled'
@@ -2938,6 +2938,9 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
     try { payload = JSON.parse(row.payload); } catch { return []; }
     const checks = normalizeUnderstandingChecks(payload?.understanding);
     if (!checks.length) return [];
+    const understanding = payload?.understanding && typeof payload.understanding === "object" && !Array.isArray(payload.understanding)
+      ? Object.fromEntries(Object.entries(payload.understanding).filter(([key]) => key !== "check" && key !== "checks"))
+      : {};
     const status = understandingQuizStatus(db, row.task_id, row.id);
     if (status === "passed") return [];
     const active = activeUnderstandingCheck(db, row.task_id, { reviewEventId: row.id, checks });
@@ -2948,7 +2951,9 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
       task_number: row.number,
       task_title: row.title,
       task_state: row.state,
+      task_kind: row.kind,
       project_id: row.project_id,
+      report: { ...payload, understanding },
       question: active.check.question,
       options: active.check.options,
       completed: active.completed,

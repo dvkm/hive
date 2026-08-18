@@ -260,6 +260,10 @@ test("understanding quiz blocks merge until the director answers correctly", asy
   const quiz = quizzes.json.quizzes.find((item: any) => item.task_id === taskId);
   expect(quiz.status).toBe("required");
   expect(quiz.answer_key).toBeUndefined();
+  expect(quiz.task_kind).toBe("ship");
+  expect(quiz.report.understanding.background).toBe("This task changes behavior.");
+  expect(quiz.report.understanding.check).toBeUndefined();
+  expect(quiz.report.understanding.checks).toBeUndefined();
 
   let merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
   expect(merge.status).toBe(409);
