@@ -314,6 +314,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       }
 
       if (pathname === "/api/checkpoints" && method === "GET") return listOpenCheckpoints(db, url);
+      if (pathname === "/api/understanding-quizzes" && method === "GET") return listUnderstandingQuizzes(db, url);
 
       if (pathname === "/api/offline" && method === "GET")
         return json({ on: isOffline(db) });
@@ -321,6 +322,10 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         return await setOffline(db, herdr, await req.json());
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/checkpoints\/([^/]+)\/ack$/);
       if (m && method === "POST") return await ackCheckpoint(db, herdr, m[1], m[2], await req.json());
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/understanding-quiz\/answer$/);
+      if (m && method === "POST") return answerUnderstandingQuiz(db, m[1], await req.json());
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/understanding-quiz\/defer$/);
+      if (m && method === "POST") return deferUnderstandingQuiz(db, m[1], await req.json());
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/focus-agent$/);
       if (m && method === "POST") return await focusAgent(db, herdr, m[1]);
@@ -2177,6 +2182,12 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
   const blocked = authzBlock(db, { project_id: task.project_id, action: "task.merge", target: task.title, task_id: id });
   if (blocked) return blocked;
 
+  const quiz = latestUnderstandingQuiz(db, id);
+  if (!quiz)
+    return err("Understanding check required. Ask the agent to submit one in its latest review before merging.", 409);
+  if (understandingQuizStatus(db, id, quiz.reviewEventId) === "required")
+    return err("Pass the understanding check before merging, or choose 'Ship now, quiz me later'.", 409);
+
   const exec = deps.exec ?? defaultExec;
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   const config = JSON.parse(project?.config ?? "{}");
@@ -2802,6 +2813,153 @@ function checkpointNote(payload: string): string {
   } catch {
     return "";
   }
+}
+
+interface UnderstandingCheck {
+  question: string;
+  options: { key: string; label: string }[];
+  answerKey: string;
+  explanation?: string;
+}
+
+function normalizeUnderstandingCheck(value: unknown): UnderstandingCheck | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const question = typeof raw.question === "string" ? raw.question.trim().slice(0, 300) : "";
+  const answerKey = typeof raw.answer_key === "string" ? raw.answer_key.trim().slice(0, 80) : "";
+  const seen = new Set<string>();
+  const options = Array.isArray(raw.options)
+    ? raw.options.flatMap((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+        const option = item as Record<string, unknown>;
+        const key = typeof option.key === "string" ? option.key.trim().slice(0, 80) : "";
+        const label = typeof option.label === "string" ? option.label.trim().slice(0, 300) : "";
+        if (!key || !label || seen.has(key)) return [];
+        seen.add(key);
+        return [{ key, label }];
+      }).slice(0, 4)
+    : [];
+  if (!question || options.length < 2 || !options.some((option) => option.key === answerKey)) return null;
+  const explanation = typeof raw.explanation === "string" && raw.explanation.trim()
+    ? raw.explanation.trim().slice(0, 600)
+    : undefined;
+  return { question, options, answerKey, explanation };
+}
+
+function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; check: UnderstandingCheck } | null {
+  const row: any = db
+    .query("SELECT id, payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY ts DESC, rowid DESC LIMIT 1")
+    .get(taskId);
+  if (!row) return null;
+  try {
+    const payload = JSON.parse(row.payload);
+    const check = normalizeUnderstandingCheck(payload?.understanding?.check);
+    return check ? { reviewEventId: row.id, check } : null;
+  } catch {
+    return null;
+  }
+}
+
+function understandingQuizStatus(db: DB, taskId: string, reviewEventId: string): "required" | "deferred" | "passed" {
+  const passed = db
+    .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_passed' AND json_extract(payload, '$.review_event_id') = ? LIMIT 1")
+    .get(taskId, reviewEventId);
+  if (passed) return "passed";
+  const deferred = db
+    .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_deferred' AND json_extract(payload, '$.review_event_id') = ? LIMIT 1")
+    .get(taskId, reviewEventId);
+  return deferred ? "deferred" : "required";
+}
+
+function listUnderstandingQuizzes(db: DB, url: URL): Response {
+  const projectId = url.searchParams.get("project_id");
+  const rows = db
+    .query(
+      `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state
+         FROM events e JOIN tasks t ON t.id = e.task_id
+        WHERE e.type = 'review_summary'
+          AND t.state != 'cancelled'
+          AND (? IS NULL OR t.project_id = ?)
+          AND NOT EXISTS (
+            SELECT 1 FROM events newer
+             WHERE newer.task_id = e.task_id AND newer.type = 'review_summary'
+               AND (newer.ts > e.ts OR (newer.ts = e.ts AND newer.rowid > e.rowid)))
+        ORDER BY t.number DESC`
+    )
+    .all(projectId, projectId) as any[];
+  const quizzes = rows.flatMap((row) => {
+    let payload: any;
+    try { payload = JSON.parse(row.payload); } catch { return []; }
+    const check = normalizeUnderstandingCheck(payload?.understanding?.check);
+    if (!check) return [];
+    const status = understandingQuizStatus(db, row.task_id, row.id);
+    if (status === "passed") return [];
+    return [{
+      id: row.id,
+      task_id: row.task_id,
+      ts: row.ts,
+      task_number: row.number,
+      task_title: row.title,
+      task_state: row.state,
+      project_id: row.project_id,
+      question: check.question,
+      options: check.options,
+      status,
+    }];
+  });
+  return json({ quizzes });
+}
+
+function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
+  const task = getTask(db, taskId);
+  if (!task) return err("task not found", 404);
+  if (task.state === "cancelled") return err("cancelled task has no active understanding check", 409);
+  if (!["in_review", "verifying", "done", "failed"].includes(task.state))
+    return err("understanding checks can be answered during review or from the post-ship backlog", 409);
+  if (body?.source !== "director") return err("only the director can answer understanding checks", 403);
+  const quiz = latestUnderstandingQuiz(db, taskId);
+  if (!quiz) return err("understanding check not found", 404);
+  const status = understandingQuizStatus(db, taskId, quiz.reviewEventId);
+  if (status === "passed") return json({ ok: true, correct: true, explanation: quiz.check.explanation ?? null });
+  const answerKey = typeof body?.answer_key === "string" ? body.answer_key : "";
+  if (!quiz.check.options.some((option) => option.key === answerKey)) return err("answer_key must match a quiz option");
+  if (answerKey !== quiz.check.answerKey) {
+    writeEvent(db, {
+      task_id: taskId,
+      source: "director",
+      type: "understanding_quiz_attempt",
+      payload: { review_event_id: quiz.reviewEventId, answer_key: answerKey, correct: false },
+    });
+    return json({ ok: false, correct: false });
+  }
+  writeEvent(db, {
+    task_id: taskId,
+    source: "director",
+    type: "understanding_quiz_passed",
+    payload: { review_event_id: quiz.reviewEventId, answer_key: answerKey },
+  });
+  return json({ ok: true, correct: true, explanation: quiz.check.explanation ?? null });
+}
+
+function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
+  const task = getTask(db, taskId);
+  if (!task) return err("task not found", 404);
+  if (task.state !== "in_review") return err("understanding checks can only be deferred while a task is in review", 409);
+  if (body?.source !== "director") return err("only the director can defer understanding checks", 403);
+  if (body?.confirm !== "quiz_later") return err("confirm must be 'quiz_later'");
+  const quiz = latestUnderstandingQuiz(db, taskId);
+  if (!quiz) return err("understanding check not found", 404);
+  const status = understandingQuizStatus(db, taskId, quiz.reviewEventId);
+  if (status === "passed") return json({ ok: true, status });
+  if (status !== "deferred") {
+    writeEvent(db, {
+      task_id: taskId,
+      source: "director",
+      type: "understanding_quiz_deferred",
+      payload: { review_event_id: quiz.reviewEventId },
+    });
+  }
+  return json({ ok: true, status: "deferred" });
 }
 
 function openCheckpointRows(db: DB, projectId: string | null): any[] {
@@ -3735,9 +3893,13 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       }
       const rawCheck = rawUnderstanding.check;
       if (rawCheck && typeof rawCheck === "object" && !Array.isArray(rawCheck)) {
-        const question = text(rawCheck.question, 300);
-        const answer = text(rawCheck.answer);
-        if (question && answer) understanding.check = { question, answer };
+        const check = normalizeUnderstandingCheck(rawCheck);
+        if (check) understanding.check = {
+          question: check.question,
+          options: check.options,
+          answer_key: check.answerKey,
+          ...(check.explanation ? { explanation: check.explanation } : {}),
+        };
       }
       if (Object.keys(understanding).length) payload.understanding = understanding;
     }

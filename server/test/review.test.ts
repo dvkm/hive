@@ -204,11 +204,29 @@ async function get(base: string, path: string) {
 }
 
 // Drive a task to in_review with a branch set (via a stubbed spawn).
-async function inReviewTask(base: string, extra: Record<string, unknown> = {}) {
+const QUIZ = {
+  question: "What makes this change safe to approve?",
+  options: [{ key: "tests", label: "Its focused tests pass." }, { key: "hope", label: "It looks plausible." }],
+  answer_key: "tests",
+  explanation: "The focused tests cover the changed behavior.",
+};
+
+async function addQuiz(base: string, taskId: string) {
+  await post(base, `/api/tasks/${taskId}/events`, {
+    type: "review_summary",
+    done: ["implemented the change"],
+    understanding: { background: "This task changes behavior.", essence: "Tests cover the new behavior.", check: QUIZ },
+  });
+}
+
+async function inReviewTask(base: string, extra: Record<string, unknown> = {}, passQuiz = true) {
   const p = await post(base, "/api/projects", { name: "p", repo_path: "/repo", config: { default_branch: "main", ...extra } });
   const t = await post(base, "/api/tasks", { project_id: p.json.id, title: "review me", brief: "b" });
   await post(base, `/api/tasks/${t.json.id}/spawn`, {}); // sets branch + agent_target, → in_progress
+  await addQuiz(base, t.json.id);
   await post(base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+  if (passQuiz)
+    await post(base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "tests", source: "director" });
   return { projectId: p.json.id, taskId: t.json.id };
 }
 
@@ -222,6 +240,57 @@ test("merge success writes a merged event and moves the task to verifying", asyn
   expect(ev.json.some((e: any) => e.type === "merged")).toBe(true);
   // best-effort teardown removed the worktree
   expect(s.removed.length).toBeGreaterThan(0);
+  s.server.stop(true);
+});
+
+test("understanding quiz blocks merge until the director answers correctly", async () => {
+  const s = makeServer();
+  const { taskId } = await inReviewTask(s.base, {}, false);
+
+  let quizzes = await get(s.base, "/api/understanding-quizzes");
+  const quiz = quizzes.json.quizzes.find((item: any) => item.task_id === taskId);
+  expect(quiz.status).toBe("required");
+  expect(quiz.answer_key).toBeUndefined();
+
+  let merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(409);
+  expect(merge.json.error).toContain("Pass the understanding check");
+
+  const wrong = await post(s.base, `/api/tasks/${taskId}/understanding-quiz/answer`, { answer_key: "hope", source: "director" });
+  expect(wrong.json.correct).toBe(false);
+  merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(409);
+
+  const right = await post(s.base, `/api/tasks/${taskId}/understanding-quiz/answer`, { answer_key: "tests", source: "director" });
+  expect(right.json.correct).toBe(true);
+  expect(right.json.explanation).toContain("focused tests");
+  merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(200);
+  quizzes = await get(s.base, "/api/understanding-quizzes");
+  expect(quizzes.json.quizzes.some((item: any) => item.task_id === taskId)).toBe(false);
+  s.server.stop(true);
+});
+
+test("explicit escape hatch ships now and keeps the quiz in Needs You until passed", async () => {
+  const s = makeServer();
+  const { taskId } = await inReviewTask(s.base, {}, false);
+
+  const badDefer = await post(s.base, `/api/tasks/${taskId}/understanding-quiz/defer`, { source: "director" });
+  expect(badDefer.status).toBe(400);
+  const deferred = await post(s.base, `/api/tasks/${taskId}/understanding-quiz/defer`, { confirm: "quiz_later", source: "director" });
+  expect(deferred.json.status).toBe("deferred");
+
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(200);
+  let quizzes = await get(s.base, "/api/understanding-quizzes");
+  const quiz = quizzes.json.quizzes.find((item: any) => item.task_id === taskId);
+  expect(quiz.status).toBe("deferred");
+  expect(["verifying", "done"]).toContain(quiz.task_state);
+
+  const passed = await post(s.base, `/api/tasks/${taskId}/understanding-quiz/answer`, { answer_key: "tests", source: "director" });
+  expect(passed.json.correct).toBe(true);
+  quizzes = await get(s.base, "/api/understanding-quizzes");
+  expect(quizzes.json.quizzes.some((item: any) => item.task_id === taskId)).toBe(false);
   s.server.stop(true);
 });
 
@@ -262,7 +331,9 @@ async function inReviewWithPr(base: string, prUrl: string) {
   // The evidence gate holds evidence-less handoffs; these tests are about the
   // PR/CI plumbing, so satisfy it.
   await post(base, `/api/tasks/${t.json.id}/events`, { type: "evidence", note: "proof", kind: "log" });
+  await addQuiz(base, t.json.id);
   await post(base, `/api/tasks/${t.json.id}/events`, { type: "ready", pr_url: prUrl });
+  await post(base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "tests", source: "director" });
   return t.json.id as string;
 }
 

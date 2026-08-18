@@ -288,6 +288,7 @@ function ChiefBriefing({
   const actionCount = needsYou.filter((item) => {
     if (item.kind === "decision") return directorRequired.has(item.decision.task_id);
     if (item.kind === "checkpoint") return directorRequired.has(item.checkpoint.task_id);
+    if (item.kind === "quiz") return true;
     return false;
   }).length;
   const working = tasks.filter((task) => task.source !== "chat_supervisor" && ["in_progress", "needs_decision", "in_review", "verifying"].includes(task.state));
@@ -296,10 +297,10 @@ function ChiefBriefing({
   const headline = !brief
     ? "Getting you caught up…"
     : actionCount > 0
-      ? `${actionCount} ${actionCount === 1 ? "decision needs" : "decisions need"} your call.`
+      ? `${actionCount} ${actionCount === 1 ? "item needs" : "items need"} you.`
       : awaiting
         ? "Hive is handling it."
-        : "No decisions need you.";
+      : "Nothing needs you.";
   const detail = actionCount > 0
     ? "Everything else keeps moving while your Chief waits for your call."
     : thread?.outcome
@@ -330,7 +331,7 @@ function ChiefBriefing({
       {(actionCount > 0 || working.length > 0 || finishedCount > 0) && (
         <div className="chief-briefing-foot">
           <div className="chief-briefing-facts">
-            {actionCount > 0 && <Link to="/inbox">Make {actionCount === 1 ? "the decision" : `${actionCount} decisions`}</Link>}
+            {actionCount > 0 && <Link to="/inbox">Handle {actionCount === 1 ? "1 item" : `${actionCount} items`}</Link>}
             {working.length > 0 && <Link to="/work">{working.length} in motion</Link>}
             {finishedCount > 0 && <span>{finishedCount} finished</span>}
           </div>

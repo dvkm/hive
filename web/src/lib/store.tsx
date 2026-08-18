@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { api, apiToken } from "./api";
-import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Checkpoint, ChatMessage } from "./api";
+import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Checkpoint, UnderstandingQuiz, ChatMessage } from "./api";
 import { getNeedsYouItems } from "./needsYou";
 import type { NeedsYouItem } from "./needsYou";
 
@@ -21,6 +21,8 @@ interface Store {
   evidenceMeta: Record<string, { url: string | null; kind: Evidence["kind"] }>; // by evidence id, for live feed thumbnails
   checkpoints: Checkpoint[]; // open (un-acked) build-time checkpoints, all tasks
   reloadCheckpoints: () => void;
+  quizzes: UnderstandingQuiz[]; // required or deferred understanding checks
+  reloadQuizzes: () => void;
   needsYou: NeedsYouItem[];
   offline: boolean; // offline mode: fleet drained, nothing new spawns
   setOffline: (on: boolean) => void;
@@ -63,13 +65,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const bump = (id: string) => setRev((r) => ({ ...r, [id]: (r[id] || 0) + 1 }));
   const reloadProjects = () => api.projects().then(setProjects).catch(() => setProjects([]));
   const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
-  const needsYou = getNeedsYouItems(decisions, tasks, checkpoints);
+  const [quizzes, setQuizzes] = useState<UnderstandingQuiz[]>([]);
+  const needsYou = getNeedsYouItems(decisions, tasks, checkpoints, quizzes);
   const [offline, setOfflineState] = useState(false);
   const setOffline = (on: boolean) => {
     setOfflineState(on); // optimistic; SSE confirms
     api.setOffline(on).catch(() => setOfflineState(!on));
   };
   const reloadCheckpoints = () => api.checkpoints().then((r) => setCheckpoints(r.checkpoints)).catch(() => {});
+  const reloadQuizzes = () => api.understandingQuizzes().then((r) => setQuizzes(r.quizzes)).catch(() => {});
 
   // Chat: the open thread + its messages. A ref mirrors the id so the SSE
   // handler (closed over once) knows which thread's messages to append.
@@ -119,6 +123,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     });
     api.decisions("open").then(setDecisions);
     reloadCheckpoints();
+    reloadQuizzes();
     api.offline().then((r) => setOfflineState(r.on)).catch(() => {});
     reloadProjects();
     api.notifications().then((n) => setNotifications(n.notifications)).catch(() => setNotifications([]));
@@ -170,6 +175,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           // Live checkbox list: any checkpoint activity refreshes the open set.
           if (ev.type === "checkpoint" || ev.type === "checkpoint_ack")
             api.checkpoints().then((r) => setCheckpoints(r.checkpoints)).catch(() => {});
+          if (["review_summary", "understanding_quiz_attempt", "understanding_quiz_passed", "understanding_quiz_deferred"].includes(ev.type))
+            api.understandingQuizzes().then((r) => setQuizzes(r.quizzes)).catch(() => {});
           bump(ev.task_id);
         } else if (msg.type === "evidence") {
           const evi: Evidence = msg.evidence;
@@ -224,7 +231,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, needsYou, offline, setOffline, sse, chatThreadId, chatMessages, openChatThread, onChatMessage }}>
+    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, quizzes, reloadQuizzes, needsYou, offline, setOffline, sse, chatThreadId, chatMessages, openChatThread, onChatMessage }}>
       {children}
     </Ctx.Provider>
   );

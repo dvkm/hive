@@ -11,6 +11,7 @@ import { relTime } from "../lib/time";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
 import { ReportView } from "./ReportView";
+import { UnderstandingQuiz } from "./UnderstandingQuiz";
 
 // Staleness marker: captured-at time always shows; the commit SHA (recorded
 // by the CLI from the agent's worktree at capture time) compares against the
@@ -112,7 +113,12 @@ interface UnderstandingPacket {
   essence?: string;
   walkthrough?: string[];
   participate?: string;
-  check?: { question: string; answer: string };
+  check?: {
+    question: string;
+    options: { key: string; label: string }[];
+    answer_key: string;
+    explanation?: string;
+  };
 }
 
 // The agent's structured self-review (latest review_summary event payload).
@@ -161,12 +167,6 @@ function ReviewUnderstanding({ packet }: { packet: UnderstandingPacket }) {
           <b>What this opens up</b>
           <p>{packet.participate}</p>
         </div>
-      )}
-      {packet.check && (
-        <details className="understanding-check">
-          <summary>Quick self-check: {packet.check.question}</summary>
-          <p>{packet.check.answer}</p>
-        </details>
       )}
     </section>
   );
@@ -278,6 +278,9 @@ export function ReviewCard({
   const [mode, setMode] = useState<ActionMode>(null);
   const [notes, setNotes] = useState("");
   const [review, setReview] = useState<ReviewSummary | null>(null);
+  const [reviewEventId, setReviewEventId] = useState<string | null>(null);
+  const [reviewLoaded, setReviewLoaded] = useState(false);
+  const [quizOverride, setQuizOverride] = useState<"passed" | "deferred" | null>(null);
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
   const [openDecisions, setOpenDecisions] = useState<Decision[]>([]);
@@ -288,6 +291,9 @@ export function ReviewCard({
     setDiff(null);
     setDiffErr("");
     setReview(null);
+    setReviewEventId(null);
+    setReviewLoaded(false);
+    setQuizOverride(null);
     setEvidence([]);
     api
       .diff(task.id)
@@ -309,12 +315,16 @@ export function ReviewCard({
               (["done", "iffy", "decisions", "testing", "followups"].some((k) => (e.payload[k] ?? []).length) ||
                 (e.payload.understanding && typeof e.payload.understanding === "object"))
           );
-        if (ev) setReview(ev.payload as ReviewSummary);
+        if (ev) {
+          setReview(ev.payload as ReviewSummary);
+          setReviewEventId(ev.id);
+        }
         setEvidence(t.evidence ?? []);
         setEvents(t.events ?? []);
         setOpenDecisions((t.decisions ?? []).filter((d: Decision) => d.status === "open"));
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => live && setReviewLoaded(true));
     return () => {
       live = false;
     };
@@ -331,8 +341,26 @@ export function ReviewCard({
   // chores have nothing to merge; accepting the report is the whole review.
   const isScout = task.kind === "scout";
   const reportOnly = isScout || (task.kind === "chore" && diff?.files.length === 0);
+  const rawQuiz = review?.understanding?.check;
+  const quiz = rawQuiz && Array.isArray(rawQuiz.options) && rawQuiz.options.length >= 2 ? rawQuiz : undefined;
+  const recordedQuizStatus = reviewEventId && events.some(
+    (event) => event.type === "understanding_quiz_passed" && event.payload.review_event_id === reviewEventId
+  )
+    ? "passed"
+    : reviewEventId && events.some(
+        (event) => event.type === "understanding_quiz_deferred" && event.payload.review_event_id === reviewEventId
+      )
+      ? "deferred"
+      : "required";
+  const quizStatus = quizOverride ?? recordedQuizStatus;
   const mergeBlocked = !reportOnly
-    ? task.ci_status === "failing"
+    ? !reviewLoaded
+      ? "Loading the understanding check"
+      : !quiz || !reviewEventId
+        ? "Understanding check is missing. Ask the agent to refresh its review."
+        : quizStatus === "required"
+          ? "Pass the understanding check, or explicitly save it for later."
+          : task.ci_status === "failing"
       ? "CI is failing — the agent has been told to iterate; unlocks when green"
       : task.ci_status === "pending"
         ? "CI is still running — wait for green"
@@ -454,6 +482,17 @@ export function ReviewCard({
           </div>
         )}
       </div>
+
+      {!reportOnly && quiz && reviewEventId && quizStatus === "required" && (
+        <UnderstandingQuiz
+          quiz={{ task_id: task.id, question: quiz.question, options: quiz.options }}
+          allowDefer
+          onPassed={() => setQuizOverride("passed")}
+          onDeferred={() => setQuizOverride("deferred")}
+        />
+      )}
+      {!reportOnly && quizStatus === "passed" && <div className="understanding-quiz-status passed">Understanding confirmed. Approval unlocked.</div>}
+      {!reportOnly && quizStatus === "deferred" && <div className="understanding-quiz-status deferred">Quiz saved in Needs You. You can ship now.</div>}
 
       <div className="review-actions">
         <button className="btn btn-primary" onClick={() => merge()} disabled={busy || !!mergeBlocked} title={mergeBlocked}>

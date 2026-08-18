@@ -68,10 +68,16 @@ Rules:
        "essence": "the goal and core idea in plain language, before code details",
        "walkthrough": ["2-4 causal steps in the order a person should learn them"],
        "participate": "what this now lets the director decide, question, or build next",
-       "check": {"question": "one conceptual self-check, not trivia", "answer": "one sentence"}}}
-  Include \`understanding\` for non-trivial code changes. Keep it short and teach
-  only the background needed for this change. Omit it for trivial or report-only
-  work. Do not build a separate explainer UI or simulation unless asked.
+       "check": {
+         "question": "one conceptual self-check, not trivia",
+         "options": [{"key": "a", "label": "..."}, {"key": "b", "label": "..."}],
+         "answer_key": "a",
+         "explanation": "why the answer is right"}}}
+  \`understanding.check\` is REQUIRED for every mergeable change. It is the
+  director's approval gate, so use 2-4 plausible options that test the core idea.
+  Keep the whole packet short and teach only the background needed for this
+  change. Omit it only for report-only work. Do not build a separate explainer
+  UI or simulation unless asked.
   Honesty rule: "iffy" is MANDATORY when anything is uncertain, hacky, or has a
   known ceiling — an empty iffy list on risky work reads as hiding it.
 - When you hit a decision the director must make, open a REAL decision card with
