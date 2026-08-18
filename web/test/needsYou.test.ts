@@ -9,6 +9,7 @@ test("needs-you queue includes every actionable item", () => {
   const checkpoint = { id: "checkpoint-1" } as Checkpoint;
   const quiz = { id: "quiz-1", task_id: "quiz-task", task_state: "in_review" } as UnderstandingQuiz;
   const activeQuiz = { id: "quiz-active", task_id: "review-1", task_state: "done" } as UnderstandingQuiz;
+  const cancelledQuiz = { id: "quiz-cancelled", task_id: "cancelled-1", task_state: "in_review" } as UnderstandingQuiz;
   const items = getNeedsYouItems(
     [decision],
     [
@@ -18,9 +19,10 @@ test("needs-you queue includes every actionable item", () => {
       task("stuck-1", "in_progress", { health: { status: "stuck", reason: null, since: "now" } }),
       task("manager-1", "in_progress", { source: "chat_supervisor", health: { status: "stuck", reason: null, since: "now" } }),
       task("quiz-task", "done"),
+      task("cancelled-1", "cancelled"),
     ],
     [checkpoint],
-    [quiz, activeQuiz]
+    [quiz, activeQuiz, cancelledQuiz]
   );
 
   expect(items.map((item) => item.kind)).toEqual(["decision", "checkpoint", "quiz", "review", "attention", "attention"]);

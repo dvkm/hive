@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
-import type { DiffFile, DiffResult, Evidence, Task } from "../lib/api";
+import type { DiffFile, DiffResult, Evidence, ReviewItem, ReviewSummary, Task, UnderstandingPacket } from "../lib/api";
 import { useStore } from "../lib/store";
 import { CiBadge, toast } from "../lib/ui";
 import { MAX_DIFF_LINES } from "../lib/api";
@@ -106,47 +106,12 @@ function ChangesThread({ events }: { events: Event[] }) {
   );
 }
 
-type ReviewItem = string | { what: string; why?: string };
-
-interface UnderstandingPacket {
-  background?: string;
-  scope?: string;
-  essence?: string;
-  walkthrough?: string[];
-  affected_areas?: string[];
-  risk_assessment?: string;
-  participate?: string;
-  check?: {
-    question: string;
-    options: { key: string; label: string }[];
-    answer_key: string;
-    explanation?: string;
-  };
-  checks?: {
-    question: string;
-    options: { key: string; label: string }[];
-    answer_key: string;
-    explanation?: string;
-  }[];
-}
-
-// The agent's structured self-review (latest review_summary event payload).
-// Sections are all optional; strings or {what, why} objects for iffy.
-interface ReviewSummary {
-  done?: string[];
-  iffy?: ReviewItem[];
-  decisions?: string[];
-  testing?: string[];
-  followups?: string[];
-  understanding?: UnderstandingPacket;
-}
-
 function reviewItemText(item: ReviewItem): string {
   return typeof item === "string" ? item : item.what;
 }
 
-function ReviewUnderstanding({ packet, report = false, caveats = [] }: { packet: UnderstandingPacket; report?: boolean; caveats?: ReviewItem[] }) {
-  const hasContent = packet.background || packet.scope || packet.essence || packet.walkthrough?.length || packet.affected_areas?.length || packet.risk_assessment || packet.participate || packet.check;
+export function ReviewUnderstanding({ packet, report = false, caveats = [] }: { packet: UnderstandingPacket; report?: boolean; caveats?: ReviewItem[] }) {
+  const hasContent = packet.background || packet.scope || packet.essence || packet.walkthrough?.length || packet.affected_areas?.length || packet.risk_assessment || packet.participate;
   if (!hasContent) return null;
 
   if (report) {
@@ -268,7 +233,7 @@ function ReviewSection({
 
 // The audit stays complete, but it is deliberately plain and subordinate to
 // the recommendation shown on the card itself.
-function ReviewAudit({ r }: { r: ReviewSummary }) {
+export function ReviewAudit({ r }: { r: ReviewSummary }) {
   return (
     <div className="review-audit">
       <ReviewSection tone="done" icon="✓" title="Completed" items={r.done} />

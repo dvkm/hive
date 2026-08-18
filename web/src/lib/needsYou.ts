@@ -25,7 +25,7 @@ export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoin
     ...quizzes
       .filter((quiz) => {
         const state = tasks.find((task) => task.id === quiz.task_id)?.state ?? quiz.task_state;
-        return !["in_progress", "in_review", "needs_decision"].includes(state);
+        return ["verifying", "done", "failed"].includes(state);
       })
       .map((quiz) => ({ kind: "quiz" as const, id: quiz.id, quiz })),
     ...tasks
