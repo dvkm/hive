@@ -2860,7 +2860,7 @@ function normalizeUnderstandingChecks(understanding: unknown): UnderstandingChec
   return values.flatMap((value) => {
     const check = normalizeUnderstandingCheck(value);
     return check ? [check] : [];
-  }).slice(0, 3);
+  }).slice(0, 5);
 }
 
 function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; checks: UnderstandingCheck[] } | null {
@@ -2877,16 +2877,33 @@ function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: strin
   }
 }
 
-function understandingAttemptCount(db: DB, taskId: string, reviewEventId: string): number {
-  const row = db
-    .query("SELECT count(*) AS n FROM events WHERE task_id = ? AND type = 'understanding_quiz_attempt' AND json_extract(payload, '$.review_event_id') = ?")
-    .get(taskId, reviewEventId) as { n: number };
-  return row.n;
+function understandingQuizProgress(db: DB, taskId: string, reviewEventId: string): { attempts: number; completed: Set<number> } {
+  const rows = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'understanding_quiz_attempt' AND json_extract(payload, '$.review_event_id') = ?")
+    .all(taskId, reviewEventId) as { payload: string }[];
+  const completed = new Set<number>();
+  for (const row of rows) {
+    try {
+      const payload = JSON.parse(row.payload);
+      if (payload.correct === true && Number.isInteger(payload.check_index)) completed.add(payload.check_index);
+    } catch {
+      /* ignore malformed legacy attempts */
+    }
+  }
+  return { attempts: rows.length, completed };
 }
 
-function activeUnderstandingCheck(db: DB, taskId: string, quiz: { reviewEventId: string; checks: UnderstandingCheck[] }): UnderstandingCheck {
-  const offset = [...quiz.reviewEventId].reduce((sum, char) => sum + char.charCodeAt(0), 0) % quiz.checks.length;
-  return quiz.checks[(offset + understandingAttemptCount(db, taskId, quiz.reviewEventId)) % quiz.checks.length];
+function activeUnderstandingCheck(
+  db: DB,
+  taskId: string,
+  quiz: { reviewEventId: string; checks: UnderstandingCheck[] }
+): { check: UnderstandingCheck; index: number; completed: number } {
+  const progress = understandingQuizProgress(db, taskId, quiz.reviewEventId);
+  const remaining = quiz.checks.map((_, index) => index).filter((index) => !progress.completed.has(index));
+  const pool = remaining.length ? remaining : quiz.checks.map((_, index) => index);
+  const offset = [...quiz.reviewEventId].reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  const index = pool[(offset + progress.attempts) % pool.length];
+  return { check: quiz.checks[index], index, completed: quiz.checks.length - remaining.length };
 }
 
 function understandingQuizStatus(db: DB, taskId: string, reviewEventId: string): "required" | "deferred" | "passed" {
@@ -2923,7 +2940,7 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
     if (!checks.length) return [];
     const status = understandingQuizStatus(db, row.task_id, row.id);
     if (status === "passed") return [];
-    const check = activeUnderstandingCheck(db, row.task_id, { reviewEventId: row.id, checks });
+    const active = activeUnderstandingCheck(db, row.task_id, { reviewEventId: row.id, checks });
     return [{
       id: row.id,
       task_id: row.task_id,
@@ -2932,8 +2949,10 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
       task_title: row.title,
       task_state: row.state,
       project_id: row.project_id,
-      question: check.question,
-      options: check.options,
+      question: active.check.question,
+      options: active.check.options,
+      completed: active.completed,
+      total: checks.length,
       status,
     }];
   });
@@ -2950,8 +2969,9 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   const quiz = latestUnderstandingQuiz(db, taskId);
   if (!quiz) return err("understanding check not found", 404);
   const status = understandingQuizStatus(db, taskId, quiz.reviewEventId);
-  const check = activeUnderstandingCheck(db, taskId, quiz);
-  if (status === "passed") return json({ ok: true, correct: true, explanation: check.explanation ?? null });
+  const active = activeUnderstandingCheck(db, taskId, quiz);
+  const check = active.check;
+  if (status === "passed") return json({ ok: true, correct: true, passed: true, explanation: check.explanation ?? null });
   const answerKey = typeof body?.answer_key === "string" ? body.answer_key : "";
   if (!check.options.some((option) => option.key === answerKey)) return err("answer_key must match a quiz option");
   if (answerKey !== check.answerKey) {
@@ -2959,23 +2979,44 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
       task_id: taskId,
       source: "director",
       type: "understanding_quiz_attempt",
-      payload: { review_event_id: quiz.reviewEventId, answer_key: answerKey, correct: false },
+      payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey, correct: false },
     });
     const next = activeUnderstandingCheck(db, taskId, quiz);
     return json({
       ok: false,
       correct: false,
+      passed: false,
       explanation: check.explanation ?? null,
-      quiz: { question: next.question, options: next.options },
+      completed: next.completed,
+      total: quiz.checks.length,
+      quiz: { question: next.check.question, options: next.check.options, completed: next.completed, total: quiz.checks.length },
+    });
+  }
+  writeEvent(db, {
+    task_id: taskId,
+    source: "director",
+    type: "understanding_quiz_attempt",
+    payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey, correct: true },
+  });
+  const next = activeUnderstandingCheck(db, taskId, quiz);
+  if (next.completed < quiz.checks.length) {
+    return json({
+      ok: true,
+      correct: true,
+      passed: false,
+      explanation: check.explanation ?? null,
+      completed: next.completed,
+      total: quiz.checks.length,
+      quiz: { question: next.check.question, options: next.check.options, completed: next.completed, total: quiz.checks.length },
     });
   }
   writeEvent(db, {
     task_id: taskId,
     source: "director",
     type: "understanding_quiz_passed",
-    payload: { review_event_id: quiz.reviewEventId, answer_key: answerKey },
+    payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey },
   });
-  return json({ ok: true, correct: true, explanation: check.explanation ?? null });
+  return json({ ok: true, correct: true, passed: true, explanation: check.explanation ?? null, completed: next.completed, total: quiz.checks.length });
 }
 
 function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
@@ -3946,7 +3987,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
           answer_key: check.answerKey,
           ...(check.explanation ? { explanation: check.explanation } : {}),
         }] : [];
-      }).slice(0, 3);
+      }).slice(0, 5);
       if (checks.length) understanding.checks = checks;
       if (!checks.length && rawCheck && typeof rawCheck === "object" && !Array.isArray(rawCheck)) {
         const check = normalizeUnderstandingCheck(rawCheck);

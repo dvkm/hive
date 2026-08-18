@@ -483,6 +483,8 @@ export interface UnderstandingQuiz {
   project_id: string;
   question: string;
   options: { key: string; label: string }[];
+  completed?: number;
+  total?: number;
   status: "required" | "deferred";
 }
 
@@ -501,7 +503,7 @@ export const api = {
     }),
   understandingQuizzes: () => req<{ quizzes: UnderstandingQuiz[] }>(`/api/understanding-quizzes`),
   answerUnderstandingQuiz: (taskId: string, answerKey: string) =>
-    req<{ ok: boolean; correct: boolean; explanation: string | null; quiz?: Pick<UnderstandingQuiz, "question" | "options"> }>(`/api/tasks/${taskId}/understanding-quiz/answer`, {
+    req<{ ok: boolean; correct: boolean; passed: boolean; explanation: string | null; completed?: number; total?: number; quiz?: Pick<UnderstandingQuiz, "question" | "options" | "completed" | "total"> }>(`/api/tasks/${taskId}/understanding-quiz/answer`, {
       method: "POST",
       body: JSON.stringify({ answer_key: answerKey, source: "director" }),
     }),

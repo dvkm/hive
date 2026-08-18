@@ -215,6 +215,9 @@ const QUIZ_BANK = [
   { question: "Why is this safe?", options: [{ key: "safe", label: "Focused tests cover it." }, { key: "guess", label: "It seems fine." }], answer_key: "safe", explanation: "Safety comes from focused coverage." },
   { question: "What evidence should approval rely on?", options: [{ key: "safe", label: "Tests of the changed path." }, { key: "guess", label: "A plausible implementation." }], answer_key: "safe", explanation: "Approval relies on evidence from the changed path." },
   { question: "What would catch a regression?", options: [{ key: "safe", label: "A focused failing test." }, { key: "guess", label: "A code comment." }], answer_key: "safe", explanation: "A focused test catches the regression." },
+  { question: "What should be tested first?", options: [{ key: "safe", label: "The changed behavior." }, { key: "guess", label: "An unrelated path." }], answer_key: "safe", explanation: "Start with the behavior that changed." },
+  { question: "When should approval stop?", options: [{ key: "safe", label: "When evidence contradicts the change." }, { key: "guess", label: "Never, if the code looks tidy." }], answer_key: "safe", explanation: "Contradictory evidence should block approval." },
+  { question: "Should a sixth question survive?", options: [{ key: "safe", label: "No, the bank is capped at five." }, { key: "guess", label: "Yes, every submitted question is kept." }], answer_key: "safe", explanation: "Quiz banks are capped at five questions." },
 ];
 
 async function addQuiz(base: string, taskId: string) {
@@ -269,6 +272,7 @@ test("understanding quiz blocks merge until the director answers correctly", asy
 
   const right = await post(s.base, `/api/tasks/${taskId}/understanding-quiz/answer`, { answer_key: "tests", source: "director" });
   expect(right.json.correct).toBe(true);
+  expect(right.json.passed).toBe(true);
   expect(right.json.explanation).toContain("focused tests");
   merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
   expect(merge.status).toBe(200);
@@ -290,14 +294,31 @@ test("a wrong answer teaches the idea and rotates to another question", async ()
   await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
 
   const before = (await get(s.base, "/api/understanding-quizzes")).json.quizzes.find((item: any) => item.task_id === t.json.id);
-  const wrong = await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "guess", source: "director" });
-  expect(wrong.json.correct).toBe(false);
-  expect(wrong.json.explanation).toBeTruthy();
-  expect(wrong.json.quiz.question).not.toBe(before.question);
+  const seen = new Set([before.question]);
+  for (let i = 0; i < 4; i++) {
+    const wrong = await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "guess", source: "director" });
+    expect(wrong.json.correct).toBe(false);
+    expect(wrong.json.explanation).toBeTruthy();
+    seen.add(wrong.json.quiz.question);
+  }
+  expect(seen.size).toBe(5);
 
   const after = (await get(s.base, "/api/understanding-quizzes")).json.quizzes.find((item: any) => item.task_id === t.json.id);
-  expect(after.question).toBe(wrong.json.quiz.question);
-  expect((await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "safe", source: "director" })).json.correct).toBe(true);
+  expect(seen.has(after.question)).toBe(true);
+  const firstCorrect = await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "safe", source: "director" });
+  expect(firstCorrect.json.correct).toBe(true);
+  expect(firstCorrect.json.passed).toBe(false);
+  expect(firstCorrect.json.completed).toBe(1);
+  expect((await get(s.base, "/api/understanding-quizzes")).json.quizzes.some((item: any) => item.task_id === t.json.id)).toBe(true);
+  for (let i = 0; i < 3; i++) {
+    const correct = await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "safe", source: "director" });
+    expect(correct.json.correct).toBe(true);
+    expect(correct.json.passed).toBe(false);
+  }
+  const finalCorrect = await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "safe", source: "director" });
+  expect(finalCorrect.json.passed).toBe(true);
+  expect(finalCorrect.json.completed).toBe(5);
+  expect((await get(s.base, "/api/understanding-quizzes")).json.quizzes.some((item: any) => item.task_id === t.json.id)).toBe(false);
   s.server.stop(true);
 });
 

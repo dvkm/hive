@@ -497,7 +497,7 @@ export function ReviewCard({
     try {
       await api.requestChanges(
         task.id,
-        "Refresh the existing review_summary without changing the implementation. Preserve the review findings, regenerate the explanation in the current format, and add exactly 3 conceptually distinct multiple-choice understanding.checks. Then submit the task for review again."
+        "Refresh the existing review_summary without changing the implementation. Preserve the review findings, regenerate the explanation in the current format, and add 1-5 multiple-choice understanding.checks. Use more than one only when each tests a distinct decision-relevant idea, angle, or scenario. Then submit the task for review again."
       );
       toast("Agent asked to add the understanding check");
       onDone?.();
