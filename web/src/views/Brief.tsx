@@ -8,6 +8,7 @@ import { DecisionCard } from "./DecisionCard";
 import { ReviewCard } from "./ReviewCard";
 import { AttentionRows } from "./attention";
 import { CheckpointsInbox } from "./Checkpoints";
+import { UnderstandingQuiz } from "./UnderstandingQuiz";
 import { fmtUsd, fmtTokens } from "./Analytics";
 
 const LAST_SEEN_KEY = "hive.brief.lastSeen";
@@ -35,7 +36,7 @@ function toLocalInput(iso: string): string {
 }
 
 export default function Brief() {
-  const { needsYou } = useStore();
+  const { needsYou, reloadQuizzes } = useStore();
   const location = useLocation();
 
   // Default the activity-summary window to the last time Needs you was viewed
@@ -60,9 +61,11 @@ export default function Brief() {
   // Action sections read from the live store so handling an item updates in
   // place via SSE. The disclosed activity summary reads the fetched snapshot.
   const [answered, setAnswered] = useState<Set<string>>(new Set());
+  const [passedQuizzes, setPassedQuizzes] = useState<Set<string>>(new Set());
   const [reviewed, setReviewed] = useState<Set<string>>(new Set());
   const openDecisions = needsYou.flatMap((item) => item.kind === "decision" && !answered.has(item.id) ? [item.decision] : []);
   const checkpoints = needsYou.flatMap((item) => item.kind === "checkpoint" ? [item.checkpoint] : []);
+  const quizzes = needsYou.flatMap((item) => item.kind === "quiz" && !passedQuizzes.has(item.id) ? [item.quiz] : []);
   const toReview = needsYou.flatMap((item) => item.kind === "review" && !reviewed.has(item.id) ? [item.task] : []);
   const attention = needsYou.flatMap((item) => item.kind === "attention" ? [item.task] : []);
 
@@ -74,7 +77,7 @@ export default function Brief() {
   const spend = data?.spend;
   const spendCount = spend ? spend.totals.calls : 0;
 
-  const actionCount = openDecisions.length + checkpoints.length + toReview.length + attention.length;
+  const actionCount = openDecisions.length + checkpoints.length + quizzes.length + toReview.length + attention.length;
 
   return (
     <div className="brief-page">
@@ -93,6 +96,22 @@ export default function Brief() {
           <div className="muted">Nothing needs you.</div>
         </div>
       )}
+
+      <Section title="Understanding backlog" count={quizzes.length}>
+        {quizzes[0] && (
+          <div className="brief-quiz">
+            <Link to={`/tasks/${quizzes[0].task_id}`}>#{quizzes[0].task_number} {quizzes[0].task_title}</Link>
+            <UnderstandingQuiz
+              quiz={quizzes[0]}
+              onPassed={() => {
+                setPassedQuizzes((items) => new Set(items).add(quizzes[0].id));
+                reloadQuizzes();
+              }}
+            />
+          </div>
+        )}
+        {quizzes.length > 1 && <div className="brief-queue-note">Next quiz appears after this one.</div>}
+      </Section>
 
       {/* ① Decisions waiting, answerable here with the shared decision card. */}
       <Section title="Decisions waiting" count={openDecisions.length}>

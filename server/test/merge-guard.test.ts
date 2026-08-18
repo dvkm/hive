@@ -27,6 +27,21 @@ function seed(): { db: DB; taskId: string } {
     type: "branch_scope",
     payload: { base_sha: "B1", files: ["src/task.ts"] },
   });
+  const review = writeEvent(db, {
+    task_id: taskId,
+    source: "agent",
+    type: "review_summary",
+    payload: {
+      understanding: {
+        check: {
+          question: "What protects this merge?",
+          options: [{ key: "guard", label: "The destructive-change guard." }, { key: "none", label: "Nothing." }],
+          answer_key: "guard",
+        },
+      },
+    },
+  });
+  writeEvent(db, { task_id: taskId, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "guard" } });
   return { db, taskId };
 }
 

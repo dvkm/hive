@@ -473,6 +473,19 @@ export interface Checkpoint {
   note: string;
 }
 
+export interface UnderstandingQuiz {
+  id: string;
+  task_id: string;
+  ts: string;
+  task_number: number;
+  task_title: string;
+  task_state: State;
+  project_id: string;
+  question: string;
+  options: { key: string; label: string }[];
+  status: "required" | "deferred";
+}
+
 export const api = {
   token: apiToken,
   subscribePush: (subscription: unknown) =>
@@ -485,6 +498,17 @@ export const api = {
     req<{ ok: boolean; delivered: boolean; followup_task_id: string | null }>(`/api/tasks/${taskId}/checkpoints/${eventId}/ack`, {
       method: "POST",
       body: JSON.stringify({ verdict, note }),
+    }),
+  understandingQuizzes: () => req<{ quizzes: UnderstandingQuiz[] }>(`/api/understanding-quizzes`),
+  answerUnderstandingQuiz: (taskId: string, answerKey: string) =>
+    req<{ ok: boolean; correct: boolean; explanation: string | null }>(`/api/tasks/${taskId}/understanding-quiz/answer`, {
+      method: "POST",
+      body: JSON.stringify({ answer_key: answerKey, source: "director" }),
+    }),
+  deferUnderstandingQuiz: (taskId: string) =>
+    req<{ ok: boolean; status: "deferred" | "passed" }>(`/api/tasks/${taskId}/understanding-quiz/defer`, {
+      method: "POST",
+      body: JSON.stringify({ confirm: "quiz_later", source: "director" }),
     }),
   tasks: (q: { state?: State; project_id?: string } = {}) => {
     const p = new URLSearchParams(q as Record<string, string>).toString();

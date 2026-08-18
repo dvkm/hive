@@ -325,6 +325,7 @@ export function composeSupervisorBrief(db: DB, thread: ChatThread): string {
       : `Post one short, concrete reply after handling each director message. System messages headed \`[hive manager wakeup]\` are internal; reply only for a genuine blocker or completed outcome.`,
     `At session start, read \`$HIVE_URL/api/chat/threads/${thread.id}\` for the durable conversation history, run ledger, meetings, verification attempts, and retrospectives before acting. This restores the top-level ask if the live session was restarted.`,
     `When the director asks to understand, catch up, or explore what is next, read the latest task review_summary understanding packets. Explain only the necessary background, the core intuition, the causal walkthrough, and what new choices the work opens up. Do not dump raw diffs or send lessons and self-checks unprompted.`,
+    `Understanding quizzes are a director-only approval boundary. Never answer or defer one for the director, even on autopilot.`,
     chief ? `Your scope is every Hive project. ${autonomyInstruction}` : autonomyInstruction
   );
 

@@ -3743,6 +3743,90 @@ a.dbundle-fact:hover {
 .understanding-check p {
   margin-top: 7px;
 }
+.understanding-quiz {
+  padding: var(--s4);
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--border));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg-elev) 88%, var(--accent) 12%);
+}
+.understanding-quiz-label {
+  color: var(--accent);
+  font-size: var(--t-eyebrow);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.understanding-quiz h4 {
+  margin: var(--s2) 0 var(--s3);
+  font-size: var(--t-lg);
+}
+.understanding-quiz-options {
+  display: grid;
+  gap: var(--s2);
+}
+.understanding-quiz-options label {
+  display: flex;
+  gap: var(--s2);
+  padding: 10px var(--s3);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-elev);
+  cursor: pointer;
+}
+.understanding-quiz-options label.selected {
+  border-color: var(--accent);
+}
+.understanding-quiz-options input {
+  margin-top: 2px;
+}
+.understanding-quiz-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  margin-top: var(--s3);
+}
+.understanding-quiz-wrong {
+  margin: var(--s2) 0 0;
+  color: var(--red);
+  font-size: var(--t-sm);
+}
+.understanding-quiz-escape {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s3);
+  margin-top: var(--s3);
+  padding-top: var(--s3);
+  border-top: 1px solid var(--border);
+}
+.understanding-quiz-escape p {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: var(--t-sm);
+}
+.understanding-quiz-status {
+  padding: 10px var(--s3);
+  border-radius: 7px;
+  font-size: var(--t-sm);
+}
+.understanding-quiz-status.passed {
+  color: var(--green);
+  background: color-mix(in srgb, var(--bg-elev) 86%, var(--green) 14%);
+}
+.understanding-quiz-status.deferred {
+  color: var(--amber);
+  background: color-mix(in srgb, var(--bg-elev) 86%, var(--amber) 14%);
+}
+.brief-quiz > a {
+  display: inline-block;
+  margin-bottom: var(--s2);
+  color: var(--text);
+  font-weight: 600;
+  text-decoration: none;
+}
+.brief-quiz > a:hover {
+  text-decoration: underline;
+}
 .mono-sm {
   font-family: var(--mono);
   font-size: 12px;

@@ -19,7 +19,7 @@ Usage:
   hive task list [--state <s>] [--project <id>]
   hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>]
         types: status | evidence | needs-decision | ready | done | blocked | deferred | undefer | review_summary | <custom>
-        review_summary: --json review.json with {done[], iffy[], decisions[], testing[], followups[], understanding{}}
+        review_summary: --json review.json with {done[], iffy[], decisions[], testing[], followups[], understanding{check{question,options[],answer_key}}}
         deferred: park a task waiting on an OFFLINE human action (no more "gone quiet" nudges);
                   [--until <iso>] or [--days <n>] to auto-resume, else indefinite. undefer to resume early.
         ready: PR open (or scout report written) → hand off to review (in_progress -> in_review)

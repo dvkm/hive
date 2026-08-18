@@ -257,10 +257,10 @@ test("sweepVerifying re-runs the advance and flags evidence-wedged tasks once", 
   expect(getTask(db, id).state).toBe("done");
 });
 
-test("autoMergeReady merges only opted-in, green, clean-review, uncontested tasks", async () => {
+test("autoMergeReady merges only director-approved, opted-in, green, clean-review, uncontested tasks", async () => {
   const { autoMergeReady } = await import("../src/reconciler.ts");
   const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
-  const mk = (extra: any) => {
+  const mk = (extra: any, approved = true) => {
     const id = makeTask(db, projectId, { kind: "chore", ...extra });
     transition(db, id, "in_progress");
     transition(db, id, "in_review");
@@ -268,12 +268,30 @@ test("autoMergeReady merges only opted-in, green, clean-review, uncontested task
     db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
       newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
     );
+    const review = writeEvent(db, {
+      task_id: id,
+      source: "agent",
+      type: "review_summary",
+      payload: {
+        understanding: {
+          check: {
+            question: "Why is this safe to merge?",
+            options: [{ key: "review", label: "The review is clean." }, { key: "guess", label: "It is a guess." }],
+            answer_key: "review",
+          },
+        },
+      },
+    });
+    if (approved)
+      writeEvent(db, { task_id: id, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "review" } });
     return id;
   };
   const clean = mk({});
   const risky = mk({});
+  const unapproved = mk({}, false);
   writeEvent(db, { task_id: clean, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
   writeEvent(db, { task_id: risky, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: ["a real risk"], questions: [] } });
+  writeEvent(db, { task_id: unapproved, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
   // primary checkout sits on the base branch; git merge-base/merge succeed for the local-ff path
   const git: Exec = stub((argv) => {
     if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
@@ -282,6 +300,7 @@ test("autoMergeReady merges only opted-in, green, clean-review, uncontested task
   await autoMergeReady(db, { exec: git });
   expect(getTask(db, clean).state).toBe("done"); // merged; no smoke configured → straight through verifying
   expect(getTask(db, risky).state).toBe("in_review"); // risks → human review
+  expect(getTask(db, unapproved).state).toBe("in_review"); // quiz not passed → director boundary
 });
 
 test("autoAnswerStale answers timed-out normal-risk cards with the recommendation, never high-risk", async () => {

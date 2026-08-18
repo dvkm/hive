@@ -207,7 +207,14 @@ the task timeline with the agent's actual work; see `hooks/install.md`):
 
 Types written by the runtime layer (Phase 2b):
 - `checkpoint` — a live build-time judgment call from a working agent (`payload: {note}`; `hive emit <id> checkpoint --note "..."`). Non-blocking. Acknowledgment uses `POST /api/tasks/:id/checkpoints/:eventId/ack` body `{verdict: "ok"|"flag", note?, source?: "director"|"chat_supervisor", actor?}` → `200 {ok, delivered, followup_task_id}` | `400` | `404`; `checkpoint_ack` events (`payload: {checkpoint_id, verdict, note, actor}`) record the outcome and their event source records who acted. A `flag` steers a live agent immediately; a flag on a finished/agentless task queues a corrective follow-up task instead (`source="checkpoint_flag"`, parent → the flagged task). `GET /api/checkpoints[?project_id=<id>]` → `200 {checkpoints: [{id, task_id, ts, task_number, task_title, task_state, project_id, note}]}` lists un-acked checkpoints, optionally scoped to one project. They survive task completion (only `cancelled` drops them) so judgment calls stay reviewable after fast agents finish.
-- `review_summary`: the agent's structured self-review, submitted before `ready`. `payload: {done?: string[], iffy?: (string|{what,why})[], decisions?: string[], testing?: string[], followups?: string[], understanding?: {background?: string, essence?: string, walkthrough?: string[], participate?: string, check?: {question: string, answer: string}}}`. The review card presents the optional understanding packet before the technical audit so the director can learn the mental model without starting from a raw diff.
+- `review_summary`: the agent's structured self-review, submitted before `ready`. `payload: {done?: string[], iffy?: (string|{what,why})[], decisions?: string[], testing?: string[], followups?: string[], understanding?: {background?: string, essence?: string, walkthrough?: string[], participate?: string, check?: {question: string, options: {key: string, label: string}[], answer_key: string, explanation?: string}}}`. Mergeable changes require a 2-4 option understanding check. The review card presents the mental model before the technical audit, then uses the check as the approval gate.
+- `understanding_quiz_attempt`, `understanding_quiz_passed`, `understanding_quiz_deferred`: director-only quiz outcomes tied to the latest `review_summary` by `payload.review_event_id`. A new review summary creates a new check. Passing removes it from the backlog. Deferring unlocks an urgent merge but deliberately leaves the quiz open after the task finishes.
+
+Understanding quiz API:
+
+- `GET /api/understanding-quizzes[?project_id=<id>]` returns `{quizzes}` for required and deferred checks on each task's latest review. Correct answers and explanations are omitted.
+- `POST /api/tasks/:id/understanding-quiz/answer` body `{answer_key, source: "director"}` returns `{ok, correct, explanation}`. Incorrect answers remain blocked and do not reveal the correct option.
+- `POST /api/tasks/:id/understanding-quiz/defer` body `{confirm: "quiz_later", source: "director"}` is the explicit urgent escape hatch. It is accepted only while the task is in review.
 - `spawned` — a herdr agent was started. `payload: {agent_target, branch, worktree_path, tab_id, label, fleet_workspace_id}`
 - `spawn_error` — spawn failed. `payload: {error, infra?}`. `infra: "herdr_unreachable"` marks a herdr-daemon-down failure (`ConnectionRefused` / `Os { code: 61 }`) rather than a task-specific fault; the dispatcher excludes these from a task's per-task backoff and handles them with a global circuit breaker instead (see `docs/runtime.md`)
 - `stack_setup` — the per-project spawn hook (`config.setup_argv`) ran while preparing the worktree, before the agent started (`source: herdr`). `payload: {argv, ok, error?}` (`error` = first 300 chars of stderr/stdout on failure; best-effort, a failure never blocks the spawn).
@@ -686,7 +693,7 @@ the reconciler recording `pr_synchronized`.
   `truncated` is `true` and the remaining diff is omitted (view the PR for the
   full patch). Binary files carry `binary: true` and no hunks.
 
-- `POST /api/tasks/:id/merge` body `{merge_strategy?: "local_ff", override_destructive_check?: boolean}` → `200 Task` (now `verifying`) | `409` (not `in_review`, or the merge failed: conflict / not a fast-forward / gh refused / **destructive auto-rebase**) | `403` (denied by a `task.merge` authority rule) | `404` | `400` (local merge but no `repo_path`/`branch`)
+- `POST /api/tasks/:id/merge` body `{merge_strategy?: "local_ff", override_destructive_check?: boolean}` → `200 Task` (now `verifying`) | `409` (not `in_review`, missing/unpassed understanding check, or the merge failed: conflict / not a fast-forward / gh refused / **destructive auto-rebase**) | `403` (denied by a `task.merge` authority rule) | `404` | `400` (local merge but no `repo_path`/`branch`)
   Approve & merge. When `pr_url` is set: `gh pr merge <url> <method>` where
   `method` is the project's `config.merge_method` (`squash` default, or `merge` /
   `rebase`). Otherwise a **local fast-forward**: the default branch is
@@ -695,6 +702,8 @@ the reconciler recording `pr_synchronized`.
   the default branch (that merge lands on `HEAD`, wherever it points) or the merge
   is not a fast-forward (diverged/conflicting — rebase the branch or open a PR for
   a squash merge).
+
+  **Understanding gate.** The latest review must include a valid multiple-choice understanding check. The director must pass it before merge. The explicit `quiz_later` defer endpoint temporarily unlocks the merge while keeping the quiz in Needs You until it is eventually passed. Supervisors cannot answer or defer it.
 
   **Stale-base fallback.** GitHub decides mergeability against `origin/<base>`,
   which can sit behind the primary checkout's local `<base>`. So when `gh pr merge`

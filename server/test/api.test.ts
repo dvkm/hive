@@ -125,14 +125,23 @@ test("review_summary keeps its structured sections; empty submission is rejected
       essence: "The queue now preserves the newest edit.",
       walkthrough: ["An edit enters the queue.", 42, "The newest edit wins."],
       participate: "We can now consider offline saves.",
-      check: { question: "Which edit wins?", answer: "The newest one." },
+      check: {
+        question: "Which edit wins?",
+        options: [{ key: "old", label: "The oldest one." }, { key: "new", label: "The newest one." }, { key: "bad" }],
+        answer_key: "new",
+        explanation: "The queue preserves the latest accepted edit.",
+      },
     },
   });
   expect(r.status).toBe(201);
   expect(r.json.event.payload.done).toEqual(["fixed the save flow"]);
   expect(r.json.event.payload.iffy[0].what).toBe("used a global lock");
   expect(r.json.event.payload.understanding.walkthrough).toEqual(["An edit enters the queue.", "The newest edit wins."]);
-  expect(r.json.event.payload.understanding.check.answer).toBe("The newest one.");
+  expect(r.json.event.payload.understanding.check.options).toEqual([
+    { key: "old", label: "The oldest one." },
+    { key: "new", label: "The newest one." },
+  ]);
+  expect(r.json.event.payload.understanding.check.answer_key).toBe("new");
   expect(r.json.event.payload.note).toBeUndefined();
   const bad = await post(`/api/tasks/${t.json.id}/events`, { type: "review_summary", note: "hi" });
   expect(bad.status).toBe(400);
@@ -313,7 +322,20 @@ test("POST /merge returns instead of hanging when the post-merge smoke check fai
     const id = t.json.id;
     await post2(`/api/tasks/${id}/transition`, { to: "in_progress" });
     await post2(`/api/tasks/${id}/events`, { type: "evidence", note: "proof", kind: "log" });
+    await post2(`/api/tasks/${id}/events`, {
+      type: "review_summary",
+      done: ["implemented"],
+      understanding: {
+        essence: "The smoke check validates the merged result.",
+        check: {
+          question: "What validates the merged result?",
+          options: [{ key: "smoke", label: "The smoke check." }, { key: "none", label: "Nothing." }],
+          answer_key: "smoke",
+        },
+      },
+    });
     await post2(`/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/1" });
+    await post2(`/api/tasks/${id}/understanding-quiz/answer`, { answer_key: "smoke", source: "director" });
 
     const start = Date.now();
     const merged = await post2(`/api/tasks/${id}/merge`, {});
