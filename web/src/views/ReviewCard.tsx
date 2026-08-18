@@ -531,6 +531,98 @@ export function ReviewCard({
         )}
       </div>
 
+      <details className="review-details" open={quizStatus === "required"}>
+        <summary>
+          <span>{reportOnly ? "Explain report" : review?.understanding ? "Understand this change" : "Why Hive recommends this"}</span>
+          <small>
+            {reportOnly && review?.understanding
+              ? `finding · impact · risk`
+              : review?.understanding
+              ? `mental model · ${evidence.length} evidence`
+              : `${review?.done?.length ?? 0} completed · ${caveats.length} caveat${caveats.length === 1 ? "" : "s"} · ${evidence.length} evidence`}
+          </small>
+        </summary>
+        <div className="review-details-body">
+          {review?.understanding && <ReviewUnderstanding packet={review.understanding} report={reportOnly} caveats={caveats} />}
+
+          <details className="report-audit">
+            <summary>
+              <span>Full report and audit trail</span>
+              <small>{review?.done?.length ?? 0} findings · {evidence.length} evidence</small>
+            </summary>
+            <div className="report-audit-body">
+              <ChangesThread events={events} />
+
+              <CheckpointList events={events} />
+
+              {review ? <ReviewAudit r={review} /> : task.summary && <p className="review-summary">{task.summary}</p>}
+              {review && task.summary && <p className="review-summary">{task.summary}</p>}
+
+              {evidence.length > 0 &&
+                (() => {
+              // Screenshots as lightbox thumbnails; everything else (test runs,
+              // logs, reports, links) as compact chips. The proof rides with the
+              // review instead of a click away on the task page.
+              const imgs = evidence.filter((e) => e.kind === "screenshot" && e.url);
+              const lb: LightboxImage[] = imgs.map((e) => ({
+                url: e.url!,
+                caption: e.caption,
+                taskId: task.id,
+                taskTitle: task.title,
+                ts: e.ts,
+              }));
+              const others = evidence.filter((e) => !(e.kind === "screenshot" && e.url));
+              return (
+                <div className="review-evidence">
+                  {imgs.map((e, i) => (
+                    <button key={e.id} className="rev-thumb" title={e.caption || "screenshot"} onClick={() => lightbox.open(lb, i)}>
+                      <img src={e.url!} alt={e.caption || "screenshot"} />
+                      <EvAge e={e} headSha={task.head_sha} />
+                    </button>
+                  ))}
+                  {others.map((e) => (
+                    <EvChip key={e.id} e={e} headSha={task.head_sha} />
+                  ))}
+                </div>
+              );
+                })()}
+
+              <div className="review-diffstat">
+                {diffErr ? (
+                  <span className="diff-err">Could not load diff: {diffErr}</span>
+                ) : !diff ? (
+                  <span className="muted">Loading diff{"…"}</span>
+                ) : stat && stat.files > 0 ? (
+                  <button className="diffstat-toggle" onClick={() => setExpanded((x) => !x)}>
+                    <span className="diff-caret">{expanded ? "▾" : "▸"}</span>
+                    {stat.files} file{stat.files === 1 ? "" : "s"}{" "}
+                    <span className="diff-add">+{stat.add}</span> <span className="diff-del">{"−"}{stat.del}</span>
+                  </button>
+                ) : (
+                  <span className="muted">No changes to show.</span>
+                )}
+                {expanded && diff && diff.files.length > 0 && (
+                  <label className="wrap-toggle">
+                    <input type="checkbox" checked={wrap} onChange={(e) => setWrap(e.target.checked)} /> wrap
+                  </label>
+                )}
+              </div>
+
+              {expanded && diff && (
+                <div className="diff-viewer">
+                  {diff.files.map((f) => (
+                    <DiffFileView key={f.path} f={f} wrap={wrap} />
+                  ))}
+                  {diff.truncated && (
+                    <div className="diff-trunc">Diff truncated (over {MAX_DIFF_LINES.toLocaleString()} lines). View the full diff in the PR.</div>
+                  )}
+                </div>
+              )}
+            </div>
+          </details>
+        </div>
+      </details>
+
       {quiz && reviewEventId && quizStatus === "required" && (
         <UnderstandingQuiz
           quiz={{ task_id: task.id, question: quiz.question, options: quiz.options }}
@@ -604,97 +696,6 @@ export function ReviewCard({
         </div>
       )}
 
-      <details className="review-details">
-        <summary>
-          <span>{reportOnly ? "Explain report" : review?.understanding ? "Understand this change" : "Why Hive recommends this"}</span>
-          <small>
-            {reportOnly && review?.understanding
-              ? `finding · impact · risk`
-              : review?.understanding
-              ? `mental model · ${evidence.length} evidence`
-              : `${review?.done?.length ?? 0} completed · ${caveats.length} caveat${caveats.length === 1 ? "" : "s"} · ${evidence.length} evidence`}
-          </small>
-        </summary>
-        <div className="review-details-body">
-          {review?.understanding && <ReviewUnderstanding packet={review.understanding} report={reportOnly} caveats={caveats} />}
-
-          <details className={`report-audit${reportOnly ? "" : " report-audit-flat"}`} open={reportOnly ? undefined : true}>
-            <summary>
-              <span>Full report and audit trail</span>
-              <small>{review?.done?.length ?? 0} findings · {evidence.length} evidence</small>
-            </summary>
-            <div className={`report-audit-body${reportOnly ? "" : " report-audit-body-flat"}`}>
-              <ChangesThread events={events} />
-
-              <CheckpointList events={events} />
-
-              {review ? <ReviewAudit r={review} /> : task.summary && <p className="review-summary">{task.summary}</p>}
-              {review && task.summary && <p className="review-summary">{task.summary}</p>}
-
-              {evidence.length > 0 &&
-                (() => {
-              // Screenshots as lightbox thumbnails; everything else (test runs,
-              // logs, reports, links) as compact chips. The proof rides with the
-              // review instead of a click away on the task page.
-              const imgs = evidence.filter((e) => e.kind === "screenshot" && e.url);
-              const lb: LightboxImage[] = imgs.map((e) => ({
-                url: e.url!,
-                caption: e.caption,
-                taskId: task.id,
-                taskTitle: task.title,
-                ts: e.ts,
-              }));
-              const others = evidence.filter((e) => !(e.kind === "screenshot" && e.url));
-              return (
-                <div className="review-evidence">
-                  {imgs.map((e, i) => (
-                    <button key={e.id} className="rev-thumb" title={e.caption || "screenshot"} onClick={() => lightbox.open(lb, i)}>
-                      <img src={e.url!} alt={e.caption || "screenshot"} />
-                      <EvAge e={e} headSha={task.head_sha} />
-                    </button>
-                  ))}
-                  {others.map((e) => (
-                    <EvChip key={e.id} e={e} headSha={task.head_sha} />
-                  ))}
-                </div>
-              );
-                })()}
-
-              <div className="review-diffstat">
-                {diffErr ? (
-                  <span className="diff-err">Could not load diff: {diffErr}</span>
-                ) : !diff ? (
-                  <span className="muted">Loading diff{"…"}</span>
-                ) : stat && stat.files > 0 ? (
-                  <button className="diffstat-toggle" onClick={() => setExpanded((x) => !x)}>
-                    <span className="diff-caret">{expanded ? "▾" : "▸"}</span>
-                    {stat.files} file{stat.files === 1 ? "" : "s"}{" "}
-                    <span className="diff-add">+{stat.add}</span> <span className="diff-del">{"−"}{stat.del}</span>
-                  </button>
-                ) : (
-                  <span className="muted">No changes to show.</span>
-                )}
-                {expanded && diff && diff.files.length > 0 && (
-                  <label className="wrap-toggle">
-                    <input type="checkbox" checked={wrap} onChange={(e) => setWrap(e.target.checked)} /> wrap
-                  </label>
-                )}
-              </div>
-
-              {expanded && diff && (
-                <div className="diff-viewer">
-                  {diff.files.map((f) => (
-                    <DiffFileView key={f.path} f={f} wrap={wrap} />
-                  ))}
-                  {diff.truncated && (
-                    <div className="diff-trunc">Diff truncated (over {MAX_DIFF_LINES.toLocaleString()} lines). View the full diff in the PR.</div>
-                  )}
-                </div>
-              )}
-            </div>
-          </details>
-        </div>
-      </details>
     </section>
   );
 }
