@@ -112,6 +112,8 @@ interface UnderstandingPacket {
   background?: string;
   essence?: string;
   walkthrough?: string[];
+  affected_areas?: string[];
+  risk_assessment?: string;
   participate?: string;
   check?: {
     question: string;
@@ -136,9 +138,55 @@ function reviewItemText(item: ReviewItem): string {
   return typeof item === "string" ? item : item.what;
 }
 
-function ReviewUnderstanding({ packet }: { packet: UnderstandingPacket }) {
-  const hasContent = packet.background || packet.essence || packet.walkthrough?.length || packet.participate || packet.check;
+function ReviewUnderstanding({ packet, report = false, caveats = [] }: { packet: UnderstandingPacket; report?: boolean; caveats?: ReviewItem[] }) {
+  const hasContent = packet.background || packet.essence || packet.walkthrough?.length || packet.affected_areas?.length || packet.risk_assessment || packet.participate || packet.check;
   if (!hasContent) return null;
+
+  if (report) {
+    const risk = packet.risk_assessment || caveats.map(reviewItemText).join(" ");
+    return (
+      <section className="review-understanding report-explanation">
+        <div className="understanding-eyebrow">Report explained</div>
+        {packet.essence && (
+          <div className="report-explanation-headline">
+            <b>Key finding</b>
+            <p>{packet.essence}</p>
+          </div>
+        )}
+        {packet.background && (
+          <div>
+            <b>Scope</b>
+            <p>{packet.background}</p>
+          </div>
+        )}
+        {packet.walkthrough?.length && (
+          <div className="understanding-walkthrough">
+            <b>Evidence chain</b>
+            <ol>{packet.walkthrough.map((step, i) => <li key={i}>{step}</li>)}</ol>
+          </div>
+        )}
+        {packet.affected_areas?.length && (
+          <div className="understanding-affected">
+            <b>Affected areas</b>
+            <ul>{packet.affected_areas.map((area, i) => <li key={i}>{area}</li>)}</ul>
+          </div>
+        )}
+        {risk && (
+          <div className="understanding-risk">
+            <b>Risk assessment</b>
+            <p>{risk}</p>
+          </div>
+        )}
+        {packet.participate && (
+          <div className="understanding-participate">
+            <b>What to do with this</b>
+            <p>{packet.participate}</p>
+          </div>
+        )}
+      </section>
+    );
+  }
+
   return (
     <section className="review-understanding">
       <div className="understanding-eyebrow">Mental model</div>
@@ -582,14 +630,14 @@ export function ReviewCard({
           <span>{reportOnly ? "Explain report" : review?.understanding ? "Understand this change" : "Why Hive recommends this"}</span>
           <small>
             {reportOnly && review?.understanding
-              ? `thesis · evidence · implications`
+              ? `finding · impact · risk`
               : review?.understanding
               ? `mental model · ${evidence.length} evidence`
               : `${review?.done?.length ?? 0} completed · ${caveats.length} caveat${caveats.length === 1 ? "" : "s"} · ${evidence.length} evidence`}
           </small>
         </summary>
         <div className="review-details-body">
-          {review?.understanding && <ReviewUnderstanding packet={review.understanding} />}
+          {review?.understanding && <ReviewUnderstanding packet={review.understanding} report={reportOnly} caveats={caveats} />}
 
           <ChangesThread events={events} />
 

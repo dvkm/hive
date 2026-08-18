@@ -3890,13 +3890,17 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       const text = (value: unknown, max = 600) =>
         typeof value === "string" && value.trim() ? value.trim().slice(0, max) : undefined;
       const understanding: Record<string, unknown> = {};
-      for (const key of ["background", "essence", "participate"]) {
+      for (const key of ["background", "essence", "risk_assessment", "participate"]) {
         const value = text(rawUnderstanding[key]);
         if (value) understanding[key] = value;
       }
       if (Array.isArray(rawUnderstanding.walkthrough)) {
         const walkthrough = rawUnderstanding.walkthrough.map((value: unknown) => text(value)).filter(Boolean).slice(0, 4);
         if (walkthrough.length) understanding.walkthrough = walkthrough;
+      }
+      if (Array.isArray(rawUnderstanding.affected_areas)) {
+        const affectedAreas = rawUnderstanding.affected_areas.map((value: unknown) => text(value)).filter(Boolean).slice(0, 5);
+        if (affectedAreas.length) understanding.affected_areas = affectedAreas;
       }
       const rawCheck = rawUnderstanding.check;
       if (rawCheck && typeof rawCheck === "object" && !Array.isArray(rawCheck)) {

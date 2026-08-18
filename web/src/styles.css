@@ -3720,6 +3720,8 @@ a.dbundle-fact:hover {
   line-height: 1.5;
 }
 .understanding-walkthrough,
+.understanding-affected,
+.understanding-risk,
 .understanding-participate,
 .understanding-check {
   margin-top: 14px;
@@ -3731,6 +3733,18 @@ a.dbundle-fact:hover {
 .understanding-walkthrough li {
   margin: 4px 0;
   line-height: 1.45;
+}
+.understanding-affected ul {
+  margin: 4px 0 0;
+  padding-left: 20px;
+}
+.understanding-affected li {
+  margin: 4px 0;
+  line-height: 1.45;
+}
+.report-explanation-headline {
+  padding-left: 10px;
+  border-left: 3px solid var(--accent);
 }
 .understanding-check {
   color: var(--text-dim);
