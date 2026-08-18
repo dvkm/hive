@@ -1,6 +1,6 @@
 import { beforeEach, expect, test } from "bun:test";
 import { makeHandler, wakeDueManagers } from "../src/api.ts";
-import { createThread } from "../src/chat.ts";
+import { appendMessage, createThread } from "../src/chat.ts";
 import { newId, now, openDb, type DB } from "../src/db.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
@@ -110,14 +110,62 @@ test("bounded meetings notify only workers managed by the thread and keep the la
   const decided = await call(`/api/chat/threads/${threadId}/meetings`, "POST", {
     stage: "decided",
     meeting_id: started.json.meeting_id,
-    decision: "Reuse task events",
+    recommendation: "Reuse task events",
     summary: "It preserves one source of truth.",
+    dissent: ["A dedicated table would be easier to query"],
+    evidence: ["The event projection already powers the run ledger"],
+    risks: ["Event payload changes need backward compatibility"],
   });
   expect(decided.status).toBe(200);
   const detail = await call(`/api/chat/threads/${threadId}`);
   expect(detail.json.meetings).toHaveLength(1);
   expect(detail.json.meetings[0].stage).toBe("decided");
   expect(detail.json.meetings[0].decision).toBe("Reuse task events");
+  expect(detail.json.meetings[0].recommendation).toBe("Reuse task events");
+  expect(detail.json.meetings[0].dissent).toEqual(["A dedicated table would be easier to query"]);
+});
+
+test("commitments stay source-linked and separate from worker tasks", async () => {
+  const source = appendMessage(db, threadId, "director", "Ship the manager and do not drop verification.");
+  const owner = worker("implement the manager");
+  const unlinked = await call(`/api/chat/threads/${threadId}/commitments`, "POST", {
+    title: "Ship the manager",
+  });
+  expect(unlinked.status).toBe(400);
+
+  const parent = await call(`/api/chat/threads/${threadId}/commitments`, "POST", {
+    title: "Ship the manager",
+    source_message_id: source.id,
+    owner_task_id: owner,
+  });
+  expect(parent.status).toBe(201);
+  expect(parent.json.owner_title).toBe("implement the manager");
+  expect(parent.json.source_message_text).toContain("do not drop verification");
+
+  const followup = await call(`/api/chat/threads/${threadId}/commitments`, "POST", {
+    title: "Verify the integrated result",
+    source_message_id: source.id,
+    depends_on: [parent.json.id],
+  });
+  expect(followup.status).toBe(201);
+  expect(followup.json.depends_on).toEqual([parent.json.id]);
+
+  const cycle = await call(`/api/chat/threads/${threadId}/commitments/${parent.json.id}`, "PUT", {
+    depends_on: [followup.json.id],
+  });
+  expect(cycle.status).toBe(409);
+
+  const updated = await call(`/api/chat/threads/${threadId}/commitments/${parent.json.id}`, "PUT", {
+    status: "done",
+  });
+  expect(updated.status).toBe(200);
+  expect(updated.json.status).toBe("done");
+
+  const detail = await call(`/api/chat/threads/${threadId}`);
+  expect(detail.json.commitments.map((item: any) => item.title)).toEqual([
+    "Verify the integrated result",
+    "Ship the manager",
+  ]);
 });
 
 test("autonomy profiles enforce supervisor decision and checkpoint boundaries", async () => {

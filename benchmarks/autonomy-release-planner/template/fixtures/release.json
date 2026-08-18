@@ -1,0 +1,9 @@
+{
+  "items": [
+    { "id": "schema", "title": "Finalize schema", "priority": 2 },
+    { "id": "api", "title": "Ship API", "priority": 5, "depends_on": ["schema"] },
+    { "id": "docs", "title": "Publish docs", "priority": 4 },
+    { "id": "deploy", "title": "Deploy release", "priority": 5, "depends_on": ["api", "docs"] }
+  ],
+  "completed": []
+}

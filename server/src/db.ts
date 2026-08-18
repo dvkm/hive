@@ -420,6 +420,29 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       `ALTER TABLE chat_threads ADD COLUMN completed_at TEXT`,
     ],
   },
+  // Commitments are the outcomes a supervisor owes, not another copy of its
+  // worker task list. They stay linked to the conversation or task that
+  // created the obligation, while owner_task_id points at the current worker.
+  {
+    name: "v22-supervisor-commitments",
+    statements: [
+      `CREATE TABLE commitments (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL REFERENCES chat_threads(id),
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        title TEXT NOT NULL,
+        owner_task_id TEXT REFERENCES tasks(id),
+        source_message_id TEXT REFERENCES chat_messages(id),
+        source_task_id TEXT REFERENCES tasks(id),
+        status TEXT NOT NULL DEFAULT 'open',
+        due_at TEXT,
+        depends_on TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE INDEX idx_commitments_thread ON commitments(thread_id, status, updated_at)`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings

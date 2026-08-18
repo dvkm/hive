@@ -57,7 +57,7 @@ export function Bubble({ m }: { m: ChatMessage }) {
   const html =
     m.role === "assistant" ? DOMPurify.sanitize(marked.parse(m.text, { async: false }) as string) : null;
   return (
-    <div className={`chat-msg chat-${m.role}${hasDecision ? " chat-has-decision" : ""}`}>
+    <div id={`message-${m.id}`} className={`chat-msg chat-${m.role}${hasDecision ? " chat-has-decision" : ""}`}>
       <div className="chat-bubble">
         {hasDecision ? (
           <div className="chat-decision-intro">One decision needs your call.</div>
@@ -116,6 +116,7 @@ function ManagerActivity({
   const meeting = thread?.meetings?.[0];
   const verification = thread?.verifications?.[0];
   const retrospective = thread?.retrospectives?.[0];
+  const commitments = (thread?.commitments ?? []).filter((item) => !["done", "dropped"].includes(item.status));
 
   const replay = async () => {
     if (!thread || !verification || replaying) return;
@@ -168,14 +169,39 @@ function ManagerActivity({
         )}
       </section>
 
+      {commitments.length > 0 && (
+        <section className="manager-activity-section manager-commitments">
+          <h2>Open loops <span>{commitments.length}</span></h2>
+          <div className="manager-commitment-list">
+            {commitments.map((item) => (
+              <div className={`manager-commitment manager-commitment-${item.status}`} key={item.id}>
+                <div className="manager-commitment-head">
+                  <span>{item.title}</span>
+                  <b>{item.status.replace("_", " ")}</b>
+                </div>
+                <div className="manager-commitment-meta">
+                  {item.owner_task_id ? <Link to={`/tasks/${item.owner_task_id}`}>{item.owner_title || "assigned worker"}</Link> : <span>Chief of Staff</span>}
+                  {item.source_task_id ? <Link to={`/tasks/${item.source_task_id}`}>source task</Link> : <span title={item.source_message_text || undefined}>from your request</span>}
+                  {item.depends_on.length > 0 && <span>{item.depends_on.length} prerequisite{item.depends_on.length === 1 ? "" : "s"}</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
       {(meeting || verification || retrospective) && (
         <section className="manager-activity-section manager-records">
           <h2>Management record</h2>
           {meeting && (
             <div className="manager-record">
-              <div className="manager-record-head"><span>Meeting</span><b>{meeting.stage}</b></div>
+              <div className="manager-record-head"><span>{meeting.stage === "decided" ? "Decision memo" : "Meeting"}</span><b>{meeting.stage}</b></div>
               <p>{meeting.topic}</p>
-              {meeting.decision && <small>Decision: {meeting.decision}</small>}
+              {(meeting.recommendation || meeting.decision) && <strong className="manager-memo-recommendation">{meeting.recommendation || meeting.decision}</strong>}
+              {meeting.summary && <small>Rationale: {meeting.summary}</small>}
+              {!!meeting.dissent?.length && <small>Dissent: {meeting.dissent.join("; ")}</small>}
+              {!!meeting.evidence?.length && <small>Evidence: {meeting.evidence.join("; ")}</small>}
+              {!!meeting.risks?.length && <small>Risk: {meeting.risks.join("; ")}</small>}
             </div>
           )}
           {verification && (

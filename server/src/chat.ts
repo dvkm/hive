@@ -47,6 +47,25 @@ export interface ChatMessage {
   text: string;
   actions: any[];
 }
+export const COMMITMENT_STATUSES = ["open", "in_progress", "blocked", "done", "dropped"] as const;
+export type CommitmentStatus = (typeof COMMITMENT_STATUSES)[number];
+export interface Commitment {
+  id: string;
+  thread_id: string;
+  project_id: string;
+  title: string;
+  owner_task_id: string | null;
+  owner_title: string | null;
+  source_message_id: string | null;
+  source_message_text: string | null;
+  source_task_id: string | null;
+  source_task_title: string | null;
+  status: CommitmentStatus;
+  due_at: string | null;
+  depends_on: string[];
+  created_at: string;
+  updated_at: string;
+}
 
 export function createThread(
   db: DB,
@@ -197,6 +216,76 @@ export function listMessages(db: DB, threadId: string, limit?: number): ChatMess
   return limit ? msgs.reverse() : msgs; // DESC+LIMIT fetches the newest N; return oldest→newest
 }
 
+function parseCommitment(row: any): Commitment {
+  let depends_on: string[] = [];
+  try {
+    const parsed = JSON.parse(row.depends_on || "[]");
+    if (Array.isArray(parsed)) depends_on = parsed.map(String);
+  } catch {}
+  return { ...row, depends_on } as Commitment;
+}
+
+export function listCommitments(db: DB, threadId: string): Commitment[] {
+  return (db.query(
+    `SELECT c.*, owner.title AS owner_title, source_task.title AS source_task_title,
+            source_message.text AS source_message_text
+       FROM commitments c
+       LEFT JOIN tasks owner ON owner.id = c.owner_task_id
+       LEFT JOIN tasks source_task ON source_task.id = c.source_task_id
+       LEFT JOIN chat_messages source_message ON source_message.id = c.source_message_id
+      WHERE c.thread_id = ?
+      ORDER BY CASE c.status WHEN 'blocked' THEN 0 WHEN 'in_progress' THEN 1 WHEN 'open' THEN 2 ELSE 3 END,
+               COALESCE(c.due_at, '9999-12-31'), c.created_at`
+  ).all(threadId) as any[]).map(parseCommitment);
+}
+
+export function createCommitment(db: DB, input: {
+  thread_id: string;
+  project_id: string;
+  title: string;
+  owner_task_id?: string | null;
+  source_message_id?: string | null;
+  source_task_id?: string | null;
+  status?: CommitmentStatus;
+  due_at?: string | null;
+  depends_on?: string[];
+}): Commitment {
+  const id = newId("commit");
+  const t = now();
+  db.query(
+    `INSERT INTO commitments
+      (id, thread_id, project_id, title, owner_task_id, source_message_id, source_task_id, status, due_at, depends_on, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(
+    id,
+    input.thread_id,
+    input.project_id,
+    input.title,
+    input.owner_task_id ?? null,
+    input.source_message_id ?? null,
+    input.source_task_id ?? null,
+    input.status ?? "open",
+    input.due_at ?? null,
+    JSON.stringify(input.depends_on ?? []),
+    t,
+    t
+  );
+  return listCommitments(db, input.thread_id).find((item) => item.id === id)!;
+}
+
+export function updateCommitment(db: DB, id: string, patch: Partial<Pick<Commitment,
+  "title" | "owner_task_id" | "status" | "due_at" | "depends_on"
+>>): Commitment | null {
+  const row = db.query("SELECT * FROM commitments WHERE id = ?").get(id) as any;
+  if (!row) return null;
+  const current = parseCommitment(row);
+  const next = { ...current, ...patch };
+  db.query(
+    `UPDATE commitments SET title = ?, owner_task_id = ?, status = ?, due_at = ?, depends_on = ?, updated_at = ? WHERE id = ?`
+  ).run(next.title, next.owner_task_id, next.status, next.due_at, JSON.stringify(next.depends_on), now(), id);
+  return listCommitments(db, current.thread_id).find((item) => item.id === id)!;
+}
+
 function safeParse(s: string): any[] {
   try {
     const v = JSON.parse(s);
@@ -261,7 +350,9 @@ You coordinate WORKER agents; you don't write project code in this session. Use 
 - Send reviewed work back for fixes:   POST $HIVE_URL/api/tasks/<id>/request-changes with body {"notes":"specific required changes"}
 - Auto-approve a safe decision card:  ${cli} decision auto-answer <id> --key <option> --reason "..."
 - Update the visible run ledger:       ${cli} chat update ${thread.id} --phase planning|executing|waiting|verifying|complete --objective "..." --criterion "..." --next "..." [--waiting "..."]
-- Run a bounded meeting:               ${cli} chat meeting ${thread.id} --stage proposal|critique|decided --topic "..." --participants <task-ids> [--meeting <id>] [--summary "..."] [--decision "..."]
+- Record an accountable commitment:    ${cli} chat commit ${thread.id} --project <project-id> --title "..." --source-message <id> [--owner <task-id>] [--depends-on <commitment-ids>]
+- Update a commitment:                 ${cli} chat commit-update ${thread.id} <commitment-id> --status open|in_progress|blocked|done|dropped [--owner <task-id>] [--due <iso>]
+- Run a bounded meeting:               ${cli} chat meeting ${thread.id} --stage proposal|critique|decided --topic "..." --participants <task-ids> [--meeting <id>] [--summary "..."] [--recommendation "..."] [--dissent "..."] [--evidence "..."] [--risk "..."]
 - Record independent verification:     ${cli} chat verify ${thread.id} --status started|passed|failed --method "..." --result "..." [--tasks <ids>] [--evidence <ids>]
 - Record the run retrospective:        ${cli} chat retrospect ${thread.id} --summary "..." [--worked "..."] [--problem "..."] [--lesson "..."]
 - Read project tasks:                   curl -sS "$HIVE_URL/api/tasks?project_id=${thread.project_id ?? "<project-id>"}"
@@ -272,7 +363,7 @@ You coordinate WORKER agents; you don't write project code in this session. Use 
 - Ask the director a real choice:     ${cli} decision ask <task-id> --title "..." --option k:Label:"..." --recommend k
 
 For every ask:
-1. Translate it into an outcome and observable acceptance criteria. Immediately write them to the run ledger. Resolve project facts from references, policies, prior decisions, the repo, or a scout before asking the director.
+1. Translate it into an outcome and observable acceptance criteria. Immediately write them to the run ledger. Create source-linked commitments for each outcome the director expects, promise Hive makes, or follow-up that must not be dropped. A commitment is not every worker task. Keep its owner, dependencies, and state current as work changes. Resolve project facts from references, policies, prior decisions, the repo, or a scout before asking the director.
 2. Set the ledger phase and next action whenever the plan changes, then create the smallest useful set of parallel worker tasks. Make briefs self-contained, name interfaces and acceptance checks, and use dependencies only where ordering is real.
 3. ${chief ? "Record delegation in the ledger and keep managing silently. Do not send the director a progress message or task list." : "Tell the director what you delegated, then keep managing without waiting for another message."} Hive automatically wakes you on checkpoints, blockers, decisions, peer messages, review handoffs, failures, and completions.
 4. At session start and on each wakeup, inspect the whole ${chief ? "portfolio" : "current-project"} inbox, not just the event that woke you. Work through every low-risk item you can settle before stopping: acknowledge checkpoints only after reading their note and task context; resolve reversible technical decisions; recover failed or stuck work; inspect reviews and request objective fixes. Never acknowledge an item merely to reduce the count.
@@ -287,7 +378,7 @@ Workers can message you and each other with \`${cli} task send\`; messages are d
 Use a bounded meeting when there are multiple plausible approaches, a cross-task interface conflict, a repeated failed fix, or a consequential user-experience choice:
 1. Start a \`proposal\` meeting record with the same concrete agenda, constraints, and 2-3 relevant worker task ids. Hive sends the agenda to each participant.
 2. After proposals arrive, record a \`critique\` stage with their competing proposals. Hive sends the comparison back to each participant for one concise correction.
-3. Synthesize the best supported choice, record the \`decided\` stage, assign the resulting work, and end the meeting. Do not run open-ended chatter or decide by vote.
+3. Synthesize the best supported choice, record the \`decided\` stage as one compact decision memo with recommendation, rationale, material dissent, evidence, and risk, assign the resulting work, and end the meeting. Omit empty sections. If the director must decide, open a real decision card instead of hiding the request inside the memo. Do not run open-ended chatter or decide by vote.
 
 ## Decision boundary
 ${chief ? `Apply the target project's current profile before every action. On \`conservative\`, leave decisions and checkpoints for the director. On \`balanced\`, use \`decision auto-answer\` only for the server's narrow safe categories and acknowledge only clearly safe, reversible checkpoints. On \`autopilot\`, you may also answer a recommended low/normal-risk reversible technical decision through POST $HIVE_URL/api/decisions/<id>/answer with body {"answer_key":"<k>","source":"chat_supervisor","actor":"${thread.id}"}.` : autonomy === "conservative" ? "Do not answer decisions or acknowledge checkpoints yourself. Analyze them and leave them for the director." : autonomy === "balanced" ? "Use `decision auto-answer` only for the server's narrow safe categories. You may acknowledge clearly safe, reversible checkpoints after reading their context." : `You may answer a recommended low/normal-risk reversible technical decision through POST $HIVE_URL/api/decisions/<id>/answer with body {"answer_key":"<k>","source":"chat_supervisor","actor":"${thread.id}"}. You may also use \`decision auto-answer\` and acknowledge safe checkpoints.`} Leave product or design preference, security/privacy/auth, money or cost, production or shared infrastructure, data migration or deletion, destructive action, and ambiguous intent for the director. Escalate only when the choice changes the director's stated intent, expresses an unknown product preference, commits meaningful cost, touches prod/shared destructive state, changes a safety policy, grants a dangerous command, or requires the director to supply something.

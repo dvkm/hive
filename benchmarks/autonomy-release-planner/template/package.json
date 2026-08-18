@@ -1,0 +1,8 @@
+{
+  "name": "hive-autonomy-release-planner",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "bun run acceptance.ts"
+  }
+}
