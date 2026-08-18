@@ -20,7 +20,9 @@ const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x
 // A stub herdr for the full visible-fleet spawn; records send() calls.
 function stubHerdr(sendResult: ExecResult = OK()) {
   const sends: { target: string; message: string }[] = [];
+  const calls: string[][] = [];
   const exec: Exec = async (argv) => {
+    calls.push(argv);
     if (has(argv, "worktree", "create")) return OK(`{"result":{"worktree":{"path":${JSON.stringify(WT)},"branch":"hive/x","open_workspace_id":"w1"}}}`);
     if (has(argv, "agent", "get")) return OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}');
     if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
@@ -31,7 +33,7 @@ function stubHerdr(sendResult: ExecResult = OK()) {
     }
     return OK();
   };
-  return { herdr: new Herdr(exec, "herdr"), sends };
+  return { herdr: new Herdr(exec, "herdr"), sends, calls };
 }
 
 const db = openDb(":memory:");
@@ -39,14 +41,14 @@ let server: any;
 let BASE = "";
 let projectId = "";
 let taskId = "";
-const { herdr, sends } = stubHerdr();
+const { herdr, sends, calls } = stubHerdr();
 
 beforeAll(async () => {
   server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr }) });
   BASE = `http://127.0.0.1:${server.port}`;
   const p = await (await fetch(BASE + "/api/projects", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: "p", repo_path: "/repo", config: { default_branch: "main" } }),
+    body: JSON.stringify({ name: "p", repo_path: "/repo", config: {} }),
   })).json();
   projectId = p.id;
   const t = await (await fetch(BASE + "/api/tasks", {
@@ -78,6 +80,9 @@ test("spawn endpoint starts the agent and moves the task to in_progress", async 
   expect(task.json.branch).toBe("hive/x");
   expect(task.json.worktree_path).toBe(WT);
   expect(task.json.events.some((e: any) => e.type === "spawned")).toBe(true);
+  const create = calls.find((argv) => has(argv, "worktree", "create"));
+  expect(create).toBeDefined();
+  expect(create!.slice(create!.indexOf("--base"), create!.indexOf("--base") + 2)).toEqual(["--base", "main"]);
   // hook wiring is written into the worktree (structural reporting).
   expect(existsSync(join(WT, ".claude", "settings.local.json"))).toBe(true);
 });
