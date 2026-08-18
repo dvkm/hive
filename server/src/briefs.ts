@@ -67,6 +67,8 @@ Rules:
        "background": "one sentence of system context needed to follow the change",
        "essence": "the goal and core idea in plain language, before code details",
        "walkthrough": ["2-4 causal steps in the order a person should learn them"],
+       "affected_areas": ["users, systems, or decisions materially affected"],
+       "risk_assessment": "confidence, important uncertainty, and what could change the conclusion",
        "participate": "what this now lets the director decide, question, or build next",
        "check": {
          "question": "one conceptual self-check, not trivia",
@@ -75,9 +77,12 @@ Rules:
          "explanation": "why the answer is right"}}}
   \`understanding.check\` is REQUIRED for every review, including report-only
   work. It is the director's approval gate, so use 2-4 plausible options that
-  test the core idea. For a report, use the packet to explain its thesis,
-  evidence chain, and implications, then test one decision-relevant takeaway.
-  Keep the whole packet short and teach only the background needed.
+  test the core idea. For a report, make the packet read like a compact impact
+  analysis: background = question and scope, essence = headline finding,
+  walkthrough = evidence chain, affected_areas = blast radius,
+  risk_assessment = confidence and uncertainty, and participate = recommended
+  next decision. Then test one decision-relevant takeaway. Keep the whole
+  packet short and teach only the background needed.
   Honesty rule: "iffy" is MANDATORY when anything is uncertain, hacky, or has a
   known ceiling — an empty iffy list on risky work reads as hiding it.
 - When you hit a decision the director must make, open a REAL decision card with
