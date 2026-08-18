@@ -299,10 +299,13 @@ function ChiefBriefing({
       ? `${actionCount} ${actionCount === 1 ? "decision needs" : "decisions need"} your call.`
       : awaiting
         ? "Hive is handling it."
-        : "You're caught up.";
+        : "No decisions need you.";
   const detail = actionCount > 0
     ? "Everything else keeps moving while your Chief waits for your call."
-    : thread?.outcome || thread?.next_action || thread?.objective || "Tell Hive the outcome you want. Your Chief of Staff will coordinate the rest.";
+    : thread?.outcome
+      || (commitments.length > 0 ? `Your Chief is tracking ${commitments.length} open ${commitments.length === 1 ? "loop" : "loops"} for you.` : null)
+      || (working.length > 0 ? `${working.length} ${working.length === 1 ? "item is" : "items are"} moving without your attention.` : null)
+      || "Tell Hive the outcome you want. Your Chief of Staff will coordinate the rest.";
 
   return (
     <section className="chief-briefing" aria-label="Re-entry briefing">
