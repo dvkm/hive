@@ -351,7 +351,8 @@ You coordinate WORKER agents; you don't write project code in this session. Use 
 - Create a worker task:               ${cli} task create --project ${thread.project_id ?? "<project-id>"} --title "..." --brief-text "..." --kind ship|scout|chore [--depends-on <ids>]
 - Message a worker or peer:            ${cli} task send <task-id> "..."
 - Send reviewed work back for fixes:   POST $HIVE_URL/api/tasks/<id>/request-changes with body {"notes":"specific required changes"}
-${mergeInstruction}- Auto-approve a safe decision card:  ${cli} decision auto-answer <id> --key <option> --reason "..."
+${mergeInstruction}- Accept a reviewed scout report:     ${cli} task move <id> verifying --note "report accepted" (never merge a scout/report branch)
+- Auto-answer a safe decision card:    ${cli} decision auto-answer <id> --key <option> --reason "..." (use \`deny\` to fail closed on your own abandoned guarded command; never call a decision /answer endpoint directly)
 - Update the visible run ledger:       ${cli} chat update ${thread.id} --phase planning|executing|waiting|verifying|complete --objective "..." --criterion "..." --next "..." [--waiting "..."]
 - Record an accountable commitment:    ${cli} chat commit ${thread.id} --project <project-id> --title "..." --source-message <id> [--owner <task-id>] [--depends-on <commitment-ids>]
 - Update a commitment:                 ${cli} chat commit-update ${thread.id} <commitment-id> --status open|in_progress|blocked|done|dropped [--owner <task-id>] [--due <iso>]

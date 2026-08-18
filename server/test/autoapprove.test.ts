@@ -93,6 +93,35 @@ test("a pending standing-authority grant is a hard exclusion even if recommended
   expect(v.category).toBe("authority");
 });
 
+test("denying a pending standing-authority command is fail-closed and auto-answerable", () => {
+  const id = seedDecision({
+    title: "Authorize: command.dangerous.force-delete-branch",
+    risk: "high",
+    options: [{ key: "approve", label: "approve" }, REC("deny")],
+  });
+  db.query(
+    "INSERT INTO authority_grants (id, task_id, action, target, decision_id, status, created_at) VALUES (?,?,?,?,?, 'pending', ?)"
+  ).run(newId("agr"), taskId, "command.dangerous.force-delete-branch", "git branch -D tmp", id, now());
+  const v = evaluateAutoApprove(db, db.query("SELECT * FROM decisions WHERE id=?").get(id), "deny");
+  expect(v.allow).toBe(true);
+  expect(v.category).toBe("authority_deny");
+});
+
+test("apiAutoAnswerDecision resolves a recommended authority deny without granting the command", async () => {
+  const d = createDecision(db, {
+    task_id: taskId,
+    title: "command approval (dangerous): force-delete branch",
+    risk: "high",
+    options: [{ key: "approve", label: "Approve" }, { key: "deny", label: "Deny", recommended: true }],
+  });
+  db.query(
+    "INSERT INTO authority_grants (id, task_id, action, target, decision_id, status, created_at) VALUES (?,?,?,?,?, 'pending', ?)"
+  ).run(newId("agr"), taskId, "command.dangerous.force-delete-branch", "git branch -D tmp", d.id, now());
+  const res = apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "deny", answer_note: "leave the harmless ref" });
+  expect(res.status).toBe(200);
+  expect((db.query("SELECT status FROM authority_grants WHERE decision_id=?").get(d.id) as any).status).toBe("denied");
+});
+
 test("high risk, prod blast radius, and non-recommended options each escalate", () => {
   const highRisk = seedDecision({ title: "Save recurring link as a project reference? https://x", risk: "high", options: [REC("save")] });
   expect(evaluateAutoApprove(db, db.query("SELECT * FROM decisions WHERE id=?").get(highRisk), "save").allow).toBe(false);

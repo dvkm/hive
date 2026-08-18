@@ -930,7 +930,10 @@ auto-answer endpoint; `conservative` leaves both decisions and checkpoints to
 the director. It must
 escalate unknown director intent or product preference, meaningful cost,
 prod/shared destructive state, safety-policy changes, dangerous-command grants,
-and inputs only the director can supply.
+and inputs only the director can supply. Denying a pending guarded command is
+fail-closed and may use the safe auto-answer endpoint; approving one always
+remains a director action. Report-only scout handoffs are accepted by moving
+the task through `verifying`, never through the merge endpoint.
 Conversation history persists in `chat_threads` / `chat_messages` (append-only,
 same shape as `events`); each thread's `task_id` is its backing supervisor task
 (`source='chat_supervisor'`, kept out of the dispatcher and the board lanes). The thread is also the durable run ledger: `objective`, `acceptance_criteria[]`, `phase`, `next_action`, `waiting_on`, `wakeup_at`, `outcome`, and `completed_at` survive supervisor restarts.

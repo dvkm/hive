@@ -2155,6 +2155,8 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
   if (!task) return err("task not found", 404);
   if (task.state !== "in_review")
     return err(`task is '${task.state}', not 'in_review'; only in-review tasks can be merged`, 409);
+  if (task.kind === "scout")
+    return err(`scout tasks are report-only; accept the report by moving task '${id}' to 'verifying' instead of merging its branch`, 409);
 
   const blocked = authzBlock(db, { project_id: task.project_id, action: "task.merge", target: task.title, task_id: id });
   if (blocked) return blocked;

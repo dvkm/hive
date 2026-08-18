@@ -14,8 +14,8 @@
 //   - only the RAISER's own `recommended` option may be auto-selected (this is
 //     also the confidence gate: dedup marks `merge` recommended only above its
 //     0.8 similarity threshold, so a weak match never clears);
-//   - a pending standing-authority grant is a HARD structural exclusion — the
-//     one class the scout flagged as never-auto-approvable by category.
+//   - a pending standing-authority grant can never be approved automatically;
+//     its recommended `deny` remains fail-closed and safe to clear.
 import type { DB } from "./db.ts";
 
 export interface AutoApproveVerdict {
@@ -43,8 +43,13 @@ function safetyBar(db: DB, d: any, answerKey: string): AutoApproveVerdict | null
   const options: any[] = Array.isArray(d.options) ? d.options : JSON.parse(d.options || "[]");
   const chosen = options.find((o) => o.key === answerKey);
   const no = (category: string, reason: string): AutoApproveVerdict => ({ allow: false, category, reason });
-  if (db.query("SELECT 1 FROM authority_grants WHERE decision_id = ? AND status = 'pending'").get(d.id))
-    return no("authority", "gates a standing-authority command grant — always the director's call");
+  const pendingAuthority = db.query("SELECT 1 FROM authority_grants WHERE decision_id = ? AND status = 'pending'").get(d.id);
+  if (pendingAuthority) {
+    if (answerKey !== "deny")
+      return no("authority", "gates a standing-authority command grant — always the director's call");
+    if (!chosen?.recommended) return no("authority", "only a recommended deny may fail closed automatically");
+    return null;
+  }
   if (!chosen?.recommended) return no("*", "only the raiser's recommended option can be auto-approved");
   const risk = String(d.risk ?? "").toLowerCase();
   if (risk !== "low" && risk !== "normal") return no("*", `risk '${d.risk ?? "(none)"}' is above the auto-approve bar`);
@@ -60,6 +65,12 @@ export function evaluateAutoApprove(db: DB, d: any, answerKey: string): AutoAppr
   const no = (category: string, reason: string): AutoApproveVerdict => ({ allow: false, category, reason });
   const blocked = safetyBar(db, d, answerKey);
   if (blocked) return blocked;
+
+  // Refusing an unexecuted guarded command is fail-closed. Let the supervisor
+  // clear its own abandoned cleanup request without asking the director, while
+  // every approval path above remains a hard human boundary.
+  if (answerKey === "deny" && db.query("SELECT 1 FROM authority_grants WHERE decision_id = ? AND status = 'pending'").get(d.id))
+    return { allow: true, category: "authority_deny", reason: "denies a pending guarded command without executing it" };
 
   // ---- the closed allow-list ------------------------------------------------
   // Reference capture: worst case is a stale, trivially-editable reference.
