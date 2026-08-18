@@ -26,3 +26,21 @@ test("needs-you queue includes every actionable item", () => {
   expect(items.map((item) => item.kind)).toEqual(["decision", "checkpoint", "quiz", "review", "attention", "attention"]);
   expect(items.map((item) => item.id)).toEqual(["decision-1", "checkpoint-1", "quiz-1", "review-1", "failed-1", "stuck-1"]);
 });
+
+test("reviews with pending CI do not hide actionable reviews", () => {
+  const items = getNeedsYouItems(
+    [],
+    [
+      task("pending", "in_review", { kind: "ship", pr_url: "https://example.com/pending", ci_status: "pending" }),
+      ...[1, 2, 3, 4].map((number) => task(`ready-${number}`, "in_review", {
+        kind: "ship",
+        pr_url: `https://example.com/ready-${number}`,
+        ci_status: "passing",
+      })),
+    ],
+    [],
+    []
+  );
+
+  expect(items.map((item) => item.id)).toEqual(["ready-1", "ready-2", "ready-3", "ready-4", "pending"]);
+});

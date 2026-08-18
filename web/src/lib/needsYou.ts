@@ -14,6 +14,10 @@ export function taskNeedsAttention(task: Task): boolean {
   return !!task.health && (task.health.status === "dead" || task.health.status === "stuck");
 }
 
+function reviewIsActionable(task: Task): boolean {
+  return task.kind === "scout" || (!!(task.pr_url || task.branch) && task.ci_status !== "pending" && task.ci_status !== "failing");
+}
+
 export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoints: Checkpoint[], quizzes: UnderstandingQuiz[]): NeedsYouItem[] {
   return [
     ...decisions.map((decision) => ({ kind: "decision" as const, id: decision.id, decision })),
@@ -24,7 +28,10 @@ export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoin
         return !["in_progress", "in_review", "needs_decision"].includes(state);
       })
       .map((quiz) => ({ kind: "quiz" as const, id: quiz.id, quiz })),
-    ...tasks.filter((task) => task.state === "in_review").map((task) => ({ kind: "review" as const, id: task.id, task })),
+    ...tasks
+      .filter((task) => task.state === "in_review")
+      .sort((a, b) => Number(reviewIsActionable(b)) - Number(reviewIsActionable(a)))
+      .map((task) => ({ kind: "review" as const, id: task.id, task })),
     ...tasks.filter(taskNeedsAttention).map((task) => ({ kind: "attention" as const, id: task.id, task })),
   ];
 }
