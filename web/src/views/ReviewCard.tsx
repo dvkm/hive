@@ -275,10 +275,11 @@ export function ReviewCard({
 
   const [mergeErr, setMergeErr] = useState<string>("");
   // The CTA must not promise what the state can't deliver ("Approve & merge"
-  // on red CI / no PR was a lie that failed on click). Scouts have nothing to
-  // merge — accepting the report is the whole review.
+  // on red CI / no PR was a lie that failed on click). Scouts and no-change
+  // chores have nothing to merge; accepting the report is the whole review.
   const isScout = task.kind === "scout";
-  const mergeBlocked = !isScout
+  const reportOnly = isScout || (task.kind === "chore" && diff?.files.length === 0);
+  const mergeBlocked = !reportOnly
     ? task.ci_status === "failing"
       ? "CI is failing — the agent has been told to iterate; unlocks when green"
       : task.ci_status === "pending"
@@ -292,13 +293,13 @@ export function ReviewCard({
     ? "Make the open decision first"
     : mergeBlocked
       ? "Wait to merge"
-      : isScout
+      : reportOnly
         ? "Accept this report"
         : "Approve and merge";
   const recommendationReason = openDecisions.length
     ? `${openDecisions.length} decision${openDecisions.length === 1 ? "" : "s"} still need your judgment.`
     : mergeBlocked ||
-      (isScout
+      (reportOnly
         ? "Hive finished the research and submitted its evidence."
         : task.ci_status === "passing"
           ? "CI passed and Hive found no blocking issue."
@@ -308,7 +309,7 @@ export function ReviewCard({
     setBusy(true);
     setMergeErr("");
     try {
-      if (isScout) {
+      if (reportOnly) {
         await api.transition(task.id, "verifying");
         toast("Report accepted");
       } else {
@@ -404,7 +405,7 @@ export function ReviewCard({
 
       <div className="review-actions">
         <button className="btn btn-primary" onClick={() => merge()} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
-          {busy ? "Working…" : isScout ? "Accept report" : "Approve & merge"}
+          {busy ? "Working…" : reportOnly ? "Accept report" : "Approve & merge"}
         </button>
         <button className="btn" onClick={() => setMode(mode === "changes" ? null : "changes")}>
           Request changes

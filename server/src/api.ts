@@ -2080,36 +2080,52 @@ async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason
   return err(reason, 409);
 }
 
-// Fast-forward the project's default branch to the task branch tip, in the
-// primary checkout. Requires the checkout to be ON `base` (git merge --ff-only
-// lands on whatever HEAD is, not on the named ref) and `base` (the LOCAL ref,
-// which can be ahead of origin/<base>) to be an ancestor of `task.branch` — a
-// diverged/conflicting branch is refused, no working tree is touched. Returns
-// null on success, or a failure reason string.
+// Fast-forward the project's default branch to the task branch tip. If the
+// primary checkout is on `base`, use git merge so its working tree follows the
+// ref. Otherwise update the un-checked-out ref atomically, leaving the user's
+// current branch untouched. A base checked out in another worktree is refused
+// rather than leaving that worktree's files out of sync. Returns null on
+// success, or a failure reason string.
 async function attemptLocalFf(exec: Exec, project: any, task: any, base: string): Promise<string | null> {
-  const head = await exec(["git", "-C", project.repo_path, "symbolic-ref", "--short", "HEAD"]);
-  const current = head.stdout.trim();
-  if (head.code !== 0 || current !== base) {
-    return (
-      `primary checkout's HEAD is on '${current || "a detached commit"}', not '${base}'; ` +
-      `switch the primary checkout to '${base}' before merging.`
-    );
-  }
-  const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", base, task.branch]);
+  const baseSha = await exec(["git", "-C", project.repo_path, "rev-parse", base]);
+  const branchSha = await exec(["git", "-C", project.repo_path, "rev-parse", task.branch]);
+  const oldSha = baseSha.stdout.trim();
+  const newSha = branchSha.stdout.trim();
+  if (baseSha.code !== 0 || branchSha.code !== 0 || !oldSha || !newSha)
+    return baseSha.stderr.trim() || branchSha.stderr.trim() || "could not resolve merge refs";
+
+  const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", oldSha, newSha]);
   if (anc.code !== 0) {
     // Name the exact commit compared against: this is the primary checkout's
     // LOCAL base ref, which can be ahead of origin/<base> — an agent rebased
     // onto origin/main and hit this identical failure twice before digging
     // out that hive checks a different, unfetchable-by-name ref.
-    const sha = (await exec(["git", "-C", project.repo_path, "rev-parse", "--short", base])).stdout.trim();
     return (
-      `'${base}' (LOCAL ref in the primary checkout${sha ? `, ${sha}` : ""} — may be ahead of origin/${base}) ` +
+      `'${base}' (LOCAL ref in the primary checkout, ${oldSha.slice(0, 12)}, may be ahead of origin/${base}) ` +
       `is not an ancestor of '${task.branch}'; not a fast-forward. Rebase onto that exact commit ` +
       `(git fetch <primary-checkout> ${base}) or open a PR.`
     );
   }
-  const r = await exec(["git", "-C", project.repo_path, "merge", "--ff-only", task.branch]);
-  if (r.code !== 0) return r.stderr.trim() || r.stdout.trim() || `git merge --ff-only exited ${r.code}`;
+  const head = await exec(["git", "-C", project.repo_path, "symbolic-ref", "--short", "HEAD"]);
+  const current = head.stdout.trim();
+  if (head.code === 0 && current === base) {
+    const r = await exec(["git", "-C", project.repo_path, "merge", "--ff-only", task.branch]);
+    if (r.code !== 0) return r.stderr.trim() || r.stdout.trim() || `git merge --ff-only exited ${r.code}`;
+    return null;
+  }
+
+  const worktrees = await exec(["git", "-C", project.repo_path, "worktree", "list", "--porcelain"]);
+  if (worktrees.code !== 0) return worktrees.stderr.trim() || "could not inspect project worktrees";
+  const holder = worktrees.stdout
+    .split(/\n\n+/)
+    .find((block) => block.split("\n").includes(`branch refs/heads/${base}`));
+  if (holder) {
+    const path = holder.split("\n").find((line) => line.startsWith("worktree "))?.slice(9) || "another worktree";
+    return `'${base}' is checked out at '${path}'; merge from that checkout before retrying.`;
+  }
+
+  const r = await exec(["git", "-C", project.repo_path, "update-ref", `refs/heads/${base}`, newSha, oldSha]);
+  if (r.code !== 0) return r.stderr.trim() || r.stdout.trim() || `git update-ref exited ${r.code}`;
   return null;
 }
 
@@ -2466,7 +2482,7 @@ export async function spawnAgent(
       hiveUrl,
       title: task.title,
       brief,
-      base: config.default_branch,
+      base: config.default_branch || "main",
       env,
       model: modelForTask(config, task.kind),
       agentArgv: config.agent_argv, // optional per-project override (verbatim)

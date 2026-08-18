@@ -122,12 +122,16 @@ function makeServer(
     reviewDecision?: string;
     rollup?: any[];
     deadAgent?: boolean;
+    baseWorktreePath?: string;
+    updateRefCode?: number;
+    updateRefStderr?: string;
   } = {}
 ) {
   const db = openDb(":memory:");
   const sends: { target: string; message: string }[] = [];
   const removed: string[] = [];
   const ghMergeCalls: string[][] = [];
+  const updateRefCalls: string[][] = [];
   // Mutable so a test can reach in_review with green checks and only then flip
   // the PR's state — the same `gh pr view` stub answers both the ready-time
   // hand-off and the merge probe, so a pending rollup set up front would hold
@@ -150,6 +154,17 @@ function makeServer(
     if (has(argv, "git", "merge", "--ff-only")) {
       const code = opts.gitMergeCode ?? 0;
       return { code, stdout: "", stderr: code ? opts.gitMergeStderr ?? "CONFLICT (content): merge conflict in x" : "" };
+    }
+    if (has(argv, "git", "worktree", "list", "--porcelain")) {
+      const primary = `worktree /repo\nbranch refs/heads/${opts.headBranch ?? "main"}\n`;
+      const base = opts.baseWorktreePath ? `\nworktree ${opts.baseWorktreePath}\nbranch refs/heads/main\n` : "";
+      return OK(primary + base);
+    }
+    if (has(argv, "git", "rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
+    if (has(argv, "git", "update-ref")) {
+      updateRefCalls.push(argv);
+      const code = opts.updateRefCode ?? 0;
+      return { code, stdout: "", stderr: code ? opts.updateRefStderr ?? "cannot lock ref" : "" };
     }
     if (has(argv, "git", "diff")) return OK(SAMPLE);
     // herdr worktree/agent plumbing during spawn:
@@ -176,7 +191,7 @@ function makeServer(
   const herdr = new Herdr(exec, "herdr");
   const server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr, exec }) });
   const base = `http://127.0.0.1:${server.port}`;
-  return { db, server, base, sends, removed, ghMergeCalls, prView };
+  return { db, server, base, sends, removed, ghMergeCalls, updateRefCalls, prView };
 }
 
 async function post(base: string, path: string, body: unknown) {
@@ -372,14 +387,36 @@ test("merge_strategy: 'local_ff' still refuses a CLOSED PR", async () => {
   s.server.stop(true);
 });
 
-// git merge --ff-only lands on whatever HEAD is, not on the named base ref —
-// a checkout parked elsewhere would silently ff that other branch instead.
-test("local ff refuses when the primary checkout is not on the base branch", async () => {
+test("local ff atomically advances an un-checked-out base without switching the primary checkout", async () => {
   const s = makeServer({ headBranch: "some/feature" });
   const id = await inReviewWithPr(s.base, "https://gh/pr/333");
   const r = await post(s.base, `/api/tasks/${id}/merge`, { merge_strategy: "local_ff" });
+  expect(r.status).toBe(200);
+  expect(s.updateRefCalls[0]?.slice(-3)).toEqual(["refs/heads/main", "branch-sha", "base-sha"]);
+  const ev = await get(s.base, `/api/tasks/${id}/events`);
+  expect(ev.json.some((e: any) => e.type === "merged")).toBe(true);
+  s.server.stop(true);
+});
+
+test("local ff refuses to desynchronize a base checked out in another worktree", async () => {
+  const s = makeServer({ headBranch: "some/feature", baseWorktreePath: "/repo-main" });
+  const id = await inReviewWithPr(s.base, "https://gh/pr/334");
+  const r = await post(s.base, `/api/tasks/${id}/merge`, { merge_strategy: "local_ff" });
   expect(r.status).toBe(409);
-  expect(r.json.error).toContain("some/feature");
+  expect(r.json.error).toContain("/repo-main");
+  expect(s.updateRefCalls.length).toBe(0);
+  const ev = await get(s.base, `/api/tasks/${id}/events`);
+  expect(ev.json.some((e: any) => e.type === "merged")).toBe(false);
+  s.server.stop(true);
+});
+
+test("local ff reports an atomic ref race without recording a merge", async () => {
+  const s = makeServer({ headBranch: "some/feature", updateRefCode: 1, updateRefStderr: "cannot lock ref: expected base-sha" });
+  const id = await inReviewWithPr(s.base, "https://gh/pr/335");
+  const r = await post(s.base, `/api/tasks/${id}/merge`, { merge_strategy: "local_ff" });
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("cannot lock ref");
+  expect((await get(s.base, `/api/tasks/${id}`)).json.state).toBe("in_review");
   const ev = await get(s.base, `/api/tasks/${id}/events`);
   expect(ev.json.some((e: any) => e.type === "merged")).toBe(false);
   s.server.stop(true);
