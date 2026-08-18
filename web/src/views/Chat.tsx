@@ -342,6 +342,7 @@ function ChiefBriefing({
 
 export default function Chat({ embedded = false }: { embedded?: boolean }) {
   const { projects, tasks, decisions, feedEvents, chatThreadId, chatMessages, openChatThread } = useStore();
+  const [lastSeen] = useState(() => localStorage.getItem(CHIEF_LAST_SEEN));
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [text, setText] = useState("");
@@ -443,11 +444,12 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
     const openDecisionMessage = [...chatMessages].reverse().find((message) =>
       message.actions?.some((action) => action.type === "decision" && action.decision_id && openDecisionIds.has(action.decision_id))
     );
-    if (lastDirector) ids.add(lastDirector.id);
-    if (lastAssistant) ids.add(lastAssistant.id);
+    const unseen = (message: ChatMessage) => !lastSeen || message.ts > lastSeen;
+    if (lastDirector && (awaiting || unseen(lastDirector))) ids.add(lastDirector.id);
+    if (lastAssistant && unseen(lastAssistant)) ids.add(lastAssistant.id);
     if (openDecisionMessage) ids.add(openDecisionMessage.id);
     return chatMessages.filter((message) => ids.has(message.id));
-  }, [chatMessages, decisions]);
+  }, [chatMessages, decisions, awaiting, lastSeen]);
   const hiddenMessageCount = chatMessages.length - focusedMessages.length;
   const visibleMessages = historyOpen ? chatMessages : focusedMessages;
   const focusedDecisionMessageId = focusedMessages.find((message) =>
