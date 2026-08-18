@@ -16,6 +16,7 @@ test("needs-you queue includes every actionable item", () => {
       task("failed-1", "failed"),
       task("requeued-1", "failed", { requeued_to: "successor" }),
       task("stuck-1", "in_progress", { health: { status: "stuck", reason: null, since: "now" } }),
+      task("manager-1", "in_progress", { source: "chat_supervisor", health: { status: "stuck", reason: null, since: "now" } }),
       task("quiz-task", "done"),
     ],
     [checkpoint],

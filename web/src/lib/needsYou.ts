@@ -8,6 +8,7 @@ export type NeedsYouItem =
   | { kind: "attention"; id: string; task: Task };
 
 export function taskNeedsAttention(task: Task): boolean {
+  if (task.source === "chat_supervisor") return false;
   if (task.state === "in_review" || task.state === "needs_decision") return false;
   if (task.state === "failed") return !task.requeued_to;
   return !!task.health && (task.health.status === "dead" || task.health.status === "stuck");
