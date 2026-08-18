@@ -3920,7 +3920,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       const text = (value: unknown, max = 600) =>
         typeof value === "string" && value.trim() ? value.trim().slice(0, max) : undefined;
       const understanding: Record<string, unknown> = {};
-      for (const key of ["background", "essence", "risk_assessment", "participate"]) {
+      for (const key of ["background", "scope", "essence", "risk_assessment", "participate"]) {
         const value = text(rawUnderstanding[key]);
         if (value) understanding[key] = value;
       }
