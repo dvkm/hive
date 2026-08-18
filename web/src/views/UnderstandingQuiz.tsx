@@ -9,7 +9,7 @@ export function UnderstandingQuiz({
   onPassed,
   onDeferred,
 }: {
-  quiz: Pick<Quiz, "task_id" | "question" | "options">;
+  quiz: Pick<Quiz, "task_id" | "question" | "options" | "completed" | "total">;
   allowDefer?: boolean;
   onPassed?: (explanation: string | null) => void;
   onDeferred?: () => void;
@@ -43,9 +43,15 @@ export function UnderstandingQuiz({
     setBusy(true);
     try {
       const result = await api.answerUnderstandingQuiz(currentQuiz.task_id, answer);
-      if (result.correct) {
+      if (result.passed) {
         toast("Understanding confirmed");
         onPassed?.(result.explanation);
+      } else if (result.correct && result.quiz) {
+        toast(`Correct. ${result.completed} of ${result.total}`);
+        setCurrentQuiz({ task_id: currentQuiz.task_id, ...result.quiz });
+        setAnswer("");
+        setFeedback("");
+        setRound((value) => value + 1);
       } else {
         setFeedback(result.explanation || "Review the explanation and apply the idea again.");
         if (result.quiz) setCurrentQuiz({ task_id: currentQuiz.task_id, ...result.quiz });
@@ -75,7 +81,10 @@ export function UnderstandingQuiz({
 
   return (
     <section className="understanding-quiz">
-      <div className="understanding-quiz-label">Before you approve</div>
+      <div className="understanding-quiz-label">
+        Before you approve
+        {(currentQuiz.total ?? 1) > 1 && ` · Question ${(currentQuiz.completed ?? 0) + 1} of ${currentQuiz.total}`}
+      </div>
       {feedback && <p className="understanding-quiz-wrong">Not quite. {feedback} Try this from another angle.</p>}
       <h4>{currentQuiz.question}</h4>
       <div className="understanding-quiz-options">

@@ -77,9 +77,10 @@ Rules:
          "answer_key": "a",
          "explanation": "why the answer is right"}]}}
   \`understanding.checks\` is REQUIRED for every review, including report-only
-  work. Provide exactly 3 questions that test the same core idea from genuinely
-  different angles or scenarios, not superficial rewordings. Each needs 2-4
-  plausible options and a short teaching explanation. Hive rotates questions
+  work. Provide 1-5 questions. Use one for a single, straightforward takeaway;
+  add more only when each tests a distinct decision-relevant idea, angle, or
+  scenario, never superficial rewordings. Each needs 2-4 plausible options and
+  a short teaching explanation. Hive rotates questions
   after a miss and shuffles option order, so never depend on answer position.
   For a report, make the packet read like a compact impact
   analysis: background = why the report was commissioned and relevant prior
