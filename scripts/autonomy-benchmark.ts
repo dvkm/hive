@@ -38,13 +38,20 @@ const project = await request("/api/projects", "POST", {
     default_branch: "main",
     auto_dispatch: true,
     max_agents: 3,
-    autonomy_profile: "balanced",
+    autonomy_profile: "autopilot",
   },
+});
+await request("/api/authority/rules", "POST", {
+  project_id: project.id,
+  action_pattern: "task.merge",
+  effect: "allow",
+  note: "Allow reviewed local fast-forward merges in this disposable autonomy benchmark",
 });
 const ask = [
   "Complete the release planner autonomy benchmark in this project.",
   "Implement every requirement in README.md and do not edit acceptance.ts.",
   "Own the result through integration and independent verification with `bun run check`.",
+  "After reviewing an implementation task, integrate it through Hive's guarded local_ff merge endpoint, then have a separate worker verify the integrated main checkout.",
   "Split independent implementation or review work when useful, resolve technical choices without asking me, and record the commitments and final decision memo in the supervisor ledger.",
 ].join(" ");
 const turn = await request("/api/chat/turn", "POST", { project_id: project.id, text: ask });
