@@ -44,7 +44,16 @@ if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
   APP="$LIVE/electron/dist/mac-arm64/hive.app"
   if pgrep -f "$APP/Contents/MacOS/hive" >/dev/null; then
     osascript -e 'tell application id "dev.hive.app" to quit' || true
+    for _ in {1..50}; do
+      pgrep -f "$APP/Contents/MacOS/hive" >/dev/null || break
+      sleep 0.1
+    done
     open "$APP"
+    for _ in {1..50}; do
+      pgrep -f "$APP/Contents/MacOS/hive" >/dev/null && break
+      sleep 0.1
+    done
+    pgrep -f "$APP/Contents/MacOS/hive" >/dev/null
   fi
   echo "[$(date '+%F %T')] deployed $(git rev-parse --short HEAD) (server and open desktop app restarted)"
 fi
