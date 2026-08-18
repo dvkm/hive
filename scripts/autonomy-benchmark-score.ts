@@ -21,6 +21,8 @@ const tasks = await get(`/api/tasks?project_id=${metadata.project_id}`);
 const decisions = await get(`/api/decisions?status=open&project_id=${metadata.project_id}`);
 const workers = tasks.filter((task: any) => task.source !== "chat_supervisor");
 const directorTurns = thread.messages.filter((message: any) => message.role === "director").length;
+const commitments = thread.commitments ?? [];
+const decisionMemos = (thread.meetings ?? []).filter((meeting: any) => meeting.stage === "decided");
 const checks = {
   acceptance_passed: acceptance.exitCode === 0,
   evaluator_unchanged: acceptanceHash === metadata.acceptance_sha256,
@@ -29,6 +31,8 @@ const checks = {
   retrospective_recorded: !!thread.retrospectives?.length,
   no_extra_human_turns: directorTurns === 1,
   no_open_decisions: decisions.length === 0,
+  commitments_completed: commitments.length > 0 && commitments.every((commitment: any) => commitment.status === "done"),
+  decision_memo_recorded: decisionMemos.length > 0,
 };
 const passed = Object.values(checks).filter(Boolean).length;
 console.log(JSON.stringify({
@@ -36,10 +40,10 @@ console.log(JSON.stringify({
   checks,
   worker_tasks: workers.length,
   failed_workers: workers.filter((task: any) => task.state === "failed").length,
-  commitments: thread.commitments?.length ?? 0,
-  decision_memos: (thread.meetings ?? []).filter((meeting: any) => meeting.stage === "decided").length,
+  commitments: commitments.length,
+  decision_memos: decisionMemos.length,
   acceptance_output: acceptance.stdout.toString().trim(),
   acceptance_errors: acceptance.stderr.toString().trim(),
 }, null, 2));
 
-if (!checks.acceptance_passed || !checks.evaluator_unchanged) process.exit(1);
+if (passed !== Object.keys(checks).length) process.exit(1);
