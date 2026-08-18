@@ -345,6 +345,39 @@ test("idle backstop never re-reviews after changes_requested until new evidence 
   expect(advanceIfFinished(db, id, "idle", "test")).toBe(true); // visible new work → review
 });
 
+test("a director answer keeps an old report and quiz out of review until regenerated", async () => {
+  const { decisionAnswerUnaddressed, writeEvent } = await import("../src/state.ts");
+  const id = await newTask("refresh after my answer");
+  await post(`/api/tasks/${id}/spawn`, {});
+  const review = () => post(`/api/tasks/${id}/events`, {
+    type: "review_summary",
+    done: ["investigated the integration"],
+    understanding: {
+      background: "Authentication was initially blocked.",
+      check: {
+        question: "What changed?",
+        options: [{ key: "input", label: "The director supplied new input." }, { key: "nothing", label: "Nothing changed." }],
+        answer_key: "input",
+      },
+    },
+  });
+  await review();
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    "evd_answer_freshness", id, new Date().toISOString(), "report", "/tmp/report.md", "report"
+  );
+  writeEvent(db, { task_id: id, source: "director", type: "decision_answered", payload: { answer_key: "provided" } });
+
+  expect(decisionAnswerUnaddressed(db, id)).toBe(true);
+  const held = await post(`/api/tasks/${id}/events`, { type: "ready" });
+  expect(held.json.reason).toBe("stale_review");
+  expect((await get(`/api/tasks/${id}`)).json.state).toBe("in_progress");
+
+  await review();
+  expect(decisionAnswerUnaddressed(db, id)).toBe(false);
+  await post(`/api/tasks/${id}/events`, { type: "ready" });
+  expect((await get(`/api/tasks/${id}`)).json.state).toBe("in_review");
+});
+
 test("reconciler handoff never re-queues after changes_requested until a new commit is pushed (#234)", async () => {
   const { handOffToReview } = await import("../src/api.ts");
   const { writeEvent } = await import("../src/state.ts");
