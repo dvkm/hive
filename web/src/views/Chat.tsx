@@ -502,7 +502,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
       </header>
       <div className={embedded ? "manager-body" : "chat-body"}>
         {embedded && <ChiefBriefing thread={managerThread} awaiting={awaiting} />}
-        <div className={embedded ? "manager-conversation" : undefined}>
+        <div className={embedded ? `manager-conversation${chatMessages.length > 0 && visibleMessages.length === 0 ? " manager-conversation-quiet" : ""}` : undefined}>
           <div className="chat-scroll" ref={scrollRef}>
             {hiddenMessageCount > 0 && (
               <button className="chat-history-toggle" onClick={() => setHistoryOpen((current) => !current)}>
