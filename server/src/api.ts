@@ -4588,10 +4588,10 @@ async function serveWeb(pathname: string): Promise<Response> {
   const filePath = join(WEB_DIST, normalize(rel));
   if (!filePath.startsWith(WEB_DIST)) return err("forbidden", 403);
   const f = Bun.file(filePath);
-  if (await f.exists()) return new Response(f);
+  if (await f.exists()) return new Response(f, rel === "index.html" ? { headers: { "Cache-Control": "no-store" } } : undefined);
   // SPA fallback to index.html if the build exists at all
   const index = Bun.file(join(WEB_DIST, "index.html"));
-  if (await index.exists()) return new Response(index);
+  if (await index.exists()) return new Response(index, { headers: { "Cache-Control": "no-store" } });
   return new Response("web app not built", {
     status: 404,
     headers: { "Content-Type": "text/plain", ...CORS },
