@@ -429,6 +429,19 @@ test("merge refuses a task that is not in_review", async () => {
   s.server.stop(true);
 });
 
+test("merge refuses report-only scout tasks", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "review report", kind: "scout" });
+  await post(s.base, `/api/tasks/${t.json.id}/spawn`, {});
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+  const r = await post(s.base, `/api/tasks/${t.json.id}/merge`, {});
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("report-only");
+  expect((await get(s.base, `/api/tasks/${t.json.id}`)).json.state).toBe("in_review");
+  s.server.stop(true);
+});
+
 test("request-changes returns the task to in_progress, sends notes, records an event", async () => {
   const s = makeServer();
   const { taskId } = await inReviewTask(s.base);

@@ -205,8 +205,9 @@ server/test/ bun test suite
   server-side (a worker on loopback gets the same verdict): a CLOSED allow-list
   of three intrinsically-reversible categories (reference capture,
   high-confidence duplicate merge, task requeue), gated on the raiser's own
-  `recommended` option, low/normal risk, and a non-prod/shared blast radius; a
-  pending standing-authority command grant is never auto-approvable. Cleared
+  `recommended` option, low/normal risk, and a non-prod/shared blast radius. A
+  pending standing-authority command grant is never auto-approvable, but its
+  recommended `deny` is fail-closed and may be cleared automatically. Cleared
   cards write an `auto_approved` audit event tagged `source="chat_supervisor"`;
   declined cards stay open, log `auto_approve_declined`, and return `403` so the
   supervisor escalates. Everything else routes to the director as before.
