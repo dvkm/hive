@@ -379,7 +379,9 @@ export function ReviewCard({
         : "Approve and merge";
   const recommendationReason = openDecisions.length
     ? `${openDecisions.length} decision${openDecisions.length === 1 ? "" : "s"} still need your judgment.`
-    : mergeBlocked ||
+    : missingQuiz
+      ? "This older review has no understanding check."
+      : mergeBlocked ||
       (reportOnly
         ? "Hive finished the research and submitted its evidence."
         : task.ci_status === "passing"
@@ -524,7 +526,6 @@ export function ReviewCard({
       </div>
       {missingQuiz ? (
         <div className="review-blocked review-blocked-action">
-          <span>This older review has no understanding check.</span>
           <button className="btn btn-mini" disabled={busy} onClick={refreshUnderstandingCheck}>
             {busy ? "Asking…" : "Have agent add it"}
           </button>
