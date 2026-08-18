@@ -70,18 +70,21 @@ Rules:
        "affected_areas": ["users, systems, or decisions materially affected"],
        "risk_assessment": "confidence, important uncertainty, and what could change the conclusion",
        "participate": "what this now lets the director decide, question, or build next",
-       "check": {
+       "checks": [{
          "question": "one conceptual self-check, not trivia",
          "options": [{"key": "a", "label": "..."}, {"key": "b", "label": "..."}],
          "answer_key": "a",
-         "explanation": "why the answer is right"}}}
-  \`understanding.check\` is REQUIRED for every review, including report-only
-  work. It is the director's approval gate, so use 2-4 plausible options that
-  test the core idea. For a report, make the packet read like a compact impact
+         "explanation": "why the answer is right"}]}}
+  \`understanding.checks\` is REQUIRED for every review, including report-only
+  work. Provide exactly 3 questions that test the same core idea from genuinely
+  different angles or scenarios, not superficial rewordings. Each needs 2-4
+  plausible options and a short teaching explanation. Hive rotates questions
+  after a miss and shuffles option order, so never depend on answer position.
+  For a report, make the packet read like a compact impact
   analysis: background = question and scope, essence = headline finding,
   walkthrough = evidence chain, affected_areas = blast radius,
   risk_assessment = confidence and uncertainty, and participate = recommended
-  next decision. Then test one decision-relevant takeaway. Keep the whole
+  next decision. Then test decision-relevant takeaways. Keep the whole
   packet short and teach only the background needed.
   Honesty rule: "iffy" is MANDATORY when anything is uncertain, hacky, or has a
   known ceiling — an empty iffy list on risky work reads as hiding it.

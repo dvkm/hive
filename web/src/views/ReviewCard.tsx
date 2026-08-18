@@ -121,6 +121,12 @@ interface UnderstandingPacket {
     answer_key: string;
     explanation?: string;
   };
+  checks?: {
+    question: string;
+    options: { key: string; label: string }[];
+    answer_key: string;
+    explanation?: string;
+  }[];
 }
 
 // The agent's structured self-review (latest review_summary event payload).
@@ -316,7 +322,7 @@ export function ReviewCard({
   task: Task;
   onDone?: () => void;
 }) {
-  const { projects } = useStore();
+  const { projects, quizzes: understandingQuizzes } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
   const [diff, setDiff] = useState<DiffResult | null>(null);
   const [diffErr, setDiffErr] = useState("");
@@ -389,8 +395,9 @@ export function ReviewCard({
   // chores have nothing to merge; accepting the report is the whole review.
   const isScout = task.kind === "scout";
   const reportOnly = isScout || (task.kind === "chore" && diff?.files.length === 0);
-  const rawQuiz = review?.understanding?.check;
-  const quiz = rawQuiz && Array.isArray(rawQuiz.options) && rawQuiz.options.length >= 2 ? rawQuiz : undefined;
+  const rawQuiz = review?.understanding?.checks?.[0] ?? review?.understanding?.check;
+  const listedQuiz = understandingQuizzes.find((item) => item.task_id === task.id);
+  const quiz = listedQuiz ?? (rawQuiz && Array.isArray(rawQuiz.options) && rawQuiz.options.length >= 2 ? rawQuiz : undefined);
   const recordedQuizStatus = reviewEventId && events.some(
     (event) => event.type === "understanding_quiz_passed" && event.payload.review_event_id === reviewEventId
   )
@@ -483,7 +490,7 @@ export function ReviewCard({
     try {
       await api.requestChanges(
         task.id,
-        "Refresh the existing review_summary without changing the implementation. Preserve the review findings and add the required understanding packet and multiple-choice understanding.check, then submit the task for review again."
+        "Refresh the existing review_summary without changing the implementation. Preserve the review findings, regenerate the explanation in the current format, and add exactly 3 conceptually distinct multiple-choice understanding.checks. Then submit the task for review again."
       );
       toast("Agent asked to add the understanding check");
       onDone?.();

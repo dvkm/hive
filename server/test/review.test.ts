@@ -211,6 +211,12 @@ const QUIZ = {
   explanation: "The focused tests cover the changed behavior.",
 };
 
+const QUIZ_BANK = [
+  { question: "Why is this safe?", options: [{ key: "safe", label: "Focused tests cover it." }, { key: "guess", label: "It seems fine." }], answer_key: "safe", explanation: "Safety comes from focused coverage." },
+  { question: "What evidence should approval rely on?", options: [{ key: "safe", label: "Tests of the changed path." }, { key: "guess", label: "A plausible implementation." }], answer_key: "safe", explanation: "Approval relies on evidence from the changed path." },
+  { question: "What would catch a regression?", options: [{ key: "safe", label: "A focused failing test." }, { key: "guess", label: "A code comment." }], answer_key: "safe", explanation: "A focused test catches the regression." },
+];
+
 async function addQuiz(base: string, taskId: string) {
   await post(base, `/api/tasks/${taskId}/events`, {
     type: "review_summary",
@@ -268,6 +274,30 @@ test("understanding quiz blocks merge until the director answers correctly", asy
   expect(merge.status).toBe(200);
   quizzes = await get(s.base, "/api/understanding-quizzes");
   expect(quizzes.json.quizzes.some((item: any) => item.task_id === taskId)).toBe(false);
+  s.server.stop(true);
+});
+
+test("a wrong answer teaches the idea and rotates to another question", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "review me" });
+  await post(s.base, `/api/tasks/${t.json.id}/spawn`, {});
+  await post(s.base, `/api/tasks/${t.json.id}/events`, {
+    type: "review_summary",
+    done: ["implemented the change"],
+    understanding: { background: "This changes behavior.", essence: "Tests cover it.", checks: QUIZ_BANK },
+  });
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+
+  const before = (await get(s.base, "/api/understanding-quizzes")).json.quizzes.find((item: any) => item.task_id === t.json.id);
+  const wrong = await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "guess", source: "director" });
+  expect(wrong.json.correct).toBe(false);
+  expect(wrong.json.explanation).toBeTruthy();
+  expect(wrong.json.quiz.question).not.toBe(before.question);
+
+  const after = (await get(s.base, "/api/understanding-quizzes")).json.quizzes.find((item: any) => item.task_id === t.json.id);
+  expect(after.question).toBe(wrong.json.quiz.question);
+  expect((await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "safe", source: "director" })).json.correct).toBe(true);
   s.server.stop(true);
 });
 
