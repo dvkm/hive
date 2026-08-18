@@ -4663,6 +4663,39 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
   border-left: 2px solid var(--yellow);
   background: rgba(255, 190, 64, 0.05);
 }
+.manager-commitment-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+.manager-commitment {
+  padding: 8px 9px;
+  border-left: 2px solid var(--accent);
+  background: var(--bg-elev);
+}
+.manager-commitment-blocked { border-left-color: var(--yellow); }
+.manager-commitment-head {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--s2);
+  color: var(--text-dim);
+  font-size: var(--t-sm);
+}
+.manager-commitment-head b {
+  color: var(--text-faint);
+  font-size: var(--t-xs);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.manager-commitment-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 5px;
+  color: var(--text-faint);
+  font-size: var(--t-xs);
+}
+.manager-commitment-meta a { color: var(--text-faint); }
 .manager-records {
   display: flex;
   flex-direction: column;
@@ -4688,6 +4721,12 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
   color: var(--text-dim);
   font-size: var(--t-sm);
   line-height: 1.4;
+}
+.manager-memo-recommendation {
+  display: block;
+  margin-top: 7px;
+  color: var(--text);
+  font-size: var(--t-sm);
 }
 .manager-record small { display: block; margin-top: 5px; color: var(--text-faint); line-height: 1.35; }
 .manager-record .link-btn { margin-top: 6px; padding: 0; font-size: var(--t-xs); }

@@ -10,6 +10,8 @@
   "scripts": {
     "server": "bun run server/src/index.ts",
     "seed": "bun run scripts/demo-seed.ts",
+    "benchmark:autonomy": "bun run scripts/autonomy-benchmark.ts",
+    "benchmark:score": "bun run scripts/autonomy-benchmark-score.ts",
     "test": "bun test"
   },
   "devDependencies": {

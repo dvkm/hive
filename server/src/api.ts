@@ -66,9 +66,13 @@ import {
   managingThreadForTask,
   updateThreadRun,
   supervisorArtifacts,
+  listCommitments,
+  createCommitment,
+  updateCommitment,
   projectAutonomyProfile,
   SUPERVISOR_PHASES,
   AUTONOMY_PROFILES,
+  COMMITMENT_STATUSES,
   type ChatThread,
 } from "./chat.ts";
 
@@ -222,6 +226,14 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (m && method === "POST") return await recordManagerMeeting(db, herdr, m[1], await req.json());
       }
       {
+        const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)\/commitments$/);
+        if (m && method === "POST") return recordCommitment(db, m[1], await req.json());
+      }
+      {
+        const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)\/commitments\/([^/]+)$/);
+        if (m && method === "PUT") return reviseCommitment(db, m[1], m[2], await req.json());
+      }
+      {
         const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)\/verifications$/);
         if (m && method === "POST") return recordManagerVerification(db, m[1], await req.json());
       }
@@ -238,7 +250,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (m && method === "GET") {
           const thread = getThread(db, m[1]);
           if (!thread) return err("thread not found", 404);
-          return json({ ...thread, ...supervisorArtifacts(db, m[1]), messages: listMessages(db, m[1]) });
+          return json({ ...thread, ...supervisorArtifacts(db, m[1]), commitments: listCommitments(db, m[1]), messages: listMessages(db, m[1]) });
         }
       }
 
@@ -1044,6 +1056,127 @@ function stringList(value: any, limit = 20): string[] {
   return value.map(String).map((item) => item.trim()).filter(Boolean).slice(0, limit);
 }
 
+function validateCommitmentTask(db: DB, thread: ChatThread, projectId: string, taskId: any, label: string): string | Response | null {
+  if (taskId == null || String(taskId).trim() === "") return null;
+  const id = String(taskId);
+  const task = getTask(db, id);
+  if (!task) return err(`${label} task not found: ${id}`, 404);
+  if (task.project_id !== projectId) return err(`${label} task is outside the commitment project`, 409);
+  if (managingThreadForTask(db, id)?.id !== thread.id) return err(`${label} task is not managed by this thread`, 409);
+  return id;
+}
+
+function validateCommitmentDeps(db: DB, threadId: string, value: any): string[] | Response {
+  const ids = [...new Set(stringList(value))];
+  for (const id of ids) {
+    const row = db.query("SELECT thread_id FROM commitments WHERE id = ?").get(id) as { thread_id: string } | undefined;
+    if (!row) return err(`commitment dependency not found: ${id}`, 404);
+    if (row.thread_id !== threadId) return err(`commitment dependency is outside this thread: ${id}`, 409);
+  }
+  return ids;
+}
+
+function commitmentDepsReach(db: DB, threadId: string, startIds: string[], targetId: string): boolean {
+  const graph = new Map(listCommitments(db, threadId).map((item) => [item.id, item.depends_on]));
+  const pending = [...startIds];
+  const seen = new Set<string>();
+  while (pending.length) {
+    const id = pending.pop()!;
+    if (id === targetId) return true;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    pending.push(...(graph.get(id) ?? []));
+  }
+  return false;
+}
+
+function recordCommitment(db: DB, threadId: string, body: any): Response {
+  const thread = getThread(db, threadId);
+  if (!thread) return err("thread not found", 404);
+  if (!thread.task_id) return err("supervisor session has not started", 409);
+  const title = String(body?.title ?? "").trim();
+  if (!title) return err("title is required");
+  const projectId = thread.project_id ?? String(body?.project_id ?? "").trim();
+  if (!projectId) return err("project_id is required for a portfolio commitment");
+  if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return err("project not found", 404);
+  if (thread.project_id && body?.project_id && String(body.project_id) !== thread.project_id)
+    return err("commitment project is outside this thread", 409);
+
+  const sourceMessageId = body?.source_message_id ? String(body.source_message_id) : null;
+  const sourceTask = validateCommitmentTask(db, thread, projectId, body?.source_task_id, "source");
+  if (sourceTask instanceof Response) return sourceTask;
+  if (sourceMessageId && !db.query("SELECT 1 FROM chat_messages WHERE id = ? AND thread_id = ?").get(sourceMessageId, threadId))
+    return err("source message is outside this thread", 409);
+  if (!sourceMessageId && !sourceTask) return err("source_message_id or source_task_id is required");
+
+  const ownerTask = validateCommitmentTask(db, thread, projectId, body?.owner_task_id, "owner");
+  if (ownerTask instanceof Response) return ownerTask;
+  const dependsOn = validateCommitmentDeps(db, threadId, body?.depends_on);
+  if (dependsOn instanceof Response) return dependsOn;
+  const status = body?.status == null ? "open" : String(body.status);
+  if (!COMMITMENT_STATUSES.includes(status as any)) return err(`status must be one of ${COMMITMENT_STATUSES.join("|")}`);
+  const dueAt = body?.due_at ? String(body.due_at) : null;
+  if (dueAt && !Number.isFinite(Date.parse(dueAt))) return err("due_at must be an ISO timestamp");
+
+  const commitment = createCommitment(db, {
+    thread_id: threadId,
+    project_id: projectId,
+    title,
+    owner_task_id: ownerTask,
+    source_message_id: sourceMessageId,
+    source_task_id: sourceTask,
+    status: status as any,
+    due_at: dueAt,
+    depends_on: dependsOn,
+  });
+  writeEvent(db, {
+    task_id: thread.task_id,
+    source: "chat_supervisor",
+    type: "manager_commitment",
+    payload: { thread_id: threadId, commitment_id: commitment.id, action: "created", title, status },
+  });
+  return json(commitment, 201);
+}
+
+function reviseCommitment(db: DB, threadId: string, commitmentId: string, body: any): Response {
+  const thread = getThread(db, threadId);
+  if (!thread?.task_id) return err(thread ? "supervisor session has not started" : "thread not found", thread ? 409 : 404);
+  const current = listCommitments(db, threadId).find((item) => item.id === commitmentId);
+  if (!current) return err("commitment not found", 404);
+  const patch: any = {};
+  if (body?.title !== undefined) {
+    patch.title = String(body.title).trim();
+    if (!patch.title) return err("title cannot be empty");
+  }
+  if (body?.status !== undefined) {
+    patch.status = String(body.status);
+    if (!COMMITMENT_STATUSES.includes(patch.status)) return err(`status must be one of ${COMMITMENT_STATUSES.join("|")}`);
+  }
+  if (body?.due_at !== undefined) {
+    patch.due_at = body.due_at ? String(body.due_at) : null;
+    if (patch.due_at && !Number.isFinite(Date.parse(patch.due_at))) return err("due_at must be an ISO timestamp");
+  }
+  if (body?.owner_task_id !== undefined) {
+    const owner = validateCommitmentTask(db, thread, current.project_id, body.owner_task_id, "owner");
+    if (owner instanceof Response) return owner;
+    patch.owner_task_id = owner;
+  }
+  if (body?.depends_on !== undefined) {
+    const dependencies = validateCommitmentDeps(db, threadId, body.depends_on);
+    if (dependencies instanceof Response) return dependencies;
+    if (commitmentDepsReach(db, threadId, dependencies, commitmentId)) return err("commitment dependency cycle", 409);
+    patch.depends_on = dependencies;
+  }
+  const commitment = updateCommitment(db, commitmentId, patch)!;
+  writeEvent(db, {
+    task_id: thread.task_id,
+    source: body?.source === "director" ? "director" : "chat_supervisor",
+    type: "manager_commitment",
+    payload: { thread_id: threadId, commitment_id: commitment.id, action: "updated", ...patch },
+  });
+  return json(commitment);
+}
+
 function updateSupervisorRun(db: DB, threadId: string, body: any): Response {
   const thread = getThread(db, threadId);
   if (!thread) return err("thread not found", 404);
@@ -1113,14 +1246,18 @@ async function recordManagerMeeting(db: DB, herdr: Herdr, threadId: string, body
 
   const summary = String(body?.summary ?? "").trim() || null;
   const decision = String(body?.decision ?? "").trim() || null;
+  const recommendation = String(body?.recommendation ?? decision ?? "").trim() || null;
+  const dissent = stringList(body?.dissent, 5);
+  const evidence = stringList(body?.evidence, 10);
+  const risks = stringList(body?.risks, 5);
   if (stage === "critique" && !summary) return err("critique stage requires summary");
-  if (stage === "decided" && !decision) return err("decided stage requires decision");
+  if (stage === "decided" && !recommendation) return err("decided stage requires recommendation");
 
   const message = stage === "proposal"
     ? `Bounded team meeting: ${topic}\nGive an independent proposal with risks and concrete evidence. Send it to manager task ${thread.task_id} with: hive task send ${thread.task_id} "<proposal>".`
     : stage === "critique"
       ? `Bounded team meeting critique: ${topic}\nCompeting proposals: ${summary}\nSend one concise correction or critique to manager task ${thread.task_id}.`
-      : `Bounded team meeting concluded: ${topic}\nDecision: ${decision}${summary ? `\nRationale: ${summary}` : ""}\nProceed on this basis.`;
+      : `Bounded team meeting concluded: ${topic}\nRecommendation: ${recommendation}${summary ? `\nRationale: ${summary}` : ""}${dissent.length ? `\nMaterial dissent: ${dissent.join("; ")}` : ""}${risks.length ? `\nRisks: ${risks.join("; ")}` : ""}\nProceed on this basis.`;
   let delivered = 0;
   for (const id of participants) if (await internalSteer(db, herdr, id, message)) delivered++;
 
@@ -1128,7 +1265,7 @@ async function recordManagerMeeting(db: DB, herdr: Herdr, threadId: string, body
     task_id: thread.task_id,
     source: "chat_supervisor",
     type: "manager_meeting",
-    payload: { thread_id: threadId, meeting_id: meetingId, stage, topic, participants, summary, decision, delivered },
+    payload: { thread_id: threadId, meeting_id: meetingId, stage, topic, participants, summary, decision: decision ?? recommendation, recommendation, dissent, evidence, risks, delivered },
   });
   return json({ ...event.payload, event_id: event.id, ts: event.ts }, stage === "proposal" ? 201 : 200);
 }

@@ -243,6 +243,24 @@ export interface ChatThread {
   meetings?: ManagerMeeting[];
   verifications?: ManagerVerification[];
   retrospectives?: ManagerRetrospective[];
+  commitments?: Commitment[];
+}
+export interface Commitment {
+  id: string;
+  thread_id: string;
+  project_id: string;
+  title: string;
+  owner_task_id: string | null;
+  owner_title: string | null;
+  source_message_id: string | null;
+  source_message_text: string | null;
+  source_task_id: string | null;
+  source_task_title: string | null;
+  status: "open" | "in_progress" | "blocked" | "done" | "dropped";
+  due_at: string | null;
+  depends_on: string[];
+  created_at: string;
+  updated_at: string;
 }
 export interface ManagerMeeting {
   event_id: string;
@@ -253,6 +271,10 @@ export interface ManagerMeeting {
   participants: string[];
   summary: string | null;
   decision: string | null;
+  recommendation: string | null;
+  dissent: string[];
+  evidence: string[];
+  risks: string[];
   delivered: number;
 }
 export interface ManagerVerification {

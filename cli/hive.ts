@@ -44,8 +44,14 @@ Usage:
                                               post one reply with actionable decision cards
   hive chat update <thread-id> [--phase <phase>] [--objective <text>] [--criterion <text> ...]
         [--next <text>] [--waiting <text>] [--wakeup <iso>] [--outcome <text>]
+  hive chat commit <thread-id> --project <id> --title <text>
+        (--source-message <id> | --source-task <id>) [--owner <task-id>]
+        [--depends-on <commitment-id,...>] [--due <iso>]
+  hive chat commit-update <thread-id> <commitment-id> [--status open|in_progress|blocked|done|dropped]
+        [--title <text>] [--owner <task-id>] [--depends-on <commitment-id,...>] [--due <iso>]
   hive chat meeting <thread-id> --stage proposal|critique|decided [--meeting <id>]
-        [--topic <text>] [--participants <task-id,...>] [--summary <text>] [--decision <text>]
+        [--topic <text>] [--participants <task-id,...>] [--summary <text>] [--recommendation <text>]
+        [--dissent <text> ...] [--evidence <text> ...] [--risk <text> ...]
   hive chat verify <thread-id> --status started|passed|failed --method <text>
         [--result <text>] [--tasks <task-id,...>] [--evidence <evidence-id,...>] [--replay-of <id>]
   hive chat retrospect <thread-id> --summary <text> [--worked <text> ...]
@@ -462,8 +468,40 @@ async function main() {
         participants,
         summary: flags.summary,
         decision: flags.decision,
+        recommendation: flags.recommendation,
+        dissent: flags.dissent == null ? undefined : ([] as any[]).concat(flags.dissent).map(String),
+        evidence: flags.evidence == null ? undefined : ([] as any[]).concat(flags.evidence).map(String),
+        risks: flags.risk == null ? undefined : ([] as any[]).concat(flags.risk).map(String),
       });
       console.log(`meeting ${r.meeting_id}: ${r.stage} (${r.delivered}/${r.participants.length} notified)`);
+      return;
+    }
+    if (sub === "commit") {
+      const threadId = _[0];
+      if (!threadId || !flags.title) die("usage: hive chat commit <thread-id> --project <id> --title <text> (--source-message <id> | --source-task <id>) ...");
+      const r = await api("POST", `/api/chat/threads/${threadId}/commitments`, {
+        project_id: flags.project,
+        title: flags.title,
+        owner_task_id: flags.owner,
+        source_message_id: flags["source-message"],
+        source_task_id: flags["source-task"],
+        depends_on: flags["depends-on"] ? String(flags["depends-on"]).split(",").filter(Boolean) : undefined,
+        due_at: flags.due,
+      });
+      console.log(`commitment ${r.id}: ${r.status}  ${r.title}`);
+      return;
+    }
+    if (sub === "commit-update") {
+      const [threadId, commitmentId] = _;
+      if (!threadId || !commitmentId) die("usage: hive chat commit-update <thread-id> <commitment-id> [--status ...]");
+      const r = await api("PUT", `/api/chat/threads/${threadId}/commitments/${commitmentId}`, {
+        title: flags.title,
+        status: flags.status,
+        owner_task_id: flags.owner,
+        depends_on: flags["depends-on"] ? String(flags["depends-on"]).split(",").filter(Boolean) : undefined,
+        due_at: flags.due,
+      });
+      console.log(`commitment ${r.id}: ${r.status}  ${r.title}`);
       return;
     }
     if (sub === "verify") {
