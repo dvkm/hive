@@ -98,6 +98,7 @@ test("stuck: agent finished (idle) with no PR and no recent activity -> visible 
 
 test("needsAttention: failed or unhealthy active tasks, excluding separate action queues", () => {
   expect(needsAttention({ state: "failed" })).toBe(true);
+  expect(needsAttention({ state: "in_progress", source: "chat_supervisor", health: { status: "stuck", reason: null, since: "" } })).toBe(false);
   expect(needsAttention({ state: "in_progress", health: { status: "dead", reason: null, since: "" } })).toBe(true);
   expect(needsAttention({ state: "in_progress", health: { status: "stuck", reason: null, since: "" } })).toBe(true);
   expect(needsAttention({ state: "in_review", health: { status: "dead", reason: null, since: "" } })).toBe(false);
