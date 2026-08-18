@@ -158,6 +158,19 @@ test("review_summary keeps its structured sections; empty submission is rejected
   expect(r.json.event.payload.understanding.checks[1].answer_key).toBe("replace");
   expect(r.json.event.payload.understanding.check).toBeUndefined();
   expect(r.json.event.payload.note).toBeUndefined();
+
+  const legacyBank = await post(`/api/tasks/${t.json.id}/events`, {
+    type: "review_summary",
+    understanding: {
+      check: [
+        { question: "First angle?", options: [{ key: "yes", label: "Yes." }, { key: "no", label: "No." }], answer_key: "yes" },
+        { question: "Second angle?", options: [{ key: "yes", label: "Yes." }, { key: "no", label: "No." }], answer_key: "yes" },
+      ],
+    },
+  });
+  expect(legacyBank.json.event.payload.understanding.checks).toHaveLength(2);
+  expect(legacyBank.json.event.payload.understanding.check).toBeUndefined();
+
   const bad = await post(`/api/tasks/${t.json.id}/events`, { type: "review_summary", note: "hi" });
   expect(bad.status).toBe(400);
 });

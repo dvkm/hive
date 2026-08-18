@@ -2856,7 +2856,7 @@ function normalizeUnderstandingCheck(value: unknown): UnderstandingCheck | null 
 function normalizeUnderstandingChecks(understanding: unknown): UnderstandingCheck[] {
   if (!understanding || typeof understanding !== "object" || Array.isArray(understanding)) return [];
   const raw = understanding as Record<string, unknown>;
-  const values = Array.isArray(raw.checks) ? raw.checks : raw.check ? [raw.check] : [];
+  const values = Array.isArray(raw.checks) ? raw.checks : Array.isArray(raw.check) ? raw.check : raw.check ? [raw.check] : [];
   return values.flatMap((value) => {
     const check = normalizeUnderstandingCheck(value);
     return check ? [check] : [];
@@ -3932,7 +3932,12 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         const affectedAreas = rawUnderstanding.affected_areas.map((value: unknown) => text(value)).filter(Boolean).slice(0, 5);
         if (affectedAreas.length) understanding.affected_areas = affectedAreas;
       }
-      const rawChecks = Array.isArray(rawUnderstanding.checks) ? rawUnderstanding.checks : [];
+      const rawCheck = rawUnderstanding.check;
+      const rawChecks = Array.isArray(rawUnderstanding.checks)
+        ? rawUnderstanding.checks
+        : Array.isArray(rawCheck)
+          ? rawCheck
+          : [];
       const checks = rawChecks.flatMap((value: unknown) => {
         const check = normalizeUnderstandingCheck(value);
         return check ? [{
@@ -3943,7 +3948,6 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         }] : [];
       }).slice(0, 3);
       if (checks.length) understanding.checks = checks;
-      const rawCheck = rawUnderstanding.check;
       if (!checks.length && rawCheck && typeof rawCheck === "object" && !Array.isArray(rawCheck)) {
         const check = normalizeUnderstandingCheck(rawCheck);
         if (check) understanding.check = {
