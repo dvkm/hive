@@ -17,6 +17,7 @@ import {
   evidenceCount,
   evidenceAtSha,
   changesRequestUnaddressed,
+  decisionAnswerUnaddressed,
   isDeferred,
   deferTask,
   undeferTask,
@@ -1519,6 +1520,7 @@ export function handOffToReview(db: DB, taskId: string, source: string): boolean
   // still green on the old head. The shared guard blocks re-queue until new work
   // (a pushed commit / evidence / review_summary) lands after the request.
   if (changesRequestUnaddressed(db, taskId)) return false;
+  if (decisionAnswerUnaddressed(db, taskId)) return false;
   transition(db, taskId, "in_review", { source, reason: "PR open, awaiting review" });
   return true;
 }
@@ -3839,6 +3841,15 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     }
     if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });
     if (t.state === "in_progress") {
+      if (decisionAnswerUnaddressed(db, taskId)) {
+        writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { reason: "stale_review" } });
+        broadcastTask(db, getTask(db, taskId));
+        return json({
+          held: true,
+          reason: "stale_review",
+          message: "Handoff held: the director answered a decision after the latest review summary. Continue with that input, then regenerate the explanation and understanding checks before emitting ready again.",
+        });
+      }
       // Review means "truly ready for the director to approve & merge" — a red
       // or still-running CI is not that. Probe the PR's checks NOW (hive's own
       // ci_status lags a reconciler cycle): failing/pending holds the task

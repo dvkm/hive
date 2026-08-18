@@ -288,6 +288,15 @@ export function changesRequestUnaddressed(db: DB, taskId: string): boolean {
   return true; // still unaddressed
 }
 
+// A director answer can invalidate the report and its quiz. Never hand the
+// task back for review until the agent has summarized the answer's effect.
+export function decisionAnswerUnaddressed(db: DB, taskId: string): boolean {
+  const answer = db.query("SELECT rowid FROM events WHERE task_id = ? AND type = 'decision_answered' ORDER BY rowid DESC LIMIT 1").get(taskId) as { rowid: number } | undefined;
+  if (!answer) return false;
+  const review = db.query("SELECT rowid FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1").get(taskId) as { rowid: number } | undefined;
+  return !review || review.rowid < answer.rowid;
+}
+
 // The finished-handoff, shared by every herdr-signal path (the reconciler's
 // poll backstop and the supervise wait loop): an agent observed idle/gone on an
 // in_progress task that has a real work product (a pr_url, or a scout report)
@@ -310,6 +319,7 @@ export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, s
   // After a changes-request, mere idleness is NOT "addressed" (#163). Require
   // visible new work before re-advancing — the shared guard below.
   if (changesRequestUnaddressed(db, taskId)) return false;
+  if (decisionAnswerUnaddressed(db, taskId)) return false;
   writeEvent(db, {
     task_id: taskId,
     source,
