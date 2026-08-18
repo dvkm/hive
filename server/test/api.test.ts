@@ -122,6 +122,7 @@ test("review_summary keeps its structured sections; empty submission is rejected
     testing: ["bun test green"],
     understanding: {
       background: "Saves used one shared queue.",
+      scope: "The editor queue and offline-save path were examined.",
       essence: "The queue now preserves the newest edit.",
       walkthrough: ["An edit enters the queue.", 42, "The newest edit wins."],
       affected_areas: ["Draft editor", 42, "Offline saves"],
@@ -152,6 +153,7 @@ test("review_summary keeps its structured sections; empty submission is rejected
   expect(r.json.event.payload.done).toEqual(["fixed the save flow"]);
   expect(r.json.event.payload.iffy[0].what).toBe("used a global lock");
   expect(r.json.event.payload.understanding.walkthrough).toEqual(["An edit enters the queue.", "The newest edit wins."]);
+  expect(r.json.event.payload.understanding.scope).toBe("The editor queue and offline-save path were examined.");
   expect(r.json.event.payload.understanding.affected_areas).toEqual(["Draft editor", "Offline saves"]);
   expect(r.json.event.payload.understanding.risk_assessment).toBe("The queue is covered, but browser shutdown can still interrupt a save.");
   expect(r.json.event.payload.understanding.checks).toHaveLength(2);

@@ -64,7 +64,8 @@ Rules:
      "testing": ["what you ran + result (tests, e2e, manual repro)"],
      "followups": ["tasks you spawned (#num) or suggest"],
      "understanding": {
-       "background": "one sentence of system context needed to follow the change",
+       "background": "why this work exists and the prior belief, decision, or history needed to understand it",
+       "scope": "what systems, sources, time range, and exclusions were examined",
        "essence": "the goal and core idea in plain language, before code details",
        "walkthrough": ["2-4 causal steps in the order a person should learn them"],
        "affected_areas": ["users, systems, or decisions materially affected"],
@@ -81,7 +82,8 @@ Rules:
   plausible options and a short teaching explanation. Hive rotates questions
   after a miss and shuffles option order, so never depend on answer position.
   For a report, make the packet read like a compact impact
-  analysis: background = question and scope, essence = headline finding,
+  analysis: background = why the report was commissioned and relevant prior
+  context, scope = investigation boundaries, essence = headline finding,
   walkthrough = evidence chain, affected_areas = blast radius,
   risk_assessment = confidence and uncertainty, and participate = recommended
   next decision. Then test decision-relevant takeaways. Keep the whole

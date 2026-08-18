@@ -110,6 +110,7 @@ type ReviewItem = string | { what: string; why?: string };
 
 interface UnderstandingPacket {
   background?: string;
+  scope?: string;
   essence?: string;
   walkthrough?: string[];
   affected_areas?: string[];
@@ -145,7 +146,7 @@ function reviewItemText(item: ReviewItem): string {
 }
 
 function ReviewUnderstanding({ packet, report = false, caveats = [] }: { packet: UnderstandingPacket; report?: boolean; caveats?: ReviewItem[] }) {
-  const hasContent = packet.background || packet.essence || packet.walkthrough?.length || packet.affected_areas?.length || packet.risk_assessment || packet.participate || packet.check;
+  const hasContent = packet.background || packet.scope || packet.essence || packet.walkthrough?.length || packet.affected_areas?.length || packet.risk_assessment || packet.participate || packet.check;
   if (!hasContent) return null;
 
   if (report) {
@@ -153,16 +154,22 @@ function ReviewUnderstanding({ packet, report = false, caveats = [] }: { packet:
     return (
       <section className="review-understanding report-explanation">
         <div className="understanding-eyebrow">Report explained</div>
+        {packet.background && (
+          <div>
+            <b>Background</b>
+            <p>{packet.background}</p>
+          </div>
+        )}
         {packet.essence && (
           <div className="report-explanation-headline">
             <b>Key finding</b>
             <p>{packet.essence}</p>
           </div>
         )}
-        {packet.background && (
+        {packet.scope && (
           <div>
             <b>Scope</b>
-            <p>{packet.background}</p>
+            <p>{packet.scope}</p>
           </div>
         )}
         {packet.walkthrough?.length && (
