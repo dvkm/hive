@@ -308,6 +308,9 @@ export function composeSupervisorBrief(db: DB, thread: ChatThread): string {
   const autonomyInstruction = chief
     ? `Each action is governed by its target project's current autonomy profile. Before acting, resolve the target project and load it from \`$HIVE_URL/api/projects/<project-id>\`; apply that profile's decision, checkpoint, and merge boundaries. The server enforces them.`
     : `This project's scope is fixed. The autonomy profile is \`${autonomy}\`; the server enforces its decision and checkpoint boundary.`;
+  const mergeInstruction = chief || autonomy === "autopilot"
+    ? `- Merge reviewed work (autopilot only): POST $HIVE_URL/api/tasks/<id>/merge with body {} for a PR or {"merge_strategy":"local_ff"} for a reviewed local branch\n`
+    : "";
   const parts: string[] = [];
   parts.push(
     `# You are hive's ${chief ? "Chief of Staff" : "director-chat supervisor"} — a PERSISTENT session.`,
@@ -348,7 +351,7 @@ You coordinate WORKER agents; you don't write project code in this session. Use 
 - Create a worker task:               ${cli} task create --project ${thread.project_id ?? "<project-id>"} --title "..." --brief-text "..." --kind ship|scout|chore [--depends-on <ids>]
 - Message a worker or peer:            ${cli} task send <task-id> "..."
 - Send reviewed work back for fixes:   POST $HIVE_URL/api/tasks/<id>/request-changes with body {"notes":"specific required changes"}
-- Auto-approve a safe decision card:  ${cli} decision auto-answer <id> --key <option> --reason "..."
+${mergeInstruction}- Auto-approve a safe decision card:  ${cli} decision auto-answer <id> --key <option> --reason "..."
 - Update the visible run ledger:       ${cli} chat update ${thread.id} --phase planning|executing|waiting|verifying|complete --objective "..." --criterion "..." --next "..." [--waiting "..."]
 - Record an accountable commitment:    ${cli} chat commit ${thread.id} --project <project-id> --title "..." --source-message <id> [--owner <task-id>] [--depends-on <commitment-ids>]
 - Update a commitment:                 ${cli} chat commit-update ${thread.id} <commitment-id> --status open|in_progress|blocked|done|dropped [--owner <task-id>] [--due <iso>]

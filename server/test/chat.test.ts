@@ -420,6 +420,15 @@ test("composeSupervisorBrief bakes in the thread id, reply verb, and hard limits
   expect(brief).toContain("independently check the integrated result");
   expect(brief).toContain("Acknowledge a safe checkpoint");
   expect(brief).toContain("whole current-project inbox");
+  expect(brief).not.toContain("merge_strategy");
+});
+
+test("autopilot supervisor brief includes the guarded merge action", () => {
+  db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify({ autonomy_profile: "autopilot" }), projectId);
+  const thread = createThread(db, { project_id: projectId, title: "autopilot" });
+  const brief = composeSupervisorBrief(db, thread);
+  expect(brief).toContain("POST $HIVE_URL/api/tasks/<id>/merge");
+  expect(brief).toContain('"merge_strategy":"local_ff"');
 });
 
 test("Chief brief requires quiet bundled decision cards", () => {
