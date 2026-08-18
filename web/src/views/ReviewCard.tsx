@@ -353,27 +353,29 @@ export function ReviewCard({
       ? "deferred"
       : "required";
   const quizStatus = quizOverride ?? recordedQuizStatus;
-  const missingQuiz = reviewLoaded && !reportOnly && (!quiz || !reviewEventId);
-  const mergeBlocked = !reportOnly
-    ? !reviewLoaded
-      ? "Loading the understanding check"
-      : !quiz || !reviewEventId
-        ? "Understanding check is missing. Ask the agent to refresh its review."
-        : quizStatus === "required"
-          ? "Pass the understanding check, or explicitly save it for later."
-          : task.ci_status === "failing"
+  const missingQuiz = reviewLoaded && (!quiz || !reviewEventId);
+  const quizBlocked = !reviewLoaded
+    ? "Loading the understanding check"
+    : missingQuiz
+      ? "Understanding check is missing. Ask the agent to refresh its review."
+      : quizStatus === "required"
+        ? "Pass the understanding check, or explicitly save it for later."
+        : "";
+  const deliveryBlocked = reportOnly
+    ? ""
+    : task.ci_status === "failing"
       ? "CI is failing — the agent has been told to iterate; unlocks when green"
       : task.ci_status === "pending"
         ? "CI is still running — wait for green"
         : !task.pr_url && !task.branch
           ? "No PR and no branch — nothing to merge"
-          : ""
-    : "";
+          : "";
+  const mergeBlocked = quizBlocked || deliveryBlocked;
   const caveats = review?.iffy ?? [];
   const recommendation = openDecisions.length
     ? "Make the open decision first"
     : mergeBlocked
-      ? "Wait to merge"
+      ? reportOnly ? "Understand before accepting" : "Wait to merge"
       : reportOnly
         ? "Accept this report"
         : "Approve and merge";
@@ -502,7 +504,7 @@ export function ReviewCard({
         )}
       </div>
 
-      {!reportOnly && quiz && reviewEventId && quizStatus === "required" && (
+      {quiz && reviewEventId && quizStatus === "required" && (
         <UnderstandingQuiz
           quiz={{ task_id: task.id, question: quiz.question, options: quiz.options }}
           allowDefer
@@ -510,8 +512,8 @@ export function ReviewCard({
           onDeferred={() => setQuizOverride("deferred")}
         />
       )}
-      {!reportOnly && quizStatus === "passed" && <div className="understanding-quiz-status passed">Understanding confirmed. Approval unlocked.</div>}
-      {!reportOnly && quizStatus === "deferred" && <div className="understanding-quiz-status deferred">Quiz saved in Needs You. You can ship now.</div>}
+      {quizStatus === "passed" && <div className="understanding-quiz-status passed">Understanding confirmed. Approval unlocked.</div>}
+      {quizStatus === "deferred" && <div className="understanding-quiz-status deferred">Quiz saved in Needs You. You can continue now.</div>}
 
       <div className="review-actions">
         <button className="btn btn-primary" onClick={() => merge()} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
@@ -577,9 +579,11 @@ export function ReviewCard({
 
       <details className="review-details">
         <summary>
-          <span>{review?.understanding ? "Understand this change" : "Why Hive recommends this"}</span>
+          <span>{reportOnly ? "Explain report" : review?.understanding ? "Understand this change" : "Why Hive recommends this"}</span>
           <small>
-            {review?.understanding
+            {reportOnly && review?.understanding
+              ? `thesis · evidence · implications`
+              : review?.understanding
               ? `mental model · ${evidence.length} evidence`
               : `${review?.done?.length ?? 0} completed · ${caveats.length} caveat${caveats.length === 1 ? "" : "s"} · ${evidence.length} evidence`}
           </small>

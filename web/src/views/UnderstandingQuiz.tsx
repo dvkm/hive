@@ -85,8 +85,8 @@ export function UnderstandingQuiz({
       </div>
       {allowDefer && showEscape && (
         <div className="understanding-quiz-escape">
-          <p>This unlocks shipping now, but the quiz will stay in Needs You until you pass it.</p>
-          <button className="btn" disabled={busy} onClick={defer}>Ship now, quiz me later</button>
+          <p>This unlocks approval now, but the quiz will stay in Needs You until you pass it.</p>
+          <button className="btn" disabled={busy} onClick={defer}>Continue now, quiz me later</button>
         </div>
       )}
     </section>

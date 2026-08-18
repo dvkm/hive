@@ -2006,6 +2006,13 @@ async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {
   if (to === "verifying" || to === "done") {
     const t = getTask(db, id);
     if (t) {
+      if (to === "verifying" && t.state === "in_review" && t.kind === "scout") {
+        const quiz = latestUnderstandingQuiz(db, id);
+        if (!quiz)
+          return err("Understanding check required. Ask the agent to add one before accepting this report.", 409);
+        if (understandingQuizStatus(db, id, quiz.reviewEventId) === "required")
+          return err("Pass the understanding check before accepting this report, or choose 'Continue now, quiz me later'.", 409);
+      }
       // A task with a PR must go through POST /merge — a plain move to verifying
       // skips the actual merge, and the smoke monitor then stamps the task done
       // with the PR still open (seen live 2026-07-18: task 2ae573b0a229 / PR #281).
@@ -2186,7 +2193,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
   if (!quiz)
     return err("Understanding check required. Ask the agent to submit one in its latest review before merging.", 409);
   if (understandingQuizStatus(db, id, quiz.reviewEventId) === "required")
-    return err("Pass the understanding check before merging, or choose 'Ship now, quiz me later'.", 409);
+    return err("Pass the understanding check before merging, or choose 'Continue now, quiz me later'.", 409);
 
   const exec = deps.exec ?? defaultExec;
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
