@@ -80,7 +80,12 @@ Rules:
   work. Provide 1-5 questions. Use one for a single, straightforward takeaway;
   add more only when each tests a distinct decision-relevant idea, angle, or
   scenario, never superficial rewordings. Each needs 2-4 plausible options and
-  a short teaching explanation. Hive rotates questions
+  a short teaching explanation. Every question must test a mental model the
+  director could apply to a future decision. Never quiz project bookkeeping:
+  why work was split into a follow-up, which task/PR/file/command/identifier
+  carried it, who did it, or what the brief happened to scope. If a question
+  cannot be reframed as a transferable scenario, omit it; fewer is better.
+  Hive rotates questions
   after a miss and shuffles option order, so never depend on answer position.
   Keep each question and option complete and under 500 characters.
   For a report, make the packet read like a compact impact
