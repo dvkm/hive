@@ -63,6 +63,13 @@ export default function Brief() {
   const [answered, setAnswered] = useState<Set<string>>(new Set());
   const [passedQuizzes, setPassedQuizzes] = useState<Set<string>>(new Set());
   const [reviewed, setReviewed] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    const active = new Set(needsYou.flatMap((item) => item.kind === "review" ? [item.id] : []));
+    setReviewed((items) => {
+      const next = new Set([...items].filter((id) => active.has(id)));
+      return next.size === items.size ? items : next;
+    });
+  }, [needsYou]);
   const openDecisions = needsYou.flatMap((item) => item.kind === "decision" && !answered.has(item.id) ? [item.decision] : []);
   const checkpoints = needsYou.flatMap((item) => item.kind === "checkpoint" ? [item.checkpoint] : []);
   const quizzes = needsYou.flatMap((item) => item.kind === "quiz" && !passedQuizzes.has(item.id) ? [item.quiz] : []);
