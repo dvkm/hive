@@ -2832,7 +2832,7 @@ interface UnderstandingCheck {
 function normalizeUnderstandingCheck(value: unknown): UnderstandingCheck | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
-  const question = typeof raw.question === "string" ? raw.question.trim().slice(0, 300) : "";
+  const question = typeof raw.question === "string" ? raw.question.trim().slice(0, 600) : "";
   const answerKey = typeof raw.answer_key === "string" ? raw.answer_key.trim().slice(0, 80) : "";
   const seen = new Set<string>();
   const options = Array.isArray(raw.options)
@@ -2840,7 +2840,7 @@ function normalizeUnderstandingCheck(value: unknown): UnderstandingCheck | null 
         if (!item || typeof item !== "object" || Array.isArray(item)) return [];
         const option = item as Record<string, unknown>;
         const key = typeof option.key === "string" ? option.key.trim().slice(0, 80) : "";
-        const label = typeof option.label === "string" ? option.label.trim().slice(0, 300) : "";
+        const label = typeof option.label === "string" ? option.label.trim().slice(0, 600) : "";
         if (!key || !label || seen.has(key)) return [];
         seen.add(key);
         return [{ key, label }];
