@@ -41,7 +41,7 @@ if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
   launchctl kickstart -k "gui/$(id -u)/dev.hive.server"
   # The desktop app keeps its existing Chromium renderer across server deploys.
   # Restart it when it is already open so the user sees the deployed assets.
-  APP="$REPO/electron/dist/mac-arm64/hive.app"
+  APP="$LIVE/electron/dist/mac-arm64/hive.app"
   if pgrep -f "$APP/Contents/MacOS/hive" >/dev/null; then
     osascript -e 'tell application id "dev.hive.app" to quit' || true
     open "$APP"
