@@ -79,8 +79,9 @@ function staleMs(): number {
 // Derivation (precedence dead > stuck > silent > healthy):
 //   dead   — agent_target set but herdr reports the agent gone (latest
 //            agent_status = "gone", written by the reconciler's probe).
-//   stuck  — herdr reports `blocked`, OR a stale-recovery escalation is in
-//            flight (the newest event is `stale`/`recovery_nudge`).
+//   stuck  — herdr reports `blocked` and no later automatic dialog recovery
+//            succeeded, OR a stale-recovery escalation is in flight (the
+//            newest event is `stale`/`recovery_nudge`).
 //   silent — no activity events past the stale threshold, agent still alive.
 //   healthy — otherwise.
 export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | null {
@@ -106,7 +107,15 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   }
 
   if (lastStatus === "gone") return { status: "dead", reason: "agent gone from herdr", since: lastStatusTs };
-  if (lastStatus === "blocked")
+  const dialogRecovered = events.find((e) => {
+    if (e.ts <= lastStatusTs || (e.type !== "dialog_auto_approved" && e.type !== "dialog_auto_declined")) return false;
+    try {
+      return JSON.parse(e.payload).delivered === true;
+    } catch {
+      return false;
+    }
+  });
+  if (lastStatus === "blocked" && !dialogRecovered)
     return { status: "stuck", reason: "agent blocked (waiting on you)", since: lastStatusTs };
 
   // A merge_failed event's reason must stay visible past the moment the task

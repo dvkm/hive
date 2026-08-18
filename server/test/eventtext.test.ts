@@ -47,3 +47,8 @@ test("new transcript types are agent-lifecycle for the feed filter", () => {
   expect(eventCategory("tool_use")).toBe("lifecycle");
   expect(eventCategory("agent_turn_end")).toBe("lifecycle");
 });
+
+test("automatic dialog recovery is readable in the supervisor trajectory", () => {
+  expect(eventText({ type: "dialog_auto_approved", payload: { kind: "workspace_trust" } })).toBe("accepted the workspace trust prompt");
+  expect(eventText({ type: "dialog_auto_declined", payload: {} })).toBe("dismissed an optional agent dialog");
+});

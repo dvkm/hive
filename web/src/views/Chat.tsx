@@ -85,6 +85,8 @@ const VISIBLE_MANAGER_EVENTS = new Set([
   "needs-decision",
   "auto_approved",
   "auto_approve_declined",
+  "dialog_auto_approved",
+  "dialog_auto_declined",
   "spawn_error",
   "steer_error",
 ]);
@@ -265,57 +267,72 @@ function ManagerActivity({
 function ChiefBriefing({
   thread,
   awaiting,
-  managerTask,
 }: {
   thread: ChatThread | null;
   awaiting: boolean;
-  managerTask: Task | null;
 }) {
   const { tasks, needsYou } = useStore();
   const [since] = useState(() => localStorage.getItem(CHIEF_LAST_SEEN));
   const [brief, setBrief] = useState<Brief | null>(null);
+  const needsYouKey = needsYou.map((item) => item.id).join(",");
   useEffect(() => {
     let live = true;
     api.morningBrief(since ?? undefined).then((result) => live && setBrief(result)).catch(() => live && setBrief(null));
-    localStorage.setItem(CHIEF_LAST_SEEN, new Date().toISOString());
     return () => {
       live = false;
     };
-  }, [since]);
+  }, [since, needsYouKey]);
+  useEffect(() => localStorage.setItem(CHIEF_LAST_SEEN, new Date().toISOString()), []);
 
-  const attentionCount = needsYou.length;
+  const directorRequired = new Set(brief?.director_required_task_ids ?? []);
+  const actionCount = needsYou.filter((item) => {
+    if (item.kind === "decision") return directorRequired.has(item.decision.task_id);
+    if (item.kind === "checkpoint") return directorRequired.has(item.checkpoint.task_id);
+    return false;
+  }).length;
   const working = tasks.filter((task) => task.source !== "chat_supervisor" && ["in_progress", "needs_decision", "in_review", "verifying"].includes(task.state));
   const finishedCount = since ? brief?.done.length ?? 0 : 0;
-  const stopped = !!managerTask && ["done", "failed", "cancelled"].includes(managerTask.state);
+  const commitments = (thread?.commitments ?? []).filter((item) => !["done", "dropped"].includes(item.status));
   const headline = !brief
     ? "Getting you caught up…"
-    : attentionCount > 0
-      ? `${attentionCount} ${attentionCount === 1 ? "thing needs" : "things need"} your attention.`
+    : actionCount > 0
+      ? `${actionCount} ${actionCount === 1 ? "decision needs" : "decisions need"} your call.`
       : awaiting
         ? "Hive is handling it."
         : "You're caught up.";
-  const detail = attentionCount > 0
+  const detail = actionCount > 0
     ? "Everything else keeps moving while your Chief waits for your call."
-    : thread?.next_action || thread?.outcome || thread?.objective || "Tell Hive the outcome you want. Your Chief of Staff will coordinate the rest.";
+    : thread?.outcome || thread?.next_action || thread?.objective || "Tell Hive the outcome you want. Your Chief of Staff will coordinate the rest.";
 
   return (
     <section className="chief-briefing" aria-label="Re-entry briefing">
       <div className="chief-briefing-copy">
-        <div className="manager-eyebrow">Briefing</div>
-        <h2>{headline}</h2>
+        <h1>{headline}</h1>
         <p>{detail}</p>
       </div>
-      <div className="chief-briefing-foot">
-        <div className="chief-briefing-facts">
-          {attentionCount > 0 && <Link to="/inbox">Review {attentionCount === 1 ? "item" : "items"}</Link>}
-          <Link to="/work">{working.length} in motion</Link>
-          {finishedCount > 0 && <span>{finishedCount} finished</span>}
+      {commitments.length > 0 && (
+        <div className="chief-commitments">
+          <div className="chief-commitments-label">Hive is handling</div>
+          <ul>
+            {commitments.slice(0, 3).map((item) => (
+              <li key={item.id}>
+                <span>{item.title}</span>
+                <b className={`chief-commitment-${item.status}`}>{item.status.replace("_", " ")}</b>
+              </li>
+            ))}
+          </ul>
+          {commitments.length > 3 && <small>{commitments.length - 3} more open loops in activity details</small>}
         </div>
-        <div className={`chief-status ${awaiting ? "chief-status-working" : ""}`}>
-          <span className="manager-live-dot" />
-          {!thread ? "Ready" : stopped ? "Stopped" : awaiting ? "Working" : "Watching"}
+      )}
+      {(actionCount > 0 || working.length > 0 || finishedCount > 0) && (
+        <div className="chief-briefing-foot">
+          <div className="chief-briefing-facts">
+            {actionCount > 0 && <Link to="/inbox">Make {actionCount === 1 ? "the decision" : `${actionCount} decisions`}</Link>}
+            {working.length > 0 && <Link to="/work">{working.length} in motion</Link>}
+            {finishedCount > 0 && <span>{finishedCount} finished</span>}
+          </div>
         </div>
-      </div>
+      )}
     </section>
   );
 }
@@ -463,10 +480,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
       <header className={embedded ? "manager-head" : "chat-head"}>
         {embedded && (
           <div className="manager-heading">
-            <div>
-              <div className="manager-eyebrow">Chief of Staff</div>
-              <h1>{awaiting ? "Working on it." : "What should Hive handle?"}</h1>
-            </div>
+            <div className="manager-eyebrow">Chief of Staff</div>
             <div className={`chief-presence ${awaiting ? "chief-presence-working" : ""}`}>
               <span className="manager-live-dot" />
               {awaiting ? "Coordinating" : "Ready"}
@@ -482,7 +496,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
         </div>
       </header>
       <div className={embedded ? "manager-body" : "chat-body"}>
-        {embedded && <ChiefBriefing thread={managerThread} awaiting={awaiting} managerTask={managerTask} />}
+        {embedded && <ChiefBriefing thread={managerThread} awaiting={awaiting} />}
         <div className={embedded ? "manager-conversation" : undefined}>
           <div className="chat-scroll" ref={scrollRef}>
             {hiddenMessageCount > 0 && (
