@@ -39,5 +39,12 @@ if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
   (cd web && bun install --silent >/dev/null && bun run build >/dev/null)
   # bun --watch hot reload is unreliable; always kickstart after a live merge
   launchctl kickstart -k "gui/$(id -u)/dev.hive.server"
-  echo "[$(date '+%F %T')] deployed $(git rev-parse --short HEAD) (server restarted)"
+  # The desktop app keeps its existing Chromium renderer across server deploys.
+  # Restart it when it is already open so the user sees the deployed assets.
+  APP="$REPO/electron/dist/mac-arm64/hive.app"
+  if pgrep -f "$APP/Contents/MacOS/hive" >/dev/null; then
+    osascript -e 'tell application id "dev.hive.app" to quit' || true
+    open "$APP"
+  fi
+  echo "[$(date '+%F %T')] deployed $(git rev-parse --short HEAD) (server and open desktop app restarted)"
 fi

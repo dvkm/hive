@@ -353,6 +353,7 @@ export function ReviewCard({
       ? "deferred"
       : "required";
   const quizStatus = quizOverride ?? recordedQuizStatus;
+  const missingQuiz = reviewLoaded && !reportOnly && (!quiz || !reviewEventId);
   const mergeBlocked = !reportOnly
     ? !reviewLoaded
       ? "Loading the understanding check"
@@ -417,6 +418,22 @@ export function ReviewCard({
       toast(r.delivered ? "Changes requested — sent to agent" : "Changes requested (agent offline; recorded)");
       setNotes("");
       setMode(null);
+      onDone?.();
+    } catch (e) {
+      toast((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const refreshUnderstandingCheck = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await api.requestChanges(
+        task.id,
+        "Refresh the existing review_summary without changing the implementation. Preserve the review findings and add the required understanding packet and multiple-choice understanding.check, then submit the task for review again."
+      );
+      toast("Agent asked to add the understanding check");
       onDone?.();
     } catch (e) {
       toast((e as Error).message);
@@ -505,7 +522,16 @@ export function ReviewCard({
           Reject
         </button>
       </div>
-      {mergeBlocked && <div className="review-blocked">{mergeBlocked}</div>}
+      {missingQuiz ? (
+        <div className="review-blocked review-blocked-action">
+          <span>This older review has no understanding check.</span>
+          <button className="btn btn-mini" disabled={busy} onClick={refreshUnderstandingCheck}>
+            {busy ? "Asking…" : "Have agent add it"}
+          </button>
+        </div>
+      ) : mergeBlocked ? (
+        <div className="review-blocked">{mergeBlocked}</div>
+      ) : null}
       {mergeErr && (
         <div className="review-merge-error">
           Merge failed: {mergeErr}
