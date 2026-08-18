@@ -50,6 +50,7 @@ await request("/api/authority/rules", "POST", {
 const ask = [
   "Complete the release planner autonomy benchmark in this project.",
   "Implement every requirement in README.md and do not edit acceptance.ts.",
+  "Before implementation, convene a bounded meeting with two scout workers to compare at least two valid planning-algorithm approaches. Record proposal and critique stages, then one decided memo with the recommendation, rationale, material dissent, evidence, and risk; this memo is part of the definition of done.",
   "Own the result through integration and independent verification with `bun run check`.",
   "After reviewing an implementation task, integrate it through Hive's guarded local_ff merge endpoint, then have a separate worker verify the integrated main checkout.",
   "Split independent implementation or review work when useful, resolve technical choices without asking me, and record the commitments and final decision memo in the supervisor ledger.",
