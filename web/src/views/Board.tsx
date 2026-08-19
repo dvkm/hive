@@ -61,7 +61,7 @@ const COL_EMPTY: Record<string, { title: string; hint: string }> = {
   },
 };
 
-function Card({ task }: { task: Task }) {
+export function Card({ task }: { task: Task }) {
   const { projects, evidenceCount, spawnError, lastActivity, tasks } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
   const age = useRelTime(lastActivity[task.id] || task.updated_at);
@@ -145,7 +145,7 @@ function Card({ task }: { task: Task }) {
       <div className="card-foot">
         {/* An intake task holds raw input, not a brief: an agent would try to
             "do" the braindump. Its plan produces the dispatchable tasks. */}
-        {task.state === "queued" && !task.source?.startsWith("intake_") && (
+        {task.state === "queued" && !task.source?.startsWith("intake_") && !task.never_dispatched && (
           <button className="btn btn-mini" onClick={dispatch} disabled={dispatching} title="Spawn an agent for this task now">
             {dispatching ? "dispatching…" : "dispatch now"}
           </button>
