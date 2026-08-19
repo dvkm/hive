@@ -2210,7 +2210,21 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
       "--json",
       "state,mergeStateStatus,reviewDecision,statusCheckRollup,baseRefName,baseRefOid",
     ]);
-    if (probe.code === 0) prView = JSON.parse(probe.stdout || "{}");
+    if (probe.code !== 0)
+      return mergeFailed(
+        db,
+        herdr,
+        task,
+        config.default_branch || "main",
+        `Could not inspect PR metadata; merge was not attempted (${probe.stderr.trim() || "gh pr view failed"}).`
+      );
+    try {
+      prView = JSON.parse(probe.stdout || "{}");
+    } catch {
+      return mergeFailed(db, herdr, task, config.default_branch || "main", "Could not parse PR metadata; merge was not attempted.");
+    }
+    if (!prView.baseRefName || !prView.baseRefOid)
+      return mergeFailed(db, herdr, task, config.default_branch || "main", "PR base metadata is missing; merge was not attempted.");
   }
   const base = prView?.baseRefName || config.default_branch || "main";
   const guardBase = prView?.baseRefOid || base;
@@ -2235,11 +2249,12 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
         const regressed = await detectDestructiveRebase(exec, project.repo_path, guardBase, task.branch, snapshot);
         if (regressed && regressed.length) {
           const files = regressed.slice(0, 10).join(", ") + (regressed.length > 10 ? `, …(+${regressed.length - 10})` : "");
+          const reason = `branch '${task.branch}' reverts base work outside this task's scope (${files})`;
           writeEvent(db, {
             task_id: id,
             source: "director",
             type: "merge_blocked_destructive",
-            payload: { base, branch: task.branch, regressed },
+            payload: { base, branch: task.branch, regressed, reason },
           });
           recordSystemLearning(
             db,
@@ -2263,7 +2278,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
           }
           transition(db, id, "in_progress", { source: "director", reason: "merge blocked: destructive auto-rebase" });
           return err(
-            `merge blocked — branch '${task.branch}' reverts base work outside this task's scope (${files}); ` +
+            `merge blocked — ${reason}; ` +
               `the auto-rebase likely dropped intervening commits (task #314). Re-cut off current '${base}', or ` +
               `merge with override_destructive_check=true if intentional.`,
             409

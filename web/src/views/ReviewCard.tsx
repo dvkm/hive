@@ -307,6 +307,7 @@ export function ReviewCard({
   const [reviewEventId, setReviewEventId] = useState<string | null>(null);
   const [reviewLoaded, setReviewLoaded] = useState(false);
   const [quizOverride, setQuizOverride] = useState<"passed" | "deferred" | null>(null);
+  const [mergeErr, setMergeErr] = useState("");
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
   const [openDecisions, setOpenDecisions] = useState<Decision[]>([]);
@@ -348,6 +349,10 @@ export function ReviewCard({
         setEvidence(t.evidence ?? []);
         setEvents(t.events ?? []);
         setOpenDecisions((t.decisions ?? []).filter((d: Decision) => d.status === "open"));
+        const mergeReason = t.health?.status === "stuck" && /^merge (?:failed|blocked): /.test(t.health.reason ?? "")
+          ? t.health!.reason!.replace(/^merge (?:failed|blocked): /, "")
+          : "";
+        setMergeErr(mergeReason);
       })
       .catch(() => {})
       .finally(() => live && setReviewLoaded(true));
@@ -361,7 +366,6 @@ export function ReviewCard({
     { files: 0, add: 0, del: 0 }
   );
 
-  const [mergeErr, setMergeErr] = useState<string>("");
   // The CTA must not promise what the state can't deliver ("Approve & merge"
   // on red CI / no PR was a lie that failed on click). Scouts and no-change
   // chores have nothing to merge; accepting the report is the whole review.
@@ -419,7 +423,6 @@ export function ReviewCard({
   const merge = async (strategy?: "local_ff") => {
     if (busy) return;
     setBusy(true);
-    setMergeErr("");
     try {
       if (reportOnly) {
         await api.transition(task.id, "verifying");

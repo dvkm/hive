@@ -128,12 +128,22 @@ test("stuck: recent merge_failed reason shows on a still-in_review task (non-con
   expect(h?.reason).toBe("merge failed: unable to write new index file");
 });
 
-test("healthy: merge_failed reason ages out past the stale window", () => {
+test("stuck: merge_failed reason does not disappear with age", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, "in_progress");
   putEvent(db, id, "merge_failed", { reason: "conflict" }, STALE + 1000);
   const h = computeHealth(db, getTask(db, id), Date.now());
-  expect(h?.status).not.toBe("stuck");
+  expect(h?.status).toBe("stuck");
+  expect(h?.reason).toBe("merge failed: conflict");
+});
+
+test("stuck: destructive merge blocks stay visible", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, "in_review");
+  putEvent(db, id, "merge_blocked_destructive", { branch: "feat", regressed: ["AGENTS.md"] }, STALE + 1000);
+  const h = computeHealth(db, getTask(db, id), Date.now());
+  expect(h?.status).toBe("stuck");
+  expect(h?.reason).toBe("merge blocked: branch 'feat' reverts base work outside this task's scope (AGENTS.md)");
 });
 
 test("healthy: a re-handoff after the conflict clears the merge_failed reason once a new commit landed", () => {

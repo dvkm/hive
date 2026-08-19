@@ -98,3 +98,21 @@ test("PR destructive guard compares against the PR's exact base commit", async (
   expect(res.status).toBe(200);
   expect(diffs).toEqual(["staging-sha...feat"]);
 });
+
+test("PR merge fails closed when its base metadata is unavailable", async () => {
+  const { db, taskId } = seed();
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/1", taskId);
+  let gitCalls = 0;
+  const exec: Exec = stub((argv) => {
+    if (argv[0] === "gh" && argv.includes("view")) return { code: 1, stdout: "", stderr: "network unavailable" };
+    gitCalls++;
+    return OK();
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec });
+  expect(res.status).toBe(409);
+  expect((await res.json() as any).error).toContain("Could not inspect PR metadata");
+  expect(getTask(db, taskId).state).toBe("in_review");
+  expect(gitCalls).toBe(0);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_failed'").get(taskId)).toBeTruthy();
+});

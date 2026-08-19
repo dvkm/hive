@@ -118,22 +118,24 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   if (lastStatus === "blocked" && !dialogRecovered)
     return { status: "stuck", reason: "agent blocked (waiting on you)", since: lastStatusTs };
 
-  // A merge_failed event's reason must stay visible past the moment the task
+  // A merge failure's reason must stay visible past the moment the task
   // bounces back to in_progress (or stays in_review on a non-conflict
   // failure) — otherwise it reads as generic recent activity and the reason
-  // vanishes within moments (task #322). Bounded by staleMs() like the rest
-  // of health, and only until something newer actually resolves it (a landed
-  // merge, or a re-handoff carrying evidence the agent pushed a fix).
+  // vanishes within moments (task #322). It stays until something newer
+  // actually resolves it: a landed merge, or a re-handoff carrying evidence
+  // the agent pushed a fix.
   if (task.state === "in_progress" || task.state === "in_review") {
-    const mergeFailedEvent = events.find((e) => e.type === "merge_failed");
-    if (
-      mergeFailedEvent &&
-      nowMs - Date.parse(mergeFailedEvent.ts) < staleMs() &&
-      !mergeFailureResolved(events, mergeFailedEvent.ts)
-    ) {
+    const mergeFailedEvent = events.find((e) => e.type === "merge_failed" || e.type === "merge_blocked_destructive");
+    if (mergeFailedEvent && !mergeFailureResolved(events, mergeFailedEvent.ts)) {
       let reason = "merge failed";
       try {
-        reason = `merge failed: ${JSON.parse(mergeFailedEvent.payload).reason || "unknown error"}`;
+        const payload = JSON.parse(mergeFailedEvent.payload);
+        if (mergeFailedEvent.type === "merge_blocked_destructive") {
+          const files = Array.isArray(payload.regressed) ? payload.regressed.join(", ") : "unknown files";
+          reason = `merge blocked: ${payload.reason || `branch '${payload.branch}' reverts base work outside this task's scope (${files})`}`;
+        } else {
+          reason = `merge failed: ${payload.reason || "unknown error"}`;
+        }
       } catch {
         /* ignore */
       }

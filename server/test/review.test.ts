@@ -138,6 +138,8 @@ function makeServer(
   // the task in_progress and the merge would 409 on the state gate instead.
   const prView = {
     state: opts.prState ?? "OPEN",
+    baseRefName: "main",
+    baseRefOid: "base-sha",
     mergeStateStatus: opts.mergeStateStatus ?? "CLEAN",
     reviewDecision: opts.reviewDecision ?? "",
     statusCheckRollup: opts.rollup ?? [],
