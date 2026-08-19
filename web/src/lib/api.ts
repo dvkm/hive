@@ -59,6 +59,7 @@ export interface Task {
   head_sha: string | null; // PR's current head commit, refreshed by the reconciler's PR poll
   summary: string | null;
   source: string | null;
+  source_ref: string | null;
   parent_task_id: string | null;
   duplicate_of: string | null; // survivor id when cancelled as a duplicate
   depends_on: string[]; // task ids this one is blocked by (unmet until they're done)
@@ -73,7 +74,7 @@ export interface Event {
   id: string;
   task_id: string;
   ts: string;
-  source: "agent" | "hook" | "herdr" | "reconciler" | "monitor" | "director" | "system" | "chat_supervisor" | "unknown";
+  source: "agent" | "hook" | "herdr" | "reconciler" | "monitor" | "director" | "system" | "chat_supervisor" | "jira" | "jira-sync" | "unknown";
   type: string;
   payload: Record<string, unknown>;
 }

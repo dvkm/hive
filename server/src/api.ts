@@ -880,7 +880,11 @@ async function flushManagerUpdate(threadId: string): Promise<void> {
 export function notifyManagerOfEvent(db: DB, herdr: Herdr, deps: HandlerDeps, event: any): void {
   if (!managerEventRelevant(event)) return;
   const origin = getTask(db, event.task_id);
-  if (!origin || origin.source === "chat_supervisor") return;
+  // Tracking-only tasks (source='external': a mirrored JIRA issue, another
+  // agent's kanban entry) are not hive-supervised work, so a human closing
+  // seven tickets upstream must not wake the supervisor seven times. Matches
+  // the exclusions the dispatcher and reconciler already apply to 'external'.
+  if (!origin || origin.source === "chat_supervisor" || origin.source === "external") return;
   const thread = managingThreadForTask(db, event.task_id) ?? activeChiefOfStaff(db) ?? activeManagerForProject(db, origin.project_id) ?? activeManager(db);
   if (!thread?.task_id) return;
   if (event.type === "steer" && event.payload?.from_task_id === thread.task_id) return;
@@ -2726,6 +2730,17 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
   if (sender && sender.project_id !== task.project_id) return err("teammates must belong to the same project", 400);
   const blocked = authzBlock(db, { project_id: task.project_id, action: "task.steer", target: task.title, task_id: id });
   if (blocked) return blocked;
+  if (String(task.source_ref ?? "").startsWith("jira:")) {
+    if (files.length) return err("Jira comment attachments are not supported yet", 400);
+    const comment = sender ? `Hive agent #${sender.number} (${sender.title}):\n${text}` : text;
+    writeEvent(db, {
+      task_id: id,
+      source: sender ? "agent" : "director",
+      type: "jira_comment",
+      payload: { direction: "outbound", text: comment, delivery: "queued", ...(sender ? { from_task_id: sender.id } : {}) },
+    });
+    return json({ ok: true, delivered: false, delivery: "queued", message: comment, attachments: [] });
+  }
   const { paths, block } = await attachFiles(id, files);
   const message = sender
     ? `[teammate #${sender.number} ${sender.title} | task ${sender.id}]\n${text}\n\nReply with: "$HIVE_CLI" task send ${sender.id} "<your reply>"${block}`

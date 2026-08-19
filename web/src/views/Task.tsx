@@ -294,6 +294,7 @@ export function TaskBody({ id }: { id: string }) {
   // Attached files live in the brief as absolute paths (that's what the agent
   // reads); show them as a gallery instead and keep the paths out of the prose.
   const { body: briefBody, files: attachments } = splitAttachments(t.brief);
+  const isJira = String(t.source_ref ?? "").startsWith("jira:");
 
   const doTransition = async (to: string) => {
     try {
@@ -311,7 +312,9 @@ export function TaskBody({ id }: { id: string }) {
       // David re-send the same message three times.
       const files = r.attachments?.length ? ` with ${r.attachments.length} file(s)` : "";
       toast(
-        r.delivered
+        isJira
+          ? "Comment queued for Jira"
+          : r.delivered
           ? `Steer delivered${files}`
           : r.delivery === "failed"
             ? `Steer undelivered: ${r.error || "task is finished"}`
@@ -574,20 +577,28 @@ export function TaskBody({ id }: { id: string }) {
             other control here is neutral, and only the destructive transitions
             (cancel / fail) get danger styling. */}
         {(() => {
-          const dispatchIsPrimary = t.state === "queued";
+          const dispatchIsPrimary = t.state === "queued" && !isJira;
           return (
             <section className="panel">
               <h2>Actions</h2>
               <div className="steer">
-                <Attach files={steerFiles} onChange={setSteerFiles}>
+                {isJira ? (
                   <textarea
-                    placeholder="Steer message to the agent…"
+                    placeholder="Add a Jira comment…"
                     value={steer}
                     onChange={(e) => setSteer(e.target.value)}
                   />
-                </Attach>
+                ) : (
+                  <Attach files={steerFiles} onChange={setSteerFiles}>
+                    <textarea
+                      placeholder="Steer message to the agent…"
+                      value={steer}
+                      onChange={(e) => setSteer(e.target.value)}
+                    />
+                  </Attach>
+                )}
                 <button className={`btn ${dispatchIsPrimary ? "" : "btn-primary"}`} onClick={sendSteer}>
-                  Send steer
+                  {isJira ? "Comment in Jira" : "Send steer"}
                 </button>
               </div>
               {t.agent_target && (
@@ -600,9 +611,11 @@ export function TaskBody({ id }: { id: string }) {
                   Dispatch now
                 </button>
               )}
-              <button className="btn" onClick={planBreakdown} disabled={planning}>
-                {planning ? "Planning…" : "Plan breakdown"}
-              </button>
+              {!isJira && (
+                <button className="btn" onClick={planBreakdown} disabled={planning}>
+                  {planning ? "Planning…" : "Plan breakdown"}
+                </button>
+              )}
               <div className="transitions">
                 {(NEXT[t.state] || []).map((to) => (
                   <button

@@ -7,6 +7,7 @@ import { startReaper } from "./reaper.ts";
 import { checkAllMonitors } from "./monitors.ts";
 import { startDigest, setNotifier } from "./notifications.ts";
 import { startGchatPoll } from "./intake/gchat.ts";
+import { startJiraSync } from "./intake/jira.ts";
 import { startWatchers } from "./watch.ts";
 import { startAutoReviewer } from "./reviewer.ts";
 import { startPromoter } from "./promoter.ts";
@@ -97,6 +98,11 @@ startGchatPoll(db);
 // Watchers: poll configured docs/pages (per-project config.watchers) and queue
 // an act-on-change task carrying the diff. Hard no-op until configured.
 startWatchers(db);
+
+// JIRA sync: mirror a Jira project onto the board and keep `status` in step
+// both ways (per-project config.jira). Hard no-op until config.jira.enabled,
+// and outbound writes stay suppressed until config.jira.write.
+startJiraSync(db);
 
 // Auto-reviewer: pre-review every task that reaches in_review (sonnet one-shot
 // over the PR diff) and post the result onto the review card. Opt-out per
