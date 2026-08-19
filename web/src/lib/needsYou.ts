@@ -19,6 +19,21 @@ export function taskNeedsAttention(task: Task): boolean {
   return !!task.health && (task.health.status === "dead" || task.health.status === "stuck");
 }
 
+// Auto-review exclusion is owned by #974/PR #87; keep this browser-side guard here so the changes merge independently.
+// A mirror of someone else's Jira ticket: hive never runs an agent on it, ever.
+export function isJiraMirror(task: Pick<Task, "source_ref">): boolean {
+  return String(task.source_ref ?? "").startsWith("jira:");
+}
+
+// Tracking-only: hive records it but does no work of its own on it. Broader than
+// isJiraMirror, and the two are NOT interchangeable. Gate HIVE-OWNED-WORK UI
+// (PR/CI panels, code review) on this; gate AGENT controls on isJiraMirror plus
+// never_dispatched, because a source='external' task a director actually
+// spawned has a live agent those controls should still reach.
+export function isTrackingOnly(task: Pick<Task, "source" | "source_ref">): boolean {
+  return task.source === "external" || isJiraMirror(task);
+}
+
 function reviewIsActionable(task: Task): boolean {
   return task.kind === "scout" || (!!(task.pr_url || task.branch) && task.ci_status !== "pending" && task.ci_status !== "failing");
 }
@@ -34,7 +49,7 @@ export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoin
       })
       .map((quiz) => ({ kind: "quiz" as const, id: quiz.id, quiz })),
     ...tasks
-      .filter((task) => task.state === "in_review")
+      .filter((task) => task.state === "in_review" && !isTrackingOnly(task))
       .sort((a, b) => Number(reviewIsActionable(b)) - Number(reviewIsActionable(a)))
       .map((task) => ({ kind: "review" as const, id: task.id, task })),
     ...tasks.filter(taskNeedsAttention).map((task) => ({ kind: "attention" as const, id: task.id, task })),

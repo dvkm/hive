@@ -3,8 +3,9 @@ import { useStore } from "../lib/store";
 import { useProjectFilter, inProjectFilter } from "../lib/projectFilter";
 import { Empty } from "../lib/ui";
 import { ReviewCard } from "./ReviewCard";
+import { isTrackingOnly } from "../lib/needsYou";
 
-// The review queue: every in_review task as a review card, newest-updated first.
+// The review queue: every Hive-owned in_review task as a review card, newest-updated first.
 // Mirrors the Decisions inbox — the single surface for "things awaiting my
 // review & merge". Cards self-remove once acted on (merge/request-changes/reject).
 export default function Review() {
@@ -12,7 +13,7 @@ export default function Review() {
   const projectFilter = useProjectFilter();
   const [hidden, setHidden] = useState<Set<string>>(new Set());
   const list = tasks.filter(
-    (t) => t.state === "in_review" && !hidden.has(t.id) && inProjectFilter(t.project_id, projectFilter)
+    (t) => t.state === "in_review" && !isTrackingOnly(t) && !hidden.has(t.id) && inProjectFilter(t.project_id, projectFilter)
   );
   const hide = (id: string) => setHidden((h) => new Set(h).add(id));
 

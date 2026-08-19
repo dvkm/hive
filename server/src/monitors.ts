@@ -11,7 +11,7 @@
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { writeEvent, transition, getTask } from "./state.ts";
+import { writeEvent, transition, getTask, isTrackingOnlyTask } from "./state.ts";
 import { recordSystemLearning } from "./learn.ts";
 import { parseIncident, parseProject } from "./rows.ts";
 import { join } from "node:path";
@@ -202,6 +202,7 @@ export async function runSmoke(db: DB, taskId: string, deps: MonitorDeps = {}): 
 // 2026-07-10). The done transition still enforces evidence; a task without any
 // stays verifying for the director rather than sneaking through.
 export async function smokeThenAdvance(db: DB, taskId: string, deps: MonitorDeps = {}): Promise<{ ran: boolean; passed: boolean }> {
+  if (isTrackingOnlyTask(getTask(db, taskId) ?? {})) return { ran: false, passed: false };
   const r = await runSmoke(db, taskId, deps);
   const task = getTask(db, taskId);
   if (task?.state === "verifying" && (r.passed || !r.ran)) {

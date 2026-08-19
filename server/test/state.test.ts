@@ -41,6 +41,17 @@ test("valid forward transition writes a state_change event", () => {
   expect(events.length).toBe(1);
 });
 
+test("transition rolls back the state when its event cannot commit", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  db.exec(`CREATE TRIGGER reject_state_event BEFORE INSERT ON events
+    WHEN NEW.type = 'state_change' BEGIN SELECT RAISE(ABORT, 'event rejected'); END`);
+
+  expect(() => transition(db, id, "in_progress")).toThrow(/event rejected/);
+  expect(getTask(db, id).state).toBe("queued");
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ?").get(id)).toEqual({ n: 0 });
+});
+
 test("invalid transition is rejected with a clear error", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId);

@@ -7,6 +7,7 @@ import { api } from "../lib/api";
 import type { State } from "../lib/api";
 import { useStore } from "../lib/store";
 import { Empty, STATE_LABEL, StatusDot } from "../lib/ui";
+import { isTrackingOnly } from "../lib/needsYou";
 
 const ACTIVE: State[] = ["in_progress", "needs_decision", "in_review", "verifying"];
 
@@ -47,7 +48,7 @@ export default function Terminals() {
     state: s,
     n: tasks.filter((t) => t.state === s).length,
   }));
-  const live = tasks.filter((t) => ACTIVE.includes(t.state) && t.agent_target);
+  const live = tasks.filter((t) => ACTIVE.includes(t.state) && t.agent_target && !isTrackingOnly(t));
   return (
     <div className="pad">
       <div className="page-head">

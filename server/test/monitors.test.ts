@@ -164,6 +164,19 @@ test("smokeThenAdvance: passing smoke (or none configured) auto-advances verifyi
     await smokeThenAdvance(db, id, { fetch: async () => ({ status: 500, body: "" }) });
     expect(getTask(db, id).state).toBe("in_progress");
   }
+  {
+    const smoke = [{ name: "h", url: "u", expect_status: 200 }];
+    const { db, projectId } = freshDb({ smoke });
+    const id = makeTask(db, projectId);
+    db.query("UPDATE tasks SET source = 'external', source_ref = 'jira:WEB-1' WHERE id = ?").run(id);
+    transition(db, id, "in_progress"); transition(db, id, "in_review"); transition(db, id, "verifying");
+    evFor(db, id);
+    let fetches = 0;
+    const result = await smokeThenAdvance(db, id, { fetch: async () => { fetches++; return { status: 200, body: "" }; } });
+    expect(result).toEqual({ ran: false, passed: false });
+    expect(fetches).toBe(0);
+    expect(getTask(db, id).state).toBe("verifying");
+  }
   // no evidence -> stays verifying (done gate holds)
   {
     const { db, projectId } = freshDb({});

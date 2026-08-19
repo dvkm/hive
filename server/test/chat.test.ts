@@ -197,6 +197,24 @@ test("startup inbox sweep wakes one active manager per project with actionable c
   expect(sends.at(-1)).toContain(`\"source\":\"chat_supervisor\"`);
 });
 
+test("manager inbox review counts exclude tracking-only tasks", async () => {
+  const project = (await post("/api/projects", { name: "review counts", repo_path: WT })).json;
+  const owned = (await post("/api/tasks", { project_id: project.id, title: "Hive review" })).json;
+  const tracked = (await post("/api/tasks", { project_id: project.id, title: "Jira review", source: "external" })).json;
+  for (const task of [owned, tracked]) {
+    await post(`/api/tasks/${task.id}/transition`, { to: "in_progress" });
+    await post(`/api/tasks/${task.id}/transition`, { to: "in_review" });
+  }
+
+  const before = sends.length;
+  await sweepManagerInboxes(db, herdr, {});
+  const wakeups = sends.slice(before).join("\n");
+  expect(wakeups).toContain(`review counts (${project.id}): 0 checkpoints, 0 decisions, 1 reviews`);
+
+  await post(`/api/tasks/${owned.id}/transition`, { to: "cancelled" });
+  await post(`/api/tasks/${tracked.id}/transition`, { to: "cancelled" });
+});
+
 test("external tracking tasks (source='external') are invisible to manager wakeups and inbox counts", async () => {
   const trackedProject = (await post("/api/projects", { name: "jira-mirrored project", repo_path: WT })).json;
   const tracked = (await post("/api/tasks", { project_id: trackedProject.id, title: "mirrored JIRA issue", source: "external" })).json;

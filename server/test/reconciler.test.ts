@@ -47,6 +47,30 @@ test("syncAgents writes an agent_status event only when the status changes", asy
   expect(events.length).toBe(1);
 });
 
+test("legacy tracking-only bindings are surfaced once without being touched", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "legacy-agent", state: "in_progress" });
+  db.query("UPDATE tasks SET source = 'external', source_ref = ?, worktree_path = ?, branch = ? WHERE id = ?")
+    .run("jira:WEB-OLD", "/repo/.worktrees/legacy", "hive/legacy", id);
+  const herdrCalls: string[][] = [];
+  const herdr = new Herdr(async (argv) => {
+    herdrCalls.push(argv);
+    return OK();
+  }, "herdr");
+  const noGh = stub(() => ({ code: 1, stdout: "", stderr: "no gh" }));
+
+  await reconcileOnce(db, { herdr, exec: noGh });
+  await reconcileOnce(db, { herdr, exec: noGh });
+
+  expect(herdrCalls).toEqual([]);
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'tracking_binding_detected'").get(id)).toEqual({ n: 1 });
+  const notification = db.query("SELECT * FROM notifications WHERE task_id = ? AND kind = 'tracking_binding'").get(id) as any;
+  expect(notification.urgency).toBe("urgent");
+  expect(notification.body).toContain("/repo/.worktrees/legacy");
+  expect(notification.body).toContain("preserved");
+  expect(getTask(db, id)).toMatchObject({ agent_target: "legacy-agent", worktree_path: "/repo/.worktrees/legacy", branch: "hive/legacy" });
+});
+
 test("syncAgents accepts the safe workspace trust prompt for an idle spawned agent", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });

@@ -775,14 +775,24 @@ test("request-changes rejects a never-dispatched external task in review", async
   s.server.stop(true);
 });
 
-test("task move to in_progress from in_review rejects a never-dispatched external task", async () => {
+// SUPERSEDED BEHAVIOR, deliberately. hive-996 rejected this move with a 409 so
+// bounceForChanges could not queue a steer nobody reads and fail to spawn an
+// agent. A tracking-only task now falls THROUGH to a plain transition instead,
+// which achieves the same thing — no steer, no spawn attempt — and lets the
+// move succeed, which is what a mirrored ticket moving back to active work in
+// the external system actually needs. What the original test protected (the
+// bounce must never run here) is still asserted; only the outcome changed from
+// "rejected" to "plainly transitioned".
+test("task move to in_progress from in_review does not bounce a never-dispatched external task", async () => {
   const s = makeServer();
   const { taskId } = await externalInReviewTask(s.base);
+  const before = s.sends.length;
   const r = await post(s.base, `/api/tasks/${taskId}/transition`, { to: "in_progress" });
-  expect(r.status).toBe(409);
-  expect(r.json.error).toContain("never been spawned");
+  expect(r.status).toBe(200);
+  expect(r.json.bounce).toBeUndefined(); // the bounce path never ran
+  expect(s.sends.length).toBe(before); // and no agent was contacted
   const task = await get(s.base, `/api/tasks/${taskId}`);
-  expect(task.json.state).toBe("in_review"); // rejected before the bounce ran
+  expect(task.json.state).toBe("in_progress");
   s.server.stop(true);
 });
 
@@ -822,6 +832,36 @@ test("task move to in_progress from in_review records changes_requested and deli
   const ev = await get(s.base, `/api/tasks/${taskId}/events`);
   const cr = ev.json.find((e: any) => e.type === "changes_requested");
   expect(cr.payload.notes).toBe("the diff misses site 4");
+  s.server.stop(true);
+});
+
+test("tracking-only review moves use a plain transition and never contact an agent", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", { name: "tracking", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", {
+    project_id: p.json.id,
+    title: "tracked Jira issue",
+    source: "external",
+    kind: "scout",
+  });
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+
+  const moved = await post(s.base, `/api/tasks/${t.json.id}/transition`, {
+    to: "in_progress",
+    reason: "Jira moved back to active work",
+  });
+  expect(moved.status).toBe(200);
+  expect(moved.json.state).toBe("in_progress");
+  expect(moved.json.bounce).toBeUndefined();
+  expect(s.sends).toEqual([]);
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+  s.db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/legacy", t.json.id);
+  const verifying = await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "verifying" });
+  expect(verifying.status).toBe(200);
+  expect(verifying.json.state).toBe("verifying");
+  const events = await get(s.base, `/api/tasks/${t.json.id}/events`);
+  expect(events.json.some((event: any) => ["changes_requested", "steer", "spawned"].includes(event.type))).toBe(false);
   s.server.stop(true);
 });
 
@@ -865,6 +905,17 @@ test("brief.to_review derivation lists in_review tasks", async () => {
   const q = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "queued" });
   const b2 = await get(s.base, `/api/brief`);
   expect(b2.json.to_review.some((t: any) => t.id === q.json.id)).toBe(false);
+
+  const external = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "external review", source: "external" });
+  const linked = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "Jira-linked review" });
+  s.db.query("UPDATE tasks SET source_ref = ? WHERE id = ?").run("jira:WEB-2", linked.json.id);
+  for (const id of [external.json.id, linked.json.id]) {
+    await post(s.base, `/api/tasks/${id}/transition`, { to: "in_progress" });
+    await post(s.base, `/api/tasks/${id}/transition`, { to: "in_review" });
+  }
+  const b3 = await get(s.base, `/api/brief`);
+  expect(b3.json.to_review.some((t: any) => t.id === external.json.id)).toBe(false);
+  expect(b3.json.to_review.some((t: any) => t.id === linked.json.id)).toBe(false);
   s.server.stop(true);
 });
 
@@ -876,6 +927,18 @@ test("diff endpoint returns the structured shape for a branch task", async () =>
   expect(r.json.files.length).toBe(2);
   expect(r.json.files[0].path).toBe("src/a.ts");
   expect(r.json.truncated).toBe(false);
+  s.server.stop(true);
+});
+
+test("diff endpoint rejects tracking-only review tasks", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", { name: "tracking", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "tracked review", source: "external" });
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+  const r = await get(s.base, `/api/tasks/${t.json.id}/diff`);
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("tracking-only");
   s.server.stop(true);
 });
 

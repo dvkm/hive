@@ -665,8 +665,8 @@ the footer is absent. hive links a PR to its task by reading these:
 `hive pr-marker <task-id>` (CLI) prints the two marker lines (`title-prefix:` and
 `body-footer:`) for a task so agents don't hand-format them.
 
-### Review experience (in-review tasks)
-An `in_review` task means the agent finished and opened a PR (or pushed/created a branch) and is **awaiting the captain's review & merge**: not busy work. The captain reviews the diff and approves/merges, requests changes, or rejects, entirely from hive (the task page, the `/review` queue, and the Needs you view all render the same review card).
+### Review experience (Hive-owned in-review tasks)
+An `in_review` task owned by Hive means the agent finished and opened a PR (or pushed/created a branch) and is **awaiting the captain's review & merge**: not busy work. The captain reviews the diff and approves/merges, requests changes, or rejects, entirely from hive (the task page, the `/review` queue, and the Needs you view all render the same review card). Tracking-only external and Jira-linked tasks may also mirror an external `in_review` state, but they are excluded from Hive review queues, diffs, PR/CI controls, and review actions.
 
 **How a task reaches `in_review` (the finished-handoff, `in_progress → in_review`):**
 - **Explicit signal (preferred):** the agent emits `ready` (`POST .../events`
@@ -698,7 +698,7 @@ evidence-only request (the director said "there are no evidences") forever. The 
 explicit `ready` emit is intentionally NOT guarded — it can legitimately race ahead of
 the reconciler recording `pr_synchronized`.
 
-- `GET /api/tasks/:id/diff` → `200 DiffResult` | `400` (no branch & no `pr_url`, or project has no `repo_path`) | `404` | `502` (gh/git failed)
+- `GET /api/tasks/:id/diff` → `200 DiffResult` | `400` (no branch & no `pr_url`, or project has no `repo_path`) | `404` | `409` (tracking-only task) | `502` (gh/git failed)
   The task branch's changes. When `pr_url` is set, `gh pr diff <url> --patch`;
   otherwise `git -C <repo> diff <default_branch>...<branch>` in the project repo.
   The unified diff is parsed into:
@@ -830,7 +830,7 @@ the reconciler recording `pr_synchronized`.
   notes so a respawned agent has them. **Reject** is not a separate endpoint — it
   is `POST /transition {to:"cancelled", reason}` (allowed from `in_review`).
 
-`GET /api/brief[?since=<iso>]` returns `{since, done, director_required_task_ids, failed_or_attention, decisions, fleet, incidents, intake, to_review, spend, learnings_new}`. `director_required_task_ids` is the unique set of task ids for open decisions the target project's autonomy profile does not allow a supervisor to answer, plus open checkpoints in conservative projects. `done` excludes `chat_supervisor` infrastructure tasks. `to_review` contains the current `in_review` tasks as full Task objects with `health`; `done`, incidents, spend, and learnings are windowed by `since`, while action-state sections remain current.
+`GET /api/brief[?since=<iso>]` returns `{since, done, director_required_task_ids, failed_or_attention, decisions, fleet, incidents, intake, to_review, spend, learnings_new}`. `director_required_task_ids` is the unique set of task ids for open decisions the target project's autonomy profile does not allow a supervisor to answer, plus open checkpoints in conservative projects. `done` excludes `chat_supervisor` infrastructure tasks. `to_review` contains the current Hive-owned `in_review` tasks as full Task objects with `health`; tracking-only external and Jira-linked tasks are excluded. `done`, incidents, spend, and learnings are windowed by `since`, while action-state sections remain current.
 
 ### Search — `GET /api/search?q=&limit=`
 Global text search across the five text-bearing entities, for the web command

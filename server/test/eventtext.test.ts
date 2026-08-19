@@ -80,3 +80,21 @@ test("automatic dialog recovery is readable in the supervisor trajectory", () =>
   expect(eventText({ type: "dialog_auto_approved", payload: { kind: "workspace_trust" } })).toBe("accepted the workspace trust prompt");
   expect(eventText({ type: "dialog_auto_declined", payload: {} })).toBe("dismissed an optional agent dialog");
 });
+
+test("Jira audit text distinguishes pending, shadow, and confirmed writes", () => {
+  const jira = (payload: Record<string, unknown>) => eventText({ type: "jira_sync", payload: { issue: "WEB-1", ...payload } });
+
+  expect(jira({ action: "push", to: "Done", outcome: "sending" })).toBe("about to send status to Jira WEB-1: Done");
+  expect(jira({ action: "push", to: "Done", shadow: true })).toBe("would send status to Jira WEB-1: Done — not sent");
+  expect(jira({ action: "push", to: "Done", outcome: "ok" })).toBe("status sent to Jira WEB-1: Done");
+  expect(jira({ action: "label", label: "hive-needs-decision", present: true, outcome: "sending" })).toBe("about to add Jira label hive-needs-decision on WEB-1");
+  expect(jira({ action: "label", label: "hive-needs-decision", present: false, shadow: true })).toBe("would remove Jira label hive-needs-decision on WEB-1 — not sent");
+  expect(jira({ action: "label", label: "hive-needs-decision", present: true, outcome: "ok" })).toBe("added Jira label hive-needs-decision on WEB-1");
+  expect(jira({ action: "label", label: "hive-needs-decision", present: true })).toContain("not confirmed");
+  expect(jira({ action: "comment_push", outcome: "terminal_unknown", error: "timed out" })).toContain("may not have completed");
+  expect(jira({ action: "comment_push", outcome: "failed", error: "403 forbidden" })).toContain("failed — 403 forbidden");
+  expect(jira({ action: "comment_push", outcome: "resolved" })).toContain("uncertainty resolved after manual check");
+  expect(jira({ action: "comment_push", outcome: "rejected", error: "empty" })).toContain("rejected — empty");
+  expect(isFailureEvent({ type: "jira_sync", payload: { outcome: "terminal_unknown" } })).toBe(true);
+  expect(isFailureEvent({ type: "jira_sync", payload: { outcome: "failed" } })).toBe(true);
+});

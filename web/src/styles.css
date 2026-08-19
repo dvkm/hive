@@ -5306,3 +5306,44 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
 @media (max-width: 700px) {
   .sup-col { flex-basis: 88vw; }
 }
+
+/* ---- Jira-linked tasks -------------------------------------------------- */
+/* A mirrored ticket needs its provenance and its sync health legible at a
+   glance; the failure state deliberately stays loud until a sync succeeds. */
+.chip-jira {
+  background: #1f3a5f;
+  color: #cfe3ff;
+  border-color: #2d5488;
+  text-decoration: none;
+}
+a.chip-jira:hover { background: #2d5488; }
+
+.jira-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 0.75rem;
+  margin: 0.75rem 0 0.5rem;
+  font-size: 0.85rem;
+}
+.jira-facts dt { color: var(--muted, #8b949e); }
+.jira-facts dd { margin: 0; }
+
+.chip-pending { background: #4a3a12; color: #ffd98a; border-color: #6b5518; }
+
+.jira-error {
+  margin: 0.5rem 0;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid #7a2f2f;
+  border-left-width: 3px;
+  border-radius: 4px;
+  background: #2a1414;
+}
+.jira-error strong { color: #ff9d9d; }
+.jira-error p { margin: 0.25rem 0 0; font-size: 0.85rem; word-break: break-word; }
+
+.jira-receipts { margin-top: 0.75rem; }
+.jira-receipts h3 { font-size: 0.8rem; margin: 0 0 0.35rem; color: var(--muted, #8b949e); }
+.jira-receipts ul { list-style: none; margin: 0; padding: 0; font-size: 0.8rem; }
+.jira-receipts li { padding: 0.15rem 0; }
+
+.jira-move-note { margin-top: 0.5rem; font-size: 0.8rem; }

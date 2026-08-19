@@ -100,9 +100,10 @@ startGchatPoll(db);
 // an act-on-change task carrying the diff. Hard no-op until configured.
 startWatchers(db);
 
-// JIRA sync: mirror a Jira project onto the board and keep `status` in step
-// both ways (per-project config.jira). Hard no-op until config.jira.enabled,
-// and outbound writes stay suppressed until config.jira.write.
+// JIRA sync: mirror a Jira project's issues onto the board and keep `status`,
+// comments, and hive's own reports/evidence in step (per-project config.jira).
+// Hard no-op until a project sets enabled:true, and a second gate (write:false)
+// keeps it read-only until the director has read a shadow cycle.
 startJiraSync(db);
 
 // Auto-reviewer: pre-review every task that reaches in_review (sonnet one-shot

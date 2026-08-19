@@ -148,6 +148,26 @@ test("requeue endpoint fails a live task and queues a fresh copy", async () => {
   expect(fresh.json.parent_task_id).toBe(t.json.id);
 });
 
+test("requeue rejects Jira tracking tasks without changing their identity", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "Jira ticket" });
+  db.query("UPDATE tasks SET state = 'failed', source = 'external', source_ref = ? WHERE id = ?")
+    .run("jira:WEB-REQUEUE", t.json.id);
+
+  const requeued = await post(`/api/tasks/${t.json.id}/requeue`, {});
+  expect(requeued.status).toBe(409);
+  expect(requeued.json.error).toContain("mirrored Jira task has no agent work to requeue");
+  const original = await get(`/api/tasks/${t.json.id}`);
+  expect(original.json.state).toBe("failed");
+  expect(original.json.source).toBe("external");
+  expect(original.json.source_ref).toBe("jira:WEB-REQUEUE");
+  expect(db.query("SELECT COUNT(*) AS n FROM tasks WHERE parent_task_id = ?").get(t.json.id)).toEqual({ n: 0 });
+
+  const transitioned = await post(`/api/tasks/${t.json.id}/transition`, { to: "queued" });
+  expect(transitioned.status).toBe(409);
+  expect(transitioned.json.error).toContain("mirrored Jira task has no agent work to requeue");
+  expect((await get(`/api/tasks/${t.json.id}`)).json.state).toBe("failed");
+});
+
 test("tasks carry a server-computed health object", async () => {
   const list = await get(`/api/tasks`);
   const spawned = list.json.find((t: any) => t.id === taskId);

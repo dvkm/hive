@@ -12,7 +12,7 @@ import { parseEvent, parseTask, parseDecision } from "./rows.ts";
 import { redact } from "./secrets.ts";
 import { enqueue } from "./notifications.ts";
 import { broadcastTask } from "./health.ts";
-import { isExternalTask } from "./supervision.ts";
+import { isTrackingOnlyTask, isJiraMirror } from "./supervision.ts";
 
 export const STATES = [
   "queued",
@@ -27,6 +27,13 @@ export const STATES = [
 export type State = (typeof STATES)[number];
 
 export const TERMINAL: State[] = ["done", "failed", "cancelled"];
+
+// Defined in supervision.ts (one definition, derived from isExternalTask).
+// Re-exported here because the existing callers import it from state.
+export { isTrackingOnlyTask };
+
+export const TRACKING_ONLY_REQUEUE_ERROR = "a mirrored Jira task has no agent work to requeue";
+export const TRACKING_ONLY_OWNERSHIP_ERROR = "tracking-only tasks cannot create Hive-owned agent work";
 
 // Allowed "forward" transitions. failed/cancelled are handled separately
 // because they are reachable from any non-terminal state.
@@ -179,8 +186,7 @@ export function evidenceAtSha(db: DB, taskId: string, sha: string): number {
   return (row as { n: number }).n;
 }
 
-// Write an append-only event row and broadcast it. Returns the parsed event.
-export function writeEvent(
+function insertEvent(
   db: DB,
   args: { task_id: string; source: string; type: string; payload?: unknown }
 ): any {
@@ -195,16 +201,38 @@ export function writeEvent(
   db.query(
     "INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)"
   ).run(row.id, row.task_id, row.ts, row.source, row.type, row.payload);
-  const parsed = parseEvent(row);
-  broadcast({ type: "event", event: parsed });
+  return parseEvent(row);
+}
+
+function publishEvent(db: DB, event: any): void {
+  broadcast({ type: "event", event });
   if (eventHook) {
     try {
-      eventHook(db, parsed);
+      eventHook(db, event);
     } catch (e) {
       console.error("[hive] event hook:", e);
     }
   }
-  return parsed;
+}
+
+// Write an append-only event row and broadcast it. Returns the parsed event.
+export function writeEvent(
+  db: DB,
+  args: { task_id: string; source: string; type: string; payload?: unknown }
+): any {
+  const event = insertEvent(db, args);
+  publishEvent(db, event);
+  return event;
+}
+
+export function mutateWithEvent<T>(
+  db: DB,
+  mutate: () => T,
+  args: { task_id: string; source: string; type: string; payload?: unknown }
+): T {
+  const [result, event] = db.transaction(() => [mutate(), insertEvent(db, args)] as const)();
+  publishEvent(db, event);
+  return result;
 }
 
 // Expire every still-open decision on a task: its options can no longer be
@@ -306,7 +334,7 @@ export function decisionAnswerUnaddressed(db: DB, taskId: string): boolean {
 export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, source: string): boolean {
   if (agentStatus !== "idle" && agentStatus !== "gone") return false; // working/blocked/unknown → leave it be
   const task = getTask(db, taskId);
-  if (!task || task.state !== "in_progress") return false;
+  if (!task || task.state !== "in_progress" || isTrackingOnlyTask(task)) return false;
   const hasReport = task.kind === "scout" && evidenceCount(db, taskId, "report") >= 1;
   if (!task.pr_url && !hasReport) return false; // no product to review → health surfaces it, don't advance
   // Review means CI is green. failing/pending holds here; the reconciler's
@@ -348,6 +376,14 @@ export function transition(
   const source = opts.source ?? "director";
 
   if (from === to) throw new TransitionError(`task already in state '${to}'`);
+  // Requeue means "retry the agent work". For a JIRA MIRROR there is none, so
+  // the operation is undefined rather than merely risky — refuse it. A plain
+  // source='external' task a director actually spawned DOES have agent work to
+  // retry, so it requeues normally (hive-996); scoping this to mirrors is what
+  // keeps both true.
+  if (from === "failed" && to === "queued" && isJiraMirror(task)) {
+    throw new TransitionError(TRACKING_ONLY_REQUEUE_ERROR);
+  }
   if (!canTransition(from, to)) {
     // Agents jump straight to done often enough (4/16 sampled sessions) that
     // the error should teach the path, not just reject.
@@ -358,10 +394,10 @@ export function transition(
     throw new TransitionError(`invalid transition: '${from}' -> '${to}'${hint}`);
   }
 
-  // Evidence gates apply to hive-driven work. Tracking-only tasks
-  // (source='external': another agent using the board as a kanban, never
-  // dispatched) move freely — hive records, it doesn't supervise them.
-  if (to === "done" && !isExternalTask(task.source)) {
+  // Evidence gates apply to hive-driven work. Tracking-only tasks (source
+  // 'external', or a Jira mirror) move freely: hive records them, it does not
+  // supervise them.
+  if (to === "done" && !isTrackingOnlyTask(task)) {
     if (evidenceCount(db, taskId) < 1) {
       throw new TransitionError(
         "cannot transition to 'done': task has no evidence"
@@ -374,22 +410,23 @@ export function transition(
     }
   }
 
-  // Re-queuing a failed task (attention tray) resets its runtime binding so the
-  // next spawn is clean — a queued task must not point at a dead agent/worktree.
-  if (to === "queued") {
-    db.query(
-      "UPDATE tasks SET state = ?, updated_at = ?, agent_target = NULL, worktree_path = NULL, branch = NULL WHERE id = ?"
-    ).run(to, now(), taskId);
-  } else {
-    db.query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?").run(to, now(), taskId);
-  }
-  writeEvent(db, {
+  const updated = mutateWithEvent(db, () => {
+    // Re-queuing a failed task (attention tray) resets its runtime binding so the
+    // next spawn is clean — a queued task must not point at a dead agent/worktree.
+    if (to === "queued") {
+      db.query(
+        "UPDATE tasks SET state = ?, updated_at = ?, agent_target = NULL, worktree_path = NULL, branch = NULL WHERE id = ?"
+      ).run(to, now(), taskId);
+    } else {
+      db.query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?").run(to, now(), taskId);
+    }
+    return getTask(db, taskId);
+  }, {
     task_id: taskId,
     source,
     type: "state_change",
     payload: { from, to, reason: opts.reason ?? null },
   });
-  const updated = getTask(db, taskId);
   broadcastTask(db, updated);
   // A terminal task can no longer act on any open decision — expire them so the
   // inbox clears and the answer endpoint can't be hit against a dead task.
