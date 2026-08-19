@@ -734,7 +734,10 @@ the reconciler recording `pr_synchronized`.
   reconciler captured at first sight (pre-rebase); if the branch now authors a
   file it did not originally *and* base advanced that file since, the merge is
   refused with `409`, a `merge_blocked_destructive` event is recorded, and the
-  task is bounced to `in_progress` with a steer to re-cut off current base.
+  task is bounced to `in_progress` with a steer to re-cut off current base. The
+  comparison uses the PR's actual GitHub base branch (falling back to the
+  project's configured default only for non-PR work), so a staging PR is never
+  compared against main.
   **`override_destructive_check: true`** skips this guard when the reverts are
   intentional. The guard is a no-op when no pre-rebase snapshot exists (hive
   first saw the branch already rebased).
