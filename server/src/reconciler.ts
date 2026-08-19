@@ -12,7 +12,8 @@ import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, isTrackingOnlyTask, TERMINAL, type State } from "./state.ts";
-import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
+import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
+import { spawnMeta } from "./cleanup.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent } from "./steer.ts";
 import { isReviewed } from "./dispatcher.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
@@ -148,7 +149,11 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
     .all() as { id: string; agent_target: string }[];
   for (const t of tasks) {
     if (isJiraMirrorId(db, t.id)) continue;
-    const { alive, status } = await h.probe(t.agent_target);
+    const { alive, status, unconfirmed } = await probeAgent(h, db, t.id, t.agent_target);
+    if (unconfirmed) {
+      noteUnconfirmedDeath(db, t.id);
+      continue; // herdr can't resolve it and its pane is still there: touch nothing
+    }
     const next = alive ? status : "gone";
     if (next === "unknown") continue; // couldn't determine; leave prior status intact
     if (next !== lastAgentStatus(db, t.id)) {
@@ -167,6 +172,61 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
       }
     }
   }
+}
+
+// Probe an agent, but never report DEAD without positive evidence. herdr's
+// `agent get` answers agent_not_found for an agent whose registration was lost
+// (a desktop-app restart wipes the registry; the panes and the claude processes
+// in them survive) — indistinguishable, from the probe alone, from a real
+// death. Herdr.confirmGone cross-checks the pane list; an unconfirmed death
+// degrades to alive+unknown, which every caller already treats as "leave it
+// alone" (2026-08-19 incident: 12+ live agents failed and their tabs closed).
+async function probeAgent(
+  h: Herdr,
+  db: DB,
+  taskId: string,
+  target: string
+): Promise<{ alive: boolean; status: AgentStatus; unconfirmed?: boolean }> {
+  const p = await h.probe(target);
+  if (p.alive) return p;
+  const task = getTask(db, taskId);
+  const gone = await h.confirmGone({ cwd: task?.worktree_path ?? null, tabId: spawnMeta(db, taskId).tab_id });
+  return gone ? p : { alive: true, status: "unknown", unconfirmed: true };
+}
+
+// Unregistered-but-running (or herdr unreachable): log it — which also resets
+// the task's silence clock, so the next look is a stale threshold away — and
+// after a few laps put it in front of the director instead of guessing. Never
+// tears anything down.
+const MAX_UNCONFIRMED_DEATHS = 3;
+
+function noteUnconfirmedDeath(db: DB, taskId: string): void {
+  const n = (
+    db
+      .query(
+        `SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'recovery'
+           AND json_extract(payload, '$.decision') = 'unconfirmed-dead'`
+      )
+      .get(taskId) as any
+  ).n as number;
+  // Bounded: an event per cycle forever would also reset the silence clock
+  // forever, masking a genuinely mute agent from flagStale.
+  if (n < MAX_UNCONFIRMED_DEATHS) {
+    writeEvent(db, { task_id: taskId, source: "reconciler", type: "recovery", payload: { decision: "unconfirmed-dead" } });
+    return;
+  }
+  const already = db
+    .query("SELECT 1 FROM notifications WHERE kind = 'agent_unreachable' AND task_id = ? LIMIT 1")
+    .get(taskId);
+  if (already) return;
+  const task = getTask(db, taskId);
+  enqueue(db, {
+    kind: "agent_unreachable",
+    urgency: "urgent",
+    task_id: taskId,
+    title: `Agent unreachable but not dead: ${task?.title ?? taskId}`,
+    body: "herdr cannot resolve the agent, but its pane is still there (or herdr is down). Nothing was torn down — check the pane.",
+  });
 }
 
 function lastAgentStatus(db: DB, taskId: string): string | null {
@@ -914,7 +974,8 @@ async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
     const staleFlagged = meaningful?.type === "stale";
     if (!goneNow && !staleFlagged) continue;
 
-    const { alive, status } = await h.probe(t.agent_target);
+    const { alive, status, unconfirmed } = await probeAgent(h, db, t.id, t.agent_target);
+    if (unconfirmed) continue; // syncAgents already logged it; never recover on a guess
     if (!alive) await recoverDead(db, h, t.id, t.agent_target);
     else if (staleFlagged) {
       // Quiet but WORKING is not stuck — long tool runs and big builds are
@@ -928,6 +989,11 @@ async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
 async function recoverDead(db: DB, h: Herdr, taskId: string, target: string): Promise<void> {
   const task = getTask(db, taskId);
   if (!task || TERMINAL.includes(task.state as State)) return;
+  // A respawn can land while the probe above is in flight: the verdict is about
+  // the OLD agent, but the teardown below (and the cleanup the `failed`
+  // transition fires) would execute against the FRESH tab/worktree, killing a
+  // 100ms-old agent. Bail if the binding moved on.
+  if (task.agent_target !== target) return;
 
   const tail = await h.read(target, 200);
   attachLog(db, taskId, tail, "agent pane tail at death (stale recovery)");

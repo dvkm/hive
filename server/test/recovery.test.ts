@@ -17,12 +17,22 @@ import type { Exec, ExecResult } from "../src/exec.ts";
 const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
 const gh: Exec = async () => ({ code: 1, stdout: "", stderr: "no gh" }); // PR sync no-op
 
+// `pane list` answers. A dead verdict now needs POSITIVE evidence: the task's
+// own pane really is gone from herdr. `panes(cwd)` puts a pane back at that cwd,
+// which is what a live-but-unregistered agent looks like (herdr's agent registry
+// is wiped by a desktop-app restart while the panes keep running).
+const NO_TASK_PANE = OK('{"result":{"panes":[{"pane_id":"w6:p1","tab_id":"w6:t1","workspace_id":"w6","cwd":"/Users/you"}]}}');
+const panes = (cwd: string) =>
+  OK(`{"result":{"panes":[{"pane_id":"w6:p9","tab_id":"w6:t9","workspace_id":"w6","cwd":"${cwd}"}]}}`);
+const isPaneList = (argv: string[]) => argv.includes("pane") && argv.includes("list");
+
 // A herdr whose `agent get` verdict (dead|alive) is configurable; records sends.
 // `sendLost` reproduces the herdr quirk where `agent send` to a vanished agent
 // exits 0 with an agent_not_found body — the message never landed.
 function herdrProbe(verdict: "dead" | "alive", status = "idle", sendLost = false) {
   const sends: { target: string; message: string }[] = [];
   const exec: Exec = async (argv) => {
+    if (isPaneList(argv)) return NO_TASK_PANE;
     if (argv.includes("get")) {
       return verdict === "dead"
         ? OK('{"error":{"code":"agent_not_found","message":"gone"}}')
@@ -215,6 +225,7 @@ function herdrDeadWithWorktree(dirty: boolean) {
       if (has(argv, "rev-parse", "--verify")) return { code: 1, stdout: "", stderr: "" }; // ghost name free
       return OK();
     }
+    if (isPaneList(argv)) return NO_TASK_PANE;
     if (argv.includes("get")) return OK('{"error":{"code":"agent_not_found","message":"gone"}}');
     if (argv.includes("read")) return OK("pane tail");
     return OK();
@@ -260,6 +271,64 @@ test("dead agent → a clean worktree is removed with no ghost branch", async ()
   expect(calls.some((c) => c.includes("checkout"))).toBe(false);
 });
 
+// 2026-08-19: a herdr desktop-app restart wiped the agent registry, so every
+// LIVE agent probed as agent_not_found. 12+ tasks were failed and had their tabs
+// closed under them. A not-found probe is only death when the pane is gone too.
+test("agent_not_found with the task's pane still alive is NOT death", async () => {
+  const { db, projectId } = freshDb();
+  const id = taskWithWorktree(db, projectId);
+  putEvent(db, id, "spawned");
+  const calls: string[][] = [];
+  const exec: Exec = async (argv) => {
+    calls.push(argv);
+    if (isPaneList(argv)) return panes("/wt/x"); // the agent's pane is still running
+    if (argv.includes("get")) return OK('{"error":{"code":"agent_not_found"}}');
+    return OK();
+  };
+
+  await reconcileOnce(db, { ...inert, herdr: new Herdr(exec, "herdr") });
+
+  expect(getTask(db, id).state).toBe("in_progress"); // never failed
+  expect(calls.some((c) => c.includes("close"))).toBe(false); // never closed
+  expect(calls.some((c) => c[0] === "git" && c.includes("remove"))).toBe(false); // worktree intact
+  const rec = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery'").get(id) as any;
+  expect(JSON.parse(rec.payload).decision).toBe("unconfirmed-dead");
+});
+
+// herdr itself unreachable (pane list comes back empty) is no evidence either.
+test("agent_not_found with no pane list at all is NOT death", async () => {
+  const { db, projectId } = freshDb();
+  const id = taskWithWorktree(db, projectId);
+  putEvent(db, id, "spawned");
+  const exec: Exec = async (argv) => {
+    if (isPaneList(argv)) return { code: 1, stdout: "", stderr: "connection refused" };
+    if (argv.includes("get")) return OK('{"error":{"code":"agent_not_found"}}');
+    return OK();
+  };
+
+  await reconcileOnce(db, { ...inert, herdr: new Herdr(exec, "herdr") });
+
+  expect(getTask(db, id).state).toBe("in_progress");
+});
+
+// Three laps of "cannot tell" puts it in front of the director, once.
+test("repeated unconfirmed deaths notify the director instead of tearing down", async () => {
+  const { db, projectId } = freshDb();
+  const id = taskWithWorktree(db, projectId);
+  putEvent(db, id, "spawned");
+  const exec: Exec = async (argv) => {
+    if (isPaneList(argv)) return panes("/wt/x");
+    if (argv.includes("get")) return OK('{"error":{"code":"agent_not_found"}}');
+    return OK();
+  };
+  const herdr = new Herdr(exec, "herdr");
+
+  for (let i = 0; i < 4; i++) await reconcileOnce(db, { ...inert, herdr });
+
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(db.query("SELECT 1 FROM notifications WHERE kind = 'agent_unreachable' AND task_id = ?").all(id).length).toBe(1);
+});
+
 test("a reclaim failure never derails recovery", async () => {
   const { db, projectId } = freshDb();
   const id = taskWithWorktree(db, projectId);
@@ -273,6 +342,7 @@ test("a reclaim failure never derails recovery", async () => {
       if (argv.includes("rev-parse")) return { code: 1, stdout: "", stderr: "" };
       return OK();
     }
+    if (isPaneList(argv)) return NO_TASK_PANE;
     if (argv.includes("get")) return OK('{"error":{"code":"agent_not_found"}}');
     return OK();
   };

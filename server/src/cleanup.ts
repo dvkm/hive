@@ -85,7 +85,7 @@ export interface CleanupOutcome {
 // The `spawned` event carries the herdr tab id and the worktree's own workspace
 // id (the task row stores neither). fleet_workspace_id is deliberately NOT
 // returned: it's the shared hive-fleet workspace and must never be closed.
-function spawnMeta(db: DB, taskId: string): { tab_id: string | null; workspace_id: string | null } {
+export function spawnMeta(db: DB, taskId: string): { tab_id: string | null; workspace_id: string | null } {
   const r = db
     .query("SELECT payload FROM events WHERE task_id = ? AND type = 'spawned' ORDER BY ts DESC LIMIT 1")
     .get(taskId) as { payload: string } | undefined;
@@ -168,7 +168,8 @@ export async function cleanupTask(
   const meta = spawnMeta(db, taskId);
   const preserved = !!worktree && !worktree.removed;
   let session = { closed: false, via: null as string | null };
-  if (preserved ? task.agent_target : task.agent_target || meta.tab_id) {
+  const attemptedClose = preserved ? !!task.agent_target : !!(task.agent_target || meta.tab_id);
+  if (attemptedClose) {
     session = await herdr.closeSession({ agentTarget: task.agent_target, tabId: meta.tab_id });
     // Also close the worktree's OWN herdr workspace: `worktree create` auto-spawns
     // it with a live pane the agent never uses (the agent runs in the fleet tab
@@ -182,7 +183,13 @@ export async function cleanupTask(
 
   // 3) emit + record.
   if (preserved) {
-    if (session.closed)
+    // The close is ATTEMPTED once, not retried forever. Keeping agent_target
+    // until the call succeeded meant a herdr outage re-issued tab.close for the
+    // same preserved worktrees on every reaper sweep, indefinitely (2026-08-19:
+    // 6 terminal tasks, ~5 closes each, every 5 minutes). Dropping the binding
+    // makes the next sweep a no-op; the pane sweep (reaper.ts) is the backstop
+    // for a tab that really is still open.
+    if (attemptedClose)
       db.query("UPDATE tasks SET agent_target = NULL, updated_at = ? WHERE id = ?").run(now(), taskId);
     // One event per distinct skip reason, not one per reaper sweep: the same
     // dozen preserved worktrees emitted 2,668 duplicate events in 3 days.
