@@ -4,9 +4,8 @@
 // in step in BOTH directions. Hard no-op until a project opts in, same as the
 // gchat intake connector.
 //
-// Config lives on the project row (`projects.config.jira`):
-//   { site: "https://acme.atlassian.net", email: "bot@acme.com",
-//     project_key: "WEB", enabled: false, write: false, jql?: "..." }
+// Config lives on the project row (`projects.config.jira`) and must pass the
+// compiled-in credential and project allowlist below before any secret resolves.
 // `enabled` is the master switch; `write` is a separate SHADOW-MODE gate — with
 // enabled:true / write:false the sync imports and computes every outbound call
 // but LOGS it instead of sending, so the director can read one cycle of "would
@@ -57,6 +56,15 @@ export const NEEDS_DECISION_LABEL = "hive:needs-decision";
 const MAX_PAGES = 20; // paging backstop; 100 issues/page
 const MAX_COMMENT_PAGES = 20;
 const HIVE_COMMENT_PROPERTY = "hive.event_id";
+
+// Compiled-in allowlist. `projects.config` is attacker-writable (the loopback
+// API is unauthenticated by design), so jiraConfig must not trust a caller's
+// site/email — it validates against these BEFORE JIRA_API_TOKEN is ever
+// resolved or an Authorization header is built.
+const ALLOWED_HOST = "corebeat.atlassian.net";
+export const ALLOWED_SITE = `https://${ALLOWED_HOST}`;
+export const ALLOWED_EMAIL = "corebeat@vid.kim";
+const ALLOWED_PROJECT_KEYS = ["WEB"]; // array so adding one later is a one-line PR
 
 export interface JiraConfig {
   site: string;
@@ -197,13 +205,43 @@ export function decideStatusSync(args: {
   return hiveAt > jiraAt ? "push" : "pull";
 }
 
+// The credential is the (site, email) PAIR: pinning only the host would still
+// let a config write swap the identity half of email:token. EXACT host match,
+// not a `*.atlassian.net` suffix check — Atlassian Cloud sites are self-serve,
+// so an attacker can register their own for free and a suffix check waves
+// them through.
+export function credentialTargetAllowed(site: unknown, email: unknown): boolean {
+  if (typeof site !== "string" || typeof email !== "string") return false;
+  let u: URL;
+  try {
+    u = new URL(site);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "https:") return false; // Basic auth over http is base64 on the wire, not encryption
+  // Reject any "@" in the raw string outright, before relying on parsed fields. new URL()
+  // normalizes away empty userinfo (e.g. "https://@host" parses to username="" password="")
+  // and slash/backslash forms (e.g. "https:/@host", "https:////@host"), so u.username/u.password
+  // can't be trusted to catch every representation of a userinfo delimiter. ALLOWED_SITE never
+  // contains "@" under any spelling, so this can't reject a legitimate value.
+  if (site.includes("@")) return false;
+  if (u.host !== ALLOWED_HOST) return false; // host, not hostname: a port makes it a different endpoint
+  return email === ALLOWED_EMAIL;
+}
+
 // ------------------------------------------------------------------ jira api
 export class JiraClient {
   constructor(
     private cfg: JiraConfig,
     private token: string,
     private fetchImpl: FetchLike = fetch
-  ) {}
+  ) {
+    // Belt-and-suspenders: JiraConfig is a plain interface, so a hand-built
+    // literal would otherwise satisfy the type and reach auth() unchecked.
+    if (!credentialTargetAllowed(cfg.site, cfg.email)) {
+      throw new Error(`jira: refusing to build a client for disallowed target ${cfg.site} <${cfg.email}>`);
+    }
+  }
 
   private auth(): string {
     return "Basic " + Buffer.from(`${this.cfg.email}:${this.token}`).toString("base64");
@@ -358,10 +396,16 @@ export function jiraConfig(raw: any): JiraConfig | null {
   const j = raw?.jira;
   if (!j || typeof j !== "object") return null;
   if (!j.site || !j.email || !j.project_key) return null;
+  const email = String(j.email);
+  const projectKey = String(j.project_key);
+  if (!credentialTargetAllowed(j.site, email)) return null;
+  if (!ALLOWED_PROJECT_KEYS.includes(projectKey)) return null;
+  // Canonicalize to hive's OWN constants, not the caller's strings, so no
+  // unvalidated remnant reaches fetch() or the Authorization header.
   return {
-    site: String(j.site).replace(/\/$/, ""),
-    email: String(j.email),
-    project_key: String(j.project_key),
+    site: ALLOWED_SITE,
+    email: ALLOWED_EMAIL,
+    project_key: projectKey,
     enabled: j.enabled === true,
     write: j.write === true,
     jql: typeof j.jql === "string" ? j.jql : undefined,

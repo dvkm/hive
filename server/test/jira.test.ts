@@ -4,14 +4,18 @@ import {
   JiraClient,
   adfToText,
   applyJiraState,
+  credentialTargetAllowed,
   decideStatusSync,
   jiraConfig,
   jiraStatusToState,
   lastStateChangeAt,
   lastStatusChangeAt,
   stateToJiraStatus,
+  syncJiraOnce,
   syncProjectOnce,
   textToAdf,
+  ALLOWED_EMAIL,
+  ALLOWED_SITE,
   NEEDS_DECISION_LABEL,
   REF_PREFIX,
   type FetchLike,
@@ -19,8 +23,8 @@ import {
 } from "../src/intake/jira.ts";
 
 const CFG: JiraConfig = {
-  site: "https://acme.atlassian.net",
-  email: "bot@acme.com",
+  site: ALLOWED_SITE,
+  email: ALLOWED_EMAIL,
   project_key: "WEB",
   enabled: true,
   write: true,
@@ -208,11 +212,64 @@ test("lastStateChangeAt prefers the newest state_change event over created_at", 
 // -------------------------------------------------------------- config gates
 test("config requires site, email and project_key, and defaults both switches off", () => {
   expect(jiraConfig({})).toBeNull();
-  expect(jiraConfig({ jira: { site: "s", email: "e" } })).toBeNull(); // no project_key
-  const c = jiraConfig({ jira: { site: "https://x.atlassian.net/", email: "e", project_key: "WEB" } })!;
+  expect(jiraConfig({ jira: { site: ALLOWED_SITE, email: ALLOWED_EMAIL } })).toBeNull(); // no project_key
+  const c = jiraConfig({ jira: { site: ALLOWED_SITE + "/", email: ALLOWED_EMAIL, project_key: "WEB" } })!;
   expect(c.enabled).toBe(false); // hard no-op until explicitly turned on
   expect(c.write).toBe(false); // shadow by default
-  expect(c.site).toBe("https://x.atlassian.net"); // trailing slash trimmed
+  expect(c.site).toBe(ALLOWED_SITE); // canonicalized to hive's own constant, trailing slash and all
+});
+
+// ------------------------------------------------------- credential pinning
+// PRODUCTION SECURITY HOTFIX: projects.config is attacker-writable (loopback
+// API, unauthenticated by design), and jiraConfig used to trust its site/email
+// wholesale, so a config write could repoint the next poll's JIRA_API_TOKEN at
+// any host. These assert the OUTPUT of the gate, not that a validator exists.
+test("credentialTargetAllowed is true ONLY for the exact compiled-in (site, email) pair", () => {
+  const bad: [unknown, unknown][] = [
+    ["http://corebeat.atlassian.net", ALLOWED_EMAIL], // http: Basic auth would go over the wire as base64, not encryption
+    ["https://evil.atlassian.net", ALLOWED_EMAIL],
+    ["https://corebeat.atlassian.net.evil.com", ALLOWED_EMAIL],
+    ["https://notcorebeat.atlassian.net", ALLOWED_EMAIL],
+    ["https://corebeat.atlassian.net@evil.tld/", ALLOWED_EMAIL], // userinfo: host is evil.tld despite reading as the real site
+    ["https://@corebeat.atlassian.net", ALLOWED_EMAIL], // empty userinfo: URL parses username/password as "", so the delimiter itself must be checked
+    ["https:////@corebeat.atlassian.net", ALLOWED_EMAIL], // WHATWG slash normalization: URL still resolves this to the allowed host with empty userinfo
+    ["https://corebeat.atlassian.net:8443", ALLOWED_EMAIL], // a port is a different endpoint
+    ["not a url", ALLOWED_EMAIL],
+    ["", ALLOWED_EMAIL],
+    [null, ALLOWED_EMAIL],
+    [ALLOWED_SITE, "someone-else@corebeat.atlassian.net"], // right site, wrong half of the pair
+  ];
+  for (const [site, email] of bad) expect(credentialTargetAllowed(site, email)).toBe(false);
+  expect(credentialTargetAllowed(ALLOWED_SITE, ALLOWED_EMAIL)).toBe(true);
+});
+
+test("jiraConfig hard no-ops (returns null, never throws) on a mutated site, mutated email, or a project_key outside the allowlist", () => {
+  expect(jiraConfig({ jira: { site: "https://evil.tld", email: ALLOWED_EMAIL, project_key: "WEB" } })).toBeNull();
+  expect(jiraConfig({ jira: { site: ALLOWED_SITE, email: "evil@vid.kim", project_key: "WEB" } })).toBeNull();
+  expect(jiraConfig({ jira: { site: ALLOWED_SITE, email: ALLOWED_EMAIL, project_key: "NOTWEB" } })).toBeNull();
+});
+
+test("new JiraClient throws for a config carrying a disallowed site", () => {
+  expect(() => new JiraClient({ ...CFG, site: "https://evil.tld" }, "tok")).toThrow();
+});
+
+test("THE KEY ONE: a project configured with a mutated site makes syncJiraOnce issue ZERO fetch calls, in write and shadow mode alike", async () => {
+  for (const write of [true, false]) {
+    const db = openDb(":memory:");
+    db.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run(
+      newId("proj"),
+      "p",
+      JSON.stringify({ jira: { site: "https://evil.tld", email: ALLOWED_EMAIL, project_key: "WEB", enabled: true, write } }),
+      now()
+    );
+    const calls = { n: 0 };
+    const spyFetch = (async () => {
+      calls.n++;
+      return new Response("{}", { status: 200 });
+    }) as FetchLike;
+    await syncJiraOnce(db, { fetch: spyFetch, token: "tok", log: () => {} });
+    expect(calls.n).toBe(0); // the leak is on the read path — shadow mode (write:false) is not protection
+  }
 });
 
 // -------------------------------------------------------------- the bypass
