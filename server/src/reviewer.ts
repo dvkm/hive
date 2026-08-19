@@ -16,7 +16,7 @@ import { writeEvent, getTask } from "./state.ts";
 import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectComparisonBase, mapLimit } from "./exec.ts";
-import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { claudeBin, defaultPlannerExec, parseModelJson, type PlannerExec } from "./planner.ts";
 import { modelFailure, modelErrorText, noteModelCall, isAuthFailure } from "./modelCall.ts";
 import { enqueue } from "./notifications.ts";
 import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
@@ -61,7 +61,7 @@ export interface AutoReview {
 // Loose-parse the model output: whole JSON, the `claude -p --output-format
 // json` {result:"..."} envelope, or a braces slice of prose.
 export function extractReview(raw: string): AutoReview | null {
-  const norm = (o: any): AutoReview | null => {
+  return parseModelJson(raw, (o: any): AutoReview | null => {
     if (!o || typeof o.summary !== "string" || !o.summary.trim()) return null;
     return {
       verdict: o.verdict === "caution" ? "caution" : "looks_good",
@@ -69,26 +69,7 @@ export function extractReview(raw: string): AutoReview | null {
       risks: Array.isArray(o.risks) ? o.risks.map(String) : [],
       questions: Array.isArray(o.questions) ? o.questions.map(String) : [],
     };
-  };
-  const tryParse = (s: string) => {
-    try {
-      return norm(JSON.parse(s));
-    } catch {
-      return null;
-    }
-  };
-  const braces = (s: string) => {
-    const a = s.indexOf("{");
-    const b = s.lastIndexOf("}");
-    return a >= 0 && b > a ? tryParse(s.slice(a, b + 1)) : null;
-  };
-  const whole = tryParse(raw);
-  if (whole) return whole;
-  try {
-    const env = JSON.parse(raw);
-    if (env && typeof env.result === "string") return tryParse(env.result) ?? braces(env.result);
-  } catch {}
-  return braces(raw);
+  });
 }
 
 async function rawDiff(db: DB, task: any, exec: Exec): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
