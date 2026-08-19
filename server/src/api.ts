@@ -5,7 +5,8 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { taskWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
-import { isSupervisedTask, supervisedSql, neverDispatched } from "./supervision.ts";
+import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched } from "./supervision.ts";
+import { REF_PREFIX as JIRA_REF_PREFIX } from "./intake/jira.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
 import {
   transition,
@@ -2533,12 +2534,23 @@ async function bounceForChanges(
   // No live agent read the notes: queue them and respawn so the fresh agent gets
   // them in its brief (spawnAgent receipts the steer on success). Without this
   // the notes sit unread and the task looks reviewed again (#710).
+  // Two separate questions here, not one: did queueSteerEvent record something
+  // worth carrying (its `queued` return value — true whenever a live agent or a
+  // future manual respawn might still pick it up, even for a source=external
+  // task that WAS manually spawned before), and is it OK for HIVE'S OWN
+  // AUTOMATION to spawn a live agent for this task right now. Those aren't the
+  // same question: a source=external task must never be auto-dispatched by
+  // hive itself, even if a director manually spawned it once before, so gate
+  // the respawn on isExternalTask directly rather than inferring it from
+  // `queued` — that was the bug a second review pass caught here.
   let respawned = false;
   if (!delivered) {
-    queueSteerEvent(db, id, msg, "changes requested; agent not live");
-    const r = await spawnAgent(db, herdr, id, { supervise: deps.supervise });
-    respawned = r.ok;
-    if (r.ok) delivered = true;
+    const queued = queueSteerEvent(db, id, msg, "changes requested; agent not live");
+    if (queued && !isExternalTask(task.source)) {
+      const r = await spawnAgent(db, herdr, id, { supervise: deps.supervise });
+      respawned = r.ok;
+      if (r.ok) delivered = true;
+    }
   }
   return { delivered, respawned, sendError };
 }
@@ -2799,7 +2811,11 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
   if (sender && sender.project_id !== task.project_id) return err("teammates must belong to the same project", 400);
   const blocked = authzBlock(db, { project_id: task.project_id, action: "task.steer", target: task.title, task_id: id });
   if (blocked) return blocked;
-  if (String(task.source_ref ?? "").startsWith("jira:")) {
+  const jiraLinked = String(task.source_ref ?? "").startsWith(JIRA_REF_PREFIX);
+  if (jiraLinked) {
+    // Jira-linked external task: its "agent" is the Jira sync, so the message
+    // becomes an outbound comment there instead — a real delivery path
+    // regardless of whether this task has ever been spawned.
     if (files.length) return err("Jira comment attachments are not supported yet", 400);
     const comment = sender ? `Hive agent #${sender.number} (${sender.title}):\n${text}` : text;
     writeEvent(db, {
@@ -2810,6 +2826,18 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
     });
     return json({ ok: true, delivered: false, delivery: "queued", message: comment, attachments: [] });
   }
+  // neverDispatched (supervision.ts): tracking-only AND never even manually
+  // spawned — since #996, spawnAgent itself refuses a never-dispatched
+  // external task's first spawn too, so the only way past this today is a
+  // task that was already spawned before that gate existed (recovery, a
+  // legacy row). Nobody is ever coming for this message, so a queued steer
+  // would sit unread forever instead of just never being delivered (task
+  // #977). Once a task HAS been spawned at least once, the normal
+  // delivered/queued/failed logic below applies unchanged: a live agent may
+  // pick it up now, or a future manual respawn may carry it, same as any
+  // other task.
+  if (neverDispatched(db, task))
+    return err("task is untracked (source=external) and has never been spawned — a steer message can never be delivered", 400);
   const { paths, block } = await attachFiles(id, files);
   const message = sender
     ? `[teammate #${sender.number} ${sender.title} | task ${sender.id}]\n${text}\n\nReply with: "$HIVE_CLI" task send ${sender.id} "<your reply>"${block}`
