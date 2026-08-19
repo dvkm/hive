@@ -19,6 +19,7 @@ import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
+import { supervisedSql } from "./supervision.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
 import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision } from "./api.ts";
@@ -768,15 +769,17 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
   // Only tasks that are actively worked (an agent could go silent).
   // needs_decision / in_review are parked on the DIRECTOR — silence there is
   // expected, and flagging it spawned pointless recovery nudges (2026-07-10).
-  // Tracking-only tasks are externally driven, and chat supervisors are
-  // intentionally idle between turns/wakeups: neither gets worker staleness.
+  // Never-spawned tracking-only tasks are externally driven, and chat
+  // supervisors are intentionally idle between turns/wakeups: neither gets
+  // worker staleness. A manually-spawned external task has a real agent that
+  // can go stale like any other, so it isn't exempt (supervisedSql).
   // A task deferred pending a human action
   // (deferred_until in the future) is intentionally parked — skip it so the
   // "gone quiet" nudge/notification never fires (task #679).
   const nowIso = new Date(nowMs).toISOString();
   const tasks = db
     .query(
-      `SELECT id FROM tasks WHERE state IN ('in_progress','verifying') AND COALESCE(source,'') NOT IN ('external','chat_supervisor')
+      `SELECT id FROM tasks WHERE state IN ('in_progress','verifying') AND ${supervisedSql()}
          AND (deferred_until IS NULL OR deferred_until <= ?)`
     )
     .all(nowIso) as { id: string }[];

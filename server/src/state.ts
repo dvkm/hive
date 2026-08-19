@@ -12,6 +12,7 @@ import { parseEvent, parseTask, parseDecision } from "./rows.ts";
 import { redact } from "./secrets.ts";
 import { enqueue } from "./notifications.ts";
 import { broadcastTask } from "./health.ts";
+import { isExternalTask } from "./supervision.ts";
 
 export const STATES = [
   "queued",
@@ -360,7 +361,7 @@ export function transition(
   // Evidence gates apply to hive-driven work. Tracking-only tasks
   // (source='external': another agent using the board as a kanban, never
   // dispatched) move freely — hive records, it doesn't supervise them.
-  if (to === "done" && task.source !== "external") {
+  if (to === "done" && !isExternalTask(task.source)) {
     if (evidenceCount(db, taskId) < 1) {
       throw new TransitionError(
         "cannot transition to 'done': task has no evidence"

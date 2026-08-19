@@ -11,8 +11,8 @@ import { join } from "node:path";
 const HOME = mkdtempSync(join(tmpdir(), "hive-chat-"));
 process.env.HIVE_HOME = HOME;
 
-const { openDb } = await import("../src/db.ts");
-const { makeHandler, notifyManagerOfEvent, sweepManagerInboxes } = await import("../src/api.ts");
+const { openDb, newId, now } = await import("../src/db.ts");
+const { makeHandler, notifyManagerOfEvent, sweepManagerInboxes, projectInboxCounts } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { composeSupervisorBrief, createThread, managingThreadForTask } = await import("../src/chat.ts");
 const { composeBrief } = await import("../src/briefs.ts");
@@ -195,6 +195,60 @@ test("startup inbox sweep wakes one active manager per project with actionable c
   expect(sends.at(-1)).toContain("across 2 projects");
   expect(sends.at(-1)).toContain("checkpoints");
   expect(sends.at(-1)).toContain(`\"source\":\"chat_supervisor\"`);
+});
+
+test("external tracking tasks (source='external') are invisible to manager wakeups and inbox counts", async () => {
+  const trackedProject = (await post("/api/projects", { name: "jira-mirrored project", repo_path: WT })).json;
+  const tracked = (await post("/api/tasks", { project_id: trackedProject.id, title: "mirrored JIRA issue", source: "external" })).json;
+  expect(tracked.source).toBe("external");
+  const control = (await post("/api/tasks", { project_id: trackedProject.id, title: "hive-driven work", source: "agent" })).json;
+
+  // notifyManagerOfEvent: an event on an external task must not wake anyone.
+  const before = sends.length;
+  const trackedCheckpoint = writeEvent(db, { task_id: tracked.id, source: "agent", type: "checkpoint", payload: { note: "upstream ticket edited" } });
+  notifyManagerOfEvent(db, herdr, {}, trackedCheckpoint);
+  await new Promise((r) => setTimeout(r, 20));
+  expect(sends.length).toBe(before);
+
+  // projectInboxCounts: put both tasks through the same trigger conditions
+  // (unacked checkpoint, open decision, in_review, failed) so the counts can
+  // only be non-zero via the control task — the external one must never add.
+  writeEvent(db, { task_id: control.id, source: "agent", type: "checkpoint", payload: { note: "used the established cache key" } });
+  db.query("INSERT INTO decisions (id, task_id, ts, title, status) VALUES (?,?,?,?,'open')").run(newId("dec"), tracked.id, now(), "should never surface");
+  db.query("INSERT INTO decisions (id, task_id, ts, title, status) VALUES (?,?,?,?,'open')").run(newId("dec"), control.id, now(), "a real open decision");
+  const failedExternal = newId();
+  db.query(
+    "INSERT INTO tasks (id, project_id, title, state, kind, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)"
+  ).run(failedExternal, trackedProject.id, "failed mirrored issue", "failed", "chore", "external", now(), now());
+  const failedControl = newId();
+  db.query(
+    "INSERT INTO tasks (id, project_id, title, state, kind, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)"
+  ).run(failedControl, trackedProject.id, "failed hive work", "failed", "chore", "agent", now(), now());
+  db.query("UPDATE tasks SET state = 'in_review' WHERE id = ?").run(tracked.id);
+  db.query("UPDATE tasks SET state = 'in_review' WHERE id = ?").run(control.id);
+
+  expect(projectInboxCounts(db, trackedProject.id)).toEqual({ checkpoints: 1, decisions: 1, reviews: 1, attention: 1 });
+});
+
+test("a manually-spawned external task (agent_target set) is real hive-driven work and stays visible", async () => {
+  // Unlike the never-spawned case above, an external task a director chose to
+  // dispatch has a live agent doing real work — supervisedSql/isSupervisedTask
+  // must not hide it just because source='external'.
+  const project = (await post("/api/projects", { name: "manually-spawned external project", repo_path: WT })).json;
+  const spawned = (await post("/api/tasks", { project_id: project.id, title: "manually dispatched mirrored issue", source: "external", agent_target: "t-external-live" })).json;
+  expect(spawned.source).toBe("external");
+  expect(spawned.agent_target).toBe("t-external-live");
+
+  const before = sends.length;
+  const spawnedCheckpoint = writeEvent(db, { task_id: spawned.id, source: "agent", type: "checkpoint", payload: { note: "real progress" } });
+  notifyManagerOfEvent(db, herdr, {}, spawnedCheckpoint);
+  await new Promise((r) => setTimeout(r, 20));
+  expect(sends.length).toBe(before + 1);
+
+  db.query("INSERT INTO decisions (id, task_id, ts, title, status) VALUES (?,?,?,?,'open')").run(newId("dec"), spawned.id, now(), "a real decision from real work");
+  db.query("UPDATE tasks SET state = 'in_review' WHERE id = ?").run(spawned.id);
+
+  expect(projectInboxCounts(db, project.id)).toEqual({ checkpoints: 1, decisions: 1, reviews: 1, attention: 0 });
 });
 
 test("a concurrent double-send on the same thread spawns only once", async () => {
