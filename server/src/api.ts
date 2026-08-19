@@ -2816,14 +2816,18 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
   if (jiraLinked) {
     // Jira-linked external task: its "agent" is the Jira sync, so the message
     // becomes an outbound comment there instead — a real delivery path
-    // regardless of whether this task has ever been spawned.
+    // regardless of whether this task has ever been spawned. No `delivery`
+    // field on the payload: the real push/shadow outcome lives in the sync
+    // log's comment_push/comment_shadow events (server/src/intake/jira.ts),
+    // and nothing reads it here — a stored 'queued' would just go stale
+    // forever once syncJiraOnce actually pushes the comment (task #1008).
     if (files.length) return err("Jira comment attachments are not supported yet", 400);
     const comment = sender ? `Hive agent #${sender.number} (${sender.title}):\n${text}` : text;
     writeEvent(db, {
       task_id: id,
       source: sender ? "agent" : "director",
       type: "jira_comment",
-      payload: { direction: "outbound", text: comment, delivery: "queued", ...(sender ? { from_task_id: sender.id } : {}) },
+      payload: { direction: "outbound", text: comment, ...(sender ? { from_task_id: sender.id } : {}) },
     });
     return json({ ok: true, delivered: false, delivery: "queued", message: comment, attachments: [] });
   }
