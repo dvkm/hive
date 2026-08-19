@@ -51,6 +51,7 @@ import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForD
 import { noteRepoMismatch, resolveRepoMismatchForDecision } from "./repoTarget.ts";
 import { costUsd } from "./pricing.ts";
 import { checkCostGuardrails, resolveCostCapForDecision, taskSpend } from "./costs.ts";
+import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
 import { vapidPublicKey, saveSubscription, removeSubscription } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
@@ -4680,6 +4681,7 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     resolveDuplicateForDecision(db, id, answerKey),
     resolveRepoMismatchForDecision(db, id, answerKey),
     resolveCostCapForDecision(db, id, answerKey),
+    resolveScopeDriftForDecision(db, id, answerKey),
     resolveRefCaptureForDecision(db, id, answerKey, answerNote),
   ].some(Boolean);
   if (!claimed) {

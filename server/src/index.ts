@@ -10,6 +10,7 @@ import { startGchatPoll } from "./intake/gchat.ts";
 import { startJiraSync } from "./intake/jira.ts";
 import { startWatchers } from "./watch.ts";
 import { startAutoReviewer } from "./reviewer.ts";
+import { startDriftWatch } from "./drift.ts";
 import { startPromoter } from "./promoter.ts";
 import { setEventHook, setTerminalHook, expireOrphanedDecisions } from "./state.ts";
 import { bootstrapAuthority } from "./authority.ts";
@@ -108,6 +109,10 @@ startJiraSync(db);
 // over the PR diff) and post the result onto the review card. Opt-out per
 // project: config.auto_review = false.
 startAutoReviewer(db);
+// In-run scope-drift watch: compares each live branch's accumulated footprint
+// against its brief every few commits, so a run that grows past what was asked
+// raises a card while trimming is still cheap (#1001).
+startDriftWatch(db);
 
 // Continuous promotion evaluator: projects with config.promote {from, to} get
 // an evaluation task queued whenever `from` moves ahead of `to`. No-op otherwise.
