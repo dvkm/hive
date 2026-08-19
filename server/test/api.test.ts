@@ -359,7 +359,9 @@ test("ready emit records the pr_url and advances in_progress -> in_review", asyn
 test("POST /merge returns instead of hanging when the post-merge smoke check fails", async () => {
   const OK = (stdout = "") => ({ code: 0, stdout, stderr: "" });
   const exec = async (argv: string[]) =>
-    argv.includes("gh") && argv.includes("pr") && argv.includes("view") ? OK(JSON.stringify({ state: "MERGED" })) : OK();
+    argv.includes("gh") && argv.includes("pr") && argv.includes("view")
+      ? OK(JSON.stringify({ state: "MERGED", baseRefName: "main", baseRefOid: "base-sha" }))
+      : OK();
   const smokeFetch: Fetcher = async () => ({ status: 500, body: "down" });
   const db2 = openDb(":memory:");
   const srv = Bun.serve({ port: 0, fetch: makeHandler(db2, { exec, fetch: smokeFetch }) });
