@@ -96,3 +96,20 @@ test("re-rendering ReviewCard in place with a different task resets mode/notes",
   });
   expect(renderer.root.findAllByType("textarea")[0].props.value).toBe("");
 });
+
+// A never-dispatched external task (source=external, never spawned — see
+// server/src/supervision.ts) has no agent to bounce back to. The server
+// rejects request-changes for it outright; the control shouldn't be offered.
+test("Request changes is hidden for a never-dispatched external task", async () => {
+  const t: Task = { ...task("never-dispatched", "external"), never_dispatched: true };
+
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t));
+  });
+
+  const requestChangesBtn = renderer.root.findAll(
+    (n) => n.type === "button" && n.children.includes("Request changes")
+  );
+  expect(requestChangesBtn.length).toBe(0);
+});

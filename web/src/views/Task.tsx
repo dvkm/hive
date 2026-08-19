@@ -577,30 +577,38 @@ export function TaskBody({ id }: { id: string }) {
             other control here is neutral, and only the destructive transitions
             (cancel / fail) get danger styling. */}
         {(() => {
-          const dispatchIsPrimary = t.state === "queued" && !isJira;
+          // A never-dispatched external task (tracking-only, never spawned —
+          // see supervision.ts) has no agent to steer and the server rejects
+          // spawning it automatically; only a deliberate manual dispatch can
+          // ever change that, so "Send steer" (unless it's a Jira comment,
+          // which always delivers) has nothing to reach.
+          const undispatchable = !!t.never_dispatched && !isJira;
+          const dispatchIsPrimary = t.state === "queued" && !isJira && !t.never_dispatched;
           return (
             <section className="panel">
               <h2>Actions</h2>
-              <div className="steer">
-                {isJira ? (
-                  <textarea
-                    placeholder="Add a Jira comment…"
-                    value={steer}
-                    onChange={(e) => setSteer(e.target.value)}
-                  />
-                ) : (
-                  <Attach files={steerFiles} onChange={setSteerFiles}>
+              {!undispatchable && (
+                <div className="steer">
+                  {isJira ? (
                     <textarea
-                      placeholder="Steer message to the agent…"
+                      placeholder="Add a Jira comment…"
                       value={steer}
                       onChange={(e) => setSteer(e.target.value)}
                     />
-                  </Attach>
-                )}
-                <button className={`btn ${dispatchIsPrimary ? "" : "btn-primary"}`} onClick={sendSteer}>
-                  {isJira ? "Comment in Jira" : "Send steer"}
-                </button>
-              </div>
+                  ) : (
+                    <Attach files={steerFiles} onChange={setSteerFiles}>
+                      <textarea
+                        placeholder="Steer message to the agent…"
+                        value={steer}
+                        onChange={(e) => setSteer(e.target.value)}
+                      />
+                    </Attach>
+                  )}
+                  <button className={`btn ${dispatchIsPrimary ? "" : "btn-primary"}`} onClick={sendSteer}>
+                    {isJira ? "Comment in Jira" : "Send steer"}
+                  </button>
+                </div>
+              )}
               {t.agent_target && (
                 <button className="btn" onClick={viewAgent} title="Focus this agent's tab in herdr">
                   View agent

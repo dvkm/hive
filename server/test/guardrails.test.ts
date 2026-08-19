@@ -160,6 +160,56 @@ test("creating an active policy auto-broadcasts it to live agents", async () => 
   expect(hit.length).toBeGreaterThanOrEqual(1);
 });
 
+// ---- external-task supervision hardening (#996) ------------------------------
+// A tracking-only task (source='external', a mirrored JIRA issue or another
+// agent's kanban entry — see supervision.ts) must never acquire an agent hive
+// itself dispatched. These close the manual-dispatch paths #974's passive
+// consolidation deliberately left open.
+
+test("creating a task rejects a caller-supplied agent_target on a source=external task", async () => {
+  const r = await post("/api/tasks", {
+    project_id: projectId,
+    title: "sneaky pre-dispatched mirror",
+    source: "external",
+    agent_target: "t-preset",
+  });
+  expect(r.status).toBe(400);
+  expect(r.json.error).toContain("agent_target");
+});
+
+test("manual spawn rejects a never-dispatched external task", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "mirrored issue, never touched", source: "external" });
+  const r = await post(`/api/tasks/${t.json.id}/spawn`, {});
+  expect(r.status).toBe(502);
+  expect(r.json.error).toContain("never been spawned");
+  const task = await get(`/api/tasks/${t.json.id}`);
+  expect(task.json.agent_target).toBeNull();
+  expect(task.json.state).toBe("queued");
+});
+
+test("manual spawn succeeds for an external task that WAS spawned before (recovery, not a first dispatch)", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "mirrored issue, recovering", source: "external" });
+  // Simulate the requeue-after-a-real-spawn case (supervision.ts's everSpawned):
+  // agent_target nulled by a failed->queued requeue, but the permanent `spawned`
+  // event from the earlier real dispatch stays.
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    "ev_prior_spawn_996", t.json.id, new Date().toISOString(), "herdr", "spawned", JSON.stringify({ agent_target: "t-old" })
+  );
+  const r = await post(`/api/tasks/${t.json.id}/spawn`, {});
+  expect(r.status).toBe(200);
+  expect(r.json.ok).toBe(true);
+});
+
+test("needs_decision unpark skips a never-dispatched external task", async () => {
+  const { unparkAnswered } = await import("../src/reconciler.ts");
+  const t = await post("/api/tasks", { project_id: projectId, title: "mirrored issue, parked", source: "external" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "needs_decision" });
+  unparkAnswered(db, Date.now() + 60 * 60 * 1000); // well past grace — must still not touch it
+  const task = await get(`/api/tasks/${t.json.id}`);
+  expect(task.json.state).toBe("needs_decision");
+});
+
 // ---- decision dismiss recovery ----------------------------------------------
 
 test("dismissing an authority card denies the grant and steers the agent", async () => {

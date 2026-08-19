@@ -16,6 +16,7 @@ import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { supervisedSql } from "./supervision.ts";
 
 const TIMEOUT_MS = Number(process.env.HIVE_REVIEWER_TIMEOUT_MS || 180_000);
 const DIFF_LIMIT = 60_000;
@@ -106,6 +107,7 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
       `SELECT t.* FROM tasks t
         WHERE t.state = 'in_review'
           AND NOT EXISTS (SELECT 1 FROM events e WHERE e.task_id = t.id AND e.type IN ('auto_review', 'auto_review_error'))
+          AND ${supervisedSql("t.source", "t.agent_target")}
         ORDER BY t.updated_at ASC LIMIT 1`
     )
     .get();

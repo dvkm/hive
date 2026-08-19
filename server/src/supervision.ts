@@ -1,3 +1,5 @@
+import type { DB } from "./db.ts";
+
 // What "hive supervises" means, in one place. Tracking-only tasks
 // (source='external': a mirrored JIRA issue, another agent's kanban entry —
 // see intake/jira.ts) sit outside hive's own loop: never auto-dispatched and
@@ -34,4 +36,27 @@ export function isSupervisedTask(task: { source?: string | null; agent_target?: 
 // or "t.source"/"t.agent_target".
 export function supervisedSql(sourceColumn = "source", agentColumn = "agent_target"): string {
   return `NOT (COALESCE(${sourceColumn}, '') = 'chat_supervisor' OR (COALESCE(${sourceColumn}, '') = 'external' AND ${agentColumn} IS NULL))`;
+}
+
+// Was this task EVER spawned, at any point in its history? task.agent_target
+// alone can't answer that: cleanup.ts nulls it on terminal-task teardown and
+// state.ts nulls it (unconditionally) on a failed->queued requeue, so a task
+// that genuinely ran once looks identical to one that never has right after
+// either event. The `spawned` event spawnAgent writes is permanent (the
+// events table is the log of record, nothing deletes from it), so it's the
+// only reliable signal.
+export function everSpawned(db: DB, taskId: string): boolean {
+  return !!db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawned' LIMIT 1").get(taskId);
+}
+
+// A source=external task nobody has ever dispatched, manually or otherwise —
+// no live agent exists for it and none automatically ever will. The gate for
+// automation that would otherwise reach for an agent that was never there: a
+// first spawn attempt, a request-changes bounce, a reconciler nudge. Once a
+// task HAS been spawned at least once it's real hive-driven work (same
+// history-based test isSupervisedTask's agent_target check approximates from
+// current state alone), so those paths behave normally again — recovery and
+// manual respawn are not blocked forever by one requeue nulling agent_target.
+export function neverDispatched(db: DB, task: { id: string; source?: string | null }): boolean {
+  return isExternalTask(task.source) && !everSpawned(db, task.id);
 }

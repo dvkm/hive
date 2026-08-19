@@ -13,12 +13,12 @@ function freshDb(config: any = {}): { db: DB; projectId: string } {
   );
   return { db, projectId };
 }
-function makeTask(db: DB, projectId: string, extra: Partial<{ agent_target: string; pr_url: string; state: string; ci_status: string; kind: string }> = {}): string {
+function makeTask(db: DB, projectId: string, extra: Partial<{ agent_target: string; pr_url: string; state: string; ci_status: string; kind: string; source: string }> = {}): string {
   const id = newId();
   const t = now();
   db.query(
-    "INSERT INTO tasks (id, project_id, title, state, kind, agent_target, pr_url, ci_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
-  ).run(id, projectId, "t", extra.state ?? "queued", extra.kind ?? "ship", extra.agent_target ?? null, extra.pr_url ?? null, extra.ci_status ?? null, t, t);
+    "INSERT INTO tasks (id, project_id, title, state, kind, agent_target, pr_url, ci_status, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+  ).run(id, projectId, "t", extra.state ?? "queued", extra.kind ?? "ship", extra.agent_target ?? null, extra.pr_url ?? null, extra.ci_status ?? null, extra.source ?? null, t, t);
   return id;
 }
 const stub = (fn: (argv: string[]) => ExecResult): Exec => async (argv) => fn(argv);
@@ -252,6 +252,73 @@ test("syncPRs bounces an in_review task whose PR was closed without merging", as
   expect(getTask(db, id).state).toBe("in_progress");
   const steers = db.query("SELECT payload FROM events WHERE task_id = ? AND type='steer'").all(id) as any[];
   expect(JSON.parse(steers.at(-1).payload).message).toContain("CLOSED (not merged)");
+});
+
+test("syncPRs' actionable phase skips a never-dispatched external task — no nudge, no auto-transition — but ci_status bookkeeping still runs", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/7", source: "external" });
+  transition(db, id, "in_progress"); // never spawned — external tasks move freely (state.ts)
+  transition(db, id, "in_review");
+  const gh: Exec = stub((argv) =>
+    argv[0] === "gh"
+      ? OK(JSON.stringify({ state: "CLOSED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-x" }))
+      : OK()
+  );
+  await reconcileOnce(db, { exec: gh });
+  const task = getTask(db, id);
+  expect(task.state).toBe("in_review"); // no auto-bounce for a task hive doesn't own
+  expect(task.ci_status).toBe("passing"); // bookkeeping still records observed PR facts
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'steer'").get(id)).toBeFalsy();
+});
+
+test("syncPRs' actionable phase still acts on an external task that WAS spawned before (agent_target-aware, not blanket source-only)", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/8", agent_target: "t-agent-live", source: "external" });
+  writeEvent(db, { task_id: id, source: "herdr", type: "spawned", payload: { agent_target: "t-agent-live" } });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  const gh: Exec = stub((argv) => (argv[0] === "gh" ? OK(JSON.stringify({ state: "CLOSED", statusCheckRollup: [] })) : OK()));
+  const herdr = new Herdr(
+    stub((argv) => (argv.includes("get") ? OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}') : OK())),
+    "herdr"
+  );
+  await reconcileOnce(db, { exec: gh, herdr });
+  expect(getTask(db, id).state).toBe("in_progress"); // bounced, same as any hive-driven task
+  const steers = db.query("SELECT payload FROM events WHERE task_id = ? AND type='steer'").all(id) as any[];
+  expect(JSON.parse(steers.at(-1).payload).message).toContain("CLOSED (not merged)");
+});
+
+test("autoMergeReady skips a never-dispatched external task even when CI is green and the pre-review looks clean", async () => {
+  const { autoMergeReady } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
+  const id = makeTask(db, projectId, { kind: "chore", source: "external" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x' WHERE id = ?").run(id);
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
+  );
+  writeEvent(db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
+  const git: Exec = stub((argv) => {
+    if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
+    return argv.includes("symbolic-ref") ? OK("main\n") : OK();
+  });
+  await autoMergeReady(db, { exec: git });
+  expect(getTask(db, id).state).toBe("in_review"); // never-dispatched external: not hive's to merge
+});
+
+test("autoAnswerStale skips a never-dispatched external task's open decision", async () => {
+  const { autoAnswerStale } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ decision_auto_answer_hours: 4 });
+  const id = makeTask(db, projectId, { source: "external" });
+  const did = newId("dec");
+  db.query(
+    "INSERT INTO decisions (id, task_id, ts, title, risk, options, status) VALUES (?,?,?,?,'normal',?, 'open')"
+  ).run(did, id, new Date(Date.now() - 5 * 3600_000).toISOString(), "should never auto-answer",
+    JSON.stringify([{ key: "go", label: "Go", recommended: true }, { key: "no", label: "No" }]));
+  const herdr = new Herdr(stub(() => OK()), "herdr");
+  autoAnswerStale(db, herdr, Date.now());
+  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(did) as any).status).toBe("open");
 });
 
 test("sweepVerifying re-runs the advance and flags evidence-wedged tasks once", async () => {

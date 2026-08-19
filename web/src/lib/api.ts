@@ -66,6 +66,7 @@ export interface Task {
   deferred_until?: string | null; // parked pending an offline human action; nudges suppressed while future-dated
   health?: Health | null;
   requeued_to?: string | null; // successor id when failed + auto-requeued
+  never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
   created_at: string;
   updated_at: string;
 }

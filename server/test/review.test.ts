@@ -694,6 +694,63 @@ test("request-changes requires notes", async () => {
   s.server.stop(true);
 });
 
+// ---- external-task supervision hardening (#996) ------------------------------
+// A never-dispatched external task (see supervision.ts) has no agent to bounce
+// back to — request-changes and the in_progress bounce below must reject
+// outright rather than queuing a steer nobody will ever read.
+async function externalInReviewTask(base: string) {
+  const p = await post(base, "/api/projects", { name: "p-ext-hardening", repo_path: "/repo" });
+  const t = await post(base, "/api/tasks", { project_id: p.json.id, title: "mirrored issue, in review", source: "external" });
+  await post(base, `/api/tasks/${t.json.id}/transition`, { to: "in_progress" }); // never spawned — external tasks move freely
+  await post(base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+  return { projectId: p.json.id, taskId: t.json.id };
+}
+
+test("request-changes rejects a never-dispatched external task in review", async () => {
+  const s = makeServer();
+  const { taskId } = await externalInReviewTask(s.base);
+  const r = await post(s.base, `/api/tasks/${taskId}/request-changes`, { notes: "fix it" });
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("never been spawned");
+  expect(s.sends.length).toBe(0);
+  const ev = await get(s.base, `/api/tasks/${taskId}/events`);
+  expect(ev.json.some((e: any) => e.type === "changes_requested")).toBe(false);
+  s.server.stop(true);
+});
+
+test("task move to in_progress from in_review rejects a never-dispatched external task", async () => {
+  const s = makeServer();
+  const { taskId } = await externalInReviewTask(s.base);
+  const r = await post(s.base, `/api/tasks/${taskId}/transition`, { to: "in_progress" });
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("never been spawned");
+  const task = await get(s.base, `/api/tasks/${taskId}`);
+  expect(task.json.state).toBe("in_review"); // rejected before the bounce ran
+  s.server.stop(true);
+});
+
+test("request-changes and the in_progress bounce work normally on an external task that WAS spawned before (recovery, not first dispatch)", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", { name: "p-ext-recovered", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "mirrored issue, previously spawned", source: "external" });
+  const taskId = t.json.id;
+  // Simulate an external task that WAS legitimately spawned before (recovery
+  // after a requeue nulls agent_target, or a legacy pre-#996 manual dispatch)
+  // — supervision.ts's neverDispatched checks the permanent `spawned` event,
+  // not the current agent_target snapshot, so this must behave like normal work.
+  s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    "ev_spawned_996", taskId, new Date().toISOString(), "herdr", "spawned", JSON.stringify({ agent_target: "t-ext-live" })
+  );
+  s.db.query("UPDATE tasks SET agent_target = 't-ext-live', state = 'in_progress' WHERE id = ?").run(taskId);
+  await post(s.base, `/api/tasks/${taskId}/transition`, { to: "in_review" });
+
+  const r = await post(s.base, `/api/tasks/${taskId}/request-changes`, { notes: "still reachable" });
+  expect(r.status).toBe(200);
+  expect(r.json.delivered).toBe(true);
+  expect(s.sends.at(-1)?.message).toContain("still reachable");
+  s.server.stop(true);
+});
+
 // #710: `hive task move <id> in_progress --note` is a reviewer bounce. It must
 // record changes_requested (so the idle-advance backstop can't silently flip the
 // task back to in_review) and deliver the note to the agent, respawning a dead one.
