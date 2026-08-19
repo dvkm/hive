@@ -11,6 +11,7 @@ const { openDb, newId, now, getSetting } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
 const { dispatchOnce, isReviewed, inBackoff } = await import("../src/dispatcher.ts");
 const { writeEvent, getTask } = await import("../src/state.ts");
+const { createDecision } = await import("../src/api.ts");
 const { queuedSteers } = await import("../src/steer.ts");
 const { createThread } = await import("../src/chat.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
@@ -396,4 +397,34 @@ test("inBackoff ignores infra-tagged (herdr-down) spawn_errors", async () => {
   // A genuine (untagged) failure still does.
   writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "bad base ref" } });
   expect(inBackoff(db, id, t)).toBe(true);
+});
+
+// #989: a task whose brief edits another project's files must not reach a
+// worktree it cannot do the work in. The open card is the hold.
+test("an unanswered repo-mismatch card holds dispatch; answering it releases the task", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  const decision = createDecision(db, {
+    task_id: id,
+    title: "Wrong target repo?",
+    context: "brief edits another project's files",
+    options: [{ key: "keep", label: "Keep" }, { key: "cancel", label: "Cancel" }],
+  });
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "repo_mismatch",
+    payload: { decision_id: decision.id, note: "held", paths: ["server/src/intake/jira.ts"] },
+  });
+
+  const held = stubHerdr();
+  await dispatchOnce(db, { herdr: held.herdr });
+  expect(held.spawns.length).toBe(0);
+  expect(getTask(db, id).state).toBe("queued");
+
+  db.query("UPDATE decisions SET status = 'answered', answer_key = 'keep' WHERE id = ?").run(decision.id);
+  const released = stubHerdr();
+  await dispatchOnce(db, { herdr: released.herdr });
+  expect(released.spawns.length).toBe(1);
+  expect(getTask(db, id).state).toBe("in_progress");
 });

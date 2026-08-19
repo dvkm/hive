@@ -46,6 +46,7 @@ import { isReviewed } from "./dispatcher.ts";
 import { runPlanner, resolvePlanForDecision, decisionPlan, selectedPlanIndices, type PlannerExec } from "./planner.ts";
 import { routeIntakeProject } from "./intake/route.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
+import { noteRepoMismatch, resolveRepoMismatchForDecision } from "./repoTarget.ts";
 import { costUsd } from "./pricing.ts";
 import { checkCostGuardrails, resolveCostCapForDecision, taskSpend } from "./costs.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
@@ -1498,9 +1499,12 @@ async function createTask(db: DB, req: Request): Promise<Response> {
       return json(taskWithHealth(db, getTask(db, row.id)), 201);
     }
     openDuplicateDecision(db, getTask(db, row.id), match);
-    return json(taskWithHealth(db, getTask(db, row.id)), 201);
   }
-  return json(taskWithHealth(db, created), 201);
+  // Target-repo sanity check (#989). Runs after dedup so an auto-merged task
+  // never gets a card it can't act on. A strong mismatch rides back on the
+  // response as `warning` (the CLI prints it) and holds dispatch via its card.
+  const warning = noteRepoMismatch(db, getTask(db, row.id));
+  return json({ ...taskWithHealth(db, getTask(db, row.id)), ...(warning ? { warning } : {}) }, 201);
 }
 
 // Link a marked PR back to its task. Matches by the `hive-task: <id>` body
@@ -4567,6 +4571,7 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     resolveRecoveryForDecision(db, id, answerKey),
     resolveBlockedForDecision(db, herdr, id, answerKey),
     resolveDuplicateForDecision(db, id, answerKey),
+    resolveRepoMismatchForDecision(db, id, answerKey),
     resolveCostCapForDecision(db, id, answerKey),
     resolveRefCaptureForDecision(db, id, answerKey, answerNote),
   ].some(Boolean);

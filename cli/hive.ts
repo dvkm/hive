@@ -168,6 +168,10 @@ async function main() {
         source: flags.track ? "external" : agentTask ? "agent" : undefined,
       });
       console.log(`created task ${t.id}  [${t.state}]  ${t.title}`);
+      // #989: the server checks the brief's file paths against the chosen
+      // project's repo. A mismatch is loud here because this is where it is
+      // cheap to fix — the alternative is an agent in the wrong worktree.
+      if (t.warning) console.log(`  ⚠ ${t.warning}`);
       return;
     }
     if (sub === "send") {

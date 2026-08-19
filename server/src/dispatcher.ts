@@ -30,6 +30,7 @@ import { spawnAgent } from "./api.ts";
 import { unmetDeps, noteDependencyBlock } from "./state.ts";
 import { isExternalTask } from "./supervision.ts";
 import { managingThreadForTask } from "./chat.ts";
+import { repoMismatchUnresolved } from "./repoTarget.ts";
 import type { Exec } from "./exec.ts";
 
 // Chores included since 2026-07-12: the queue sat at 10 tasks / 1 live agent
@@ -165,6 +166,11 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         if (activeFor(task.project_id) >= cap * REVIEW_OVERHANG) continue; // review overhang bound
 
         if (inBackoff(db, task.id, nowMs)) continue; // still cooling down after a spawn failure
+
+        // #989: the brief edits files that live in ANOTHER project's repo. The
+        // open card is the visible reason; spawning here hands the agent a
+        // worktree it cannot do the work in.
+        if (repoMismatchUnresolved(db, task.id)) continue;
 
         const authz = authorize(db, {
           project_id: task.project_id,
