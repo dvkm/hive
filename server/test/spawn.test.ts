@@ -215,6 +215,35 @@ test("secrets API stores names/metadata only (no values)", async () => {
   expect(del.status).toBe(200);
 });
 
+test("secrets API ignores a caller-supplied ref, so a secret cannot alias another keychain item", async () => {
+  const { resolveProjectSecrets } = await import("../src/secrets.ts");
+  // A keychain holding one unrelated item plus whatever hive itself wrote.
+  const vault: Record<string, string> = {
+    "AWS_PROD_ROOT": "SUPERSECRET_NOT_YOURS",
+    [`hive/${projectId}/STOLEN`]: "own-project-value",
+  };
+  const exec: Exec = async (argv) => {
+    if (!has(argv, "find-generic-password")) return OK();
+    const svc = argv[argv.indexOf("-s") + 1];
+    return svc in vault ? OK(vault[svc] + "\n") : { code: 44, stdout: "", stderr: "not found" };
+  };
+
+  // Point the new secret at someone else's keychain item.
+  const r = await post(`/api/projects/${projectId}/secrets`, { name: "STOLEN", provider: "keychain", ref: "AWS_PROD_ROOT" });
+  expect(r.status).toBe(201);
+
+  const env = await resolveProjectSecrets(db, projectId, exec);
+  expect(env.STOLEN).not.toBe("SUPERSECRET_NOT_YOURS");
+  expect(JSON.stringify(env)).not.toContain("SUPERSECRET_NOT_YOURS");
+  // it resolves this project's own namespaced item instead
+  expect(env.STOLEN).toBe("own-project-value");
+  expect(
+    (db.query("SELECT ref FROM secrets WHERE project_id = ? AND name = 'STOLEN'").get(projectId) as any).ref
+  ).toBe(`hive/${projectId}/STOLEN`);
+
+  await fetch(BASE + `/api/projects/${projectId}/secrets/STOLEN`, { method: "DELETE" });
+});
+
 test("modelForTask: per-kind default, config.model, config.model_by_kind override in order", async () => {
   const { modelForTask } = await import("../src/api.ts");
   expect(modelForTask({}, "ship")).toBe("opus");

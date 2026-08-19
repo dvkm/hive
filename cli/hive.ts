@@ -573,8 +573,10 @@ async function main() {
       const value = (await Bun.stdin.text()).replace(/\n$/, "");
       if (!value) die("no value on stdin (pipe or type the secret, then Ctrl-D)");
       const { providerFor } = await import("../server/src/secrets.ts");
-      const { ref } = await providerFor(provider).set(project, name, value);
-      const s = await api("POST", `/api/projects/${project}/secrets`, { name, provider, ref });
+      // The provider owns the ref (`hive/<project>/<name>`); the server derives
+      // the same one, so nothing client-side gets to choose it.
+      await providerFor(provider).set(project, name, value);
+      await api("POST", `/api/projects/${project}/secrets`, { name, provider });
       console.log(`stored secret '${name}' [${provider}] for project ${project} (ref kept in provider only)`);
       return;
     }
