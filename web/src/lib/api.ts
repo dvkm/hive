@@ -338,6 +338,14 @@ export interface DiffResult {
 // Mirrors server/src/diff.ts MAX_DIFF_LINES (used only for the truncation notice).
 export const MAX_DIFF_LINES = 20000;
 
+// Live dependency + stacked-branch status (server/src/api.ts taskBranchCheckEndpoint,
+// task #1000): recomputed fresh on every fetch rather than trusted from an
+// agent's evidence prose about what a dependency or branch contains.
+export interface BranchCheck {
+  unmet_deps: { id: string; number: number; title: string; state: State }[];
+  embedded_tasks: { id: string; number: number; title: string }[];
+}
+
 // One global-search hit. task_state/project_id are present only for task hits.
 export interface SearchHit {
   type: "task" | "decision" | "learning" | "policy" | "project";
@@ -617,6 +625,7 @@ export const api = {
   duplicates: () =>
     req<{ clusters: { project_id: string; tasks: Pick<Task, "id" | "title" | "project_id" | "state">[] }[] }>(`/api/tasks/duplicates`),
   diff: (id: string) => req<DiffResult>(`/api/tasks/${id}/diff`),
+  branchCheck: (id: string) => req<BranchCheck>(`/api/tasks/${id}/branch-check`),
   merge: (id: string, strategy?: "local_ff") =>
     req<Task>(`/api/tasks/${id}/merge`, { method: "POST", body: JSON.stringify(strategy ? { merge_strategy: strategy } : {}) }),
   requestChanges: (id: string, notes: string) =>

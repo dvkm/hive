@@ -123,6 +123,39 @@ test("PR guard repairs a stale local-ref snapshot from the first exact PR head",
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_blocked_destructive'").get(taskId)).toBeFalsy();
 });
 
+test("mergeTask BLOCKS while a declared dependency hasn't actually merged/done yet (#1000)", async () => {
+  const { db, taskId } = seed();
+  const projectId = (db.query("SELECT project_id FROM tasks WHERE id = ?").get(taskId) as any).project_id;
+  const depId = newId();
+  const t = now();
+  db.query(
+    "INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at) VALUES (?,?,?,?,?,?,?)"
+  ).run(depId, projectId, "dependency task", "in_progress", "ship", t, t);
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([depId]), taskId);
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec: destructiveExec });
+  expect(res.status).toBe(409);
+  const body: any = await res.json();
+  expect(body.error).toContain("unmet dependency");
+  expect(body.error).toContain("dependency task");
+  // Refused outright, not bounced to the agent — this isn't the agent's fix to make.
+  expect(getTask(db, taskId).state).toBe("in_review");
+});
+
+test("mergeTask proceeds once the declared dependency reaches done", async () => {
+  const { db, taskId } = seed();
+  const projectId = (db.query("SELECT project_id FROM tasks WHERE id = ?").get(taskId) as any).project_id;
+  const depId = newId();
+  const t = now();
+  db.query(
+    "INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at) VALUES (?,?,?,?,?,?,?)"
+  ).run(depId, projectId, "dependency task", "done", "ship", t, t);
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([depId]), taskId);
+
+  const res = await mergeTask(db, herdr, taskId, { override_destructive_check: true }, { exec: destructiveExec });
+  expect(res.status).toBe(200);
+});
+
 test("PR merge fails closed when its base metadata is unavailable", async () => {
   const { db, taskId } = seed();
   db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/1", taskId);

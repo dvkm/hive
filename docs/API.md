@@ -693,6 +693,21 @@ the reconciler recording `pr_synchronized`.
   `truncated` is `true` and the remaining diff is omitted (view the PR for the
   full patch). Binary files carry `binary: true` and no hunks.
 
+- `GET /api/tasks/:id/branch-check` → `200 {unmet_deps, embedded_tasks}` | `404` (task #1000)
+  Live dependency + stacked-branch status for the review UI, recomputed on
+  every call rather than trusted from the agent's evidence prose. `unmet_deps`
+  is `unmetDeps(db, task)` (state.ts) — the same live gate the dispatcher
+  checks before spawning and merge now checks before landing. `embedded_tasks`
+  flags a **stacked PR**: another currently open task (same project, non-terminal,
+  has a branch) whose branch shares commit history with this one beyond their
+  common base with the default branch (`git merge-base` pairwise comparison,
+  server/src/branchContents.ts) — meaning this branch was cut from, or had
+  merged into it, that task's in-flight work, so a later rewrite of that task's
+  branch (e.g. a scope trim) won't be reflected here. Informational only, not
+  merge-blocking: stacked branches are sometimes intentional. Both arrays are
+  `[]` when clean; a git read failure silently skips that candidate rather than
+  flagging it (can't tell ≠ blocked).
+
 - `POST /api/tasks/:id/merge` body `{merge_strategy?: "local_ff", override_destructive_check?: boolean}` → `200 Task` (now `verifying`) | `409` (not `in_review`, missing/unpassed understanding check, or the merge failed: conflict / not a fast-forward / gh refused / **destructive auto-rebase**) | `403` (denied by a `task.merge` authority rule) | `404` | `400` (local merge but no `repo_path`/`branch`)
   Approve & merge. When `pr_url` is set: `gh pr merge <url> <method>` where
   `method` is the project's `config.merge_method` (`squash` default, or `merge` /
@@ -704,6 +719,13 @@ the reconciler recording `pr_synchronized`.
   a squash merge).
 
   **Understanding gate.** The latest review must include a valid multiple-choice understanding check. The director must pass it before merge. The explicit `quiz_later` defer endpoint temporarily unlocks the merge while keeping the quiz in Needs You until it is eventually passed. Supervisors cannot answer or defer it.
+
+  **Dependency gate (task #1000).** Recomputed live via `unmetDeps` (state.ts) right
+  before merging, not trusted from the agent's evidence prose about what a
+  dependency contains — mirrors the dispatcher's own spawn-time gate. If any
+  `depends_on` task hasn't reached `verifying`/`done`, the merge is refused
+  (`409`, naming the blocking task(s)); there is no override, since the only
+  fix is for the dependency to actually land.
 
   **Stale-base fallback.** GitHub decides mergeability against `origin/<base>`,
   which can sit behind the primary checkout's local `<base>`. So when `gh pr merge`
