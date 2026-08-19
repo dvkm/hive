@@ -303,6 +303,34 @@ test("cleanupTask preserves an UNMERGED worktree but still closes the session (p
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'cleanup_skipped'").all(id).length).toBe(1);
 });
 
+// 2026-08-19: herdr answered every tab.close with an error, so agent_target was
+// never cleared and the same six preserved worktrees were re-closed on every
+// 5-minute reaper sweep, forever. The attempt is what counts, not its outcome.
+test("cleanupTask drops the binding even when the session close FAILS (no re-close every sweep)", async () => {
+  const { db, projectId } = freshDb();
+  const id = seedTask(db, projectId, { state: "done", branch: "hive/CT4", worktree_path: "/wt/hive-CT4" });
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    newId("evt"), id, now(), "herdr", "spawned", JSON.stringify({ tab_id: "wF:t4", agent_target: `agent-${id}` })
+  );
+  const calls: string[][] = [];
+  const exec: Exec = async (argv) => {
+    calls.push(argv);
+    if (argv[0] === "git" && argv.includes("--merged")) return OK("* main"); // not merged
+    if (argv[0] === "git" && argv.includes("ls-remote")) return OK(""); // not pushed
+    if (argv[0] !== "git") return { code: 1, stdout: "", stderr: "herdr error" }; // every close fails
+    return OK();
+  };
+  const herdr = new Herdr(exec, "herdr");
+
+  const out = await cleanupTask(db, herdr, id);
+  expect(out.session.closed).toBe(false);
+  expect((db.query("SELECT agent_target FROM tasks WHERE id = ?").get(id) as any).agent_target).toBeNull();
+
+  calls.length = 0;
+  await cleanupTask(db, herdr, id);
+  expect(calls.some((c) => c[0] !== "git")).toBe(false); // no second tab.close
+});
+
 test("cleanupTask also closes the worktree's OWN herdr workspace (the auto-spawned pty), once", async () => {
   const { db, projectId } = freshDb();
   const branch = "hive/CT3";

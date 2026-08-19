@@ -9,7 +9,7 @@
 // Isolated try/catch per item; a failure never crashes the server. Mirrors the
 // reconciler loop pattern.
 import type { DB } from "./db.ts";
-import { setSetting, now } from "./db.ts";
+import { setSetting, now, isOffline } from "./db.ts";
 import { getTask, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, parseWorktreeList } from "./runtime/herdr.ts";
 import { cleanupTask } from "./cleanup.ts";
@@ -31,6 +31,13 @@ export function taskIdFromBranch(branch: string | null): string | null {
 }
 
 export async function reapOnce(db: DB, deps: ReaperDeps = {}): Promise<void> {
+  // Offline is the director's stop button. It gated dispatch only, so the reaper
+  // kept closing tabs and removing worktrees while the fleet was supposedly
+  // paused (2026-08-19). Everything here is a side effect; skip the whole sweep.
+  if (isOffline(db)) {
+    setSetting(db, "last_reap_at", now()); // the loop is healthy, just idle
+    return;
+  }
   const herdr = deps.herdr ?? defaultHerdr;
   const exec = deps.exec ?? defaultExec;
   const projects = db

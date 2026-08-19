@@ -663,6 +663,21 @@ export class Herdr {
     return parseAgentProbe(r.stdout);
   }
 
+  // Positive evidence that an agent is REALLY gone, for callers that would tear
+  // something down. A `not found` probe is not proof: a herdr desktop-app
+  // restart wipes the agent registry while the panes — and the claude processes
+  // inside them — keep running. On 2026-08-19 every live agent read
+  // agent_not_found for hours (`agent list` empty, `pane list` full) and 12+
+  // tasks were failed with their tabs closed under them. Confirm against the
+  // pane list: the task's own pane still being there means alive-but-
+  // unregistered. An empty/unavailable pane list is NOT evidence of death
+  // either — that is exactly what a down daemon looks like.
+  async confirmGone(hint: { cwd?: string | null; tabId?: string | null }): Promise<boolean> {
+    const panes = await this.listPanes();
+    if (!panes.length) return false;
+    return !panes.some((p) => (hint.cwd && p.cwd === hint.cwd) || (hint.tabId && p.tabId === hint.tabId));
+  }
+
   // Pane tail for stale-recovery evidence and dialog diagnosis. herdr wraps
   // the text in a JSON envelope ({result:{read:{text}}}); return the TEXT —
   // diagnosis line-splits it, and a one-line JSON blob broke every pattern
