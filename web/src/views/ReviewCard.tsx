@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
-import type { DiffFile, DiffResult, Evidence, ReviewItem, ReviewSummary, Task, UnderstandingPacket } from "../lib/api";
+import type { BranchCheck, DiffFile, DiffResult, Evidence, ReviewItem, ReviewSummary, Task, UnderstandingPacket } from "../lib/api";
 import { useStore } from "../lib/store";
 import { CiBadge, toast } from "../lib/ui";
 import { MAX_DIFF_LINES } from "../lib/api";
@@ -309,6 +309,7 @@ export function ReviewCard({
   const [reviewLoaded, setReviewLoaded] = useState(false);
   const [quizOverride, setQuizOverride] = useState<"passed" | "deferred" | null>(null);
   const [mergeErr, setMergeErr] = useState("");
+  const [branchCheck, setBranchCheck] = useState<BranchCheck | null>(null);
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
   const [openDecisions, setOpenDecisions] = useState<Decision[]>([]);
@@ -323,6 +324,7 @@ export function ReviewCard({
     setReviewLoaded(false);
     setQuizOverride(null);
     setEvidence([]);
+    setBranchCheck(null);
     // Same-route navigation between tasks re-renders this component in place
     // (no remount) — without this, a "Request changes" editor left open on
     // the previous task keeps rendering, notes and all, against the new one.
@@ -332,6 +334,13 @@ export function ReviewCard({
       .diff(task.id)
       .then((d) => live && setDiff(d))
       .catch((e) => live && setDiffErr((e as Error).message));
+    // Recomputed live on every review, not trusted from the agent's evidence
+    // prose (task #1000): is the declared dependency actually merged, and
+    // does this branch share history with another currently open task's.
+    api
+      .branchCheck(task.id)
+      .then((b) => live && setBranchCheck(b))
+      .catch(() => {});
     // Latest structured self-review, if the agent submitted one.
     api
       .task(task.id)
@@ -398,6 +407,13 @@ export function ReviewCard({
       : quizStatus === "required"
         ? "Pass the understanding check, or explicitly save it for later."
         : "";
+  // Live, not the agent's evidence prose (task #1000): recomputed on every
+  // review via GET .../branch-check, same as CI/quiz below.
+  const unmetDeps = branchCheck?.unmet_deps ?? [];
+  const depBlocked =
+    reportOnly || !unmetDeps.length
+      ? ""
+      : `Waiting on ${unmetDeps.map((d) => `#${d.number} ${d.title}`).join(", ")} — not yet merged/done`;
   const deliveryBlocked = reportOnly
     ? ""
     : task.ci_status === "failing"
@@ -407,7 +423,8 @@ export function ReviewCard({
         : !task.pr_url && !task.branch
           ? "No PR and no branch — nothing to merge"
           : "";
-  const mergeBlocked = quizBlocked || deliveryBlocked;
+  const mergeBlocked = quizBlocked || depBlocked || deliveryBlocked;
+  const embeddedTasks = branchCheck?.embedded_tasks ?? [];
   const failures = [...events]
     .reverse()
     .filter(isFailureEvent);
@@ -530,6 +547,17 @@ export function ReviewCard({
       {openDecisions.map((d) => (
         <DecisionCard key={d.id} d={d} onDone={() => setOpenDecisions((ds) => ds.filter((x) => x.id !== d.id))} />
       ))}
+
+      {/* Stacked-PR flag (task #1000): this branch shares history with another
+          currently open task's branch, computed live via merge-base — not a
+          claim in the agent's evidence. Informational, not blocking: stacked
+          branches are sometimes intentional, but the director should know
+          before merging that the other task's later rewrites won't be reflected here. */}
+      {embeddedTasks.length > 0 && (
+        <div className="review-merge-error" title="Detected via git merge-base against every other open task's branch in this project">
+          ⚠ Shares history with {embeddedTasks.map((t) => `#${t.number} ${t.title}`).join(", ")} — if that task's branch is later rewritten, this one won't pick up the change.
+        </div>
+      )}
 
       <div className="review-recommendation">
         <span className="review-recommendation-label">Hive recommends</span>

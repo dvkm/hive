@@ -22,6 +22,7 @@ import {
   isDeferred,
   deferTask,
   undeferTask,
+  unmetDeps,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
@@ -56,6 +57,7 @@ import { autoResumeOnTurnEnd } from "./resume.ts";
 import { ciStatusOf } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
+import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
@@ -355,6 +357,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       }
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/diff$/);
       if (m && method === "GET") return await taskDiffEndpoint(db, m[1], deps);
+
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/branch-check$/);
+      if (m && method === "GET") return await taskBranchCheckEndpoint(db, m[1], deps);
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/merge$/);
       if (m && method === "POST") return await mergeTask(db, herdr, m[1], await safeJson(req), deps);
@@ -2096,6 +2101,35 @@ async function taskDiffEndpoint(db: DB, id: string, deps: HandlerDeps): Promise<
   return r.ok ? json(r.diff) : err(r.error, r.status);
 }
 
+// GET /api/tasks/:id/branch-check → live dependency + stacked-branch status
+// for the review UI (task #1000). An agent's evidence prose ("origin/main now
+// includes dependencies") is a frozen claim from whenever it was written;
+// this recomputes the two things that claim actually asserts, fresh on every
+// call: (a) is every declared depends_on task actually merged/done, and
+// (b) does this branch share history with another currently open task's
+// branch (a stacked PR that can silently carry that task's pre-rewrite
+// commits — see findEmbeddedTasks).
+export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerDeps): Promise<Response> {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  const unmet_deps = unmetDeps(db, task).map((b) => ({ id: b.id, number: b.number, title: b.title, state: b.state }));
+
+  let embedded_tasks: { id: string; number: number; title: string }[] = [];
+  const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
+  if (project?.repo_path && task.branch) {
+    const config = JSON.parse(project.config ?? "{}");
+    const base = config.default_branch || "main";
+    const others = db
+      .query(
+        `SELECT id, number, title, branch FROM tasks WHERE project_id = ? AND id != ? AND branch IS NOT NULL AND state NOT IN ('done', 'cancelled')`
+      )
+      .all(task.project_id, id) as { id: string; number: number; title: string; branch: string }[];
+    const found = await findEmbeddedTasks(deps.exec ?? defaultExec, project.repo_path, base, task.branch, others);
+    if (found) embedded_tasks = found;
+  }
+  return json({ unmet_deps, embedded_tasks });
+}
+
 // Map our merge_method config onto gh's flag. Squash is the default.
 function ghMergeFlag(method: string | undefined): string {
   if (method === "merge") return "--merge";
@@ -2241,6 +2275,17 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
     return err("Understanding check required. Ask the agent to submit one in its latest review before merging.", 409);
   if (understandingQuizStatus(db, id, quiz.reviewEventId) === "required")
     return err("Pass the understanding check before merging, or choose 'Continue now, quiz me later'.", 409);
+
+  // Recompute the dependency claim live rather than trusting evidence prose
+  // (task #1000: #977 claimed its dependency had landed on main; it hadn't).
+  // Mirrors the dispatcher's own gate (state.ts unmetDeps) at the other end
+  // of the task's life — spawn and merge both refuse while a declared
+  // dependency isn't actually merged/done.
+  const blockingDeps = unmetDeps(db, task);
+  if (blockingDeps.length) {
+    const names = blockingDeps.map((b) => `#${b.number} ${b.title} (${b.state})`).join(", ");
+    return err(`blocked by unmet dependenc${blockingDeps.length === 1 ? "y" : "ies"}: ${names} — not yet merged/done`, 409);
+  }
 
   const exec = deps.exec ?? defaultExec;
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);

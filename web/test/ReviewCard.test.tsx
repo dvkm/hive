@@ -40,10 +40,11 @@ const detail = (id: string, source: string | null): TaskDetail => ({
   decisions: [],
 });
 
-// api.diff/api.task hit real fetch() otherwise; ReviewCard's own effect is
-// the only thing that calls them, so stubbing these two is enough.
+// api.diff/api.task/api.branchCheck hit real fetch() otherwise; ReviewCard's
+// own effect is the only thing that calls them, so stubbing these is enough.
 api.diff = (async () => ({ files: [], truncated: false })) as typeof api.diff;
 api.task = (async (id: string) => detail(id, "agent")) as typeof api.task;
+api.branchCheck = (async () => ({ unmet_deps: [], embedded_tasks: [] })) as typeof api.branchCheck;
 
 function tree(t: Task) {
   return (
@@ -95,6 +96,93 @@ test("re-rendering ReviewCard in place with a different task resets mode/notes",
     requestChangesBtnB.props.onClick();
   });
   expect(renderer.root.findAllByType("textarea")[0].props.value).toBe("");
+});
+
+// A detail whose understanding check is already passed, so quizBlocked is
+// false and deliveryBlocked is false (pr_url set, ci_status passing) — the
+// merge button's enabled/disabled state is then caused ONLY by branch-check,
+// not by some other pre-existing block (task #1000's two tests below rely on
+// this isolation, per the "does this check even test the thing" principle).
+function passingDetail(id: string): TaskDetail {
+  return {
+    ...task(id, "agent"),
+    events: [
+      {
+        id: "rev-1",
+        task_id: id,
+        ts: "2026-01-01T00:00:00.000Z",
+        source: "agent",
+        type: "review_summary",
+        payload: { understanding: { check: { question: "Q?", options: [{ key: "a", label: "A" }, { key: "b", label: "B" }], answer_key: "a" } } },
+      } as any,
+      {
+        id: "quiz-1",
+        task_id: id,
+        ts: "2026-01-01T00:00:01.000Z",
+        source: "director",
+        type: "understanding_quiz_passed",
+        payload: { review_event_id: "rev-1" },
+      } as any,
+    ],
+    evidence: [],
+    decisions: [],
+  };
+}
+
+// task #1000: the merge decision must reflect the LIVE branch-check, not just
+// whatever the agent's own review_summary claims. An unmet dependency
+// disables the merge button; a shared-history branch shows an explicit flag
+// without blocking (stacked branches are sometimes intentional).
+test("an unmet dependency from branch-check disables Approve & merge", async () => {
+  const originalTask = api.task;
+  const originalBranchCheck = api.branchCheck;
+  api.task = (async (id: string) => passingDetail(id)) as typeof api.task;
+  api.branchCheck = (async () => ({
+    unmet_deps: [{ id: "dep-1", number: 974, title: "consolidate the shared definition", state: "in_progress" }],
+    embedded_tasks: [],
+  })) as typeof api.branchCheck;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree(task("blocked-by-dep")));
+    });
+    const approveBtn = renderer.root.findAll(
+      (n) => n.type === "button" && n.children.includes("Approve & merge")
+    )[0];
+    expect(approveBtn.props.disabled).toBe(true);
+    expect(approveBtn.props.title).toContain("#974");
+  } finally {
+    api.task = originalTask;
+    api.branchCheck = originalBranchCheck;
+  }
+});
+
+test("with no unmet dependency, a stacked branch is flagged but does not block merge", async () => {
+  const originalTask = api.task;
+  const originalBranchCheck = api.branchCheck;
+  api.task = (async (id: string) => passingDetail(id)) as typeof api.task;
+  api.branchCheck = (async () => ({
+    unmet_deps: [],
+    embedded_tasks: [{ id: "other-1", number: 977, title: "some other in-flight task" }],
+  })) as typeof api.branchCheck;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree(task("stacked")));
+    });
+    const approveBtn = renderer.root.findAll(
+      (n) => n.type === "button" && n.children.includes("Approve & merge")
+    )[0];
+    expect(approveBtn.props.disabled).toBe(false);
+    const flag = renderer.root.findAll(
+      (n) => n.type === "div" && typeof n.props.className === "string" && n.props.className.includes("review-merge-error")
+    );
+    expect(flag.length).toBe(1);
+    expect(JSON.stringify(flag[0].props.children)).toContain("#977");
+  } finally {
+    api.task = originalTask;
+    api.branchCheck = originalBranchCheck;
+  }
 });
 
 // A never-dispatched external task (source=external, never spawned — see
