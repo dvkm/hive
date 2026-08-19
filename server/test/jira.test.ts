@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
+import { transition } from "../src/state.ts";
 import {
   JiraClient,
   adfToText,
@@ -515,4 +516,131 @@ test("a malformed issue payload degrades instead of throwing", async () => {
   const t = db.query("SELECT * FROM tasks WHERE source_ref = ?").get(REF_PREFIX + "WEB-2") as any;
   expect(t.title).toBe("[WEB-2] (no summary)");
   expect(t.state).toBe("queued"); // unmappable status falls back to queued
+});
+
+// ------------------------------------------------- disposition of a deleted issue
+// A mirror whose Jira issue is deleted used to sit queued forever with one
+// import event on it. These tests pin the distinction that makes dispositioning
+// it safe: a direct per-issue 404 is positive proof of removal, while absence
+// from a search result is not evidence of anything.
+
+// `direct` maps an issue key to the status its per-issue GET answers with;
+// anything unlisted answers 200. Kept separate from makeFetch so the direct
+// read and the search can disagree, which is the entire point of these tests.
+function deletionFetch(issues: any[], direct: Record<string, number> = {}): FetchLike {
+  return (async (input: any, init?: any) => {
+    const u = String(input);
+    if (u.includes("fields=key")) {
+      const key = decodeURIComponent(u.split("/issue/")[1].split("?")[0]);
+      const status = direct[key] ?? 200;
+      return new Response(status === 200 ? JSON.stringify({ key }) : "gone", { status });
+    }
+    if (u.includes("/search/jql")) return new Response(JSON.stringify({ issues, isLast: true }), { status: 200 });
+    if (u.includes("/comment")) return new Response(JSON.stringify({ comments: [], total: 0 }), { status: 200 });
+    if (u.includes("/myself")) return new Response(JSON.stringify({ accountId: "acct-1" }), { status: 200 });
+    return new Response("{}", { status: 200 });
+  }) as FetchLike;
+}
+
+function sync(db: DB, projectId: string, issues: any[], direct: Record<string, number> = {}) {
+  return syncProjectOnce(db, projectId, CFG, new JiraClient(CFG, "tok", deletionFetch(issues, direct)), { log: () => {} });
+}
+
+function taskFor(db: DB, key: string): any {
+  return db.query("SELECT * FROM tasks WHERE source_ref = ?").get(REF_PREFIX + key) as any;
+}
+
+function eventsFor(db: DB, taskId: string): { type: string; source: string; payload: any }[] {
+  return (db.query("SELECT type, source, payload FROM events WHERE task_id = ? ORDER BY ts, rowid").all(taskId) as any[])
+    .map((e) => ({ ...e, payload: JSON.parse(e.payload) }));
+}
+
+test("an issue proven deleted by a direct 404 cancels its mirror, keeping the row", async () => {
+  const { db, projectId } = freshDb();
+  await sync(db, projectId, [issue({ key: "WEB-14" })]);
+  const before = taskFor(db, "WEB-14");
+  expect(before.state).toBe("queued");
+
+  // Gone from search AND a direct read says 404 — positive proof of removal.
+  const stats = await sync(db, projectId, [], { "WEB-14": 404 });
+  expect(stats.cancelled).toBe(1);
+  expect(stats.errors).toBe(0);
+
+  const after = taskFor(db, "WEB-14");
+  expect(after).toBeTruthy(); // the row is NEVER deleted: its comments/evidence are the only record left
+  expect(after.id).toBe(before.id);
+  expect(after.state).toBe("cancelled"); // terminal, so it also leaves the board and the attention tray
+  const events = eventsFor(db, after.id);
+  const stateChange = events.filter((e) => e.type === "state_change").at(-1)!;
+  expect(stateChange.payload.to).toBe("cancelled");
+  expect(stateChange.payload.reason).toContain("404"); // the task itself says why it stopped updating
+  expect(events.some((e) => e.type === "jira_sync" && e.payload.action === "source_deleted")).toBe(true);
+});
+
+// THE regression this whole design exists to prevent. Jira's search index is
+// eventually consistent, so an issue can drop out of `issues()` while being
+// perfectly alive. Acting on that would destroy a live mirror on an index artifact.
+test("an issue merely missing from search is left completely untouched", async () => {
+  const { db, projectId } = freshDb();
+  await sync(db, projectId, [issue({ key: "WEB-14" })]);
+  const before = taskFor(db, "WEB-14");
+  const eventsBefore = eventsFor(db, before.id).length;
+
+  // Absent from search, but the direct read finds it alive (default 200).
+  const stats = await sync(db, projectId, []);
+  expect(stats.cancelled).toBe(0);
+  expect(stats.errors).toBe(0);
+
+  const after = taskFor(db, "WEB-14");
+  expect(after.state).toBe("queued"); // NOT terminal
+  expect(after.updated_at).toBe(before.updated_at);
+  expect(eventsFor(db, after.id).length).toBe(eventsBefore); // no consequence recorded at all
+});
+
+// "hive could not tell" must never reach the disposition as "it is gone". A 5xx
+// looks conclusive (Jira definitely answered) but proves nothing about existence.
+test("an unreachable Jira never cancels a mirror", async () => {
+  const { db, projectId } = freshDb();
+  await sync(db, projectId, [issue({ key: "WEB-14" })]);
+  const stats = await sync(db, projectId, [], { "WEB-14": 500 });
+  expect(stats.cancelled).toBe(0);
+  expect(stats.errors).toBe(1); // surfaced as a failure, not as a disposition
+  expect(taskFor(db, "WEB-14").state).toBe("queued");
+});
+
+test("a search omission followed by a reappearance records no consequence", async () => {
+  const { db, projectId } = freshDb();
+  await sync(db, projectId, [issue({ key: "WEB-14" })]);
+  const task = taskFor(db, "WEB-14");
+  const eventsBefore = eventsFor(db, task.id).length;
+
+  await sync(db, projectId, []); // omitted from search, still alive
+  await sync(db, projectId, [issue({ key: "WEB-14" })]); // back in the search result
+
+  expect(taskFor(db, "WEB-14").state).toBe("queued");
+  expect(eventsFor(db, task.id).length).toBe(eventsBefore);
+});
+
+// A 404 proves the issue is unreadable, and Jira answers 404 (not 403) when
+// permission is lost, so the cancellation is presumptive and must be reversible.
+test("hive undoes its own deletion cancel when the issue comes back", async () => {
+  const { db, projectId } = freshDb();
+  await sync(db, projectId, [issue({ key: "WEB-14" })]);
+  await sync(db, projectId, [], { "WEB-14": 404 });
+  expect(taskFor(db, "WEB-14").state).toBe("cancelled");
+
+  await sync(db, projectId, [issue({ key: "WEB-14", status: "In Progress" })]);
+  const restored = taskFor(db, "WEB-14");
+  expect(restored.state).toBe("in_progress"); // back in step with Jira, not stuck terminal
+  expect(eventsFor(db, restored.id).some((e) => e.type === "jira_sync" && e.payload.action === "source_restored")).toBe(true);
+});
+
+test("a director's cancellation is never undone by the sync", async () => {
+  const { db, projectId } = freshDb();
+  await sync(db, projectId, [issue({ key: "WEB-14" })]);
+  const task = taskFor(db, "WEB-14");
+  transition(db, task.id, "cancelled", { source: "director", reason: "not doing this" });
+
+  await sync(db, projectId, [issue({ key: "WEB-14" })]);
+  expect(taskFor(db, "WEB-14").state).toBe("cancelled"); // stays cancelled
 });

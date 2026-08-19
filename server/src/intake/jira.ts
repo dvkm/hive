@@ -42,7 +42,7 @@
 import type { DB } from "../db.ts";
 import { newId, now } from "../db.ts";
 import { broadcast } from "../bus.ts";
-import { writeEvent, getTask, type State } from "../state.ts";
+import { writeEvent, getTask, transition, TERMINAL, type State } from "../state.ts";
 import { broadcastTask } from "../health.ts";
 import { resolveProjectSecrets } from "../secrets.ts";
 import type { Exec } from "../exec.ts";
@@ -230,6 +230,16 @@ export function credentialTargetAllowed(site: unknown, email: unknown): boolean 
 }
 
 // ------------------------------------------------------------------ jira api
+// The status has to survive as a FIELD, not as text inside the message: the
+// deletion disposition below turns on a 404 specifically, and scraping a
+// number back out of a formatted string is exactly the kind of match that
+// silently starts matching the wrong thing.
+export class JiraHttpError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
 export class JiraClient {
   constructor(
     private cfg: JiraConfig,
@@ -257,7 +267,8 @@ export class JiraClient {
         ...(init.headers ?? {}),
       },
     });
-    if (!res.ok) throw new Error(`jira ${init.method ?? "GET"} ${path} -> ${res.status} ${await res.text()}`);
+    if (!res.ok)
+      throw new JiraHttpError(`jira ${init.method ?? "GET"} ${path} -> ${res.status} ${await res.text()}`, res.status);
     if (res.status === 204) return null;
     const text = await res.text();
     return text ? JSON.parse(text) : null;
@@ -283,6 +294,23 @@ export class JiraClient {
       if (body?.isLast !== false || !token) break;
     }
     return out;
+  }
+
+  // Positive proof that an issue is GONE, which is a different question from
+  // "did the search return it". Jira's search index is eventually consistent
+  // and `issues()` above also truncates at MAX_PAGES, so an issue can be absent
+  // from that result while existing perfectly well; only a direct per-issue GET
+  // separates the two. 404 is the single outcome that answers "gone" — a 200
+  // says it is there, and a 5xx/timeout/auth failure PROPAGATES, because
+  // "hive could not tell" must never reach a caller as "it is gone".
+  async issueMissing(key: string): Promise<boolean> {
+    try {
+      await this.call(`/rest/api/3/issue/${encodeURIComponent(key)}?fields=key`);
+      return false;
+    } catch (e) {
+      if (e instanceof JiraHttpError && e.status === 404) return true;
+      throw e;
+    }
   }
 
   async accountId(): Promise<string | null> {
@@ -421,6 +449,7 @@ export interface SyncStats {
   comments_pulled: number;
   comments_pushed: number;
   shadow: number; // outbound calls suppressed by write:false
+  cancelled: number; // mirrors dispositioned because their issue is proven gone
   errors: number;
 }
 
@@ -437,6 +466,23 @@ function jiraCommentRecorded(db: DB, taskId: string, jiraId: string): boolean {
        OR (type = 'jira_sync' AND json_extract(payload, '$.jira_comment_id') = ?)
      ) LIMIT 1`
   ).get(taskId, jiraId, jiraId);
+}
+
+// Did hive's own deletion sweep cancel this mirror, or did a human? Only the
+// former may be undone when the issue comes back — a director who cancels a
+// mirrored task means it, and the sync must not resurrect it. The most recent
+// state_change already carries the answer in its `source`, so this needs no
+// extra marker column to drift out of step with the transition that sets it.
+function cancelledByJiraSync(db: DB, taskId: string): boolean {
+  const r = db
+    .query("SELECT source, payload FROM events WHERE task_id = ? AND type = 'state_change' ORDER BY ts DESC, rowid DESC LIMIT 1")
+    .get(taskId) as { source: string; payload: string } | undefined;
+  if (r?.source !== "jira-sync") return false;
+  try {
+    return JSON.parse(r.payload)?.to === "cancelled";
+  } catch {
+    return false;
+  }
 }
 
 function commentPushRecorded(db: DB, taskId: string, eventId: string, action: string): boolean {
@@ -458,7 +504,7 @@ export async function syncProjectOnce(
   const log = deps.log ?? ((m: string, e?: unknown) => console.error(`[hive] jira: ${m}`, e ?? ""));
   const stats: SyncStats = {
     imported: 0, pushed: 0, pulled: 0, labeled: 0, assigned: 0,
-    comments_pulled: 0, comments_pushed: 0, shadow: 0, errors: 0,
+    comments_pulled: 0, comments_pushed: 0, shadow: 0, cancelled: 0, errors: 0,
   };
   const issues = await client.issues();
   let selfId: string | null = null;
@@ -490,6 +536,20 @@ export async function syncProjectOnce(
       if (task.title !== title || task.brief !== brief) {
         db.query("UPDATE tasks SET title = ?, brief = ?, updated_at = ? WHERE id = ?").run(title, brief, now(), task.id);
         broadcastTask(db, getTask(db, task.id));
+      }
+
+      // ---- reappearance: undo a deletion disposition when the issue is back.
+      // The 404 the sweep below acts on proves the issue is not READABLE by
+      // hive, which is deletion in all but one case: Jira answers 404 rather
+      // than 403 for an issue you have lost permission to see, deliberately,
+      // so it does not leak existence. That makes the cancellation presumptive,
+      // and a presumptive terminal state has to be reversible or a permission
+      // blip becomes a permanent one-way trapdoor. Seeing the issue again is
+      // itself positive evidence, so it is safe to act on.
+      if (task.state === "cancelled" && cancelledByJiraSync(db, task.id)) {
+        logSync(db, task.id, { action: "source_restored", issue: issue.key, state: jiraState ?? "queued" });
+        applyJiraState(db, task, jiraState ?? "queued", `jira ${issue.key} exists again`);
+        task = getTask(db, task.id);
       }
 
       // ---- status: bidirectional alongside comments
@@ -627,6 +687,48 @@ export async function syncProjectOnce(
       log(`issue ${issue?.key} failed`, e);
     }
   }
+
+  // ---- disposition: a mirror whose issue is PROVEN gone stops being queued
+  // forever. Without this a deleted Jira issue leaves a tracking task sitting
+  // in the inbox with one import event on it, never updated again and with
+  // nothing on the task saying why.
+  //
+  // The two-step shape is the whole safety property, and the steps answer
+  // different questions. Absence from `issues()` only SELECTS CANDIDATES: it is
+  // not evidence of anything, since the search index lags and the page cap can
+  // truncate. The consequence is driven exclusively by `issueMissing`, a direct
+  // read whose 404 is a positive signal. A candidate that turns out to be
+  // present, or that hive fails to reach at all, is left completely untouched —
+  // no state change, no event, nothing that a later cycle has to undo.
+  //
+  // The row itself is never deleted: comments, evidence and receipts hang off
+  // it and are the only surviving record that the work existed. `cancelled` is
+  // terminal, so the mirror also leaves the board and the attention tray, which
+  // is the point — it becomes history instead of clutter.
+  const seenKeys = new Set(issues.map((i: any) => String(i?.key ?? "")));
+  const linked = db
+    .query(
+      `SELECT id, source_ref FROM tasks
+       WHERE project_id = ? AND source_ref LIKE ?
+         AND state NOT IN (${TERMINAL.map(() => "?").join(",")})`
+    )
+    .all(projectId, REF_PREFIX + "%", ...TERMINAL) as { id: string; source_ref: string }[];
+  for (const row of linked) {
+    const key = String(row.source_ref).slice(REF_PREFIX.length);
+    if (seenKeys.has(key)) continue;
+    try {
+      if (!(await client.issueMissing(key))) continue; // still there: absent from search only
+      logSync(db, row.id, { action: "source_deleted", issue: key, proof: "direct GET returned 404" });
+      transition(db, row.id, "cancelled", {
+        source: "jira-sync",
+        reason: `jira ${key} no longer exists (direct read returned 404)`,
+      });
+      stats.cancelled++;
+    } catch (e) {
+      stats.errors++;
+      log(`issue ${key} deletion check failed`, e);
+    }
+  }
   return stats;
 }
 
@@ -652,9 +754,9 @@ export async function syncJiraOnce(db: DB, deps: JiraDeps = {}): Promise<SyncSta
       const client = new JiraClient(cfg, token, deps.fetch ?? fetch);
       const stats = await syncProjectOnce(db, p.id, cfg, client, deps);
       out.push(stats);
-      if (stats.imported || stats.pushed || stats.pulled || stats.labeled || stats.assigned || stats.comments_pulled || stats.comments_pushed || stats.shadow || stats.errors)
+      if (stats.imported || stats.pushed || stats.pulled || stats.labeled || stats.assigned || stats.comments_pulled || stats.comments_pushed || stats.shadow || stats.cancelled || stats.errors)
         console.log(
-          `[hive] jira ${cfg.project_key}: +${stats.imported} imported, ${stats.pushed} pushed, ${stats.pulled} pulled, ${stats.labeled} labeled, ${stats.assigned} assigned, ${stats.comments_pulled} comments in, ${stats.comments_pushed} comments out, ${stats.shadow} shadow, ${stats.errors} errors`
+          `[hive] jira ${cfg.project_key}: +${stats.imported} imported, ${stats.pushed} pushed, ${stats.pulled} pulled, ${stats.labeled} labeled, ${stats.assigned} assigned, ${stats.comments_pulled} comments in, ${stats.comments_pushed} comments out, ${stats.shadow} shadow, ${stats.cancelled} cancelled, ${stats.errors} errors`
         );
     } catch (e) {
       log(`project ${p.id} sync failed`, e);
