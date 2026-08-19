@@ -310,6 +310,7 @@ export function briefFor(issue: any, site: string): string {
     `JIRA: ${site}/browse/${issue.key}`,
     `Type: ${f.issuetype?.name ?? "-"}`,
     `Priority: ${f.priority?.name ?? "-"}`,
+    `Assignee: ${f.assignee?.displayName ?? "Unassigned"}`,
     `Labels: ${(f.labels ?? []).join(", ") || "-"}`,
     "",
     adfToText(f.description).trim() || "(no description)",
@@ -447,7 +448,7 @@ export async function syncProjectOnce(
         broadcastTask(db, getTask(db, task.id));
       }
 
-      // ---- status: the one bidirectional field
+      // ---- status: bidirectional alongside comments
       const jiraAt = lastStatusChangeAt(issue);
       const hiveAt = lastStateChangeAt(db, task.id);
       const action = decideStatusSync({ jiraState, hiveState: task.state, jiraAt, hiveAt });
@@ -607,7 +608,7 @@ export async function syncJiraOnce(db: DB, deps: JiraDeps = {}): Promise<SyncSta
       const client = new JiraClient(cfg, token, deps.fetch ?? fetch);
       const stats = await syncProjectOnce(db, p.id, cfg, client, deps);
       out.push(stats);
-      if (stats.imported || stats.pushed || stats.pulled || stats.labeled || stats.assigned || stats.comments_pulled || stats.comments_pushed || stats.shadow)
+      if (stats.imported || stats.pushed || stats.pulled || stats.labeled || stats.assigned || stats.comments_pulled || stats.comments_pushed || stats.shadow || stats.errors)
         console.log(
           `[hive] jira ${cfg.project_key}: +${stats.imported} imported, ${stats.pushed} pushed, ${stats.pulled} pulled, ${stats.labeled} labeled, ${stats.assigned} assigned, ${stats.comments_pulled} comments in, ${stats.comments_pushed} comments out, ${stats.shadow} shadow, ${stats.errors} errors`
         );
