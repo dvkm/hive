@@ -4,10 +4,10 @@ import { MemoryRouter } from "react-router-dom";
 import { Ctx, type Store } from "../src/lib/store";
 import { LightboxProvider } from "../src/lib/lightbox";
 import { api } from "../src/lib/api";
-import type { Task, TaskDetail } from "../src/lib/api";
+import type { Task, TaskDetail, UnderstandingQuiz } from "../src/lib/api";
 import { TaskBody } from "../src/views/Task";
 
-const fakeStore = { tasks: [], projects: [], rev: {} } as unknown as Store;
+const fakeStore = { tasks: [], projects: [], rev: {}, quizzes: [], reloadQuizzes: () => {} } as unknown as Store;
 
 const task = (id: string, extra: Partial<Task> = {}): Task => ({
   id,
@@ -42,11 +42,11 @@ api.taskUsage = (async (id: string) => ({
   totals: { total_tokens: 0, cost_usd: 0, unpriced: 0, calls: 0 },
 })) as typeof api.taskUsage;
 
-function tree(t: Task) {
+function tree(t: Task, store: Store = fakeStore) {
   api.task = (async () => detail(t)) as typeof api.task;
   return (
     <MemoryRouter>
-      <Ctx.Provider value={fakeStore}>
+      <Ctx.Provider value={store}>
         <LightboxProvider>
           <TaskBody id={t.id} />
         </LightboxProvider>
@@ -54,6 +54,22 @@ function tree(t: Task) {
     </MemoryRouter>
   );
 }
+
+const quiz = (taskId: string, extra: Partial<UnderstandingQuiz> = {}): UnderstandingQuiz => ({
+  id: `quiz-${taskId}`,
+  task_id: taskId,
+  ts: "2026-01-01T00:00:00.000Z",
+  task_number: 1,
+  task_title: "task",
+  task_state: "done",
+  task_kind: "ship",
+  project_id: "project",
+  report: {},
+  question: "Why does this matter?",
+  options: [{ key: "a", label: "A" }, { key: "b", label: "B" }],
+  status: "required",
+  ...extra,
+});
 
 const btn = (renderer: ReturnType<typeof create>, label: string) =>
   renderer.root.findAll((n) => n.type === "button" && n.children.includes(label));
@@ -96,3 +112,21 @@ test("Dispatch now and Send steer show normally for an ordinary (non-external) q
   expect(btn(renderer, "Dispatch now").length).toBe(1);
   expect(btn(renderer, "Send steer").length).toBe(1);
 });
+
+// The server accepts understanding-quiz answers in in_review/verifying/done/failed
+// (server/src/api.ts's UNDERSTANDING_QUIZ_ANSWERABLE_STATES), but the task page
+// used to only render the quiz when state === "in_review" — a task moved to
+// done/failed with a pending quiz showed no way to clear it (hive-1028).
+for (const state of ["done", "failed", "verifying"] as const) {
+  test(`a pending understanding quiz renders on the task page for a ${state} task`, async () => {
+    const t = task(`${state}-task`, { state });
+    const q = quiz(t.id, { task_state: state });
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree(t, { ...fakeStore, quizzes: [q] } as unknown as Store));
+    });
+
+    const questions = renderer.root.findAll((n) => n.type === "h4" && n.children.includes(q.question));
+    expect(questions.length).toBe(1);
+  });
+}

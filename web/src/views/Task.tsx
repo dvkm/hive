@@ -7,10 +7,11 @@ import type { Decision, Evidence, JiraTaskState, TaskDetail } from "../lib/api";
 import { useStore } from "../lib/store";
 import { splitAttachments } from "../lib/attachments";
 import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
-import { ReviewCard } from "./ReviewCard";
+import { ReviewAudit, ReviewCard, ReviewUnderstanding } from "./ReviewCard";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
 import { ReportView } from "./ReportView";
+import { UnderstandingQuiz } from "./UnderstandingQuiz";
 import { relTime } from "../lib/time";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
@@ -482,7 +483,7 @@ export function JiraPanel({
 
 // board modal (see App.tsx / views/TaskModal.tsx).
 export function TaskBody({ id }: { id: string }) {
-  const { rev, projects, tasks } = useStore();
+  const { rev, projects, tasks, quizzes, reloadQuizzes } = useStore();
   const lightbox = useLightbox();
   const [t, setT] = useState<TaskDetail | null>(null);
   const [jira, setJira] = useState<JiraTaskState | null>(null);
@@ -540,6 +541,11 @@ export function TaskBody({ id }: { id: string }) {
   const jiraMirror = isJiraMirror(t);
   const codeReview = t.state === "in_review" && !trackingOnly;
   const bindingNotice = trackingBindingNotice(t);
+  // ReviewCard already renders the quiz for in_review; this covers the states
+  // the API also accepts answers in (verifying/done/failed) where no review
+  // card exists — the task page used to hide a quiz the Understanding column
+  // still counted as pending (hive-1028).
+  const postShipQuiz = !codeReview ? quizzes.find((q) => q.task_id === t.id) : undefined;
 
   const doTransition = async (to: string) => {
     try {
@@ -705,6 +711,29 @@ export function TaskBody({ id }: { id: string }) {
         )}
 
         {codeReview && <ReviewCard task={t} onDone={refresh} />}
+
+        {postShipQuiz && (
+          <section className="panel understanding-quiz-panel">
+            <h2>Understanding check</h2>
+            <details className="review-details" open>
+              <summary>
+                <span>{postShipQuiz.task_kind === "scout" ? "Explain report" : "Understand this change"}</span>
+                <small>Read before answering</small>
+              </summary>
+              <div className="review-details-body">
+                {postShipQuiz.report.understanding && (
+                  <ReviewUnderstanding
+                    packet={postShipQuiz.report.understanding}
+                    report={postShipQuiz.task_kind === "scout"}
+                    caveats={postShipQuiz.report.iffy}
+                  />
+                )}
+                <ReviewAudit r={postShipQuiz.report} />
+              </div>
+            </details>
+            <UnderstandingQuiz quiz={postShipQuiz} onPassed={reloadQuizzes} />
+          </section>
+        )}
 
         {!codeReview && <CheckpointList events={t.events} />}
 
