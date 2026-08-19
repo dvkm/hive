@@ -10,8 +10,17 @@ import { AttentionRows } from "./attention";
 import { CheckpointsInbox } from "./Checkpoints";
 import { UnderstandingQuiz } from "./UnderstandingQuiz";
 import { fmtUsd, fmtTokens } from "./Analytics";
+import type { NeedsYouItem } from "../lib/needsYou";
 
 const LAST_SEEN_KEY = "hive.brief.lastSeen";
+const MODE_KEY = "hive.inbox.mode";
+const ITEM_LABELS: Record<NeedsYouItem["kind"], string> = {
+  decision: "Decision",
+  checkpoint: "Checkpoint",
+  quiz: "Understanding",
+  review: "Review",
+  attention: "Issue",
+};
 
 // A calm memo section: a heading with a count, then its body. Renders nothing
 // when empty so the brief collapses to only what needs the reader.
@@ -38,6 +47,7 @@ function toLocalInput(iso: string): string {
 export default function Brief() {
   const { needsYou, reloadQuizzes } = useStore();
   const location = useLocation();
+  const [mode, setMode] = useState<"focus" | "backlogs">(() => localStorage.getItem(MODE_KEY) === "backlogs" ? "backlogs" : "focus");
 
   // Default the activity-summary window to the last time Needs you was viewed
   // (localStorage, same pattern as the feed's last-seen). Read the stored marker
@@ -85,15 +95,29 @@ export default function Brief() {
   const spendCount = spend ? spend.totals.calls : 0;
 
   const actionCount = openDecisions.length + checkpoints.length + quizzes.length + toReview.length + attention.length;
+  const focusItem = needsYou.find((item) => {
+    if (item.kind === "decision") return !answered.has(item.id);
+    if (item.kind === "quiz") return !passedQuizzes.has(item.id);
+    if (item.kind === "review") return !reviewed.has(item.id);
+    return true;
+  });
+  const chooseMode = (next: "focus" | "backlogs") => {
+    setMode(next);
+    localStorage.setItem(MODE_KEY, next);
+  };
 
   return (
     <div className="brief-page">
       <header className="brief-top">
         <div>
-          <h1 className="brief-title">Needs you</h1>
+          <h1 className="brief-title">{mode === "focus" ? "Focus" : "Backlogs"}</h1>
           <div className="brief-since muted">
-            Decisions, approvals, and issues Hive cannot finish without you.
+            {mode === "focus" ? "One thing at a time. Hive picks what needs you next." : "Every queue, grouped so you can scan what remains."}
           </div>
+        </div>
+        <div className="brief-mode-switch" role="group" aria-label="Needs you view">
+          <button aria-pressed={mode === "focus"} onClick={() => chooseMode("focus")}>Focus</button>
+          <button aria-pressed={mode === "backlogs"} onClick={() => chooseMode("backlogs")}>Backlogs <span>{actionCount}</span></button>
         </div>
       </header>
 
@@ -104,68 +128,79 @@ export default function Brief() {
         </div>
       )}
 
-      <Section title="Understanding backlog" count={quizzes.length}>
-        {quizzes[0] && (
-          <div className="brief-quiz">
-            <Link to={`/tasks/${quizzes[0].task_id}`}>#{quizzes[0].task_number} {quizzes[0].task_title}</Link>
-            <details className="review-details" open>
-              <summary>
-                <span>{quizzes[0].task_kind === "scout" ? "Explain report" : "Understand this change"}</span>
-                <small>Read before answering</small>
-              </summary>
-              <div className="review-details-body">
-                {quizzes[0].report.understanding && (
-                  <ReviewUnderstanding
-                    packet={quizzes[0].report.understanding}
-                    report={quizzes[0].task_kind === "scout"}
-                    caveats={quizzes[0].report.iffy}
-                  />
-                )}
-                <ReviewAudit r={quizzes[0].report} />
-              </div>
-            </details>
-            <UnderstandingQuiz
-              quiz={quizzes[0]}
-              onPassed={() => {
-                setPassedQuizzes((items) => new Set(items).add(quizzes[0].id));
-                reloadQuizzes();
-              }}
-            />
+      {mode === "focus" && focusItem && (
+        <section className="brief-focus">
+          <div className="brief-focus-meta">
+            <span>{ITEM_LABELS[focusItem.kind]}</span>
+            <span>1 of {actionCount}</span>
           </div>
-        )}
-        {quizzes.length > 1 && <div className="brief-queue-note">Next quiz appears after this one.</div>}
-      </Section>
+          {focusItem.kind === "decision" && (
+            <DecisionCard d={focusItem.decision} onDone={(id) => setAnswered((items) => new Set(items).add(id))} />
+          )}
+          {focusItem.kind === "checkpoint" && <CheckpointsInbox limit={1} heading={false} />}
+          {focusItem.kind === "quiz" && (
+            <div className="brief-quiz">
+              <Link to={`/tasks/${focusItem.quiz.task_id}`}>#{focusItem.quiz.task_number} {focusItem.quiz.task_title}</Link>
+              <details className="review-details" open>
+                <summary>
+                  <span>{focusItem.quiz.task_kind === "scout" ? "Explain report" : "Understand this change"}</span>
+                  <small>Read before answering</small>
+                </summary>
+                <div className="review-details-body">
+                  {focusItem.quiz.report.understanding && (
+                    <ReviewUnderstanding packet={focusItem.quiz.report.understanding} report={focusItem.quiz.task_kind === "scout"} caveats={focusItem.quiz.report.iffy} />
+                  )}
+                  <ReviewAudit r={focusItem.quiz.report} />
+                </div>
+              </details>
+              <UnderstandingQuiz
+                quiz={focusItem.quiz}
+                onPassed={() => {
+                  setPassedQuizzes((items) => new Set(items).add(focusItem.id));
+                  reloadQuizzes();
+                }}
+              />
+            </div>
+          )}
+          {focusItem.kind === "review" && (
+            <ReviewCard task={focusItem.task} onDone={() => setReviewed((items) => new Set(items).add(focusItem.id))} />
+          )}
+          {focusItem.kind === "attention" && <div className="brief-attn"><AttentionRows tasks={[focusItem.task]} /></div>}
+          {actionCount > 1 && <div className="brief-queue-note">{actionCount - 1} more waiting. Finish this one to continue.</div>}
+        </section>
+      )}
 
-      {/* ① Decisions waiting, answerable here with the shared decision card. */}
-      <Section title="Decisions waiting" count={openDecisions.length}>
-        <div className="brief-decisions">
-          {openDecisions[0] && <DecisionCard key={openDecisions[0].id} d={openDecisions[0]} onDone={(id) => setAnswered((s) => new Set(s).add(id))} />}
-          {openDecisions.length > 1 && <div className="brief-queue-note">Next decision appears after this one.</div>}
+      {mode === "backlogs" && (
+        <div className="brief-backlogs">
+          <Section title="Decisions" count={openDecisions.length}>
+            <ul className="brief-backlog-list">
+              {openDecisions.map((decision) => <li key={decision.id}><Link to={`/decisions#dcard-${decision.id}`}>{decision.title}</Link><span>{decision.risk || "decision"}</span></li>)}
+            </ul>
+          </Section>
+          <Section title="Checkpoints" count={checkpoints.length}>
+            <ul className="brief-backlog-list">
+              {checkpoints.map((checkpoint) => <li key={checkpoint.id}><Link to={`/tasks/${checkpoint.task_id}`}>#{checkpoint.task_number} {checkpoint.task_title}</Link><span>{checkpoint.note}</span></li>)}
+            </ul>
+          </Section>
+          <Section title="Understanding" count={quizzes.length}>
+            <ul className="brief-backlog-list">
+              {quizzes.map((quiz) => <li key={quiz.id}><Link to={`/tasks/${quiz.task_id}`}>#{quiz.task_number} {quiz.task_title}</Link><span>{quiz.task_kind === "scout" ? "Report" : "Change"}</span></li>)}
+            </ul>
+          </Section>
+          <Section title="Reviews" count={toReview.length}>
+            <ul className="brief-backlog-list">
+              {toReview.map((task) => <li key={task.id}><Link to={`/tasks/${task.id}`}>#{task.number} {task.title}</Link><span>{task.ci_status === "passing" ? "Ready" : task.ci_status || "Review"}</span></li>)}
+            </ul>
+          </Section>
+          <Section title="Issues" count={attention.length}>
+            <ul className="brief-backlog-list">
+              {attention.map((task) => <li key={task.id}><Link to={`/tasks/${task.id}`}>#{task.number} {task.title}</Link><span>{task.health?.reason || task.summary || "Needs attention"}</span></li>)}
+            </ul>
+          </Section>
         </div>
-      </Section>
+      )}
 
-      <Section title="Checkpoints" count={checkpoints.length}>
-        <CheckpointsInbox limit={1} heading={false} />
-        {checkpoints.length > 1 && <div className="brief-queue-note">Next checkpoint appears after this one.</div>}
-      </Section>
-
-      {/* ②a To review — in-review tasks awaiting review & merge (shared card). */}
-      <Section title="To review" count={toReview.length}>
-        <div className="brief-reviews">
-          {toReview[0] && <ReviewCard task={toReview[0]} onDone={() => setReviewed((s) => new Set(s).add(toReview[0].id))} />}
-          {toReview.length > 1 && <div className="brief-queue-note">Next review appears after this one.</div>}
-        </div>
-      </Section>
-
-      {/* ② Needs attention — reuses the board's tray rows. */}
-      <Section title="Needs attention" count={attention.length}>
-        <div className="brief-attn">
-          <AttentionRows tasks={attention.slice(0, 1)} />
-        </div>
-        {attention.length > 1 && <div className="brief-queue-note">Next issue appears after this one.</div>}
-      </Section>
-
-      {data && (
+      {mode === "backlogs" && data && (
         <details className="brief-digest">
           <summary>
             <span>Activity summary</span>

@@ -3173,6 +3173,84 @@ a.dbundle-fact:hover {
   font-size: 13px;
   margin-top: 3px;
 }
+.brief-mode-switch {
+  display: flex;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elev);
+}
+.brief-mode-switch button {
+  border: 0;
+  border-radius: 7px;
+  padding: 7px 11px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.brief-mode-switch button[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--bg-elev2);
+  box-shadow: inset 0 0 0 1px var(--border-soft);
+}
+.brief-mode-switch button span {
+  margin-left: 3px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.brief-focus {
+  min-width: 0;
+}
+.brief-focus-meta {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.brief-focus .brief-queue-note {
+  margin-top: 14px;
+}
+.brief-backlog-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.brief-backlog-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(100px, 34%);
+  gap: 18px;
+  align-items: center;
+  padding: 11px 13px;
+  border-top: 1px solid var(--border-soft);
+}
+.brief-backlog-list li:first-child { border-top: 0; }
+.brief-backlog-list a {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-weight: 550;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.brief-backlog-list a:hover { text-decoration: underline; }
+.brief-backlog-list li > span {
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
 .brief-picker {
   display: flex;
   align-items: center;
@@ -3339,6 +3417,13 @@ a.dbundle-fact:hover {
 .brief-health.attn-stuck { color: var(--orange); }
 .brief-health.attn-dead { color: var(--red); }
 .brief-health.attn-silent { color: var(--amber); }
+
+@media (max-width: 640px) {
+  .brief-top { align-items: stretch; flex-direction: column; }
+  .brief-mode-switch { align-self: flex-start; }
+  .brief-backlog-list li { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  .brief-backlog-list li > span { text-align: left; }
+}
 
 .brief-inc-status {
   font-size: 10px;
