@@ -2200,7 +2200,19 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
   const exec = deps.exec ?? defaultExec;
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   const config = JSON.parse(project?.config ?? "{}");
-  const base = config.default_branch || "main";
+  let prView: any = null;
+  if (task.pr_url) {
+    const probe = await exec([
+      "gh",
+      "pr",
+      "view",
+      task.pr_url,
+      "--json",
+      "state,mergeStateStatus,reviewDecision,statusCheckRollup,baseRefName",
+    ]);
+    if (probe.code === 0) prView = JSON.parse(probe.stdout || "{}");
+  }
+  const base = prView?.baseRefName || config.default_branch || "main";
   const forceLocalFf = body?.merge_strategy === "local_ff";
 
   // Guard against a destructive auto-rebase landing (task #314): a stale branch
@@ -2261,7 +2273,6 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
   }
 
   let method = "";
-  let prView: any = null;
   if (task.pr_url) {
     // A closed or already-merged PR fails `gh pr merge` with an opaque GraphQL
     // error and used to bounce the agent with a bogus conflict steer (task #90
@@ -2269,16 +2280,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
     // GitHub says MERGED, just advance: the work landed, hive's link was stale.
     // Runs on the forced local_ff path too: that override exists for a stale
     // base comparison, never for landing a rejected PR's branch.
-    const probe = await exec([
-      "gh",
-      "pr",
-      "view",
-      task.pr_url,
-      "--json",
-      "state,mergeStateStatus,reviewDecision,statusCheckRollup",
-    ]);
-    if (probe.code === 0) {
-      prView = JSON.parse(probe.stdout || "{}");
+    if (prView) {
       const prState = String(prView.state ?? "").toUpperCase();
       if (prState === "MERGED") {
         method = "already merged on GitHub";

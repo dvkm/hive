@@ -226,7 +226,7 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     .all() as { id: string; state: string; pr_url: string; ci_status: string | null; head_sha: string | null; agent_target: string | null; project_id: string; branch: string | null }[];
 
   for (const t of tasks) {
-    const r = await exec(["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup,mergeable,headRefOid"]);
+    const r = await exec(["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup,mergeable,headRefOid,baseRefName"]);
     if (r.code !== 0) continue; // gh unavailable / auth: skip, try next cycle
     let data: any;
     try {
@@ -274,9 +274,9 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
           | { config: string; repo_path: string | null }
           | undefined;
         if (project?.repo_path) {
-          let base = "main";
+          let base = data.baseRefName || "main";
           try {
-            base = JSON.parse(project.config ?? "{}").default_branch || "main";
+            base = data.baseRefName || JSON.parse(project.config ?? "{}").default_branch || "main";
           } catch {}
           const scope = await captureBranchScope(exec, project.repo_path, base, t.branch);
           if (scope) writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: scope });

@@ -167,6 +167,28 @@ test("syncPRs persists the PR's head_sha so the review card can flag stale evide
   expect(getTask(db, id).head_sha).toBe("sha-b");
 });
 
+test("syncPRs snapshots branch scope against the PR's actual base", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/staging" });
+  db.query("UPDATE tasks SET branch = ? WHERE id = ?").run("feat", id);
+  const diffs: string[] = [];
+  const exec: Exec = stub((argv) => {
+    if (argv[0] === "gh")
+      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], headRefOid: "head", baseRefName: "staging" }));
+    if (argv.includes("diff") && argv.includes("--name-only")) {
+      diffs.push(argv.at(-1)!);
+      return OK("src/task.ts\n");
+    }
+    if (argv.includes("rev-parse")) return OK("staging-sha\n");
+    return OK();
+  });
+
+  await reconcileOnce(db, { exec });
+  const scope: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'branch_scope'").get(id);
+  expect(diffs).toEqual(["staging...feat"]);
+  expect(JSON.parse(scope.payload)).toEqual({ base_sha: "staging-sha", files: ["src/task.ts"] });
+});
+
 test("syncPRs bounces an in_review task whose CI turned red, steers once per sha", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { pr_url: "https://gh/pr/2", agent_target: "t-agent" });
