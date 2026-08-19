@@ -146,7 +146,7 @@ export function remoteAuthOk(db: DB, req: Request, url: URL, ip: string | null):
 
 export function makeHandler(db: DB, deps: HandlerDeps = {}) {
   const herdr = deps.herdr ?? defaultHerdr;
-  return async function handle(req: Request, server?: { requestIP?: (r: Request) => { address: string } | null }): Promise<Response> {
+  async function handle(req: Request, server?: { requestIP?: (r: Request) => { address: string } | null }): Promise<Response> {
     const url = new URL(req.url);
     const { pathname } = url;
     const method = req.method;
@@ -477,6 +477,33 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       console.error("[hive] handler error:", e);
       return err(e?.message || "internal error", 500);
     }
+  }
+
+  return async (req: Request, server?: { requestIP?: (r: Request) => { address: string } | null }): Promise<Response> => {
+    const pathname = new URL(req.url).pathname;
+    const match = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(.*))?$/);
+    const taskId = match && getTask(db, match[1]) ? match[1] : null;
+    const before = taskId
+      ? ((db.query("SELECT COALESCE(MAX(rowid), 0) AS rowid FROM events WHERE task_id = ?").get(taskId) as { rowid: number }).rowid)
+      : 0;
+    const response = await handle(req, server);
+    if (taskId && !response.ok && response.status !== 401) {
+      const alreadyRecorded = db.query("SELECT 1 FROM events WHERE task_id = ? AND rowid > ? LIMIT 1").get(taskId, before);
+      if (!alreadyRecorded) {
+        let reason = response.statusText || `HTTP ${response.status}`;
+        try {
+          const body = await response.clone().json() as { error?: unknown };
+          if (body?.error) reason = String(body.error);
+        } catch {}
+        writeEvent(db, {
+          task_id: taskId,
+          source: "system",
+          type: "action_failed",
+          payload: { action: `${req.method} /${match![2] || "task"}`, status: response.status, reason },
+        });
+      }
+    }
+    return response;
   };
 }
 

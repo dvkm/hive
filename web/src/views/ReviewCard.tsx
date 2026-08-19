@@ -8,7 +8,7 @@ import { MAX_DIFF_LINES } from "../lib/api";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
 import { relTime } from "../lib/time";
-import { eventText } from "../lib/eventText";
+import { eventText, isFailureEvent } from "../lib/eventText";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
 import { ReportView } from "./ReportView";
@@ -403,9 +403,9 @@ export function ReviewCard({
           ? "No PR and no branch — nothing to merge"
           : "";
   const mergeBlocked = quizBlocked || deliveryBlocked;
-  const mergeIssues = [...events]
+  const failures = [...events]
     .reverse()
-    .filter((event) => event.type === "merge_failed" || event.type === "merge_blocked_destructive");
+    .filter(isFailureEvent);
   const caveats = review?.iffy ?? [];
   const recommendation = openDecisions.length
     ? "Make the open decision first"
@@ -679,20 +679,20 @@ export function ReviewCard({
               Force local merge
             </button>
           )}
-          {mergeIssues.length > 0 && (
-            <details className="merge-issues">
-              <summary>{mergeIssues.length} recorded merge issue{mergeIssues.length === 1 ? "" : "s"}</summary>
-              <ol>
-                {mergeIssues.map((issue) => (
-                  <li key={issue.id}>
-                    <time title={issue.ts}>{relTime(issue.ts)}</time>
-                    <span>{eventText(issue)}</span>
-                  </li>
-                ))}
-              </ol>
-            </details>
-          )}
         </div>
+      )}
+      {failures.length > 0 && (
+        <details className="merge-issues">
+          <summary>{failures.length} recorded failure{failures.length === 1 ? "" : "s"}</summary>
+          <ol>
+            {failures.map((failure) => (
+              <li key={failure.id}>
+                <time title={failure.ts}>{relTime(failure.ts)}</time>
+                <span>{eventText(failure)}</span>
+              </li>
+            ))}
+          </ol>
+        </details>
       )}
 
       {mode && (
