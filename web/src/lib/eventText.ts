@@ -84,6 +84,16 @@ export function eventText(e: EventLike): string {
     }
     case "auto_review_error":
       return `pre-review failed: ${s(p.error)}`;
+    case "scope_drift": {
+      const beyond = Array.isArray(p.beyond) ? (p.beyond as string[]) : [];
+      const listed = beyond.slice(0, 6).join(", ") + (beyond.length > 6 ? `, …(+${beyond.length - 6})` : "");
+      return `scope growing past the brief at ${s(p.commits)} commits — ${listed || s(p.why) || "beyond the brief"}`;
+    }
+    case "scope_drift_check":
+      if (s(p.error)) return `scope check failed: ${s(p.error)}`;
+      return p.drifting === false
+        ? `scope check at ${s(p.commits)} commits: still within the brief`
+        : `scope checked at ${s(p.commits)} commits`;
     case "action_failed":
       return `${s(p.action) || "task action"} failed: ${s(p.reason) || `HTTP ${s(p.status)}`}`;
     case "auto_merged":
@@ -207,6 +217,7 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
   stale: "incident",
   merge_failed: "incident",
   merge_blocked_destructive: "incident",
+  scope_drift: "decision",
   action_failed: "incident",
   spawn_error: "incident",
   smoke_failed: "incident",

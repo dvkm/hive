@@ -19,7 +19,7 @@ export interface BranchScope {
 // Files the branch's own commits touch, relative to their merge-base with base
 // (three-dot: the branch's authored diff, ignoring base's own advance). Returns
 // null on any git error so callers can treat "can't tell" as "don't block".
-async function authoredFiles(exec: Exec, repoPath: string, base: string, branch: string): Promise<string[] | null> {
+export async function authoredFiles(exec: Exec, repoPath: string, base: string, branch: string): Promise<string[] | null> {
   const r = await exec(["git", "-C", repoPath, "diff", "--name-only", `${base}...${branch}`]);
   if (r.code !== 0) return null;
   return r.stdout

@@ -78,6 +78,11 @@ don't install deps / bring up their stack themselves; emits a `stack_setup`
 event) and `cleanup_argv` (e.g. `[...,"down","{worktree}"]`, run before the
 worktree is removed; emits a `stack_teardown` event). Both are best-effort with a
 120s timeout — a failed hook never blocks spawn nor cleanup.
+Scope-drift keys (see the Scope-drift watch section): `scope_drift` (bool,
+default `true`; set `false` to disable the in-run scope check for this project),
+`scope_drift_commits` (number, default `3`; how many new commits on a task's
+branch trigger the next check) and `model_by_kind.drift` (string, default
+`"sonnet"`; the model that judges footprint against brief).
 Lifecycle key: `archived` (bool, default absent/`false`; when `true` the project
 is hidden from the default `GET /api/projects` list and the web Projects view —
 tasks keep referencing it, there is no hard delete).
@@ -763,6 +768,28 @@ the reconciler recording `pr_synchronized`.
   **`override_destructive_check: true`** skips this guard when the reverts are
   intentional. The guard is a no-op when no pre-rebase snapshot exists (hive
   first saw the branch already rebased).
+
+  **Scope-drift watch.** The same class of runaway, caught earlier: task #974's
+  brief was a consolidation with an explicit "do NOT alter task semantics"
+  boundary, and the run grew ~9 rounds of adjacent hardening before anyone saw
+  it — 5.5h and $36.76 in, at final review, when the only remaining option was
+  to pay to undo the work. A background loop watches every live branch: each
+  time it has gained `config.scope_drift_commits` commits (default 3, so the
+  first check lands before a third no-mistakes review round) hive collects the
+  branch's authored file list and commit subjects and asks a one-shot
+  `claude -p` (default `sonnet`, override with `config.model_by_kind.drift`)
+  whether the run has grown past its brief. Every check writes a
+  `scope_drift_check` event; a `drifting` verdict additionally writes
+  `scope_drift` and opens a decision card — **trim** (recommended: drop the
+  extra, finish the brief), **split** (queue the extra as follow-up tasks) or
+  **continue** (the wider scope is wanted). Answering steers the live agent; a
+  task gets at most one card, and the check stops once it has one. Advisory,
+  never blocking: the agent keeps working while the card is open. A git read
+  failure, an empty brief or an unparseable verdict never raises a card, and
+  `config.scope_drift = false` turns the watch off per project. The judge is
+  given the brief, the file list and the commit subjects — no diff — so a check
+  is small; it does not replace the final pre-review, it just stops a run from
+  paying for eight rounds of out-of-scope work first.
 
   On success: writes
   a `merged` event, transitions `in_review → verifying` (which runs the project's
