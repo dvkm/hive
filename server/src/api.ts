@@ -5,6 +5,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { taskWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
+import { isSupervisedTask, supervisedSql } from "./supervision.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
 import {
   transition,
@@ -880,11 +881,7 @@ async function flushManagerUpdate(threadId: string): Promise<void> {
 export function notifyManagerOfEvent(db: DB, herdr: Herdr, deps: HandlerDeps, event: any): void {
   if (!managerEventRelevant(event)) return;
   const origin = getTask(db, event.task_id);
-  // Tracking-only tasks (source='external': a mirrored JIRA issue, another
-  // agent's kanban entry) are not hive-supervised work, so a human closing
-  // seven tickets upstream must not wake the supervisor seven times. Matches
-  // the exclusions the dispatcher and reconciler already apply to 'external'.
-  if (!origin || origin.source === "chat_supervisor" || origin.source === "external") return;
+  if (!origin || !isSupervisedTask(origin)) return;
   const thread = managingThreadForTask(db, event.task_id) ?? activeChiefOfStaff(db) ?? activeManagerForProject(db, origin.project_id) ?? activeManager(db);
   if (!thread?.task_id) return;
   if (event.type === "steer" && event.payload?.from_task_id === thread.task_id) return;
@@ -900,12 +897,12 @@ export function notifyManagerOfEvent(db: DB, herdr: Herdr, deps: HandlerDeps, ev
   pendingManagerUpdates.set(thread.id, { db, herdr, deps, events: [event] });
 }
 
-function projectInboxCounts(db: DB, projectId: string): { checkpoints: number; decisions: number; reviews: number; attention: number } {
+export function projectInboxCounts(db: DB, projectId: string): { checkpoints: number; decisions: number; reviews: number; attention: number } {
   const checkpoints = Number(
     (db
       .query(
         `SELECT COUNT(*) AS n FROM events e JOIN tasks t ON t.id = e.task_id
-          WHERE e.type = 'checkpoint' AND t.project_id = ? AND t.state != 'cancelled'
+          WHERE e.type = 'checkpoint' AND t.project_id = ? AND t.state != 'cancelled' AND ${supervisedSql("t.source", "t.agent_target")}
             AND NOT EXISTS (
               SELECT 1 FROM events a
                WHERE a.task_id = e.task_id AND a.type = 'checkpoint_ack'
@@ -915,11 +912,11 @@ function projectInboxCounts(db: DB, projectId: string): { checkpoints: number; d
   );
   const decisions = Number(
     (db
-      .query("SELECT COUNT(*) AS n FROM decisions d JOIN tasks t ON t.id = d.task_id WHERE d.status = 'open' AND t.project_id = ?")
+      .query(`SELECT COUNT(*) AS n FROM decisions d JOIN tasks t ON t.id = d.task_id WHERE d.status = 'open' AND t.project_id = ? AND ${supervisedSql("t.source", "t.agent_target")}`)
       .get(projectId) as { n: number }).n
   );
   const reviews = Number(
-    (db.query("SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND state = 'in_review'").get(projectId) as { n: number }).n
+    (db.query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND state = 'in_review' AND ${supervisedSql()}`).get(projectId) as { n: number }).n
   );
   const tasks = db.query("SELECT * FROM tasks WHERE project_id = ?").all(projectId).map((task) => taskWithHealth(db, parseTask(task)));
   const attention = tasks.filter(needsAttention).length;

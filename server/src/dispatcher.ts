@@ -28,6 +28,7 @@ import { Herdr, herdr as defaultHerdr, isHerdrUnreachable } from "./runtime/herd
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
 import { unmetDeps, noteDependencyBlock } from "./state.ts";
+import { isExternalTask } from "./supervision.ts";
 import { managingThreadForTask } from "./chat.ts";
 import type { Exec } from "./exec.ts";
 
@@ -157,7 +158,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         if (!kinds.includes(task.kind) && task.source !== "requeue") continue; // chore / human-titled tasks excluded
 
         if (task.source?.startsWith("intake_") && !isReviewed(db, task.id)) continue; // unreviewed intake
-        if (task.source === "external") continue; // tracking-only: another agent's kanban entry, never spawned
+        if (isExternalTask(task.source)) continue; // tracking-only: never spawned
 
         const cap = Number.isFinite(cfg.max_agents) ? Number(cfg.max_agents) : MAX_AGENTS_DEFAULT;
         if (workingFor(task.project_id) >= cap) continue; // working-concurrency cap

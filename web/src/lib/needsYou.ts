@@ -7,8 +7,13 @@ export type NeedsYouItem =
   | { kind: "review"; id: string; task: Task }
   | { kind: "attention"; id: string; task: Task };
 
+// Mirrors server/src/health.ts's needsAttention — keep both excluding the
+// same unsupervised tasks (see server/src/supervision.ts's isSupervisedTask).
+// A never-spawned external task (tracking-only, no agent_target) is excluded;
+// a manually-spawned one is real hive-driven work and stays visible.
 export function taskNeedsAttention(task: Task): boolean {
   if (task.source === "chat_supervisor") return false;
+  if (task.source === "external" && !task.agent_target) return false;
   if (task.state === "in_review" || task.state === "needs_decision") return false;
   if (task.state === "failed") return !task.requeued_to;
   return !!task.health && (task.health.status === "dead" || task.health.status === "stuck");
