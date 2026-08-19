@@ -100,6 +100,7 @@ test("tracking-only tasks never enter code-review queues", () => {
     [
       task("jira", "in_review", { source: "external", source_ref: "jira:WEB-1" }),
       task("linked", "in_review", { source: "agent", source_ref: "jira:WEB-2" }),
+      task("canary-1", "in_review", { source: "external", never_dispatched: true }),
       task("review", "in_review", { source: "agent", pr_url: "https://example.com/pr", ci_status: "passing" }),
     ],
     [],
