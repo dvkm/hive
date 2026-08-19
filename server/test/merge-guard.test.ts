@@ -79,13 +79,13 @@ test("override_destructive_check bypasses the guard", async () => {
   expect(ev).toBeFalsy();
 });
 
-test("PR destructive guard compares against the PR's actual base branch", async () => {
+test("PR destructive guard compares against the PR's exact base commit", async () => {
   const { db, taskId } = seed();
   db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/1", taskId);
   const diffs: string[] = [];
   const exec: Exec = stub((argv) => {
     if (argv[0] === "gh" && argv.includes("view"))
-      return OK(JSON.stringify({ state: "OPEN", baseRefName: "staging", mergeStateStatus: "CLEAN", statusCheckRollup: [] }));
+      return OK(JSON.stringify({ state: "OPEN", baseRefName: "staging", baseRefOid: "staging-sha", mergeStateStatus: "CLEAN", statusCheckRollup: [] }));
     if (argv[0] === "gh" && argv.includes("merge")) return OK();
     if (argv.includes("diff") && argv.includes("--name-only")) {
       diffs.push(argv.at(-1)!);
@@ -96,5 +96,5 @@ test("PR destructive guard compares against the PR's actual base branch", async 
 
   const res = await mergeTask(db, herdr, taskId, {}, { exec });
   expect(res.status).toBe(200);
-  expect(diffs).toEqual(["staging...feat"]);
+  expect(diffs).toEqual(["staging-sha...feat"]);
 });

@@ -2208,11 +2208,12 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
       "view",
       task.pr_url,
       "--json",
-      "state,mergeStateStatus,reviewDecision,statusCheckRollup,baseRefName",
+      "state,mergeStateStatus,reviewDecision,statusCheckRollup,baseRefName,baseRefOid",
     ]);
     if (probe.code === 0) prView = JSON.parse(probe.stdout || "{}");
   }
   const base = prView?.baseRefName || config.default_branch || "main";
+  const guardBase = prView?.baseRefOid || base;
   const forceLocalFf = body?.merge_strategy === "local_ff";
 
   // Guard against a destructive auto-rebase landing (task #314): a stale branch
@@ -2231,7 +2232,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
         snapshot = JSON.parse(snapEvent.payload);
       } catch {}
       if (snapshot) {
-        const regressed = await detectDestructiveRebase(exec, project.repo_path, base, task.branch, snapshot);
+        const regressed = await detectDestructiveRebase(exec, project.repo_path, guardBase, task.branch, snapshot);
         if (regressed && regressed.length) {
           const files = regressed.slice(0, 10).join(", ") + (regressed.length > 10 ? `, …(+${regressed.length - 10})` : "");
           writeEvent(db, {
