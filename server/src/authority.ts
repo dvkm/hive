@@ -343,12 +343,19 @@ function maybeProposeDenyGuardrail(db: DB, grant: any): void {
   // Already gated by a rule, or a proposal already exists → nothing to do.
   if (db.query("SELECT 1 FROM authority_rules WHERE active = 1 AND action_pattern = ? AND (project_id IS NULL OR project_id = ?)").get(grant.action, projectId))
     return;
+  // Denials the explainer already called zero-risk don't count toward the
+  // "always block?" tally — a false-positive classifier match denied 3x must
+  // not be able to mint a standing deny rule off its own false positives
+  // (task 1022; the explainer runs async, so LEFT JOIN — a not-yet-explained
+  // or unmatched decision still counts, same as before this column existed).
   const denies = (
     db
       .query(
         `SELECT COUNT(DISTINCT ag.decision_id) AS n FROM authority_grants ag
            JOIN tasks t ON t.id = ag.task_id
-          WHERE ag.action = ? AND ag.status = 'denied' AND t.project_id = ?`
+           LEFT JOIN decisions d ON d.id = ag.decision_id
+          WHERE ag.action = ? AND ag.status = 'denied' AND t.project_id = ?
+            AND (d.explainer_verdict IS NULL OR d.explainer_verdict != 'zero-risk')`
       )
       .get(grant.action, projectId) as any
   ).n as number;
