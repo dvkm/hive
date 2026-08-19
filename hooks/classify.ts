@@ -373,6 +373,22 @@ function sqlTargetsSandboxed(cmd: string, env: Record<string, string | undefined
   });
 }
 
+// SQL dangerous rules must never fire on a pure read-only search/inspection
+// pipeline (grep/rg/sed/cat/awk/…) whose argument text merely CONTAINS
+// SQL-looking words — the string being searched FOR is not a statement being
+// executed. Task 1022: `grep -rn "UPDATE tasks SET" src | grep -i source`
+// classified dangerous because the bare word "source" (an EXECUTOR name) in
+// the second grep's search pattern disabled data-text stripping for the
+// whole command, so the SQL regex matched the first grep's quoted argument.
+// Reuses the SAFE allowlist rather than a second list of read-only tools —
+// a command this waives is, by construction, a command SAFE would already
+// allow once the SQL false-positive stops hiding that.
+function sqlKeywordIsSearchData(cmd: string): boolean {
+  if (/\$\(|`|<\(/.test(cmd)) return false; // subshell: can't prove read-only
+  const segs = segments(cmd);
+  return segs.length > 0 && segs.every((seg) => SAFE.some((rx) => rx.test(seg)));
+}
+
 // A lone `hive emit …` (any invocation form, optionally preceded by VAR=
 // assignments) only POSTs its arguments to hive as JSON — the text is data,
 // never executed. Without this, a status note that MENTIONS a destructive
@@ -485,7 +501,10 @@ export function classify(
     if (reason === "force push" && forcePushOwnBranch(cmd, env)) continue;
     if ((reason.startsWith("hard reset") || reason.startsWith("git clean")) && gitResetInSandbox(cmd, env, cwd))
       continue;
-    if (reason.startsWith("SQL ") && (sqlTargetsSandboxed(cmd, env) || dockerDbTargetsSandboxed(cmd, env, cwd)))
+    if (
+      reason.startsWith("SQL ") &&
+      (sqlTargetsSandboxed(cmd, env) || dockerDbTargetsSandboxed(cmd, env, cwd) || sqlKeywordIsSearchData(cmd))
+    )
       continue;
     return { decision: "dangerous", reason };
   }

@@ -544,6 +544,47 @@ test("denying a command card steers the agent the reason; 3rd deny proposes a bl
   expect(blocked.status).toBe(403); // standing deny, no new card
 });
 
+// task 1022: denials of decisions the explainer already called zero-risk
+// must not count toward the "always block?" tally — otherwise a repeated
+// classifier false positive mints a standing deny rule off its own noise.
+test("denials on zero-risk-verdict decisions don't count toward the always-block tally", async () => {
+  const id = await newTask("false-positive denies");
+  await post(`/api/tasks/${id}/spawn`, {});
+  const gate = async () =>
+    (await post(`/api/tasks/${id}/guarded-action`, {
+      action: "command.dangerous.sql-update-without-where",
+      target: 'grep -rn "UPDATE tasks SET" server/src | grep -i source',
+      detail: "command approval (dangerous): SQL UPDATE without WHERE",
+      summary: "search for the SQL update site",
+    })).json.decision_id;
+
+  // 3 denials, each already marked zero-risk by the explainer (as if it ran
+  // before the director answered) → no block-always proposal.
+  for (let i = 0; i < 3; i++) {
+    const did = await gate();
+    db.query("UPDATE decisions SET explainer_verdict = 'zero-risk' WHERE id = ?").run(did);
+    await post(`/api/decisions/${did}/answer`, { answer_key: "deny" });
+  }
+  expect(
+    db.query("SELECT 1 FROM decisions WHERE title LIKE 'Always block%sql-update-without-where%' AND status='open'").get()
+  ).toBeFalsy();
+
+  // a 4th, unexplained (real) denial pushes the real tally to 1 — still no
+  // proposal until a 3rd REAL denial is reached.
+  const d4 = await gate();
+  await post(`/api/decisions/${d4}/answer`, { answer_key: "deny" });
+  expect(
+    db.query("SELECT 1 FROM decisions WHERE title LIKE 'Always block%sql-update-without-where%' AND status='open'").get()
+  ).toBeFalsy();
+  const d5 = await gate();
+  await post(`/api/decisions/${d5}/answer`, { answer_key: "deny" });
+  const d6 = await gate();
+  await post(`/api/decisions/${d6}/answer`, { answer_key: "deny" });
+  expect(
+    db.query("SELECT 1 FROM decisions WHERE title LIKE 'Always block%sql-update-without-where%' AND status='open'").get()
+  ).toBeTruthy();
+});
+
 // ---- command-card context ----------------------------------------------------------
 
 test("command cards carry intent, the literal command, category explanation, and answer semantics", async () => {
@@ -583,6 +624,47 @@ test("explainCommandDecision appends the haiku explanation to an OPEN card only"
   await explainCommandDecision(db, did, "pkill -f something", { exec: stubExec });
   const after: any = db.query("SELECT context FROM decisions WHERE id = ?").get(did);
   expect(after.context).toBe(d.context);
+});
+
+// task 1022: the explainer's structured verdict flips the recommended
+// answer (never auto-decides — the gate is server-enforced, not LLM-enforced)
+// and is stored so the deny-guardrail tally can exclude false-positive denials.
+test("a zero-risk explainer verdict flips the recommended option away from Deny; real-risk leaves it", async () => {
+  const { explainCommandDecision } = await import("../src/explain.ts");
+  const optionsOf = (did: string) => JSON.parse((db.query("SELECT options FROM decisions WHERE id = ?").get(did) as any).options);
+  const recommended = (opts: any[]) => opts.find((o) => o.recommended)?.key;
+  const id = await newTask("explainer verdict");
+
+  const zeroRisk = await post(`/api/tasks/${id}/guarded-action`, {
+    action: "command.dangerous.sql-update-without-where",
+    target: 'grep -rn "UPDATE tasks SET" server/src | grep -i source',
+    detail: "command approval (dangerous): SQL UPDATE without WHERE",
+    summary: "search for the SQL update site",
+  });
+  const zeroExec = async () => ({
+    code: 0,
+    stdout: JSON.stringify({ result: "VERDICT: zero-risk\n- greps two files for text, no database access, zero risk" }),
+    stderr: "",
+  });
+  await explainCommandDecision(db, zeroRisk.json.decision_id, "grep …", { exec: zeroExec });
+  expect((db.query("SELECT explainer_verdict FROM decisions WHERE id = ?").get(zeroRisk.json.decision_id) as any).explainer_verdict).toBe(
+    "zero-risk"
+  );
+  expect(recommended(optionsOf(zeroRisk.json.decision_id))).toBe("approve");
+
+  const realRisk = await post(`/api/tasks/${id}/guarded-action`, {
+    action: "command.dangerous.sql-update-without-where",
+    target: 'mysql -e "UPDATE tasks SET status=1"',
+    detail: "command approval (dangerous): SQL UPDATE without WHERE",
+    summary: "run the update",
+  });
+  const realExec = async () => ({
+    code: 0,
+    stdout: JSON.stringify({ result: "VERDICT: real-risk\n- mutates every row in tasks, no WHERE clause" }),
+    stderr: "",
+  });
+  await explainCommandDecision(db, realRisk.json.decision_id, "mysql …", { exec: realExec });
+  expect(recommended(optionsOf(realRisk.json.decision_id))).toBe("deny");
 });
 
 // ---- pane view --------------------------------------------------------------------

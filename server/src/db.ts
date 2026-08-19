@@ -443,6 +443,16 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       `CREATE INDEX idx_commitments_thread ON commitments(thread_id, status, updated_at)`,
     ],
   },
+  // The command-card haiku explainer (explain.ts) now reports a structured
+  // verdict ("zero-risk" | "real-risk"), not just free-text bullets. Stored
+  // per-decision so the deny-guardrail tally (authority.ts) can exclude
+  // denials the explainer already called zero-risk from the "always block?"
+  // count — a false-positive classifier match shouldn't be able to mint a
+  // standing deny rule on its own (task 1022).
+  {
+    name: "v23-decision-explainer-verdict",
+    statements: [`ALTER TABLE decisions ADD COLUMN explainer_verdict TEXT`],
+  },
 ];
 
 // -------------------------------------------------------------- settings

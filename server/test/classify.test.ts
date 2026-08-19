@@ -239,6 +239,22 @@ test("SQL on a sandboxed sqlite copy downgrades; live/server DBs stay dangerous"
   expect(classify('sqlite3 /tmp/claude-501/x.db "drop table usage"; psql -c "x"', env).decision).toBe("dangerous");
 });
 
+// task 1022: a read-only search pipeline whose argument text merely CONTAINS
+// SQL keywords must never classify dangerous — the string being searched FOR
+// is not a statement being executed. The specific incident: a bare "source"
+// (an EXECUTOR name) in the second grep's unquoted pattern disabled data-text
+// stripping for the whole command, so the quoted "UPDATE tasks SET" text got
+// scanned as if it were live shell text.
+test("SQL-looking text in a pure read-only search pipeline is not dangerous", () => {
+  const env = { HOME: "/Users/you" };
+  expect(classify('grep -rn "UPDATE tasks SET" server/src | grep -i source', env).decision).toBe("safe");
+  expect(classify('rg "DELETE FROM users" src', env).decision).toBe("safe");
+  expect(classify('grep -n "DROP TABLE accounts" migrations/*.sql', env).decision).toBe("safe");
+  // a real SQL client in the pipeline still gates, even alongside a grep
+  expect(classify('grep -l "UPDATE" *.sql | xargs -I{} mysql -e "UPDATE t SET x=1"', env).decision).toBe("dangerous");
+  expect(classify('echo "UPDATE t SET x=1" | mysql', env).decision).toBe("dangerous");
+});
+
 test("hive emit with destructive text in the note is data, not danger", () => {
   // A lone `hive emit` call is on the SAFE allowlist (herdr reporting calls are
   // required constantly and only POST to hive's own board); note text is data.
