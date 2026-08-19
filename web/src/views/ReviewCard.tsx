@@ -403,7 +403,9 @@ export function ReviewCard({
   const quizBlocked = !reviewLoaded
     ? "Loading the understanding check"
     : missingQuiz
-      ? "Understanding check is missing. Ask the agent to refresh its review."
+      ? task.never_dispatched
+        ? "No understanding check, and this tracking-only task has never been dispatched to an agent to add one."
+        : "Understanding check is missing. Ask the agent to refresh its review."
       : quizStatus === "required"
         ? "Pass the understanding check, or explicitly save it for later."
         : "";
@@ -688,7 +690,7 @@ export function ReviewCard({
           Reject
         </button>
       </div>
-      {missingQuiz ? (
+      {missingQuiz && !task.never_dispatched ? (
         <div className="review-blocked review-blocked-action">
           <button className="btn btn-mini" disabled={busy} onClick={refreshUnderstandingCheck}>
             {busy ? "Asking…" : "Have agent add it"}

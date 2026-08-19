@@ -201,3 +201,28 @@ test("Request changes is hidden for a never-dispatched external task", async () 
   );
   expect(requestChangesBtn.length).toBe(0);
 });
+
+// "Have agent add it" (shown when the review has no understanding quiz yet)
+// calls the same requestChanges API as "Request changes" above — same gap,
+// same fix.
+test("Have agent add it is hidden for a never-dispatched external task", async () => {
+  const t: Task = { ...task("never-dispatched-quiz", "external"), never_dispatched: true };
+
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t));
+  });
+
+  const haveAgentBtn = renderer.root.findAll(
+    (n) => n.type === "button" && n.children.includes("Have agent add it")
+  );
+  expect(haveAgentBtn.length).toBe(0);
+
+  // The button is gone, but the blocked-reason text left behind must not still
+  // tell the director to ask an agent that was never dispatched.
+  const blockedText = JSON.stringify(
+    renderer.root.findAll((n) => n.type === "div" && typeof n.props.className === "string" && n.props.className.includes("review-blocked")).map((n) => n.children)
+  );
+  expect(blockedText).not.toContain("Ask the agent to refresh its review");
+  expect(blockedText).toContain("never been dispatched");
+});
