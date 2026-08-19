@@ -52,6 +52,7 @@ import { checkCostGuardrails, resolveCostCapForDecision, taskSpend } from "./cos
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
 import { vapidPublicKey, saveSubscription, removeSubscription } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
+import { autoResumeOnTurnEnd } from "./resume.ts";
 import { ciStatusOf } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
@@ -1638,7 +1639,7 @@ const FEED_CATEGORIES: Record<string, string[]> = {
   decision: ["needs-decision", "decision_answered", "planned", "authority_required", "authority_granted", "auto_approved", "auto_approve_declined"],
   evidence: ["evidence", "smoke_passed"],
   incident: ["blocked", "stale", "spawn_error", "smoke_failed", "steer_error", "planner_error", "supervise_error", "authority_denied", "merge_failed"],
-  lifecycle: ["created", "spawned", "agent_status", "status", "steer", "note", "ci_status", "pr_merged", "planning", "assistant_text", "tool_use", "agent_turn_end"],
+  lifecycle: ["created", "spawned", "agent_status", "status", "steer", "note", "ci_status", "pr_merged", "planning", "assistant_text", "tool_use", "agent_turn_end", "auto_resume"],
 };
 
 function listFeed(db: DB, url: URL): Response {
@@ -4087,6 +4088,17 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       try { payload = JSON.parse(fields.payload); } catch { /* ignore */ }
     }
     const event = writeEvent(db, { task_id: taskId, source, type, payload });
+    // Turn ENDED (the Stop hook, not a subagent finishing): if the agent's own
+    // final message named work it has not done, resume it with its own words.
+    // Best-effort — a supervision check must never fail the agent's heartbeat.
+    if (type === "agent_turn_end" && payload.hook === "Stop") {
+      const herdr = deps.herdr ?? defaultHerdr;
+      try {
+        await autoResumeOnTurnEnd(db, taskId, (id, message) => internalSteer(db, herdr, id, message));
+      } catch (e) {
+        console.error("[hive] auto-resume:", e);
+      }
+    }
     return json({ event }, 201);
   }
 

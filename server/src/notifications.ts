@@ -81,6 +81,7 @@ const KIND_LABEL: Record<string, string> = {
   incident: "incident",
   stale: "stale",
   answer: "answered",
+  auto_resume: "stopped mid-commitment",
 };
 
 // "2 done, 1 failed, 1 needs decision" — counts by kind, in enqueue order.

@@ -78,6 +78,10 @@ On a stale flag: probe the agent (exists? integration status? pane tail). Dead �
 - Steer: `POST /api/tasks/:id/send` → `herdr agent send`.
 - Teardown on done/cancelled: `herdr worktree remove` only after PR merged or branch pushed (verify with git; refuse otherwise).
 
+## Auto-resume (the agent's own words)
+
+Orthogonal to the timer above and much stronger: when an agent's turn ENDS (the Stop hook's `agent_turn_end` event, not a subagent finishing), hive reads the agent's own final message. If it named unfinished work it committed to itself ("Continuing…", "next I will…", "resuming…"), the task is `in_progress` with nothing blocking it (not deferred, no open decision card, no unmet dependency, not tracking-only), and nothing has happened since that message, hive steers the agent by quoting that exact sentence back at it. Quoting the agent means hive needs no opinion about what should happen next. Deliberately conservative: a message that reports completion, describes someone else's next step, or says it is waiting on a human or an external system is left alone. Capped at 3 auto-resumes per task, then one escalation to the director; every resume is a visible `auto_resume` task event (`server/src/resume.ts`).
+
 ## Web app (the product)
 
 Views (React + Vite + TS; no UI framework dependency heavier than needed; SSE via EventSource to `/api/stream`):

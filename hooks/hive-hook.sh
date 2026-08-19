@@ -30,12 +30,14 @@ printf '%s' "$INPUT" | "$BUN" "$DIR/report-transcript.ts" >/dev/null 2>&1 || tru
 
 # On (Subagent)Stop: report per-model token usage, and record a lightweight
 # lifecycle heartbeat (agent_turn_end) so the reconciler/health still see agent
-# activity — without the "hook: Stop" noise.
+# activity — without the "hook: Stop" noise. The label rides along in the
+# payload: only a real Stop means the AGENT's turn ended, and hive's auto-resume
+# check must not fire when a subagent finishes mid-turn.
 if [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SubagentStop" ]; then
   printf '%s' "$INPUT" | "$BUN" "$DIR/report-usage.ts" >/dev/null 2>&1 || true
   curl -s -m 2 -X POST "$HIVE_URL/api/tasks/$HIVE_TASK_ID/events" \
     -H 'Content-Type: application/json' \
-    -d "{\"type\":\"agent_turn_end\",\"source\":\"hook\"}" \
+    -d "{\"type\":\"agent_turn_end\",\"source\":\"hook\",\"payload\":{\"hook\":\"$EVENT\"}}" \
     >/dev/null 2>&1 || true
 fi
 
