@@ -131,7 +131,10 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
       try {
         const payload = JSON.parse(mergeFailedEvent.payload);
         if (mergeFailedEvent.type === "merge_blocked_destructive") {
-          const files = Array.isArray(payload.regressed) ? payload.regressed.join(", ") : "unknown files";
+          const regressed = Array.isArray(payload.regressed) ? payload.regressed : [];
+          const files = regressed.length
+            ? regressed.slice(0, 10).join(", ") + (regressed.length > 10 ? `, …(+${regressed.length - 10})` : "")
+            : "unknown files";
           reason = `merge blocked: ${payload.reason || `branch '${payload.branch}' reverts base work outside this task's scope (${files})`}`;
         } else {
           reason = `merge failed: ${payload.reason || "unknown error"}`;

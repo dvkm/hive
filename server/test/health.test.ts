@@ -140,10 +140,10 @@ test("stuck: merge_failed reason does not disappear with age", () => {
 test("stuck: destructive merge blocks stay visible", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, "in_review");
-  putEvent(db, id, "merge_blocked_destructive", { branch: "feat", regressed: ["AGENTS.md"] }, STALE + 1000);
+  putEvent(db, id, "merge_blocked_destructive", { branch: "feat", regressed: Array.from({ length: 11 }, (_, i) => `file${i}`) }, STALE + 1000);
   const h = computeHealth(db, getTask(db, id), Date.now());
   expect(h?.status).toBe("stuck");
-  expect(h?.reason).toBe("merge blocked: branch 'feat' reverts base work outside this task's scope (AGENTS.md)");
+  expect(h?.reason).toBe("merge blocked: branch 'feat' reverts base work outside this task's scope (file0, file1, file2, file3, file4, file5, file6, file7, file8, file9, …(+1))");
 });
 
 test("healthy: a re-handoff after the conflict clears the merge_failed reason once a new commit landed", () => {
