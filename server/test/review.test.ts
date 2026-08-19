@@ -7,7 +7,7 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-review-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb } = await import("../src/db.ts");
-const { makeHandler } = await import("../src/api.ts");
+const { makeHandler, repairDuplicateQuizPasses } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { parseUnifiedDiff, taskDiff, MAX_DIFF_LINES } = await import("../src/diff.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
@@ -284,6 +284,46 @@ test("understanding quiz blocks merge until the director answers correctly", asy
   expect(merge.status).toBe(200);
   quizzes = await get(s.base, "/api/understanding-quizzes");
   expect(quizzes.json.quizzes.some((item: any) => item.task_id === taskId)).toBe(false);
+  s.server.stop(true);
+});
+
+test("an identical review after a merge failure keeps the completed quiz", async () => {
+  const s = makeServer({ gitMergeCode: 128, gitMergeStderr: "fatal: unable to write new index file" });
+  const { taskId } = await inReviewTask(s.base);
+
+  expect((await post(s.base, `/api/tasks/${taskId}/merge`, {})).status).toBe(409);
+  const duplicate = await post(s.base, `/api/tasks/${taskId}/events`, {
+    type: "review_summary",
+    done: ["implemented the change"],
+    understanding: { background: "This task changes behavior.", essence: "Tests cover the new behavior.", check: QUIZ },
+  });
+  expect(duplicate.json.duplicate).toBe(true);
+
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  expect(events.json.filter((event: any) => event.type === "review_summary")).toHaveLength(1);
+  expect((await get(s.base, "/api/understanding-quizzes")).json.quizzes.some((item: any) => item.task_id === taskId)).toBe(false);
+  s.server.stop(true);
+});
+
+test("startup repair carries a completed quiz onto a legacy duplicate review", async () => {
+  const s = makeServer();
+  const { taskId } = await inReviewTask(s.base);
+  const original: any = s.db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId);
+  s.db
+    .query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run("evt_legacy_duplicate", taskId, new Date().toISOString(), "agent", "review_summary", original.payload);
+
+  expect(repairDuplicateQuizPasses(s.db)).toBe(1);
+  const carried: any = s.db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'understanding_quiz_passed' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId);
+  expect(JSON.parse(carried.payload)).toMatchObject({
+    review_event_id: "evt_legacy_duplicate",
+    reason: "identical review already understood",
+  });
+  expect(repairDuplicateQuizPasses(s.db)).toBe(0);
   s.server.stop(true);
 });
 

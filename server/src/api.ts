@@ -2993,6 +2993,58 @@ function understandingQuizStatus(db: DB, taskId: string, reviewEventId: string):
   return deferred ? "deferred" : "required";
 }
 
+// Older agents sometimes re-submit the exact same review after an unrelated
+// merge failure. That must not erase a quiz the director already completed.
+// Repair the latest duplicate once at startup; future duplicates are rejected
+// idempotently at ingestion below.
+export function repairDuplicateQuizPasses(db: DB): number {
+  const latest = db
+    .query(
+      `SELECT e.id, e.task_id, e.payload, e.rowid
+         FROM events e
+        WHERE e.type = 'review_summary'
+          AND NOT EXISTS (
+            SELECT 1 FROM events newer
+             WHERE newer.task_id = e.task_id AND newer.type = 'review_summary' AND newer.rowid > e.rowid)`
+    )
+    .all() as { id: string; task_id: string; payload: string; rowid: number }[];
+  let repaired = 0;
+  for (const review of latest) {
+    if (understandingQuizStatus(db, review.task_id, review.id) === "passed") continue;
+    const prior = db
+      .query(
+        `SELECT older.id
+           FROM events older
+          WHERE older.task_id = ? AND older.type = 'review_summary'
+            AND older.rowid < ? AND older.payload = ?
+            AND EXISTS (
+              SELECT 1 FROM events passed
+               WHERE passed.task_id = older.task_id AND passed.type = 'understanding_quiz_passed'
+                 AND json_extract(passed.payload, '$.review_event_id') = older.id)
+            AND NOT EXISTS (
+              SELECT 1 FROM events invalidated
+               WHERE invalidated.task_id = older.task_id
+                 AND invalidated.rowid > older.rowid AND invalidated.rowid < ?
+                 AND invalidated.type IN ('changes_requested', 'decision_answered'))
+          ORDER BY older.rowid DESC LIMIT 1`
+      )
+      .get(review.task_id, review.rowid, review.payload, review.rowid) as { id: string } | undefined;
+    if (!prior) continue;
+    writeEvent(db, {
+      task_id: review.task_id,
+      source: "system",
+      type: "understanding_quiz_passed",
+      payload: {
+        review_event_id: review.id,
+        carried_from_review_event_id: prior.id,
+        reason: "identical review already understood",
+      },
+    });
+    repaired++;
+  }
+  return repaired;
+}
+
 function listUnderstandingQuizzes(db: DB, url: URL): Response {
   const projectId = url.searchParams.get("project_id");
   const rows = db
@@ -4097,6 +4149,15 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     }
     if (!Object.keys(payload).length)
       return err("review_summary needs a structured review section");
+    const latest = db
+      .query("SELECT * FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
+      .get(taskId) as any;
+    if (
+      latest?.payload === JSON.stringify(payload) &&
+      !changesRequestUnaddressed(db, taskId) &&
+      !decisionAnswerUnaddressed(db, taskId)
+    )
+      return json({ event: parseEvent(latest), duplicate: true }, 201);
     const event = writeEvent(db, { task_id: taskId, source, type, payload });
     return json({ event }, 201);
   }

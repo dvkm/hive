@@ -1,6 +1,6 @@
 // hive daemon entrypoint. Bun.serve on 127.0.0.1:4700 (override HIVE_PORT).
 import { openDb, defaultDbPath } from "./db.ts";
-import { makeHandler, notifyManagerOfEvent, sweepManagerInboxes, wakeDueManagers } from "./api.ts";
+import { makeHandler, notifyManagerOfEvent, repairDuplicateQuizPasses, sweepManagerInboxes, wakeDueManagers } from "./api.ts";
 import { startReconciler } from "./reconciler.ts";
 import { startDispatcher } from "./dispatcher.ts";
 import { startReaper } from "./reaper.ts";
@@ -19,6 +19,8 @@ import { defaultExec } from "./exec.ts";
 const port = Number(process.env.HIVE_PORT || 4700);
 const dbPath = defaultDbPath();
 const db = openDb(dbPath);
+const carriedQuizPasses = repairDuplicateQuizPasses(db);
+if (carriedQuizPasses) console.log(`[hive] preserved ${carriedQuizPasses} completed quiz pass(es) across duplicate reviews`);
 const handle = makeHandler(db, { supervise: true });
 
 // First-run bootstrap: make sure the standing safety rules exist. Idempotent.
