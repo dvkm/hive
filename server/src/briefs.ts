@@ -30,7 +30,7 @@ and \`hive pr-marker\`. Prefer the CLI over raw curl: it attributes what you do.
 
   hive emit <task-id> status   --note "what you just did / are doing"
   hive emit <task-id> evidence --file ./screenshot.png --note "caption"
-  hive decision ask <task-id> --title "..." --option k:label:detail ...   (opens a card AND parks the task — see below)
+  hive decision ask <task-id> --title "..." --context "..." --option k:label:detail ...   (opens a card AND parks the task — see below)
   hive emit <task-id> blocked  --note "why you are stuck"
   hive emit <task-id> ready    --pr-url <url> --note "PR <url>"   (hand off for review)
   hive emit <task-id> done     --note "final summary"
@@ -102,10 +102,16 @@ Rules:
   (text questions can't be answered with a click):
 
     hive decision ask <task-id> --title "one specific question" \\
+      --context "why this surfaced, what changes, and your recommendation" \\
       --option key1:Label:"what choosing this means" --option key2:Label:"..." \\
       --recommend key1
 
-  One card per question, 2-4 options each, always include your recommendation.
+  Context is mandatory. In 2-4 short sentences, give the current state, why the
+  choice matters to the director or users, what is uncertain, and your
+  recommendation with its reason. The card must stand alone without opening
+  the task or decoding identifiers. Put shared framing in context, then use
+  each option's detail only for that option's consequence and risk. One card
+  per question, 2-4 options each, always include your recommendation.
   \`hive decision ask\` already parks the task in \`needs_decision\` — don't also
   emit \`needs-decision\` for the same question, it opens a second, redundant
   card (two entries for one decision). Stop and wait for the answer if you

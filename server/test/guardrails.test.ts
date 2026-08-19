@@ -436,6 +436,7 @@ test("answering a plain question card steers the answer to the live agent", asyn
   const d = await post("/api/decisions", {
     task_id: id,
     title: "Flip the runner, or check infra first?",
+    context: "Choose whether to change the runner now or validate infrastructure first.",
     options: [
       { key: "flip", label: "Flip the runner now" },
       { key: "cautious", label: "Check AWS prereqs first" },

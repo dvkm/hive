@@ -375,6 +375,7 @@ test("Chief bundles real decisions into actionable message data and does not res
   const decision = (await post("/api/decisions", {
     task_id: worker.id,
     title: "Which launch mode should we use?",
+    context: "Choose the launch mode for this worker task.",
     options: [
       { key: "safe", label: "Safe rollout", recommended: true },
       { key: "fast", label: "Fast rollout" },
@@ -420,6 +421,7 @@ test("composeSupervisorBrief bakes in the thread id, reply verb, and hard limits
   expect(brief).toContain("independently check the integrated result");
   expect(brief).toContain("Acknowledge a safe checkpoint");
   expect(brief).toContain("whole current-project inbox");
+  expect(brief).toContain("--context \"current state, why it matters, uncertainty, and recommendation\"");
   expect(brief).not.toContain("merge_strategy");
 });
 

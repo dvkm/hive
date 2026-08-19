@@ -182,6 +182,7 @@ test("autonomy profiles enforce supervisor decision and checkpoint boundaries", 
   const decision = await call("/api/decisions", "POST", {
     task_id: taskId,
     title: "Use the existing route?",
+    context: "Choose whether this task should reuse the existing local handler.",
     risk: "low",
     blast_radius: "one local handler",
     options: [{ key: "yes", label: "Yes", recommended: true }, { key: "no", label: "No" }],

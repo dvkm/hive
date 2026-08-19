@@ -463,6 +463,7 @@ test("decision: create, draft autosave, answer flow", async () => {
   const otherDecision = await post("/api/decisions", {
     task_id: otherTask.json.id,
     title: "Other project choice",
+    context: "Other project decision context.",
     options: [{ key: "yes", label: "Yes" }],
   });
   const projectOpen = await get(`/api/decisions?status=open&project_id=${projectId}`);
@@ -504,6 +505,7 @@ test("answer records the caller identity (source + actor) on row and event", asy
   const d = await post("/api/decisions", {
     task_id: t.json.id,
     title: "ship?",
+    context: "Choose whether to ship this task.",
     risk: "low",
     blast_radius: "one local task",
     options: [{ key: "yes", label: "Yes", recommended: true }],
@@ -530,6 +532,7 @@ test("answer without a source is recorded as unknown, not director", async () =>
   const d = await post("/api/decisions", {
     task_id: t.json.id,
     title: "pick",
+    context: "Choose an option for this task.",
     options: [{ key: "a", label: "A" }],
   });
   const ans = await post(`/api/decisions/${d.json.id}/answer`, { answer_key: "a" });
@@ -543,6 +546,7 @@ test("answer with an invalid source is rejected 400", async () => {
   const d = await post("/api/decisions", {
     task_id: t.json.id,
     title: "pick",
+    context: "Choose an option for this task.",
     options: [{ key: "a", label: "A" }],
   });
   const bad = await post(`/api/decisions/${d.json.id}/answer`, { answer_key: "a", source: "root" });
@@ -557,6 +561,7 @@ test("rejecting an answer_key not in options", async () => {
   const d = await post("/api/decisions", {
     task_id: t.json.id,
     title: "pick",
+    context: "Choose an option for this task.",
     options: [{ key: "a", label: "A" }],
   });
   const bad = await post(`/api/decisions/${d.json.id}/answer`, { answer_key: "zzz" });
@@ -565,16 +570,25 @@ test("rejecting an answer_key not in options", async () => {
 
 test("direct POST /api/decisions rejects empty/missing options with 400", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "d-empty" });
-  const missing = await post("/api/decisions", { task_id: t.json.id, title: "no opts" });
+  const missing = await post("/api/decisions", { task_id: t.json.id, title: "no opts", context: "Test missing options." });
   expect(missing.status).toBe(400);
-  const empty = await post("/api/decisions", { task_id: t.json.id, title: "no opts", options: [] });
+  const empty = await post("/api/decisions", { task_id: t.json.id, title: "no opts", context: "Test empty options.", options: [] });
   expect(empty.status).toBe(400);
 });
 
-test("needs-decision emit path defaults options instead of dropping the signal", async () => {
+test("direct POST /api/decisions requires context", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "d-no-context" });
+  const missing = await post("/api/decisions", { task_id: t.json.id, title: "contextless", options: [{ key: "a", label: "A" }] });
+  expect(missing.status).toBe(400);
+  expect(missing.json.error).toBe("context is required");
+});
+
+test("needs-decision emit path requires context and defaults options", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "d-emit" });
   await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
-  const r = await post(`/api/tasks/${t.json.id}/events`, { type: "needs-decision", title: "should I proceed?" });
+  const missing = await post(`/api/tasks/${t.json.id}/events`, { type: "needs-decision", title: "should I proceed?" });
+  expect(missing.status).toBe(400);
+  const r = await post(`/api/tasks/${t.json.id}/events`, { type: "needs-decision", title: "should I proceed?", context: "Choose whether this task should continue." });
   expect(r.status).toBe(201);
   const opts = r.json.decision.options;
   expect(opts.length).toBe(2);
@@ -587,7 +601,7 @@ test("needs-decision emit path defaults options instead of dropping the signal",
 
 test("dismiss endpoint expires an open decision and 409s on re-dismiss", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "d-dismiss" });
-  const d = await post("/api/decisions", { task_id: t.json.id, title: "dismiss me", options: [{ key: "a", label: "A" }] });
+  const d = await post("/api/decisions", { task_id: t.json.id, title: "dismiss me", context: "Test dismissing a decision.", options: [{ key: "a", label: "A" }] });
   const dis = await post(`/api/decisions/${d.json.id}/dismiss`, {});
   expect(dis.status).toBe(200);
   expect(dis.json.status).toBe("expired");
@@ -605,8 +619,8 @@ test("dismiss endpoint expires an open decision and 409s on re-dismiss", async (
 test("dismissing the last open decision resumes a needs_decision task", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "d-resume" });
   await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
-  const d1 = await post("/api/decisions", { task_id: t.json.id, title: "gate 1", options: [{ key: "a", label: "A" }] });
-  const d2 = await post("/api/decisions", { task_id: t.json.id, title: "gate 2", options: [{ key: "a", label: "A" }] });
+  const d1 = await post("/api/decisions", { task_id: t.json.id, title: "gate 1", context: "First test gate.", options: [{ key: "a", label: "A" }] });
+  const d2 = await post("/api/decisions", { task_id: t.json.id, title: "gate 2", context: "Second test gate.", options: [{ key: "a", label: "A" }] });
   await post(`/api/tasks/${t.json.id}/transition`, { to: "needs_decision" });
   // one card still open → stays parked
   await post(`/api/decisions/${d1.json.id}/dismiss`, {});
@@ -620,7 +634,7 @@ test("dismissing the last open decision resumes a needs_decision task", async ()
 
 test("cancelling a task clears its open decisions from the inbox (SSE broadcast + expiry)", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "d-cancel" });
-  const d = await post("/api/decisions", { task_id: t.json.id, title: "orphan?", options: [{ key: "a", label: "A" }] });
+  const d = await post("/api/decisions", { task_id: t.json.id, title: "orphan?", context: "Test cancelling a task with an open decision.", options: [{ key: "a", label: "A" }] });
   await post(`/api/tasks/${t.json.id}/transition`, { to: "cancelled" });
   const one = await get(`/api/decisions/${d.json.id}`);
   expect(one.json.status).toBe("expired");

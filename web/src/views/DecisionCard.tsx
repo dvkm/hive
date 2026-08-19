@@ -105,15 +105,22 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
       {d.plan ? (
         <PlanView decisionId={d.id} plan={d.plan} selected={selected} onToggle={toggleTask} answers={answers} onAnswer={setAnswer} />
       ) : (
-        d.context && <p className="dcard-context">{d.context}</p>
+        d.context && (
+          <section className="dcard-brief">
+            <div className="dcard-brief-label">Decision brief</div>
+            <p className="dcard-context">{d.context}</p>
+          </section>
+        )
       )}
 
-      <div className={`blast ${risk.className}`}>
-        <div className="blast-label">
-          Risk: <strong>{risk.label}</strong>
+      {(d.risk || riskDetail) && (
+        <div className={`blast ${risk.className}`}>
+          <div className="blast-label">
+            Risk: <strong>{risk.label}</strong>
+          </div>
+          {riskDetail && <div className="blast-body">{riskDetail}</div>}
         </div>
-        {riskDetail && <div className="blast-body">{riskDetail}</div>}
-      </div>
+      )}
 
       <DecisionBundleView bundle={d.bundle} />
 

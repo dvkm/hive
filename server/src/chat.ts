@@ -366,7 +366,7 @@ ${mergeInstruction}- Accept a reviewed scout report:     ${cli} task move <id> v
 - Acknowledge a safe checkpoint:       POST $HIVE_URL/api/tasks/<task>/checkpoints/<event>/ack with body {"verdict":"ok","source":"chat_supervisor","actor":"${thread.id}"}
 - Flag an objectively wrong checkpoint: POST the same endpoint with body {"verdict":"flag","note":"specific correction","source":"chat_supervisor","actor":"${thread.id}"}
 - Read recent activity:                curl -sS "$HIVE_URL/api/feed?project=${thread.project_id ?? "<project-id>"}"
-- Ask the director a real choice:     ${cli} decision ask <task-id> --title "..." --option k:Label:"..." --recommend k
+- Ask the director a real choice:     ${cli} decision ask <task-id> --title "..." --context "current state, why it matters, uncertainty, and recommendation" --option k:Label:"..." --recommend k
 
 For every ask:
 1. Translate it into an outcome and observable acceptance criteria. Immediately write them to the run ledger. Create source-linked commitments for each outcome the director expects, promise Hive makes, or follow-up that must not be dropped. A commitment is not every worker task. Keep its owner, dependencies, and state current as work changes. Resolve project facts from references, policies, prior decisions, the repo, or a scout before asking the director.
