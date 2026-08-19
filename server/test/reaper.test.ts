@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { openDb, newId, now, getSetting, type DB } from "../src/db.ts";
+import { openDb, newId, now, getSetting, setSetting, type DB } from "../src/db.ts";
 import { reapOnce, taskIdFromBranch, taskIdFromCwd, sweepOrphanedAgents, sweepOrphanedPanes, sweepFinishedTestProjects } from "../src/reaper.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
@@ -31,6 +31,22 @@ test("reapOnce writes a last_reap_at liveness heartbeat", async () => {
   const ts = getSetting(db, "last_reap_at");
   expect(ts).not.toBeNull();
   expect(Date.now() - Date.parse(ts!)).toBeLessThan(5000);
+});
+
+test("offline mode skips the sweep entirely (no closes, no worktree removals)", async () => {
+  const { db, projectId } = freshDb();
+  seedTask(db, projectId, "DONE", "done");
+  setSetting(db, "offline", "1");
+  const calls: string[][] = [];
+  const herdr = new Herdr(async (argv) => {
+    calls.push(argv);
+    return OK();
+  }, "herdr");
+
+  await reapOnce(db, { herdr, exec: async (argv) => (calls.push(argv), OK()) });
+
+  expect(calls.length).toBe(0);
+  expect(getSetting(db, "last_reap_at")).not.toBeNull(); // the loop is alive, just idle
 });
 
 test("taskIdFromBranch extracts only hive/<id>; ghosts and others are ignored", () => {
