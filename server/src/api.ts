@@ -40,7 +40,7 @@ import {
 import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
-import { resolveProjectSecrets } from "./secrets.ts";
+import { resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
 import { enqueue, ackNotifications } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, resolveDenyGuardrailForDecision, type AuthzInput } from "./authority.ts";
@@ -3870,14 +3870,19 @@ function listSecrets(db: DB, projectId: string): Response {
 function createSecret(db: DB, projectId: string, body: any): Response {
   if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return err("project not found", 404);
   if (!body?.name) return err("name is required");
-  if (!body?.ref) return err("ref is required");
   const provider = body.provider ?? "keychain";
+  const name = String(body.name);
   const row = {
     id: newId("sec"),
     project_id: projectId,
-    name: String(body.name),
+    name,
     provider: String(provider),
-    ref: String(body.ref),
+    // Derived, never taken from the caller: a client-supplied ref is used
+    // verbatim as the keychain service / bitwarden item name, so accepting one
+    // would let any caller alias an arbitrary item on the machine and have
+    // resolveProjectSecrets hand out its value. Providers' set() computes the
+    // same thing, so the value written is always the one this ref resolves.
+    ref: serviceName(projectId, name),
     created_at: now(),
   };
   db.query(
