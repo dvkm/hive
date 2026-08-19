@@ -9,11 +9,11 @@ process.env.HIVE_HOME = HOME;
 
 const { openDb, newId, now } = await import("../src/db.ts");
 const { autoReviewOnce, extractReview } = await import("../src/reviewer.ts");
-const { transition } = await import("../src/state.ts");
+const { transition, writeEvent } = await import("../src/state.ts");
 import type { DB } from "../src/db.ts";
 import type { Exec } from "../src/exec.ts";
 
-function setup(config: any = {}): { db: DB; id: string } {
+function setup(config: any = {}, extra: Partial<{ source: string; agent_target: string }> = {}): { db: DB; id: string } {
   const db = openDb(":memory:");
   const pid = newId("proj");
   const t = now();
@@ -22,8 +22,8 @@ function setup(config: any = {}): { db: DB; id: string } {
   );
   const id = newId();
   db.query(
-    "INSERT INTO tasks (id, project_id, title, brief, state, kind, pr_url, created_at, updated_at) VALUES (?,?,?,?, 'queued','ship',?,?,?)"
-  ).run(id, pid, "add feature", "make it work", "https://gh/pr/5", t, t);
+    "INSERT INTO tasks (id, project_id, title, brief, state, kind, source, agent_target, pr_url, created_at, updated_at) VALUES (?,?,?,?, 'queued','ship',?,?,?,?,?)"
+  ).run(id, pid, "add feature", "make it work", extra.source ?? null, extra.agent_target ?? null, "https://gh/pr/5", t, t);
   transition(db, id, "in_progress");
   transition(db, id, "in_review");
   return { db, id };
@@ -70,6 +70,26 @@ test("project opt-out records a skip", async () => {
   const claude = async () => { throw new Error("should not run"); };
   await autoReviewOnce(db, { exec: claude as any, shellExec: ghDiff });
   expect(events(db, id, "auto_review")[0].payload.skipped).toContain("disabled");
+});
+
+test("a never-dispatched external task in review is skipped, not auto-reviewed", async () => {
+  const { db, id } = setup({}, { source: "external" });
+  const claude = async () => { throw new Error("should not run"); };
+  await autoReviewOnce(db, { exec: claude as any, shellExec: ghDiff });
+  expect(events(db, id, "auto_review")).toHaveLength(0);
+  expect(events(db, id, "auto_review_error")).toHaveLength(0);
+});
+
+test("an external task that WAS spawned before (agent_target set, real hive-driven work) is still auto-reviewed", async () => {
+  const { db, id } = setup({}, { source: "external", agent_target: "t-live" });
+  writeEvent(db, { task_id: id, source: "herdr", type: "spawned", payload: { agent_target: "t-live" } });
+  const claude = async () => ({
+    code: 0,
+    stdout: JSON.stringify({ result: '{"verdict":"looks_good","summary":"fine","risks":[],"questions":[]}' }),
+    stderr: "",
+  });
+  await autoReviewOnce(db, { exec: claude, shellExec: ghDiff });
+  expect(events(db, id, "auto_review")).toHaveLength(1);
 });
 
 test("extractReview parses whole JSON, envelope, and prose-wrapped output", () => {

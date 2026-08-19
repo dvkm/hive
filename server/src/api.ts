@@ -5,7 +5,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { taskWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
-import { isSupervisedTask, supervisedSql } from "./supervision.ts";
+import { isSupervisedTask, supervisedSql, neverDispatched } from "./supervision.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
 import {
   transition,
@@ -1427,6 +1427,12 @@ async function createTask(db: DB, req: Request): Promise<Response> {
     return err("unknown project_id", 400);
   const kind = body.kind ?? "ship";
   if (!["ship", "scout", "chore"].includes(kind)) return err("invalid kind");
+  // A tracking-only task starts life with no agent — that's the whole point
+  // (see supervision.ts). Accepting a caller-supplied agent_target here would
+  // let a fresh external task skip straight past the neverDispatched gate
+  // spawnAgent enforces below.
+  if (body.source === "external" && body.agent_target)
+    return err("external tasks cannot be created with an agent_target — they start tracking-only and are dispatched (if ever) via spawn", 400);
   // Agents may create follow-up tasks (source="agent", parent_task_id → the
   // spawning task); the dispatcher treats them like director-created tasks.
   const parent = body.parent_task_id ? String(body.parent_task_id) : null;
@@ -2031,6 +2037,12 @@ async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {
   if (to === "in_progress") {
     const t = getTask(db, id);
     if (t && t.state === "in_review") {
+      // A never-dispatched external task (see supervision.ts) has no agent to
+      // bounce back to — bounceForChanges would just queue a steer nobody
+      // will ever read and try (and fail) to spawn one. Reject outright
+      // rather than pretending the bounce did something.
+      if (neverDispatched(db, t))
+        return err("task is untracked (source=external) and has never been spawned — there is no agent to bounce back to", 409);
       const herdr = deps.herdr ?? defaultHerdr;
       const notes = String(body?.reason ?? "").trim() || "The director moved this back to in_progress for more work.";
       const { delivered, respawned } = await bounceForChanges(db, herdr, t, notes, deps);
@@ -2493,6 +2505,8 @@ async function requestChanges(db: DB, herdr: Herdr, id: string, body: any, deps:
   if (!task) return err("task not found", 404);
   if (task.state !== "in_review")
     return err(`task is '${task.state}', not 'in_review'`, 409);
+  if (neverDispatched(db, task))
+    return err("task is untracked (source=external) and has never been spawned — there is no agent to request changes from", 409);
   const notes = String(body?.notes ?? "").trim();
   if (!notes) return err("notes are required");
   const { delivered, respawned } = await bounceForChanges(db, herdr, task, notes, deps);
@@ -2545,6 +2559,14 @@ export async function spawnAgent(
 ): Promise<{ ok: true; agent_target: string } | { ok: false; error: string }> {
   const task = getTask(db, id);
   if (!task) return { ok: false, error: "task not found" };
+  // The shared spawn core: every path that starts an agent (the manual /spawn
+  // endpoint, the dispatcher's auto loop, bounceForChanges' respawn-on-
+  // undelivered fallback) routes through here, so this is the one place that
+  // needs to reject a never-dispatched external task (see supervision.ts) —
+  // dispatcher.ts's own isExternalTask skip only covers its own loop. A task
+  // that WAS spawned before (recovery, manual respawn) is unaffected.
+  if (neverDispatched(db, task))
+    return { ok: false, error: "task is untracked (source=external) and has never been spawned — hive does not dispatch agents for tracking-only tasks" };
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   if (!project?.repo_path) return { ok: false, error: "project has no repo_path" };
   const config = JSON.parse(project.config ?? "{}");

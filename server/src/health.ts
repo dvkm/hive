@@ -10,7 +10,7 @@
 import type { DB } from "./db.ts";
 import { getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { isSupervisedTask } from "./supervision.ts";
+import { isSupervisedTask, neverDispatched } from "./supervision.ts";
 
 export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
 export interface Health {
@@ -222,7 +222,9 @@ export function taskWithHealth(db: DB, task: any): any {
     task.state === "failed"
       ? ((db.query("SELECT id FROM tasks WHERE parent_task_id = ? AND source = 'requeue' LIMIT 1").get(task.id) as any)?.id ?? null)
       : null;
-  return { ...task, health: computeHealth(db, task), requeued_to };
+  // Server-computed so the web app never has to re-derive "was this ever
+  // spawned" from raw event history — see supervision.ts's neverDispatched.
+  return { ...task, health: computeHealth(db, task), requeued_to, never_dispatched: neverDispatched(db, task) };
 }
 
 // "Needs attention" tray eligibility (the single rule; the web mirrors it):

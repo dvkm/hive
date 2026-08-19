@@ -85,6 +85,26 @@ test("dead agent → capture pane tail, fail, auto-requeue (attempt 1)", async (
   expect(JSON.parse(requeued.payload).attempt).toBe(1);
 });
 
+test("a source=external task with agent_target set (regression guard: should be unreachable post-#996) is still recovered sanely, not stuck forever", async () => {
+  // supervision.ts's neverDispatched, plus the createTask/spawnAgent guards in
+  // api.ts, should make this state unreachable going forward — this guards the
+  // regression the reverted #996 attempt's landmine warned about: recoverStale
+  // must NOT special-case 'external' the way it does 'chat_supervisor' below,
+  // or a ghost external task with a dead target it can never dispatch to would
+  // sit in_progress forever instead of failing/requeuing like anything else.
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { source: "external", agent: "t-ghost" });
+  putEvent(db, id, "spawned");
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  expect(getTask(db, id).state).toBe("failed"); // recovered within one cycle, unlike chat_supervisor
+  const requeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(id);
+  expect(requeue).toBeTruthy();
+  expect(requeue.state).toBe("queued");
+});
+
 test("an idle or vanished chat supervisor is not failed by worker stale recovery", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { source: "chat_supervisor", agent: "manager" });

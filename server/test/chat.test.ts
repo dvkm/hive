@@ -233,11 +233,15 @@ test("external tracking tasks (source='external') are invisible to manager wakeu
 test("a manually-spawned external task (agent_target set) is real hive-driven work and stays visible", async () => {
   // Unlike the never-spawned case above, an external task a director chose to
   // dispatch has a live agent doing real work — supervisedSql/isSupervisedTask
-  // must not hide it just because source='external'.
+  // must not hide it just because source='external'. createTask itself now
+  // rejects source=external combined with a caller-supplied agent_target (see
+  // supervision.ts's neverDispatched / the createTask guard in api.ts), so
+  // simulate the already-dispatched state the way a legacy row carries it: a
+  // direct agent_target write after creation, same as a real spawn would do.
   const project = (await post("/api/projects", { name: "manually-spawned external project", repo_path: WT })).json;
-  const spawned = (await post("/api/tasks", { project_id: project.id, title: "manually dispatched mirrored issue", source: "external", agent_target: "t-external-live" })).json;
+  const spawned = (await post("/api/tasks", { project_id: project.id, title: "manually dispatched mirrored issue", source: "external" })).json;
   expect(spawned.source).toBe("external");
-  expect(spawned.agent_target).toBe("t-external-live");
+  db.query("UPDATE tasks SET agent_target = ? WHERE id = ?").run("t-external-live", spawned.id);
 
   const before = sends.length;
   const spawnedCheckpoint = writeEvent(db, { task_id: spawned.id, source: "agent", type: "checkpoint", payload: { note: "real progress" } });

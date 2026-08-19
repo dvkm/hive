@@ -19,7 +19,7 @@ import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
-import { supervisedSql } from "./supervision.ts";
+import { supervisedSql, neverDispatched } from "./supervision.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
 import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision } from "./api.ts";
@@ -295,6 +295,12 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       db.query("UPDATE tasks SET head_sha = ?, updated_at = ? WHERE id = ?").run(data.headRefOid, now(), t.id);
       broadcast({ type: "task", task: getTask(db, t.id) });
     }
+    // A never-dispatched external task (see supervision.ts) has no agent to
+    // nudge and isn't hive's to auto-transition through review/merge/smoke —
+    // skip the actionable phase below entirely. The bookkeeping above
+    // (ci_status, head_sha, branch_scope, pr_synchronized) already ran: it's
+    // just recording observed PR facts, useful for the tracked view.
+    if (neverDispatched(db, live)) continue;
     // Time-based fallback for the link-time hand-off — but review means "CI is
     // green and the director can merge", so failing/pending checks HOLD the
     // task in_progress (this is also what promotes a held `ready`: the moment
@@ -541,7 +547,7 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
   const rows = db
     .query(
       `SELECT t.id, t.number, t.title, t.kind, p.config FROM tasks t JOIN projects p ON p.id = t.project_id
-        WHERE t.state = 'in_review' AND t.ci_status = 'passing'`
+        WHERE t.state = 'in_review' AND t.ci_status = 'passing' AND ${supervisedSql("t.source", "t.agent_target")}`
     )
     .all() as { id: string; number: number; title: string; kind: string; config: string }[];
   for (const r of rows) {
@@ -609,7 +615,7 @@ export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()
     .query(
       `SELECT d.id, d.task_id, d.ts, d.title, d.options, p.config FROM decisions d
          JOIN tasks t ON t.id = d.task_id JOIN projects p ON p.id = t.project_id
-        WHERE d.status = 'open' AND COALESCE(d.risk, 'normal') != 'high'`
+        WHERE d.status = 'open' AND COALESCE(d.risk, 'normal') != 'high' AND ${supervisedSql("t.source", "t.agent_target")}`
     )
     .all() as { id: string; task_id: string; ts: string; title: string; options: string; config: string }[];
   for (const r of rows) {
@@ -742,7 +748,8 @@ export function unparkAnswered(db: DB, nowMs: number = Date.now()): void {
     .query(
       `SELECT t.id, t.updated_at FROM tasks t
         WHERE t.state = 'needs_decision'
-          AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.task_id = t.id AND d.status = 'open')`
+          AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.task_id = t.id AND d.status = 'open')
+          AND ${supervisedSql("t.source", "t.agent_target")}`
     )
     .all() as { id: string; updated_at: string }[];
   for (const r of rows) {

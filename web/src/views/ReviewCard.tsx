@@ -651,9 +651,11 @@ export function ReviewCard({
         <button className="btn btn-primary" onClick={() => merge()} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
           {busy ? "Working…" : reportOnly ? "Accept report" : "Approve & merge"}
         </button>
-        <button className="btn" onClick={() => setMode(mode === "changes" ? null : "changes")}>
-          Request changes
-        </button>
+        {!task.never_dispatched && (
+          <button className="btn" onClick={() => setMode(mode === "changes" ? null : "changes")}>
+            Request changes
+          </button>
+        )}
         <button className="btn btn-danger" onClick={() => setMode(mode === "reject" ? null : "reject")}>
           Reject
         </button>
