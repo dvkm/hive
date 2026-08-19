@@ -171,9 +171,21 @@ export async function watchOnce(db: DB, deps: WatchDeps = {}): Promise<void> {
   }
 }
 
+// Each start call owns its timer and in-flight guard; a slow cycle skips ticks
+// instead of queueing them.
 export function startWatchers(db: DB, deps: WatchDeps & { intervalMs?: number } = {}): () => void {
+  let running = false;
   const timer = setInterval(() => {
-    watchOnce(db, deps).catch((e) => console.error("[hive] watch cycle crashed:", e));
+    if (running) {
+      console.error("[hive] watch cycle skipped: previous cycle still running");
+      return;
+    }
+    running = true;
+    watchOnce(db, deps)
+      .catch((e) => console.error("[hive] watch cycle crashed:", e))
+      .finally(() => {
+        running = false;
+      });
   }, deps.intervalMs ?? 60_000);
   return () => clearInterval(timer);
 }

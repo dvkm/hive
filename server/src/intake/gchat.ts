@@ -43,6 +43,7 @@ const SCOPE = [
 ].join(" ");
 export const IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024; // 5MB cap per image
+const REQUEST_TIMEOUT_MS = 20_000; // bounds every poll-path HTTP call so one hung request can't wedge the loop
 
 export interface GchatSecrets {
   clientId: string;
@@ -113,6 +114,7 @@ export async function getAccessToken(
       refresh_token: s.refreshToken,
       grant_type: "refresh_token",
     }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`token refresh failed: ${res.status}`);
   const data: any = await res.json();
@@ -147,6 +149,7 @@ export async function listMessages(
   if (cursor) params.set("filter", `createTime > "${cursor}"`);
   const res = await fetchImpl(`${CHAT_API}/${space}/messages?${params}`, {
     headers: { Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`messages.list ${space} failed: ${res.status}`);
   const data: any = await res.json();
@@ -163,6 +166,7 @@ export async function listSpaces(token: string, fetchImpl: FetchLike): Promise<s
     if (pageToken) params.set("pageToken", pageToken);
     const res = await fetchImpl(`${CHAT_API}/spaces?${params}`, {
       headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     if (!res.ok) throw new Error(`spaces.list failed: ${res.status}`);
     const data: any = await res.json();
@@ -211,6 +215,7 @@ async function attachImage(
   if (!IMAGE_TYPES.includes(contentType) || !resourceName) return; // only uploaded images
   const res = await fetchImpl(`${CHAT_API}/media/${resourceName}?alt=media`, {
     headers: { Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!res.ok) return;
   const buf = new Uint8Array(await res.arrayBuffer());
@@ -386,11 +391,23 @@ export async function pollGchatOnce(db: DB, deps: GchatDeps = {}): Promise<{ cre
   return { created, spaces: jobs.length };
 }
 
-// Background loop. Started only from index.ts (never in tests).
+// Production starts one background loop from index.ts. Each start call owns its
+// timer and in-flight guard; a slow cycle skips ticks instead of queueing them.
 export function startGchatPoll(db: DB, deps: GchatDeps = {}): () => void {
+  const log = deps.log ?? ((m: string, e?: unknown) => console.error(`[hive] gchat: ${m}`, e ?? ""));
   const intervalMs = deps.intervalMs ?? Number(process.env.HIVE_GCHAT_POLL_MS || 60_000);
+  let running = false;
   const timer = setInterval(() => {
-    pollGchatOnce(db, deps).catch((e) => console.error("[hive] gchat poll crashed:", e));
+    if (running) {
+      log("poll tick skipped: previous cycle still running");
+      return;
+    }
+    running = true;
+    pollGchatOnce(db, deps)
+      .catch((e) => console.error("[hive] gchat poll crashed:", e))
+      .finally(() => {
+        running = false;
+      });
   }, intervalMs);
   return () => clearInterval(timer);
 }

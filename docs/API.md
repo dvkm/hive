@@ -1213,8 +1213,7 @@ verbatim, never executed or shell-inlined. Self-authored (`GCHAT_SELF_ID`) and
 bot messages are skipped; each message is deduped by its resource name (unique
 `tasks.source_ref`). Every new intake task enqueues a `normal` notification.
 
-- Poll interval: `HIVE_GCHAT_POLL_MS` (default 60000). Hard no-op until at least
-  one project sets `config.gchat_spaces`.
+- Poll schedule: `HIVE_GCHAT_POLL_MS` (default 60000). Each started loop runs at most one cycle at a time; ticks during a slow cycle are logged and skipped, not queued. Token refresh, message/space listing, and attachment downloads each time out after 20 seconds. The connector is a hard no-op until at least one project sets `config.gchat_spaces`.
 - Cursor: `intake_cursors(source, key, cursor)` persists the incremental
   `createTime` position per `("gchat", <space>)`.
 - Secrets (values in the macOS keychain under `hive/gchat/*`, never in the DB):
@@ -1270,19 +1269,7 @@ Silent-path diagnosis (auth lost, context exhausted, transient API errors) is
 described in `server/src/diagnose.ts`.
 
 ### Promoter (continuous promote-to-main evaluation)
-No HTTP endpoints — a server-internal loop (`server/src/promoter.ts`, every
-`HIVE_PROMOTE_MS`, default 30m, plus one run ~30s after boot). Projects opt in
-with `config.promote = {from: "staging", to: "main"}`. Whenever `origin/<from>`
-has commits `origin/<to>` lacks, it queues ONE evaluation task
-(`source="promoter"`, `source_ref` = the evaluated head SHA, kind `ship`) that
-the dispatcher spawns like any other. The agent judges readiness — CI green,
-test comprehensiveness for the promoted range (uncovered bug fixes or gaps in
-auth/billing/data-integrity paths BLOCK promotion; the agent spawns a gap task
-per missing test), half-shipped features, pending migrations — and either opens
-the Promote PR with a per-PR "Test coverage" verdict section (base `<to>`,
-head `<from>`; the DIRECTOR merges) or attaches a not-ready report and finishes. Dedup: one in-flight evaluation per project, a given head
-SHA is evaluated at most once, and an already-open promote PR suppresses new
-evaluations until it's merged/closed.
+No HTTP endpoints — a server-internal loop (`server/src/promoter.ts`, scheduled by `HIVE_PROMOTE_MS`, default 30m, plus one run ~30s after boot). Each started loop runs at most one cycle at a time; ticks during a slow cycle are logged and skipped, not queued. Projects opt in with `config.promote = {from: "staging", to: "main"}`. Whenever `origin/<from>` has commits `origin/<to>` lacks, it queues ONE evaluation task (`source="promoter"`, `source_ref` = the evaluated head SHA, kind `ship`) that the dispatcher spawns like any other. The agent judges readiness — CI green, test comprehensiveness for the promoted range (uncovered bug fixes or gaps in auth/billing/data-integrity paths BLOCK promotion; the agent spawns a gap task per missing test), half-shipped features, pending migrations — and either opens the Promote PR with a per-PR "Test coverage" verdict section (base `<to>`, head `<from>`; the DIRECTOR merges) or attaches a not-ready report and finishes. Dedup: one in-flight evaluation per project, a given head SHA is evaluated at most once, and an already-open promote PR suppresses new evaluations until it's merged/closed.
 
 ### Dispatcher (self-driving spawn loop)
 No HTTP endpoints — the dispatcher is a server-internal loop (`server/src/dispatcher.ts`,

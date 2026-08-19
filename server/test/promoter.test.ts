@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
-import { promoteOnce } from "../src/promoter.ts";
+import { promoteOnce, startPromoter } from "../src/promoter.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
 const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
@@ -78,4 +78,41 @@ test("dedup: same head is never re-evaluated; a new head is; in-flight blocks", 
   expect(promoterTasks(db, projectId).length).toBe(1);
   await promoteOnce(db, { exec: stubExec(3, "headBBB") });
   expect(promoterTasks(db, projectId).length).toBe(2);
+});
+
+test("startPromoter skips a tick while a cycle is already running", async () => {
+  const { db } = freshDb();
+  let active = 0;
+  let maxActive = 0;
+  let cycles = 0;
+  // Never "ahead" -> no task ever created, so the in-flight-task dedup never
+  // blocks a later tick and every tick re-runs the (slow) fetch.
+  const slowExec: Exec = async (argv) => {
+    if (argv.includes("fetch")) {
+      cycles++;
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((r) => setTimeout(r, 60));
+      active--;
+      return OK();
+    }
+    if (argv.includes("rev-list")) return OK("0\n");
+    return OK();
+  };
+
+  const origError = console.error;
+  const logs: string[] = [];
+  console.error = ((...args: any[]) => logs.push(String(args[0]))) as typeof console.error;
+  let stop: () => void;
+  try {
+    stop = startPromoter(db, { exec: slowExec, intervalMs: 15 });
+    await new Promise((r) => setTimeout(r, 140)); // ~9 ticks at 15ms while each cycle takes 60ms
+    stop();
+  } finally {
+    console.error = origError;
+  }
+
+  expect(maxActive).toBe(1); // never two cycles in flight at once
+  expect(cycles).toBeLessThan(6); // most ticks were skipped, not queued
+  expect(logs.some((m) => m.includes("skipped"))).toBe(true);
 });
