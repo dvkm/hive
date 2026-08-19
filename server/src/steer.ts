@@ -6,14 +6,17 @@
 //
 //   delivered — herdr accepted it and the agent's pane got the Enter
 //   queued    — nothing was live to receive it; the next spawn delivers it
-//   failed    — the task is terminal, so no spawn will ever come
+//   failed    — either the task is terminal, or it's a never-spawned
+//               source=external task (see queueSteerEvent below) — either
+//               way, no spawn is ever coming to carry it
 //
 // The events table is the log of record — no side table, no migration. A queued
 // steer is just a `steer` event whose payload says so, flipped to delivered when
 // the respawn brief carries it.
 import type { DB } from "./db.ts";
 import { now } from "./db.ts";
-import { writeEvent } from "./state.ts";
+import { writeEvent, getTask } from "./state.ts";
+import { neverDispatched } from "./supervision.ts";
 
 export type Delivery = "delivered" | "queued" | "failed";
 
@@ -21,13 +24,35 @@ export type Delivery = "delivered" | "queued" | "failed";
 // have no Herdr handle: cost guardrails, decision-dismiss recovery). Payload
 // shape matches internalSteer's queued path, so drainSteers delivers it to a
 // live agent within a reconciler cycle and a respawn brief carries it otherwise.
-export function queueSteerEvent(db: DB, taskId: string, message: string, reason: string): void {
+//
+// neverDispatched (supervision.ts) means nothing — no live agent, no future
+// spawn — will ever carry this message, so 'queued' would be a lie that sits
+// unread forever (task #977). Record it 'failed' instead, same as a terminal
+// task gets elsewhere. Returns false in that case so a caller that wants to
+// surface it (e.g. reject the request) can.
+//
+// Deliberately does NOT special-case a Jira-linked task the way sendSteer's
+// own jiraLinked branch does (posting the message as an outbound Jira
+// comment): sendSteer's messages are director-authored text meant for a
+// human to read, but every caller here writes hive-internal automation
+// text ("do not retry", "note the call as a checkpoint") that would leak
+// into a real ticket as a live comment nobody watching that Jira issue
+// should see.
+export function queueSteerEvent(db: DB, taskId: string, message: string, reason: string): boolean {
+  const dead = neverDispatched(db, { id: taskId, source: getTask(db, taskId)?.source });
   writeEvent(db, {
     task_id: taskId,
     source: "system",
     type: "steer",
-    payload: { message, target: null, attachments: [], delivery: "queued", error: reason },
+    payload: {
+      message,
+      target: null,
+      attachments: [],
+      delivery: dead ? "failed" : "queued",
+      error: dead ? `${reason} — task is untracked (source=external) and has never been spawned, message undeliverable` : reason,
+    },
   });
+  return !dead;
 }
 
 export interface QueuedSteer {

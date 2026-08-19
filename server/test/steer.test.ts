@@ -72,6 +72,16 @@ async function get(path: string) {
 const newTask = async (title: string) => (await post("/api/tasks", { project_id: projectId, title })).json.id;
 const steerEvents = async (id: string) =>
   (await get(`/api/tasks/${id}/events`)).json.filter((e: any) => e.type === "steer");
+// Since #996, spawnAgent itself rejects a never-dispatched external task's
+// first spawn — so "manually spawned before" now has to be faked the same
+// way #996's own tests do: write the permanent `spawned` event directly,
+// which is all supervision.ts's neverDispatched actually checks. A real
+// POST /spawn afterwards then succeeds normally, same as recovery would see.
+let spawnEventSeq = 0;
+const fakePriorSpawn = (taskId: string) =>
+  db
+    .query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run(`ev_prior_spawn_${++spawnEventSeq}`, taskId, new Date().toISOString(), "herdr", "spawned", JSON.stringify({ agent_target: "t-old" }));
 
 // The headline fix: no live agent -> queued, then carried by the next spawn.
 test("a steer to a task with no agent is queued and delivered on the next spawn", async () => {
@@ -257,6 +267,159 @@ test("a steer to a terminal task is recorded as failed, not queued", async () =>
   const r = await post(`/api/tasks/${id}/send`, { message: "too late" });
   expect(r.json.delivery).toBe("failed");
   expect((await steerEvents(id))[0].payload.delivery).toBe("failed");
+});
+
+// source='external' (tracking-only) tasks are never dispatched (supervision.ts),
+// so nothing will ever respawn them to carry a queued steer — /send used to
+// report delivery:'queued' anyway, implying a delivery that would never happen.
+// (A Jira-linked external task is the exception — see the Jira comment test
+// above; it has a real delivery path, so it does NOT hit this rejection.)
+test("a steer to a tracking-only (source=external) task is rejected, not queued", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "mirrored JIRA issue", source: "external" });
+  const r = await post(`/api/tasks/${t.json.id}/send`, { message: "never delivered" });
+  expect(r.status).toBe(400);
+  expect(r.json.error).toContain("external");
+  expect(await steerEvents(t.json.id)).toEqual([]); // rejected before anything was recorded
+});
+
+// The same "queued" lie can happen off the /send path: a decision answered (or
+// dismissed) on an external task falls back to queueSteerEvent to notify the
+// agent. The shared helper (steer.ts) short-circuits it to 'failed' instead.
+test("queueSteerEvent records failed, not queued, for a decision answered on an external task", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "tracked", source: "external" });
+  const d = await post("/api/decisions", {
+    task_id: t.json.id,
+    title: "external gate",
+    context: "Test decision on a tracking-only task.",
+    options: [{ key: "a", label: "A" }],
+  });
+  const ans = await post(`/api/decisions/${d.json.id}/answer`, { answer_key: "a" });
+  expect(ans.status).toBe(200);
+  const steer = (await steerEvents(t.json.id)).at(-1);
+  expect(steer.payload.delivery).toBe("failed");
+});
+
+test("queueSteerEvent records failed, not queued, for a decision dismissed on an external task", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "tracked2", source: "external" });
+  const d = await post("/api/decisions", {
+    task_id: t.json.id,
+    title: "external gate 2",
+    context: "Test dismiss on a tracking-only task.",
+    options: [{ key: "a", label: "A" }],
+  });
+  const dis = await post(`/api/decisions/${d.json.id}/dismiss`, {});
+  expect(dis.status).toBe(200);
+  const steer = (await steerEvents(t.json.id)).at(-1);
+  expect(steer.payload.delivery).toBe("failed");
+});
+
+// queueSteerEvent deliberately does NOT special-case a Jira-linked task the
+// way sendSteer's own jiraLinked branch does: every queueSteerEvent caller
+// writes hive-internal automation text ("proceed on this basis"), and
+// posting that verbatim as a live comment on a real Jira issue would leak
+// jargon nobody watching that ticket should see. A never-dispatched
+// Jira-linked task gets the same honest 'failed' as any other.
+test("queueSteerEvent does not post to Jira for a decision answered on a never-dispatched Jira-linked task", async () => {
+  const id = await newTask("[WEB-9] Jira issue");
+  db.query("UPDATE tasks SET source = 'external', source_ref = 'jira:WEB-9' WHERE id = ?").run(id);
+  const d = await post("/api/decisions", {
+    task_id: id,
+    title: "jira gate",
+    context: "Test decision on a Jira-linked task.",
+    options: [{ key: "a", label: "A" }],
+  });
+  const ans = await post(`/api/decisions/${d.json.id}/answer`, { answer_key: "a" });
+  expect(ans.status).toBe(200);
+  const steer = (await steerEvents(id)).at(-1);
+  expect(steer.payload.delivery).toBe("failed");
+  const comments = (await get(`/api/tasks/${id}/events`)).json.filter((e: any) => e.type === "jira_comment");
+  expect(comments).toHaveLength(0);
+});
+
+// requestChanges now rejects a never-dispatched external task outright (#996,
+// server/src/api.ts requestChanges) before ever calling bounceForChanges, so
+// this never reaches queueSteerEvent — confirm no spawn and no stray steer
+// or changes_requested event either.
+test("request-changes on a source=external task is rejected and does not spawn an agent", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "tracked, in review", source: "external" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+  const briefsBefore = briefs.length;
+  const r = await post(`/api/tasks/${t.json.id}/request-changes`, { notes: "fix the thing" });
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("never been spawned");
+  expect(briefs.length).toBe(briefsBefore); // no agent was spawned
+  expect(await steerEvents(t.json.id)).toEqual([]); // rejected before anything was recorded
+});
+
+// A Jira-linked task in this same never-dispatched state gets identical
+// treatment — requestChanges's neverDispatched gate doesn't special-case
+// Jira-linkage the way sendSteer's own jiraLinked branch does.
+test("request-changes on a never-dispatched Jira-linked external task is also rejected, not routed to Jira", async () => {
+  const id = await newTask("[WEB-12] Jira issue, in review");
+  db.query("UPDATE tasks SET source = 'external', source_ref = 'jira:WEB-12' WHERE id = ?").run(id);
+  await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
+  await post(`/api/tasks/${id}/transition`, { to: "in_review" });
+  const briefsBefore = briefs.length;
+  const r = await post(`/api/tasks/${id}/request-changes`, { notes: "fix the thing" });
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("never been spawned");
+  expect(briefs.length).toBe(briefsBefore);
+  expect(await steerEvents(id)).toEqual([]);
+  const comments = (await get(`/api/tasks/${id}/events`)).json.filter((e: any) => e.type === "jira_comment");
+  expect(comments).toHaveLength(0);
+});
+
+// The core gap the third review pass found: source=external only means
+// "never AUTO-dispatched" — a task that was spawned once before (recovery,
+// or here, a legacy row that predates #996's first-spawn gate) CAN still
+// have a real, live agent. Once that's true, /send and queueSteerEvent must
+// both treat it like any other live task, not reject or dead-letter a
+// message that could actually reach someone.
+test("a steer to a manually-spawned (source=external, has agent_target) task is delivered normally, not rejected", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "tracked, manually dispatched", source: "external" });
+  fakePriorSpawn(t.json.id); // was spawned before — #996's neverDispatched gate no longer applies
+  const spawn = await post(`/api/tasks/${t.json.id}/spawn`, {});
+  expect(spawn.json.ok).toBe(true);
+
+  const r = await post(`/api/tasks/${t.json.id}/send`, { message: "ship it" });
+  expect(r.status).toBe(200);
+  expect(r.json.delivery).toBe("delivered"); // not the 400 a never-spawned external task gets
+});
+
+test("queueSteerEvent records queued, not failed, for a manually-spawned (source=external) task", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "tracked, manually dispatched 2", source: "external" });
+  fakePriorSpawn(t.json.id);
+  await post(`/api/tasks/${t.json.id}/spawn`, {});
+  const d = await post("/api/decisions", {
+    task_id: t.json.id,
+    title: "gate on a live external task",
+    context: "Test decision on a manually-dispatched tracking-only task.",
+    options: [{ key: "a", label: "A" }],
+  });
+  const ans = await post(`/api/decisions/${d.json.id}/answer`, { answer_key: "a" });
+  expect(ans.status).toBe(200);
+  const steer = (await steerEvents(t.json.id)).at(-1);
+  expect(steer.payload.delivery).toBe("queued"); // a live agent (or a future manual respawn) may still carry it
+});
+
+// The fourth review pass caught this: task.agent_target is NOT a permanent
+// "was this ever spawned" marker. cleanup.ts nulls it on terminal cleanup,
+// and a failed->queued requeue (state.ts) nulls it unconditionally too — so
+// a task that genuinely ran once would otherwise look identical to one that
+// never has, right after either event. neverDispatched must survive that.
+test("a requeue nulling agent_target does not make an already-spawned external task look never-dispatched", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "tracked, spawned then requeued", source: "external" });
+  fakePriorSpawn(t.json.id); // was spawned before — #996's neverDispatched gate no longer applies
+  await post(`/api/tasks/${t.json.id}/spawn`, {}); // writes the permanent 'spawned' event
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "failed", reason: "test" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "queued" }); // nulls agent_target (state.ts)
+  const after = await get(`/api/tasks/${t.json.id}`);
+  expect(after.json.agent_target).toBeNull(); // confirm the precondition really holds
+
+  const r = await post(`/api/tasks/${t.json.id}/send`, { message: "still not permanently undeliverable" });
+  expect(r.status).toBe(200); // not the 400 a truly never-spawned task gets
+  expect(r.json.delivery).toBe("queued"); // no live agent_target right now, but not a lie either
 });
 
 // The merge seam: attachment paths live in the stored message (text + block), so
