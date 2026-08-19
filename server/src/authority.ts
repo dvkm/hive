@@ -225,6 +225,15 @@ export function authorize(db: DB, input: AuthzInput, clock: () => string = now):
   // generic — so seven "recursive/forced rm" cards read as seven intents.
   if (!input.task_id) return { effect: "deny", reason: "denied: needs a decision but has no task", rule_id: rule?.id ?? null };
   const summary = input.summary?.trim();
+  // Command approval cards must state both intent and effect. Reject before
+  // creating one so the caller can retry with a one-line description.
+  if (!summary && input.action.startsWith("command."))
+    return {
+      effect: "deny",
+      reason:
+        "denied: no description given for this command — retry the same command with a one-line description of what it does and why, so the approval card carries your stated intent",
+      rule_id: rule?.id ?? null,
+    };
   const title = summary
     ? summary.length > 110
       ? summary.slice(0, 109) + "…"

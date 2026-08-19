@@ -582,15 +582,19 @@ priced rows only).
   already exist.
 - `GET /api/tasks/:id/brief` → `200 {"task_id":"...", "brief":"<multiline string>"}` | `404`
   (task description + definition of done + `hive emit` protocol + active global + project policies + standing-authority section + project knowledge: References, "Decisions already made", Known failure patterns)
-- `POST /api/tasks/:id/guarded-action` body `{action (required), target (required), detail?}` → see below | `404` | `400`
+- `POST /api/tasks/:id/guarded-action` body `{action (required), target (required), detail?, summary?}` → see below | `404` | `400`
   The gate agents call BEFORE any externally-risky operation they run themselves
   (prod deploy, feature-flag flip, destructive op). The server evaluates the
   standing-authority rules for the task's project:
+
+  `summary` is the caller's one-line stated intent. When a new approval card would be required for a `command.*` action, a missing, null, empty, or whitespace-only `summary` returns `403 deny` with retry guidance and creates no card.
+
   - `allow` → `200 {"ok":true, "effect":"allow"}` + an `authority_logged` event. Proceed.
-  - `deny` → `403 {"ok":false, "effect":"deny", "error":"..."}` + an `authority_denied` event. Stop.
+  - `deny` → `403 {"ok":false, "effect":"deny", "error":"..."}`. Stop. Denials from a standing-authority rule also write an `authority_denied` event.
   - `require_decision` → `409 {"ok":false, "effect":"require_decision", "decision_id":"..."}`.
     A decision card is opened naming the EXACT target (risk `high`, options
-    `approve`/`deny`) and the task is parked in `needs_decision`. The agent waits,
+    `approve`/`deny`, plus `approve_always` for `command.*`) and the task is parked
+    in `needs_decision`. The agent waits,
     then retries the SAME call. Retrying while the card is still open returns the
     same `decision_id` (no duplicate cards). Once the director answers `approve`,
     a single-use grant scoped to that exact `action` + `target` + task (expiring
@@ -1090,7 +1094,7 @@ same authority engine (`writeHookSettings` in `api.ts`; `hooks/classify.ts` +
      `DELETE FROM`/`UPDATE … SET` without `WHERE`, fork bomb, `mkfs`/`dd of=`,
      device/system-path writes, `kill`, `terraform apply/destroy`,
      `kubectl delete`, SSH/AWS credential files, …) → escalates via
-     `POST guarded-action {action:"command.dangerous", target:<cmd>}`.
+     `POST guarded-action {action:"command.dangerous.<category>", target:<cmd>, summary:<Bash description>}`. The hook forwards the Bash tool's one-line description as the stated intent; see the `guarded-action` contract above for missing-summary behavior.
      Never auto-allowed, even under `command_approval:"allow"`.
      **Sandbox waiver**: a destructive command PROVEN to act only inside the
      agent's own sandbox (its herdr worktree or a tmp scratchpad) is first
