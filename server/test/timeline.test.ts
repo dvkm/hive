@@ -29,6 +29,13 @@ test("renders assistant_text as a transcript bubble", () => {
   if (items[0].kind === "text") expect(items[0].text).toBe("line one\nline two");
 });
 
+test("renders Jira comments as readable conversation bubbles", () => {
+  const inbound = buildTimeline([ev("jira_comment", { direction: "inbound", author: "Sam", text: "can we ship?" }, "jira")], []);
+  expect(inbound[0]).toMatchObject({ kind: "text", source: "jira", text: "Sam: can we ship?" });
+  const outbound = buildTimeline([ev("jira_comment", { direction: "outbound", text: "yes" }, "director")], []);
+  expect(outbound[0]).toMatchObject({ kind: "text", source: "director", text: "yes" });
+});
+
 test("groups consecutive tool_use into one item, split by assistant_text", () => {
   const items = buildTimeline(
     [

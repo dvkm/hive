@@ -166,6 +166,50 @@ server/test/ bun test suite
   home for the allowlist: the existing per-project `config` column (the owning
   project is the target), so no new table or endpoint.
 
+- **JIRA bidirectional sync** (`server/src/intake/jira.ts`, no migration). Mirrors
+  one Jira Cloud project onto the board and keeps `status` in step BOTH ways, on
+  a `HIVE_JIRA_SYNC_MS` (default 60s) cycle. Two independent switches, both off
+  by default: `config.jira.enabled` turns the connector on at all, and
+  `config.jira.write` releases outbound writes — with `enabled` on and `write`
+  off it runs in SHADOW mode, computing and logging every outbound call ("would
+  have transitioned WEB-3 to In Review") without sending it, so a dry cycle is
+  readable before hive edits a real ticket.
+
+  ```jsonc
+  "jira": { "site": "https://acme.atlassian.net", "email": "bot@acme.com",
+            "project_key": "WEB", "enabled": false, "write": false,
+            "jql": "labels = sync" }   // optional, ANDed with project = <key>
+  ```
+
+  Auth is HTTP Basic (`email:api_token`) — a personal API token sent as `Bearer`
+  is rejected as an unparseable Connect JWT. The token is the project secret
+  `JIRA_API_TOKEN` (keychain; never in the DB). Note `/rest/api/3/search` is
+  removed (410); this uses `/search/jql`.
+
+  Field ownership avoids most conflicts by construction: Jira owns
+  summary/description/type/priority/labels (hive never writes them back), while
+  status and comments sync both ways. hive marks active unassigned issues with
+  the sync account, but never replaces or clears a human assignee. Status maps
+  `To Do/In Progress/In Review/Done` against `queued/in_progress/in_review/done`.
+  hive's `needs_decision` has no Jira status, so it rides as a
+  `hive:needs-decision` label added and removed on top of whatever status the
+  issue already has. `verifying` shows as In Review (merged is not Done to a
+  human); `failed`/`cancelled` never move Jira.
+
+  Conflicts resolve by newest status-change time, read from the issue CHANGELOG
+  and never from `fields.updated` (which also moves for comments and label edits,
+  so it would let an unrelated edit win a status tiebreak). Every overwrite
+  writes a `jira_sync` event carrying both sides, both timestamps and the winner.
+
+  hive never CREATES Jira issues — it only mirrors existing ones, which keeps a
+  curated backlog from turning into hive's activity log. Imported issues are
+  tracking-only (`source: external`), so the dispatcher never auto-spawns agents
+  on them and the done-gate evidence requirement is skipped (a ticket a human
+  closed upstream has no hive PR). Because hive binds loopback with no public
+  ingress, inbound is polling rather than a Jira webhook; that also makes loop
+  prevention structural, since a cycle writes only when the two sides differ and
+  a completed write leaves them agreeing.
+
 ## v3 notes (domain supervisors)
 
 - **On-demand planners** (`server/src/planner.ts`, migration v7). A per-project

@@ -95,6 +95,13 @@ export function buildTimeline(events: TLEvent[], decisions: TLDecision[]): Timel
       continue;
     }
 
+    if (ev.type === "jira_comment") {
+      const text = String(ev.payload?.text ?? "").trim();
+      const author = ev.payload?.direction === "inbound" ? String(ev.payload?.author ?? "Jira") : "";
+      if (text) items.push({ kind: "text", id: ev.id, ts: ev.ts, source: ev.source, text: author ? `${author}: ${text}` : text });
+      continue;
+    }
+
     if (ev.type === "needs-decision") {
       const d = byId.get(String(ev.payload?.decision_id ?? ""));
       if (d) {

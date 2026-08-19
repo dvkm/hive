@@ -96,6 +96,19 @@ test("a steer to a task with no agent is queued and delivered on the next spawn"
   expect(ev.payload.delivered_via).toBe("respawn");
 });
 
+test("a message on a Jira-linked task becomes a Jira comment, not a dead steer", async () => {
+  const id = await newTask("[WEB-7] Jira issue");
+  db.query("UPDATE tasks SET source = 'external', source_ref = 'jira:WEB-7' WHERE id = ?").run(id);
+  const before = sends.length;
+  const r = await post(`/api/tasks/${id}/send`, { message: "please add a regression test" });
+  expect(r.json).toMatchObject({ ok: true, delivered: false, delivery: "queued" });
+  expect(sends).toHaveLength(before);
+  expect(await steerEvents(id)).toHaveLength(0);
+  const events = (await get(`/api/tasks/${id}/events`)).json.filter((e: any) => e.type === "jira_comment");
+  expect(events).toHaveLength(1);
+  expect(events[0].payload).toMatchObject({ direction: "outbound", text: "please add a regression test" });
+});
+
 test("a delivered steer is receipted and not replayed into a later spawn", async () => {
   const id = await newTask("live agent");
   await post(`/api/tasks/${id}/spawn`, {});
