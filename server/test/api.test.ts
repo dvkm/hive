@@ -181,6 +181,26 @@ test("review_summary keeps its structured sections; empty submission is rejected
 
   const bad = await post(`/api/tasks/${t.json.id}/events`, { type: "review_summary", note: "hi" });
   expect(bad.status).toBe(400);
+
+  for (const question of [
+    "You find that a shared resource is blocking your task. What should you do?",
+    "A PR is green, but merge keeps failing. Where else could the actual blocker live?",
+    "Your branch needs new base commits, but force-pushing is denied. What's the correct move?",
+  ]) {
+    const agentTraining = await post(`/api/tasks/${t.json.id}/events`, {
+      type: "review_summary",
+      done: ["reviewed the change"],
+      understanding: {
+        checks: [{
+          question,
+          options: [{ key: "inspect", label: "Inspect the worker environment." }, { key: "ignore", label: "Ignore it." }],
+          answer_key: "inspect",
+        }],
+      },
+    });
+    expect(agentTraining.status).toBe(400);
+    expect(agentTraining.json.error).toContain("teach the director");
+  }
 });
 
 test("checkpoints: emit -> listed open -> ack removes; flag steers; bad verdict 400", async () => {
