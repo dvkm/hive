@@ -246,7 +246,7 @@ function Bell() {
 
 export default function App() {
   const { needsYou, offline, setOffline } = useStore();
-  const inboxCount = needsYou.length;
+  const inboxCount = needsYou.filter((item) => item.kind !== "waiting").length;
   const location = useLocation();
   // Board card clicks push /tasks/:id with state.backgroundLocation set to the
   // board's location — that keeps the board mounted and rendered underneath
