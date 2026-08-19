@@ -91,6 +91,11 @@ export function eventText(e: EventLike): string {
       const badge = p.delivered ? "sent back to agent" : "⚠ could not notify agent";
       return `merge conflict — ${badge}: ${s(p.reason)}`;
     }
+    case "merge_blocked_destructive": {
+      const regressed = Array.isArray(p.regressed) ? p.regressed : [];
+      const files = regressed.slice(0, 10).join(", ") + (regressed.length > 10 ? `, …(+${regressed.length - 10})` : "");
+      return `merge blocked: ${s(p.reason) || `branch '${s(p.branch)}' reverts base work outside this task's scope (${files || "unknown files"})`}`;
+    }
     case "pr_closed":
       return `PR closed without merging — sent back to the agent`;
     case "verify_wedged":
@@ -179,6 +184,7 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
   blocked: "incident",
   stale: "incident",
   merge_failed: "incident",
+  merge_blocked_destructive: "incident",
   spawn_error: "incident",
   smoke_failed: "incident",
   steer_error: "incident",
