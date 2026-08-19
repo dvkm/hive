@@ -2,7 +2,7 @@
 
 This is the authoritative contract for the hive daemon. The web app (Phase 2)
 must be built against this file. Server: `http://127.0.0.1:4700` (override
-`HIVE_PORT`). No auth (localhost tool).
+`HIVE_PORT`). Loopback is trustless except for config/secret writes (below).
 
 - All request and response bodies are JSON unless noted (evidence upload is
   `multipart/form-data`; the SSE stream is `text/event-stream`; evidence files
@@ -12,6 +12,17 @@ must be built against this file. Server: `http://127.0.0.1:4700` (override
   multipart form, text fields carry the same names as the JSON keys and any
   number of files may be sent under the field name `files`. See
   [Attachments](#attachments).
+- **Auth.** Requests from off-box (a phone on the LAN / Tailscale) must present
+  the API token as `Authorization: Bearer <t>` or `?token=<t>` (the SSE stream
+  has no headers, hence the query form); `hive remote` prints it. Loopback
+  callers need no token EXCEPT on the config- and secret-store writes
+  `PUT /api/projects/:id`, `POST /api/projects/:id/secrets` and
+  `DELETE /api/projects/:id/secrets/:name`, which require the token from any
+  caller and answer `401` without it. Those two stores are where a
+  caller-supplied value gets paired with a credential, so they are gated even
+  on localhost (`WRITE_AUTH_ROUTES` in `server/src/api.ts` — a future
+  config-plus-secret store belongs on that list). The `hive` CLI and the web app
+  present the token for you; reads and the whole task flow stay trustless.
 - Errors return `{"error": "<message>"}` with a non-2xx status:
   `400` bad input, `404` not found, `409` illegal state transition / already
   answered, `500` internal.
@@ -545,7 +556,7 @@ priced rows only).
   Auto-sets `config.test = true` when `repo_path` lives inside a task's own
   worktree/scratchpad, unless `config.test` was passed explicitly.
 - `GET /api/projects/:id` → `200 Project` | `404`
-- `PUT /api/projects/:id` body `{name?, repo_path?, config?}` → `200 Project` | `404`
+- `PUT /api/projects/:id` body `{name?, repo_path?, config?}` → `200 Project` | `404` | `401` without the API token (see Auth)
   Updates mutable fields. `config` is REPLACED wholesale when present (read the
   project, edit keys like `auto_dispatch`, write the object back). Used by the
   Policies-page auto-dispatch toggle.
@@ -1166,6 +1177,8 @@ touching ordinary `command` escalations.
   Marks all currently-undelivered notifications as seen (`delivered_at` set to now). Called when the header bell dropdown is opened, so those events are not re-pushed by the next digest.
 
 ### Secrets (metadata only)
+`POST` and `DELETE` here require the API token from every caller, loopback
+included (`401` without it — see Auth); `GET` does not.
 Values are never accepted or returned here. Set them with `hive secret set`
 (writes to the provider locally, then registers the reference via `POST`).
 - `GET /api/projects/:id/secrets` → `200 {"secrets": [Secret, ...]}` (by name) | `404`

@@ -116,10 +116,34 @@ function gitHeadSha(): string | null {
   }
 }
 
+// Config/secret writes need the API token even over loopback (see
+// requireWriteAuth in server/src/api.ts). Being on this machine as this user IS
+// the capability: we read the token the server minted out of its own DB, the
+// same way `hive remote` prints it. Sent on every call — harmless elsewhere.
+let cachedToken: string | null | undefined;
+async function localToken(): Promise<string | null> {
+  if (cachedToken !== undefined) return cachedToken;
+  try {
+    const { Database } = await import("bun:sqlite");
+    const { defaultDbPath } = await import("../server/src/db.ts");
+    const row = new Database(defaultDbPath(), { readonly: true })
+      .query("SELECT value FROM settings WHERE key = 'api_token'")
+      .get() as { value: string } | null;
+    cachedToken = row?.value ?? null;
+  } catch {
+    cachedToken = null; // no local DB (remote HIVE_URL) — the server will say so
+  }
+  return cachedToken;
+}
+
 async function api(method: string, path: string, body?: unknown): Promise<any> {
+  const token = await localToken();
   const res = await fetch(BASE + path, {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
+    headers: {
+      ...(body ? { "Content-Type": "application/json" } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     body: body ? JSON.stringify(body) : undefined,
   }).catch((e) => die(`cannot reach hive server at ${BASE} (${e.message}). Is 'hive serve' running?`));
   const text = await res.text();
