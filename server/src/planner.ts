@@ -15,7 +15,7 @@
 import type { DB } from "./db.ts";
 import { newId, now } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { writeEvent, getTask, transition } from "./state.ts";
+import { writeEvent, getTask, transition, isTrackingOnlyTask, TRACKING_ONLY_OWNERSHIP_ERROR, TransitionError } from "./state.ts";
 import { enqueue } from "./notifications.ts";
 import { createDecision, withBundle } from "./api.ts";
 import { parseDecision } from "./rows.ts";
@@ -216,6 +216,7 @@ export interface PlanResult {
   ok: boolean;
   decision?: any;
   error?: string;
+  status?: number;
 }
 
 // Run the planner for a task: record a `planning` event, invoke the subprocess,
@@ -225,6 +226,7 @@ export interface PlanResult {
 export async function runPlanner(db: DB, taskId: string, deps: PlannerDeps = {}): Promise<PlanResult> {
   const task = getTask(db, taskId);
   if (!task) return { ok: false, error: "task not found" };
+  if (isTrackingOnlyTask(task)) return { ok: false, error: TRACKING_ONLY_OWNERSHIP_ERROR, status: 409 };
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   const config = JSON.parse(project?.config ?? "{}");
 
@@ -371,6 +373,7 @@ export function resolvePlanForDecision(
   const proposed = selectedPlanIndices(allProposed.length, selectedIndices).map((i) => allProposed[i]);
   const source = getTask(db, sourceTaskId);
   if (!source) return true;
+  if (isTrackingOnlyTask(source)) throw new TransitionError(TRACKING_ONLY_OWNERSHIP_ERROR);
   const directorNotes = answerNote?.trim();
 
   const createdIds: string[] = [];

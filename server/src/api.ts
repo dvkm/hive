@@ -5,7 +5,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { taskWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
-import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched } from "./supervision.ts";
+import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror, isTrackingOnlyTask } from "./supervision.ts";
 import { isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
 import { REF_PREFIX as JIRA_REF_PREFIX } from "./intake/jira.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
@@ -22,6 +22,9 @@ import {
   changesRequestUnaddressed,
   decisionAnswerUnaddressed,
   isDeferred,
+  isTrackingOnlyTask,
+  TRACKING_ONLY_REQUEUE_ERROR,
+  TRACKING_ONLY_OWNERSHIP_ERROR,
   deferTask,
   undeferTask,
   unmetDeps,
@@ -48,6 +51,20 @@ import { authorize, resolveGrantForDecision, resolveDenyGuardrailForDecision, ty
 import { isReviewed } from "./dispatcher.ts";
 import { runPlanner, resolvePlanForDecision, decisionPlan, selectedPlanIndices, type PlannerExec } from "./planner.ts";
 import { routeIntakeProject } from "./intake/route.ts";
+import {
+  REF_PREFIX as JIRA_REF_PREFIX,
+  JIRA_SITE,
+  JIRA_COMMENT_MAX_LENGTH,
+  JIRA_WRITE_SCOPE,
+  jiraConfigStatusFor,
+  readSyncState as readJiraSyncState,
+  runProjectCycle as runJiraProjectCycle,
+  pendingOutbound,
+  deliveredOutbound,
+  resolveUnknownOutbound,
+  resolveEvidenceUrl,
+  type JiraDeps,
+} from "./intake/jira.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { noteRepoMismatch, resolveRepoMismatchForDecision } from "./repoTarget.ts";
 import { costUsd } from "./pricing.ts";
@@ -91,6 +108,7 @@ export interface HandlerDeps {
   plannerExec?: PlannerExec; // injectable planner subprocess (domain supervisors)
   exec?: Exec; // injectable gh/git subprocess (diff + merge); tests pass a stub
   fetch?: Fetcher; // injectable smoke-check fetcher (post-merge); tests pass a stub
+  jira?: JiraDeps;
 }
 
 const VERSION = "0.1.0";
@@ -374,6 +392,15 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/request-changes$/);
       if (m && method === "POST") return await requestChanges(db, herdr, m[1], await req.json(), deps);
 
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/jira$/);
+      if (m && method === "GET") return jiraTaskState(db, m[1]);
+
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/jira\/sync$/);
+      if (m && method === "POST") return await jiraManualSync(db, m[1], deps.jira);
+
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/jira\/delivery\/resolve$/);
+      if (m && method === "POST") return jiraResolveDelivery(db, m[1], await safeJson(req));
+
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/guarded-action$/);
       if (m && method === "POST") return guardedAction(db, m[1], await req.json());
 
@@ -381,7 +408,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (m && method === "POST") {
         if (!getTask(db, m[1])) return err("task not found", 404);
         const r = await runPlanner(db, m[1], { exec: deps.plannerExec });
-        return r.ok ? json({ ok: true, decision: r.decision }) : json({ ok: false, error: r.error }, 502);
+        return r.ok ? json({ ok: true, decision: r.decision }) : json({ ok: false, error: r.error }, r.status ?? 502);
       }
 
       // ---- decisions ----
@@ -555,6 +582,67 @@ function updateProject(db: DB, id: string, body: any): Response {
   const config = body?.config !== undefined ? JSON.stringify(body.config) : existing.config;
   db.query("UPDATE projects SET name = ?, repo_path = ?, config = ? WHERE id = ?").run(name, repo_path, config, id);
   return json(parseProject(db.query("SELECT * FROM projects WHERE id = ?").get(id)));
+}
+
+// ---------------------------------------------------------------- jira
+// Everything the board needs to show a mirrored Jira ticket honestly: where it
+// lives, when it last synced, what is still unresolved, and any error
+// that has NOT been cleared by a later success. A director should never have to
+// guess whether the sync ran, which is what makes people re-submit work.
+function jiraTaskState(db: DB, taskId: string): Response {
+  const task = getTask(db, taskId);
+  if (!task) return err("task not found", 404);
+  const ref = String(task.source_ref ?? "");
+  if (!ref.startsWith(JIRA_REF_PREFIX)) return json({ linked: false });
+
+  const key = ref.slice(JIRA_REF_PREFIX.length);
+  const configStatus = jiraConfigStatusFor(db, task.project_id);
+  const cfg = configStatus.config;
+  const state = readJiraSyncState(db, task.project_id);
+  const pending = pendingOutbound(db, taskId);
+  const assignee = /^Assignee: (.+)$/m.exec(String(task.brief ?? ""))?.[1] ?? null;
+  const delivered = deliveredOutbound(db, taskId);
+
+  return json({
+    linked: true,
+    issue_key: key,
+    browse_url: key ? `${JIRA_SITE}/browse/${encodeURIComponent(key)}` : null,
+    enabled: cfg?.enabled ?? false,
+    write: cfg?.write ?? false,
+    // A configured-but-not-allowlisted target reads as "not configured" here on
+    // purpose: the credential gate refused it, and the UI should not imply the
+    // site it names is in use.
+    configured: !!cfg,
+    write_scope: JIRA_WRITE_SCOPE,
+    assignee: assignee === "-" ? null : assignee,
+    sync: configStatus.error ? { ...state, last_error: `jira cycle could not run: ${configStatus.error}` } : state,
+    pending,
+    delivered,
+  });
+}
+
+function jiraResolveDelivery(db: DB, taskId: string, body: any): Response {
+  const task = getTask(db, taskId);
+  if (!task) return err("task not found", 404);
+  if (!String(task.source_ref ?? "").startsWith(JIRA_REF_PREFIX)) return err("task is not linked to a Jira issue", 400);
+  const action = String(body?.action ?? "");
+  const sourceId = String(body?.source_id ?? "");
+  if ((action !== "comment_push" && action !== "receipt") || !sourceId)
+    return err("action and source_id identify the unknown Jira delivery", 400);
+  if (!resolveUnknownOutbound(db, taskId, action, sourceId))
+    return err("delivery is not awaiting confirmation", 409);
+  return jiraTaskState(db, taskId);
+}
+
+// Manual retry. Runs the SAME per-project cycle the timer runs, so a director
+// clicking retry exercises exactly the automatic path — there is no second
+// implementation that could succeed while the real one keeps failing.
+async function jiraManualSync(db: DB, taskId: string, deps?: JiraDeps): Promise<Response> {
+  const task = getTask(db, taskId);
+  if (!task) return err("task not found", 404);
+  if (!String(task.source_ref ?? "").startsWith(JIRA_REF_PREFIX)) return err("task is not linked to a Jira issue", 400);
+  const r = await runJiraProjectCycle(db, task.project_id, deps);
+  return json({ ok: r.ok, error: r.error ?? null, stats: r.stats ?? null, sync: r.state }, r.ok ? 200 : 502);
 }
 
 // ---------------------------------------------------------------- intake
@@ -934,8 +1022,10 @@ export function projectInboxCounts(db: DB, projectId: string): { checkpoints: nu
       .query(`SELECT COUNT(*) AS n FROM decisions d JOIN tasks t ON t.id = d.task_id WHERE d.status = 'open' AND t.project_id = ? AND ${supervisedSql("t.source", "t.agent_target")}`)
       .get(projectId) as { n: number }).n
   );
+  // supervisedSql() covers source='external'; the source_ref clause covers a
+  // Jira mirror, which is tracking-only whatever its source column says.
   const reviews = Number(
-    (db.query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND state = 'in_review' AND ${supervisedSql()}`).get(projectId) as { n: number }).n
+    (db.query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND state = 'in_review' AND ${supervisedSql()} AND COALESCE(source_ref, '') NOT LIKE 'jira:%'`).get(projectId) as { n: number }).n
   );
   const tasks = db.query("SELECT * FROM tasks WHERE project_id = ?").all(projectId).map((task) => taskWithHealth(db, parseTask(task)));
   const attention = tasks.filter(needsAttention).length;
@@ -1453,8 +1543,11 @@ async function createTask(db: DB, req: Request): Promise<Response> {
   // Agents may create follow-up tasks (source="agent", parent_task_id → the
   // spawning task); the dispatcher treats them like director-created tasks.
   const parent = body.parent_task_id ? String(body.parent_task_id) : null;
-  if (parent && !db.query("SELECT 1 FROM tasks WHERE id = ?").get(parent))
-    return err("unknown parent_task_id", 400);
+  const parentTask = parent ? getTask(db, parent) : null;
+  if (parent && !parentTask) return err("unknown parent_task_id", 400);
+  if (parentTask && isTrackingOnlyTask(parentTask)) return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
+  if (isTrackingOnlyTask({ source: body.source }) && body.agent_target)
+    return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
   // depends_on: task ids this task waits on (array, or comma-separated string
   // from the CLI). Validated here so a typo can't block a task forever.
   const rawDeps = Array.isArray(body.depends_on)
@@ -1557,6 +1650,7 @@ export function linkPrIfMarked(
     }
   }
   if (!task) return null;
+  if (isTrackingOnlyTask(task)) return { task_id: task.id, number: task.number, linked: false };
   if (task.pr_url) return { task_id: task.id, number: task.number, linked: false };
   db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(pr.url, now(), task.id);
   writeEvent(db, { task_id: task.id, source, type: "pr_linked", payload: { pr_url: pr.url, via } });
@@ -1570,7 +1664,7 @@ export function linkPrIfMarked(
 // (queued/needs_decision/terminal), so it is safe to call repeatedly.
 export function handOffToReview(db: DB, taskId: string, source: string): boolean {
   const t: any = getTask(db, taskId);
-  if (!t || t.state !== "in_progress") return false;
+  if (!t || t.state !== "in_progress" || isTrackingOnlyTask(t)) return false;
   // #234: the reconciler's CI-green poll used to re-queue a task the director
   // JUST sent back (changes_requested) 33s later, before any new commit — CI was
   // still green on the old head. The shared guard blocks re-queue until new work
@@ -1607,6 +1701,7 @@ async function linkPrEndpoint(db: DB, body: any, deps: HandlerDeps): Promise<Res
 async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
+  if (isTrackingOnlyTask(task)) return err("tracking-only task fields are owned by the external system", 409);
   const { fields: body, files } = await bodyWithFiles(req);
   const title = body?.title != null ? String(body.title) : task.title;
   const { block } = await attachFiles(id, files);
@@ -1853,12 +1948,13 @@ function brief(db: DB, url: URL): Response {
     .filter((t: any) => !isReviewed(db, t.id))
     .map((t: any) => ({ ...parseTask(t), project_name: t.project_name }));
 
-  // ⑦ to review — in-review tasks awaiting the captain's review & merge. Full
-  // task objects (with health) so the web renders review cards inline.
+  // ⑦ to review — Hive-owned in-review tasks awaiting the captain's review
+  // and merge. Full task objects (with health) so the web renders review cards inline.
   const to_review = db
     .query("SELECT * FROM tasks WHERE state = 'in_review' ORDER BY updated_at DESC")
     .all()
     .map(parseTask)
+    .filter((task: any) => !isTrackingOnlyTask(task))
     .map((t: any) => taskWithHealth(db, t));
 
   // ⑧ spend since — reuse the analytics rollup (totals + by-model for top model).
@@ -2057,13 +2153,19 @@ async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {
   // dead agent with the note in its brief).
   if (to === "in_progress") {
     const t = getTask(db, id);
-    if (t && t.state === "in_review") {
-      // A never-dispatched external task (see supervision.ts) has no agent to
-      // bounce back to — bounceForChanges would just queue a steer nobody
-      // will ever read and try (and fail) to spawn one. Reject outright
-      // rather than pretending the bounce did something.
-      if (neverDispatched(db, t))
-        return err("task is untracked (source=external) and has never been spawned — there is no agent to bounce back to", 409);
+    // Tracking-only tasks fall through to a PLAIN transition. For them an
+    // in_review -> in_progress move is not "the director requests changes", it
+    // is the external system moving its own ticket back, so there is nothing to
+    // bounce and no agent to contact.
+    //
+    // This supersedes hive-996's 409 here, deliberately. That guard rejected a
+    // never-dispatched external task to stop bounceForChanges queueing a steer
+    // nobody reads and failing to spawn an agent. Falling through achieves the
+    // same thing — no steer, no spawn — and lets the move actually succeed,
+    // which is what a mirrored ticket needs. neverDispatched implies
+    // source='external' implies tracking-only, so that guard would be
+    // unreachable below rather than merely unused.
+    if (t && t.state === "in_review" && !isTrackingOnlyTask(t)) {
       const herdr = deps.herdr ?? defaultHerdr;
       const notes = String(body?.reason ?? "").trim() || "The director moved this back to in_progress for more work.";
       const { delivered, respawned } = await bounceForChanges(db, herdr, t, notes, deps);
@@ -2074,7 +2176,8 @@ async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {
   if (to === "verifying" || to === "done") {
     const t = getTask(db, id);
     if (t) {
-      if (to === "verifying" && t.state === "in_review" && t.kind === "scout") {
+      const hiveOwnedReview = !isTrackingOnlyTask(t);
+      if (hiveOwnedReview && to === "verifying" && t.state === "in_review" && t.kind === "scout") {
         const quiz = latestUnderstandingQuiz(db, id);
         if (!quiz)
           return err("Understanding check required. Ask the agent to add one before accepting this report.", 409);
@@ -2087,7 +2190,7 @@ async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {
       // /merge handles every PR state: open → merges, MERGED → advances, CLOSED →
       // merge_failed with re-link guidance. mergeTask calls transition() directly,
       // so the sanctioned path is unaffected.
-      if (to === "verifying" && t.state === "in_review" && t.pr_url)
+      if (hiveOwnedReview && to === "verifying" && t.state === "in_review" && t.pr_url)
         return err(
           `task has a PR (${t.pr_url}); use POST /api/tasks/${id}/merge so the PR actually merges — a direct move to 'verifying' skips the merge`,
           409
@@ -2113,6 +2216,9 @@ async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {
 
 // GET /api/tasks/:id/diff → the structured branch diff for the review UI.
 async function taskDiffEndpoint(db: DB, id: string, deps: HandlerDeps): Promise<Response> {
+  const task = getTask(db, id);
+  if (!task) return err("task not found", 404);
+  if (isTrackingOnlyTask(task)) return err("tracking-only tasks have no Hive-owned diff to review", 409);
   const r = await taskDiff(db, id, deps.exec ?? defaultExec);
   return r.ok ? json(r.diff) : err(r.error, r.status);
 }
@@ -2278,6 +2384,7 @@ function staleBaseRefusal(prView: any): boolean {
 export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
+  if (isTrackingOnlyTask(task)) return err("tracking-only tasks have no Hive-owned work to merge", 409);
   if (task.state !== "in_review")
     return err(`task is '${task.state}', not 'in_review'; only in-review tasks can be merged`, 409);
   if (task.kind === "scout")
@@ -2577,6 +2684,8 @@ async function requestChanges(db: DB, herdr: Herdr, id: string, body: any, deps:
   if (!task) return err("task not found", 404);
   if (task.state !== "in_review")
     return err(`task is '${task.state}', not 'in_review'`, 409);
+  if (isJiraMirror(task))
+    return err("this task mirrors a Jira issue — hive does no agent work on it, so there are no changes to request", 409);
   if (neverDispatched(db, task))
     return err("task is untracked (source=external) and has never been spawned — there is no agent to request changes from", 409);
   const notes = String(body?.notes ?? "").trim();
@@ -2634,9 +2743,12 @@ export async function spawnAgent(
   // The shared spawn core: every path that starts an agent (the manual /spawn
   // endpoint, the dispatcher's auto loop, bounceForChanges' respawn-on-
   // undelivered fallback) routes through here, so this is the one place that
-  // needs to reject a never-dispatched external task (see supervision.ts) —
-  // dispatcher.ts's own isExternalTask skip only covers its own loop. A task
+  // needs to reject work hive must not do. A Jira mirror is refused ALWAYS —
+  // it mirrors someone else's ticket, so there is no hive work to start, ever.
+  // A never-dispatched external task (see supervision.ts) is refused too; one
   // that WAS spawned before (recovery, manual respawn) is unaffected.
+  if (isJiraMirror(task))
+    return { ok: false, error: "this task mirrors a Jira issue — hive tracks it but never runs agents on it" };
   if (neverDispatched(db, task))
     return { ok: false, error: "task is untracked (source=external) and has never been spawned — hive does not dispatch agents for tracking-only tasks" };
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
@@ -2795,7 +2907,7 @@ async function sendOnce(herdr: Herdr, target: string, message: string): Promise<
 // no authz gate (the server is steering, not an agent).
 async function internalSteer(db: DB, herdr: Herdr, id: string, message: string): Promise<boolean> {
   const task = getTask(db, id);
-  if (!task) return false;
+  if (!task || isTrackingOnlyTask(task)) return false;
   const target = task.agent_target;
   let error: string | null = target ? null : "task has no agent_target (not spawned)";
   if (target) {
@@ -2818,7 +2930,7 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
   const { fields, files } = await bodyWithFiles(req);
-  const text = String(fields?.message ?? "");
+  const text = String(fields?.message ?? "").trim();
   if (!text) return err("message is required");
   const fromTaskId = fields?.from_task_id ? String(fields.from_task_id) : null;
   const sender = fromTaskId ? getTask(db, fromTaskId) : null;
@@ -2837,6 +2949,8 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
     // forever once syncJiraOnce actually pushes the comment (task #1008).
     if (files.length) return err("Jira comment attachments are not supported yet", 400);
     const comment = sender ? `Hive agent #${sender.number} (${sender.title}):\n${text}` : text;
+    if (comment.length > JIRA_COMMENT_MAX_LENGTH)
+      return err(`Jira comments are limited to ${JIRA_COMMENT_MAX_LENGTH} characters`, 413);
     writeEvent(db, {
       task_id: id,
       source: sender ? "agent" : "director",
@@ -2845,6 +2959,9 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
     });
     return json({ ok: true, delivered: false, delivery: "queued", message: comment, attachments: [] });
   }
+  // A Jira mirror never has an agent, now or later, so a steer can never land.
+  if (isJiraMirror(task))
+    return err("this task mirrors a Jira issue — hive runs no agent on it, so a steer can never be delivered", 400);
   // neverDispatched (supervision.ts): tracking-only AND never even manually
   // spawned — since #996, spawnAgent itself refuses a never-dispatched
   // external task's first spawn too, so the only way past this today is a
@@ -2897,6 +3014,7 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
 async function taskPane(db: DB, herdr: Herdr, id: string, url: URL): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
+  if (isTrackingOnlyTask(task)) return err("tracking-only tasks have no agent pane", 409);
   if (!task.agent_target) return err("task has no agent (not spawned, or already cleaned up)", 404);
   const lines = Math.min(Math.max(Number(url.searchParams.get("lines")) || 200, 10), 2000);
   const raw = await herdr.read(task.agent_target, lines);
@@ -3362,6 +3480,8 @@ async function ackCheckpoint(db: DB, herdr: Herdr, taskId: string, eventId: stri
     return err("source must be 'director' or 'chat_supervisor'");
   const actor = body?.actor ? String(body.actor) : null;
   const task = getTask(db, taskId);
+  if (verdict === "flag" && task && isTrackingOnlyTask(task))
+    return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
   if (source === "chat_supervisor") {
     if (!actor || !getThread(db, actor)) return err("chat_supervisor checkpoint actions require a valid thread actor", 403);
     if (projectAutonomyProfile(db, task?.project_id ?? null) === "conservative")
@@ -3529,6 +3649,7 @@ function writeHookSettings(
 async function focusAgent(db: DB, herdr: Herdr, id: string): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
+  if (isTrackingOnlyTask(task)) return err("tracking-only tasks have no agent to focus", 409);
   if (!task.agent_target) return json({ ok: false, focused: false, error: "task has no agent" });
   try {
     const r = await herdr.focus(task.agent_target);
@@ -3548,6 +3669,7 @@ async function focusAgent(db: DB, herdr: Herdr, id: string): Promise<Response> {
 function requeueEndpoint(db: DB, id: string): Response {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
+  if (isJiraMirror(task)) return err(TRACKING_ONLY_REQUEUE_ERROR, 409);
   if (!TERMINAL.includes(task.state as State)) {
     transition(db, id, "failed", { source: "director", reason: "manual fail + requeue" });
   }
@@ -3569,9 +3691,10 @@ async function cleanupEndpoint(db: DB, herdr: Herdr, id: string): Promise<Respon
   return json({ ok: true, ...r });
 }
 
-// Create a fresh queued copy of a task (source='requeue', parent_task_id → the
-// failed original). The lineage links let the recovery loop cap auto-requeues.
+// Create a fresh queued copy of a task (parent_task_id → the failed original).
+// The lineage links let the recovery loop cap auto-requeues.
 export function requeueTask(db: DB, source: any): string {
+  if (isJiraMirror(source)) throw new TransitionError(TRACKING_ONLY_REQUEUE_ERROR);
   const id = newId();
   const t = now();
   db.query(
@@ -3638,15 +3761,19 @@ export function resolveBlockedForDecision(db: DB, herdr: Herdr, decisionId: stri
 }
 
 export function resolveRecoveryForDecision(db: DB, decisionId: string, answerKey: string): boolean {
+  const card = recoveryCardForDecision(db, decisionId);
+  if (!card) return false;
+  if (answerKey !== "requeue") return true;
+  const source = getTask(db, card.source_task_id);
+  if (source) requeueTask(db, source);
+  return true;
+}
+
+function recoveryCardForDecision(db: DB, decisionId: string): { source_task_id: string } | null {
   const ev = db
     .query("SELECT payload FROM events WHERE type = 'recovery_card' AND json_extract(payload, '$.decision_id') = ? ORDER BY ts DESC LIMIT 1")
     .get(decisionId) as { payload: string } | undefined;
-  if (!ev) return false;
-  if (answerKey !== "requeue") return true;
-  const sourceId = JSON.parse(ev.payload).source_task_id;
-  const source = getTask(db, sourceId);
-  if (source) requeueTask(db, source);
-  return true;
+  return ev ? JSON.parse(ev.payload) : null;
 }
 
 // ---------------------------------------------------------------- incidents
@@ -3753,6 +3880,9 @@ function createLearning(db: DB, body: any): Response {
     root_cause_task_id: null,
     kind: body.kind,
   };
+  const sourceTask = row.source_task_id ? getTask(db, row.source_task_id) : null;
+  if (body.create_root_cause_task && sourceTask && isTrackingOnlyTask(sourceTask))
+    return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
   if (body.create_root_cause_task)
     row.root_cause_task_id = createRootCauseTask(db, row);
   db.query(
@@ -3989,7 +4119,8 @@ async function headSha(exec: Exec, cwd: string | null): Promise<string | null> {
 
 // ---------------------------------------------------------------- event ingestion (`hive emit`)
 async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDeps = {}): Promise<Response> {
-  if (!getTask(db, taskId)) return err("task not found", 404);
+  const task = getTask(db, taskId);
+  if (!task) return err("task not found", 404);
   const exec = deps.exec ?? defaultExec;
   const ct = req.headers.get("content-type") || "";
   let fields: Record<string, string> = {};
@@ -4011,6 +4142,8 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
 
   const type = fields.type;
   if (!type) return err("event 'type' is required");
+  if (isTrackingOnlyTask(task) && ["needs-decision", "done", "ready"].includes(type))
+    return err("tracking-only tasks do not accept agent lifecycle events", 409);
   const source = fields.source || "agent";
   const note = fields.note ?? null;
 
@@ -4031,6 +4164,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       path = saved.path;
       servedUrl = saved.url;
     }
+    if (servedUrl && !resolveEvidenceUrl(servedUrl)) return err("evidence url must be a valid HTTP(S) URL or path", 400);
     // Tie the artifact to the commit it was captured from: the worktree HEAD at
     // emit time. The ready gate reads meta.commit_sha to reject stale evidence.
     let meta = fields.meta ?? "{}";
@@ -4688,6 +4822,12 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
   }
 
   const plan = decisionPlan(db, r.task_id, id);
+  if (plan && answerKey === "approve" && isTrackingOnlyTask(getTask(db, r.task_id) ?? {}))
+    return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
+  const recoveryCard = answerKey === "requeue" ? recoveryCardForDecision(db, id) : null;
+  const recoverySource = recoveryCard ? getTask(db, recoveryCard.source_task_id) : null;
+  if (recoverySource && isJiraMirror(recoverySource))
+    return err(TRACKING_ONLY_REQUEUE_ERROR, 409);
   const selectedIndices = body?.selected_indices;
   if (plan && answerKey === "approve" && selectedPlanIndices(plan.proposed_tasks.length, selectedIndices).length === 0)
     return err("Cannot approve a planner breakdown with no tasks; answer 'reject' instead.", 400);

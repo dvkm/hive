@@ -352,9 +352,13 @@ test("request-changes on a source=external task is rejected and does not spawn a
   expect(await steerEvents(t.json.id)).toEqual([]); // rejected before anything was recorded
 });
 
-// A Jira-linked task in this same never-dispatched state gets identical
-// treatment — requestChanges's neverDispatched gate doesn't special-case
-// Jira-linkage the way sendSteer's own jiraLinked branch does.
+// A Jira-linked task in this same never-dispatched state is rejected too. It
+// now trips the JIRA-MIRROR gate rather than the neverDispatched one, because
+// two rules apply and the mirror rule is the permanent one: "never spawned" can
+// stop being true the moment someone dispatches, while "this mirrors someone
+// else's ticket" never does. The rejection is what the test pins; which of the
+// two reasons is reported is deliberately not over-specified beyond it naming
+// the mirror.
 test("request-changes on a never-dispatched Jira-linked external task is also rejected, not routed to Jira", async () => {
   const id = await newTask("[WEB-12] Jira issue, in review");
   db.query("UPDATE tasks SET source = 'external', source_ref = 'jira:WEB-12' WHERE id = ?").run(id);
@@ -363,7 +367,7 @@ test("request-changes on a never-dispatched Jira-linked external task is also re
   const briefsBefore = briefs.length;
   const r = await post(`/api/tasks/${id}/request-changes`, { notes: "fix the thing" });
   expect(r.status).toBe(409);
-  expect(r.json.error).toContain("never been spawned");
+  expect(r.json.error).toContain("mirrors a Jira issue");
   expect(briefs.length).toBe(briefsBefore);
   expect(await steerEvents(id)).toEqual([]);
   const comments = (await get(`/api/tasks/${id}/events`)).json.filter((e: any) => e.type === "jira_comment");

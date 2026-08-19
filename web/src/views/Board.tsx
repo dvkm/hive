@@ -7,6 +7,7 @@ import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, STATE_LABEL, StatusDot
 import { useRelTime } from "../lib/time";
 import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
 import { AttentionTray, needsAttention } from "./attention";
+import { isJiraMirror, isTrackingOnly } from "../lib/needsYou";
 
 // A compact "why this card needs attention" line: e.g. "agent gone" or
 // "no activity 22m". Server-provided reason + live-ticking since-age.
@@ -96,6 +97,8 @@ export function Card({ task }: { task: Task }) {
 
   const health = task.health;
   const unhealthy = health && health.status !== "healthy";
+  const trackingOnly = isTrackingOnly(task);
+  const jiraMirror = isJiraMirror(task);
 
   return (
     <Link to={`/tasks/${task.id}`} state={{ backgroundLocation: location }} className="card">
@@ -145,17 +148,17 @@ export function Card({ task }: { task: Task }) {
       <div className="card-foot">
         {/* An intake task holds raw input, not a brief: an agent would try to
             "do" the braindump. Its plan produces the dispatchable tasks. */}
-        {task.state === "queued" && !task.source?.startsWith("intake_") && !task.never_dispatched && (
+        {task.state === "queued" && !task.source?.startsWith("intake_") && !jiraMirror && !task.never_dispatched && (
           <button className="btn btn-mini" onClick={dispatch} disabled={dispatching} title="Spawn an agent for this task now">
             {dispatching ? "dispatching…" : "dispatch now"}
           </button>
         )}
-        {task.agent_target && task.state === "in_progress" && (
+        {task.agent_target && task.state === "in_progress" && !jiraMirror && (
           <button className="btn btn-mini" onClick={viewAgent} title="Focus this agent's tab in herdr">
             view agent
           </button>
         )}
-        {task.pr_url && (
+        {!trackingOnly && task.pr_url && (
           <a
             className="pr"
             href={task.pr_url}
@@ -167,7 +170,7 @@ export function Card({ task }: { task: Task }) {
             PR ↔ #{task.number}
           </a>
         )}
-        <CiBadge status={task.ci_status} />
+        {!trackingOnly && <CiBadge status={task.ci_status} />}
         {ev != null && ev > 0 && <span className="evc" title="evidence items">◱ {ev}</span>}
       </div>
     </Link>
@@ -184,7 +187,7 @@ function BriefBanner() {
   const { decisions, tasks } = useStore();
   const attn = tasks.filter(needsAttention).length;
   const decs = decisions.length;
-  const review = tasks.filter((t) => t.state === "in_review").length;
+  const review = tasks.filter((t) => t.state === "in_review" && !isTrackingOnly(t)).length;
   const sig = `${decs}:${attn}:${review}`;
   const [dismissed, setDismissed] = useState<string>(() => localStorage.getItem(BANNER_DISMISS_KEY) || "");
   if (decs + attn + review === 0 || dismissed === sig) return null;
@@ -269,7 +272,7 @@ export default function Board() {
         return (
           <section className="column" key={s}>
             <header className="col-head">
-              <span className="col-title" title={s === "in_review" ? "awaiting your review & merge" : undefined}>
+              <span className="col-title" title={s === "in_review" ? "Hive-owned work awaits review and merge; tracked work mirrors its external review state" : undefined}>
                 {STATE_LABEL[s]}
               </span>
               <div className="col-head-right">

@@ -16,6 +16,27 @@ export function isExternalTask(source: string | null | undefined): boolean {
   return source === "external";
 }
 
+// Tracking-only: a task hive RECORDS but never does agent work for. Two ways in:
+//   * source='external' — another agent using the board as a kanban;
+//   * a Jira mirror (source_ref 'jira:KEY') — it mirrors someone else's ticket.
+// The Jira arm matters on its own: a mirror that loses source='external' (e.g. a
+// clone made by some future path) would otherwise become dispatchable work, and
+// spawn/steer/requeue are UNDEFINED for a mirror, not merely risky — there is no
+// agent work to retry. Derived FROM isExternalTask so 'external' keeps exactly
+// one definition.
+// A mirror of someone else's Jira ticket. Separate from isExternalTask because
+// the two answer different questions: an external kanban task the director
+// manually spawned IS real hive work and stays steerable (#996), while a Jira
+// mirror never is, whatever its spawn history — spawn/steer/bounce/requeue are
+// UNDEFINED for it, not merely risky.
+export function isJiraMirror(task: { source_ref?: string | null }): boolean {
+  return String(task.source_ref ?? "").startsWith("jira:");
+}
+
+export function isTrackingOnlyTask(task: { source?: string | null; source_ref?: string | null }): boolean {
+  return isExternalTask(task.source) || isJiraMirror(task);
+}
+
 // Tasks hive actively supervises: watched for staleness, wake the manager on
 // their events, and count toward a project's inbox totals. A chat_supervisor
 // task is always excluded (it's the infrastructure session, not director

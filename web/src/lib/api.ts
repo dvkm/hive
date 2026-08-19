@@ -432,7 +432,7 @@ export interface Brief {
   fleet: Task[];
   incidents: BriefIncident[];
   intake: BriefIntake[];
-  to_review: Task[];
+  to_review: Task[]; // Hive-owned reviews; tracking-only tasks are excluded.
   spend: { totals: UsageTotals; by_model: (UsageTotals & { model: string })[] };
   learnings_new: BriefLearning[];
 }
@@ -534,8 +534,54 @@ export interface UnderstandingQuiz {
   status: "required" | "deferred";
 }
 
+export interface JiraSyncState {
+  last_attempt_at: string | null;
+  last_success_at: string | null;
+  last_error: string | null;
+  last_error_at: string | null;
+  consecutive_failures: number;
+  next_due_at: string | null;
+  interval_ms: number;
+  running: boolean;
+  stats: Record<string, unknown> | null;
+}
+
+export interface JiraTaskState {
+  linked: boolean;
+  issue_key?: string;
+  browse_url?: string | null;
+  enabled?: boolean;
+  write?: boolean;
+  configured?: boolean;
+  write_scope?: {
+    status: boolean;
+    comments: boolean;
+    labels: readonly string[];
+    assignee: boolean;
+  };
+  assignee?: string | null;
+  sync?: JiraSyncState;
+  pending?: {
+    comments: number;
+    receipts: number;
+    unknown: { action: "comment_push" | "receipt"; source_id: string; error: string | null; text: string | null; ts: string }[];
+  };
+  delivered?: Record<string, unknown>[];
+}
+
 export const api = {
   token: apiToken,
+  jira: (taskId: string) => req<JiraTaskState>(`/api/tasks/${taskId}/jira`),
+  jiraSync: (taskId: string) =>
+    req<{ ok: boolean; error: string | null; stats: Record<string, unknown> | null; sync: JiraSyncState }>(
+      `/api/tasks/${taskId}/jira/sync`,
+      { method: "POST" }
+    ),
+  jiraResolveDelivery: (taskId: string, action: "comment_push" | "receipt", sourceId: string) =>
+    req<JiraTaskState>(`/api/tasks/${taskId}/jira/delivery/resolve`, {
+      method: "POST",
+      body: JSON.stringify({ action, source_id: sourceId }),
+    }),
   subscribePush: (subscription: unknown) =>
     req<{ ok: boolean }>(`/api/push/subscribe`, { method: "POST", body: JSON.stringify(subscription) }),
   offline: () => req<{ on: boolean }>(`/api/offline`),

@@ -8,7 +8,7 @@ process.env.HIVE_HOME = HOME;
 
 const { openDb } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
-const { composePlannerPrompt, extractPlan, runPlanner } = await import("../src/planner.ts");
+const { composePlannerPrompt, extractPlan, runPlanner, resolvePlanForDecision } = await import("../src/planner.ts");
 const { isReviewed } = await import("../src/dispatcher.ts");
 const { addClient, removeClient } = await import("../src/bus.ts");
 const { writeEvent } = await import("../src/state.ts");
@@ -155,6 +155,29 @@ test("plan endpoint -> decision card; approve creates linked child tasks", async
   } finally {
     s2.stop(true);
   }
+});
+
+test("tracking-only tasks cannot run or approve planner work", async () => {
+  const tracking = (await post("/api/tasks", { project_id: projectId, title: "Jira plan", source: "external" })).json;
+  const blockedExec = stubExec(VALID);
+  const direct = await runPlanner(db, tracking.id, { exec: blockedExec.exec });
+  expect(direct).toMatchObject({ ok: false, status: 409 });
+  expect(direct.error).toContain("tracking-only tasks cannot create Hive-owned agent work");
+  expect(blockedExec.calls).toHaveLength(0);
+
+  const endpoint = await post(`/api/tasks/${tracking.id}/plan`, {});
+  expect(endpoint.status).toBe(409);
+  expect(endpoint.json.error).toContain("tracking-only tasks cannot create Hive-owned agent work");
+
+  const legacy = await mkTask("Existing Jira plan");
+  const planned = await runPlanner(db, legacy.id, { exec: stubExec(VALID).exec });
+  db.query("UPDATE tasks SET source = 'external', source_ref = ? WHERE id = ?").run("jira:WEB-PLAN", legacy.id);
+  expect(() => resolvePlanForDecision(db, legacy.id, planned.decision.id, "approve")).toThrow(/tracking-only tasks/);
+
+  const answer = await post(`/api/decisions/${planned.decision.id}/answer`, { answer_key: "approve" });
+  expect(answer.status).toBe(409);
+  expect((await get(`/api/decisions/${planned.decision.id}`)).json.status).toBe("open");
+  expect((await get(`/api/tasks?project_id=${projectId}`)).json.filter((task: any) => task.parent_task_id === legacy.id)).toEqual([]);
 });
 
 test("decision exposes structured plan for the UI checklist", async () => {

@@ -3,7 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faDiamond } from "@fortawesome/free-solid-svg-icons";
 import { api } from "../lib/api";
-import type { Decision, Evidence, TaskDetail } from "../lib/api";
+import type { Decision, Evidence, JiraTaskState, TaskDetail } from "../lib/api";
 import { useStore } from "../lib/store";
 import { splitAttachments } from "../lib/attachments";
 import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
@@ -19,6 +19,7 @@ import { buildTimeline } from "../lib/timeline";
 import { ANSWERED_BY_LABEL } from "../lib/labels";
 import type { TimelineItem } from "../lib/timeline";
 import { eventText } from "../lib/eventText";
+import { isJiraMirror, isTrackingOnly } from "../lib/needsYou";
 
 // Compact per-task usage line: tokens + estimated cost, only when usage exists.
 function UsageLine({ id, rev }: { id: string; rev: number }) {
@@ -259,11 +260,232 @@ function PaneTerminal({ taskId }: { taskId: string }) {
 }
 
 // The task detail content, shared by the standalone /tasks/:id route and the
+// What a director needs to know about a mirrored Jira ticket without asking:
+// where it is, whether the automatic sync is actually running, what has not gone
+// out yet, and any error that is still true. Everything here derives from
+// delivery receipts rather than an optimistic local flag, so the panel cannot
+// claim something reached Jira that did not.
+type JiraSyncMode = "loading" | "unconfigured" | "paused" | "shadow" | "live";
+
+function jiraSyncMode(jira: JiraTaskState | null): JiraSyncMode {
+  if (!jira) return "loading";
+  if (jira.configured === false) return "unconfigured";
+  if (jira.configured !== true) return "loading";
+  if (jira.enabled === false) return "paused";
+  if (jira.enabled !== true) return "loading";
+  if (jira.write === false) return "shadow";
+  return jira.write === true ? "live" : "loading";
+}
+
+export function jiraMoveHint(from: string, to: string, jira: JiraTaskState | null): string {
+  const state = to as TaskDetail["state"];
+  const label = STATE_LABEL[state];
+  const mode = jiraSyncMode(jira);
+  if (mode === "loading")
+    return `Moves this task to ${label} in Hive; Jira sync state is still loading, so its Jira effect is unknown.`;
+  if (mode === "unconfigured")
+    return `Moves this task to ${label} in Hive; Jira sync is unconfigured or not allow-listed, so Jira will not change.`;
+  if (mode === "paused")
+    return `Moves this task to ${label} in Hive; Jira sync is paused, so no Jira cycle will run.`;
+  if (from === "in_review" && state === "verifying")
+    return `Moves this task to ${label}; Jira stays at In Review, so no Jira change is needed.`;
+  if (from === "needs_decision" && state !== "needs_decision")
+    return mode === "shadow"
+      ? `Moves this task to ${label}; shadow mode logs removal of the Jira needs-decision label but does not send it.`
+      : `Moves this task to ${label}; Jira keeps its status and removes the needs-decision label on the next sync.`;
+  if (state === "failed" || state === "cancelled")
+    return `Moves this task to ${label} in Hive only; Jira will not change.`;
+  if (state === "needs_decision")
+    return mode === "shadow"
+      ? `Moves this task to ${label}; shadow mode logs the Jira needs-decision label but does not add it.`
+      : `Moves this task to ${label}; Jira keeps its status and gains the needs-decision label.`;
+  const jiraStatus = state === "queued" ? "To Do" : state === "in_progress" ? "In Progress" : state === "done" ? "Done" : "In Review";
+  if (mode === "shadow")
+    return `Moves this task to ${label}; shadow mode logs Jira status ${jiraStatus} but does not send it.`;
+  return `Moves this task to ${label} and sets Jira to ${jiraStatus} on the next sync.`;
+}
+
+export function jiraMoveSummary(from: string, jira: JiraTaskState | null): string {
+  const mode = jiraSyncMode(jira);
+  if (mode === "loading") return "Jira sync state is still loading; move effects in Jira are not known yet.";
+  if (mode === "unconfigured") return "Jira sync is unconfigured or not allow-listed; moves stay in Hive.";
+  if (mode === "paused") return "Jira sync is paused; no automatic cycle will send these moves.";
+  if (mode === "shadow") return from === "needs_decision"
+    ? "Shadow mode logs removal of the Jira needs-decision label for every move out of this state, but sends nothing."
+    : "Shadow mode logs mapped status and label changes without sending them; Hive-only moves never change Jira.";
+  return from === "needs_decision"
+    ? "Mapped moves sync Jira; every move out of Needs decision also removes its Jira label."
+    : "Mapped moves sync Jira; Needs decision changes only its label; Failed and Cancelled stay Hive-only.";
+}
+
+export function jiraPanelNotice(jira: JiraTaskState | null): string | null {
+  const mode = jiraSyncMode(jira);
+  if (mode === "loading") return "Jira sync state is still loading.";
+  if (mode === "unconfigured") return "Jira sync is unconfigured or not allow-listed, so no cycle will run.";
+  if (mode === "paused") return "Jira sync is paused, so no cycle will run.";
+  if (mode === "shadow") return "Shadow mode: hive computes and logs every outbound change but sends none.";
+  return null;
+}
+
+export function jiraNextAutomaticText(jira: JiraTaskState | null): string {
+  const mode = jiraSyncMode(jira);
+  if (mode === "loading") return "sync state loading";
+  if (mode === "unconfigured") return "not configured";
+  if (mode === "paused") return "paused (sync disabled)";
+  return jira?.sync?.next_due_at ? relTime(jira.sync.next_due_at) : "—";
+}
+
+export function trackingBindingNotice(task: TaskDetail): string | null {
+  if (!isTrackingOnly(task) || (!task.agent_target && !task.worktree_path && !task.branch)) return null;
+  const location = task.worktree_path ?? task.branch ?? task.agent_target;
+  return `Inspect the preserved work at ${location} before cancelling; terminal tasks can then use cleanup.`;
+}
+
+export function JiraPanel({
+  task,
+  jira,
+  onSynced,
+}: {
+  task: TaskDetail;
+  jira: JiraTaskState | null;
+  onSynced: (s: JiraTaskState) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [resolving, setResolving] = useState<string | null>(null);
+  const key = jira?.issue_key ?? String(task.source_ref ?? "").replace(/^jira:/, "");
+  const sync = jira?.sync;
+  const pending = jira?.pending;
+  const pendingTotal = (pending?.comments ?? 0) + (pending?.receipts ?? 0);
+  const unknown = pending?.unknown ?? [];
+  const failing = (sync?.consecutive_failures ?? 0) > 0 && !!sync?.last_error;
+  const modeNotice = jiraPanelNotice(jira);
+
+  const retry = async () => {
+    setBusy(true);
+    try {
+      const r = await api.jiraSync(task.id);
+      toast(r.ok ? "Synced with Jira" : `Sync failed: ${r.error ?? "unknown error"}`);
+      onSynced(await api.jira(task.id));
+    } catch (e) {
+      toast((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resolveUnknown = async (action: "comment_push" | "receipt", sourceId: string) => {
+    setResolving(sourceId);
+    try {
+      onSynced(await api.jiraResolveDelivery(task.id, action, sourceId));
+      toast("Jira delivery marked resolved");
+    } catch (e) {
+      toast((e as Error).message);
+    } finally {
+      setResolving(null);
+    }
+  };
+
+  return (
+    <section className="panel jira-panel">
+      <h2>Jira</h2>
+
+      {jira?.browse_url ? (
+        <a className="pr pr-lg" href={jira.browse_url} target="_blank" rel="noreferrer" title={`Open ${key} in Jira`}>
+          Open {key} in Jira ↗
+        </a>
+      ) : (
+        <div className="muted">{key || "linked ticket"}</div>
+      )}
+
+      <dl className="jira-facts">
+        <dt>Assignee</dt>
+        <dd>{jira?.assignee ?? <span className="muted">unassigned</span>}</dd>
+        <dt>Last synced</dt>
+        <dd>{sync?.last_success_at ? relTime(sync.last_success_at) : <span className="muted">never</span>}</dd>
+        <dt>Next automatic</dt>
+        <dd>{jiraNextAutomaticText(jira)}</dd>
+        <dt>Unresolved outbound</dt>
+        <dd>
+          {pendingTotal === 0 ? (
+            <span className="muted">nothing unresolved</span>
+          ) : (
+            <span className="chip chip-pending">
+              {pending?.comments ? `${pending.comments} comment${pending.comments > 1 ? "s" : ""}` : ""}
+              {pending?.comments && pending?.receipts ? ", " : ""}
+              {pending?.receipts ? `${pending.receipts} report/evidence` : ""}
+            </span>
+          )}
+        </dd>
+      </dl>
+
+      {unknown.length > 0 && (
+        <div className="jira-error" role="alert">
+          <strong>Delivery outcome unknown</strong>
+          <p>Jira can accept a comment after Hive stops waiting. Hive will not retry because Jira does not enforce idempotency-key uniqueness. Check Jira, then resolve the item here.</p>
+          <ul>
+            {unknown.map((item) => (
+              <li key={`${item.action}:${item.source_id}`}>
+                <span className="chip">{item.action === "receipt" ? "report/evidence" : "comment"}</span>{" "}
+                <span className="muted">{item.text || item.error || item.source_id}</span>{" "}
+                <button
+                  className="btn btn-mini"
+                  onClick={() => resolveUnknown(item.action, item.source_id)}
+                  disabled={resolving === item.source_id}
+                >
+                  {resolving === item.source_id ? "Resolving…" : "I checked Jira · resolve"}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {modeNotice && <p className="muted">{modeNotice}</p>}
+
+      {/* A failure stays on screen until a later attempt actually succeeds. */}
+      {failing && (
+        <div className="jira-error" role="alert">
+          <strong>Sync failing</strong>
+          <p>{sync?.last_error}</p>
+          <p className="muted">
+            {sync?.consecutive_failures} consecutive failure{(sync?.consecutive_failures ?? 0) > 1 ? "s" : ""}
+            {sync?.last_error_at ? ` \u00b7 since ${relTime(sync.last_error_at)}` : ""}
+          </p>
+        </div>
+      )}
+
+      {/* Manual retry runs the SAME cycle the timer runs: a way to go sooner,
+          never a second code path that could succeed while the real one fails. */}
+      <button className="btn btn-mini" onClick={retry} disabled={busy}>
+        {busy ? "Syncing\u2026" : failing ? "Retry sync now" : "Sync now"}
+      </button>
+
+      {/* Delivery receipts: proof hive's reports and comments reached Jira, so
+          nobody re-sends something that already landed. */}
+      {!!jira?.delivered?.length && (
+        <div className="jira-receipts">
+          <h3>Delivered to Jira</h3>
+          <ul>
+            {jira.delivered.map((d, i) => (
+              <li key={i}>
+                <span className="chip">{String(d.action) === "receipt" ? "report/evidence" : "comment"}</span>{" "}
+                {d.jira_comment_id ? <span className="muted">#{String(d.jira_comment_id)}</span> : null}
+                {d.recovered ? <span className="muted"> &middot; receipt recovered</span> : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
+
 // board modal (see App.tsx / views/TaskModal.tsx).
 export function TaskBody({ id }: { id: string }) {
   const { rev, projects, tasks } = useStore();
   const lightbox = useLightbox();
   const [t, setT] = useState<TaskDetail | null>(null);
+  const [jira, setJira] = useState<JiraTaskState | null>(null);
   const [err, setErr] = useState<string>("");
   const [steer, setSteer] = useState("");
   const [steerFiles, setSteerFiles] = useState<File[]>([]);
@@ -282,6 +504,25 @@ export function TaskBody({ id }: { id: string }) {
     };
   }, [id, rev[id]]);
 
+  // Sync state for a mirrored Jira ticket. Re-polled on a short timer as well as
+  // on task changes, because "last synced 40s ago" is only reassuring if the
+  // number actually moves — a frozen timestamp is what makes people re-submit.
+  useEffect(() => {
+    let live = true;
+    const load = () => {
+      api
+        .jira(id)
+        .then((d) => live && setJira(d))
+        .catch(() => {});
+    };
+    load();
+    const timer = setInterval(load, 15_000);
+    return () => {
+      live = false;
+      clearInterval(timer);
+    };
+  }, [id, rev[id]]);
+
   if (err) return <div className="pad">Task not found: {err}</div>;
   if (!t) return <div className="pad">Loading…</div>;
 
@@ -295,6 +536,10 @@ export function TaskBody({ id }: { id: string }) {
   // reads); show them as a gallery instead and keep the paths out of the prose.
   const { body: briefBody, files: attachments } = splitAttachments(t.brief);
   const isJira = String(t.source_ref ?? "").startsWith("jira:");
+  const trackingOnly = isTrackingOnly(t);
+  const jiraMirror = isJiraMirror(t);
+  const codeReview = t.state === "in_review" && !trackingOnly;
+  const bindingNotice = trackingBindingNotice(t);
 
   const doTransition = async (to: string) => {
     try {
@@ -375,10 +620,10 @@ export function TaskBody({ id }: { id: string }) {
   const health = t.health;
   // A review has already left the agent's hands. A gone worker is expected at
   // this point, not a recovery action for the director.
-  const unhealthy = t.state !== "in_review" && health && health.status !== "healthy";
+  const unhealthy = !codeReview && health && health.status !== "healthy";
 
   return (
-    <div className={`task ${t.state === "in_review" ? "task-reviewing" : ""}`}>
+    <div className={`task ${codeReview ? "task-reviewing" : ""}`}>
       <div className="task-main">
         <div className="crumbs">
           <Link to="/work">← Work</Link>
@@ -389,7 +634,7 @@ export function TaskBody({ id }: { id: string }) {
             </>
           )}
         </div>
-        {t.state !== "in_review" && (
+        {!codeReview && (
           <>
             <h1 className="task-title">
               <StatusDot state={t.state} health={t.health} />{" "}
@@ -399,6 +644,17 @@ export function TaskBody({ id }: { id: string }) {
               {project && <span className="chip">{project.name}</span>}
               <span className={`chip chip-kind chip-${t.kind}`}>{t.kind}</span>
               <span className="chip">{STATE_LABEL[t.state]}</span>
+              {/* At a glance: this row IS a Jira ticket, and one click opens it.
+                  The link used to be plain text buried in the brief. */}
+              {isJira && (
+                jira?.browse_url ? (
+                  <a className="chip chip-jira" href={jira.browse_url} target="_blank" rel="noreferrer" title="Open this ticket in Jira">
+                    {jira.issue_key} ↗
+                  </a>
+                ) : (
+                  <span className="chip chip-jira">{String(t.source_ref ?? "").replace(/^jira:/, "")}</span>
+                )
+              )}
               <BlockedBy depends_on={t.depends_on} tasks={tasks} />
               {t.duplicate_of && (
                 <Link
@@ -421,26 +677,36 @@ export function TaskBody({ id }: { id: string }) {
               {health!.reason ? ` — ${health!.reason}` : ""} · since {relTime(health!.since)}
             </div>
             <div className="health-banner-actions">
-              {t.agent_target && (
+              {!jiraMirror && t.agent_target && (
                 <button className="btn btn-mini" onClick={viewAgent}>
                   View agent
                 </button>
               )}
-              {t.agent_target && (
+              {!jiraMirror && t.agent_target && (
                 <button className="btn btn-mini" onClick={nudge}>
                   Nudge
                 </button>
               )}
-              <button className="btn btn-mini btn-danger" onClick={failRequeue}>
-                Fail + requeue
-              </button>
+              {!trackingOnly && (
+                <button className="btn btn-mini btn-danger" onClick={failRequeue}>
+                  Fail + requeue
+                </button>
+              )}
             </div>
           </div>
         )}
 
-        {t.state === "in_review" && <ReviewCard task={t} onDone={refresh} />}
+        {bindingNotice && (
+          <div className="health-banner banner-stuck" role="alert">
+            <div className="health-banner-text">
+              <strong>Legacy Hive work attached</strong> — {bindingNotice}
+            </div>
+          </div>
+        )}
 
-        {t.state !== "in_review" && <CheckpointList events={t.events} />}
+        {codeReview && <ReviewCard task={t} onDone={refresh} />}
+
+        {!codeReview && <CheckpointList events={t.events} />}
 
         <section className="panel">
           <h2>Brief</h2>
@@ -477,7 +743,7 @@ export function TaskBody({ id }: { id: string }) {
           );
         })()}
 
-        {t.agent_target && !["done", "cancelled", "failed"].includes(t.state) && <PaneTerminal taskId={t.id} />}
+        {!jiraMirror && t.agent_target && !["done", "cancelled", "failed"].includes(t.state) && <PaneTerminal taskId={t.id} />}
 
         {children.length > 0 && (
           <section className="panel">
@@ -550,20 +816,27 @@ export function TaskBody({ id }: { id: string }) {
         </section>
       </div>
 
-      {t.state !== "in_review" && <aside className="task-side">
-        <section className="panel">
-          <h2>PR / CI</h2>
-          {t.pr_url ? (
-            <a className="pr pr-lg" href={t.pr_url} target="_blank" rel="noreferrer" title={`Pull request linked to #${t.number}`}>
-              View PR ↔ #{t.number}
-            </a>
-          ) : (
-            <div className="muted">No PR yet</div>
-          )}
-          <div className="ci-row">
-            <CiBadge status={t.ci_status} />
-          </div>
-        </section>
+      {!codeReview && <aside className="task-side">
+        {/* A mirrored Jira ticket is tracking-only: hive never builds it, so
+            there is no branch, no PR and no CI to report. Showing "No PR yet"
+            there reads as work pending rather than work that will never exist. */}
+        {isJira ? (
+          <JiraPanel task={t} jira={jira} onSynced={setJira} />
+        ) : !trackingOnly ? (
+          <section className="panel">
+            <h2>PR / CI</h2>
+            {t.pr_url ? (
+              <a className="pr pr-lg" href={t.pr_url} target="_blank" rel="noreferrer" title={`Pull request linked to #${t.number}`}>
+                View PR ↔ #{t.number}
+              </a>
+            ) : (
+              <div className="muted">No PR yet</div>
+            )}
+            <div className="ci-row">
+              <CiBadge status={t.ci_status} />
+            </div>
+          </section>
+        ) : null}
 
         {t.summary && (
           <section className="panel">
@@ -577,13 +850,14 @@ export function TaskBody({ id }: { id: string }) {
             other control here is neutral, and only the destructive transitions
             (cancel / fail) get danger styling. */}
         {(() => {
-          // A never-dispatched external task (tracking-only, never spawned —
-          // see supervision.ts) has no agent to steer and the server rejects
-          // spawning it automatically; only a deliberate manual dispatch can
-          // ever change that, so "Send steer" (unless it's a Jira comment,
-          // which always delivers) has nothing to reach.
-          const undispatchable = !!t.never_dispatched && !isJira;
-          const dispatchIsPrimary = t.state === "queued" && !isJira && !t.never_dispatched;
+          // Two separate reasons the steer box has nothing to reach, and they
+          // are NOT the same question. A never-dispatched external task (see
+          // supervision.ts) has no agent yet but a manual dispatch could still
+          // give it one. A tracking-only task never gets one at all. Jira is
+          // the exception in both cases: the box posts a COMMENT to the ticket,
+          // which always delivers, so it stays.
+          const undispatchable = (!!t.never_dispatched || jiraMirror) && !isJira;
+          const dispatchIsPrimary = t.state === "queued" && !isJira && !jiraMirror && !t.never_dispatched;
           return (
             <section className="panel">
               <h2>Actions</h2>
@@ -609,7 +883,7 @@ export function TaskBody({ id }: { id: string }) {
                   </button>
                 </div>
               )}
-              {t.agent_target && (
+              {!jiraMirror && t.agent_target && (
                 <button className="btn" onClick={viewAgent} title="Focus this agent's tab in herdr">
                   View agent
                 </button>
@@ -619,22 +893,31 @@ export function TaskBody({ id }: { id: string }) {
                   Dispatch now
                 </button>
               )}
-              {!isJira && (
+              {!trackingOnly && (
                 <button className="btn" onClick={planBreakdown} disabled={planning}>
                   {planning ? "Planning…" : "Plan breakdown"}
                 </button>
               )}
               <div className="transitions">
-                {(NEXT[t.state] || []).map((to) => (
+                {(NEXT[t.state] || []).filter((to) => !(trackingOnly && t.state === "failed" && to === "queued")).map((to) => (
                   <button
                     key={to}
                     className={`btn ${to === "cancelled" || to === "failed" ? "btn-danger" : ""}`}
                     onClick={() => doTransition(to)}
+                    title={isJira ? jiraMoveHint(t.state, to, jira) : undefined}
                   >
                     {STATE_LABEL[to]}
                   </button>
                 ))}
               </div>
+              {/* Moving a linked ticket writes to Jira. Saying so on the control
+                  itself is the difference between a deliberate action and a
+                  surprise a colleague notices in their ticket feed. */}
+              {isJira && (
+                <p className="muted jira-move-note">
+                  {jiraMoveSummary(t.state, jira)}
+                </p>
+              )}
             </section>
           );
         })()}

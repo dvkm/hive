@@ -12,7 +12,9 @@
     "seed": "bun run scripts/demo-seed.ts",
     "benchmark:autonomy": "bun run scripts/autonomy-benchmark.ts",
     "benchmark:score": "bun run scripts/autonomy-benchmark-score.ts",
-    "test": "bun test"
+    "docs:jira": "bun run scripts/generate-jira-write-scope.ts",
+    "docs:jira:check": "bun run scripts/generate-jira-write-scope.ts --check",
+    "test": "bun run docs:jira:check && bun test"
   },
   "devDependencies": {
     "@types/bun": "latest"

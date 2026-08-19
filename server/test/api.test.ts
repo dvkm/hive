@@ -122,6 +122,74 @@ test("agent-created task carries source + parent_task_id", async () => {
   expect(bad.status).toBe(400);
 });
 
+test("tracking-only tasks cannot mint direct, checkpoint, or learning work", async () => {
+  const tracking = await post("/api/tasks", {
+    project_id: projectId,
+    title: "Jira ownership boundary",
+    source: "external",
+  });
+  const child = await post("/api/tasks", {
+    project_id: projectId,
+    title: "forbidden child",
+    parent_task_id: tracking.json.id,
+  });
+  expect(child.status).toBe(409);
+
+  const prebound = await post("/api/tasks", {
+    project_id: projectId,
+    title: "forbidden binding",
+    source: "external",
+    agent_target: "legacy-agent",
+  });
+  // Rejected by createTask's own source=external + agent_target guard (400),
+  // which lands before the tracking-only ownership check would (hive-996).
+  expect(prebound.status).toBe(400);
+
+  const checkpoint = await post(`/api/tasks/${tracking.json.id}/events`, { type: "checkpoint", note: "needs agent follow-up" });
+  const flagged = await post(`/api/tasks/${tracking.json.id}/checkpoints/${checkpoint.json.event.id}/ack`, { verdict: "flag" });
+  expect(flagged.status).toBe(409);
+
+  const learning = await post("/api/learnings", {
+    project_id: projectId,
+    title: "tracking-only failure",
+    kind: "failure",
+    source_task_id: tracking.json.id,
+    create_root_cause_task: true,
+  });
+  expect(learning.status).toBe(409);
+  expect(db.query("SELECT COUNT(*) AS n FROM tasks WHERE parent_task_id = ?").get(tracking.json.id)).toEqual({ n: 0 });
+});
+
+test("the shared spawn boundary rejects external and Jira-linked tasks", async () => {
+  const external = await post("/api/tasks", {
+    project_id: projectId,
+    title: "external tracking only",
+    source: "external",
+  });
+  const linked = await post("/api/tasks", {
+    project_id: projectId,
+    title: "Jira-linked tracking only",
+    source: "agent",
+  });
+  db.query("UPDATE tasks SET source_ref = ? WHERE id = ?").run("jira:WEB-9999", linked.json.id);
+
+  // Both are refused at the shared spawn core, for DIFFERENT and both-correct
+  // reasons: the plain external task has never been dispatched (hive-996), the
+  // Jira-linked one mirrors someone else's ticket and never gets an agent at
+  // all. Asserting the specific reason keeps the two rules distinguishable.
+  for (const [id, reason] of [
+    [external.json.id, "never been spawned"],
+    [linked.json.id, "mirrors a Jira issue"],
+  ] as const) {
+    const result = await post(`/api/tasks/${id}/spawn`, {});
+    expect(result.status).toBe(502);
+    expect(result.json.error).toContain(reason);
+    expect((await get(`/api/tasks/${id}`)).json.state).toBe("queued");
+    const events = (await get(`/api/tasks/${id}/events`)).json;
+    expect(events.some((event: any) => ["spawned", "spawn_error"].includes(event.type))).toBe(false);
+  }
+});
+
 test("review_summary keeps its structured sections; empty submission is rejected", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "rs task" });
   const longQuestion = "cms-e2e.yml requires VITE_CMS_URL to use host.docker.internal:5175 rather than localhost:5175, even though both names can sound like the same Vite server. Given the reasoning that made this task's WEB_URL override safe, why would replacing host.docker.internal with localhost break this suite when the browser runs from a separate Docker container?";
@@ -274,18 +342,15 @@ test("checkpoints: emit -> listed open -> ack removes; flag steers; bad verdict 
   expect(open.json.checkpoints.some((c: any) => c.id === otherCheckpoint.json.event.id)).toBe(false);
 });
 
-test("tracking-only tasks move freely (done without evidence)", async () => {
+test("tracking-only tasks move freely without automatic smoke advancement", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "tracked by another agent", source: "external" });
   expect(t.json.source).toBe("external");
   await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
   await post(`/api/tasks/${t.json.id}/transition`, { to: "in_review" });
-  const done = await post(`/api/tasks/${t.json.id}/transition`, { to: "verifying" }); // auto-advance path
-  // no evidence, but external tasks skip the gate
-  expect(["done", "verifying"]).toContain(done.json.state);
-  if (done.json.state === "verifying") {
-    const d2 = await post(`/api/tasks/${t.json.id}/transition`, { to: "done" });
-    expect(d2.json.state).toBe("done");
-  }
+  const verifying = await post(`/api/tasks/${t.json.id}/transition`, { to: "verifying" });
+  expect(verifying.json.state).toBe("verifying");
+  const done = await post(`/api/tasks/${t.json.id}/transition`, { to: "done" });
+  expect(done.json.state).toBe("done");
 });
 
 test("checkpoints survive task completion; cancelled tasks drop out", async () => {
@@ -429,6 +494,20 @@ test("evidence upload round-trips through /evidence", async () => {
   expect(fetched.status).toBe(200);
   const bytes = new Uint8Array(await fetched.arrayBuffer());
   expect(Array.from(bytes)).toEqual([1, 2, 3, 4]);
+});
+
+test("evidence ingestion rejects malformed URLs", async () => {
+  const before = (await get(`/api/tasks/${taskId}`)).json.evidence.length;
+  const result = await post(`/api/tasks/${taskId}/events`, {
+    type: "evidence",
+    kind: "link",
+    url: "http://[",
+    note: "bad link",
+  });
+
+  expect(result.status).toBe(400);
+  expect(result.json.error).toContain("valid HTTP(S) URL or path");
+  expect((await get(`/api/tasks/${taskId}`)).json.evidence).toHaveLength(before);
 });
 
 test("evidence kind is inferred from the uploaded file's extension", async () => {

@@ -399,6 +399,19 @@ test("idle backstop never re-reviews after changes_requested until new evidence 
   expect(advanceIfFinished(db, id, "idle", "test")).toBe(true); // visible new work → review
 });
 
+test("tracking-only tasks never enter automatic review handoffs", async () => {
+  const { advanceIfFinished } = await import("../src/state.ts");
+  const { handOffToReview } = await import("../src/api.ts");
+  const id = await newTask("externally tracked");
+  db.query("UPDATE tasks SET state = 'in_progress', source = 'external', source_ref = 'jira:WEB-1', pr_url = 'https://gh/pr/9' WHERE id = ?").run(id);
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    "evd_tracking_handoff", id, new Date().toISOString(), "log", "/tmp/proof.log", "proof"
+  );
+  expect(advanceIfFinished(db, id, "idle", "reconciler")).toBe(false);
+  expect(handOffToReview(db, id, "reconciler")).toBe(false);
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_progress");
+});
+
 test("a director answer keeps an old report and quiz out of review until regenerated", async () => {
   const { decisionAnswerUnaddressed, writeEvent } = await import("../src/state.ts");
   const id = await newTask("refresh after my answer");

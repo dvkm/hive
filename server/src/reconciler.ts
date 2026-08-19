@@ -11,7 +11,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, TERMINAL, type State } from "./state.ts";
+import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, isTrackingOnlyTask, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent } from "./steer.ts";
 import { isReviewed } from "./dispatcher.ts";
@@ -19,7 +19,7 @@ import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
-import { supervisedSql, neverDispatched } from "./supervision.ts";
+import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
 import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision } from "./api.ts";
@@ -44,6 +44,16 @@ export interface ReconcilerDeps {
 }
 
 const DEFAULT_STALE_MS = 15 * 60 * 1000;
+
+function isTrackingOnlyId(db: DB, id: string): boolean {
+  const task = getTask(db, id);
+  return !!task && isTrackingOnlyTask(task);
+}
+
+function isJiraMirrorId(db: DB, id: string): boolean {
+  const task = getTask(db, id);
+  return !!task && isJiraMirror(task);
+}
 
 export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<void> {
   const startedAt = Date.now();
@@ -71,6 +81,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   const logRun = (outcome: string) => {
     console.log(`[hive] reconciler run: duration_ms=${Date.now() - startedAt} steps=${steps} errors=${errors} outcome=${outcome}`);
   };
+  await step("surfaceTrackingBindings", () => surfaceTrackingBindings(db));
   await step("syncAgents", () => syncAgents(db, deps));
   await step("drainSteers", () => drainSteers(db, deps));
   await step("advanceFinished", () => advanceFinished(db, deps));
@@ -96,6 +107,36 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   logRun(errors > 0 ? "error" : "ok");
 }
 
+export function surfaceTrackingBindings(db: DB): void {
+  const tasks = db
+    .query("SELECT id, number, title, source, source_ref, agent_target, worktree_path, branch FROM tasks WHERE agent_target IS NOT NULL OR worktree_path IS NOT NULL OR branch IS NOT NULL")
+    .all() as any[];
+  for (const task of tasks) {
+    if (!isTrackingOnlyTask(task)) continue;
+    if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'tracking_binding_detected' LIMIT 1").get(task.id))
+      continue;
+    const location = task.worktree_path ?? task.branch ?? task.agent_target ?? "unknown binding";
+    writeEvent(db, {
+      task_id: task.id,
+      source: "reconciler",
+      type: "tracking_binding_detected",
+      payload: {
+        note: `Legacy Hive work is still attached at ${location}. Inspect it before cancelling; terminal tasks can then use the cleanup action.`,
+        agent_target: task.agent_target,
+        worktree_path: task.worktree_path,
+        branch: task.branch,
+      },
+    });
+    enqueue(db, {
+      kind: "tracking_binding",
+      urgency: "urgent",
+      task_id: task.id,
+      title: `Legacy Hive work attached to tracking-only task #${task.number}: ${task.title}`,
+      body: `Inspect ${location} before cancelling the task, then run cleanup once it is terminal. The binding was preserved.`,
+    });
+  }
+}
+
 // ---- agent status sync ----
 // Probe every agent-bearing task. A vanished agent is recorded as status
 // `gone` (so health can show "dead" within one cycle); a live status change is
@@ -106,6 +147,7 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
     .query(`SELECT id, agent_target FROM tasks WHERE agent_target IS NOT NULL AND state IN ${NON_TERMINAL}`)
     .all() as { id: string; agent_target: string }[];
   for (const t of tasks) {
+    if (isJiraMirrorId(db, t.id)) continue;
     const { alive, status } = await h.probe(t.agent_target);
     const next = alive ? status : "gone";
     if (next === "unknown") continue; // couldn't determine; leave prior status intact
@@ -160,6 +202,7 @@ async function drainSteers(db: DB, deps: ReconcilerDeps): Promise<void> {
     .query(`SELECT id, agent_target FROM tasks WHERE agent_target IS NOT NULL AND state IN ${NON_TERMINAL}`)
     .all() as { id: string; agent_target: string }[];
   for (const t of tasks) {
+    if (isJiraMirrorId(db, t.id)) continue;
     const pending = queuedSteers(db, t.id);
     if (!pending.length) continue; // the common case: no probe, no herdr call
     // Dead agent → leave them queued; the next spawn's brief carries them. A herdr
@@ -227,6 +270,11 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     .all() as { id: string; state: string; pr_url: string; ci_status: string | null; head_sha: string | null; agent_target: string | null; project_id: string; branch: string | null }[];
 
   for (const t of tasks) {
+    // A Jira mirror has no hive-owned PR at all, so there is nothing to record;
+    // skip it outright. A non-Jira external task DOES get its observed PR facts
+    // recorded (ci_status, head_sha, ...) and is skipped further down, at the
+    // ACTIONABLE phase only — see the neverDispatched guard below (hive-996).
+    if (isJiraMirrorId(db, t.id)) continue;
     const r = await exec(["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup,mergeable,headRefOid,baseRefName,baseRefOid"]);
     if (r.code !== 0) continue; // gh unavailable / auth: skip, try next cycle
     let data: any;
@@ -551,6 +599,7 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     )
     .all() as { id: string; number: number; title: string; kind: string; config: string }[];
   for (const r of rows) {
+    if (isTrackingOnlyId(db, r.id)) continue;
     let kinds: string[] = [];
     try {
       const c = JSON.parse(r.config ?? "{}");
@@ -619,6 +668,7 @@ export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()
     )
     .all() as { id: string; task_id: string; ts: string; title: string; options: string; config: string }[];
   for (const r of rows) {
+    if (isTrackingOnlyId(db, r.task_id)) continue;
     let hours = 0;
     try {
       hours = Number(JSON.parse(r.config ?? "{}").decision_auto_answer_hours) || 0;
@@ -683,6 +733,7 @@ export async function sweepVerifying(db: DB, deps: ReconcilerDeps = {}): Promise
     .query("SELECT id, title, updated_at FROM tasks WHERE state = 'verifying'")
     .all() as { id: string; title: string; updated_at: string }[];
   for (const r of rows) {
+    if (isTrackingOnlyId(db, r.id)) continue;
     if (nowMs - Date.parse(r.updated_at) < VERIFY_WEDGE_MS) continue;
     try {
       await smokeThenAdvance(db, r.id, deps.smoke ?? {});
@@ -753,6 +804,7 @@ export function unparkAnswered(db: DB, nowMs: number = Date.now()): void {
     )
     .all() as { id: string; updated_at: string }[];
   for (const r of rows) {
+    if (isTrackingOnlyId(db, r.id)) continue;
     if (nowMs - Date.parse(r.updated_at) < UNPARK_GRACE_MS) continue;
     transition(db, r.id, "in_progress", {
       source: "reconciler",
@@ -791,6 +843,7 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
     )
     .all(nowIso) as { id: string }[];
   for (const t of tasks) {
+    if (isJiraMirrorId(db, t.id)) continue;
     // Held by the dependency gate: advanceFinished refuses to advance it and
     // dependency_blocked is deduped, so it stays intentionally quiet — never
     // stale (skipping the flag also spares it recoverStale, which the flag drives).
@@ -840,6 +893,12 @@ async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
     // verifying) is owned by a human/the merge flow: a gone agent there is expected
     // (its work is done), so it must NOT be failed/requeued.
     const cur = getTask(db, t.id);
+    // A JIRA MIRROR never has an agent of hive's, so there is nothing to
+    // recover. A plain source='external' task with agent_target set DOES have
+    // one (a recovery respawn, or a legacy pre-#996 manual dispatch), and a
+    // dead agent there must still be failed rather than left in_progress
+    // forever — scoping this to mirrors is what keeps both true.
+    if (cur && isJiraMirror(cur)) continue;
     if (cur && (cur.state === "in_review" || cur.state === "verifying")) continue;
     // Deferred pending a human action: neither nudge nor fail it (the goneNow
     // branch below would otherwise fail an idle-but-deferred task) — task #679.
@@ -962,6 +1021,7 @@ export function resumeUsageLimited(db: DB, nowMs: number = Date.now()): void {
     )
     .all() as { task_id: string; resume_at: string | null }[];
   for (const r of rows) {
+    if (isJiraMirrorId(db, r.task_id)) continue;
     if (!r.resume_at || Date.parse(r.resume_at) > nowMs) continue;
     queueSteerEvent(
       db,

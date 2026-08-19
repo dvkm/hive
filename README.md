@@ -184,16 +184,6 @@ server/test/ bun test suite
   `JIRA_API_TOKEN` (keychain; never in the DB). Note `/rest/api/3/search` is
   removed (410); this uses `/search/jql`.
 
-  Field ownership avoids most conflicts by construction: Jira owns
-  summary/description/type/priority/labels (hive never writes them back), while
-  status and comments sync both ways. hive marks active unassigned issues with
-  the sync account, but never replaces or clears a human assignee. Status maps
-  `To Do/In Progress/In Review/Done` against `queued/in_progress/in_review/done`.
-  hive's `needs_decision` has no Jira status, so it rides as a
-  `hive:needs-decision` label added and removed on top of whatever status the
-  issue already has. `verifying` shows as In Review (merged is not Done to a
-  human); `failed`/`cancelled` never move Jira.
-
   Conflicts resolve by newest status-change time, read from the issue CHANGELOG
   and never from `fields.updated` (which also moves for comments and label edits,
   so it would let an unrelated edit win a status tiebreak). Every overwrite
@@ -253,3 +243,66 @@ server/test/ bun test suite
   cards write an `auto_approved` audit event tagged `source="chat_supervisor"`;
   declined cards stay open, log `auto_approve_declined`, and return `403` so the
   supervisor escalates. Everything else routes to the director as before.
+
+## v5 notes (JIRA bidirectional sync)
+
+- **JIRA sync** (`server/src/intake/jira.ts`) mirrors one Atlassian Jira project
+  onto the board and keeps `status` in step BOTH ways, every `HIVE_JIRA_SYNC_MS`
+  (default 60s). No new tables: `tasks.source_ref` (`jira:WEB-7`, already
+  UNIQUE-indexed) is the task↔issue link and `intake_cursors` holds the distinct
+  direct-missing and scope-absence streaks. Per-project `config.jira`:
+  `{site, email, project_key, enabled, write, jql?}`. Two independent gates —
+  `enabled` (master switch) and `write` (shadow mode) — both default to **false**,
+  so the connector is a hard no-op until opted in, and read-only until opted in
+  again. Under `write: false` every outbound call is computed and LOGGED but never
+  sent, including on the first cycle, so a director can read one full
+  "would have done X" pass before hive touches a real issue.
+<!-- BEGIN GENERATED JIRA WRITE SCOPE -->
+- **Field ownership.** Jira owns `summary`, `description`, `issue type`, `priority`, and all labels except `hive:needs-decision`. Hive's generated write scope is `status`, `comments` and evidence receipts, and `hive:needs-decision` label; everything else flows Jira → hive only. **hive never writes the assignee at all.** It reads the field to display it and stops there because Jira Cloud has no compare-and-swap across the separate check and write requests, so "a human's assignment is never touched" only holds absolutely if hive never touches it (dec_234877ea4617). `GET /api/tasks/:id/jira` exposes the same registry as `write_scope`. `needs_decision` has no Jira status, `verifying` maps to In Review, and `failed` and `cancelled` never move Jira.
+<!-- END GENERATED JIRA WRITE SCOPE -->
+- **Idempotent comments and receipts with contained unknowns.** Jira comments
+  become timeline entries; hive-side comments are an outbox drained on the next
+  cycle; and hive's reports and evidence reach the ticket with links back into
+  hive. Every comment hive writes carries a Jira comment *property* naming the
+  local row that produced it. A later cycle can recover a missing local receipt
+  when that property is visible. Jira does not enforce property uniqueness, so
+  there is a real late-arrival window where a timed-out request may still land
+  after hive checked the ticket. Hive contains that unknown instead of retrying:
+  it remains visibly unresolved until the property appears or a human checks Jira
+  and resolves it. Hive therefore never knowingly posts twice and never silently
+  drops an ambiguous delivery, but it does not claim atomic uniqueness.
+- **Visible sync state.** Every attempt records last success, last error,
+  consecutive failures and next due (`intake_cursors`, source `jira-state`), so
+  the board can answer "did it run?" without anyone guessing. A failure stays
+  visible until a later attempt actually succeeds. `GET /api/tasks/:id/jira`
+  serves that plus what is still unresolved; `POST /api/tasks/:id/jira/sync`
+  is the manual retry and runs the SAME per-project cycle the timer runs, so it
+  can never succeed while the automatic path keeps failing.
+- **Converging reconciler, not webhooks.** hive binds loopback and has no public
+  ingress, so Jira Cloud cannot reach it. Polling is also the safer design: a
+  cycle writes only when the two sides actually differ, so a sync-driven write
+  leaves them agreeing and the next cycle finds nothing to do. Loop prevention is
+  structural rather than a marker every code path must remember to check. The
+  agreement test compares JIRA-STATUS space, not hive-state space, because the
+  mapping is 2:1 (`in_review` and `verifying` both show as "In Review").
+- **Credential gate.** `config` is writable through the loopback API, so the site
+  and email are pinned to compiled-in constants (`credentialTargetAllowed`),
+  matched EXACTLY — https only, no userinfo, no suffix match, since Atlassian
+  Cloud sites are self-serve and `*.atlassian.net` would be free for an attacker
+  to register. The gate runs before secret resolution and before any auth header
+  exists; a mismatch yields `null` (hard no-op). Adding a site is a PR.
+- **Eventual consistency.** Jira's enhanced search is treated as DISCOVERY-ONLY:
+  it returns candidate keys, and every per-issue action derives from one fresh,
+  strongly-consistent read (status and its timestamp taken from the same
+  changelog record, via the paginated changelog endpoint — search's
+  `expand=changelog` truncates at 20 entries). Every Jira write re-reads
+  immediately before acting and aborts visibly if the premise moved. Scope that
+  cannot be CONFIRMED blocks writes. A linked issue omitted by search is
+  strong-read before either absence streak changes. A direct issue-read 404
+  advances only the missing streak; a coherent out-of-scope observation
+  advances only the separate scope streak; an in-scope observation resets both;
+  and an operational failure leaves both unchanged while failing the cycle
+  visibly. Neither signal deletes or terminally transitions the task. After
+  `ABSENT_STREAK_LIMIT` consecutive observations of one kind it earns one
+  visible `sync_stopped` event and then goes quiet. Auth is HTTP Basic (`email:api_token`);
+  bearer is rejected by this site with a Connect-JWT parse error.

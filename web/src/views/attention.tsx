@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
 import type { Task } from "../lib/api";
-import { taskNeedsAttention } from "../lib/needsYou";
+import { isTrackingOnly, taskNeedsAttention } from "../lib/needsYou";
 import { Attach, HEALTH_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 
@@ -16,6 +16,7 @@ export function FailedRow({ task }: { task: Task }) {
   const project = projects.find((p) => p.id === task.project_id);
   const age = useRelTime(task.updated_at);
   const [editing, setEditing] = useState(false);
+  const trackingOnly = isTrackingOnly(task);
   const act = async (fn: () => Promise<unknown>, msg: string) => {
     try {
       await fn();
@@ -34,17 +35,21 @@ export function FailedRow({ task }: { task: Task }) {
       <span className="attn-reason">{task.summary || "failed — awaiting triage"}</span>
       <span className="attn-age">{age}</span>
       <div className="attn-actions">
-        <button className="btn btn-mini" onClick={() => act(() => api.transition(task.id, "queued", "requeued"), "Re-queued")}>
-          Requeue
-        </button>
-        <button className="btn btn-mini" onClick={() => setEditing(true)}>
-          Edit &amp; requeue
-        </button>
+        {!trackingOnly && (
+          <>
+            <button className="btn btn-mini" onClick={() => act(() => api.transition(task.id, "queued", "requeued"), "Re-queued")}>
+              Requeue
+            </button>
+            <button className="btn btn-mini" onClick={() => setEditing(true)}>
+              Edit &amp; requeue
+            </button>
+          </>
+        )}
         <button className="btn btn-mini btn-danger" onClick={() => act(() => api.transition(task.id, "cancelled", "dismissed from tray"), "Cancelled")}>
           Cancel
         </button>
       </div>
-      {editing && <EditRequeueModal task={task} onClose={() => setEditing(false)} />}
+      {editing && !trackingOnly && <EditRequeueModal task={task} onClose={() => setEditing(false)} />}
     </div>
   );
 }
@@ -54,6 +59,7 @@ export function UnhealthyRow({ task }: { task: Task }) {
   const { projects } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
   const age = useRelTime(task.health?.since || task.updated_at);
+  const trackingOnly = isTrackingOnly(task);
   const act = async (fn: () => Promise<unknown>, msg: string) => {
     try {
       await fn();
@@ -75,19 +81,21 @@ export function UnhealthyRow({ task }: { task: Task }) {
       </span>
       <span className="attn-age">{age}</span>
       <div className="attn-actions">
-        {task.agent_target && (
+        {!trackingOnly && task.agent_target && (
           <button className="btn btn-mini" onClick={() => act(async () => { const r = await api.focusAgent(task.id); if (!r.ok) throw new Error(r.error); }, "Focused agent tab")}>
             View agent
           </button>
         )}
-        {task.agent_target && (
+        {!trackingOnly && task.agent_target && (
           <button className="btn btn-mini" onClick={() => act(() => api.send(task.id, "hive: status? Reply with what you're doing or what's blocking you."), "Nudge sent")}>
             Nudge
           </button>
         )}
-        <button className="btn btn-mini btn-danger" onClick={() => act(() => api.requeue(task.id), "Failed & requeued")}>
-          Fail + requeue
-        </button>
+        {!trackingOnly && (
+          <button className="btn btn-mini btn-danger" onClick={() => act(() => api.requeue(task.id), "Failed & requeued")}>
+            Fail + requeue
+          </button>
+        )}
       </div>
     </div>
   );
@@ -99,6 +107,7 @@ export function EditRequeueModal({ task, onClose }: { task: Task; onClose: () =>
   const [brief, setBrief] = useState(task.brief || "");
   const [files, setFiles] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
+  if (isTrackingOnly(task)) return null;
   const submit = async () => {
     if (!title.trim() || busy) return;
     setBusy(true);

@@ -177,6 +177,72 @@ export function eventText(e: EventLike): string {
       return s(p.status) === "resolved"
         ? `monitor recovered: ${s(p.monitor)}`
         : `monitor down: ${s(p.monitor)}${s(p.detail) ? ` — ${s(p.detail)}` : ""}`;
+    // Jira sync rows used to render as the bare words "jira sync", which told a
+    // reader nothing about what happened or which way it went. Every action gets
+    // a sentence naming the issue, the direction, and the outcome.
+    case "jira_sync": {
+      const issue = s(p.issue);
+      const at = issue ? ` ${issue}` : "";
+      const action = s(p.action);
+      const outcome = s(p.outcome);
+      const confirmed = outcome === "ok" || outcome === "recovered" || p.recovered === true;
+      // A write recorded before its response came back, then never confirmed.
+      if (outcome === "unknown" || outcome === "terminal_unknown") return `Jira${at}: ${action.replace(/_/g, " ")} may not have completed — ${s(p.error) || "no response"}`;
+      if (outcome === "failed") return `Jira${at}: ${action.replace(/_/g, " ")} failed — ${s(p.error) || "Jira rejected the request"}`;
+      if (outcome === "resolved") return `Jira${at}: ${action.replace(/_/g, " ")} uncertainty resolved after manual check`;
+      if (outcome === "rejected") return `Jira${at}: ${action.replace(/_/g, " ")} rejected — ${s(p.error) || "invalid outbound item"}`;
+      if (p.aborted) return `Jira${at}: ${action.replace(/_/g, " ")} aborted — ${s(p.aborted)}`;
+      if (p.blocked) return `Jira${at}: ${action.replace(/_/g, " ")} not sent — ${s(p.blocked)}`;
+      switch (action) {
+        case "import":
+          return `mirrored from Jira${at}${s(p.jira_status) ? ` (${s(p.jira_status)})` : ""}`;
+        case "pull":
+          return `Jira${at} moved to ${s(p.jira_status) || s(p.to)} — task follows`;
+        case "push":
+          if (p.shadow === true) return `would send status to Jira${at}: ${s(p.to)} — not sent`;
+          if (outcome === "sending") return `about to send status to Jira${at}: ${s(p.to)}`;
+          return confirmed
+            ? `status sent to Jira${at}: ${s(p.to)}`
+            : `status change for Jira${at} to ${s(p.to)} is not confirmed`;
+        case "label": {
+          const verb = p.present ? "add" : "remove";
+          const target = `Jira label ${s(p.label)}${at ? ` on${at}` : ""}`;
+          if (p.shadow === true) return `would ${verb} ${target} — not sent`;
+          if (outcome === "sending") return `about to ${verb} ${target}`;
+          return confirmed ? `${p.present ? "added" : "removed"} ${target}` : `${target} change is not confirmed`;
+        }
+        case "comment_push":
+          if (p.recovered) return `comment to Jira${at} confirmed already delivered`;
+          if (outcome === "sending") return `sending comment to Jira${at}…`;
+          return `comment delivered to Jira${at}`;
+        case "comment_shadow":
+          return `comment queued for Jira${at} (shadow: not sent)`;
+        case "receipt":
+          if (p.recovered) return `report/evidence for Jira${at} confirmed already delivered`;
+          if (outcome === "sending") return `delivering report/evidence to Jira${at}…`;
+          return `report/evidence delivered to Jira${at}`;
+        case "receipt_shadow":
+          return `report/evidence ready for Jira${at} (shadow: not sent)`;
+        case "comment_sync_skipped":
+          return `Jira${at}: comment sync skipped this cycle — ${s(p.reason)}`;
+        case "unmapped_status":
+          return `Jira${at} is in "${s(p.jira_status)}", which hive has no equivalent for — left alone`;
+        case "out_of_scope":
+          return `Jira${at} is no longer in the synced project scope`;
+        case "sync_stopped":
+          return `stopped syncing Jira${at} — ${s(p.reason)}`;
+        case "pull_deferred":
+          return `held off following Jira${at} — ${s(p.reason)}`;
+        default:
+          return `Jira${at}: ${action.replace(/_/g, " ") || "sync"}`;
+      }
+    }
+    case "jira_comment": {
+      const issue = s(p.issue);
+      const at = issue ? ` on ${issue}` : "";
+      if (s(p.direction) === "inbound") return `Jira comment${at} from ${s(p.author) || "someone"}`;
+      return `comment queued for Jira${at}`;
+    }
     default: {
       const words = e.type.replace(/[_-]+/g, " ");
       const note = s(p.note);
@@ -264,5 +330,8 @@ export function isFailureEvent(e: EventLike): boolean {
   if (e.type === "steer") return p.delivery === "failed";
   if (e.type === "recovery_nudge" || e.type === "dialog_answered" || e.type === "dialog_auto_approved" || e.type === "dialog_auto_declined")
     return p.delivered === false;
+  // "Jira may have accepted it but we never saw the response" is a real, durable unknown:
+  // it must not read the same as a clean success in the failure history.
+  if (e.type === "jira_sync") return p.outcome === "unknown" || p.outcome === "terminal_unknown" || p.outcome === "failed" || !!p.blocked;
   return e.type === "changes_requested" && !!p.send_error;
 }
