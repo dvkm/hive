@@ -102,6 +102,7 @@ function ProjectCard({
   onChanged: () => void;
 }) {
   const archived = p.config?.archived === true;
+  const isTest = p.config?.test === true;
   const autoDispatch = p.config?.auto_dispatch === true;
   const monitors = (p.config?.monitors?.length as number) || 0;
   const total = COUNT_STATES.reduce((n, s) => n + (counts[s] || 0), 0);
@@ -118,6 +119,7 @@ function ProjectCard({
         <div className="proj-name">
           {p.name}
           {archived && <span className="chip chip-off">archived</span>}
+          {isTest && <span className="chip chip-off" title="repo_path pointed at a worktree/scratchpad — hidden from tasks/decisions/notifications">test</span>}
         </div>
         <div className="spacer" />
         <button className="link-btn" onClick={onToggleOpen}>

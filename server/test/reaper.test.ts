@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, getSetting, type DB } from "../src/db.ts";
-import { reapOnce, taskIdFromBranch, taskIdFromCwd, sweepOrphanedAgents, sweepOrphanedPanes } from "../src/reaper.ts";
+import { reapOnce, taskIdFromBranch, taskIdFromCwd, sweepOrphanedAgents, sweepOrphanedPanes, sweepFinishedTestProjects } from "../src/reaper.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -256,4 +256,50 @@ test("sweepOrphanedAgents defers to cleanupTask for a TERMINAL task's lingering 
   // preserved: the sweep must NOT bypass cleanupTask's guard and close it directly
   expect(calls.some((c) => has(c, "tab", "close"))).toBe(false);
   expect(db.query("SELECT * FROM events WHERE task_id = 'TERM1' AND type = 'cleanup_skipped'").all().length).toBe(1);
+});
+
+// ---- sweepFinishedTestProjects (#1020): a test/ephemeral project (config.test
+// = true) auto-archives once every task it owns is terminal.
+function makeTestProject(db: DB, name: string): string {
+  const id = newId("proj");
+  db.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run(
+    id, name, JSON.stringify({ test: true }), now()
+  );
+  return id;
+}
+function isArchived(db: DB, projectId: string): boolean {
+  const row = db.query("SELECT config FROM projects WHERE id = ?").get(projectId) as { config: string };
+  return JSON.parse(row.config).archived === true;
+}
+
+test("sweepFinishedTestProjects archives a test project once every task it owns is terminal", () => {
+  const { db } = freshDb();
+  const testProjectId = makeTestProject(db, "scratch");
+  seedTask(db, testProjectId, "S1", "done");
+  seedTask(db, testProjectId, "S2", "cancelled");
+  sweepFinishedTestProjects(db);
+  expect(isArchived(db, testProjectId)).toBe(true);
+});
+
+test("sweepFinishedTestProjects leaves a test project alone while any task is still live", () => {
+  const { db } = freshDb();
+  const testProjectId = makeTestProject(db, "scratch");
+  seedTask(db, testProjectId, "S3", "done");
+  seedTask(db, testProjectId, "S4", "in_progress");
+  sweepFinishedTestProjects(db);
+  expect(isArchived(db, testProjectId)).toBe(false);
+});
+
+test("sweepFinishedTestProjects leaves a test project with zero tasks alone", () => {
+  const { db } = freshDb();
+  const testProjectId = makeTestProject(db, "scratch");
+  sweepFinishedTestProjects(db);
+  expect(isArchived(db, testProjectId)).toBe(false);
+});
+
+test("sweepFinishedTestProjects never touches a non-test project", () => {
+  const { db, projectId } = freshDb();
+  seedTask(db, projectId, "S5", "done");
+  sweepFinishedTestProjects(db);
+  expect(isArchived(db, projectId)).toBe(false);
 });

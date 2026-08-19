@@ -77,6 +77,12 @@ export async function reapOnce(db: DB, deps: ReaperDeps = {}): Promise<void> {
     console.error("[hive] reaper pane sweep:", e); // isolated; never crash the sweep
   }
 
+  try {
+    sweepFinishedTestProjects(db);
+  } catch (e) {
+    console.error("[hive] reaper test-project sweep:", e); // isolated; never crash the sweep
+  }
+
   // Liveness heartbeat, written only once a cycle COMPLETES so a wedged sweep
   // (e.g. a hung `git worktree list`) ages toward stale instead of a fresh
   // setInterval tick re-marking it. See dispatcher.ts.
@@ -177,6 +183,36 @@ export async function sweepOrphanedPanes(db: DB, deps: ReaperDeps = {}): Promise
     } catch (e) {
       console.error(`[hive] reaper orphan pane ${taskId}:`, e); // isolated; never crash the sweep
     }
+  }
+}
+
+// A test/ephemeral project (config.test = true, see testProjects.ts) auto-
+// archives once every task it owns is terminal — the "auto-reap" half of
+// #1020: scratch board noise from an agent's own live E2E run clears itself
+// instead of sitting in the project list forever. A project with zero tasks
+// yet is left alone (just created, not "finished"). Archiving (not deleting)
+// reuses the existing hide mechanism GET /api/projects already has for
+// config.archived, and keeps the row around in case someone needs to check
+// what happened.
+export function sweepFinishedTestProjects(db: DB): void {
+  const projects = db
+    .query(
+      `SELECT id, config FROM projects
+        WHERE COALESCE(json_extract(config, '$.test'), 0) = 1
+          AND COALESCE(json_extract(config, '$.archived'), 0) = 0`
+    )
+    .all() as { id: string; config: string }[];
+  for (const p of projects) {
+    const states = (db.query("SELECT state FROM tasks WHERE project_id = ?").all(p.id) as { state: string }[]).map((r) => r.state);
+    if (!states.length || states.some((s) => !TERMINAL.includes(s as State))) continue;
+    let config: any;
+    try {
+      config = JSON.parse(p.config);
+    } catch {
+      config = {};
+    }
+    config.archived = true;
+    db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify(config), p.id);
   }
 }
 

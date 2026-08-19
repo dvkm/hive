@@ -14,6 +14,7 @@ import { newId, now } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { pushToAll } from "./push.ts";
 import type { Exec } from "./exec.ts";
+import { notTestProjectSql } from "./testProjects.ts";
 
 export type Urgency = "normal" | "urgent";
 
@@ -42,10 +43,21 @@ async function osaNotify(exec: Exec, title: string, message: string): Promise<vo
   }
 }
 
+// A task under a test/ephemeral project (see testProjects.ts) never pushes a
+// notification — no OS push, no digest entry, no bell count. That's the exact
+// pain an agent's own live E2E run caused (task #1020): real notifications
+// firing for scratch decisions/tasks it created by mistake.
+function isTestProjectTask(db: DB, taskId: string): boolean {
+  return !!db
+    .query(`SELECT 1 FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id = ? AND NOT ${notTestProjectSql("p.config")}`)
+    .get(taskId);
+}
+
 // Enqueue a notification: insert the row + SSE broadcast. Urgent notifications
 // deliver immediately (marking delivered_at) via the configured exec; normal
 // ones wait for the digest. `deps.exec` overrides the module notifier (tests).
 export function enqueue(db: DB, n: NotifInput, deps: { exec?: Exec } = {}): any {
+  if (n.task_id && isTestProjectTask(db, n.task_id)) return null;
   const urgency: Urgency = n.urgency ?? "normal";
   const exec = deps.exec ?? notifier;
   const row = {

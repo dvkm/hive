@@ -186,6 +186,7 @@ export interface Project {
     playbook?: string;
     autonomy_profile?: "conservative" | "balanced" | "autopilot";
     archived?: boolean;
+    test?: boolean;
     [k: string]: unknown;
   };
   created_at: string;
@@ -664,7 +665,7 @@ export const api = {
     req<AuthorityRule>(`/api/authority/rules/${id}`, { method: "PUT", body: JSON.stringify(b) }),
 
   projects: (opts: { archived?: boolean } = {}) =>
-    req<Project[]>(`/api/projects${opts.archived ? "?archived=all" : ""}`),
+    req<Project[]>(`/api/projects${opts.archived ? "?archived=all&test=all" : ""}`),
   createProject: (b: { name: string; repo_path: string; config?: Project["config"] }) =>
     req<Project>(`/api/projects`, { method: "POST", body: JSON.stringify(b) }),
   updateProject: (id: string, b: { config?: Project["config"]; name?: string; repo_path?: string | null }) =>
