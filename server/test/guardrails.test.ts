@@ -218,6 +218,7 @@ test("dismissing an authority card denies the grant and steers the agent", async
     action: "command.dangerous.process-kill",
     target: "pkill -f vite",
     detail: "command approval (dangerous): process kill",
+    summary: "free the vite dev server port",
   });
   expect(g1.status).toBe(409);
   const d1 = g1.json.decision_id;
@@ -231,6 +232,7 @@ test("dismissing an authority card denies the grant and steers the agent", async
     action: "command.dangerous.process-kill",
     target: "pkill -f vite",
     detail: "command approval (dangerous): process kill",
+    summary: "free the vite dev server port",
   });
   expect(g2.status).toBe(409);
   expect(g2.json.decision_id).not.toBe(d1);
@@ -244,6 +246,7 @@ test("open decisions nag urgently at 15m and again at 60m, once per tier", async
     action: "command.dangerous.recursive-forced-rm",
     target: "rm -rf /somewhere",
     detail: "command approval (dangerous): recursive/forced rm",
+    summary: "clear a scratch directory",
   });
   const decisionId = r.json.decision_id;
   const t0 = Date.parse(
@@ -328,6 +331,7 @@ test("needs_decision with no open card unparks after the grace period", async ()
     action: "command.dangerous.recursive-forced-rm",
     target: "rm -rf /x",
     detail: "command approval (dangerous): recursive/forced rm",
+    summary: "clear a scratch directory",
   });
   expect(g.status).toBe(409);
   await post(`/api/tasks/${id}/transition`, { to: "needs_decision" });
@@ -508,6 +512,7 @@ test("denying a command card steers the agent the reason; 3rd deny proposes a bl
       action: "command.dangerous.privilege-escalation",
       target: "sudo rm -rf /etc/x",
       detail: "command approval (dangerous): privilege escalation",
+      summary: "reset permissions on the config dir",
     })).json.decision_id;
 
   // deny #1 with a reason → agent gets a steer carrying it
@@ -564,6 +569,7 @@ test("explainCommandDecision appends the haiku explanation to an OPEN card only"
     action: "command.dangerous.process-kill",
     target: "pkill -f something",
     detail: "command approval (dangerous): process kill",
+    summary: "kill the stray test server",
   });
   const did = g.json.decision_id;
   const stubExec = async () => ({ code: 0, stdout: JSON.stringify({ result: "- kills processes matching 'something'" }), stderr: "" });

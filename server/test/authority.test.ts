@@ -131,13 +131,27 @@ test("summary becomes the card title (truncated); detail stays in context", () =
 test("command.dangerous requires a decision with NO rule in the db", () => {
   const { db, taskId, projectId } = freshDb();
   expect(resolveRule(db, projectId, "command.dangerous")).toBeNull(); // nothing seeded
-  const r = authorize(db, { project_id: projectId, action: "command.dangerous", target: "rm -rf /", task_id: taskId });
+  const r = authorize(db, { project_id: projectId, action: "command.dangerous", target: "rm -rf /", task_id: taskId, summary: "clean the build cache" });
   expect(r.effect).toBe("require_decision");
   const d: any = db.query("SELECT * FROM decisions WHERE id = ?").get(r.effect === "require_decision" ? r.decision_id : "");
   expect(d.blast_radius).toContain("rm -rf /");
   // sibling namespaces are untouched: an unknown command still default-allows
   const { db: db2, taskId: t2, projectId: p2 } = freshDb();
   expect(authorize(db2, { project_id: p2, action: "command", target: "frobnicate", task_id: t2 }).effect).toBe("allow");
+});
+
+test("a command approval can never be created with an empty intent", () => {
+  const { db, taskId, projectId } = freshDb();
+  for (const summary of [undefined, null, "", "   "]) {
+    const r = authorize(db, { project_id: projectId, action: "command.dangerous.recursive-forced-rm", target: "rm -rf /srv", task_id: taskId, summary });
+    expect(r.effect).toBe("deny");
+    if (r.effect === "deny") expect(r.reason).toContain("no description");
+  }
+  // no card was ever opened for any of the attempts above
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE task_id = ?").get(taskId) as any).n).toBe(0);
+  // a stated intent (even after prior empty attempts) opens the card normally
+  const ok = authorize(db, { project_id: projectId, action: "command.dangerous.recursive-forced-rm", target: "rm -rf /srv", task_id: taskId, summary: "clear stale build output" });
+  expect(ok.effect).toBe("require_decision");
 });
 
 test("an explicit rule still overrides the deny-safe default", () => {
@@ -297,7 +311,7 @@ test("guarded-action: deny rule → 403, never passes", async () => {
 // ---------------------------------------------------------------- approve_always
 test("gated commands offer approve_always; answering it mints a standing project rule", () => {
   const { db, taskId, projectId } = freshDb();
-  const input = { project_id: projectId, action: "command.dangerous.process-kill", target: "pkill -f 'vite --mode dev'", task_id: taskId };
+  const input = { project_id: projectId, action: "command.dangerous.process-kill", target: "pkill -f 'vite --mode dev'", task_id: taskId, summary: "free the dev server port before restarting it" };
   const r = authorize(db, input);
   expect(r.effect).toBe("require_decision");
   const decisionId = r.effect === "require_decision" ? r.decision_id : "";
@@ -319,7 +333,7 @@ test("gated commands offer approve_always; answering it mints a standing project
 
 test("approve_always is idempotent across two parked cards of the same category", () => {
   const { db, taskId, projectId } = freshDb();
-  const base = { project_id: projectId, action: "command.dangerous.recursive-forced-rm", task_id: taskId };
+  const base = { project_id: projectId, action: "command.dangerous.recursive-forced-rm", task_id: taskId, summary: "clean up the temp dir" };
   const r1 = authorize(db, { ...base, target: "rm -rf /srv/a" });
   const r2 = authorize(db, { ...base, target: "rm -rf /srv/b" }); // different target → its own card
   const d1 = r1.effect === "require_decision" ? r1.decision_id : "";
@@ -342,7 +356,7 @@ test("non-command actions do NOT offer approve_always", () => {
 
 test("plain approve never mints a rule (single-use only)", () => {
   const { db, taskId, projectId } = freshDb();
-  const input = { project_id: projectId, action: "command.dangerous.process-kill", target: "pkill -f x", task_id: taskId };
+  const input = { project_id: projectId, action: "command.dangerous.process-kill", target: "pkill -f x", task_id: taskId, summary: "kill the stray test server" };
   const r = authorize(db, input);
   resolveGrantForDecision(db, r.effect === "require_decision" ? r.decision_id : "", "approve");
   expect(authorize(db, input).effect).toBe("allow"); // grant consumed

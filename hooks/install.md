@@ -138,7 +138,7 @@ Code's normal permission flow. The hook never emits exit 2; any internal error
 exits 0 so the agent is never crashed.
 
 **Routing**: safe → `allow`. dangerous + unknown → `POST guarded-action` (action
-`command.dangerous` vs `command`); the response maps `200 allow`→allow,
+`command.dangerous.<category>` vs `command`, with the Bash description forwarded as `summary`; see the [guarded-action endpoint contract](../docs/API.md#tasks)); the response maps `200 allow`→allow,
 `403 deny`→deny, `409 require_decision`→deny with `escalated to hive decision <id>`
 (retry the same command once the director approves; a single-use grant lets it
 through). **Fail-safe**: hive unreachable → `deny` (2s curl cap).
@@ -168,7 +168,7 @@ export HIVE_TASK_ID=<task-id> HIVE_URL=http://127.0.0.1:4700
 # safe → allow:
 printf '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}' | hooks/hive-approve.sh escalate
 # dangerous → escalates to guarded-action (deny unless a standing grant/rule allows):
-printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}' | hooks/hive-approve.sh escalate
+printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /","description":"remove an obsolete system directory"}}' | hooks/hive-approve.sh escalate
 ```
 
 Dangerous commands are STOPPED out of the box: `command.dangerous*` requires a decision by default (deny-safe in code, plus a
