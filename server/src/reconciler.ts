@@ -278,8 +278,9 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
           try {
             base = data.baseRefName || JSON.parse(project.config ?? "{}").default_branch || "main";
           } catch {}
-          const scope = await captureBranchScope(exec, project.repo_path, data.baseRefOid || base, t.branch);
-          if (scope) writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: scope });
+          const scopeHead = data.headRefOid || t.branch;
+          const scope = await captureBranchScope(exec, project.repo_path, data.baseRefOid || base, scopeHead);
+          if (scope) writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: { ...scope, head_sha: data.headRefOid ?? null } });
         }
       }
     }
