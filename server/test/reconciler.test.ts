@@ -185,8 +185,8 @@ test("syncPRs snapshots branch scope against the PR's exact base commit", async 
 
   await reconcileOnce(db, { exec });
   const scope: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'branch_scope'").get(id);
-  expect(diffs).toEqual(["staging-sha...feat"]);
-  expect(JSON.parse(scope.payload)).toEqual({ base_sha: "staging-sha", files: ["src/task.ts"] });
+  expect(diffs).toEqual(["staging-sha...head"]);
+  expect(JSON.parse(scope.payload)).toEqual({ base_sha: "staging-sha", files: ["src/task.ts"], head_sha: "head" });
 });
 
 test("syncPRs bounces an in_review task whose CI turned red, steers once per sha", async () => {

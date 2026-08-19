@@ -99,6 +99,30 @@ test("PR destructive guard compares against the PR's exact base commit", async (
   expect(diffs).toEqual(["staging-sha...feat"]);
 });
 
+test("PR guard repairs a stale local-ref snapshot from the first exact PR head", async () => {
+  const { db, taskId } = seed();
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/2", taskId);
+  writeEvent(db, { task_id: taskId, source: "reconciler", type: "pr_synchronized", payload: { head_sha: "original-head" } });
+  const diffs: string[] = [];
+  const exec: Exec = stub((argv) => {
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(JSON.stringify({ state: "OPEN", baseRefName: "staging", baseRefOid: "staging-sha", headRefOid: "current-head", mergeStateStatus: "CLEAN", statusCheckRollup: [] }));
+    if (argv[0] === "gh" && argv.includes("merge")) return OK();
+    if (argv.includes("diff") && argv.includes("--name-only")) {
+      diffs.push(argv.at(-1)!);
+      return OK("src/task.ts\n");
+    }
+    if (argv.includes("rev-parse")) return OK(`${argv.at(-1)}\n`);
+    if (argv[3] === "log") return OK("base touched task file\n");
+    return OK();
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec });
+  expect(res.status).toBe(200);
+  expect(diffs).toEqual(["staging-sha...original-head", "staging-sha...current-head"]);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_blocked_destructive'").get(taskId)).toBeFalsy();
+});
+
 test("PR merge fails closed when its base metadata is unavailable", async () => {
   const { db, taskId } = seed();
   db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/1", taskId);

@@ -52,7 +52,7 @@ import { vapidPublicKey, saveSubscription, removeSubscription } from "./push.ts"
 import { explainCommandDecision } from "./explain.ts";
 import { ciStatusOf } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
-import { detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
+import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
@@ -2235,7 +2235,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
       "view",
       task.pr_url,
       "--json",
-      "state,mergeStateStatus,reviewDecision,statusCheckRollup,baseRefName,baseRefOid",
+      "state,mergeStateStatus,reviewDecision,statusCheckRollup,baseRefName,baseRefOid,headRefOid",
     ]);
     if (probe.code !== 0)
       return mergeFailed(
@@ -2255,6 +2255,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
   }
   const base = prView?.baseRefName || config.default_branch || "main";
   const guardBase = prView?.baseRefOid || base;
+  const guardHead = prView?.headRefOid || task.branch;
   const forceLocalFf = body?.merge_strategy === "local_ff";
 
   // Guard against a destructive auto-rebase landing (task #314): a stale branch
@@ -2273,7 +2274,21 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
         snapshot = JSON.parse(snapEvent.payload);
       } catch {}
       if (snapshot) {
-        const regressed = await detectDestructiveRebase(exec, project.repo_path, guardBase, task.branch, snapshot);
+        // Legacy snapshots were measured against task.branch, a local ref that
+        // can point somewhere other than the PR head. Rebuild their intended
+        // file set from the first exact PR head observed in the same cycle.
+        const firstSync = db
+          .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_synchronized' ORDER BY ts ASC LIMIT 1")
+          .get(id) as { payload: string } | undefined;
+        let originalHead: string | null = (snapshot as BranchScope & { head_sha?: string | null }).head_sha ?? null;
+        try {
+          originalHead ||= firstSync ? JSON.parse(firstSync.payload).head_sha ?? null : null;
+        } catch {}
+        if (originalHead) {
+          const exact = await captureBranchScope(exec, project.repo_path, guardBase, originalHead);
+          if (exact) snapshot = { ...snapshot, files: exact.files };
+        }
+        const regressed = await detectDestructiveRebase(exec, project.repo_path, guardBase, guardHead, snapshot);
         if (regressed && regressed.length) {
           const files = regressed.slice(0, 10).join(", ") + (regressed.length > 10 ? `, …(+${regressed.length - 10})` : "");
           const reason = `branch '${task.branch}' reverts base work outside this task's scope (${files})`;
