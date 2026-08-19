@@ -3052,6 +3052,11 @@ function normalizeUnderstandingChecks(understanding: unknown): UnderstandingChec
   }).slice(0, 5);
 }
 
+// listUnderstandingQuizzes and answerUnderstandingQuiz must agree on which task
+// states have an actionable quiz, or the list can advertise an item the answer
+// endpoint then rejects (hive-1006).
+const UNDERSTANDING_QUIZ_ANSWERABLE_STATES = ["in_review", "verifying", "done", "failed"];
+
 function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; checks: UnderstandingCheck[] } | null {
   const row: any = db
     .query("SELECT id, payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY ts DESC, rowid DESC LIMIT 1")
@@ -3160,12 +3165,13 @@ export function repairDuplicateQuizPasses(db: DB): number {
 
 function listUnderstandingQuizzes(db: DB, url: URL): Response {
   const projectId = url.searchParams.get("project_id");
+  const statePlaceholders = UNDERSTANDING_QUIZ_ANSWERABLE_STATES.map(() => "?").join(",");
   const rows = db
     .query(
       `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state, t.kind
          FROM events e JOIN tasks t ON t.id = e.task_id
         WHERE e.type = 'review_summary'
-          AND t.state != 'cancelled'
+          AND t.state IN (${statePlaceholders})
           AND (? IS NULL OR t.project_id = ?)
           AND NOT EXISTS (
             SELECT 1 FROM events newer
@@ -3173,7 +3179,7 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
                AND (newer.ts > e.ts OR (newer.ts = e.ts AND newer.rowid > e.rowid)))
         ORDER BY t.number DESC`
     )
-    .all(projectId, projectId) as any[];
+    .all(...UNDERSTANDING_QUIZ_ANSWERABLE_STATES, projectId, projectId) as any[];
   const quizzes = rows.flatMap((row) => {
     let payload: any;
     try { payload = JSON.parse(row.payload); } catch { return []; }
@@ -3209,7 +3215,7 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   const task = getTask(db, taskId);
   if (!task) return err("task not found", 404);
   if (task.state === "cancelled") return err("cancelled task has no active understanding check", 409);
-  if (!["in_review", "verifying", "done", "failed"].includes(task.state))
+  if (!UNDERSTANDING_QUIZ_ANSWERABLE_STATES.includes(task.state))
     return err("understanding checks can be answered during review or from the post-ship backlog", 409);
   if (body?.source !== "director") return err("only the director can answer understanding checks", 403);
   const quiz = latestUnderstandingQuiz(db, taskId);

@@ -287,6 +287,27 @@ test("understanding quiz blocks merge until the director answers correctly", asy
   s.server.stop(true);
 });
 
+test("hive-1006: a review_summary submitted while in_progress is not listed or answerable until review", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo", config: { default_branch: "main" } });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "mid trim", brief: "b" });
+  await post(s.base, `/api/tasks/${t.json.id}/spawn`, {}); // → in_progress
+  await addQuiz(s.base, t.json.id); // review_summary submitted while still in_progress
+
+  const beforeReview = await get(s.base, "/api/understanding-quizzes");
+  expect(beforeReview.json.quizzes.some((item: any) => item.task_id === t.json.id)).toBe(false);
+
+  const answer = await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "tests", source: "director" });
+  expect(answer.status).toBe(409);
+  expect(answer.json.error).toContain("understanding checks can be answered during review or from the post-ship backlog");
+
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+  const afterReview = await get(s.base, "/api/understanding-quizzes");
+  expect(afterReview.json.quizzes.some((item: any) => item.task_id === t.json.id)).toBe(true);
+
+  s.server.stop(true);
+});
+
 test("an identical review after a merge failure keeps the completed quiz", async () => {
   const s = makeServer({ gitMergeCode: 128, gitMergeStderr: "fatal: unable to write new index file" });
   const { taskId } = await inReviewTask(s.base);
