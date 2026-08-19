@@ -8,7 +8,7 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-watch-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb, newId, now } = await import("../src/db.ts");
-const { checkWatcher, watchOnce, fetchableUrl } = await import("../src/watch.ts");
+const { checkWatcher, watchOnce, startWatchers, fetchableUrl } = await import("../src/watch.ts");
 import type { DB } from "../src/db.ts";
 
 function freshDb(watchers?: any[]): { db: DB; projectId: string } {
@@ -20,7 +20,7 @@ function freshDb(watchers?: any[]): { db: DB; projectId: string } {
   return { db, projectId };
 }
 
-const fetchBody = (body: string) => (async () => new Response(body, { status: 200 })) as typeof fetch;
+const fetchBody = (body: string) => (async () => new Response(body, { status: 200 })) as unknown as typeof fetch;
 const watchTasks = (db: DB) => db.query("SELECT * FROM tasks WHERE source = 'watch'").all() as any[];
 const W = { name: "spec", url: "https://example.com/spec", prompt: "sync the roadmap page" };
 
@@ -61,7 +61,7 @@ test("no stacking: while a watch task is active, further changes wait (cursor ho
 test("watchOnce respects per-watcher cadence and offline mode", async () => {
   const { db, projectId } = freshDb([{ ...W, interval_minutes: 5 }]);
   let calls = 0;
-  const f = (async () => (calls++, new Response(`v${calls}`, { status: 200 }))) as typeof fetch;
+  const f = (async () => (calls++, new Response(`v${calls}`, { status: 200 }))) as unknown as typeof fetch;
   const t0 = Date.now();
   await watchOnce(db, { fetchImpl: f, nowMs: () => t0 });
   await watchOnce(db, { fetchImpl: f, nowMs: () => t0 + 60_000 }); // 1m: not due
@@ -73,6 +73,39 @@ test("watchOnce respects per-watcher cadence and offline mode", async () => {
   db.query("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('offline','1',?)").run(now());
   await watchOnce(db, { fetchImpl: f, nowMs: () => t0 + 20 * 60_000 });
   expect(calls).toBe(2); // offline: no polling
+});
+
+test("startWatchers skips a tick while a cycle is already running", async () => {
+  // interval_minutes tiny-but-nonzero so the per-watcher cadence gate never
+  // blocks a tick; the overlap guard is what's under test here.
+  const { db } = freshDb([{ ...W, interval_minutes: 0.0001 }]);
+  let active = 0;
+  let maxActive = 0;
+  let cycles = 0;
+  const slowFetch = (async () => {
+    cycles++;
+    active++;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((r) => setTimeout(r, 60));
+    active--;
+    return new Response(`v${cycles}`, { status: 200 });
+  }) as unknown as typeof fetch;
+
+  const origError = console.error;
+  const logs: string[] = [];
+  console.error = ((...args: any[]) => logs.push(String(args[0]))) as typeof console.error;
+  let stop: () => void;
+  try {
+    stop = startWatchers(db, { fetchImpl: slowFetch, intervalMs: 15 });
+    await new Promise((r) => setTimeout(r, 140)); // ~9 ticks at 15ms while each cycle takes 60ms
+    stop();
+  } finally {
+    console.error = origError;
+  }
+
+  expect(maxActive).toBe(1); // never two cycles in flight at once
+  expect(cycles).toBeLessThan(6); // most ticks were skipped, not queued
+  expect(logs.some((m) => m.includes("skipped"))).toBe(true);
 });
 
 test("google docs/sheets edit links rewrite to export endpoints", () => {

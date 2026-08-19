@@ -122,11 +122,25 @@ export async function promoteOnce(db: DB, deps: PromoterDeps = {}): Promise<void
   }
 }
 
-// Background loop. Started only from index.ts (never in tests). Fires once
-// shortly after boot (SHA dedup makes restarts harmless), then every interval.
+// Production starts one background loop from index.ts. Each start call owns its
+// timers and in-flight guard; a slow cycle skips ticks instead of queueing them.
+// It fires once shortly after boot (SHA dedup makes restarts harmless), then on
+// every interval.
 export function startPromoter(db: DB, deps: PromoterDeps & { intervalMs?: number } = {}): () => void {
   const intervalMs = deps.intervalMs ?? 30 * 60 * 1000;
-  const run = () => promoteOnce(db, deps).catch((e) => console.error("[hive] promoter cycle crashed:", e));
+  let running = false;
+  const run = () => {
+    if (running) {
+      console.error("[hive] promoter cycle skipped: previous cycle still running");
+      return;
+    }
+    running = true;
+    promoteOnce(db, deps)
+      .catch((e) => console.error("[hive] promoter cycle crashed:", e))
+      .finally(() => {
+        running = false;
+      });
+  };
   const boot = setTimeout(run, 30_000);
   const timer = setInterval(run, intervalMs);
   return () => {

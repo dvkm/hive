@@ -2,6 +2,7 @@ import { test, expect, beforeEach } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
 import {
   pollGchatOnce,
+  startGchatPoll,
   getAccessToken,
   getCursor,
   buildPermalink,
@@ -214,6 +215,84 @@ test('gchat_spaces "*" survives a spaces.list failure with one diagnostic', asyn
   const r = await pollGchatOnce(db, { fetch: failing, secrets: SECRETS, notify: false, log: (m) => logs.push(m) });
   expect(r).toEqual({ created: 0, spaces: 0 }); // no jobs, no crash
   expect(logs.length).toBe(1);
+});
+
+test("poll-path requests all carry a 20-second timeout signal", async () => {
+  const { db } = freshDb("*");
+  const originalTimeout = AbortSignal.timeout;
+  const timeoutCalls: number[] = [];
+  const timeoutSignals: AbortSignal[] = [];
+  const requestSignals: (AbortSignal | null | undefined)[] = [];
+  (AbortSignal as any).timeout = (ms: number) => {
+    timeoutCalls.push(ms);
+    const signal = new AbortController().signal;
+    timeoutSignals.push(signal);
+    return signal;
+  };
+
+  try {
+    const f = (async (input: any, init?: RequestInit) => {
+      const u = String(input);
+      requestSignals.push(init?.signal);
+      if (u.includes("oauth2.googleapis.com/token"))
+        return new Response(JSON.stringify({ access_token: "at", expires_in: 3600 }), { status: 200 });
+      if (u.includes("/v1/spaces?"))
+        return new Response(JSON.stringify({ spaces: [{ name: "spaces/AAA" }] }), { status: 200 });
+      if (u.includes("/messages?")) {
+        const withAttachment = msg({
+          attachment: [{ contentType: "image/png", attachmentDataRef: { resourceName: "media/abc" } }],
+        });
+        return new Response(JSON.stringify({ messages: [withAttachment] }), { status: 200 });
+      }
+      if (u.includes("/media/")) return new Response("unavailable", { status: 503 });
+      throw new Error(`unexpected request: ${u}`);
+    }) as unknown as FetchLike;
+
+    await pollGchatOnce(db, { fetch: f, secrets: SECRETS, notify: false });
+  } finally {
+    (AbortSignal as any).timeout = originalTimeout;
+  }
+
+  expect(timeoutCalls).toEqual([20_000, 20_000, 20_000, 20_000]);
+  expect(requestSignals).toEqual(timeoutSignals);
+});
+
+test("startGchatPoll skips a tick while a cycle is already running", async () => {
+  const { db } = freshDb();
+  let active = 0;
+  let maxActive = 0;
+  let cycles = 0;
+  const logs: string[] = [];
+  // The messages.list call is slow (60ms) and runs on every cycle (unlike the
+  // token fetch, which caches) — it's the reliable signal for overlap.
+  const slowFetch: FetchLike = (async (input: any) => {
+    const u = String(input);
+    if (u.includes("oauth2.googleapis.com/token"))
+      return new Response(JSON.stringify({ access_token: "at", expires_in: 3600 }), { status: 200 });
+    if (u.includes("/messages?")) {
+      cycles++;
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((r) => setTimeout(r, 60));
+      active--;
+      return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+    }
+    return new Response("{}", { status: 200 });
+  }) as unknown as FetchLike;
+
+  const stop = startGchatPoll(db, {
+    fetch: slowFetch,
+    secrets: SECRETS,
+    notify: false,
+    intervalMs: 15,
+    log: (m: string) => logs.push(m),
+  });
+  await new Promise((r) => setTimeout(r, 140)); // ~9 ticks at 15ms while each cycle takes 60ms
+  stop();
+
+  expect(maxActive).toBe(1); // never two cycles in flight at once
+  expect(cycles).toBeLessThan(6); // most ticks were skipped, not queued
+  expect(logs.some((m) => m.includes("skipped"))).toBe(true);
 });
 
 test("buildPermalink reconstructs a best-effort room deep-link", () => {

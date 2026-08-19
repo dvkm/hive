@@ -155,16 +155,7 @@ server/test/ bun test suite
 
 ## v2 notes (intake connector)
 
-- **Google Chat intake** (`server/src/intake/gchat.ts`, migration v5) polls the
-  spaces in each project's `config.gchat_spaces` (`[{space, label?}]`) every
-  `HIVE_GCHAT_POLL_MS` (default 60s) and drafts a `queued` ship task per new
-  message, tagged `source: intake_gchat` and marked UNREVIEWED. Message text is
-  untrusted (stored verbatim, never executed). Images (≤5MB, png/jpg/gif/webp)
-  become evidence; messages dedupe by resource name; self/bot messages skip.
-  OAuth (scope `chat.messages.readonly`) is set up once with `hive gchat auth`;
-  the connector is a hard no-op until a space is configured. Simplest durable
-  home for the allowlist: the existing per-project `config` column (the owning
-  project is the target), so no new table or endpoint.
+- **Google Chat intake** (`server/src/intake/gchat.ts`, migration v5) schedules checks of each project's `config.gchat_spaces` (`[{space, label?}]`) via `HIVE_GCHAT_POLL_MS` (default 60s) and drafts a `queued` ship task per new message, tagged `source: intake_gchat` and marked UNREVIEWED. Message text is untrusted (stored verbatim, never executed). Images (≤5MB, png/jpg/gif/webp) become evidence; messages dedupe by resource name; self/bot messages skip. OAuth (scope `chat.messages.readonly`) is set up once with `hive gchat auth`; the connector is a hard no-op until a space is configured. Simplest durable home for the allowlist: the existing per-project `config` column (the owning project is the target), so no new table or endpoint.
 
 - **JIRA bidirectional sync** (`server/src/intake/jira.ts`, no migration). Mirrors
   one Jira Cloud project onto the board and keeps `status` in step BOTH ways, on
