@@ -176,10 +176,17 @@ server/test/ bun test suite
   readable before hive edits a real ticket.
 
   ```jsonc
-  "jira": { "site": "https://acme.atlassian.net", "email": "bot@acme.com",
+  "jira": { "site": "https://corebeat.atlassian.net", "email": "corebeat@vid.kim",
             "project_key": "WEB", "enabled": false, "write": false,
             "jql": "labels = sync" }   // optional, ANDed with project = <key>
   ```
+
+  `site`, `email` and `project_key` must match a compiled-in allowlist
+  (`credentialTargetAllowed` in `server/src/intake/jira.ts`) or the connector
+  is a silent no-op; config alone can't repoint it elsewhere, since
+  `projects.config` is writable over hive's unauthenticated loopback API and a
+  config-supplied site would otherwise be able to send `JIRA_API_TOKEN`
+  anywhere. Changing the allowed target is a code change, not a config edit.
 
   Auth is HTTP Basic (`email:api_token`) — a personal API token sent as `Bearer`
   is rejected as an unparseable Connect JWT. The token is the project secret
