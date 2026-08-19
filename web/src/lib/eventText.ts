@@ -56,6 +56,12 @@ export function eventText(e: EventLike): string {
     }
     case "agent_turn_end":
       return "agent turn ended";
+    case "auto_resume": {
+      const quote = s(p.quote);
+      return p.escalated
+        ? `stopped mid-commitment ${s(p.resumes)}× after auto-resume — escalated to you: “${quote}”`
+        : `auto-resumed (#${s(p.resumes)}) — it had said: “${quote}”`;
+    }
     case "steer": {
       // The delivery receipt: David must never wonder whether a steer landed.
       // Pre-receipt events (no `delivery`) stay bare rather than claim delivery.
@@ -184,6 +190,7 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
   assistant_text: "lifecycle",
   tool_use: "lifecycle",
   agent_turn_end: "lifecycle",
+  auto_resume: "lifecycle",
   state_change: "state",
   ready_for_review: "state",
   "needs-decision": "decision",
