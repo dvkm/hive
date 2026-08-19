@@ -2831,6 +2831,20 @@ interface UnderstandingCheck {
   explanation?: string;
 }
 
+function isAgentProcedureQuestion(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const question = typeof (value as Record<string, unknown>).question === "string"
+    ? String((value as Record<string, unknown>).question)
+    : "";
+  return [
+    /\bwhat should (?:you|an? agent|the agent|the worker|the supervisor|the orchestrator) do\b/i,
+    /\byour (?:branch|task|pr|pull request|checkout|worktree)\b/i,
+    /\bwhere (?:else )?(?:could|should|would) (?:the )?(?:actual )?blocker live\b/i,
+    /\bwhere should you investigate\b/i,
+    /\bwhat(?:'s| is) the (?:correct|best|next) move\b/i,
+  ].some((pattern) => pattern.test(question));
+}
+
 function normalizeUnderstandingCheck(value: unknown): UnderstandingCheck | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
@@ -3997,6 +4011,9 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         : Array.isArray(rawCheck)
           ? rawCheck
           : [];
+      const submittedChecks = rawChecks.length ? rawChecks : rawCheck ? [rawCheck] : [];
+      if (submittedChecks.some(isAgentProcedureQuestion))
+        return err("understanding checks must teach the director about this specific change, not test agent procedures", 400);
       const checks = rawChecks.flatMap((value: unknown) => {
         const check = normalizeUnderstandingCheck(value);
         return check ? [{

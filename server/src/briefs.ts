@@ -80,11 +80,19 @@ Rules:
   work. Provide 1-5 questions. Use one for a single, straightforward takeaway;
   add more only when each tests a distinct decision-relevant idea, angle, or
   scenario, never superficial rewordings. Each needs 2-4 plausible options and
-  a short teaching explanation. Every question must test a mental model the
-  director could apply to a future decision. Never quiz project bookkeeping:
+  a short teaching explanation. The audience is the director, who delegates
+  implementation. Every question must help them understand this specific
+  change or report: its behavior, user impact, risk, tradeoff, or evidence.
+  Its answer must be taught in the explanation above. Never test whether the
+  agent knows how to code, debug, merge, use tools, follow agent policy, or
+  operate Hive. Never put the director in the worker's role with questions
+  like "what should you do?", "your branch/task/PR", or "where should you
+  investigate?" Agent competence belongs in internal checks, not the
+  director's approval gate. Never quiz project bookkeeping:
   why work was split into a follow-up, which task/PR/file/command/identifier
   carried it, who did it, or what the brief happened to scope. If a question
-  cannot be reframed as a transferable scenario, omit it; fewer is better.
+  does not improve the director's understanding of this review, omit it;
+  fewer is better.
   Hive rotates questions
   after a miss and shuffles option order, so never depend on answer position.
   Keep each question and option complete and under 500 characters.

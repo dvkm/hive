@@ -47,9 +47,11 @@ test("brief tells the agent to verify browsers headlessly, not via the denied MC
 test("brief excludes project bookkeeping from understanding quizzes", () => {
   const { db, taskId } = setup();
   const brief = composeBrief(db, taskId);
-  expect(brief).toContain("Every question must test a mental model");
+  expect(brief).toContain("Every question must help them understand this specific");
+  expect(brief).toContain("agent knows how to code, debug, merge");
+  expect(brief).toContain("Agent competence belongs in internal checks");
   expect(brief).toContain("Never quiz project bookkeeping");
-  expect(brief).toContain("cannot be reframed as a transferable scenario, omit it");
+  expect(brief).toContain("does not improve the director's understanding of this review");
 });
 
 test("brief requires a standalone decision context", () => {
