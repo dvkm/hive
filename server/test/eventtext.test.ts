@@ -68,6 +68,14 @@ test("new transcript types are agent-lifecycle for the feed filter", () => {
   expect(eventCategory("agent_turn_end")).toBe("lifecycle");
 });
 
+// #989: the mismatch has to be legible on the board, not just present in the DB.
+// It rides the generic `<type words>: <note>` fallback rather than its own case.
+test("a repo_mismatch event reads as a sentence on the timeline", () => {
+  expect(
+    eventText({ type: "repo_mismatch", payload: { note: 'Brief targets files that exist in project "hive" but not in "acme": server/src/intake/jira.ts.' } })
+  ).toBe('repo mismatch: Brief targets files that exist in project "hive" but not in "acme": server/src/intake/jira.ts.');
+});
+
 test("automatic dialog recovery is readable in the supervisor trajectory", () => {
   expect(eventText({ type: "dialog_auto_approved", payload: { kind: "workspace_trust" } })).toBe("accepted the workspace trust prompt");
   expect(eventText({ type: "dialog_auto_declined", payload: {} })).toBe("dismissed an optional agent dialog");
