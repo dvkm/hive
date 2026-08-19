@@ -86,6 +86,16 @@ branch trigger the next check) and `model_by_kind.drift` (string, default
 Lifecycle key: `archived` (bool, default absent/`false`; when `true` the project
 is hidden from the default `GET /api/projects` list and the web Projects view —
 tasks keep referencing it, there is no hard delete).
+Lifecycle key: `test` (bool, default absent/`false`; marks a scratch/ephemeral
+project — e.g. an agent's own E2E run registered it against the live server
+instead of a throwaway instance). Auto-set at `POST /api/projects` time when
+`repo_path` lives inside a task's own worktree/scratchpad, unless the caller
+already passed `config.test` explicitly. Hides the project (same as
+`archived`) and its tasks/decisions/checkpoints from the default
+`GET /api/projects` / `/api/tasks` / `/api/decisions` / `/api/checkpoints`
+lists — pass `?test=all` to include them — and its tasks never push a
+notification. The reaper auto-sets `archived: true` on a `test` project once
+every task it owns is terminal.
 Worktree stack hooks (symmetric per-project lifecycle commands): `setup_argv`
 (string[], run AFTER the worktree exists but BEFORE the agent starts — e.g.
 `["infra/worktree/wt.sh", "up", "{worktree}"]` — so agents don't bring up their
@@ -211,7 +221,7 @@ the task timeline with the agent's actual work; see `hooks/install.md`):
 - `agent_turn_end` — a quiet Stop/SubagentStop liveness heartbeat. `payload: {}` (kept for health/reconciler; the timeline hides it)
 
 Types written by the runtime layer (Phase 2b):
-- `checkpoint` — a live build-time judgment call from a working agent (`payload: {note}`; `hive emit <id> checkpoint --note "..."`). Non-blocking. Acknowledgment uses `POST /api/tasks/:id/checkpoints/:eventId/ack` body `{verdict: "ok"|"flag", note?, source?: "director"|"chat_supervisor", actor?}` → `200 {ok, delivered, followup_task_id}` | `400` | `404`; `checkpoint_ack` events (`payload: {checkpoint_id, verdict, note, actor}`) record the outcome and their event source records who acted. A `flag` steers a live agent immediately; a flag on a finished/agentless task queues a corrective follow-up task instead (`source="checkpoint_flag"`, parent → the flagged task). `GET /api/checkpoints[?project_id=<id>]` → `200 {checkpoints: [{id, task_id, ts, task_number, task_title, task_state, project_id, note}]}` lists un-acked checkpoints, optionally scoped to one project. They survive task completion (only `cancelled` drops them) so judgment calls stay reviewable after fast agents finish.
+- `checkpoint` — a live build-time judgment call from a working agent (`payload: {note}`; `hive emit <id> checkpoint --note "..."`). Non-blocking. Acknowledgment uses `POST /api/tasks/:id/checkpoints/:eventId/ack` body `{verdict: "ok"|"flag", note?, source?: "director"|"chat_supervisor", actor?}` → `200 {ok, delivered, followup_task_id}` | `400` | `404`; `checkpoint_ack` events (`payload: {checkpoint_id, verdict, note, actor}`) record the outcome and their event source records who acted. A `flag` steers a live agent immediately; a flag on a finished/agentless task queues a corrective follow-up task instead (`source="checkpoint_flag"`, parent → the flagged task). `GET /api/checkpoints[?project_id=<id>][?test=all]` → `200 {checkpoints: [{id, task_id, ts, task_number, task_title, task_state, project_id, note}]}` lists un-acked checkpoints, optionally scoped to one project. They survive task completion (only `cancelled` drops them) so judgment calls stay reviewable after fast agents finish. Checkpoints under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
 - `review_summary`: the agent's structured self-review, submitted before `ready`. `payload: {done?: string[], iffy?: (string|{what,why})[], decisions?: string[], testing?: string[], followups?: string[], understanding?: {background?: string, essence?: string, walkthrough?: string[], participate?: string, check?: {question: string, options: {key: string, label: string}[], answer_key: string, explanation?: string}}}`. Mergeable changes require a 2-4 option understanding check. The review card presents the mental model before the technical audit, then uses the check as the approval gate. Questions must teach the director about the specific change or report and may not test agent procedures, debugging, merging, tools, or policy.
 - `understanding_quiz_attempt`, `understanding_quiz_passed`, `understanding_quiz_deferred`: director-only quiz outcomes tied to the latest `review_summary` by `payload.review_event_id`. A new review summary creates a new check. Passing removes it from the backlog. Deferring unlocks an urgent merge but deliberately leaves the quiz open after the task finishes.
 
@@ -451,7 +461,10 @@ made aware — urgent notifications push a macOS notification immediately (so it
 set on creation); normal ones are batched into a single digest every
 `HIVE_DIGEST_MS` (default 30m), or marked when the header bell is opened
 (`POST /api/notifications/ack`). The bell's unread count is the rows where
-`delivered_at` is null.
+`delivered_at` is null. A `task_id`'d notification whose task belongs to a
+test/ephemeral project (`config.test === true`) is never created at all — no
+row, no push, no digest entry, no bell count. Unlike the list endpoints above,
+there is no override for this; see the `test` lifecycle key above.
 
 ### Usage (cost/token analytics)
 ```json
@@ -521,12 +534,16 @@ priced rows only).
 `sessions` surfaces PTY / herdr-session utilization — the pty pool is a hard, low OS cap (macOS `kern.tty.ptmx_max`, 511) whose exhaustion is otherwise SILENT (it hit 511/511 twice on 2026-07-25 and every spawn failed with `openpty: Os { code: 6 }`). `panes` is the live pane count the reaper records each sweep (one pty each), `max` the cap (`HIVE_PTY_MAX`, default 511), `pct` the ratio, and `warn` flips true at ≥80% (`HIVE_PTY_WARN_PCT`) so a leak is visible before it hits the wall. `null` until the first pane sweep has run.
 
 ### Projects
-- `GET /api/projects[?archived=all]` → `200 [Project, ...]` (oldest first)
+- `GET /api/projects[?archived=all][?test=all]` → `200 [Project, ...]` (oldest first)
   Archived projects (`config.archived === true`) are hidden by default; pass
   `?archived=all` to include them. There is no project delete (tasks reference
   projects) — set `config.archived: true` to hide one and back to `false`/absent
-  to restore it.
+  to restore it. Test/ephemeral projects (`config.test === true`, see the
+  `test` lifecycle key above) are hidden the same way; pass `?test=all` to
+  include them.
 - `POST /api/projects` body `{name (required), repo_path?, config?}` → `201 Project`
+  Auto-sets `config.test = true` when `repo_path` lives inside a task's own
+  worktree/scratchpad, unless `config.test` was passed explicitly.
 - `GET /api/projects/:id` → `200 Project` | `404`
 - `PUT /api/projects/:id` body `{name?, repo_path?, config?}` → `200 Project` | `404`
   Updates mutable fields. `config` is REPLACED wholesale when present (read the
@@ -534,7 +551,7 @@ priced rows only).
   Policies-page auto-dispatch toggle.
 
 ### Tasks
-- `GET /api/tasks?state=&project_id=` → `200 [Task, ...]` (newest `updated_at` first; both filters optional)
+- `GET /api/tasks?state=&project_id=&test=` → `200 [Task, ...]` (newest `updated_at` first; all filters optional). Tasks under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
 - `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher won't spawn — and the reconciler won't advance — the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban — never auto-dispatched, never staleness-supervised, exempt from the done-evidence gate, moved freely via transitions (`hive task move <id> <state>`); the board shows a `tracked` chip. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
@@ -928,7 +945,7 @@ work. Use `POST /api/tasks/:id/events` with `type=evidence` for that.
   All usage rows for a task (oldest first) plus the totals object.
 
 ### Decisions
-- `GET /api/decisions?status=open[&project_id=<id>]` → `200 [Decision, ...]` (newest first; `status` defaults to `open`; `status=all` returns every decision; `project_id` optionally scopes the list)
+- `GET /api/decisions?status=open[&project_id=<id>][&test=all]` → `200 [Decision, ...]` (newest first; `status` defaults to `open`; `status=all` returns every decision; `project_id` optionally scopes the list). Decisions under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
 - `POST /api/decisions` body `{task_id (required), title (required), context (required), risk?, blast_radius?, options (required, non-empty)}` → `201 Decision` | `400` (missing context or missing/empty `options`)
   (also writes a `needs-decision` event and parks the task in `needs_decision` if its current state allows it)
 - `GET /api/decisions/:id` → `200 Decision` | `404`

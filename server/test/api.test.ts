@@ -705,3 +705,95 @@ test("SSE stream sends a hello headline", async () => {
   expect(text).toContain('"type":"hello"');
   await reader.cancel();
 });
+
+// ---- test/ephemeral projects (#1020): a project whose repo_path lives
+// inside a task's own worktree/scratchpad can only be a scratch artifact from
+// an agent's own E2E run. It auto-flags config.test = true and its tasks,
+// decisions, checkpoints and notifications are hidden from the default
+// (unfiltered) list endpoints — see testProjects.ts.
+test("a repo_path inside a worktree/scratchpad auto-flags the project test; a normal path does not", async () => {
+  const wt = await post("/api/projects", {
+    name: "auto-flagged",
+    repo_path: "/private/tmp/claude-501/some-session/scratchpad/corebeat",
+  });
+  expect(wt.json.config.test).toBe(true);
+
+  const worktreePath = await post("/api/projects", {
+    name: "auto-flagged-2",
+    repo_path: "/Users/david/.herdr/worktrees/hive/hive-abc123",
+  });
+  expect(worktreePath.json.config.test).toBe(true);
+
+  const normal = await post("/api/projects", { name: "normal", repo_path: "/Users/david/projects/hive" });
+  expect(normal.json.config.test).toBeUndefined();
+
+  // an explicit config.test always wins over the heuristic
+  const explicit = await post("/api/projects", {
+    name: "explicit-false",
+    repo_path: "/tmp/scratchpad/whatever",
+    config: { test: false },
+  });
+  expect(explicit.json.config.test).toBe(false);
+});
+
+test("test projects, their tasks, decisions and checkpoints are hidden by default and shown with ?test=all", async () => {
+  const tp = await post("/api/projects", { name: "hidden", repo_path: "/x/scratchpad/y" });
+  const testProjectId = tp.json.id;
+  const tt = await post("/api/tasks", { project_id: testProjectId, title: "scratch task" });
+  const testTaskId = tt.json.id;
+  await post(`/api/tasks/${testTaskId}/transition`, { to: "in_progress" });
+  const cp = await post(`/api/tasks/${testTaskId}/events`, { type: "checkpoint", note: "scratch checkpoint" });
+  const d = await post("/api/decisions", {
+    task_id: testTaskId,
+    title: "scratch decision",
+    context: "ctx",
+    options: [{ key: "a", label: "A" }],
+  });
+  expect(d.status).toBe(201);
+
+  // project list
+  const projects = await get("/api/projects");
+  expect(projects.json.some((p: any) => p.id === testProjectId)).toBe(false);
+  const projectsAll = await get("/api/projects?test=all");
+  expect(projectsAll.json.some((p: any) => p.id === testProjectId)).toBe(true);
+
+  // task list
+  const tasks = await get("/api/tasks");
+  expect(tasks.json.some((t: any) => t.id === testTaskId)).toBe(false);
+  const tasksAll = await get("/api/tasks?test=all");
+  expect(tasksAll.json.some((t: any) => t.id === testTaskId)).toBe(true);
+
+  // decision list
+  const decisions = await get("/api/decisions?status=all");
+  expect(decisions.json.some((x: any) => x.id === d.json.id)).toBe(false);
+  const decisionsAll = await get("/api/decisions?status=all&test=all");
+  expect(decisionsAll.json.some((x: any) => x.id === d.json.id)).toBe(true);
+
+  // checkpoint list
+  const checkpoints = await get("/api/checkpoints");
+  expect(checkpoints.json.checkpoints.some((c: any) => c.id === cp.json.event.id)).toBe(false);
+  const checkpointsAll = await get("/api/checkpoints?test=all");
+  expect(checkpointsAll.json.checkpoints.some((c: any) => c.id === cp.json.event.id)).toBe(true);
+
+  // a direct-by-id fetch is never filtered
+  const directTask = await get(`/api/tasks/${testTaskId}`);
+  expect(directTask.status).toBe(200);
+  const directDecision = await get(`/api/decisions/${d.json.id}`);
+  expect(directDecision.status).toBe(200);
+});
+
+test("a test project never pushes a notification, even for a high-risk decision", async () => {
+  const tp = await post("/api/projects", { name: "hidden-notif", repo_path: "/x/scratchpad/z" });
+  const tt = await post("/api/tasks", { project_id: tp.json.id, title: "scratch task" });
+  await post(`/api/tasks/${tt.json.id}/transition`, { to: "in_progress" });
+  const before = await get("/api/notifications");
+  await post("/api/decisions", {
+    task_id: tt.json.id,
+    title: "scratch high-risk decision",
+    context: "ctx",
+    risk: "high",
+    options: [{ key: "a", label: "A" }],
+  });
+  const after = await get("/api/notifications");
+  expect(after.json.notifications.length).toBe(before.json.notifications.length);
+});

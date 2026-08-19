@@ -83,6 +83,26 @@ test("transition to done/failed enqueues a normal notification", () => {
   expect(notif.delivered_at).toBeNull(); // waits for the digest
 });
 
+test("a task under a test/ephemeral project never enqueues a notification, even urgent", () => {
+  const { db } = freshDb();
+  const testProjectId = newId("proj");
+  db.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run(
+    testProjectId, "scratch", JSON.stringify({ test: true }), now()
+  );
+  const taskId = newId();
+  const t = now();
+  db.query("INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at) VALUES (?,?,?, 'queued','ship', ?, ?)").run(
+    taskId, testProjectId, "scratch task", t, t
+  );
+  const { exec, calls } = recordingExec();
+  const row = enqueue(db, { kind: "decision", task_id: taskId, title: "scratch decision", urgency: "urgent" }, { exec });
+
+  expect(row).toBeNull();
+  expect(calls.length).toBe(0);
+  const count = db.query("SELECT COUNT(*) AS n FROM notifications WHERE task_id = ?").get(taskId) as { n: number };
+  expect(count.n).toBe(0);
+});
+
 test("ack marks all undelivered notifications as seen", () => {
   const { db } = freshDb();
   enqueue(db, { kind: "done", title: "a" });

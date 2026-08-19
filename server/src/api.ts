@@ -6,6 +6,7 @@ import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { taskWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
 import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched } from "./supervision.ts";
+import { isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
 import { REF_PREFIX as JIRA_REF_PREFIX } from "./intake/jira.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
 import {
@@ -182,10 +183,14 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (method === "GET") {
           // Archived projects (config.archived === true) are hidden unless
           // ?archived=all is passed. tasks still reference them; there is no delete.
+          // Test/ephemeral projects (config.test === true, see testProjects.ts)
+          // are hidden the same way, unless ?test=all is passed.
           const includeArchived = url.searchParams.get("archived") === "all";
-          const sql = includeArchived
-            ? "SELECT * FROM projects ORDER BY created_at"
-            : "SELECT * FROM projects WHERE COALESCE(json_extract(config, '$.archived'), 0) = 0 ORDER BY created_at";
+          const includeTest = url.searchParams.get("test") === "all";
+          const conds: string[] = [];
+          if (!includeArchived) conds.push("COALESCE(json_extract(config, '$.archived'), 0) = 0");
+          if (!includeTest) conds.push(notTestProjectSql());
+          const sql = "SELECT * FROM projects" + (conds.length ? " WHERE " + conds.join(" AND ") : "") + " ORDER BY created_at";
           return json(db.query(sql).all().map(parseProject));
         }
         if (method === "POST") return createProject(db, await req.json());
@@ -520,11 +525,16 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 // ---------------------------------------------------------------- projects
 function createProject(db: DB, body: any): Response {
   if (!body?.name) return err("name is required");
+  // A repo_path living inside a task's own worktree/scratchpad can only be a
+  // scratch artifact (see testProjects.ts) — auto-flag it test unless the
+  // caller already said one way or the other.
+  const config = { ...(body.config ?? {}) };
+  if (config.test === undefined && isEphemeralRepoPath(body.repo_path)) config.test = true;
   const row = {
     id: newId("proj"),
     name: String(body.name),
     repo_path: body.repo_path ?? null,
-    config: JSON.stringify(body.config ?? {}),
+    config: JSON.stringify(config),
     created_at: now(),
   };
   db.query(
@@ -1628,14 +1638,18 @@ function mergeIntoEndpoint(db: DB, id: string, body: any): Response {
 function listTasks(db: DB, url: URL): Response {
   const state = url.searchParams.get("state");
   const projectId = url.searchParams.get("project_id");
+  const includeTest = url.searchParams.get("test") === "all";
   const where: string[] = [];
   const args: any[] = [];
-  if (state) { where.push("state = ?"); args.push(state); }
-  if (projectId) { where.push("project_id = ?"); args.push(projectId); }
+  if (state) { where.push("t.state = ?"); args.push(state); }
+  if (projectId) { where.push("t.project_id = ?"); args.push(projectId); }
+  // Tasks under a test/ephemeral project (see testProjects.ts) are hidden
+  // from director surfaces by default, same as the project itself.
+  if (!includeTest) where.push(notTestProjectSql("p.config"));
   const sql =
-    "SELECT * FROM tasks" +
+    "SELECT t.* FROM tasks t JOIN projects p ON p.id = t.project_id" +
     (where.length ? " WHERE " + where.join(" AND ") : "") +
-    " ORDER BY updated_at DESC";
+    " ORDER BY t.updated_at DESC";
   return json(db.query(sql).all(...args).map(parseTask).map((t) => taskWithHealth(db, t)));
 }
 
@@ -3296,29 +3310,32 @@ function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   return json({ ok: true, status: "deferred" });
 }
 
-function openCheckpointRows(db: DB, projectId: string | null): any[] {
+function openCheckpointRows(db: DB, projectId: string | null, includeTest = false): any[] {
   // Un-acked checkpoints stay reviewable AFTER the task finishes — agents
   // finish faster than the director's attention cycle, and 21 of the first 25
   // checkpoints vanished unreviewed when this filtered to live states
   // (2026-07-10). Only cancelled tasks drop out (their calls died with them).
+  // Checkpoints under a test/ephemeral project (see testProjects.ts) are
+  // hidden from director surfaces by default, same as the project itself.
   return db
     .query(
       `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state
-         FROM events e JOIN tasks t ON t.id = e.task_id
+         FROM events e JOIN tasks t ON t.id = e.task_id JOIN projects p ON p.id = t.project_id
         WHERE e.type = 'checkpoint'
           AND t.state != 'cancelled'
           AND (? IS NULL OR t.project_id = ?)
+          AND (? OR ${notTestProjectSql("p.config")})
           AND NOT EXISTS (
             SELECT 1 FROM events a
              WHERE a.task_id = e.task_id AND a.type = 'checkpoint_ack'
                AND json_extract(a.payload, '$.checkpoint_id') = e.id)
         ORDER BY t.number DESC, e.ts ASC`
     )
-    .all(projectId, projectId) as any[];
+    .all(projectId, projectId, includeTest ? 1 : 0) as any[];
 }
 
 function listOpenCheckpoints(db: DB, url: URL): Response {
-  const rows = openCheckpointRows(db, url.searchParams.get("project_id"));
+  const rows = openCheckpointRows(db, url.searchParams.get("project_id"), url.searchParams.get("test") === "all");
   return json({
     checkpoints: rows.map((r) => ({
       id: r.id,
@@ -4602,13 +4619,19 @@ function apiCreateDecision(db: DB, body: any): Response {
 function listDecisions(db: DB, url: URL): Response {
   const status = url.searchParams.get("status") ?? "open";
   const projectId = url.searchParams.get("project_id");
-  const rows = projectId
-    ? status === "all"
-      ? db.query("SELECT d.* FROM decisions d JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ? ORDER BY d.ts DESC").all(projectId)
-      : db.query("SELECT d.* FROM decisions d JOIN tasks t ON t.id = d.task_id WHERE d.status = ? AND t.project_id = ? ORDER BY d.ts DESC").all(status, projectId)
-    : status === "all"
-      ? db.query("SELECT * FROM decisions ORDER BY ts DESC").all()
-      : db.query("SELECT * FROM decisions WHERE status = ? ORDER BY ts DESC").all(status);
+  const includeTest = url.searchParams.get("test") === "all";
+  const where: string[] = [];
+  const args: any[] = [];
+  if (status !== "all") { where.push("d.status = ?"); args.push(status); }
+  if (projectId) { where.push("t.project_id = ?"); args.push(projectId); }
+  // Decisions under a test/ephemeral project (see testProjects.ts) are hidden
+  // from director surfaces by default, same as the project itself.
+  if (!includeTest) where.push(notTestProjectSql("p.config"));
+  const sql =
+    "SELECT d.* FROM decisions d JOIN tasks t ON t.id = d.task_id JOIN projects p ON p.id = t.project_id" +
+    (where.length ? " WHERE " + where.join(" AND ") : "") +
+    " ORDER BY d.ts DESC";
+  const rows = db.query(sql).all(...args);
   return json(rows.map((r) => withBundle(db, parseDecision(r))));
 }
 
