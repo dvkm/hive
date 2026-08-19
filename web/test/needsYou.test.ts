@@ -33,6 +33,49 @@ test("needs-you queue includes every actionable item", () => {
   expect(items.map((item) => item.id)).toEqual(["decision-1", "checkpoint-1", "quiz-1", "review-1", "failed-1", "stuck-1"]);
 });
 
+test("a stuck/dead task blocked on an unmerged dependency is 'waiting', not 'attention', and contributes no attention item", () => {
+  const blocker = task("blocker-1", "in_progress", { number: 87, title: "Consolidate the external-task guard", pr_url: "https://example.com/pull/87" });
+  const stuck = task("stuck-1", "in_progress", { number: 993, title: "Reject undeliverable sends", depends_on: ["blocker-1"], health: { status: "stuck", reason: null, since: "now" } });
+  const items = getNeedsYouItems([], [blocker, stuck], [], []);
+
+  expect(items).toEqual([
+    {
+      kind: "waiting",
+      id: "stuck-1",
+      task: stuck,
+      blockedBy: [{ id: "blocker-1", number: 87, title: "Consolidate the external-task guard", state: "in_progress", pr_url: "https://example.com/pull/87" }],
+    },
+  ]);
+});
+
+test("a dependency landing (verifying/done) moves its dependent from 'waiting' back to 'attention'", () => {
+  const items = getNeedsYouItems(
+    [],
+    [
+      task("blocker-1", "verifying", { number: 87, title: "Consolidate the external-task guard" }),
+      task("stuck-1", "in_progress", { depends_on: ["blocker-1"], health: { status: "stuck", reason: null, since: "now" } }),
+    ],
+    [],
+    []
+  );
+
+  expect(items.map((item) => item.kind)).toEqual(["attention"]);
+});
+
+test("a failed task always needs routing, even with an unmet dependency", () => {
+  const items = getNeedsYouItems(
+    [],
+    [
+      task("blocker-1", "in_progress", { number: 87, title: "Still in flight" }),
+      task("failed-1", "failed", { depends_on: ["blocker-1"] }),
+    ],
+    [],
+    []
+  );
+
+  expect(items.map((item) => item.kind)).toEqual(["attention"]);
+});
+
 test("reviews with pending CI do not hide actionable reviews", () => {
   const items = getNeedsYouItems(
     [],

@@ -6,7 +6,7 @@ import type { Health, Kind, State, Task } from "../lib/api";
 import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
-import { AttentionTray, needsAttention } from "./attention";
+import { AttentionTray, needsAttention, isWaiting } from "./attention";
 import { isJiraMirror, isTrackingOnly } from "../lib/needsYou";
 
 // A compact "why this card needs attention" line: e.g. "agent gone" or
@@ -185,7 +185,7 @@ const BANNER_DISMISS_KEY = "hive.brief.bannerDismissed";
 // unhealthy task brings it back rather than staying hidden forever.
 function BriefBanner() {
   const { decisions, tasks } = useStore();
-  const attn = tasks.filter(needsAttention).length;
+  const attn = tasks.filter((t) => needsAttention(t) && !isWaiting(t, tasks)).length;
   const decs = decisions.length;
   const review = tasks.filter((t) => t.state === "in_review" && !isTrackingOnly(t)).length;
   const sig = `${decs}:${attn}:${review}`;

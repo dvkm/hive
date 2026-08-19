@@ -3,11 +3,34 @@ import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
 import type { Task } from "../lib/api";
-import { isTrackingOnly, taskNeedsAttention } from "../lib/needsYou";
+import { isTrackingOnly, taskNeedsAttention, isWaiting, unmetDeps } from "../lib/needsYou";
+import type { BlockingTaskRef } from "../lib/needsYou";
 import { Attach, HEALTH_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 
-export { taskNeedsAttention as needsAttention } from "../lib/needsYou";
+export { taskNeedsAttention as needsAttention, isWaiting } from "../lib/needsYou";
+
+// "waiting on #N Title, #M Title" — each ref linked to its PR (if open) or its
+// task page, the blocking artifact the director would actually check.
+export function BlockedByLine({ blockedBy }: { blockedBy: BlockingTaskRef[] }) {
+  return (
+    <>
+      waiting on{" "}
+      {blockedBy.map((b, i) => (
+        <span key={b.id}>
+          {i > 0 && ", "}
+          {b.pr_url ? (
+            <a href={b.pr_url} target="_blank" rel="noreferrer">#{b.number} {b.title}</a>
+          ) : b.state === "missing" ? (
+            b.title
+          ) : (
+            <Link to={`/tasks/${b.id}`}>#{b.number} {b.title}</Link>
+          )}
+        </span>
+      ))}
+    </>
+  );
+}
 
 // One compact tray row for a FAILED task awaiting human triage. Failed tasks are
 // not a board column, so without this tray they vanish entirely.
@@ -101,6 +124,28 @@ export function UnhealthyRow({ task }: { task: Task }) {
   );
 }
 
+// One compact tray row for a live task that is only waiting on another task's
+// PR to land — nothing for the director to do but see it and wait.
+export function WaitingRow({ task }: { task: Task }) {
+  const { projects, tasks } = useStore();
+  const project = projects.find((p) => p.id === task.project_id);
+  const age = useRelTime(task.updated_at);
+  const blockedBy = unmetDeps(task, tasks);
+  return (
+    <div className="attn-row">
+      <span className="sdot sdot-queued" />
+      <Link to={`/tasks/${task.id}`} className="attn-title">
+        {task.title}
+      </Link>
+      {project && <span className="chip">{project.name}</span>}
+      <span className="attn-reason">
+        <BlockedByLine blockedBy={blockedBy} />
+      </span>
+      <span className="attn-age">{age}</span>
+    </div>
+  );
+}
+
 // Small modal: edit a failed task's brief/title, then re-queue it.
 export function EditRequeueModal({ task, onClose }: { task: Task; onClose: () => void }) {
   const [title, setTitle] = useState(task.title);
@@ -167,19 +212,42 @@ export function AttentionRows({ tasks }: { tasks: Task[] }) {
   );
 }
 
-// Collapsed when empty. Failed tasks (awaiting triage) + dead/stuck live tasks.
+// Collapsed when empty. Failed tasks (awaiting triage) + dead/stuck live tasks,
+// split into what needs routing now vs. what is only waiting on another
+// task's PR to land (a pure wait state contributes nothing to either count
+// but the tray body it belongs in).
 export function AttentionTray({ tasks }: { tasks: Task[] }) {
+  const { tasks: allTasks } = useStore();
   const eligible = tasks.filter(taskNeedsAttention);
+  const waiting = eligible.filter((t) => isWaiting(t, allTasks));
+  const actionable = eligible.filter((t) => !isWaiting(t, allTasks));
   if (eligible.length === 0) return null;
   return (
     <section className="attn-tray">
-      <header className="attn-head">
-        <span className="attn-head-title">⚠ Needs attention</span>
-        <span className="col-count">{eligible.length}</span>
-      </header>
-      <div className="attn-body">
-        <AttentionRows tasks={eligible} />
-      </div>
+      {actionable.length > 0 && (
+        <>
+          <header className="attn-head">
+            <span className="attn-head-title">⚠ Needs attention</span>
+            <span className="col-count">{actionable.length}</span>
+          </header>
+          <div className="attn-body">
+            <AttentionRows tasks={actionable} />
+          </div>
+        </>
+      )}
+      {waiting.length > 0 && (
+        <>
+          <header className="attn-head">
+            <span className="attn-head-title">Waiting</span>
+            <span className="col-count">{waiting.length}</span>
+          </header>
+          <div className="attn-body">
+            {waiting.map((t) => (
+              <WaitingRow key={t.id} task={t} />
+            ))}
+          </div>
+        </>
+      )}
     </section>
   );
 }

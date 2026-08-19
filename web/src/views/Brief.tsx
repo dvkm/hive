@@ -6,7 +6,7 @@ import { useStore } from "../lib/store";
 import { StatusDot, HEALTH_LABEL } from "../lib/ui";
 import { DecisionCard } from "./DecisionCard";
 import { ReviewAudit, ReviewCard, ReviewUnderstanding } from "./ReviewCard";
-import { AttentionRows } from "./attention";
+import { AttentionRows, BlockedByLine } from "./attention";
 import { CheckpointsInbox } from "./Checkpoints";
 import { UnderstandingQuiz } from "./UnderstandingQuiz";
 import { fmtUsd, fmtTokens } from "./Analytics";
@@ -20,6 +20,7 @@ const ITEM_LABELS: Record<NeedsYouItem["kind"], string> = {
   quiz: "Understanding",
   review: "Review",
   attention: "Issue",
+  waiting: "Waiting",
 };
 
 // A calm memo section: a heading with a count, then its body. Renders nothing
@@ -85,6 +86,7 @@ export default function Brief() {
   const quizzes = needsYou.flatMap((item) => item.kind === "quiz" && !passedQuizzes.has(item.id) ? [item.quiz] : []);
   const toReview = needsYou.flatMap((item) => item.kind === "review" && !reviewed.has(item.id) ? [item.task] : []);
   const attention = needsYou.flatMap((item) => item.kind === "attention" ? [item.task] : []);
+  const waiting = needsYou.flatMap((item) => item.kind === "waiting" ? [{ task: item.task, blockedBy: item.blockedBy }] : []);
 
   const done = data?.done ?? [];
   const fleet = data?.fleet ?? [];
@@ -99,6 +101,7 @@ export default function Brief() {
     if (item.kind === "decision") return !answered.has(item.id);
     if (item.kind === "quiz") return !passedQuizzes.has(item.id);
     if (item.kind === "review") return !reviewed.has(item.id);
+    if (item.kind === "waiting") return false;
     return true;
   });
   const chooseMode = (next: "focus" | "backlogs") => {
@@ -124,7 +127,11 @@ export default function Brief() {
       {data && actionCount === 0 && (
         <div className="brief-quiet">
           <div className="empty-big">All quiet.</div>
-          <div className="muted">Nothing needs you.</div>
+          <div className="muted">
+            {waiting.length > 0
+              ? `Nothing needs you. ${waiting.length} waiting on a merge.`
+              : "Nothing needs you."}
+          </div>
         </div>
       )}
 
@@ -195,6 +202,16 @@ export default function Brief() {
           <Section title="Issues" count={attention.length}>
             <ul className="brief-backlog-list">
               {attention.map((task) => <li key={task.id}><Link to={`/tasks/${task.id}`}>#{task.number} {task.title}</Link><span>{task.health?.reason || task.summary || "Needs attention"}</span></li>)}
+            </ul>
+          </Section>
+          <Section title="Waiting" count={waiting.length}>
+            <ul className="brief-backlog-list">
+              {waiting.map(({ task, blockedBy }) => (
+                <li key={task.id}>
+                  <Link to={`/tasks/${task.id}`}>#{task.number} {task.title}</Link>
+                  <span><BlockedByLine blockedBy={blockedBy} /></span>
+                </li>
+              ))}
             </ul>
           </Section>
         </div>
