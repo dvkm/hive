@@ -6,7 +6,7 @@ import type { NeedsYouItem } from "./needsYou";
 
 export type SseState = "connecting" | "open" | "reconnecting";
 
-interface Store {
+export interface Store {
   tasks: Task[];
   projects: Project[]; // unarchived, shared across board/policies/new-task
   reloadProjects: () => void; // refresh after a project is created/edited/archived
@@ -39,7 +39,9 @@ interface Store {
 
 const FEED_CAP = 400;
 
-const Ctx = createContext<Store | null>(null);
+// Exported so tests can provide a fake Store without mounting the real
+// StoreProvider (which opens a live EventSource and hits every api.* on load).
+export const Ctx = createContext<Store | null>(null);
 export const useStore = () => {
   const s = useContext(Ctx);
   if (!s) throw new Error("useStore outside provider");

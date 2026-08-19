@@ -323,6 +323,11 @@ export function ReviewCard({
     setReviewLoaded(false);
     setQuizOverride(null);
     setEvidence([]);
+    // Same-route navigation between tasks re-renders this component in place
+    // (no remount) — without this, a "Request changes" editor left open on
+    // the previous task keeps rendering, notes and all, against the new one.
+    setMode(null);
+    setNotes("");
     api
       .diff(task.id)
       .then((d) => live && setDiff(d))
