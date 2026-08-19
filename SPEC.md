@@ -94,7 +94,7 @@ Views (React + Vite + TS; no UI framework dependency heavier than needed; SSE vi
 
 Navigation: a universal search/command trigger, a concise Needs you indicator, and one Browse menu keep every operational view available without placing them beside the current conversation.
 
-Design: dark, calm, conversational, and focused. Localhost tool, no auth. Desktop-first.
+Design: dark, calm, conversational, and focused. Localhost tool, no auth except config/secret writes (project settings and secrets ask for the API token once, then remember it). Desktop-first.
 
 ## Monitors (D3-B)
 

@@ -1,7 +1,7 @@
 import { beforeEach, expect, test } from "bun:test";
 import { makeHandler, wakeDueManagers } from "../src/api.ts";
 import { appendMessage, createThread } from "../src/chat.ts";
-import { newId, now, openDb, type DB } from "../src/db.ts";
+import { newId, now, openDb, setSetting, type DB } from "../src/db.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
 
@@ -13,6 +13,7 @@ const exec: Exec = async (argv) => {
   return OK();
 };
 const herdr = new Herdr(exec, "herdr");
+const TOKEN = "test-token";
 
 let db: DB;
 let handle: ReturnType<typeof makeHandler>;
@@ -31,13 +32,17 @@ beforeEach(() => {
     "INSERT INTO tasks (id, project_id, title, state, kind, source, agent_target, created_at, updated_at) VALUES (?,?,?, 'in_progress', 'chore', 'chat_supervisor', 'manager-agent', ?, ?)"
   ).run(managerId, projectId, "manager", t, t);
   threadId = createThread(db, { project_id: projectId, task_id: managerId, title: "Ship a reliable manager" }).id;
+  setSetting(db, "api_token", TOKEN); // PUT /api/projects/:id is write-gated
   handle = makeHandler(db, { herdr });
 });
 
 async function call(path: string, method = "GET", body?: unknown) {
   const res = await handle(new Request(`http://localhost${path}`, {
     method,
-    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
   }));
   return { status: res.status, json: await res.json() as any };

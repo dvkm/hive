@@ -6,7 +6,7 @@ import { join } from "node:path";
 const HOME = mkdtempSync(join(tmpdir(), "hive-spawn-"));
 process.env.HIVE_HOME = HOME;
 
-const { openDb } = await import("../src/db.ts");
+const { openDb, setSetting } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
@@ -36,7 +36,9 @@ function stubHerdr(sendResult: ExecResult = OK()) {
   return { herdr: new Herdr(exec, "herdr"), sends, calls };
 }
 
+const TOKEN = "test-token";
 const db = openDb(":memory:");
+setSetting(db, "api_token", TOKEN); // the /secrets writes below are gated
 let server: any;
 let BASE = "";
 let projectId = "";
@@ -60,7 +62,7 @@ beforeAll(async () => {
 afterAll(() => server.stop(true));
 
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` }, body: JSON.stringify(body) });
   return { status: res.status, json: await res.json() };
 }
 async function get(path: string) {
@@ -231,7 +233,7 @@ test("secrets API stores names/metadata only (no values)", async () => {
   // no value/ref leaks in the list
   expect(JSON.stringify(list.json)).not.toContain("value");
 
-  const del = await fetch(BASE + `/api/projects/${projectId}/secrets/API_KEY`, { method: "DELETE" });
+  const del = await fetch(BASE + `/api/projects/${projectId}/secrets/API_KEY`, { method: "DELETE", headers: { Authorization: `Bearer ${TOKEN}` } });
   expect(del.status).toBe(200);
 });
 
@@ -261,7 +263,7 @@ test("secrets API ignores a caller-supplied ref, so a secret cannot alias anothe
     (db.query("SELECT ref FROM secrets WHERE project_id = ? AND name = 'STOLEN'").get(projectId) as any).ref
   ).toBe(`hive/${projectId}/STOLEN`);
 
-  await fetch(BASE + `/api/projects/${projectId}/secrets/STOLEN`, { method: "DELETE" });
+  await fetch(BASE + `/api/projects/${projectId}/secrets/STOLEN`, { method: "DELETE", headers: { Authorization: `Bearer ${TOKEN}` } });
 });
 
 test("modelForTask: per-kind default, config.model, config.model_by_kind override in order", async () => {

@@ -6,10 +6,12 @@ import { join } from "node:path";
 const HOME = mkdtempSync(join(tmpdir(), "hive-proj-test-"));
 process.env.HIVE_HOME = HOME;
 
-const { openDb } = await import("../src/db.ts");
+const { openDb, setSetting } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
 
+const TOKEN = "test-token";
 const db = openDb(":memory:");
+setSetting(db, "api_token", TOKEN); // PUT /api/projects/:id is write-gated
 const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
 const BASE = `http://127.0.0.1:${server.port}`;
 afterAll(() => server.stop(true));
@@ -25,7 +27,7 @@ async function post(path: string, body: unknown) {
 async function put(path: string, body: unknown) {
   const res = await fetch(BASE + path, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
     body: JSON.stringify(body),
   });
   return { status: res.status, json: await res.json() };
