@@ -4364,6 +4364,11 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
   color: var(--red);
   white-space: pre-wrap;
 }
+.merge-issues { margin-top: var(--s2); color: var(--text-dim); }
+.merge-issues > summary { cursor: pointer; color: var(--red); }
+.merge-issues ol { margin: var(--s2) 0 0; padding-left: 20px; }
+.merge-issues li + li { margin-top: var(--s2); }
+.merge-issues time { margin-right: var(--s2); color: var(--text-faint); white-space: nowrap; }
 
 /* ---- page header: title + one-line "what this view is for" ----
    Gives the standalone list views (Terminals, Evidence, …) the same top-of-page

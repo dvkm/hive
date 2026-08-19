@@ -42,6 +42,15 @@ test("merge_failed distinguishes conflict from a plain failure", () => {
   expect(mf({ reason: "x", conflict: true, delivered: false })).toBe("merge conflict — ⚠ could not notify agent: x");
 });
 
+test("destructive merge blocks are readable and compact", () => {
+  const text = eventText({
+    type: "merge_blocked_destructive",
+    payload: { branch: "feat", regressed: Array.from({ length: 11 }, (_, i) => `file${i}`) },
+  });
+  expect(text).toBe("merge blocked: branch 'feat' reverts base work outside this task's scope (file0, file1, file2, file3, file4, file5, file6, file7, file8, file9, …(+1))");
+  expect(eventCategory("merge_blocked_destructive")).toBe("incident");
+});
+
 test("new transcript types are agent-lifecycle for the feed filter", () => {
   expect(eventCategory("assistant_text")).toBe("lifecycle");
   expect(eventCategory("tool_use")).toBe("lifecycle");
