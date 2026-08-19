@@ -186,6 +186,7 @@ test("Chief briefing leaves operational work to the manager and counts only enfo
   await post("/api/decisions", {
     task_id: balancedTask,
     title: "Save recurring link as a project reference? docs",
+    context: "Choose whether this recurring link should become durable project knowledge.",
     risk: "low",
     blast_radius: "one project reference",
     options: [{ key: "save", label: "Save", recommended: true }, { key: "skip", label: "Skip" }],
@@ -201,6 +202,7 @@ test("Chief briefing leaves operational work to the manager and counts only enfo
   await post("/api/decisions", {
     task_id: conservativeTask,
     title: "Save recurring link as a project reference? conservative",
+    context: "Choose whether this recurring link should become durable project knowledge.",
     risk: "low",
     blast_radius: "one project reference",
     options: [{ key: "save", label: "Save", recommended: true }, { key: "skip", label: "Skip" }],

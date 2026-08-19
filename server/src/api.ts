@@ -3795,10 +3795,12 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
 
   // --- needs-decision (minimal card; full cards go via POST /api/decisions) ---
   if (type === "needs-decision") {
+    const context = fields.context ?? note;
+    if (!String(context ?? "").trim()) return err("needs-decision needs context", 400);
     const decision = createDecision(db, {
       task_id: taskId,
       title: fields.title || note || "Decision needed",
-      context: fields.context ?? note,
+      context,
       risk: fields.risk,
       blast_radius: fields.blast_radius,
       options: fields.options ? JSON.parse(fields.options) : [],
@@ -4306,6 +4308,7 @@ export function createDecision(
 function apiCreateDecision(db: DB, body: any): Response {
   if (!body?.task_id) return err("task_id is required");
   if (!body?.title) return err("title is required");
+  if (!String(body?.context ?? "").trim()) return err("context is required", 400);
   if (!Array.isArray(body?.options) || body.options.length === 0)
     return err("options must be a non-empty array", 400);
   const decision = createDecision(db, {

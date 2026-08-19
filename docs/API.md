@@ -873,7 +873,7 @@ work. Use `POST /api/tasks/:id/events` with `type=evidence` for that.
 
 ### Decisions
 - `GET /api/decisions?status=open[&project_id=<id>]` → `200 [Decision, ...]` (newest first; `status` defaults to `open`; `status=all` returns every decision; `project_id` optionally scopes the list)
-- `POST /api/decisions` body `{task_id (required), title (required), context?, risk?, blast_radius?, options (required, non-empty)}` → `201 Decision` | `400` (missing/empty `options`)
+- `POST /api/decisions` body `{task_id (required), title (required), context (required), risk?, blast_radius?, options (required, non-empty)}` → `201 Decision` | `400` (missing context or missing/empty `options`)
   (also writes a `needs-decision` event and parks the task in `needs_decision` if its current state allows it)
 - `GET /api/decisions/:id` → `200 Decision` | `404`
 - `PUT /api/decisions/:id/draft` body `{draft_note}` → `200 {"ok":true, "id":...}` | `404`

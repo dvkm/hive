@@ -23,7 +23,7 @@ Usage:
         deferred: park a task waiting on an OFFLINE human action (no more "gone quiet" nudges);
                   [--until <iso>] or [--days <n>] to auto-resume, else indefinite. undefer to resume early.
         ready: PR open (or scout report written) → hand off to review (in_progress -> in_review)
-  hive decision ask <task-id> --title <t> [--context <s>] [--risk <s>] [--blast <s>]
+  hive decision ask <task-id> --title <t> --context <s> [--risk <s>] [--blast <s>]
         --option key:label:detail  (repeatable)  --recommend <key>  --needs-input <key>
   hive decision auto-answer <decision-id> --key <option> [--reason <s>]
         supervisor self-approval: answers ONLY if the server-enforced safety bar
@@ -254,6 +254,7 @@ async function main() {
       const taskId = _[0];
       if (!taskId) die("usage: hive decision ask <task-id> --title ... --option k:l:d ...");
       if (!flags.title) die("--title is required");
+      if (typeof flags.context !== "string" || !flags.context.trim()) die("--context is required: explain why this needs a decision, what changes, and why you recommend one option");
       const rawOpts = ([] as any[]).concat(flags.option || []);
       const recommend = flags.recommend ? String(flags.recommend) : undefined;
       const needsInput = new Set(([] as any[]).concat(flags["needs-input"] || []).map(String));

@@ -182,7 +182,7 @@ test("decision exposes structured plan for the UI checklist", async () => {
   const notification = db.query("SELECT body FROM notifications WHERE decision_id = ?").get(r.decision!.id) as { body: string };
   expect(notification.body).toContain("Proposed tasks");
   // a non-planner card has no plan
-  const other = await post("/api/decisions", { task_id: t.id, title: "unrelated", options: [{ key: "ok", label: "OK" }] });
+  const other = await post("/api/decisions", { task_id: t.id, title: "unrelated", context: "A non-planner test decision.", options: [{ key: "ok", label: "OK" }] });
   expect(other.json.plan).toBeNull();
 });
 

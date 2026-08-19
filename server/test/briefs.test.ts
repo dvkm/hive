@@ -52,6 +52,13 @@ test("brief excludes project bookkeeping from understanding quizzes", () => {
   expect(brief).toContain("cannot be reframed as a transferable scenario, omit it");
 });
 
+test("brief requires a standalone decision context", () => {
+  const { db, taskId } = setup();
+  const brief = composeBrief(db, taskId);
+  expect(brief).toContain("--context");
+  expect(brief).toContain("stand alone without opening");
+});
+
 test("scout brief has a report-based definition of done", () => {
   const { db, taskId } = setup();
   db.query("UPDATE tasks SET kind = 'scout' WHERE id = ?").run(taskId);
