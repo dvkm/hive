@@ -368,6 +368,42 @@ test("a wrong answer teaches the idea and rotates to another question", async ()
   s.server.stop(true);
 });
 
+test("list completed/total tracks a two-check quiz exactly through pass (hive-1002)", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "review me" });
+  await post(s.base, `/api/tasks/${t.json.id}/spawn`, {});
+  await post(s.base, `/api/tasks/${t.json.id}/events`, {
+    type: "review_summary",
+    done: ["implemented the change"],
+    understanding: { background: "This changes behavior.", essence: "Tests cover it.", checks: QUIZ_BANK.slice(0, 2) },
+  });
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+
+  let quiz = (await get(s.base, "/api/understanding-quizzes")).json.quizzes.find((item: any) => item.task_id === t.json.id);
+  expect(quiz.total).toBe(2);
+  expect(quiz.completed).toBe(0);
+
+  const first = await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "safe", source: "director" });
+  expect(first.json.correct).toBe(true);
+  expect(first.json.passed).toBe(false);
+  expect(first.json.completed).toBe(1);
+  expect(first.json.total).toBe(2);
+
+  quiz = (await get(s.base, "/api/understanding-quizzes")).json.quizzes.find((item: any) => item.task_id === t.json.id);
+  expect(quiz).toBeTruthy(); // one check still outstanding, must stay listed
+  expect(quiz.completed).toBe(1);
+  expect(quiz.total).toBe(2);
+
+  const second = await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "safe", source: "director" });
+  expect(second.json.correct).toBe(true);
+  expect(second.json.passed).toBe(true);
+  expect(second.json.completed).toBe(2);
+
+  expect((await get(s.base, "/api/understanding-quizzes")).json.quizzes.some((item: any) => item.task_id === t.json.id)).toBe(false);
+  s.server.stop(true);
+});
+
 test("explicit escape hatch ships now and keeps the quiz in Needs You until passed", async () => {
   const s = makeServer();
   const { taskId } = await inReviewTask(s.base, {}, false);
