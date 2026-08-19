@@ -95,6 +95,15 @@ test("task create + list + get", async () => {
   expect(Array.isArray(one.json.events)).toBe(true);
 });
 
+test("every unrecorded task action failure gets a durable receipt", async () => {
+  const failed = await post(`/api/tasks/${taskId}/transition`, { to: "queued" });
+  expect(failed.status).toBe(409);
+  const events = (await get(`/api/tasks/${taskId}/events`)).json;
+  const receipt = events.findLast((event: any) => event.type === "action_failed");
+  expect(receipt.payload).toMatchObject({ action: "POST /transition", status: 409 });
+  expect(receipt.payload.reason).toContain("already in state");
+});
+
 test("agent-created task carries source + parent_task_id", async () => {
   const r = await post("/api/tasks", {
     project_id: projectId,

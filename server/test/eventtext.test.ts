@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { eventText, eventCategory } from "../../web/src/lib/eventText.ts";
+import { eventText, eventCategory, isFailureEvent } from "../../web/src/lib/eventText.ts";
 
 test("assistant_text reads as its first line", () => {
   expect(eventText({ type: "assistant_text", payload: { text: "patching the middleware\nnext step" } })).toBe(
@@ -49,6 +49,17 @@ test("destructive merge blocks are readable and compact", () => {
   });
   expect(text).toBe("merge blocked: branch 'feat' reverts base work outside this task's scope (file0, file1, file2, file3, file4, file5, file6, file7, file8, file9, …(+1))");
   expect(eventCategory("merge_blocked_destructive")).toBe("incident");
+});
+
+test("failure history includes explicit and payload-based failures", () => {
+  expect(isFailureEvent({ type: "action_failed", payload: { status: 409 } })).toBe(true);
+  expect(isFailureEvent({ type: "future_worker_error", payload: {} })).toBe(true);
+  expect(isFailureEvent({ type: "state_change", payload: { to: "failed" } })).toBe(true);
+  expect(isFailureEvent({ type: "stack_teardown", payload: { ok: false } })).toBe(true);
+  expect(isFailureEvent({ type: "steer", payload: { delivery: "failed" } })).toBe(true);
+  expect(isFailureEvent({ type: "stack_teardown", payload: { ok: true } })).toBe(false);
+  expect(isFailureEvent({ type: "state_change", payload: { to: "done" } })).toBe(false);
+  expect(eventText({ type: "action_failed", payload: { action: "POST /merge", reason: "CI pending" } })).toBe("POST /merge failed: CI pending");
 });
 
 test("new transcript types are agent-lifecycle for the feed filter", () => {

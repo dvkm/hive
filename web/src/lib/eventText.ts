@@ -78,6 +78,21 @@ export function eventText(e: EventLike): string {
     }
     case "auto_review_error":
       return `pre-review failed: ${s(p.error)}`;
+    case "action_failed":
+      return `${s(p.action) || "task action"} failed: ${s(p.reason) || `HTTP ${s(p.status)}`}`;
+    case "auto_merged":
+      return p.ok === false ? `automatic merge failed: ${s(p.error) || `HTTP ${s(p.status)}`}` : "automatically merged";
+    case "cleanup_skipped":
+      return `cleanup failed safely: ${s(p.reason) || "worktree preserved"}`;
+    case "stack_setup":
+    case "stack_teardown":
+      return p.ok === false ? `${e.type.replace("_", " ")} failed: ${s(p.error)}` : `${e.type.replace("_", " ")} completed`;
+    case "recovery":
+      return `agent failure detected: ${s(p.decision) || s(p.excerpt) || "recovery required"}`;
+    case "recovery_nudge":
+      return p.delivered === false ? `recovery nudge failed: ${s(p.error)}` : "recovery nudge delivered";
+    case "worktree_reclaim_failed":
+      return `worktree reclaim failed: ${s(p.error)}`;
     case "ready_held":
       return s(p.reason) === "no_evidence"
         ? "handoff held: no evidence attached yet"
@@ -185,6 +200,7 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
   stale: "incident",
   merge_failed: "incident",
   merge_blocked_destructive: "incident",
+  action_failed: "incident",
   spawn_error: "incident",
   smoke_failed: "incident",
   steer_error: "incident",
@@ -197,4 +213,38 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
 // lifecycle (the catch-all), matching the server's default grouping.
 export function eventCategory(type: string): FeedCategory {
   return CATEGORY_OF[type] ?? "lifecycle";
+}
+
+const FAILURE_TYPES = new Set([
+  "action_failed",
+  "authority_denied",
+  "auto_review_error",
+  "ci_failure",
+  "cleanup_skipped",
+  "merge_blocked_destructive",
+  "merge_failed",
+  "planner_error",
+  "pr_closed",
+  "pr_conflict",
+  "recovery",
+  "smoke_failed",
+  "spawn_error",
+  "steer_error",
+  "supervise_error",
+  "usage_limit",
+  "verify_wedged",
+  "worktree_reclaim_failed",
+]);
+
+// One definition for the durable failure history. Most failures have their own
+// event type; a few lifecycle events carry success/failure in their payload.
+export function isFailureEvent(e: EventLike): boolean {
+  if (FAILURE_TYPES.has(e.type) || /(?:_error|_failed|_failure)$/.test(e.type)) return true;
+  const p = e.payload || {};
+  if (e.type === "state_change") return p.to === "failed";
+  if (e.type === "auto_merged" || e.type === "stack_setup" || e.type === "stack_teardown") return p.ok === false;
+  if (e.type === "steer") return p.delivery === "failed";
+  if (e.type === "recovery_nudge" || e.type === "dialog_answered" || e.type === "dialog_auto_approved" || e.type === "dialog_auto_declined")
+    return p.delivered === false;
+  return e.type === "changes_requested" && !!p.send_error;
 }

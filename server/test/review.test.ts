@@ -364,6 +364,7 @@ test("merge conflict bounces the task back to the agent with rebase instructions
   const mf = ev.json.find((e: any) => e.type === "merge_failed");
   expect(mf.payload.conflict).toBe(true);
   expect(mf.payload.delivered).toBe(true);
+  expect(ev.json.some((e: any) => e.type === "action_failed")).toBe(false);
   s.server.stop(true);
 });
 
