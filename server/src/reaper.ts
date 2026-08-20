@@ -12,7 +12,7 @@ import type { DB } from "./db.ts";
 import { setSetting, now, isOffline } from "./db.ts";
 import { getTask, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, parseWorktreeList } from "./runtime/herdr.ts";
-import { cleanupTask } from "./cleanup.ts";
+import { cleanupTask, releaseReviewAgents } from "./cleanup.ts";
 import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
@@ -70,6 +70,14 @@ export async function reapOnce(db: DB, deps: ReaperDeps = {}): Promise<void> {
         console.error(`[hive] reaper ${taskId}:`, e); // isolated; never crash the sweep
       }
     }
+  }
+
+  // Free the agents parked on review BEFORE the orphan sweeps: they are live,
+  // idle and holding both a pty and a dispatch slot (see releaseReviewAgent).
+  try {
+    await releaseReviewAgents(db, herdr);
+  } catch (e) {
+    console.error("[hive] reaper review-agent release:", e); // isolated; never crash the sweep
   }
 
   try {

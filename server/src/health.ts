@@ -87,7 +87,13 @@ function staleMs(): number {
 //   silent — no activity events past the stale threshold, agent still alive.
 //   healthy — otherwise.
 export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | null {
-  if (!HEALTH_STATES.has(task.state) || !task.agent_target) return null;
+  if (!HEALTH_STATES.has(task.state)) return null;
+  // Health is agent-derived, so it needs a bound agent — with one exception: a
+  // task in review whose agent was RELEASED (cleanup.releaseReviewAgent) is
+  // parked on the director, and its merge-failure symptom must stay visible.
+  // The liveness branches below stay gated on agent_target so a leftover
+  // `gone`/`blocked` status event can't read as a dead agent that no longer exists.
+  if (!task.agent_target && task.state !== "in_review") return null;
 
   // Deferred pending an OFFLINE human action (state.ts's deferTask/isDeferred):
   // the agent exits normally right after emitting `deferred`, herdr reports it
@@ -116,7 +122,8 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
     }
   }
 
-  if (lastStatus === "gone") return { status: "dead", reason: "agent gone from herdr", since: lastStatusTs };
+  if (task.agent_target && lastStatus === "gone")
+    return { status: "dead", reason: "agent gone from herdr", since: lastStatusTs };
   const dialogRecovered = events.find((e) => {
     if (e.ts <= lastStatusTs || (e.type !== "dialog_auto_approved" && e.type !== "dialog_auto_declined")) return false;
     try {
@@ -125,7 +132,7 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
       return false;
     }
   });
-  if (lastStatus === "blocked" && !dialogRecovered)
+  if (task.agent_target && lastStatus === "blocked" && !dialogRecovered)
     return { status: "stuck", reason: "agent blocked (waiting on you)", since: lastStatusTs };
 
   // A merge failure's reason must stay visible past the moment the task

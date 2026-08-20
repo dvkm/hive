@@ -10,6 +10,9 @@ import type { DB } from "./db.ts";
 import { now } from "./db.ts";
 import { getTask, writeEvent, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
+import { isTrackingOnlyTask } from "./supervision.ts";
+import { queuedSteers } from "./steer.ts";
+import { broadcastTask } from "./health.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, safeBranch } from "./exec.ts";
 
@@ -235,4 +238,85 @@ export async function cleanupTask(
   // Clear the now-gone runtime binding so a re-run/reaper pass is a no-op.
   db.query("UPDATE tasks SET agent_target = NULL, worktree_path = NULL, updated_at = ? WHERE id = ?").run(now(), taskId);
   return { cleaned: true, worktree, session };
+}
+
+// ---- review-parked agent release ----
+// A task in review is parked on the DIRECTOR: the PR is open, CI is green, and
+// nothing in hive asks its agent to act again until a human (or a red check)
+// does. Left alive that agent still holds a pty AND a dispatch slot — 10 idle
+// review agents starved acme to 3 running against 19 queued (2026-08-19).
+//
+// Release = close the session, KEEP the worktree and branch (the PR still needs
+// them), drop agent_target so the dispatcher stops counting it. Feedback brings
+// an agent back onto the same branch with that feedback in its brief (the
+// reattach pass in dispatcher.ts).
+//
+// Deliberately NOT gated on the understanding quiz: a quiz is director-only
+// (answering or deferring it never reaches the agent), so "quiz still pending"
+// is exactly the state the slot would be held for. `idle` is the same signal
+// advanceIfFinished already reads as "this agent has nothing left to do".
+export async function releaseReviewAgent(
+  db: DB,
+  herdr: Herdr = defaultHerdr,
+  taskId: string
+): Promise<{ released: boolean; reason: string }> {
+  const task = getTask(db, taskId);
+  if (!task) return { released: false, reason: "no such task" };
+  if (task.state !== "in_review" || !task.agent_target) return { released: false, reason: "no review-parked agent" };
+  if (isTrackingOnlyTask(task) || task.source === "chat_supervisor")
+    return { released: false, reason: "not a hive worker task" };
+  // Undelivered feedback is already waiting: the reconciler's drainSteers can
+  // hand it to the live agent this cycle, which beats release-then-respawn.
+  if (queuedSteers(db, taskId).length) return { released: false, reason: "steers pending delivery" };
+
+  const meta = spawnMeta(db, taskId);
+  const probe = await herdr.probe(task.agent_target).catch(() => ({ alive: true, status: "unknown" as const }));
+  // `gone` needs positive proof. An unresolvable probe is what a herdr registry
+  // wipe looks like, and closing a tab under a live agent is the kill wave this
+  // repo already paid for once (2026-08-19, false-dead incident).
+  const gone = !probe.alive && (await herdr.confirmGone({ cwd: task.worktree_path, tabId: meta.tab_id }));
+  if (!gone && !(probe.alive && probe.status === "idle"))
+    return { released: false, reason: `agent is ${probe.alive ? probe.status : "unconfirmed-gone"}` };
+
+  const session = await herdr.closeSession({ agentTarget: task.agent_target, tabId: meta.tab_id });
+  // The worktree's OWN workspace holds a second pty the agent never used (see
+  // cleanupTask). The checkout on disk is untouched by a workspace close.
+  if (meta.workspace_id) await herdr.closeWorkspace(meta.workspace_id);
+  db.query("UPDATE tasks SET agent_target = NULL, updated_at = ? WHERE id = ?").run(now(), taskId);
+  const reason = gone ? "agent gone" : "idle in review";
+  writeEvent(db, {
+    task_id: taskId,
+    source: "reaper",
+    type: "agent_released",
+    payload: {
+      reason,
+      branch: task.branch,
+      worktree_path: task.worktree_path,
+      session_closed: session.closed,
+      session_via: session.via,
+    },
+  });
+  broadcastTask(db, getTask(db, taskId));
+  return { released: true, reason };
+}
+
+// Sweep every review-parked agent. Per-project opt-out:
+// config.release_review_agents = false keeps agents alive through review.
+export async function releaseReviewAgents(db: DB, herdr: Herdr = defaultHerdr): Promise<number> {
+  const rows = db
+    .query(
+      `SELECT t.id FROM tasks t JOIN projects p ON p.id = t.project_id
+        WHERE t.state = 'in_review' AND t.agent_target IS NOT NULL
+          AND COALESCE(json_extract(p.config, '$.release_review_agents'), 1) != 0`
+    )
+    .all() as { id: string }[];
+  let released = 0;
+  for (const r of rows) {
+    try {
+      if ((await releaseReviewAgent(db, herdr, r.id)).released) released++;
+    } catch (e) {
+      console.error(`[hive] release review agent ${r.id}:`, e); // isolated; never crash the sweep
+    }
+  }
+  return released;
 }

@@ -2303,20 +2303,21 @@ function ghMergeFlag(method: string | undefined): string {
 const MERGE_CONFLICT_RE = /conflict|not mergeable|not an ancestor|fast-forward/i;
 async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason: string): Promise<Response> {
   const conflict = MERGE_CONFLICT_RE.test(reason);
+  const msg = `hive: merge into '${base}' failed — ${reason}\nRebase your branch '${task.branch}' onto the latest '${base}', resolve the conflicts, rerun the tests, then push.`;
   let delivered = false;
   let sendError: string | null = null;
   if (conflict && task.agent_target) {
     try {
-      const res = await herdr.send(
-        task.agent_target,
-        `hive: merge into '${base}' failed — ${reason}\nRebase your branch '${task.branch}' onto the latest '${base}', resolve the conflicts, rerun the tests, then push.`
-      );
+      const res = await herdr.send(task.agent_target, msg);
       sendError = sendFailure(res);
       delivered = sendError === null;
     } catch (e: any) {
       sendError = String(e?.message ?? e);
     }
   }
+  // The task stays in_review, where its agent has usually been released, so a
+  // conflict that reached nobody is queued for the dispatcher's reattach pass.
+  if (conflict && !delivered) queueSteerEvent(db, task.id, msg, "merge conflict; no live agent");
   writeEvent(db, {
     task_id: task.id,
     source: "director",

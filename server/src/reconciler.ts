@@ -471,21 +471,24 @@ async function nudgeCiFailure(
       if ((JSON.parse(last.payload).head_sha ?? null) === headSha) return;
     } catch {}
   }
+  const msg =
+    `hive: CI is FAILING on your PR ${t.pr_url}. Run \`gh pr checks ${t.pr_url}\` to see the failures, fix them, and push. ` +
+    `The task returns to review automatically when checks pass — do not emit ready while CI is red.`;
   let delivered = false;
   let error: string | null = null;
   if (t.agent_target) {
     try {
-      const r = await h.send(
-        t.agent_target,
-        `hive: CI is FAILING on your PR ${t.pr_url}. Run \`gh pr checks ${t.pr_url}\` to see the failures, fix them, and push. ` +
-          `The task returns to review automatically when checks pass — do not emit ready while CI is red.`
-      );
+      const r = await h.send(t.agent_target, msg);
       error = sendFailure(r);
       delivered = error === null;
     } catch (e: any) {
       error = String(e?.message ?? e);
     }
   }
+  // Nobody live read it (released after review handoff, or dead): queue it so the
+  // dispatcher's reattach pass respawns an agent carrying it. The per-head-SHA
+  // dedupe above means at most one queued steer per pushed head, not a backlog.
+  if (!delivered) queueSteerEvent(db, t.id, msg, "CI failing; no live agent");
   writeEvent(db, {
     task_id: t.id,
     source: "reconciler",
@@ -546,20 +549,21 @@ async function nudgeConflict(
     }
   }
 
+  const msg = `hive: your PR ${t.pr_url} has merge conflicts with '${base}'. Fetch and merge the latest 'origin/${base}' into your branch (or rebase onto it), resolve the conflicts, rerun the tests, then push.`;
   let delivered = false;
   let error: string | null = null;
   if (t.agent_target) {
     try {
-      const r = await h.send(
-        t.agent_target,
-        `hive: your PR ${t.pr_url} has merge conflicts with '${base}'. Fetch and merge the latest 'origin/${base}' into your branch (or rebase onto it), resolve the conflicts, rerun the tests, then push.`
-      );
+      const r = await h.send(t.agent_target, msg);
       error = sendFailure(r);
       delivered = error === null;
     } catch (e: any) {
       error = String(e?.message ?? e);
     }
   }
+  // Same as nudgeCiFailure: an in_review task's agent is usually released, so
+  // queue the nudge for the reattach respawn instead of dropping it.
+  if (!delivered) queueSteerEvent(db, t.id, msg, "PR conflicting; no live agent");
   writeEvent(db, {
     task_id: t.id,
     source: "reconciler",

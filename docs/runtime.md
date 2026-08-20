@@ -28,7 +28,9 @@ web UI now runs instead of sitting in Queued forever. Every gate below must pass
 4. **`config.max_agents`** (default 3). Worker concurrency cap per project, counting
    tasks currently holding an agent (`agent_target` set and state in
    in_progress / needs_decision / in_review / verifying). The chat-supervisor
-   manager session does not consume a worker slot.
+   manager session does not consume a worker slot. Review-parked agents are
+   RELEASED once idle (see below), so they drop out of both counts — the `× 2`
+   overhang bounds live agents, not review depth.
 5. **Authority gate.** `authorize(action="task.dispatch", target=<title>)` must
    resolve to `allow`. A `deny` or `require_decision` standing-authority rule
    blocks the auto-spawn (and, for `require_decision`, opens the usual card).
@@ -71,6 +73,42 @@ would `spawn_error` on the create step; the slow `setup_argv` runs after that
 lock releases, so parallelizing across projects is the safe win. The
 per-project count caches (`max_agents` gate) are only ever keyed by a project's
 own id, so concurrent project loops never race on shared state.
+
+## Review-parked agents: release and reattach
+
+An `in_review` task is parked on the DIRECTOR — PR open, CI green, quiz waiting
+on a human. Its agent has nothing to do, but while it lives it holds a pty and a
+dispatch slot. On 2026-08-19 ten such agents held acme at 3 running against
+19 queued, because live agents (`max_agents × 2`) were all review-parked.
+
+**Release** (`cleanup.releaseReviewAgent`, run every reaper sweep). For each
+`in_review` task still holding an `agent_target`, herdr is probed:
+
+- `idle` → release. Confirmed `gone` (probe says not found AND the pane list has
+  no trace) → release.
+- `working`, `blocked`, or an UNCONFIRMED death → leave it alone. An
+  unresolvable probe is what a herdr registry wipe looks like, and closing a tab
+  under a live agent is the 2026-08-19 kill wave.
+- Undelivered steers pending → leave it alone; `drainSteers` gets first go.
+
+Releasing closes the fleet tab and the worktree's own workspace, PRESERVES the
+git worktree and branch (the PR still points at them), nulls `agent_target`, and
+writes an `agent_released` event. Lifecycle is untouched — the task stays
+`in_review`. Per-project opt-out: `config.release_review_agents: false`.
+
+Deliberately NOT gated on the understanding quiz: a quiz is director-only
+(answering or deferring it never reaches the agent), so "quiz still pending" is
+exactly the state the slot would otherwise be held for.
+
+**Reattach** (the dispatcher's first pass each cycle). Every path that hands work
+back to an agent it could not reach now QUEUES a steer — a changes-request
+bounce, red CI, a closed PR, a PR conflict, a failed merge. The dispatcher picks
+up any `in_progress`/`in_review` task with no `agent_target` and queued steers,
+and respawns onto the SAME branch: `worktree create` collides, `reclaimWorktree`
+preserves any loose WIP on a ghost branch and removes the checkout, and the retry
+re-checks out `hive/<taskId>` at its existing head, so the PR's commits are
+untouched (verified live against herdr 0.7.x). The feedback rides in as the
+steer preamble at the top of the fresh brief.
 
 ## Visible interactive fleet (spawn design)
 
