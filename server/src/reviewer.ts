@@ -14,7 +14,7 @@ import { isOffline } from "./db.ts";
 import { writeEvent, getTask } from "./state.ts";
 import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec } from "./exec.ts";
+import { defaultExec, safeBranch } from "./exec.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
 import { supervisedSql } from "./supervision.ts";
 
@@ -74,7 +74,7 @@ async function rawDiff(db: DB, task: any, exec: Exec): Promise<{ ok: true; text:
   }
   const project: any = db.query("SELECT repo_path, config FROM projects WHERE id = ?").get(task.project_id);
   if (!project?.repo_path || !task.branch) return { ok: false, error: "no pr_url and no branch to diff" };
-  const base = JSON.parse(project.config ?? "{}").default_branch || "main";
+  const base = safeBranch(JSON.parse(project.config ?? "{}").default_branch);
   const r = await exec(["git", "-C", project.repo_path, "diff", `${base}...${task.branch}`]);
   if (r.code !== 0) return { ok: false, error: r.stderr.trim() || `git diff exited ${r.code}` };
   return { ok: true, text: r.stdout };

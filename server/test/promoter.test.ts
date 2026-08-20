@@ -116,3 +116,42 @@ test("startPromoter skips a tick while a cycle is already running", async () => 
   expect(cycles).toBeLessThan(6); // most ticks were skipped, not queued
   expect(logs.some((m) => m.includes("skipped"))).toBe(true);
 });
+
+// Argument injection (task #1024). config.promote.{from,to} are POSITIONAL
+// arguments to `git fetch origin <from> <to>`, and git reads a positional
+// starting with `-` as an OPTION: `--upload-pack=<cmd>` makes git run <cmd> as
+// the local user. config is caller-writable via PUT /api/projects, so the
+// branch names must never reach argv unchecked. Asserts the behaviour — exec is
+// never called at all — not that some regex exists.
+test("a config.promote branch name starting with `-` never reaches exec (task #1024)", async () => {
+  const payload = "--upload-pack=/tmp/pwn.sh";
+  for (const promote of [{ from: payload, to: "main" }, { from: "staging", to: payload }]) {
+    const { db, projectId } = freshDb({ promote });
+    const calls: string[][] = [];
+    const recording: Exec = async (argv) => {
+      calls.push(argv);
+      return OK("9\n");
+    };
+    const origError = console.error;
+    console.error = (() => {}) as typeof console.error;
+    try {
+      await promoteOnce(db, { exec: recording });
+    } finally {
+      console.error = origError;
+    }
+    expect(calls).toEqual([]);
+    expect(promoterTasks(db, projectId).length).toBe(0);
+  }
+});
+
+test("ordinary branch names still promote (guard is not over-tight)", async () => {
+  for (const promote of [
+    { from: "staging", to: "main" },
+    { from: "release/2.1", to: "main" },
+    { from: "feature_x.y", to: "trunk-1" },
+  ]) {
+    const { db, projectId } = freshDb({ promote });
+    await promoteOnce(db, { exec: stubExec(3) });
+    expect(promoterTasks(db, projectId).length).toBe(1);
+  }
+});

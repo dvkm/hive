@@ -45,3 +45,25 @@ export const defaultExec: Exec = async (argv, opts = {}) => {
     clearTimeout(timer);
   }
 };
+
+// ---------------------------------------------------------------- ref names
+// Branch names sourced from project config (config.promote.{from,to},
+// config.default_branch) end up as POSITIONAL git arguments. git parses a
+// positional starting with `-` as an OPTION, not a ref: a config write of
+// `--upload-pack=/tmp/evil` turns `git fetch origin <from>` into arbitrary
+// command execution, and `--output=<path>` turns `git diff <base>...<branch>`
+// into an arbitrary file write. No shell is involved — argv arrays don't help.
+// So config-sourced refs are checked before they reach any exec() call.
+// ponytail: regex, not `git check-ref-format` — these are short branch names
+// like "staging"/"main", and spawning a process per read would be absurd.
+// `..` is excluded because `<base>...<branch>` interpolation would otherwise
+// let a base smuggle in its own revision range.
+const REF_RE = /^[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}$/;
+
+export function isSafeRef(v: unknown): v is string {
+  return typeof v === "string" && REF_RE.test(v) && !v.includes("..");
+}
+
+// A config-sourced branch name, or `fallback` when it is missing or unsafe.
+// Every `config.default_branch || "main"` read goes through this.
+export const safeBranch = (v: unknown, fallback = "main"): string => (isSafeRef(v) ? v : fallback);
