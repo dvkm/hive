@@ -33,7 +33,7 @@ import { writeEvent } from "./state.ts";
 import { queueSteerEvent } from "./steer.ts";
 import { createDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec } from "./exec.ts";
+import { defaultExec, safeBranch } from "./exec.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
 import { supervisedSql } from "./supervision.ts";
 import { authoredFiles } from "./rebaseGuard.ts";
@@ -193,7 +193,7 @@ export async function driftCheckOnce(db: DB, deps: DriftDeps = {}): Promise<stri
     if (!String(t.brief ?? "").trim()) continue; // nothing to measure scope against
 
     const step = Math.max(1, cfgNum(config.scope_drift_commits, DEFAULT_COMMIT_STEP));
-    const base = config.default_branch || "main";
+    const base = safeBranch(config.default_branch);
     const fp = await branchFootprint(shell, project.repo_path, base, t.branch);
     if (!fp) continue; // git could not tell us — never raise a card on a read failure
 

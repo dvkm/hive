@@ -25,7 +25,7 @@ import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
 import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec } from "./exec.ts";
+import { defaultExec, safeBranch } from "./exec.ts";
 import { captureBranchScope } from "./rebaseGuard.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
 
@@ -385,7 +385,7 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
         if (project?.repo_path) {
           let base = data.baseRefName || "main";
           try {
-            base = data.baseRefName || JSON.parse(project.config ?? "{}").default_branch || "main";
+            base = data.baseRefName || safeBranch(JSON.parse(project.config ?? "{}").default_branch);
           } catch {}
           const scopeHead = data.headRefOid || t.branch;
           const scope = await captureBranchScope(exec, project.repo_path, data.baseRefOid || base, scopeHead);
@@ -522,7 +522,7 @@ async function nudgeConflict(
     | undefined;
   let base = "main";
   try {
-    base = JSON.parse(project?.config ?? "{}").default_branch || "main";
+    base = safeBranch(JSON.parse(project?.config ?? "{}").default_branch);
   } catch {}
 
   // GitHub reports CONFLICTING against origin/<base>, which is a DIVERGENT line

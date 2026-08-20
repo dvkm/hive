@@ -254,3 +254,25 @@ test("the recommended option is safe for the stale auto-answer path", async () =
   expect(card.risk).toBe("normal"); // 'high' is never auto-answered
   for (const opt of JSON.parse(card.options)) expect(optionNeedsDirectorInput(opt)).toBe(false);
 });
+
+// Argument injection (task #1024). config.default_branch reaches git as a
+// POSITIONAL argument here (`git diff --name-only <base>...<branch>`, `git log
+// <base>..<branch>`), and git reads a leading `-` as an option — `--output=…`
+// writes an arbitrary file as the local user. config is caller-writable via PUT
+// /api/projects, so the poisoned value must never appear in argv at all.
+test("a config.default_branch starting with `-` never reaches git argv (task #1024)", async () => {
+  const payload = "--output=/tmp/pwn";
+  const { db } = setup({ default_branch: payload });
+  const argvs: string[][] = [];
+  const recording: Exec = async (argv) => {
+    argvs.push(argv);
+    if (argv.includes("--name-only")) return { code: 0, stdout: WITHIN.join("\n"), stderr: "" };
+    return { code: 0, stdout: "r3\nr2\nr1", stderr: "" };
+  };
+  await driftCheckOnce(db, { shellExec: recording, exec: judge({ drifting: false, beyond: [], why: "" }) });
+
+  expect(argvs.length).toBeGreaterThan(0);
+  for (const argv of argvs) expect(argv.join(" ")).not.toContain(payload);
+  // and it fell back to the default base, so the check still ran normally
+  expect(argvs.some((a) => a.some((x) => x.startsWith("main.")))).toBe(true);
+});

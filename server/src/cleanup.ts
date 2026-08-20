@@ -11,7 +11,7 @@ import { now } from "./db.ts";
 import { getTask, writeEvent, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec } from "./exec.ts";
+import { defaultExec, safeBranch } from "./exec.ts";
 
 // Per-project stack lifecycle command. Two symmetric hooks share this runner:
 //   config.setup_argv    = ["infra/worktree/wt.sh", "up",   "{worktree}"]  (spawn time, before agent starts)
@@ -117,7 +117,7 @@ export async function cleanupTask(
   const repoPath = project?.repo_path ?? null;
   let defaultBranch: string | undefined;
   try {
-    defaultBranch = JSON.parse(project?.config ?? "{}").default_branch;
+    defaultBranch = safeBranch(JSON.parse(project?.config ?? "{}").default_branch);
   } catch {
     defaultBranch = undefined;
   }

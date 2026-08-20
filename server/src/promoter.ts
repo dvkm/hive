@@ -15,7 +15,7 @@ import { now, newId, isOffline } from "./db.ts";
 import { writeEvent, getTask } from "./state.ts";
 import { broadcastTask } from "./health.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec } from "./exec.ts";
+import { defaultExec, isSafeRef } from "./exec.ts";
 
 export interface PromoterDeps {
   exec?: Exec;
@@ -49,6 +49,13 @@ export async function promoteOnce(db: DB, deps: PromoterDeps = {}): Promise<void
       const cfg = JSON.parse(p.config ?? "{}");
       const { from: fromB, to: toB } = cfg.promote ?? {};
       if (!fromB || !toB || !p.repo_path) continue;
+      // These are positional git/gh arguments — a name starting with `-` is an
+      // option to git, not a ref (see isSafeRef). Skip the project entirely
+      // rather than fall back to a guessed branch pair.
+      if (!isSafeRef(fromB) || !isSafeRef(toB)) {
+        console.error(`[hive] promoter project ${p.id}: refusing config.promote branch names ${JSON.stringify([fromB, toB])}`);
+        continue;
+      }
 
       // One evaluation in flight at a time.
       const open = db

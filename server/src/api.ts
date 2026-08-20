@@ -79,7 +79,7 @@ import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec } from "./exec.ts";
+import { defaultExec, safeBranch } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
 import {
   createThread,
@@ -2276,7 +2276,7 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   if (project?.repo_path && task.branch) {
     const config = JSON.parse(project.config ?? "{}");
-    const base = config.default_branch || "main";
+    const base = safeBranch(config.default_branch);
     const others = db
       .query(
         `SELECT id, number, title, branch FROM tasks WHERE project_id = ? AND id != ? AND branch IS NOT NULL AND state NOT IN ('done', 'cancelled')`
@@ -2464,18 +2464,18 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
         db,
         herdr,
         task,
-        config.default_branch || "main",
+        safeBranch(config.default_branch),
         `Could not inspect PR metadata; merge was not attempted (${probe.stderr.trim() || "gh pr view failed"}).`
       );
     try {
       prView = JSON.parse(probe.stdout || "{}");
     } catch {
-      return mergeFailed(db, herdr, task, config.default_branch || "main", "Could not parse PR metadata; merge was not attempted.");
+      return mergeFailed(db, herdr, task, safeBranch(config.default_branch), "Could not parse PR metadata; merge was not attempted.");
     }
     if (!prView.baseRefName || !prView.baseRefOid)
-      return mergeFailed(db, herdr, task, config.default_branch || "main", "PR base metadata is missing; merge was not attempted.");
+      return mergeFailed(db, herdr, task, safeBranch(config.default_branch), "PR base metadata is missing; merge was not attempted.");
   }
-  const base = prView?.baseRefName || config.default_branch || "main";
+  const base = prView?.baseRefName || safeBranch(config.default_branch);
   const guardBase = prView?.baseRefOid || base;
   const guardHead = prView?.headRefOid || task.branch;
   const forceLocalFf = body?.merge_strategy === "local_ff";
@@ -2854,7 +2854,7 @@ export async function spawnAgent(
       hiveUrl,
       title: task.title,
       brief,
-      base: config.default_branch || "main",
+      base: safeBranch(config.default_branch),
       env,
       model: modelForTask(config, task.kind),
       agentArgv: agentArgvFor(config, task.kind, brief),
