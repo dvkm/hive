@@ -11,6 +11,7 @@ import type { DB } from "./db.ts";
 import { getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { isSupervisedTask, neverDispatched } from "./supervision.ts";
+import { isDeferred } from "./state.ts";
 
 export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
 export interface Health {
@@ -87,6 +88,14 @@ function staleMs(): number {
 //   healthy — otherwise.
 export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | null {
   if (!HEALTH_STATES.has(task.state) || !task.agent_target) return null;
+
+  // Deferred pending an OFFLINE human action (state.ts's deferTask/isDeferred):
+  // the agent exits normally right after emitting `deferred`, herdr reports it
+  // gone, and the dead/stuck branches below would otherwise re-surface exactly
+  // the "gone quiet" nag `deferred` exists to suppress (task #1078).
+  if (isDeferred(task, nowMs)) {
+    return { status: "healthy", reason: "deferred", since: task.updated_at as string };
+  }
 
   const events = db
     .query("SELECT type, ts, payload FROM events WHERE task_id = ? ORDER BY ts DESC")
