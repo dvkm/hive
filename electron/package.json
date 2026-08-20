@@ -6,7 +6,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder --mac --dir"
+    "build": "electron-builder --mac --dir && codesign --force --sign - --requirements '=designated => identifier \"dev.hive.app\"' dist/mac-arm64/hive.app"
   },
   "build": {
     "appId": "dev.hive.app",
@@ -24,7 +24,8 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "build/icon.png",
-      "identity": null
+      "identity": "-",
+      "hardenedRuntime": false
     }
   },
   "devDependencies": {
