@@ -6,7 +6,7 @@ import type { SearchHit } from "../lib/api";
 import { useStore } from "../lib/store";
 import { toast } from "../lib/ui";
 import { setProjectFilter } from "../lib/projectFilter";
-import { isTrackingOnly } from "../lib/needsYou";
+import { isJiraMirror } from "../lib/needsYou";
 import { NewTaskModal } from "./Board";
 
 // Cmd+K / "/" command palette + global search, mounted once over every view.
@@ -206,7 +206,7 @@ export default function Palette() {
         },
       })),
       ...tasks
-        .filter((t) => t.state === "queued" && !isTrackingOnly(t))
+        .filter((t) => t.state === "queued" && !isJiraMirror(t) && !t.never_dispatched)
         .map((t) => ({
           key: `cmd:dispatch:${t.id}`,
           group: "Commands",
