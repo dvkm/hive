@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// Claude Code Stop-hook usage reporter -> hive.
+// Claude Code / Codex Stop-hook usage reporter -> hive.
 //
 // The Stop-hook JSON payload does NOT carry token counts, but it carries
 // `transcript_path` — a JSONL where every assistant message has a `message.usage`
@@ -43,6 +43,8 @@ type Agg = {
   cache_write_tokens: number;
 };
 const perModel: Record<string, Agg> = {};
+let codexModel = "codex";
+let codexTotals: any = null;
 for (const line of text.split("\n")) {
   if (!line.trim()) continue;
   let row: any;
@@ -51,6 +53,9 @@ for (const line of text.split("\n")) {
   } catch {
     continue;
   }
+  if (row?.type === "turn_context" && row.payload?.model) codexModel = String(row.payload.model);
+  if (row?.type === "event_msg" && row.payload?.type === "token_count" && row.payload.info?.total_token_usage)
+    codexTotals = row.payload.info.total_token_usage;
   const msg = row?.message;
   if (row?.type !== "assistant" || !msg?.usage) continue;
   const u = msg.usage;
@@ -65,6 +70,19 @@ for (const line of text.split("\n")) {
   a.output_tokens += u.output_tokens || 0;
   a.cache_read_tokens += u.cache_read_input_tokens || 0;
   a.cache_write_tokens += u.cache_creation_input_tokens || 0;
+}
+
+// Codex records cumulative totals separately from its response items. Attribute
+// the latest total to the active model; model switching inside one Hive worker
+// is rare, and an unknown split is better represented once than double-counted.
+if (!Object.keys(perModel).length && codexTotals) {
+  const cached = codexTotals.cached_input_tokens || 0;
+  perModel[codexModel] = {
+    input_tokens: Math.max(0, (codexTotals.input_tokens || 0) - cached),
+    output_tokens: codexTotals.output_tokens || 0,
+    cache_read_tokens: cached,
+    cache_write_tokens: codexTotals.cache_write_input_tokens || 0,
+  };
 }
 
 // The transcript filename is the session uuid — stable across every Stop of

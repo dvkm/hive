@@ -184,6 +184,9 @@ export interface Project {
     max_agents?: number;
     supervisor_persona?: string;
     playbook?: string;
+    agent?: "claude" | "codex";
+    codex_model?: string;
+    codex_model_by_kind?: Partial<Record<Kind, string>>;
     autonomy_profile?: "conservative" | "balanced" | "autopilot";
     archived?: boolean;
     test?: boolean;

@@ -588,6 +588,8 @@ function createProject(db: DB, body: any): Response {
   // scratch artifact (see testProjects.ts) — auto-flag it test unless the
   // caller already said one way or the other.
   const config = { ...(body.config ?? {}) };
+  if (config.agent != null && !AGENTS.includes(config.agent))
+    return err(`agent must be one of ${AGENTS.join("|")}`);
   if (config.test === undefined && isEphemeralRepoPath(body.repo_path)) config.test = true;
   const row = {
     id: newId("proj"),
@@ -611,6 +613,8 @@ function updateProject(db: DB, id: string, body: any): Response {
   const repo_path = body?.repo_path !== undefined ? body.repo_path : existing.repo_path;
   if (body?.config?.autonomy_profile != null && !AUTONOMY_PROFILES.includes(body.config.autonomy_profile))
     return err(`autonomy_profile must be one of ${AUTONOMY_PROFILES.join("|")}`);
+  if (body?.config?.agent != null && !AGENTS.includes(body.config.agent))
+    return err(`agent must be one of ${AGENTS.join("|")}`);
   const config = body?.config !== undefined ? JSON.stringify(body.config) : existing.config;
   db.query("UPDATE projects SET name = ?, repo_path = ?, config = ? WHERE id = ?").run(name, repo_path, config, id);
   return json(parseProject(db.query("SELECT * FROM projects WHERE id = ?").get(id)));
@@ -2747,16 +2751,59 @@ async function spawnTask(
   return json({ ok: true, task: getTask(db, id), agent_target: r.agent_target });
 }
 
-// Model per task kind, always pinned: without an explicit --model the CLI's
-// own default applies, which can be the priciest tier (fable burned $2.2k in
-// 97 sessions, incl. Opus-priced "say hello" health checks). Ship work gets
-// opus; scouts/chores are mechanical enough for sonnet. Per-project overrides:
-// config.model_by_kind = {ship:"opus",...} wins over config.model wins over
-// these defaults. config.agent_argv (verbatim) bypasses this entirely.
+export const AGENTS = ["claude", "codex"] as const;
+export type Agent = (typeof AGENTS)[number];
+
+export function agentForConfig(config: any): Agent {
+  return config?.agent === "codex" ? "codex" : "claude";
+}
+
+// Claude is pinned by task kind: without an explicit --model its CLI default
+// can be the priciest tier. Codex inherits the signed-in ChatGPT account's
+// current default unless the project sets codex_model(_by_kind), so Hive never
+// bakes a moving OpenAI model slug into project config.
 const DEFAULT_MODEL_BY_KIND: Record<string, string> = { ship: "opus", scout: "sonnet", chore: "sonnet" };
 
-export function modelForTask(config: any, kind: string): string {
+export function modelForTask(config: any, kind: string): string | undefined {
+  if (agentForConfig(config) === "codex")
+    return config?.codex_model_by_kind?.[kind] ?? config?.codex_model;
   return config?.model_by_kind?.[kind] ?? config?.model ?? DEFAULT_MODEL_BY_KIND[kind] ?? "sonnet";
+}
+
+function codexHookOverride(event: string, command: string, matcher?: string): string {
+  const group = `${matcher ? `matcher=${JSON.stringify(matcher)},` : ""}hooks=[{type="command",command=${JSON.stringify(command)},timeout=30}]`;
+  return `hooks.${event}=[{${group}}]`;
+}
+
+export function codexAgentArgv(
+  brief: string,
+  model?: string,
+  commandApproval: "escalate" | "allow" | "prompt" = "escalate"
+): string[] {
+  const hook = join(HOOKS_DIR, "hive-hook.sh");
+  const approve = join(HOOKS_DIR, "hive-approve.sh");
+  const argv = [
+    "codex",
+    "--sandbox", "workspace-write",
+    "--ask-for-approval", "on-request",
+    "--dangerously-bypass-hook-trust",
+    "-c", "features.hooks=true",
+    "-c", codexHookOverride("PreToolUse", `${approve} ${commandApproval}`, "^Bash$"),
+    "-c", codexHookOverride("PermissionRequest", `${approve} ${commandApproval}`, "^Bash$"),
+    "-c", codexHookOverride("PostToolUse", `${hook} PostToolUse`),
+    "-c", codexHookOverride("Stop", `${hook} Stop`),
+    "-c", codexHookOverride("SubagentStop", `${hook} SubagentStop`),
+  ];
+  if (model) argv.push("--model", model);
+  argv.push(brief);
+  return argv;
+}
+
+export function agentArgvFor(config: any, kind: string, brief: string): string[] | undefined {
+  if (Array.isArray(config?.agent_argv) && config.agent_argv.length) return config.agent_argv;
+  if (agentForConfig(config) !== "codex") return undefined;
+  const policy = ["allow", "prompt"].includes(config.command_approval) ? config.command_approval : "escalate";
+  return codexAgentArgv(brief, modelForTask(config, kind), policy);
 }
 
 // The reusable spawn core, shared by the /spawn endpoint and the dispatcher.
@@ -2786,9 +2833,10 @@ export async function spawnAgent(
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   if (!project?.repo_path) return { ok: false, error: "project has no repo_path" };
   const config = JSON.parse(project.config ?? "{}");
+  const agent = agentForConfig(config);
 
   // Compose the brief fresh; it is delivered as the interactive agent's first
-  // prompt (see runtime/herdr.defaultAgentArgv) — no `-p` one-shot. Steers sent
+  // prompt (see runtime/herdr.defaultAgentArgv) with no one-shot mode. Steers sent
   // while the task had no live agent ride along on top, so they reach the fresh
   // agent instead of vanishing. briefOverride is the persistent-chat supervisor's
   // bespoke brief (it isn't a normal ship/scout task, so composeBrief's
@@ -2796,7 +2844,7 @@ export async function spawnAgent(
   const pending = queuedSteers(db, id);
   const brief = steerPreamble(pending) + (opts.briefOverride ?? composeBrief(db, id));
   const hiveUrl = opts.hiveUrl || process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
-  const env = await resolveProjectSecrets(db, task.project_id);
+  const env = { ...(await resolveProjectSecrets(db, task.project_id)), HIVE_AGENT: agent };
 
   let result;
   try {
@@ -2809,13 +2857,13 @@ export async function spawnAgent(
       base: config.default_branch || "main",
       env,
       model: modelForTask(config, task.kind),
-      agentArgv: config.agent_argv, // optional per-project override (verbatim)
-      // Seed the worktree BEFORE the agent starts: hive's Claude Code hook
-      // wiring (structural Stop/SubagentStop/PostToolUse reporting), then the
+      agentArgv: agentArgvFor(config, task.kind, brief),
+      // Seed the worktree BEFORE the agent starts: agent hook wiring
+      // (structural Stop/SubagentStop/PostToolUse reporting), then the
       // per-project spawn hook (config.setup_argv, e.g. wt.sh up {worktree}) so
       // agents don't have to install deps / bring up their stack themselves.
       prepareWorktree: async (worktreePath) => {
-        writeHookSettings(worktreePath, id, hiveUrl, config.command_approval);
+        if (agent === "claude") writeHookSettings(worktreePath, id, hiveUrl, config.command_approval);
         const setup = await runStackCmd(db, id, config.setup_argv, project.repo_path, worktreePath, opts.exec ?? defaultExec, {
           type: "stack_setup",
           source: "herdr",
@@ -4371,7 +4419,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
   // --- usage (cost/token analytics) ---
   if (type === "usage") return ingestUsage(db, taskId, fields, source);
 
-  // --- transcript + lifecycle (from the Claude Code hooks) ---
+  // --- transcript + lifecycle (from the Claude Code / Codex hooks) ---
   // assistant_text = the agent's actual output; tool_use = a one-line tool
   // summary; agent_turn_end = a quiet Stop/SubagentStop heartbeat. These carry a
   // structured `payload` object (JSON body) rather than a bare `note`.

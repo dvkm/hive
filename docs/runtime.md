@@ -74,17 +74,11 @@ own id, so concurrent project loops never race on shared state.
 
 ## Visible interactive fleet (spawn design)
 
-hive uses herdr the way firstmate's `docs/herdr-backend.md` proved it should be
-used: agents are VISIBLE and INTERACTIVE, never invisible one-shot `claude -p`
-processes (the exact failure that killed three real tasks — a one-shot exited
-without reporting, the agent vanished, the board pointed at a ghost). `spawn()`
-(`server/src/runtime/herdr.ts`) does, in order:
+hive uses herdr the way firstmate's `docs/herdr-backend.md` proved it should be used: agents are VISIBLE and INTERACTIVE, never invisible one-shot processes. A project selects Claude Code (default) or ChatGPT through the Codex CLI with `config.agent`; both stay attached to a labelled Herdr tab. `spawn()` (`server/src/runtime/herdr.ts`) does, in order:
 
 1. `herdr worktree create --cwd <repo> --branch hive/<id> --json` — the git
    worktree (path + branch parsed from the 0.7.x envelope).
-2. **Prepare the worktree** (callback) — writes `.claude/settings.local.json`
-   wiring hive's Stop/SubagentStop/PostToolUse hooks BEFORE the agent starts, so
-   lifecycle reporting is structural, not brief-dependent (`hooks/`), then runs
+2. **Prepare the worktree** (callback) wires Hive's Stop/SubagentStop/PostToolUse hooks before the agent starts (`.claude/settings.local.json` for Claude; per-invocation Codex hook config for ChatGPT), so lifecycle reporting is structural, not brief-dependent (`hooks/`), then runs
    the per-project spawn hook `config.setup_argv` (e.g.
    `["infra/worktree/wt.sh", "up", "{worktree}"]`) so agents don't have to
    install deps / bring up their stack themselves. It is the symmetric partner of
@@ -100,13 +94,7 @@ without reporting, the agent vanished, the board pointed at a ghost). `spawn()`
    label-collision class firstmate's 2026-07-02 self-kill documents.
 4. `herdr tab create --workspace <fleet> --cwd <worktree> --label "<id> <title>"`
    — one labelled tab per task (this IS the visible "id + title" affordance).
-5. `herdr agent start <id> --workspace <fleet> --tab <tab> --cwd <worktree>
-   --env HIVE_TASK_ID=<id> --env HIVE_URL=... [secrets] --no-focus -- claude
-   "<brief>" --permission-mode auto` — an INTERACTIVE claude with the
-   composed brief delivered as its first prompt argument (execvp argv after `--`,
-   so a multi-line brief needs no quoting and none of firstmate's documented
-   send-text/composer-autocomplete hazard). The agent stays live and tolerates
-   the captain attaching and typing.
+5. `herdr agent start <id> --workspace <fleet> --tab <tab> --cwd <worktree> --env HIVE_TASK_ID=<id> --env HIVE_URL=... [secrets] --no-focus -- <agent command>` starts either interactive `claude "<brief>" --permission-mode auto` or interactive `codex --sandbox workspace-write --ask-for-approval on-request ... "<brief>"`. The composed brief is the first prompt, and the agent stays live for steering or direct attachment.
 
 **No `agent rename`.** Verified live against herdr 0.7.1: renaming an agent
 changes its resolvable name, after which `agent get <taskId>` returns
@@ -116,13 +104,7 @@ its canonical `taskId` name so probe/send/focus by `agent_target` keep resolving
 Per-project `config.agent_argv` overrides the command verbatim (the operator owns
 briefing in that case).
 
-**Model pinning.** Every spawned agent gets an explicit `--model` — never the
-CLI default (which can be the priciest tier). Defaults per task kind:
-`ship → opus`, `scout`/`chore` → `sonnet`. Override per project with
-`config.model` (all kinds) or `config.model_by_kind` (e.g.
-`{"ship":"opus","chore":"haiku"}`); `config.agent_argv` bypasses pinning
-entirely. The planner one-shot (`claude -p`) is pinned to `sonnet` unless
-`config.planner_argv` overrides it.
+**Model selection.** Claude workers stay explicitly pinned by task kind: `ship → opus`, `scout`/`chore` → `sonnet`, overridable through `config.model` or `config.model_by_kind`. Codex workers inherit the current ChatGPT/Codex default unless `config.codex_model` or `config.codex_model_by_kind` is set. `config.agent_argv` bypasses both paths. The planner one-shot remains Claude and is pinned to `sonnet` unless `config.planner_argv` overrides it.
 
 ## Stale recovery loop (`server/src/reconciler.ts`)
 

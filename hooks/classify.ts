@@ -13,9 +13,9 @@
 // requires EVERY shell segment to match the safe allowlist. Anything unrecognized
 // falls to "unknown", never "safe".
 //
-// The import.meta.main runner reads a Claude Code PreToolUse payload on stdin and
-// emits the PreToolUse decision JSON (allow/deny), calling hive's guarded-action
-// gate for anything not provably safe. See hooks/install.md.
+// The import.meta.main runner reads a Claude Code or Codex PreToolUse /
+// PermissionRequest payload on stdin and emits the matching decision JSON,
+// calling hive's guarded-action gate for anything not provably safe.
 
 export type Decision = "safe" | "dangerous" | "unknown";
 export interface Classification {
@@ -521,10 +521,26 @@ export function classify(
 
 // ------------------------------------------------------------------ PreToolUse runner
 
-function preToolUseOutput(permissionDecision: "allow" | "deny", reason: string): string {
+function hookOutput(
+  event: "PreToolUse" | "PermissionRequest",
+  permissionDecision: "allow" | "deny",
+  reason: string,
+  codex = false
+): string {
+  if (event === "PermissionRequest") {
+    return JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: event,
+        decision: permissionDecision === "allow"
+          ? { behavior: "allow" }
+          : { behavior: "deny", message: reason },
+      },
+    });
+  }
+  if (codex && permissionDecision === "allow") return "";
   return JSON.stringify({
     hookSpecificOutput: {
-      hookEventName: "PreToolUse",
+      hookEventName: event,
       permissionDecision,
       permissionDecisionReason: reason,
     },
@@ -550,6 +566,8 @@ async function escalate(
   command: string,
   decision: Decision,
   reason: string,
+  event: "PreToolUse" | "PermissionRequest",
+  codex: boolean,
   summary?: string
 ): Promise<string> {
   // Distinct action namespace so a standing rule can gate destructive commands
@@ -573,18 +591,23 @@ async function escalate(
     });
     const body: any = await res.json().catch(() => ({}));
     if (res.status === 200 && body.effect === "allow")
-      return preToolUseOutput("allow", "authority engine: standing grant/rule");
+      return hookOutput(event, "allow", "authority engine: standing grant/rule", codex);
     if (res.status === 403)
-      return preToolUseOutput("deny", body.error || "denied by standing authority");
+      return hookOutput(event, "deny", body.error || "denied by standing authority");
     if (res.status === 409)
-      return preToolUseOutput(
+      return hookOutput(
+        event,
         "deny",
         `escalated to hive decision ${body.decision_id} — waiting on the director; retry this command once approved`
       );
-    return preToolUseOutput("deny", `unexpected guarded-action response (${res.status})`);
+    return hookOutput(event, "deny", `unexpected guarded-action response (${res.status})`);
   } catch (e: any) {
-    return preToolUseOutput("deny", `hive unreachable, denying for safety: ${String(e?.message ?? e)}`);
+    return hookOutput(event, "deny", `hive unreachable, denying for safety: ${String(e?.message ?? e)}`);
   }
+}
+
+function emit(output: string): void {
+  if (output) console.log(output);
 }
 
 if (import.meta.main) {
@@ -596,6 +619,8 @@ if (import.meta.main) {
   } catch {
     process.exit(0); // unparseable → defer to normal flow, never crash the agent
   }
+  const event = payload?.hook_event_name === "PermissionRequest" ? "PermissionRequest" : "PreToolUse";
+  const codex = process.env.HIVE_AGENT === "codex";
   const command = payload?.tool_input?.command;
   if (typeof command !== "string") process.exit(0); // not a Bash command → defer
 
@@ -606,7 +631,7 @@ if (import.meta.main) {
   );
 
   if (decision === "safe") {
-    console.log(preToolUseOutput("allow", reason));
+    emit(hookOutput(event, "allow", reason, codex));
     process.exit(0);
   }
 
@@ -614,20 +639,20 @@ if (import.meta.main) {
   // DANGEROUS is never eligible for either shortcut — it always escalates.
   if (decision === "unknown") {
     if (policy === "allow") {
-      console.log(preToolUseOutput("allow", "command_approval=allow: unknown command permitted"));
+      emit(hookOutput(event, "allow", "command_approval=allow: unknown command permitted", codex));
       process.exit(0);
     }
-    if (policy === "prompt") process.exit(0); // defer to Claude Code's own prompt
+    if (policy === "prompt") process.exit(0); // defer to the agent's own prompt
   }
 
   const taskId = process.env.HIVE_TASK_ID;
   const hiveUrl = process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
   if (!taskId) {
     // No hive task to escalate to: fail safe. Dangerous → deny; unknown → defer.
-    if (decision === "dangerous") console.log(preToolUseOutput("deny", `blocked (${reason}); no hive task to authorize`));
+    if (decision === "dangerous") console.log(hookOutput(event, "deny", `blocked (${reason}); no hive task to authorize`));
     process.exit(0);
   }
   const summary = typeof payload?.tool_input?.description === "string" ? payload.tool_input.description : undefined;
-  console.log(await escalate(hiveUrl, taskId, command, decision, reason, summary));
+  emit(await escalate(hiveUrl, taskId, command, decision, reason, event, codex, summary));
   process.exit(0);
 }

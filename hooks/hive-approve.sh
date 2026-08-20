@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Claude Code PreToolUse hook -> hive command auto-approval.
+# Claude Code / Codex command hook -> hive command auto-approval.
 #
-# Reads the PreToolUse payload on stdin and hands it to classify.ts, which emits
-# the PreToolUse decision JSON (allow/deny) on stdout. SAFE commands auto-approve
-# with no dialog; DANGEROUS and (by default) UNKNOWN commands escalate to hive's
-# authority engine via the guarded-action gate. See hooks/install.md.
+# Reads a PreToolUse or PermissionRequest payload on stdin and hands it to
+# classify.ts, which emits the event's decision JSON on stdout. SAFE commands
+# auto-approve with no dialog; DANGEROUS and (by default) UNKNOWN commands
+# escalate to hive's authority engine via the guarded-action gate.
 #
 # Usage (from settings.local.json): hive-approve.sh <policy>
 #   policy = escalate (default) | allow | prompt  — governs UNKNOWN commands.

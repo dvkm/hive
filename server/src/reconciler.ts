@@ -1238,7 +1238,7 @@ async function recoverBlockedDialog(db: DB, task: any, excerpt: string, tail: st
   enqueue(db, { kind: "decision", task_id: task.id, decision_id: d.id, title: `Agent blocked on a dialog: ${task.title}`, urgency: "urgent" });
 }
 
-// Claude Code lost auth: failing or requeuing is pointless (a fresh agent hits
+// The worker lost auth: failing or requeuing is pointless (a fresh agent hits
 // the same wall). Urgent-notify the director once per hour and wait.
 async function recoverAuthLost(db: DB, task: any, excerpt: string, tail: string): Promise<void> {
   writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "auth-lost", excerpt: excerpt.slice(0, 300) } });
@@ -1246,15 +1246,15 @@ async function recoverAuthLost(db: DB, task: any, excerpt: string, tail: string)
     .query("SELECT 1 FROM notifications WHERE kind = 'auth_lost' AND ts > datetime('now', '-60 minutes') LIMIT 1")
     .get();
   if (recent) return;
-  attachLog(db, task.id, tail, "agent pane tail: Claude Code auth lost");
+  attachLog(db, task.id, tail, "agent pane tail: worker auth lost");
   enqueue(db, {
     kind: "auth_lost",
     task_id: task.id,
-    title: "Claude Code auth expired — agents cannot work",
-    body: "An agent pane shows 'Not logged in'. Run /login in any Claude Code session (or fix credentials); affected agents resume on their own.",
+    title: "Agent authentication expired: workers cannot continue",
+    body: "An agent pane shows 'Not logged in'. Restore the selected worker's login (`/login` for Claude Code or `codex login` for ChatGPT/Codex); affected agents resume on their own.",
     urgency: "urgent",
   });
-  recordSystemLearning(db, task.project_id, "Claude Code auth expired mid-fleet", "Agents stall with 'Not logged in · Please run /login'. Fix auth once; do not requeue (a fresh agent hits the same wall).", task.id);
+  recordSystemLearning(db, task.project_id, "agent authentication expired mid-fleet", "Agents stall when their CLI login expires. Fix auth once; do not requeue (a fresh agent hits the same wall).", task.id);
 }
 
 // Context window exhausted: the ONE case where auto-requeue is exactly right —
