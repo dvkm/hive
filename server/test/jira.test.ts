@@ -2508,6 +2508,126 @@ test("shadow mode logs the receipt it WOULD deliver, and sends nothing", async (
 });
 
 // ============================================================================
+// REVIEW CONTEXT: THE ONE COMMENT THAT EXPLAINS A STATUS FLIP
+// ============================================================================
+// A mirror used to reach "In Review" with nothing but the column change: no PR,
+// no summary, no evidence, so the reporter opened the ticket and learned
+// nothing. Composition is at most once per JIRA STATUS and delivery rides the
+// ordinary outbound-comment ledger, so re-syncs stay silent.
+const reachReview = (db: DB, taskId: string, reason: string) => {
+  transition(db, taskId, "in_progress", { source: "director", reason: "starting" });
+  transition(db, taskId, "in_review", { source: "director", reason });
+};
+
+test("a mirror reaching In Review gets exactly ONE context comment, and re-syncs post nothing", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const task = tasks(db)[0];
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://github.com/acme/x/pull/815", task.id);
+  addEvidence(db, task.id, "screenshot", "member list after the merge");
+  writeEvent(db, {
+    task_id: task.id, source: "agent", type: "review_summary",
+    payload: { done: ["unified member list"], iffy: [{ what: "deletion is soft-flagged", why: "send suppression lands separately" }] },
+  });
+  reachReview(db, task.id, "PR #815 (CI green): unified member list, counts conserved");
+
+  const s1 = await run(db, projectId, jira.fetchImpl);
+  const context = jira.byKey.get("WEB-1")!.comments.filter((c: any) => String(c.text).includes("Hive moved this to In Review"));
+  expect(context).toHaveLength(1);
+  expect(context[0].text).toContain("PR #815 (CI green): unified member list, counts conserved");
+  expect(context[0].text).toContain("https://github.com/acme/x/pull/815");
+  expect(context[0].text).toContain("deletion is soft-flagged: send suppression lands separately");
+  expect(context[0].text).toContain(`${J.hiveBaseUrl()}/evidence/${task.id}/x.png`);
+  expect(s1.comments_pushed).toBe(1);
+
+  // Second cycle (and a few more): the status already agrees and the ledger
+  // already holds the delivery, so nothing new is composed or posted.
+  for (let i = 0; i < 3; i++) await run(db, projectId, jira.fetchImpl);
+  expect(jira.byKey.get("WEB-1")!.comments.filter((c: any) => String(c.text).includes("Hive moved this to In Review"))).toHaveLength(1);
+});
+
+test("verifying shares In Review's comment, and Done gets its own", async () => {
+  // in_review and verifying both render as "In Review", so keying composition on
+  // the hive state would say the same thing twice for one visible column.
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const task = tasks(db)[0];
+  // The fake stamps a pushed transition with the wall clock, which ties with
+  // hive's next transition at millisecond resolution and lets Jira win the
+  // status race. Backdating keeps THIS test about comments, not clocks.
+  const jiraClockBehind = () => {
+    const iss = jira.byKey.get("WEB-1")!;
+    iss.history = iss.history.map((h) => ({ ...h, at: "2026-01-01T00:00:00.000Z" }));
+  };
+
+  reachReview(db, task.id, "PR is up");
+  await run(db, projectId, jira.fetchImpl);
+  jiraClockBehind();
+
+  transition(db, task.id, "verifying", { source: "director", reason: "merged, smoke pending" });
+  await run(db, projectId, jira.fetchImpl);
+  jiraClockBehind();
+  const texts = () => jira.byKey.get("WEB-1")!.comments.map((c: any) => String(c.text));
+  expect(texts().filter((t) => t.includes("Hive moved this to In Review"))).toHaveLength(1);
+
+  transition(db, task.id, "done", { source: "director", reason: "smoke checks pass" });
+  await run(db, projectId, jira.fetchImpl);
+  jiraClockBehind();
+  expect(texts().filter((t) => t.includes("Hive finished this: smoke checks pass"))).toHaveLength(1);
+  for (let i = 0; i < 2; i++) await run(db, projectId, jira.fetchImpl);
+  expect(texts().filter((t) => t.startsWith("Hive"))).toHaveLength(2); // one per Jira status, ever
+});
+
+test("a human's own move to In Review gets no comment when hive has nothing to add", async () => {
+  // The reporter moved the column themselves and hive never worked the ticket.
+  // Telling them what they just did is noise, so nothing is composed.
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId } = freshDb();
+  const stats = await run(db, projectId, jira.fetchImpl);
+  expect(tasks(db)[0].state).toBe("in_review");
+  expect(stats.comments_pushed).toBe(0);
+  expect(jira.byKey.get("WEB-1")!.comments).toEqual([]);
+});
+
+test("a context comment Jira committed but did not acknowledge is never posted twice", async () => {
+  // The queued event is the COMPOSITION ledger and the delivery receipts are the
+  // DELIVERY ledger. A 5xx after Jira already stored the comment trips neither
+  // into writing a second one; the next cycle recovers it by its property.
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }], failCommentPosts: 1 });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const task = tasks(db)[0];
+  reachReview(db, task.id, "PR #815 is up");
+
+  const failed = await run(db, projectId, jira.fetchImpl);
+  expect(failed.errors).toBe(1);
+  expect(jira.byKey.get("WEB-1")!.comments).toHaveLength(1);
+  expect(J.pendingOutbound(db, task.id).unknown).toHaveLength(1); // visible, not silently dropped
+
+  for (let i = 0; i < 3; i++) await run(db, projectId, jira.fetchImpl);
+  expect(jira.byKey.get("WEB-1")!.comments).toHaveLength(1);
+  expect(J.pendingOutbound(db, task.id)).toEqual({ comments: 0, receipts: 0, unknown: [] });
+});
+
+test("the context comment stays short: evidence is capped and long reasons are clipped", async () => {
+  const { db, projectId } = freshDb();
+  const id = newId();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, source_ref, created_at, updated_at)
+     VALUES (?,?,?,?, 'in_review', 'ship', 'external', 'jira:WEB-1', ?, ?)`
+  ).run(id, projectId, "[WEB-1] t", "b", now(), now());
+  writeEvent(db, { task_id: id, source: "director", type: "state_change", payload: { from: "in_progress", to: "in_review", reason: "x".repeat(900) } });
+  for (let i = 0; i < 9; i++) addEvidence(db, id, "screenshot", `shot ${i}`);
+
+  const text = J.reviewContextText(db, { id, pr_url: null }, "In Review")!;
+  expect(text.split("\n").filter((line) => line.startsWith("- ")).filter((l) => !l.includes("more in Hive"))).toHaveLength(5);
+  expect(text).toContain("- +4 more in Hive");
+  expect(text.split("\n")[0].length).toBeLessThan(450);
+});
+
+// ============================================================================
 // VISIBLE SYNC STATE + MANUAL RETRY
 // ============================================================================
 test("a successful cycle records last_success_at and clears any prior error", async () => {

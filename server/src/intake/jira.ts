@@ -1691,6 +1691,9 @@ async function reconcileIssue(ctx: Ctx, read: IssueRead, task: any): Promise<voi
   // holds absolutely if hive never writes the field at all, so it does not.
   // hive still READS the assignee, to show it on the board.
 
+  // ---- review context: one plain comment when the ticket reaches In Review/Done
+  queueReviewContext(ctx, current);
+
   // ---- comments and receipts: everything hive says to Jira, with remote keys
   await syncCommentsAndReceipts(ctx, key, current, remoteComments);
 }
@@ -1829,6 +1832,133 @@ async function syncCommentsAndReceipts(
       onDone: () => { stats.receipts++; },
     });
   }
+}
+
+// ---- review context ------------------------------------------------------
+// A status push alone tells the reporter nothing: they open the ticket, see the
+// column move, and still have no PR, no summary, and no evidence. This composes
+// that context ONCE per Jira status and queues it as an ORDINARY outbound
+// comment, so it inherits the whole at-most-once delivery ledger (property
+// recovery, containment of an unknown outcome, no re-post next cycle) instead
+// of growing a second delivery path with its own duplication bugs.
+//
+// Keyed on the JIRA STATUS, not the hive state, because in_review and verifying
+// both mean "In Review" to a reader — keying on the hive state would post the
+// same comment twice for one visible column.
+const CONTEXT_STATUSES = ["In Review", "Done"];
+const CONTEXT_EVIDENCE_LIMIT = 5;
+const CONTEXT_TEXT_MAX = 400;
+
+const clampText = (text: string, max: number): string =>
+  text.length <= max ? text : text.slice(0, max - 1).trimEnd() + "\u2026";
+
+// The reason hive itself recorded for reaching this Jira status. Sync-driven
+// state changes are excluded: their reason is "jira WEB-1 -> In Review", which
+// tells the reporter what they already did.
+function hiveStateReason(db: DB, taskId: string, jiraStatus: string): string | null {
+  const rows = db
+    .query(
+      `SELECT payload FROM events WHERE task_id = ? AND type = 'state_change'
+         AND source NOT IN ('jira-sync', 'jira') ORDER BY ts DESC, rowid DESC`
+    )
+    .all(taskId) as { payload: string }[];
+  for (const row of rows) {
+    let payload: { to?: string; reason?: string };
+    try {
+      payload = JSON.parse(row.payload);
+    } catch {
+      continue;
+    }
+    if (!sameStatus(stateToJiraStatus(String(payload.to ?? "")), jiraStatus)) continue;
+    return String(payload.reason ?? "").trim() || null;
+  }
+  return null;
+}
+
+function latestReviewSummary(db: DB, taskId: string): any {
+  const row = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY ts DESC, rowid DESC LIMIT 1")
+    .get(taskId) as { payload: string } | undefined;
+  if (!row) return null;
+  try {
+    return JSON.parse(row.payload);
+  } catch {
+    return null;
+  }
+}
+
+// What the reporter reads on the ticket: what changed, the PR, anything they
+// must know, then where the evidence is. Returns null when hive genuinely has
+// nothing to add (a human moved the issue themselves and hive never worked it),
+// because an empty "for your information" is worse than silence.
+export function reviewContextText(db: DB, task: any, jiraStatus: string): string | null {
+  const review = latestReviewSummary(db, task.id);
+  const list = (value: unknown): any[] => (Array.isArray(value) ? value : []);
+  const pr = String(task.pr_url ?? "").trim();
+  const evidence = db
+    .query("SELECT kind, url, caption FROM evidence WHERE task_id = ? ORDER BY ts")
+    .all(task.id) as { kind: string; url: string | null; caption: string | null }[];
+
+  const headline =
+    hiveStateReason(db, task.id, jiraStatus) ??
+    list(review?.done).map((item) => String(item ?? "").trim()).find(Boolean) ??
+    null;
+  if (!headline && !pr && !evidence.length) return null;
+
+  const caveats = [
+    ...list(review?.iffy).map((item) =>
+      typeof item === "string"
+        ? item.trim()
+        : [item?.what, item?.why].map((v) => String(v ?? "").trim()).filter(Boolean).join(": ")
+    ),
+    ...list(review?.decisions).map((item) => String(item ?? "").trim()),
+  ].filter(Boolean);
+
+  const lines = [
+    `${jiraStatus === "Done" ? "Hive finished this" : "Hive moved this to In Review"}: ` +
+      clampText(headline ?? "see the Hive task for what changed", CONTEXT_TEXT_MAX),
+  ];
+  if (pr && !lines[0].includes(pr)) lines.push(`PR: ${pr}`);
+  if (caveats.length) lines.push(`Heads-up: ${clampText(caveats.join("; "), CONTEXT_TEXT_MAX)}`);
+  // ponytail: evidence is LINKED, not uploaded. Jira has an attachment API, but
+  // using it widens the declared write scope (jira-write-scope.ts) on a live
+  // corporate project for files hive already serves.
+  if (evidence.length) {
+    lines.push("", "Evidence:");
+    for (const row of evidence.slice(0, CONTEXT_EVIDENCE_LIMIT)) {
+      const url = resolveEvidenceUrl(row.url);
+      const label = row.caption?.trim() || row.kind;
+      lines.push(url ? `- ${label}: ${url}` : `- ${label}`);
+    }
+    if (evidence.length > CONTEXT_EVIDENCE_LIMIT)
+      lines.push(`- +${evidence.length - CONTEXT_EVIDENCE_LIMIT} more in Hive`);
+  }
+  lines.push("", `Hive task: ${hiveBaseUrl()}/tasks/${task.id}`);
+  return clampText(lines.join("\n"), JIRA_COMMENT_MAX_LENGTH);
+}
+
+// Queue the context comment at most once per Jira status. The event row itself
+// is the ledger: it is written whatever the later delivery outcome is, so a
+// contained or rejected delivery is never recomposed into a second comment.
+function queueReviewContext(ctx: Ctx, task: any): void {
+  const { db } = ctx;
+  const jiraStatus = stateToJiraStatus(task.state);
+  if (!jiraStatus || !CONTEXT_STATUSES.includes(jiraStatus)) return;
+  const already = db
+    .query(
+      `SELECT 1 FROM events WHERE task_id = ? AND type = 'jira_comment'
+         AND json_extract(payload, '$.review_context') = ? LIMIT 1`
+    )
+    .get(task.id, jiraStatus);
+  if (already) return;
+  const text = reviewContextText(db, task, jiraStatus);
+  if (!text) return;
+  writeEvent(db, {
+    task_id: task.id,
+    source: "jira-sync",
+    type: "jira_comment",
+    payload: { direction: "outbound", review_context: jiraStatus, text },
+  });
 }
 
 // What a receipt says on the Jira ticket. Written for a human reading Jira with
