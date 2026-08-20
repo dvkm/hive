@@ -1328,6 +1328,30 @@ Manual dispatch (the web "dispatch now" button → `POST /api/tasks/:id/spawn`)
 bypasses these policy gates but still runs the `task.spawn` authority gate. See
 `docs/runtime.md`.
 
+Each cycle also runs a **reattach** pass BEFORE the queued pass: a live task
+(`in_progress`/`in_review`) with no `agent_target` but with QUEUED steers gets an
+agent respawned onto its existing branch and worktree, with that feedback at the
+top of the fresh brief. This is the return leg of releasing review-parked agents
+(below): the release frees the slot, the reattach brings an agent back when
+review talks back (a changes-request, red CI, a closed PR, a merge conflict).
+It skips `auto_dispatch`, `dispatch_kinds`, intake review and the authority gate
+— the task was already authorized when it first dispatched, and the alternative
+is feedback nobody ever reads — but `max_agents` and the per-task spawn backoff
+still apply.
+
+### Releasing review-parked agents
+
+A task in `in_review` is parked on the director: its PR is open, CI is green, and
+nothing asks its agent to act again until a human (or a red check) does. Every
+reaper sweep (`server/src/cleanup.ts` → `releaseReviewAgent`) therefore closes the
+session of any `in_review` agent herdr reports **idle** — or confirmed gone —
+and drops `agent_target`, so it stops counting toward `max_agents`. The git
+worktree and branch are PRESERVED (the PR still needs them); an `agent_released`
+event records it. An agent that is still `working`, one with undelivered steers,
+and one whose death cannot be positively confirmed against the pane list are all
+left alone. Per-project opt-out: `config.release_review_agents: false` (default
+on).
+
 ### Duplicate detection & auto-merge (`server/src/dedup.ts`)
 Ghost-task recreation and repeated asks produce real duplicate tasks (e.g. two
 "intake form" tasks). Every `POST /api/tasks` runs detection against the existing

@@ -21,6 +21,12 @@
 // The actual spawn (worktree + agent start + events + queued->in_progress) is
 // the shared spawnAgent() core, so the auto path and the manual /spawn endpoint
 // behave identically.
+//
+// Each cycle also runs a REATTACH pass first: a live task that has no agent but
+// does have queued steers (feedback nobody could deliver) gets one respawned onto
+// its existing branch/worktree, with the feedback in its brief. That is the other
+// half of releasing review-parked agents (cleanup.releaseReviewAgent) — the
+// release frees the slot, this brings the agent back when review talks back.
 import type { DB } from "./db.ts";
 import { parseTask } from "./rows.ts";
 import { isOffline, setSetting, getSetting, now } from "./db.ts";
@@ -29,6 +35,7 @@ import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
 import { unmetDeps, noteDependencyBlock } from "./state.ts";
 import { isTrackingOnlyTask } from "./supervision.ts";
+import { queuedSteers } from "./steer.ts";
 import { managingThreadForTask } from "./chat.ts";
 import { repoMismatchUnresolved } from "./repoTarget.ts";
 import type { Exec } from "./exec.ts";
@@ -58,6 +65,10 @@ const WORKING_STATES = "('in_progress','needs_decision')";
 const ACTIVE_STATES = "('in_progress','needs_decision','in_review','verifying')";
 // ponytail: fixed 2× multiplier — total live agents (incl. review-parked) may
 // reach max_agents*2 before dispatch pauses; make it config if it ever matters.
+// Both counts key on agent_target, so a review agent RELEASED after handoff
+// (cleanup.releaseReviewAgent) drops out of them: the overhang now bounds live
+// agents rather than review depth, which is what it was always meant to bound —
+// 10 idle review agents held corebeat at 3 running against 19 queued.
 const REVIEW_OVERHANG = 2;
 
 export interface DispatcherDeps {
@@ -101,6 +112,20 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     .all()
     .map(parseTask);
 
+  // Reattach candidates: a live task with NO agent but feedback waiting for one.
+  // Two ways in — the agent was released at review handoff
+  // (cleanup.releaseReviewAgent), or it died — and one shape: the feedback sits
+  // as QUEUED steers (the CI-red / closed-PR / conflict / merge-failure paths all
+  // queue one when they can't deliver). Respawning here puts a fresh agent on the
+  // SAME branch and worktree with that feedback at the top of its brief
+  // (spawnAgent's steer preamble). Before this, such a task sat in_progress with
+  // nobody on it until it aged into a stale notification.
+  const reattach = db
+    .query(`SELECT * FROM tasks WHERE agent_target IS NULL AND state IN ('in_progress','in_review') ORDER BY updated_at ASC`)
+    .all()
+    .map(parseTask)
+    .filter((t: any) => !isTrackingOnlyTask(t) && t.source !== "chat_supervisor" && queuedSteers(db, t.id).length > 0);
+
   let errors = 0;
   const projectCache = new Map<string, { repo_path: string | null; config: any } | null>();
   const workingCount = new Map<string, number>(); // per-project working slots used
@@ -136,8 +161,49 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   // concurrent project loop bails out so a dead daemon is probed once, not once
   // per queued task. Single-threaded async makes the check-then-set race-free.
   let herdrDown = false;
-  const dispatchProject = async (tasks: typeof queued) => {
-    for (const task of tasks) {
+  // Shared spawn tail: cap bookkeeping + the herdr-outage circuit breaker.
+  // Returns false when the daemon is down and the whole cycle must bail.
+  const spawnFor = async (task: any): Promise<boolean> => {
+    const r = await spawnAgent(db, h, task.id, { hiveUrl: deps.hiveUrl, supervise: deps.supervise, exec: deps.exec });
+    if (r.ok) {
+      workingCount.set(task.project_id, workingFor(task.project_id) + 1);
+      activeCount.set(task.project_id, activeFor(task.project_id) + 1);
+      clearHerdrOutage(db); // daemon answered — reset the outage streak
+    } else if (isHerdrUnreachable(r.error) && !herdrDown) {
+      herdrDown = true; // first hit sets the global cooldown; rest of the cycle bails
+      noteHerdrOutage(db, nowMs);
+      return false;
+    }
+    // On failure spawnAgent already wrote a single spawn_error event; the
+    // backoff above governs the next attempt (no immediate retry).
+    return true;
+  };
+
+  const dispatchProject = async (group: { reattach: typeof queued; queued: typeof queued }) => {
+    // Feedback on work already in flight comes back BEFORE new work starts —
+    // otherwise a bounce queues behind fresh dispatch for the same slot.
+    // Deliberately NOT gated on auto_dispatch, dispatch_kinds, intake review or
+    // authority: this is the SAME task resuming, already authorized when it first
+    // dispatched, and the alternative is feedback nobody ever reads. Same
+    // reasoning bounceForChanges (api.ts) respawns on. max_agents and the
+    // per-task spawn backoff still apply.
+    for (const task of group.reattach) {
+      if (herdrDown) return;
+      try {
+        const proj = getProject(task.project_id);
+        if (!proj?.repo_path) continue;
+        const cfg = proj.config ?? {};
+        const cap = Number.isFinite(cfg.max_agents) ? Number(cfg.max_agents) : MAX_AGENTS_DEFAULT;
+        if (workingFor(task.project_id) >= cap) continue;
+        if (inBackoff(db, task.id, nowMs)) continue;
+        if (!(await spawnFor(task))) return;
+      } catch (e) {
+        errors++;
+        console.error(`[hive] dispatcher reattach ${task.id}:`, e);
+      }
+    }
+
+    for (const task of group.queued) {
       if (herdrDown) return; // daemon down this cycle — stop, cooldown already set
       try {
         const proj = getProject(task.project_id);
@@ -188,18 +254,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
           continue;
         }
 
-        const r = await spawnAgent(db, h, task.id, { hiveUrl: deps.hiveUrl, supervise: deps.supervise, exec: deps.exec });
-        if (r.ok) {
-          workingCount.set(task.project_id, workingFor(task.project_id) + 1);
-          activeCount.set(task.project_id, activeFor(task.project_id) + 1);
-          clearHerdrOutage(db); // daemon answered — reset the outage streak
-        } else if (isHerdrUnreachable(r.error) && !herdrDown) {
-          herdrDown = true; // first hit sets the global cooldown; rest of the cycle bails
-          noteHerdrOutage(db, nowMs);
-          return;
-        }
-        // On failure spawnAgent already wrote a single spawn_error event; the
-        // backoff above governs the next attempt (no immediate retry).
+        if (!(await spawnFor(task))) return;
       } catch (e) {
         errors++;
         console.error(`[hive] dispatcher task ${task.id}:`, e);
@@ -211,16 +266,18 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   // created_at sort) and dispatch the projects concurrently. The count-cache
   // Maps are only ever touched for a project's own key, so concurrent project
   // loops never race on shared state.
-  const byProject = new Map<string, typeof queued>();
-  for (const task of queued) {
-    const arr = byProject.get(task.project_id);
-    if (arr) arr.push(task);
-    else byProject.set(task.project_id, [task]);
-  }
+  const byProject = new Map<string, { reattach: typeof queued; queued: typeof queued }>();
+  const groupFor = (pid: string) => {
+    let g = byProject.get(pid);
+    if (!g) byProject.set(pid, (g = { reattach: [], queued: [] }));
+    return g;
+  };
+  for (const task of reattach) groupFor(task.project_id).reattach.push(task);
+  for (const task of queued) groupFor(task.project_id).queued.push(task);
   await Promise.all([...byProject.values()].map(dispatchProject));
   setSetting(db, "last_dispatch_at", now()); // cycle completed — refresh heartbeat
   console.log(
-    `[hive] dispatcher run: duration_ms=${Date.now() - startedAt} steps=${queued.length} errors=${errors} outcome=${errors > 0 ? "error" : "ok"}`
+    `[hive] dispatcher run: duration_ms=${Date.now() - startedAt} steps=${queued.length} reattach=${reattach.length} errors=${errors} outcome=${errors > 0 ? "error" : "ok"}`
   );
 }
 
