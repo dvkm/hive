@@ -86,6 +86,18 @@ test("dead: agent gone from herdr", () => {
   expect(h?.reason).toBe("agent gone from herdr");
 });
 
+test("healthy: a deferred task whose agent went gone is not dead/stuck, and needsAttention is false", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId); // in_progress
+  const farFuture = "9999-12-31T00:00:00.000Z";
+  db.query("UPDATE tasks SET deferred_until = ? WHERE id = ?").run(farFuture, id);
+  putEvent(db, id, "deferred", { until: farFuture, note: "waiting on sudo" });
+  putEvent(db, id, "agent_status", { status: "gone" });
+  const h = computeHealth(db, getTask(db, id), Date.now());
+  expect(h?.status).toBe("healthy");
+  expect(needsAttention({ state: "in_progress", health: h })).toBe(false);
+});
+
 test("stuck: agent finished (idle) with no PR and no recent activity -> visible in the tray", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId); // in_progress, no pr_url
