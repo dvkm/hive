@@ -81,6 +81,7 @@ function showNotification(rawUrl) {
     body: url.searchParams.get("body") || "",
   });
   note.on("click", () => goto(path.startsWith("/") ? path : "/"));
+  note.on("failed", (_event, error) => console.error("[hive] notification failed:", error));
   note.show();
 }
 
