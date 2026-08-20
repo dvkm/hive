@@ -5,8 +5,9 @@ import { useStore } from "../lib/store";
 import { STATE_LABEL, toast } from "../lib/ui";
 
 // Config keys the structured editor owns; everything else is edited as raw JSON.
-const STRUCTURED_KEYS = ["auto_dispatch", "max_agents", "dispatch_kinds", "supervisor_persona", "playbook"];
+const STRUCTURED_KEYS = ["agent", "auto_dispatch", "max_agents", "dispatch_kinds", "supervisor_persona", "playbook"];
 const ALL_KINDS: Kind[] = ["ship", "scout", "chore"];
+type Agent = "claude" | "codex";
 // States worth surfacing as per-project counts (skip terminal cancelled).
 const COUNT_STATES: State[] = ["queued", "in_progress", "needs_decision", "in_review", "verifying", "done", "failed"];
 
@@ -104,6 +105,7 @@ function ProjectCard({
   const archived = p.config?.archived === true;
   const isTest = p.config?.test === true;
   const autoDispatch = p.config?.auto_dispatch === true;
+  const agent = p.config?.agent === "codex" ? "codex" : "claude";
   const monitors = (p.config?.monitors?.length as number) || 0;
   const total = COUNT_STATES.reduce((n, s) => n + (counts[s] || 0), 0);
 
@@ -138,6 +140,7 @@ function ProjectCard({
         <span className={`chip ${autoDispatch ? "effect-allow" : ""}`}>
           auto-dispatch {autoDispatch ? "on" : "off"}
         </span>
+        <span className="chip">{agent === "codex" ? "ChatGPT · Codex" : "Claude Code"}</span>
         <span className="chip">{monitors} monitor{monitors === 1 ? "" : "s"}</span>
         <span className="chip">{total} task{total === 1 ? "" : "s"}</span>
       </div>
@@ -164,6 +167,7 @@ function ProjectCard({
 function ProjectEditor({ p, onSaved, onClose }: { p: Project; onSaved: () => void; onClose: () => void }) {
   const [name, setName] = useState(p.name);
   const [repoPath, setRepoPath] = useState(p.repo_path || "");
+  const [agent, setAgent] = useState<Agent>(p.config?.agent === "codex" ? "codex" : "claude");
   const [autoDispatch, setAutoDispatch] = useState(p.config?.auto_dispatch === true);
   const [maxAgents, setMaxAgents] = useState(
     p.config?.max_agents != null ? String(p.config.max_agents) : ""
@@ -192,7 +196,7 @@ function ProjectEditor({ p, onSaved, onClose }: { p: Project; onSaved: () => voi
       return;
     }
     setJsonErr(null);
-    const config: Record<string, unknown> = { ...rest, auto_dispatch: autoDispatch, dispatch_kinds: dispatchKinds };
+    const config: Record<string, unknown> = { ...rest, agent, auto_dispatch: autoDispatch, dispatch_kinds: dispatchKinds };
     if (maxAgents.trim()) config.max_agents = Number(maxAgents);
     if (persona.trim()) config.supervisor_persona = persona;
     if (playbook.trim()) config.playbook = playbook;
@@ -221,6 +225,13 @@ function ProjectEditor({ p, onSaved, onClose }: { p: Project; onSaved: () => voi
 
       <div className="proj-config">
         <h3>Config</h3>
+        <label className="fld">
+          <span>Worker</span>
+          <select value={agent} onChange={(e) => setAgent(e.target.value as Agent)}>
+            <option value="claude">Claude Code</option>
+            <option value="codex">ChatGPT (Codex CLI)</option>
+          </select>
+        </label>
         <label className="ck proj-switch">
           <input type="checkbox" checked={autoDispatch} onChange={(e) => setAutoDispatch(e.target.checked)} />
           Auto-dispatch queued ship/scout tasks
@@ -284,6 +295,7 @@ function ProjectEditor({ p, onSaved, onClose }: { p: Project; onSaved: () => voi
 function NewProjectModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const [name, setName] = useState("");
   const [repoPath, setRepoPath] = useState("");
+  const [agent, setAgent] = useState<Agent>("claude");
   const [busy, setBusy] = useState(false);
 
   const submit = async () => {
@@ -295,7 +307,7 @@ function NewProjectModal({ onClose, onCreated }: { onClose: () => void; onCreate
     setBusy(true);
     try {
       // Sensible empty config: default_branch main, everything else off/default.
-      await api.createProject({ name: name.trim(), repo_path: repoPath.trim(), config: { default_branch: "main" } });
+      await api.createProject({ name: name.trim(), repo_path: repoPath.trim(), config: { default_branch: "main", agent } });
       toast("Project created");
       onCreated();
     } catch (e) {
@@ -320,6 +332,13 @@ function NewProjectModal({ onClose, onCreated }: { onClose: () => void; onCreate
         <label className="fld">
           <span>Repo path (absolute)</span>
           <input className="mono-input" placeholder="/Users/you/code/acme-web" value={repoPath} onChange={(e) => setRepoPath(e.target.value)} />
+        </label>
+        <label className="fld">
+          <span>Worker</span>
+          <select value={agent} onChange={(e) => setAgent(e.target.value as Agent)}>
+            <option value="claude">Claude Code</option>
+            <option value="codex">ChatGPT (Codex CLI)</option>
+          </select>
         </label>
         <div className="modal-foot">
           <span className="muted modal-hint">⌘↵ to create · Esc to close</span>

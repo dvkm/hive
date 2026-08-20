@@ -89,6 +89,26 @@ test("spawn endpoint starts the agent and moves the task to in_progress", async 
   expect(existsSync(join(WT, ".claude", "settings.local.json"))).toBe(true);
 });
 
+test("a ChatGPT project starts an interactive Codex worker with Hive hooks", async () => {
+  const p = await post("/api/projects", { name: "codex", repo_path: "/repo", config: { agent: "codex" } });
+  const t = await post("/api/tasks", { project_id: p.json.id, title: "codex task" });
+  const before = calls.length;
+  const r = await post(`/api/tasks/${t.json.id}/spawn`, {});
+  expect(r.status).toBe(200);
+
+  const start = calls.slice(before).find((argv) => has(argv, "agent", "start"))!;
+  const agent = start.slice(start.indexOf("--") + 1);
+  expect(start).toContain("HIVE_AGENT=codex");
+  expect(agent[0]).toBe("codex");
+  expect(agent).toContain("workspace-write");
+  expect(agent).toContain("on-request");
+  expect(agent).toContain("--dangerously-bypass-hook-trust");
+  expect(agent.some((arg) => arg.includes("hooks.PermissionRequest") && arg.includes("hive-approve.sh"))).toBe(true);
+  expect(agent.some((arg) => arg.includes("hooks.Stop") && arg.includes("hive-hook.sh"))).toBe(true);
+  expect(agent.at(-1)).toContain("codex task");
+  expect(agent).not.toContain("--model");
+});
+
 // A worker has no human at its pane: an MCP server that opens an Allow/Deny
 // dialog hangs it forever. The seeded settings must deny those servers.
 test("spawned worktree settings deny the interactive-prompt MCP servers", () => {
@@ -117,6 +137,12 @@ test("spawn refuses a project without a repo_path", async () => {
   const r = await post(`/api/tasks/${t.json.id}/spawn`, {});
   expect(r.status).toBe(400);
   expect(r.json.error).toContain("repo_path");
+});
+
+test("project config rejects unknown worker agents", async () => {
+  const r = await post("/api/projects", { name: "bad-agent", repo_path: "/repo", config: { agent: "chatgpt" } });
+  expect(r.status).toBe(400);
+  expect(r.json.error).toContain("claude|codex");
 });
 
 test("focus-agent focuses the herdr tab for a spawned task", async () => {
@@ -274,4 +300,7 @@ test("modelForTask: per-kind default, config.model, config.model_by_kind overrid
   expect(modelForTask({ model: "haiku" }, "ship")).toBe("haiku");
   expect(modelForTask({ model: "haiku", model_by_kind: { ship: "opus" } }, "ship")).toBe("opus");
   expect(modelForTask({ model_by_kind: { ship: "opus" } }, "scout")).toBe("sonnet");
+  expect(modelForTask({ agent: "codex" }, "ship")).toBeUndefined();
+  expect(modelForTask({ agent: "codex", codex_model: "gpt-codex" }, "ship")).toBe("gpt-codex");
+  expect(modelForTask({ agent: "codex", codex_model: "gpt-codex", codex_model_by_kind: { scout: "gpt-codex-mini" } }, "scout")).toBe("gpt-codex-mini");
 });

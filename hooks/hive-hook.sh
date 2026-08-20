@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Claude Code lifecycle hook -> hive.
+# Claude Code / Codex lifecycle hook -> hive.
 #
 # POSTs a status event to $HIVE_URL for the current task when $HIVE_TASK_ID is
 # set (the herdr spawn adapter injects both env vars). This gives hive a
@@ -16,8 +16,8 @@
 HIVE_URL="${HIVE_URL:-http://127.0.0.1:4700}"
 EVENT="${1:-Stop}"
 
-# Claude Code passes hook JSON on stdin; capture it (transcript reporting +
-# usage below both need it).
+# The agent passes hook JSON on stdin; capture it (transcript reporting + usage
+# below both need it).
 INPUT="$(cat 2>/dev/null || true)"
 
 BUN="$(command -v bun || echo "$HOME/.bun/bin/bun")"
@@ -40,5 +40,8 @@ if [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SubagentStop" ]; then
     -d "{\"type\":\"agent_turn_end\",\"source\":\"hook\",\"payload\":{\"hook\":\"$EVENT\"}}" \
     >/dev/null 2>&1 || true
 fi
+
+# Codex Stop hooks require JSON output. Claude ignores this empty decision.
+[ "$HIVE_AGENT" = "codex" ] && printf '{}\n'
 
 exit 0

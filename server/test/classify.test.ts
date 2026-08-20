@@ -3,6 +3,7 @@
 // dangerous cases: everything destructive must classify as "dangerous" (never
 // "safe"), and anything unrecognized must fall to "unknown" (never "safe").
 import { test, expect } from "bun:test";
+import { join } from "node:path";
 import { classify, actionFor } from "../../hooks/classify.ts";
 
 const dangerous = [
@@ -132,6 +133,35 @@ test("safe commands classify as safe", () => {
     const r = classify(cmd);
     expect(r.decision).toBe("safe");
   }
+});
+
+test("Codex PermissionRequest receives the Codex allow shape", async () => {
+  const proc = Bun.spawn(["bun", join(import.meta.dir, "../../hooks/classify.ts")], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  proc.stdin.write(JSON.stringify({ hook_event_name: "PermissionRequest", cwd: "/tmp", tool_input: { command: "git status" } }));
+  await proc.stdin.end();
+  const output = JSON.parse(await new Response(proc.stdout).text());
+  expect(await proc.exited).toBe(0);
+  expect(output.hookSpecificOutput).toEqual({
+    hookEventName: "PermissionRequest",
+    decision: { behavior: "allow" },
+  });
+});
+
+test("Codex PreToolUse continues safe commands without an unsupported allow decision", async () => {
+  const proc = Bun.spawn(["bun", join(import.meta.dir, "../../hooks/classify.ts")], {
+    env: { ...process.env, HIVE_AGENT: "codex" },
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  proc.stdin.write(JSON.stringify({ hook_event_name: "PreToolUse", cwd: "/tmp", tool_input: { command: "git status" } }));
+  await proc.stdin.end();
+  expect((await new Response(proc.stdout).text()).trim()).toBe("");
+  expect(await proc.exited).toBe(0);
 });
 
 test("unrecognized commands classify as unknown (never safe)", () => {

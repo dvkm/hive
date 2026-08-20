@@ -1,4 +1,4 @@
-# hive Claude Code hooks
+# hive agent hooks
 
 These hooks give hive a **zero-discipline** liveness signal: even if an agent
 never calls `hive emit`, hive still sees Stop / SubagentStop / tool activity and
@@ -8,7 +8,7 @@ paths (emit CLI, hooks, reconciler).
 ## What they do
 
 On every fire (`PostToolUse`, `Stop`, `SubagentStop`), `hive-hook.sh <event-label>`
-reads the `transcript_path` from the hook's stdin payload and extracts the agent's
+reads the `transcript_path` from Claude Code or Codex hook input and extracts the agent's
 **new turns since a per-transcript cursor** (`report-transcript.ts`), POSTing them
 to `$HIVE_URL/api/tasks/$HIVE_TASK_ID/events`:
 
@@ -41,20 +41,7 @@ it never blocks the agent.
 On `Stop` / `SubagentStop`, `hive-hook.sh` also reports **per-model token usage**
 to hive's analytics via `report-usage.ts` (run with Bun).
 
-The finding, honestly: the Stop-hook **stdin payload does not contain token
-counts** — it carries `session_id`, `transcript_path`, `cwd`, `hook_event_name`,
-and `stop_hook_active`. But `transcript_path` points at the session's JSONL, and
-every assistant line there has a `message.usage` block
-(`input_tokens`, `output_tokens`, `cache_read_input_tokens`,
-`cache_creation_input_tokens`) plus `message.model`. So the usage IS available —
-one indirection away. `report-usage.ts` reads the transcript, aggregates per
-model, and POSTs a `usage` event per model.
-
-Caveat: it sums the whole transcript on each Stop. That is correct for hive's
-one-shot `claude -p` agents (Stop fires once). In a long interactive session
-with repeated Stops it would double-count — add a per-session line cursor if you
-ever wire these hooks into interactive use. `cache_creation_input_tokens` is
-folded into `input_tokens` (hive's `usage` schema has no cache-write bucket).
+The Stop-hook input does not contain token counts directly, but `transcript_path` points at the session JSONL. Claude stores usage on assistant rows; Codex stores cumulative token counts in `event_msg` rows. `report-usage.ts` reads either format and posts cumulative usage by session, which Hive upserts instead of double-counting repeated Stops. Codex model switches inside one session are attributed to the latest active model because its transcript exposes one session total rather than a per-model split.
 
 If you prefer not to rely on transcript parsing, drop `report-usage.ts` and have
 agents report usage directly via the `usage` event on
@@ -62,7 +49,7 @@ agents report usage directly via the `usage` event on
 
 ## Wiring (settings.json)
 
-The spawn adapter runs `claude -p <brief>` inside the worktree, so Claude Code
+The spawn adapter runs interactive `claude <brief>` inside the worktree, so Claude Code
 reads the project (or user) `settings.json`. Add:
 
 ```json
@@ -86,6 +73,8 @@ scoped to the state-changing tools (`Bash|Write|Edit`) so the board sees real
 progress without a flood of read-only tool calls; drop it if you only want
 start/stop signals.
 
+Codex projects do not need a repository hook file. Hive passes equivalent `PreToolUse`, `PermissionRequest`, `PostToolUse`, `Stop`, and `SubagentStop` hooks as per-invocation Codex config and bypasses the interactive hook-trust prompt for that vetted command. Run `codex login` once on the Hive machine before selecting “ChatGPT (Codex CLI)” as a project's worker.
+
 ## Make it executable
 
 ```bash
@@ -103,10 +92,7 @@ printf '{"transcript_path":"/path/to/transcript.jsonl"}' | hooks/hive-hook.sh St
 
 ## Command auto-approval (PreToolUse classifier)
 
-`hive-approve.sh` + `classify.ts` are a **PreToolUse** hook that keeps an
-autonomous worker from hanging on a Bash permission dialog. `writeHookSettings`
-wires them into every spawned worktree automatically (alongside the static
-`permissions.allow` list); this section documents the contract.
+`hive-approve.sh` + `classify.ts` handle **PreToolUse** and Codex **PermissionRequest** events so an autonomous worker does not hang on a Bash permission dialog. Hive wires them into every spawned worker automatically; this section documents the contract.
 
 `classify.ts` (pure, unit-tested in `server/test/classify.test.ts`) sorts a
 command into **safe** / **dangerous** / **unknown**:
@@ -133,9 +119,7 @@ command into **safe** / **dangerous** / **unknown**:
 ```json
 {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"..."}}
 ```
-`permissionDecision` is `allow` or `deny`. No output + exit 0 = defer to Claude
-Code's normal permission flow. The hook never emits exit 2; any internal error
-exits 0 so the agent is never crashed.
+`permissionDecision` is `allow` or `deny`. Codex PermissionRequest uses its event-specific `{decision:{behavior}}` shape. No output + exit 0 defers to the agent's normal permission flow. The hook never emits exit 2; any internal error exits 0 so the agent is never crashed.
 
 **Routing**: safe → `allow`. dangerous + unknown → `POST guarded-action` (action
 `command.dangerous.<category>` vs `command`, with the Bash description forwarded as `summary`; see the [guarded-action endpoint contract](../docs/API.md#tasks)); the response maps `200 allow`→allow,

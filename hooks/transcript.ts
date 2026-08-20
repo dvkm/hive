@@ -1,6 +1,6 @@
-// Pure transcript extraction: turn Claude Code transcript JSONL lines into hive
-// timeline events. Kept dependency-free and side-effect-free so report-transcript.ts
-// (the hook runner) and the unit tests can share it.
+// Pure transcript extraction: turn Claude Code or Codex transcript JSONL lines
+// into hive timeline events. Kept dependency-free and side-effect-free so the
+// hook runner and unit tests can share it.
 //
 // The transcript is append-only JSONL. Each assistant row looks like:
 //   {"type":"assistant","message":{"content":[
@@ -20,11 +20,18 @@ const MAX_SUMMARY = 200;
 
 // One cheap, sensible field per tool — never dump the whole input blob.
 export function toolSummary(name: string, input: any): string {
+  if (typeof input === "string") {
+    const s = input.replace(/\s+/g, " ").trim();
+    return s.length > MAX_SUMMARY ? s.slice(0, MAX_SUMMARY - 1) + "…" : s;
+  }
   if (!input || typeof input !== "object") return "";
   let s = "";
   switch (name) {
     case "Bash":
+    case "exec_command":
+    case "local_shell":
       s = input.command ?? "";
+      s ||= input.cmd ?? input.action?.command ?? "";
       break;
     case "Read":
     case "Write":
@@ -57,8 +64,28 @@ export function toolSummary(name: string, input: any): string {
   return s.length > MAX_SUMMARY ? s.slice(0, MAX_SUMMARY - 1) + "…" : s;
 }
 
-// Extract ordered event bodies from a slice of NEW transcript lines. Non-assistant
-// rows and unparseable lines are skipped. Empty/whitespace text blocks are dropped.
+function toolInput(item: any): any {
+  const raw = item?.input ?? item?.arguments ?? item?.action ?? {};
+  if (typeof raw !== "string") return raw;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function appendText(out: EventBody[], content: any): void {
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    if (block?.type !== "text" && block?.type !== "output_text") continue;
+    const text = String(block.text ?? "").trim();
+    if (text) out.push({ type: "assistant_text", source: "hook", payload: { text } });
+  }
+}
+
+// Extract ordered event bodies from a slice of NEW transcript lines. Claude
+// stores assistant blocks under `type=assistant`; Codex stores them as
+// `response_item` rows. Empty and unparseable rows are skipped.
 export function extractTurns(lines: string[]): EventBody[] {
   const out: EventBody[] = [];
   for (const line of lines) {
@@ -69,17 +96,24 @@ export function extractTurns(lines: string[]): EventBody[] {
     } catch {
       continue;
     }
-    if (row?.type !== "assistant") continue;
-    const content = row?.message?.content;
-    if (!Array.isArray(content)) continue;
-    for (const block of content) {
-      if (block?.type === "text") {
-        const text = String(block.text ?? "").trim();
-        if (text) out.push({ type: "assistant_text", source: "hook", payload: { text } });
-      } else if (block?.type === "tool_use") {
-        const tool = String(block.name ?? "tool");
-        out.push({ type: "tool_use", source: "hook", payload: { tool, summary: toolSummary(tool, block.input) } });
+    if (row?.type === "assistant") {
+      const content = row?.message?.content;
+      if (!Array.isArray(content)) continue;
+      for (const block of content) {
+        if (block?.type === "text") appendText(out, [block]);
+        else if (block?.type === "tool_use") {
+          const tool = String(block.name ?? "tool");
+          out.push({ type: "tool_use", source: "hook", payload: { tool, summary: toolSummary(tool, block.input) } });
+        }
       }
+      continue;
+    }
+
+    const item = row?.type === "response_item" ? row.payload : null;
+    if (item?.type === "message" && item.role === "assistant") appendText(out, item.content);
+    else if (["custom_tool_call", "function_call", "local_shell_call"].includes(item?.type)) {
+      const tool = String(item.name ?? (item.type === "local_shell_call" ? "local_shell" : "tool"));
+      out.push({ type: "tool_use", source: "hook", payload: { tool, summary: toolSummary(tool, toolInput(item)) } });
     }
   }
   return out;

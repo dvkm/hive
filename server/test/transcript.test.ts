@@ -30,6 +30,17 @@ test("extracts tool_use blocks with a one-line summary per tool", () => {
   expect(out[2].payload).toEqual({ tool: "Grep", summary: "TODO" });
 });
 
+test("extracts Codex response items", () => {
+  const lines = [
+    line({ type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Checking the tests." }] } }),
+    line({ type: "response_item", payload: { type: "custom_tool_call", name: "exec_command", input: JSON.stringify({ cmd: "bun test" }) } }),
+  ];
+  expect(extractTurns(lines)).toEqual([
+    { type: "assistant_text", source: "hook", payload: { text: "Checking the tests." } },
+    { type: "tool_use", source: "hook", payload: { tool: "exec_command", summary: "bun test" } },
+  ]);
+});
+
 test("interleaves text and tools in transcript order, skips empty text + non-assistant rows", () => {
   const lines = [
     line({ type: "user", message: { content: "hi" } }),

@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// Claude Code hook -> hive transcript reporter.
+// Claude Code / Codex hook -> hive transcript reporter.
 //
 // Reads the `transcript_path` JSONL from the hook stdin payload, extracts the
 // NEW assistant turns since a per-transcript line cursor, and POSTs them to hive

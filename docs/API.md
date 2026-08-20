@@ -52,8 +52,7 @@ must be built against this file. Server: `http://127.0.0.1:4700` (override
 `monitors` (`[{name, url, expect_status, expect_substring?, interval_s}]`),
 `monitors_auto_task` (bool; a monitor failure auto-creates a `chore` task),
 `smoke` (`[{name, url, expect_status, expect_substring?}]`, run once on
-`verifying`), `agent_argv` (string[], per-project override of the command
-herdr runs, default `["claude","-p",<brief-file>,"--permission-mode","acceptEdits"]`),
+`verifying`), `agent` (`"claude" | "codex"`, default `"claude"`; `"codex"` runs the interactive Codex CLI using the machine's ChatGPT login), `codex_model` / `codex_model_by_kind` (optional Codex model overrides; omitted means the current Codex default), `agent_argv` (string[], advanced per-project override of the complete command herdr runs; verbatim and responsible for its own briefing),
 `setup_argv` / `cleanup_argv` (string[], a symmetric per-project stack hook pair —
 `setup_argv` runs at spawn time once the worktree exists but before the agent
 starts, `cleanup_argv` runs before the worktree is removed; relative `argv[0]`

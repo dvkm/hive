@@ -2,9 +2,7 @@
 
 Local-first orchestration control plane built around one persistent Chief of Staff. The default web home shows a compact briefing, the current exchange, and one consequential decision at a time. Earlier conversation and detailed agent activity stay behind progressive disclosure, while search and a single Browse menu keep operational views available without competing for attention. hive owns durable state (SQLite), an event-driven timeline, evidence, policies, and a server-enforced task state machine. See [SPEC.md](./SPEC.md) for the full product spec and [docs/API.md](./docs/API.md) for the HTTP contract.
 
-This repo contains **Phase 1** (server core + CLI) and **Phase 2b** (the runtime
-layer: herdr adapter, reconciler, monitors + post-deploy smoke, secrets, and
-Claude Code hooks). The web app is built separately against `docs/API.md`.
+This repo contains **Phase 1** (server core + CLI) and **Phase 2b** (the runtime layer: herdr adapter, reconciler, monitors + post-deploy smoke, secrets, and Claude Code/Codex hooks). The web app is built separately against `docs/API.md`.
 
 ## Requirements
 
@@ -117,7 +115,7 @@ server/test/ bun test suite
 - **herdr adapter** (`server/src/runtime/herdr.ts`) is a thin subprocess layer
   over the `herdr` CLI with an injectable `Exec`, so command construction and
   teardown safety are unit-tested without a live herdr server. `HERDR_BIN`
-  overrides the binary path.
+  overrides the binary path. Projects choose `config.agent: "claude" | "codex"`; the latter launches an interactive Codex worker using the machine's ChatGPT login (`codex login`) while preserving Hive's lifecycle and command-policy hooks.
 - **Teardown refuses to destroy work**: `herdr worktree remove` runs only after
   the branch is pushed to origin or merged into the default branch (verified
   with git); otherwise it returns `{removed:false}`.
