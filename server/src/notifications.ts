@@ -27,19 +27,22 @@ export interface NotifInput {
   decision_id?: string | null;
 }
 
-// Module-level osascript sink. Off by default (null) so tests and the CLI never
+// Module-level macOS app sink. Off by default (null) so tests and the CLI never
 // pop real notifications; the server turns it on with the real Exec (index.ts).
 let notifier: Exec | null = null;
 export function setNotifier(exec: Exec | null): void {
   notifier = exec;
 }
 
-async function osaNotify(exec: Exec, title: string, message: string): Promise<void> {
+async function appNotify(exec: Exec, title: string, message: string, path = "/"): Promise<void> {
   try {
-    const q = (s: string) => s.replace(/"/g, '\\"');
-    await exec(["osascript", "-e", `display notification "${q(message)}" with title "${q(title)}"`]);
+    const url = new URL("hive://notify");
+    url.searchParams.set("title", title);
+    url.searchParams.set("body", message);
+    url.searchParams.set("path", path);
+    await exec(["open", "-g", "-b", "dev.hive.app", url.toString()]);
   } catch {
-    /* non-fatal: osascript missing / not macOS */
+    /* non-fatal: hive.app missing / not macOS */
   }
 }
 
@@ -75,7 +78,13 @@ export function enqueue(db: DB, n: NotifInput, deps: { exec?: Exec } = {}): any 
     "INSERT INTO notifications (id, ts, kind, task_id, decision_id, title, body, urgency, delivered_at) VALUES (?,?,?,?,?,?,?,?,?)"
   ).run(row.id, row.ts, row.kind, row.task_id, row.decision_id, row.title, row.body, row.urgency, row.delivered_at);
   broadcast({ type: "notification", notification: row });
-  if (urgency === "urgent" && exec) void osaNotify(exec, n.title, n.body ?? "");
+  if (urgency === "urgent" && exec)
+    void appNotify(
+      exec,
+      n.title,
+      n.body ?? "",
+      n.decision_id ? "/decisions" : n.task_id ? `/tasks/${n.task_id}` : "/"
+    );
   // Urgent → also push to the phone (PWA web push). Best-effort, never throws.
   if (urgency === "urgent")
     void pushToAll(db, {
@@ -126,7 +135,7 @@ export function runDigest(db: DB, deps: DigestDeps = {}): { delivered: boolean; 
     `UPDATE notifications SET delivered_at = ? WHERE id IN (${ids.map(() => "?").join(",")})`
   ).run(at, ...ids);
   const exec = deps.exec ?? notifier;
-  if (exec) void osaNotify(exec, "hive digest", summary);
+  if (exec) void appNotify(exec, "hive digest", summary);
   return { delivered: true, count: pending.length, summary };
 }
 

@@ -10,6 +10,8 @@ const BASE = process.env.HIVE_URL || "http://127.0.0.1:4700";
 const SMOKE = !!process.env.HIVE_SMOKE; // load, print ok, quit — used by CI/verification
 
 let win = null;
+let launchedByNotification = false;
+const pendingNotifications = [];
 
 function createWindow() {
   // Clamp the initial size to the display's work area. At a fixed 1440x920 the
@@ -60,14 +62,36 @@ function loadWithRetry() {
 
 function goto(path) {
   if (!win) createWindow();
+  if (win.isMinimized()) win.restore();
   win.show();
+  app.focus({ steal: true });
+  win.focus();
   win.loadURL(BASE + path).catch(() => {});
 }
 
-// ---- native notifications from the server's SSE stream ----
-// The server already decides what deserves attention (decisions, blocked
-// agents, failures, incidents — enqueue() in notifications.ts) and broadcasts
-// each as {type:"notification"}. We surface exactly those natively.
+// The server opens hive://notify for alerts so macOS attributes them to this
+// app and their click can focus the right Hive screen. Queue cold-start URLs
+// until Electron is ready to create a native notification.
+function showNotification(rawUrl) {
+  const url = new URL(rawUrl);
+  if (url.protocol !== "hive:" || url.hostname !== "notify") return;
+  const path = url.searchParams.get("path") || "/";
+  const note = new Notification({
+    title: url.searchParams.get("title") || "hive",
+    body: url.searchParams.get("body") || "",
+  });
+  note.on("click", () => goto(path.startsWith("/") ? path : "/"));
+  note.show();
+}
+
+app.on("open-url", (event, url) => {
+  event.preventDefault();
+  launchedByNotification = true;
+  if (app.isReady()) showNotification(url);
+  else pendingNotifications.push(url);
+});
+
+// ---- live state from the server's SSE stream ----
 function subscribe() {
   const req = http.get(BASE + "/api/stream", { headers: { Accept: "text/event-stream" } }, (res) => {
     let buf = "";
@@ -97,16 +121,6 @@ function subscribe() {
 }
 
 function handle(msg) {
-  if (msg.type === "notification" && msg.notification) {
-    const n = msg.notification;
-    const note = new Notification({
-      title: n.title || "hive",
-      body: n.body || "",
-      silent: n.urgency !== "urgent",
-    });
-    note.on("click", () => goto(n.decision_id ? "/decisions" : n.task_id ? `/tasks/${n.task_id}` : "/"));
-    note.show();
-  }
   // Anything that can change the inbox count refreshes the badge.
   if (["decision", "event", "task", "notification"].includes(msg.type)) refreshBadge();
 }
@@ -130,7 +144,8 @@ function refreshBadge() {
 }
 
 app.whenReady().then(() => {
-  createWindow();
+  if (!launchedByNotification || SMOKE) createWindow();
+  pendingNotifications.splice(0).forEach(showNotification);
   subscribe();
   refreshBadge();
   if (SMOKE) {

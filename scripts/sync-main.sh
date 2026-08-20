@@ -37,6 +37,7 @@ if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
   git merge --ff-only FETCH_HEAD --quiet
   (cd server && bun install --silent >/dev/null)
   (cd web && bun install --silent >/dev/null && bun run build >/dev/null)
+  (cd electron && bun install --silent >/dev/null && bun run build >/dev/null)
   # bun --watch hot reload is unreliable; always kickstart after a live merge
   launchctl kickstart -k "gui/$(id -u)/dev.hive.server"
   # The desktop app keeps its existing Chromium renderer across server deploys.

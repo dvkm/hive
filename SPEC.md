@@ -99,7 +99,7 @@ Design: dark, calm, conversational, and focused. Localhost tool, no auth except 
 ## Monitors (D3-B)
 
 - Per-project config: list of `{name, url, expect_status, expect_substring?, interval_s}`.
-- Runner in the server; failure → incident row + SSE + macOS notification (`osascript`) + optional auto-task creation (config flag).
+- Runner in the server; failure → incident row + SSE + native Hive notification + optional auto-task creation (config flag).
 - Post-deploy smoke: a task entering `verifying` runs the project's smoke list once; pass → evidence row (test_run) + eligible for done; fail → back to `in_progress` with event.
 
 ## CLI (`bin/hive`)

@@ -87,7 +87,7 @@ setInterval(() => {
 const reapMs = Number(process.env.HIVE_REAP_MS || 300_000);
 startReaper(db, { intervalMs: reapMs });
 
-// Notification delivery: turn on the osascript sink (urgent -> immediate push)
+// Notification delivery: hand alerts to hive.app (urgent -> immediate push)
 // and start the batched digest loop (normal -> one digest every HIVE_DIGEST_MS).
 setNotifier(defaultExec);
 startDigest(db);
