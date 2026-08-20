@@ -41,9 +41,15 @@ test("normal notifications batch into ONE digest, then never repeat", () => {
   expect(first.delivered).toBe(true);
   expect(first.count).toBe(3);
   expect(first.summary).toBe("2 done, 1 needs decision");
-  // ONE digest osascript call, not one per event
+  // ONE digest handoff to hive.app, not one per event
   expect(calls.length).toBe(1);
-  expect(calls[0][0]).toBe("osascript");
+  expect(calls[0].slice(0, 4)).toEqual(["open", "-g", "-b", "dev.hive.app"]);
+  const notification = new URL(calls[0][4]);
+  expect(notification.protocol).toBe("hive:");
+  expect(notification.hostname).toBe("notify");
+  expect(notification.searchParams.get("title")).toBe("hive digest");
+  expect(notification.searchParams.get("body")).toBe("2 done, 1 needs decision");
+  expect(notification.searchParams.get("path")).toBe("/");
 
   // all marked delivered; a second digest with nothing pending is a no-op
   const second = runDigest(db, { exec });
@@ -51,15 +57,28 @@ test("normal notifications batch into ONE digest, then never repeat", () => {
   expect(calls.length).toBe(1);
 });
 
-test("urgent notification pushes immediately via injected exec and is pre-delivered", () => {
+test("urgent notification opens hive.app with its click destination and is pre-delivered", () => {
   const { db } = freshDb();
   const { exec, calls } = recordingExec();
-  const row = enqueue(db, { kind: "incident", title: "Monitor down: api", body: "503", urgency: "urgent" }, { exec });
+  const row = enqueue(
+    db,
+    {
+      kind: "decision",
+      decision_id: "dec_123",
+      title: "Decision needed: ship prod?",
+      body: "Production DB acme-prod-db.",
+      urgency: "urgent",
+    },
+    { exec }
+  );
 
   expect(row.delivered_at).toBeTruthy(); // urgent is delivered on enqueue
   expect(calls.length).toBe(1);
-  expect(calls[0][0]).toBe("osascript");
-  expect(calls[0].join(" ")).toContain("Monitor down: api");
+  expect(calls[0].slice(0, 4)).toEqual(["open", "-g", "-b", "dev.hive.app"]);
+  const notification = new URL(calls[0][4]);
+  expect(notification.searchParams.get("title")).toBe("Decision needed: ship prod?");
+  expect(notification.searchParams.get("body")).toBe("Production DB acme-prod-db.");
+  expect(notification.searchParams.get("path")).toBe("/decisions");
 
   // urgent is not pending for the digest
   const digest = runDigest(db, { exec });

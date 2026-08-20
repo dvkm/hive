@@ -139,8 +139,8 @@ server/test/ bun test suite
   `HIVE_STALE_MS` (default 15m) as `stale`. Every cycle is failure-isolated and
   emits at most one `reconciler_error` per cycle; it never crashes the server.
 - **Monitors** (`server/src/monitors.ts`, 60s; `HIVE_MONITOR_MS`) run per-project
-  URL checks from `config.monitors`; failures open incidents + SSE + an
-  `osascript` notification (non-fatal if unavailable) and, behind
+  URL checks from `config.monitors`; failures open incidents + SSE + a native
+  Hive notification (non-fatal if the app is unavailable) and, behind
   `config.monitors_auto_task`, an auto `chore` task. Post-deploy smoke
   (`config.smoke`) runs once on `verifying`: pass → `test_run` evidence,
   fail → back to `in_progress`.

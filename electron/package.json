@@ -11,6 +11,12 @@
   "build": {
     "appId": "dev.hive.app",
     "productName": "hive",
+    "protocols": [
+      {
+        "name": "hive",
+        "schemes": ["hive"]
+      }
+    ],
     "directories": {
       "output": "dist"
     },
