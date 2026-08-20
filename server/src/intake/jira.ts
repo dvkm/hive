@@ -50,7 +50,6 @@
 //   (state.ts), since a ticket a human closed in Jira will never have a hive PR.
 import type { DB } from "../db.ts";
 import { isOffline, newId, now } from "../db.ts";
-import { broadcast } from "../bus.ts";
 import { writeEvent, mutateWithEvent, getTask, transition, TERMINAL, type State } from "../state.ts";
 import { broadcastTask } from "../health.ts";
 import { resolveProjectSecrets } from "../secrets.ts";
@@ -1889,7 +1888,7 @@ async function importAndReconcile(ctx: Ctx, projectId: string, read: IssueRead):
       ...(jiraState == null ? { unmapped: true, coerced_to: "queued" } : {}),
     },
   });
-  broadcast({ type: "task", task });
+  broadcastTask(db, task);
   stats.imported++;
 
   await reconcileIssue(ctx, read, task);

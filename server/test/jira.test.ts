@@ -20,6 +20,7 @@ process.env.HIVE_HOME = HOME;
 
 const { openDb, newId, now, setSetting } = await import("../src/db.ts");
 const { writeEvent, transition } = await import("../src/state.ts");
+const { addClient, removeClient } = await import("../src/bus.ts");
 const J = await import("../src/intake/jira.ts");
 import type { DB } from "../src/db.ts";
 
@@ -441,6 +442,24 @@ test("import mirrors an issue as a tracking-only task with the mapped state", as
   expect(t.state).toBe("in_review");
   expect(t.title).toBe("[WEB-1] 뉴스레터 기획");
   expect(t.brief).toContain(`${SITE}/browse/WEB-1`);
+});
+
+test("import broadcasts via broadcastTask, so the live-pushed card already carries never_dispatched", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId } = freshDb();
+  const messages: any[] = [];
+  const c = { id: "jira-import-broadcast-test", send: (data: string) => messages.push(JSON.parse(data)) };
+  addClient(c);
+  try {
+    await run(db, projectId, jira.fetchImpl);
+  } finally {
+    removeClient(c);
+  }
+  const imported = messages.find((m) => m.type === "task" && m.task.source_ref === "jira:WEB-1");
+  expect(imported).toBeTruthy();
+  // A raw broadcast (pre-fix) omits this field entirely (undefined), which
+  // client-side !task.never_dispatched checks misread as false.
+  expect(imported.task.never_dispatched).toBe(true);
 });
 
 test("an import carries Jira's status time instead of the observation time", async () => {
