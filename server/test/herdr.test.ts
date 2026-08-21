@@ -528,3 +528,105 @@ test("spawn retries once when herdr's worktree op lock is busy", async () => {
   expect(creates).toBe(2);
   expect(isWorktreeBusyError({ code: 1, stdout: "", stderr: "boom" })).toBe(false);
 }, 10_000);
+
+// ---- task #1151: per-(repo,branch) worktree lock ----
+// reclaimWorktree/cleanupWorktree remove a worktree via raw `git worktree
+// remove`, bypassing herdr's own create/remove serialization. Two callers
+// (e.g. dispatcher spawn retry + reconciler dead-agent reclaim) racing the
+// SAME worktree produced the incident's two-different-errors-in-sequence
+// signature. These tests prove the fix's actual invariant: `git worktree
+// remove` for the same (repoPath, branch) never runs concurrently, while
+// unrelated branches are never needlessly serialized against each other.
+
+test("worktree lock: two concurrent reclaims of the SAME worktree never overlap on git worktree remove", async () => {
+  const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x));
+  let removeInFlight = 0;
+  let maxRemoveInFlight = 0;
+  let present = true;
+  const exec: Exec = async (argv) => {
+    const git = argv[0] === "git";
+    if (git && has(argv, "worktree", "list")) return OK(present ? `worktree ${WT}\nHEAD s1\nbranch refs/heads/hive/t1\n` : "");
+    if (git && has(argv, "status", "--porcelain")) return OK("");
+    if (git && has(argv, "worktree", "remove")) {
+      removeInFlight++;
+      maxRemoveInFlight = Math.max(maxRemoveInFlight, removeInFlight);
+      await new Promise((r) => setTimeout(r, 20)); // widen the race window
+      present = false;
+      removeInFlight--;
+      return OK();
+    }
+    return OK();
+  };
+  const h = new Herdr(exec, "herdr");
+  const [a, b] = await Promise.all([
+    h.reclaimWorktree({ repoPath: "/repo", branch: "hive/t1", taskId: "t1", hintPath: WT }),
+    h.reclaimWorktree({ repoPath: "/repo", branch: "hive/t1", taskId: "t1", hintPath: WT }),
+  ]);
+  expect(maxRemoveInFlight).toBe(1); // never two `git worktree remove` calls in flight together
+  // exactly one caller actually found and removed it; the other, running after
+  // the lock frees, sees it already gone and no-ops gracefully instead of
+  // racing git's metadata mid-removal.
+  expect([a.reclaimed, b.reclaimed].filter(Boolean).length).toBe(1);
+});
+
+test("worktree lock: reclaims of DIFFERENT branches are not serialized against each other", async () => {
+  const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x));
+  let removeInFlight = 0;
+  let maxRemoveInFlight = 0;
+  const exec: Exec = async (argv) => {
+    const git = argv[0] === "git";
+    if (git && has(argv, "worktree", "list"))
+      return OK("worktree /wt/a\nHEAD s1\nbranch refs/heads/hive/a\n\nworktree /wt/b\nHEAD s2\nbranch refs/heads/hive/b\n");
+    if (git && has(argv, "status", "--porcelain")) return OK("");
+    if (git && has(argv, "worktree", "remove")) {
+      removeInFlight++;
+      maxRemoveInFlight = Math.max(maxRemoveInFlight, removeInFlight);
+      await new Promise((r) => setTimeout(r, 20));
+      removeInFlight--;
+      return OK();
+    }
+    return OK();
+  };
+  const h = new Herdr(exec, "herdr");
+  const [a, b] = await Promise.all([
+    h.reclaimWorktree({ repoPath: "/repo", branch: "hive/a", taskId: "a", hintPath: "/wt/a" }),
+    h.reclaimWorktree({ repoPath: "/repo", branch: "hive/b", taskId: "b", hintPath: "/wt/b" }),
+  ]);
+  expect(maxRemoveInFlight).toBe(2); // different branches run concurrently, not queued behind each other
+  expect(a.reclaimed).toBe(true);
+  expect(b.reclaimed).toBe(true);
+});
+
+test("worktree lock: a spawn's own leftover-reclaim never overlaps a concurrent reconciler reclaim on the same branch", async () => {
+  const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x));
+  let removeInFlight = 0;
+  let maxRemoveInFlight = 0;
+  let present = true;
+  const exec: Exec = async (argv) => {
+    const git = argv[0] === "git";
+    if (argv[0] === "herdr" && has(argv, "worktree", "create"))
+      return present ? EXISTS : OK(`{"result":{"worktree":{"path":"${WT}","branch":"hive/t1","open_workspace_id":"w1"}}}`);
+    if (git && has(argv, "worktree", "list")) return OK(present ? `worktree ${WT}\nHEAD abc\nbranch refs/heads/hive/t1\n` : "");
+    if (git && has(argv, "status", "--porcelain")) return OK("");
+    if (git && has(argv, "worktree", "remove")) {
+      removeInFlight++;
+      maxRemoveInFlight = Math.max(maxRemoveInFlight, removeInFlight);
+      await new Promise((r) => setTimeout(r, 20));
+      present = false;
+      removeInFlight--;
+      return OK();
+    }
+    if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
+    if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t1"}}}');
+    return OK("started");
+  };
+  const h = new Herdr(exec, "herdr");
+  // spawnT1 hits the leftover and reclaims it internally; a concurrent
+  // reconciler-style reclaimWorktree call for the same branch races it —
+  // exactly #1151's shape (dispatcher retry vs. reaper/reconciler).
+  await Promise.all([
+    spawnT1(h),
+    h.reclaimWorktree({ repoPath: "/repo", branch: "hive/t1", taskId: "t1", hintPath: WT }).catch(() => null),
+  ]);
+  expect(maxRemoveInFlight).toBe(1);
+});

@@ -74,6 +74,8 @@ lock releases, so parallelizing across projects is the safe win. The
 per-project count caches (`max_agents` gate) are only ever keyed by a project's
 own id, so concurrent project loops never race on shared state.
 
+The herdr adapter also serializes create, reclaim, cleanup, and teardown for the same `(repo_path, branch)` across the dispatcher, reconciler, and reaper. This prevents those independent loops from mutating one worktree's git metadata at the same time without adding adapter-level serialization across different branches. Spawn releases this per-branch lock before worktree preparation, tab creation, and agent startup, so a slow `setup_argv` does not hold it.
+
 ## Review-parked agents: release and reattach
 
 An `in_review` task is parked on the DIRECTOR — PR open, CI green, quiz waiting
