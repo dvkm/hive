@@ -199,8 +199,8 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   // quiet "silent" that hides forever. A PR-bearing idle task is auto-advanced to
   // in_review by the reconciler, so it never reaches here; scouts hand off via a
   // report and are advanced too.
-  if (task.state === "in_progress" && task.kind !== "scout" && lastStatus === "idle" && !task.pr_url && age > staleMs()) {
-    return { status: "stuck", reason: "finished or stuck: agent idle, no PR", since: activityTs };
+  if (task.state === "in_progress" && task.kind !== "scout" && (lastStatus === "idle" || lastStatus === "done") && !task.pr_url && age > staleMs()) {
+    return { status: "stuck", reason: `finished or stuck: agent ${lastStatus}, no PR`, since: activityTs };
   }
   if (age > staleMs()) {
     const escalating = events.some((e) => e.type === "stale" && e.ts > activityTs);

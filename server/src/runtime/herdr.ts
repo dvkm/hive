@@ -23,7 +23,7 @@
 // PARSED, never inferred from the exit code.
 import { join } from "node:path";
 import type { Exec, ExecResult } from "../exec.ts";
-import { defaultExec } from "../exec.ts";
+import { defaultExec, isSafeRef } from "../exec.ts";
 
 // Absolute path to the hive CLI (…/repo/bin/hive from server/src/runtime/),
 // handed to every spawned agent as $HIVE_CLI so `"$HIVE_CLI" emit …` works from
@@ -44,7 +44,7 @@ export const FLEET_LABEL = process.env.HIVE_FLEET_LABEL || "hive-fleet";
 
 export class HerdrError extends Error {}
 
-export type AgentStatus = "idle" | "working" | "blocked" | "unknown" | "gone";
+export type AgentStatus = "idle" | "done" | "working" | "blocked" | "unknown" | "gone";
 
 export interface SpawnArgs {
   taskId: string;
@@ -516,14 +516,16 @@ export function parseAgentStatus(stdout: string): AgentStatus {
   }
   if (/\bblocked\b/.test(s)) return "blocked";
   if (/\bworking\b|\brunning\b|\bbusy\b/.test(s)) return "working";
-  if (/\bidle\b|\bdone\b|\bready\b/.test(s)) return "idle";
+  if (/\bdone\b/.test(s)) return "done";
+  if (/\bidle\b|\bready\b/.test(s)) return "idle";
   return "unknown";
 }
 
 function normalizeStatus(v: string): AgentStatus {
   if (v.includes("block")) return "blocked";
   if (v.includes("work") || v.includes("run") || v.includes("busy")) return "working";
-  if (v.includes("idle") || v.includes("done") || v.includes("ready")) return "idle";
+  if (v.includes("done")) return "done";
+  if (v.includes("idle") || v.includes("ready")) return "idle";
   return "unknown";
 }
 
@@ -654,13 +656,26 @@ export class Herdr {
     args: SpawnArgs,
     branch: string
   ): Promise<{ path: string; branch: string | null; workspaceId: string | null }> {
-    let create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
+    let base = args.base;
+    if (base) {
+      base = base.replace(/^origin\//, "");
+      if (!isSafeRef(base)) throw new HerdrError(`invalid worktree base: ${JSON.stringify(args.base)}`);
+      const remoteBase = `origin/${base}`;
+      const fetched = await this.exec([
+        "git", "-C", args.repoPath, "fetch", "--no-tags", "origin",
+        `refs/heads/${base}:refs/remotes/origin/${base}`,
+      ]);
+      if (fetched.code !== 0)
+        throw new HerdrError(`base fetch failed: ${fetched.stderr.trim() || fetched.stdout.trim()}`);
+      base = remoteBase;
+    }
+    let create = await this.run(worktreeCreateArgv(args.repoPath, branch, base));
     // herdr runs worktree ops one at a time; concurrent cross-project spawns
     // make this fail transiently. Retry with jittered backoff so simultaneous
     // contenders spread out instead of thundering-herding a single retry.
     for (let attempt = 1; create.code !== 0 && isWorktreeBusyError(create) && attempt < 5; attempt++) {
       await new Promise((r) => setTimeout(r, 500 * attempt + Math.random() * 400));
-      create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
+      create = await this.run(worktreeCreateArgv(args.repoPath, branch, base));
     }
     // A respawn reuses the task id, and so the branch and the worktree path. A
     // worktree left behind by a dead agent (or by a spawn that created the
@@ -675,7 +690,7 @@ export class Herdr {
         taskId: args.taskId,
         hintPath: parseExistingWorktreePath(`${create.stdout}\n${create.stderr}`),
       });
-      if (rec.reclaimed) create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
+      if (rec.reclaimed) create = await this.run(worktreeCreateArgv(args.repoPath, branch, base));
     }
     if (create.code !== 0)
       throw new HerdrError(`worktree create failed: ${create.stderr.trim() || create.stdout.trim()}`);
@@ -715,6 +730,8 @@ export class Herdr {
     try {
       const got = await this.run(agentGetArgv(target));
       const probe = parseAgentProbe(got.stdout);
+      if (probe.status === "done")
+        return { code: 1, stdout: got.stdout, stderr: "agent turn is complete; respawn required" };
       if (!probe.alive || probe.status === "unknown")
         return { code: 1, stdout: got.stdout, stderr: "agent is not active; refusing to steer its shell pane" };
       const paneId = parsePaneId(got.stdout);

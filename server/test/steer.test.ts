@@ -11,6 +11,7 @@ process.env.HIVE_HOME = HOME;
 const { openDb } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
 const { reconcileOnce } = await import("../src/reconciler.ts");
+const { dispatchOnce } = await import("../src/dispatcher.ts");
 const { Herdr, sendFailure } = await import("../src/runtime/herdr.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -264,6 +265,26 @@ test("the reconciler leaves a queued steer alone when the agent is dead", async 
   // Still queued means the respawn path still carries it.
   await f.call(`/api/tasks/${f.id}/spawn`, {});
   expect(f.briefs.at(-1)).toContain("1. rebase onto main");
+  expect((await f.steer(f.id)).payload.delivered_via).toBe("respawn");
+  f.stop();
+});
+
+test("a steer to a completed turn is queued, then reattached on the same task", async () => {
+  const DONE = () => OK('{"result":{"agent":{"pane_id":"p1","agent_status":"done"}}}');
+  const f = await drainFixture(() => OK(), DONE);
+
+  const r = await f.call(`/api/tasks/${f.id}/send`, { message: "continue with the requested fix" });
+  expect(r).toMatchObject({ ok: false, delivered: false, delivery: "queued" });
+  expect(r.error).toContain("respawn required");
+  expect(f.sends).toEqual([]);
+
+  await reconcileOnce(f.db, { herdr: f.herdr, exec: NO_GH });
+  expect((await f.call(`/api/tasks/${f.id}`)).agent_target).toBeNull();
+  expect((await f.steer(f.id)).payload.delivery).toBe("queued");
+
+  await dispatchOnce(f.db, { herdr: f.herdr, exec: NO_GH });
+  expect((await f.call(`/api/tasks/${f.id}`)).agent_target).toBe(f.id);
+  expect(f.briefs.at(-1)).toContain("1. continue with the requested fix");
   expect((await f.steer(f.id)).payload.delivered_via).toBe("respawn");
   f.stop();
 });
