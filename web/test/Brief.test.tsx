@@ -2,10 +2,11 @@ import { expect, test } from "bun:test";
 import { act, create } from "react-test-renderer";
 import { MemoryRouter } from "react-router-dom";
 import { api } from "../src/lib/api";
-import type { Brief as BriefData, Evidence, Task } from "../src/lib/api";
+import type { Brief as BriefData, Decision, Evidence, Task } from "../src/lib/api";
 import { LightboxProvider } from "../src/lib/lightbox";
 import { Ctx, type Store } from "../src/lib/store";
 import Brief from "../src/views/Brief";
+import { DecisionCard } from "../src/views/DecisionCard";
 
 (globalThis as unknown as { window: typeof globalThis }).window = globalThis;
 const values = new Map([["hive.inbox.mode", "backlogs"]]);
@@ -90,4 +91,66 @@ test("Focus and Backlogs show task evidence inline", async () => {
   });
   expect(renderer.root.findAll((node) => node.type === "img" && node.props.alt === "Finished screen")).toHaveLength(1);
   expect(renderer.root.findByProps({ className: "rev-ev-cap" }).children).toContain("Tests pass");
+});
+
+test("Focus resets local card state and evidence when advancing to the next item", async () => {
+  values.set("hive.inbox.mode", "focus");
+  const secondTask = { ...task, id: "task-2", number: 2, title: "Second task" };
+  const decision = (id: string, taskId: string, title: string): Decision => ({
+    id,
+    task_id: taskId,
+    ts: task.updated_at,
+    title,
+    context: null,
+    risk: null,
+    blast_radius: null,
+    options: [{ key: "yes", label: "Yes", recommended: true }],
+    status: "open",
+    answer_key: null,
+    answer_note: null,
+    draft_note: null,
+    answered_at: null,
+    answered_by: null,
+    answered_actor: null,
+  });
+  const first = decision("decision-1", task.id, "First decision");
+  const second = decision("decision-2", secondTask.id, "Second decision");
+  api.answerDecision = (() => new Promise(() => {})) as typeof api.answerDecision;
+  api.evidence = ((query) => query.task === task.id
+    ? Promise.resolve({ evidence: [{ ...evidence[0], caption: "First evidence", task_title: task.title, task_kind: task.kind, project_id: task.project_id, project_name: "Project" }] })
+    : new Promise(() => {})) as typeof api.evidence;
+  const store = {
+    tasks: [task, secondTask],
+    needsYou: [
+      { kind: "decision", id: first.id, decision: first },
+      { kind: "decision", id: second.id, decision: second },
+    ],
+    checkpoints: [],
+    rev: {},
+    reloadCheckpoints: () => {},
+    reloadQuizzes: () => {},
+  } as unknown as Store;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(
+      <MemoryRouter>
+        <Ctx.Provider value={store}>
+          <LightboxProvider><Brief /></LightboxProvider>
+        </Ctx.Provider>
+      </MemoryRouter>
+    );
+  });
+  expect(renderer.root.findAll((node) => node.type === "img" && node.props.alt === "First evidence")).toHaveLength(1);
+
+  act(() => {
+    renderer.root.findByProps({ className: "btn btn-primary btn-submit" }).props.onClick();
+  });
+  expect(renderer.root.findByProps({ className: "btn btn-primary btn-submit" }).children).toContain("Submitting…");
+  act(() => {
+    renderer.root.findByType(DecisionCard).props.onDone(first.id);
+  });
+
+  expect(renderer.root.findByType("h2").children).toContain("Second decision");
+  expect(renderer.root.findByProps({ className: "btn btn-primary btn-submit" }).children).toContain("Submit decision");
+  expect(renderer.root.findAll((node) => node.type === "img" && node.props.alt === "First evidence")).toHaveLength(0);
 });
