@@ -527,6 +527,38 @@ function normalizeStatus(v: string): AgentStatus {
   return "unknown";
 }
 
+// ---- per-(repo,branch) worktree lock ----
+// herdr serializes its OWN worktree create/remove calls internally (a single
+// global lock over calls made *through* the herdr binary — the source of
+// worktree_operation_in_progress above), but reclaimWorktree/cleanupWorktree
+// remove worktrees by calling `git worktree remove` DIRECTLY (see their
+// comments), bypassing that lock entirely. The dispatcher (spawn), reaper
+// (cleanupWorktree) and reconciler (reclaimWorktree) run as independent
+// setInterval loops in the same process and can hit the same branch's
+// worktree concurrently — task #1151: 6 tasks hit spawn_error in a 5-minute
+// window with TWO different error shapes on the SAME path in sequence
+// ("Directory not empty" from --force racing a concurrent delete, then
+// "is not a working tree" or worktree_operation_in_progress moments later).
+// Every create/remove entry point below acquires this lock first, keyed on
+// (repoPath, branch) — the identifier all of them share, and known before the
+// worktree's filesystem path is (spawn's create call).
+const worktreeLocks = new Map<string, Promise<unknown>>();
+
+function withWorktreeLock<T>(repoPath: string, branch: string, fn: () => Promise<T>): Promise<T> {
+  const key = `${repoPath}\0${branch}`;
+  const prior = worktreeLocks.get(key) ?? Promise.resolve();
+  const run = prior.then(fn, fn);
+  const settled = run.then(
+    () => {},
+    () => {}
+  );
+  worktreeLocks.set(key, settled);
+  settled.then(() => {
+    if (worktreeLocks.get(key) === settled) worktreeLocks.delete(key);
+  });
+  return run;
+}
+
 // ---- adapter ----
 
 export class Herdr {
@@ -546,33 +578,7 @@ export class Herdr {
     const branch = args.branch || `hive/${args.taskId}`;
     const label = fleetLabel(args.taskId, args.title);
 
-    let create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
-    // herdr runs worktree ops one at a time; concurrent cross-project spawns
-    // make this fail transiently. Retry with jittered backoff so simultaneous
-    // contenders spread out instead of thundering-herding a single retry.
-    for (let attempt = 1; create.code !== 0 && isWorktreeBusyError(create) && attempt < 5; attempt++) {
-      await new Promise((r) => setTimeout(r, 500 * attempt + Math.random() * 400));
-      create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
-    }
-    // A respawn reuses the task id, and so the branch and the worktree path. A
-    // worktree left behind by a dead agent (or by a spawn that created the
-    // worktree and then failed at `agent start`) collides here and, without
-    // this, the dispatcher retries the same task id forever. Reclaim it —
-    // preserving any uncommitted work to a ghost branch — and retry once. Real
-    // commits ride on `branch` and survive the recreate.
-    if (create.code !== 0 && isWorktreeExistsError(create)) {
-      const rec = await this.reclaimWorktree({
-        repoPath: args.repoPath,
-        branch,
-        taskId: args.taskId,
-        hintPath: parseExistingWorktreePath(`${create.stdout}\n${create.stderr}`),
-      });
-      if (rec.reclaimed) create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
-    }
-    if (create.code !== 0)
-      throw new HerdrError(`worktree create failed: ${create.stderr.trim() || create.stdout.trim()}`);
-    const wt = parseWorktreeJson(create.stdout);
-    if (!wt.path) throw new HerdrError(`worktree create returned no path: ${create.stdout.trim()}`);
+    const wt = await withWorktreeLock(args.repoPath, branch, () => this.createWorktreeLocked(args, branch));
 
     // Seed the worktree (hive hook settings) before the agent starts, so
     // lifecycle reporting is structural rather than brief-dependent.
@@ -638,6 +644,44 @@ export class Herdr {
       pane_id: agent?.pane_id ?? null,
       label,
     };
+  }
+
+  // The worktree-create-and-reclaim sequence, run under spawn()'s worktree
+  // lock. Split out so the lock's scope stops here — it must not cover
+  // agent start / tab create, which can take up to the setup_argv hook's
+  // 120s timeout and have nothing to do with git worktree metadata.
+  private async createWorktreeLocked(
+    args: SpawnArgs,
+    branch: string
+  ): Promise<{ path: string; branch: string | null; workspaceId: string | null }> {
+    let create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
+    // herdr runs worktree ops one at a time; concurrent cross-project spawns
+    // make this fail transiently. Retry with jittered backoff so simultaneous
+    // contenders spread out instead of thundering-herding a single retry.
+    for (let attempt = 1; create.code !== 0 && isWorktreeBusyError(create) && attempt < 5; attempt++) {
+      await new Promise((r) => setTimeout(r, 500 * attempt + Math.random() * 400));
+      create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
+    }
+    // A respawn reuses the task id, and so the branch and the worktree path. A
+    // worktree left behind by a dead agent (or by a spawn that created the
+    // worktree and then failed at `agent start`) collides here and, without
+    // this, the dispatcher retries the same task id forever. Reclaim it —
+    // preserving any uncommitted work to a ghost branch — and retry once. Real
+    // commits ride on `branch` and survive the recreate.
+    if (create.code !== 0 && isWorktreeExistsError(create)) {
+      const rec = await this.reclaimWorktreeCore({
+        repoPath: args.repoPath,
+        branch,
+        taskId: args.taskId,
+        hintPath: parseExistingWorktreePath(`${create.stdout}\n${create.stderr}`),
+      });
+      if (rec.reclaimed) create = await this.run(worktreeCreateArgv(args.repoPath, branch, args.base));
+    }
+    if (create.code !== 0)
+      throw new HerdrError(`worktree create failed: ${create.stderr.trim() || create.stdout.trim()}`);
+    const wt = parseWorktreeJson(create.stdout);
+    if (!wt.path) throw new HerdrError(`worktree create returned no path: ${create.stdout.trim()}`);
+    return wt as { path: string; branch: string | null; workspaceId: string | null };
   }
 
   // Adopt the existing hive-fleet workspace (find-before-create, like
@@ -852,6 +896,18 @@ export class Herdr {
     taskId: string;
     hintPath?: string | null; // the path git named in its refusal, when known
   }): Promise<{ reclaimed: boolean; ghost_branch: string | null; path: string | null; reason: string }> {
+    return withWorktreeLock(args.repoPath, args.branch, () => this.reclaimWorktreeCore(args));
+  }
+
+  // The actual reclaim, without acquiring the lock — called directly by
+  // callers (spawn, cleanupWorktree) that already hold it for this
+  // (repoPath, branch), so a second acquire here would deadlock.
+  private async reclaimWorktreeCore(args: {
+    repoPath: string;
+    branch: string;
+    taskId: string;
+    hintPath?: string | null;
+  }): Promise<{ reclaimed: boolean; ghost_branch: string | null; path: string | null; reason: string }> {
     const miss = (reason: string, path: string | null = null) => ({ reclaimed: false, ghost_branch: null, path, reason });
 
     const list = await this.exec(["git", "-C", args.repoPath, "worktree", "list", "--porcelain"]);
@@ -920,12 +976,14 @@ export class Herdr {
     workspaceId: string;
     defaultBranch?: string;
   }): Promise<{ removed: boolean; reason: string }> {
-    const safe = await this.branchIsSafe(args.repoPath, args.branch, args.defaultBranch ?? "main");
-    if (!safe.safe) return { removed: false, reason: safe.reason };
-    const r = await this.run(worktreeRemoveArgv({ workspaceId: args.workspaceId }));
-    if (r.code !== 0)
-      throw new HerdrError(`worktree remove failed: ${r.stderr.trim() || r.stdout.trim()}`);
-    return { removed: true, reason: safe.reason };
+    return withWorktreeLock(args.repoPath, args.branch, async () => {
+      const safe = await this.branchIsSafe(args.repoPath, args.branch, args.defaultBranch ?? "main");
+      if (!safe.safe) return { removed: false, reason: safe.reason };
+      const r = await this.run(worktreeRemoveArgv({ workspaceId: args.workspaceId }));
+      if (r.code !== 0)
+        throw new HerdrError(`worktree remove failed: ${r.stderr.trim() || r.stdout.trim()}`);
+      return { removed: true, reason: safe.reason };
+    });
   }
 
   // Safe to remove iff the branch is pushed to origin OR merged into the default
@@ -964,6 +1022,16 @@ export class Herdr {
     taskId: string;
     defaultBranch?: string;
   }): Promise<{ removed: boolean; reason: string; ghost_branch: string | null }> {
+    return withWorktreeLock(args.repoPath, args.branch, () => this.cleanupWorktreeCore(args));
+  }
+
+  private async cleanupWorktreeCore(args: {
+    repoPath: string;
+    branch: string;
+    worktreePath: string;
+    taskId: string;
+    defaultBranch?: string;
+  }): Promise<{ removed: boolean; reason: string; ghost_branch: string | null }> {
     const safe = await this.branchIsSafe(args.repoPath, args.branch, args.defaultBranch ?? "main");
     if (!safe.safe) return { removed: false, reason: safe.reason, ghost_branch: null };
 
@@ -974,7 +1042,7 @@ export class Herdr {
 
     if (trackedDirty) {
       // Real uncommitted work on an otherwise-safe branch: preserve, then remove.
-      const rec = await this.reclaimWorktree({
+      const rec = await this.reclaimWorktreeCore({
         repoPath: args.repoPath,
         branch: args.branch,
         taskId: args.taskId,
