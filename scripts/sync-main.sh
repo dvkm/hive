@@ -32,8 +32,8 @@ if [ "$BEHIND" -gt 0 ]; then
   else
     # The launchd job often runs while the primary checkout is on a feature
     # branch. Advance the named main ref, not whichever branch happens to be
-    # checked out. The expected old SHA makes a concurrent main update fail.
-    git update-ref refs/heads/main "$ORIGIN_MAIN" "$MAIN_BEFORE"
+    # checked out.
+    git fetch . "$ORIGIN_MAIN:refs/heads/main" --quiet
   fi
   echo "[$(date '+%F %T')] pulled $BEHIND commit(s) from origin/main -> $(git rev-parse --short main)"
 fi
