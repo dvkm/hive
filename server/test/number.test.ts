@@ -7,6 +7,7 @@ import { getTask, transition } from "../src/state.ts";
 import { linkPrIfMarked } from "../src/api.ts";
 import { reconcileOnce } from "../src/reconciler.ts";
 import { prTitlePrefix, prBodyFooter, prMarker, taskIdFromBody, taskNumberFromTitle } from "../src/marker.ts";
+import { projectPrefix, taskIdentifier } from "../src/taskIdentifier.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
 function freshDb(): { db: DB; projectId: string } {
@@ -38,6 +39,20 @@ test("number is assigned monotonically starting at 1", () => {
   expect(a.number).toBe(1);
   expect(b.number).toBe(2);
   expect(c.number).toBe(3);
+});
+
+test("project numbers start at 1 independently while global numbers stay unique", () => {
+  const { db, projectId } = freshDb();
+  const otherProjectId = newId("proj");
+  db.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run(otherProjectId, "other", "{}", now());
+  const a = getTask(db, makeTask(db, projectId));
+  const b = getTask(db, makeTask(db, otherProjectId));
+  const c = getTask(db, makeTask(db, projectId));
+  expect([a.project_number, b.project_number, c.project_number]).toEqual([1, 1, 2]);
+  expect([a.number, b.number, c.number]).toEqual([1, 2, 3]);
+  expect(taskIdentifier(db, a)).toBe("P-1");
+  expect(taskIdentifier(db, b)).toBe("OTHE-1");
+  expect(projectPrefix("corebeat")).toBe("CORE");
 });
 
 test("number is unique — a duplicate explicit number is rejected", () => {

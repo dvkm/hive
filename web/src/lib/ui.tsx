@@ -53,7 +53,7 @@ export function CiBadge({ status }: { status: CiStatus }) {
 // needsYou.ts; an unknown id stays blocking and displays its short id.
 // ponytail: plain span, not a Link, because the card wrapping it is already an anchor
 // and nested anchors are invalid HTML.
-type DepTask = { id: string; number: number; title: string; state: State };
+type DepTask = { id: string; number: number; display_id?: string; title: string; state: State };
 export function BlockedBy({ depends_on, tasks }: { depends_on: string[]; tasks: DepTask[] }) {
   const deps = depends_on ?? [];
   if (!deps.length) return null;
@@ -61,9 +61,9 @@ export function BlockedBy({ depends_on, tasks }: { depends_on: string[]; tasks: 
     .map((id) => ({ id, t: tasks.find((x) => x.id === id) }))
     .filter(({ t }) => !t || !DEP_MET_STATES.has(t.state));
   if (!unmet.length) return null;
-  const label = unmet.map(({ id, t }) => (t ? `#${t.number}` : id.slice(0, 6))).join(", ");
+  const label = unmet.map(({ id, t }) => (t ? t.display_id || `#${t.number}` : id.slice(0, 6))).join(", ");
   const tip = unmet
-    .map(({ id, t }) => (t ? `#${t.number} ${t.title} (${STATE_LABEL[t.state]})` : `${id} (unknown)`))
+    .map(({ id, t }) => (t ? `${t.display_id || `#${t.number}`} ${t.title} (${STATE_LABEL[t.state]})` : `${id} (unknown)`))
     .join("\n");
   return (
     <span className="chip chip-blocked" title={`Blocked by:\n${tip}`}>

@@ -156,11 +156,7 @@ a card, so it must not linger in the inbox. Legacy orphans are swept on startup.
 poll alongside `ci_status`; `null` until the first poll after a PR links. The
 review card compares it against each evidence item's `meta.commit_sha` to flag
 evidence captured against an older commit as stale.
-`number` is a human-friendly, monotonic per-hive counter assigned at creation
-(`MAX(number)+1`, starting at 1) and never reused — it is THE handle people and
-GitHub PR markers use, while the opaque `id` stays the machine key. Assigned by a
-DB trigger so every creation path gets one; existing rows were backfilled in
-`created_at` order. Unique across all tasks.
+`display_id` is the human-facing project identifier, for example `HIVE-247` or `CORE-82`. Its numeric half is the task's immutable `project_number`, assigned from a per-project sequence and never reused; its prefix is the first four alphanumeric characters of the project name, uppercased. The older global `number` remains unique across Hive for PR-marker and API compatibility; the opaque `id` stays the machine key. Both numbers are assigned by DB triggers so every creation path gets them, and existing rows are backfilled in `created_at` order.
 `health` is a SERVER-COMPUTED dimension separate from lifecycle `state` — the
 visible symptom that a task pointing at a live agent is actually fine or actually
 stuck. **It is the single source of truth; clients render it, never re-derive
@@ -853,10 +849,11 @@ palette. → `200 {"hits": [SearchHit, ...]}`.
 ```json
 { "type": "task", "id": "9da7c5527580", "title": "Add dark mode toggle",
   "snippet": "User-facing dark mode toggle in settings.",
-  "task_state": "done", "project_id": "proj_ab12..." }
+  "task_state": "done", "project_id": "proj_ab12...", "display_id": "ACME-7" }
 ```
 - `type ∈ {task, decision, learning, policy, project}`. `task_state` and
-  `project_id` are present only on `task` hits; other types omit them.
+  `project_id` and `display_id` are present only on `task` hits; other types omit them.
+- An exact project task identifier such as `HIVE-247` resolves directly.
 - Fields searched per type: task (title, brief, summary), decision (title,
   context), learning (title, body), policy (title, body), project (name).
 - `snippet` is a ~120-char window around the first body match (empty for

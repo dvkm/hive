@@ -59,6 +59,13 @@ test("tasks carry task_state and project_id", async () => {
   const hit = json.hits.find((h: any) => h.type === "task" && h.id === taskExact);
   expect(hit.task_state).toBe("queued");
   expect(hit.project_id).toBe(projectId);
+  expect(hit.display_id).toBe("WIDG-1");
+});
+
+test("project task identifiers resolve directly", async () => {
+  const { json } = await get("/api/search?q=widg-1");
+  expect(json.hits).toHaveLength(1);
+  expect(json.hits[0]).toMatchObject({ type: "task", id: taskExact, display_id: "WIDG-1" });
 });
 
 test("ranking: exact title beats prefix beats body-only", async () => {

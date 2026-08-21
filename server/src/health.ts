@@ -12,6 +12,7 @@ import { getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { isSupervisedTask, neverDispatched } from "./supervision.ts";
 import { isDeferred } from "./state.ts";
+import { taskIdentifier } from "./taskIdentifier.ts";
 
 export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
 
@@ -253,7 +254,7 @@ export function taskWithHealth(db: DB, task: any): any {
       : null;
   // Server-computed so the web app never has to re-derive "was this ever
   // spawned" from raw event history — see supervision.ts's neverDispatched.
-  return { ...task, health: computeHealth(db, task), requeued_to, never_dispatched: neverDispatched(db, task) };
+  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, never_dispatched: neverDispatched(db, task) };
 }
 
 // "Needs attention" tray eligibility (the single rule; the web mirrors it):

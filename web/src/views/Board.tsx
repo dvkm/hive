@@ -8,6 +8,7 @@ import { useRelTime } from "../lib/time";
 import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
 import { AttentionTray, needsAttention, isWaiting } from "./attention";
 import { isJiraMirror, isTrackingOnly } from "../lib/needsYou";
+import { taskLabel } from "../lib/references";
 
 // A compact "why this card needs attention" line: e.g. "agent gone" or
 // "no activity 22m". Server-provided reason + live-ticking since-age.
@@ -104,7 +105,7 @@ export function Card({ task }: { task: Task }) {
     <Link to={`/tasks/${task.id}`} state={{ backgroundLocation: location }} className="card">
       <div className="card-top">
         <StatusDot state={task.state} health={task.health} />
-        <span className="card-num" title="Task number">#{task.number}</span>
+        <span className="card-num" title={`Legacy task #${task.number}`}>{taskLabel(task)}</span>
         <span className="card-title">{task.title}</span>
       </div>
       {unhealthy && <HealthLine health={health!} />}
@@ -164,10 +165,10 @@ export function Card({ task }: { task: Task }) {
             href={task.pr_url}
             target="_blank"
             rel="noreferrer"
-            title={`Pull request linked to #${task.number}`}
+            title={`Pull request linked to ${taskLabel(task)}`}
             onClick={(e) => e.stopPropagation()}
           >
-            PR ↔ #{task.number}
+            PR ↔ {taskLabel(task)}
           </a>
         )}
         {!trackingOnly && <CiBadge status={task.ci_status} />}

@@ -28,6 +28,7 @@ test("bundle carries PR, branch, and rounded task spend", () => {
   const b = decisionBundle(db, taskId, "none");
   expect(b.pr_url).toBe("https://github.com/o/r/pull/7");
   expect(b.branch).toBe("hive/x");
+  expect(b.task_display_id).toBe("P-1");
   expect(b.spend_usd).toBe(1.5);
   expect(b.prior_decisions).toEqual([]);
 });

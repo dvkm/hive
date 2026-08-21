@@ -8,6 +8,7 @@ import type { State } from "../lib/api";
 import { useStore } from "../lib/store";
 import { Empty, STATE_LABEL, StatusDot } from "../lib/ui";
 import { isTrackingOnly } from "../lib/needsYou";
+import { taskLabel } from "../lib/references";
 
 const ACTIVE: State[] = ["in_progress", "needs_decision", "in_review", "verifying"];
 
@@ -77,7 +78,7 @@ export default function Terminals() {
               <header className="fleet-head">
                 <StatusDot state={t.state} />
                 <Link to={`/tasks/${t.id}`} className="fleet-title">
-                  #{t.number} {t.title}
+                  {taskLabel(t)} {t.title}
                 </Link>
                 <span className="chip">{STATE_LABEL[t.state]}</span>
               </header>

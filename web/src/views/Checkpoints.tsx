@@ -4,6 +4,7 @@ import { api } from "../lib/api";
 import type { Checkpoint, Event } from "../lib/api";
 import { useStore } from "../lib/store";
 import { useProjectFilter, inProjectFilter } from "../lib/projectFilter";
+import { taskLabel } from "../lib/references";
 import { toast } from "../lib/ui";
 
 // Live build-time checkboxes: agents emit `checkpoint` events while working;
@@ -145,7 +146,7 @@ export function CheckpointList({ events }: { events: Event[] }) {
 // Un-acked checkpoints survive task completion (marked "shipped") — a late
 // flag becomes a corrective follow-up task instead of a dead steer.
 export function CheckpointsInbox({ limit, heading = true }: { limit?: number; heading?: boolean } = {}) {
-  const { checkpoints, reloadCheckpoints } = useStore();
+  const { checkpoints, reloadCheckpoints, tasks } = useStore();
   const projectFilter = useProjectFilter();
   const [busy, setBusy] = useState(false);
   const scoped = checkpoints.filter((c) => inProjectFilter(c.project_id, projectFilter));
@@ -188,7 +189,7 @@ export function CheckpointsInbox({ limit, heading = true }: { limit?: number; he
           <div className="cp-group" key={c0.task_id}>
             <div className="cp-group-head">
               <Link className="cp-task" to={`/tasks/${c0.task_id}`}>
-                #{c0.task_number} {c0.task_title}
+                {taskLabel(tasks.find((task) => task.id === c0.task_id) ?? { number: c0.task_number })} {c0.task_title}
               </Link>
               {finished && <span className="chip" title="Task already finished — flags spawn a corrective task">shipped</span>}
               {items.length > 1 && (

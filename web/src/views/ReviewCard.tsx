@@ -13,6 +13,7 @@ import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
 import { ReportView } from "./ReportView";
 import { UnderstandingQuiz } from "./UnderstandingQuiz";
+import { PrReference, TaskRef, TaskReference, prLabel, taskLabel } from "../lib/references";
 
 // Staleness marker: captured-at time always shows; the commit SHA (recorded
 // by the CLI from the agent's worktree at capture time) compares against the
@@ -321,7 +322,7 @@ export function ReviewCard({
   task: Task;
   onDone?: () => void;
 }) {
-  const { projects, quizzes: understandingQuizzes } = useStore();
+  const { projects, tasks = [], quizzes: understandingQuizzes } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
   const [diff, setDiff] = useState<DiffResult | null>(null);
   const [diffErr, setDiffErr] = useState("");
@@ -437,10 +438,14 @@ export function ReviewCard({
   // Live, not the agent's evidence prose (task #1000): recomputed on every
   // review via GET .../branch-check, same as CI/quiz below.
   const unmetDeps = branchCheck?.unmet_deps ?? [];
+  const referencedTaskLabel = (ref: { id: string; number: number }) => {
+    const fullTask = tasks.find((candidate) => candidate.id === ref.id);
+    return fullTask ? taskLabel(fullTask) : `#${ref.number}`;
+  };
   const depBlocked =
     reportOnly || !unmetDeps.length
       ? ""
-      : `Waiting on ${unmetDeps.map((d) => `#${d.number} ${d.title}`).join(", ")} — not yet merged/done`;
+      : `Waiting on ${unmetDeps.map((d) => `${referencedTaskLabel(d)} ${d.title}`).join(", ")} — not yet merged/done`;
   const deliveryBlocked = reportOnly
     ? ""
     : task.ci_status === "failing"
@@ -550,7 +555,7 @@ export function ReviewCard({
       <div className="review-card-head">
         <div className="review-card-heading">
           <div className="review-card-meta">
-            <span className="card-num" title="Task number">#{task.number}</span>
+            <TaskRef task={task} className="card-num" />
             {project && <span>{project.name}</span>}
             <span>{task.kind}</span>
           </div>
@@ -560,9 +565,7 @@ export function ReviewCard({
         </div>
         <div className="review-status">
           {task.pr_url ? (
-            <a className="pr" href={task.pr_url} target="_blank" rel="noreferrer" title={`Pull request linked to #${task.number}`}>
-              PR ↔ #{task.number} {"↗"}
-            </a>
+            <PrReference className="pr" url={task.pr_url} label={`${prLabel(task.pr_url)} ↗`} />
           ) : (
             <span className="muted mono-sm">branch {task.branch || "?"}</span>
           )}
@@ -586,7 +589,9 @@ export function ReviewCard({
         <div className="review-merge-error" title="Detected via git merge-base against every other open task's branch in this project">
           ⚠ Branch shares unmerged commits with {embeddedTasks.length} active{" "}
           {embeddedTasks.length === 1 ? "task" : "tasks"} (
-          {embeddedTasks.slice(0, 3).map((t) => `#${t.number}`).join(", ")}
+          {embeddedTasks.slice(0, 3).map((t, index) => (
+            <span key={t.id}>{index > 0 && ", "}<TaskReference taskId={t.id} label={referencedTaskLabel(t)} /></span>
+          ))}
           {embeddedTasks.length > 3 && `, +${embeddedTasks.length - 3} more`}) — a rebase or rewrite
           there won't propagate here.
           {embeddedTasks.length > 3 && (
@@ -594,7 +599,7 @@ export function ReviewCard({
               <summary>Which tasks</summary>
               <ol>
                 {embeddedTasks.map((t) => (
-                  <li key={t.id}>#{t.number} {t.title}</li>
+                  <li key={t.id}><TaskReference taskId={t.id} label={referencedTaskLabel(t)} /> {t.title}</li>
                 ))}
               </ol>
             </details>
