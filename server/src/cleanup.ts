@@ -4,8 +4,9 @@
 //
 // Fired two ways: from the transition path (state.setTerminalHook, on done /
 // cancelled) for immediacy, and from the reaper sweep (reaper.ts) as the
-// backstop for teardowns that were skipped or missed. Idempotent: it clears the
-// task's runtime binding after a successful removal so a re-run is a no-op.
+// backstop for teardowns that were skipped or missed. Idempotent per spawn: a
+// task that already has a `cleaned_up` event newer than its last `spawned` one
+// is never torn down twice (see cleanedUpSinceLastSpawn).
 import type { DB } from "./db.ts";
 import { now } from "./db.ts";
 import { getTask, writeEvent, TERMINAL, type State } from "./state.ts";
@@ -102,6 +103,34 @@ export function spawnMeta(db: DB, taskId: string): { tab_id: string | null; work
   }
 }
 
+// `cleaned_up` is the record that this spawn's teardown already ran to
+// completion: the worktree was removed (or there never was one) and the session
+// close was attempted. Re-running it can only re-issue herdr calls at ids that
+// are long dead and re-write the same event.
+//
+// Re-entry is GUARANTEED, not hypothetical. A task row whose worktree_path was
+// cleared can no longer remove its own checkout, but git still LISTS that
+// worktree, so the reaper's worktree pass hands the same task back on every
+// 5-minute lap. Six ancient terminal tasks did exactly that: ~5 tab.close calls
+// at tab ids from a herdr generation two app-restarts ago, plus a duplicate
+// `cleaned_up` event and an updated_at bump each, forever — 11,458 events per
+// task by 2026-08-20. a6a4c70 cleared agent_target, but the tab id ALSO comes
+// from the immutable `spawned` event, which no teardown can clear.
+//
+// Scoped to the LAST spawn so a requeued task tears down again. A preserved
+// (unmerged) worktree writes `cleanup_skipped`, not `cleaned_up`, and keeps
+// retrying on purpose until its branch is mergeable.
+function cleanedUpSinceLastSpawn(db: DB, taskId: string): boolean {
+  const r = db
+    .query(
+      `SELECT MAX(CASE WHEN type = 'cleaned_up' THEN ts END) AS cleaned,
+              MAX(CASE WHEN type = 'spawned'    THEN ts END) AS spawned
+         FROM events WHERE task_id = ? AND type IN ('cleaned_up', 'spawned')`
+    )
+    .get(taskId) as { cleaned: string | null; spawned: string | null };
+  return !!r.cleaned && (!r.spawned || r.spawned <= r.cleaned);
+}
+
 // Tear down a finished task. `force` skips the terminal-state guard (used by the
 // manual endpoint and the reaper, which have already established eligibility).
 export async function cleanupTask(
@@ -114,6 +143,7 @@ export async function cleanupTask(
   const task = getTask(db, taskId);
   if (!task) return noop;
   if (!opts.force && !TERMINAL.includes(task.state as State)) return noop;
+  if (cleanedUpSinceLastSpawn(db, taskId)) return noop; // already torn down; see above
 
   const project = db.query("SELECT repo_path, config FROM projects WHERE id = ?").get(task.project_id) as
     | { repo_path: string | null; config: string | null }

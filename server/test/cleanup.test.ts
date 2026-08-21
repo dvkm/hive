@@ -362,6 +362,50 @@ test("cleanupTask also closes the worktree's OWN herdr workspace (the auto-spawn
   expect(calls.some((c) => c[0] !== "git")).toBe(false);
 });
 
+// 2026-08-20: the sibling hole a6a4c70 left open. On the NON-preserved path the
+// tab id comes from the immutable `spawned` event, so clearing agent_target
+// changed nothing — six ancient terminal tasks re-closed dead tab ids and
+// re-wrote `cleaned_up` on every 5-minute lap (11,458 events each).
+test("cleanupTask never re-closes a tab id read from the immutable spawned event", async () => {
+  const { db, projectId } = freshDb();
+  // The live shape: the row lost its worktree_path/branch, so nothing here can
+  // remove the checkout — only the stale spawn metadata is left.
+  const id = seedTask(db, projectId, { state: "cancelled" });
+  db.query("UPDATE tasks SET agent_target = NULL, worktree_path = NULL, branch = NULL WHERE id = ?").run(id);
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    newId("evt"), id, now(), "herdr", "spawned", JSON.stringify({ tab_id: "wR:t11", workspace_id: "wKT11" })
+  );
+  const { exec, calls } = stubExec(() => OK());
+  const herdr = new Herdr(exec, "herdr");
+
+  await cleanupTask(db, herdr, id, { force: true });
+  expect(calls.some((c) => has(c, "tab", "close", "wR:t11"))).toBe(true); // attempted once
+
+  calls.length = 0;
+  await cleanupTask(db, herdr, id, { force: true });
+  expect(calls.length).toBe(0); // ...and never again
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'cleaned_up'").all(id).length).toBe(1);
+});
+
+test("a requeued task (fresh spawn after a cleanup) is torn down again", async () => {
+  const { db, projectId } = freshDb();
+  const id = seedTask(db, projectId, { state: "done" });
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    newId("evt"), id, "2026-01-01T00:00:00.000Z", "herdr", "cleaned_up", "{}"
+  );
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    newId("evt"), id, "2026-01-02T00:00:00.000Z", "herdr", "spawned", JSON.stringify({ tab_id: "wF:t9" })
+  );
+  const branch = (db.query("SELECT branch FROM tasks WHERE id = ?").get(id) as any).branch;
+  const { exec, calls } = stubExec((argv) => {
+    if (argv[0] === "git" && argv.includes("--merged")) return OK(`  main\n  ${branch}`);
+    return OK();
+  });
+  const out = await cleanupTask(db, new Herdr(exec, "herdr"), id, { force: true });
+  expect(out.cleaned).toBe(true);
+  expect(calls.some((c) => has(c, "tab", "close", "wF:t9"))).toBe(true);
+});
+
 test("cleanupTask on a NON-terminal task is a no-op unless forced", async () => {
   const { db, projectId } = freshDb();
   const id = seedTask(db, projectId, { state: "in_progress" });
