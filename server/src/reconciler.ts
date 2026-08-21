@@ -311,7 +311,7 @@ function lastAgentStatus(db: DB, taskId: string): string | null {
 // it was drained ONLY at spawn time. So a socket blip while the agent was alive
 // and working queued the message and then never redelivered it: no respawn was
 // coming, and it sat there until the task ended. Every cycle, re-attempt any
-// queued steer against an agent that still probes alive.
+// queued steer against an agent that still has an active turn.
 //
 // Cheap: the queued-steer read is checked BEFORE any probe, so the ordinary case
 // (nothing queued) costs one small query per agent-bearing task and zero herdr
@@ -357,12 +357,12 @@ async function drainSteers(db: DB, deps: ReconcilerDeps): Promise<void> {
 
 // ---- ready-for-review advancement (fixes tasks stuck in in_progress) ----
 // An agent that finished — opened a PR (ship/chore) or wrote its report (scout) —
-// and then went idle/gone used to sit in `in_progress` forever: nothing moved it
+// and then went idle/done/gone used to sit in `in_progress` forever: nothing moved it
 // into the review queue. This is the backstop that unsticks it regardless of
 // agent discipline (the explicit `hive emit <id> ready` path is the clean signal;
-// this catches the agents that just go idle).
+// this catches the agents whose interactive turn finishes without that emit).
 //
-// Trigger: state=in_progress, agent status idle OR gone (NOT working/blocked/
+// Trigger: state=in_progress, agent status idle, done, OR gone (NOT working/blocked/
 // unknown — an agent that opens a PR and keeps working still reports `working`),
 // AND a real work product exists (a pr_url, or a scout `report`). Advancing on a
 // single idle read is safe precisely because mid-work reads `working`; after a
@@ -1266,7 +1266,10 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string, d
   // class has a graceful path. Nudge→fail is only for the truly unexplained.
   const tail = await h.read(target, 200);
   const diag = diagnosePane(tail);
-  if (diag?.kind === "blocked_dialog") return handleBlockedAgent(db, h, taskId, target);
+  if (diag?.kind === "blocked_dialog") {
+    await handleBlockedAgent(db, h, taskId, target);
+    return;
+  }
   if (diag?.kind === "auth_lost") return recoverAuthLost(db, h, task, diag.excerpt, tail, deps);
   if (diag?.kind === "context_full") return recoverContextFull(db, h, task, tail);
   if (diag?.kind === "usage_limit") return recoverUsageLimit(db, task, diag.excerpt);

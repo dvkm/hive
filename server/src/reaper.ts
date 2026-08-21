@@ -83,7 +83,7 @@ export async function reapOnce(db: DB, deps: ReaperDeps = {}): Promise<void> {
   }
 
   // Free the agents parked on review BEFORE the orphan sweeps: they are live,
-  // idle and holding both a pty and a dispatch slot (see releaseReviewAgent).
+  // idle/done and holding both a pty and a dispatch slot (see releaseReviewAgent).
   try {
     await releaseReviewAgents(db, herdr);
   } catch (e) {
