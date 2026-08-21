@@ -412,6 +412,21 @@ test("tracking-only tasks never enter automatic review handoffs", async () => {
   expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_progress");
 });
 
+test("handOffToReview holds while a queued-input recovery is in flight (#1234 review-12)", async () => {
+  const { writeEvent } = await import("../src/state.ts");
+  const { handOffToReview } = await import("../src/api.ts");
+  const id = await newTask("queued input mid-flight");
+  db.query("UPDATE tasks SET state = 'in_progress', pr_url = 'https://gh/pr/9' WHERE id = ?").run(id);
+  writeEvent(db, { task_id: id, source: "reconciler", type: "queued_input_recovered", payload: { delivered: true } });
+
+  expect(handOffToReview(db, id, "reconciler")).toBe(false);
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_progress");
+
+  db.query("UPDATE events SET ts = ? WHERE task_id = ? AND type = 'queued_input_recovered'")
+    .run(new Date(Date.now() - 3 * 60 * 1000).toISOString(), id);
+  expect(handOffToReview(db, id, "reconciler")).toBe(true);
+});
+
 test("a director answer keeps an old report and quiz out of review until regenerated", async () => {
   const { decisionAnswerUnaddressed, writeEvent } = await import("../src/state.ts");
   const id = await newTask("refresh after my answer");

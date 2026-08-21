@@ -9,7 +9,7 @@
 // is never torn down twice (see cleanedUpSinceLastSpawn).
 import type { DB } from "./db.ts";
 import { now } from "./db.ts";
-import { getTask, writeEvent, TERMINAL, type State } from "./state.ts";
+import { getTask, writeEvent, TERMINAL, queuedInputRecoveryPending, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { isTrackingOnlyTask } from "./supervision.ts";
 import { queuedSteers } from "./steer.ts";
@@ -306,6 +306,9 @@ export async function releaseReviewAgent(
   // Undelivered feedback is already waiting: the reconciler's drainSteers can
   // hand it to the live agent this cycle, which beats release-then-respawn.
   if (queuedSteers(db, taskId).length) return { released: false, reason: "steers pending delivery" };
+  // #1234 review-12: a queued-input recovery in flight on this same task means
+  // a turn may be about to run — closing the session now would kill it mid-air.
+  if (queuedInputRecoveryPending(db, taskId)) return { released: false, reason: "queued-input recovery pending" };
 
   const meta = spawnMeta(db, taskId);
   const probe = await herdr.probe(task.agent_target).catch(() => ({ alive: true, status: "unknown" as const }));

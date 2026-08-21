@@ -101,6 +101,49 @@ test("advanceIfFinished waits for queued-input recovery to settle", () => {
   expect(getTask(db, id).state).toBe("in_review");
 });
 
+test("a crash-orphaned delivered:null reservation ages out instead of blocking forever (#1234 review-14)", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  transition(db, id, "in_progress");
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/1", id);
+  addEvidence(db, id);
+  const recovery = writeEvent(db, {
+    task_id: id,
+    source: "reconciler",
+    type: "queued_input_recovered",
+    payload: { delivered: null }, // server crashed between the reservation write and the pane I/O resolving it
+  });
+
+  expect(advanceIfFinished(db, id, "idle", "herdr")).toBe(false); // still within the grace window
+
+  db.query("UPDATE events SET ts = ? WHERE id = ?").run(new Date(Date.now() - 3 * 60 * 1000).toISOString(), recovery.id);
+  expect(advanceIfFinished(db, id, "idle", "herdr")).toBe(true); // the orphaned null no longer blocks forever
+  expect(getTask(db, id).state).toBe("in_review");
+});
+
+test("advanceIfFinished stays blocked past the grace window while a queued_input_stuck alert is still open (#1234 review-13)", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  // Direct SQL, not transition() — a state_change event would get "now" as its
+  // ts and, once the recovery/alert below are backdated under it, would look
+  // like real activity AFTER the alert.
+  db.query("UPDATE tasks SET state = 'in_progress', pr_url = ? WHERE id = ?").run("https://gh/pr/1", id);
+  addEvidence(db, id);
+  const old = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  const recovery = writeEvent(db, { task_id: id, source: "reconciler", type: "queued_input_recovered", payload: { delivered: false } });
+  db.query("UPDATE events SET ts = ? WHERE id = ?").run(old, recovery.id);
+  const stuck = db.query("INSERT INTO notifications (id, ts, kind, task_id, title, urgency) VALUES (?,?,?,?,?,?)");
+  stuck.run("ntf_stuck", old, "queued_input_stuck", id, "still stuck", "urgent");
+
+  // Well past the flat grace window, but nothing real has happened since the
+  // alert — the old design would have let this advance at t=4min regardless.
+  expect(advanceIfFinished(db, id, "idle", "herdr")).toBe(false);
+
+  writeEvent(db, { task_id: id, source: "agent", type: "progress" }); // real activity after the alert
+  expect(advanceIfFinished(db, id, "idle", "herdr")).toBe(true);
+  expect(getTask(db, id).state).toBe("in_review");
+});
+
 test("scout requires a report evidence for done", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, "scout");
