@@ -289,6 +289,26 @@ test("a steer to a completed turn is queued, then reattached on the same task", 
   f.stop();
 });
 
+test("a verifying task reattaches after its completed turn is released", async () => {
+  const DONE = () => OK('{"result":{"agent":{"pane_id":"p1","agent_status":"done"}}}');
+  const f = await drainFixture(() => OK(), DONE);
+  f.db.query("UPDATE tasks SET state = 'verifying' WHERE id = ?").run(f.id);
+
+  const r = await f.call(`/api/tasks/${f.id}/send`, { message: "attach the missing verification evidence" });
+  expect(r).toMatchObject({ ok: false, delivered: false, delivery: "queued" });
+
+  await reconcileOnce(f.db, { herdr: f.herdr, exec: NO_GH });
+  expect((await f.call(`/api/tasks/${f.id}`)).agent_target).toBeNull();
+
+  await dispatchOnce(f.db, { herdr: f.herdr, exec: NO_GH });
+  const task = await f.call(`/api/tasks/${f.id}`);
+  expect(task.agent_target).toBe(f.id);
+  expect(task.state).toBe("verifying");
+  expect(f.briefs.at(-1)).toContain("1. attach the missing verification evidence");
+  expect((await f.steer(f.id)).payload.delivered_via).toBe("respawn");
+  f.stop();
+});
+
 // Queuing a steer for a task nothing will ever respawn would be a lie.
 test("a steer to a terminal task is recorded as failed, not queued", async () => {
   const id = await newTask("cancelled");
