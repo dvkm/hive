@@ -600,7 +600,10 @@ priced rows only).
   then creates a FRESH queued copy (`source="requeue"`, `parent_task_id` → the
   original). Distinct from the attention tray's in-place requeue of an
   already-failed task (`POST /transition {to:"queued"}`, which reactivates the
-  SAME task and clears its runtime binding).
+  SAME task and clears its runtime binding). Before failing a still-live task,
+  reclaims its worktree exactly like dead-agent/context-full auto-requeue:
+  uncommitted state is preserved to a `ghost-<task-id>` branch, recorded as a
+  `worktree_reclaimed` event.
 - `POST /api/tasks/:id/cleanup` body `{}` → `200 {"ok":true, "cleaned":bool, "worktree":{removed,reason,ghost_branch}|null, "session":{closed,via}}` | `404` | `409` (task not terminal)
   Manual force-teardown for a **terminal** task (`done`/`cancelled`/`failed`): removes its git worktree and closes its herdr session. Refuses (`409`) on a live task so an in-flight worktree is never pulled out from under a working agent. Keeps every safety guard: the worktree is removed only when its branch is pushed/merged (else `cleanup_skipped`), and any tracked uncommitted work is preserved to a `ghost-<task-id>` branch first. Backstop for the auto-teardown that fires on the `done`/`cancelled` transition and the periodic reaper sweep.
 - `POST /api/tasks/:id/merge-into` body `{target_id (required)}` → `200 Task` (now `cancelled`) | `400` (missing/self `target_id`) | `404` (task or target missing) | `409` (source is already terminal)

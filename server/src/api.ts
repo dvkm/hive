@@ -75,7 +75,7 @@ import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts"
 import { vapidPublicKey, saveSubscription, removeSubscription } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
-import { ciStatusOf, ciStatusProbed } from "./reconciler.ts";
+import { ciStatusOf, ciStatusProbed, reclaimDeadWorktree } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
@@ -416,7 +416,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (m && method === "POST") return await focusAgent(db, herdr, m[1]);
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/requeue$/);
-      if (m && method === "POST") return requeueEndpoint(db, m[1]);
+      if (m && method === "POST") return await requeueEndpoint(db, herdr, m[1]);
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/cleanup$/);
       if (m && method === "POST") return await cleanupEndpoint(db, herdr, m[1]);
@@ -3841,11 +3841,12 @@ async function focusAgent(db: DB, herdr: Herdr, id: string): Promise<Response> {
 
 // Manual "fail + requeue" (the recovery banner's override): fail the task if
 // live, then spin up a fresh queued copy. Idempotent on an already-failed task.
-function requeueEndpoint(db: DB, id: string): Response {
+async function requeueEndpoint(db: DB, herdr: Herdr, id: string): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
   if (isJiraMirror(task)) return err(TRACKING_ONLY_REQUEUE_ERROR, 409);
   if (!TERMINAL.includes(task.state as State)) {
+    await reclaimDeadWorktree(db, herdr, task);
     transition(db, id, "failed", { source: "director", reason: "manual fail + requeue" });
   }
   const newId = requeueTask(db, getTask(db, id));

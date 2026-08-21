@@ -1168,12 +1168,14 @@ async function recoverDead(db: DB, h: Herdr, taskId: string, target: string): Pr
   }
 }
 
-// Teardown at death-detection time: the dead agent's worktree lingers, and the
-// next spawn on this branch (a manual respawn, or the director answering the
-// recovery card) would collide with it. Reclaim it here, while the pane tail is
-// still fresh, preserving any uncommitted work to a ghost branch.
+// Reclaim a task's worktree before it's abandoned (dead-agent recovery,
+// context-full requeue, or a manual fail+requeue): the next spawn on this
+// branch (a respawn, or the director answering the recovery card) would
+// otherwise collide with the lingering worktree. Preserves any uncommitted
+// work to a ghost branch and records the `worktree_reclaimed` event that
+// requeueTask's resume brief reads to surface it.
 // Never fatal: a reclaim failure is recorded and recovery proceeds.
-async function reclaimDeadWorktree(db: DB, h: Herdr, task: any): Promise<void> {
+export async function reclaimDeadWorktree(db: DB, h: Herdr, task: any): Promise<void> {
   if (!task.branch || !task.worktree_path) return;
   const project = db.query("SELECT repo_path FROM projects WHERE id = ?").get(task.project_id) as
     | { repo_path: string | null }
@@ -1261,7 +1263,7 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string, d
   const diag = diagnosePane(tail);
   if (diag?.kind === "blocked_dialog") return handleBlockedAgent(db, h, taskId, target);
   if (diag?.kind === "auth_lost") return recoverAuthLost(db, h, task, diag.excerpt, tail, deps);
-  if (diag?.kind === "context_full") return recoverContextFull(db, task, tail);
+  if (diag?.kind === "context_full") return recoverContextFull(db, h, task, tail);
   if (diag?.kind === "usage_limit") return recoverUsageLimit(db, task, diag.excerpt);
   if (diag?.kind === "queued_input") return recoverQueuedInput(db, h, task, target, diag.excerpt);
   if (diag?.kind === "api_error") {
@@ -1516,8 +1518,9 @@ async function recoverAuthLost(db: DB, h: Herdr, task: any, excerpt: string, tai
 
 // Context window exhausted: the ONE case where auto-requeue is exactly right —
 // a fresh agent gets a fresh context. Capped by MAX_AUTO_REQUEUE like death.
-async function recoverContextFull(db: DB, task: any, tail: string): Promise<void> {
+async function recoverContextFull(db: DB, h: Herdr, task: any, tail: string): Promise<void> {
   attachLog(db, task.id, tail, "agent pane tail: context window exhausted");
+  await reclaimDeadWorktree(db, h, task);
   const attempts = requeueDepth(db, task);
   writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "context-full", attempts } });
   transition(db, task.id, "failed", { source: "reconciler", reason: "context window exhausted" });
