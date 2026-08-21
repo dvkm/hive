@@ -769,7 +769,7 @@ test("autoMergeReady holds a task while a queued-input recovery is in flight (#1
 
 test("autoMergeReady holds a task with work still queued for its agent", async () => {
   const { autoMergeReady } = await import("../src/reconciler.ts");
-  const { queueSteerEvent } = await import("../src/steer.ts");
+  const { markSteersDelivered, queueSteerEvent, queuedSteers, resumeReviewForDeliveredSteers } = await import("../src/steer.ts");
   const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
   const id = makeTask(db, projectId, { kind: "chore" });
   transition(db, id, "in_progress");
@@ -790,6 +790,12 @@ test("autoMergeReady holds a task with work still queued for its agent", async (
 
   await autoMergeReady(db, { exec: stub(() => OK()) });
   expect(getTask(db, id).state).toBe("in_review");
+
+  const pending = queuedSteers(db, id);
+  markSteersDelivered(db, pending.map((steer) => steer.id));
+  resumeReviewForDeliveredSteers(db, id, pending, "respawn");
+  await autoMergeReady(db, { exec: stub(() => OK()) });
+  expect(getTask(db, id).state).toBe("in_progress");
 });
 
 test("autoAnswerStale answers timed-out normal-risk cards with the recommendation, never high-risk", async () => {

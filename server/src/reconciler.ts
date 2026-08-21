@@ -14,7 +14,7 @@ import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, isTrackingOnlyTask, queuedInputRecoveryPending, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
 import { spawnMeta } from "./cleanup.ts";
-import { queuedSteers, markSteersDelivered, queueSteerEvent } from "./steer.ts";
+import { queuedSteers, markSteersDelivered, queueSteerEvent, resumeReviewForDeliveredSteers } from "./steer.ts";
 import { isReviewed } from "./dispatcher.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
@@ -352,6 +352,12 @@ async function drainSteers(db: DB, deps: ReconcilerDeps): Promise<void> {
       delivered.push(s.id);
     }
     markSteersDelivered(db, delivered, "drain");
+    resumeReviewForDeliveredSteers(
+      db,
+      t.id,
+      pending.filter((steer) => delivered.includes(steer.id)),
+      "drain"
+    );
   }
 }
 

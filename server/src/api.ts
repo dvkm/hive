@@ -42,7 +42,7 @@ import {
   parseIncident,
 } from "./rows.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from "./runtime/herdr.ts";
-import { queuedSteers, markSteersDelivered, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
+import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
@@ -3022,6 +3022,7 @@ export async function spawnAgent(
   // The agent is up and holding the queued steers in its brief — receipt them.
   // Only now: a failed spawn above leaves them queued for the next attempt.
   markSteersDelivered(db, pending.map((s) => s.id));
+  resumeReviewForDeliveredSteers(db, id, pending, "respawn");
   if (task.state === "queued") transition(db, id, "in_progress", { source: "herdr", reason: "agent spawned" });
 
   if (opts.supervise) superviseAgent(db, herdr, id, result.agent_target);

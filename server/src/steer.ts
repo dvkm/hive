@@ -15,7 +15,7 @@
 // the respawn brief carries it.
 import type { DB } from "./db.ts";
 import { now } from "./db.ts";
-import { writeEvent, getTask } from "./state.ts";
+import { writeEvent, getTask, transition } from "./state.ts";
 import { neverDispatched } from "./supervision.ts";
 
 export type Delivery = "delivered" | "queued" | "failed";
@@ -87,6 +87,37 @@ export function markSteersDelivered(db: DB, ids: string[], via: "respawn" | "dra
      WHERE id = ?`
   );
   for (const id of ids) q.run(ts, via, id);
+}
+
+export function resumeReviewForDeliveredSteers(
+  db: DB,
+  taskId: string,
+  steers: QueuedSteer[],
+  via: "respawn" | "drain"
+): void {
+  const task = getTask(db, taskId);
+  if (!steers.length || task?.state !== "in_review") return;
+  const lastSync = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_synchronized' ORDER BY ts DESC LIMIT 1")
+    .get(taskId) as { payload: string } | undefined;
+  let head_sha: string | null = null;
+  try {
+    head_sha = lastSync ? (JSON.parse(lastSync.payload).head_sha ?? null) : null;
+  } catch {
+    head_sha = null;
+  }
+  writeEvent(db, {
+    task_id: taskId,
+    source: "system",
+    type: "changes_requested",
+    payload: {
+      notes: steers.map((steer) => steer.message).join("\n\n"),
+      delivered: true,
+      head_sha,
+      delivery_via: via,
+    },
+  });
+  transition(db, taskId, "in_progress", { source: "system", reason: "queued agent work delivered" });
 }
 
 // Prepended to the respawn brief, above the task heading, so it is the first
