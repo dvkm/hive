@@ -178,7 +178,7 @@ test("mergeTask never lets an option-shaped PR baseRefName reach git argv (task 
           statusCheckRollup: [{ conclusion: "SUCCESS" }],
           baseRefName: payload,
           baseRefOid: "base-sha-real",
-          headRefOid: "head-sha-real",
+          headRefOid: "feat-sha",
         })
       );
     if (argv[0] === "gh" && argv.includes("merge")) return { code: 1, stdout: "", stderr: "GraphQL: Pull Request is not mergeable" };

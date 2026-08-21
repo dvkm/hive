@@ -126,6 +126,7 @@ function makeServer(
     updateRefCode?: number;
     updateRefStderr?: string;
     baseRefOid?: string;
+    headRefOid?: string;
     currentBaseAncestor?: boolean;
   } = {}
 ) {
@@ -142,6 +143,7 @@ function makeServer(
     state: opts.prState ?? "OPEN",
     baseRefName: "main",
     baseRefOid: opts.baseRefOid ?? "base-sha",
+    headRefOid: opts.headRefOid ?? "branch-sha",
     mergeStateStatus: opts.mergeStateStatus ?? "CLEAN",
     reviewDecision: opts.reviewDecision ?? "",
     statusCheckRollup: opts.rollup ?? [],
@@ -646,6 +648,22 @@ test("a stale local base cannot bypass a conflict with the PR's current remote b
   const r = await post(s.base, `/api/tasks/${id}/merge`, {});
   expect(r.status).toBe(409);
   expect(r.json.error).toContain("current PR base remote-base");
+  expect((await get(s.base, `/api/tasks/${id}`)).json.state).toBe("in_progress");
+  const ev = await get(s.base, `/api/tasks/${id}/events`);
+  expect(ev.json.some((e: any) => e.type === "merged")).toBe(false);
+  s.server.stop(true);
+});
+
+test("a stale local task branch cannot replace the PR head during fallback", async () => {
+  const s = makeServer({
+    ghMergeCode: 1,
+    mergeStateStatus: "BEHIND",
+    headRefOid: "reviewed-head-sha",
+  });
+  const id = await inReviewWithPr(s.base, "https://gh/pr/818");
+  const r = await post(s.base, `/api/tasks/${id}/merge`, {});
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("but the PR head is reviewed-hea");
   expect((await get(s.base, `/api/tasks/${id}`)).json.state).toBe("in_progress");
   const ev = await get(s.base, `/api/tasks/${id}/events`);
   expect(ev.json.some((e: any) => e.type === "merged")).toBe(false);

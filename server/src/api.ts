@@ -2418,7 +2418,13 @@ async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason
 // current branch untouched. A base checked out in another worktree is refused
 // rather than leaving that worktree's files out of sync. Returns null on
 // success, or a failure reason string.
-async function attemptLocalFf(exec: Exec, project: any, task: any, base: string, requiredBase?: string): Promise<string | null> {
+async function attemptLocalFf(
+  exec: Exec,
+  project: any,
+  task: any,
+  base: string,
+  requiredPr?: { base: string; head: string | null }
+): Promise<string | null> {
   const baseSha = await exec(["git", "-C", project.repo_path, "rev-parse", base]);
   const branchSha = await exec(["git", "-C", project.repo_path, "rev-parse", task.branch]);
   const oldSha = baseSha.stdout.trim();
@@ -2429,10 +2435,14 @@ async function attemptLocalFf(exec: Exec, project: any, task: any, base: string,
   // A PR branch must contain the PR's current base commit, not merely Hive's
   // possibly stale local branch. Otherwise a local ff can bypass GitHub's
   // conflict verdict and silently omit integration-branch commits.
-  if (requiredBase) {
-    const current = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", requiredBase, newSha]);
+  if (requiredPr) {
+    if (!requiredPr.head)
+      return "PR head metadata is missing; local fast-forward was not attempted";
+    if (newSha !== requiredPr.head)
+      return `local branch '${task.branch}' resolves to ${newSha.slice(0, 12)}, but the PR head is ${requiredPr.head.slice(0, 12)}; refresh the local branch from the PR head`;
+    const current = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", requiredPr.base, newSha]);
     if (current.code !== 0)
-      return `current PR base ${requiredBase.slice(0, 12)} is not an ancestor of '${task.branch}'; refresh the branch from origin/${base}`;
+      return `current PR base ${requiredPr.base.slice(0, 12)} is not an ancestor of '${task.branch}'; refresh the branch from origin/${base}`;
   }
 
   const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", oldSha, newSha]);
@@ -2684,7 +2694,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
         // state: a protection block (failing checks, missing reviews) wears the
         // same "not mergeable" reason, and must never be merged around.
         if (MERGE_CONFLICT_RE.test(reason) && staleBaseRefusal(prView) && project?.repo_path && task.branch) {
-          const ffReason = await attemptLocalFf(exec, project, task, base, guardBase);
+          const ffReason = await attemptLocalFf(exec, project, task, base, { base: guardBase, head: prView?.headRefOid ?? null });
           if (ffReason === null) {
             method = "local ff-only (PR merge reported not-mergeable against origin/" + base + ")";
           } else {
@@ -2701,7 +2711,13 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
       // branch tip. Requires the default branch to be an ancestor of the task
       // branch; a non-fast-forward (diverged / conflicting) merge is refused, no
       // working tree is touched. Callers wanting a squash merge should use a PR.
-      const ffReason = await attemptLocalFf(exec, project, task, base, task.pr_url ? guardBase : undefined);
+      const ffReason = await attemptLocalFf(
+        exec,
+        project,
+        task,
+        base,
+        task.pr_url ? { base: guardBase, head: prView?.headRefOid ?? null } : undefined
+      );
       if (ffReason !== null) return mergeFailed(db, herdr, task, base, ffReason, actor);
       method = forceLocalFf && task.pr_url ? "local ff-only (forced; PR-backed task)" : "local ff-only";
     }

@@ -266,7 +266,7 @@ test("spawn refreshes its base from origin and cuts the worktree from that remot
 
   expect(calls[0]).toEqual([
     "git", "-C", "/repo", "fetch", "--no-tags", "origin",
-    "refs/heads/staging:refs/remotes/origin/staging",
+    "+refs/heads/staging:refs/remotes/origin/staging",
   ]);
   const create = calls.find((c) => c.includes("worktree") && c.includes("create"))!;
   expect(create.slice(create.indexOf("--base"), create.indexOf("--base") + 2)).toEqual(["--base", "origin/staging"]);
