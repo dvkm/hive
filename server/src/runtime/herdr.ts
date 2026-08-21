@@ -663,7 +663,7 @@ export class Herdr {
       const remoteBase = `origin/${base}`;
       const fetched = await this.exec([
         "git", "-C", args.repoPath, "fetch", "--no-tags", "origin",
-        `refs/heads/${base}:refs/remotes/origin/${base}`,
+        `+refs/heads/${base}:refs/remotes/origin/${base}`,
       ]);
       if (fetched.code !== 0)
         throw new HerdrError(`base fetch failed: ${fetched.stderr.trim() || fetched.stdout.trim()}`);
