@@ -28,6 +28,7 @@ import {
   deferTask,
   undeferTask,
   unmetDeps,
+  queuedInputRecoveryPending,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
@@ -1738,6 +1739,10 @@ export function handOffToReview(db: DB, taskId: string, source: string): boolean
   // (a pushed commit / evidence / review_summary) lands after the request.
   if (changesRequestUnaddressed(db, taskId)) return false;
   if (decisionAnswerUnaddressed(db, taskId)) return false;
+  // #1234 review-12: a PR can already be open while a queued-input recovery is
+  // in flight (or just resolved) on this same task — don't hand it to review
+  // until the redelivered turn has had its chance to run.
+  if (queuedInputRecoveryPending(db, taskId)) return false;
   transition(db, taskId, "in_review", { source, reason: "PR open, awaiting review" });
   return true;
 }

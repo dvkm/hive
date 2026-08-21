@@ -328,23 +328,50 @@ export function decisionAnswerUnaddressed(db: DB, taskId: string): boolean {
 
 const QUEUED_INPUT_HANDOFF_GRACE_MS = 2 * 60 * 1000;
 
+// True while a queued-input recovery (reconciler.ts's recoverQueuedInput, task
+// #1098) means an automatic transition should hold off this task: the pane
+// write is recent enough that the redelivered turn may not have started yet
+// (this same short window also covers an in-flight `delivered: null`
+// reservation, including one orphaned by a server crash mid-write — #1234
+// review-14 — since it ages out instead of blocking forever), or the recovery
+// escalated to an unresolved `queued_input_stuck` alert with no real activity
+// on the task since (#1234 review-13 — cheaper and more accurate than the
+// flat grace window alone, which could let a still-stuck task advance once the
+// window passed, or hold a resolved one).
+//
+// Shared by every automatic transition that can act on a task mid-recovery:
+// advanceIfFinished below (the reconciler's advanceFinished + api.ts's
+// superviseAgent), handOffToReview, autoMergeReady, and releaseReviewAgent
+// (#1234 review-12 — the guard used to cover only the first two).
+export function queuedInputRecoveryPending(db: DB, taskId: string): boolean {
+  const latest = db
+    .query("SELECT ts FROM events WHERE task_id = ? AND type = 'queued_input_recovered' ORDER BY ts DESC, rowid DESC LIMIT 1")
+    .get(taskId) as { ts: string } | undefined;
+  if (!latest) return false;
+  if (Date.now() - Date.parse(latest.ts) < QUEUED_INPUT_HANDOFF_GRACE_MS) return true;
+  const stuck = db
+    .query("SELECT ts FROM notifications WHERE kind = 'queued_input_stuck' AND task_id = ? ORDER BY ts DESC LIMIT 1")
+    .get(taskId) as { ts: string } | undefined;
+  if (!stuck) return false;
+  const movedOn = db
+    .query(
+      "SELECT 1 FROM events WHERE task_id = ? AND ts > ? AND type NOT IN ('queued_input_recovered','agent_status','stale') LIMIT 1"
+    )
+    .get(taskId, stuck.ts);
+  return !movedOn;
+}
+
 // The finished-handoff, shared by every herdr-signal path (the reconciler's
 // poll backstop and the supervise wait loop): an agent observed idle/gone on an
 // in_progress task that has a real work product (a pr_url, or a scout report)
-// advances to in_review, except while a queued-input recovery is pending or in
-// its brief grace period. Deliberately independent of anything the agent emits.
+// advances to in_review, except while a queued-input recovery is pending.
+// Deliberately independent of anything the agent emits.
 // Returns true when the task was advanced.
 export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, source: string): boolean {
   if (agentStatus !== "idle" && agentStatus !== "gone") return false; // working/blocked/unknown → leave it be
   const task = getTask(db, taskId);
   if (!task || task.state !== "in_progress" || isTrackingOnlyTask(task)) return false;
-  const queuedRecovery = db
-    .query("SELECT ts, payload FROM events WHERE task_id = ? AND type = 'queued_input_recovered' ORDER BY ts DESC, rowid DESC LIMIT 1")
-    .get(taskId) as { ts: string; payload: string } | undefined;
-  if (queuedRecovery) {
-    const delivered = JSON.parse(queuedRecovery.payload).delivered;
-    if (delivered === null || Date.now() - Date.parse(queuedRecovery.ts) < QUEUED_INPUT_HANDOFF_GRACE_MS) return false;
-  }
+  if (queuedInputRecoveryPending(db, taskId)) return false;
   const hasReport = task.kind === "scout" && evidenceCount(db, taskId, "report") >= 1;
   if (!task.pr_url && !hasReport) return false; // no product to review → health surfaces it, don't advance
   // Review means CI is green. failing/pending holds here; the reconciler's

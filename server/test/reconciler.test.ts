@@ -216,8 +216,14 @@ test("syncAgents recovers an idle agent with unconsumed queued input via Up+Ente
   const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'queued_input_recovered'").get(id) as any;
   expect(ev).toBeTruthy();
   expect(JSON.parse(ev.payload).delivered).toBe(true);
+  // #1234 review-15: the DB row is corrected in place (delivered: null -> true),
+  // but the event is NOT re-broadcast under the same id — the web timeline
+  // appends every SSE event rather than replacing by id, so a second broadcast
+  // would render as a duplicate row with a duplicate React key. Only the
+  // original reservation goes out live; the live feed catches up to the
+  // corrected payload on its next full fetch.
   const recoveryUpdates = messages.filter((m) => m.type === "event" && m.event.type === "queued_input_recovered");
-  expect(recoveryUpdates.map((m) => m.event.payload.delivered)).toEqual([null, true]);
+  expect(recoveryUpdates.map((m) => m.event.payload.delivered)).toEqual([null]);
 });
 
 test("queued-input recovery blocks review handoff through its grace period", async () => {
@@ -725,6 +731,40 @@ test("autoMergeReady merges only director-approved, opted-in, green, clean-revie
   expect(getTask(db, clean).state).toBe("done"); // merged; no smoke configured → straight through verifying
   expect(getTask(db, risky).state).toBe("in_review"); // risks → human review
   expect(getTask(db, unapproved).state).toBe("in_review"); // quiz not passed → director boundary
+});
+
+test("autoMergeReady holds a task while a queued-input recovery is in flight (#1234 review-12)", async () => {
+  const { autoMergeReady } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
+  const mk = () => {
+    const id = makeTask(db, projectId, { kind: "chore" });
+    transition(db, id, "in_progress");
+    transition(db, id, "in_review");
+    db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x' WHERE id = ?").run(id);
+    db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+      newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
+    );
+    const review = writeEvent(db, {
+      task_id: id,
+      source: "agent",
+      type: "review_summary",
+      payload: { understanding: { check: { question: "safe?", options: [{ key: "review", label: "yes" }], answer_key: "review" } } },
+    });
+    writeEvent(db, { task_id: id, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "review" } });
+    writeEvent(db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
+    return id;
+  };
+  const guarded = mk();
+  // A steer got stuck behind "Press up to edit queued messages" and was just
+  // redelivered — the agent's redelivered turn hasn't had a chance to run yet.
+  writeEvent(db, { task_id: guarded, source: "reconciler", type: "queued_input_recovered", payload: { delivered: true } });
+
+  const git: Exec = stub((argv) => {
+    if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
+    return argv.includes("symbolic-ref") ? OK("main\n") : OK();
+  });
+  await autoMergeReady(db, { exec: git });
+  expect(getTask(db, guarded).state).toBe("in_review"); // held, not merged out from under the recovery
 });
 
 test("autoAnswerStale answers timed-out normal-risk cards with the recommendation, never high-risk", async () => {

@@ -154,6 +154,20 @@ test("a genuinely gone agent (pane list has no trace) IS released", async () => 
   expect(getTask(db, id).agent_target).toBeNull();
 });
 
+test("a queued-input recovery in flight holds the release (#1234 review-12)", async () => {
+  const { db, projectId } = freshDb();
+  const id = seedTask(db, projectId);
+  // Up+Enter was just sent to unstick the pane — the redelivered turn may be
+  // about to run. Closing the session now would kill it mid-air.
+  writeEvent(db, { task_id: id, source: "reconciler", type: "queued_input_recovered", payload: { delivered: true } });
+
+  const r = await releaseReviewAgent(db, herdrWithStatus("idle"), id);
+
+  expect(r.released).toBe(false);
+  expect(r.reason).toBe("queued-input recovery pending");
+  expect(getTask(db, id).agent_target).toBe(id);
+});
+
 test("undelivered feedback holds the release (drainSteers gets first go at a live agent)", async () => {
   const { db, projectId } = freshDb();
   const id = seedTask(db, projectId);

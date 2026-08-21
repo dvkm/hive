@@ -11,7 +11,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, isTrackingOnlyTask, TERMINAL, type State } from "./state.ts";
+import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, isTrackingOnlyTask, queuedInputRecoveryPending, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
 import { spawnMeta } from "./cleanup.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent } from "./steer.ts";
@@ -793,6 +793,9 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     .all() as { id: string; number: number; title: string; kind: string; config: string }[];
   for (const r of rows) {
     if (isTrackingOnlyId(db, r.id)) continue;
+    // #1234 review-12: don't auto-merge out from under a queued-input recovery
+    // that just fired on this same task — the redelivered turn may still push.
+    if (queuedInputRecoveryPending(db, r.id)) continue;
     let kinds: string[] = [];
     try {
       const c = JSON.parse(r.config ?? "{}");
@@ -1416,9 +1419,13 @@ async function recoverQueuedInput(db: DB, h: Herdr, task: any, target: string, e
   });
   let r = await h.answerDialog(target, "Up");
   if (r.code !== 0) r = await h.answerDialog(target, "Enter");
-  const resolved = { ...attempt, payload: { ...attempt.payload, delivered: r.code === 0 } };
-  db.query("UPDATE events SET payload = ? WHERE id = ?").run(JSON.stringify(resolved.payload), attempt.id);
-  broadcast({ type: "event", event: resolved });
+  const delivered = { ...attempt.payload, delivered: r.code === 0 };
+  db.query("UPDATE events SET payload = ? WHERE id = ?").run(JSON.stringify(delivered), attempt.id);
+  // No re-broadcast: the web timeline appends every SSE event rather than
+  // replacing by id, so re-sending this same event id would show two rows
+  // (#1234 review-15). Same tradeoff already accepted in steer.ts's
+  // markSteersDelivered — the live feed shows the pending row until the next
+  // full fetch (GET /api/feed), which reads the corrected payload.
 }
 
 // ---- graceful failure-class handlers (pane-diagnosed) ----
