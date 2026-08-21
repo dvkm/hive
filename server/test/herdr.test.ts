@@ -125,7 +125,7 @@ test("agentListArgv + parseAgentList: only named (hive-spawned) agents survive, 
       type: "agent_list",
     },
   });
-  expect(parseAgentList(stdout)).toEqual([{ name: "vfeabd2a", tabId: "w6:t1" }]);
+  expect(parseAgentList(stdout)).toEqual([{ name: "vfeabd2a", tabId: "w6:t1", cwd: "/wt/hive-vfeabd2a" }]);
   expect(parseAgentList("garbage")).toEqual([]);
   expect(parseAgentList('{"result":{"agents":[]}}')).toEqual([]);
 });
@@ -138,16 +138,16 @@ test("paneListArgv + workspaceCloseArgv + parsePaneList: the pty-leak sweep surf
     id: "cli:pane:list",
     result: {
       panes: [
-        { pane_id: "w11S:p1", tab_id: "w11S:t1", workspace_id: "w11S", cwd: "/wt/hive-5ba4edd2f39d", agent_status: "unknown" },
-        { pane_id: "wR:p2", tab_id: "wR:t2", workspace_id: "wR", cwd: "/wt/hive-222a5d0a2b73" },
+        { pane_id: "w11S:p1", tab_id: "w11S:t1", workspace_id: "w11S", cwd: "/wt/hive-5ba4edd2f39d", agent_status: "unknown", terminal_id: "term_1" },
+        { pane_id: "wR:p2", tab_id: "wR:t2", workspace_id: "wR", cwd: "/wt/hive-222a5d0a2b73", terminal_id: "term_2", label: "222a5d0a2b73", agent: "claude" },
         { agent_status: "idle" }, // no pane_id → dropped
       ],
       type: "pane_list",
     },
   });
   expect(parsePaneList(stdout)).toEqual([
-    { paneId: "w11S:p1", tabId: "w11S:t1", workspaceId: "w11S", cwd: "/wt/hive-5ba4edd2f39d" },
-    { paneId: "wR:p2", tabId: "wR:t2", workspaceId: "wR", cwd: "/wt/hive-222a5d0a2b73" },
+    { paneId: "w11S:p1", tabId: "w11S:t1", workspaceId: "w11S", cwd: "/wt/hive-5ba4edd2f39d", terminalId: "term_1", label: null, agent: null },
+    { paneId: "wR:p2", tabId: "wR:t2", workspaceId: "wR", cwd: "/wt/hive-222a5d0a2b73", terminalId: "term_2", label: "222a5d0a2b73", agent: "claude" },
   ]);
   expect(parsePaneList("garbage")).toEqual([]);
   expect(parsePaneList('{"result":{"panes":[]}}')).toEqual([]);
@@ -184,6 +184,8 @@ test("spawn builds the visible interactive fleet: worktree, fleet workspace, lab
     if (has(argv, "worktree", "create")) return OK('{"result":{"worktree":{"path":"/wt/hive-t1","branch":"hive/t1","open_workspace_id":"w9"}}}');
     if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
     if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t2"}}}');
+    // spawn reads the started agent back once, to record its STABLE terminal id.
+    if (has(argv, "agent", "get")) return OK('{"result":{"agent":{"pane_id":"wF:p3","terminal_id":"term_t1"}}}');
     return OK("started");
   });
   const h = new Herdr(exec, "herdr");
@@ -204,6 +206,8 @@ test("spawn builds the visible interactive fleet: worktree, fleet workspace, lab
     workspace_id: "w9",
     fleet_workspace_id: "wF",
     tab_id: "wF:t2",
+    terminal_id: "term_t1",
+    pane_id: "wF:p3",
     label: "t1 Fix the bug",
   });
   // prepareWorktree ran with the created worktree path, before agent start.

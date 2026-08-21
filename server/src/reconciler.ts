@@ -23,7 +23,8 @@ import { broadcastTask } from "./health.ts";
 import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
-import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision } from "./api.ts";
+import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, spawnAgent } from "./api.ts";
+import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, safeBranch, preferSafeRef } from "./exec.ts";
 import { captureBranchScope } from "./rebaseGuard.ts";
@@ -42,6 +43,7 @@ export interface ReconcilerDeps {
   staleMs?: number; // default 15m
   smoke?: MonitorDeps; // deps for smokeThenAdvance on merge->verifying
   nowMs?: () => number; // injectable clock (tests)
+  supervise?: boolean; // start the herdr push-wait loop on agents this loop spawns
 }
 
 const DEFAULT_STALE_MS = 15 * 60 * 1000;
@@ -190,8 +192,25 @@ async function probeAgent(
   const p = await h.probe(target);
   if (p.alive) return p;
   const task = getTask(db, taskId);
-  const gone = await h.confirmGone({ cwd: task?.worktree_path ?? null, tabId: spawnMeta(db, taskId).tab_id });
-  return gone ? p : { alive: true, status: "unknown", unconfirmed: true };
+  const meta = spawnMeta(db, taskId);
+  const hint = { cwd: task?.worktree_path ?? null, tabId: meta.tab_id, terminalId: meta.terminal_id };
+  const gone = await h.confirmGone(hint);
+  if (gone) return p;
+  // Alive but unregistered. Don't just leave it alone — REGISTER IT BACK, so
+  // steers, dialog handling and status all work again on an agent that never
+  // stopped working. Everything downstream keeps addressing it by agent_target.
+  const re = await h.readopt({ name: target, ...hint });
+  if (re.readopted) {
+    writeEvent(db, {
+      task_id: taskId,
+      source: "reconciler",
+      type: "readopted",
+      payload: { agent_target: target, pane_id: re.paneId, terminal_id: re.terminalId, reason: re.reason },
+    });
+    const again = await h.probe(target);
+    if (again.alive) return again;
+  }
+  return { alive: true, status: "unknown", unconfirmed: true };
 }
 
 // Unregistered-but-running (or herdr unreachable): log it — which also resets
@@ -950,6 +969,7 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
 // the requeue/nudge backoff.
 async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
   const h = deps.herdr ?? defaultHerdr;
+  const nowMs = (deps.nowMs ?? (() => Date.now()))();
   const tasks = db
     .query(`SELECT id, agent_target FROM tasks WHERE agent_target IS NOT NULL AND COALESCE(source, '') != 'chat_supervisor' AND state IN ${RECOVERABLE}`)
     .all() as { id: string; agent_target: string }[];
@@ -981,12 +1001,27 @@ async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
 
     const { alive, status, unconfirmed } = await probeAgent(h, db, t.id, t.agent_target);
     if (unconfirmed) continue; // syncAgents already logged it; never recover on a guess
-    if (!alive) await recoverDead(db, h, t.id, t.agent_target);
-    else if (staleFlagged) {
+    if (!alive) {
+      // Both teardown gates sit HERE, in front of the only path that fails and
+      // requeues a task. A server that just booted, or a fleet-wide burst of
+      // death verdicts, means hive is the thing that lost its footing — the
+      // agents are processes and will still be there next lap.
+      const blocked = teardownBlocked(db, nowMs);
+      if (blocked) {
+        console.log(`[hive] recovery held for ${t.id}: ${blocked}`);
+        continue;
+      }
+      const dead = recentDeadVerdicts(db, nowMs);
+      if (dead >= DEAD_BURST_N) {
+        if (cur) openBreakerDecision(db, cur, dead, Math.round(DEAD_BURST_MS / 60_000));
+        continue; // breaker now open: every later task this lap is held by teardownBlocked
+      }
+      await recoverDead(db, h, t.id, t.agent_target);
+    } else if (staleFlagged) {
       // Quiet but WORKING is not stuck — long tool runs and big builds are
       // silent by nature. Only idle/blocked/unknown agents enter recovery.
       if (status === "working") continue;
-      await recoverSilent(db, h, t.id, t.agent_target);
+      await recoverSilent(db, h, t.id, t.agent_target, deps);
     }
   }
 }
@@ -1104,7 +1139,7 @@ export function resumeUsageLimited(db: DB, nowMs: number = Date.now()): void {
   }
 }
 
-async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string): Promise<void> {
+async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string, deps: ReconcilerDeps = {}): Promise<void> {
   const task = getTask(db, taskId);
   if (!task || TERMINAL.includes(task.state as State)) return;
 
@@ -1113,7 +1148,7 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string): 
   const tail = await h.read(target, 200);
   const diag = diagnosePane(tail);
   if (diag?.kind === "blocked_dialog") return handleBlockedAgent(db, h, taskId, target);
-  if (diag?.kind === "auth_lost") return recoverAuthLost(db, task, diag.excerpt, tail);
+  if (diag?.kind === "auth_lost") return recoverAuthLost(db, h, task, diag.excerpt, tail, deps);
   if (diag?.kind === "context_full") return recoverContextFull(db, task, tail);
   if (diag?.kind === "usage_limit") return recoverUsageLimit(db, task, diag.excerpt);
   if (diag?.kind === "api_error") {
@@ -1243,10 +1278,44 @@ async function recoverBlockedDialog(db: DB, task: any, excerpt: string, tail: st
   enqueue(db, { kind: "decision", task_id: task.id, decision_id: d.id, title: `Agent blocked on a dialog: ${task.title}`, urgency: "urgent" });
 }
 
-// The worker lost auth: failing or requeuing is pointless (a fresh agent hits
-// the same wall). Urgent-notify the director once per hour and wait.
-async function recoverAuthLost(db: DB, task: any, excerpt: string, tail: string): Promise<void> {
-  writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "auth-lost", excerpt: excerpt.slice(0, 300) } });
+// The worker lost auth. Notifying the director is necessary but was the WHOLE
+// recovery, and a notification does not unfreeze a pane: the agent sat at the
+// login wall indefinitely while this very event reset its health clock, so the
+// task read "healthy" lap after lap with a byte-identical tail (#1149/#1156,
+// 2026-08-20 — two tasks flipped stale → auth-lost → healthy twice, 15 minutes
+// apart, with zero real work in between).
+//
+// So: respawn, like any other agent that is not coming back on its own. Hive has
+// no signal that a login was restored, and trying IS the signal — a respawn
+// either revives the task or hits the same wall and says so. Rate-limited per
+// task (HIVE_AUTH_RESPAWN_MS, 15m) so a still-broken login costs four spawns an
+// hour instead of one a minute — the cooldown counts ATTEMPTS, not successes,
+// so a spawn path that is itself broken cannot turn this into a retry storm.
+// Never requeues: a fresh TASK would lose the
+// worktree and its context for a problem that has nothing to do with the work.
+const AUTH_RESPAWN_MS = Number(process.env.HIVE_AUTH_RESPAWN_MS || 15 * 60_000);
+
+async function recoverAuthLost(db: DB, h: Herdr, task: any, excerpt: string, tail: string, deps: ReconcilerDeps = {}): Promise<void> {
+  const nowMs = (deps.nowMs ?? (() => Date.now()))();
+  const lastTry = db
+    .query(
+      `SELECT ts FROM events WHERE task_id = ? AND type = 'recovery'
+         AND json_extract(payload, '$.decision') = 'auth-lost'
+         AND json_extract(payload, '$.respawned') IS NOT NULL
+       ORDER BY ts DESC LIMIT 1`
+    )
+    .get(task.id) as { ts: string } | undefined;
+  // The `respawned` key is written ONLY on a lap that actually tried — it is the
+  // cooldown's clock, and stamping it every lap would push the next attempt out
+  // of reach forever.
+  const due = !lastTry || nowMs - Date.parse(lastTry.ts) >= AUTH_RESPAWN_MS;
+  const respawned = due ? (await spawnAgent(db, h, task.id, { supervise: deps.supervise })).ok : null;
+  writeEvent(db, {
+    task_id: task.id,
+    source: "reconciler",
+    type: "recovery",
+    payload: { decision: "auth-lost", excerpt: excerpt.slice(0, 300), ...(due ? { respawned } : {}) },
+  });
   const recent = db
     .query("SELECT 1 FROM notifications WHERE kind = 'auth_lost' AND ts > datetime('now', '-60 minutes') LIMIT 1")
     .get();
@@ -1256,7 +1325,7 @@ async function recoverAuthLost(db: DB, task: any, excerpt: string, tail: string)
     kind: "auth_lost",
     task_id: task.id,
     title: "Agent authentication expired: workers cannot continue",
-    body: "An agent pane shows 'Not logged in'. Restore the selected worker's login (`/login` for Claude Code or `codex login` for ChatGPT/Codex); affected agents resume on their own.",
+    body: "An agent pane shows 'Not logged in'. Restore the selected worker's login (`/login` for Claude Code or `codex login` for ChatGPT/Codex); hive retries each affected agent every 15 minutes, so the fleet comes back on its own once you do.",
     urgency: "urgent",
   });
   recordSystemLearning(db, task.project_id, "agent authentication expired mid-fleet", "Agents stall when their CLI login expires. Fix auth once; do not requeue (a fresh agent hits the same wall).", task.id);

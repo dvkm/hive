@@ -17,10 +17,42 @@ import { bootstrapAuthority } from "./authority.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { defaultExec } from "./exec.ts";
+import { claimLease, startLease, holdsLease, interloperReason, registerInstance, unregisterInstance, evictContenders, LEASE_MS } from "./lease.ts";
+import { enqueue } from "./notifications.ts";
+import { setSetting, now } from "./db.ts";
 
 const port = Number(process.env.HIVE_PORT || 4700);
 const dbPath = defaultDbPath();
 const db = openDb(dbPath);
+
+// Refuse to be the second server on the live fleet database. A custom port with
+// the default DB is the signature of a throwaway/test server that forgot
+// HIVE_DB, and one of those ran reconciler laps against the live fleet for 25
+// minutes on 2026-08-19, evicting working agents until a human killed it by
+// hand. Exiting HERE means no listener, no lease, no loops — nothing of this
+// process ever touches the fleet. Set HIVE_ALLOW_SHARED_DB=1 to override.
+{
+  const reason = interloperReason(dbPath, port);
+  if (reason) {
+    console.error(`[hive] REFUSING TO START: ${reason}.`);
+    console.error(`[hive] A second server on the live DB kills working agents. Use a scratch DB: HIVE_DB=/tmp/smoke.db HIVE_PORT=${port} bun run server/src/index.ts`);
+    // One card per incident, not per retry: a refused server under a supervisor
+    // (launchd, `bun --watch`) relaunches on a loop and would otherwise fill the
+    // tray with the same sentence.
+    const recent = db
+      .query("SELECT 1 FROM notifications WHERE kind = 'server_refused' AND ts > datetime('now', '-10 minutes') LIMIT 1")
+      .get();
+    if (!recent)
+      enqueue(db, {
+        kind: "server_refused",
+        urgency: "normal",
+        title: "Blocked a second hive server on the live database",
+        body: `Something started a hive server on port ${port} against the fleet DB. It was refused and nothing was touched — it needed HIVE_DB set to a scratch path.`,
+      });
+    process.exit(1);
+  }
+}
+
 const carriedQuizPasses = repairDuplicateQuizPasses(db);
 if (carriedQuizPasses) console.log(`[hive] preserved ${carriedQuizPasses} completed quiz pass(es) across duplicate reviews`);
 const handle = makeHandler(db, { supervise: true });
@@ -51,12 +83,63 @@ const server = Bun.serve({
   fetch: handle,
 });
 
+// Single-writer lease. Claimed only now that the listener is up, so a server
+// that cannot even bind never evicts a healthy one. Newest wins: any predecessor
+// still running against this DB (including a `bun --watch` worker that survived
+// a launchctl kickstart by re-parenting to launchd — 2026-08-19, four of them,
+// none holding the port) sees the lease change on its next heartbeat and exits.
+{
+  const { instance, displaced } = claimLease(db);
+  // Register BEFORE any loop starts: this row is how a future lease holder can
+  // find and terminate this process if it ever stops standing down on its own.
+  registerInstance(db, instance, process.pid, port);
+  if (displaced)
+    console.warn(
+      `[hive] took the DB lease from a previous server (instance=${displaced.instance} pid=${displaced.pid} at=${displaced.at}); it will stand down within one heartbeat`
+    );
+  startLease(db, instance, (holder) => {
+    console.error(`[hive] DB lease lost to instance=${holder?.instance ?? "?"} pid=${holder?.pid ?? "?"}; standing down so only one server runs the loops`);
+    unregisterInstance(db, instance);
+    process.exit(0);
+  });
+  process.on("exit", () => {
+    try {
+      unregisterInstance(db, instance);
+    } catch {
+      /* the DB may already be closed; the next holder drops the row anyway */
+    }
+  });
+
+  // Enforcement: asking a predecessor to stand down does not reach one that is
+  // wedged, or a `bun --watch` worker orphaned by a launchctl kickstart. Kill
+  // what is still attached, and tell the director — an eviction is never
+  // routine, and the director used to have to do it by hand.
+  setInterval(() => {
+    if (!holdsLease(db, instance)) return; // we are the one on the way out
+    for (const { contender, signal } of evictContenders(db, instance)) {
+      console.warn(`[hive] evicted a second server: pid=${contender.pid} port=${contender.port} instance=${contender.instance} (${signal})`);
+      if (signal !== "SIGTERM") continue; // the SIGKILL escalation is automatic; one card is enough
+      enqueue(db, {
+        kind: "server_evicted",
+        urgency: "normal",
+        title: "Evicted a second hive server from the fleet database",
+        body: `A second server (pid ${contender.pid}, port ${contender.port}) was still running loops against the fleet DB after losing the lease. Hive terminated it — nothing for you to do.`,
+      });
+    }
+  }, LEASE_MS);
+}
+
+// Boot stamp: the teardown guard reads it so nothing is failed, requeued or
+// reaped in the first minutes after a restart/self-deploy, when herdr's agent
+// registry may still be cold and every live agent probes as gone.
+setSetting(db, "server_started_at", now());
+
 // Background supervision: coarse reconciler (herdr status + gh PR sync + stale
 // flagging) and per-project URL monitors. Both are failure-isolated internally.
 const reconcileMs = Number(process.env.HIVE_RECONCILE_MS || 60_000);
 const monitorMs = Number(process.env.HIVE_MONITOR_MS || 60_000);
 const staleMs = Number(process.env.HIVE_STALE_MS || 15 * 60 * 1000);
-startReconciler(db, { intervalMs: reconcileMs, staleMs });
+startReconciler(db, { intervalMs: reconcileMs, staleMs, supervise: true });
 
 // Dispatcher: pick up `queued` tasks in auto-dispatch projects and spawn agents
 // (opt-in per project; the reason web-UI tasks used to sit in Queued forever).

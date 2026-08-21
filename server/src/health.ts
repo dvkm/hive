@@ -14,6 +14,13 @@ import { isSupervisedTask, neverDispatched } from "./supervision.ts";
 import { isDeferred } from "./state.ts";
 
 export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
+
+// Rows the reconciler writes about an agent, never by the agent. None of them
+// prove the agent is alive, so none of them may reset its silence clock.
+// `spawn_error` is here for the same reason: a respawn hive TRIED and failed is
+// not the agent doing something, and letting it reset the clock would hide a
+// dead task behind hive's own retry loop.
+const RECONCILER_NOISE = new Set(["stale", "recovery_nudge", "recovery", "spawn_error"]);
 export interface Health {
   status: HealthStatus;
   reason: string | null;
@@ -170,15 +177,21 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   if (task.state === "needs_decision" || task.state === "in_review")
     return { status: "healthy", reason: null, since: task.updated_at as string };
 
-  const latest = events[0];
-  if (latest && latest.type === "recovery_nudge")
-    return { status: "stuck", reason: "stale recovery in progress", since: latest.ts };
-
-  // "Activity" excludes reconciler noise (stale flags, recovery nudges) so a
-  // genuinely quiet agent keeps aging toward silent instead of resetting.
-  const activity = events.find((e) => e.type !== "stale" && e.type !== "recovery_nudge");
+  // "Activity" excludes reconciler noise so a genuinely quiet agent keeps aging
+  // toward silent instead of resetting. `recovery` belongs in that set and was
+  // missing: hive re-diagnosed an auth-lost pane every lap, and each diagnosis
+  // wrote a `recovery` row that reset this clock — so a frozen pane read
+  // HEALTHY, lap after lap, with a byte-identical tail (#1149/#1156, 2026-08-20).
+  // A row hive wrote ABOUT an agent is not evidence the agent did anything.
+  const activity = events.find((e) => !RECONCILER_NOISE.has(e.type));
   const activityTs = activity ? activity.ts : (task.updated_at as string);
   const age = nowMs - Date.parse(activityTs);
+
+  // Recovery is underway if hive nudged AFTER the last real activity. Keyed off
+  // activityTs rather than "is it the newest event", which any trailing
+  // bookkeeping row would silently defeat.
+  const nudge = events.find((e) => e.type === "recovery_nudge" && e.ts > activityTs);
+  if (nudge) return { status: "stuck", reason: "stale recovery in progress", since: nudge.ts };
   // Finished-without-a-PR (or genuinely stuck): an idle agent (it stopped working)
   // on an in_progress task that opened no PR and has gone quiet is either done but
   // never handed off, or wedged. Surface it in the attention tray instead of the
@@ -189,7 +202,7 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
     return { status: "stuck", reason: "finished or stuck: agent idle, no PR", since: activityTs };
   }
   if (age > staleMs()) {
-    const escalating = latest && latest.type === "stale";
+    const escalating = events.some((e) => e.type === "stale" && e.ts > activityTs);
     return {
       status: escalating ? "stuck" : "silent",
       reason: escalating ? "stale recovery in progress" : "no activity",

@@ -1,0 +1,64 @@
+
+===== setup: throwaway workspace + tab (root pane is a login SHELL) =====
+$ herdr workspace create --label hive-readopt-verify-23eddc --no-focus
+  code=0 stdout={"id":"cli:workspace:create","result":{"root_pane":{"agent_status":"unknown","cwd":"/Users/david/.herdr/worktrees/monorepo/hive-9d85e46129cb","focused":false,"foreground_cwd":"/Users/david/.herdr/worktrees/monorepo/hive-9d85e46129cb","pane_id":"w1FA:p1","revision":0,"tab_id":"w1FA:t1","terminal_id":"term_6596d382079d2216","workspace_id":"w1FA"},"tab":{"agent_status":"unknown","focused":false,"labe stderr=
+$ herdr tab create --workspace w1FA --cwd /tmp --label readopt-verify-23eddc --no-focus
+  code=0 stdout={"id":"cli:tab:create","result":{"root_pane":{"agent_status":"unknown","cwd":"/private/tmp","focused":false,"foreground_cwd":"/private/tmp","pane_id":"w1FA:p2","revision":0,"tab_id":"w1FA:t2","terminal_id":"term_6596d3820b6e9217","workspace_id":"w1FA"},"tab":{"agent_status":"unknown","focused":false,"label":"readopt-verify-23eddc","number":2,"pane_count":1,"tab_id":"w1FA:t2","workspace_id":"w1FA"} stderr=
+
+===== setup: an 'agent' pane in the SAME tab at the SAME cwd (what a fleet tab looks like) =====
+$ herdr agent start readopt-verify-23eddc --cwd /tmp --tab w1FA:t2 --no-focus -- sleep 600
+  code=0 stdout={"id":"cli:agent:start","result":{"agent":{"agent_status":"unknown","cwd":"/private/tmp","focused":false,"foreground_cwd":"/private/tmp","name":"readopt-verify-23eddc","pane_id":"w1FA:p3","revision":0,"tab_id":"w1FA:t2","terminal_id":"term_6596d382173aa218","workspace_id":"w1FA"},"argv":["sleep","600"],"type":"agent_started"}} stderr=
+$ herdr agent get readopt-verify-23eddc
+  code=0 stdout={"id":"cli:agent:get","result":{"agent":{"agent_status":"unknown","cwd":"/private/tmp","focused":false,"foreground_cwd":"/private/tmp","name":"readopt-verify-23eddc","pane_id":"w1FA:p3","revision":0,"tab_id":"w1FA:t2","terminal_id":"term_6596d382173aa218","workspace_id":"w1FA"},"type":"agent_info"}} stderr=
+PASS two panes in tab w1FA:t2: shell w1FA:p2, agent w1FA:p3
+
+===== A. pane list carries cwd + STABLE terminal_id for every pane =====
+$ herdr pane list
+  code=0 stdout={"id":"cli:pane:list","result":{"panes":[{"agent_status":"unknown","cwd":"/Users/david/projects/monorepo","focused":false,"foreground_cwd":"/Users/david/projects/monorepo","pane_id":"w134:p1","revision":0,"tab_id":"w134:t1","terminal_id":"term_65958601988ddf","workspace_id":"w134"},{"agent_status":"unknown","cwd":"/Users/david/projects/interview","focused":false,"foreground_cwd":"/Users/david/proj stderr=
+PASS both panes visible (2)
+PASS both panes report the same cwd — cwd ALONE cannot pick the agent
+PASS every pane carries a terminal_id
+
+===== B. process-info separates the agent pane from the tab's shell pane =====
+$ herdr pane process-info --pane w1FA:p3
+  code=0 stdout={"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":84311,"foreground_processes":[{"argv":["sleep","600"],"argv0":"sleep","cmdline":"sleep 600","cwd":"/private/tmp","name":"sleep","pid":84311}],"pane_id":"w1FA:p3","shell_pid":84311},"type":"pane_process_info"}} stderr=
+PASS agent pane: running a command
+$ herdr pane process-info --pane w1FA:p2
+  code=0 stdout={"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":84294,"foreground_processes":[{"argv":["-zsh"],"argv0":"zsh","cmdline":"-zsh","cwd":"/private/tmp","name":"zsh","pid":84294}],"pane_id":"w1FA:p2","shell_pid":84294},"type":"pane_process_info"}} stderr=
+PASS shell pane: a login shell, never re-adopted
+
+===== C. the wipe: with the name gone, `agent get` is agent_not_found (what hive sees after a desktop-app restart) =====
+$ herdr agent rename readopt-verify-23eddc --clear
+  code=0 stdout={"id":"cli:agent:rename","result":{"agent":{"agent_status":"unknown","cwd":"/private/tmp","focused":false,"foreground_cwd":"/private/tmp","pane_id":"w1FA:p3","revision":0,"tab_id":"w1FA:t2","terminal_id":"term_6596d382173aa218","workspace_id":"w1FA"},"type":"agent_info"}} stderr=
+$ herdr agent get readopt-verify-23eddc
+  code=1 stdout= stderr={"error":{"code":"agent_not_found","message":"agent target readopt-verify-23eddc not found"},"id":"cli:agent:get"}
+PASS target no longer resolves
+
+===== D. re-adoption: report-agent + rename put the RUNNING pane back under its name =====
+$ herdr pane report-agent w1FA:p3 --source hive --agent readopt-verify-23eddc --state unknown
+  code=0 stdout= stderr=
+$ herdr agent rename readopt-verify-23eddc readopt-verify-23eddc
+  code=0 stdout={"id":"cli:agent:rename","result":{"agent":{"agent":"readopt-verify-23eddc","agent_status":"unknown","cwd":"/private/tmp","focused":false,"foreground_cwd":"/private/tmp","name":"readopt-verify-23eddc","pane_id":"w1FA:p3","revision":0,"tab_id":"w1FA:t2","terminal_id":"term_6596d382173aa218","workspace_id":"w1FA"},"type":"agent_info"}} stderr=
+$ herdr agent get readopt-verify-23eddc
+  code=0 stdout={"id":"cli:agent:get","result":{"agent":{"agent":"readopt-verify-23eddc","agent_status":"unknown","cwd":"/private/tmp","focused":false,"foreground_cwd":"/private/tmp","name":"readopt-verify-23eddc","pane_id":"w1FA:p3","revision":0,"tab_id":"w1FA:t2","terminal_id":"term_6596d382173aa218","workspace_id":"w1FA"},"type":"agent_info"}} stderr=
+PASS `agent get <name>` resolves again
+PASS …and it is the same live pane, not a new session
+
+===== E. the binding SURVIVES Claude Code's own integration re-reporting on that pane =====
+$ herdr pane report-agent w1FA:p3 --source claude-code --agent claude --state idle
+  code=0 stdout= stderr=
+$ herdr agent get readopt-verify-23eddc
+  code=0 stdout={"id":"cli:agent:get","result":{"agent":{"agent":"claude","agent_status":"idle","cwd":"/private/tmp","focused":false,"foreground_cwd":"/private/tmp","name":"readopt-verify-23eddc","pane_id":"w1FA:p3","revision":0,"tab_id":"w1FA:t2","terminal_id":"term_6596d382173aa218","workspace_id":"w1FA"},"type":"agent_info"}} stderr=
+PASS name pinned by rename survives a foreign source's report
+PASS …while the detected agent + status are handed back to the real integration
+
+===== F. hive can steer the re-adopted target again =====
+$ herdr agent send readopt-verify-23eddc hive readopt verification
+  code=0 stdout={"id":"cli:agent:send","result":{"type":"ok"}} stderr=
+PASS `agent send <name>` is accepted
+
+===== teardown =====
+$ herdr workspace close w1FA
+  code=0 stdout={"id":"cli:workspace:close","result":{"type":"ok"}} stderr=
+
+===== RESULT: all checks passed =====

@@ -69,6 +69,8 @@ export interface SpawnResult {
   workspace_id: string | null; // the WORKTREE's own workspace (used by teardown)
   fleet_workspace_id: string | null; // the shared hive-fleet workspace the tab lives in
   tab_id: string | null;
+  terminal_id: string | null; // stable pane handle; tab/pane ids are reused
+  pane_id: string | null;
   label: string;
 }
 
@@ -276,6 +278,48 @@ export function paneListArgv(): string[] {
   return ["pane", "list"];
 }
 
+// Re-register an already-running pane as an agent named `name`. This is how a
+// live agent is RE-ADOPTED after herdr's agent registry is wiped (a desktop-app
+// restart drops every agent record while the panes — and the claude processes
+// in them — keep running; 2026-08-19). Verified live against herdr 0.7.1:
+// report-agent makes `agent get <name>` resolve again, and when Claude Code's
+// own integration later re-reports on the same pane it overwrites the
+// agent/status fields while the NAME set by `agent rename` survives — so the
+// placeholder self-corrects instead of masking the real status forever.
+export function paneReportAgentArgv(paneId: string, name: string): string[] {
+  return ["pane", "report-agent", paneId, "--source", "hive", "--agent", name, "--state", "unknown"];
+}
+
+export function agentRenameArgv(target: string, name: string): string[] {
+  return ["agent", "rename", target, name];
+}
+
+export function paneProcessInfoArgv(paneId: string): string[] {
+  return ["pane", "process-info", "--pane", paneId];
+}
+
+// A hive fleet tab holds TWO panes at the same worktree cwd: the tab's own root
+// shell (`tab create --cwd`) and the agent's pane (`agent start --tab` splits a
+// second one). Once the registry is wiped they are indistinguishable by cwd, and
+// re-adopting the wrong one would wire every future steer into a bare zsh. This
+// is the positive evidence that tells them apart: the pane's shell pid is
+// running the agent command, not a login shell.
+const LOGIN_SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh"]);
+
+export function paneRunsAgentCommand(stdout: string): boolean {
+  try {
+    const info = (JSON.parse(stdout).result ?? {}).process_info;
+    if (!info) return false;
+    const procs: any[] = info.foreground_processes ?? [];
+    const root = procs.find((x) => x.pid === info.shell_pid) ?? procs[0];
+    if (!root) return false;
+    const name = String(root.argv0 ?? root.name ?? "").replace(/^-/, "");
+    return !!name && !LOGIN_SHELLS.has(name);
+  } catch {
+    return false;
+  }
+}
+
 // Close a whole herdr workspace (its tabs + panes + ptys) WITHOUT removing the
 // git worktree — verified live against 0.7.1: `workspace close` is a terminal-UI
 // op, the checkout on disk is untouched (`herdr worktree open` re-attaches on
@@ -291,6 +335,14 @@ export interface PaneInfo {
   tabId: string | null;
   workspaceId: string | null;
   cwd: string | null;
+  // Stable for the pane's whole life, unlike tab_id/pane_id which herdr reuses
+  // after a close — the id to record at spawn and address a pane by later.
+  terminalId: string | null;
+  // Present only while herdr's agent registry knows this pane: `label` is the
+  // agent's name (hive writes the task id), `agent` its detected kind
+  // ("claude"). Both vanish when a desktop-app restart wipes the registry.
+  label: string | null;
+  agent: string | null;
 }
 
 // `herdr pane list` → {"result":{"panes":[{pane_id,tab_id,workspace_id,cwd,...}]}}.
@@ -305,6 +357,9 @@ export function parsePaneList(stdout: string): PaneInfo[] {
         tabId: p.tab_id ?? p.tabId ?? null,
         workspaceId: p.workspace_id ?? p.workspaceId ?? null,
         cwd: p.cwd ?? null,
+        terminalId: p.terminal_id ?? p.terminalId ?? null,
+        label: p.label ?? null,
+        agent: p.agent ?? null,
       }));
   } catch {
     return [];
@@ -317,13 +372,13 @@ export function parsePaneList(stdout: string): PaneInfo[] {
 // Only hive-spawned agents carry `name` (agentStartArgv names the agent after
 // the task id) — a bare interactive session (David's own) has none; filter to
 // the named ones so the orphan sweep never touches a human's own pane.
-export function parseAgentList(stdout: string): { name: string; tabId: string | null }[] {
+export function parseAgentList(stdout: string): { name: string; tabId: string | null; cwd: string | null }[] {
   try {
     const obj: any = JSON.parse(stdout);
     const agents: any[] = obj.result?.agents ?? obj.agents ?? [];
     return agents
       .filter((a) => typeof a.name === "string" && a.name)
-      .map((a) => ({ name: a.name as string, tabId: a.tab_id ?? a.tabId ?? null }));
+      .map((a) => ({ name: a.name as string, tabId: a.tab_id ?? a.tabId ?? null, cwd: a.cwd ?? null }));
   } catch {
     return [];
   }
@@ -560,6 +615,18 @@ export class Herdr {
     // affordance; the agent keeps its canonical taskId name so probe/send/focus
     // by agent_target keep resolving.
 
+    // One extra `agent get` to record the pane's STABLE terminal id. tab/pane
+    // ids are recycled by herdr; the terminal id is not, so it is what a later
+    // re-adoption (readopt) and any teardown can safely address the pane by.
+    const got = await this.run(agentGetArgv(args.taskId));
+    const agent = (() => {
+      try {
+        return JSON.parse(got.stdout).result?.agent ?? null;
+      } catch {
+        return null;
+      }
+    })();
+
     return {
       agent_target: args.taskId,
       worktree_path: wt.path,
@@ -567,6 +634,8 @@ export class Herdr {
       workspace_id: wt.workspaceId,
       fleet_workspace_id: fleetWs,
       tab_id: tabId,
+      terminal_id: agent?.terminal_id ?? null,
+      pane_id: agent?.pane_id ?? null,
       label,
     };
   }
@@ -672,10 +741,71 @@ export class Herdr {
   // pane list: the task's own pane still being there means alive-but-
   // unregistered. An empty/unavailable pane list is NOT evidence of death
   // either — that is exactly what a down daemon looks like.
-  async confirmGone(hint: { cwd?: string | null; tabId?: string | null }): Promise<boolean> {
+  async confirmGone(hint: { cwd?: string | null; tabId?: string | null; terminalId?: string | null }): Promise<boolean> {
     const panes = await this.listPanes();
     if (!panes.length) return false;
-    return !panes.some((p) => (hint.cwd && p.cwd === hint.cwd) || (hint.tabId && p.tabId === hint.tabId));
+    return !panes.some(
+      (p) =>
+        (hint.terminalId && p.terminalId === hint.terminalId) ||
+        (hint.cwd && p.cwd === hint.cwd) ||
+        (hint.tabId && p.tabId === hint.tabId)
+    );
+  }
+
+  // Re-adopt a live-but-unregistered agent: find its surviving pane and register
+  // it back under `name`, so probe / send / focus / dialog handling all resolve
+  // again without restarting the agent or losing its context. This is the repair
+  // for the failure mode a6a4c70 only made safe: a desktop-app restart wipes
+  // herdr's agent registry, `agent get` answers agent_not_found forever, and
+  // hive loses every channel INTO an agent that is still working.
+  //
+  // Never guesses. It re-registers only a pane it can positively identify as the
+  // agent's: the terminal id recorded at spawn, a surviving registry label, or —
+  // when both are gone — the one pane at the task's cwd whose foreground process
+  // is not a login shell (a fleet tab holds a shell pane at the same cwd).
+  async readopt(hint: {
+    name: string;
+    cwd?: string | null;
+    tabId?: string | null;
+    terminalId?: string | null;
+  }): Promise<{ readopted: boolean; paneId: string | null; terminalId: string | null; reason: string }> {
+    const miss = (reason: string) => ({ readopted: false, paneId: null, terminalId: null, reason });
+    const panes = await this.listPanes();
+    if (!panes.length) return miss("herdr returned no panes"); // daemon down, not a wipe
+
+    let pane: PaneInfo | undefined;
+    let how = "";
+    if (hint.terminalId) {
+      pane = panes.find((p) => p.terminalId === hint.terminalId);
+      how = "terminal_id";
+    }
+    if (!pane) {
+      pane = panes.find((p) => p.label === hint.name);
+      if (pane) how = "label";
+    }
+    if (!pane) {
+      const sameCwd = panes.filter((p) => hint.cwd && p.cwd === hint.cwd && (!hint.tabId || p.tabId === hint.tabId));
+      const running: PaneInfo[] = [];
+      for (const p of sameCwd) {
+        const info = await this.run(paneProcessInfoArgv(p.paneId));
+        if (paneRunsAgentCommand(info.stdout)) running.push(p);
+      }
+      if (running.length !== 1) return miss(`no unambiguous agent pane at cwd (${sameCwd.length} panes, ${running.length} running a command)`);
+      pane = running[0];
+      how = "cwd+process";
+    }
+    if (!pane) return miss("no matching pane");
+
+    const report = await this.run(paneReportAgentArgv(pane.paneId, hint.name));
+    if (report.code !== 0) return miss(`report-agent failed: ${report.stderr.trim() || report.stdout.trim()}`);
+    // Pin the NAME too. The label alone is overwritten the moment Claude Code's
+    // own integration reports on this pane again; the name set here survives
+    // that (verified live), which is what keeps `agent get <taskId>` resolving.
+    await this.run(agentRenameArgv(hint.name, hint.name));
+
+    const probe = await this.probe(hint.name);
+    if (!probe.alive) return miss("re-registered pane still does not resolve");
+    return { readopted: true, paneId: pane.paneId, terminalId: pane.terminalId, reason: `matched by ${how}` };
   }
 
   // Pane tail for stale-recovery evidence and dialog diagnosis. herdr wraps
@@ -876,11 +1006,36 @@ export class Herdr {
   async closeSession(args: {
     agentTarget?: string | null;
     tabId?: string | null;
-  }): Promise<{ closed: boolean; via: string | null }> {
+    // Verify the tab still holds THIS task before closing it. Either is enough.
+    expectTerminalId?: string | null;
+    expectCwd?: string | null;
+  }): Promise<{ closed: boolean; via: string | null; refused?: string }> {
+    let refused: string | undefined;
     try {
       if (args.tabId) {
-        const r = await this.run(tabCloseArgv(args.tabId));
-        if (r.code === 0) return { closed: true, via: `tab ${args.tabId}` };
+        // herdr REUSES tab ids after a close, so a tab id recorded at spawn can
+        // by then belong to a DIFFERENT task's agent — closing it blind is how a
+        // teardown kills a stranger's live session. When the caller knows what
+        // the tab should hold, prove the occupant first and otherwise fall
+        // through to the agent's own pane, which resolves by name.
+        const expect = args.expectTerminalId || args.expectCwd;
+        const held = expect ? (await this.listPanes()).filter((p) => p.tabId === args.tabId) : [];
+        // Refuse only on POSITIVE evidence of a stranger: the tab has panes and
+        // none of them is ours. An empty/unavailable pane list proves nothing
+        // (that is what a down daemon looks like) and must not block cleanup —
+        // the same asymmetry confirmGone uses for death verdicts.
+        const stranger =
+          held.length > 0 &&
+          !held.some(
+            (p) =>
+              (args.expectTerminalId && p.terminalId === args.expectTerminalId) ||
+              (args.expectCwd && p.cwd === args.expectCwd)
+          );
+        if (stranger) refused = `tab ${args.tabId} no longer holds ${expect}`;
+        else {
+          const r = await this.run(tabCloseArgv(args.tabId));
+          if (r.code === 0) return { closed: true, via: `tab ${args.tabId}` };
+        }
       }
       if (args.agentTarget) {
         const got = await this.run(agentGetArgv(args.agentTarget));
@@ -893,7 +1048,7 @@ export class Herdr {
     } catch {
       /* best-effort */
     }
-    return { closed: false, via: null };
+    return { closed: false, via: null, ...(refused ? { refused } : {}) };
   }
 
   // Every hive-spawned agent herdr currently knows about, named by task id

@@ -13,6 +13,7 @@ import { setSetting, now, isOffline } from "./db.ts";
 import { getTask, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, parseWorktreeList } from "./runtime/herdr.ts";
 import { cleanupTask, releaseReviewAgents } from "./cleanup.ts";
+import { teardownBlocked } from "./teardownGuard.ts";
 import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
@@ -36,6 +37,15 @@ export async function reapOnce(db: DB, deps: ReaperDeps = {}): Promise<void> {
   // paused (2026-08-19). Everything here is a side effect; skip the whole sweep.
   if (isOffline(db)) {
     setSetting(db, "last_reap_at", now()); // the loop is healthy, just idle
+    return;
+  }
+  // Same two gates the reconciler's recovery path uses: don't remove worktrees
+  // or close tabs while hive's own view of the fleet is unreliable (the minutes
+  // right after a boot/self-deploy, or while the death-burst breaker is open).
+  const blocked = teardownBlocked(db);
+  if (blocked) {
+    console.log(`[hive] reaper sweep held: ${blocked}`);
+    setSetting(db, "last_reap_at", now()); // the loop is healthy, just holding
     return;
   }
   const herdr = deps.herdr ?? defaultHerdr;
