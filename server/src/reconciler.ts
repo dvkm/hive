@@ -25,7 +25,7 @@ import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
 import { requeueTask, openRecoveryDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, safeBranch } from "./exec.ts";
+import { defaultExec, safeBranch, preferSafeRef } from "./exec.ts";
 import { captureBranchScope } from "./rebaseGuard.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
 
@@ -383,10 +383,11 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
           | { config: string; repo_path: string | null }
           | undefined;
         if (project?.repo_path) {
-          let base = data.baseRefName || "main";
+          let base = "main";
           try {
-            base = data.baseRefName || safeBranch(JSON.parse(project.config ?? "{}").default_branch);
+            base = safeBranch(JSON.parse(project.config ?? "{}").default_branch);
           } catch {}
+          base = preferSafeRef(data.baseRefName, base);
           const scopeHead = data.headRefOid || t.branch;
           const scope = await captureBranchScope(exec, project.repo_path, data.baseRefOid || base, scopeHead);
           if (scope) writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: { ...scope, head_sha: data.headRefOid ?? null } });

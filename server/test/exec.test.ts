@@ -47,3 +47,32 @@ test("isSafeRef rejects option-shaped and malformed refs, accepts real branch na
     expect(safeBranch(good)).toBe(good);
   }
 });
+
+// GitHub-sourced refs (a PR's live baseRefName) hit the same argv risk as
+// config-sourced ones (task #1086, same bug class as #1024).
+test("preferSafeRef uses the candidate only when safe, else the given fallback", async () => {
+  const { preferSafeRef } = await import("../src/exec.ts");
+  expect(preferSafeRef("staging", "main")).toBe("staging");
+  expect(preferSafeRef("--upload-pack=/tmp/evil", "main")).toBe("main");
+  expect(preferSafeRef(undefined, "main")).toBe("main");
+});
+
+// safeBranch/preferSafeRef used to fall back silently everywhere except
+// promoter.ts, so a malformed default_branch quietly diffed against the wrong
+// branch with no operator signal (task #1086).
+test("safeBranch and preferSafeRef warn when rejecting a present-but-unsafe value", async () => {
+  const { safeBranch, preferSafeRef } = await import("../src/exec.ts");
+  const calls: unknown[][] = [];
+  const orig = console.error;
+  console.error = (...args: unknown[]) => calls.push(args);
+  try {
+    safeBranch("--output=/tmp/x");
+    preferSafeRef("--output=/tmp/y", "main");
+    safeBranch(undefined); // missing, not malformed — no warning
+  } finally {
+    console.error = orig;
+  }
+  expect(calls.length).toBe(2);
+  expect(calls[0].join(" ")).toContain("--output=/tmp/x");
+  expect(calls[1].join(" ")).toContain("--output=/tmp/y");
+});

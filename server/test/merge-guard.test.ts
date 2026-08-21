@@ -156,6 +156,49 @@ test("mergeTask proceeds once the declared dependency reaches done", async () =>
   expect(res.status).toBe(200);
 });
 
+// A PR's baseRefName is GitHub-sourced (set via the GitHub UI/API, not local
+// config), but it lands as a POSITIONAL git argument in attemptLocalFf's
+// fallback path the same way config.default_branch does, and git's ref-name
+// rules don't forbid a leading `-` (task #1086, same bug class as #1024).
+// baseRefOid stays a real sha so the early "PR base metadata is missing"
+// guard doesn't short-circuit before the vulnerable read.
+test("mergeTask never lets an option-shaped PR baseRefName reach git argv (task #1086)", async () => {
+  const { db, taskId } = seed();
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/evil", taskId);
+  const payload = "--upload-pack=/tmp/evil";
+  const argvs: string[][] = [];
+  const exec: Exec = stub((argv) => {
+    argvs.push(argv);
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(
+        JSON.stringify({
+          state: "OPEN",
+          mergeStateStatus: "DIRTY",
+          reviewDecision: "APPROVED",
+          statusCheckRollup: [{ conclusion: "SUCCESS" }],
+          baseRefName: payload,
+          baseRefOid: "base-sha-real",
+          headRefOid: "head-sha-real",
+        })
+      );
+    if (argv[0] === "gh" && argv.includes("merge")) return { code: 1, stdout: "", stderr: "GraphQL: Pull Request is not mergeable" };
+    if (argv.includes("diff") && argv.includes("--name-only")) return OK("src/task.ts\n");
+    if (argv.includes("rev-parse")) return OK(argv.at(-1) === "feat" ? "feat-sha\n" : "main-sha\n");
+    if (argv.includes("merge-base") && argv.includes("--is-ancestor")) return OK();
+    if (argv.includes("symbolic-ref")) return OK("other\n");
+    if (argv.includes("worktree") && argv.includes("list")) return OK("");
+    if (argv.includes("update-ref")) return OK();
+    return OK();
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec });
+  expect(res.status).toBe(200);
+  for (const argv of argvs) expect(argv).not.toContain(payload);
+  // fell back to config.default_branch's own fallback ("main"), not the payload
+  const merged: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'merged'").get(taskId);
+  expect(JSON.parse(merged.payload).base).toBe("main");
+});
+
 test("PR merge fails closed when its base metadata is unavailable", async () => {
   const { db, taskId } = seed();
   db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/1", taskId);

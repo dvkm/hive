@@ -64,6 +64,28 @@ export function isSafeRef(v: unknown): v is string {
   return typeof v === "string" && REF_RE.test(v) && !v.includes("..");
 }
 
+function warnUnsafeRef(v: unknown, fallback: string): void {
+  if (v !== undefined && v !== null && v !== "") {
+    console.error(`[hive] rejecting unsafe ref name ${JSON.stringify(v)}; falling back to '${fallback}'`);
+  }
+}
+
 // A config-sourced branch name, or `fallback` when it is missing or unsafe.
-// Every `config.default_branch || "main"` read goes through this.
-export const safeBranch = (v: unknown, fallback = "main"): string => (isSafeRef(v) ? v : fallback);
+// Every `config.default_branch || "main"` read goes through this. Logs when a
+// present-but-unsafe value is rejected, so a malformed default_branch doesn't
+// silently diff against the wrong branch with no operator signal.
+export const safeBranch = (v: unknown, fallback = "main"): string => {
+  if (isSafeRef(v)) return v;
+  warnUnsafeRef(v, fallback);
+  return fallback;
+};
+
+// Prefers `candidate` (e.g. a PR's live baseRefName from `gh pr view`) when it
+// is a safe ref, else `fallback`. Same argv-injection risk as safeBranch even
+// though candidate is GitHub-sourced rather than local config: it still lands
+// as a positional git argument.
+export function preferSafeRef(candidate: unknown, fallback: string): string {
+  if (isSafeRef(candidate)) return candidate;
+  warnUnsafeRef(candidate, fallback);
+  return fallback;
+}
