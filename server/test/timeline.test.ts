@@ -64,6 +64,7 @@ test("needs-decision + decision_answered renders prompt + resolved answer label"
     status: "answered",
     answer_key: "sqlite",
     answer_note: "keep it local",
+    answered_actor: "director-tab-a",
     options: [
       { key: "sqlite", label: "SQLite" },
       { key: "pg", label: "Postgres" },
@@ -80,6 +81,7 @@ test("needs-decision + decision_answered renders prompt + resolved answer label"
     expect(items[0].open).toBe(false);
     expect(items[0].answerLabel).toBe("SQLite"); // resolved key -> label
     expect(items[0].decision.title).toBe("Which database?");
+    expect(items[0].decision.answered_actor).toBe("director-tab-a");
   }
 });
 

@@ -146,7 +146,7 @@ test("apiAutoAnswerDecision: safe card is answered, resolver runs, audit trail r
     risk: "normal",
     options: [{ key: "save", label: "Save as reference", recommended: true }, { key: "ignore", label: "ignore" }],
   });
-  const res = apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "save", answer_note: "the dashboard" });
+  const res = apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "save", answer_note: "the dashboard", actor: "supervisor-session-a" });
   expect(res.status).toBe(200);
 
   // Card is answered and the resolver ran (reference stored).
@@ -156,10 +156,10 @@ test("apiAutoAnswerDecision: safe card is answered, resolver runs, audit trail r
   // Audit: an auto_approved event + a supervisor-sourced decision_answered.
   const audit = db.query("SELECT source, payload FROM events WHERE type='auto_approved' AND json_extract(payload,'$.decision_id')=?").get(d.id) as any;
   expect(audit.source).toBe("chat_supervisor");
-  expect(JSON.parse(audit.payload).category).toBe("ref_capture");
+  expect(JSON.parse(audit.payload)).toMatchObject({ category: "ref_capture", actor: "supervisor-session-a" });
   const answered = db.query("SELECT source, payload FROM events WHERE type='decision_answered' AND json_extract(payload,'$.decision_id')=?").get(d.id) as any;
   expect(answered.source).toBe("chat_supervisor");
-  expect(JSON.parse(answered.payload).answered_by).toBe("chat_supervisor");
+  expect(JSON.parse(answered.payload)).toMatchObject({ answered_by: "chat_supervisor", actor: "supervisor-session-a" });
 });
 
 test("apiAutoAnswerDecision: malformed body is rejected before audit", async () => {

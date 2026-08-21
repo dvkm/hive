@@ -34,6 +34,7 @@ export interface TLDecision {
   answer_note?: string | null;
   answered_at?: string | null;
   answered_by?: string | null;
+  answered_actor?: string | null;
   options?: TLOption[];
 }
 

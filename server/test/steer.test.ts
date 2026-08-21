@@ -86,10 +86,10 @@ const fakePriorSpawn = (taskId: string) =>
 // The headline fix: no live agent -> queued, then carried by the next spawn.
 test("a steer to a task with no agent is queued and delivered on the next spawn", async () => {
   const id = await newTask("no agent yet");
-  const r = await post(`/api/tasks/${id}/send`, { message: "use the OAuth creds in 1password" });
+  const r = await post(`/api/tasks/${id}/send`, { message: "use the OAuth creds in 1password", actor: "director-tab-b" });
   expect(r.json.delivery).toBe("queued");
   expect(r.json.delivered).toBe(false);
-  expect((await steerEvents(id))[0].payload.delivery).toBe("queued");
+  expect((await steerEvents(id))[0].payload).toMatchObject({ delivery: "queued", actor: "director-tab-b" });
 
   const spawn = await post(`/api/tasks/${id}/spawn`, {});
   expect(spawn.json.ok).toBe(true);

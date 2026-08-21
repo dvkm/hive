@@ -28,7 +28,7 @@ Usage:
         ready: PR open (or scout report written) → hand off to review (in_progress -> in_review)
   hive decision ask <task-id> --title <t> --context <s> [--risk <s>] [--blast <s>]
         --option key:label:detail  (repeatable)  --recommend <key>  --needs-input <key>
-  hive decision auto-answer <decision-id> --key <option> [--reason <s>]
+  hive decision auto-answer <decision-id> --key <option> [--reason <s>] [--actor <session>]
         supervisor self-approval: answers ONLY if the server-enforced safety bar
         clears, else exits 3 and leaves the card open for the director
   hive policy add --title <t> --body <s>|--body-file <f> [--scope global|project:<id>]
@@ -60,7 +60,7 @@ Usage:
   hive chat retrospect <thread-id> --summary <text> [--worked <text> ...]
         [--problem <text> ...] [--lesson <text> ...]
   hive chat close <thread-id>             end a thread's live session (reclaims its worktree/agent)
-  hive steer-all "message" [--project <id>]   broadcast a steer to every live agent
+  hive steer-all "message" [--project <id>] [--actor <session>]   broadcast a steer to every live agent
   hive tunnel                             expose hive to your phone over Tailscale HTTPS (private; enables push)
   hive remote                             print LAN URL + API token for phone access (PWA)
   hive stats [--days 7]                   autonomy scorecard (steers, decisions, CI gate, cost)
@@ -320,14 +320,18 @@ async function main() {
     }
     if (sub === "auto-answer") {
       const id = _[0];
-      if (!id) die('usage: hive decision auto-answer <decision-id> --key <option> [--reason "..."]');
+      if (!id) die('usage: hive decision auto-answer <decision-id> --key <option> [--reason "..."] [--actor <session>]');
       if (!flags.key) die("--key is required");
       // Not api(): a 403 here means "not auto-approvable, escalate to the
       // director" — an expected outcome, not a CLI error to die on.
       const r = await fetch(BASE + `/api/decisions/${id}/auto-answer`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ answer_key: String(flags.key), answer_note: flags.reason ? String(flags.reason) : undefined }),
+        body: JSON.stringify({
+          answer_key: String(flags.key),
+          answer_note: flags.reason ? String(flags.reason) : undefined,
+          actor: flags.actor ? String(flags.actor) : undefined,
+        }),
       }).catch((e) => die(`cannot reach hive server at ${BASE} (${e.message}). Is 'hive serve' running?`));
       const res: any = await r.json();
       if (r.status === 403 && res.effect === "escalate") {
@@ -870,14 +874,15 @@ async function main() {
   }
 
   // Broadcast a steer to every live agent (optionally one project's):
-  //   hive steer-all "message" [--project <id>]
+  //   hive steer-all "message" [--project <id>] [--actor <session>]
   if (cmd === "steer-all") {
     const message = argv[1];
     const { flags } = parseFlags(argv.slice(2));
-    if (!message) die('usage: hive steer-all "message" [--project <id>]');
+    if (!message) die('usage: hive steer-all "message" [--project <id>] [--actor <session>]');
     const r = await api("POST", "/api/steer/broadcast", {
       message,
       ...(flags.project ? { project_id: String(flags.project) } : {}),
+      ...(flags.actor ? { actor: String(flags.actor) } : {}),
     });
     console.log(`steered ${r.delivered}/${r.targets} live agents (undelivered are queued for respawn)`);
     return;

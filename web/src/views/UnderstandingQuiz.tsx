@@ -10,7 +10,7 @@ export function UnderstandingQuiz({
   onPassed,
   onDeferred,
 }: {
-  quiz: Pick<Quiz, "task_id" | "question" | "options" | "completed" | "total">;
+  quiz: Pick<Quiz, "task_id" | "question" | "options" | "version" | "completed" | "total">;
   label?: string;
   allowDefer?: boolean;
   onPassed?: (explanation: string | null) => void;
@@ -33,18 +33,18 @@ export function UnderstandingQuiz({
   }, [currentQuiz.question, optionSignature, round]);
 
   useEffect(() => {
-    if (quiz.question === currentQuiz.question) return;
+    if (quiz.question === currentQuiz.question && quiz.version === currentQuiz.version) return;
     setCurrentQuiz(quiz);
     setAnswer("");
     setFeedback("");
     setRound((value) => value + 1);
-  }, [quiz.question]);
+  }, [quiz.question, quiz.version]);
 
   const submit = async () => {
     if (!answer || busy) return;
     setBusy(true);
     try {
-      const result = await api.answerUnderstandingQuiz(currentQuiz.task_id, answer);
+      const result = await api.answerUnderstandingQuiz(currentQuiz.task_id, answer, currentQuiz.version);
       if (result.passed) {
         toast("Understanding confirmed");
         onPassed?.(result.explanation);

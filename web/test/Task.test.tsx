@@ -42,8 +42,8 @@ api.taskUsage = (async (id: string) => ({
   totals: { total_tokens: 0, cost_usd: 0, unpriced: 0, calls: 0 },
 })) as typeof api.taskUsage;
 
-function tree(t: Task, store: Store = fakeStore) {
-  api.task = (async () => detail(t)) as typeof api.task;
+function tree(t: Task, store: Store = fakeStore, taskDetail: TaskDetail = detail(t)) {
+  api.task = (async () => taskDetail) as typeof api.task;
   return (
     <MemoryRouter>
       <Ctx.Provider value={store}>
@@ -67,6 +67,7 @@ const quiz = (taskId: string, extra: Partial<UnderstandingQuiz> = {}): Understan
   report: {},
   question: "Why does this matter?",
   options: [{ key: "a", label: "A" }, { key: "b", label: "B" }],
+  version: `quiz-${taskId}:0`,
   status: "required",
   ...extra,
 });
@@ -111,6 +112,43 @@ test("Dispatch now and Send steer show normally for an ordinary (non-external) q
 
   expect(btn(renderer, "Dispatch now").length).toBe(1);
   expect(btn(renderer, "Send steer").length).toBe(1);
+});
+
+test("the task timeline renders director actors on actions and resolved decisions", async () => {
+  const t = task("actors", { state: "in_progress" });
+  const d = {
+    id: "dec-actors",
+    task_id: t.id,
+    ts: "2026-01-01T00:00:00.000Z",
+    title: "Ship now?",
+    context: "Choose whether to ship.",
+    risk: "low",
+    blast_radius: null,
+    options: [{ key: "yes", label: "Ship" }],
+    status: "answered",
+    answer_key: "yes",
+    answer_note: null,
+    draft_note: null,
+    answered_at: "2026-01-01T00:00:02.000Z",
+    answered_by: "director",
+    answered_actor: "director-tab-a",
+  } as const;
+  const taskDetail = {
+    ...detail(t),
+    events: [
+      { id: "evt-decision", task_id: t.id, ts: d.ts, source: "agent", type: "needs-decision", payload: { decision_id: d.id } },
+      { id: "evt-merge", task_id: t.id, ts: "2026-01-01T00:00:03.000Z", source: "director", type: "merged", payload: { actor: "director-tab-b" } },
+    ],
+    decisions: [d],
+  } as unknown as TaskDetail;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t, fakeStore, taskDetail));
+  });
+
+  const text = JSON.stringify(renderer.toJSON());
+  expect(text).toContain("director-tab-a");
+  expect(text).toContain("director-tab-b");
 });
 
 // The server accepts understanding-quiz answers in in_review/verifying/done/failed

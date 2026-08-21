@@ -183,11 +183,8 @@ function TimelineRow({ it }: { it: TimelineItem }) {
           <Link className="btn btn-primary btn-mini" to="/decisions">Answer in inbox →</Link>
         ) : (
           <div className="tl-decision-answer">
-            {d.answered_by && ANSWERED_BY_LABEL[d.answered_by] ? (
-              <>{ANSWERED_BY_LABEL[d.answered_by]} answered: </>
-            ) : (
-              <>✓ You answered: </>
-            )}
+            {d.answered_by && ANSWERED_BY_LABEL[d.answered_by] ? ANSWERED_BY_LABEL[d.answered_by] : "✓ You"}
+            {d.answered_actor && <> ({d.answered_actor})</>} answered:{" "}
             <strong>{it.answerLabel}</strong>
             {d.answer_note && <> — {d.answer_note}</>}
             {d.answered_at && <span className="tl-age"> · {relTime(d.answered_at)}</span>}
@@ -198,9 +195,10 @@ function TimelineRow({ it }: { it: TimelineItem }) {
   }
 
   const ev = it.ev;
+  const actor = typeof ev.payload.actor === "string" && ev.payload.actor.trim() ? ev.payload.actor : null;
   return (
     <li>
-      <span className={`src src-${ev.source}`}>{ev.source}</span>
+      <span className={`src src-${ev.source}`}>{ev.source}{actor && ` · ${actor}`}</span>
       <span className="tl-type">{ev.type}</span>
       <span className="tl-note">{eventText(ev)}</span>
       <span className="tl-age" title={ev.ts}>{relTime(ev.ts)}</span>
