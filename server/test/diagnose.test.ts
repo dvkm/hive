@@ -75,6 +75,35 @@ test("auto-approve: read-shaped MCP tools yes, write tools and file prompts no",
   expect(dialogAutoApprovable("anything", ["([bad"]) ).toBe(false);
 });
 
+test("diagnoses Claude Code's queued-messages footer on an idle agent (task #1098)", () => {
+  const tail = `Set up auto mode for your environment?
+Also scan shell history
+Quick safety check: Is this a project you trust?
+Yes, I trust this folder
+requested permissions to edit .git
+Do you want to proceed?
+Esc to cancel
+API Error: an older request failed
+╭──────────────────────────────────────╮
+│ >                                      │
+╰──────────────────────────────────────╯
+  Press up to edit queued messages`;
+  expect(diagnosePane(tail)?.kind).toBe("queued_input");
+});
+
+test("does not diagnose historical or echoed queued-message footer text", () => {
+  const historical = `Press up to edit queued messages
+completed
+old output 1
+old output 2
+old output 3
+old output 4
+old output 5
+>`;
+  expect(diagnosePane(historical)).toBeNull();
+  expect(diagnosePane('Claude printed "Press up to edit queued messages" here\n>')).toBeNull();
+});
+
 test("dialog wins over other matches; clean output diagnoses null", () => {
   const both = "API Error: rate limit\n...\nrequested permissions to edit .git\nDo you want to proceed?\n 1. Yes";
   expect(diagnosePane(both)?.kind).toBe("blocked_dialog");

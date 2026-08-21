@@ -10,6 +10,7 @@ export type PaneDiagnosis =
   | { kind: "context_full"; excerpt: string }
   | { kind: "usage_limit"; excerpt: string }
   | { kind: "api_error"; excerpt: string }
+  | { kind: "queued_input"; excerpt: string }
   | null;
 
 // "You've hit your session limit · resets 4:20pm (America/Los_Angeles)" →
@@ -64,7 +65,18 @@ export function diagnosePane(tail: string): PaneDiagnosis {
     return -1;
   };
 
-  // Order matters: a dialog is the most specific, actionable state.
+  // Claude Code queued a submitted message (sent while it was mid-turn) but
+  // went idle without auto-draining it (task #1098, incident 2026-08-19: a
+  // steer's Enter landed, the text queued exactly as the UI intends, and then
+  // the turn that would have drained it just never started). The footer is the
+  // CLI's own signal that something is queued for a future turn, so it's safe
+  // to act on directly.
+  const footer = lines.slice(-6);
+  const queued = footer.findIndex((line) => /^\s*Press up to edit queued messages\s*$/i.test(line));
+  if (queued !== -1)
+    return { kind: "queued_input", excerpt: excerptAround(lines, lines.length - footer.length + queued) };
+
+  // Dialogs are the next most specific, actionable state.
   const autoMode = find(/Set up auto mode for your environment\?/i);
   if (
     autoMode !== -1 &&

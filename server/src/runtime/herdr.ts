@@ -747,7 +747,7 @@ export class Herdr {
       if (!paneId) return { code: 1, stdout: got.stdout, stderr: "agent has no pane" };
       const sent = await this.run(paneSendKeysArgv(paneId, key));
       if (sent.code !== 0) return sent;
-      if (key === "Escape") return sent;
+      if (key === "Escape" || key === "Enter") return sent;
       return this.run(paneSendKeysArgv(paneId, "Enter"));
     } catch (e: any) {
       return { code: 1, stdout: "", stderr: String(e?.message ?? e) };
