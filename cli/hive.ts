@@ -17,6 +17,9 @@ Usage:
   hive task move <task-id> <state> [--note <s>]   states: queued in_progress needs_decision
         in_review verifying done failed cancelled
   hive task list [--state <s>] [--project <id>]
+  hive task update <task-id> --depends-on <id,id>   declare a dependency discovered mid-task
+        (e.g. "my PR needs #993's to merge first"); full replace, so pass every
+        id this task should still wait on, not just the new one
   hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>]
         types: status | evidence | needs-decision | ready | done | blocked | deferred | undefer | review_summary | <custom>
         review_summary: --json review.json with {done[], iffy[], decisions[], testing[], followups[], understanding{check{question,options[],answer_key}}}
@@ -227,6 +230,14 @@ async function main() {
       if (!tasks.length) return console.log("(no tasks)");
       for (const t of tasks)
         console.log(`${t.id}  ${t.state.padEnd(14)} ${t.kind.padEnd(6)} ${t.title}`);
+      return;
+    }
+    if (sub === "update") {
+      const taskId = _[0];
+      if (!taskId) die("usage: hive task update <task-id> --depends-on <id,id>");
+      if (flags["depends-on"] === undefined) die("--depends-on is required (full replace — pass every id this task should wait on)");
+      const t = await api("PUT", `/api/tasks/${taskId}`, { depends_on: String(flags["depends-on"]) });
+      console.log(`task ${t.id} depends_on: ${t.depends_on.length ? t.depends_on.join(", ") : "(none)"}`);
       return;
     }
     die(`unknown 'task' subcommand: ${sub}\n\n${USAGE}`);
