@@ -42,7 +42,7 @@ import {
   parseIncident,
 } from "./rows.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from "./runtime/herdr.ts";
-import { queuedSteers, markSteersDelivered, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
+import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
@@ -79,7 +79,7 @@ import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, projectBaseBranch, preferSafeRef } from "./exec.ts";
+import { defaultExec, projectBaseBranch, projectComparisonBase, preferSafeRef } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
 import { projectPrefix, taskIdentifier } from "./taskIdentifier.ts";
 import {
@@ -2351,7 +2351,7 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   if (project?.repo_path && task.branch) {
     const config = JSON.parse(project.config ?? "{}");
-    const base = projectBaseBranch(config);
+    const base = projectComparisonBase(config);
     // TERMINAL, not just done/cancelled: a `failed` task's branch is as dead as
     // a cancelled one, and acme's 109 failed tasks were 87 of the 103 rows
     // this flag used to dump on one card (task #1134).
@@ -2380,6 +2380,7 @@ function ghMergeFlag(method: string | undefined): string {
 // records everything for a respawned agent). Other failures (CI blocked, auth,
 // gh missing) keep the task in_review and just report the reason.
 const MERGE_CONFLICT_RE = /conflict|not mergeable|not an ancestor|fast-forward/i;
+const AUTO_MERGE_PAUSED = "auto-merge paused because task readiness changed; review the task again";
 async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason: string, actor: string | null = null): Promise<Response> {
   const conflict = MERGE_CONFLICT_RE.test(reason);
   const msg = `hive: merge into '${base}' failed — ${reason}\nRebase your branch '${task.branch}' onto the latest '${base}', resolve the conflicts, rerun the tests, then push.`;
@@ -2422,7 +2423,8 @@ async function attemptLocalFf(
   project: any,
   task: any,
   base: string,
-  requiredPr?: { base: string; head: string | null }
+  requiredPr?: { base: string; head: string | null },
+  beforeMutation?: () => boolean
 ): Promise<string | null> {
   const baseSha = await exec(["git", "-C", project.repo_path, "rev-parse", base]);
   const branchSha = await exec(["git", "-C", project.repo_path, "rev-parse", task.branch]);
@@ -2459,6 +2461,7 @@ async function attemptLocalFf(
   const head = await exec(["git", "-C", project.repo_path, "symbolic-ref", "--short", "HEAD"]);
   const current = head.stdout.trim();
   if (head.code === 0 && current === base) {
+    if (beforeMutation && !beforeMutation()) return AUTO_MERGE_PAUSED;
     const r = await exec(["git", "-C", project.repo_path, "merge", "--ff-only", task.branch]);
     if (r.code !== 0) return r.stderr.trim() || r.stdout.trim() || `git merge --ff-only exited ${r.code}`;
     return null;
@@ -2474,6 +2477,7 @@ async function attemptLocalFf(
     return `'${base}' is checked out at '${path}'; merge from that checkout before retrying.`;
   }
 
+  if (beforeMutation && !beforeMutation()) return AUTO_MERGE_PAUSED;
   const r = await exec(["git", "-C", project.repo_path, "update-ref", `refs/heads/${base}`, newSha, oldSha]);
   if (r.code !== 0) return r.stderr.trim() || r.stdout.trim() || `git update-ref exited ${r.code}`;
   return null;
@@ -2517,7 +2521,14 @@ function staleBaseRefusal(prView: any): boolean {
 // the local ff before bouncing the task back to the agent (rebasing onto a
 // stale origin/<base> would only make things worse).
 // Guarded by the `task.merge` standing-authority action.
-export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps): Promise<Response> {
+export async function mergeTask(
+  db: DB,
+  herdr: Herdr,
+  id: string,
+  body: any,
+  deps: HandlerDeps,
+  opts: { beforeMutation?: () => boolean } = {}
+): Promise<Response> {
   const task = getTask(db, id);
   const actor = actorOf(body);
   if (!task) return err("task not found", 404);
@@ -2683,6 +2694,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
     if (task.pr_url && !forceLocalFf) {
       const flag = ghMergeFlag(config.merge_method);
       method = `pr ${flag.slice(2)}`;
+      if (opts.beforeMutation && !opts.beforeMutation()) return err(AUTO_MERGE_PAUSED, 409);
       const r = await exec(["gh", "pr", "merge", task.pr_url, flag]);
       if (r.code !== 0) {
         const reason = r.stderr.trim() || r.stdout.trim() || `gh pr merge exited ${r.code}`;
@@ -2694,9 +2706,18 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
         // state: a protection block (failing checks, missing reviews) wears the
         // same "not mergeable" reason, and must never be merged around.
         if (MERGE_CONFLICT_RE.test(reason) && staleBaseRefusal(prView) && project?.repo_path && task.branch) {
-          const ffReason = await attemptLocalFf(exec, project, task, base, { base: guardBase, head: prView?.headRefOid ?? null });
+          const ffReason = await attemptLocalFf(
+            exec,
+            project,
+            task,
+            base,
+            { base: guardBase, head: prView?.headRefOid ?? null },
+            opts.beforeMutation
+          );
           if (ffReason === null) {
             method = "local ff-only (PR merge reported not-mergeable against origin/" + base + ")";
+          } else if (ffReason === AUTO_MERGE_PAUSED) {
+            return err(ffReason, 409);
           } else {
             return mergeFailed(db, herdr, task, base, `${reason}; local fast-forward also refused: ${ffReason}`, actor);
           }
@@ -2716,8 +2737,10 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
         project,
         task,
         base,
-        task.pr_url ? { base: guardBase, head: prView?.headRefOid ?? null } : undefined
+        task.pr_url ? { base: guardBase, head: prView?.headRefOid ?? null } : undefined,
+        opts.beforeMutation
       );
+      if (ffReason === AUTO_MERGE_PAUSED) return err(ffReason, 409);
       if (ffReason !== null) return mergeFailed(db, herdr, task, base, ffReason, actor);
       method = forceLocalFf && task.pr_url ? "local ff-only (forced; PR-backed task)" : "local ff-only";
     }
@@ -3022,6 +3045,7 @@ export async function spawnAgent(
   // The agent is up and holding the queued steers in its brief — receipt them.
   // Only now: a failed spawn above leaves them queued for the next attempt.
   markSteersDelivered(db, pending.map((s) => s.id));
+  resumeReviewForDeliveredSteers(db, id, pending, "respawn");
   if (task.state === "queued") transition(db, id, "in_progress", { source: "herdr", reason: "agent spawned" });
 
   if (opts.supervise) superviseAgent(db, herdr, id, result.agent_target);

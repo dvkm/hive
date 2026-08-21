@@ -13,7 +13,10 @@ const { transition, writeEvent } = await import("../src/state.ts");
 import type { DB } from "../src/db.ts";
 import type { Exec } from "../src/exec.ts";
 
-function setup(config: any = {}, extra: Partial<{ source: string; agent_target: string }> = {}): { db: DB; id: string } {
+function setup(
+  config: any = {},
+  extra: Partial<{ source: string; agent_target: string; pr_url: string | null; branch: string }> = {}
+): { db: DB; id: string } {
   const db = openDb(":memory:");
   const pid = newId("proj");
   const t = now();
@@ -22,8 +25,19 @@ function setup(config: any = {}, extra: Partial<{ source: string; agent_target: 
   );
   const id = newId();
   db.query(
-    "INSERT INTO tasks (id, project_id, title, brief, state, kind, source, agent_target, pr_url, created_at, updated_at) VALUES (?,?,?,?, 'queued','ship',?,?,?,?,?)"
-  ).run(id, pid, "add feature", "make it work", extra.source ?? null, extra.agent_target ?? null, "https://gh/pr/5", t, t);
+    "INSERT INTO tasks (id, project_id, title, brief, state, kind, source, agent_target, branch, pr_url, created_at, updated_at) VALUES (?,?,?,?, 'queued','ship',?,?,?,?,?,?)"
+  ).run(
+    id,
+    pid,
+    "add feature",
+    "make it work",
+    extra.source ?? null,
+    extra.agent_target ?? null,
+    extra.branch ?? null,
+    extra.pr_url === undefined ? "https://gh/pr/5" : extra.pr_url,
+    t,
+    t
+  );
   transition(db, id, "in_progress");
   transition(db, id, "in_review");
   return { db, id };
@@ -53,6 +67,28 @@ test("posts a structured pre-review onto the review card, once", async () => {
   expect(prompts[0]).toContain("--model sonnet");
 
   await autoReviewOnce(db, { exec: claude, shellExec: ghDiff }); // no second review
+  expect(events(db, id, "auto_review")).toHaveLength(1);
+});
+
+test("a branch-only review compares against the remote integration branch", async () => {
+  const { db, id } = setup(
+    { promote: { from: "staging", to: "main" } },
+    { branch: "hive/task", pr_url: null }
+  );
+  const gitCalls: string[][] = [];
+  const git: Exec = async (argv) => {
+    gitCalls.push(argv);
+    return { code: 0, stdout: "--- a/x.ts\n+++ b/x.ts\n+const y = 1;", stderr: "" };
+  };
+  const claude = async () => ({
+    code: 0,
+    stdout: JSON.stringify({ result: '{"verdict":"looks_good","summary":"fine","risks":[],"questions":[]}' }),
+    stderr: "",
+  });
+
+  await autoReviewOnce(db, { exec: claude, shellExec: git });
+
+  expect(gitCalls).toEqual([["git", "-C", "/repo", "diff", "origin/staging...hive/task"]]);
   expect(events(db, id, "auto_review")).toHaveLength(1);
 });
 

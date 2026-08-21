@@ -92,7 +92,7 @@ test("taskDiff uses git diff base...branch for a branch task, gh for a PR task",
   };
   const rg = await taskDiff(db, "task1", gitExec);
   expect(rg.ok).toBe(true);
-  expect(has(seen, "git", "diff", "main...hive/task1")).toBe(true);
+  expect(has(seen, "git", "diff", "origin/main...hive/task1")).toBe(true);
 
   // now give it a PR url → gh path
   db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/1", "task1");

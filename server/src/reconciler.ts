@@ -14,7 +14,7 @@ import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, isTrackingOnlyTask, queuedInputRecoveryPending, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
 import { spawnMeta } from "./cleanup.ts";
-import { queuedSteers, markSteersDelivered, queueSteerEvent } from "./steer.ts";
+import { queuedSteers, markSteersDelivered, queueSteerEvent, resumeReviewForDeliveredSteers } from "./steer.ts";
 import { isReviewed } from "./dispatcher.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
@@ -352,6 +352,12 @@ async function drainSteers(db: DB, deps: ReconcilerDeps): Promise<void> {
       delivered.push(s.id);
     }
     markSteersDelivered(db, delivered, "drain");
+    resumeReviewForDeliveredSteers(
+      db,
+      t.id,
+      pending.filter((steer) => delivered.includes(steer.id)),
+      "drain"
+    );
   }
 }
 
@@ -798,6 +804,9 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     .all() as { id: string; number: number; title: string; kind: string; config: string }[];
   for (const r of rows) {
     if (isTrackingOnlyId(db, r.id)) continue;
+    // A queued steer is requested work the agent has not received yet. Never
+    // merge the branch before a fresh turn can address it.
+    if (queuedSteers(db, r.id).length) continue;
     // #1234 review-12: don't auto-merge out from under a queued-input recovery
     // that just fired on this same task — the redelivered turn may still push.
     if (queuedInputRecoveryPending(db, r.id)) continue;
@@ -838,7 +847,13 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     const evidence = (db.query("SELECT COUNT(*) n FROM evidence WHERE task_id = ?").get(r.id) as any).n;
     if (!evidence) continue;
     try {
-      const res = await mergeTask(db, h, r.id, {}, { exec: deps.exec });
+      const beforeMutation = () => {
+        const task = getTask(db, r.id);
+        if (!task || task.state !== "in_review" || task.ci_status !== "passing") return false;
+        if (queuedSteers(db, r.id).length || queuedInputRecoveryPending(db, r.id)) return false;
+        return !db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'changes_requested' LIMIT 1").get(r.id);
+      };
+      const res = await mergeTask(db, h, r.id, {}, { exec: deps.exec }, { beforeMutation });
       const ok = res.status === 200;
       writeEvent(db, { task_id: r.id, source: "reconciler", type: "auto_merged", payload: { ok, status: res.status } });
       if (ok)
