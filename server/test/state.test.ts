@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
-import { transition, canTransition, TransitionError, getTask, expireOpenDecisions, expireOrphanedDecisions, isDeferred, deferTask, undeferTask } from "../src/state.ts";
+import { transition, canTransition, TransitionError, getTask, expireOpenDecisions, expireOrphanedDecisions, isDeferred, deferTask, undeferTask, advanceIfFinished, writeEvent } from "../src/state.ts";
 
 function freshDb(): { db: DB; projectId: string } {
   const db = openDb(":memory:");
@@ -77,6 +77,28 @@ test("done succeeds once evidence exists", () => {
   addEvidence(db, id);
   transition(db, id, "done");
   expect(getTask(db, id).state).toBe("done");
+});
+
+test("advanceIfFinished waits for queued-input recovery to settle", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  transition(db, id, "in_progress");
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/1", id);
+  addEvidence(db, id);
+  const recovery = writeEvent(db, {
+    task_id: id,
+    source: "reconciler",
+    type: "queued_input_recovered",
+    payload: { delivered: null },
+  });
+
+  expect(advanceIfFinished(db, id, "idle", "herdr")).toBe(false);
+  db.query("UPDATE events SET payload = ? WHERE id = ?").run(JSON.stringify({ delivered: true }), recovery.id);
+  expect(advanceIfFinished(db, id, "idle", "reconciler")).toBe(false);
+
+  db.query("UPDATE events SET ts = ? WHERE id = ?").run(new Date(Date.now() - 3 * 60 * 1000).toISOString(), recovery.id);
+  expect(advanceIfFinished(db, id, "idle", "herdr")).toBe(true);
+  expect(getTask(db, id).state).toBe("in_review");
 });
 
 test("scout requires a report evidence for done", () => {

@@ -575,14 +575,30 @@ export function ReviewCard({
         <DecisionCard key={d.id} d={d} onDone={() => setOpenDecisions((ds) => ds.filter((x) => x.id !== d.id))} />
       ))}
 
-      {/* Stacked-PR flag (task #1000): this branch shares history with another
-          currently open task's branch, computed live via merge-base — not a
-          claim in the agent's evidence. Informational, not blocking: stacked
-          branches are sometimes intentional, but the director should know
-          before merging that the other task's later rewrites won't be reflected here. */}
+      {/* Stacked-PR flag (task #1000): this branch shares unmerged commits with
+          another currently open task's branch, computed live via merge-base — not
+          a claim in the agent's evidence. Informational, not blocking: stacked
+          branches are sometimes intentional, but the director should know before
+          merging that those tasks' later rewrites won't be reflected here.
+          One sentence, numbers only — task #1134: listing every title made this
+          an 80-line dump nobody could act on. Titles live in the expander. */}
       {embeddedTasks.length > 0 && (
         <div className="review-merge-error" title="Detected via git merge-base against every other open task's branch in this project">
-          ⚠ Shares history with {embeddedTasks.map((t) => `#${t.number} ${t.title}`).join(", ")} — if that task's branch is later rewritten, this one won't pick up the change.
+          ⚠ Branch shares unmerged commits with {embeddedTasks.length} active{" "}
+          {embeddedTasks.length === 1 ? "task" : "tasks"} (
+          {embeddedTasks.slice(0, 3).map((t) => `#${t.number}`).join(", ")}
+          {embeddedTasks.length > 3 && `, +${embeddedTasks.length - 3} more`}) — a rebase or rewrite
+          there won't propagate here.
+          {embeddedTasks.length > 3 && (
+            <details className="merge-issues">
+              <summary>Which tasks</summary>
+              <ol>
+                {embeddedTasks.map((t) => (
+                  <li key={t.id}>#{t.number} {t.title}</li>
+                ))}
+              </ol>
+            </details>
+          )}
         </div>
       )}
 

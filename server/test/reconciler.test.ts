@@ -1,8 +1,9 @@
 import { test, expect } from "bun:test";
-import { openDb, newId, now, type DB } from "../src/db.ts";
+import { openDb, newId, now, getSetting, type DB } from "../src/db.ts";
 import { transition, getTask, writeEvent } from "../src/state.ts";
 import { reconcileOnce, ciStatusOf } from "../src/reconciler.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
+import { addClient, removeClient } from "../src/bus.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
 function freshDb(config: any = {}): { db: DB; projectId: string } {
@@ -109,6 +110,189 @@ test("syncAgents cancels Claude's optional auto-mode scan without opting in", as
 
   expect(keys).toEqual(["Escape"]);
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dialog_auto_declined'").get(id)).toBeTruthy();
+});
+
+test("syncAgents recovers an idle agent with unconsumed queued input via Up+Enter (task #1098)", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  const keys: string[] = [];
+  const messages: any[] = [];
+  const client = { id: newId("client"), send: (data: string) => messages.push(JSON.parse(data)) };
+  const herdr = new Herdr(stub((argv) => {
+    if (argv.includes("read"))
+      return OK(JSON.stringify({ result: { read: { text: "> \n\nPress up to edit queued messages" } } }));
+    if (argv.includes("send-keys")) {
+      keys.push(argv.at(-1)!);
+      return OK();
+    }
+    return OK('{"result":{"agent":{"agent_status":"idle","pane_id":"w1:p1"}}}');
+  }), "herdr");
+
+  addClient(client);
+  try {
+    await reconcileOnce(db, { herdr, staleMs: 60 * 60 * 1000, exec: stub(() => ({ code: 1, stdout: "", stderr: "no gh" })) });
+  } finally {
+    removeClient(client);
+  }
+
+  expect(keys).toEqual(["Up", "Enter"]);
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'queued_input_recovered'").get(id) as any;
+  expect(ev).toBeTruthy();
+  expect(JSON.parse(ev.payload).delivered).toBe(true);
+  const recoveryUpdates = messages.filter((m) => m.type === "event" && m.event.type === "queued_input_recovered");
+  expect(recoveryUpdates.map((m) => m.event.payload.delivered)).toEqual([null, true]);
+});
+
+test("queued-input recovery blocks review handoff through its grace period", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "t-agent", pr_url: "https://gh/pr/1", state: "in_progress" });
+  db.query("INSERT INTO evidence (id, task_id, ts, kind) VALUES (?,?,?,?)").run(newId("ev"), id, now(), "log");
+  let reads = 0;
+  const herdr = new Herdr(stub((argv) => {
+    if (argv.includes("get")) {
+      return OK(JSON.stringify({ result: { agent: { agent_status: "idle", pane_id: "w1:p1" } } }));
+    }
+    if (argv.includes("read")) {
+      const text = reads++ === 0 ? "Press up to edit queued messages" : ">";
+      return OK(JSON.stringify({ result: { read: { text } } }));
+    }
+    return OK();
+  }), "herdr");
+  const noGh = stub(() => ({ code: 1, stdout: "", stderr: "no gh" }));
+
+  await reconcileOnce(db, { herdr, staleMs: 60 * 60 * 1000, exec: noGh });
+  expect(getTask(db, id).state).toBe("in_progress");
+
+  db.query("UPDATE events SET ts = ? WHERE task_id = ? AND type = 'queued_input_recovered'")
+    .run(new Date(Date.now() - 3 * 60 * 1000).toISOString(), id);
+  await reconcileOnce(db, { herdr, staleMs: 60 * 60 * 1000, exec: noGh });
+  expect(getTask(db, id).state).toBe("in_review");
+});
+
+test("queued-input recovery retries Enter when Up succeeds but submission fails", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  const keys: string[] = [];
+  let enters = 0;
+  const herdr = new Herdr(stub((argv) => {
+    if (argv.includes("read"))
+      return OK(JSON.stringify({ result: { read: { text: "Press up to edit queued messages" } } }));
+    if (argv.includes("send-keys")) {
+      const key = argv.at(-1)!;
+      keys.push(key);
+      if (key === "Enter" && enters++ === 0) return { code: 1, stdout: "", stderr: "submission failed" };
+      return OK();
+    }
+    return OK('{"result":{"agent":{"agent_status":"idle","pane_id":"w1:p1"}}}');
+  }), "herdr");
+
+  await reconcileOnce(db, { herdr, staleMs: 60 * 60 * 1000, exec: stub(() => ({ code: 1, stdout: "", stderr: "no gh" })) });
+
+  expect(keys).toEqual(["Up", "Enter", "Enter"]);
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'queued_input_recovered'").get(id) as any;
+  expect(JSON.parse(ev.payload).delivered).toBe(true);
+});
+
+test("queued-input recovery stops hammering the pane and alerts after repeated failures to drain", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  const keys: string[] = [];
+  const herdr = new Herdr(stub((argv) => {
+    if (argv.includes("read"))
+      return OK(JSON.stringify({ result: { read: { text: "Press up to edit queued messages" } } }));
+    if (argv.includes("send-keys")) {
+      keys.push(argv.at(-1)!);
+      return OK();
+    }
+    return OK('{"result":{"agent":{"agent_status":"idle","pane_id":"w1:p1"}}}');
+  }), "herdr");
+  const noGh = stub(() => ({ code: 1, stdout: "", stderr: "no gh" }));
+
+  for (let i = 0; i < 5; i++) await reconcileOnce(db, { herdr, staleMs: 60 * 60 * 1000, exec: noGh });
+
+  // Never sends more than MAX_QUEUED_INPUT_NUDGES (3) attempts — stops
+  // hammering the pane once it's clear Up+Enter isn't draining the queue.
+  expect(keys.filter((k) => k === "Up").length).toBe(3);
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'queued_input_recovered'").get(id)).toEqual({ n: 3 });
+  const notif = db.query("SELECT * FROM notifications WHERE task_id = ? AND kind = 'queued_input_stuck'").all(id);
+  expect(notif.length).toBe(1); // alerts once, doesn't spam every cycle after
+
+  db.query("UPDATE events SET ts = '2000-01-01T00:00:00.000Z' WHERE task_id = ?").run(id);
+  db.query("UPDATE notifications SET ts = '2000-01-01T00:00:00.000Z' WHERE task_id = ?").run(id);
+  const activity = writeEvent(db, { task_id: id, source: "agent", type: "progress" });
+  db.query("UPDATE events SET ts = '2001-01-01T00:00:00.000Z' WHERE id = ?").run(activity.id);
+
+  for (let i = 0; i < 5; i++) await reconcileOnce(db, { herdr, staleMs: 60 * 60 * 1000, exec: noGh });
+
+  expect(keys.filter((k) => k === "Up").length).toBe(6);
+  expect(db.query("SELECT COUNT(*) AS n FROM notifications WHERE task_id = ? AND kind = 'queued_input_stuck'").get(id)).toEqual({ n: 2 });
+});
+
+test("overlapping queued-input recoveries reserve attempts before pane writes", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  for (let i = 0; i < 2; i++)
+    writeEvent(db, { task_id: id, source: "reconciler", type: "queued_input_recovered", payload: { delivered: true } });
+
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve));
+  let markFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => (markFirstStarted = resolve));
+  let upCalls = 0;
+  const herdr = new Herdr(async (argv) => {
+    if (argv.includes("read"))
+      return OK(JSON.stringify({ result: { read: { text: "Press up to edit queued messages" } } }));
+    if (argv.includes("send-keys") && argv.at(-1) === "Up") {
+      upCalls++;
+      if (upCalls === 1) {
+        markFirstStarted();
+        await firstGate;
+      }
+      return OK();
+    }
+    if (argv.includes("send-keys")) return OK();
+    return OK('{"result":{"agent":{"agent_status":"idle","pane_id":"w1:p1"}}}');
+  }, "herdr");
+  const noGh = stub(() => ({ code: 1, stdout: "", stderr: "no gh" }));
+
+  const first = reconcileOnce(db, { herdr, staleMs: 60 * 60 * 1000, exec: noGh });
+  await firstStarted;
+  const second = reconcileOnce(db, { herdr, staleMs: 60 * 60 * 1000, exec: noGh });
+  await second;
+  expect(db.query("SELECT COUNT(*) AS n FROM notifications WHERE task_id = ? AND kind = 'queued_input_stuck'").get(id)).toEqual({ n: 0 });
+  releaseFirst();
+  await first;
+
+  expect(upCalls).toBe(1);
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'queued_input_recovered'").get(id)).toEqual({ n: 3 });
+  await reconcileOnce(db, { herdr, staleMs: 60 * 60 * 1000, exec: noGh });
+  expect(db.query("SELECT COUNT(*) AS n FROM notifications WHERE task_id = ? AND kind = 'queued_input_stuck'").get(id)).toEqual({ n: 1 });
+});
+
+test("stale queued-input recovery shares the immediate three-attempt cap", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  for (let i = 0; i < 3; i++)
+    writeEvent(db, { task_id: id, source: "reconciler", type: "queued_input_recovered", payload: { delivered: true } });
+  writeEvent(db, { task_id: id, source: "reconciler", type: "stale" });
+  const writes: string[][] = [];
+  let probes = 0;
+  const herdr = new Herdr(stub((argv) => {
+    if (argv[0] === "agent" && argv[1] === "get") {
+      const status = probes++ === 0 ? "working" : "idle";
+      return OK(JSON.stringify({ result: { agent: { agent_status: status, pane_id: "w1:p1" } } }));
+    }
+    if (argv.includes("read"))
+      return OK(JSON.stringify({ result: { read: { text: "Press up to edit queued messages" } } }));
+    if (argv.includes("send") || argv.includes("send-keys")) writes.push(argv);
+    return OK();
+  }), "herdr");
+
+  await reconcileOnce(db, { herdr, staleMs: 60 * 60 * 1000, exec: stub(() => ({ code: 1, stdout: "", stderr: "no gh" })) });
+
+  expect(writes).toEqual([]);
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'recovery_nudge'").get(id)).toEqual({ n: 0 });
+  expect(db.query("SELECT COUNT(*) AS n FROM notifications WHERE task_id = ? AND kind = 'queued_input_stuck'").get(id)).toEqual({ n: 1 });
 });
 
 test("syncPRs updates ci_status and transitions in_review->verifying on merge", async () => {
@@ -745,4 +929,29 @@ test("reconciler never throws; a failing sub-step broadcasts at most one error",
   // Should resolve, not reject.
   await reconcileOnce(db, { herdr: aliveHerdr, exec: boom });
   expect(true).toBe(true);
+});
+
+// task #1096: `gh` ENOENT under linkPRs errored every cycle for ~27min live
+// with zero signal on /api/health, because reconcileOnce never recorded its
+// own outcome anywhere durable. This is the heartbeat that fixes that.
+test("reconcileOnce heartbeats last_reconcile_at and tracks a failing step's error streak, resetting on recovery (task #1096)", async () => {
+  const { db } = freshDb(); // freshDb's project has repo_path set, so linkPRs always runs
+  const ghEnoent: Exec = async () => {
+    throw new Error("posix_spawn gh ENOENT (-2)");
+  };
+
+  expect(getSetting(db, "last_reconcile_at")).toBeNull();
+  expect(getSetting(db, "reconciler_error_streak")).toBeNull();
+
+  await reconcileOnce(db, { exec: ghEnoent });
+  expect(getSetting(db, "last_reconcile_at")).not.toBeNull();
+  expect(getSetting(db, "reconciler_error_streak")).toBe("1");
+  expect(getSetting(db, "reconciler_last_error")).toContain("ENOENT");
+
+  await reconcileOnce(db, { exec: ghEnoent });
+  expect(getSetting(db, "reconciler_error_streak")).toBe("2");
+
+  // A clean cycle (gh resolves again) resets the streak.
+  await reconcileOnce(db, { exec: stub(() => OK("[]")) });
+  expect(getSetting(db, "reconciler_error_streak")).toBe("0");
 });

@@ -326,15 +326,25 @@ export function decisionAnswerUnaddressed(db: DB, taskId: string): boolean {
   return !review || review.rowid < answer.rowid;
 }
 
+const QUEUED_INPUT_HANDOFF_GRACE_MS = 2 * 60 * 1000;
+
 // The finished-handoff, shared by every herdr-signal path (the reconciler's
 // poll backstop and the supervise wait loop): an agent observed idle/gone on an
 // in_progress task that has a real work product (a pr_url, or a scout report)
-// advances to in_review. Deliberately independent of anything the agent emits.
+// advances to in_review, except while a queued-input recovery is pending or in
+// its brief grace period. Deliberately independent of anything the agent emits.
 // Returns true when the task was advanced.
 export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, source: string): boolean {
   if (agentStatus !== "idle" && agentStatus !== "gone") return false; // working/blocked/unknown → leave it be
   const task = getTask(db, taskId);
   if (!task || task.state !== "in_progress" || isTrackingOnlyTask(task)) return false;
+  const queuedRecovery = db
+    .query("SELECT ts, payload FROM events WHERE task_id = ? AND type = 'queued_input_recovered' ORDER BY ts DESC, rowid DESC LIMIT 1")
+    .get(taskId) as { ts: string; payload: string } | undefined;
+  if (queuedRecovery) {
+    const delivered = JSON.parse(queuedRecovery.payload).delivered;
+    if (delivered === null || Date.now() - Date.parse(queuedRecovery.ts) < QUEUED_INPUT_HANDOFF_GRACE_MS) return false;
+  }
   const hasReport = task.kind === "scout" && evidenceCount(db, taskId, "report") >= 1;
   if (!task.pr_url && !hasReport) return false; // no product to review → health surfaces it, don't advance
   // Review means CI is green. failing/pending holds here; the reconciler's

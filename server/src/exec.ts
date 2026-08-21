@@ -10,6 +10,21 @@ export type Exec = (
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 
+// Common CLI install dirs, appended to whatever PATH the process currently has.
+// Task #1096: under `bun --watch` (how the server actually runs, per the
+// launchd plist), Bun.spawn with no `env` override threw ENOENT for `gh` on
+// every reconciler cycle, even though `ps` on the running process showed a
+// correct PATH and a bare `bun -e` reproduction with that same PATH resolved
+// `gh` fine — something about --watch's env handling loses PATH at the exact
+// spawn call. Rather than depend on inheritance working, build PATH explicitly
+// so resolution never depends on how the server process itself was started.
+const FALLBACK_PATH_DIRS = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin", `${process.env.HOME ?? ""}/.bun/bin`];
+function spawnEnv(): Record<string, string | undefined> {
+  const current = (process.env.PATH ?? "").split(":").filter(Boolean);
+  const path = Array.from(new Set([...current, ...FALLBACK_PATH_DIRS])).join(":");
+  return { ...process.env, PATH: path };
+}
+
 // Real implementation over Bun.spawn. `input` is written to stdin (used by
 // `hive secret set`, which reads the value from stdin so it never hits argv).
 //
@@ -22,6 +37,7 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 export const defaultExec: Exec = async (argv, opts = {}) => {
   const proc = Bun.spawn(argv, {
     cwd: opts.cwd,
+    env: spawnEnv(),
     stdin: opts.input != null ? "pipe" : "ignore",
     stdout: "pipe",
     stderr: "pipe",

@@ -76,6 +76,35 @@ test("health endpoint surfaces herdr_outage only during an active backoff window
   expect((await get("/api/health")).json.herdr_outage).toBeNull();
 });
 
+// task #1096: the reconciler errored every cycle (gh ENOENT) for ~27min live
+// with /health reporting ok:true the whole time, because nothing recorded its
+// outcome anywhere /health could read. consecutive_errors is the signal; a
+// fresh boot (never run yet, 0 errors) must NOT itself flip ok false.
+test("health endpoint surfaces reconciler heartbeat and flips ok false once failures cross the sustained threshold (task #1096)", async () => {
+  let h = (await get("/api/health")).json;
+  expect(h.ok).toBe(true);
+  expect(h.reconciler).toEqual({ last_run: null, stale: true, consecutive_errors: 0, last_error: null });
+
+  // Below the sustained-failure threshold: visible, but ok stays true.
+  setSetting(db, "last_reconcile_at", new Date().toISOString());
+  setSetting(db, "reconciler_error_streak", "2");
+  setSetting(db, "reconciler_last_error", "linkPRs: posix_spawn gh ENOENT (-2)");
+  h = (await get("/api/health")).json;
+  expect(h.ok).toBe(true);
+  expect(h.reconciler.stale).toBe(false);
+  expect(h.reconciler.consecutive_errors).toBe(2);
+  expect(h.reconciler.last_error).toContain("ENOENT");
+
+  // Sustained failure (3+ consecutive cycles): ok flips false.
+  setSetting(db, "reconciler_error_streak", "3");
+  h = (await get("/api/health")).json;
+  expect(h.ok).toBe(false);
+
+  // Recovery: a clean cycle resets the streak, ok recovers.
+  setSetting(db, "reconciler_error_streak", "0");
+  expect((await get("/api/health")).json.ok).toBe(true);
+});
+
 test("health endpoint exposes pty/session utilization once the reaper has counted", async () => {
   // Absent until the first pane sweep records a count.
   expect((await get("/api/health")).json.sessions).toBeNull();
