@@ -566,6 +566,29 @@ test("syncPRs bounces an in_review task whose PR was closed without merging", as
   expect(JSON.parse(steers.at(-1).payload).message).toContain("CLOSED (not merged)");
 });
 
+test("syncPRs records pr_closed for a PR closed while its task is still in_progress (never reached in_review) (task #1233)", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/4", agent_target: "t-agent" });
+  transition(db, id, "in_progress");
+  const gh: Exec = stub((argv) =>
+    argv[0] === "gh" ? OK(JSON.stringify({ state: "CLOSED", statusCheckRollup: [] })) : OK()
+  );
+  const herdr = new Herdr(
+    stub((argv) =>
+      argv.includes("get") ? OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}') : OK()
+    ),
+    "herdr"
+  );
+  await reconcileOnce(db, { exec: gh, herdr });
+  expect(getTask(db, id).state).toBe("in_progress"); // never reached review, stays put
+  const closed = db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_closed'").all(id) as any[];
+  expect(closed.length).toBe(1);
+
+  // second cycle: no duplicate event
+  await reconcileOnce(db, { exec: gh, herdr });
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_closed'").all(id).length).toBe(1);
+});
+
 test("syncPRs' actionable phase skips a never-dispatched external task — no nudge, no auto-transition — but ci_status bookkeeping still runs", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { pr_url: "https://gh/pr/7", source: "external" });
