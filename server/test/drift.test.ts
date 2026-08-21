@@ -274,5 +274,5 @@ test("a config.default_branch starting with `-` never reaches git argv (task #10
   expect(argvs.length).toBeGreaterThan(0);
   for (const argv of argvs) expect(argv.join(" ")).not.toContain(payload);
   // and it fell back to the default base, so the check still ran normally
-  expect(argvs.some((a) => a.some((x) => x.startsWith("main.")))).toBe(true);
+  expect(argvs.some((a) => a.some((x) => x.startsWith("origin/main.")))).toBe(true);
 });

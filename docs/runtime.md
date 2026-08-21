@@ -112,7 +112,9 @@ and respawns onto the SAME branch: `worktree create` collides, `reclaimWorktree`
 preserves any loose WIP on a ghost branch and removes the checkout, and the retry
 re-checks out `hive/<taskId>` at its existing head, so the PR's commits are
 untouched (verified live against herdr 0.7.x). The feedback rides in as the
-steer preamble at the top of the fresh brief.
+steer preamble at the top of the fresh brief. See the API contract's
+[Review experience](API.md#review-experience-hive-owned-in-review-tasks) for the
+lifecycle effect when queued feedback reaches an `in_review` task.
 
 ## Visible interactive fleet (spawn design)
 
@@ -123,6 +125,8 @@ hive uses herdr the way firstmate's `docs/herdr-backend.md` proved it should be 
    then run `herdr worktree create --cwd <repo> --branch hive/<id> --base
    origin/<base> --json`. New task worktrees therefore start from the current
    integration branch instead of a possibly stale local ref.
+
+Read-only branch comparisons (review diffs, scope-drift footprints, and stacked-branch checks) likewise use `origin/<base>`. Local branch state is reserved for operations that intentionally act on the checkout, such as merging and cleanup.
 2. **Prepare the worktree** (callback) wires Hive's Stop/SubagentStop/PostToolUse hooks before the agent starts (`.claude/settings.local.json` for Claude; per-invocation Codex hook config for ChatGPT), so lifecycle reporting is structural, not brief-dependent (`hooks/`), then runs
    the per-project spawn hook `config.setup_argv` (e.g.
    `["infra/worktree/wt.sh", "up", "{worktree}"]`) so agents don't have to

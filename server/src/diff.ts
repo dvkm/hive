@@ -6,7 +6,7 @@
 import type { DB } from "./db.ts";
 import { getTask } from "./state.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, projectBaseBranch } from "./exec.ts";
+import { defaultExec, projectComparisonBase } from "./exec.ts";
 
 export type LineKind = "add" | "del" | "ctx";
 export interface DiffLine {
@@ -130,7 +130,7 @@ export async function taskDiff(db: DB, taskId: string, exec: Exec = defaultExec)
   if (!project?.repo_path) return { ok: false, status: 400, error: "project has no repo_path; cannot diff" };
   if (!task.branch) return { ok: false, status: 400, error: "task has no branch and no pr_url; nothing to diff" };
   const config = JSON.parse(project.config ?? "{}");
-  const base = projectBaseBranch(config);
+  const base = projectComparisonBase(config);
 
   const r = await exec(["git", "-C", project.repo_path, "diff", `${base}...${task.branch}`]);
   if (r.code !== 0)
