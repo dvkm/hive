@@ -670,6 +670,10 @@ function jiraTaskState(db: DB, taskId: string): Response {
     // purpose: the credential gate refused it, and the UI should not imply the
     // site it names is in use.
     configured: !!cfg,
+    // The config is present but invalid (a bad JQL filter, unparsable JSON).
+    // The automatic cycle is OFF for it, so the board shows this reason from the
+    // first read rather than waiting for a failure count to climb.
+    config_error: configStatus.error,
     write_scope: JIRA_WRITE_SCOPE,
     assignee: assignee === "-" ? null : assignee,
     sync: configStatus.error ? { ...state, last_error: `jira cycle could not run: ${configStatus.error}` } : state,

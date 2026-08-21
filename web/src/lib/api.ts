@@ -564,6 +564,7 @@ export interface JiraTaskState {
   enabled?: boolean;
   write?: boolean;
   configured?: boolean;
+  config_error?: string | null;
   write_scope?: {
     status: boolean;
     comments: boolean;

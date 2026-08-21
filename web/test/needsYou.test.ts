@@ -200,6 +200,34 @@ test("the Jira panel keeps the safe browse action when sync is unconfigured", ()
   expect(html).toContain("unconfigured");
 });
 
+test("the Jira panel names an invalid config on the first read, before anything has failed", () => {
+  // The automatic cycle is off for a config the server refused, so waiting for a
+  // failure count would leave the director reading "not configured" and hunting
+  // for a setup that is actually there but broken.
+  const jira = {
+    linked: true,
+    issue_key: "WEB-1",
+    configured: false,
+    config_error: 'config.jira.jql is invalid: "labels = sync) OR project = OPS"',
+    sync: { consecutive_failures: 0, last_error: null, next_due_at: null },
+  } as any;
+  const html = renderToStaticMarkup(createElement(JiraPanel, {
+    task: { id: "jira-task", source_ref: "jira:WEB-1" } as any,
+    jira,
+    onSynced: () => {},
+  }));
+
+  expect(html).toContain("Jira config invalid");
+  expect(html).toContain("config.jira.jql is invalid");
+  expect(html).toContain("The automatic sync is off until this is fixed");
+  expect(html).not.toContain("consecutive failure");
+  expect(html).not.toContain("unconfigured or not allow-listed");
+  expect(jiraNextAutomaticText(jira)).toBe("off (config invalid)");
+  expect(jiraPanelNotice(jira)).toBeNull();
+  expect(jiraMoveHint("verifying", "done", jira)).toContain("the Jira config is invalid");
+  expect(jiraMoveSummary("verifying", jira)).toContain("The Jira config is invalid");
+});
+
 test("legacy tracking bindings remain visibly actionable", () => {
   const jira = task("legacy", "in_progress", {
     source: "external",

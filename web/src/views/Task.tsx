@@ -267,10 +267,14 @@ function PaneTerminal({ taskId }: { taskId: string }) {
 // out yet, and any error that is still true. Everything here derives from
 // delivery receipts rather than an optimistic local flag, so the panel cannot
 // claim something reached Jira that did not.
-type JiraSyncMode = "loading" | "unconfigured" | "paused" | "shadow" | "live";
+type JiraSyncMode = "loading" | "invalid" | "unconfigured" | "paused" | "shadow" | "live";
 
 function jiraSyncMode(jira: JiraTaskState | null): JiraSyncMode {
   if (!jira) return "loading";
+  // An invalid config is NOT the same as an absent one: the server refuses to
+  // run the automatic cycle for it, and the director needs the actual reason
+  // rather than "not configured", which sends them looking for a missing setup.
+  if (jira.config_error) return "invalid";
   if (jira.configured === false) return "unconfigured";
   if (jira.configured !== true) return "loading";
   if (jira.enabled === false) return "paused";
@@ -285,6 +289,8 @@ export function jiraMoveHint(from: string, to: string, jira: JiraTaskState | nul
   const mode = jiraSyncMode(jira);
   if (mode === "loading")
     return `Moves this task to ${label} in Hive; Jira sync state is still loading, so its Jira effect is unknown.`;
+  if (mode === "invalid")
+    return `Moves this task to ${label} in Hive; the Jira config is invalid, so no cycle runs and Jira will not change.`;
   if (mode === "unconfigured")
     return `Moves this task to ${label} in Hive; Jira sync is unconfigured or not allow-listed, so Jira will not change.`;
   if (mode === "paused")
@@ -310,6 +316,7 @@ export function jiraMoveHint(from: string, to: string, jira: JiraTaskState | nul
 export function jiraMoveSummary(from: string, jira: JiraTaskState | null): string {
   const mode = jiraSyncMode(jira);
   if (mode === "loading") return "Jira sync state is still loading; move effects in Jira are not known yet.";
+  if (mode === "invalid") return "The Jira config is invalid, so no cycle will run; moves stay in Hive.";
   if (mode === "unconfigured") return "Jira sync is unconfigured or not allow-listed; moves stay in Hive.";
   if (mode === "paused") return "Jira sync is paused; no automatic cycle will send these moves.";
   if (mode === "shadow") return from === "needs_decision"
@@ -323,6 +330,9 @@ export function jiraMoveSummary(from: string, jira: JiraTaskState | null): strin
 export function jiraPanelNotice(jira: JiraTaskState | null): string | null {
   const mode = jiraSyncMode(jira);
   if (mode === "loading") return "Jira sync state is still loading.";
+  // The error box below names the invalid setting, so a generic notice here
+  // would only say the same thing twice.
+  if (mode === "invalid") return null;
   if (mode === "unconfigured") return "Jira sync is unconfigured or not allow-listed, so no cycle will run.";
   if (mode === "paused") return "Jira sync is paused, so no cycle will run.";
   if (mode === "shadow") return "Shadow mode: hive computes and logs every outbound change but sends none.";
@@ -332,6 +342,7 @@ export function jiraPanelNotice(jira: JiraTaskState | null): string | null {
 export function jiraNextAutomaticText(jira: JiraTaskState | null): string {
   const mode = jiraSyncMode(jira);
   if (mode === "loading") return "sync state loading";
+  if (mode === "invalid") return "off (config invalid)";
   if (mode === "unconfigured") return "not configured";
   if (mode === "paused") return "paused (sync disabled)";
   return jira?.sync?.next_due_at ? relTime(jira.sync.next_due_at) : "—";
@@ -359,7 +370,8 @@ export function JiraPanel({
   const pending = jira?.pending;
   const pendingTotal = (pending?.comments ?? 0) + (pending?.receipts ?? 0);
   const unknown = pending?.unknown ?? [];
-  const failing = (sync?.consecutive_failures ?? 0) > 0 && !!sync?.last_error;
+  const configError = jira?.config_error ?? null;
+  const failing = !!configError || ((sync?.consecutive_failures ?? 0) > 0 && !!sync?.last_error);
   const modeNotice = jiraPanelNotice(jira);
 
   const retry = async () => {
@@ -447,11 +459,17 @@ export function JiraPanel({
       {/* A failure stays on screen until a later attempt actually succeeds. */}
       {failing && (
         <div className="jira-error" role="alert">
-          <strong>Sync failing</strong>
-          <p>{sync?.last_error}</p>
+          <strong>{configError ? "Jira config invalid" : "Sync failing"}</strong>
+          <p>{configError ?? sync?.last_error}</p>
           <p className="muted">
-            {sync?.consecutive_failures} consecutive failure{(sync?.consecutive_failures ?? 0) > 1 ? "s" : ""}
-            {sync?.last_error_at ? ` \u00b7 since ${relTime(sync.last_error_at)}` : ""}
+            {configError ? (
+              "The automatic sync is off until this is fixed. Sync now returns the same error."
+            ) : (
+              <>
+                {sync?.consecutive_failures} consecutive failure{(sync?.consecutive_failures ?? 0) > 1 ? "s" : ""}
+                {sync?.last_error_at ? ` \u00b7 since ${relTime(sync.last_error_at)}` : ""}
+              </>
+            )}
           </p>
         </div>
       )}

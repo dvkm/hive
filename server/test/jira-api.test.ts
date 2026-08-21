@@ -131,8 +131,13 @@ test("an invalid Jira filter is surfaced through sync state and manual retry", a
   const jql = "labels = sync) OR project = OPS OR (project = WEB";
   const { jiraTask } = seed({ ...CFG, jql });
 
+  // The FIRST read names the invalid setting. Nothing has failed yet, so a
+  // board that waited for consecutive_failures to climb would show only
+  // "not configured" while the director hunted for a missing setup.
   const state = await get(`/api/tasks/${jiraTask}/jira`);
   expect(state.json.configured).toBe(false);
+  expect(state.json.config_error).toContain(`config.jira.jql is invalid: ${JSON.stringify(jql)}`);
+  expect(state.json.sync.consecutive_failures).toBe(0);
   expect(state.json.sync.last_error).toContain(`config.jira.jql is invalid: ${JSON.stringify(jql)}`);
 
   const retry = await post(`/api/tasks/${jiraTask}/jira/sync`);
