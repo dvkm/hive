@@ -125,6 +125,9 @@ function makeServer(
     baseWorktreePath?: string;
     updateRefCode?: number;
     updateRefStderr?: string;
+    baseRefOid?: string;
+    headRefOid?: string;
+    currentBaseAncestor?: boolean;
   } = {}
 ) {
   const db = openDb(":memory:");
@@ -139,7 +142,8 @@ function makeServer(
   const prView = {
     state: opts.prState ?? "OPEN",
     baseRefName: "main",
-    baseRefOid: "base-sha",
+    baseRefOid: opts.baseRefOid ?? "base-sha",
+    headRefOid: opts.headRefOid ?? "branch-sha",
     mergeStateStatus: opts.mergeStateStatus ?? "CLEAN",
     reviewDecision: opts.reviewDecision ?? "",
     statusCheckRollup: opts.rollup ?? [],
@@ -152,7 +156,11 @@ function makeServer(
       return code ? { code, stdout: "", stderr: "GraphQL: Pull Request is not mergeable (mergePullRequest)" } : OK();
     }
     if (has(argv, "git", "symbolic-ref", "--short", "HEAD")) return OK(`${opts.headBranch ?? "main"}\n`);
-    if (has(argv, "git", "merge-base", "--is-ancestor")) return OK();
+    if (has(argv, "git", "merge-base", "--is-ancestor")) {
+      if (opts.currentBaseAncestor === false && argv.includes(opts.baseRefOid ?? "base-sha"))
+        return { code: 1, stdout: "", stderr: "not an ancestor" };
+      return OK();
+    }
     if (has(argv, "git", "merge", "--ff-only")) {
       const code = opts.gitMergeCode ?? 0;
       return { code, stdout: "", stderr: code ? opts.gitMergeStderr ?? "CONFLICT (content): merge conflict in x" : "" };
@@ -626,6 +634,39 @@ test("PR merge fails and the local ff also fails (real conflict) → still bounc
   expect(r.json.error).toContain("local fast-forward also refused"); // the actionable ff reason, not just gh's
   const task = await get(s.base, `/api/tasks/${id}`);
   expect(task.json.state).toBe("in_progress");
+  s.server.stop(true);
+});
+
+test("a stale local base cannot bypass a conflict with the PR's current remote base", async () => {
+  const s = makeServer({
+    ghMergeCode: 1,
+    mergeStateStatus: "BEHIND",
+    baseRefOid: "remote-base-sha",
+    currentBaseAncestor: false,
+  });
+  const id = await inReviewWithPr(s.base, "https://gh/pr/817");
+  const r = await post(s.base, `/api/tasks/${id}/merge`, {});
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("current PR base remote-base");
+  expect((await get(s.base, `/api/tasks/${id}`)).json.state).toBe("in_progress");
+  const ev = await get(s.base, `/api/tasks/${id}/events`);
+  expect(ev.json.some((e: any) => e.type === "merged")).toBe(false);
+  s.server.stop(true);
+});
+
+test("a stale local task branch cannot replace the PR head during fallback", async () => {
+  const s = makeServer({
+    ghMergeCode: 1,
+    mergeStateStatus: "BEHIND",
+    headRefOid: "reviewed-head-sha",
+  });
+  const id = await inReviewWithPr(s.base, "https://gh/pr/818");
+  const r = await post(s.base, `/api/tasks/${id}/merge`, {});
+  expect(r.status).toBe(409);
+  expect(r.json.error).toContain("but the PR head is reviewed-hea");
+  expect((await get(s.base, `/api/tasks/${id}`)).json.state).toBe("in_progress");
+  const ev = await get(s.base, `/api/tasks/${id}/events`);
+  expect(ev.json.some((e: any) => e.type === "merged")).toBe(false);
   s.server.stop(true);
 });
 

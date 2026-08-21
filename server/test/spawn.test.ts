@@ -84,7 +84,8 @@ test("spawn endpoint starts the agent and moves the task to in_progress", async 
   expect(task.json.events.some((e: any) => e.type === "spawned")).toBe(true);
   const create = calls.find((argv) => has(argv, "worktree", "create"));
   expect(create).toBeDefined();
-  expect(create!.slice(create!.indexOf("--base"), create!.indexOf("--base") + 2)).toEqual(["--base", "main"]);
+  expect(create!.slice(create!.indexOf("--base"), create!.indexOf("--base") + 2)).toEqual(["--base", "origin/main"]);
+  expect(calls.some((argv) => argv[0] === "git" && has(argv, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"))).toBe(true);
   // hook wiring is written into the worktree (structural reporting).
   expect(existsSync(join(WT, ".claude", "settings.local.json"))).toBe(true);
 });

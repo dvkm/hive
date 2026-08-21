@@ -86,7 +86,7 @@ dispatch slot. On 2026-08-19 ten such agents held corebeat at 3 running against
 **Release** (`cleanup.releaseReviewAgent`, run every reaper sweep). For each
 `in_review` task still holding an `agent_target`, herdr is probed:
 
-- `idle` → release. Confirmed `gone` (probe says not found AND the pane list has
+- `idle` or `done` → release. Confirmed `gone` (probe says not found AND the pane list has
   no trace) → release.
 - `working`, `blocked`, or an UNCONFIRMED death → leave it alone. An
   unresolvable probe is what a herdr registry wipe looks like, and closing a tab
@@ -104,8 +104,10 @@ exactly the state the slot would otherwise be held for.
 
 **Reattach** (the dispatcher's first pass each cycle). Every path that hands work
 back to an agent it could not reach now QUEUES a steer — a changes-request
-bounce, red CI, a closed PR, a PR conflict, a failed merge. The dispatcher picks
-up any `in_progress`/`in_review` task with no `agent_target` and queued steers,
+bounce, red CI, a closed PR, a PR conflict, a failed merge, or a steer sent after
+the current interactive turn completed. The reconciler releases a `done` turn
+that has queued steers, preserving its task checkout. The dispatcher picks up
+any `in_progress`/`in_review`/`verifying` task with no `agent_target` and queued steers,
 and respawns onto the SAME branch: `worktree create` collides, `reclaimWorktree`
 preserves any loose WIP on a ghost branch and removes the checkout, and the retry
 re-checks out `hive/<taskId>` at its existing head, so the PR's commits are
@@ -116,8 +118,11 @@ steer preamble at the top of the fresh brief.
 
 hive uses herdr the way firstmate's `docs/herdr-backend.md` proved it should be used: agents are VISIBLE and INTERACTIVE, never invisible one-shot processes. A project selects Claude Code (default) or ChatGPT through the Codex CLI with `config.agent`; both stay attached to a labelled Herdr tab. `spawn()` (`server/src/runtime/herdr.ts`) does, in order:
 
-1. `herdr worktree create --cwd <repo> --branch hive/<id> --json` — the git
-   worktree (path + branch parsed from the 0.7.x envelope).
+1. Resolve the base as `config.default_branch`, otherwise `config.promote.from`,
+   otherwise `main`. Fetch that branch from `origin` into its remote-tracking ref,
+   then run `herdr worktree create --cwd <repo> --branch hive/<id> --base
+   origin/<base> --json`. New task worktrees therefore start from the current
+   integration branch instead of a possibly stale local ref.
 2. **Prepare the worktree** (callback) wires Hive's Stop/SubagentStop/PostToolUse hooks before the agent starts (`.claude/settings.local.json` for Claude; per-invocation Codex hook config for ChatGPT), so lifecycle reporting is structural, not brief-dependent (`hooks/`), then runs
    the per-project spawn hook `config.setup_argv` (e.g.
    `["infra/worktree/wt.sh", "up", "{worktree}"]`) so agents don't have to

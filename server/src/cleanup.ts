@@ -15,7 +15,7 @@ import { isTrackingOnlyTask } from "./supervision.ts";
 import { queuedSteers } from "./steer.ts";
 import { broadcastTask } from "./health.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, safeBranch } from "./exec.ts";
+import { defaultExec, projectBaseBranch } from "./exec.ts";
 
 // Per-project stack lifecycle command. Two symmetric hooks share this runner:
 //   config.setup_argv    = ["infra/worktree/wt.sh", "up",   "{worktree}"]  (spawn time, before agent starts)
@@ -151,7 +151,7 @@ export async function cleanupTask(
   const repoPath = project?.repo_path ?? null;
   let defaultBranch: string | undefined;
   try {
-    defaultBranch = safeBranch(JSON.parse(project?.config ?? "{}").default_branch);
+    defaultBranch = projectBaseBranch(JSON.parse(project?.config ?? "{}"));
   } catch {
     defaultBranch = undefined;
   }
@@ -316,7 +316,7 @@ export async function releaseReviewAgent(
   // wipe looks like, and closing a tab under a live agent is the kill wave this
   // repo already paid for once (2026-08-19, false-dead incident).
   const gone = !probe.alive && (await herdr.confirmGone({ cwd: task.worktree_path, tabId: meta.tab_id }));
-  if (!gone && !(probe.alive && probe.status === "idle"))
+  if (!gone && !(probe.alive && (probe.status === "idle" || probe.status === "done")))
     return { released: false, reason: `agent is ${probe.alive ? probe.status : "unconfirmed-gone"}` };
 
   const session = await herdr.closeSession({ agentTarget: task.agent_target, tabId: meta.tab_id });
@@ -324,7 +324,7 @@ export async function releaseReviewAgent(
   // cleanupTask). The checkout on disk is untouched by a workspace close.
   if (meta.workspace_id) await herdr.closeWorkspace(meta.workspace_id);
   db.query("UPDATE tasks SET agent_target = NULL, updated_at = ? WHERE id = ?").run(now(), taskId);
-  const reason = gone ? "agent gone" : "idle in review";
+  const reason = gone ? "agent gone" : `${probe.status} in review`;
   writeEvent(db, {
     task_id: taskId,
     source: "reaper",

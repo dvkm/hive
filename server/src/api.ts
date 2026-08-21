@@ -5,9 +5,8 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { taskWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
-import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror, isTrackingOnlyTask } from "./supervision.ts";
+import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
-import { REF_PREFIX as JIRA_REF_PREFIX } from "./intake/jira.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
 import {
   transition,
@@ -72,7 +71,7 @@ import { costUsd } from "./pricing.ts";
 import { checkCostGuardrails, resolveCostCapForDecision, taskSpend } from "./costs.ts";
 import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
-import { vapidPublicKey, saveSubscription, removeSubscription } from "./push.ts";
+import { vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
 import { ciStatusOf, ciStatusProbed, reclaimDeadWorktree } from "./reconciler.ts";
@@ -80,7 +79,7 @@ import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, safeBranch, preferSafeRef } from "./exec.ts";
+import { defaultExec, projectBaseBranch, preferSafeRef } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
 import { projectPrefix, taskIdentifier } from "./taskIdentifier.ts";
 import {
@@ -399,7 +398,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         return json({ key: vapidPublicKey(db) });
       if (pathname === "/api/push/subscribe" && method === "POST") {
         try {
-          saveSubscription(db, await req.json());
+          saveSubscription(db, await req.json() as PushSub);
           return json({ ok: true });
         } catch (e: any) {
           return err(String(e?.message ?? e), 400);
@@ -2352,7 +2351,7 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   if (project?.repo_path && task.branch) {
     const config = JSON.parse(project.config ?? "{}");
-    const base = safeBranch(config.default_branch);
+    const base = projectBaseBranch(config);
     // TERMINAL, not just done/cancelled: a `failed` task's branch is as dead as
     // a cancelled one, and corebeat's 109 failed tasks were 87 of the 103 rows
     // this flag used to dump on one card (task #1134).
@@ -2418,13 +2417,32 @@ async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason
 // current branch untouched. A base checked out in another worktree is refused
 // rather than leaving that worktree's files out of sync. Returns null on
 // success, or a failure reason string.
-async function attemptLocalFf(exec: Exec, project: any, task: any, base: string): Promise<string | null> {
+async function attemptLocalFf(
+  exec: Exec,
+  project: any,
+  task: any,
+  base: string,
+  requiredPr?: { base: string; head: string | null }
+): Promise<string | null> {
   const baseSha = await exec(["git", "-C", project.repo_path, "rev-parse", base]);
   const branchSha = await exec(["git", "-C", project.repo_path, "rev-parse", task.branch]);
   const oldSha = baseSha.stdout.trim();
   const newSha = branchSha.stdout.trim();
   if (baseSha.code !== 0 || branchSha.code !== 0 || !oldSha || !newSha)
     return baseSha.stderr.trim() || branchSha.stderr.trim() || "could not resolve merge refs";
+
+  // A PR branch must contain the PR's current base commit, not merely Hive's
+  // possibly stale local branch. Otherwise a local ff can bypass GitHub's
+  // conflict verdict and silently omit integration-branch commits.
+  if (requiredPr) {
+    if (!requiredPr.head)
+      return "PR head metadata is missing; local fast-forward was not attempted";
+    if (newSha !== requiredPr.head)
+      return `local branch '${task.branch}' resolves to ${newSha.slice(0, 12)}, but the PR head is ${requiredPr.head.slice(0, 12)}; refresh the local branch from the PR head`;
+    const current = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", requiredPr.base, newSha]);
+    if (current.code !== 0)
+      return `current PR base ${requiredPr.base.slice(0, 12)} is not an ancestor of '${task.branch}'; refresh the branch from origin/${base}`;
+  }
 
   const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", oldSha, newSha]);
   if (anc.code !== 0) {
@@ -2490,8 +2508,9 @@ function staleBaseRefusal(prView: any): boolean {
 // on GitHub is stale (origin/<base> behind the primary checkout's local
 // <base>) while the branch is still a clean ff onto local <base>. It skips
 // `gh pr merge` and the staleBaseRefusal gate (an explicit override is the
-// caller's call to make) but still honours the PR state probe: a CLOSED PR is
-// refused and a MERGED one just advances. The same
+// caller's call to make), but still requires the local branch to match the PR
+// head and contain its current base. It also honours the PR state probe: a
+// CLOSED PR is refused and a MERGED one just advances. The same
 // staleness shape is also detected automatically: if `gh pr merge` fails with
 // a conflict/not-mergeable/not-an-ancestor reason AND the PR's own state says
 // the blocker is the base comparison rather than branch protection, hive tries
@@ -2546,19 +2565,19 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
         db,
         herdr,
         task,
-        safeBranch(config.default_branch),
+        projectBaseBranch(config),
         `Could not inspect PR metadata; merge was not attempted (${probe.stderr.trim() || "gh pr view failed"}).`,
         actor
       );
     try {
       prView = JSON.parse(probe.stdout || "{}");
     } catch {
-      return mergeFailed(db, herdr, task, safeBranch(config.default_branch), "Could not parse PR metadata; merge was not attempted.", actor);
+      return mergeFailed(db, herdr, task, projectBaseBranch(config), "Could not parse PR metadata; merge was not attempted.", actor);
     }
     if (!prView.baseRefName || !prView.baseRefOid)
-      return mergeFailed(db, herdr, task, safeBranch(config.default_branch), "PR base metadata is missing; merge was not attempted.", actor);
+      return mergeFailed(db, herdr, task, projectBaseBranch(config), "PR base metadata is missing; merge was not attempted.", actor);
   }
-  const base = preferSafeRef(prView?.baseRefName, safeBranch(config.default_branch));
+  const base = preferSafeRef(prView?.baseRefName, projectBaseBranch(config));
   const guardBase = prView?.baseRefOid || base;
   const guardHead = prView?.headRefOid || task.branch;
   const forceLocalFf = body?.merge_strategy === "local_ff";
@@ -2675,7 +2694,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
         // state: a protection block (failing checks, missing reviews) wears the
         // same "not mergeable" reason, and must never be merged around.
         if (MERGE_CONFLICT_RE.test(reason) && staleBaseRefusal(prView) && project?.repo_path && task.branch) {
-          const ffReason = await attemptLocalFf(exec, project, task, base);
+          const ffReason = await attemptLocalFf(exec, project, task, base, { base: guardBase, head: prView?.headRefOid ?? null });
           if (ffReason === null) {
             method = "local ff-only (PR merge reported not-mergeable against origin/" + base + ")";
           } else {
@@ -2692,7 +2711,13 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
       // branch tip. Requires the default branch to be an ancestor of the task
       // branch; a non-fast-forward (diverged / conflicting) merge is refused, no
       // working tree is touched. Callers wanting a squash merge should use a PR.
-      const ffReason = await attemptLocalFf(exec, project, task, base);
+      const ffReason = await attemptLocalFf(
+        exec,
+        project,
+        task,
+        base,
+        task.pr_url ? { base: guardBase, head: prView?.headRefOid ?? null } : undefined
+      );
       if (ffReason !== null) return mergeFailed(db, herdr, task, base, ffReason, actor);
       method = forceLocalFf && task.pr_url ? "local ff-only (forced; PR-backed task)" : "local ff-only";
     }
@@ -2727,7 +2752,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
 
 // Bounce an in-review task back to in_progress with reviewer feedback, and make
 // sure the feedback actually REACHES an agent. Delivers to the live agent; if
-// none is live (idle/gone, or the send fails) it queues the notes as a steer and
+// none has an active turn (done/gone, or the send fails) it queues the notes as a steer and
 // RESPAWNS so the fresh agent gets them in its first brief. Records a
 // `changes_requested` event either way — that carries the notes on the timeline
 // AND marks the bounce unaddressed, so the reconciler's idle-advance backstop
@@ -2935,7 +2960,7 @@ export async function spawnAgent(
       hiveUrl,
       title: task.title,
       brief,
-      base: safeBranch(config.default_branch),
+      base: projectBaseBranch(config),
       env,
       model: modelForTask(config, task.kind),
       agentArgv: agentArgvFor(config, task.kind, brief),
@@ -3005,7 +3030,7 @@ export async function spawnAgent(
 }
 
 // Re-arming supervised wait loop: the herdr PUSH channel for "the agent is
-// done". It never relies on anything the agent emits — herdr's own idle signal
+// done". It never relies on anything the agent emits — herdr's own idle/done signal
 // drives the in_progress → in_review handoff (advanceIfFinished, same logic as
 // the reconciler's poll backstop). A wait timeout re-arms while the agent is
 // alive, so supervision covers tasks longer than one wait window; the loop ends
@@ -4691,7 +4716,12 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       const submittedChecks = rawChecks.length ? rawChecks : rawCheck ? [rawCheck] : [];
       if (submittedChecks.some(isAgentProcedureQuestion))
         return err("understanding checks must teach the director about this specific change, not test agent procedures", 400);
-      const checks = dropRepeats(
+      const checks = dropRepeats<{
+        question: string;
+        options: UnderstandingCheck["options"];
+        answer_key: string;
+        explanation?: string;
+      }>(
         rawChecks.flatMap((value: unknown) => {
           const check = normalizeUnderstandingCheck(value);
           return check ? [{

@@ -971,26 +971,19 @@ test("conflict watchdog: a mergeable PR is left alone", async () => {
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_conflict'").all(id).length).toBe(0);
 });
 
-// task #321: hive cuts worktrees from LOCAL main; GitHub origin/main is a
-// divergent fork, so a branch that's a clean ff onto LOCAL main still reports
-// CONFLICTING on GitHub. The old watchdog nudged "merge origin/main", the agent
-// pulled the fork in, pushed a new head that STILL conflicted, and the per-SHA
-// dedup couldn't stop the loop (PR #38 got 5+ identical nudges). The branch
-// being a clean local ff must suppress the nudge — no send even across pushes.
-test("conflict watchdog: no nudge when the branch is a clean ff onto LOCAL base (divergent origin/main)", async () => {
+// A stale local integration branch must not suppress GitHub's conflict verdict.
+// New worktrees use origin/main, so conflict recovery follows that same source.
+test("conflict watchdog follows GitHub's remote base even when local main is an ancestor", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { agent_target: "a1", pr_url: "https://gh/pr/38" });
   db.query("UPDATE tasks SET branch = ? WHERE id = ?").run("hive/321", id);
   transition(db, id, "in_progress");
   transition(db, id, "in_review");
   const { h, sends } = sendCapturingHerdr("idle");
-  // gh: CONFLICTING (vs divergent origin/main). git merge-base --is-ancestor:
-  // exit 0 => LOCAL base IS an ancestor of the branch (clean ff).
   const exec = (sha: string): Exec =>
     stub((argv) => {
       if (argv[0] === "gh")
         return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], mergeable: "CONFLICTING", headRefOid: sha }));
-      if (argv[0] === "git" && argv.includes("--is-ancestor")) return OK(); // code 0 = ancestor
       return OK();
     });
 
@@ -998,10 +991,10 @@ test("conflict watchdog: no nudge when the branch is a clean ff onto LOCAL base 
   await reconcileOnce(db, { herdr: h, exec: exec("sha2") }); // agent "merged origin/main", new head, still conflicts
   await reconcileOnce(db, { herdr: h, exec: exec("sha3") });
 
-  expect(sends.length).toBe(0); // no rebase spam across any push
+  expect(sends.length).toBe(3); // once per pushed head, never suppressed by local main
   expect(getTask(db, id).state).toBe("in_review"); // lifecycle untouched
   const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_conflict'").all(id) as { payload: string }[];
-  expect(ev.every((e) => JSON.parse(e.payload).suppressed === "local-ff")).toBe(true);
+  expect(ev.every((e) => JSON.parse(e.payload).delivered === true)).toBe(true);
 });
 
 test("advanceFinished: in_progress + pr_url + idle agent -> in_review (+ event)", async () => {
