@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
-import type { Brief } from "../lib/api";
+import type { Brief, Evidence } from "../lib/api";
 import { useStore } from "../lib/store";
 import { StatusDot, HEALTH_LABEL } from "../lib/ui";
 import { DecisionCard } from "./DecisionCard";
-import { ReviewAudit, ReviewCard, ReviewUnderstanding } from "./ReviewCard";
+import { EvidenceStrip, ReviewAudit, ReviewCard, ReviewUnderstanding } from "./ReviewCard";
 import { AttentionRows, BlockedByLine } from "./attention";
 import { CheckpointsInbox } from "./Checkpoints";
 import { UnderstandingQuiz } from "./UnderstandingQuiz";
@@ -43,6 +43,18 @@ function toLocalInput(iso: string): string {
   if (Number.isNaN(d.getTime())) return "";
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function TaskEvidence({ taskId, title, compact = false }: { taskId: string; title: string; compact?: boolean }) {
+  const { rev, tasks } = useStore();
+  const [evidence, setEvidence] = useState<Evidence[]>([]);
+  const task = tasks.find((item) => item.id === taskId);
+  useEffect(() => {
+    let live = true;
+    api.evidence({ task: taskId, limit: 100 }).then((result) => live && setEvidence(result.evidence)).catch(() => live && setEvidence([]));
+    return () => { live = false; };
+  }, [taskId, rev[taskId]]);
+  return <EvidenceStrip evidence={evidence} task={{ id: taskId, title, head_sha: task?.head_sha ?? null }} limit={compact ? 4 : undefined} />;
 }
 
 export default function Brief() {
@@ -173,6 +185,12 @@ export default function Brief() {
             <ReviewCard task={focusItem.task} onDone={() => setReviewed((items) => new Set(items).add(focusItem.id))} />
           )}
           {focusItem.kind === "attention" && <div className="brief-attn"><AttentionRows tasks={[focusItem.task]} /></div>}
+          {focusItem.kind !== "review" && (
+            <TaskEvidence
+              taskId={focusItem.kind === "decision" ? focusItem.decision.task_id : focusItem.kind === "checkpoint" ? focusItem.checkpoint.task_id : focusItem.kind === "quiz" ? focusItem.quiz.task_id : focusItem.task.id}
+              title={focusItem.kind === "decision" ? focusItem.decision.title : focusItem.kind === "checkpoint" ? focusItem.checkpoint.task_title : focusItem.kind === "quiz" ? focusItem.quiz.task_title : focusItem.task.title}
+            />
+          )}
           {actionCount > 1 && <div className="brief-queue-note">{actionCount - 1} more waiting. Finish this one to continue.</div>}
         </section>
       )}
@@ -181,27 +199,27 @@ export default function Brief() {
         <div className="brief-backlogs">
           <Section title="Decisions" count={openDecisions.length}>
             <ul className="brief-backlog-list">
-              {openDecisions.map((decision) => <li key={decision.id}><Link to={`/decisions#dcard-${decision.id}`}>{decision.title}</Link><span>{decision.risk || "decision"}</span></li>)}
+              {openDecisions.map((decision) => <li key={decision.id}><Link to={`/decisions#dcard-${decision.id}`}>{decision.title}</Link><span>{decision.risk || "decision"}</span><TaskEvidence taskId={decision.task_id} title={decision.title} compact /></li>)}
             </ul>
           </Section>
           <Section title="Checkpoints" count={checkpoints.length}>
             <ul className="brief-backlog-list">
-              {checkpoints.map((checkpoint) => <li key={checkpoint.id}><Link to={`/tasks/${checkpoint.task_id}`}>#{checkpoint.task_number} {checkpoint.task_title}</Link><span>{checkpoint.note}</span></li>)}
+              {checkpoints.map((checkpoint) => <li key={checkpoint.id}><Link to={`/tasks/${checkpoint.task_id}`}>#{checkpoint.task_number} {checkpoint.task_title}</Link><span>{checkpoint.note}</span><TaskEvidence taskId={checkpoint.task_id} title={checkpoint.task_title} compact /></li>)}
             </ul>
           </Section>
           <Section title="Understanding" count={quizzes.length}>
             <ul className="brief-backlog-list">
-              {quizzes.map((quiz) => <li key={quiz.id}><Link to={`/tasks/${quiz.task_id}`}>#{quiz.task_number} {quiz.task_title}</Link><span>{quiz.task_kind === "scout" ? "Report" : "Change"}</span></li>)}
+              {quizzes.map((quiz) => <li key={quiz.id}><Link to={`/tasks/${quiz.task_id}`}>#{quiz.task_number} {quiz.task_title}</Link><span>{quiz.task_kind === "scout" ? "Report" : "Change"}</span><TaskEvidence taskId={quiz.task_id} title={quiz.task_title} compact /></li>)}
             </ul>
           </Section>
           <Section title="Reviews" count={toReview.length}>
             <ul className="brief-backlog-list">
-              {toReview.map((task) => <li key={task.id}><Link to={`/tasks/${task.id}`}>#{task.number} {task.title}</Link><span>{task.ci_status === "passing" ? "Ready" : task.ci_status || "Review"}</span></li>)}
+              {toReview.map((task) => <li key={task.id}><Link to={`/tasks/${task.id}`}>#{task.number} {task.title}</Link><span>{task.ci_status === "passing" ? "Ready" : task.ci_status || "Review"}</span><TaskEvidence taskId={task.id} title={task.title} compact /></li>)}
             </ul>
           </Section>
           <Section title="Issues" count={attention.length}>
             <ul className="brief-backlog-list">
-              {attention.map((task) => <li key={task.id}><Link to={`/tasks/${task.id}`}>#{task.number} {task.title}</Link><span>{task.health?.reason || task.summary || "Needs attention"}</span></li>)}
+              {attention.map((task) => <li key={task.id}><Link to={`/tasks/${task.id}`}>#{task.number} {task.title}</Link><span>{task.health?.reason || task.summary || "Needs attention"}</span><TaskEvidence taskId={task.id} title={task.title} compact /></li>)}
             </ul>
           </Section>
           <Section title="Waiting" count={waiting.length}>
@@ -210,6 +228,7 @@ export default function Brief() {
                 <li key={task.id}>
                   <Link to={`/tasks/${task.id}`}>#{task.number} {task.title}</Link>
                   <span><BlockedByLine blockedBy={blockedBy} /></span>
+                  <TaskEvidence taskId={task.id} title={task.title} compact />
                 </li>
               ))}
             </ul>
