@@ -96,6 +96,16 @@ export const safeBranch = (v: unknown, fallback = "main"): string => {
   return fallback;
 };
 
+// One authoritative integration branch for every project git operation. A
+// promotion project naturally works on promote.from; requiring it to repeat
+// that value as default_branch made a missing key silently cut work from main
+// even while every PR targeted staging.
+export function projectBaseBranch(config: any): string {
+  if (config?.default_branch !== undefined && config?.default_branch !== null)
+    return safeBranch(config.default_branch);
+  return safeBranch(config?.promote?.from);
+}
+
 // Prefers `candidate` (e.g. a PR's live baseRefName from `gh pr view`) when it
 // is a safe ref, else `fallback`. Same argv-injection risk as safeBranch even
 // though candidate is GitHub-sourced rather than local config: it still lands

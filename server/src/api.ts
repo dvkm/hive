@@ -80,7 +80,7 @@ import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, safeBranch, preferSafeRef } from "./exec.ts";
+import { defaultExec, projectBaseBranch, preferSafeRef } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
 import { projectPrefix, taskIdentifier } from "./taskIdentifier.ts";
 import {
@@ -2352,7 +2352,7 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   if (project?.repo_path && task.branch) {
     const config = JSON.parse(project.config ?? "{}");
-    const base = safeBranch(config.default_branch);
+    const base = projectBaseBranch(config);
     // TERMINAL, not just done/cancelled: a `failed` task's branch is as dead as
     // a cancelled one, and acme's 109 failed tasks were 87 of the 103 rows
     // this flag used to dump on one card (task #1134).
@@ -2418,13 +2418,22 @@ async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason
 // current branch untouched. A base checked out in another worktree is refused
 // rather than leaving that worktree's files out of sync. Returns null on
 // success, or a failure reason string.
-async function attemptLocalFf(exec: Exec, project: any, task: any, base: string): Promise<string | null> {
+async function attemptLocalFf(exec: Exec, project: any, task: any, base: string, requiredBase?: string): Promise<string | null> {
   const baseSha = await exec(["git", "-C", project.repo_path, "rev-parse", base]);
   const branchSha = await exec(["git", "-C", project.repo_path, "rev-parse", task.branch]);
   const oldSha = baseSha.stdout.trim();
   const newSha = branchSha.stdout.trim();
   if (baseSha.code !== 0 || branchSha.code !== 0 || !oldSha || !newSha)
     return baseSha.stderr.trim() || branchSha.stderr.trim() || "could not resolve merge refs";
+
+  // A PR branch must contain the PR's current base commit, not merely Hive's
+  // possibly stale local branch. Otherwise a local ff can bypass GitHub's
+  // conflict verdict and silently omit integration-branch commits.
+  if (requiredBase) {
+    const current = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", requiredBase, newSha]);
+    if (current.code !== 0)
+      return `current PR base ${requiredBase.slice(0, 12)} is not an ancestor of '${task.branch}'; refresh the branch from origin/${base}`;
+  }
 
   const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", oldSha, newSha]);
   if (anc.code !== 0) {
@@ -2546,19 +2555,19 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
         db,
         herdr,
         task,
-        safeBranch(config.default_branch),
+        projectBaseBranch(config),
         `Could not inspect PR metadata; merge was not attempted (${probe.stderr.trim() || "gh pr view failed"}).`,
         actor
       );
     try {
       prView = JSON.parse(probe.stdout || "{}");
     } catch {
-      return mergeFailed(db, herdr, task, safeBranch(config.default_branch), "Could not parse PR metadata; merge was not attempted.", actor);
+      return mergeFailed(db, herdr, task, projectBaseBranch(config), "Could not parse PR metadata; merge was not attempted.", actor);
     }
     if (!prView.baseRefName || !prView.baseRefOid)
-      return mergeFailed(db, herdr, task, safeBranch(config.default_branch), "PR base metadata is missing; merge was not attempted.", actor);
+      return mergeFailed(db, herdr, task, projectBaseBranch(config), "PR base metadata is missing; merge was not attempted.", actor);
   }
-  const base = preferSafeRef(prView?.baseRefName, safeBranch(config.default_branch));
+  const base = preferSafeRef(prView?.baseRefName, projectBaseBranch(config));
   const guardBase = prView?.baseRefOid || base;
   const guardHead = prView?.headRefOid || task.branch;
   const forceLocalFf = body?.merge_strategy === "local_ff";
@@ -2675,7 +2684,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
         // state: a protection block (failing checks, missing reviews) wears the
         // same "not mergeable" reason, and must never be merged around.
         if (MERGE_CONFLICT_RE.test(reason) && staleBaseRefusal(prView) && project?.repo_path && task.branch) {
-          const ffReason = await attemptLocalFf(exec, project, task, base);
+          const ffReason = await attemptLocalFf(exec, project, task, base, guardBase);
           if (ffReason === null) {
             method = "local ff-only (PR merge reported not-mergeable against origin/" + base + ")";
           } else {
@@ -2692,7 +2701,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
       // branch tip. Requires the default branch to be an ancestor of the task
       // branch; a non-fast-forward (diverged / conflicting) merge is refused, no
       // working tree is touched. Callers wanting a squash merge should use a PR.
-      const ffReason = await attemptLocalFf(exec, project, task, base);
+      const ffReason = await attemptLocalFf(exec, project, task, base, task.pr_url ? guardBase : undefined);
       if (ffReason !== null) return mergeFailed(db, herdr, task, base, ffReason, actor);
       method = forceLocalFf && task.pr_url ? "local ff-only (forced; PR-backed task)" : "local ff-only";
     }
@@ -2935,7 +2944,7 @@ export async function spawnAgent(
       hiveUrl,
       title: task.title,
       brief,
-      base: safeBranch(config.default_branch),
+      base: projectBaseBranch(config),
       env,
       model: modelForTask(config, task.kind),
       agentArgv: agentArgvFor(config, task.kind, brief),

@@ -175,6 +175,7 @@ test("parseAgentStatus maps herdr status onto the enum", () => {
   expect(parseAgentStatus('{"status":"blocked"}')).toBe("blocked");
   expect(parseAgentStatus("agent is working on it")).toBe("working");
   expect(parseAgentStatus("idle")).toBe("idle");
+  expect(parseAgentStatus('{"result":{"agent":{"agent_status":"done"}}}')).toBe("done");
   expect(parseAgentStatus("???")).toBe("unknown");
 });
 
@@ -251,6 +252,32 @@ test("spawn throws when worktree create fails", async () => {
   expect(
     h.spawn({ taskId: "t1", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b" })
   ).rejects.toThrow(/worktree create failed/);
+});
+
+test("spawn refreshes its base from origin and cuts the worktree from that remote ref", async () => {
+  const { exec, calls } = stubExec((argv) => {
+    if (argv[0] === "git") return OK();
+    if (argv.includes("worktree") && argv.includes("create"))
+      return OK('{"result":{"worktree":{"path":"/wt/x","branch":"hive/x"}}}');
+    if (argv.includes("workspace") && argv.includes("list")) return OK('{"result":{"workspaces":[]}}');
+    return OK();
+  });
+  await new Herdr(exec, "herdr").spawn({ taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b", base: "staging" });
+
+  expect(calls[0]).toEqual([
+    "git", "-C", "/repo", "fetch", "--no-tags", "origin",
+    "refs/heads/staging:refs/remotes/origin/staging",
+  ]);
+  const create = calls.find((c) => c.includes("worktree") && c.includes("create"))!;
+  expect(create.slice(create.indexOf("--base"), create.indexOf("--base") + 2)).toEqual(["--base", "origin/staging"]);
+});
+
+test("spawn stops before worktree creation when the authoritative base cannot be fetched", async () => {
+  const { exec, calls } = stubExec((argv) => argv[0] === "git" ? FAIL("remote unavailable") : OK());
+  await expect(
+    new Herdr(exec, "herdr").spawn({ taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b", base: "staging" })
+  ).rejects.toThrow(/base fetch failed: remote unavailable/);
+  expect(calls.some((c) => c.includes("worktree") && c.includes("create"))).toBe(false);
 });
 
 test("probe/read/focus wrap the herdr calls and never throw on a dead agent", async () => {
@@ -340,6 +367,19 @@ test("send refuses to type into an unknown shell pane", async () => {
   expect(result.stderr).toContain("not active");
   expect(calls.some((c) => c[1] === "agent" && c[2] === "send")).toBe(false);
   expect(calls.some((c) => c[1] === "pane")).toBe(false);
+});
+
+test("send refuses a completed turn so the message can be queued for respawn", async () => {
+  const { exec, calls } = stubExec((argv) => {
+    if (argv.includes("agent") && argv.includes("get"))
+      return OK('{"result":{"agent":{"pane_id":"wR:p7","agent_status":"done"}}}');
+    return OK("ok");
+  });
+  const result = await new Herdr(exec, "herdr").send("t1", "continue");
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain("respawn required");
+  expect(calls.some((c) => c[1] === "agent" && c[2] === "send")).toBe(false);
+  expect(calls.some((c) => c[1] === "pane" && c[2] === "send-keys")).toBe(false);
 });
 
 test("answerDialog sends Escape without submitting Enter", async () => {

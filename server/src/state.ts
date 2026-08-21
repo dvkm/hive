@@ -368,7 +368,7 @@ export function queuedInputRecoveryPending(db: DB, taskId: string): boolean {
 // Deliberately independent of anything the agent emits.
 // Returns true when the task was advanced.
 export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, source: string): boolean {
-  if (agentStatus !== "idle" && agentStatus !== "gone") return false; // working/blocked/unknown → leave it be
+  if (agentStatus !== "idle" && agentStatus !== "done" && agentStatus !== "gone") return false; // working/blocked/unknown → leave it be
   const task = getTask(db, taskId);
   if (!task || task.state !== "in_progress" || isTrackingOnlyTask(task)) return false;
   if (queuedInputRecoveryPending(db, taskId)) return false;

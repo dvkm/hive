@@ -52,7 +52,7 @@ boundary (`POST`/`PUT /api/projects`) against the schema in
 and their types. A malformed value or an unrecognised top-level key is a `400`,
 because several of these keys become subprocess argv or network destinations
 downstream (see `agent_argv` below). Keys used elsewhere:
-`default_branch` (string, used as the worktree base + merge target),
+`default_branch` (string, used as the worktree base + merge target; when omitted it inherits `promote.from`, then falls back to `main`; spawn refreshes and cuts from `origin/<branch>` rather than a potentially stale local branch),
 `deploy_notes` (string),
 `monitors` (`[{name, url, expect_status, expect_substring?, interval_s}]`),
 `monitors_auto_task` (bool; a monitor failure auto-creates a `chore` task),
