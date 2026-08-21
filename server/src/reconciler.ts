@@ -798,6 +798,9 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     .all() as { id: string; number: number; title: string; kind: string; config: string }[];
   for (const r of rows) {
     if (isTrackingOnlyId(db, r.id)) continue;
+    // A queued steer is requested work the agent has not received yet. Never
+    // merge the branch before a fresh turn can address it.
+    if (queuedSteers(db, r.id).length) continue;
     // #1234 review-12: don't auto-merge out from under a queued-input recovery
     // that just fired on this same task — the redelivered turn may still push.
     if (queuedInputRecoveryPending(db, r.id)) continue;

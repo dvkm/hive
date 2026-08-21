@@ -38,6 +38,7 @@ test("reports an unmet dependency live, regardless of any stale claim elsewhere"
 
 test("flags a branch that shares history with another open task's branch", async () => {
   const { db, projectId, taskId } = seed();
+  db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify({ promote: { from: "staging", to: "main" } }), projectId);
   const otherId = newId();
   const t = now();
   db.query(
@@ -47,7 +48,7 @@ test("flags a branch that shares history with another open task's branch", async
   const exec: Exec = async (argv) => {
     if (argv[3] !== "merge-base") return OK();
     const [a, b] = [argv[4], argv[5]];
-    if ([a, b].sort().join("|") === "feat|main") return OK("base-sha\n");
+    if ([a, b].sort().join("|") === "feat|origin/staging") return OK("base-sha\n");
     if ([a, b].sort().join("|") === "feat|other-branch") return OK("shared-ancestor-sha\n"); // deeper than base
     return FAIL();
   };
@@ -79,7 +80,7 @@ test("a failed task's branch is not a stacked-branch candidate", async () => {
   const exec: Exec = async (argv) => {
     if (argv[3] !== "merge-base") return OK();
     if (argv[4] === "--is-ancestor") return FAIL();
-    return OK([argv[4], argv[5]].sort().join("|") === "feat|main" ? "base-sha\n" : "shared-sha\n");
+    return OK([argv[4], argv[5]].sort().join("|") === "feat|origin/main" ? "base-sha\n" : "shared-sha\n");
   };
 
   const res = await taskBranchCheckEndpoint(db, taskId, { exec });

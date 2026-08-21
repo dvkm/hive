@@ -75,10 +75,11 @@ test("preferSafeRef uses the candidate only when safe, else the given fallback",
 });
 
 test("projectBaseBranch inherits the promotion source before falling back to main", async () => {
-  const { projectBaseBranch } = await import("../src/exec.ts");
+  const { projectBaseBranch, projectComparisonBase } = await import("../src/exec.ts");
   expect(projectBaseBranch({ default_branch: "release", promote: { from: "staging" } })).toBe("release");
   expect(projectBaseBranch({ promote: { from: "staging", to: "main" } })).toBe("staging");
   expect(projectBaseBranch({})).toBe("main");
+  expect(projectComparisonBase({ promote: { from: "staging", to: "main" } })).toBe("origin/staging");
 });
 
 // safeBranch/preferSafeRef used to fall back silently everywhere except

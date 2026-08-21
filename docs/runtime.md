@@ -123,6 +123,8 @@ hive uses herdr the way priortool's `docs/herdr-backend.md` proved it should be 
    then run `herdr worktree create --cwd <repo> --branch hive/<id> --base
    origin/<base> --json`. New task worktrees therefore start from the current
    integration branch instead of a possibly stale local ref.
+
+Read-only branch comparisons (review diffs, scope-drift footprints, and stacked-branch checks) likewise use `origin/<base>`. Local branch state is reserved for operations that intentionally act on the checkout, such as merging and cleanup.
 2. **Prepare the worktree** (callback) wires Hive's Stop/SubagentStop/PostToolUse hooks before the agent starts (`.claude/settings.local.json` for Claude; per-invocation Codex hook config for ChatGPT), so lifecycle reporting is structural, not brief-dependent (`hooks/`), then runs
    the per-project spawn hook `config.setup_argv` (e.g.
    `["infra/worktree/wt.sh", "up", "{worktree}"]`) so agents don't have to

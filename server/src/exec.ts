@@ -106,6 +106,13 @@ export function projectBaseBranch(config: any): string {
   return safeBranch(config?.promote?.from);
 }
 
+// Read-only comparisons should follow the remote-tracking integration ref.
+// The local branch can be missing or lag behind origin without affecting the
+// branch that GitHub actually uses as the PR base.
+export function projectComparisonBase(config: any): string {
+  return `origin/${projectBaseBranch(config)}`;
+}
+
 // Prefers `candidate` (e.g. a PR's live baseRefName from `gh pr view`) when it
 // is a safe ref, else `fallback`. Same argv-injection risk as safeBranch even
 // though candidate is GitHub-sourced rather than local config: it still lands
