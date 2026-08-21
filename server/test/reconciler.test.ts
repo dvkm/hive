@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, getSetting, type DB } from "../src/db.ts";
 import { transition, getTask, writeEvent } from "../src/state.ts";
-import { reconcileOnce, ciStatusOf } from "../src/reconciler.ts";
+import { reconcileOnce, ciStatusOf, ciStatusProbed } from "../src/reconciler.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
 import { addClient, removeClient } from "../src/bus.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
@@ -31,6 +31,83 @@ test("ciStatusOf derives failing > pending > passing", () => {
   expect(ciStatusOf([{ conclusion: "SUCCESS" }, { conclusion: "FAILURE" }])).toBe("failing");
   expect(ciStatusOf([{ state: "PENDING" }])).toBe("pending");
   expect(ciStatusOf([])).toBeNull();
+});
+
+// GitHub marks a check FAILURE even when it refuses to START the job (unpaid
+// Actions billing, no runner). No commit can fix that, so hive must call it
+// "unavailable" and let the handoff through instead of steering the agent to
+// go fix it (task #1210).
+const JOB_URL = "https://github.com/dvkm/hive/actions/runs/32422454730/job/96597180562";
+const RED_URL = "https://github.com/dvkm/hive/actions/runs/32422454730/job/11111111111";
+// Verbatim from the live billing-blocked run on PR #121.
+const BILLING_ANNOTATION = JSON.stringify([
+  {
+    annotation_level: "failure",
+    message:
+      "The job was not started because recent account payments have failed or your spending limit needs to be increased. Please check the 'Billing & plans' section in your settings",
+  },
+]);
+// The annotation probe, stubbed at the gh layer: the non-start job reports the
+// billing message, a genuinely red job reports an ordinary test failure.
+const annotations = (): Exec =>
+  stub((argv) => {
+    if (argv[0] !== "gh" || argv[1] !== "api") return OK();
+    if (String(argv[2]).includes("96597180562")) return OK(BILLING_ANNOTATION);
+    return OK(JSON.stringify([{ annotation_level: "failure", message: "Process completed with exit code 1." }]));
+  });
+
+test("ciStatusProbed calls a real red test failing and a job GitHub never started unavailable", async () => {
+  const exec = annotations();
+  const nonStart = { conclusion: "FAILURE", detailsUrl: JOB_URL };
+  const redTest = { conclusion: "FAILURE", detailsUrl: RED_URL };
+
+  // A genuine red test stays 'failing' — that gate is load-bearing.
+  expect(await ciStatusProbed(exec, [{ conclusion: "SUCCESS" }, redTest])).toBe("failing");
+  // Billing non-start: GitHub's own annotation says the job never started.
+  expect(await ciStatusProbed(exec, [nonStart])).toBe("unavailable");
+  // Mixed: one real failure alongside the non-start still holds the handoff.
+  expect(await ciStatusProbed(exec, [nonStart, redTest])).toBe("failing");
+  // Rollups that aren't red are untouched, probe or no probe.
+  expect(await ciStatusProbed(exec, [{ conclusion: "SUCCESS" }])).toBe("passing");
+  expect(await ciStatusProbed(exec, [{ status: "IN_PROGRESS" }])).toBe("pending");
+  expect(await ciStatusProbed(exec, [])).toBeNull();
+});
+
+test("ciStatusProbed keeps 'failing' when the annotation probe can't answer", async () => {
+  // No detailsUrl to identify the check run (a StatusContext, or an older gh).
+  expect(await ciStatusProbed(annotations(), [{ conclusion: "FAILURE" }])).toBe("failing");
+  // gh errored, and gh returned something that isn't an annotation list. A red
+  // test must never be downgraded because the probe misfired.
+  const broken = stub((argv) => (argv[1] === "api" ? { code: 1, stdout: "", stderr: "gh: not found" } : OK()));
+  expect(await ciStatusProbed(broken, [{ conclusion: "FAILURE", detailsUrl: JOB_URL }])).toBe("failing");
+  const garbage = stub((argv) => (argv[1] === "api" ? OK("not json") : OK()));
+  expect(await ciStatusProbed(garbage, [{ conclusion: "FAILURE", detailsUrl: JOB_URL }])).toBe("failing");
+});
+
+test("syncPRs hands off a PR whose CI never started, and tells the director instead of the agent", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/1210", agent_target: "t-agent" });
+  transition(db, id, "in_progress");
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,?)").run(
+    newId("ev"), id, now(), "log", "/tmp/x", "/evidence/x", "c", "{}"
+  );
+
+  const gh: Exec = stub((argv) => {
+    if (argv[0] !== "gh") return OK();
+    if (argv[1] === "api") return OK(BILLING_ANNOTATION);
+    if (argv[1] === "pr" && argv[2] === "view")
+      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "FAILURE", detailsUrl: JOB_URL }] }));
+    return OK("[]");
+  });
+  await reconcileOnce(db, { exec: gh });
+
+  const task = getTask(db, id);
+  expect(task.ci_status).toBe("unavailable");
+  // The whole point: the agent moves on to review instead of being told to fix
+  // a job that never ran.
+  expect(task.state).toBe("in_review");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'ci_failure'").get(id)).toBeFalsy();
+  expect((db.query("SELECT COUNT(*) AS n FROM notifications WHERE kind = 'ci_unavailable'").get() as any).n).toBe(1);
 });
 
 test("syncAgents writes an agent_status event only when the status changes", async () => {

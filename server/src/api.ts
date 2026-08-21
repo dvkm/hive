@@ -74,7 +74,7 @@ import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts"
 import { vapidPublicKey, saveSubscription, removeSubscription } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
-import { ciStatusOf } from "./reconciler.ts";
+import { ciStatusOf, ciStatusProbed } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
@@ -4507,7 +4507,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         const probe = await exec(["gh", "pr", "view", pr, "--json", "statusCheckRollup"]);
         if (probe.code === 0) {
           try {
-            ci = ciStatusOf(JSON.parse(probe.stdout || "{}").statusCheckRollup);
+            ci = await ciStatusProbed(exec, JSON.parse(probe.stdout || "{}").statusCheckRollup);
           } catch {
             ci = null;
           }

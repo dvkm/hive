@@ -435,11 +435,12 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
         }
       }
     }
-    const ci = ciStatusOf(data.statusCheckRollup);
+    const ci = await ciStatusProbed(exec, data.statusCheckRollup);
     if (ci && ci !== t.ci_status) {
       db.query("UPDATE tasks SET ci_status = ?, updated_at = ? WHERE id = ?").run(ci, now(), t.id);
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "ci_status", payload: { ci_status: ci } });
       broadcast({ type: "task", task: getTask(db, t.id) });
+      if (ci === "unavailable") notifyCiUnavailable(db, t.id, t.pr_url);
     }
     if (data.headRefOid && data.headRefOid !== t.head_sha) {
       db.query("UPDATE tasks SET head_sha = ?, updated_at = ? WHERE id = ?").run(data.headRefOid, now(), t.id);
@@ -640,21 +641,94 @@ async function linkPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   }
 }
 
+// One rollup entry counts as red. Shared by ciStatusOf and the non-start probe
+// below so both agree on exactly which checks are the failing ones.
+function isFailedCheck(c: any): boolean {
+  const conclusion = String(c.conclusion ?? "").toUpperCase();
+  const state = String(c.state ?? "").toUpperCase(); // StatusContext
+  return (
+    conclusion === "FAILURE" || conclusion === "ERROR" || conclusion === "CANCELLED" || conclusion === "TIMED_OUT" ||
+    state === "FAILURE" || state === "ERROR"
+  );
+}
+
 // Derive a coarse ci_status from gh's statusCheckRollup (a mix of CheckRun and
 // StatusContext objects). failing > pending > passing.
 export function ciStatusOf(rollup: any): string | null {
   if (!Array.isArray(rollup) || rollup.length === 0) return null;
   let anyPending = false;
   for (const c of rollup) {
-    const conclusion = String(c.conclusion ?? "").toUpperCase();
     const status = String(c.status ?? "").toUpperCase();
     const state = String(c.state ?? "").toUpperCase(); // StatusContext
-    if (conclusion === "FAILURE" || conclusion === "ERROR" || conclusion === "CANCELLED" || conclusion === "TIMED_OUT" || state === "FAILURE" || state === "ERROR")
-      return "failing";
+    if (isFailedCheck(c)) return "failing";
     if (status === "QUEUED" || status === "IN_PROGRESS" || status === "PENDING" || state === "PENDING")
       anyPending = true;
   }
   return anyPending ? "pending" : "passing";
+}
+
+// GitHub still creates a check run and marks it {conclusion: FAILURE} when it
+// REFUSES to start the job — unpaid Actions billing, a spending limit, no
+// runner. In the rollup that is byte-for-byte a red test, so the ready gate
+// held the handoff and told the agent to "fix the failures and push", which no
+// commit can do: the job never ran (task #1210, seen live on PR #121, failed in
+// 3s with steps: []). GitHub says so in the check run's annotation, and every
+// one of those messages starts with the same phrase.
+const NON_START_ANNOTATION = /job was not started/i;
+
+// True when GitHub's own annotation says this failing check never started.
+// Everything unexpected — no details URL, gh error, output that isn't an
+// annotation array — returns false. A genuine red test must never be downgraded
+// because a probe misfired.
+async function isNonStart(exec: Exec, check: any): Promise<boolean> {
+  // detailsUrl: https://github.com/<owner>/<repo>/actions/runs/<run>/job/<id>,
+  // where <id> is also the check-run id.
+  const m = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/.*\/job\/(\d+)/.exec(String(check?.detailsUrl ?? ""));
+  if (!m) return false;
+  const r = await exec(["gh", "api", `repos/${m[1]}/${m[2]}/check-runs/${m[3]}/annotations`]);
+  if (r.code !== 0) return false;
+  try {
+    const anns = JSON.parse(r.stdout);
+    return Array.isArray(anns) && anns.some((a: any) => NON_START_ANNOTATION.test(String(a?.message ?? "")));
+  } catch {
+    return false;
+  }
+}
+
+// Surface a non-start to the director, not to the agent — the agent can't fix
+// it. Once per hour for the whole fleet: the failure mode this exists for is
+// EVERY open PR going red at the same moment (Actions billing lapses), and a
+// push per task would bury the one thing that matters.
+const CI_UNAVAILABLE_QUIET_MS = 60 * 60 * 1000;
+
+function notifyCiUnavailable(db: DB, taskId: string, prUrl: string): void {
+  const since = new Date(Date.now() - CI_UNAVAILABLE_QUIET_MS).toISOString();
+  const recent = db.query("SELECT 1 FROM notifications WHERE kind = 'ci_unavailable' AND ts > ? LIMIT 1").get(since);
+  if (recent) return;
+  enqueue(db, {
+    kind: "ci_unavailable",
+    task_id: taskId,
+    title: "GitHub refused to run CI — checks are red for a reason no agent can fix",
+    body: `The job never started on ${prUrl}. Check Actions billing and runners. Handoffs are NOT held, so review is unblocked.`,
+  });
+}
+
+// ciStatusOf plus the one thing the rollup can't tell you on its own: a
+// 'failing' rollup whose failing checks ALL never started is 'unavailable', not
+// 'failing'. Callers gate on 'failing'/'pending' and let 'unavailable' through
+// like a repo with no CI at all, because holding the agent there is a trap.
+// Mixed — one real red test alongside a non-start — stays 'failing': a genuine
+// failure always wins.
+// ponytail: one extra `gh api` per failing check per cycle, and only while a PR
+// is red — green and pending rollups never probe. Cache per head SHA if a repo
+// ever sits red across many tasks for long enough to matter.
+export async function ciStatusProbed(exec: Exec, rollup: any): Promise<string | null> {
+  const status = ciStatusOf(rollup);
+  if (status !== "failing") return status;
+  for (const c of (rollup as any[]).filter(isFailedCheck)) {
+    if (!(await isNonStart(exec, c))) return "failing";
+  }
+  return "unavailable";
 }
 
 // ---- stale detection ----

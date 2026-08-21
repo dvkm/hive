@@ -46,7 +46,7 @@ export function Empty({
 
 export function CiBadge({ status }: { status: CiStatus }) {
   if (!status) return null;
-  return <span className={`ci ci-${status}`}>CI {status}</span>;
+  return <span className={`ci ci-${status}`}>{status === "unavailable" ? "CI never ran" : `CI ${status}`}</span>;
 }
 
 // "Blocked by #N, #M" chip. Uses the browser-side dependency gate mirror from
