@@ -49,6 +49,45 @@ test("offline mode skips the sweep entirely (no closes, no worktree removals)", 
   expect(getSetting(db, "last_reap_at")).not.toBeNull(); // the loop is alive, just idle
 });
 
+// Task #1112 / 2026-08-20. The live loop, reproduced: six ancient terminal tasks
+// whose rows had lost worktree_path (so cleanupTask can no longer remove the
+// checkout) but whose worktrees git STILL lists. The reaper handed them back
+// every 300s lap and cleanupTask re-fired tab.close at a tab id from the
+// immutable `spawned` event — ~5 dead closes and 11,458 duplicate `cleaned_up`
+// events per task. The teardown must converge after ONE lap.
+test("two reaper laps over an already-cleaned terminal task: the second issues no herdr closes", async () => {
+  const { db, projectId } = freshDb();
+  const t = now();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, agent_target, worktree_path, branch, created_at, updated_at)
+     VALUES (?,?,?, 'cancelled', 'ship', NULL, NULL, NULL, ?, ?)`
+  ).run("ANCIENT", projectId, "t", t, t);
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    newId("evt"), "ANCIENT", t, "herdr", "spawned", JSON.stringify({ tab_id: "wR:t11", workspace_id: "wKT11" })
+  );
+
+  const calls: string[][] = [];
+  // git keeps listing the worktree forever — that is what guarantees re-entry.
+  const exec: Exec = async (argv) => {
+    calls.push(argv);
+    if (argv[0] === "git" && has(argv, "worktree", "list"))
+      return OK("worktree /repo\nHEAD r0\nbranch refs/heads/main\n\nworktree /wt/hive-ANCIENT\nHEAD r1\nbranch refs/heads/hive/ANCIENT\n");
+    return OK();
+  };
+  const herdr = new Herdr(exec, "herdr");
+  const closes = () => calls.filter((c) => c[0] === "herdr" && c.includes("close"));
+
+  await reapOnce(db, { herdr, exec });
+  expect(closes().some((c) => has(c, "tab", "close", "wR:t11"))).toBe(true); // attempted once
+  const events = db.query("SELECT COUNT(*) n FROM events WHERE task_id = ?").get("ANCIENT") as { n: number };
+
+  calls.length = 0;
+  await reapOnce(db, { herdr, exec });
+  expect(calls.some((c) => c[0] === "git" && has(c, "worktree", "list"))).toBe(true); // still re-entered...
+  expect(closes()).toEqual([]); // ...but did nothing
+  expect((db.query("SELECT COUNT(*) n FROM events WHERE task_id = ?").get("ANCIENT") as { n: number }).n).toBe(events.n);
+});
+
 test("taskIdFromBranch extracts only hive/<id>; ghosts and others are ignored", () => {
   expect(taskIdFromBranch("hive/abc123")).toBe("abc123");
   expect(taskIdFromBranch("ghost-abc123")).toBeNull();
