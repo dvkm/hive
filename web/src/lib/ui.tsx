@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { State, CiStatus, Health } from "./api";
 import { STATE_LABEL, HEALTH_LABEL } from "./labels";
+import { DEP_MET_STATES } from "./needsYou";
 
 export { STATE_LABEL, HEALTH_LABEL, NEXT } from "./labels"; // callers keep importing them from here
 
@@ -48,12 +49,9 @@ export function CiBadge({ status }: { status: CiStatus }) {
   return <span className={`ci ci-${status}`}>CI {status}</span>;
 }
 
-// "Blocked by #N, #M" chip: the dependencies from `depends_on` that aren't
-// done or cancelled yet. Renders nothing once every dependency resolves (or
-// the list is empty). A cancelled dep (e.g. folded into a duplicate) will never
-// reach 'done', so it clears too. An id that resolves to no known task counts
-// as unmet (we can't prove it done) and shows its short id.
-// ponytail: plain span, not a Link — the card wrapping it is already an anchor,
+// "Blocked by #N, #M" chip. Uses the browser-side dependency gate mirror from
+// needsYou.ts; an unknown id stays blocking and displays its short id.
+// ponytail: plain span, not a Link, because the card wrapping it is already an anchor
 // and nested anchors are invalid HTML.
 type DepTask = { id: string; number: number; title: string; state: State };
 export function BlockedBy({ depends_on, tasks }: { depends_on: string[]; tasks: DepTask[] }) {
@@ -61,7 +59,7 @@ export function BlockedBy({ depends_on, tasks }: { depends_on: string[]; tasks: 
   if (!deps.length) return null;
   const unmet = deps
     .map((id) => ({ id, t: tasks.find((x) => x.id === id) }))
-    .filter(({ t }) => !t || (t.state !== "done" && t.state !== "cancelled"));
+    .filter(({ t }) => !t || !DEP_MET_STATES.has(t.state));
   if (!unmet.length) return null;
   const label = unmet.map(({ id, t }) => (t ? `#${t.number}` : id.slice(0, 6))).join(", ");
   const tip = unmet
