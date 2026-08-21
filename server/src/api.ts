@@ -5,9 +5,8 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { taskWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
-import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror, isTrackingOnlyTask } from "./supervision.ts";
+import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
-import { REF_PREFIX as JIRA_REF_PREFIX } from "./intake/jira.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
 import {
   transition,
@@ -72,7 +71,7 @@ import { costUsd } from "./pricing.ts";
 import { checkCostGuardrails, resolveCostCapForDecision, taskSpend } from "./costs.ts";
 import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
-import { vapidPublicKey, saveSubscription, removeSubscription } from "./push.ts";
+import { vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
 import { ciStatusOf, ciStatusProbed, reclaimDeadWorktree } from "./reconciler.ts";
@@ -399,7 +398,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         return json({ key: vapidPublicKey(db) });
       if (pathname === "/api/push/subscribe" && method === "POST") {
         try {
-          saveSubscription(db, await req.json());
+          saveSubscription(db, await req.json() as PushSub);
           return json({ ok: true });
         } catch (e: any) {
           return err(String(e?.message ?? e), 400);
@@ -2509,8 +2508,9 @@ function staleBaseRefusal(prView: any): boolean {
 // on GitHub is stale (origin/<base> behind the primary checkout's local
 // <base>) while the branch is still a clean ff onto local <base>. It skips
 // `gh pr merge` and the staleBaseRefusal gate (an explicit override is the
-// caller's call to make) but still honours the PR state probe: a CLOSED PR is
-// refused and a MERGED one just advances. The same
+// caller's call to make), but still requires the local branch to match the PR
+// head and contain its current base. It also honours the PR state probe: a
+// CLOSED PR is refused and a MERGED one just advances. The same
 // staleness shape is also detected automatically: if `gh pr merge` fails with
 // a conflict/not-mergeable/not-an-ancestor reason AND the PR's own state says
 // the blocker is the base comparison rather than branch protection, hive tries
@@ -2752,7 +2752,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
 
 // Bounce an in-review task back to in_progress with reviewer feedback, and make
 // sure the feedback actually REACHES an agent. Delivers to the live agent; if
-// none is live (idle/gone, or the send fails) it queues the notes as a steer and
+// none has an active turn (done/gone, or the send fails) it queues the notes as a steer and
 // RESPAWNS so the fresh agent gets them in its first brief. Records a
 // `changes_requested` event either way — that carries the notes on the timeline
 // AND marks the bounce unaddressed, so the reconciler's idle-advance backstop
@@ -3030,7 +3030,7 @@ export async function spawnAgent(
 }
 
 // Re-arming supervised wait loop: the herdr PUSH channel for "the agent is
-// done". It never relies on anything the agent emits — herdr's own idle signal
+// done". It never relies on anything the agent emits — herdr's own idle/done signal
 // drives the in_progress → in_review handoff (advanceIfFinished, same logic as
 // the reconciler's poll backstop). A wait timeout re-arms while the agent is
 // alive, so supervision covers tasks longer than one wait window; the loop ends
@@ -4716,7 +4716,12 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       const submittedChecks = rawChecks.length ? rawChecks : rawCheck ? [rawCheck] : [];
       if (submittedChecks.some(isAgentProcedureQuestion))
         return err("understanding checks must teach the director about this specific change, not test agent procedures", 400);
-      const checks = dropRepeats(
+      const checks = dropRepeats<{
+        question: string;
+        options: UnderstandingCheck["options"];
+        answer_key: string;
+        explanation?: string;
+      }>(
         rawChecks.flatMap((value: unknown) => {
           const check = normalizeUnderstandingCheck(value);
           return check ? [{

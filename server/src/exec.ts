@@ -87,9 +87,9 @@ function warnUnsafeRef(v: unknown, fallback: string): void {
 }
 
 // A config-sourced branch name, or `fallback` when it is missing or unsafe.
-// Every `config.default_branch || "main"` read goes through this. Logs when a
-// present-but-unsafe value is rejected, so a malformed default_branch doesn't
-// silently diff against the wrong branch with no operator signal.
+// projectBaseBranch routes project integration-branch reads through this. Logs
+// when a present-but-unsafe value is rejected, so a malformed branch doesn't
+// silently select the wrong ref with no operator signal.
 export const safeBranch = (v: unknown, fallback = "main"): string => {
   if (isSafeRef(v)) return v;
   warnUnsafeRef(v, fallback);

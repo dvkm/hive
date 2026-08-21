@@ -362,7 +362,7 @@ export function queuedInputRecoveryPending(db: DB, taskId: string): boolean {
 }
 
 // The finished-handoff, shared by every herdr-signal path (the reconciler's
-// poll backstop and the supervise wait loop): an agent observed idle/gone on an
+// poll backstop and the supervise wait loop): an agent observed idle/done/gone on an
 // in_progress task that has a real work product (a pr_url, or a scout report)
 // advances to in_review, except while a queued-input recovery is pending.
 // Deliberately independent of anything the agent emits.
