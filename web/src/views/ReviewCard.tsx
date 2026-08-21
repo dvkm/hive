@@ -72,6 +72,32 @@ function EvChip({ e, headSha }: { e: Evidence; headSha: string | null }) {
     </span>
   );
 }
+
+export function EvidenceStrip({ evidence, task, limit }: { evidence: Evidence[]; task: Pick<Task, "id" | "title" | "head_sha">; limit?: number }) {
+  const lightbox = useLightbox();
+  if (!evidence.length) return null;
+  const ordered = [...evidence].sort((a, b) => a.ts.localeCompare(b.ts));
+  const visible = limit ? ordered.slice(-limit) : ordered;
+  const images = visible.filter((e) => e.kind === "screenshot" && e.url);
+  const lightboxImages: LightboxImage[] = images.map((e) => ({
+    url: e.url!,
+    caption: e.caption,
+    taskId: task.id,
+    taskTitle: task.title,
+    ts: e.ts,
+  }));
+  return (
+    <div className="review-evidence brief-evidence">
+      {visible.map((e) => e.kind === "screenshot" && e.url ? (
+        <button key={e.id} className="rev-thumb" title={e.caption || "screenshot"} onClick={() => lightbox.open(lightboxImages, images.findIndex((image) => image.id === e.id))}>
+          <img src={e.url} alt={e.caption || "screenshot"} />
+          <EvAge e={e} headSha={task.head_sha} />
+        </button>
+      ) : <EvChip key={e.id} e={e} headSha={task.head_sha} />)}
+      {limit && evidence.length > limit && <Link className="brief-evidence-more" to={`/tasks/${task.id}`}>+{evidence.length - limit} more</Link>}
+    </div>
+  );
+}
 import type { Decision, Event } from "../lib/api";
 
 // The request-changes exchange: the director's notes and the agent's replies,
@@ -313,7 +339,6 @@ export function ReviewCard({
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
   const [openDecisions, setOpenDecisions] = useState<Decision[]>([]);
-  const lightbox = useLightbox();
 
   useEffect(() => {
     let live = true;
@@ -574,6 +599,8 @@ export function ReviewCard({
         )}
       </div>
 
+      <EvidenceStrip evidence={evidence} task={task} />
+
       <details className="review-details" open={quizStatus === "required"}>
         <summary>
           <span>{reportOnly ? "Explain report" : review?.understanding ? "Understand this change" : "Why Hive recommends this"}</span>
@@ -600,35 +627,6 @@ export function ReviewCard({
 
               {review ? <ReviewAudit r={review} /> : task.summary && <p className="review-summary">{task.summary}</p>}
               {review && task.summary && <p className="review-summary">{task.summary}</p>}
-
-              {evidence.length > 0 &&
-                (() => {
-              // Screenshots as lightbox thumbnails; everything else (test runs,
-              // logs, reports, links) as compact chips. The proof rides with the
-              // review instead of a click away on the task page.
-              const imgs = evidence.filter((e) => e.kind === "screenshot" && e.url);
-              const lb: LightboxImage[] = imgs.map((e) => ({
-                url: e.url!,
-                caption: e.caption,
-                taskId: task.id,
-                taskTitle: task.title,
-                ts: e.ts,
-              }));
-              const others = evidence.filter((e) => !(e.kind === "screenshot" && e.url));
-              return (
-                <div className="review-evidence">
-                  {imgs.map((e, i) => (
-                    <button key={e.id} className="rev-thumb" title={e.caption || "screenshot"} onClick={() => lightbox.open(lb, i)}>
-                      <img src={e.url!} alt={e.caption || "screenshot"} />
-                      <EvAge e={e} headSha={task.head_sha} />
-                    </button>
-                  ))}
-                  {others.map((e) => (
-                    <EvChip key={e.id} e={e} headSha={task.head_sha} />
-                  ))}
-                </div>
-              );
-                })()}
 
               <div className="review-diffstat">
                 {diffErr ? (

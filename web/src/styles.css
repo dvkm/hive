@@ -3251,6 +3251,21 @@ a.dbundle-fact:hover {
   white-space: nowrap;
   text-align: right;
 }
+.brief-backlog-list .brief-evidence {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+.brief-backlog-list .brief-evidence .rev-thumb img {
+  height: 64px;
+  max-width: 150px;
+}
+.brief-evidence-more {
+  align-self: center;
+  color: var(--text-faint) !important;
+  font-size: 12px;
+  font-weight: 500 !important;
+  white-space: nowrap;
+}
 .brief-picker {
   display: flex;
   align-items: center;
@@ -4157,6 +4172,7 @@ a.dbundle-fact:hover {
 /* ---- evidence staleness marker (captured-at + commit SHA vs PR head) ---- */
 .ev-age {
   display: inline-flex;
+  flex: none;
   align-items: center;
   gap: 4px;
   font-size: 11px;
@@ -4164,6 +4180,7 @@ a.dbundle-fact:hover {
   border: 1px solid transparent;
   border-radius: 5px;
   padding: 1px 4px;
+  white-space: nowrap;
 }
 .ev-age-stale { color: #d4a72c; border-color: #d4a72c66; }
 .ev-sha { font-family: var(--mono, monospace); opacity: 0.8; }
@@ -4180,7 +4197,7 @@ a.dbundle-fact:hover {
   max-width: 320px;
 }
 .rev-ev-chip:hover { background: color-mix(in srgb, currentColor 6%, transparent); }
-.rev-ev-cap { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rev-ev-cap { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---- checkpoint inbox groups ---- */
 .cp-group { margin: 10px 0 4px; }
