@@ -1,0 +1,174 @@
+// Schema for projects.config, checked at the API boundary (POST/PUT /api/projects).
+//
+// projects.config is client-writable and hive's loopback API is unauthenticated
+// by design, so this object is a trust boundary. Every subsystem downstream of
+// it trusts its shape completely; the sharpest case is config.agent_argv, which
+// becomes the verbatim binary+argv of every spawned task agent (runtime/herdr.ts)
+// while that same spawn injects all of the project's resolved secrets into the
+// process env — so a single config write reaches an attacker-chosen command on
+// the next dispatch. reviewer_argv / planner_argv / setup_argv / cleanup_argv
+// are the same shape against the server's own ambient env.
+//
+// Type-checking here does NOT remove that RCE surface: those overrides are an
+// intentional per-project feature. It stops malformed values from reaching code
+// that assumes a shape, and it gives tighter policy (e.g. requiring argv[0] to
+// resolve to an allowlisted binary) exactly one place to live. See task #991's
+// inventory for the full config-field -> call-site map.
+//
+// CHECKS is the allowlist: an unknown top-level key is rejected, so a new config
+// key cannot be wired into a reader without someone landing here and choosing
+// its check. Keys hive stores but never reads are listed with `any` explicitly.
+import { AUTONOMY_PROFILES } from "./chat.ts";
+
+// Lives here, not in api.ts: this schema needs it, and api.ts already imports
+// this file, so importing back would be a cycle. api.ts re-exports the name.
+export const AGENTS = ["claude", "codex"] as const;
+export type Agent = (typeof AGENTS)[number];
+
+type Check = (v: unknown) => string | null; // null = valid, else the reason
+
+const any: Check = () => null;
+const str: Check = (v) => (typeof v === "string" ? null : "must be a string");
+const bool: Check = (v) => (typeof v === "boolean" ? null : "must be a boolean");
+const num: Check = (v) => (typeof v === "number" && Number.isFinite(v) ? null : "must be a number");
+const obj: Check = (v) => (v !== null && typeof v === "object" && !Array.isArray(v) ? null : "must be an object");
+const strArray: Check = (v) =>
+  Array.isArray(v) && v.every((x) => typeof x === "string") ? null : "must be an array of strings";
+const oneOf =
+  (...allowed: string[]): Check =>
+  (v) =>
+    typeof v === "string" && allowed.includes(v) ? null : `must be one of ${allowed.join("|")}`;
+
+// The subprocess-override family. Constrained to a string[] so nothing but an
+// argv can be smuggled through; the CONTENT stays the project's choice, which
+// is what these keys exist for.
+const argv = strArray;
+
+// No credential rides along on these fetches (they are plain GETs), so this is
+// SSRF-bounding, not exfil: reject anything that is not a well-formed http(s)
+// URL. Internal hosts are deliberately NOT rejected — monitors and smoke checks
+// legitimately point at 127.0.0.1 dev servers.
+function httpUrl(v: unknown): string | null {
+  if (typeof v !== "string") return "must be a string";
+  let u: URL;
+  try {
+    u = new URL(v);
+  } catch {
+    return "must be a valid URL";
+  }
+  return u.protocol === "http:" || u.protocol === "https:" ? null : "must be an http(s) URL";
+}
+
+// watchers / monitors / smoke: [{name, url, ...}]. The url is the only field
+// that becomes a destination, so that is the field pinned.
+const urlList: Check = (v) => {
+  if (!Array.isArray(v)) return "must be an array";
+  for (let i = 0; i < v.length; i++) {
+    const e = v[i] as Record<string, unknown>;
+    if (e === null || typeof e !== "object" || Array.isArray(e)) return `[${i}] must be an object`;
+    const bad = httpUrl(e.url);
+    if (bad) return `[${i}].url ${bad}`;
+  }
+  return null;
+};
+
+// Mirrors what intake/jira.ts's jiraConfigStatus() needs to build a usable
+// config. The credential target itself is pinned there against compiled-in
+// constants (credentialTargetAllowed); this only keeps a malformed value from
+// reaching it at all.
+const jira: Check = (v) => {
+  const bad = obj(v);
+  if (bad) return bad;
+  const j = v as Record<string, unknown>;
+  for (const k of ["site", "email", "project_key"]) if (typeof j[k] !== "string") return `.${k} must be a string`;
+  for (const k of ["enabled", "write"]) if (j[k] !== undefined && typeof j[k] !== "boolean") return `.${k} must be a boolean`;
+  if (j.jql !== undefined && typeof j.jql !== "string") return ".jql must be a string";
+  return null;
+};
+
+// Either the literal "*" (every space the authorized user belongs to) or
+// [{space, label?}] — see intake/gchat.ts.
+const gchatSpaces: Check = (v) => {
+  if (v === "*") return null;
+  if (!Array.isArray(v)) return 'must be "*" or an array of {space} objects';
+  for (let i = 0; i < v.length; i++) {
+    const e = v[i] as Record<string, unknown>;
+    if (e === null || typeof e !== "object" || Array.isArray(e)) return `[${i}] must be an object`;
+    if (typeof e.space !== "string") return `[${i}].space must be a string`;
+  }
+  return null;
+};
+
+const CHECKS: Record<string, Check> = {
+  // dispatch / autonomy
+  auto_dispatch: bool,
+  autonomy_profile: oneOf(...AUTONOMY_PROFILES),
+  dispatch_kinds: strArray,
+  max_agents: num,
+  archived: bool,
+  test: bool, // test/ephemeral project, hidden from director surfaces (testProjects.ts)
+  plan_intake: bool,
+  intake_keywords: strArray,
+  // subprocess argv overrides (see above)
+  agent_argv: argv,
+  reviewer_argv: argv,
+  planner_argv: argv,
+  setup_argv: argv,
+  cleanup_argv: argv,
+  stack_setup_timeout_ms: num,
+  // agent behaviour
+  agent: oneOf(...AGENTS),
+  model: str,
+  model_by_kind: obj,
+  codex_model: str,
+  codex_model_by_kind: obj,
+  supervisor_persona: str,
+  playbook: str,
+  command_approval: oneOf("escalate", "allow", "prompt"),
+  dialog_auto_approve: strArray,
+  // git / merge
+  default_branch: str,
+  merge_method: str,
+  promote: obj,
+  auto_merge: obj,
+  auto_review: bool,
+  release_review_agents: bool,
+  scope_drift: bool,
+  scope_drift_commits: num,
+  // config-driven network destinations
+  watchers: urlList,
+  monitors: urlList,
+  monitors_auto_task: bool,
+  smoke: urlList,
+  jira,
+  gchat_spaces: gchatSpaces,
+  // budgets / bookkeeping
+  cost_warn_usd: num,
+  cost_cap_usd: num,
+  decision_auto_answer_hours: num,
+  pricing: obj,
+  // stored by the director, read by nothing in server/ today
+  deploy_notes: str,
+  note: str, // free-text annotation on archived/scratch projects, live in prod data
+  env: obj,
+  open_prs: bool,
+  interview: any,
+};
+
+// Returns an error message for the first problem found, or null when the whole
+// object is acceptable. Callers turn a message into a 400.
+export function validateProjectConfig(config: unknown): string | null {
+  if (config === null || typeof config !== "object" || Array.isArray(config)) return "config must be an object";
+  for (const [key, value] of Object.entries(config as Record<string, unknown>)) {
+    // hasOwn, not a plain lookup: "toString"/"__proto__" would otherwise resolve
+    // to Object.prototype members and be called as if they were checks.
+    if (!Object.hasOwn(CHECKS, key)) return `config.${key} is not a known project config key`;
+    const check = CHECKS[key]!;
+    if (value === null || value === undefined) continue; // clearing a key is always fine
+    const bad = check(value);
+    // Nested reasons already carry their own path (".project_key", "[0].url"),
+    // so they butt straight up against the key instead of taking a space.
+    if (bad) return `config.${key}${/^[.[]/.test(bad) ? "" : " "}${bad}`;
+  }
+  return null;
+}

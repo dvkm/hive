@@ -97,10 +97,10 @@ import {
   updateCommitment,
   projectAutonomyProfile,
   SUPERVISOR_PHASES,
-  AUTONOMY_PROFILES,
   COMMITMENT_STATUSES,
   type ChatThread,
 } from "./chat.ts";
+import { validateProjectConfig, type Agent } from "./projectConfig.ts";
 
 export interface HandlerDeps {
   herdr?: Herdr; // injectable for tests
@@ -584,12 +584,12 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 // ---------------------------------------------------------------- projects
 function createProject(db: DB, body: any): Response {
   if (!body?.name) return err("name is required");
+  const invalid = validateProjectConfig(body.config ?? {});
+  if (invalid) return err(invalid);
   // A repo_path living inside a task's own worktree/scratchpad can only be a
   // scratch artifact (see testProjects.ts) — auto-flag it test unless the
   // caller already said one way or the other.
   const config = { ...(body.config ?? {}) };
-  if (config.agent != null && !AGENTS.includes(config.agent))
-    return err(`agent must be one of ${AGENTS.join("|")}`);
   if (config.test === undefined && isEphemeralRepoPath(body.repo_path)) config.test = true;
   const row = {
     id: newId("proj"),
@@ -611,10 +611,10 @@ function updateProject(db: DB, id: string, body: any): Response {
   if (!existing) return err("project not found", 404);
   const name = body?.name != null ? String(body.name) : existing.name;
   const repo_path = body?.repo_path !== undefined ? body.repo_path : existing.repo_path;
-  if (body?.config?.autonomy_profile != null && !AUTONOMY_PROFILES.includes(body.config.autonomy_profile))
-    return err(`autonomy_profile must be one of ${AUTONOMY_PROFILES.join("|")}`);
-  if (body?.config?.agent != null && !AGENTS.includes(body.config.agent))
-    return err(`agent must be one of ${AGENTS.join("|")}`);
+  if (body?.config !== undefined) {
+    const invalid = validateProjectConfig(body.config);
+    if (invalid) return err(invalid);
+  }
   const config = body?.config !== undefined ? JSON.stringify(body.config) : existing.config;
   db.query("UPDATE projects SET name = ?, repo_path = ?, config = ? WHERE id = ?").run(name, repo_path, config, id);
   return json(parseProject(db.query("SELECT * FROM projects WHERE id = ?").get(id)));
@@ -2768,9 +2768,6 @@ async function spawnTask(
   if (!r.ok) return err(`spawn failed: ${r.error}`, 502);
   return json({ ok: true, task: getTask(db, id), agent_target: r.agent_target });
 }
-
-export const AGENTS = ["claude", "codex"] as const;
-export type Agent = (typeof AGENTS)[number];
 
 export function agentForConfig(config: any): Agent {
   return config?.agent === "codex" ? "codex" : "claude";

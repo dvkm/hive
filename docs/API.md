@@ -46,7 +46,12 @@ must be built against this file. Server: `http://127.0.0.1:4700` (override
   "created_at": "2026-07-08T12:00:00.000Z"
 }
 ```
-`config` is a free-form object (JSON column). Known keys used elsewhere:
+`config` is a JSON column, but NOT free-form: it is validated at the API
+boundary (`POST`/`PUT /api/projects`) against the schema in
+`server/src/projectConfig.ts`, which is the authoritative list of accepted keys
+and their types. A malformed value or an unrecognised top-level key is a `400`,
+because several of these keys become subprocess argv or network destinations
+downstream (see `agent_argv` below). Keys used elsewhere:
 `default_branch` (string, used as the worktree base + merge target),
 `deploy_notes` (string),
 `monitors` (`[{name, url, expect_status, expect_substring?, interval_s}]`),
