@@ -213,6 +213,33 @@ test("syncPRs snapshots branch scope against the PR's exact base commit", async 
   expect(JSON.parse(scope.payload)).toEqual({ base_sha: "staging-sha", files: ["src/task.ts"], head_sha: "head" });
 });
 
+// A PR's baseRefName is GitHub-sourced (set by the PR author via the GitHub
+// UI/API, not local config), but it lands as a POSITIONAL git argument the
+// same way config.default_branch does, and git's ref-name rules don't forbid
+// a leading `-` (task #1086, same bug class as #1024). Omit baseRefOid so the
+// vulnerable `data.baseRefOid || base` fallback is exercised.
+test("syncPRs never lets an option-shaped PR baseRefName reach git argv (task #1086)", async () => {
+  const { db, projectId } = freshDb({ default_branch: "staging" });
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/evil" });
+  db.query("UPDATE tasks SET branch = ? WHERE id = ?").run("feat", id);
+  const payload = "--output=/tmp/pwn";
+  const argvs: string[][] = [];
+  const exec: Exec = stub((argv) => {
+    argvs.push(argv);
+    if (argv[0] === "gh") return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], headRefOid: "head", baseRefName: payload }));
+    if (argv.includes("diff") && argv.includes("--name-only")) return OK("src/task.ts\n");
+    if (argv.includes("rev-parse")) return OK("staging-sha\n");
+    return OK();
+  });
+
+  await reconcileOnce(db, { exec });
+
+  for (const argv of argvs) expect(argv).not.toContain(payload);
+  // fell back to config.default_branch, so the scope snapshot still ran
+  const scope: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'branch_scope'").get(id);
+  expect(JSON.parse(scope.payload).base_sha).toBe("staging-sha");
+});
+
 test("syncPRs bounces an in_review task whose CI turned red, steers once per sha", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { pr_url: "https://gh/pr/2", agent_target: "t-agent" });

@@ -79,7 +79,7 @@ import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, safeBranch } from "./exec.ts";
+import { defaultExec, safeBranch, preferSafeRef } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
 import {
   createThread,
@@ -2476,7 +2476,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
     if (!prView.baseRefName || !prView.baseRefOid)
       return mergeFailed(db, herdr, task, safeBranch(config.default_branch), "PR base metadata is missing; merge was not attempted.");
   }
-  const base = prView?.baseRefName || safeBranch(config.default_branch);
+  const base = preferSafeRef(prView?.baseRefName, safeBranch(config.default_branch));
   const guardBase = prView?.baseRefOid || base;
   const guardHead = prView?.headRefOid || task.branch;
   const forceLocalFf = body?.merge_strategy === "local_ff";
