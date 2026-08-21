@@ -74,6 +74,13 @@ test("preferSafeRef uses the candidate only when safe, else the given fallback",
   expect(preferSafeRef(undefined, "main")).toBe("main");
 });
 
+test("projectBaseBranch inherits the promotion source before falling back to main", async () => {
+  const { projectBaseBranch } = await import("../src/exec.ts");
+  expect(projectBaseBranch({ default_branch: "release", promote: { from: "staging" } })).toBe("release");
+  expect(projectBaseBranch({ promote: { from: "staging", to: "main" } })).toBe("staging");
+  expect(projectBaseBranch({})).toBe("main");
+});
+
 // safeBranch/preferSafeRef used to fall back silently everywhere except
 // promoter.ts, so a malformed default_branch quietly diffed against the wrong
 // branch with no operator signal (task #1086).

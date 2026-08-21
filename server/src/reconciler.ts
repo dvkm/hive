@@ -26,7 +26,7 @@ import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.
 import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, spawnAgent } from "./api.ts";
 import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, safeBranch, preferSafeRef } from "./exec.ts";
+import { defaultExec, projectBaseBranch, preferSafeRef } from "./exec.ts";
 import { captureBranchScope } from "./rebaseGuard.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
 
@@ -186,12 +186,38 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
     // startup trust dialog reports `idle`, auto-mode setup reports `done`, and
     // tool permission dialogs report `blocked`. Idempotent: a handled dialog
     // disappears from the pane.
+    let handledDialog = false;
     if (next === "blocked" || next === "idle" || next === "done") {
       try {
-        await handleBlockedAgent(db, h, t.id, t.agent_target);
+        handledDialog = await handleBlockedAgent(db, h, t.id, t.agent_target);
       } catch (e) {
         console.error(`[hive] handleBlockedAgent ${t.id}:`, e);
       }
+    }
+    // A completed interactive turn cannot consume another submission. If one
+    // is waiting, release only the terminal session, keep the branch/worktree,
+    // and let the dispatcher's existing reattach pass start a fresh turn with
+    // the queued steer in its brief. A handled startup dialog gets one cycle to
+    // change status instead of being mistaken for a completed turn.
+    if (next === "done" && !handledDialog && queuedSteers(db, t.id).length) {
+      const task = getTask(db, t.id);
+      const meta = spawnMeta(db, t.id);
+      const session = await h.closeSession({
+        agentTarget: t.agent_target,
+        tabId: meta.tab_id,
+        expectTerminalId: meta.terminal_id,
+        expectCwd: task?.worktree_path,
+      });
+      if (!session.closed) continue;
+      if (meta.workspace_id) await h.closeWorkspace(meta.workspace_id);
+      db.query("UPDATE tasks SET agent_target = NULL, updated_at = ? WHERE id = ?").run(now(), t.id);
+      writeEvent(db, {
+        task_id: t.id,
+        source: "reconciler",
+        type: "agent_released",
+        payload: { reason: "completed turn has queued steer", branch: task?.branch, worktree_path: task?.worktree_path },
+      });
+      broadcastTask(db, getTask(db, t.id));
     }
   }
 }
@@ -285,7 +311,7 @@ function lastAgentStatus(db: DB, taskId: string): string | null {
 // it was drained ONLY at spawn time. So a socket blip while the agent was alive
 // and working queued the message and then never redelivered it: no respawn was
 // coming, and it sat there until the task ended. Every cycle, re-attempt any
-// queued steer against an agent that still probes alive.
+// queued steer against an agent that still has an active turn.
 //
 // Cheap: the queued-steer read is checked BEFORE any probe, so the ordinary case
 // (nothing queued) costs one small query per agent-bearing task and zero herdr
@@ -331,12 +357,12 @@ async function drainSteers(db: DB, deps: ReconcilerDeps): Promise<void> {
 
 // ---- ready-for-review advancement (fixes tasks stuck in in_progress) ----
 // An agent that finished — opened a PR (ship/chore) or wrote its report (scout) —
-// and then went idle/gone used to sit in `in_progress` forever: nothing moved it
+// and then went idle/done/gone used to sit in `in_progress` forever: nothing moved it
 // into the review queue. This is the backstop that unsticks it regardless of
 // agent discipline (the explicit `hive emit <id> ready` path is the clean signal;
-// this catches the agents that just go idle).
+// this catches the agents whose interactive turn finishes without that emit).
 //
-// Trigger: state=in_progress, agent status idle OR gone (NOT working/blocked/
+// Trigger: state=in_progress, agent status idle, done, OR gone (NOT working/blocked/
 // unknown — an agent that opens a PR and keeps working still reports `working`),
 // AND a real work product exists (a pr_url, or a scout `report`). Advancing on a
 // single idle read is safe precisely because mid-work reads `working`; after a
@@ -426,7 +452,7 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
         if (project?.repo_path) {
           let base = "main";
           try {
-            base = safeBranch(JSON.parse(project.config ?? "{}").default_branch);
+            base = projectBaseBranch(JSON.parse(project.config ?? "{}"));
           } catch {}
           base = preferSafeRef(data.baseRefName, base);
           const scopeHead = data.headRefOid || t.branch;
@@ -581,29 +607,8 @@ async function nudgeConflict(
     | undefined;
   let base = "main";
   try {
-    base = safeBranch(JSON.parse(project?.config ?? "{}").default_branch);
+    base = projectBaseBranch(JSON.parse(project?.config ?? "{}"));
   } catch {}
-
-  // GitHub reports CONFLICTING against origin/<base>, which is a DIVERGENT line
-  // from the LOCAL <base> that hive cuts worktrees from and merges back into.
-  // If the branch is already a clean fast-forward onto LOCAL <base>, the
-  // conflict is purely origin/<base>'s divergence — nudging "merge origin/base"
-  // makes the agent pull the stale fork in, pushing a new head that STILL
-  // conflicts, which defeats the per-SHA dedup and loops forever (task #321,
-  // PR #38 got 5+ identical nudges). Suppress the nudge: the director merges
-  // locally. See the origin/main-stale-fork learning.
-  if (project?.repo_path && t.branch) {
-    const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", base, t.branch]);
-    if (anc.code === 0) {
-      writeEvent(db, {
-        task_id: t.id,
-        source: "reconciler",
-        type: "pr_conflict",
-        payload: { pr_url: t.pr_url, head_sha: headSha, delivered: false, suppressed: "local-ff", base },
-      });
-      return;
-    }
-  }
 
   const msg = `hive: your PR ${t.pr_url} has merge conflicts with '${base}'. Fetch and merge the latest 'origin/${base}' into your branch (or rebase onto it), resolve the conflicts, rerun the tests, then push.`;
   let delivered = false;
@@ -1261,7 +1266,10 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string, d
   // class has a graceful path. Nudge→fail is only for the truly unexplained.
   const tail = await h.read(target, 200);
   const diag = diagnosePane(tail);
-  if (diag?.kind === "blocked_dialog") return handleBlockedAgent(db, h, taskId, target);
+  if (diag?.kind === "blocked_dialog") {
+    await handleBlockedAgent(db, h, taskId, target);
+    return;
+  }
   if (diag?.kind === "auth_lost") return recoverAuthLost(db, h, task, diag.excerpt, tail, deps);
   if (diag?.kind === "context_full") return recoverContextFull(db, h, task, tail);
   if (diag?.kind === "usage_limit") return recoverUsageLimit(db, task, diag.excerpt);
@@ -1312,9 +1320,9 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string, d
 // (read-only MCP tools + project config.dialog_auto_approve patterns) are
 // answered automatically with "2" (yes, don't ask again in this worktree) so
 // the same tool never re-prompts; everything else opens the answerable card.
-export async function handleBlockedAgent(db: DB, h: Herdr, taskId: string, target: string): Promise<void> {
+export async function handleBlockedAgent(db: DB, h: Herdr, taskId: string, target: string): Promise<boolean> {
   const task = getTask(db, taskId);
-  if (!task || TERMINAL.includes(task.state as State)) return;
+  if (!task || TERMINAL.includes(task.state as State)) return false;
   const tail = await h.read(target, 200);
   const diag = diagnosePane(tail);
   if (diag?.kind === "auto_mode_setup") {
@@ -1325,7 +1333,7 @@ export async function handleBlockedAgent(db: DB, h: Herdr, taskId: string, targe
       type: "dialog_auto_declined",
       payload: { delivered: r.code === 0, kind: "auto_mode_setup", excerpt: diag.excerpt.slice(0, 300) },
     });
-    return;
+    return true;
   }
   if (diag?.kind === "trust_dialog") {
     const r = await h.answerDialog(target, "1");
@@ -1335,10 +1343,13 @@ export async function handleBlockedAgent(db: DB, h: Herdr, taskId: string, targe
       type: "dialog_auto_approved",
       payload: { delivered: r.code === 0, kind: "workspace_trust", excerpt: diag.excerpt.slice(0, 300) },
     });
-    return;
+    return true;
   }
-  if (diag?.kind === "queued_input") return recoverQueuedInput(db, h, task, target, diag.excerpt);
-  if (diag?.kind !== "blocked_dialog") return; // blocked but no visible dialog: leave to the silent path
+  if (diag?.kind === "queued_input") {
+    await recoverQueuedInput(db, h, task, target, diag.excerpt);
+    return true;
+  }
+  if (diag?.kind !== "blocked_dialog") return false; // blocked but no visible dialog: leave to the silent path
 
   const project = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id) as { config: string } | undefined;
   let extra: string[] = [];
@@ -1356,9 +1367,10 @@ export async function handleBlockedAgent(db: DB, h: Herdr, taskId: string, targe
       type: "dialog_auto_approved",
       payload: { delivered: r.code === 0, excerpt: diag.excerpt.slice(0, 300) },
     });
-    return;
+    return true;
   }
   await recoverBlockedDialog(db, task, diag.excerpt, tail);
+  return true;
 }
 
 // A live agent went idle with input still QUEUED but never consumed: the

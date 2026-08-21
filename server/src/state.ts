@@ -362,13 +362,13 @@ export function queuedInputRecoveryPending(db: DB, taskId: string): boolean {
 }
 
 // The finished-handoff, shared by every herdr-signal path (the reconciler's
-// poll backstop and the supervise wait loop): an agent observed idle/gone on an
+// poll backstop and the supervise wait loop): an agent observed idle/done/gone on an
 // in_progress task that has a real work product (a pr_url, or a scout report)
 // advances to in_review, except while a queued-input recovery is pending.
 // Deliberately independent of anything the agent emits.
 // Returns true when the task was advanced.
 export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, source: string): boolean {
-  if (agentStatus !== "idle" && agentStatus !== "gone") return false; // working/blocked/unknown → leave it be
+  if (agentStatus !== "idle" && agentStatus !== "done" && agentStatus !== "gone") return false; // working/blocked/unknown → leave it be
   const task = getTask(db, taskId);
   if (!task || task.state !== "in_progress" || isTrackingOnlyTask(task)) return false;
   if (queuedInputRecoveryPending(db, taskId)) return false;

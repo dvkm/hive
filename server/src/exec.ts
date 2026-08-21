@@ -87,14 +87,24 @@ function warnUnsafeRef(v: unknown, fallback: string): void {
 }
 
 // A config-sourced branch name, or `fallback` when it is missing or unsafe.
-// Every `config.default_branch || "main"` read goes through this. Logs when a
-// present-but-unsafe value is rejected, so a malformed default_branch doesn't
-// silently diff against the wrong branch with no operator signal.
+// projectBaseBranch routes project integration-branch reads through this. Logs
+// when a present-but-unsafe value is rejected, so a malformed branch doesn't
+// silently select the wrong ref with no operator signal.
 export const safeBranch = (v: unknown, fallback = "main"): string => {
   if (isSafeRef(v)) return v;
   warnUnsafeRef(v, fallback);
   return fallback;
 };
+
+// One authoritative integration branch for every project git operation. A
+// promotion project naturally works on promote.from; requiring it to repeat
+// that value as default_branch made a missing key silently cut work from main
+// even while every PR targeted staging.
+export function projectBaseBranch(config: any): string {
+  if (config?.default_branch !== undefined && config?.default_branch !== null)
+    return safeBranch(config.default_branch);
+  return safeBranch(config?.promote?.from);
+}
 
 // Prefers `candidate` (e.g. a PR's live baseRefName from `gh pr view`) when it
 // is a safe ref, else `fallback`. Same argv-injection risk as safeBranch even

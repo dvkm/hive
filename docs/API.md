@@ -52,7 +52,7 @@ boundary (`POST`/`PUT /api/projects`) against the schema in
 and their types. A malformed value or an unrecognised top-level key is a `400`,
 because several of these keys become subprocess argv or network destinations
 downstream (see `agent_argv` below). Keys used elsewhere:
-`default_branch` (string, used as the worktree base + merge target),
+`default_branch` (string, used as the worktree base + merge target; when omitted it inherits `promote.from`, then falls back to `main`; spawn refreshes and cuts from `origin/<branch>` rather than a potentially stale local branch),
 `deploy_notes` (string),
 `monitors` (`[{name, url, expect_status, expect_substring?, interval_s}]`),
 `monitors_auto_task` (bool; a monitor failure auto-creates a `chore` task),
@@ -245,7 +245,7 @@ Understanding quiz API:
 - `spawn_error` — spawn failed. `payload: {error, infra?}`. `infra: "herdr_unreachable"` marks a herdr-daemon-down failure (`ConnectionRefused` / `Os { code: 61 }`) rather than a task-specific fault; the dispatcher excludes these from a task's per-task backoff and handles them with a global circuit breaker instead (see `docs/runtime.md`)
 - `stack_setup` — the per-project spawn hook (`config.setup_argv`) ran while preparing the worktree, before the agent started (`source: herdr`). `payload: {argv, ok, error?}` (`error` = first 300 chars of stderr/stdout on failure; best-effort, a failure never blocks the spawn).
 - `stack_teardown` — the per-project teardown hook (`config.cleanup_argv`) ran before the worktree was removed (`source: reaper`). `payload: {argv, ok, error?}` (best-effort, a failure never blocks worktree/session cleanup). Both share `runStackCmd` (`server/src/cleanup.ts`).
-- `agent_status` — herdr agent status changed (via wait loop or reconciler). `payload: {status}` (`idle|working|blocked|gone` — `gone` = the reconciler's probe found the agent missing from herdr)
+- `agent_status` — herdr agent status changed (via wait loop or reconciler). `payload: {status}` (`idle|done|working|blocked|gone`; `done` means the interactive turn completed, while `gone` means the reconciler's probe found the agent missing from herdr)
 - `focus_agent` — the director focused the agent's herdr tab ("view agent"). `payload: {target}`
 - `recovery` — a stale-recovery decision was taken. `payload: {decision:"dead"|"silent-escalate", attempts?|nudges?}`
 - `recovery_nudge` — a status nudge was sent to an alive-but-silent agent. `payload: {nudge, delivered}`
@@ -255,7 +255,7 @@ Understanding quiz API:
 - `ci_status` — reconciler synced CI. `payload: {ci_status}` (`passing|pending|failing`)
 - `pr_merged` — reconciler detected the PR merged. `payload: {pr_url}`
 - `pr_conflict` — reconciler saw the PR CONFLICTING with its base and nudged the agent to resolve (once per head SHA; lifecycle untouched). `payload: {pr_url, head_sha, delivered}`
-- `ready_for_review` — records an `in_progress → in_review` handoff. `payload: {pr_url, via, kind}` (`via ∈ {emit, idle, gone}`). See "Review experience" for the explicit and automatic handoff contracts.
+- `ready_for_review` — records an `in_progress → in_review` handoff. `payload: {pr_url, via, kind}` (`via ∈ {emit, idle, done, gone}`). See "Review experience" for the explicit and automatic handoff contracts.
 - `pr_linked` — a marked PR was matched back to this task and its `pr_url` set (by the reconciler's scan or `POST /api/tasks/link-pr`). `payload: {pr_url, via}` (`via ∈ {id, number}` — which half of the marker matched)
 - `pr_synchronized` — the reconciler observed the PR head SHA change (hive's stand-in for GitHub's synchronize webhook). `payload: {head_sha}`. Emitted only when the head differs from the prior `pr_synchronized` (the first observation is a baseline). Used to tell "the agent pushed a fix" from "CI is still green on the same old head" — by the re-queue guard after a `changes_requested`, and by `health` to decide whether a re-handoff clears a `merge_failed` reason.
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
@@ -576,11 +576,11 @@ priced rows only).
   When `from_task_id` is present (the CLI supplies `$HIVE_TASK_ID` for `hive task send`), the sender must exist in the same project. The delivered text names the teammate task and includes an exact reply command; the event is attributed to `source:"agent"` with `from_task_id`, `from_task_number`, and the unwrapped `original_message` for UI display. Peer messages under a managed chat ancestry also wake the owning supervisor, except for messages the supervisor itself sent.
   - `delivered` — herdr accepted it **and** the agent's pane took the submitting Enter (payload also gets `delivered_at`). Two silent drops count as failures, not deliveries: a send that exits 0 with an `{"error":{"code":"agent_not_found"}}` body, and a pane-less agent, whose composer would hold the text unsubmitted.
   - `queued` — no `agent_target`, or herdr refused it twice (one automatic retry). The steer is **not dropped**; it is redelivered by whichever of these comes first, and the event's payload then flips to `delivered` with a `delivered_via` recording how:
-    - `delivered_via:"drain"` — the reconciler, on any cycle, finds a queued steer on a task whose agent still probes **alive** and re-sends it. This covers the common case of a herdr socket blip while the agent is alive and working: no respawn is coming, so waiting for one would strand the message until the task ended. Delivery is re-attempted every cycle until it lands; a dead agent is skipped (its steers wait for the next spawn), and a partial drain stops at the first failure so the remainder stay queued **in order**.
-    - `delivered_via:"respawn"` — the next `POST /spawn` of the task prepends every still-queued steer to the agent's brief under "## Steers waiting for you".
+    - `delivered_via:"drain"` — the reconciler, on any cycle, finds a queued steer on a task whose agent still has an active turn and re-sends it. This covers the common case of a herdr socket blip while the agent is alive and working: no respawn is coming, so waiting for one would strand the message until the task ended. Delivery is re-attempted every cycle until it lands; a dead agent or a completed (`done`) turn is skipped, and a partial drain stops at the first failure so the remainder stay queued **in order**.
+    - `delivered_via:"respawn"` — the next `POST /spawn` or automatic dispatcher reattach of the task prepends every still-queued steer to the agent's brief under "## Steers waiting for you". When a steer reaches a completed (`done`) turn, hive queues it, releases that terminal session, and reattaches a fresh turn to the same task, branch, and worktree.
   - `failed` — the task is terminal, so no spawn will ever carry it.
 
-  Never throws. A herdr failure additionally records a `steer_error` event. The timeline renders the receipt (`✓` / `⏳ queued` / `⚠ undelivered`) so a steer never has to be re-sent blind. Besides the respawn drain, the reconciler re-attempts every queued steer each cycle against any still-alive agent (receipt flips with `delivered_via:"drain"`); a successful drain writes no event of its own — the receipt flip is the record, and a fresh event would reset the task's silence clock and mask a mute agent from `stale` detection.
+  Never throws. A herdr failure additionally records a `steer_error` event. The timeline renders the receipt (`✓` / `⏳ queued` / `⚠ undelivered`) so a steer never has to be re-sent blind. Besides the respawn drain, the reconciler re-attempts every queued steer each cycle against any agent with an active turn (receipt flips with `delivered_via:"drain"`); a successful drain writes no event of its own — the receipt flip is the record, and a fresh event would reset the task's silence clock and mask a mute agent from `stale` detection.
 - `PUT /api/tasks/:id` body `{title?, brief?, depends_on?}` (or multipart: same fields + `files`) → `200 Task` | `404` | `400` (unknown/self-referencing `depends_on` id)
   Attached files are appended to the resulting `brief` under an `## Attachments` heading.
   Updates a task's editable fields. Used by the attention tray's "edit & requeue"
@@ -694,10 +694,10 @@ An `in_review` task owned by Hive means the agent finished and opened a PR (or p
   is open (or, for a scout, its report is written). Records `pr_url` when supplied
   and not already linked, then advances the task. Idempotent — a duplicate `ready`
   on an already-advanced task just acks (`200`). Writes a `ready_for_review` event.
-- **Automatic idle/gone handoff (safety net):** the herdr supervise loop and the reconciler's per-cycle poll both route an `in_progress` task whose agent is **idle or gone** (NOT `working`/`blocked` — an agent that opened a PR and kept working still reports `working`) and that has a real work product (a `pr_url`, or a scout `report` evidence) through the same auto-advance to `in_review` (`ready_for_review` event, `via: idle|gone`). Advancing on a single idle read is safe because mid-work reads `working`; after a queued-input recovery attempt, however, automatic handoff waits at least two minutes so the recovered turn can start (`delivered: null` also holds handoff until the pane write resolves). The reconciler checks this before stale recovery, so a handed-off task with a gone agent is moved to review rather than failed/requeued. This unsticks finished tasks regardless of whether the agent emitted `ready`.
-- **Finished with NO PR:** an `in_progress` task whose agent went idle with no PR and
+- **Automatic idle/done/gone handoff (safety net):** the herdr supervise loop and the reconciler's per-cycle poll both route an `in_progress` task whose agent is **idle, done, or gone** (NOT `working`/`blocked` — an agent that opened a PR and kept working still reports `working`) and that has a real work product (a `pr_url`, or a scout `report` evidence) through the same auto-advance to `in_review` (`ready_for_review` event, `via: idle|done|gone`). Advancing on a completed or idle read is safe because mid-work reads `working`; after a queued-input recovery attempt, however, automatic handoff waits at least two minutes so the recovered turn can start (`delivered: null` also holds handoff until the pane write resolves). The reconciler checks this before stale recovery, so a handed-off task with a gone agent is moved to review rather than failed/requeued. This unsticks finished tasks regardless of whether the agent emitted `ready`.
+- **Finished with NO PR:** an `in_progress` task whose agent went idle or completed with no PR and
   no recent activity is not auto-advanced (nothing to review) but is made VISIBLE:
-  its `health` becomes `stuck` (reason `finished or stuck: agent idle, no PR`), which
+  its `health` becomes `stuck` (reason `finished or stuck: agent <idle|done>, no PR`), which
   surfaces it in the attention tray for the director instead of sitting silently.
 
 **Changes-requested re-queue guard:** once the captain requests changes, the task
@@ -766,14 +766,17 @@ the reconciler recording `pr_synchronized`.
   (`409`, naming the blocking task(s)); there is no override, since the only
   fix is for the dependency to actually land.
 
-  **Stale-base fallback.** GitHub decides mergeability against `origin/<base>`,
-  which can sit behind the primary checkout's local `<base>`. So when `gh pr merge`
+  **Stale-base fallback.** GitHub decides mergeability against the PR's remote
+  base, which can sit behind the primary checkout's local `<base>`. So when `gh pr merge`
   fails with a conflict-shaped reason *and* the PR's own state blames the base
   comparison (`mergeStateStatus` is `DIRTY`/`BEHIND`/`UNKNOWN`, no blocking
   `reviewDecision`, no failing or running required check) and the project has a
-  `repo_path` and the task a `branch`, hive retries as a local fast-forward onto
-  local `<base>` instead of bouncing the task to the agent — rebasing onto a stale
-  `origin/<base>` would only pull in unrelated history. Branch protection wears the
+  `repo_path` and the task a `branch`, hive may retry as a local fast-forward onto
+  local `<base>` instead of bouncing the task to the agent. The fallback first
+  requires the local task branch to resolve to the PR's current head SHA and to
+  contain the PR's current base SHA. This prevents a stale local ref from bypassing
+  a real remote-base conflict or merging code other than the reviewed PR head.
+  Branch protection wears the
   same opaque "not mergeable" reason, so this gate never fires on a protection
   block. When the gate does not open, the normal `409` / bounce-to-agent behaviour
   below applies with the `gh pr merge` reason alone; when it opens but the local ff
@@ -782,8 +785,9 @@ the reconciler recording `pr_synchronized`.
   **`merge_strategy: "local_ff"`** forces the local fast-forward for a PR-backed
   task, skipping `gh pr merge` and the fallback's review/check gate — an explicit
   override for a PR whose base comparison is stale while the branch is still a
-  clean ff onto local `<base>`. The PR state probe still runs: a `CLOSED` (not
-  merged) PR is refused, a `MERGED` one just advances the task. The review card
+  clean ff onto local `<base>`. It still requires the local branch to match the
+  PR head and contain the current PR base. The PR state probe still runs: a
+  `CLOSED` (not merged) PR is refused, a `MERGED` one just advances the task. The review card
   surfaces this as a **Force local merge** button next to a failed merge on a
   PR-backed task, so the escape hatch needs no raw API call.
 
@@ -1307,7 +1311,7 @@ described in `server/src/diagnose.ts`.
 
 Whenever the same `idle`/`blocked`/`done` sweep sees Claude Code's own "…to edit queued messages" footer, a message was queued but Claude Code went idle without consuming it (task #1098). The reconciler records a `queued_input_recovered` event, sends `Up` then `Enter` to the pane (the sequence verified live to move the queued message into the editable input and submit it), and updates the event's `delivered` field from `null` to whether the pane write succeeded in the DB row only — it is not re-broadcast over SSE under the same event id, so the live feed keeps showing the pending row until its next full fetch (same tradeoff as `steer.ts`'s `markSteersDelivered`). While the footer persists, it makes at most three consecutive attempts; `agent_status` and `stale` events do not reset that count, but other activity starts a new episode. It then stops sending keystrokes and enqueues one `queued_input_stuck` notification (`urgency: "urgent"`) for the episode.
 
-Every automatic transition that could act on a task mid-recovery — idle/gone handoff to review (`advanceIfFinished`, `handOffToReview`), `autoMergeReady`, and `releaseReviewAgent` — shares one guard (`state.ts`'s `queuedInputRecoveryPending`, task #1234): it holds for two minutes after the latest `queued_input_recovered` event (giving the redelivered turn time to start, and letting a crash-orphaned `delivered: null` reservation age out instead of blocking forever), and beyond that window it keeps holding only while an unresolved `queued_input_stuck` notification exists with no other task activity since — so a genuinely stuck task can't slip through once the flat window passes, and a task that's actually fine isn't held any longer than necessary.
+Every automatic transition that could act on a task mid-recovery — idle/done/gone handoff to review (`advanceIfFinished`, `handOffToReview`), `autoMergeReady`, and `releaseReviewAgent` — shares one guard (`state.ts`'s `queuedInputRecoveryPending`, task #1234): it holds for two minutes after the latest `queued_input_recovered` event (giving the redelivered turn time to start, and letting a crash-orphaned `delivered: null` reservation age out instead of blocking forever), and beyond that window it keeps holding only while an unresolved `queued_input_stuck` notification exists with no other task activity since — so a genuinely stuck task can't slip through once the flat window passes, and a task that's actually fine isn't held any longer than necessary.
 
 ### Promoter (continuous promote-to-main evaluation)
 No HTTP endpoints — a server-internal loop (`server/src/promoter.ts`, scheduled by `HIVE_PROMOTE_MS`, default 30m, plus one run ~30s after boot). Each started loop runs at most one cycle at a time; ticks during a slow cycle are logged and skipped, not queued. Projects opt in with `config.promote = {from: "staging", to: "main"}`. Whenever `origin/<from>` has commits `origin/<to>` lacks, it queues ONE evaluation task (`source="promoter"`, `source_ref` = the evaluated head SHA, kind `ship`) that the dispatcher spawns like any other. The agent judges readiness — CI green, test comprehensiveness for the promoted range (uncovered bug fixes or gaps in auth/billing/data-integrity paths BLOCK promotion; the agent spawns a gap task per missing test), half-shipped features, pending migrations — and either opens the Promote PR with a per-PR "Test coverage" verdict section (base `<to>`, head `<from>`; the DIRECTOR merges) or attaches a not-ready report and finishes. Dedup: one in-flight evaluation per project, a given head SHA is evaluated at most once, and an already-open promote PR suppresses new evaluations until it's merged/closed.
@@ -1337,7 +1341,7 @@ bypasses these policy gates but still runs the `task.spawn` authority gate. See
 `docs/runtime.md`.
 
 Each cycle also runs a **reattach** pass BEFORE the queued pass: a live task
-(`in_progress`/`in_review`) with no `agent_target` but with QUEUED steers gets an
+(`in_progress`/`in_review`/`verifying`) with no `agent_target` but with QUEUED steers gets an
 agent respawned onto its existing branch and worktree, with that feedback at the
 top of the fresh brief. This is the return leg of releasing review-parked agents
 (below): the release frees the slot, the reattach brings an agent back when
@@ -1352,7 +1356,7 @@ still apply.
 A task in `in_review` is parked on the director: its PR is open, CI is green, and
 nothing asks its agent to act again until a human (or a red check) does. Every
 reaper sweep (`server/src/cleanup.ts` → `releaseReviewAgent`) therefore closes the
-session of any `in_review` agent herdr reports **idle** — or confirmed gone —
+session of any `in_review` agent herdr reports **idle** or **done** — or confirmed gone —
 and drops `agent_target`, so it stops counting toward `max_agents`. The git
 worktree and branch are PRESERVED (the PR still needs them); an `agent_released`
 event records it. An agent that is still `working`, one with undelivered steers,
