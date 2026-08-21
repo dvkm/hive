@@ -20,7 +20,7 @@ import { buildTimeline } from "../lib/timeline";
 import { ANSWERED_BY_LABEL } from "../lib/labels";
 import type { TimelineItem } from "../lib/timeline";
 import { eventText } from "../lib/eventText";
-import { isJiraMirror, isTrackingOnly } from "../lib/needsYou";
+import { isJiraMirror, isTrackingOnly, trackedSubtasks } from "../lib/needsYou";
 import { PrReference, ReferenceText, TaskRef, prLabel } from "../lib/references";
 
 // Compact per-task usage line: tokens + estimated cost, only when usage exists.
@@ -548,7 +548,7 @@ export function TaskBody({ id }: { id: string }) {
   const timeline = buildTimeline(t.events, t.decisions);
   const openDecisions = t.decisions.filter((d) => d.status === "open");
   const pastDecisions = t.decisions.filter((d) => d.status !== "open");
-  const children = tasks.filter((x) => x.parent_task_id === t.id);
+  const children = isTrackingOnly(t) ? trackedSubtasks(t, tasks) : tasks.filter((x) => x.parent_task_id === t.id);
   const parent = t.parent_task_id ? tasks.find((x) => x.id === t.parent_task_id) : undefined;
   // Attached files live in the brief as absolute paths (that's what the agent
   // reads); show them as a gallery instead and keep the paths out of the prose.

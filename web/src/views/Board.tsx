@@ -7,7 +7,7 @@ import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, STATE_LABEL, StatusDot
 import { useRelTime } from "../lib/time";
 import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
 import { AttentionTray, needsAttention, isWaiting } from "./attention";
-import { isJiraMirror, isTrackingOnly } from "../lib/needsYou";
+import { isJiraMirror, isTrackingOnly, trackedSubtasks } from "../lib/needsYou";
 import { taskLabel } from "../lib/references";
 
 // A compact "why this card needs attention" line: e.g. "agent gone" or
@@ -24,14 +24,14 @@ function HealthLine({ health }: { health: Health }) {
   );
 }
 
-const COLUMNS: State[] = [
-  "queued",
-  "in_progress",
-  "needs_decision",
-  "in_review",
-  "verifying",
-  "done",
+const COLUMNS: { state: State; label: string }[] = [
+  { state: "queued", label: "Queued" },
+  { state: "in_progress", label: "Working" },
+  { state: "needs_decision", label: "Needs You" },
+  { state: "in_review", label: "Ready to Merge" },
+  { state: "done", label: "Done" },
 ];
+const BOARD_STATES = new Set<State>([...COLUMNS.map(({ state }) => state), "verifying"]);
 
 // What an empty column MEANS, and what puts a card in it. An empty column is
 // the most common thing on this board, so "—" was the most common thing the
@@ -50,12 +50,8 @@ const COL_EMPTY: Record<string, { title: string; hint: string }> = {
     hint: "An agent that hits a call only you can make parks here and waits.",
   },
   in_review: {
-    title: "Nothing to review",
+    title: "Nothing ready to merge",
     hint: "Agents land here once the PR is open and CI is green. That's your cue to merge.",
-  },
-  verifying: {
-    title: "Nothing verifying",
-    hint: "Merged tasks sit here while post-merge smoke checks run.",
   },
   done: {
     title: "Nothing finished yet",
@@ -100,6 +96,7 @@ export function Card({ task }: { task: Task }) {
   const unhealthy = health && health.status !== "healthy";
   const trackingOnly = isTrackingOnly(task);
   const jiraMirror = isJiraMirror(task);
+  const subtasks = trackingOnly ? trackedSubtasks(task, tasks) : [];
 
   return (
     <Link to={`/tasks/${task.id}`} state={{ backgroundLocation: location }} className="card">
@@ -127,6 +124,7 @@ export function Card({ task }: { task: Task }) {
             tracked
           </span>
         )}
+        {trackingOnly && <span className="chip">{STATE_LABEL[task.state]}</span>}
         {task.source === "planner" && (
           <span className="chip chip-planned" title="Created from an approved planner breakdown">
             planned
@@ -146,6 +144,22 @@ export function Card({ task }: { task: Task }) {
         <span className="card-age">{age}</span>
       </div>
       {task.summary && <div className="card-summary">{task.summary}</div>}
+      {subtasks.length > 0 && (
+        <div className="card-subtasks">
+          <div className="card-subtasks-head">
+            <span>Subtasks</span>
+            <span>{subtasks.filter((subtask) => subtask.state === "done").length}/{subtasks.length} done</span>
+          </div>
+          {subtasks.map((subtask) => (
+            <div className="card-subtask" key={subtask.id}>
+              <StatusDot state={subtask.state} health={subtask.health} />
+              <span className="card-subtask-id">{taskLabel(subtask)}</span>
+              <span className="card-subtask-title">{subtask.title}</span>
+              <span className="card-subtask-state">{STATE_LABEL[subtask.state]}</span>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="card-foot">
         {/* An intake task holds raw input, not a brief: an agent would try to
             "do" the braindump. Its plan produces the dispatchable tasks. */}
@@ -217,6 +231,7 @@ function BriefBanner() {
 export default function Board() {
   const { tasks, projects } = useStore();
   const [adding, setAdding] = useState(false);
+  const [view, setView] = useState<"work" | "tracked">("work");
   // Compact project filter (All / per project), shared across board/inboxes and
   // persisted across reloads. Setting it broadcasts to every mounted view.
   const projectFilter = useProjectFilter();
@@ -225,15 +240,18 @@ export default function Board() {
   const [cardFilter, setCardFilter] = useState("");
   const scoped = projectFilter ? tasks.filter((t) => t.project_id === projectFilter) : tasks;
   const q = cardFilter.trim().toLowerCase();
+  const matches = (task: Task) => task.title.toLowerCase().includes(q) || (task.summary || "").toLowerCase().includes(q);
   const visible = q
-    ? scoped.filter((t) => t.title.toLowerCase().includes(q) || (t.summary || "").toLowerCase().includes(q))
+    ? scoped.filter((task) => matches(task) || (isTrackingOnly(task) && trackedSubtasks(task, scoped).some(matches)))
     : scoped;
   const byState = (s: State) => {
-    let list = visible.filter((t) => t.state === s);
+    let list = visible.filter((t) => !isTrackingOnly(t) && t.state === s);
     // list is already newest-updated first from the API / SSE upserts.
     if (s === "done") list = list.slice(0, 10);
     return list;
   };
+  const verifying = visible.filter((task) => !isTrackingOnly(task) && task.state === "verifying");
+  const tracked = visible.filter((task) => isTrackingOnly(task) && BOARD_STATES.has(task.state));
 
   return (
     <div className="board-wrap">
@@ -253,6 +271,9 @@ export default function Board() {
             {p.name}
           </button>
         ))}
+        <span className="board-switch-label board-view-label">View</span>
+        <button className={`board-chip ${view === "work" ? "board-chip-on" : ""}`} onClick={() => setView("work")}>Work</button>
+        <button className={`board-chip ${view === "tracked" ? "board-chip-on" : ""}`} onClick={() => setView("tracked")}>Tracked {tracked.length}</button>
         <input
           className="board-search"
           placeholder="Filter cards…"
@@ -266,41 +287,70 @@ export default function Board() {
           }}
         />
       </div>
-      <div className="board">
-      {COLUMNS.map((s) => {
-        const list = byState(s);
-        const attention = list.filter((t) => t.health && t.health.status !== "healthy").length;
-        return (
-          <section className="column" key={s}>
-            <header className="col-head">
-              <span className="col-title" title={s === "in_review" ? "Hive-owned work awaits review and merge; tracked work mirrors its external review state" : undefined}>
-                {STATE_LABEL[s]}
-              </span>
-              <div className="col-head-right">
-                {attention > 0 && (
-                  <span className="col-attn" title={`${attention} task(s) need attention`}>
-                    {attention} need attention
-                  </span>
-                )}
-                {s === "queued" && (
-                  <button className="btn btn-primary btn-new" onClick={() => setAdding(true)}>
-                    + New task
-                  </button>
-                )}
-                <span className="col-count">{list.length}</span>
-              </div>
-            </header>
-            <div className="col-body">
-              {list.map((t) => (
-                <Card key={t.id} task={t} />
+      {view === "work" ? (
+        <>
+          {verifying.length > 0 && (
+            <section className="verification-strip" aria-label="Post-merge checks">
+              <span className="verification-title">Post-merge checks</span>
+              {verifying.map((task) => (
+                <Link className="verification-item" to={`/tasks/${task.id}`} key={task.id}>
+                  <StatusDot state={task.state} health={task.health} />
+                  <span>{taskLabel(task)}</span>
+                  <span className="verification-task-title">{task.title}</span>
+                </Link>
               ))}
-              {list.length === 0 && <Empty compact {...COL_EMPTY[s]} />}
+            </section>
+          )}
+          <div className="board">
+          {COLUMNS.map(({ state, label }) => {
+            const list = byState(state);
+            const attention = list.filter((t) => t.health && t.health.status !== "healthy").length;
+            return (
+              <section className="column" key={state}>
+                <header className="col-head">
+                  <span className="col-title">{label}</span>
+                  <div className="col-head-right">
+                    {attention > 0 && (
+                      <span className="col-attn" title={`${attention} task(s) need attention`}>
+                        {attention} need attention
+                      </span>
+                    )}
+                    {state === "queued" && (
+                      <button className="btn btn-primary btn-new" onClick={() => setAdding(true)}>
+                        + New task
+                      </button>
+                    )}
+                    <span className="col-count">{list.length}</span>
+                  </div>
+                </header>
+                <div className="col-body">
+                  {list.map((t) => <Card key={t.id} task={t} />)}
+                  {list.length === 0 && <Empty compact {...COL_EMPTY[state]} />}
+                </div>
+              </section>
+            );
+          })}
+          </div>
+        </>
+      ) : (
+        <section className="tracked-view">
+          <header className="tracked-head">
+            <div>
+              <h2>Tracked</h2>
+              <p>Outside work grouped here with its external status. Hive subtasks stay visible without entering the merge queue.</p>
             </div>
-          </section>
-        );
-      })}
+            <span className="col-count">{tracked.length}</span>
+          </header>
+          {tracked.length > 0 ? (
+            <div className="tracked-grid">
+              {tracked.map((task) => <Card key={task.id} task={task} />)}
+            </div>
+          ) : (
+            <Empty title="Nothing tracked" hint="Tracking-only tasks appear here without mixing into Hive's execution lanes." />
+          )}
+        </section>
+      )}
       {adding && <NewTaskModal onClose={() => setAdding(false)} />}
-      </div>
     </div>
   );
 }

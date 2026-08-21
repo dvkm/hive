@@ -309,6 +309,11 @@ a {
   color: var(--text-faint);
   margin-right: 4px;
 }
+.board-view-label {
+  margin-left: 8px;
+  padding-left: 14px;
+  border-left: 1px solid var(--border);
+}
 .board-chip {
   background: var(--bg-elev);
   border: 1px solid var(--border);
@@ -342,6 +347,70 @@ a {
   height: auto;
   flex: 1;
   min-height: 0;
+}
+.verification-strip {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  margin: var(--s3) 16px 0;
+  padding: var(--s2) var(--s3);
+  border: 1px solid rgba(89, 142, 255, 0.35);
+  border-radius: var(--radius);
+  background: var(--accent-dim);
+  overflow-x: auto;
+  flex-shrink: 0;
+}
+.verification-title {
+  color: #d9e6ff;
+  font-size: var(--t-xs);
+  font-weight: 650;
+  white-space: nowrap;
+}
+.verification-item {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  min-width: 0;
+  padding: 4px var(--s2);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.16);
+  color: var(--text);
+  font-size: var(--t-xs);
+  white-space: nowrap;
+}
+.verification-task-title {
+  max-width: 280px;
+  overflow: hidden;
+  color: var(--text-dim);
+  text-overflow: ellipsis;
+}
+.tracked-view {
+  flex: 1;
+  min-height: 0;
+  margin: 16px;
+  overflow-y: auto;
+}
+.tracked-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--s3);
+  margin-bottom: var(--s3);
+}
+.tracked-head h2 {
+  margin: 0;
+  font-size: 16px;
+}
+.tracked-head p {
+  margin: 3px 0 0;
+  color: var(--text-dim);
+  font-size: var(--t-xs);
+}
+.tracked-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  align-items: start;
+  gap: var(--s3);
 }
 .column {
   background: var(--bg-elev);
@@ -512,6 +581,46 @@ a {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+.card-subtasks {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid var(--border-soft);
+}
+.card-subtasks-head {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+.card-subtask {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.card-subtask-id {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-weight: 600;
+}
+.card-subtask-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.card-subtask-state {
+  color: var(--text-faint);
+  white-space: nowrap;
 }
 .card-foot {
   display: flex;
@@ -4610,6 +4719,22 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
   .board-search {
     flex: 1;
     min-width: 120px;
+  }
+  .board-view-label {
+    width: 100%;
+    margin: var(--s1) 0 0;
+    padding: var(--s2) 0 0;
+    border-top: 1px solid var(--border);
+    border-left: 0;
+  }
+  .verification-strip {
+    margin: var(--s3) var(--s3) 0;
+  }
+  .tracked-view {
+    margin: var(--s3);
+  }
+  .tracked-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .fleet-grid {

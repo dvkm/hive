@@ -2,10 +2,48 @@ import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { Checkpoint, Decision, Task, UnderstandingQuiz } from "../src/lib/api";
-import { getNeedsYouItems } from "../src/lib/needsYou";
+import { getNeedsYouItems, trackedSubtasks } from "../src/lib/needsYou";
 import { JiraPanel, jiraMoveHint, jiraMoveSummary, jiraNextAutomaticText, jiraPanelNotice, trackingBindingNotice } from "../src/views/Task";
 
 const task = (id: string, state: Task["state"], extra: Partial<Task> = {}) => ({ id, state, ...extra }) as Task;
+
+test("tracked Jira cards show logical subtasks with retry chains collapsed", () => {
+  const tracked = task("jira", "in_review", {
+    project_id: "corebeat",
+    title: "[WEB-7] Newsletter",
+    source: "external",
+    source_ref: "jira:WEB-7",
+  });
+  const shipped = task("shipped", "done", {
+    project_id: "corebeat",
+    title: "[WEB-7] Analytics",
+    parent_task_id: "manager",
+    updated_at: "2026-08-20T00:00:00Z",
+  });
+  const failed = task("failed", "failed", {
+    project_id: "corebeat",
+    title: "[WEB-7] Autosave",
+    parent_task_id: "manager",
+    updated_at: "2026-08-19T00:00:00Z",
+  });
+  const retry = task("retry", "in_progress", {
+    project_id: "corebeat",
+    title: failed.title,
+    source: "requeue",
+    parent_task_id: failed.id,
+    updated_at: "2026-08-21T00:00:00Z",
+  });
+  const otherIssue = task("other", "done", {
+    project_id: "corebeat",
+    title: "[WEB-6] Intro",
+    updated_at: "2026-08-21T00:00:00Z",
+  });
+
+  expect(trackedSubtasks(tracked, [tracked, shipped, failed, retry, otherIssue]).map((candidate) => candidate.id)).toEqual([
+    "retry",
+    "shipped",
+  ]);
+});
 
 test("needs-you queue includes every actionable item", () => {
   const decision = { id: "decision-1" } as Decision;

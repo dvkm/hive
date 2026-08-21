@@ -44,6 +44,39 @@ export function isTrackingOnly(task: Pick<Task, "source" | "source_ref">): boole
   return task.source === "external" || isJiraMirror(task);
 }
 
+// Tracking cards are containers, not execution owners. Plain tracked cards use
+// their direct children; Jira cards also group Hive work carrying the same
+// stable issue-key prefix (e.g. [WEB-7]). Retry chains stay owned by their
+// original supervisor, so collapse each one to its newest attempt instead of
+// rewriting parent_task_id or showing every failed attempt as another subtask.
+export function trackedSubtasks(task: Task, tasks: Task[]): Task[] {
+  if (!isTrackingOnly(task)) return [];
+  const direct = tasks.filter((candidate) => candidate.parent_task_id === task.id);
+  const jiraKey = isJiraMirror(task) ? String(task.source_ref).slice("jira:".length) : "";
+  const keyed = jiraKey
+    ? tasks.filter((candidate) =>
+        candidate.project_id === task.project_id &&
+        !isTrackingOnly(candidate) &&
+        candidate.source !== "requeue" &&
+        candidate.title.startsWith(`[${jiraKey}]`)
+      )
+    : [];
+  const roots = [...new Map([...direct, ...keyed].map((candidate) => [candidate.id, candidate])).values()];
+
+  return roots.map((root) => {
+    let latest = root;
+    const seen = new Set([root.id]);
+    while (true) {
+      const retry = tasks
+        .filter((candidate) => candidate.parent_task_id === latest.id && candidate.source === "requeue" && !seen.has(candidate.id))
+        .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at))[0];
+      if (!retry) return latest;
+      seen.add(retry.id);
+      latest = retry;
+    }
+  }).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+}
+
 function reviewIsActionable(task: Task): boolean {
   return task.kind === "scout" || (!!(task.pr_url || task.branch) && task.ci_status !== "pending" && task.ci_status !== "failing");
 }
