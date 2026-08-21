@@ -21,6 +21,7 @@ import { ANSWERED_BY_LABEL } from "../lib/labels";
 import type { TimelineItem } from "../lib/timeline";
 import { eventText } from "../lib/eventText";
 import { isJiraMirror, isTrackingOnly } from "../lib/needsYou";
+import { PrReference, TaskRef, prLabel } from "../lib/references";
 
 // Compact per-task usage line: tokens + estimated cost, only when usage exists.
 function UsageLine({ id, rev }: { id: string; rev: number }) {
@@ -652,7 +653,7 @@ export function TaskBody({ id }: { id: string }) {
           <>
             <h1 className="task-title">
               <StatusDot state={t.state} health={t.health} />{" "}
-              <span className="task-num" title="Task number">#{t.number}</span> {t.title}
+              <TaskRef task={t} self className="task-num" /> {t.title}
             </h1>
             <div className="task-sub">
               {project && <span className="chip">{project.name}</span>}
@@ -864,9 +865,7 @@ export function TaskBody({ id }: { id: string }) {
           <section className="panel">
             <h2>PR / CI</h2>
             {t.pr_url ? (
-              <a className="pr pr-lg" href={t.pr_url} target="_blank" rel="noreferrer" title={`Pull request linked to #${t.number}`}>
-                View PR ↔ #{t.number}
-              </a>
+              <PrReference className="pr pr-lg" url={t.pr_url} label={`View ${prLabel(t.pr_url)} ↗`} />
             ) : (
               <div className="muted">No PR yet</div>
             )}

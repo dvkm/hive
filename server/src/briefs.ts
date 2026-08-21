@@ -5,6 +5,7 @@ import { getTask } from "./state.ts";
 import { prTitlePrefix, prBodyFooter } from "./marker.ts";
 import { managingThreadForTask } from "./chat.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
+import { taskIdentifier } from "./taskIdentifier.ts";
 
 // The PR marker contract (documented in docs/API.md). Both halves are REQUIRED
 // on any PR the agent opens so hive can link the PR back to this task.
@@ -307,8 +308,9 @@ export function composeBrief(db: DB, taskId: string): string {
     .all(projectScope) as { title: string; body: string }[];
 
   const parts: string[] = [];
-  parts.push(`# Task #${task.number}: ${task.title}`);
-  parts.push(`Task number: ${task.number}\nTask id: ${task.id}\nKind: ${task.kind}`);
+  const displayId = taskIdentifier(db, task);
+  parts.push(`# Task ${displayId}: ${task.title}`);
+  parts.push(`Task identifier: ${displayId}\nLegacy task number: ${task.number}\nTask id: ${task.id}\nKind: ${task.kind}`);
   parts.push(`## Brief\n${task.brief?.trim() || "(no description provided)"}`);
   parts.push(definitionOfDone(task.kind));
   parts.push(EMIT_PROTOCOL);

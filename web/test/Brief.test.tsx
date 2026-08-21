@@ -7,6 +7,7 @@ import { LightboxProvider } from "../src/lib/lightbox";
 import { Ctx, type Store } from "../src/lib/store";
 import Brief from "../src/views/Brief";
 import { DecisionCard } from "../src/views/DecisionCard";
+import { ReferenceText } from "../src/lib/references";
 
 (globalThis as unknown as { window: typeof globalThis }).window = globalThis;
 const values = new Map([["hive.inbox.mode", "backlogs"]]);
@@ -150,7 +151,7 @@ test("Focus resets local card state and evidence when advancing to the next item
     renderer.root.findByType(DecisionCard).props.onDone(first.id);
   });
 
-  expect(renderer.root.findByType("h2").children).toContain("Second decision");
+  expect(renderer.root.findByType("h2").findByType(ReferenceText).props.text).toBe("Second decision");
   expect(renderer.root.findByProps({ className: "btn btn-primary btn-submit" }).children).toContain("Submit decision");
   expect(renderer.root.findAll((node) => node.type === "img" && node.props.alt === "First evidence")).toHaveLength(0);
 });

@@ -98,7 +98,7 @@ test("a steer to a task with no agent is queued and delivered on the next spawn"
   const brief = briefs.at(-1)!;
   expect(brief).toContain("## Steers waiting for you");
   expect(brief).toContain("1. use the OAuth creds in 1password");
-  expect(brief.indexOf("Steers waiting")).toBeLessThan(brief.indexOf("# Task #"));
+  expect(brief.indexOf("Steers waiting")).toBeLessThan(brief.indexOf("# Task P-"));
 
   // ...and the receipt flipped, so the UI stops showing it as queued.
   const ev = (await steerEvents(id))[0];

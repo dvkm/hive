@@ -178,13 +178,14 @@ test("many stacked branches collapse to one sentence, not a title dump", async (
     const flag = renderer.root.findAll(
       (n) => n.type === "div" && typeof n.props.className === "string" && n.props.className.includes("review-merge-error")
     )[0];
-    // The sentence itself: count + first three numbers + overflow, no titles.
-    // Direct text children only — the expander below is a separate element.
+    // The sentence itself: count + first three linked numbers + overflow, no titles.
+    // Direct text children exclude the task-reference components and expander.
     const sentence = flag.children.filter((c) => typeof c === "string").join("");
     expect(sentence).toContain("16");
-    expect(sentence).toContain("#1100");
     expect(sentence).toContain("+13 more");
     expect(sentence).not.toContain("must not appear inline");
+    const references = flag.findAll((n) => n.type === "a" && n.children.some((child) => typeof child === "string" && child.startsWith("#")));
+    expect(references.slice(0, 3).map((reference) => reference.children.join(""))).toEqual(["#1100", "#1101", "#1102"]);
     // The rest is still reachable, just collapsed.
     const details = flag.findAll((n) => n.type === "details");
     expect(details.length).toBe(1);
@@ -218,7 +219,7 @@ test("with no unmet dependency, a stacked branch is flagged but does not block m
       (n) => n.type === "div" && typeof n.props.className === "string" && n.props.className.includes("review-merge-error")
     );
     expect(flag.length).toBe(1);
-    expect(JSON.stringify(flag[0].props.children)).toContain("#977");
+    expect(flag[0].findAll((n) => n.type === "a" && n.children.includes("#977"))).toHaveLength(1);
   } finally {
     api.task = originalTask;
     api.branchCheck = originalBranchCheck;

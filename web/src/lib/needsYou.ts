@@ -3,6 +3,7 @@ import type { Checkpoint, Decision, Task, UnderstandingQuiz } from "./api";
 export interface BlockingTaskRef {
   id: string;
   number: number;
+  display_id?: string;
   title: string;
   state: string;
   pr_url: string | null;
@@ -55,7 +56,7 @@ export function unmetDeps(task: Task, tasks: Task[]): BlockingTaskRef[] {
     const dep = tasks.find((t) => t.id === id);
     if (dep && DEP_MET_STATES.has(dep.state)) return [];
     return [dep
-      ? { id: dep.id, number: dep.number, title: dep.title, state: dep.state, pr_url: dep.pr_url }
+      ? { id: dep.id, number: dep.number, display_id: dep.display_id, title: dep.title, state: dep.state, pr_url: dep.pr_url }
       : { id, number: 0, title: "(unknown task)", state: "missing", pr_url: null }];
   });
 }

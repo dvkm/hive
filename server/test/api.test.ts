@@ -129,6 +129,8 @@ test("task create + list + get", async () => {
   expect(list.json.some((t: any) => t.id === taskId)).toBe(true);
   const one = await get(`/api/tasks/${taskId}`);
   expect(one.json.id).toBe(taskId);
+  expect(one.json.project_number).toBe(1);
+  expect(one.json.display_id).toBe("TEST-1");
   expect(Array.isArray(one.json.events)).toBe(true);
 });
 

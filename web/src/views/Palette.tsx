@@ -7,6 +7,7 @@ import { useStore } from "../lib/store";
 import { toast } from "../lib/ui";
 import { setProjectFilter } from "../lib/projectFilter";
 import { isJiraMirror } from "../lib/needsYou";
+import { taskLabel } from "../lib/references";
 import { NewTaskModal } from "./Board";
 
 // Cmd+K / "/" command palette + global search, mounted once over every view.
@@ -250,7 +251,7 @@ export default function Palette() {
           key: `hit:num:${t.id}`,
           group: "Tasks",
           icon: "◱",
-          label: `#${t.number} ${t.title}`,
+          label: `${taskLabel(t)} ${t.title}`,
           sub: t.state,
           hint: t.state,
           run: () => {
@@ -265,7 +266,7 @@ export default function Palette() {
         key: `hit:${h.type}:${h.id}`,
         group: TYPE_GROUP[h.type],
         icon: TYPE_ICON[h.type],
-        label: h.title || "(untitled)",
+        label: h.type === "task" && h.display_id ? `${h.display_id} ${h.title}` : h.title || "(untitled)",
         sub: h.snippet || (h.task_state ? h.task_state : undefined),
         hint: h.type === "task" ? h.task_state : undefined,
         run: () => {

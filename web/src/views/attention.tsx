@@ -7,6 +7,7 @@ import { isTrackingOnly, taskNeedsAttention, isWaiting, unmetDeps } from "../lib
 import type { BlockingTaskRef } from "../lib/needsYou";
 import { Attach, HEALTH_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
+import { taskLabel } from "../lib/references";
 
 export { taskNeedsAttention as needsAttention, isWaiting } from "../lib/needsYou";
 
@@ -20,11 +21,11 @@ export function BlockedByLine({ blockedBy }: { blockedBy: BlockingTaskRef[] }) {
         <span key={b.id}>
           {i > 0 && ", "}
           {b.pr_url ? (
-            <a href={b.pr_url} target="_blank" rel="noreferrer">#{b.number} {b.title}</a>
+            <a href={b.pr_url} target="_blank" rel="noreferrer">{taskLabel(b)} {b.title}</a>
           ) : b.state === "missing" ? (
             b.title
           ) : (
-            <Link to={`/tasks/${b.id}`}>#{b.number} {b.title}</Link>
+            <Link to={`/tasks/${b.id}`}>{taskLabel(b)} {b.title}</Link>
           )}
         </span>
       ))}

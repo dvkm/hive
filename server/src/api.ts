@@ -81,6 +81,7 @@ import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, safeBranch, preferSafeRef } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
+import { projectPrefix, taskIdentifier } from "./taskIdentifier.ts";
 import {
   createThread,
   getThread,
@@ -1864,7 +1865,8 @@ function listFeed(db: DB, url: URL): Response {
     }
     const sql =
       `SELECT e.id, e.task_id, e.ts, e.source, e.type, e.payload,
-              t.number AS task_number, t.title AS task_title, t.kind AS task_kind, t.project_id AS project_id,
+              t.number AS task_number, t.project_number AS task_project_number,
+              t.title AS task_title, t.kind AS task_kind, t.project_id AS project_id,
               p.name AS project_name,
               ev.url AS evidence_url, ev.kind AS evidence_kind
        FROM events e
@@ -1882,6 +1884,7 @@ function listFeed(db: DB, url: URL): Response {
       type: r.type,
       payload: JSON.parse(r.payload || "{}"),
       task_number: r.task_number ?? null,
+      task_display_id: `${projectPrefix(r.project_name)}-${r.task_project_number ?? r.task_number}`,
       task_title: r.task_title,
       task_kind: r.task_kind,
       project_id: r.project_id,
@@ -1913,6 +1916,7 @@ function listFeed(db: DB, url: URL): Response {
       type: "incident",
       payload: { monitor: r.monitor, status: r.status, detail: r.detail, project_id: r.project_id },
       task_number: null,
+      task_display_id: null,
       task_title: null,
       task_kind: null,
       project_id: r.project_id,
@@ -2139,11 +2143,23 @@ function search(db: DB, url: URL): Response {
   limit = Math.min(limit, 50);
   if (!q) return json({ hits: [] });
 
+  const ref = /^([a-z0-9]+)-(\d+)$/i.exec(q);
+  if (ref) {
+    const candidates = db
+      .query(`SELECT t.id, t.number, t.title, t.summary, t.state, t.project_id, t.project_number, p.name AS project_name
+                FROM tasks t JOIN projects p ON p.id = t.project_id
+               WHERE t.project_number = ?`)
+      .all(Number(ref[2])) as any[];
+    const match = candidates.find((task) => projectPrefix(task.project_name) === ref[1].toUpperCase());
+    if (match)
+      return json({ hits: [{ type: "task", id: match.id, title: match.title, snippet: match.summary ?? "", task_state: match.state, project_id: match.project_id, display_id: taskIdentifier(db, match) }] });
+  }
+
   const like = "%" + q.replace(/[\\%_]/g, (c) => "\\" + c) + "%";
   const E = " ESCAPE '\\'";
   type Hit = {
     type: string; id: string; title: string; snippet: string;
-    task_state?: string; project_id?: string; _rank: number;
+    task_state?: string; project_id?: string; display_id?: string; _rank: number;
   };
   const hits: Hit[] = [];
   const bodySnippet = (title: string, ...bodies: (string | null)[]) => {
@@ -2152,10 +2168,11 @@ function search(db: DB, url: URL): Response {
   };
 
   for (const r of db.query(
-    `SELECT id, title, brief, summary, state, project_id FROM tasks
-     WHERE title LIKE ?${E} OR brief LIKE ?${E} OR summary LIKE ?${E}`
+    `SELECT t.id, t.number, t.project_number, t.title, t.brief, t.summary, t.state, t.project_id
+       FROM tasks t
+      WHERE t.title LIKE ?${E} OR t.brief LIKE ?${E} OR t.summary LIKE ?${E}`
   ).all(like, like, like) as any[]) {
-    hits.push({ type: "task", id: r.id, title: r.title, snippet: bodySnippet(r.title, r.brief, r.summary), task_state: r.state, project_id: r.project_id, _rank: titleRank(r.title, q) });
+    hits.push({ type: "task", id: r.id, title: r.title, snippet: bodySnippet(r.title, r.brief, r.summary), task_state: r.state, project_id: r.project_id, display_id: taskIdentifier(db, r), _rank: titleRank(r.title, q) });
   }
   for (const r of db.query(
     `SELECT id, title, context FROM decisions WHERE title LIKE ?${E} OR context LIKE ?${E}`
@@ -4853,6 +4870,7 @@ export function decisionBundle(db: DB, taskId: string, decisionId: string): any 
   });
   return {
     task_number: task.number ?? null,
+    task_display_id: taskIdentifier(db, task),
     pr_url: task.pr_url ?? null,
     branch: task.branch ?? null,
     spend_usd: +taskSpend(db, taskId).toFixed(2),

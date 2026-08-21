@@ -4,6 +4,7 @@ import { api } from "../lib/api";
 import type { Decision, DecisionBundle, DecisionPlan } from "../lib/api";
 import { riskDisplay } from "../lib/decision";
 import { toast } from "../lib/ui";
+import { PrReference, ReferenceText } from "../lib/references";
 
 // One decision card: options (recommended first), risk/blast radius, autosaved
 // draft note, Submit. Shared by the Chief exchange, Needs you, and detailed
@@ -96,7 +97,7 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
   return (
     <article className="dcard" id={`dcard-${d.id}`}>
       <header className="dcard-head">
-        <h2>{d.title}</h2>
+        <h2><ReferenceText text={d.title} taskId={d.task_id} bundle={d.bundle} /></h2>
         <Link className="dcard-task" to={`/tasks/${d.task_id}`}>
           task {d.task_id.slice(0, 8)} →
         </Link>
@@ -108,7 +109,7 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
         d.context && (
           <section className="dcard-brief">
             <div className="dcard-brief-label">Decision brief</div>
-            <p className="dcard-context">{d.context}</p>
+            <p className="dcard-context"><ReferenceText text={d.context} taskId={d.task_id} bundle={d.bundle} /></p>
           </section>
         )
       )}
@@ -268,9 +269,7 @@ function DecisionBundleView({ bundle }: { bundle?: DecisionBundle | null }) {
       {hasFacts && (
         <div className="dbundle-facts">
           {pr_url && (
-            <a className="dbundle-fact" href={pr_url} target="_blank" rel="noreferrer">
-              {prLabel(pr_url)}
-            </a>
+            <PrReference className="dbundle-fact" url={pr_url} />
           )}
           {branch && !pr_url && <span className="dbundle-fact">{branch}</span>}
           {spend_usd > 0 && <span className="dbundle-fact">${spend_usd.toFixed(2)} spent</span>}
@@ -291,10 +290,4 @@ function DecisionBundleView({ bundle }: { bundle?: DecisionBundle | null }) {
       )}
     </div>
   );
-}
-
-// "owner/repo#123" from a GitHub PR URL; the raw URL otherwise.
-function prLabel(url: string): string {
-  const m = url.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
-  return m ? `${m[1]}#${m[2]}` : url;
 }

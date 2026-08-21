@@ -45,7 +45,9 @@ export interface Health {
 
 export interface Task {
   id: string;
-  number: number; // human-friendly monotonic per-hive handle (the opaque `id` stays the machine key)
+  number: number; // legacy global handle retained for PR markers and API compatibility
+  project_number?: number; // stable sequence within the project
+  display_id?: string; // project-scoped human handle, e.g. HIVE-247
   project_id: string;
   title: string;
   brief: string;
@@ -144,6 +146,7 @@ export interface DecisionPlan {
 // task spend so far — enough to decide without opening the task.
 export interface DecisionBundle {
   task_number: number | null;
+  task_display_id?: string | null;
   pr_url: string | null;
   branch: string | null;
   spend_usd: number;
@@ -358,6 +361,7 @@ export interface SearchHit {
   snippet: string;
   task_state?: State;
   project_id?: string;
+  display_id?: string;
 }
 
 export interface UsageTotals {
@@ -396,6 +400,7 @@ export interface AnalyticsSummary {
 export interface FeedEvent extends Omit<Event, "task_id"> {
   task_id: string | null;
   task_number: number | null;
+  task_display_id: string | null;
   task_title: string | null;
   task_kind: Kind | null;
   project_id: string;

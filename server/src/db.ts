@@ -478,6 +478,30 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       )`,
     ],
   },
+  // Human-facing task numbers are scoped to their project. The original
+  // globally unique `number` remains intact for old PR markers and API
+  // compatibility; `project_number` is the stable sequence used by the UI.
+  {
+    name: "v25-project-task-numbers",
+    statements: [
+      `ALTER TABLE tasks ADD COLUMN project_number INTEGER`,
+      `UPDATE tasks SET project_number = (
+        SELECT COUNT(*) FROM tasks t2
+        WHERE t2.project_id = tasks.project_id
+          AND (t2.created_at < tasks.created_at
+            OR (t2.created_at = tasks.created_at AND t2.id <= tasks.id))
+      ) WHERE project_number IS NULL`,
+      `CREATE UNIQUE INDEX idx_tasks_project_number ON tasks(project_id, project_number)`,
+      `CREATE TRIGGER tasks_assign_project_number AFTER INSERT ON tasks
+      WHEN NEW.project_number IS NULL
+      BEGIN
+        UPDATE tasks SET project_number = (
+          SELECT COALESCE(MAX(project_number), 0) + 1 FROM tasks
+          WHERE project_id = NEW.project_id
+        ) WHERE id = NEW.id;
+      END`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings
