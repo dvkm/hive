@@ -157,6 +157,46 @@ test("an unmet dependency from branch-check disables Approve & merge", async () 
   }
 });
 
+// task #1134: the flag used to spell out every task's title inline — 80+ of
+// them on one corebeat card, with the actual risk buried at the very end. It
+// must stay one glanceable sentence no matter how many tasks are involved.
+test("many stacked branches collapse to one sentence, not a title dump", async () => {
+  const originalTask = api.task;
+  const originalBranchCheck = api.branchCheck;
+  api.task = (async (id: string) => passingDetail(id)) as typeof api.task;
+  const many = Array.from({ length: 16 }, (_, i) => ({
+    id: `other-${i}`,
+    number: 1100 + i,
+    title: `a very long in-flight task title number ${i} that must not appear inline`,
+  }));
+  api.branchCheck = (async () => ({ unmet_deps: [], embedded_tasks: many })) as typeof api.branchCheck;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree(task("stacked")));
+    });
+    const flag = renderer.root.findAll(
+      (n) => n.type === "div" && typeof n.props.className === "string" && n.props.className.includes("review-merge-error")
+    )[0];
+    // The sentence itself: count + first three numbers + overflow, no titles.
+    // Direct text children only — the expander below is a separate element.
+    const sentence = flag.children.filter((c) => typeof c === "string").join("");
+    expect(sentence).toContain("16");
+    expect(sentence).toContain("#1100");
+    expect(sentence).toContain("+13 more");
+    expect(sentence).not.toContain("must not appear inline");
+    // The rest is still reachable, just collapsed.
+    const details = flag.findAll((n) => n.type === "details");
+    expect(details.length).toBe(1);
+    const listed = details[0].findAll((n) => n.type === "li").map((li) => li.children.join(""));
+    expect(listed.length).toBe(16);
+    expect(listed[0]).toContain("must not appear inline");
+  } finally {
+    api.task = originalTask;
+    api.branchCheck = originalBranchCheck;
+  }
+});
+
 test("with no unmet dependency, a stacked branch is flagged but does not block merge", async () => {
   const originalTask = api.task;
   const originalBranchCheck = api.branchCheck;
