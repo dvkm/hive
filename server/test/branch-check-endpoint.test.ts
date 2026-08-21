@@ -64,3 +64,25 @@ test("task not found → 404", async () => {
   const res = await taskBranchCheckEndpoint(db, "nope", { exec: async () => OK() });
   expect(res.status).toBe(404);
 });
+
+// task #1134: `failed` is terminal too — acme had 109 failed tasks whose
+// dead branches made up most of a 103-row warning on a single review card.
+test("a failed task's branch is not a stacked-branch candidate", async () => {
+  const { db, projectId, taskId } = seed();
+  const t = now();
+  db.query(
+    "INSERT INTO tasks (id, project_id, title, state, kind, branch, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)"
+  ).run(newId(), projectId, "long-dead task", "failed", "ship", "dead-branch", t, t);
+
+  // Every comparison says "shares deep history" — only the state filter can
+  // keep this out of the result.
+  const exec: Exec = async (argv) => {
+    if (argv[3] !== "merge-base") return OK();
+    if (argv[4] === "--is-ancestor") return FAIL();
+    return OK([argv[4], argv[5]].sort().join("|") === "feat|main" ? "base-sha\n" : "shared-sha\n");
+  };
+
+  const res = await taskBranchCheckEndpoint(db, taskId, { exec });
+  const body: any = await res.json();
+  expect(body.embedded_tasks).toEqual([]);
+});

@@ -7,9 +7,12 @@ const FAIL = (stderr = "boom"): ExecResult => ({ code: 1, stdout: "", stderr });
 
 // Routes `git merge-base <a> <b>` to a lookup keyed by the exact call order
 // findEmbeddedTasks uses: first "<base>|<branch>", then "<branch>|<other>".
-function mergeBaseStub(bases: Record<string, string>): Exec {
+// `inBase` lists the shas that `git merge-base --is-ancestor <sha> <base>`
+// should answer yes for — i.e. commits base already contains.
+function mergeBaseStub(bases: Record<string, string>, inBase: string[] = []): Exec {
   return async (argv) => {
     if (argv[3] !== "merge-base") return OK();
+    if (argv[4] === "--is-ancestor") return inBase.includes(argv[5]!) ? OK() : FAIL("not an ancestor");
     const key = `${argv[4]}|${argv[5]}`;
     return bases[key] !== undefined ? OK(bases[key]) : FAIL("no merge base");
   };
@@ -61,4 +64,36 @@ test("this branch itself unreadable against base → null (caller must not block
     { id: "t2", number: 2, title: "x", branch: "other" },
   ]);
   expect(embedded).toBeNull();
+});
+
+// task #1134: the flag used to fire on ANY branch whose merge-base differed
+// from ours, which includes every branch cut from an earlier point on base —
+// 103 tasks on one acme card. A shared commit base already contains is
+// ordinary forking, not in-flight work that a rewrite could strand.
+test("a branch cut from an earlier point on base is not flagged", async () => {
+  const exec = mergeBaseStub(
+    {
+      "main|feat": "base-sha",
+      "feat|older": "earlier-base-sha", // != base-sha, but still on main
+    },
+    ["earlier-base-sha"]
+  );
+  const embedded = await findEmbeddedTasks(exec, "/repo", "main", "feat", [
+    { id: "t2", number: 2, title: "forked from main last week", branch: "older" },
+  ]);
+  expect(embedded).toEqual([]);
+});
+
+test("a shared commit base does NOT contain is still flagged", async () => {
+  const exec = mergeBaseStub(
+    {
+      "main|feat": "base-sha",
+      "feat|stacked": "in-flight-sha",
+    },
+    ["base-sha"] // in-flight-sha is deliberately absent → genuinely unmerged
+  );
+  const embedded = await findEmbeddedTasks(exec, "/repo", "main", "feat", [
+    { id: "t2", number: 977, title: "stacked on our branch", branch: "stacked" },
+  ]);
+  expect(embedded).toEqual([{ id: "t2", number: 977, title: "stacked on our branch" }]);
 });

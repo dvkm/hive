@@ -2294,11 +2294,15 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
   if (project?.repo_path && task.branch) {
     const config = JSON.parse(project.config ?? "{}");
     const base = safeBranch(config.default_branch);
+    // TERMINAL, not just done/cancelled: a `failed` task's branch is as dead as
+    // a cancelled one, and acme's 109 failed tasks were 87 of the 103 rows
+    // this flag used to dump on one card (task #1134).
     const others = db
       .query(
-        `SELECT id, number, title, branch FROM tasks WHERE project_id = ? AND id != ? AND branch IS NOT NULL AND state NOT IN ('done', 'cancelled')`
+        `SELECT id, number, title, branch FROM tasks WHERE project_id = ? AND id != ? AND branch IS NOT NULL
+           AND state NOT IN (${TERMINAL.map(() => "?").join(", ")}) ORDER BY number`
       )
-      .all(task.project_id, id) as { id: string; number: number; title: string; branch: string }[];
+      .all(task.project_id, id, ...TERMINAL) as { id: string; number: number; title: string; branch: string }[];
     const found = await findEmbeddedTasks(deps.exec ?? defaultExec, project.repo_path, base, task.branch, others);
     if (found) embedded_tasks = found;
   }
