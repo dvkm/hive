@@ -47,10 +47,9 @@ function reviewIsActionable(task: Task): boolean {
   return task.kind === "scout" || (!!(task.pr_url || task.branch) && task.ci_status !== "pending" && task.ci_status !== "failing");
 }
 
-// Mirrors server/src/state.ts's unmetDeps: a dependency is met once its PR is
-// merged (verifying) or the task is fully done. A vanished dependency can
-// never be met, so it stays blocking (visible as "(unknown task)").
-const DEP_MET_STATES = new Set(["verifying", "done"]);
+// Browser-safe mirror of server/src/state.ts's dependency gate. Exported so
+// BlockedBy and the needs-you queue use the same threshold.
+export const DEP_MET_STATES = new Set(["verifying", "done"]);
 export function unmetDeps(task: Task, tasks: Task[]): BlockingTaskRef[] {
   return (task.depends_on ?? []).flatMap((id) => {
     const dep = tasks.find((t) => t.id === id);
