@@ -485,6 +485,19 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       );
       transition(db, t.id, "in_progress", { source: "reconciler", reason: "PR closed without merging — returned to the agent" });
       broadcast({ type: "task", task: getTask(db, t.id) });
+    } else if (state === "in_progress" && ["MERGED", "CLOSED"].includes(String(data.state).toUpperCase())) {
+      // A PR can be merged/closed by a human while its task is still held in
+      // in_progress (handoff to in_review is held on pending/failing CI — see
+      // the OPEN+in_progress branch above), and the task can die before ever
+      // reaching in_review. Record the terminal PR event either way so
+      // predecessorOpenPrUrl (api.ts) never cites an already-dead PR in a
+      // requeue brief — but skip the in_review side effects (steer, smoke,
+      // verifying transition): the task never reached review, so there's
+      // nothing to bounce back or advance. One-shot per task (no transition
+      // moves it off in_progress to stop this from recurring every cycle).
+      const type = String(data.state).toUpperCase() === "MERGED" ? "pr_merged" : "pr_closed";
+      const already = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = ? LIMIT 1").get(t.id, type);
+      if (!already) writeEvent(db, { task_id: t.id, source: "reconciler", type, payload: { pr_url: t.pr_url } });
     } else if (ci === "failing" && state === "in_review") {
       // Checks went red AFTER the handoff: red is not reviewable. Send it back
       // to the agent to iterate; it returns automatically when green.
