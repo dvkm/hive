@@ -713,7 +713,7 @@ the reconciler recording `pr_synchronized`.
 
 - `GET /api/tasks/:id/diff` → `200 DiffResult` | `400` (no branch & no `pr_url`, or project has no `repo_path`) | `404` | `409` (tracking-only task) | `502` (gh/git failed)
   The task branch's changes. When `pr_url` is set, `gh pr diff <url> --patch`;
-  otherwise `git -C <repo> diff <default_branch>...<branch>` in the project repo.
+  otherwise `git -C <repo> diff origin/<integration_branch>...<branch>` in the project repo, where the integration branch is `default_branch`, then `promote.from`, then `main`.
   The unified diff is parsed into:
   ```json
   {

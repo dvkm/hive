@@ -231,7 +231,8 @@ test("feedback on a released task respawns an agent on the same branch, with the
   expect(start!.join(" ")).toContain("reviewer: please rename the flag"); // feedback rides in the brief
   expect(getTask(db, id).agent_target).toBe(id);
   expect(queuedSteers(db, id).length).toBe(0); // receipted by the spawn
-  expect(getTask(db, id).state).toBe("in_review"); // reattach never changes lifecycle
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'changes_requested'").get(id)).toBeTruthy();
 });
 
 test("reattach ignores agentless tasks with nothing queued, and tracking-only tasks", async () => {
