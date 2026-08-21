@@ -147,8 +147,9 @@ export default function Brief() {
         </div>
       )}
 
+      {/* A new item must not inherit the previous card's submit state or evidence. */}
       {mode === "focus" && focusItem && (
-        <section className="brief-focus">
+        <section className="brief-focus" key={`${focusItem.kind}:${focusItem.id}`}>
           <div className="brief-focus-meta">
             <span>{ITEM_LABELS[focusItem.kind]}</span>
             <span>1 of {actionCount}</span>
