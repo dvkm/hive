@@ -767,6 +767,31 @@ test("autoMergeReady holds a task while a queued-input recovery is in flight (#1
   expect(getTask(db, guarded).state).toBe("in_review"); // held, not merged out from under the recovery
 });
 
+test("autoMergeReady holds a task with work still queued for its agent", async () => {
+  const { autoMergeReady } = await import("../src/reconciler.ts");
+  const { queueSteerEvent } = await import("../src/steer.ts");
+  const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
+  const id = makeTask(db, projectId, { kind: "chore" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x' WHERE id = ?").run(id);
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
+  );
+  const review = writeEvent(db, {
+    task_id: id,
+    source: "agent",
+    type: "review_summary",
+    payload: { understanding: { check: { question: "safe?", options: [{ key: "review", label: "yes" }], answer_key: "review" } } },
+  });
+  writeEvent(db, { task_id: id, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "review" } });
+  writeEvent(db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
+  queueSteerEvent(db, id, "Please address the requested follow-up before merging.", "agent turn complete");
+
+  await autoMergeReady(db, { exec: stub(() => OK()) });
+  expect(getTask(db, id).state).toBe("in_review");
+});
+
 test("autoAnswerStale answers timed-out normal-risk cards with the recommendation, never high-risk", async () => {
   const { autoAnswerStale } = await import("../src/reconciler.ts");
   const { db, projectId } = freshDb({ decision_auto_answer_hours: 4 });

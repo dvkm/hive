@@ -79,7 +79,7 @@ import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, projectBaseBranch, preferSafeRef } from "./exec.ts";
+import { defaultExec, projectBaseBranch, projectComparisonBase, preferSafeRef } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
 import { projectPrefix, taskIdentifier } from "./taskIdentifier.ts";
 import {
@@ -2351,7 +2351,7 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   if (project?.repo_path && task.branch) {
     const config = JSON.parse(project.config ?? "{}");
-    const base = projectBaseBranch(config);
+    const base = projectComparisonBase(config);
     // TERMINAL, not just done/cancelled: a `failed` task's branch is as dead as
     // a cancelled one, and corebeat's 109 failed tasks were 87 of the 103 rows
     // this flag used to dump on one card (task #1134).
