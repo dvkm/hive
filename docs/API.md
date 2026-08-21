@@ -267,10 +267,10 @@ Understanding quiz API:
 - `cleanup_skipped` — teardown was refused because the branch is neither pushed nor merged; the worktree and its session are left fully intact so no unmerged work is lost. `payload: {reason, worktree_path, branch}`
 - `stack_setup` / `stack_teardown` — a per-project worktree stack hook ran (`config.setup_argv` at spawn, `source: herdr`; `config.cleanup_argv` at teardown, `source: reaper`). `payload: {argv, ok, error?}` (`error` is the trimmed stderr/stdout on failure or a timeout note).
 
-Review events (written by the director path, `source: director`):
+Review events (normally written by the director path with `source: director`):
 - `merged` — an in-review task was approved & merged. `payload: {method, base, branch, pr_url}`
 - `merge_failed` — a merge attempt failed (conflict / not a fast-forward / gh refused). `payload: {reason, conflict, delivered, send_error?}` — `conflict` = the reason looks like the agent's to fix, which bounces the task back to `in_progress` with rebase instructions (a best-effort send; `delivered` records whether it landed, `send_error` the failure). A non-conflict failure leaves the task `in_review` with `delivered: false`.
-- `changes_requested` — the captain requested changes; the task returns to `in_progress`. `payload: {notes, delivered, head_sha}` (`head_sha` = the PR head at request time, read from the latest `pr_synchronized`; the baseline the re-queue guard compares against, `null` when no `pr_synchronized` existed yet)
+- `changes_requested` — follow-up work was requested; the task returns to `in_progress`. This is written either when the captain requests changes or, with `source: system`, when a queued steer reaches an `in_review` task. `payload: {notes, delivered, head_sha, delivery_via?}` (`head_sha` = the PR head at request time, read from the latest `pr_synchronized`; the baseline the re-queue guard compares against, `null` when no `pr_synchronized` existed yet; `delivery_via` is `drain` or `respawn` on the queued-steer path)
 
 Domain-supervisor events (written by the planner, `source: system`):
 - `planning` — a planner run started for the task. `payload: {title}`
@@ -578,6 +578,8 @@ priced rows only).
   - `queued` — no `agent_target`, or herdr refused it twice (one automatic retry). The steer is **not dropped**; it is redelivered by whichever of these comes first, and the event's payload then flips to `delivered` with a `delivered_via` recording how:
     - `delivered_via:"drain"` — the reconciler, on any cycle, finds a queued steer on a task whose agent still has an active turn and re-sends it. This covers the common case of a herdr socket blip while the agent is alive and working: no respawn is coming, so waiting for one would strand the message until the task ended. Delivery is re-attempted every cycle until it lands; a dead agent or a completed (`done`) turn is skipped, and a partial drain stops at the first failure so the remainder stay queued **in order**.
     - `delivered_via:"respawn"` — the next `POST /spawn` or automatic dispatcher reattach of the task prepends every still-queued steer to the agent's brief under "## Steers waiting for you". When a steer reaches a completed (`done`) turn, hive queues it, releases that terminal session, and reattaches a fresh turn to the same task, branch, and worktree.
+
+    When either path delivers queued work to an `in_review` task, hive records `changes_requested` and resumes it in `in_progress` before it can merge.
   - `failed` — the task is terminal, so no spawn will ever carry it.
 
   Never throws. A herdr failure additionally records a `steer_error` event. The timeline renders the receipt (`✓` / `⏳ queued` / `⚠ undelivered`) so a steer never has to be re-sent blind. Besides the respawn drain, the reconciler re-attempts every queued steer each cycle against any agent with an active turn (receipt flips with `delivered_via:"drain"`); a successful drain writes no event of its own — the receipt flip is the record, and a fresh event would reset the task's silence clock and mask a mute agent from `stale` detection.
@@ -700,7 +702,8 @@ An `in_review` task owned by Hive means the agent finished and opened a PR (or p
   its `health` becomes `stuck` (reason `finished or stuck: agent <idle|done>, no PR`), which
   surfaces it in the attention tray for the director instead of sitting silently.
 
-**Changes-requested re-queue guard:** once the captain requests changes, the task
+**Changes-requested re-queue guard:** once follow-up work is delivered, whether
+through the captain's request-changes action or a queued steer, the task
 must NOT bounce straight back into review until the agent has actually acted. Both
 auto-advance paths (the reconciler's CI-green poll / link-pr handoff and the idle
 backstop) skip a task whose latest `changes_requested` is still unaddressed. "Addressed"
@@ -711,9 +714,15 @@ evidence-only request (the director said "there are no evidences") forever. The 
 explicit `ready` emit is intentionally NOT guarded — it can legitimately race ahead of
 the reconciler recording `pr_synchronized`.
 
+**Queued-work auto-merge guard:** the opt-in auto-merge pass does not merge while
+a steer is still queued or a queued-input recovery is pending. It rechecks the
+task state, passing CI, queued work, recovery state, and changes-request history
+immediately before each GitHub merge, local merge, or local ref update, so work
+that arrives during earlier merge checks still prevents the mutation.
+
 - `GET /api/tasks/:id/diff` → `200 DiffResult` | `400` (no branch & no `pr_url`, or project has no `repo_path`) | `404` | `409` (tracking-only task) | `502` (gh/git failed)
   The task branch's changes. When `pr_url` is set, `gh pr diff <url> --patch`;
-  otherwise `git -C <repo> diff origin/<integration_branch>...<branch>` in the project repo, where the integration branch is `default_branch`, then `promote.from`, then `main`.
+  otherwise `git -C <repo> diff origin/<base>...<branch>` in the project repo, using the `default_branch` base selection described above.
   The unified diff is parsed into:
   ```json
   {
@@ -739,7 +748,8 @@ the reconciler recording `pr_synchronized`.
   checks before spawning and merge now checks before landing. `embedded_tasks`
   flags a **stacked PR**: another currently open task (same project, non-terminal,
   has a branch) whose branch shares commit history with this one beyond their
-  common base with the default branch (`git merge-base` pairwise comparison,
+  common base with the remote-tracking integration branch (`origin/<base>`, using
+  the `default_branch` selection described above; `git merge-base` pairwise comparison,
   server/src/branchContents.ts) — meaning this branch was cut from, or had
   merged into it, that task's in-flight work, so a later rewrite of that task's
   branch (e.g. a scope trim) won't be reflected here. Informational only, not
@@ -812,7 +822,8 @@ the reconciler recording `pr_synchronized`.
   boundary, and the run grew ~9 rounds of adjacent hardening before anyone saw
   it — 5.5h and $36.76 in, at final review, when the only remaining option was
   to pay to undo the work. A background loop watches every live branch: each
-  time it has gained `config.scope_drift_commits` commits (default 3, so the
+  time it has gained `config.scope_drift_commits` commits (default 3) relative
+  to the remote-tracking integration branch (`origin/<base>`), so the
   first check lands before a third no-mistakes review round) hive collects the
   branch's authored file list and commit subjects and asks a one-shot
   `claude -p` (default `sonnet`, override with `config.model_by_kind.drift`)
@@ -1343,7 +1354,8 @@ bypasses these policy gates but still runs the `task.spawn` authority gate. See
 Each cycle also runs a **reattach** pass BEFORE the queued pass: a live task
 (`in_progress`/`in_review`/`verifying`) with no `agent_target` but with QUEUED steers gets an
 agent respawned onto its existing branch and worktree, with that feedback at the
-top of the fresh brief. This is the return leg of releasing review-parked agents
+top of the fresh brief. For an `in_review` task, the queued-work guard described
+under Review experience records `changes_requested` and resumes work. This is the return leg of releasing review-parked agents
 (below): the release frees the slot, the reattach brings an agent back when
 review talks back (a changes-request, red CI, a closed PR, a merge conflict).
 It skips `auto_dispatch`, `dispatch_kinds`, intake review and the authority gate
