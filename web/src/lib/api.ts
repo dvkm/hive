@@ -33,7 +33,10 @@ export type State =
   | "failed"
   | "cancelled";
 export type Kind = "ship" | "scout" | "chore";
-export type CiStatus = "passing" | "failing" | "pending" | null;
+// "unavailable" = GitHub created the check but refused to run the job (billing,
+// no runner). Red on GitHub, but nothing an agent can fix, so hive doesn't gate
+// on it — see ciStatusProbed in server/src/reconciler.ts.
+export type CiStatus = "passing" | "failing" | "pending" | "unavailable" | null;
 
 // Server-computed health (single source of truth; never re-derived here).
 export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";

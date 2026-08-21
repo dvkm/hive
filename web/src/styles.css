@@ -831,6 +831,11 @@ a {
   background: rgba(226, 165, 66, 0.14);
   color: var(--amber);
 }
+/* GitHub refused to start the job — red, but not the agent's fault. */
+.ci-unavailable {
+  background: rgba(226, 165, 66, 0.14);
+  color: var(--amber);
+}
 .evc {
   font-size: 11.5px;
   color: var(--text-faint);
