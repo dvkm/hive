@@ -608,8 +608,16 @@ export function TaskBody({ id }: { id: string }) {
   };
   const nudge = async () => {
     try {
-      await api.send(t.id, "hive: status? Reply with what you just did / are doing, or what's blocking you.");
-      toast("Status nudge sent");
+      const r = await api.send(t.id, "hive: status? Reply with what you just did / are doing, or what's blocking you.");
+      // Same reasoning as sendSteer: a bare "sent" toast would lie when the
+      // agent is dead (hive-1097) — report the actual delivery outcome.
+      toast(
+        r.delivered
+          ? "Status nudge delivered"
+          : r.delivery === "failed"
+          ? `Nudge undelivered: ${r.error || "task is finished"}`
+          : "No live agent — nudge queued for the next spawn"
+      );
     } catch (e) {
       toast((e as Error).message);
     }

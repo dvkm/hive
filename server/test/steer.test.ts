@@ -241,11 +241,19 @@ test("the reconciler drains a queued steer to an agent that is alive", async () 
 });
 
 // A genuinely dead agent must keep its steers queued for the next spawn's brief.
+// hive-1097: an operator steer to a task whose agent was just killed (e.g. by a
+// self-deploy restart) must never come back as a bare 200 — the caller needs
+// the failure in the response body itself, not just in the event log.
 test("the reconciler leaves a queued steer alone when the agent is dead", async () => {
   const f = await drainFixture(() => OK(), DEAD); // send lands, but the pane is gone
 
   const r = await f.call(`/api/tasks/${f.id}/send`, { message: "rebase onto main" });
+  expect(r.ok).toBe(false);
+  expect(r.delivered).toBe(false);
   expect(r.delivery).toBe("queued");
+  expect(r.error).toContain("agent is not active");
+  const errEvents = (await f.call(`/api/tasks/${f.id}/events`)).filter((e: any) => e.type === "steer_error");
+  expect(errEvents.at(-1)?.payload.error).toBe("agent is not active; refusing to steer its shell pane");
   const before = f.sends.length;
 
   await reconcileOnce(f.db, { herdr: f.herdr, exec: NO_GH });
