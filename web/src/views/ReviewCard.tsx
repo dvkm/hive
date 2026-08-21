@@ -687,7 +687,12 @@ export function ReviewCard({
 
       {quiz && reviewEventId && quizStatus === "required" && (
         <UnderstandingQuiz
-          quiz={{ task_id: task.id, question: quiz.question, options: quiz.options }}
+          quiz={{
+            task_id: task.id,
+            question: quiz.question,
+            options: quiz.options,
+            version: "version" in quiz ? quiz.version : `${reviewEventId}:0`,
+          }}
           allowDefer
           onPassed={() => setQuizOverride("passed")}
           onDeferred={() => setQuizOverride("deferred")}

@@ -1,6 +1,20 @@
 // Thin API helper. Same-origin in the built app; dev uses the vite proxy.
 // VITE_HIVE_URL lets you point the dev app at a daemon on another host.
 const BASE = import.meta.env.VITE_HIVE_URL || "";
+const DIRECTOR_ACTOR_KEY = "hive_director_actor";
+
+export function directorActor(): string | null {
+  try {
+    let actor = sessionStorage.getItem(DIRECTOR_ACTOR_KEY);
+    if (!actor) {
+      actor = `web-${crypto.randomUUID().slice(0, 8)}`;
+      sessionStorage.setItem(DIRECTOR_ACTOR_KEY, actor);
+    }
+    return actor;
+  } catch {
+    return null;
+  }
+}
 
 // Remote access (phone PWA over LAN/Tailscale): the server 401s non-loopback
 // requests without the API token (`hive remote` prints it). Stored once in
@@ -540,6 +554,7 @@ export interface UnderstandingQuiz {
   report: ReviewSummary;
   question: string;
   options: { key: string; label: string }[];
+  version: string;
   completed?: number;
   total?: number;
   status: "required" | "deferred";
@@ -603,18 +618,18 @@ export const api = {
   ackCheckpoint: (taskId: string, eventId: string, verdict: "ok" | "flag", note?: string) =>
     req<{ ok: boolean; delivered: boolean; followup_task_id: string | null }>(`/api/tasks/${taskId}/checkpoints/${eventId}/ack`, {
       method: "POST",
-      body: JSON.stringify({ verdict, note }),
+      body: JSON.stringify({ verdict, note, source: "director", actor: directorActor() }),
     }),
   understandingQuizzes: () => req<{ quizzes: UnderstandingQuiz[] }>(`/api/understanding-quizzes`),
-  answerUnderstandingQuiz: (taskId: string, answerKey: string) =>
-    req<{ ok: boolean; correct: boolean; passed: boolean; explanation: string | null; completed?: number; total?: number; quiz?: Pick<UnderstandingQuiz, "question" | "options" | "completed" | "total"> }>(`/api/tasks/${taskId}/understanding-quiz/answer`, {
+  answerUnderstandingQuiz: (taskId: string, answerKey: string, version: string) =>
+    req<{ ok: boolean; correct: boolean; passed: boolean; explanation: string | null; completed?: number; total?: number; quiz?: Pick<UnderstandingQuiz, "question" | "options" | "version" | "completed" | "total"> }>(`/api/tasks/${taskId}/understanding-quiz/answer`, {
       method: "POST",
-      body: JSON.stringify({ answer_key: answerKey, source: "director" }),
+      body: JSON.stringify({ answer_key: answerKey, version, source: "director", actor: directorActor() }),
     }),
   deferUnderstandingQuiz: (taskId: string) =>
     req<{ ok: boolean; status: "deferred" | "passed" }>(`/api/tasks/${taskId}/understanding-quiz/defer`, {
       method: "POST",
-      body: JSON.stringify({ confirm: "quiz_later", source: "director" }),
+      body: JSON.stringify({ confirm: "quiz_later", source: "director", actor: directorActor() }),
     }),
   tasks: (q: { state?: State; project_id?: string } = {}) => {
     const p = new URLSearchParams(q as Record<string, string>).toString();
@@ -657,7 +672,7 @@ export const api = {
     // `attachments` is absent on the no-agent / herdr-error responses.
     req<{ ok: boolean; delivered: boolean; delivery: "delivered" | "queued" | "failed"; message: string; attachments?: string[]; error?: string }>(`/api/tasks/${id}/send`, {
       method: "POST",
-      body: bodyFor({ message }, files),
+      body: bodyFor({ message, actor: directorActor() }, files),
     }),
   plan: (id: string) =>
     req<{ ok: boolean; decision?: Decision; error?: string }>(`/api/tasks/${id}/plan`, {
@@ -686,7 +701,10 @@ export const api = {
   diff: (id: string) => req<DiffResult>(`/api/tasks/${id}/diff`),
   branchCheck: (id: string) => req<BranchCheck>(`/api/tasks/${id}/branch-check`),
   merge: (id: string, strategy?: "local_ff") =>
-    req<Task>(`/api/tasks/${id}/merge`, { method: "POST", body: JSON.stringify(strategy ? { merge_strategy: strategy } : {}) }),
+    req<Task>(`/api/tasks/${id}/merge`, {
+      method: "POST",
+      body: JSON.stringify({ ...(strategy ? { merge_strategy: strategy } : {}), actor: directorActor() }),
+    }),
   requestChanges: (id: string, notes: string) =>
     req<{ ok: boolean; delivered: boolean; task: Task }>(`/api/tasks/${id}/request-changes`, {
       method: "POST",
@@ -704,7 +722,7 @@ export const api = {
     req<Decision>(`/api/decisions/${id}/answer`, {
       method: "POST",
       // The inbox is David's surface — answers from here are the director's.
-      body: JSON.stringify({ answer_key, answer_note, selected_indices, source: "director" }),
+      body: JSON.stringify({ answer_key, answer_note, selected_indices, source: "director", actor: directorActor() }),
     }),
   dismissDecision: (id: string) =>
     req<Decision>(`/api/decisions/${id}/dismiss`, { method: "POST" }),

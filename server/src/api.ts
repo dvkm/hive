@@ -130,6 +130,19 @@ function err(message: string, status = 400): Response {
   return json({ error: message }, status);
 }
 
+function actorOf(body: any): string | null {
+  const actor = body?.actor == null ? "" : String(body.actor).trim();
+  return actor || null;
+}
+
+function staleResponse(message: string, resolution: Record<string, unknown>): Response {
+  const source = resolution.source ? String(resolution.source) : "unknown actor";
+  const actor = resolution.actor ? ` (${String(resolution.actor)})` : "";
+  const at = resolution.at ? ` at ${String(resolution.at)}` : "";
+  const outcome = resolution.answer_label ?? resolution.verdict ?? resolution.reason;
+  return json({ error: `${message} by ${source}${actor}${at}${outcome ? `: ${String(outcome)}` : ""}`, stale: true, resolution }, 409);
+}
+
 // Background-loop liveness for /api/health (incident 2026-07-17: the
 // dispatcher stopped ticking for 3.5h with zero outward signal). Threshold is
 // 3 missed cycles, floored at 5min so a loop's own interval never makes it
@@ -2368,7 +2381,7 @@ function ghMergeFlag(method: string | undefined): string {
 // records everything for a respawned agent). Other failures (CI blocked, auth,
 // gh missing) keep the task in_review and just report the reason.
 const MERGE_CONFLICT_RE = /conflict|not mergeable|not an ancestor|fast-forward/i;
-async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason: string): Promise<Response> {
+async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason: string, actor: string | null = null): Promise<Response> {
   const conflict = MERGE_CONFLICT_RE.test(reason);
   const msg = `hive: merge into '${base}' failed — ${reason}\nRebase your branch '${task.branch}' onto the latest '${base}', resolve the conflicts, rerun the tests, then push.`;
   let delivered = false;
@@ -2389,7 +2402,7 @@ async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason
     task_id: task.id,
     source: "director",
     type: "merge_failed",
-    payload: { reason, conflict, delivered, ...(sendError ? { send_error: sendError } : {}) },
+    payload: { reason, conflict, delivered, actor, ...(sendError ? { send_error: sendError } : {}) },
   });
   recordSystemLearning(db, task.project_id, `merge failure: ${signature(reason)}`, reason, task.id);
   if (conflict) {
@@ -2487,6 +2500,7 @@ function staleBaseRefusal(prView: any): boolean {
 // Guarded by the `task.merge` standing-authority action.
 export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps): Promise<Response> {
   const task = getTask(db, id);
+  const actor = actorOf(body);
   if (!task) return err("task not found", 404);
   if (isTrackingOnlyTask(task)) return err("tracking-only tasks have no Hive-owned work to merge", 409);
   if (task.state !== "in_review")
@@ -2533,15 +2547,16 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
         herdr,
         task,
         safeBranch(config.default_branch),
-        `Could not inspect PR metadata; merge was not attempted (${probe.stderr.trim() || "gh pr view failed"}).`
+        `Could not inspect PR metadata; merge was not attempted (${probe.stderr.trim() || "gh pr view failed"}).`,
+        actor
       );
     try {
       prView = JSON.parse(probe.stdout || "{}");
     } catch {
-      return mergeFailed(db, herdr, task, safeBranch(config.default_branch), "Could not parse PR metadata; merge was not attempted.");
+      return mergeFailed(db, herdr, task, safeBranch(config.default_branch), "Could not parse PR metadata; merge was not attempted.", actor);
     }
     if (!prView.baseRefName || !prView.baseRefOid)
-      return mergeFailed(db, herdr, task, safeBranch(config.default_branch), "PR base metadata is missing; merge was not attempted.");
+      return mergeFailed(db, herdr, task, safeBranch(config.default_branch), "PR base metadata is missing; merge was not attempted.", actor);
   }
   const base = preferSafeRef(prView?.baseRefName, safeBranch(config.default_branch));
   const guardBase = prView?.baseRefOid || base;
@@ -2586,7 +2601,7 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
             task_id: id,
             source: "director",
             type: "merge_blocked_destructive",
-            payload: { base, branch: task.branch, regressed, reason },
+            payload: { base, branch: task.branch, regressed, reason, actor },
           });
           recordSystemLearning(
             db,
@@ -2638,7 +2653,8 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
           herdr,
           task,
           base,
-          `PR is CLOSED (not merged): ${task.pr_url}. If the agent replaced it, its 'ready' emit now re-links the task; otherwise re-link via POST /api/tasks/link-pr.`
+          `PR is CLOSED (not merged): ${task.pr_url}. If the agent replaced it, its 'ready' emit now re-links the task; otherwise re-link via POST /api/tasks/link-pr.`,
+          actor
         );
       }
     }
@@ -2663,10 +2679,10 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
           if (ffReason === null) {
             method = "local ff-only (PR merge reported not-mergeable against origin/" + base + ")";
           } else {
-            return mergeFailed(db, herdr, task, base, `${reason}; local fast-forward also refused: ${ffReason}`);
+            return mergeFailed(db, herdr, task, base, `${reason}; local fast-forward also refused: ${ffReason}`, actor);
           }
         } else {
-          return mergeFailed(db, herdr, task, base, reason);
+          return mergeFailed(db, herdr, task, base, reason, actor);
         }
       }
     } else {
@@ -2677,12 +2693,12 @@ export async function mergeTask(db: DB, herdr: Herdr, id: string, body: any, dep
       // branch; a non-fast-forward (diverged / conflicting) merge is refused, no
       // working tree is touched. Callers wanting a squash merge should use a PR.
       const ffReason = await attemptLocalFf(exec, project, task, base);
-      if (ffReason !== null) return mergeFailed(db, herdr, task, base, ffReason);
+      if (ffReason !== null) return mergeFailed(db, herdr, task, base, ffReason, actor);
       method = forceLocalFf && task.pr_url ? "local ff-only (forced; PR-backed task)" : "local ff-only";
     }
   }
 
-  writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url } });
+  writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url, actor } });
   // in_review → verifying (runs post-deploy smoke once).
   transition(db, id, "verifying", { source: "director", reason: `merged (${method})` });
   await smokeThenAdvance(db, id, { fetch: deps.fetch }).catch((e) => console.error("[hive] smoke run failed:", e));
@@ -3054,7 +3070,7 @@ async function sendOnce(herdr: Herdr, target: string, message: string): Promise<
 // Programmatic steer for hive's own subsystems (offline prep, checkpoint
 // flags): same delivery-receipt semantics as the HTTP path, no Request object,
 // no authz gate (the server is steering, not an agent).
-async function internalSteer(db: DB, herdr: Herdr, id: string, message: string): Promise<boolean> {
+async function internalSteer(db: DB, herdr: Herdr, id: string, message: string, actor: string | null = null): Promise<boolean> {
   const task = getTask(db, id);
   if (!task || isTrackingOnlyTask(task)) return false;
   const target = task.agent_target;
@@ -3070,7 +3086,7 @@ async function internalSteer(db: DB, herdr: Herdr, id: string, message: string):
     task_id: id,
     source: "director",
     type: "steer",
-    payload: { message, target, attachments: [], delivery, ...(delivered ? { delivered_at: now() } : { error }) },
+    payload: { message, target, attachments: [], delivery, ...(actor ? { actor } : {}), ...(delivered ? { delivered_at: now() } : { error }) },
   });
   return delivered;
 }
@@ -3083,6 +3099,7 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
   if (!text) return err("message is required");
   const fromTaskId = fields?.from_task_id ? String(fields.from_task_id) : null;
   const sender = fromTaskId ? getTask(db, fromTaskId) : null;
+  const actor = sender ? null : actorOf(fields);
   if (fromTaskId && !sender) return err("unknown from_task_id", 400);
   if (sender && sender.project_id !== task.project_id) return err("teammates must belong to the same project", 400);
   const blocked = authzBlock(db, { project_id: task.project_id, action: "task.steer", target: task.title, task_id: id });
@@ -3104,7 +3121,7 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
       task_id: id,
       source: sender ? "agent" : "director",
       type: "jira_comment",
-      payload: { direction: "outbound", text: comment, ...(sender ? { from_task_id: sender.id } : {}) },
+      payload: { direction: "outbound", text: comment, ...(sender ? { from_task_id: sender.id } : { actor }) },
     });
     return json({ ok: true, delivered: false, delivery: "queued", message: comment, attachments: [] });
   }
@@ -3151,6 +3168,7 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
       attachments: paths,
       delivery,
       ...(sender ? { from_task_id: sender.id, from_task_number: sender.number, original_message: text } : {}),
+      ...(!sender ? { actor } : {}),
       ...(delivered ? { delivered_at: now() } : { error }),
     },
   });
@@ -3183,7 +3201,8 @@ async function steerLiveAgents(
   db: DB,
   herdr: Herdr,
   message: string,
-  projectId?: string
+  projectId?: string,
+  actor: string | null = null
 ): Promise<{ targets: number; delivered: number; results: { task_id: string; delivered: boolean }[] }> {
   const rows = db
     .query(
@@ -3193,7 +3212,7 @@ async function steerLiveAgents(
     .all(...(projectId ? [projectId] : [])) as { id: string }[];
   const results: { task_id: string; delivered: boolean }[] = [];
   for (const t of rows) {
-    results.push({ task_id: t.id, delivered: await internalSteer(db, herdr, t.id, message) });
+    results.push({ task_id: t.id, delivered: await internalSteer(db, herdr, t.id, message, actor) });
   }
   return { targets: results.length, delivered: results.filter((r) => r.delivered).length, results };
 }
@@ -3201,7 +3220,7 @@ async function steerLiveAgents(
 async function broadcastSteer(db: DB, herdr: Herdr, body: any): Promise<Response> {
   const message = String(body?.message ?? "").trim();
   if (!message) return err("message is required");
-  const r = await steerLiveAgents(db, herdr, message, body?.project_id ? String(body.project_id) : undefined);
+  const r = await steerLiveAgents(db, herdr, message, body?.project_id ? String(body.project_id) : undefined, actorOf(body));
   return json({ ok: true, ...r });
 }
 
@@ -3402,13 +3421,13 @@ function activeUnderstandingCheck(
   db: DB,
   taskId: string,
   quiz: { reviewEventId: string; checks: UnderstandingCheck[] }
-): { check: UnderstandingCheck; index: number; completed: number } {
+): { check: UnderstandingCheck; index: number; completed: number; version: string } {
   const progress = understandingQuizProgress(db, taskId, quiz.reviewEventId);
   const remaining = quiz.checks.map((_, index) => index).filter((index) => !progress.completed.has(index));
   const pool = remaining.length ? remaining : quiz.checks.map((_, index) => index);
   const offset = [...quiz.reviewEventId].reduce((sum, char) => sum + char.charCodeAt(0), 0);
   const index = pool[(offset + progress.attempts) % pool.length];
-  return { check: quiz.checks[index], index, completed: quiz.checks.length - remaining.length };
+  return { check: quiz.checks[index], index, completed: quiz.checks.length - remaining.length, version: `${quiz.reviewEventId}:${progress.attempts}` };
 }
 
 function understandingQuizStatus(db: DB, taskId: string, reviewEventId: string): "required" | "deferred" | "passed" {
@@ -3514,6 +3533,7 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
       report: { ...payload, understanding },
       question: active.check.question,
       options: active.check.options,
+      version: active.version,
       completed: active.completed,
       total: checks.length,
       status,
@@ -3534,7 +3554,35 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   const status = understandingQuizStatus(db, taskId, quiz.reviewEventId);
   const active = activeUnderstandingCheck(db, taskId, quiz);
   const check = active.check;
-  if (status === "passed") return json({ ok: true, correct: true, passed: true, explanation: check.explanation ?? null });
+  const actor = actorOf(body);
+  const expectedVersion = body?.version;
+  if (expectedVersion !== undefined && typeof expectedVersion !== "string") return err("version must be a string");
+  if (status === "passed" || (expectedVersion !== undefined && expectedVersion !== active.version)) {
+    const winner: any = db
+      .query(
+        `SELECT * FROM events WHERE task_id = ?
+          AND type IN ('understanding_quiz_attempt', 'understanding_quiz_passed')
+          AND json_extract(payload, '$.review_event_id') = ? ORDER BY rowid DESC LIMIT 1`
+      )
+      .get(taskId, quiz.reviewEventId);
+    if (expectedVersion === undefined)
+      return json({ ok: true, correct: true, passed: true, explanation: check.explanation ?? null });
+    const event = winner ? parseEvent(winner) : null;
+    const index = Number(event?.payload?.check_index);
+    const answerKey = event?.payload?.answer_key ?? null;
+    const answerLabel = Number.isInteger(index)
+      ? quiz.checks[index]?.options.find((option) => option.key === answerKey)?.label ?? answerKey
+      : answerKey;
+    return staleResponse("understanding check already changed", {
+      status,
+      source: event?.source ?? "system",
+      actor: event?.payload?.actor ?? null,
+      at: event?.ts ?? null,
+      answer_key: answerKey,
+      answer_label: answerLabel,
+      correct: event?.payload?.correct ?? status === "passed",
+    });
+  }
   const answerKey = typeof body?.answer_key === "string" ? body.answer_key : "";
   if (!check.options.some((option) => option.key === answerKey)) return err("answer_key must match a quiz option");
   if (answerKey !== check.answerKey) {
@@ -3542,7 +3590,7 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
       task_id: taskId,
       source: "director",
       type: "understanding_quiz_attempt",
-      payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey, correct: false },
+      payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey, correct: false, actor },
     });
     const next = activeUnderstandingCheck(db, taskId, quiz);
     return json({
@@ -3552,14 +3600,14 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
       explanation: check.explanation ?? null,
       completed: next.completed,
       total: quiz.checks.length,
-      quiz: { question: next.check.question, options: next.check.options, completed: next.completed, total: quiz.checks.length },
+      quiz: { question: next.check.question, options: next.check.options, version: next.version, completed: next.completed, total: quiz.checks.length },
     });
   }
   writeEvent(db, {
     task_id: taskId,
     source: "director",
     type: "understanding_quiz_attempt",
-    payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey, correct: true },
+    payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey, correct: true, actor },
   });
   const next = activeUnderstandingCheck(db, taskId, quiz);
   if (next.completed < quiz.checks.length) {
@@ -3570,14 +3618,14 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
       explanation: check.explanation ?? null,
       completed: next.completed,
       total: quiz.checks.length,
-      quiz: { question: next.check.question, options: next.check.options, completed: next.completed, total: quiz.checks.length },
+      quiz: { question: next.check.question, options: next.check.options, version: next.version, completed: next.completed, total: quiz.checks.length },
     });
   }
   writeEvent(db, {
     task_id: taskId,
     source: "director",
     type: "understanding_quiz_passed",
-    payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey },
+    payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey, actor },
   });
   return json({ ok: true, correct: true, passed: true, explanation: check.explanation ?? null, completed: next.completed, total: quiz.checks.length });
 }
@@ -3597,7 +3645,7 @@ function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
       task_id: taskId,
       source: "director",
       type: "understanding_quiz_deferred",
-      payload: { review_event_id: quiz.reviewEventId },
+      payload: { review_event_id: quiz.reviewEventId, actor: actorOf(body) },
     });
   }
   return json({ ok: true, status: "deferred" });
@@ -3648,12 +3696,29 @@ async function ackCheckpoint(db: DB, herdr: Herdr, taskId: string, eventId: stri
     .query("SELECT * FROM events WHERE id = ? AND task_id = ? AND type = 'checkpoint'")
     .get(eventId, taskId);
   if (!ev) return err("checkpoint not found", 404);
+  const prior: any = db
+    .query(
+      `SELECT * FROM events WHERE task_id = ? AND type = 'checkpoint_ack'
+        AND json_extract(payload, '$.checkpoint_id') = ? ORDER BY rowid ASC LIMIT 1`
+    )
+    .get(taskId, eventId);
+  if (prior) {
+    const winner = parseEvent(prior);
+    return staleResponse("checkpoint already acknowledged", {
+      status: "acknowledged",
+      source: winner.source,
+      actor: winner.payload.actor ?? null,
+      at: winner.ts,
+      verdict: winner.payload.verdict,
+      note: winner.payload.note ?? null,
+    });
+  }
   const verdict = body?.verdict;
   if (verdict !== "ok" && verdict !== "flag") return err("verdict must be 'ok' or 'flag'");
   const source = body?.source ?? "director";
   if (source !== "director" && source !== "chat_supervisor")
     return err("source must be 'director' or 'chat_supervisor'");
-  const actor = body?.actor ? String(body.actor) : null;
+  const actor = actorOf(body);
   const task = getTask(db, taskId);
   if (verdict === "flag" && task && isTrackingOnlyTask(task))
     return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
@@ -5004,10 +5069,34 @@ function decisionAnswerBodyError(body: any): string | null {
   return null;
 }
 
+function closedDecisionResponse(db: DB, r: any): Response | null {
+  if (r.status === "open") return null;
+  const resolutionRow: any = db
+    .query(
+      `SELECT * FROM events WHERE task_id = ? AND type IN ('decision_answered', 'decision_expired')
+        AND json_extract(payload, '$.decision_id') = ? ORDER BY rowid DESC LIMIT 1`
+    )
+    .get(r.task_id, r.id);
+  const event = resolutionRow ? parseEvent(resolutionRow) : null;
+  const options: any[] = JSON.parse(r.options || "[]");
+  const answerLabel = options.find((option) => option.key === r.answer_key)?.label ?? r.answer_key ?? null;
+  return staleResponse(`decision already ${r.status}`, {
+    status: r.status,
+    source: r.answered_by ?? event?.source ?? "unknown",
+    actor: r.answered_actor ?? event?.payload?.actor ?? null,
+    at: r.answered_at ?? event?.ts ?? null,
+    answer_key: r.answer_key ?? null,
+    answer_label: answerLabel,
+    answer_note: r.answer_note ?? null,
+    reason: event?.payload?.reason ?? null,
+  });
+}
+
 export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, supervisorVerified = false): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
   if (!r) return err("decision not found", 404);
-  if (r.status !== "open") return err(`decision already ${r.status}`, 409);
+  const closed = closedDecisionResponse(db, r);
+  if (closed) return closed;
   const answerKey = body?.answer_key;
   if (!answerKey) return err("answer_key is required");
   const options: any[] = JSON.parse(r.options || "[]");
@@ -5023,7 +5112,7 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
   const answeredBy = body?.source ?? "unknown";
   if (!ANSWER_SOURCES.includes(answeredBy))
     return err(`source '${answeredBy}' is not one of ${ANSWER_SOURCES.join("|")}`, 400);
-  const answeredActor = body?.actor ?? null;
+  const answeredActor = actorOf(body);
   if (answeredBy === "chat_supervisor" && !supervisorVerified) {
     if (!answeredActor || !getThread(db, String(answeredActor)))
       return err("chat_supervisor decision answers require a valid thread actor", 403);
@@ -5109,8 +5198,10 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
 export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
   if (!r) return err("decision not found", 404);
-  if (r.status !== "open") return err(`decision already ${r.status}`, 409);
+  const closed = closedDecisionResponse(db, r);
+  if (closed) return closed;
   const answerKey = body?.answer_key;
+  const actor = actorOf(body);
   if (!answerKey) return err("answer_key is required");
   const bodyError = decisionAnswerBodyError(body);
   if (bodyError) return err(bodyError, 400);
@@ -5121,7 +5212,7 @@ export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: an
       task_id: r.task_id,
       source: "chat_supervisor",
       type: "auto_approve_declined",
-      payload: { decision_id: id, answer_key: answerKey, category: "autonomy", reason: "project autonomy is conservative; decision requires the director" },
+      payload: { decision_id: id, answer_key: answerKey, category: "autonomy", reason: "project autonomy is conservative; decision requires the director", actor },
     });
     return json({ effect: "escalate", category: "autonomy", reason: "project autonomy is conservative; decision requires the director" }, 403);
   }
@@ -5132,7 +5223,7 @@ export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: an
       task_id: r.task_id,
       source: "chat_supervisor",
       type: "auto_approve_declined",
-      payload: { decision_id: id, answer_key: answerKey, category: verdict.category, reason: verdict.reason },
+      payload: { decision_id: id, answer_key: answerKey, category: verdict.category, reason: verdict.reason, actor },
     });
     return json({ effect: "escalate", category: verdict.category, reason: verdict.reason }, 403);
   }
@@ -5143,7 +5234,7 @@ export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: an
     task_id: r.task_id,
     source: "chat_supervisor",
     type: "auto_approved",
-    payload: { decision_id: id, answer_key: answerKey, category: verdict.category, reason: verdict.reason, note: body?.answer_note ?? null },
+    payload: { decision_id: id, answer_key: answerKey, category: verdict.category, reason: verdict.reason, note: body?.answer_note ?? null, actor },
   });
   return apiAnswerDecision(db, herdr, id, { ...body, source: "chat_supervisor" }, true);
 }

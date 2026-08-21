@@ -146,10 +146,12 @@ test("broadcast steer reaches every live agent, skips agentless tasks", async ()
   await post(`/api/tasks/${a}/spawn`, {});
   await post(`/api/tasks/${b}/spawn`, {});
   sends.length = 0;
-  const r = await post("/api/steer/broadcast", { message: "fleet: new rule" });
+  const r = await post("/api/steer/broadcast", { message: "fleet: new rule", actor: "director-session-a" });
   expect(r.json.targets).toBe(2);
   expect(r.json.delivered).toBe(2);
   expect(sends.filter((s) => s.includes("fleet: new rule"))).toHaveLength(2);
+  const events = db.query("SELECT payload FROM events WHERE task_id IN (?, ?) AND type = 'steer' ORDER BY rowid DESC LIMIT 2").all(a, b) as { payload: string }[];
+  expect(events.every((event) => JSON.parse(event.payload).actor === "director-session-a")).toBe(true);
 });
 
 test("creating an active policy auto-broadcasts it to live agents", async () => {

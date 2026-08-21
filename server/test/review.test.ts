@@ -244,11 +244,11 @@ async function inReviewTask(base: string, extra: Record<string, unknown> = {}, p
 test("merge success writes a merged event and moves the task to verifying", async () => {
   const s = makeServer();
   const { taskId } = await inReviewTask(s.base);
-  const r = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  const r = await post(s.base, `/api/tasks/${taskId}/merge`, { actor: "director-tab-a" });
   expect(r.status).toBe(200);
   expect(r.json.state).toBe("verifying");
   const ev = await get(s.base, `/api/tasks/${taskId}/events`);
-  expect(ev.json.some((e: any) => e.type === "merged")).toBe(true);
+  expect(ev.json.some((e: any) => e.type === "merged" && e.payload.actor === "director-tab-a")).toBe(true);
   // best-effort teardown removed the worktree
   expect(s.removed.length).toBeGreaterThan(0);
   s.server.stop(true);
@@ -386,6 +386,77 @@ test("a wrong answer teaches the idea and rotates to another question", async ()
   expect(finalCorrect.json.passed).toBe(true);
   expect(finalCorrect.json.completed).toBe(5);
   expect((await get(s.base, "/api/understanding-quizzes")).json.quizzes.some((item: any) => item.task_id === t.json.id)).toBe(false);
+  s.server.stop(true);
+});
+
+test("a stale quiz answer returns the actor and answer that changed the card", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", { name: "quiz race", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "review me" });
+  await post(s.base, `/api/tasks/${t.json.id}/spawn`, {});
+  await post(s.base, `/api/tasks/${t.json.id}/events`, {
+    type: "review_summary",
+    done: ["implemented the change"],
+    understanding: { background: "This changes behavior.", essence: "Tests cover it.", checks: QUIZ_BANK.slice(0, 2) },
+  });
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+
+  const card = (await get(s.base, "/api/understanding-quizzes")).json.quizzes.find((item: any) => item.task_id === t.json.id);
+  const winner = await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, {
+    answer_key: "safe",
+    version: card.version,
+    source: "director",
+    actor: "director-tab-a",
+  });
+  expect(winner.status).toBe(200);
+
+  const stale = await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, {
+    answer_key: "guess",
+    version: card.version,
+    source: "director",
+    actor: "director-tab-b",
+  });
+  expect(stale.status).toBe(409);
+  expect(stale.json).toMatchObject({
+    stale: true,
+    resolution: {
+      status: "required",
+      source: "director",
+      actor: "director-tab-a",
+      answer_key: "safe",
+      correct: true,
+    },
+  });
+  expect(stale.json.resolution.at).toBeTruthy();
+  expect(stale.json.error).toContain("director-tab-a");
+  const attempts = (await get(s.base, `/api/tasks/${t.json.id}/events`)).json.filter((event: any) => event.type === "understanding_quiz_attempt");
+  expect(attempts).toHaveLength(1);
+  s.server.stop(true);
+});
+
+test("a replacement review invalidates the prior quiz version", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", { name: "quiz replacement", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "review me" });
+  await post(s.base, `/api/tasks/${t.json.id}/spawn`, {});
+  const review = (essence: string) => post(s.base, `/api/tasks/${t.json.id}/events`, {
+    type: "review_summary",
+    done: ["implemented the change"],
+    understanding: { background: "This changes behavior.", essence, checks: QUIZ_BANK.slice(0, 2) },
+  });
+  await review("Tests cover the first review.");
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+  const oldCard = (await get(s.base, "/api/understanding-quizzes")).json.quizzes.find((item: any) => item.task_id === t.json.id);
+  await review("Tests cover the replacement review.");
+
+  const stale = await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, {
+    answer_key: "safe",
+    version: oldCard.version,
+    source: "director",
+  });
+  expect(stale.status).toBe(409);
+  const current = (await get(s.base, "/api/understanding-quizzes")).json.quizzes.find((item: any) => item.task_id === t.json.id);
+  expect(current.version).not.toBe(oldCard.version);
   s.server.stop(true);
 });
 

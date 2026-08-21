@@ -362,8 +362,15 @@ test("checkpoints: emit -> listed open -> ack removes; flag steers; bad verdict 
   const missing = await post(`/api/tasks/${t.json.id}/checkpoints/evt_nope/ack`, { verdict: "ok" });
   expect(missing.status).toBe(404);
 
-  const ok = await post(`/api/tasks/${t.json.id}/checkpoints/${cpId}/ack`, { verdict: "ok" });
+  const ok = await post(`/api/tasks/${t.json.id}/checkpoints/${cpId}/ack`, { verdict: "ok", actor: "director-tab-a" });
   expect(ok.status).toBe(200);
+  const stale = await post(`/api/tasks/${t.json.id}/checkpoints/${cpId}/ack`, { verdict: "flag", actor: "director-tab-b" });
+  expect(stale.status).toBe(409);
+  expect(stale.json).toMatchObject({
+    stale: true,
+    resolution: { source: "director", actor: "director-tab-a", verdict: "ok" },
+  });
+  expect(stale.json.error).toContain("director-tab-a");
   open = await get("/api/checkpoints");
   expect(open.json.checkpoints.some((c: any) => c.id === cpId)).toBe(false);
 
@@ -702,6 +709,69 @@ test("answer records the caller identity (source + actor) on row and event", asy
   expect(ev.source).toBe("chat_supervisor");
   expect(ev.payload.answered_by).toBe("chat_supervisor");
   expect(ev.payload.actor).toBe(manager.id);
+});
+
+test("a stale decision answer returns the winning actor, time, and option", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "decision race" });
+  const d = await post("/api/decisions", {
+    task_id: t.json.id,
+    title: "ship?",
+    context: "Choose whether to ship.",
+    options: [{ key: "yes", label: "Ship now" }, { key: "no", label: "Hold" }],
+  });
+  expect((await post(`/api/decisions/${d.json.id}/answer`, {
+    answer_key: "yes",
+    source: "director",
+    actor: "director-tab-a",
+  })).status).toBe(200);
+
+  const stale = await post(`/api/decisions/${d.json.id}/answer`, {
+    answer_key: "no",
+    source: "director",
+    actor: "director-tab-b",
+  });
+  expect(stale.status).toBe(409);
+  expect(stale.json).toMatchObject({
+    stale: true,
+    resolution: {
+      status: "answered",
+      source: "director",
+      actor: "director-tab-a",
+      answer_key: "yes",
+      answer_label: "Ship now",
+    },
+  });
+  expect(stale.json.resolution.at).toBeTruthy();
+  expect(stale.json.error).toContain("director-tab-a");
+  expect(stale.json.error).toContain("Ship now");
+
+  const staleAuto = await post(`/api/decisions/${d.json.id}/auto-answer`, { answer_key: "yes" });
+  expect(staleAuto.status).toBe(409);
+  expect(staleAuto.json.resolution).toMatchObject({ actor: "director-tab-a", answer_label: "Ship now" });
+});
+
+test("an expired decision answer returns what resolved the card", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "expired decision race" });
+  const d = await post("/api/decisions", {
+    task_id: t.json.id,
+    title: "continue?",
+    context: "Choose whether to continue.",
+    options: [{ key: "yes", label: "Continue" }],
+  });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "cancelled", reason: "work superseded" });
+
+  const stale = await post(`/api/decisions/${d.json.id}/answer`, {
+    answer_key: "yes",
+    source: "director",
+    actor: "director-tab-b",
+  });
+  expect(stale.status).toBe(409);
+  expect(stale.json).toMatchObject({
+    stale: true,
+    resolution: { status: "expired", source: "system", reason: "task cancelled" },
+  });
+  expect(stale.json.resolution.at).toBeTruthy();
+  expect(stale.json.error).toContain("task cancelled");
 });
 
 test("answer without a source is recorded as unknown, not director", async () => {
