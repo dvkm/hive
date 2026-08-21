@@ -3263,6 +3263,32 @@ function normalizeUnderstandingCheck(value: unknown): UnderstandingCheck | null 
   return { question, options, answerKey, explanation };
 }
 
+// Recurrence guard. One artifact states a fact once: a review card that repeats
+// the same point across three bullets and then quizzes it again is the padding
+// the director called out (2026-08-19). The prompts (see plainEnglish.ts) ask
+// for this; here it is enforced for the case a rule cannot be argued with — the
+// SAME sentence twice, ignoring case, punctuation and spacing. A reworded
+// repeat still gets through, so this is a floor, not a filter.
+function recurrenceKey(value: unknown): string {
+  const text =
+    typeof value === "string"
+      ? value
+      : value && typeof value === "object" && typeof (value as any).what === "string"
+        ? (value as any).what
+        : JSON.stringify(value ?? "");
+  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+}
+
+function dropRepeats<T>(items: T[], key: (value: T) => string = recurrenceKey): T[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const k = key(item);
+    if (!k || seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 function normalizeUnderstandingChecks(understanding: unknown): UnderstandingCheck[] {
   if (!understanding || typeof understanding !== "object" || Array.isArray(understanding)) return [];
   const raw = understanding as Record<string, unknown>;
@@ -4503,7 +4529,8 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     const payload: Record<string, unknown> = {};
     for (const k of ["done", "iffy", "decisions", "testing", "followups"]) {
       const v = pick(k);
-      if (v?.length) payload[k] = v;
+      const deduped = v ? dropRepeats(v) : undefined;
+      if (deduped?.length) payload[k] = deduped;
     }
     let rawUnderstanding: any = (fields as any).understanding;
     if (typeof rawUnderstanding === "string") {
@@ -4518,11 +4545,11 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         if (value) understanding[key] = value;
       }
       if (Array.isArray(rawUnderstanding.walkthrough)) {
-        const walkthrough = rawUnderstanding.walkthrough.map((value: unknown) => text(value)).filter(Boolean).slice(0, 4);
+        const walkthrough = dropRepeats(rawUnderstanding.walkthrough.map((value: unknown) => text(value)).filter(Boolean)).slice(0, 4);
         if (walkthrough.length) understanding.walkthrough = walkthrough;
       }
       if (Array.isArray(rawUnderstanding.affected_areas)) {
-        const affectedAreas = rawUnderstanding.affected_areas.map((value: unknown) => text(value)).filter(Boolean).slice(0, 5);
+        const affectedAreas = dropRepeats(rawUnderstanding.affected_areas.map((value: unknown) => text(value)).filter(Boolean)).slice(0, 5);
         if (affectedAreas.length) understanding.affected_areas = affectedAreas;
       }
       const rawCheck = rawUnderstanding.check;
@@ -4534,15 +4561,18 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       const submittedChecks = rawChecks.length ? rawChecks : rawCheck ? [rawCheck] : [];
       if (submittedChecks.some(isAgentProcedureQuestion))
         return err("understanding checks must teach the director about this specific change, not test agent procedures", 400);
-      const checks = rawChecks.flatMap((value: unknown) => {
-        const check = normalizeUnderstandingCheck(value);
-        return check ? [{
-          question: check.question,
-          options: check.options,
-          answer_key: check.answerKey,
-          ...(check.explanation ? { explanation: check.explanation } : {}),
-        }] : [];
-      }).slice(0, 5);
+      const checks = dropRepeats(
+        rawChecks.flatMap((value: unknown) => {
+          const check = normalizeUnderstandingCheck(value);
+          return check ? [{
+            question: check.question,
+            options: check.options,
+            answer_key: check.answerKey,
+            ...(check.explanation ? { explanation: check.explanation } : {}),
+          }] : [];
+        }),
+        (check) => recurrenceKey(check.question)
+      ).slice(0, 5);
       if (checks.length) understanding.checks = checks;
       if (!checks.length && rawCheck && typeof rawCheck === "object" && !Array.isArray(rawCheck)) {
         const check = normalizeUnderstandingCheck(rawCheck);

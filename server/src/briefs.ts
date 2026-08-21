@@ -4,6 +4,7 @@ import type { DB } from "./db.ts";
 import { getTask } from "./state.ts";
 import { prTitlePrefix, prBodyFooter } from "./marker.ts";
 import { managingThreadForTask } from "./chat.ts";
+import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 
 // The PR marker contract (documented in docs/API.md). Both halves are REQUIRED
 // on any PR the agent opens so hive can link the PR back to this task.
@@ -93,6 +94,9 @@ Rules:
   carried it, who did it, or what the brief happened to scope. If a question
   does not improve the director's understanding of this review, omit it;
   fewer is better.
+  Questions, options, and explanations are read by a human on a phone:
+  write them to the Plain English bar below, and never restate one question's
+  point in another.
   Hive rotates questions
   after a miss and shuffles option order, so never depend on answer position.
   Keep each question and option complete and under 500 characters.
@@ -308,6 +312,7 @@ export function composeBrief(db: DB, taskId: string): string {
   parts.push(`## Brief\n${task.brief?.trim() || "(no description provided)"}`);
   parts.push(definitionOfDone(task.kind));
   parts.push(EMIT_PROTOCOL);
+  parts.push(PLAIN_ENGLISH);
   parts.push(CHECKPOINTS);
   parts.push(spawnTasksSection(task.project_id));
   const team = teamSection(db, taskId);

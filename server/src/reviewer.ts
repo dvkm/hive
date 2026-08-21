@@ -17,6 +17,7 @@ import type { Exec } from "./exec.ts";
 import { defaultExec, safeBranch } from "./exec.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
 import { supervisedSql } from "./supervision.ts";
+import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 
 const TIMEOUT_MS = Number(process.env.HIVE_REVIEWER_TIMEOUT_MS || 180_000);
 const DIFF_LIMIT = 60_000;
@@ -90,12 +91,15 @@ function reviewPrompt(task: any, diff: string): string {
     `Diff (may be truncated):`,
     diff.slice(0, DIFF_LIMIT),
     ``,
+    PLAIN_ENGLISH,
+    ``,
     `Answer as ONLY a JSON object, no prose around it:`,
     `{"verdict": "looks_good" | "caution",`,
     ` "summary": "2-3 sentences: what the change does and whether it matches the brief",`,
     ` "risks": ["each concrete risk/bug/scope-creep, with file:line when possible"],`,
     ` "questions": ["only questions the human MUST answer before merging"]}`,
     `Rules: verdict 'caution' if anything in risks would block YOUR merge. Empty arrays are fine.`,
+    `Each risk and question must add something new — never restate the summary or another bullet.`,
   ].join("\n");
 }
 
