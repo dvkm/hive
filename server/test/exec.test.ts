@@ -7,6 +7,23 @@ test("defaultExec returns real output and code for a normal command", async () =
   expect(r.stdout.trim()).toBe("hi");
 });
 
+// task #1096: `gh` resolved via a healthy inherited PATH everywhere except
+// inside the actual running server (bun --watch), throwing ENOENT on every
+// reconciler cycle. defaultExec no longer trusts inheritance for PATH — it
+// builds one explicitly — so a bare binary name must still resolve even when
+// the calling process's own PATH is stripped down to nothing.
+test("defaultExec resolves a PATH-only binary name even with a stripped-down inherited PATH (task #1096)", async () => {
+  const original = process.env.PATH;
+  try {
+    process.env.PATH = "";
+    const r = await defaultExec(["echo", "hi"]);
+    expect(r.code).toBe(0);
+    expect(r.stdout.trim()).toBe("hi");
+  } finally {
+    process.env.PATH = original;
+  }
+});
+
 // A stalled subprocess (network hang, or a detached grandchild still holding
 // the stdio pipes open after the direct child exits) used to hang the caller
 // forever — observed live wedging POST /merge (task #621). This asserts the

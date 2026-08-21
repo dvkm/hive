@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { openDb, newId, now, type DB } from "../src/db.ts";
+import { openDb, newId, now, getSetting, type DB } from "../src/db.ts";
 import { transition, getTask, writeEvent } from "../src/state.ts";
 import { reconcileOnce, ciStatusOf } from "../src/reconciler.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
@@ -929,4 +929,29 @@ test("reconciler never throws; a failing sub-step broadcasts at most one error",
   // Should resolve, not reject.
   await reconcileOnce(db, { herdr: aliveHerdr, exec: boom });
   expect(true).toBe(true);
+});
+
+// task #1096: `gh` ENOENT under linkPRs errored every cycle for ~27min live
+// with zero signal on /api/health, because reconcileOnce never recorded its
+// own outcome anywhere durable. This is the heartbeat that fixes that.
+test("reconcileOnce heartbeats last_reconcile_at and tracks a failing step's error streak, resetting on recovery (task #1096)", async () => {
+  const { db } = freshDb(); // freshDb's project has repo_path set, so linkPRs always runs
+  const ghEnoent: Exec = async () => {
+    throw new Error("posix_spawn gh ENOENT (-2)");
+  };
+
+  expect(getSetting(db, "last_reconcile_at")).toBeNull();
+  expect(getSetting(db, "reconciler_error_streak")).toBeNull();
+
+  await reconcileOnce(db, { exec: ghEnoent });
+  expect(getSetting(db, "last_reconcile_at")).not.toBeNull();
+  expect(getSetting(db, "reconciler_error_streak")).toBe("1");
+  expect(getSetting(db, "reconciler_last_error")).toContain("ENOENT");
+
+  await reconcileOnce(db, { exec: ghEnoent });
+  expect(getSetting(db, "reconciler_error_streak")).toBe("2");
+
+  // A clean cycle (gh resolves again) resets the streak.
+  await reconcileOnce(db, { exec: stub(() => OK("[]")) });
+  expect(getSetting(db, "reconciler_error_streak")).toBe("0");
 });

@@ -9,7 +9,7 @@
 import { join } from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
-import { now, newId, evidenceDir, isOffline } from "./db.ts";
+import { now, newId, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, isTrackingOnlyTask, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
@@ -63,8 +63,10 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   let errored = false;
   let steps = 0;
   let errors = 0;
+  let lastError: string | null = null;
   const fail = (where: string, e: unknown) => {
     errors++;
+    lastError = `${where}: ${String((e as any)?.message ?? e)}`;
     if (!errored) {
       errored = true;
       console.error(`[hive] reconciler ${where}:`, e);
@@ -84,6 +86,22 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   const logRun = (outcome: string) => {
     console.log(`[hive] reconciler run: duration_ms=${Date.now() - startedAt} steps=${steps} errors=${errors} outcome=${outcome}`);
   };
+  // Liveness + failure heartbeat for /api/health (task #1096: `gh` ENOENT under
+  // linkPRs made every cycle error for ~27min with zero outward signal — /health
+  // stayed ok:true the whole time). Written on every return path below, success
+  // or error, so /health can tell "loop finished" apart from "loop wedged
+  // mid-cycle" (same distinction dispatcher/reaper already make). The error
+  // streak resets on any clean cycle, so a single blip doesn't linger.
+  const heartbeat = () => {
+    setSetting(db, "last_reconcile_at", now());
+    if (errors > 0) {
+      const streak = Number(getSetting(db, "reconciler_error_streak") ?? "0") + 1;
+      setSetting(db, "reconciler_error_streak", String(streak));
+      if (lastError) setSetting(db, "reconciler_last_error", lastError);
+    } else {
+      setSetting(db, "reconciler_error_streak", "0");
+    }
+  };
   await step("surfaceTrackingBindings", () => surfaceTrackingBindings(db));
   await step("syncAgents", () => syncAgents(db, deps));
   await step("drainSteers", () => drainSteers(db, deps));
@@ -97,6 +115,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   // agents for being offline (stale flags, nudges, failure escalation). Stop here.
   if (isOffline(db)) {
     logRun("offline");
+    heartbeat();
     return;
   }
   await step("syncPRs", () => syncPRs(db, deps));
@@ -108,6 +127,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("autoMergeReady", () => autoMergeReady(db, deps));
   await step("autoAnswerStale", () => autoAnswerStale(db, deps.herdr ?? defaultHerdr, (deps.nowMs ?? (() => Date.now()))()));
   logRun(errors > 0 ? "error" : "ok");
+  heartbeat();
 }
 
 export function surfaceTrackingBindings(db: DB): void {
