@@ -798,6 +798,73 @@ test("autoMergeReady holds a task with work still queued for its agent", async (
   expect(getTask(db, id).state).toBe("in_progress");
 });
 
+test("autoMergeReady rechecks queued work at every destructive merge boundary", async () => {
+  const { autoMergeReady } = await import("../src/reconciler.ts");
+  const { queueSteerEvent, queuedSteers } = await import("../src/steer.ts");
+
+  for (const mode of ["pr", "local-merge", "local-update"] as const) {
+    const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
+    const id = makeTask(db, projectId, { kind: "chore" });
+    transition(db, id, "in_progress");
+    transition(db, id, "in_review");
+    db.query("UPDATE tasks SET ci_status = 'passing', branch = ?, pr_url = ? WHERE id = ?").run(
+      "hive/x",
+      mode === "pr" ? "https://gh/pr/1" : null,
+      id
+    );
+    db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+      newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
+    );
+    const review = writeEvent(db, {
+      task_id: id,
+      source: "agent",
+      type: "review_summary",
+      payload: { understanding: { check: { question: "safe?", options: [{ key: "review", label: "yes" }, { key: "guess", label: "no" }], answer_key: "review" } } },
+    });
+    writeEvent(db, { task_id: id, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "review" } });
+    writeEvent(db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
+
+    let releaseProbe!: () => void;
+    let reachedProbe!: () => void;
+    const probeHeld = new Promise<void>((resolve) => { releaseProbe = resolve; });
+    const probeReached = new Promise<void>((resolve) => { reachedProbe = resolve; });
+    let held = false;
+    const destructive: string[][] = [];
+    const exec: Exec = async (argv) => {
+      const gate = mode === "pr"
+        ? argv[0] === "gh" && argv.includes("view")
+        : argv.includes("rev-parse") && !held;
+      if (gate) {
+        held = true;
+        reachedProbe();
+        await probeHeld;
+      }
+      if ((argv[0] === "gh" && argv.includes("merge")) || argv.includes("merge") || argv.includes("update-ref"))
+        destructive.push(argv);
+      if (argv[0] === "gh" && argv.includes("view"))
+        return OK(JSON.stringify({ state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", statusCheckRollup: [{ conclusion: "SUCCESS" }], baseRefName: "main", baseRefOid: "base-sha", headRefOid: "branch-sha" }));
+      if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
+      if (argv.includes("symbolic-ref")) return OK(mode === "local-update" ? "other\n" : "main\n");
+      if (argv.includes("worktree") && argv.includes("list")) return OK("");
+      return OK();
+    };
+
+    const run = autoMergeReady(db, { exec });
+    const reached = await Promise.race([probeReached.then(() => true), run.then(() => false)]);
+    if (!reached) {
+      const events = db.query("SELECT type, payload FROM events WHERE task_id = ? ORDER BY ts").all(id);
+      throw new Error(`${mode} ended before its pre-mutation probe: ${JSON.stringify(events)}`);
+    }
+    queueSteerEvent(db, id, "Please address this before merging.", "agent not live");
+    releaseProbe();
+    await run;
+
+    expect({ mode, destructive }).toEqual({ mode, destructive: [] });
+    expect(getTask(db, id).state).toBe("in_review");
+    expect(queuedSteers(db, id).length).toBe(1);
+  }
+});
+
 test("autoAnswerStale answers timed-out normal-risk cards with the recommendation, never high-risk", async () => {
   const { autoAnswerStale } = await import("../src/reconciler.ts");
   const { db, projectId } = freshDb({ decision_auto_answer_hours: 4 });

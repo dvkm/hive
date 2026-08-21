@@ -847,7 +847,13 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     const evidence = (db.query("SELECT COUNT(*) n FROM evidence WHERE task_id = ?").get(r.id) as any).n;
     if (!evidence) continue;
     try {
-      const res = await mergeTask(db, h, r.id, {}, { exec: deps.exec });
+      const beforeMutation = () => {
+        const task = getTask(db, r.id);
+        if (!task || task.state !== "in_review" || task.ci_status !== "passing") return false;
+        if (queuedSteers(db, r.id).length || queuedInputRecoveryPending(db, r.id)) return false;
+        return !db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'changes_requested' LIMIT 1").get(r.id);
+      };
+      const res = await mergeTask(db, h, r.id, {}, { exec: deps.exec }, { beforeMutation });
       const ok = res.status === 200;
       writeEvent(db, { task_id: r.id, source: "reconciler", type: "auto_merged", payload: { ok, status: res.status } });
       if (ok)
