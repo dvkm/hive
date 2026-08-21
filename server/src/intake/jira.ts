@@ -2255,7 +2255,19 @@ export async function syncJiraOnce(db: DB, deps: JiraDeps = {}): Promise<SyncSta
   const projects = db.query("SELECT id FROM projects").all() as { id: string }[];
   for (const p of projects) {
     const status = jiraConfigStatusFor(db, p.id);
-    if (!status.error && !status.config?.enabled) continue;
+    // A config the gate rejected cannot produce a working cycle, so running one
+    // every interval only burns a poll and inflates consecutive_failures until
+    // the real reason is buried. Record WHY the automatic cycle is off instead,
+    // and drop any next_due_at a previously-valid config left behind. Manual
+    // retry still runs the cycle, so it still returns the validation error.
+    if (status.error) {
+      const error = `jira cycle could not run: ${status.error}`;
+      const prev = readSyncState(db, p.id);
+      if (prev.last_error !== error || prev.next_due_at !== null)
+        writeSyncState(db, p.id, { last_error: error, last_error_at: now(), next_due_at: null, running: false });
+      continue;
+    }
+    if (!status.config?.enabled) continue;
     const r = await runProjectCycle(db, p.id, deps);
     if (r.stats) out.push(r.stats);
   }

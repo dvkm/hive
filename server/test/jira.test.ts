@@ -361,6 +361,31 @@ test("SECURITY: escaping JQL disables sync before an outside project can be obse
   expect(J.readSyncState(db, project.id).last_error).toContain(`config.jira.jql is invalid: ${JSON.stringify(jql)}`);
 });
 
+test("an invalid JQL filter turns the automatic cycle OFF instead of failing one every interval", async () => {
+  // The old behaviour ran a doomed cycle per tick: it burned a poll, pushed
+  // consecutive_failures up forever, and the schedule still advertised a next
+  // sync that could never succeed. Invalid config is a stop, not a retry loop.
+  const jql = "labels = sync) OR project = OPS OR (project = WEB";
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }] });
+  const { db, projectId } = freshDb({ ...CFG, jql });
+  // a schedule left over from when the same config still parsed
+  J.writeSyncState(db, projectId, { next_due_at: "2026-01-01T00:00:00.000Z", interval_ms: 60_000 });
+
+  for (let tick = 0; tick < 3; tick++) await J.syncJiraOnce(db, { fetch: jira.fetchImpl, token: "tok" });
+
+  const state = J.readSyncState(db, projectId);
+  expect(jira.calls).toEqual([]);
+  expect(state.last_attempt_at).toBeNull(); // no cycle was attempted at all
+  expect(state.consecutive_failures).toBe(0); // so there is nothing to count
+  expect(state.next_due_at).toBeNull(); // and no sync is promised
+  expect(state.last_error).toContain(`config.jira.jql is invalid: ${JSON.stringify(jql)}`);
+
+  // Manual retry still runs the real cycle, so it still reports the real error.
+  const retry = await J.runProjectCycle(db, projectId, { fetch: jira.fetchImpl, token: "tok" });
+  expect(retry.ok).toBe(false);
+  expect(retry.error).toContain(`config.jira.jql is invalid: ${JSON.stringify(jql)}`);
+});
+
 test("SECURITY: a mutated target NEVER produces a request, even on the read path", async () => {
   // This is the actual guarantee, so this asserts the OUTPUT (no network call at
   // all) rather than merely that the validator exists. write:false is included
