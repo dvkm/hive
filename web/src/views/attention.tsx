@@ -110,7 +110,24 @@ export function UnhealthyRow({ task }: { task: Task }) {
           </button>
         )}
         {!trackingOnly && task.agent_target && (
-          <button className="btn btn-mini" onClick={() => act(() => api.send(task.id, "hive: status? Reply with what you're doing or what's blocking you."), "Nudge sent")}>
+          <button
+            className="btn btn-mini"
+            onClick={async () => {
+              try {
+                const r = await api.send(task.id, "hive: status? Reply with what you're doing or what's blocking you.");
+                // A bare "Nudge sent" would lie when the agent is dead (hive-1097).
+                toast(
+                  r.delivered
+                    ? "Nudge delivered"
+                    : r.delivery === "failed"
+                    ? `Nudge undelivered: ${r.error || "task is finished"}`
+                    : "No live agent — nudge queued for the next spawn"
+                );
+              } catch (e) {
+                toast((e as Error).message);
+              }
+            }}
+          >
             Nudge
           </button>
         )}

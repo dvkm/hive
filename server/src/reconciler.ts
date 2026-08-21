@@ -9,7 +9,7 @@
 import { join } from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
-import { now, newId, evidenceDir, isOffline } from "./db.ts";
+import { now, newId, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, isTrackingOnlyTask, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
@@ -63,8 +63,10 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   let errored = false;
   let steps = 0;
   let errors = 0;
+  let lastError: string | null = null;
   const fail = (where: string, e: unknown) => {
     errors++;
+    lastError = `${where}: ${String((e as any)?.message ?? e)}`;
     if (!errored) {
       errored = true;
       console.error(`[hive] reconciler ${where}:`, e);
@@ -84,6 +86,22 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   const logRun = (outcome: string) => {
     console.log(`[hive] reconciler run: duration_ms=${Date.now() - startedAt} steps=${steps} errors=${errors} outcome=${outcome}`);
   };
+  // Liveness + failure heartbeat for /api/health (task #1096: `gh` ENOENT under
+  // linkPRs made every cycle error for ~27min with zero outward signal — /health
+  // stayed ok:true the whole time). Written on every return path below, success
+  // or error, so /health can tell "loop finished" apart from "loop wedged
+  // mid-cycle" (same distinction dispatcher/reaper already make). The error
+  // streak resets on any clean cycle, so a single blip doesn't linger.
+  const heartbeat = () => {
+    setSetting(db, "last_reconcile_at", now());
+    if (errors > 0) {
+      const streak = Number(getSetting(db, "reconciler_error_streak") ?? "0") + 1;
+      setSetting(db, "reconciler_error_streak", String(streak));
+      if (lastError) setSetting(db, "reconciler_last_error", lastError);
+    } else {
+      setSetting(db, "reconciler_error_streak", "0");
+    }
+  };
   await step("surfaceTrackingBindings", () => surfaceTrackingBindings(db));
   await step("syncAgents", () => syncAgents(db, deps));
   await step("drainSteers", () => drainSteers(db, deps));
@@ -97,6 +115,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   // agents for being offline (stale flags, nudges, failure escalation). Stop here.
   if (isOffline(db)) {
     logRun("offline");
+    heartbeat();
     return;
   }
   await step("syncPRs", () => syncPRs(db, deps));
@@ -108,6 +127,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("autoMergeReady", () => autoMergeReady(db, deps));
   await step("autoAnswerStale", () => autoAnswerStale(db, deps.herdr ?? defaultHerdr, (deps.nowMs ?? (() => Date.now()))()));
   logRun(errors > 0 ? "error" : "ok");
+  heartbeat();
 }
 
 export function surfaceTrackingBindings(db: DB): void {
@@ -319,8 +339,10 @@ async function drainSteers(db: DB, deps: ReconcilerDeps): Promise<void> {
 // Trigger: state=in_progress, agent status idle OR gone (NOT working/blocked/
 // unknown — an agent that opens a PR and keeps working still reports `working`),
 // AND a real work product exists (a pr_url, or a scout `report`). Advancing on a
-// single idle read is safe precisely because mid-work reads `working`. Runs
-// BEFORE recoverStale so a handed-off task is never failed/requeued.
+// single idle read is safe precisely because mid-work reads `working`; after a
+// queued-input recovery, advanceIfFinished adds a short grace period for the
+// recovered turn to start. Runs BEFORE recoverStale so a handed-off task is
+// never failed/requeued.
 async function advanceFinished(db: DB, _deps: ReconcilerDeps): Promise<void> {
   const tasks = db
     .query(`SELECT id FROM tasks WHERE state = 'in_progress' AND agent_target IS NOT NULL`)
@@ -1151,6 +1173,7 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string, d
   if (diag?.kind === "auth_lost") return recoverAuthLost(db, h, task, diag.excerpt, tail, deps);
   if (diag?.kind === "context_full") return recoverContextFull(db, task, tail);
   if (diag?.kind === "usage_limit") return recoverUsageLimit(db, task, diag.excerpt);
+  if (diag?.kind === "queued_input") return recoverQueuedInput(db, h, task, target, diag.excerpt);
   if (diag?.kind === "api_error") {
     // Transient (rate limit / network / overload): extend patience instead of
     // burning a nudge — this event resets the silence clock for one threshold.
@@ -1222,6 +1245,7 @@ export async function handleBlockedAgent(db: DB, h: Herdr, taskId: string, targe
     });
     return;
   }
+  if (diag?.kind === "queued_input") return recoverQueuedInput(db, h, task, target, diag.excerpt);
   if (diag?.kind !== "blocked_dialog") return; // blocked but no visible dialog: leave to the silent path
 
   const project = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id) as { config: string } | undefined;
@@ -1243,6 +1267,71 @@ export async function handleBlockedAgent(db: DB, h: Herdr, taskId: string, targe
     return;
   }
   await recoverBlockedDialog(db, task, diag.excerpt, tail);
+}
+
+// A live agent went idle with input still QUEUED but never consumed: the
+// steer's own Enter landed (recorded `delivered`), Claude Code queued it
+// exactly as its UI intends, and then the turn that should have drained the
+// queue never started (task #1098, incident 2026-08-19 — director found 3
+// steers sitting behind "Press up to edit queued messages" with no spinner
+// since delivery). The keystroke sequence verified live to unstick it: Up
+// (pulls the queued message into the editable input line) then Enter (submits
+// it) — reused from answerDialog's key-then-Enter delivery. Runs every cycle
+// syncAgents sees the idle status (~60s worst case), not gated behind the
+// 15-minute stale threshold, since the pane already names the exact problem.
+const MAX_QUEUED_INPUT_NUDGES = 3;
+
+function queuedInputEpisode(
+  db: DB,
+  taskId: string
+): { attempts: number; startedAt: string | null; latestDelivered: boolean | null | undefined } {
+  const rows = db.query("SELECT type, ts, payload FROM events WHERE task_id = ? ORDER BY ts DESC, rowid DESC").all(taskId) as {
+    type: string;
+    ts: string;
+    payload: string;
+  }[];
+  let n = 0;
+  let startedAt: string | null = null;
+  let latestDelivered: boolean | null | undefined;
+  for (const r of rows) {
+    if (r.type === "queued_input_recovered") {
+      if (n === 0) latestDelivered = JSON.parse(r.payload).delivered;
+      n++;
+      startedAt = r.ts;
+    } else if (r.type === "agent_status" || r.type === "stale") continue; // reconciler noise
+    else break; // real activity resets the count
+  }
+  return { attempts: n, startedAt, latestDelivered };
+}
+
+async function recoverQueuedInput(db: DB, h: Herdr, task: any, target: string, excerpt: string): Promise<void> {
+  const episode = queuedInputEpisode(db, task.id);
+  if (episode.attempts >= MAX_QUEUED_INPUT_NUDGES) {
+    if (episode.latestDelivered === null) return;
+    const already = db
+      .query("SELECT 1 FROM notifications WHERE kind = 'queued_input_stuck' AND task_id = ? AND ts >= ? LIMIT 1")
+      .get(task.id, episode.startedAt);
+    if (already) return; // already alerted; don't spam, and don't keep hammering the pane either
+    enqueue(db, {
+      kind: "queued_input_stuck",
+      urgency: "urgent",
+      task_id: task.id,
+      title: `Agent idle with unconsumed queued input: ${task.title}`,
+      body: `Sent Up+Enter to the pane ${MAX_QUEUED_INPUT_NUDGES}× but the queue never drained. Check the pane manually.\n\n${excerpt}`,
+    });
+    return;
+  }
+  const attempt = writeEvent(db, {
+    task_id: task.id,
+    source: "reconciler",
+    type: "queued_input_recovered",
+    payload: { delivered: null, excerpt: excerpt.slice(0, 300) },
+  });
+  let r = await h.answerDialog(target, "Up");
+  if (r.code !== 0) r = await h.answerDialog(target, "Enter");
+  const resolved = { ...attempt, payload: { ...attempt.payload, delivered: r.code === 0 } };
+  db.query("UPDATE events SET payload = ? WHERE id = ?").run(JSON.stringify(resolved.payload), attempt.id);
+  broadcast({ type: "event", event: resolved });
 }
 
 // ---- graceful failure-class handlers (pane-diagnosed) ----

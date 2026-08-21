@@ -135,10 +135,27 @@ function err(message: string, status = 400): Response {
 const STALE_FLOOR_MS = 5 * 60 * 1000;
 const DISPATCH_STALE_MS = Math.max(STALE_FLOOR_MS, Number(process.env.HIVE_DISPATCH_MS || 30_000) * 3);
 const REAP_STALE_MS = Math.max(STALE_FLOOR_MS, Number(process.env.HIVE_REAP_MS || 300_000) * 3);
+const RECONCILE_STALE_MS = Math.max(STALE_FLOOR_MS, Number(process.env.HIVE_RECONCILE_MS || 60_000) * 3);
 function loopLiveness(db: DB, settingKey: string, staleMs: number): { last_run: string | null; stale: boolean } {
   const lastRun = getSetting(db, settingKey);
   const ageMs = lastRun ? Date.now() - Date.parse(lastRun) : null;
   return { last_run: lastRun, stale: ageMs === null || ageMs > staleMs };
+}
+
+// task #1096: the reconciler (gh PR sync, herdr status sync, staleness flags)
+// errored on EVERY cycle for ~27min live (gh ENOENT) and /health stayed
+// ok:true throughout — reconciler.error_streak set by reconciler.ts's
+// heartbeat() was the only place that failure was recorded at all. 3
+// consecutive failing cycles (not "never run yet", which would false-alarm on
+// every fresh boot before the first cycle completes) is the sustained-failure
+// signal that flips top-level `ok`.
+const RECONCILE_ERROR_STREAK_THRESHOLD = 3;
+function reconcilerHealth(db: DB): { last_run: string | null; stale: boolean; consecutive_errors: number; last_error: string | null } {
+  return {
+    ...loopLiveness(db, "last_reconcile_at", RECONCILE_STALE_MS),
+    consecutive_errors: Number(getSetting(db, "reconciler_error_streak") ?? "0"),
+    last_error: getSetting(db, "reconciler_last_error"),
+  };
 }
 
 // Standing-authority gate for the internal risky paths (spawn, steer, verify,
@@ -221,8 +238,11 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (pathname === "/api/stream" && method === "GET") return sseStream();
 
       // ---- health ----
-      if (pathname === "/api/health" && method === "GET")
-        return json({ ok: true, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
+      if (pathname === "/api/health" && method === "GET") {
+        const reconciler = reconcilerHealth(db);
+        const ok = reconciler.consecutive_errors < RECONCILE_ERROR_STREAK_THRESHOLD;
+        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
+      }
 
       // ---- evidence static files ----
       if (pathname.startsWith("/evidence/") && method === "GET")
@@ -2294,11 +2314,15 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
   if (project?.repo_path && task.branch) {
     const config = JSON.parse(project.config ?? "{}");
     const base = safeBranch(config.default_branch);
+    // TERMINAL, not just done/cancelled: a `failed` task's branch is as dead as
+    // a cancelled one, and corebeat's 109 failed tasks were 87 of the 103 rows
+    // this flag used to dump on one card (task #1134).
     const others = db
       .query(
-        `SELECT id, number, title, branch FROM tasks WHERE project_id = ? AND id != ? AND branch IS NOT NULL AND state NOT IN ('done', 'cancelled')`
+        `SELECT id, number, title, branch FROM tasks WHERE project_id = ? AND id != ? AND branch IS NOT NULL
+           AND state NOT IN (${TERMINAL.map(() => "?").join(", ")}) ORDER BY number`
       )
-      .all(task.project_id, id) as { id: string; number: number; title: string; branch: string }[];
+      .all(task.project_id, id, ...TERMINAL) as { id: string; number: number; title: string; branch: string }[];
     const found = await findEmbeddedTasks(deps.exec ?? defaultExec, project.repo_path, base, task.branch, others);
     if (found) embedded_tasks = found;
   }

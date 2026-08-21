@@ -62,7 +62,7 @@ export interface Task {
   source_ref: string | null;
   parent_task_id: string | null;
   duplicate_of: string | null; // survivor id when cancelled as a duplicate
-  depends_on: string[]; // task ids this one is blocked by (unmet until they're done)
+  depends_on: string[]; // task ids governed by the server dependency gate (docs/API.md)
   deferred_until?: string | null; // parked pending an offline human action; nudges suppressed while future-dated
   health?: Health | null;
   requeued_to?: string | null; // successor id when failed + auto-requeued

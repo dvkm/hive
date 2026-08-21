@@ -253,12 +253,13 @@ Understanding quiz API:
 - `focus_agent` — the director focused the agent's herdr tab ("view agent"). `payload: {target}`
 - `recovery` — a stale-recovery decision was taken. `payload: {decision:"dead"|"silent-escalate", attempts?|nudges?}`
 - `recovery_nudge` — a status nudge was sent to an alive-but-silent agent. `payload: {nudge, delivered}`
+- `queued_input_recovered` — a queued-input recovery attempt. `payload: {delivered: boolean|null, excerpt}` (`null` while the pane write is pending). See "Blocked agents (dialog handling)" for the recovery and retry contract.
 - `requeued` — a failed task was auto-requeued as a fresh task. `payload: {new_task_id, attempt?}`
 - `recovery_card` — a recovery escalation opened a decision card. `payload: {decision_id, source_task_id}`
 - `ci_status` — reconciler synced CI. `payload: {ci_status}` (`passing|pending|failing`)
 - `pr_merged` — reconciler detected the PR merged. `payload: {pr_url}`
 - `pr_conflict` — reconciler saw the PR CONFLICTING with its base and nudged the agent to resolve (once per head SHA; lifecycle untouched). `payload: {pr_url, head_sha, delivered}`
-- `ready_for_review` — the task was handed off `in_progress → in_review`: by the agent's `ready` emit, by the herdr supervise loop's push signal (`source: herdr`, the moment herdr reports the agent idle), or by the reconciler's idle/gone poll backstop. `payload: {pr_url, via, kind}` (`via ∈ {emit, idle, gone}`)
+- `ready_for_review` — records an `in_progress → in_review` handoff. `payload: {pr_url, via, kind}` (`via ∈ {emit, idle, gone}`). See "Review experience" for the explicit and automatic handoff contracts.
 - `pr_linked` — a marked PR was matched back to this task and its `pr_url` set (by the reconciler's scan or `POST /api/tasks/link-pr`). `payload: {pr_url, via}` (`via ∈ {id, number}` — which half of the marker matched)
 - `pr_synchronized` — the reconciler observed the PR head SHA change (hive's stand-in for GitHub's synchronize webhook). `payload: {head_sha}`. Emitted only when the head differs from the prior `pr_synchronized` (the first observation is a baseline). Used to tell "the agent pushed a fix" from "CI is still green on the same old head" — by the re-queue guard after a `changes_requested`, and by `health` to decide whether a re-handoff clears a `merge_failed` reason.
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
@@ -694,14 +695,7 @@ An `in_review` task owned by Hive means the agent finished and opened a PR (or p
   is open (or, for a scout, its report is written). Records `pr_url` when supplied
   and not already linked, then advances the task. Idempotent — a duplicate `ready`
   on an already-advanced task just acks (`200`). Writes a `ready_for_review` event.
-- **Reconciler backstop (safety net):** every cycle, an `in_progress` task whose
-  agent is **idle or gone** (NOT `working`/`blocked` — an agent that opened a PR and
-  kept working still reports `working`) and that has a real work product (a `pr_url`,
-  or a scout `report` evidence) is auto-advanced to `in_review` (`ready_for_review`
-  event, `via: idle|gone`). Advancing on a single idle read is safe because mid-work
-  reads `working`; this runs before stale-recovery, so a handed-off task with a gone
-  agent is moved to review rather than failed/requeued. This unsticks finished tasks
-  regardless of whether the agent emitted `ready`.
+- **Automatic idle/gone handoff (safety net):** the herdr supervise loop and the reconciler's per-cycle poll both route an `in_progress` task whose agent is **idle or gone** (NOT `working`/`blocked` — an agent that opened a PR and kept working still reports `working`) and that has a real work product (a `pr_url`, or a scout `report` evidence) through the same auto-advance to `in_review` (`ready_for_review` event, `via: idle|gone`). Advancing on a single idle read is safe because mid-work reads `working`; after a queued-input recovery attempt, however, automatic handoff waits at least two minutes so the recovered turn can start (`delivered: null` also holds handoff until the pane write resolves). The reconciler checks this before stale recovery, so a handed-off task with a gone agent is moved to review rather than failed/requeued. This unsticks finished tasks regardless of whether the agent emitted `ready`.
 - **Finished with NO PR:** an `in_progress` task whose agent went idle with no PR and
   no recent activity is not auto-advanced (nothing to review) but is made VISIBLE:
   its `health` becomes `stuck` (reason `finished or stuck: agent idle, no PR`), which
@@ -1310,6 +1304,8 @@ Approve/Deny answer sends the keystroke to the pane remotely
 (`blocked_card`/`dialog_answered` events); the task parks in `needs_decision`.
 Silent-path diagnosis (auth lost, context exhausted, transient API errors) is
 described in `server/src/diagnose.ts`.
+
+Whenever the same `idle`/`blocked`/`done` sweep sees Claude Code's own "…to edit queued messages" footer, a message was queued but Claude Code went idle without consuming it (task #1098). The reconciler records a `queued_input_recovered` event, sends `Up` then `Enter` to the pane (the sequence verified live to move the queued message into the editable input and submit it), and updates the event's `delivered` field from `null` to whether the pane write succeeded. While the footer persists, it makes at most three consecutive attempts; `agent_status` and `stale` events do not reset that count, but other activity starts a new episode. It then stops sending keystrokes and enqueues one `queued_input_stuck` notification (`urgency: "urgent"`) for the episode. Automatic idle/gone handoff to review waits at least two minutes after an attempt so the recovered turn has time to start, and a still-pending attempt holds the handoff until its pane write resolves.
 
 ### Promoter (continuous promote-to-main evaluation)
 No HTTP endpoints — a server-internal loop (`server/src/promoter.ts`, scheduled by `HIVE_PROMOTE_MS`, default 30m, plus one run ~30s after boot). Each started loop runs at most one cycle at a time; ticks during a slow cycle are logged and skipped, not queued. Projects opt in with `config.promote = {from: "staging", to: "main"}`. Whenever `origin/<from>` has commits `origin/<to>` lacks, it queues ONE evaluation task (`source="promoter"`, `source_ref` = the evaluated head SHA, kind `ship`) that the dispatcher spawns like any other. The agent judges readiness — CI green, test comprehensiveness for the promoted range (uncovered bug fixes or gaps in auth/billing/data-integrity paths BLOCK promotion; the agent spawns a gap task per missing test), half-shipped features, pending migrations — and either opens the Promote PR with a per-PR "Test coverage" verdict section (base `<to>`, head `<from>`; the DIRECTOR merges) or attaches a not-ready report and finishes. Dedup: one in-flight evaluation per project, a given head SHA is evaluated at most once, and an already-open promote PR suppresses new evaluations until it's merged/closed.
