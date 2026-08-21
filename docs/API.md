@@ -579,10 +579,15 @@ priced rows only).
   - `failed` — the task is terminal, so no spawn will ever carry it.
 
   Never throws. A herdr failure additionally records a `steer_error` event. The timeline renders the receipt (`✓` / `⏳ queued` / `⚠ undelivered`) so a steer never has to be re-sent blind. Besides the respawn drain, the reconciler re-attempts every queued steer each cycle against any still-alive agent (receipt flips with `delivered_via:"drain"`); a successful drain writes no event of its own — the receipt flip is the record, and a fresh event would reset the task's silence clock and mask a mute agent from `stale` detection.
-- `PUT /api/tasks/:id` body `{title?, brief?}` (or multipart: same fields + `files`) → `200 Task` | `404`
+- `PUT /api/tasks/:id` body `{title?, brief?, depends_on?}` (or multipart: same fields + `files`) → `200 Task` | `404` | `400` (unknown/self-referencing `depends_on` id)
   Attached files are appended to the resulting `brief` under an `## Attachments` heading.
   Updates a task's editable fields. Used by the attention tray's "edit & requeue"
-  flow before it re-queues a failed task.
+  flow before it re-queues a failed task, and by `hive task update <id> --depends-on <id,id>` —
+  the way an agent declares a dependency it discovers mid-task (`depends_on` is
+  otherwise only settable at creation, see `POST /api/tasks` above). Omit
+  `depends_on` to leave it alone; when sent, it's a full replace (same
+  validation as creation: each id must exist, and a task may not depend on
+  itself), so pass every id the task should still wait on, not just the new one.
 - `POST /api/tasks/:id/focus-agent` body `{}` → `200 {"ok":true, "focused":true, "target":"..."}` | `404`
   The board's "view agent" affordance: focuses the task's herdr tab via
   `herdr agent focus` so David can watch/attach. Records a `focus_agent` event.

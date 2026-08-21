@@ -1559,6 +1559,21 @@ function recordManagerRetrospective(db: DB, threadId: string, body: any): Respon
 }
 
 // ---------------------------------------------------------------- tasks
+// depends_on: task ids this task waits on (array, or comma-separated string
+// from the CLI). Validated here — against real tasks, and never against
+// `selfId` — so a typo, or a task naming itself, can't block forever. Shared
+// by createTask and updateTask (the latter is how an agent declares a
+// dependency it discovers mid-task, after creation).
+function parseDeps(db: DB, raw: any, selfId?: string): string[] | Response {
+  const rawDeps = Array.isArray(raw) ? raw : raw ? String(raw).split(",") : [];
+  const deps = rawDeps.map((d: any) => String(d).trim()).filter(Boolean);
+  for (const d of deps) {
+    if (selfId && d === selfId) return err("a task cannot depend on itself", 400);
+    if (!db.query("SELECT 1 FROM tasks WHERE id = ?").get(d)) return err(`unknown depends_on task: ${d}`, 400);
+  }
+  return deps;
+}
+
 // Accepts JSON or multipart; attached files are saved under the new task's id
 // and their absolute paths appended to the brief, so the agent that picks the
 // task up can read them.
@@ -1584,17 +1599,8 @@ async function createTask(db: DB, req: Request): Promise<Response> {
   if (parentTask && isTrackingOnlyTask(parentTask)) return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
   if (isTrackingOnlyTask({ source: body.source }) && body.agent_target)
     return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
-  // depends_on: task ids this task waits on (array, or comma-separated string
-  // from the CLI). Validated here so a typo can't block a task forever.
-  const rawDeps = Array.isArray(body.depends_on)
-    ? body.depends_on
-    : body.depends_on
-      ? String(body.depends_on).split(",")
-      : [];
-  const deps = rawDeps.map((d: any) => String(d).trim()).filter(Boolean);
-  for (const d of deps) {
-    if (!db.query("SELECT 1 FROM tasks WHERE id = ?").get(d)) return err(`unknown depends_on task: ${d}`, 400);
-  }
+  const deps = parseDeps(db, body.depends_on);
+  if (deps instanceof Response) return deps;
   const t = now();
   // Id first: attachments are stored under it, and the brief they extend is
   // written in the INSERT below (and read by duplicate detection).
@@ -1730,8 +1736,10 @@ async function linkPrEndpoint(db: DB, body: any, deps: HandlerDeps): Promise<Res
   return json({ ok: true, ...res });
 }
 
-// Update a task's editable fields (title / brief). Used by the attention tray's
-// "edit & requeue" flow before it re-queues a failed task.
+// Update a task's editable fields (title / brief / depends_on). Used by the
+// attention tray's "edit & requeue" flow before it re-queues a failed task,
+// and by an agent that discovers mid-task it needs another task's PR to land
+// first (depends_on is otherwise only settable at creation).
 // Accepts JSON or multipart; attached files are appended to the brief the same
 // way task creation does.
 async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
@@ -1745,7 +1753,16 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
   // title-only PUT does not turn a NULL brief into "".
   const base = body?.brief != null ? String(body.brief) : task.brief;
   const brief = block ? (base ?? "") + block : base;
-  db.query("UPDATE tasks SET title = ?, brief = ?, updated_at = ? WHERE id = ?").run(title, brief, now(), id);
+  // depends_on is full-replace, same contract as at creation: omit the field to
+  // leave it alone, send an array (or comma-separated string) to replace it.
+  let deps: string[] = task.depends_on;
+  if (body?.depends_on !== undefined) {
+    const parsed = parseDeps(db, body.depends_on, id);
+    if (parsed instanceof Response) return parsed;
+    deps = parsed;
+  }
+  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, updated_at = ? WHERE id = ?")
+    .run(title, brief, deps.length ? JSON.stringify(deps) : null, now(), id);
   const updated = getTask(db, id);
   broadcastTask(db, updated);
   return json(taskWithHealth(db, updated));

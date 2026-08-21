@@ -30,6 +30,14 @@ async function get(path: string) {
   const res = await fetch(BASE + path);
   return { status: res.status, json: await res.json() };
 }
+async function put(path: string, body: unknown) {
+  const res = await fetch(BASE + path, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return { status: res.status, json: await res.json() };
+}
 
 let projectId = "";
 let taskId = "";
@@ -120,6 +128,34 @@ test("agent-created task carries source + parent_task_id", async () => {
     parent_task_id: "nope",
   });
   expect(bad.status).toBe(400);
+});
+
+test("PUT /api/tasks/:id can declare a dependency after creation, mid-task", async () => {
+  const a = await post("/api/tasks", { project_id: projectId, title: "blocker PR" });
+  const b = await post("/api/tasks", { project_id: projectId, title: "depends on blocker, discovered mid-task" });
+  expect(b.json.depends_on).toEqual([]);
+
+  const updated = await put(`/api/tasks/${b.json.id}`, { depends_on: a.json.id });
+  expect(updated.status).toBe(200);
+  expect(updated.json.depends_on).toEqual([a.json.id]);
+
+  // unmetDeps (the mechanism hive-1027's Needs You "waiting" classification
+  // reads) picks it up live — no further plumbing needed.
+  const { unmetDeps } = await import("../src/state.ts");
+  expect(unmetDeps(db, updated.json).map((d: any) => d.id)).toEqual([a.json.id]);
+
+  // unknown dep id -> 400, task untouched
+  const badDep = await put(`/api/tasks/${b.json.id}`, { depends_on: "nope" });
+  expect(badDep.status).toBe(400);
+
+  // a task cannot depend on itself
+  const selfDep = await put(`/api/tasks/${b.json.id}`, { depends_on: b.json.id });
+  expect(selfDep.status).toBe(400);
+
+  // omitting depends_on entirely leaves it alone (only title/brief change)
+  const titleOnly = await put(`/api/tasks/${b.json.id}`, { title: "renamed" });
+  expect(titleOnly.status).toBe(200);
+  expect(titleOnly.json.depends_on).toEqual([a.json.id]);
 });
 
 test("tracking-only tasks cannot mint direct, checkpoint, or learning work", async () => {
