@@ -21,8 +21,19 @@ if [ "$AHEAD" -gt 0 ] && [ "$BEHIND" -gt 0 ]; then
   exit 1
 fi
 if [ "$BEHIND" -gt 0 ]; then
-  # ff-only refuses if the working tree blocks it (untracked collisions etc.)
-  git merge --ff-only origin/main --quiet
+  if [ "$(git branch --show-current)" = "main" ]; then
+    # ff-only refuses if the working tree blocks it (untracked collisions etc.)
+    git merge --ff-only origin/main --quiet
+  elif git worktree list --porcelain | grep -qx "branch refs/heads/main"; then
+    echo "[$(date '+%F %T')] main is checked out in another worktree; not updating its ref behind that checkout"
+    exit 1
+  else
+    # The launchd job often runs while the primary checkout is on a feature
+    # branch. Advance the named main ref, not whichever branch happens to be
+    # checked out. The expected old SHA makes a concurrent main update fail.
+    MAIN_BEFORE=$(git rev-parse main)
+    git update-ref refs/heads/main "$(git rev-parse origin/main)" "$MAIN_BEFORE"
+  fi
   echo "[$(date '+%F %T')] pulled $BEHIND commit(s) from origin/main -> $(git rev-parse --short main)"
 fi
 if [ "$AHEAD" -gt 0 ]; then
