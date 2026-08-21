@@ -112,7 +112,9 @@ and respawns onto the SAME branch: `worktree create` collides, `reclaimWorktree`
 preserves any loose WIP on a ghost branch and removes the checkout, and the retry
 re-checks out `hive/<taskId>` at its existing head, so the PR's commits are
 untouched (verified live against herdr 0.7.x). The feedback rides in as the
-steer preamble at the top of the fresh brief.
+steer preamble at the top of the fresh brief. See the API contract's
+[Review experience](API.md#review-experience-hive-owned-in-review-tasks) for the
+lifecycle effect when queued feedback reaches an `in_review` task.
 
 ## Visible interactive fleet (spawn design)
 
