@@ -128,5 +128,8 @@ for (const state of ["done", "failed", "verifying"] as const) {
 
     const questions = renderer.root.findAll((n) => n.type === "h4" && n.children.includes(q.question));
     expect(questions.length).toBe(1);
+
+    const labels = renderer.root.findAll((n) => n.props.className === "understanding-quiz-label");
+    expect(labels[0].children.join("")).toContain("Confirm you understood the change");
   });
 }

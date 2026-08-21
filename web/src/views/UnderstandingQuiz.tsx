@@ -5,11 +5,13 @@ import { toast } from "../lib/ui";
 
 export function UnderstandingQuiz({
   quiz,
+  label = "Before you approve",
   allowDefer = false,
   onPassed,
   onDeferred,
 }: {
   quiz: Pick<Quiz, "task_id" | "question" | "options" | "completed" | "total">;
+  label?: string;
   allowDefer?: boolean;
   onPassed?: (explanation: string | null) => void;
   onDeferred?: () => void;
@@ -82,7 +84,7 @@ export function UnderstandingQuiz({
   return (
     <section className="understanding-quiz">
       <div className="understanding-quiz-label">
-        Before you approve
+        {label}
         {(currentQuiz.total ?? 1) > 1 && ` · Question ${(currentQuiz.completed ?? 0) + 1} of ${currentQuiz.total}`}
       </div>
       {feedback && <p className="understanding-quiz-wrong">Not quite. {feedback} Try this from another angle.</p>}

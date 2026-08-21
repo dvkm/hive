@@ -731,7 +731,8 @@ export function TaskBody({ id }: { id: string }) {
                 <ReviewAudit r={postShipQuiz.report} />
               </div>
             </details>
-            <UnderstandingQuiz quiz={postShipQuiz} onPassed={reloadQuizzes} />
+            {/* no allowDefer/onDeferred: done/failed tasks block nothing, so there's no approval to unlock early */}
+            <UnderstandingQuiz quiz={postShipQuiz} label="Confirm you understood the change" onPassed={reloadQuizzes} />
           </section>
         )}
 
