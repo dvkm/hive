@@ -21,7 +21,7 @@ import { ANSWERED_BY_LABEL } from "../lib/labels";
 import type { TimelineItem } from "../lib/timeline";
 import { eventText } from "../lib/eventText";
 import { isJiraMirror, isTrackingOnly } from "../lib/needsYou";
-import { PrReference, TaskRef, prLabel } from "../lib/references";
+import { PrReference, ReferenceText, TaskRef, prLabel } from "../lib/references";
 
 // Compact per-task usage line: tokens + estimated cost, only when usage exists.
 function UsageLine({ id, rev }: { id: string; rev: number }) {
@@ -101,7 +101,7 @@ function DecisionMini({ d }: { d: Decision }) {
   return (
     <div className={`dmini ${answered ? "dmini-done" : "dmini-open"}`}>
       <div className="dmini-head">
-        <strong>{d.title}</strong>
+        <strong><ReferenceText text={d.title} taskId={d.task_id} bundle={d.bundle} /></strong>
         <span className={`chip chip-risk risk-${d.risk || "unknown"}`}>{d.risk || "?"}</span>
       </div>
       {answered ? (

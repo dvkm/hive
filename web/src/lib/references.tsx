@@ -25,7 +25,7 @@ export function TaskReference({ taskId, label, self = false, className }: { task
   const href = `/tasks/${taskId}`;
   return (
     <span className="hover-reference">
-      {self ? <span className={className}>{label}</span> : <Link className={className} to={href}>{label}</Link>}
+      {self ? <span className={className} tabIndex={0}>{label}</span> : <Link className={className} to={href}>{label}</Link>}
       <Actions label={label} href={href} />
     </span>
   );
