@@ -13,8 +13,10 @@ exec >>"$LOG" 2>&1
 
 cd "$REPO"
 git fetch origin main --quiet
-AHEAD=$(git rev-list --count origin/main..main)
-BEHIND=$(git rev-list --count main..origin/main)
+MAIN_BEFORE=$(git rev-parse refs/heads/main)
+ORIGIN_MAIN=$(git rev-parse refs/remotes/origin/main)
+AHEAD=$(git rev-list --count "$ORIGIN_MAIN..$MAIN_BEFORE")
+BEHIND=$(git rev-list --count "$MAIN_BEFORE..$ORIGIN_MAIN")
 
 if [ "$AHEAD" -gt 0 ] && [ "$BEHIND" -gt 0 ]; then
   echo "[$(date '+%F %T')] DIVERGED: local main +$AHEAD / origin/main +$BEHIND — not touching it; reconcile by MERGE COMMIT (never squash), see docs"
@@ -23,7 +25,7 @@ fi
 if [ "$BEHIND" -gt 0 ]; then
   if [ "$(git branch --show-current)" = "main" ]; then
     # ff-only refuses if the working tree blocks it (untracked collisions etc.)
-    git merge --ff-only origin/main --quiet
+    git merge --ff-only "$ORIGIN_MAIN" --quiet
   elif git worktree list --porcelain | grep -qx "branch refs/heads/main"; then
     echo "[$(date '+%F %T')] main is checked out in another worktree; not updating its ref behind that checkout"
     exit 1
@@ -31,8 +33,7 @@ if [ "$BEHIND" -gt 0 ]; then
     # The launchd job often runs while the primary checkout is on a feature
     # branch. Advance the named main ref, not whichever branch happens to be
     # checked out. The expected old SHA makes a concurrent main update fail.
-    MAIN_BEFORE=$(git rev-parse main)
-    git update-ref refs/heads/main "$(git rev-parse origin/main)" "$MAIN_BEFORE"
+    git update-ref refs/heads/main "$ORIGIN_MAIN" "$MAIN_BEFORE"
   fi
   echo "[$(date '+%F %T')] pulled $BEHIND commit(s) from origin/main -> $(git rev-parse --short main)"
 fi
