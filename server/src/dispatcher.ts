@@ -121,7 +121,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   // (spawnAgent's steer preamble). Before this, such a task sat in_progress with
   // nobody on it until it aged into a stale notification.
   const reattach = db
-    .query(`SELECT * FROM tasks WHERE agent_target IS NULL AND state IN ('in_progress','in_review') ORDER BY updated_at ASC`)
+    .query(`SELECT * FROM tasks WHERE agent_target IS NULL AND state IN ('in_progress','in_review','verifying') ORDER BY updated_at ASC`)
     .all()
     .map(parseTask)
     .filter((t: any) => !isTrackingOnlyTask(t) && t.source !== "chat_supervisor" && queuedSteers(db, t.id).length > 0);
