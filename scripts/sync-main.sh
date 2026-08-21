@@ -40,6 +40,22 @@ if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
   (cd electron && bun install --silent >/dev/null && bun run build >/dev/null)
   # bun --watch hot reload is unreliable; always kickstart after a live merge
   launchctl kickstart -k "gui/$(id -u)/dev.hive.server"
+  # kickstart -k kills the JOB, not the tree: on 2026-08-19 four `bun --watch`
+  # workers survived it by re-parenting to launchd and kept running reconcilers
+  # against the shared DB for 14 hours (they held no port, so nothing noticed).
+  # The DB lease now makes any survivor stand down within a heartbeat once the
+  # new server boots — this is the check that it actually happened. Never kills:
+  # a stray that outlives the grace is a real bug and must be seen, not hidden.
+  # `|| true` on every pgrep: it exits 1 when nothing matches, and pipefail
+  # would take the whole deploy script down with it.
+  for _ in {1..20}; do
+    SERVERS=$( (pgrep -f "bun --watch server/src/index.ts" || true) | wc -l | tr -d ' ')
+    [ "$SERVERS" = "1" ] && break
+    sleep 1
+  done
+  if [ "${SERVERS:-0}" != "1" ]; then
+    echo "[$(date '+%F %T')] WARNING: $SERVERS hive server processes alive 20s after kickstart (expected 1) — $( (pgrep -fl 'bun --watch server/src/index.ts' || true) | tr '\n' ';')"
+  fi
   # The desktop app keeps its existing Chromium renderer across server deploys.
   # Restart it when it is already open so the user sees the deployed assets.
   APP="$LIVE/electron/dist/mac-arm64/hive.app"

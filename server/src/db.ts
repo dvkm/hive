@@ -6,7 +6,15 @@ import { dirname, join } from "node:path";
 import { mkdirSync } from "node:fs";
 
 export function defaultDbPath(): string {
-  return process.env.HIVE_DB || join(homedir(), ".hive", "hive.db");
+  return process.env.HIVE_DB || homeDbPath();
+}
+
+// The LIVE fleet's database, ignoring every env override. HIVE_DB moves
+// defaultDbPath; nothing moves this. The single-server guard needs to know
+// "am I about to open the real one?" and cannot ask defaultDbPath, which
+// answers with whatever the caller already set.
+export function homeDbPath(): string {
+  return join(homedir(), ".hive", "hive.db");
 }
 
 export function hiveHome(): string {
@@ -452,6 +460,23 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
   {
     name: "v23-decision-explainer-verdict",
     statements: [`ALTER TABLE decisions ADD COLUMN explainer_verdict TEXT`],
+  },
+  // Every hive server process registers here BEFORE it runs a single background
+  // loop, so the one holding the DB lease can see — and terminate — any other
+  // server still attached to this database (lease.ts). A lease alone only tells
+  // a well-behaved predecessor to stand down; this is what closes the case
+  // where it doesn't (task #1152).
+  {
+    name: "v24-server-instances",
+    statements: [
+      `CREATE TABLE server_instances (
+        instance TEXT PRIMARY KEY,
+        pid INTEGER NOT NULL,
+        port INTEGER NOT NULL,
+        registered_at TEXT NOT NULL,
+        evicted_at TEXT
+      )`,
+    ],
   },
 ];
 

@@ -88,16 +88,17 @@ export interface CleanupOutcome {
 // The `spawned` event carries the herdr tab id and the worktree's own workspace
 // id (the task row stores neither). fleet_workspace_id is deliberately NOT
 // returned: it's the shared hive-fleet workspace and must never be closed.
-export function spawnMeta(db: DB, taskId: string): { tab_id: string | null; workspace_id: string | null } {
+export function spawnMeta(db: DB, taskId: string): { tab_id: string | null; workspace_id: string | null; terminal_id: string | null } {
+  const empty = { tab_id: null, workspace_id: null, terminal_id: null };
   const r = db
     .query("SELECT payload FROM events WHERE task_id = ? AND type = 'spawned' ORDER BY ts DESC LIMIT 1")
     .get(taskId) as { payload: string } | undefined;
-  if (!r) return { tab_id: null, workspace_id: null };
+  if (!r) return empty;
   try {
     const p = JSON.parse(r.payload);
-    return { tab_id: p.tab_id ?? null, workspace_id: p.workspace_id ?? null };
+    return { tab_id: p.tab_id ?? null, workspace_id: p.workspace_id ?? null, terminal_id: p.terminal_id ?? null };
   } catch {
-    return { tab_id: null, workspace_id: null };
+    return empty;
   }
 }
 
@@ -173,7 +174,14 @@ export async function cleanupTask(
   let session = { closed: false, via: null as string | null };
   const attemptedClose = preserved ? !!task.agent_target : !!(task.agent_target || meta.tab_id);
   if (attemptedClose) {
-    session = await herdr.closeSession({ agentTarget: task.agent_target, tabId: meta.tab_id });
+    session = await herdr.closeSession({
+      agentTarget: task.agent_target,
+      tabId: meta.tab_id,
+      // Prove the tab is still THIS task's before closing it: herdr recycles tab
+      // ids, so a stale one recorded at spawn can name another agent's live tab.
+      expectTerminalId: meta.terminal_id,
+      expectCwd: task.worktree_path,
+    });
     // Also close the worktree's OWN herdr workspace: `worktree create` auto-spawns
     // it with a live pane the agent never uses (the agent runs in the fleet tab
     // closed above), and it leaked a pty per task until nothing reaped it

@@ -2902,6 +2902,10 @@ export async function spawnAgent(
       branch: result.branch,
       worktree_path: result.worktree_path,
       tab_id: result.tab_id,
+      // Stable pane handle: herdr recycles tab/pane ids, terminal ids it does
+      // not. Re-adoption after a registry wipe addresses the pane by this.
+      terminal_id: result.terminal_id,
+      pane_id: result.pane_id,
       label: result.label,
       fleet_workspace_id: result.fleet_workspace_id,
       // The worktree's OWN workspace (distinct from the fleet). `worktree create`
@@ -3808,6 +3812,39 @@ export function openRecoveryDecision(db: DB, task: any, attempts: number): any {
     ],
   });
   writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery_card", payload: { decision_id: decision.id, source_task_id: task.id } });
+  return decision;
+}
+
+// The circuit breaker's ONE card. Raised when hive declares more agents dead in
+// a short window than any real fleet loses — the signature of hive losing sight
+// of herdr, not of agents dying (2026-08-19). Every teardown path stays paused
+// while this card is open, so answering it IS the resume: no second switch.
+// Attached to the task whose teardown was blocked, because a decision needs a
+// task and that one is the concrete casualty the director can look at.
+export function openBreakerDecision(db: DB, task: any, count: number, windowMinutes: number): any {
+  const decision = createDecision(db, {
+    task_id: task.id,
+    title: `Paused recovery: ${count} agents declared dead in ${windowMinutes} min`,
+    context:
+      `Hive stopped failing and requeuing agents. ${count} death verdicts in ${windowMinutes} minutes usually means hive lost ` +
+      `sight of herdr (a desktop-app restart wipes the agent registry while the agents keep running), not that the fleet died. ` +
+      `Nothing was torn down and no tabs were closed. Check the herdr panes: if the agents are alive, resume and hive will re-adopt them.`,
+    risk: "high",
+    blast_radius: "All agent recovery and worktree/session reaping, fleet-wide.",
+    options: [
+      { key: "resume", label: "Resume recovery", detail: "Agents look fine (or really are gone) — turn sweeps back on.", recommended: true },
+      { key: "checked", label: "Resume, I fixed herdr", detail: "Same effect; records that you intervened first." },
+    ],
+  });
+  writeEvent(db, { task_id: task.id, source: "reconciler", type: "breaker_card", payload: { decision_id: decision.id, dead_count: count } });
+  enqueue(db, {
+    kind: "circuit_breaker",
+    urgency: "urgent",
+    task_id: task.id,
+    decision_id: decision.id,
+    title: `Recovery paused: ${count} agents declared dead in ${windowMinutes} min`,
+    body: "Nothing was torn down. Check the herdr panes, then answer the card to resume.",
+  });
   return decision;
 }
 

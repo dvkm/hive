@@ -78,6 +78,22 @@ On a stale flag: probe the agent (exists? integration status? pane tail). Dead �
 - Steer: `POST /api/tasks/:id/send` → `herdr agent send`.
 - Teardown on done/cancelled: `herdr worktree remove` only after PR merged or branch pushed (verify with git; refuse otherwise).
 
+## Restart survivability (hive restarts must not cost agents or their context)
+
+Agents are long-lived processes in herdr panes; hive restarting, self-deploying or updating must never end them. Four mechanisms, all of them refusing to act on absence of evidence:
+
+- **Re-adoption** (`Herdr.readopt`, driven from the reconciler's probe): a desktop-app restart wipes herdr's agent registry while every pane keeps running, so `agent get` answers `agent_not_found` for a fleet that is entirely alive. Hive finds the task's surviving pane (stable `terminal_id` recorded at spawn, else a registry label, else the one pane at the task worktree cwd whose foreground process is not a login shell — a fleet tab also holds a shell pane there) and re-registers it with `pane report-agent` + `agent rename`. Probe, steer, focus and dialog handling resume on the same cycle; the pinned name survives Claude Code's own integration re-reporting later.
+- **Boot grace** (`server/src/teardownGuard.ts`, `HIVE_BOOT_GRACE_MS`, default 5 min): nothing is failed, requeued or reaped in the first minutes after boot, when herdr may still be cold and every agent probes as gone.
+- **Circuit breaker**: `HIVE_DEAD_BURST_N` death verdicts (default 3) inside `HIVE_DEAD_BURST_MS` (default 10 min) is hive losing sight of herdr, not a fleet dying. All teardown pauses and ONE decision card is raised; answering it resumes.
+- **Single-writer DB lease** (`server/src/lease.ts`): exactly one server may run the loops against a DB. A booting server claims the lease after its listener is up; predecessors — including `bun --watch` workers that survived a `launchctl kickstart` by re-parenting to launchd, holding no port — notice on their next heartbeat and exit. The lease is ENFORCED, not merely announced, because a second server's reconciler evicts working agents:
+  - A server whose port is not the fleet port (`HIVE_FLEET_PORT`, default 4700) refuses to open the live fleet DB at all and exits 1 before it serves, leases or reconciles — that is the exact shape of a throwaway smoke server that forgot `HIVE_DB` (override with `HIVE_ALLOW_SHARED_DB=1`).
+  - Every server registers its pid in `server_instances` BEFORE starting a loop, and the lease holder SIGTERMs (then SIGKILLs) any registered contender still alive after losing the lease — the case a stand-down request cannot reach. Only a pid whose command line still reads as a hive server is ever signalled.
+  - Both paths notify the director. Nobody has to kill a rogue server by hand.
+
+Recovery must actually recover: a diagnosis is not a revival. Lost worker auth respawns the agent on the same task and worktree (rate-limited per task by `HIVE_AUTH_RESPAWN_MS`, default 15 min, counting attempts rather than successes), which is also the only way hive learns the login was restored. And no row hive writes ABOUT an agent (`stale`, `recovery`, `recovery_nudge`, `spawn_error`) counts as agent activity — otherwise diagnosing a frozen pane resets its own silence clock and the task reads healthy forever.
+
+Teardown also proves its target: `closeSession` refuses a recycled `tab_id` that demonstrably holds a different worktree, and every pane hint prefers the stable `terminal_id` over reusable tab/pane ids.
+
 ## Auto-resume (the agent's own words)
 
 Orthogonal to the timer above and much stronger: when an agent's turn ENDS (the Stop hook's `agent_turn_end` event, not a subagent finishing), hive reads the agent's own final message. If it named unfinished work it committed to itself ("Continuing…", "next I will…", "resuming…"), the task is `in_progress` with nothing blocking it (not deferred, no open decision card, no unmet dependency, not tracking-only), and nothing has happened since that message, hive steers the agent by quoting that exact sentence back at it. Quoting the agent means hive needs no opinion about what should happen next. Deliberately conservative: a message that reports completion, describes someone else's next step, or says it is waiting on a human or an external system is left alone. Capped at 3 auto-resumes per task, then one escalation to the director; every resume is a visible `auto_resume` task event (`server/src/resume.ts`).
