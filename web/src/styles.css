@@ -3960,6 +3960,9 @@ a.dbundle-fact:hover {
   color: var(--amber);
   background: color-mix(in srgb, var(--bg-elev) 86%, var(--amber) 14%);
 }
+.understanding-quiz-panel .understanding-quiz {
+  margin-top: var(--s3);
+}
 .brief-quiz > a {
   display: inline-block;
   margin-bottom: var(--s2);
