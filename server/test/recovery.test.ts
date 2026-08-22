@@ -60,8 +60,8 @@ function makeTask(db: DB, projectId: string, extra: Partial<{ source: string; pa
   const id = newId();
   const t = now();
   db.query(
-    "INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, agent_target, created_at, updated_at) VALUES (?,?,?,?, 'in_progress', 'ship', ?, ?, ?, ?, ?)"
-  ).run(id, projectId, "t", "do it", extra.source ?? null, extra.parent ?? null, extra.agent ?? "a" + id.slice(0, 4), t, t);
+    "INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, agent_target, worktree_path, created_at, updated_at) VALUES (?,?,?,?, 'in_progress', 'ship', ?, ?, ?, ?, ?, ?)"
+  ).run(id, projectId, "t", "do it", extra.source ?? null, extra.parent ?? null, extra.agent ?? "a" + id.slice(0, 4), `/wt/${id}`, t, t);
   // Mirror requeueTask()'s own creation event so a synthetic 'requeue' row here
   // reads as trusted provenance (state.ts: verifyRequeueProvenance), same as a
   // real requeue chain would.

@@ -17,6 +17,7 @@ import { createDecision } from "./api.ts";
 import { queueSteerEvent } from "./steer.ts";
 
 const GRANT_TTL_MS = 24 * 60 * 60 * 1000;
+const LIVE_SERVER_ACTION = "command.dangerous.live-hive-server-control";
 
 // Actions that require an answered decision even with NO matching rule. A fresh
 // install, a wiped DB, or a deleted rule must not silently auto-run `rm -rf`.
@@ -36,6 +37,11 @@ export function bootstrapAuthority(db: DB): number {
       action_pattern: "command.dangerous*",
       effect: "require_decision",
       note: "Dangerous commands (rm -rf, force push, DROP, sudo, prod) need the director to approve",
+    },
+    {
+      action_pattern: LIVE_SERVER_ACTION,
+      effect: "require_decision",
+      note: "Agents must not restart or replace the live Hive server without a director decision",
     },
   ];
   let inserted = 0;
@@ -247,7 +253,7 @@ export function authorize(db: DB, input: AuthzInput, clock: () => string = now):
   // one-time-only: "always allow a deploy" is never one click.
   const options = [
     { key: "approve", label: "Approve", detail: `Allow '${input.action}' on ${input.target} (one time).` },
-    ...(input.action.startsWith("command.")
+    ...(input.action.startsWith("command.") && input.action !== LIVE_SERVER_ACTION
       ? [{
           key: "approve_always",
           label: "Approve & always allow",

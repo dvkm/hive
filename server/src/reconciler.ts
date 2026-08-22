@@ -44,6 +44,7 @@ export interface ReconcilerDeps {
   smoke?: MonitorDeps; // deps for smokeThenAdvance on merge->verifying
   nowMs?: () => number; // injectable clock (tests)
   supervise?: boolean; // start the herdr push-wait loop on agents this loop spawns
+  instanceId?: string;
 }
 
 const DEFAULT_STALE_MS = 15 * 60 * 1000;
@@ -251,6 +252,12 @@ async function probeAgent(
 ): Promise<{ alive: boolean; status: AgentStatus; unconfirmed?: boolean }> {
   const p = await h.probe(target);
   if (p.alive) return p;
+  // A server takeover can briefly make `agent get` miss an agent that is
+  // already present in herdr's live registry. Trust the fleet snapshot before
+  // consulting pane absence, which can otherwise turn that startup race into
+  // a false death verdict.
+  if ((await h.listAgents()).some((agent) => agent.name === target))
+    return { alive: true, status: "unknown" };
   const task = getTask(db, taskId);
   const meta = spawnMeta(db, taskId);
   const hint = { cwd: task?.worktree_path ?? null, tabId: meta.tab_id, terminalId: meta.terminal_id };
@@ -1449,7 +1456,7 @@ async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
       // requeues a task. A server that just booted, or a fleet-wide burst of
       // death verdicts, means hive is the thing that lost its footing — the
       // agents are processes and will still be there next lap.
-      const blocked = teardownBlocked(db, nowMs);
+      const blocked = teardownBlocked(db, nowMs, deps.instanceId);
       if (blocked) {
         console.log(`[hive] recovery held for ${t.id}: ${blocked}`);
         continue;

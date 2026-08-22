@@ -95,46 +95,44 @@ const server = Bun.serve({
 // still running against this DB (including a `bun --watch` worker that survived
 // a launchctl kickstart by re-parenting to launchd — 2026-08-19, four of them,
 // none holding the port) sees the lease change on its next heartbeat and exits.
-{
-  const { instance, displaced } = claimLease(db);
-  // Register BEFORE any loop starts: this row is how a future lease holder can
-  // find and terminate this process if it ever stops standing down on its own.
-  registerInstance(db, instance, process.pid, port);
-  if (displaced)
-    console.warn(
-      `[hive] took the DB lease from a previous server (instance=${displaced.instance} pid=${displaced.pid} at=${displaced.at}); it will stand down within one heartbeat`
-    );
-  startLease(db, instance, (holder) => {
-    console.error(`[hive] DB lease lost to instance=${holder?.instance ?? "?"} pid=${holder?.pid ?? "?"}; standing down so only one server runs the loops`);
+const { instance, displaced } = claimLease(db);
+// Register BEFORE any loop starts: this row is how a future lease holder can
+// find and terminate this process if it ever stops standing down on its own.
+registerInstance(db, instance, process.pid, port);
+if (displaced)
+  console.warn(
+    `[hive] took the DB lease from a previous server (instance=${displaced.instance} pid=${displaced.pid} at=${displaced.at}); it will stand down within one heartbeat`
+  );
+startLease(db, instance, (holder) => {
+  console.error(`[hive] DB lease lost to instance=${holder?.instance ?? "?"} pid=${holder?.pid ?? "?"}; standing down so only one server runs the loops`);
+  unregisterInstance(db, instance);
+  process.exit(0);
+});
+process.on("exit", () => {
+  try {
     unregisterInstance(db, instance);
-    process.exit(0);
-  });
-  process.on("exit", () => {
-    try {
-      unregisterInstance(db, instance);
-    } catch {
-      /* the DB may already be closed; the next holder drops the row anyway */
-    }
-  });
+  } catch {
+    /* the DB may already be closed; the next holder drops the row anyway */
+  }
+});
 
-  // Enforcement: asking a predecessor to stand down does not reach one that is
-  // wedged, or a `bun --watch` worker orphaned by a launchctl kickstart. Kill
-  // what is still attached, and tell the director — an eviction is never
-  // routine, and the director used to have to do it by hand.
-  setInterval(() => {
-    if (!holdsLease(db, instance)) return; // we are the one on the way out
-    for (const { contender, signal } of evictContenders(db, instance)) {
-      console.warn(`[hive] evicted a second server: pid=${contender.pid} port=${contender.port} instance=${contender.instance} (${signal})`);
-      if (signal !== "SIGTERM") continue; // the SIGKILL escalation is automatic; one card is enough
-      enqueue(db, {
-        kind: "server_evicted",
-        urgency: "normal",
-        title: "Evicted a second hive server from the fleet database",
-        body: `A second server (pid ${contender.pid}, port ${contender.port}) was still running loops against the fleet DB after losing the lease. Hive terminated it — nothing for you to do.`,
-      });
-    }
-  }, LEASE_MS);
-}
+// Enforcement: asking a predecessor to stand down does not reach one that is
+// wedged, or a `bun --watch` worker orphaned by a launchctl kickstart. Kill
+// what is still attached, and tell the director — an eviction is never
+// routine, and the director used to have to do it by hand.
+setInterval(() => {
+  if (!holdsLease(db, instance)) return; // we are the one on the way out
+  for (const { contender, signal } of evictContenders(db, instance)) {
+    console.warn(`[hive] evicted a second server: pid=${contender.pid} port=${contender.port} instance=${contender.instance} (${signal})`);
+    if (signal !== "SIGTERM") continue; // the SIGKILL escalation is automatic; one card is enough
+    enqueue(db, {
+      kind: "server_evicted",
+      urgency: "normal",
+      title: "Evicted a second hive server from the fleet database",
+      body: `A second server (pid ${contender.pid}, port ${contender.port}) was still running loops against the fleet DB. Hive terminated it. Nothing for you to do.`,
+    });
+  }
+}, LEASE_MS);
 
 // Boot stamp: the teardown guard reads it so nothing is failed, requeued or
 // reaped in the first minutes after a restart/self-deploy, when herdr's agent
@@ -146,7 +144,7 @@ setSetting(db, "server_started_at", now());
 const reconcileMs = Number(process.env.HIVE_RECONCILE_MS || 60_000);
 const monitorMs = Number(process.env.HIVE_MONITOR_MS || 60_000);
 const staleMs = Number(process.env.HIVE_STALE_MS || 15 * 60 * 1000);
-startReconciler(db, { intervalMs: reconcileMs, staleMs, supervise: true });
+startReconciler(db, { intervalMs: reconcileMs, staleMs, supervise: true, instanceId: instance });
 
 // Dispatcher: pick up `queued` tasks in auto-dispatch projects and spawn agents
 // (opt-in per project; the reason web-UI tasks used to sit in Queued forever).
@@ -175,7 +173,7 @@ setInterval(() => {
   wakeDueManagers(db, defaultHerdr, { supervise: true }).catch((e) => console.error("[hive] scheduled manager wakeup:", e));
 }, managerWakeMs);
 const reapMs = Number(process.env.HIVE_REAP_MS || 300_000);
-startReaper(db, { intervalMs: reapMs });
+startReaper(db, { intervalMs: reapMs, instanceId: instance });
 
 // Notification delivery: hand alerts to hive.app (urgent -> immediate push)
 // and start the batched digest loop (normal -> one digest every HIVE_DIGEST_MS).

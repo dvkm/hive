@@ -402,3 +402,31 @@ test("sweepFinishedTestProjects never touches a non-test project", () => {
   sweepFinishedTestProjects(db);
   expect(isArchived(db, projectId)).toBe(false);
 });
+
+test("a server that lost the lease reaps nothing", async () => {
+  const { db, projectId } = freshDb();
+  const { claimLease } = await import("../src/lease.ts");
+  seedTask(db, projectId, "DONE", "done");
+  const mine = claimLease(db, 100).instance;
+  claimLease(db, 200);
+  const calls: string[][] = [];
+  const herdr = new Herdr(async (argv) => (calls.push(argv), OK()), "herdr");
+
+  await reapOnce(db, { herdr, exec: async (argv) => (calls.push(argv), OK()), instanceId: mine });
+
+  expect(calls.length).toBe(0);
+  expect(getSetting(db, "last_reap_at")).not.toBeNull();
+});
+
+test("the current lease holder can reap", async () => {
+  const { db, projectId } = freshDb();
+  const { claimLease } = await import("../src/lease.ts");
+  seedTask(db, projectId, "DONE", "done");
+  const mine = claimLease(db, 100).instance;
+  const calls: string[][] = [];
+  const herdr = new Herdr(async (argv) => (calls.push(argv), OK()), "herdr");
+
+  await reapOnce(db, { herdr, exec: async (argv) => (calls.push(argv), OK()), instanceId: mine });
+
+  expect(getSetting(db, "last_reap_at")).not.toBeNull();
+});

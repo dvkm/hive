@@ -47,6 +47,19 @@ const dangerous = [
   "cat ~/.ssh/id_rsa",
   "cat ~/.aws/credentials",
   `osascript -e 'tell application "System Events" to keystroke "hi"'`,
+  "launchctl kickstart -k gui/501/dev.hive.server",
+  "launchctl bootout gui/501/dev.hive.server",
+  "./scripts/sync-main.sh",
+  "./electron/install-app.sh",
+  "hive serve",
+  '"$HIVE_CLI" serve',
+  "HIVE_PORT=4700 bun server/src/index.ts",
+  "env HIVE_PORT=4700 npm start",
+  "bun server/src/index.ts",
+  "python3 -m http.server 4700",
+  "bun run dev --port 4700",
+  "npm run dev -- --port 4700",
+  "socat TCP-LISTEN:4700,fork TCP:127.0.0.1:4800",
 ];
 
 const safe = [
@@ -175,6 +188,10 @@ test("unrecognized commands classify as unknown (never safe)", () => {
 test("git commit / non-force push escalate rather than auto-approve", () => {
   expect(classify("git commit -m wip").decision).toBe("unknown");
   expect(classify("git push origin main").decision).toBe("unknown");
+});
+
+test("an isolated Hive server does not count as live server control", () => {
+  expect(classify("HIVE_PORT=4812 HIVE_DB=/tmp/hive-test.db bun server/src/index.ts").decision).toBe("unknown");
 });
 
 test("dev/null and dev/urandom redirects are not treated as device writes", () => {
