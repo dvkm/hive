@@ -1639,6 +1639,13 @@ async function createTask(db: DB, req: Request): Promise<Response> {
     return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
   const deps = parseDeps(db, body.depends_on);
   if (deps instanceof Response) return deps;
+  // A follow-up task's brief often describes code that only exists in the
+  // parent's still-open PR (HIVE-299). Auto-depend on the parent until its PR
+  // has merged so the dispatcher holds this task the same way unmetDeps
+  // already holds explicit depends_on — no separate PR-status check needed.
+  if (parentTask && unmetDeps(db, { depends_on: [parent as string] }).length && !deps.includes(parent as string)) {
+    deps.push(parent as string);
+  }
   const t = now();
   // Id first: attachments are stored under it, and the brief they extend is
   // written in the INSERT below (and read by duplicate detection).

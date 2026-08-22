@@ -161,6 +161,42 @@ test("agent-created task carries source + parent_task_id", async () => {
   expect(bad.status).toBe(400);
 });
 
+test("HIVE-299: follow-up task auto-depends on a parent whose PR hasn't merged yet", async () => {
+  const parent = await post("/api/tasks", { project_id: projectId, title: "parent with open PR" });
+  const child = await post("/api/tasks", {
+    project_id: projectId,
+    title: "follow-up describing parent's unmerged code",
+    source: "agent",
+    parent_task_id: parent.json.id,
+  });
+  expect(child.json.depends_on).toEqual([parent.json.id]);
+
+  const { unmetDeps } = await import("../src/state.ts");
+  expect(unmetDeps(db, child.json).map((d: any) => d.id)).toEqual([parent.json.id]);
+
+  // once the parent's PR has merged (state -> verifying/done), a NEW follow-up
+  // should not be auto-blocked on it.
+  await db.query("UPDATE tasks SET state = 'verifying' WHERE id = ?").run(parent.json.id);
+  const child2 = await post("/api/tasks", {
+    project_id: projectId,
+    title: "follow-up filed after parent merged",
+    source: "agent",
+    parent_task_id: parent.json.id,
+  });
+  expect(child2.json.depends_on).toEqual([]);
+
+  // an explicit depends_on isn't duplicated
+  await db.query("UPDATE tasks SET state = 'queued' WHERE id = ?").run(parent.json.id);
+  const child3 = await post("/api/tasks", {
+    project_id: projectId,
+    title: "follow-up with explicit dep on unmerged parent",
+    source: "agent",
+    parent_task_id: parent.json.id,
+    depends_on: parent.json.id,
+  });
+  expect(child3.json.depends_on).toEqual([parent.json.id]);
+});
+
 test("PUT /api/tasks/:id can declare a dependency after creation, mid-task", async () => {
   const a = await post("/api/tasks", { project_id: projectId, title: "blocker PR" });
   const b = await post("/api/tasks", { project_id: projectId, title: "depends on blocker, discovered mid-task" });
