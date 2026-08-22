@@ -380,8 +380,10 @@ the last 3 answered cards on the same project, each with the option `label` the
 director chose. Computed at fetch/broadcast time so it stays fresh; absent on
 older SSE payloads and terminal-card broadcasts.
 
-`bundle.ci` is present only on a card whose own title or context is about the
-checks, and it is what keeps such a card honest: `at_card` is the CI status when
+`bundle.ci` is present only on a card raised on a task whose checks are actually
+red or unavailable AND whose own title or context is about those checks — the
+words alone are not enough, since "red", "green" and "check" are ordinary
+English. It is what keeps such a card honest: `at_card` is the CI status when
 the card was written, `status` and `checked_at` are the live re-check, and
 `changed` says the two disagree. When the checks turn green under a card that
 cited red, the reconciler closes the card itself (`status=expired`, reason
@@ -391,6 +393,8 @@ signal and the task hive dispatched to fix it. Answering ONE such card settles
 it: a later card blocked by the same signal on the same project is auto-answered
 with that ruling (`answered_by: "system"`, actor `ci-outage-ruling`) and raises
 no notification, provided the earlier answer's key is one of its own options.
+The ruling holds only while the outage does: once the diagnostic task hive
+dispatched for that signal is closed, the next card asks the director again.
 
 `plan` is likewise derived (from the `planned` event, keyed by `decision_id`) —
 non-null only for a planner breakdown card produced by

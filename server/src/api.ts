@@ -74,7 +74,7 @@ import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts"
 import { vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
-import { ciStatusOf, ciStatusProbed, reclaimDeadWorktree } from "./reconciler.ts";
+import { ciStatusOf, ciStatusProbed, reclaimDeadWorktree, infraTaskOpen } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
@@ -5039,16 +5039,19 @@ export function withBundle(db: DB, d: any): any {
   return { ...d, bundle: decisionBundle(db, d.task_id, d.id), plan: decisionPlan(db, d.task_id, d.id) };
 }
 
-// A card "cites CI" when its own words are about the checks — that is the set
-// of cards whose facts go stale the moment the checks move, and the set the
-// director should never be asked twice about during one outage.
+// A card "cites CI" when the task's checks are actually not passing AND the
+// card's own words are about them. The status is the gate: the words alone
+// match ordinary English ("keep the red icon", "add a permission check"), and
+// mislabelling a card as CI-related would let it be auto-dismissed or
+// auto-answered by an unrelated outage.
 const CITES_CI = /\bCI\b|\bchecks?\b|\bred\b|\bfailing\b|\bgreen\b/i;
+const CI_BLOCKED = new Set(["failing", "unavailable"]);
 
 // What the CI signal looked like when a card was written: the status it cited,
 // and the infra-outage signal (from the reconciler's ci_infra event for the
 // PR's current head) that was blocking it, if any.
 function ciCitation(db: DB, task: any, text: string): { status: string | null; signal: string | null } {
-  if (!task?.pr_url || !CITES_CI.test(text)) return { status: null, signal: null };
+  if (!task?.pr_url || !CI_BLOCKED.has(task.ci_status ?? "") || !CITES_CI.test(text)) return { status: null, signal: null };
   const row: any = db
     .query("SELECT payload FROM events WHERE task_id = ? AND type = 'ci_infra' ORDER BY rowid DESC LIMIT 1")
     .get(task.id);
@@ -5067,6 +5070,9 @@ function ciCitation(db: DB, task: any, text: string): { status: string | null; s
 // is one of this card's own options, otherwise the inherited key would be
 // meaningless here.
 function standingCiRuling(db: DB, projectId: string, signal: string, options: any[]): { key: string; note: string } | null {
+  // The ruling holds only while the outage does. hive tracks the outage as one
+  // diagnostic task; once that task is closed, the next card asks again.
+  if (!infraTaskOpen(db, projectId, signal)) return null;
   const prior: any = db
     .query(
       `SELECT dc.id, dc.answer_key, dc.answer_note, dc.answered_at, dc.title FROM decisions dc
@@ -5129,13 +5135,15 @@ export function createDecision(
   // this exists to remove.
   const ruling = row.ci_signal ? standingCiRuling(db, task.project_id, row.ci_signal, options) : null;
   if (ruling) {
-    apiAnswerDecision(db, defaultHerdr, row.id, {
+    const res = apiAnswerDecision(db, defaultHerdr, row.id, {
       answer_key: ruling.key,
       answer_note: ruling.note,
       source: "system",
       actor: "ci-outage-ruling",
     });
-    return withBundle(db, parseDecision(db.query("SELECT * FROM decisions WHERE id = ?").get(row.id)));
+    // If the auto-answer failed the card is still open — fall through and
+    // notify, rather than leaving an orphan nobody was told about.
+    if (res.ok) return withBundle(db, parseDecision(db.query("SELECT * FROM decisions WHERE id = ?").get(row.id)));
   }
   // Enrich AFTER the transition so the bundle's spend/PR reflect current state.
   const decision = withBundle(db, parseDecision(row));
