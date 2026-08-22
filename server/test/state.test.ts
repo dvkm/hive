@@ -101,6 +101,17 @@ test("advanceIfFinished waits for queued-input recovery to settle", () => {
   expect(getTask(db, id).state).toBe("in_review");
 });
 
+test("advanceIfFinished does not promote a task whose linked PR is CLOSED (#1256)", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  transition(db, id, "in_progress");
+  db.query("UPDATE tasks SET pr_url = ?, pr_state = 'CLOSED' WHERE id = ?").run("https://gh/pr/1", id);
+  addEvidence(db, id);
+
+  expect(advanceIfFinished(db, id, "idle", "herdr")).toBe(false);
+  expect(getTask(db, id).state).toBe("in_progress");
+});
+
 test("a crash-orphaned delivered:null reservation ages out instead of blocking forever (#1234 review-14)", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId);

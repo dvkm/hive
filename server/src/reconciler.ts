@@ -400,8 +400,8 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   const exec = deps.exec ?? defaultExec;
   const h = deps.herdr ?? defaultHerdr;
   const tasks = db
-    .query(`SELECT id, state, pr_url, ci_status, head_sha, agent_target, project_id, branch FROM tasks WHERE pr_url IS NOT NULL AND state IN ${NON_TERMINAL}`)
-    .all() as { id: string; state: string; pr_url: string; ci_status: string | null; head_sha: string | null; agent_target: string | null; project_id: string; branch: string | null }[];
+    .query(`SELECT id, state, pr_url, ci_status, head_sha, pr_state, agent_target, project_id, branch FROM tasks WHERE pr_url IS NOT NULL AND state IN ${NON_TERMINAL}`)
+    .all() as { id: string; state: string; pr_url: string; ci_status: string | null; head_sha: string | null; pr_state: string | null; agent_target: string | null; project_id: string; branch: string | null }[];
 
   for (const t of tasks) {
     // A Jira mirror has no hive-owned PR at all, so there is nothing to record;
@@ -467,6 +467,10 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
           if (scope) writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: { ...scope, head_sha: data.headRefOid ?? null } });
         }
       }
+    }
+    const prState = String(data.state ?? "").toUpperCase() || null;
+    if (prState && prState !== t.pr_state) {
+      db.query("UPDATE tasks SET pr_state = ?, updated_at = ? WHERE id = ?").run(prState, now(), t.id);
     }
     const { status: ci, red } = await probeRed(exec, data.statusCheckRollup, data.baseRefOid ?? null);
     // ci_status only changes when the answer changes; ci_checked_at records

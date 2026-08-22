@@ -516,6 +516,14 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       `ALTER TABLE decisions ADD COLUMN ci_signal TEXT`,
     ],
   },
+  // The PR's last-observed GitHub state (OPEN/CLOSED/MERGED), refreshed by the
+  // reconciler's PR poll alongside ci_status. advanceIfFinished reads this to
+  // avoid promoting to in_review a task whose PR is already known-closed —
+  // syncPRs would immediately bounce it back, ping-ponging every tick (#1256).
+  {
+    name: "v27-task-pr-state",
+    statements: [`ALTER TABLE tasks ADD COLUMN pr_state TEXT`],
+  },
 ];
 
 // -------------------------------------------------------------- settings
