@@ -4874,6 +4874,17 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
           ...(branch ? { branch } : {}),
         },
       });
+    } else if (prUrl) {
+      const branch = await prHeadBranch(exec, prUrl);
+      if (branch && branch !== t.branch) {
+        db.query("UPDATE tasks SET branch = ?, updated_at = ? WHERE id = ?").run(branch, now(), taskId);
+        writeEvent(db, {
+          task_id: taskId,
+          source,
+          type: "pr_branch_refreshed",
+          payload: { pr_url: prUrl, branch, replaced: t.branch },
+        });
+      }
     }
     if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });
     if (t.state === "in_progress") {

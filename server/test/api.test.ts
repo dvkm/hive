@@ -550,7 +550,7 @@ test("ready emit records the pr_url and advances in_progress -> in_review", asyn
   expect(again.json.task.state).toBe("in_review");
 });
 
-test("ready emit refreshes branch metadata when an agent replaces its PR", async () => {
+test("ready emit refreshes stale branch metadata for an already-linked PR", async () => {
   const db2 = openDb(":memory:");
   const exec = async (argv: string[]) => {
     const fields = argv[argv.indexOf("--json") + 1];
@@ -575,7 +575,7 @@ test("ready emit refreshes branch metadata when an agent replaces its PR", async
     await call(`/api/tasks/${task.json.id}/events`, { type: "evidence", note: "proof", kind: "log" });
     db2.query("UPDATE tasks SET branch = ?, pr_url = ? WHERE id = ?").run(
       "hive/task-rejected",
-      "https://github.com/example/repo/pull/1",
+      "https://github.com/example/repo/pull/2",
       task.json.id
     );
 
