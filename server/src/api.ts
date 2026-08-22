@@ -1957,12 +1957,15 @@ function listFeed(db: DB, url: URL): Response {
 // section is a plain query over rows the other endpoints already expose; the web
 // renders them with the existing Decisions / attention-tray / card components.
 //
+// `?project` scopes the spend rollup to one project; the web filters the other
+// sections in the browser, which spend cannot do because it arrives pre-summed.
 // `?since` (ISO) scopes the "what changed" sections (done / incidents / spend /
 // learnings). The action-state sections (open decisions, needs-attention, live
 // fleet, unreviewed intake) are current-state, not windowed — they need you now
 // regardless of when you last looked.
 function brief(db: DB, url: URL): Response {
   const since = url.searchParams.get("since");
+  const project = url.searchParams.get("project");
 
   // ① done since — completed tasks with evidence count + summary, keyed on the
   // state_change→done event ts (the actual completion moment).
@@ -2053,12 +2056,17 @@ function brief(db: DB, url: URL): Response {
     .map((t: any) => taskWithHealth(db, t));
 
   // ⑧ spend since — reuse the analytics rollup (totals + by-model for top model).
-  const w = since ? " WHERE ts >= ?" : "";
-  const a = since ? [since] : [];
+  // `?project` scopes it, so a reader who filtered the brief to one project does
+  // not read a fleet-wide cost next to that project's rows. Usage rows only know
+  // their task, so the project filter joins through tasks.
+  const clauses = [...(since ? ["u.ts >= ?"] : []), ...(project ? ["t.project_id = ?"] : [])];
+  const w = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
+  const a = [...(since ? [since] : []), ...(project ? [project] : [])];
+  const from = `FROM usage u JOIN tasks t ON u.task_id = t.id${w}`;
   const spend = {
-    totals: db.query(`SELECT ${usageTotals()} FROM usage${w}`).get(...a),
+    totals: db.query(`SELECT ${usageTotals("u.")} ${from}`).get(...a),
     by_model: db
-      .query(`SELECT model, ${usageTotals()} FROM usage${w} GROUP BY model ORDER BY cost_usd DESC, total_tokens DESC`)
+      .query(`SELECT u.model, ${usageTotals("u.")} ${from} GROUP BY u.model ORDER BY cost_usd DESC, total_tokens DESC`)
       .all(...a),
   };
 

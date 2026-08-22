@@ -10,7 +10,9 @@ import { AttentionRows, BlockedByLine } from "./attention";
 import { CheckpointsInbox } from "./Checkpoints";
 import { UnderstandingQuiz } from "./UnderstandingQuiz";
 import { fmtUsd, fmtTokens } from "./Analytics";
+import { itemProject } from "../lib/needsYou";
 import type { NeedsYouItem } from "../lib/needsYou";
+import { useProjectFilter, setProjectFilter, inProjectFilter } from "../lib/projectFilter";
 import { taskLabel } from "../lib/references";
 
 const LAST_SEEN_KEY = "hive.brief.lastSeen";
@@ -59,8 +61,15 @@ function TaskEvidence({ taskId, title, compact = false }: { taskId: string; titl
 }
 
 export default function Brief() {
-  const { needsYou, reloadQuizzes, tasks } = useStore();
+  const { needsYou: allNeedsYou, reloadQuizzes, tasks, projects } = useStore();
   const location = useLocation();
+  // Same project filter the board and the other inboxes use, so picking a
+  // project anywhere scopes this queue too.
+  const projectFilter = useProjectFilter();
+  const needsYou = useMemo(
+    () => allNeedsYou.filter((item) => inProjectFilter(itemProject(item, tasks), projectFilter)),
+    [allNeedsYou, tasks, projectFilter],
+  );
   const [mode, setMode] = useState<"focus" | "backlogs">(() => localStorage.getItem(MODE_KEY) === "backlogs" ? "backlogs" : "focus");
 
   // Default the activity-summary window to the last time Needs you was viewed
@@ -76,11 +85,11 @@ export default function Brief() {
 
   useEffect(() => {
     let live = true;
-    api.morningBrief(since).then((b) => live && setData(b)).catch(() => live && setData(null));
+    api.morningBrief(since, projectFilter).then((b) => live && setData(b)).catch(() => live && setData(null));
     return () => {
       live = false;
     };
-  }, [since]);
+  }, [since, projectFilter]);
 
   // Action sections read from the live store so handling an item updates in
   // place via SSE. The disclosed activity summary reads the fetched snapshot.
@@ -101,11 +110,15 @@ export default function Brief() {
   const attention = needsYou.flatMap((item) => item.kind === "attention" ? [item.task] : []);
   const waiting = needsYou.flatMap((item) => item.kind === "waiting" ? [{ task: item.task, blockedBy: item.blockedBy }] : []);
 
-  const done = data?.done ?? [];
-  const fleet = data?.fleet ?? [];
-  const incidents = data?.incidents ?? [];
-  const intake = data?.intake ?? [];
-  const learnings = data?.learnings_new ?? [];
+  // The activity summary is a fetched snapshot, so scope its rows here too.
+  function scope<T extends { project_id: string }>(rows: T[]): T[] {
+    return rows.filter((row) => inProjectFilter(row.project_id, projectFilter));
+  }
+  const done = scope(data?.done ?? []);
+  const fleet = scope(data?.fleet ?? []);
+  const incidents = scope(data?.incidents ?? []);
+  const intake = scope(data?.intake ?? []);
+  const learnings = scope(data?.learnings_new ?? []);
   const spend = data?.spend;
   const spendCount = spend ? spend.totals.calls : 0;
 
@@ -121,6 +134,7 @@ export default function Brief() {
     setMode(next);
     localStorage.setItem(MODE_KEY, next);
   };
+  const activeProject = projects.find((p) => p.id === projectFilter);
   const taskIdLabel = (id: string, number: number) => taskLabel(tasks.find((task) => task.id === id) ?? { number });
 
   return (
@@ -138,13 +152,27 @@ export default function Brief() {
         </div>
       </header>
 
+      <div className="board-switch brief-projects" role="group" aria-label="Project filter">
+        <span className="board-switch-label">Project</span>
+        <button aria-pressed={!projectFilter} className={`board-chip ${projectFilter ? "" : "board-chip-on"}`} onClick={() => setProjectFilter("")}>All</button>
+        {projects.map((p) => (
+          <button
+            key={p.id}
+            aria-pressed={projectFilter === p.id}
+            className={`board-chip ${projectFilter === p.id ? "board-chip-on" : ""}`}
+            onClick={() => setProjectFilter(p.id)}
+          >
+            {p.name}
+          </button>
+        ))}
+      </div>
+
       {data && actionCount === 0 && (
         <div className="brief-quiet">
           <div className="empty-big">All quiet.</div>
           <div className="muted">
-            {waiting.length > 0
-              ? `Nothing needs you. ${waiting.length} waiting on a merge.`
-              : "Nothing needs you."}
+            {`Nothing needs you${activeProject ? ` in ${activeProject.name}` : ""}.`}
+            {waiting.length > 0 && ` ${waiting.length} waiting on a merge.`}
           </div>
         </div>
       )}

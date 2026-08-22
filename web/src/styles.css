@@ -5583,3 +5583,10 @@ a.chip-jira:hover { background: #2d5488; }
 .review-explain-title { display: block; font-weight: 600; }
 .review-explain-title::after { content: " ↗"; opacity: 0.6; }
 .review-explain-hint { display: block; font-size: 12px; color: var(--muted); }
+
+/* The focus/backlogs project chips reuse the board's switcher, minus its
+   board-only page padding. */
+.brief-projects {
+  padding: 0;
+  margin: -16px 0 20px;
+}

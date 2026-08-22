@@ -246,3 +246,21 @@ test("empty brief on a fresh DB has all sections empty", async () => {
     srv.stop(true);
   }
 });
+
+test("?project scopes the spend rollup to that project only", async () => {
+  const otherProject = (await post("/api/projects", { name: "spend-other-proj", repo_path: "/tmp/y" })).json.id;
+  const otherTask = (await post("/api/tasks", { project_id: otherProject, title: "Other project task" })).json.id;
+  db.query("INSERT INTO usage (id, task_id, ts, model, input_tokens, output_tokens, cache_read_tokens, cost_usd, source) VALUES (?,?,?,?,?,?,?,?,?)")
+    .run(newId("use"), otherTask, now(), "claude-haiku-4-5", 100, 10, 0, 0.02, "agent");
+
+  const all = (await get("/api/brief")).json;
+  const scoped = (await get(`/api/brief?project=${otherProject}`)).json;
+  const original = (await get(`/api/brief?project=${projectId}`)).json;
+
+  expect(all.spend.totals.calls).toBe(3);
+  expect(scoped.spend.totals.calls).toBe(1);
+  expect(scoped.spend.totals.cost_usd).toBeCloseTo(0.02, 5);
+  expect(scoped.spend.by_model.map((m: any) => m.model)).toEqual(["claude-haiku-4-5"]);
+  // The other project keeps its own two calls, so scoping is a filter, not a reset.
+  expect(original.spend.totals.calls).toBe(2);
+});

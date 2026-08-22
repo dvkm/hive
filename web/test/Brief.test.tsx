@@ -67,6 +67,7 @@ api.evidence = (async () => ({ evidence: evidence.map((item) => ({ ...item, task
 test("Focus and Backlogs show task evidence inline", async () => {
   const store = {
     tasks: [task],
+    projects: [{ id: task.project_id, name: "Project" }],
     needsYou: [{ kind: "checkpoint", id: checkpoint.id, checkpoint }],
     checkpoints: [checkpoint],
     rev: {},
@@ -122,6 +123,7 @@ test("Focus resets local card state and evidence when advancing to the next item
     : new Promise(() => {})) as typeof api.evidence;
   const store = {
     tasks: [task, secondTask],
+    projects: [{ id: task.project_id, name: "Project" }],
     needsYou: [
       { kind: "decision", id: first.id, decision: first },
       { kind: "decision", id: second.id, decision: second },
@@ -154,4 +156,42 @@ test("Focus resets local card state and evidence when advancing to the next item
   expect(renderer.root.findByType("h2").findByType(ReferenceText).props.text).toBe("Second decision");
   expect(renderer.root.findByProps({ className: "btn btn-primary btn-submit" }).children).toContain("Submit decision");
   expect(renderer.root.findAll((node) => node.type === "img" && node.props.alt === "First evidence")).toHaveLength(0);
+});
+
+test("the project picker scopes Focus to the chosen project", async () => {
+  values.set("hive.inbox.mode", "focus");
+  values.set("hive.board.project", "project-2");
+  const otherTask = { ...task, id: "task-3", number: 3, project_id: "project-2", title: "Other project task" };
+  const mine = { id: "checkpoint-2", task_id: otherTask.id, ts: task.updated_at, task_number: 3, task_title: otherTask.title, task_state: otherTask.state, project_id: "project-2", note: "Mine" };
+  api.evidence = (async () => ({ evidence: [] })) as typeof api.evidence;
+  const store = {
+    tasks: [task, otherTask],
+    projects: [{ id: "project-1", name: "Project one" }, { id: "project-2", name: "Project two" }],
+    needsYou: [
+      { kind: "checkpoint", id: checkpoint.id, checkpoint },
+      { kind: "checkpoint", id: mine.id, checkpoint: mine },
+    ],
+    checkpoints: [checkpoint, mine],
+    rev: {},
+    reloadCheckpoints: () => {},
+    reloadQuizzes: () => {},
+  } as unknown as Store;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(
+      <MemoryRouter>
+        <Ctx.Provider value={store}>
+          <LightboxProvider><Brief /></LightboxProvider>
+        </Ctx.Provider>
+      </MemoryRouter>
+    );
+  });
+
+  // Only the chosen project's checkpoint counts, so the queue reads "1 of 1".
+  expect(renderer.root.findByProps({ className: "brief-focus-meta" }).findAll((node) => node.type === "span")[1].children.join("")).toBe("1 of 1");
+  // "Project two" is the selected chip; "All" is not.
+  const chip = (name: string) => renderer.root.findAll((node) => node.type === "button" && node.children.includes(name))[0];
+  expect(chip("Project two").props.className).toContain("board-chip-on");
+  expect(chip("All").props.className).not.toContain("board-chip-on");
+  values.delete("hive.board.project");
 });
