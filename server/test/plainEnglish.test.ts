@@ -43,7 +43,10 @@ test("the drift judge and the auto-reviewer both carry the plain-English bar", a
   const { db, id } = seed();
   transition(db, id, "in_progress");
   transition(db, id, "in_review");
-  const shellExec: Exec = async () => ({ code: 0, stdout: "+const y = 1;", stderr: "" });
+  const shellExec: Exec = async (argv) =>
+    argv.includes("diff")
+      ? { code: 0, stdout: "+const y = 1;", stderr: "" }
+      : { code: 0, stdout: JSON.stringify({ headRefOid: "review-head" }), stderr: "" };
   let prompt = "";
   await autoReviewOnce(db, {
     shellExec,

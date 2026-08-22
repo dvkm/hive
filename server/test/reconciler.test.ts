@@ -435,6 +435,28 @@ test("syncPRs skips a task that raced ahead to done instead of throwing (task #6
   expect(getTask(db, other).ci_status).toBe("failing");
 });
 
+test("syncPRs never merges/closes a task for a PR it was already replaced with (HIVE-307)", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/old" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+
+  const gh: Exec = stub((argv) => {
+    if (argv[0] !== "gh") return OK();
+    // The agent replaces the PR mid-probe — a fresh `ready` re-links pr_url
+    // to a brand-new PR while this cycle's `gh pr view` for the OLD one is
+    // still in flight.
+    db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run("https://gh/pr/new", now(), id);
+    return OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] }));
+  });
+  await reconcileOnce(db, { exec: gh });
+
+  // The replacement PR must not be reported merged just because the OLD one was.
+  expect(getTask(db, id).pr_url).toBe("https://gh/pr/new");
+  expect(getTask(db, id).state).toBe("in_review");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'pr_merged'").get(id)).toBeFalsy();
+});
+
 test("syncPRs persists the PR's head_sha so the review card can flag stale evidence", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { pr_url: "https://gh/pr/1a" });
@@ -790,6 +812,39 @@ test("autoMergeReady merges only director-approved, opted-in, green, clean-revie
   expect(getTask(db, unapproved).state).toBe("in_review"); // quiz not passed → director boundary
 });
 
+test("autoMergeReady never auto-merges a PR-backed task on a review taken against an earlier head (HIVE-307)", async () => {
+  const { autoMergeReady } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
+  const id = makeTask(db, projectId, { kind: "chore", pr_url: "https://gh/pr/force-pushed" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x', head_sha = ? WHERE id = ?").run("new-head", id);
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
+  );
+  const review = writeEvent(db, {
+    task_id: id,
+    source: "agent",
+    type: "review_summary",
+    payload: { understanding: { check: { question: "safe?", options: [{ key: "review", label: "yes" }], answer_key: "review" } } },
+  });
+  writeEvent(db, { task_id: id, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "review" } });
+  // The review on file is against the OLD (pre-force-push) head.
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "auto_review",
+    payload: { verdict: "looks_good", summary: "s", risks: [], questions: [], reviewed_pr_url: "https://gh/pr/force-pushed", reviewed_head_sha: "old-head" },
+  });
+
+  const git: Exec = stub((argv) => {
+    if (argv[0] === "gh" && argv.includes("merge")) throw new Error("must never merge on a stale review");
+    return OK();
+  });
+  await autoMergeReady(db, { exec: git });
+  expect(getTask(db, id).state).toBe("in_review"); // held — waiting for a fresh review of the new head
+});
+
 test("autoMergeReady holds a task while a queued-input recovery is in flight (#1234 review-12)", async () => {
   const { autoMergeReady } = await import("../src/reconciler.ts");
   const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
@@ -879,7 +934,19 @@ test("autoMergeReady rechecks queued work at every destructive merge boundary", 
       payload: { understanding: { check: { question: "safe?", options: [{ key: "review", label: "yes" }, { key: "guess", label: "no" }], answer_key: "review" } } },
     });
     writeEvent(db, { task_id: id, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "review" } });
-    writeEvent(db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
+    writeEvent(db, {
+      task_id: id,
+      source: "system",
+      type: "auto_review",
+      payload: {
+        verdict: "looks_good",
+        summary: "s",
+        risks: [],
+        questions: [],
+        reviewed_pr_url: mode === "pr" ? "https://gh/pr/1" : null,
+        reviewed_head_sha: (getTask(db, id) as any).head_sha ?? null,
+      },
+    });
 
     let releaseProbe!: () => void;
     let reachedProbe!: () => void;

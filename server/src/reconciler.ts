@@ -53,6 +53,18 @@ function isTrackingOnlyId(db: DB, id: string): boolean {
   return !!task && isTrackingOnlyTask(task);
 }
 
+// The task the reconciler is mid-way through acting on may have moved to a
+// different PR (or a terminal state) while an `await exec` for the OLD PR was
+// in flight — a replacement `ready` emit, a concurrent POST /merge, or
+// another reconcile cycle. Re-checking this before every transition/write
+// keeps a slow gh probe for a since-replaced PR from mutating the task that
+// replaced it (task HIVE-307).
+function currentPrTask(db: DB, task: { id: string; pr_url: string }): any | null {
+  const current = getTask(db, task.id);
+  if (!current || TERMINAL.includes(current.state as State) || current.pr_url !== task.pr_url) return null;
+  return current;
+}
+
 function isJiraMirrorId(db: DB, id: string): boolean {
   const task = getTask(db, id);
   return !!task && isJiraMirror(task);
@@ -421,14 +433,17 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     // The task's state may have moved on since the SELECT above — a concurrent
     // POST /merge, autoMergeReady, or an overlapping reconcile cycle can land
     // while this `await exec` was in flight and advance the task to a terminal
-    // state or replace its linked PR. Every branch below acts on those facts;
-    // re-read them and skip once terminal or re-linked rather than trusting the
-    // stale `t` snapshot — that stale state read is exactly what threw
-    // "invalid transition: 'done' -> 'verifying'" in production (task #621).
-    const live = getTask(db, t.id);
-    if (!live || TERMINAL.includes(live.state as State) || live.pr_url !== t.pr_url) continue;
-    const state: string = live.state;
-    const deferred = isDeferred(live);
+    // state, OR the agent can have replaced this PR with another one (a fresh
+    // `ready` re-links pr_url). Every branch below transitions off the task's
+    // state or writes events tagged with this PR; re-read fresh and skip once
+    // terminal or re-linked, rather than trusting the stale `t` snapshot —
+    // that stale read is exactly what threw "invalid transition: 'done' ->
+    // 'verifying'" in production (task #621), and an untagged skip here would
+    // let a slow probe for a REPLACED PR advance the task that replaced it.
+    let live = currentPrTask(db, t);
+    if (!live) continue;
+    let state: string = live.state;
+    let deferred = isDeferred(live);
     // Record a new pushed commit as `pr_synchronized` (hive's stand-in for
     // GitHub's synchronize webhook) so changesRequestUnaddressed can tell "the
     // agent pushed a fix" from "CI is still green on the same old head". The
@@ -513,6 +528,13 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     // (ci_status, head_sha, branch_scope, pr_synchronized) already ran: it's
     // just recording observed PR facts, useful for the tracked view.
     if (neverDispatched(db, live)) continue;
+    // Re-check once more right before the actionable phase: the bookkeeping
+    // above (probeRed, ci_status writes) awaited too, and is the last chance
+    // for a PR replacement/closure race to have landed.
+    live = currentPrTask(db, t);
+    if (!live) continue;
+    state = live.state;
+    deferred = isDeferred(live);
     // Time-based fallback for the link-time hand-off — but review means "CI is
     // green and the director can merge", so failing/pending checks HOLD the
     // task in_progress (this is also what promotes a held `ready`: the moment
@@ -962,6 +984,45 @@ export async function ciStatusProbed(exec: Exec, rollup: any, baseSha?: string |
   return (await probeRed(exec, rollup, baseSha)).status;
 }
 
+// A stable read of a PR's live state/head/CI, for callers about to act on it
+// (merge). Reads twice and only trusts an answer where head, state, and the
+// check rollup agree across both reads — a force-push or a check landing
+// mid-probe just re-reads rather than handing back a torn snapshot. Up to 3
+// attempts before giving up. Used to give `gh pr merge` the verified head as
+// an atomic `--match-head-commit` precondition (task HIVE-307).
+export async function probePrReadiness(
+  exec: Exec,
+  prUrl: string
+): Promise<{ ok: true; data: any; ci: string | null } | { ok: false }> {
+  const fields = "state,statusCheckRollup,headRefOid";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const first = await exec(["gh", "pr", "view", prUrl, "--json", fields]);
+    if (first.code !== 0) return { ok: false };
+    let data: any;
+    try {
+      data = JSON.parse(first.stdout || "{}");
+    } catch {
+      return { ok: false };
+    }
+    const ci = await ciStatusProbed(exec, data.statusCheckRollup);
+    const confirmed = await exec(["gh", "pr", "view", prUrl, "--json", fields]);
+    if (confirmed.code !== 0) return { ok: false };
+    let current: any;
+    try {
+      current = JSON.parse(confirmed.stdout || "{}");
+    } catch {
+      return { ok: false };
+    }
+    if (
+      data.headRefOid === current.headRefOid &&
+      String(data.state ?? "").toUpperCase() === String(current.state ?? "").toUpperCase() &&
+      JSON.stringify(data.statusCheckRollup ?? null) === JSON.stringify(current.statusCheckRollup ?? null)
+    )
+      return { ok: true, data: current, ci };
+  }
+  return { ok: false };
+}
+
 // Signal freshness. A card that cited red checks is only worth the director's
 // attention while the checks are still red. syncPRs re-probes every cycle, so
 // the moment they turn green the question is moot: close it, tell the agent, and
@@ -1027,10 +1088,10 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
   const h = deps.herdr ?? defaultHerdr;
   const rows = db
     .query(
-      `SELECT t.id, t.number, t.title, t.kind, p.config FROM tasks t JOIN projects p ON p.id = t.project_id
+      `SELECT t.id, t.number, t.title, t.kind, t.pr_url, t.head_sha, p.config FROM tasks t JOIN projects p ON p.id = t.project_id
         WHERE t.state = 'in_review' AND t.ci_status = 'passing' AND ${supervisedSql("t.source", "t.agent_target")}`
     )
-    .all() as { id: string; number: number; title: string; kind: string; config: string }[];
+    .all() as { id: string; number: number; title: string; kind: string; pr_url: string | null; head_sha: string | null; config: string }[];
   for (const r of rows) {
     if (isTrackingOnlyId(db, r.id)) continue;
     // A queued steer is requested work the agent has not received yet. Never
@@ -1057,6 +1118,11 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
       continue;
     }
     if (verdict.skipped || verdict.verdict !== "looks_good") continue;
+    // A PR-backed task's most recent review must have been taken against the
+    // PR head that's about to be merged — a delayed review from before a
+    // force-push or PR replacement must never auto-merge the new head
+    // (task HIVE-307). Not fatal: just wait for autoReviewOnce to catch up.
+    if (r.pr_url && (verdict.reviewed_pr_url !== r.pr_url || verdict.reviewed_head_sha !== r.head_sha)) continue;
     // Same policy the planner uses for its breakdown cards: a PR merge is
     // always revertible (reversible=true) and touches the shared main branch
     // (blastRadius="shared"); the pre-review's own risks/questions are the

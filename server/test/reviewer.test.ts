@@ -46,7 +46,7 @@ function setup(
 const ghDiff: Exec = async (argv) =>
   argv.includes("diff")
     ? { code: 0, stdout: "--- a/x.ts\n+++ b/x.ts\n+const y = 1;", stderr: "" }
-    : { code: 0, stdout: "", stderr: "" };
+    : { code: 0, stdout: JSON.stringify({ headRefOid: "review-head" }), stderr: "" };
 
 const events = (db: DB, id: string, type: string) =>
   db.query("SELECT * FROM events WHERE task_id = ? AND type = ?").all(id, type).map((e: any) => ({ ...e, payload: JSON.parse(e.payload) }));
@@ -63,11 +63,84 @@ test("posts a structured pre-review onto the review card, once", async () => {
   expect(revs).toHaveLength(1);
   expect(revs[0].payload.verdict).toBe("caution");
   expect(revs[0].payload.risks[0]).toContain("dead code");
+  expect(revs[0].payload).toMatchObject({ reviewed_pr_url: "https://gh/pr/5", reviewed_head_sha: "review-head" });
   expect(prompts[0]).toContain("add feature"); // brief made it into the prompt
   expect(prompts[0]).toContain("--model sonnet");
 
   await autoReviewOnce(db, { exec: claude, shellExec: ghDiff }); // no second review
   expect(events(db, id, "auto_review")).toHaveLength(1);
+});
+
+test("reviewer discards a verdict when the live PR head changes during review", async () => {
+  const { db, id } = setup();
+  let head = "head-before-review";
+  const shell: Exec = async (argv) =>
+    argv.includes("diff")
+      ? { code: 0, stdout: "+const reviewed = true;", stderr: "" }
+      : { code: 0, stdout: JSON.stringify({ headRefOid: head }), stderr: "" };
+  let release!: () => void;
+  const waiting = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const began = new Promise<void>((resolve) => { started = resolve; });
+  const stale = autoReviewOnce(db, {
+    shellExec: shell,
+    exec: async () => {
+      started();
+      await waiting;
+      return {
+        code: 0,
+        stdout: JSON.stringify({ result: '{"verdict":"looks_good","summary":"stale head","risks":[],"questions":[]}' }),
+        stderr: "",
+      };
+    },
+  });
+  await began;
+  head = "head-after-force-push";
+  release();
+  await stale;
+
+  expect(events(db, id, "auto_review")).toHaveLength(0);
+
+  await autoReviewOnce(db, {
+    shellExec: shell,
+    exec: async () => ({
+      code: 0,
+      stdout: JSON.stringify({ result: '{"verdict":"looks_good","summary":"current head","risks":[],"questions":[]}' }),
+      stderr: "",
+    }),
+  });
+  expect(events(db, id, "auto_review")[0].payload).toMatchObject({
+    summary: "current head",
+    reviewed_pr_url: "https://gh/pr/5",
+    reviewed_head_sha: "head-after-force-push",
+  });
+});
+
+test("reviewer runs again after a reviewed PR is force-pushed", async () => {
+  const { db, id } = setup();
+  let head = "reviewed-head";
+  const shell: Exec = async (argv) =>
+    argv.includes("diff")
+      ? { code: 0, stdout: "+const reviewed = true;", stderr: "" }
+      : { code: 0, stdout: JSON.stringify({ headRefOid: head }), stderr: "" };
+  let reviews = 0;
+  const claude = async () => ({
+    code: 0,
+    stdout: JSON.stringify({
+      result: JSON.stringify({ verdict: "looks_good", summary: `review ${++reviews}`, risks: [], questions: [] }),
+    }),
+    stderr: "",
+  });
+
+  await autoReviewOnce(db, { exec: claude, shellExec: shell });
+  head = "force-pushed-head";
+  db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run(head, id);
+  await autoReviewOnce(db, { exec: claude, shellExec: shell });
+
+  expect(events(db, id, "auto_review").map((event) => event.payload.reviewed_head_sha)).toEqual([
+    "reviewed-head",
+    "force-pushed-head",
+  ]);
 });
 
 test("a branch-only review compares against the remote integration branch", async () => {

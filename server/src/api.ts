@@ -74,7 +74,7 @@ import { vapidPublicKey, saveSubscription, removeSubscription, type PushSub } fr
 import { explainCommandDecision } from "./explain.ts";
 import { explanationGate } from "./explainDiff.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
-import { ciStatusOf, ciStatusProbed, reclaimDeadWorktree, infraTaskOpen } from "./reconciler.ts";
+import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
@@ -2692,7 +2692,25 @@ export async function mergeTask(
       const flag = ghMergeFlag(config.merge_method);
       method = `pr ${flag.slice(2)}`;
       if (opts.beforeMutation && !opts.beforeMutation()) return err(AUTO_MERGE_PAUSED, 409);
-      const r = await exec(["gh", "pr", "merge", task.pr_url, flag]);
+      // Re-verify the PR's live head immediately before merging (the probe at
+      // the top of this function, any auto-review pass, and the director's
+      // click can all be arbitrarily stale by now) and give `gh pr merge` that
+      // exact head as an atomic precondition — a force-push or new commit
+      // landing in the gap then fails the merge instead of being silently
+      // absorbed into it (task HIVE-307). Best-effort: if the live head can't
+      // be confirmed, fall back to the unguarded merge rather than blocking on
+      // a probe failure unrelated to the merge itself.
+      let matchedHead: string | null = null;
+      const readiness = await probePrReadiness(exec, task.pr_url);
+      if (opts.beforeMutation && !opts.beforeMutation()) return err(AUTO_MERGE_PAUSED, 409);
+      if (readiness.ok) {
+        const liveHead =
+          typeof readiness.data.headRefOid === "string" && readiness.data.headRefOid ? readiness.data.headRefOid : null;
+        if (liveHead && String(readiness.data.state ?? "").toUpperCase() === "OPEN") matchedHead = liveHead;
+      }
+      const mergeArgv = ["gh", "pr", "merge", task.pr_url, flag];
+      if (matchedHead) mergeArgv.push("--match-head-commit", matchedHead);
+      const r = await exec(mergeArgv);
       if (r.code !== 0) {
         const reason = r.stderr.trim() || r.stdout.trim() || `gh pr merge exited ${r.code}`;
         // GitHub's mergeability check compares against origin/<base>, which can
