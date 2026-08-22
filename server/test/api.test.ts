@@ -550,6 +550,47 @@ test("ready emit records the pr_url and advances in_progress -> in_review", asyn
   expect(again.json.task.state).toBe("in_review");
 });
 
+test("ready emit refreshes branch metadata when an agent replaces its PR", async () => {
+  const db2 = openDb(":memory:");
+  const exec = async (argv: string[]) => {
+    const fields = argv[argv.indexOf("--json") + 1];
+    if (fields === "headRefName")
+      return { code: 0, stdout: JSON.stringify({ headRefName: "hive/task-recut" }), stderr: "" };
+    return { code: 1, stdout: "", stderr: "not needed" };
+  };
+  const srv = Bun.serve({ port: 0, fetch: makeHandler(db2, { exec }) });
+  const call = async (path: string, body: unknown) => {
+    const response = await fetch(`http://127.0.0.1:${srv.port}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { status: response.status, json: await response.json() };
+  };
+
+  try {
+    const project = await call("/api/projects", { name: "replacement-pr", repo_path: "/tmp/x" });
+    const task = await call("/api/tasks", { project_id: project.json.id, title: "replace stale PR" });
+    await call(`/api/tasks/${task.json.id}/transition`, { to: "in_progress" });
+    await call(`/api/tasks/${task.json.id}/events`, { type: "evidence", note: "proof", kind: "log" });
+    db2.query("UPDATE tasks SET branch = ?, pr_url = ? WHERE id = ?").run(
+      "hive/task-rejected",
+      "https://github.com/example/repo/pull/1",
+      task.json.id
+    );
+
+    const ready = await call(`/api/tasks/${task.json.id}/events`, {
+      type: "ready",
+      pr_url: "https://github.com/example/repo/pull/2",
+    });
+    expect(ready.status).toBe(200);
+    expect(ready.json.task.pr_url).toBe("https://github.com/example/repo/pull/2");
+    expect(ready.json.task.branch).toBe("hive/task-recut");
+  } finally {
+    srv.stop(true);
+  }
+});
+
 // HIVE-314: a task's own PR closed with nothing left to merge (head==base),
 // but the work actually landed via a different PR/commit on the base branch.
 // `unmergeable` is the agent's self-service terminal path: hive verifies the
