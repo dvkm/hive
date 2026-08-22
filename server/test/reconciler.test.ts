@@ -1267,6 +1267,7 @@ test("reconciler backfills a requeue when its failed predecessor's PR is linked 
   db.query("UPDATE tasks SET branch = ? WHERE id = ?").run(branch, predecessor);
   db.query("UPDATE tasks SET parent_task_id = ?, resume_branch = ?, brief = ? WHERE id = ?")
     .run(predecessor, branch, "Keep this original brief.", successor);
+  writeEvent(db, { task_id: successor, source: "reconciler", type: "created", payload: { requeue_of: predecessor } });
 
   const gh: Exec = stub((argv) => argv.includes("list")
     ? OK(JSON.stringify([{ title: "PR", body: `hive-task: ${predecessor}`, url: prUrl }]))
