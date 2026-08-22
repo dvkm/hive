@@ -276,3 +276,53 @@ test("a config.default_branch starting with `-` never reaches git argv (task #10
   // and it fell back to the default base, so the check still ran normally
   expect(argvs.some((a) => a.some((x) => x.startsWith("origin/main.")))).toBe(true);
 });
+
+// HIVE-291 / #1095 (dec_46a0c8614067): local main pinned at an old commit while
+// origin/main advanced past it. A task branch correctly rebased onto origin/main
+// (zero commits of its own ahead of it) must not have origin/main's own commits
+// — landed by unrelated PRs since local main last moved — counted as its footprint.
+test("a branch rebased onto an ahead-of-local-main origin/main shows zero footprint (HIVE-291)", async () => {
+  const foreignCommits = [
+    "fix(reconciler): resolve gh PATH, health surfacing (#126)",
+    "fix(reconciler): recover agents with queued input (#129)",
+  ];
+  const foreignFiles = ["server/src/reconciler.ts", "server/src/health.ts"];
+  const { branchFootprint } = await import("../src/drift.ts");
+
+  // A stale local `main` sees the branch as having "accumulated" everything
+  // origin/main gained since local main last fast-forwarded — the bug.
+  const staleLocalMain: Exec = async (argv) => {
+    if (argv.includes("--name-only")) return { code: 0, stdout: foreignFiles.join("\n"), stderr: "" };
+    if (argv.includes("--format=%s")) return { code: 0, stdout: foreignCommits.join("\n"), stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const staleFp = await branchFootprint(staleLocalMain, "/repo", "main", "hive/abc");
+  expect(staleFp?.commits).toEqual(foreignCommits); // demonstrates the bug against a stale local ref
+
+  // Measured against origin/main (what projectComparisonBase resolves to), the
+  // rebased branch has zero real commits and zero files of its own.
+  const originMain: Exec = async (argv) => {
+    if (argv.includes("--name-only")) return { code: 0, stdout: "", stderr: "" };
+    if (argv.includes("--format=%s")) return { code: 0, stdout: "", stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const fixedFp = await branchFootprint(originMain, "/repo", "origin/main", "hive/abc");
+  expect(fixedFp?.commits).toEqual([]);
+  expect(fixedFp?.files).toEqual([]);
+  for (const c of foreignCommits) expect(fixedFp?.commits).not.toContain(c);
+
+  // End to end: driftCheckOnce resolves the base itself, and must use
+  // origin/main (via projectComparisonBase), never the bare local branch name.
+  const { db, id } = setup();
+  const argvs: string[][] = [];
+  const recording: Exec = async (argv) => {
+    argvs.push(argv);
+    const usedOrigin = argv.some((a) => a.startsWith("origin/main"));
+    if (argv.includes("--name-only")) return { code: 0, stdout: usedOrigin ? "" : foreignFiles.join("\n"), stderr: "" };
+    if (argv.includes("--format=%s")) return { code: 0, stdout: usedOrigin ? "" : foreignCommits.join("\n"), stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  expect(await driftCheckOnce(db, { shellExec: recording, exec: judge({ drifting: false, beyond: [], why: "" }) })).toBeNull();
+  expect(argvs.some((a) => a.some((x) => x.startsWith("main.")))).toBe(false);
+  expect(openCards(db, id)).toHaveLength(0);
+});
