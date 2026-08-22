@@ -122,6 +122,62 @@ test("apiAutoAnswerDecision resolves a recommended authority deny without granti
   expect((db.query("SELECT status FROM authority_grants WHERE decision_id=?").get(d.id) as any).status).toBe("denied");
 });
 
+test("agent-dialog deny only closes a stale card from the current agent generation", async () => {
+  const released = seedDecision({
+    title: "Agent blocked on a dialog: permission prompt",
+    risk: "medium",
+    options: [{ key: "approve", label: "Approve" }, { key: "deny", label: "Deny" }],
+  });
+  marker("blocked_card", released);
+  marker("agent_released", released);
+  expect(apiAutoAnswerDecision(db, herdr as any, released, { answer_key: "deny" }).status).toBe(200);
+
+  const done = seedDecision({
+    title: "Agent blocked on a dialog: permission prompt",
+    risk: "medium",
+    options: [{ key: "approve", label: "Approve" }, { key: "deny", label: "Deny" }],
+  });
+  marker("blocked_card", done);
+  marker("agent_status", done, { status: "done" });
+  expect(apiAutoAnswerDecision(db, herdr as any, done, { answer_key: "deny" }).status).toBe(200);
+
+  const live = seedDecision({
+    title: "Agent blocked on a dialog: permission prompt",
+    risk: "medium",
+    options: [{ key: "approve", label: "Approve" }, { key: "deny", label: "Deny" }],
+  });
+  marker("blocked_card", live);
+  expect(apiAutoAnswerDecision(db, herdr as any, live, { answer_key: "deny" }).status).toBe(403);
+
+  const respawned = seedDecision({
+    title: "Agent blocked on a dialog: permission prompt",
+    risk: "medium",
+    options: [{ key: "approve", label: "Approve" }, { key: "deny", label: "Deny" }],
+  });
+  marker("blocked_card", respawned);
+  marker("agent_released", respawned);
+  marker("spawned", respawned);
+  expect(apiAutoAnswerDecision(db, herdr as any, respawned, { answer_key: "deny" }).status).toBe(403);
+
+  const approve = seedDecision({
+    title: "Agent blocked on a dialog: permission prompt",
+    risk: "medium",
+    options: [{ key: "approve", label: "Approve" }, { key: "deny", label: "Deny" }],
+  });
+  marker("blocked_card", approve);
+  marker("agent_released", approve);
+  expect(apiAutoAnswerDecision(db, herdr as any, approve, { answer_key: "approve" }).status).toBe(403);
+
+  const unrelated = seedDecision({
+    title: "Choose a launch segment",
+    risk: "normal",
+    options: [{ key: "deny", label: "Deny" }],
+  });
+  const response = apiAutoAnswerDecision(db, herdr as any, unrelated, { answer_key: "deny" });
+  expect(response.status).toBe(403);
+  expect((await response.json()).reason).toBe("only the raiser's recommended option can be auto-approved");
+});
+
 test("high risk, prod blast radius, and non-recommended options each escalate", () => {
   const highRisk = seedDecision({ title: "Save recurring link as a project reference? https://x", risk: "high", options: [REC("save")] });
   expect(evaluateAutoApprove(db, db.query("SELECT * FROM decisions WHERE id=?").get(highRisk), "save").allow).toBe(false);
