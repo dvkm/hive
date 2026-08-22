@@ -379,6 +379,11 @@ export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, s
   if (queuedInputRecoveryPending(db, taskId)) return false;
   const hasReport = task.kind === "scout" && evidenceCount(db, taskId, "report") >= 1;
   if (!task.pr_url && !hasReport) return false; // no product to review → health surfaces it, don't advance
+  // A PR the reconciler last observed CLOSED (not merged) has nothing to
+  // review — promoting anyway is a same-tick self-contradiction: syncPRs
+  // would immediately bounce it back to in_progress, ping-ponging every
+  // reconciler cycle and re-steering the agent each time (#1256).
+  if (task.pr_url && task.pr_state === "CLOSED") return false;
   // Review means CI is green. failing/pending holds here; the reconciler's
   // syncPRs promotes the moment checks pass (and steers the agent on red).
   // null = no checks known (repo without CI) — that flows as before.
