@@ -285,6 +285,49 @@ test("SQL-looking text in a pure read-only search pipeline is not dangerous", ()
   expect(classify('echo "UPDATE t SET x=1" | mysql', env).decision).toBe("dangerous");
 });
 
+// HIVE-287 (task 1246): #1022 fixed this only for reason.startsWith("SQL ").
+// Same mechanism trips every other dangerous category too — a benign
+// read-only pipeline where a LATER unquoted grep pattern happens to be an
+// EXECUTOR name ("source") disables data-text stripping, so the trigger word
+// quoted in an EARLIER segment gets scanned as if it were live shell text.
+// Live incident: an echo whose quoted payload contained "SWEEP-KILL
+// EVIDENCE" tripped command.dangerous.process-kill though nothing was killed.
+test("quoted trigger words in a read-only pipeline are not dangerous, across every category", () => {
+  const env = { HOME: "/Users/you" };
+  const triggers: [string, string][] = [
+    ["recursive/forced rm", "rm -rf /tmp/x"],
+    ["privilege escalation", "sudo rm -rf /"],
+    // pipe-to-shell is excluded: its trigger phrase contains a literal "|",
+    // which the naive segmenter (not quote-aware, see segments() above)
+    // splits as a real pipe — correctly keeps this one conservative/dangerous.
+    ["force push", "git push --force origin main"],
+    ["hard reset", "git reset --hard HEAD"],
+    ["git clean", "git clean -fd"],
+    ["force-delete branch", "git branch -D old-branch"],
+    ["filesystem format", "mkfs.ext4 /dev/sda1"],
+    ["raw disk write", "dd if=/dev/zero of=/dev/sda"],
+    ["power/session control", "shutdown -h now"],
+    ["world-writable chmod", "chmod 777 secrets"],
+    ["recursive chown", "chown -R nobody /srv"],
+    ["process kill", "SWEEP-KILL EVIDENCE: kill -9 1234"],
+    ["find with -delete/-exec", "find / -delete"],
+    ["SQL drop/truncate", "DROP TABLE users"],
+    ["SQL DELETE without WHERE", "DELETE FROM users"],
+    ["SQL UPDATE without WHERE", "UPDATE users SET active=1"],
+    ["terraform apply/destroy", "terraform destroy"],
+    ["kubectl delete", "kubectl delete pod x"],
+    ["helm delete/uninstall", "helm uninstall x"],
+  ];
+  for (const [category, phrase] of triggers) {
+    const cmd = `grep -rn "${phrase}" server/src | grep -i source`;
+    expect(classify(cmd, env).decision, `${category}: ${cmd}`).toBe("safe");
+  }
+  // the waiver requires the WHOLE pipeline to be read-only — a real executor
+  // (not just an EXECUTOR-shaped word) alongside the same text still gates
+  expect(classify('grep -l "UPDATE" *.sql | xargs -I{} mysql -e "UPDATE t SET x=1"', env).decision).toBe("dangerous");
+  expect(classify('echo "kill -9 1234" | bash', env).decision).toBe("dangerous");
+});
+
 test("hive emit with destructive text in the note is data, not danger", () => {
   // A lone `hive emit` call is on the SAFE allowlist (herdr reporting calls are
   // required constantly and only POST to hive's own board); note text is data.
