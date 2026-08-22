@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 
 // Single source of truth for the active project filter, shared across the board,
-// the decisions/review inboxes, and the command palette. Persisted in
-// localStorage and broadcast via a window event so every mounted view stays in
-// sync when the filter changes from anywhere (board chips or palette action).
+// the decisions/review inboxes, the focus/backlogs queue, and the command
+// palette. Persisted in localStorage and broadcast via a window event so every
+// mounted view stays in sync when the filter changes from anywhere (board chips
+// or palette action).
 const KEY = "hive.board.project";
 const EVENT = "hive:project-filter";
 
@@ -12,8 +13,8 @@ export function getProjectFilter(): string {
 }
 
 // Does an item belong to the active project filter? An empty filter ("" = All)
-// matches everything. Used by the board and the decisions/review inboxes so the
-// scoping rule lives in exactly one place.
+// matches everything. Used by the board, the decisions/review inboxes, and the
+// focus/backlogs queue so the scoping rule lives in exactly one place.
 export function inProjectFilter(projectId: string | undefined, filter: string): boolean {
   return !filter || projectId === filter;
 }

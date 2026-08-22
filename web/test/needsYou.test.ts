@@ -2,7 +2,8 @@ import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { Checkpoint, Decision, Task, UnderstandingQuiz } from "../src/lib/api";
-import { getNeedsYouItems, trackedSubtasks } from "../src/lib/needsYou";
+import { getNeedsYouItems, itemProject, trackedSubtasks } from "../src/lib/needsYou";
+import { inProjectFilter } from "../src/lib/projectFilter";
 import { JiraPanel, jiraMoveHint, jiraMoveSummary, jiraNextAutomaticText, jiraPanelNotice, trackingBindingNotice } from "../src/views/Task";
 
 const task = (id: string, state: Task["state"], extra: Partial<Task> = {}) => ({ id, state, ...extra }) as Task;
@@ -275,4 +276,21 @@ test("legacy tracking bindings remain visibly actionable", () => {
   }) as any;
   expect(trackingBindingNotice(jira)).toContain("/repo/.worktrees/legacy");
   expect(trackingBindingNotice(task("ordinary", "in_progress") as any)).toBeNull();
+});
+
+test("itemProject resolves the project for every needs-you item kind", () => {
+  const reviewTask = task("t-review", "in_review", { project_id: "p1", pr_url: "https://x/1", ci_status: "passing" });
+  const decisionTask = task("t-decision", "needs_decision", { project_id: "p2" });
+  const tasks = [reviewTask, decisionTask];
+  const decision = { id: "d1", task_id: "t-decision", status: "open" } as Decision;
+  const checkpoint = { id: "c1", task_id: "t-x", project_id: "p3" } as Checkpoint;
+  const quiz = { id: "q1", task_id: "t-y", project_id: "p4", task_state: "verifying" } as UnderstandingQuiz;
+
+  const items = getNeedsYouItems([decision], tasks, [checkpoint], [quiz]);
+  const projects = Object.fromEntries(items.map((item) => [item.kind, itemProject(item, tasks)]));
+  expect(projects).toEqual({ decision: "p2", checkpoint: "p3", quiz: "p4", review: "p1" });
+
+  // "All" (empty filter) keeps everything; a project filter keeps only its own.
+  expect(items.filter((item) => inProjectFilter(itemProject(item, tasks), "")).length).toBe(4);
+  expect(items.filter((item) => inProjectFilter(itemProject(item, tasks), "p2")).map((item) => item.kind)).toEqual(["decision"]);
 });

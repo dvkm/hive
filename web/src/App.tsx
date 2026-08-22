@@ -16,6 +16,8 @@ import {
   faHeart,
 } from "@fortawesome/free-solid-svg-icons";
 import { useStore } from "./lib/store";
+import { itemProject } from "./lib/needsYou";
+import { useProjectFilter, inProjectFilter } from "./lib/projectFilter";
 import { relTime } from "./lib/time";
 import { toast } from "./lib/ui";
 import { pushState, enablePush } from "./lib/push";
@@ -245,8 +247,11 @@ function Bell() {
 }
 
 export default function App() {
-  const { needsYou, offline, setOffline } = useStore();
-  const inboxCount = needsYou.filter((item) => item.kind !== "waiting").length;
+  const { needsYou, tasks, offline, setOffline } = useStore();
+  const projectFilter = useProjectFilter();
+  const inboxCount = needsYou.filter(
+    (item) => item.kind !== "waiting" && inProjectFilter(itemProject(item, tasks), projectFilter),
+  ).length;
   const location = useLocation();
   // Board card clicks push /tasks/:id with state.backgroundLocation set to the
   // board's location — that keeps the board mounted and rendered underneath

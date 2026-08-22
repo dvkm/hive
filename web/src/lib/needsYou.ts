@@ -124,3 +124,13 @@ export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoin
     }),
   ];
 }
+
+// Which project does a needs-you item belong to? Checkpoints and quizzes carry
+// their project; a decision only knows its task, so look that up. Used by the
+// focus/backlogs views to honour the shared project filter.
+export function itemProject(item: NeedsYouItem, tasks: Task[]): string | undefined {
+  if (item.kind === "decision") return tasks.find((task) => task.id === item.decision.task_id)?.project_id;
+  if (item.kind === "checkpoint") return item.checkpoint.project_id;
+  if (item.kind === "quiz") return item.quiz.project_id;
+  return item.task.project_id;
+}

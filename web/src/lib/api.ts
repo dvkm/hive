@@ -817,8 +817,13 @@ export const api = {
   search: (q: string, limit = 50) =>
     req<{ hits: SearchHit[] }>(`/api/search?q=${encodeURIComponent(q)}&limit=${limit}`),
 
-  morningBrief: (since?: string) =>
-    req<Brief>(`/api/brief${since ? "?since=" + encodeURIComponent(since) : ""}`),
+  morningBrief: (since?: string, project?: string) => {
+    const q = new URLSearchParams();
+    if (since) q.set("since", since);
+    if (project) q.set("project", project); // scopes the spend rollup; other sections filter in the browser
+    const qs = q.toString();
+    return req<Brief>(`/api/brief${qs ? "?" + qs : ""}`);
+  },
 
   // Director chat (persistent project supervisor or global Chief of Staff session).
   chatThreads: (project_id?: string) =>
