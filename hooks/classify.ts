@@ -26,6 +26,13 @@ export interface Classification {
 // Destructive / high-blast patterns. Matched against the whole command string,
 // so chaining (`ok; rm -rf /`) or piping into a shell can't hide them.
 const DANGEROUS: [RegExp, string][] = [
+  [/\blaunchctl\s+(kickstart|bootout)\b/i, "live Hive server control"],
+  [/(^|[\s;&|])(?:\.\/)?scripts\/sync-main\.sh\b/i, "live Hive server control"],
+  [/(^|[\s;&|])(?:\.\/)?electron\/install-app\.sh\b/i, "live Hive server control"],
+  [/(^|[\s;&|])(?:\$HIVE_CLI|(?:\.\/)?bin\/hive|hive)\s+serve\b/i, "live Hive server control"],
+  [/(^|[\s;&|])(?:env\s+)?HIVE_PORT=4700\b/i, "live Hive server control"],
+  [/^(?![\s\S]*\bHIVE_PORT=(?!4700\b)\d+\b)[\s\S]*(^|[\s;&|])(?:bun|node)\b[^\n;&|]*server\/src\/index\.ts\b/i, "live Hive server control"],
+  [/(^|[\s;&|])(?:bun|node|npm|npx|pnpm|yarn|vite|python3?|ruby|go|socat)\b[^\n;&|]*(?:--port(?:=|\s+)4700\b|\bhttp\.server\s+4700\b|TCP-LISTEN:4700\b)/i, "live Hive server control"],
   [/(^|[\s;&|("'])rm\s+(-[a-z]*\s+)*-[a-z]*[rf]/i, "recursive/forced rm"],
   [/(^|[\s;&|(])(sudo|doas)\b/i, "privilege escalation"],
   [/(curl|wget|fetch)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh|python|perl|ruby|node)\b/i, "pipe-to-shell from network"],
@@ -58,6 +65,7 @@ const DANGEROUS: [RegExp, string][] = [
 // executable shell text — matched against the RAW command, never the
 // data-stripped scan target (the argument is usually quoted).
 const DANGEROUS_RAW: [RegExp, string][] = [
+  [/(^|[\s;&|])"\$HIVE_CLI"\s+serve\b/i, "live Hive server control"],
   // Agents answering their own decision cards / minting authority rules defeats
   // the whole escalation model — attempted live 2026-07-10 (dec_c698522e5c30).
   [/\/api\/decisions\/[^\s"']+\/(answer|dismiss)/i, "hive decision tampering"],
