@@ -928,10 +928,11 @@ recognized fields (JSON keys == form field names):
 
 | field | meaning |
 |-------|---------|
-| `type` (required) | `status` \| `evidence` \| `needs-decision` \| `ready` \| `done` \| `blocked` \| `deferred` \| `undefer` \| `usage` \| `assistant_text` \| `tool_use` \| `agent_turn_end` \| any custom string |
+| `type` (required) | `status` \| `evidence` \| `needs-decision` \| `ready` \| `done` \| `unmergeable` \| `blocked` \| `deferred` \| `undefer` \| `usage` \| `assistant_text` \| `tool_use` \| `agent_turn_end` \| any custom string |
 | `source` | defaults to `agent` |
 | `note` | free text; stored in the event payload / used as caption/summary |
 | `pr_url` | (`ready` type) the opened PR URL; recorded on the task, replacing its prior PR link when different |
+| `landing_commit` (or `commit_sha`) | (`unmergeable` type) the git SHA (7-40 hex chars) that actually carries the work on the base branch |
 | `payload` | structured event payload object, passed through verbatim for `assistant_text` / `tool_use` / `agent_turn_end` (JSON body) |
 | `kind` | evidence kind (evidence type only); defaults to `screenshot` if a file is present, else `link`/`log` |
 | `caption` | evidence caption |
@@ -952,6 +953,15 @@ Behavior by `type`:
 - `ready` → the finished-handoff signal. Records or replaces `pr_url` when supplied (writing a `pr_linked` event and clearing prior `ci_status`/`head_sha` on replacement), then advances `in_progress → in_review` with a `ready_for_review` event. Idempotent: on a task that isn't `in_progress` (already advanced) it acks without transitioning. → `200 {task: Task}`
 - `done` → records the `note` as summary + `note` event, then transitions the
   task to `done` (evidence rule enforced). → `200 {task: Task}` | `409`
+- `unmergeable` (HIVE-314) → self-service terminal path for a task whose own PR
+  has nothing left to merge (e.g. GitHub refuses `reopenPullRequest` because
+  head==base) but the work already landed via a different PR/commit. Fetches
+  the project's base branch and verifies `landing_commit` is an ancestor of it
+  (`git merge-base --is-ancestor`); on success writes an `unmergeable` event and
+  transitions straight to `done`, bypassing the normal in_review → verifying
+  merge step (evidence rule still enforced). → `200 {task: Task}` | `400`
+  (bad/missing `landing_commit`) | `409` (commit not verifiable on the base
+  branch, or task not eligible)
 - `usage` → inserts a Usage row (cost computed server-side when `cost_usd` is
   omitted; null for unpriced models) and broadcasts a `usage` SSE message. Writes
   no timeline event. → `201 {usage: Usage}` | `400` (missing `model`)
