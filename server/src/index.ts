@@ -12,7 +12,7 @@ import { startWatchers } from "./watch.ts";
 import { startAutoReviewer } from "./reviewer.ts";
 import { startDriftWatch } from "./drift.ts";
 import { startPromoter } from "./promoter.ts";
-import { setEventHook, setTerminalHook, expireOrphanedDecisions } from "./state.ts";
+import { setEventHook, setTerminalHook, expireOrphanedDecisions, repairRequeueProvenance } from "./state.ts";
 import { bootstrapAuthority } from "./authority.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { herdr as defaultHerdr } from "./runtime/herdr.ts";
@@ -65,6 +65,13 @@ if (seeded) console.log(`[hive] bootstrapped ${seeded} standing authority rule(s
 // orphans predating transition-time expiry). Idempotent.
 const orphaned = expireOrphanedDecisions(db);
 if (orphaned) console.log(`[hive] expired ${orphaned} orphaned open decision(s) on terminal tasks`);
+
+// Backfill/backstop: verify (or quarantine) any requeue row whose lineage
+// hasn't been checked yet — legacy rows predating provenance tracking, or
+// ones interrupted mid-check by a restart. Idempotent (repairRequeueProvenance
+// only ever rescans unverified rows).
+const quarantinedRequeues = repairRequeueProvenance(db);
+if (quarantinedRequeues) console.log(`[hive] quarantined ${quarantinedRequeues} requeue task(s) with unverifiable provenance`);
 
 // Mint the remote API token once (phones/tablets present it; loopback never
 // needs it). Shown by `hive remote`.
