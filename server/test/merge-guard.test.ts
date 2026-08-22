@@ -123,6 +123,35 @@ test("PR guard repairs a stale local-ref snapshot from the first exact PR head",
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_blocked_destructive'").get(taskId)).toBeFalsy();
 });
 
+test("mergeTask atomically matches the freshly-verified PR head (HIVE-307)", async () => {
+  const { db, taskId } = seed();
+  const prUrl = "https://gh/pr/atomic";
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run(prUrl, taskId);
+  const head = "verified-head";
+  const mergeArgvs: string[][] = [];
+  const exec: Exec = stub((argv) => {
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(
+        JSON.stringify({
+          state: "OPEN",
+          baseRefName: "main",
+          baseRefOid: "base-sha",
+          headRefOid: head,
+          mergeStateStatus: "CLEAN",
+          statusCheckRollup: [{ conclusion: "SUCCESS" }],
+        })
+      );
+    if (argv[0] === "gh" && argv.includes("merge")) mergeArgvs.push(argv);
+    if (argv.includes("diff") && argv.includes("--name-only")) return OK("src/task.ts\n");
+    return OK();
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec });
+
+  expect(res.status).toBe(200);
+  expect(mergeArgvs).toEqual([["gh", "pr", "merge", prUrl, "--squash", "--match-head-commit", head]]);
+});
+
 test("mergeTask BLOCKS while a declared dependency hasn't actually merged/done yet (#1000)", async () => {
   const { db, taskId } = seed();
   const projectId = (db.query("SELECT project_id FROM tasks WHERE id = ?").get(taskId) as any).project_id;

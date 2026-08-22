@@ -81,6 +81,20 @@ async function rawDiff(db: DB, task: any, exec: Exec): Promise<{ ok: true; text:
   return { ok: true, text: r.stdout };
 }
 
+// The live PR head, read fresh right before diffing and again after the (slow)
+// LLM call — a force-push or PR replacement mid-review must not let a stale
+// verdict land on the new head (task HIVE-307).
+async function livePrHead(exec: Exec, prUrl: string): Promise<string | null> {
+  const r = await exec(["gh", "pr", "view", prUrl, "--json", "headRefOid"]);
+  if (r.code !== 0) return null;
+  try {
+    const data = JSON.parse(r.stdout || "{}");
+    return typeof data.headRefOid === "string" && data.headRefOid ? data.headRefOid : null;
+  } catch {
+    return null;
+  }
+}
+
 function reviewPrompt(task: any, diff: string): string {
   return [
     `You are pre-reviewing a PR for a busy human reviewer. Be terse and concrete; no praise, no filler.`,
@@ -110,12 +124,35 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
     .query(
       `SELECT t.* FROM tasks t
         WHERE t.state = 'in_review'
-          AND NOT EXISTS (SELECT 1 FROM events e WHERE e.task_id = t.id AND e.type IN ('auto_review', 'auto_review_error'))
+          AND NOT EXISTS (
+            SELECT 1 FROM events e WHERE e.task_id = t.id AND e.type IN ('auto_review', 'auto_review_error')
+              AND (
+                t.pr_url IS NULL
+                OR (e.type = 'auto_review' AND json_valid(e.payload) AND json_extract(e.payload, '$.skipped') IS NOT NULL)
+                OR (
+                  json_valid(e.payload)
+                  AND json_extract(e.payload, '$.reviewed_pr_url') = t.pr_url
+                  AND json_extract(e.payload, '$.reviewed_head_sha') = t.head_sha
+                )
+              )
+          )
           AND ${supervisedSql("t.source", "t.agent_target")}
         ORDER BY t.updated_at ASC LIMIT 1`
     )
     .get();
   if (!t) return;
+  // Guards against a delayed/stale review landing after the task moved on
+  // (state left in_review, or the linked PR/branch/head changed underneath
+  // it) — the review this pass produces is only good for the exact task and
+  // PR head captured here.
+  const stillCurrent = (): boolean => {
+    const current: any = getTask(db, t.id);
+    return !!current
+      && current.state === "in_review"
+      && current.pr_url === t.pr_url
+      && current.branch === t.branch
+      && (!t.pr_url || current.head_sha === t.head_sha);
+  };
   const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(t.project_id);
   const config = JSON.parse(project?.config ?? "{}");
   if (config.auto_review === false) {
@@ -124,9 +161,21 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
   }
 
   const shell = deps.shellExec ?? defaultExec;
+  // Refresh the exact head being reviewed BEFORE the diff is pulled, so a
+  // force-push that lands right before this pass reviews its own new head
+  // instead of silently diffing the old one.
+  let reviewedHead: string | null = null;
+  if (t.pr_url) {
+    reviewedHead = await livePrHead(shell, t.pr_url);
+    if (!reviewedHead || !stillCurrent()) return;
+    db.query("UPDATE tasks SET head_sha = ? WHERE id = ? AND pr_url = ?").run(reviewedHead, t.id, t.pr_url);
+    t.head_sha = reviewedHead;
+  }
+  const reviewIdentity = t.pr_url ? { reviewed_pr_url: t.pr_url, reviewed_head_sha: reviewedHead } : {};
   const diff = await rawDiff(db, t, shell);
+  if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
   if (!diff.ok) {
-    writeEvent(db, { task_id: t.id, source: "system", type: "auto_review_error", payload: { error: diff.error } });
+    writeEvent(db, { task_id: t.id, source: "system", type: "auto_review_error", payload: { error: diff.error, ...reviewIdentity } });
     return;
   }
   const argv: string[] =
@@ -140,24 +189,36 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
   try {
     res = await exec(argv, { timeoutMs: TIMEOUT_MS });
   } catch (e: any) {
-    writeEvent(db, { task_id: t.id, source: "system", type: "auto_review_error", payload: { error: String(e?.message ?? e) } });
+    if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
+    writeEvent(db, { task_id: t.id, source: "system", type: "auto_review_error", payload: { error: String(e?.message ?? e), ...reviewIdentity } });
     return;
   }
+  // The LLM call is the slow part (up to TIMEOUT_MS) — re-check right after it
+  // returns, before trusting anything it said about this head.
+  if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
   if (res.timedOut || res.code !== 0) {
     writeEvent(db, {
       task_id: t.id,
       source: "system",
       type: "auto_review_error",
-      payload: { error: res.timedOut ? `timed out after ${TIMEOUT_MS}ms` : `exited ${res.code}: ${res.stderr.trim().slice(0, 300)}` },
+      payload: {
+        error: res.timedOut ? `timed out after ${TIMEOUT_MS}ms` : `exited ${res.code}: ${res.stderr.trim().slice(0, 300)}`,
+        ...reviewIdentity,
+      },
     });
     return;
   }
   const review = extractReview(res.stdout);
   if (!review) {
-    writeEvent(db, { task_id: t.id, source: "system", type: "auto_review_error", payload: { error: "unparseable reviewer output" } });
+    writeEvent(db, {
+      task_id: t.id,
+      source: "system",
+      type: "auto_review_error",
+      payload: { error: "unparseable reviewer output", ...reviewIdentity },
+    });
     return;
   }
-  writeEvent(db, { task_id: t.id, source: "system", type: "auto_review", payload: review as any });
+  writeEvent(db, { task_id: t.id, source: "system", type: "auto_review", payload: { ...review, ...reviewIdentity } as any });
   broadcast({ type: "task", task: getTask(db, t.id) });
 }
 
