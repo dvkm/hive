@@ -1,7 +1,7 @@
 // hive daemon entrypoint. Bun.serve on 127.0.0.1:4700 (override HIVE_PORT).
 import { openDb, defaultDbPath } from "./db.ts";
 import { makeHandler, notifyManagerOfEvent, repairDuplicateQuizPasses, sweepManagerInboxes, wakeDueManagers } from "./api.ts";
-import { startReconciler } from "./reconciler.ts";
+import { startReconciler, reAdoptAgentsOnBoot } from "./reconciler.ts";
 import { startDispatcher } from "./dispatcher.ts";
 import { startReaper } from "./reaper.ts";
 import { checkAllMonitors } from "./monitors.ts";
@@ -144,6 +144,12 @@ setSetting(db, "server_started_at", now());
 const reconcileMs = Number(process.env.HIVE_RECONCILE_MS || 60_000);
 const monitorMs = Number(process.env.HIVE_MONITOR_MS || 60_000);
 const staleMs = Number(process.env.HIVE_STALE_MS || 15 * 60 * 1000);
+// Re-adopt every live agent BEFORE the first reconcile lap, so a restart never
+// leaves an agent unaddressable (herdr keeps the panes; hive just lost the
+// registration). Fire-and-forget: it must not delay the loops, and boot grace
+// already holds teardown while it runs.
+reAdoptAgentsOnBoot(db, { supervise: true }).catch((e) => console.error("[hive] boot re-adopt:", e));
+
 startReconciler(db, { intervalMs: reconcileMs, staleMs, supervise: true, instanceId: instance });
 
 // Dispatcher: pick up `queued` tasks in auto-dispatch projects and spawn agents
