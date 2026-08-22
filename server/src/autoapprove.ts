@@ -39,6 +39,20 @@ function hasDecisionEvent(db: DB, type: string, decisionId: string): boolean {
   );
 }
 
+function isStaleAgentDialog(db: DB, decisionId: string): boolean {
+  const latest = db
+    .query(
+      `SELECT e.type, json_extract(e.payload, '$.status') AS status
+       FROM events e
+       WHERE e.task_id = (SELECT task_id FROM decisions WHERE id = ?)
+         AND e.rowid > (SELECT rowid FROM events WHERE type = 'blocked_card' AND json_extract(payload, '$.decision_id') = ?)
+         AND (e.type IN ('spawned', 'agent_released') OR (e.type = 'agent_status' AND json_extract(e.payload, '$.status') = 'done'))
+       ORDER BY e.rowid DESC LIMIT 1`
+    )
+    .get(decisionId, decisionId) as { type: string; status: string | null } | null;
+  return latest?.type === "agent_released" || latest?.status === "done";
+}
+
 function safetyBar(db: DB, d: any, answerKey: string): AutoApproveVerdict | null {
   const options: any[] = Array.isArray(d.options) ? d.options : JSON.parse(d.options || "[]");
   const chosen = options.find((o) => o.key === answerKey);
@@ -50,6 +64,8 @@ function safetyBar(db: DB, d: any, answerKey: string): AutoApproveVerdict | null
     if (!chosen?.recommended) return no("authority", "only a recommended deny may fail closed automatically");
     return null;
   }
+  if (answerKey === "deny" && chosen && isStaleAgentDialog(db, d.id))
+    return { allow: true, category: "agent_dialog_deny", reason: "denies an agent dialog by sending only its cancel keystroke" };
   if (!chosen?.recommended) return no("*", "only the raiser's recommended option can be auto-approved");
   const risk = String(d.risk ?? "").toLowerCase();
   if (risk !== "low" && risk !== "normal") return no("*", `risk '${d.risk ?? "(none)"}' is above the auto-approve bar`);
