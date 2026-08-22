@@ -123,6 +123,32 @@ test("PR guard repairs a stale local-ref snapshot from the first exact PR head",
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_blocked_destructive'").get(taskId)).toBeFalsy();
 });
 
+test("a replacement PR does not inherit the rejected PR's branch scope", async () => {
+  const { db, taskId } = seed();
+  const prUrl = "https://gh/pr/replacement";
+  db.query("UPDATE tasks SET pr_url = ?, branch = ? WHERE id = ?").run(prUrl, "feat-recut", taskId);
+  writeEvent(db, {
+    task_id: taskId,
+    source: "agent",
+    type: "pr_linked",
+    payload: { pr_url: prUrl, via: "ready_replaced", replaced: "https://gh/pr/rejected" },
+  });
+  let diffCalls = 0;
+  const exec: Exec = stub((argv) => {
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(JSON.stringify({ state: "OPEN", baseRefName: "main", baseRefOid: "current-base", headRefOid: "recut-head", mergeStateStatus: "CLEAN", statusCheckRollup: [] }));
+    if (argv[0] === "gh" && argv.includes("merge")) return OK();
+    if (argv.includes("diff") && argv.includes("--name-only")) diffCalls++;
+    return OK();
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec });
+
+  expect(res.status).toBe(200);
+  expect(diffCalls).toBe(0);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_blocked_destructive'").get(taskId)).toBeFalsy();
+});
+
 test("mergeTask atomically matches the freshly-verified PR head (HIVE-307)", async () => {
   const { db, taskId } = seed();
   const prUrl = "https://gh/pr/atomic";

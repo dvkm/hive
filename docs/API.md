@@ -849,7 +849,9 @@ that arrives during earlier merge checks still prevents the mutation.
   task is bounced to `in_progress` with a steer to re-cut off current base. The
   comparison uses the PR's exact GitHub base commit (falling back to the
   project's configured default only for non-PR work), so stale local refs and
-  moving base branches cannot produce false positives.
+  moving base branches cannot produce false positives. An explicitly replaced
+  PR starts a new branch lineage, so snapshots from the rejected PR do not carry
+  into the replacement branch.
   **`override_destructive_check: true`** skips this guard when the reverts are
   intentional. The guard is a no-op when no pre-rebase snapshot exists (hive
   first saw the branch already rebased).
