@@ -33,9 +33,9 @@ export const ANSWERED_BY_LABEL: Record<string, string> = {
 
 // Which transitions the director can trigger from the current state.
 export const NEXT: Partial<Record<State, State[]>> = {
-  queued: ["in_progress", "cancelled"],
+  queued: ["in_progress", "needs_decision", "cancelled"],
   in_progress: ["in_review", "needs_decision", "failed", "cancelled"],
-  needs_decision: ["in_progress", "cancelled"],
+  needs_decision: ["in_progress", "queued", "cancelled"],
   in_review: ["verifying", "in_progress", "cancelled"],
   verifying: ["done", "in_progress", "failed"],
 };
