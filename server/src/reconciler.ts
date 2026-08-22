@@ -11,7 +11,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, TERMINAL, type State } from "./state.ts";
+import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, repairRequeueProvenance, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
 import { spawnMeta } from "./cleanup.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent, resumeReviewForDeliveredSteers } from "./steer.ts";
@@ -110,6 +110,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("unparkAnswered", () => unparkAnswered(db, (deps.nowMs ?? (() => Date.now()))()));
   await step("remindUnreviewedIntake", () => remindUnreviewedIntake(db, (deps.nowMs ?? (() => Date.now()))()));
   await step("captureRecurringRefs", () => captureRecurringRefs(db));
+  await step("repairRequeueProvenance", () => repairRequeueProvenance(db));
   // Offline mode: everything above is local (herdr + sqlite) and keeps state
   // honest; everything below either needs the network (gh) or would punish
   // agents for being offline (stale flags, nudges, failure escalation). Stop here.
