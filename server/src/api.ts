@@ -72,6 +72,7 @@ import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
 import { vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
+import { explanationGate } from "./explainDiff.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
 import { ciStatusOf, ciStatusProbed, reclaimDeadWorktree, infraTaskOpen } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
@@ -1740,6 +1741,10 @@ export function handOffToReview(db: DB, taskId: string, source: string): boolean
   // in flight (or just resolved) on this same task — don't hand it to review
   // until the redelivered turn has had its chance to run.
   if (queuedInputRecoveryPending(db, taskId)) return false;
+  // #1249: review also means "there is a page explaining this change". A
+  // missing one holds the task here and kicks off the generation, which calls
+  // back into this function when the page lands.
+  if (explanationGate(db, t) !== "ready") return false;
   transition(db, taskId, "in_review", { source, reason: "PR open, awaiting review" });
   return true;
 }
@@ -4867,6 +4872,20 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
                 : `CI is still running on ${pr}. End this turn; hive monitors the checks, hands off automatically when they pass, and steers you if they fail.`,
           });
         }
+      }
+      // Explanation gate (#1249). CI is green by here; the last thing review
+      // waits on is the page that explains the change. Generation runs in the
+      // background and hands the task off itself when the page is stored, so
+      // the agent stays on the task meanwhile instead of going idle.
+      if (explanationGate(db, getTask(db, taskId), { exec, plannerExec: deps.plannerExec }) !== "ready") {
+        writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { pr_url: pr ?? null, reason: "explanation_pending" } });
+        broadcastTask(db, getTask(db, taskId));
+        return json({
+          held: true,
+          reason: "explanation_pending",
+          message:
+            "Handoff held: hive is writing the explanation page for this PR. Stay on the task — it moves to review by itself when the page is ready (usually a few minutes).",
+        });
       }
       writeEvent(db, { task_id: taskId, source, type: "ready_for_review", payload: { pr_url: prUrl ?? t.pr_url ?? null, via: "emit", kind: t.kind } });
       const task = transition(db, taskId, "in_review", { source, reason: note ?? "agent handoff: ready for review" });

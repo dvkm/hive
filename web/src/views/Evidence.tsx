@@ -8,7 +8,7 @@ import type { LightboxImage } from "../lib/lightbox";
 import { relTime } from "../lib/time";
 import { Empty } from "../lib/ui";
 
-const KINDS = ["screenshot", "test_run", "log", "report", "link"] as const;
+const KINDS = ["screenshot", "test_run", "log", "report", "explanation", "link"] as const;
 
 export default function Evidence() {
   const { projects, tasks } = useStore();

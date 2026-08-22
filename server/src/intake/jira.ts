@@ -1895,15 +1895,19 @@ export function reviewContextText(db: DB, task: any, jiraStatus: string): string
   const review = latestReviewSummary(db, task.id);
   const list = (value: unknown): any[] => (Array.isArray(value) ? value : []);
   const pr = String(task.pr_url ?? "").trim();
-  const evidence = db
+  const allEvidence = db
     .query("SELECT kind, url, caption FROM evidence WHERE task_id = ? ORDER BY ts")
     .all(task.id) as { kind: string; url: string | null; caption: string | null }[];
+  // #1249: the explanation page gets its own line rather than a slot in the
+  // capped evidence list — it is the one link a reporter actually wants.
+  const explain = resolveEvidenceUrl(allEvidence.filter((row) => row.kind === "explanation").at(-1)?.url ?? null);
+  const evidence = allEvidence.filter((row) => row.kind !== "explanation");
 
   const headline =
     hiveStateReason(db, task.id, jiraStatus) ??
     list(review?.done).map((item) => String(item ?? "").trim()).find(Boolean) ??
     null;
-  if (!headline && !pr && !evidence.length) return null;
+  if (!headline && !pr && !evidence.length && !explain) return null;
 
   const caveats = [
     ...list(review?.iffy).map((item) =>
@@ -1919,6 +1923,7 @@ export function reviewContextText(db: DB, task: any, jiraStatus: string): string
       clampText(headline ?? "see the Hive task for what changed", CONTEXT_TEXT_MAX),
   ];
   if (pr && !lines[0].includes(pr)) lines.push(`PR: ${pr}`);
+  if (explain) lines.push(`What changed, explained: ${explain}`);
   if (caveats.length) lines.push(`Heads-up: ${clampText(caveats.join("; "), CONTEXT_TEXT_MAX)}`);
   // ponytail: evidence is LINKED, not uploaded. Jira has an attachment API, but
   // using it widens the declared write scope (jira-write-scope.ts) on a live
@@ -1968,7 +1973,7 @@ export function receiptText(
   row: { kind: string; url: string | null; caption: string | null; ts: string }
 ): string {
   const base = hiveBaseUrl();
-  const label = row.kind === "report" ? "report" : row.kind;
+  const label = row.kind === "report" ? "report" : row.kind === "explanation" ? "walkthrough of this change" : row.kind;
   const directLink = resolveEvidenceUrl(row.url);
   const hiveLink = `${base}/tasks/${task.id}`;
   const receipt = [

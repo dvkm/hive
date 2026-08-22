@@ -5568,3 +5568,18 @@ a.chip-jira:hover { background: #2d5488; }
 .jira-receipts li { padding: 0.15rem 0; }
 
 .jira-move-note { margin-top: 0.5rem; font-size: 0.8rem; }
+
+/* #1249: the literate-diff walkthrough for a PR, linked from the review card. */
+.review-explain {
+  display: block;
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  text-decoration: none;
+}
+.review-explain:hover { border-color: var(--accent); }
+.review-explain-title { display: block; font-weight: 600; }
+.review-explain-title::after { content: " ↗"; opacity: 0.6; }
+.review-explain-hint { display: block; font-size: 12px; color: var(--muted); }

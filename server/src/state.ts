@@ -13,6 +13,7 @@ import { redact } from "./secrets.ts";
 import { enqueue } from "./notifications.ts";
 import { broadcastTask } from "./health.ts";
 import { isTrackingOnlyTask, isJiraMirror } from "./supervision.ts";
+import { explanationGate } from "./explainDiff.ts";
 
 export const STATES = [
   "queued",
@@ -401,6 +402,9 @@ export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, s
   // visible new work before re-advancing — the shared guard below.
   if (changesRequestUnaddressed(db, taskId)) return false;
   if (decisionAnswerUnaddressed(db, taskId)) return false;
+  // #1249: no explanation page yet → hold here and let the generation (kicked
+  // off by the gate) hand the task off when the page is stored.
+  if (explanationGate(db, task) !== "ready") return false;
   writeEvent(db, {
     task_id: taskId,
     source,
