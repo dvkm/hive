@@ -319,3 +319,63 @@ test("modelForTask: per-kind default, config.model, config.model_by_kind overrid
   expect(custom).toContain("model_auto_compact_token_limit=80000");
   expect(custom).toContain("tool_output_token_limit=4000");
 });
+
+// hive-1090 adoption guard: a requeue's resume_pr_url pointer is normally
+// self-consistent with its brief (requeueTask always writes both together),
+// but this is the backstop for a later brief edit that strips the pointer
+// back out — dispatch must refuse rather than silently spawn an agent blind
+// to the predecessor's still-open PR (which is how the original incident
+// produced a second, conflicting PR).
+test("spawn refuses when resume_pr_url is set but the brief no longer references it", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "resume without the pointer", brief: "just do it, no adoption note here" });
+  db.query("UPDATE tasks SET resume_pr_url = ? WHERE id = ?").run("https://github.com/acme/web/pull/819", t.json.id);
+
+  const r = await post(`/api/tasks/${t.json.id}/spawn`, {});
+  expect(r.status).toBe(502);
+  expect(r.json.error).toContain("pull/819");
+
+  const task = (await get(`/api/tasks/${t.json.id}`)).json;
+  expect(task.state).toBe("queued"); // never dispatched
+  const spawnError = task.events.find((event: any) => event.type === "spawn_error");
+  expect(spawnError.payload.error).toContain("pull/819");
+  expect(r.json.error).toBe(`spawn failed: ${spawnError.payload.error}`);
+});
+
+test("spawn refuses when the brief references only a longer PR number", async () => {
+  const resumePrUrl = "https://github.com/acme/web/pull/81";
+  const otherPrUrl = "https://github.com/acme/web/pull/819";
+  const t = await post("/api/tasks", { project_id: projectId, title: "resume with a prefix collision", brief: `Adopt PR ${otherPrUrl}.` });
+  db.query("UPDATE tasks SET resume_pr_url = ? WHERE id = ?").run(resumePrUrl, t.json.id);
+
+  const r = await post(`/api/tasks/${t.json.id}/spawn`, {});
+
+  expect(r.status).toBe(502);
+  expect(r.json.error).toContain("pull/81");
+  expect((await get(`/api/tasks/${t.json.id}`)).json.state).toBe("queued");
+});
+
+test("spawn accepts an exact PR reference after an earlier prefix collision", async () => {
+  const resumePrUrl = "https://github.com/acme/web/pull/81";
+  const otherPrUrl = "https://github.com/acme/web/pull/819";
+  const t = await post("/api/tasks", {
+    project_id: projectId,
+    title: "resume after a prefix collision",
+    brief: `Related PR ${otherPrUrl}. Adopt PR ${resumePrUrl}.`,
+  });
+  db.query("UPDATE tasks SET resume_pr_url = ? WHERE id = ?").run(resumePrUrl, t.json.id);
+
+  const r = await post(`/api/tasks/${t.json.id}/spawn`, {});
+
+  expect(r.status).toBe(200);
+  expect(r.json.ok).toBe(true);
+});
+
+test("spawn proceeds once the brief carries the resume_pr_url pointer", async () => {
+  const prUrl = "https://github.com/acme/web/pull/820";
+  const t = await post("/api/tasks", { project_id: projectId, title: "resume with the pointer", brief: `**RESUME** — adopt PR ${prUrl}.` });
+  db.query("UPDATE tasks SET resume_pr_url = ? WHERE id = ?").run(prUrl, t.json.id);
+
+  const r = await post(`/api/tasks/${t.json.id}/spawn`, {});
+  expect(r.status).toBe(200);
+  expect(r.json.ok).toBe(true);
+});

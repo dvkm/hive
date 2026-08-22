@@ -1705,6 +1705,7 @@ export function linkPrIfMarked(
   if (task.pr_url) return { task_id: task.id, number: task.number, linked: false };
   db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(pr.url, now(), task.id);
   writeEvent(db, { task_id: task.id, source, type: "pr_linked", payload: { pr_url: pr.url, via } });
+  backfillRequeueResume(db, task.id, source);
   handOffToReview(db, task.id, source);
   broadcastTask(db, getTask(db, task.id));
   return { task_id: task.id, number: task.number, linked: true };
@@ -2925,6 +2926,17 @@ export function agentArgvFor(config: any, kind: string, brief: string): string[]
   });
 }
 
+function referencesUrl(text: string, url: string): boolean {
+  let from = 0;
+  while (true) {
+    const idx = text.indexOf(url, from);
+    if (idx === -1) return false;
+    const after = text.charCodeAt(idx + url.length);
+    if (Number.isNaN(after) || after < 48 || after > 57) return true;
+    from = idx + 1;
+  }
+}
+
 // The reusable spawn core, shared by the /spawn endpoint and the dispatcher.
 // Composes the brief, creates the worktree + starts the agent via herdr, writes
 // the `spawned`/`spawn_error` events and the queued->in_progress transition.
@@ -2949,6 +2961,17 @@ export async function spawnAgent(
     return { ok: false, error: "this task mirrors a Jira issue — hive tracks it but never runs agents on it" };
   if (neverDispatched(db, task))
     return { ok: false, error: "task is untracked (source=external) and has never been spawned — hive does not dispatch agents for tracking-only tasks" };
+  // Adoption guard (hive-1090): a requeue whose predecessor left an open PR
+  // must carry that pointer in its brief before it dispatches — this is the
+  // structural backstop for buildResumeSection (requeueTask always writes the
+  // pointer), catching a brief edit that stripped it back out. Without this a
+  // fresh agent, blind to the open PR, can rebuild the whole feature as a
+  // second conflicting PR (the exact incident this closes).
+  if (task.resume_pr_url && !referencesUrl(task.brief ?? "", task.resume_pr_url)) {
+    const error = `refusing to dispatch: predecessor's open PR ${task.resume_pr_url} is not referenced in this task's brief — restore the RESUME/adoption pointer before dispatching`;
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error } });
+    return { ok: false, error };
+  }
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   if (!project?.repo_path) return { ok: false, error: "project has no repo_path" };
   const config = JSON.parse(project.config ?? "{}");
@@ -3971,21 +3994,197 @@ async function cleanupEndpoint(db: DB, herdr: Herdr, id: string): Promise<Respon
   return json({ ok: true, ...r });
 }
 
+// The ghost branch a dead worktree's uncommitted WIP was rescued onto
+// (reclaimDeadWorktree / herdr.reclaimWorktree), if the reconciler ever had to
+// do that rescue for this task. Most recent one wins (a task can be rescued
+// more than once across retries).
+function latestGhostBranch(db: DB, taskId: string): string | null {
+  const rows = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'worktree_reclaimed' ORDER BY ts DESC")
+    .all(taskId) as { payload: string }[];
+  for (const r of rows) {
+    const ghost = JSON.parse(r.payload)?.ghost_branch;
+    if (ghost) return ghost;
+  }
+  return null;
+}
+
+// A predecessor's pr_url only means "adopt this" while the PR is still open —
+// once the reconciler has recorded it merged/closed (or a director merged it),
+// there's nothing left to adopt.
+function prOutcome(db: DB, ids: string[], url: string): "open" | "closed" | "merged" {
+  const placeholders = ids.map(() => "?").join(",");
+  const row = db
+    .query(
+      `SELECT type FROM events WHERE task_id IN (${placeholders})
+       AND type IN ('pr_closed','pr_merged','merged')
+       AND json_extract(payload, '$.pr_url') = ?
+       ORDER BY ts DESC LIMIT 1`
+    )
+    .get(...ids, url) as { type: string } | undefined;
+  if (!row) return "open";
+  return row.type === "pr_closed" ? "closed" : "merged";
+}
+
+function predecessorOpenPrUrl(db: DB, source: any): string | null {
+  const inheritedUrl = source.resume_pr_url || null;
+  const ownUrl = source.pr_url && source.pr_url !== inheritedUrl ? source.pr_url : null;
+  if (ownUrl) {
+    const ownOutcome = prOutcome(db, [source.id], ownUrl);
+    if (ownOutcome === "open") return ownUrl;
+    if (ownOutcome === "merged") return null;
+  }
+  if (!inheritedUrl) return null;
+  const ids = source.parent_task_id ? [source.id, source.parent_task_id] : [source.id];
+  return prOutcome(db, ids, inheritedUrl) === "open" ? inheritedUrl : null;
+}
+
+function answeredDecisionSummaries(db: DB, taskId: string): string[] {
+  const rows = db
+    .query("SELECT title, answer_key, answer_note, answered_by, options FROM decisions WHERE task_id = ? AND status = 'answered' ORDER BY answered_at")
+    .all(taskId) as { title: string; answer_key: string | null; answer_note: string | null; answered_by: string | null; options: string }[];
+  return rows.map((r) => {
+    const opts = JSON.parse(r.options || "[]");
+    const chosen = opts.find((o: any) => o.key === r.answer_key);
+    const note = r.answer_note?.trim();
+    const answerer = r.answered_by && r.answered_by !== "director"
+      ? `; [answered by ${r.answered_by}, not director]`
+      : "";
+    return `${r.title} — ${chosen?.label ?? r.answer_key ?? "answered"}${note ? `; note: ${note}` : ""}${answerer}`;
+  });
+}
+
+function lastReviewHeadline(db: DB, taskId: string): string | null {
+  const row = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY ts DESC, rowid DESC LIMIT 1")
+    .get(taskId) as { payload: string } | undefined;
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.payload);
+    const p = parsed && typeof parsed === "object" ? parsed : {};
+    const doneCount = Array.isArray(p.done) ? p.done.length : 0;
+    const iffyCount = Array.isArray(p.iffy) ? p.iffy.length : 0;
+    if (doneCount || iffyCount)
+      return `a self-review was already submitted (${doneCount} item(s) done, ${iffyCount} flagged iffy) — read the review_summary event before redoing that work`;
+    const sections = ["decisions", "testing", "followups", "understanding"].filter((key) => {
+      const value = p[key];
+      if (Array.isArray(value)) return value.length > 0;
+      return Boolean(value && typeof value === "object" && Object.keys(value).length);
+    });
+    const detail = sections.length ? ` (${sections.join(", ")} section(s) included)` : "";
+    return `a self-review was already submitted${detail} — read the review_summary event before redoing that work`;
+  } catch {
+    return null;
+  }
+}
+
+const RESUME_START = "<!-- hive:resume -->";
+const RESUME_END = "<!-- /hive:resume -->";
+
+function stripPriorResumeSection(brief: string | null | undefined): string {
+  const text = brief ?? "";
+  const start = text.indexOf(RESUME_START);
+  if (start === -1) return text;
+  const end = text.indexOf(RESUME_END, start);
+  if (end === -1) return text;
+  return (text.slice(0, start) + text.slice(end + RESUME_END.length)).trim();
+}
+
+// The auto-generated "RESUME" section prepended to a requeue's brief (see
+// requeueTask). Returns null when the predecessor never got as far as a
+// branch — nothing to adopt, requeue behaves exactly as before.
+function buildResumeSection(
+  db: DB,
+  source: any
+): { text: string; branch: string; ghostBranch: string | null; prUrl: string | null } | null {
+  const ownGhostBranch = latestGhostBranch(db, source.id);
+  const branch = source.branch || source.resume_branch;
+  if (!branch) return null;
+  const inheritedBranch = source.resume_branch && source.resume_branch !== branch ? source.resume_branch : null;
+  const inheritedGhost = source.resume_ghost_branch && source.resume_ghost_branch !== ownGhostBranch ? source.resume_ghost_branch : null;
+  const ghostBranch = ownGhostBranch || inheritedGhost;
+  const prUrl = predecessorOpenPrUrl(db, source);
+  const prFactsApply = !!prUrl && prUrl === source.pr_url;
+  const decisions = answeredDecisionSummaries(db, source.id);
+  const review = lastReviewHeadline(db, source.id);
+  const lead = prUrl
+    ? `**RESUME — adopt PR ${prUrl} / branch \`${branch}\`. Do NOT rebuild this feature from scratch.**`
+    : `**RESUME — adopt branch \`${branch}\`. Do NOT rebuild this feature from scratch.**`;
+  const lines = [
+    RESUME_START,
+    lead,
+    `This continues failed attempt task #${source.number ?? "?"} (id ${source.id}), which already made progress. Fetch \`${branch}\` and merge it into your own branch. Do not check it out and switch away from your own branch; Hive tracks yours going forward, not the predecessor's. Read the merged work and continue from where it stopped.`,
+    "",
+    `- Branch to merge in: \`${branch}\``,
+  ];
+  if (ownGhostBranch)
+    lines.push(`- Uncommitted WIP was rescued onto \`${ownGhostBranch}\` when the dead worktree was reclaimed. Merge it, along with the adopted branch above, into your own current branch before continuing.`);
+  if (inheritedBranch)
+    lines.push(`- This attempt itself inherited \`${inheritedBranch}\` from an earlier failed attempt but never confirmed merging it before it also died. Fetch it too, check whether it holds work the branch above is missing, and merge whichever has the real content.`);
+  if (inheritedGhost)
+    lines.push(`- An earlier attempt also had uncommitted WIP separately rescued onto \`${inheritedGhost}\`. Check it too and merge any missing work into your own current branch.`);
+  if (prUrl) lines.push(`- Open PR: ${prUrl}${prFactsApply && source.head_sha ? ` (last known head \`${source.head_sha}\`)` : ""} — push your fixes to this PR. Do not open a second PR for this feature.`);
+  if (prFactsApply && source.ci_status) lines.push(`- Last known CI status: ${source.ci_status}`);
+  if (decisions.length) {
+    lines.push(`- Decisions the director already answered on the failed attempt (don't re-ask):`);
+    for (const d of decisions) lines.push(`  - ${d}`);
+  }
+  if (review) lines.push(`- ${review}`);
+  lines.push("", "---", RESUME_END);
+  return { text: lines.join("\n"), branch, ghostBranch, prUrl };
+}
+
+function backfillRequeueResume(db: DB, predecessorId: string, source: "reconciler" | "director"): void {
+  const predecessor: any = getTask(db, predecessorId);
+  if (!predecessor || (predecessor.state !== "failed" && predecessor.state !== "cancelled")) return;
+  const resume = buildResumeSection(db, predecessor);
+  if (!resume?.prUrl) return;
+  const successors = db
+    .query("SELECT * FROM tasks WHERE parent_task_id = ? AND source = 'requeue' AND resume_pr_url IS NULL")
+    .all(predecessorId) as any[];
+  for (const successor of successors) {
+    const priorBrief = stripPriorResumeSection(successor.brief);
+    const brief = [resume.text, priorBrief].join("\n").trim();
+    const result = db.query(
+      "UPDATE tasks SET brief = ?, resume_branch = ?, resume_ghost_branch = ?, resume_pr_url = ?, updated_at = ? WHERE id = ? AND resume_pr_url IS NULL"
+    ).run(brief, resume.branch, resume.ghostBranch, resume.prUrl, now(), successor.id);
+    if (!result.changes) continue;
+    writeEvent(db, {
+      task_id: successor.id,
+      source,
+      type: "resume_pr_backfilled",
+      payload: { predecessor_task_id: predecessorId, pr_url: resume.prUrl },
+    });
+    broadcastTask(db, getTask(db, successor.id));
+  }
+}
+
 // Create a fresh queued copy of a task (parent_task_id → the failed original).
-// The lineage links let the recovery loop cap auto-requeues.
+// The lineage links let the recovery loop cap auto-requeues. When the failed
+// attempt left a branch behind, an auto-generated RESUME section is prepended
+// to the new task's brief (and the pointer recorded structurally on the row —
+// see buildResumeSection) so a cold dispatch adopts the prior work instead of
+// silently rebuilding it (hive-1090).
 export function requeueTask(db: DB, source: any): string {
   if (isJiraMirror(source)) throw new TransitionError(TRACKING_ONLY_REQUEUE_ERROR);
+  const fresh = getTask(db, source.id) ?? source;
   const id = newId();
   const t = now();
+  const resume = buildResumeSection(db, fresh);
+  const priorBrief = stripPriorResumeSection(fresh.brief);
+  const brief = resume ? [resume.text, priorBrief].join("\n").trim() : (priorBrief || null);
   db.query(
-    `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, created_at, updated_at)
-     VALUES (?,?,?,?, 'queued', ?, 'requeue', ?, ?, ?)`
-  ).run(id, source.project_id, source.title, source.brief ?? null, source.kind, source.id, t, t);
-  writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title: source.title, requeue_of: source.id } });
+    `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, resume_branch, resume_ghost_branch, resume_pr_url, created_at, updated_at)
+     VALUES (?,?,?,?, 'queued', ?, 'requeue', ?, ?, ?, ?, ?, ?)`
+  ).run(
+    id, fresh.project_id, fresh.title, brief || null, fresh.kind, fresh.id,
+    resume?.branch ?? null, resume?.ghostBranch ?? null, resume?.prUrl ?? null, t, t
+  );
+  writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title: fresh.title, requeue_of: fresh.id } });
   broadcastTask(db, getTask(db, id));
   // Re-broadcast the failed original: its earlier `failed` SSE frame predates
   // this successor, so clients still show it as awaiting triage without this.
-  broadcastTask(db, getTask(db, source.id));
+  broadcastTask(db, getTask(db, fresh.id));
   return id;
 }
 
@@ -4540,8 +4739,8 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
   // --- ready (agent handoff: PR open / report written → into the review queue) ---
   // The explicit, preferred counterpart to the reconciler's advanceFinished
   // backstop: an agent that has opened its PR (or written its scout report) emits
-  // this to hand off for review instead of just going idle. Records a pr_url when
-  // supplied and not already linked, then advances in_progress → in_review.
+  // this to hand off for review instead of just going idle. Records or replaces
+  // pr_url when supplied, then advances in_progress → in_review.
   if (type === "ready") {
     const t = getTask(db, taskId);
     const prUrl = (fields.pr_url ?? fields.url ?? null) as string | null;
@@ -4549,9 +4748,9 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     // work — including when it replaces an earlier PR (closed #161 → rebased
     // #166, task #90). The old `only if unlinked` guard silently ignored the
     // new url, so every merge kept hitting the closed PR in a loop. ci_status
-    // resets: it described the old PR.
+    // and head_sha reset because they described the old PR.
     if (prUrl && prUrl !== t.pr_url) {
-      db.query("UPDATE tasks SET pr_url = ?, ci_status = NULL, updated_at = ? WHERE id = ?").run(prUrl, now(), taskId);
+      db.query("UPDATE tasks SET pr_url = ?, ci_status = NULL, head_sha = NULL, updated_at = ? WHERE id = ?").run(prUrl, now(), taskId);
       writeEvent(db, {
         task_id: taskId,
         source,

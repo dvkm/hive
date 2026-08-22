@@ -140,6 +140,9 @@ timeout — a failed hook never blocks spawn nor teardown.
   "summary": "Shipped dark mode toggle; all tests green.",
   "source": null,
   "parent_task_id": null,
+  "resume_branch": null,
+  "resume_ghost_branch": null,
+  "resume_pr_url": null,
   "depends_on": [],
   "duplicate_of": null,
   "health": { "status": "healthy", "reason": null, "since": "..." },
@@ -167,6 +170,7 @@ when the answer moves, so this is the timestamp a decision card cites.
 poll alongside `ci_status`; `null` until the first poll after a PR links. The
 review card compares it against each evidence item's `meta.commit_sha` to flag
 evidence captured against an older commit as stale.
+`resume_branch`/`resume_ghost_branch`/`resume_pr_url` are set only on a `source="requeue"` task whose failed predecessor left a branch behind (see `requeueTask`): the branch to adopt, the ghost branch holding any rescued uncommitted WIP, and the predecessor's still-open PR, if any. The same pointers are prepended as a RESUME section at the top of `brief`. When available on the failed predecessor, that section also carries the open PR's last-known head and CI status, answered decisions, and a one-line self-review summary; PRs with a recorded closed or merged event are omitted. `spawnAgent` refuses to dispatch a task with `resume_pr_url` set if that exact URL isn't present in `brief`, so an edited brief can't silently drop the "adopt, don't rebuild" instruction and spawn an agent that opens a second, conflicting PR.
 `display_id` is the human-facing project identifier, for example `HIVE-247` or `CORE-82`. Its numeric half is the task's immutable `project_number`, assigned from a per-project sequence and never reused; its prefix is the first four alphanumeric characters of the project name, uppercased. The older global `number` remains unique across Hive for PR-marker and API compatibility; the opaque `id` stays the machine key. Both numbers are assigned by DB triggers so every creation path gets them, and existing rows are backfilled in `created_at` order.
 `health` is a SERVER-COMPUTED dimension separate from lifecycle `state` — the
 visible symptom that a task pointing at a live agent is actually fine or actually
@@ -203,8 +207,7 @@ approved domain-supervisor breakdown (see the Domain supervisors section), or
 (`parent_task_id` → the failed original; see Stale recovery). A
 companion `source_ref` column (not returned) holds the upstream message resource
 name and is uniquely indexed for dedupe.
-`parent_task_id` is null for top-level tasks, or the id of the source task a
-`"planner"` task was broken out of (links a child to its parent).
+`parent_task_id` is null for top-level tasks, or the id of the source task for a derived task such as a planner child, agent follow-up, or requeue.
 `duplicate_of` is null for normal tasks, or the id of the SURVIVOR task this one
 was folded into when it was cancelled as a duplicate (see Duplicate detection
 below). Set only on a `cancelled` task; the survivor keeps working. Tasks are
@@ -604,7 +607,7 @@ priced rows only).
   (i.e. the full task object plus three arrays for the task page)
 - `POST /api/tasks/:id/transition` body `{to (required), reason?, source?}` → `200 Task` | `409` (invalid transition or `done` without evidence) | `404`
   When `to` is `verifying`, the project's post-deploy smoke list (`config.smoke`) runs once before the response returns. A smoke failure bounces the task back to `in_progress`, so the returned Task may be `in_progress`, not `verifying`.
-- `POST /api/tasks/:id/spawn` body `{hive_url?}` → `200 {"ok":true, "task": Task, "agent_target":"..."}` | `400` (project has no `repo_path`) | `404` | `502` (herdr spawn failed; a `spawn_error` event is recorded)
+- `POST /api/tasks/:id/spawn` body `{hive_url?}` → `200 {"ok":true, "task": Task, "agent_target":"..."}` | `400` (project has no `repo_path`) | `404` | `502` (dispatch refused or herdr spawn failed; a `spawn_error` event is recorded)
   Creates the herdr worktree (`hive/<task-id>`), starts the agent with `HIVE_TASK_ID`/`HIVE_URL` + the project's resolved secrets in env and the composed brief, sets `agent_target`/`worktree_path`/`branch`, transitions `queued → in_progress`, and writes a `spawned` event.
 - `POST /api/tasks/:id/send` body `{message (required), from_task_id?, actor?}` (or multipart: `message` + `files` + `from_task_id?` + `actor?`) → `200 {"ok", "delivered", "delivery", "message", "attachments":[abs paths], "error"?}` | `404` | `400` (empty message, unknown sender, cross-project teammate, or a `source="external"` tracking-only task that isn't Jira-linked AND has never been spawned even once — nothing has ever been, or automatically will be, dispatched to read it. An external task that WAS spawned before is unaffected and delivers normally)
   Dispatches the message to the task's live agent via `herdr agent send`, and always records one `steer` event (`payload: {message, target, attachments, delivery, ...}`) carrying a **delivery receipt**. Attached files are saved and their absolute paths appended to the delivered message under an `## Attachments` heading; because the paths live in the stored `message`, they ride along when a queued steer is redelivered. `delivery` is one of:
@@ -633,14 +636,7 @@ priced rows only).
   Degrades gracefully (never throws): `200 {"ok":false, "focused":false, "error":"..."}`
   when the task has no agent or herdr fails.
 - `POST /api/tasks/:id/requeue` body `{}` → `200 {"ok":true, "new_task_id":"..."}` | `404`
-  The recovery banner's manual "fail + requeue": fails the task if still live,
-  then creates a FRESH queued copy (`source="requeue"`, `parent_task_id` → the
-  original). Distinct from the attention tray's in-place requeue of an
-  already-failed task (`POST /transition {to:"queued"}`, which reactivates the
-  SAME task and clears its runtime binding). Before failing a still-live task,
-  reclaims its worktree exactly like dead-agent/context-full auto-requeue:
-  uncommitted state is preserved to a `ghost-<task-id>` branch, recorded as a
-  `worktree_reclaimed` event.
+  The recovery banner's manual "fail + requeue": reclaims a still-live task's worktree, fails it, then creates a FRESH queued copy (`source="requeue"`, `parent_task_id` → the original) with the [Task resume context](#task) whenever the original left a branch. Reclaim matches dead-agent and context-full auto-requeue: uncommitted state is preserved to a `ghost-<task-id>` branch and recorded as a `worktree_reclaimed` event. Distinct from the attention tray's in-place requeue of an already-failed task (`POST /transition {to:"queued"}`, which reactivates the SAME task and clears its runtime binding).
 - `POST /api/tasks/:id/cleanup` body `{}` → `200 {"ok":true, "cleaned":bool, "worktree":{removed,reason,ghost_branch}|null, "session":{closed,via}}` | `404` | `409` (task not terminal)
   Manual force-teardown for a **terminal** task (`done`/`cancelled`/`failed`): removes its git worktree and closes its herdr session. Refuses (`409`) on a live task so an in-flight worktree is never pulled out from under a working agent. Keeps every safety guard: the worktree is removed only when its branch is pushed/merged (else `cleanup_skipped`), and any tracked uncommitted work is preserved to a `ghost-<task-id>` branch first. Backstop for the auto-teardown that fires on the `done`/`cancelled` transition and the periodic reaper sweep.
 - `POST /api/tasks/:id/merge-into` body `{target_id (required)}` → `200 Task` (now `cancelled`) | `400` (missing/self `target_id`) | `404` (task or target missing) | `409` (source is already terminal)
@@ -726,11 +722,7 @@ the footer is absent. hive links a PR to its task by reading these:
 An `in_review` task owned by Hive means the agent finished and opened a PR (or pushed/created a branch) and is **awaiting the captain's review & merge**: not busy work. The captain reviews the diff and approves/merges, requests changes, or rejects, entirely from hive (the task page, the `/review` queue, and the Needs you view all render the same review card). Tracking-only external and Jira-linked tasks may also mirror an external `in_review` state, but they are excluded from Hive review queues, diffs, PR/CI controls, and review actions.
 
 **How a task reaches `in_review` (the finished-handoff, `in_progress → in_review`):**
-- **Explicit signal (preferred):** the agent emits `ready` (`POST .../events`
-  `{type:"ready", pr_url?}`, i.e. `hive emit <id> ready --pr-url <url>`) once its PR
-  is open (or, for a scout, its report is written). Records `pr_url` when supplied
-  and not already linked, then advances the task. Idempotent — a duplicate `ready`
-  on an already-advanced task just acks (`200`). Writes a `ready_for_review` event.
+- **Explicit signal (preferred):** the agent emits `ready` (`POST .../events` `{type:"ready", pr_url?}`, i.e. `hive emit <id> ready --pr-url <url>`) once its PR is open (or, for a scout, its report is written). Records or replaces `pr_url` when supplied, clearing the prior PR's `ci_status` and `head_sha` on replacement, then advances the task. Idempotent: a duplicate `ready` on an already-advanced task just acks (`200`). Writes a `ready_for_review` event.
 - **Automatic idle/done/gone handoff (safety net):** the herdr supervise loop and the reconciler's per-cycle poll both route an `in_progress` task whose agent is **idle, done, or gone** (NOT `working`/`blocked` — an agent that opened a PR and kept working still reports `working`) and that has a real work product (a `pr_url`, or a scout `report` evidence) through the same auto-advance to `in_review` (`ready_for_review` event, `via: idle|done|gone`). Advancing on a completed or idle read is safe because mid-work reads `working`; after a queued-input recovery attempt, however, automatic handoff waits at least two minutes so the recovered turn can start (`delivered: null` also holds handoff until the pane write resolves). The reconciler checks this before stale recovery, so a handed-off task with a gone agent is moved to review rather than failed/requeued. This unsticks finished tasks regardless of whether the agent emitted `ready`.
 - **Finished with NO PR:** an `in_progress` task whose agent went idle or completed with no PR and
   no recent activity is not auto-advanced (nothing to review) but is made VISIBLE:
@@ -929,7 +921,7 @@ recognized fields (JSON keys == form field names):
 | `type` (required) | `status` \| `evidence` \| `needs-decision` \| `ready` \| `done` \| `blocked` \| `deferred` \| `undefer` \| `usage` \| `assistant_text` \| `tool_use` \| `agent_turn_end` \| any custom string |
 | `source` | defaults to `agent` |
 | `note` | free text; stored in the event payload / used as caption/summary |
-| `pr_url` | (`ready` type) the opened PR URL; recorded on the task if not already linked |
+| `pr_url` | (`ready` type) the opened PR URL; recorded on the task, replacing its prior PR link when different |
 | `payload` | structured event payload object, passed through verbatim for `assistant_text` / `tool_use` / `agent_turn_end` (JSON body) |
 | `kind` | evidence kind (evidence type only); defaults to `screenshot` if a file is present, else `link`/`log` |
 | `caption` | evidence caption |
@@ -947,10 +939,7 @@ Behavior by `type`:
   parks the task in `needs_decision`. Missing/empty `options` default to
   `proceed`/`dismiss` (the emit path defaults rather than dropping the agent's
   signal). → `201 {decision: Decision, task: Task}`
-- `ready` → the finished-handoff signal. Records `pr_url` (when supplied and not
-  already linked, writing a `pr_linked` event), then advances `in_progress →
-  in_review` with a `ready_for_review` event. Idempotent: on a task that isn't
-  `in_progress` (already advanced) it acks without transitioning. → `200 {task: Task}`
+- `ready` → the finished-handoff signal. Records or replaces `pr_url` when supplied (writing a `pr_linked` event and clearing prior `ci_status`/`head_sha` on replacement), then advances `in_progress → in_review` with a `ready_for_review` event. Idempotent: on a task that isn't `in_progress` (already advanced) it acks without transitioning. → `200 {task: Task}`
 - `done` → records the `note` as summary + `note` event, then transitions the
   task to `done` (evidence rule enforced). → `200 {task: Task}` | `409`
 - `usage` → inserts a Usage row (cost computed server-side when `cost_usd` is
@@ -1485,13 +1474,7 @@ task's `agent_target`/`worktree_path` are cleared so a re-run is a no-op.
 The reconciler (`docs/runtime.md`) turns an observed agent death into action.
 Two kinds of failure, deliberately kept distinct:
 
-- **Infra failure (auto-recovered, bounded).** An agent that vanishes (herdr
-  reports it gone, or it goes stale-and-dead) is auto-recovered: the pane tail is
-  captured as `log` evidence, the task is marked `failed`, and a FRESH
-  `source="requeue"` task is queued (`parent_task_id` → the failed one). This is
-  capped at **2 auto-requeues** per lineage; the third death opens a decision
-  card instead (`recovery_card` event). An alive-but-silent agent is nudged up to
-  3 times, then also escalates to a card.
+- **Infra failure (auto-recovered, bounded).** An agent that vanishes (herdr reports it gone, or it goes stale-and-dead) is auto-recovered: the pane tail is captured as `log` evidence, the task is marked `failed`, and a FRESH `source="requeue"` task is queued (`parent_task_id` → the failed one). This is capped at **2 auto-requeues** per lineage; the third death opens a decision card instead (`recovery_card` event). An alive-but-silent agent is nudged up to 3 times, then also escalates to a card. Every auto-requeue (and the manual `POST /api/tasks/:id/requeue`) runs through `requeueTask`, which prepends the [Task resume context](#task) whenever the failed task left a branch. This is never optional: it prevents a requeue from silently restarting near-complete work or opening a second PR next to a predecessor's still-open one.
 - **Terminal failure (human triage).** A task that failed PAST the auto-requeue
   cap, was cancelled/failed for work reasons, or that the director failed
   manually, STAYS `failed`. `failed` is not a board column, so these surface ONLY

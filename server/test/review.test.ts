@@ -576,11 +576,14 @@ test("a 'ready' with a new PR url re-links the task (replaced PR, the #90 loop)"
   const id = await inReviewWithPr(s.base, "https://gh/pr/161");
   let task = await get(s.base, `/api/tasks/${id}`);
   expect(task.json.pr_url).toBe("https://gh/pr/161");
+  s.db.query("UPDATE tasks SET head_sha = ?, ci_status = ? WHERE id = ?").run("old-pr-head", "failing", id);
   // PR replaced: task bounces to in_progress, agent re-emits ready with the new url
   await post(s.base, `/api/tasks/${id}/transition`, { to: "in_progress" });
   await post(s.base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/166" });
   task = await get(s.base, `/api/tasks/${id}`);
   expect(task.json.pr_url).toBe("https://gh/pr/166"); // used to stay 161 forever
+  expect(task.json.head_sha).toBeNull();
+  expect(task.json.ci_status).toBeNull();
   const ev = await get(s.base, `/api/tasks/${id}/events`);
   const link = ev.json.filter((e: any) => e.type === "pr_linked").at(-1);
   expect(link.payload.via).toBe("ready_replaced");

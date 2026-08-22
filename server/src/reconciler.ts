@@ -420,12 +420,12 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     // The task's state may have moved on since the SELECT above — a concurrent
     // POST /merge, autoMergeReady, or an overlapping reconcile cycle can land
     // while this `await exec` was in flight and advance the task to a terminal
-    // state. Every branch below transitions off the task's state; re-read it
-    // fresh and skip once terminal, rather than trusting the stale `t.state`
-    // snapshot — that stale read is exactly what threw
+    // state or replace its linked PR. Every branch below acts on those facts;
+    // re-read them and skip once terminal or re-linked rather than trusting the
+    // stale `t` snapshot — that stale state read is exactly what threw
     // "invalid transition: 'done' -> 'verifying'" in production (task #621).
     const live = getTask(db, t.id);
-    if (!live || TERMINAL.includes(live.state as State)) continue;
+    if (!live || TERMINAL.includes(live.state as State) || live.pr_url !== t.pr_url) continue;
     const state: string = live.state;
     // Record a new pushed commit as `pr_synchronized` (hive's stand-in for
     // GitHub's synchronize webhook) so changesRequestUnaddressed can tell "the
@@ -464,6 +464,8 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
           base = preferSafeRef(data.baseRefName, base);
           const scopeHead = data.headRefOid || t.branch;
           const scope = await captureBranchScope(exec, project.repo_path, data.baseRefOid || base, scopeHead);
+          const afterScope = getTask(db, t.id);
+          if (!afterScope || TERMINAL.includes(afterScope.state as State) || afterScope.pr_url !== t.pr_url) continue;
           if (scope) writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: { ...scope, head_sha: data.headRefOid ?? null } });
         }
       }

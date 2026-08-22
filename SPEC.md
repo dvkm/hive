@@ -39,7 +39,7 @@ herdr agents (worktree-isolated)      Claude Code hooks       reconciler (timer)
 ## Data model (SQLite)
 
 - `projects(id, name, repo_path, created_at)` — plus JSON config column: monitor URLs, default branch, deploy notes.
-- `tasks(id TEXT pk, project_id, title, brief, state, kind, agent_target, worktree_path, branch, pr_url, ci_status, summary, created_at, updated_at)`
+- `tasks`: durable task records. `server/src/db.ts` owns the canonical SQLite schema; [docs/API.md](./docs/API.md#task) owns the public Task shape and field semantics.
   - `state ∈ {queued, in_progress, needs_decision, in_review, verifying, done, failed, cancelled}`
   - `kind ∈ {ship, scout, chore}` (scout = knowledge only, done requires a report as evidence)
 - `events(id, task_id, ts, source ∈ {agent, hook, herdr, reconciler, monitor, director, system, chat_supervisor, unknown}, type, payload JSON)` — append-only timeline; every state change writes an event.
@@ -70,7 +70,7 @@ Non-negotiable presentation rules (2026-07-09, David): hive uses herdr the way p
 
 ## Stale recovery (observed → acted on)
 
-On a stale flag: probe the agent (exists? integration status? pane tail). Dead → mark task failed with reason + captured pane tail as evidence, requeue under backoff (max 2 auto-requeues, then decision card). Alive but silent → send a status nudge via `herdr agent send`; still silent after N cycles (default 3) → decision card. Spawn also auto-installs hive's Claude Code hook wiring into the spawned agent's env so lifecycle reporting is structural, not brief-dependent.
+On a stale flag: probe the agent (exists? integration status? pane tail). Dead → mark task failed with reason + captured pane tail as evidence, requeue under backoff (max 2 auto-requeues, then decision card). Fresh requeues must adopt the failed attempt's working state instead of rebuilding it; [the Task resume contract](./docs/API.md#task) owns the structural fields and dispatch guard. Alive but silent → send a status nudge via `herdr agent send`; still silent after N cycles (default 3) → decision card. Spawn also auto-installs hive's Claude Code hook wiring into the spawned agent's env so lifecycle reporting is structural, not brief-dependent.
 
 - Spawn: `herdr worktree create --cwd <repo> --branch hive/<task-id> --json` then `herdr agent start <task-id> --cwd <worktree> --env HIVE_TASK_ID=<id> --env HIVE_URL=... --no-focus -- claude -p <brief-file> --permission-mode acceptEdits` (exact argv per-project configurable).
 - Brief composition (`server/src/briefs.ts`): task brief = task description + definition of done + `hive emit` protocol instructions + ALL active global policies + project policies + project playbook. Composed fresh at spawn time.

@@ -478,6 +478,20 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       )`,
     ],
   },
+  // Requeue adoption pointers: the predecessor's branch/ghost-branch/open-PR,
+  // recorded structurally on the requeue's own row (not just prose in its
+  // brief) so a dispatch-time guard can enforce "adopt, don't rebuild" even if
+  // the brief text is later edited. Fixes the duplicate-PR class (hive-1090):
+  // a requeued task rebuilt a whole feature as a second PR while the first
+  // one sat open, unreferenced, on the failed predecessor.
+  {
+    name: "v24-task-resume-context",
+    statements: [
+      `ALTER TABLE tasks ADD COLUMN resume_branch TEXT`,
+      `ALTER TABLE tasks ADD COLUMN resume_ghost_branch TEXT`,
+      `ALTER TABLE tasks ADD COLUMN resume_pr_url TEXT`,
+    ],
+  },
   // Human-facing task numbers are scoped to their project. The original
   // globally unique `number` remains intact for old PR markers and API
   // compatibility; `project_number` is the stable sequence used by the UI.
