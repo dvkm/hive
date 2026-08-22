@@ -503,12 +503,14 @@ learnings table doubles as the project knowledge store:
   "delivered_at": "2026-07-09T09:00:00.000Z"
 }
 ```
-`kind ∈ {decision, done, failed, incident, stale, intake, planned}`. `urgency ∈ {normal, urgent}`.
+`kind ∈ {decision, review, done, failed, incident, stale, intake, planned, test}`. `urgency ∈ {normal, urgent}`.
 (`intake` is a new Google-Chat draft task; `planned` is an approved planner
-breakdown — both always `normal`, batched into the digest.)
+breakdown — both always `normal`, batched into the digest. `review` is a task
+handed to the director for approval, always `urgent`.)
 `task_id` / `decision_id` may be null. `delivered_at` is set once David has been
-made aware — urgent notifications push a macOS notification immediately (so it is
-set on creation); normal ones are batched into a single digest every
+made aware — for an urgent notification that means the desktop app reported that
+macOS actually rendered it (`POST /api/notifications/:id/shown`), NOT that the
+server tried to send it; normal ones are batched into a single digest every
 `HIVE_DIGEST_MS` (default 30m), or marked when the header bell is opened
 (`POST /api/notifications/ack`). The bell's unread count is the rows where
 `delivered_at` is null. A `task_id`'d notification whose task belongs to a
@@ -1214,7 +1216,18 @@ touching ordinary `command` escalations.
   Bumps `occurrences` + refreshes `last_seen` and re-activates the learning (`status:"active"`); the same failure pattern happened again. Broadcasts a `learning` SSE message.
 
 ### Notifications
-- `GET /api/notifications?since=` → `200 {"notifications": [Notification, ...], "unread": <n>}` (newest first; `since` is an ISO timestamp filter, else the 100 most recent; `unread` counts rows with `delivered_at` null)
+Notification click targets and the `hive://` URL scheme: a notification's
+destination is `/decisions#dcard-<decision_id>` when it names a decision, else
+`/tasks/<task_id>`, else `/`. The desktop app registers the `hive` scheme, so the
+same destinations are reachable from anywhere: `hive://task/<number-or-id>`,
+`hive://decision/<id>`, `hive://quiz/<task-id>`, `hive://open?path=/<route>`.
+Task routes accept a task NUMBER as well as an id (`hive://task/1247`).
+
+- `GET /api/notifications?since=` → `200 {"notifications": [Notification, ...], "unread": <n>, "last_delivery_error": {"id","error","at"}|null}` (newest first; `since` is an ISO timestamp filter, else the 100 most recent; `unread` counts rows with `delivered_at` null)
+- `POST /api/notifications/:id/delivery` → `200 {"ok": <bool>}`
+  The desktop app reports what macOS did. `{"shown": true}` sets `delivered_at` (`ok:false` means it was already delivered, or the id is a digest, not a row). `{"error": "..."}` records the refusal instead — the common one is `UNErrorDomain error 1`, meaning notifications are switched off for hive. The latest refusal comes back as `last_delivery_error` on `GET /api/notifications`. Nothing else should call this: it is the only honest signal that a native notification appeared.
+- `POST /api/notifications/test` → `201 {"id": "ntf_...", "app_clients": <n>}`
+  Fires one urgent test notification down the live delivery path. `app_clients` is how many desktop apps are attached to the stream; zero means delivery falls back to launching the app. Behind `hive notify --test`, which then polls for `delivered_at`.
 - `POST /api/notifications/ack` → `200 {"ok":true, "acked": <n>}`
   Marks all currently-undelivered notifications as seen (`delivered_at` set to now). Called when the header bell dropdown is opened, so those events are not re-pushed by the next digest.
 

@@ -144,6 +144,27 @@ server/test/ bun test suite
   `config.monitors_auto_task`, an auto `chore` task. Post-deploy smoke
   (`config.smoke`) runs once on `verifying`: pass → `test_run` evidence,
   fail → back to `in_progress`.
+- **Native notifications + deeplinks** (`server/src/notifications.ts`,
+  `electron/main.js`). Urgent events (a decision opened, a task handed to
+  review, an agent unreachable, a monitor incident) raise a real macOS
+  notification through the desktop app, so it carries the hive icon and obeys
+  Do Not Disturb. The app already holds an SSE connection
+  (`/api/stream?client=app`), so the server delivers over that; only when no app
+  is attached does it fall back to launching the app with a `hive://` URL.
+  `delivered_at` is set when the app reports the notification actually rendered,
+  not when the server tried. Clicking one opens the exact task or decision.
+  `hive://` deeplinks work from anywhere (Terminal, another app, a script):
+
+  ```
+  open "hive://task/1247"           # task by number or id
+  open "hive://decision/dec_ab12"   # the decision card, scrolled to + highlighted
+  open "hive://quiz/1b75826af9fb"   # the understanding check on that task
+  open "hive://open?path=/inbox"    # any app route
+  ```
+
+  Check the whole chain without waiting for a real event: `hive notify --test`
+  fires one urgent notification and waits up to 10s for the app to confirm
+  macOS rendered it. It fails loudly if nothing did.
 - **Secrets** store names/refs only (migration v2). Values live in macOS
   Keychain (`security`) or Bitwarden (`bw`), resolved at spawn and injected as
   env; the server redacts known secret values from stored payloads. Manage with

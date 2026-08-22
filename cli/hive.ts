@@ -76,6 +76,8 @@ Usage:
   hive secret list --project <id>
   hive secret rm --project <id> --name <n>
   hive offline [on|off]                   drain the fleet before losing internet / resume after
+  hive notify --test                      fire one real macOS notification and report whether
+        the desktop app rendered it (proves the whole chain without a real event)
   hive open                               open the board in a browser
   hive app                                open the hive desktop app (native notifications
         + dock badge; build once: cd electron && bun install && bun run build)
@@ -899,6 +901,35 @@ async function main() {
       console.log(`offline mode: ${r.on ? "ON" : "off"}`);
     }
     return;
+  }
+
+  // Fire one real notification through the live delivery path and wait for the
+  // desktop app to confirm macOS rendered it. Only the app can confirm, so a
+  // timeout means the notification did not actually appear.
+  if (cmd === "notify") {
+    const { flags } = parseFlags(argv.slice(1));
+    if (!flags.test) die("usage: hive notify --test");
+    const { id, app_clients } = await api("POST", "/api/notifications/test");
+    if (!app_clients)
+      console.log("desktop app is NOT connected — falling back to launching it via hive://");
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      const { notifications, last_delivery_error } = await api("GET", "/api/notifications");
+      const row = notifications.find((n: any) => n.id === id);
+      if (row?.delivered_at) {
+        console.log(`OK — hive.app rendered the notification at ${row.delivered_at} (${id})`);
+        return;
+      }
+      if (last_delivery_error?.id === id)
+        die(
+          `macOS REFUSED the notification: ${last_delivery_error.error}\n` +
+            "Turn hive's notifications on in System Settings > Notifications > hive, then run this again."
+        );
+    }
+    die(
+      `no confirmation after 10s (${id}). The notification did not render. Check that hive.app is running (hive app) ` +
+        "and that hive is allowed to notify in System Settings > Notifications."
+    );
   }
 
   if (cmd === "open") {

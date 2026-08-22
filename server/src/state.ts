@@ -77,8 +77,13 @@ export function setEventHook(fn: EventHook | null): void {
   eventHook = fn;
 }
 
+// Accepts a task id or a task NUMBER. Ids win: they are 12 hex characters, so a
+// small number can never collide with one that exists. This is what makes
+// hive://task/1247 and /tasks/1247 resolve the way a human writes them.
 export function getTask(db: DB, id: string): any | null {
-  const r = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+  const r =
+    db.query("SELECT * FROM tasks WHERE id = ?").get(id) ??
+    (/^\d{1,9}$/.test(id) ? db.query("SELECT * FROM tasks WHERE number = ?").get(Number(id)) : null);
   return r ? parseTask(r) : null;
 }
 
@@ -483,6 +488,17 @@ export function transition(
     enqueue(db, { kind: "done", task_id: taskId, title: `Task done: ${task.title}`, body: task.summary ?? undefined });
   else if (to === "failed")
     enqueue(db, { kind: "failed", task_id: taskId, title: `Task failed: ${task.title}`, body: opts.reason ?? undefined });
+  // A task landing in review is waiting on the director and nobody else: the
+  // agent is parked until it is approved, sent back, or its understanding check
+  // is answered. That is urgent by definition, not digest material.
+  else if (to === "in_review")
+    enqueue(db, {
+      kind: "review",
+      urgency: "urgent",
+      task_id: taskId,
+      title: `Review #${task.number}: ${task.title}`,
+      body: "Approve, request changes, or answer the understanding check.",
+    });
   // Auto-teardown on an unambiguously-final state. failed is excluded (still retriable).
   if ((to === "done" || to === "cancelled") && terminalHook) {
     try {
