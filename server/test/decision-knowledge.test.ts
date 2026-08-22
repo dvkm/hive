@@ -64,10 +64,11 @@ test("answering a plain question persists it as decision knowledge; recall + bri
   expect(knowledge.decisions).toHaveLength(1);
   expect(knowledge.decisions[0].title).toContain("Which format");
 
-  // the next task's brief carries it so the crew doesn't re-ask
+  // the next task's brief points to it without replaying the answer
   const brief = composeBrief(db, task(db, projectId, "add a second export button"));
-  expect(brief).toContain("Decisions already made");
-  expect(brief).toContain("Which format for the data export");
+  expect(brief).toContain("1 past decisions");
+  expect(brief).toContain("hive recall");
+  expect(brief).not.toContain("Which format for the data export");
 });
 
 test("re-asking the same question bumps occurrences, refreshes the answer, no duplicate", async () => {

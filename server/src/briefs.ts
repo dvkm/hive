@@ -11,9 +11,8 @@ import { taskIdentifier } from "./taskIdentifier.ts";
 // on any PR the agent opens so hive can link the PR back to this task.
 function prMarkerSection(number: number, id: string): string {
   return `## Opening a PR (REQUIRED marker)
-When you open the PR for this task — whether via /no-mistakes or directly with
-\`gh pr create\` — it MUST carry the hive marker so the board links the PR back
-to this task automatically:
+When you open the PR for this task, it MUST carry the hive marker so the board
+links the PR back to this task automatically:
 
 - The PR **title** MUST start with \`${prTitlePrefix(number)}\` (the space is part of it).
 - The PR **body** MUST include this line on its own (a footer is ideal):
@@ -24,11 +23,8 @@ Don't hand-format it — run \`hive pr-marker ${id}\` and paste what it prints.`
 }
 
 const EMIT_PROTOCOL = `## Reporting protocol (\`hive emit\`)
-You are running under hive. Report progress with the \`hive emit\` CLI so the
-director's board stays current. Do not wait to be asked for status.
-If \`hive\` is not on your PATH, run it as \`"$HIVE_CLI"\` (set in your env), e.g.
-\`"$HIVE_CLI" emit <task-id> status --note "..."\` — same for \`hive task create\`
-and \`hive pr-marker\`. Prefer the CLI over raw curl: it attributes what you do.
+Keep the director's board current with the \`hive\` CLI. If it is not on PATH,
+use \`"$HIVE_CLI"\`. Prefer the CLI over raw curl so actions are attributed.
 
   hive emit <task-id> status   --note "what you just did / are doing"
   hive emit <task-id> evidence --file ./screenshot.png --note "caption"
@@ -38,24 +34,13 @@ and \`hive pr-marker\`. Prefer the CLI over raw curl: it attributes what you do.
   hive emit <task-id> done     --note "final summary"
 
 Rules:
-- BEFORE any command expected to run more than a minute (builds, full test
-  suites, e2e, docker up), emit status first, e.g.
-  \`hive emit <task-id> status --note "running e2e (~5m)"\` — a silent long
-  command looks stuck and triggers supervisor nudges (one agent ate 10).
-- A task NEVER reaches Done without evidence. Attach at least one evidence item
-  (screenshot, test run, log, report, or link) before emitting \`done\`.
-- Attach evidence BEFORE \`ready\`, not just before done — the review card shows
-  it to the director next to your diff. Anything visual gets a screenshot
-  (before/after for changes to existing UI); everything else gets test output.
+- Emit status before commands expected to exceed a minute.
+- Attach evidence before \`ready\`. Use screenshots for visual work and test
+  output for other changes. A task never reaches Done without evidence.
 - Scout tasks (knowledge-only) require a written report as evidence.
-- HAND OFF, don't go idle. When your PR is open (or, for a scout, your report
-  is attached), emit \`hive emit <task-id> ready --pr-url <url>\`. Review means
-  CI IS GREEN: if checks are still running or failing, the handoff is HELD and
-  the response tells you — stay on the task. hive moves it to review
-  automatically the moment checks pass, and steers you if they fail; fix and
-  push until green. Never sit idle with red CI.
-- BEFORE \`ready\`, submit a structured self-review — the director reviews THIS,
-  not your prose, so keep every bullet one tight line:
+- Hand off with \`ready\` when the PR is open. If CI is pending, END THE TURN;
+  hive monitors it and wakes you only if action is needed. If CI fails, fix it.
+- Before \`ready\`, submit a concise structured self-review:
 
     hive emit <task-id> review_summary --json review.json
 
@@ -78,38 +63,17 @@ Rules:
          "options": [{"key": "a", "label": "..."}, {"key": "b", "label": "..."}],
          "answer_key": "a",
          "explanation": "why the answer is right"}]}}
-  \`understanding.checks\` is REQUIRED for every review, including report-only
-  work. Provide 1-5 questions. Use one for a single, straightforward takeaway;
-  add more only when each tests a distinct decision-relevant idea, angle, or
-  scenario, never superficial rewordings. Each needs 2-4 plausible options and
-  a short teaching explanation. The audience is the director, who delegates
-  implementation. Every question must help them understand this specific
-  change or report: its behavior, user impact, risk, tradeoff, or evidence.
-  Its answer must be taught in the explanation above. Never test whether the
-  agent knows how to code, debug, merge, use tools, follow agent policy, or
-  operate Hive. Never put the director in the worker's role with questions
-  like "what should you do?", "your branch/task/PR", or "where should you
-  investigate?" Agent competence belongs in internal checks, not the
-  director's approval gate. Never quiz project bookkeeping:
-  why work was split into a follow-up, which task/PR/file/command/identifier
-  carried it, who did it, or what the brief happened to scope. If a question
-  does not improve the director's understanding of this review, omit it;
-  fewer is better.
-  Questions, options, and explanations are read by a human on a phone:
-  write them to the Plain English bar below, and never restate one question's
-  point in another.
-  Hive rotates questions
-  after a miss and shuffles option order, so never depend on answer position.
-  Keep each question and option complete and under 500 characters.
-  For a report, make the packet read like a compact impact
-  analysis: background = why the report was commissioned and relevant prior
-  context, scope = investigation boundaries, essence = headline finding,
-  walkthrough = evidence chain, affected_areas = blast radius,
-  risk_assessment = confidence and uncertainty, and participate = recommended
-  next decision. Then test decision-relevant takeaways. Keep the whole
-  packet short and teach only the background needed.
-  Honesty rule: "iffy" is MANDATORY when anything is uncertain, hacky, or has a
-  known ceiling — an empty iffy list on risky work reads as hiding it.
+  \`understanding.checks\` is required for every review. Use 1-5 questions,
+  each with 2-4 plausible options and a teaching explanation.
+  Every question must help them understand this specific change or report:
+  behavior, user impact, risk, tradeoff, or evidence. Never test whether the
+  agent knows how
+  to code, debug, merge, use tools, follow agent policy, or operate Hive. Agent
+  competence belongs in internal checks. Never quiz project bookkeeping. If a
+  question does not improve the director's understanding of this review, omit
+  it. Keep each question and option under 500 characters. For reports, make the
+  packet a compact impact analysis. Include \`iffy\` whenever work is uncertain,
+  hacky, or has a known ceiling.
 - When you hit a decision the director must make, open a REAL decision card with
   concrete options — never bury a question in a status note or review summary
   (text questions can't be answered with a click):
@@ -119,16 +83,9 @@ Rules:
       --option key1:Label:"what choosing this means" --option key2:Label:"..." \\
       --recommend key1
 
-  Context is mandatory. In 2-4 short sentences, give the current state, why the
-  choice matters to the director or users, what is uncertain, and your
-  recommendation with its reason. The card must stand alone without opening
-  the task or decoding identifiers. Put shared framing in context, then use
-  each option's detail only for that option's consequence and risk. One card
-  per question, 2-4 options each, always include your recommendation.
-  \`hive decision ask\` already parks the task in \`needs_decision\` — don't also
-  emit \`needs-decision\` for the same question, it opens a second, redundant
-  card (two entries for one decision). Stop and wait for the answer if you
-  can't proceed without it; keep working on other parts if you can.
+  Context must stand alone without opening the task. Give 2-4 options and a
+  recommendation. \`hive decision ask\` parks the task, so do not emit a second
+  needs-decision event. Keep working elsewhere if the answer is not blocking.
 - When the director REQUESTS CHANGES, first reply with
   \`hive emit <task-id> status --note "..."\` saying what you'll change (this is
   a visible conversation — silence looks like the request was lost), then do the
@@ -339,65 +296,17 @@ export function composeBrief(db: DB, taskId: string): string {
   // protocol it MUST use before any externally-risky operation it runs itself.
   parts.push(standingAuthority(db, task.project_id, task.id));
 
-  // Project reference: durable facts (design files, dashboards, glossary). The
-  // brief carries only the INDEX (titles) so it stays small as the store grows;
-  // the agent pulls the full fact on demand with `hive recall`. Short reference
-  // bodies (a bare URL / one line) are shown inline — no round-trip for those.
-  const references = db
-    .query("SELECT title, body FROM learnings WHERE project_id = ? AND kind = 'reference' AND status = 'active' ORDER BY first_seen")
-    .all(task.project_id) as { title: string; body: string | null }[];
-  if (references.length) {
-    const line = (r: { title: string; body: string | null }) => {
-      const b = (r.body ?? "").trim();
-      return b && b.length <= 120 && !b.includes("\n") ? `- **${r.title}** — ${b}` : `- **${r.title}**`;
-    };
-    parts.push(
-      `## Project knowledge (search it — DON'T ask the director for what's here)
-This project has stored references, past-failure learnings, and policies. Before
-you assume, guess, or ask the director something a teammate would already know,
-search them:
+  // Project history grows without bound, so briefs carry counts and retrieve
+  // task-relevant facts on demand instead of replaying the whole store.
+  const knowledge = db
+    .query("SELECT kind, COUNT(*) AS count FROM learnings WHERE project_id = ? AND status = 'active' GROUP BY kind")
+    .all(task.project_id) as { kind: string; count: number }[];
+  if (knowledge.length) {
+    const counts = Object.fromEntries(knowledge.map((row) => [row.kind, row.count]));
+    parts.push(`## Project knowledge (recall, then act)
+Hive has ${counts.reference ?? 0} references, ${counts.decision ?? 0} past decisions, and ${counts.failure ?? 0} failure patterns for this project. Before guessing, asking, or repeating an old failure, search with task-specific keywords:
 
-  hive recall <keywords>          # e.g. hive recall figma design, hive recall migration
-
-Reference facts on file (run \`hive recall\` for the full detail of any):
-${references.map(line).join("\n")}`
-    );
-  }
-
-  // Answers to past decision cards — so this crew consults the prior ruling
-  // before raising the same question again. Indexed by question (+ a short
-  // answer inline); the full note is one `hive recall` away.
-  const decisions = db
-    .query(
-      "SELECT title, body FROM learnings WHERE project_id = ? AND kind = 'decision' AND status = 'active' ORDER BY last_seen DESC LIMIT 12"
-    )
-    .all(task.project_id) as { title: string; body: string | null }[];
-  if (decisions.length) {
-    const line = (d: { title: string; body: string | null }) => {
-      const a = (d.body ?? "").replace(/\n/g, " ").trim();
-      return a && a.length <= 140 ? `- **${d.title}** — ${a}` : `- **${d.title}**`;
-    };
-    parts.push(
-      `## Decisions already made (don't re-ask — recall, then act)
-The director already answered these for this project. Before you raise a
-decision card, check whether it's already settled here (or via \`hive recall\`):
-${decisions.map(line).join("\n")}`
-    );
-  }
-
-  // Known failure patterns: active FAILURE learnings, 10 most recent.
-  const learnings = db
-    .query(
-      "SELECT title, body, occurrences FROM learnings WHERE project_id = ? AND kind = 'failure' AND status = 'active' ORDER BY last_seen DESC LIMIT 10"
-    )
-    .all(task.project_id) as { title: string; body: string | null; occurrences: number }[];
-  if (learnings.length) {
-    parts.push(
-      "## Known failure patterns (learn from past regressions)\n" +
-        learnings
-          .map((l) => `### ${l.title} (seen ${l.occurrences}×)\n${l.body?.trim() || ""}`.trimEnd())
-          .join("\n\n")
-    );
+  hive recall <keywords>`);
   }
 
   return parts.join("\n\n") + "\n";

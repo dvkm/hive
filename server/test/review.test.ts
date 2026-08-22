@@ -780,6 +780,9 @@ test("ready with failing CI is HELD in_progress; with passing CI it hands off", 
   id = await inReviewWithPr(pending.base, "https://gh/pr/11");
   task = await get(pending.base, `/api/tasks/${id}`);
   expect(task.json.state).toBe("in_progress"); // held while checks run
+  const held = await post(pending.base, `/api/tasks/${id}/events`, { type: "ready" });
+  expect(held.json.message).toContain("End this turn");
+  expect(held.json.message).not.toContain("Stay on the task");
   pending.server.stop(true);
 });
 

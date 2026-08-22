@@ -18,12 +18,11 @@
 // CHECKS is the allowlist: an unknown top-level key is rejected, so a new config
 // key cannot be wired into a reader without someone landing here and choosing
 // its check. Keys hive stores but never reads are listed with `any` explicitly.
-import { AUTONOMY_PROFILES } from "./chat.ts";
-
 // Lives here, not in api.ts: this schema needs it, and api.ts already imports
 // this file, so importing back would be a cycle. api.ts re-exports the name.
 export const AGENTS = ["claude", "codex"] as const;
 export type Agent = (typeof AGENTS)[number];
+export const AUTONOMY_PROFILES = ["conservative", "balanced", "autopilot"] as const;
 
 type Check = (v: unknown) => string | null; // null = valid, else the reason
 
@@ -31,6 +30,8 @@ const any: Check = () => null;
 const str: Check = (v) => (typeof v === "string" ? null : "must be a string");
 const bool: Check = (v) => (typeof v === "boolean" ? null : "must be a boolean");
 const num: Check = (v) => (typeof v === "number" && Number.isFinite(v) ? null : "must be a number");
+const positiveInt: Check = (v) =>
+  typeof v === "number" && Number.isInteger(v) && v > 0 ? null : "must be a positive integer";
 const obj: Check = (v) => (v !== null && typeof v === "object" && !Array.isArray(v) ? null : "must be an object");
 const strArray: Check = (v) =>
   Array.isArray(v) && v.every((x) => typeof x === "string") ? null : "must be an array of strings";
@@ -38,6 +39,16 @@ const oneOf =
   (...allowed: string[]): Check =>
   (v) =>
     typeof v === "string" && allowed.includes(v) ? null : `must be one of ${allowed.join("|")}`;
+const reasoningEffort = oneOf("minimal", "low", "medium", "high", "xhigh");
+const reasoningByKind: Check = (v) => {
+  const bad = obj(v);
+  if (bad) return bad;
+  for (const [key, value] of Object.entries(v as Record<string, unknown>)) {
+    const invalid = reasoningEffort(value);
+    if (invalid) return `.${key} ${invalid}`;
+  }
+  return null;
+};
 
 // The subprocess-override family. Constrained to a string[] so nothing but an
 // argv can be smuggled through; the CONTENT stays the project's choice, which
@@ -122,6 +133,10 @@ const CHECKS: Record<string, Check> = {
   model_by_kind: obj,
   codex_model: str,
   codex_model_by_kind: obj,
+  codex_reasoning_effort: reasoningEffort,
+  codex_reasoning_effort_by_kind: reasoningByKind,
+  codex_auto_compact_token_limit: positiveInt,
+  codex_tool_output_token_limit: positiveInt,
   supervisor_persona: str,
   playbook: str,
   command_approval: oneOf("escalate", "allow", "prompt"),

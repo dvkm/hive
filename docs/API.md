@@ -57,7 +57,7 @@ downstream (see `agent_argv` below). Keys used elsewhere:
 `monitors` (`[{name, url, expect_status, expect_substring?, interval_s}]`),
 `monitors_auto_task` (bool; a monitor failure auto-creates a `chore` task),
 `smoke` (`[{name, url, expect_status, expect_substring?}]`, run once on
-`verifying`), `agent` (`"claude" | "codex"`, default `"claude"`; `"codex"` runs the interactive Codex CLI using the machine's ChatGPT login), `codex_model` / `codex_model_by_kind` (optional Codex model overrides; omitted means the current Codex default), `agent_argv` (string[], advanced per-project override of the complete command herdr runs; verbatim and responsible for its own briefing),
+`verifying`), `agent` (`"claude" | "codex"`, default `"claude"`; `"codex"` runs the interactive Codex CLI using the machine's ChatGPT login), `codex_model` / `codex_model_by_kind` (optional Codex model overrides; omitted means the current Codex default), `codex_reasoning_effort` / `codex_reasoning_effort_by_kind` (optional Codex reasoning overrides; defaults are `medium` for ship and `low` for scout/chore), `codex_auto_compact_token_limit` (default `64000`), `codex_tool_output_token_limit` (default `6000`), `agent_argv` (string[], advanced per-project override of the complete command herdr runs; verbatim and responsible for its own briefing),
 `setup_argv` / `cleanup_argv` (string[], a symmetric per-project stack hook pair —
 `setup_argv` runs at spawn time once the worktree exists but before the agent
 starts, `cleanup_argv` runs before the worktree is removed; relative `argv[0]`

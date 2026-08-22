@@ -31,27 +31,29 @@ function task(db: DB, projectId: string, title: string, brief = ""): string {
 }
 const openCards = (db: DB) => db.query("SELECT * FROM decisions WHERE status = 'open'").all() as any[];
 
-test("addReference stores a pinned fact; the brief carries the index + a recall pointer", () => {
+test("addReference stores a pinned fact; the brief carries a count + recall pointer", () => {
   const { db, projectId } = freshDb();
   addReference(db, projectId, "Design file", FIGMA);
   expect(listReferences(db, projectId)).toEqual([{ title: "Design file", body: FIGMA }]);
   const id = task(db, projectId, "make market-radar match the design");
   const brief = composeBrief(db, id);
   expect(brief).toContain("hive recall"); // agents search on demand
-  expect(brief).toContain("Design file"); // the title is indexed
-  expect(brief).toContain(FIGMA); // short body (a URL) shown inline
+  expect(brief).toContain("1 references");
+  expect(brief).not.toContain("Design file");
+  expect(brief).not.toContain(FIGMA);
   // upsert by title: no duplicate row
   addReference(db, projectId, "Design file", FIGMA + "?node-id=1");
   expect(listReferences(db, projectId)).toHaveLength(1);
 });
 
-test("a long reference body is indexed by TITLE only (kept out of the brief bulk)", () => {
+test("reference titles and bodies stay out of the brief bulk", () => {
   const { db, projectId } = freshDb();
   const longBody = "This is a long multi-line fact.\n".repeat(20);
   addReference(db, projectId, "Deploy runbook", longBody);
   const brief = composeBrief(db, task(db, projectId, "t"));
-  expect(brief).toContain("Deploy runbook"); // title present
-  expect(brief).not.toContain("long multi-line fact"); // body NOT dumped
+  expect(brief).toContain("1 references");
+  expect(brief).not.toContain("Deploy runbook");
+  expect(brief).not.toContain("long multi-line fact");
 });
 
 test("references stay in their own store, separate from failure learnings", () => {
@@ -60,8 +62,8 @@ test("references stay in their own store, separate from failure learnings", () =
   for (let i = 0; i < 15; i++) recordSystemLearning(db, projectId, `failure ${i}`, "b");
   addReference(db, projectId, "Ref A", "https://a");
   const brief = composeBrief(db, task(db, projectId, "t"));
-  expect(brief).toContain("Ref A");
-  expect(brief).toContain("Known failure patterns");
+  expect(brief).toContain("1 references");
+  expect(brief).toContain("15 failure patterns");
 });
 
 test("captureRecurringRefs proposes a card for a link in >=3 tasks, once, and save stores it", () => {

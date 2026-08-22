@@ -153,7 +153,7 @@ its canonical `taskId` name so probe/send/focus by `agent_target` keep resolving
 Per-project `config.agent_argv` overrides the command verbatim (the operator owns
 briefing in that case).
 
-**Model selection.** Claude workers stay explicitly pinned by task kind: `ship → opus`, `scout`/`chore` → `sonnet`, overridable through `config.model` or `config.model_by_kind`. Codex workers inherit the current ChatGPT/Codex default unless `config.codex_model` or `config.codex_model_by_kind` is set. `config.agent_argv` bypasses both paths. The planner one-shot remains Claude and is pinned to `sonnet` unless `config.planner_argv` overrides it.
+**Model selection.** Claude workers stay explicitly pinned by task kind: `ship → opus`, `scout`/`chore` → `sonnet`, overridable through `config.model` or `config.model_by_kind`. Codex workers inherit the current ChatGPT/Codex default unless `config.codex_model` or `config.codex_model_by_kind` is set. Hive bounds Codex's default token use with `medium` reasoning for ship tasks, `low` for scout/chore tasks, compaction at 64,000 tokens, and 6,000-token tool output. Override those with `config.codex_reasoning_effort`, `config.codex_reasoning_effort_by_kind`, `config.codex_auto_compact_token_limit`, and `config.codex_tool_output_token_limit`. `config.agent_argv` bypasses all of these paths. The planner one-shot remains Claude and is pinned to `sonnet` unless `config.planner_argv` overrides it.
 
 ## Stale recovery loop (`server/src/reconciler.ts`)
 

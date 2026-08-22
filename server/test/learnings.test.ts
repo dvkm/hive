@@ -249,7 +249,7 @@ test("a recurrence after recategorization re-files as a failure, not a bump of t
   expect(rows.find((r) => r.kind === "failure")).toBeTruthy();
 });
 
-test("active learnings are injected into composed briefs, capped at 10", async () => {
+test("active learnings are counted in briefs without replaying their bodies", async () => {
   // fresh project + task so we control the learning set
   const p = await post("/api/projects", { name: "brief-proj", repo_path: "/tmp/y" });
   const pid = p.json.id;
@@ -262,11 +262,8 @@ test("active learnings are injected into composed briefs, capped at 10", async (
   await put(`/api/learnings/${resolvedL.json.id}`, { status: "resolved" });
 
   const brief = composeBrief(db, t.json.id);
-  expect(brief).toContain("Known failure patterns");
-  expect(brief).toContain("pattern 11");
+  expect(brief).toContain("12 failure patterns");
+  expect(brief).not.toContain("pattern 11");
   expect(brief).not.toContain("already fixed");
-  // cap at 10: only the 10 most recent by last_seen; pattern 0/1 are oldest.
-  expect(brief).not.toContain("pattern 0\n");
-  const shown = [...brief.matchAll(/### pattern \d+/g)].length;
-  expect(shown).toBe(10);
+  expect(brief).not.toContain("body 11");
 });
