@@ -5,6 +5,7 @@ import type { Decision, DecisionBundle, DecisionPlan } from "../lib/api";
 import { riskDisplay } from "../lib/decision";
 import { toast } from "../lib/ui";
 import { PrReference, ReferenceText } from "../lib/references";
+import { relTime } from "../lib/time";
 
 // One decision card: options (recommended first), risk/blast radius, autosaved
 // draft note, Submit. Shared by the Chief exchange, Needs you, and detailed
@@ -255,17 +256,45 @@ function firstLine(s: string): string {
   return line.length > 200 ? line.slice(0, 200) + "…" : line;
 }
 
+// This card talks about the checks, so say whether its facts are still true.
+// A changed signal is the loud case: the card was written about one result and
+// the checks now say another, so don't let it read as current.
+function CiFreshness({ ci }: { ci: NonNullable<DecisionBundle["ci"]> }) {
+  const checked = ci.checked_at ? relTime(ci.checked_at) : "not since this card was written";
+  return (
+    <div className={ci.changed ? "dbundle-ci dbundle-ci-changed" : "dbundle-ci"}>
+      {ci.changed ? (
+        <span>
+          Checks changed since this card: {ci.at_card} → {ci.status ?? "unknown"}. Re-checked {checked}.
+        </span>
+      ) : (
+        <span>
+          Checks still {ci.status ?? ci.at_card}. Re-checked {checked}.
+        </span>
+      )}
+      {ci.outage && (
+        <div>
+          These checks are an infrastructure outage, not this PR.{" "}
+          {ci.outage.fix_task_number ? `Hive is already fixing it in #${ci.outage.fix_task_number}. ` : ""}
+          Your answer covers every PR blocked by it.
+        </div>
+      )}
+    </div>
+  );
+}
+
 // The server-derived context that lets the director decide without opening the
 // task: the affected PR/branch + spend, and how they've answered before on this
 // project. Renders nothing when no bundle is present (older SSE payloads, tests).
 function DecisionBundleView({ bundle }: { bundle?: DecisionBundle | null }) {
   if (!bundle) return null;
-  const { pr_url, branch, spend_usd, prior_decisions } = bundle;
+  const { pr_url, branch, spend_usd, prior_decisions, ci } = bundle;
   const hasFacts = pr_url || branch || spend_usd > 0;
-  if (!hasFacts && prior_decisions.length === 0) return null;
+  if (!hasFacts && prior_decisions.length === 0 && !ci) return null;
 
   return (
     <div className="dbundle">
+      {ci && <CiFreshness ci={ci} />}
       {hasFacts && (
         <div className="dbundle-facts">
           {pr_url && (

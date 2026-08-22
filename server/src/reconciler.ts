@@ -23,7 +23,7 @@ import { broadcastTask } from "./health.ts";
 import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
-import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, spawnAgent } from "./api.ts";
+import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent } from "./api.ts";
 import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectBaseBranch, preferSafeRef } from "./exec.ts";
@@ -119,6 +119,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
     return;
   }
   await step("syncPRs", () => syncPRs(db, deps));
+  await step("revalidateCiDecisions", () => revalidateCiDecisions(db));
   await step("linkPRs", () => linkPRs(db, deps));
   await step("resumeUsageLimited", () => resumeUsageLimited(db, (deps.nowMs ?? (() => Date.now()))()));
   await step("flagStale", () => flagStale(db, deps));
@@ -467,12 +468,32 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
         }
       }
     }
-    const ci = await ciStatusProbed(exec, data.statusCheckRollup);
+    const { status: ci, red } = await probeRed(exec, data.statusCheckRollup, data.baseRefOid ?? null);
+    // ci_status only changes when the answer changes; ci_checked_at records
+    // every LOOK, which is what a decision card citing CI has to show.
+    db.query("UPDATE tasks SET ci_checked_at = ? WHERE id = ?").run(now(), t.id);
     if (ci && ci !== t.ci_status) {
       db.query("UPDATE tasks SET ci_status = ?, updated_at = ? WHERE id = ?").run(ci, now(), t.id);
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "ci_status", payload: { ci_status: ci } });
       broadcast({ type: "task", task: getTask(db, t.id) });
       if (ci === "unavailable") notifyCiUnavailable(db, t.id, t.pr_url);
+    }
+    // Infra-red: the signal itself is the bug, so dispatch ONE diagnostic task
+    // for it across every PR it hits, and record the signal on this task so a
+    // decision card raised here can inherit the director's single ruling.
+    const signal = ci === "unavailable" ? ciSignalKey(red) : null;
+    if (signal) {
+      // One event per (head, signal): the probe repeats every cycle while a PR
+      // sits red, and the timeline must not fill up with the same fact.
+      const logged = db
+        .query(
+          `SELECT 1 FROM events WHERE task_id = ? AND type = 'ci_infra'
+             AND json_extract(payload, '$.signal') = ? AND COALESCE(json_extract(payload, '$.head_sha'), '') = ? LIMIT 1`
+        )
+        .get(t.id, signal, headSha ?? "");
+      if (!logged)
+        writeEvent(db, { task_id: t.id, source: "reconciler", type: "ci_infra", payload: { signal, checks: red, head_sha: headSha } });
+      ensureInfraTask(db, t.project_id, signal, red, t.pr_url);
     }
     if (data.headRefOid && data.headRefOid !== t.head_sha) {
       db.query("UPDATE tasks SET head_sha = ?, updated_at = ? WHERE id = ?").run(data.headRefOid, now(), t.id);
@@ -719,6 +740,100 @@ async function isNonStart(exec: Exec, check: any): Promise<boolean> {
   }
 }
 
+// The other two infra shapes, both seen on corebeat PR #811: the job "ran" but
+// executed ZERO steps in a couple of seconds (no runner picked it up), and the
+// exact same check is already red on the base branch, where this PR's diff does
+// not exist. Neither can be fixed by a commit on the PR.
+const NO_STEPS_MAX_MS = 20_000;
+
+function jobRef(check: any): { owner: string; repo: string; job: string } | null {
+  const m = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/.*\/job\/(\d+)/.exec(String(check?.detailsUrl ?? ""));
+  return m ? { owner: m[1], repo: m[2], job: m[3] } : null;
+}
+
+// True when the Actions job record shows no steps at all and a runtime of
+// seconds. Anything unparseable → false: a genuine red test is never downgraded
+// because a probe misfired.
+async function ranNoSteps(exec: Exec, check: any): Promise<boolean> {
+  const ref = jobRef(check);
+  if (!ref) return false;
+  const r = await exec(["gh", "api", `repos/${ref.owner}/${ref.repo}/actions/jobs/${ref.job}`]);
+  if (r.code !== 0) return false;
+  try {
+    const job = JSON.parse(r.stdout);
+    if (!Array.isArray(job?.steps) || job.steps.length > 0) return false;
+    const started = Date.parse(job?.started_at ?? "");
+    const completed = Date.parse(job?.completed_at ?? "");
+    if (!Number.isFinite(started) || !Number.isFinite(completed)) return false;
+    return completed - started <= NO_STEPS_MAX_MS;
+  } catch {
+    return false;
+  }
+}
+
+// Names of the checks already failing on the PR's base commit — the same
+// failure without this PR's diff. One gh call per red PR, not per check.
+async function baseFailures(exec: Exec, check: any, baseSha: string | null | undefined): Promise<Set<string>> {
+  const ref = jobRef(check);
+  if (!ref || !baseSha) return new Set();
+  const r = await exec(["gh", "api", `repos/${ref.owner}/${ref.repo}/commits/${baseSha}/check-runs`]);
+  if (r.code !== 0) return new Set();
+  try {
+    const runs = JSON.parse(r.stdout)?.check_runs;
+    if (!Array.isArray(runs)) return new Set();
+    return new Set(runs.filter(isFailedCheck).map((c: any) => String(c?.name ?? "")));
+  } catch {
+    return new Set();
+  }
+}
+
+// Why a red check is infra, in the order the probes are cheapest and most
+// certain. `null` = the diff plausibly caused it, i.e. code-red.
+const INFRA_REASONS: Record<string, string> = {
+  "not-started": "GitHub never started the job",
+  "no-steps": "the job ran zero steps and ended in seconds — no runner picked it up",
+  "red-on-base": "the same check is already red on the base branch, without this PR's changes",
+};
+
+export type RedCheck = { name: string; infra: string | null };
+
+// Classify every red check on a rollup as infra or code. Only ever called on a
+// rollup that is already red.
+export async function classifyRed(exec: Exec, rollup: any, baseSha?: string | null): Promise<RedCheck[]> {
+  const red = (Array.isArray(rollup) ? rollup : []).filter(isFailedCheck);
+  let base: Set<string> | null = null;
+  const out: RedCheck[] = [];
+  for (const c of red) {
+    const name = String(c?.name ?? c?.context ?? "check");
+    let infra: string | null = null;
+    if (await isNonStart(exec, c)) infra = "not-started";
+    else if (await ranNoSteps(exec, c)) infra = "no-steps";
+    else {
+      if (base === null) base = await baseFailures(exec, c, baseSha);
+      if (name && base.has(name)) infra = "red-on-base";
+    }
+    out.push({ name, infra });
+  }
+  return out;
+}
+
+// A stable id for "this same outage", shared by every PR it hits: the failing
+// check names plus why. Two PRs blocked by the billing lapse on 'syntax' and
+// 'parity' produce one key, so they get one task and one ruling.
+export function ciSignalKey(red: RedCheck[]): string | null {
+  const infra = red.filter((c) => c.infra);
+  if (!infra.length || infra.length !== red.length) return null; // any code-red → not an outage
+  const names = [...new Set(infra.map((c) => c.name))].sort().join(",");
+  const why = [...new Set(infra.map((c) => c.infra))].sort().join(",");
+  return `${names}:${why}`;
+}
+
+export function ciSignalSentence(red: RedCheck[]): string {
+  const reasons = [...new Set(red.map((c) => c.infra).filter(Boolean))].map((k) => INFRA_REASONS[k as string] ?? k);
+  const names = [...new Set(red.map((c) => c.name))].join(", ");
+  return `${names}: ${reasons.join("; ")}`;
+}
+
 // Surface a non-start to the director, not to the agent — the agent can't fix
 // it. Once per hour for the whole fleet: the failure mode this exists for is
 // EVERY open PR going red at the same moment (Actions billing lapses), and a
@@ -737,6 +852,45 @@ function notifyCiUnavailable(db: DB, taskId: string, prUrl: string): void {
   });
 }
 
+const INFRA_TASK_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+// One diagnostic task per outage signal, for the whole fleet — not one per
+// blocked PR. Deduped on the `ci-signal:` marker in the brief, so the six PRs
+// that shared today's billing block share one task. Skipped while an earlier
+// task for the same signal is still open.
+export function ensureInfraTask(db: DB, projectId: string, signal: string, red: RedCheck[], prUrl: string): string | null {
+  // ponytail: the marker is matched with LIKE, so a check name containing % or _
+  // would over-match; check names are workflow/job names, which don't.
+  const marker = `ci-signal: ${signal}`;
+  // Still open, or closed within a day: an outage nobody can fix from here (a
+  // billing lapse) would otherwise mint a fresh task every cycle after the last
+  // one is closed.
+  const recent = db
+    .query(
+      `SELECT id FROM tasks WHERE brief LIKE ? AND (state IN ${NON_TERMINAL} OR created_at > ?) LIMIT 1`
+    )
+    .get(`%${marker}%`, new Date(Date.now() - INFRA_TASK_COOLDOWN_MS).toISOString()) as { id: string } | undefined;
+  if (recent) return null;
+  const t = now();
+  const id = newId();
+  const names = [...new Set(red.map((c) => c.name))].join(", ");
+  const title = `CI infrastructure red: ${names}`;
+  const brief =
+    `Automated: the check(s) ${names} are red for a reason no PR can fix.\n\n` +
+    `Signal: ${ciSignalSentence(red)}.\n` +
+    `First seen on ${prUrl}. Every PR hitting this same signal shares THIS task — do not open one per PR.\n\n` +
+    `Diagnose the signal itself (GitHub Actions billing, spending limit, runner availability, or a broken workflow on the base branch), ` +
+    `fix it or report exactly what a human must change, and attach evidence that a rerun of ${names} now passes.\n\n` +
+    `ci-signal: ${signal}`;
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, brief, state, kind, created_at, updated_at)
+     VALUES (?,?,?,?, 'queued', 'chore', ?, ?)`
+  ).run(id, projectId, title, brief, t, t);
+  writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title, ci_signal: signal, pr_url: prUrl } });
+  broadcast({ type: "task", task: getTask(db, id) });
+  return id;
+}
+
 // ciStatusOf plus the one thing the rollup can't tell you on its own: a
 // 'failing' rollup whose failing checks ALL never started is 'unavailable', not
 // 'failing'. Callers gate on 'failing'/'pending' and let 'unavailable' through
@@ -746,13 +900,41 @@ function notifyCiUnavailable(db: DB, taskId: string, prUrl: string): void {
 // ponytail: one extra `gh api` per failing check per cycle, and only while a PR
 // is red — green and pending rollups never probe. Cache per head SHA if a repo
 // ever sits red across many tasks for long enough to matter.
-export async function ciStatusProbed(exec: Exec, rollup: any): Promise<string | null> {
+export async function probeRed(
+  exec: Exec,
+  rollup: any,
+  baseSha?: string | null
+): Promise<{ status: string | null; red: RedCheck[] }> {
   const status = ciStatusOf(rollup);
-  if (status !== "failing") return status;
-  for (const c of (rollup as any[]).filter(isFailedCheck)) {
-    if (!(await isNonStart(exec, c))) return "failing";
+  if (status !== "failing") return { status, red: [] };
+  const red = await classifyRed(exec, rollup, baseSha);
+  return { status: red.length && red.every((c) => c.infra) ? "unavailable" : "failing", red };
+}
+
+export async function ciStatusProbed(exec: Exec, rollup: any, baseSha?: string | null): Promise<string | null> {
+  return (await probeRed(exec, rollup, baseSha)).status;
+}
+
+// Signal freshness. A card that cited red checks is only worth the director's
+// attention while the checks are still red. syncPRs re-probes every cycle, so
+// the moment they turn green the question is moot: close it, tell the agent, and
+// let it carry on — showing stale facts is worse than showing nothing.
+export function revalidateCiDecisions(db: DB): number {
+  const rows = db
+    .query(
+      `SELECT d.id, d.title, t.ci_status FROM decisions d JOIN tasks t ON t.id = d.task_id
+        WHERE d.status = 'open' AND d.ci_status_at_card IN ('failing', 'unavailable') AND t.ci_status = 'passing'`
+    )
+    .all() as { id: string; title: string; ci_status: string }[];
+  for (const r of rows) {
+    apiDismissDecision(db, r.id, {
+      reason: "ci_signal_changed",
+      steer:
+        `hive closed your decision card "${r.title}" on its own: the checks it was about are GREEN now, ` +
+        `so the question no longer applies. Re-check the PR and carry on; ask again only if something is still blocked.`,
+    });
   }
-  return "unavailable";
+  return rows.length;
 }
 
 // ---- stale detection ----
