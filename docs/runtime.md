@@ -155,6 +155,8 @@ briefing in that case).
 
 **Model selection.** Claude workers stay explicitly pinned by task kind: `ship → opus`, `scout`/`chore` → `sonnet`, overridable through `config.model` or `config.model_by_kind`. Codex workers inherit the current ChatGPT/Codex default unless `config.codex_model` or `config.codex_model_by_kind` is set. Hive bounds Codex's default token use with `medium` reasoning for ship tasks, `low` for scout/chore tasks, compaction at 64,000 tokens, and 6,000-token tool output. Override those with `config.codex_reasoning_effort`, `config.codex_reasoning_effort_by_kind`, `config.codex_auto_compact_token_limit`, and `config.codex_tool_output_token_limit`. `config.agent_argv` bypasses all of these paths. The planner one-shot remains Claude and is pinned to `sonnet` unless `config.planner_argv` overrides it.
 
+**Token controls.** The composed prompt keeps the lifecycle and standing-authority contracts inline, but stores policy, reference, prior-decision, and failure bodies behind task-scoped `hive recall` searches. Default processed-token warning/cap thresholds are 75M/200M and wait-call thresholds are 25/100; projects can override or disable each with `processed_token_warn`, `processed_token_cap`, `wait_call_warn`, and `wait_call_cap`. Warnings steer once. A cap parks an in-progress task behind a wrap-up-or-continue decision, and continuing doubles that task's effective threshold. This works for unpriced models because it does not depend on `cost_usd`.
+
 ## Stale recovery loop (`server/src/reconciler.ts`)
 
 `syncAgents` probes every agent-bearing task each cycle; a vanished agent is

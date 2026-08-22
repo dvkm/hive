@@ -57,7 +57,7 @@ downstream (see `agent_argv` below). Keys used elsewhere:
 `monitors` (`[{name, url, expect_status, expect_substring?, interval_s}]`),
 `monitors_auto_task` (bool; a monitor failure auto-creates a `chore` task),
 `smoke` (`[{name, url, expect_status, expect_substring?}]`, run once on
-`verifying`), `agent` (`"claude" | "codex"`, default `"claude"`; `"codex"` runs the interactive Codex CLI using the machine's ChatGPT login), `codex_model` / `codex_model_by_kind` (optional Codex model overrides; omitted means the current Codex default), `codex_reasoning_effort` / `codex_reasoning_effort_by_kind` (optional Codex reasoning overrides; defaults are `medium` for ship and `low` for scout/chore), `codex_auto_compact_token_limit` (default `64000`), `codex_tool_output_token_limit` (default `6000`), `agent_argv` (string[], advanced per-project override of the complete command herdr runs; verbatim and responsible for its own briefing),
+`verifying`), `agent` (`"claude" | "codex"`, default `"claude"`; `"codex"` runs the interactive Codex CLI using the machine's ChatGPT login), `codex_model` / `codex_model_by_kind` (optional Codex model overrides; omitted means the current Codex default), `codex_reasoning_effort` / `codex_reasoning_effort_by_kind` (optional Codex reasoning overrides; defaults are `medium` for ship and `low` for scout/chore), `codex_auto_compact_token_limit` (default `64000`), `codex_tool_output_token_limit` (default `6000`), `processed_token_warn` / `processed_token_cap` (defaults `75000000` / `200000000`), `wait_call_warn` / `wait_call_cap` (defaults `25` / `100`; `0` disables a threshold), `agent_argv` (string[], advanced per-project override of the complete command herdr runs; verbatim and responsible for its own briefing),
 `setup_argv` / `cleanup_argv` (string[], a symmetric per-project stack hook pair —
 `setup_argv` runs at spawn time once the worktree exists but before the agent
 starts, `cleanup_argv` runs before the worktree is removed; relative `argv[0]`
@@ -478,16 +478,12 @@ recurred (bumped via `/recur`). `source_task_id` (the task that first hit it) an
 accepts `failure` or `reference` only; `decision` rows are written by the server
 itself. A misfiled `failure`/`reference` is correctable later via `PUT`. The
 learnings table doubles as the project knowledge store:
-- `failure` — the regression ledger. Active ones inject into composed briefs (see
-  `/api/tasks/:id/brief`) under a "Known failure patterns" section, 10 most recent
-  by `last_seen`.
-- `reference` — durable facts, pinned into every brief under a "References" section.
+- `failure`: the regression ledger. Briefs carry only the active count; `hive recall <keywords>` retrieves matching bodies.
+- `reference`: durable facts retrieved on demand with `hive recall`; briefs carry only the count.
 - `decision` — the answer to a resolved decision card, written back automatically
   when the director answers a card no resolver claimed (a genuine
   product/preference question), deduped by `(project_id, title)` so re-asking the
-  same question bumps `occurrences` and refreshes the answer. Active ones inject
-  into briefs under a "Decisions already made (don't re-ask)" section and surface
-  in `hive recall`, so a crew consults the prior ruling before re-raising the card.
+  same question bumps `occurrences` and refreshes the answer. Briefs carry only the active count and direct the crew to `hive recall`, so prior rulings are retrieved without replaying the full store on every task.
 
 ### Notification
 ```json
@@ -545,7 +541,13 @@ for an unpriced (unknown) model — ingestion is never blocked on an unknown mod
 and unpriced rows surface as `"unpriced"` in rollups. Analytics rollups expose
 `totals` shaped `{input_tokens, output_tokens, cache_read_tokens,
 cache_write_tokens, total_tokens, cost_usd, calls, unpriced}` (summed cost counts
-priced rows only).
+priced rows only). `total_tokens` is a compatibility field meaning **processed
+tokens**: fresh input + cached input + cache writes + output. The web labels it
+that way and shows those components separately; it is not a billable-token
+estimate. Every usage ingest also checks processed-token guardrails, and every
+recorded `wait`/`wait_agent` tool call checks wait-call guardrails. Warnings steer
+once; caps park an in-progress task behind a wrap-up-or-continue decision. A
+`continue` answer doubles that task's effective cap.
 
 ### ChatThread / ChatMessage (director chat)
 ```json
@@ -661,7 +663,7 @@ priced rows only).
   clusters of size ≥ 2 are returned). For a backfill/triage UI over dups that
   already exist.
 - `GET /api/tasks/:id/brief` → `200 {"task_id":"...", "brief":"<multiline string>"}` | `404`
-  (task description + definition of done + `hive emit` protocol + active global + project policies + standing-authority section + project knowledge: References, "Decisions already made", Known failure patterns)
+  (task description + compact lifecycle contract + standing-authority section + counts for active policies, references, decisions, and failure patterns; matching bodies are retrieved with `hive recall`)
 - `POST /api/tasks/:id/guarded-action` body `{action (required), target (required), detail?, summary?}` → see below | `404` | `400`
   The gate agents call BEFORE any externally-risky operation they run themselves
   (prod deploy, feature-flag flip, destructive op). The server evaluates the
@@ -1097,9 +1099,7 @@ same shape as `events`); each thread's `task_id` is its backing supervisor task
 
 The supervisor task is also the root of an automatic management loop. Tasks it
 creates inherit `parent_task_id=$HIVE_TASK_ID`; nested agent follow-ups preserve
-the chain. Hive walks that ancestry for meaningful events, batches synchronous
-transition bursts, and pushes one `[hive manager wakeup]` steer into the current
-supervisor session. When an active Chief of Staff exists, it takes priority over project-scoped fallback managers for otherwise unowned worker events and inbox sweeps. The wake set covers blockers, decisions, peer messages,
+the chain. Hive walks that ancestry for meaningful events, keeps the latest event per task during a 45-second debounce window, and pushes one `[hive manager wakeup]` steer into the owning supervisor session. Unowned project events do not fall back to the Chief of Staff or another manager. Inbox sweeps remain separate. The wake set covers blockers, decisions, peer messages,
 review handoffs, CI/merge/smoke results, recovery, failures, and terminal state
 changes. An explicitly closed thread is not respawned by a child event. The
 manager brief requires it to act on each wakeup, use bounded proposal → critique

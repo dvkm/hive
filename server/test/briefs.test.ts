@@ -20,7 +20,7 @@ function addPolicy(db: DB, scope: string, title: string, body: string, active = 
   ).run(newId("pol"), scope, title, body, active, now(), now());
 }
 
-test("brief includes task, DoD, emit protocol, and active policies", () => {
+test("brief includes the lifecycle contract and keeps policy bodies behind recall", () => {
   const { db, projectId, taskId } = setup();
   addPolicy(db, "global", "No em-dashes", "Use commas.");
   addPolicy(db, `project:${projectId}`, "Deploy safety", "Prod needs a decision card.");
@@ -31,11 +31,29 @@ test("brief includes task, DoD, emit protocol, and active policies", () => {
   expect(brief).toContain("Detailed description here.");
   expect(brief).toContain("Definition of done");
   expect(brief).toContain("hive emit");
-  expect(brief).toContain("No em-dashes");
-  expect(brief).toContain("Deploy safety");
+  expect(brief).toContain("1 global policies");
+  expect(brief).toContain("1 project policies");
+  expect(brief).toContain("hive recall");
+  expect(brief).not.toContain("No em-dashes");
+  expect(brief).not.toContain("Use commas.");
+  expect(brief).not.toContain("Deploy safety");
+  expect(brief).not.toContain("Prod needs a decision card.");
   expect(brief).not.toContain("Should not appear.");
   expect(brief).not.toContain("/no-mistakes");
   expect(brief).toContain("If CI is pending, END THE TURN");
+  expect(brief.length).toBeLessThan(11_000); // roughly <3k tokens plus a short task brief
+});
+
+test("stored policy growth does not grow the task prompt", () => {
+  const { db, projectId, taskId } = setup();
+  const body = "A long policy body that belongs behind recall. ".repeat(500);
+  for (let i = 0; i < 20; i++) addPolicy(db, i % 2 ? "global" : `project:${projectId}`, `Policy ${i}`, body);
+
+  const brief = composeBrief(db, taskId);
+  expect(brief.length).toBeLessThan(11_000);
+  expect(brief).toContain("10 global policies");
+  expect(brief).toContain("10 project policies");
+  expect(brief).not.toContain("A long policy body");
 });
 
 test("brief tells the agent to verify browsers headlessly, not via the denied MCPs", () => {
@@ -49,11 +67,12 @@ test("brief tells the agent to verify browsers headlessly, not via the denied MC
 test("brief excludes project bookkeeping from understanding quizzes", () => {
   const { db, taskId } = setup();
   const brief = composeBrief(db, taskId);
-  expect(brief).toContain("Every question must help them understand this specific");
-  expect(brief).toContain("Never test whether the");
-  expect(brief).toContain("competence belongs in internal checks");
-  expect(brief).toContain("Never quiz project bookkeeping");
-  expect(brief).toContain("does not improve the director's understanding of this review");
+  const prose = brief.replace(/\s+/g, " ");
+  expect(prose).toContain("Every question must help them understand this specific");
+  expect(prose).toContain("Never test whether the");
+  expect(prose).toContain("competence belongs in internal checks");
+  expect(prose).toContain("Never quiz project bookkeeping");
+  expect(prose).toContain("does not improve the director's understanding of this review");
 });
 
 test("brief requires a standalone decision context", () => {

@@ -339,7 +339,7 @@ export default function Brief() {
                 <h2 className="brief-h">Spend</h2>
                 <div className="brief-spend">
                   <span className="brief-spend-total">{fmtUsd(spend.totals.cost_usd)}</span>
-                  <span className="muted">{fmtTokens(spend.totals.total_tokens)} tokens · {spend.totals.calls} calls</span>
+                  <span className="muted">{fmtTokens(spend.totals.total_tokens)} processed · {fmtTokens(spend.totals.input_tokens)} fresh · {fmtTokens(spend.totals.cache_read_tokens)} cached · {fmtTokens(spend.totals.output_tokens)} output · {fmtTokens(spend.totals.cache_write_tokens)} cache write · {spend.totals.calls} calls</span>
                   {spend.by_model[0] && <span className="brief-spend-model">top: {spend.by_model[0].model} ({fmtUsd(spend.by_model[0].cost_usd)})</span>}
                 </div>
               </section>

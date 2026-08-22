@@ -72,6 +72,10 @@ const GOOD_CONFIG = {
   watchers: [{ name: "doc", url: "https://docs.google.com/document/d/abc/edit" }],
   monitors: [{ name: "root", url: "http://127.0.0.1:1/", expect_status: 200 }],
   smoke: [{ name: "root", url: "http://127.0.0.1:1/", expect_status: 200 }],
+  processed_token_warn: 75_000_000,
+  processed_token_cap: 200_000_000,
+  wait_call_warn: 25,
+  wait_call_cap: 100,
 };
 
 beforeAll(async () => {
@@ -125,6 +129,8 @@ const BAD: [string, unknown, string][] = [
   ["a watcher url with a file:// scheme", { watchers: [{ name: "w", url: "file:///etc/passwd" }] }, "watchers"],
   ["a monitor url that is not a URL", { monitors: [{ name: "m", url: "not a url" }] }, "monitors"],
   ["a smoke url with a javascript: scheme", { smoke: [{ name: "s", url: "javascript:alert(1)" }] }, "smoke"],
+  ["a negative processed-token threshold", { processed_token_warn: -1 }, "processed_token_warn"],
+  ["a fractional wait-call threshold", { wait_call_cap: 2.5 }, "wait_call_cap"],
   ["watchers as an object", { watchers: { url: "https://x.example" } }, "watchers"],
   ["an unknown top-level key", { totally_new_key: true }, "totally_new_key"],
   ["an unknown key alongside valid ones", { auto_dispatch: true, sneaky: ["sh", "-c", "id"] }, "sneaky"],

@@ -1061,10 +1061,13 @@ test("policies CRUD", async () => {
   expect(del.status).toBe(200);
 });
 
-test("brief endpoint composes policies", async () => {
+test("brief endpoint counts policies and retrieves their bodies through recall", async () => {
   await post("/api/policies", { title: "GlobalRule", body: "no em-dashes", scope: "global" });
   const b = await get(`/api/tasks/${taskId}/brief`);
-  expect(b.json.brief).toContain("GlobalRule");
+  expect(b.json.brief).toContain("1 global policies");
+  expect(b.json.brief).toContain("hive recall");
+  expect(b.json.brief).not.toContain("GlobalRule");
+  expect(b.json.brief).not.toContain("no em-dashes");
   expect(b.json.brief).toContain("hive emit");
 });
 

@@ -256,6 +256,10 @@ export interface Project {
     codex_reasoning_effort_by_kind?: Partial<Record<Kind, "minimal" | "low" | "medium" | "high" | "xhigh">>;
     codex_auto_compact_token_limit?: number;
     codex_tool_output_token_limit?: number;
+    processed_token_warn?: number;
+    processed_token_cap?: number;
+    wait_call_warn?: number;
+    wait_call_cap?: number;
     autonomy_profile?: "conservative" | "balanced" | "autopilot";
     archived?: boolean;
     test?: boolean;

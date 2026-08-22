@@ -146,6 +146,12 @@ test("task usage endpoint returns rows + totals", async () => {
   expect(json.task_id).toBe(taskId);
   expect(json.usage.length).toBeGreaterThanOrEqual(5);
   expect(json.totals.calls).toBe(json.usage.length);
+  const processed = json.usage.reduce(
+    (sum: number, row: any) =>
+      sum + row.input_tokens + row.output_tokens + row.cache_read_tokens + row.cache_write_tokens,
+    0
+  );
+  expect(json.totals.total_tokens).toBe(processed);
   // totals.cost_usd only sums priced rows; unpriced row contributes null->0
   expect(json.totals.cost_usd).toBeGreaterThan(0);
   expect(json.totals.unpriced).toBeGreaterThanOrEqual(1);
