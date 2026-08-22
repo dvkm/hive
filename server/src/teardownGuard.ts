@@ -14,6 +14,7 @@
 //      time (2026-08-19: 12+ live agents failed with their tabs closed).
 import type { DB } from "./db.ts";
 import { getSetting } from "./db.ts";
+import { holdsLease } from "./lease.ts";
 
 export const BOOT_GRACE_MS = Number(process.env.HIVE_BOOT_GRACE_MS || 5 * 60_000);
 export const DEAD_BURST_N = Number(process.env.HIVE_DEAD_BURST_N || 3);
@@ -57,8 +58,14 @@ export function breakerTripped(db: DB): boolean {
 // May hive tear something down right now? One call, used by every destructive
 // path (stale recovery, the reaper sweep). Returns the reason it may not, so the
 // caller can log something a human can act on.
-export function teardownBlocked(db: DB, nowMs: number = Date.now()): string | null {
+export function teardownBlocked(db: DB, nowMs: number = Date.now(), instanceId?: string): string | null {
   if (withinBootGrace(db, nowMs)) return "boot grace";
   if (breakerTripped(db)) return "circuit breaker open";
+  // A server that has lost the DB lease is on its way out (it exits within one
+  // heartbeat) but its 60s reconciler / reaper loops can still fire once in that
+  // window. It must not reap: from a displaced server every agent looks gone
+  // because the NEW server now owns herdr's registry. Only the lease holder may
+  // tear anything down. (No instanceId — tests, embedded use — keeps prior behaviour.)
+  if (instanceId && !holdsLease(db, instanceId)) return "not the lease holder";
   return null;
 }

@@ -1,7 +1,7 @@
 // hive daemon entrypoint. Bun.serve on 127.0.0.1:4700 (override HIVE_PORT).
 import { openDb, defaultDbPath } from "./db.ts";
 import { makeHandler, notifyManagerOfEvent, repairDuplicateQuizPasses, sweepManagerInboxes, wakeDueManagers } from "./api.ts";
-import { startReconciler } from "./reconciler.ts";
+import { startReconciler, reAdoptAgentsOnBoot } from "./reconciler.ts";
 import { startDispatcher } from "./dispatcher.ts";
 import { startReaper } from "./reaper.ts";
 import { checkAllMonitors } from "./monitors.ts";
@@ -95,8 +95,7 @@ const server = Bun.serve({
 // still running against this DB (including a `bun --watch` worker that survived
 // a launchctl kickstart by re-parenting to launchd — 2026-08-19, four of them,
 // none holding the port) sees the lease change on its next heartbeat and exits.
-{
-  const { instance, displaced } = claimLease(db);
+const { instance, displaced } = claimLease(db);
   // Register BEFORE any loop starts: this row is how a future lease holder can
   // find and terminate this process if it ever stops standing down on its own.
   registerInstance(db, instance, process.pid, port);
@@ -134,7 +133,6 @@ const server = Bun.serve({
       });
     }
   }, LEASE_MS);
-}
 
 // Boot stamp: the teardown guard reads it so nothing is failed, requeued or
 // reaped in the first minutes after a restart/self-deploy, when herdr's agent
@@ -146,7 +144,13 @@ setSetting(db, "server_started_at", now());
 const reconcileMs = Number(process.env.HIVE_RECONCILE_MS || 60_000);
 const monitorMs = Number(process.env.HIVE_MONITOR_MS || 60_000);
 const staleMs = Number(process.env.HIVE_STALE_MS || 15 * 60 * 1000);
-startReconciler(db, { intervalMs: reconcileMs, staleMs, supervise: true });
+// Re-adopt every live agent BEFORE the first reconcile lap, so a restart never
+// leaves an agent unaddressable (herdr keeps the panes; hive just lost the
+// registration). Fire-and-forget: it must not delay the loops, and boot grace
+// already holds teardown while it runs.
+reAdoptAgentsOnBoot(db, { supervise: true }).catch((e) => console.error("[hive] boot re-adopt:", e));
+
+startReconciler(db, { intervalMs: reconcileMs, staleMs, supervise: true, instanceId: instance });
 
 // Dispatcher: pick up `queued` tasks in auto-dispatch projects and spawn agents
 // (opt-in per project; the reason web-UI tasks used to sit in Queued forever).
@@ -175,7 +179,7 @@ setInterval(() => {
   wakeDueManagers(db, defaultHerdr, { supervise: true }).catch((e) => console.error("[hive] scheduled manager wakeup:", e));
 }, managerWakeMs);
 const reapMs = Number(process.env.HIVE_REAP_MS || 300_000);
-startReaper(db, { intervalMs: reapMs });
+startReaper(db, { intervalMs: reapMs, instanceId: instance });
 
 // Notification delivery: hand alerts to hive.app (urgent -> immediate push)
 // and start the batched digest loop (normal -> one digest every HIVE_DIGEST_MS).
