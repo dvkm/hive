@@ -263,6 +263,23 @@ test("tracking-only tasks cannot mint direct, checkpoint, or learning work", asy
   expect(db.query("SELECT COUNT(*) AS n FROM tasks WHERE parent_task_id = ?").get(tracking.json.id)).toEqual({ n: 0 });
 });
 
+test("hive-1264 gap B: a plain external tracking task accepts director brief edits; a Jira mirror does not", async () => {
+  const log = await post("/api/tasks", {
+    project_id: projectId,
+    title: "director-owned observations log",
+    source: "external",
+  });
+  const edited = await put(`/api/tasks/${log.json.id}`, { brief: "item 20: appended by the director" });
+  expect(edited.status).toBe(200);
+  expect(edited.json.brief).toBe("item 20: appended by the director");
+
+  const mirror = await post("/api/tasks", { project_id: projectId, title: "WEB-1", source: "agent" });
+  db.query("UPDATE tasks SET source_ref = ? WHERE id = ?").run("jira:WEB-1", mirror.json.id);
+  const blocked = await put(`/api/tasks/${mirror.json.id}`, { brief: "trying to edit a mirror" });
+  expect(blocked.status).toBe(409);
+  expect(blocked.json.error).toContain("jira:WEB-1");
+});
+
 test("the shared spawn boundary rejects external and Jira-linked tasks", async () => {
   const external = await post("/api/tasks", {
     project_id: projectId,

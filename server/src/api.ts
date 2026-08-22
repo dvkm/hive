@@ -12,7 +12,6 @@ import {
   transition,
   writeEvent,
   getTask,
-  canTransition,
   TransitionError,
   TERMINAL,
   advanceIfFinished,
@@ -1794,7 +1793,14 @@ async function linkPrEndpoint(db: DB, body: any, deps: HandlerDeps): Promise<Res
 async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
-  if (isTrackingOnlyTask(task)) return err("tracking-only task fields are owned by the external system", 409);
+  // Only a JIRA MIRROR has an external system that actually owns title/brief
+  // (the sync overwrites them from the issue every cycle, so a director edit
+  // here would just be clobbered next pull). A plain source='external' task
+  // (e.g. a director-authored kanban/observations log) has no such owner —
+  // the director IS the author, so blocking edits there only locks them out
+  // of their own log for no reason.
+  if (isJiraMirror(task))
+    return err(`tracking-only task fields are owned by Jira (${task.source_ref}) — edit the issue there instead`, 409);
   const { fields: body, files } = await bodyWithFiles(req);
   const title = body?.title != null ? String(body.title) : task.title;
   const { block } = await attachFiles(id, files);
@@ -5132,9 +5138,14 @@ export function createDecision(
     row.draft_note, row.answered_at, row.ci_status_at_card, row.ci_signal
   );
   writeEvent(db, { task_id: d.task_id, source: "agent", type: "needs-decision", payload: { decision_id: row.id, title: row.title } });
-  // Move task into needs_decision if the current state allows it.
+  // Move task into needs_decision only from in_progress — an agent mid-work
+  // raising a card. A queued task (e.g. a dispatcher-raised repo-mismatch card)
+  // holds dispatch via the open-decision check itself (repoMismatchUnresolved)
+  // and must stay 'queued', not jump to needs_decision, which now also reaches
+  // from queued via the director's own explicit park action (hive-1264 gap A) —
+  // that path is deliberate and director-only, so it must not fire here too.
   const task = getTask(db, d.task_id);
-  if (canTransition(task.state, "needs_decision")) {
+  if (task.state === "in_progress") {
     transition(db, d.task_id, "needs_decision", { source: "agent", reason: row.title });
   }
   // Same outage, same ruling: answer it now with what the director already
