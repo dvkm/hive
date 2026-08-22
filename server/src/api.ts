@@ -986,48 +986,6 @@ function managerEventLine(db: DB, event: any): string {
   return `- #${task?.number ?? "?"} ${task?.title ?? event.task_id} [${task?.state ?? "unknown"}]: ${event.type}${suffix}`;
 }
 
-function activeManagerForProject(db: DB, projectId: string): ChatThread | null {
-  return (
-    (db
-      .query(
-        `SELECT c.* FROM chat_threads c
-           JOIN tasks t ON t.id = c.task_id
-          WHERE c.project_id = ? AND t.source = 'chat_supervisor'
-            AND t.state NOT IN ('done', 'failed', 'cancelled')
-          ORDER BY c.updated_at DESC LIMIT 1`
-      )
-      .get(projectId) as ChatThread | undefined) ?? null
-  );
-}
-
-function activeChiefOfStaff(db: DB): ChatThread | null {
-  return (
-    (db
-      .query(
-        `SELECT c.* FROM chat_threads c
-           JOIN tasks t ON t.id = c.task_id
-          WHERE c.project_id IS NULL AND t.source = 'chat_supervisor'
-            AND t.state NOT IN ('done', 'failed', 'cancelled')
-          ORDER BY c.updated_at DESC LIMIT 1`
-      )
-      .get() as ChatThread | undefined) ?? null
-  );
-}
-
-function activeManager(db: DB): ChatThread | null {
-  return (
-    (db
-      .query(
-        `SELECT c.* FROM chat_threads c
-           JOIN tasks t ON t.id = c.task_id
-          WHERE t.source = 'chat_supervisor'
-            AND t.state NOT IN ('done', 'failed', 'cancelled')
-          ORDER BY c.updated_at DESC LIMIT 1`
-      )
-      .get() as ChatThread | undefined) ?? null
-  );
-}
-
 async function flushManagerUpdate(threadId: string): Promise<void> {
   const pending = pendingManagerUpdates.get(threadId);
   if (!pending) return;
@@ -1062,7 +1020,7 @@ export function notifyManagerOfEvent(db: DB, herdr: Herdr, deps: HandlerDeps, ev
   if (!managerEventRelevant(event)) return;
   const origin = getTask(db, event.task_id);
   if (!origin || !isSupervisedTask(origin)) return;
-  const thread = managingThreadForTask(db, event.task_id) ?? activeChiefOfStaff(db) ?? activeManagerForProject(db, origin.project_id) ?? activeManager(db);
+  const thread = managingThreadForTask(db, event.task_id);
   if (!thread?.task_id) return;
   if (event.type === "steer" && event.payload?.from_task_id === thread.task_id) return;
 
@@ -2927,7 +2885,12 @@ function codexHookOverride(event: string, command: string, matcher?: string): st
 export function codexAgentArgv(
   brief: string,
   model?: string,
-  commandApproval: "escalate" | "allow" | "prompt" = "escalate"
+  commandApproval: "escalate" | "allow" | "prompt" = "escalate",
+  settings: { reasoningEffort: string; autoCompactTokenLimit: number; toolOutputTokenLimit: number } = {
+    reasoningEffort: "medium",
+    autoCompactTokenLimit: 64_000,
+    toolOutputTokenLimit: 6_000,
+  }
 ): string[] {
   const hook = join(HOOKS_DIR, "hive-hook.sh");
   const approve = join(HOOKS_DIR, "hive-approve.sh");
@@ -2942,6 +2905,9 @@ export function codexAgentArgv(
     "-c", codexHookOverride("PostToolUse", `${hook} PostToolUse`),
     "-c", codexHookOverride("Stop", `${hook} Stop`),
     "-c", codexHookOverride("SubagentStop", `${hook} SubagentStop`),
+    "-c", `model_reasoning_effort=${JSON.stringify(settings.reasoningEffort)}`,
+    "-c", `model_auto_compact_token_limit=${settings.autoCompactTokenLimit}`,
+    "-c", `tool_output_token_limit=${settings.toolOutputTokenLimit}`,
   ];
   if (model) argv.push("--model", model);
   argv.push(brief);
@@ -2952,7 +2918,11 @@ export function agentArgvFor(config: any, kind: string, brief: string): string[]
   if (Array.isArray(config?.agent_argv) && config.agent_argv.length) return config.agent_argv;
   if (agentForConfig(config) !== "codex") return undefined;
   const policy = ["allow", "prompt"].includes(config.command_approval) ? config.command_approval : "escalate";
-  return codexAgentArgv(brief, modelForTask(config, kind), policy);
+  return codexAgentArgv(brief, modelForTask(config, kind), policy, {
+    reasoningEffort: config.codex_reasoning_effort_by_kind?.[kind] ?? config.codex_reasoning_effort ?? (kind === "ship" ? "medium" : "low"),
+    autoCompactTokenLimit: config.codex_auto_compact_token_limit ?? 64_000,
+    toolOutputTokenLimit: config.codex_tool_output_token_limit ?? 6_000,
+  });
 }
 
 // The reusable spawn core, shared by the /spawn endpoint and the dispatcher.
@@ -4668,7 +4638,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
             message:
               ci === "failing"
                 ? `CI is FAILING on ${pr} — the handoff is held. Run \`gh pr checks ${pr}\`, fix the failures, push; hive hands off automatically when checks pass.`
-                : `CI is still running on ${pr} — the handoff is held. Stay on the task; hive hands off automatically when checks pass (and steers you if they fail).`,
+                : `CI is still running on ${pr}. End this turn; hive monitors the checks, hands off automatically when they pass, and steers you if they fail.`,
           });
         }
       }

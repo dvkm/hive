@@ -162,7 +162,7 @@ test("descendant worker events wake the manager once with a batched update", asy
   expect(sends.at(-1)).toContain("Act on anything you can resolve");
 });
 
-test("project inbox events fall back to the active manager when that project has no manager", async () => {
+test("unrelated project events do not wake a catch-all manager", async () => {
   const otherProject = (await post("/api/projects", {
     name: "other project",
     repo_path: WT,
@@ -181,9 +181,7 @@ test("project inbox events fall back to the active manager when that project has
   notifyManagerOfEvent(db, herdr, {}, checkpoint);
   await new Promise((r) => setTimeout(r, 20));
 
-  expect(sends.length).toBe(before + 1);
-  expect(sends.at(-1)).toContain("older project work");
-  expect(sends.at(-1)).toContain(`/api/checkpoints?project_id=${otherProject.id}`);
+  expect(sends.length).toBe(before);
 });
 
 test("startup inbox sweep wakes one active manager per project with actionable counts", async () => {
@@ -265,7 +263,7 @@ test("a manually-spawned external task (agent_target set) is real hive-driven wo
   const spawnedCheckpoint = writeEvent(db, { task_id: spawned.id, source: "agent", type: "checkpoint", payload: { note: "real progress" } });
   notifyManagerOfEvent(db, herdr, {}, spawnedCheckpoint);
   await new Promise((r) => setTimeout(r, 20));
-  expect(sends.length).toBe(before + 1);
+  expect(sends.length).toBe(before); // visible to inbox sweeps, but no unrelated immediate wakeup
 
   db.query("INSERT INTO decisions (id, task_id, ts, title, status) VALUES (?,?,?,?,'open')").run(newId("dec"), spawned.id, now(), "a real decision from real work");
   db.query("UPDATE tasks SET state = 'in_review' WHERE id = ?").run(spawned.id);

@@ -252,6 +252,10 @@ export interface Project {
     agent?: "claude" | "codex";
     codex_model?: string;
     codex_model_by_kind?: Partial<Record<Kind, string>>;
+    codex_reasoning_effort?: "minimal" | "low" | "medium" | "high" | "xhigh";
+    codex_reasoning_effort_by_kind?: Partial<Record<Kind, "minimal" | "low" | "medium" | "high" | "xhigh">>;
+    codex_auto_compact_token_limit?: number;
+    codex_tool_output_token_limit?: number;
     autonomy_profile?: "conservative" | "balanced" | "autopilot";
     archived?: boolean;
     test?: boolean;

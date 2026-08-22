@@ -34,6 +34,8 @@ test("brief includes task, DoD, emit protocol, and active policies", () => {
   expect(brief).toContain("No em-dashes");
   expect(brief).toContain("Deploy safety");
   expect(brief).not.toContain("Should not appear.");
+  expect(brief).not.toContain("/no-mistakes");
+  expect(brief).toContain("If CI is pending, END THE TURN");
 });
 
 test("brief tells the agent to verify browsers headlessly, not via the denied MCPs", () => {
@@ -48,8 +50,8 @@ test("brief excludes project bookkeeping from understanding quizzes", () => {
   const { db, taskId } = setup();
   const brief = composeBrief(db, taskId);
   expect(brief).toContain("Every question must help them understand this specific");
-  expect(brief).toContain("agent knows how to code, debug, merge");
-  expect(brief).toContain("Agent competence belongs in internal checks");
+  expect(brief).toContain("Never test whether the");
+  expect(brief).toContain("competence belongs in internal checks");
   expect(brief).toContain("Never quiz project bookkeeping");
   expect(brief).toContain("does not improve the director's understanding of this review");
 });

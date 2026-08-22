@@ -106,6 +106,9 @@ test("a ChatGPT project starts an interactive Codex worker with Hive hooks", asy
   expect(agent).toContain("--dangerously-bypass-hook-trust");
   expect(agent.some((arg) => arg.includes("hooks.PermissionRequest") && arg.includes("hive-approve.sh"))).toBe(true);
   expect(agent.some((arg) => arg.includes("hooks.Stop") && arg.includes("hive-hook.sh"))).toBe(true);
+  expect(agent).toContain('model_reasoning_effort="medium"');
+  expect(agent).toContain("model_auto_compact_token_limit=64000");
+  expect(agent).toContain("tool_output_token_limit=6000");
   expect(agent.at(-1)).toContain("codex task");
   expect(agent).not.toContain("--model");
 });
@@ -294,7 +297,7 @@ test("secrets API ignores a caller-supplied ref, so a secret cannot alias anothe
 });
 
 test("modelForTask: per-kind default, config.model, config.model_by_kind override in order", async () => {
-  const { modelForTask } = await import("../src/api.ts");
+  const { agentArgvFor, modelForTask } = await import("../src/api.ts");
   expect(modelForTask({}, "ship")).toBe("opus");
   expect(modelForTask({}, "scout")).toBe("sonnet");
   expect(modelForTask({}, "chore")).toBe("sonnet");
@@ -304,4 +307,15 @@ test("modelForTask: per-kind default, config.model, config.model_by_kind overrid
   expect(modelForTask({ agent: "codex" }, "ship")).toBeUndefined();
   expect(modelForTask({ agent: "codex", codex_model: "gpt-codex" }, "ship")).toBe("gpt-codex");
   expect(modelForTask({ agent: "codex", codex_model: "gpt-codex", codex_model_by_kind: { scout: "gpt-codex-mini" } }, "scout")).toBe("gpt-codex-mini");
+  const scout = agentArgvFor({ agent: "codex" }, "scout", "brief")!;
+  expect(scout).toContain('model_reasoning_effort="low"');
+  const custom = agentArgvFor({
+    agent: "codex",
+    codex_reasoning_effort: "high",
+    codex_auto_compact_token_limit: 80_000,
+    codex_tool_output_token_limit: 4_000,
+  }, "ship", "brief")!;
+  expect(custom).toContain('model_reasoning_effort="high"');
+  expect(custom).toContain("model_auto_compact_token_limit=80000");
+  expect(custom).toContain("tool_output_token_limit=4000");
 });

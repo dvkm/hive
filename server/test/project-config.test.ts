@@ -178,15 +178,34 @@ test("a PUT that omits config leaves the stored config untouched", async () => {
   expect(r.json.config).toEqual(before);
 });
 
-// The Codex-worker keys (config.agent / codex_model*) landed on main after this
+// The Codex-worker keys landed on main after this
 // schema was written. An allowlist that does not know them turns every Codex
 // project's config into a 400, so pin that they pass.
 test("a codex worker config is accepted", async () => {
   const r = await put(`/api/projects/${projectId}`, {
-    config: { ...GOOD_CONFIG, agent: "codex", codex_model: "gpt-5", codex_model_by_kind: { ship: "gpt-5" }, release_review_agents: false },
+    config: {
+      ...GOOD_CONFIG,
+      agent: "codex",
+      codex_model: "gpt-5",
+      codex_model_by_kind: { ship: "gpt-5" },
+      codex_reasoning_effort: "medium",
+      codex_reasoning_effort_by_kind: { scout: "low" },
+      codex_auto_compact_token_limit: 64_000,
+      codex_tool_output_token_limit: 6_000,
+      release_review_agents: false,
+    },
   });
   expect(r.status).toBe(200);
   expect(r.json.config.agent).toBe("codex");
+});
+
+test("codex token settings reject invalid values", async () => {
+  const badEffort = await put(`/api/projects/${projectId}`, { config: { codex_reasoning_effort_by_kind: { scout: "maximum" } } });
+  expect(badEffort.status).toBe(400);
+  expect(badEffort.json.error).toContain("config.codex_reasoning_effort_by_kind.scout");
+  const badLimit = await put(`/api/projects/${projectId}`, { config: { codex_tool_output_token_limit: -1 } });
+  expect(badLimit.status).toBe(400);
+  expect(badLimit.json.error).toContain("positive integer");
 });
 
 // Two independent gates guard this route: the token check (task #1025) runs in

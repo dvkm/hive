@@ -17,6 +17,7 @@
 import type { DB } from "./db.ts";
 import { newId, now } from "./db.ts";
 import { listReferences } from "./learn.ts";
+import { AUTONOMY_PROFILES } from "./projectConfig.ts";
 
 // -------------------------------------------------------------- persistence
 export interface ChatThread {
@@ -37,7 +38,6 @@ export interface ChatThread {
 }
 export const SUPERVISOR_PHASES = ["intake", "planning", "executing", "waiting", "verifying", "complete", "stopped"] as const;
 export type SupervisorPhase = (typeof SUPERVISOR_PHASES)[number];
-export const AUTONOMY_PROFILES = ["conservative", "balanced", "autopilot"] as const;
 export type AutonomyProfile = (typeof AUTONOMY_PROFILES)[number];
 export interface ChatMessage {
   id: string;
