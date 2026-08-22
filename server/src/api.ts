@@ -4686,7 +4686,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
 
   const type = fields.type;
   if (!type) return err("event 'type' is required");
-  if (isTrackingOnlyTask(task) && ["needs-decision", "done", "ready"].includes(type))
+  if (isTrackingOnlyTask(task) && ["needs-decision", "done", "ready", "unmergeable"].includes(type))
     return err("tracking-only tasks do not accept agent lifecycle events", 409);
   const source = fields.source || "agent";
   const note = fields.note ?? null;
@@ -4766,6 +4766,49 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     if (note) db.query("UPDATE tasks SET summary = ? WHERE id = ?").run(note, taskId);
     const task = transition(db, taskId, "done", { source, reason: note ?? undefined });
     return json({ task });
+  }
+
+  // --- unmergeable (HIVE-314: this task's own PR has nothing left to merge,
+  // e.g. GitHub refuses reopenPullRequest because head==base, but the work
+  // already landed via a different PR/commit). The agent points at the commit
+  // that actually carries the work; hive verifies it against the base branch
+  // before granting a terminal 'done' without going through the normal
+  // in_review -> verifying merge step.
+  if (type === "unmergeable") {
+    const landingCommit = String(fields.landing_commit ?? fields.commit_sha ?? "").trim();
+    if (!/^[0-9a-f]{7,40}$/i.test(landingCommit))
+      return err("unmergeable needs a 'landing_commit' git SHA (7-40 hex chars) that actually carries the work", 400);
+    const t = getTask(db, taskId);
+    const blocked = authzBlock(db, { project_id: t.project_id, action: "task.done", target: t.title, task_id: taskId });
+    if (blocked) return blocked;
+    if (!t.pr_url || !["in_review", "verifying"].includes(t.state))
+      return err("unmergeable requires a linked PR and a task in review or verifying", 409);
+    const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(t.project_id);
+    if (!project?.repo_path) return err("project has no repo_path to verify the landing commit against", 400);
+    const config = JSON.parse(project.config ?? "{}");
+    const baseBranch = projectBaseBranch(config);
+    const base = projectComparisonBase(config);
+    const fetched = await exec(["git", "-C", project.repo_path, "fetch", "origin", baseBranch]);
+    if (fetched.code !== 0) return err(`could not fetch ${baseBranch}; landing commit was not verified`, 409);
+    const check = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", landingCommit, base]);
+    if (check.code !== 0)
+      return err(
+        `landing_commit ${landingCommit} could not be verified as an ancestor of ${base}; cannot confirm the work actually landed`,
+        409
+      );
+    if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });
+    writeEvent(db, { task_id: taskId, source, type: "unmergeable", payload: { landing_commit: landingCommit, base, note: note ?? null } });
+    if (note) db.query("UPDATE tasks SET summary = ? WHERE id = ?").run(note, taskId);
+    try {
+      const task = transition(db, taskId, "done", {
+        source,
+        reason: note ?? `unmergeable: work landed via ${landingCommit}, verified on ${base}`,
+        force: true,
+      });
+      return json({ task });
+    } catch (e: any) {
+      return err(e.message ?? "could not close task", 409);
+    }
   }
 
   // --- ready (agent handoff: PR open / report written → into the review queue) ---

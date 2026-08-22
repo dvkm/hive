@@ -550,6 +550,67 @@ test("ready emit records the pr_url and advances in_progress -> in_review", asyn
   expect(again.json.task.state).toBe("in_review");
 });
 
+// HIVE-314: a task's own PR closed with nothing left to merge (head==base),
+// but the work actually landed via a different PR/commit on the base branch.
+// `unmergeable` is the agent's self-service terminal path: hive verifies the
+// cited commit against the base branch (via a real `git fetch` + `merge-base
+// --is-ancestor`) before granting `done` without the normal merge step.
+test("unmergeable emit closes the task once the landing commit is verified on the base branch", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" });
+
+  const origin = mkdtempSync(join(tmpdir(), "hive-test-origin-"));
+  git(origin, ["init", "--bare", "-q"]);
+
+  const cloneA = mkdtempSync(join(tmpdir(), "hive-test-clonea-"));
+  git(cloneA, ["clone", "-q", origin, "."]);
+  git(cloneA, ["checkout", "-q", "-b", "main"]);
+  git(cloneA, ["-c", "user.email=a@a.com", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "init"]);
+  git(cloneA, ["push", "-q", "-u", "origin", "main"]);
+
+  // A second clone lands a commit on main that cloneA (the project's repo_path)
+  // has not fetched yet. This is the "work landed via a different PR" case.
+  const cloneB = mkdtempSync(join(tmpdir(), "hive-test-cloneb-"));
+  git(cloneB, ["clone", "-q", origin, "."]);
+  git(cloneB, ["-c", "user.email=b@b.com", "-c", "user.name=b", "commit", "-q", "--allow-empty", "-m", "landed elsewhere"]);
+  git(cloneB, ["push", "-q", "origin", "main"]);
+  const landingCommit = git(cloneB, ["rev-parse", "HEAD"]).trim();
+
+  const p = await post("/api/projects", { name: "unmergeable-proj", repo_path: cloneA, config: { default_branch: "main" } });
+  const t = await post("/api/tasks", { project_id: p.json.id, title: "unmergeable task" });
+  const id = t.json.id;
+  await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
+  await post(`/api/tasks/${id}/events`, { type: "evidence", note: "proof", kind: "log" });
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://github.com/example/repo/pull/1", id);
+
+  const invalidState = await post(`/api/tasks/${id}/events`, { type: "unmergeable", landing_commit: landingCommit });
+  expect(invalidState.status).toBe(409);
+  expect((await get(`/api/tasks/${id}`)).json.state).toBe("in_progress");
+
+  await post(`/api/tasks/${id}/transition`, { to: "in_review" });
+
+  const bogus = await post(`/api/tasks/${id}/events`, { type: "unmergeable", landing_commit: "deadbeef", note: "nope" });
+  expect(bogus.status).toBe(409);
+  expect((await get(`/api/tasks/${id}`)).json.state).toBe("in_review");
+
+  git(cloneA, ["remote", "set-url", "origin", join(origin, "missing")]);
+  const failedFetch = await post(`/api/tasks/${id}/events`, { type: "unmergeable", landing_commit: landingCommit });
+  expect(failedFetch.status).toBe(409);
+  expect((await get(`/api/tasks/${id}`)).json.state).toBe("in_review");
+  git(cloneA, ["remote", "set-url", "origin", origin]);
+
+  const r = await post(`/api/tasks/${id}/events`, {
+    type: "unmergeable",
+    landing_commit: landingCommit,
+    note: "PR had nothing left to merge; work landed via a different PR",
+  });
+  expect(r.status).toBe(200);
+  expect(r.json.task.state).toBe("done");
+
+  const events = await get(`/api/tasks/${id}/events`);
+  expect(events.json.some((e: any) => e.type === "unmergeable" && e.payload.landing_commit === landingCommit)).toBe(true);
+});
+
 // POST /merge used to hang forever when the project's post-merge smoke check
 // hit an unreachable/stalled URL: mergeTask awaits smokeThenAdvance
 // synchronously before responding, and the default fetcher had no timeout

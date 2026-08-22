@@ -33,6 +33,14 @@ use \`"$HIVE_CLI"\`. Prefer the CLI over raw curl so actions are attributed.
   hive emit <task-id> ready    --pr-url <url> --note "PR <url>"   (hand off for review)
   hive emit <task-id> done     --note "final summary"
 
+If your task's own PR closes with nothing left to merge (head==base, so GitHub
+refuses to reopen it) but the work already landed via a different PR/commit,
+don't wait on a human: point at the commit that actually carries the work and
+close the task yourself. Hive verifies that commit is on the base branch
+before it lets this through:
+
+  hive emit <task-id> unmergeable --landing-commit <sha> --note "why"
+
 Rules:
 - Emit status before commands expected to exceed a minute.
 - Attach evidence before \`ready\`. Use screenshots for visual work and test

@@ -20,8 +20,12 @@ Usage:
   hive task update <task-id> --depends-on <id,id>   declare a dependency discovered mid-task
         (e.g. "my PR needs #993's to merge first"); full replace, so pass every
         id this task should still wait on, not just the new one
-  hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>]
-        types: status | evidence | needs-decision | ready | done | blocked | deferred | undefer | review_summary | <custom>
+  hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>] [--landing-commit <sha>]
+        types: status | evidence | needs-decision | ready | done | unmergeable | blocked | deferred | undefer | review_summary | <custom>
+        unmergeable: this task's PR has nothing left to merge (GitHub refused to
+        reopen it) but the work landed via a different PR/commit. Pass
+        --landing-commit <sha>; hive verifies it's on the base branch, then closes
+        the task without a merge step.
         review_summary: --json review.json with {done[], iffy[], decisions[], testing[], followups[], understanding{check{question,options[],answer_key}}}
         deferred: park a task waiting on an OFFLINE human action (no more "gone quiet" nudges);
                   [--until <iso>] or [--days <n>] to auto-resume, else indefinite. undefer to resume early.
@@ -280,6 +284,7 @@ async function main() {
         until: flags.until,
         days: flags.days,
         pr_url: flags["pr-url"] ?? flags.url,
+        landing_commit: flags["landing-commit"],
         ...(sha && !extra.meta ? { meta: JSON.stringify({ commit_sha: sha }) } : {}),
         ...extra,
       });

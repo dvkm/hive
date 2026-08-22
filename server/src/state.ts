@@ -503,7 +503,7 @@ export function transition(
   db: DB,
   taskId: string,
   to: State,
-  opts: { source?: string; reason?: string } = {}
+  opts: { source?: string; reason?: string; force?: boolean } = {}
 ): any {
   const task = getTask(db, taskId);
   if (!task) throw new TransitionError(`unknown task: ${taskId}`);
@@ -519,7 +519,14 @@ export function transition(
   if (from === "failed" && to === "queued" && isJiraMirror(task)) {
     throw new TransitionError(TRACKING_ONLY_REQUEUE_ERROR);
   }
-  if (!canTransition(from, to)) {
+  // force skips the normal FORWARD-graph check (still non-terminal -> terminal
+  // only, evidence gates still apply below). HIVE-314's escape hatch for a PR
+  // that closed with nothing left to merge: the caller has already verified the
+  // work landed on the base branch via a different commit, so the usual
+  // in_review -> verifying -> done merge path doesn't apply.
+  if (opts.force) {
+    if (TERMINAL.includes(from)) throw new TransitionError(`task already terminal ('${from}')`);
+  } else if (!canTransition(from, to)) {
     // Agents jump straight to done often enough (4/16 sampled sessions) that
     // the error should teach the path, not just reject.
     const hint =

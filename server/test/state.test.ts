@@ -178,6 +178,29 @@ test("any non-terminal state can go to failed/cancelled; terminals cannot", () =
   expect(getTask(db, id).state).toBe("cancelled");
 });
 
+test("force bypasses the FORWARD graph (HIVE-314: unmergeable PR, work landed elsewhere) but still requires evidence for done", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  transition(db, id, "in_progress");
+  // Normal path refuses in_progress -> done outright.
+  expect(canTransition("in_progress", "done")).toBe(false);
+  expect(() => transition(db, id, "done")).toThrow(/invalid transition/);
+  // force still enforces the done evidence gate.
+  expect(() => transition(db, id, "done", { force: true })).toThrow(/no evidence/);
+  addEvidence(db, id);
+  const t = transition(db, id, "done", { source: "agent", reason: "unmergeable: landed via abc123", force: true });
+  expect(t.state).toBe("done");
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'state_change' ORDER BY ts DESC LIMIT 1").get(id) as { payload: string };
+  expect(JSON.parse(ev.payload)).toMatchObject({ from: "in_progress", to: "done" });
+});
+
+test("force still refuses a task that is already terminal", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  transition(db, id, "cancelled");
+  expect(() => transition(db, id, "done", { force: true })).toThrow(/already terminal/);
+});
+
 test("a failed task can be re-queued (attention tray), resetting its runtime binding", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId);
