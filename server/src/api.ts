@@ -79,7 +79,7 @@ import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, projectBaseBranch, projectComparisonBase, preferSafeRef } from "./exec.ts";
+import { defaultExec, isSafeRef, projectBaseBranch, projectComparisonBase, preferSafeRef } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
 import { projectPrefix, taskIdentifier } from "./taskIdentifier.ts";
 import {
@@ -4679,6 +4679,17 @@ async function headSha(exec: Exec, cwd: string | null): Promise<string | null> {
   }
 }
 
+async function prHeadBranch(exec: Exec, prUrl: string): Promise<string | null> {
+  try {
+    const result = await exec(["gh", "pr", "view", prUrl, "--json", "headRefName"]);
+    if (result.code !== 0) return null;
+    const branch = JSON.parse(result.stdout)?.headRefName;
+    return isSafeRef(branch) ? branch : null;
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------- event ingestion (`hive emit`)
 async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDeps = {}): Promise<Response> {
   const task = getTask(db, taskId);
@@ -4841,14 +4852,27 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     // work — including when it replaces an earlier PR (closed #161 → rebased
     // #166, task #90). The old `only if unlinked` guard silently ignored the
     // new url, so every merge kept hitting the closed PR in a loop. ci_status
-    // and head_sha reset because they described the old PR.
+    // and head_sha reset because they described the old PR. Refresh branch too:
+    // the destructive-rebase guard and cleanup must inspect the replacement
+    // PR's head, not the stale branch from the rejected attempt.
     if (prUrl && prUrl !== t.pr_url) {
-      db.query("UPDATE tasks SET pr_url = ?, ci_status = NULL, head_sha = NULL, updated_at = ? WHERE id = ?").run(prUrl, now(), taskId);
+      const branch = await prHeadBranch(exec, prUrl);
+      db.query("UPDATE tasks SET pr_url = ?, branch = COALESCE(?, branch), ci_status = NULL, head_sha = NULL, updated_at = ? WHERE id = ?").run(
+        prUrl,
+        branch,
+        now(),
+        taskId
+      );
       writeEvent(db, {
         task_id: taskId,
         source,
         type: "pr_linked",
-        payload: { pr_url: prUrl, via: t.pr_url ? "ready_replaced" : "ready", ...(t.pr_url ? { replaced: t.pr_url } : {}) },
+        payload: {
+          pr_url: prUrl,
+          via: t.pr_url ? "ready_replaced" : "ready",
+          ...(t.pr_url ? { replaced: t.pr_url } : {}),
+          ...(branch ? { branch } : {}),
+        },
       });
     }
     if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });

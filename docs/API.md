@@ -950,7 +950,7 @@ Behavior by `type`:
   parks the task in `needs_decision`. Missing/empty `options` default to
   `proceed`/`dismiss` (the emit path defaults rather than dropping the agent's
   signal). → `201 {decision: Decision, task: Task}`
-- `ready` → the finished-handoff signal. Records or replaces `pr_url` when supplied (writing a `pr_linked` event and clearing prior `ci_status`/`head_sha` on replacement), then advances `in_progress → in_review` with a `ready_for_review` event. Idempotent: on a task that isn't `in_progress` (already advanced) it acks without transitioning. → `200 {task: Task}`
+- `ready` → the finished-handoff signal. Records or replaces `pr_url` when supplied (writing a `pr_linked` event, refreshing `branch` from the pull request head when available, and clearing prior `ci_status`/`head_sha` on replacement), then advances `in_progress → in_review` with a `ready_for_review` event. Idempotent: on a task that isn't `in_progress` (already advanced) it acks without transitioning. → `200 {task: Task}`
 - `done` → records the `note` as summary + `note` event, then transitions the
   task to `done` (evidence rule enforced). → `200 {task: Task}` | `409`
 - `unmergeable` (HIVE-314) → self-service terminal path for a task whose own PR
