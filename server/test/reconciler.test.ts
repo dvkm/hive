@@ -458,6 +458,63 @@ test("syncPRs persists the PR's head_sha so the review card can flag stale evide
   expect(getTask(db, id).head_sha).toBe("sha-b");
 });
 
+test("syncPRs discards facts fetched for a PR replaced in flight", async () => {
+  const { db, projectId } = freshDb();
+  const oldPr = "https://gh/pr/old";
+  const newPr = "https://gh/pr/new";
+  const id = makeTask(db, projectId, { pr_url: oldPr });
+  transition(db, id, "in_progress");
+  db.query("UPDATE tasks SET ci_status = ?, head_sha = ? WHERE id = ?").run("passing", "prior-head", id);
+
+  const gh: Exec = stub((argv) => {
+    if (argv[0] === "gh") {
+      db.query("UPDATE tasks SET pr_url = ?, ci_status = NULL, head_sha = NULL WHERE id = ?").run(newPr, id);
+      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "FAILURE" }], headRefOid: "stale-old-head" }));
+    }
+    return OK();
+  });
+
+  await reconcileOnce(db, { exec: gh });
+
+  const task = getTask(db, id);
+  expect(task.pr_url).toBe(newPr);
+  expect(task.ci_status).toBeNull();
+  expect(task.head_sha).toBeNull();
+  expect(task.state).toBe("in_progress");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type IN ('ci_status', 'pr_synchronized')").all(id)).toHaveLength(0);
+});
+
+test("syncPRs rechecks PR identity after branch scope capture", async () => {
+  const { db, projectId } = freshDb();
+  const oldPr = "https://gh/pr/old-scope";
+  const newPr = "https://gh/pr/new-scope";
+  const id = makeTask(db, projectId, { pr_url: oldPr });
+  transition(db, id, "in_progress");
+  db.query("UPDATE tasks SET branch = ?, ci_status = ?, head_sha = ? WHERE id = ?")
+    .run("hive/scope-race", "passing", "prior-head", id);
+
+  const exec: Exec = stub((argv) => {
+    if (argv[0] === "gh")
+      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ status: "IN_PROGRESS" }], headRefOid: "stale-old-head", baseRefName: "main", baseRefOid: "old-base" }));
+    if (argv.includes("diff") && argv.includes("--name-only")) {
+      db.query("UPDATE tasks SET pr_url = ?, ci_status = NULL, head_sha = NULL WHERE id = ?").run(newPr, id);
+      return OK("src/task.ts\n");
+    }
+    if (argv.includes("rev-parse")) return OK("old-base\n");
+    return OK();
+  });
+
+  await reconcileOnce(db, { exec });
+
+  const task = getTask(db, id);
+  expect(task.pr_url).toBe(newPr);
+  expect(task.ci_status).toBeNull();
+  expect(task.head_sha).toBeNull();
+  expect(task.state).toBe("in_progress");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'branch_scope'").get(id)).toBeNull();
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'ci_status'").get(id)).toBeNull();
+});
+
 test("syncPRs snapshots branch scope against the PR's exact base commit", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { pr_url: "https://gh/pr/staging" });
@@ -1146,6 +1203,30 @@ test("advanceFinished: a scout with report evidence + idle agent -> in_review", 
   await reconcileOnce(db, { herdr: statusHerdr("idle"), exec: stub(() => ({ code: 1, stdout: "", stderr: "no gh" })) });
 
   expect(getTask(db, id).state).toBe("in_review");
+});
+
+test("reconciler backfills a requeue when its failed predecessor's PR is linked later", async () => {
+  const { db, projectId } = freshDb();
+  const predecessor = makeTask(db, projectId, { state: "failed" });
+  const successor = makeTask(db, projectId, { source: "requeue" });
+  const branch = `hive/${predecessor}`;
+  const prUrl = "https://gh/pr/819";
+  db.query("UPDATE tasks SET branch = ? WHERE id = ?").run(branch, predecessor);
+  db.query("UPDATE tasks SET parent_task_id = ?, resume_branch = ?, brief = ? WHERE id = ?")
+    .run(predecessor, branch, "Keep this original brief.", successor);
+
+  const gh: Exec = stub((argv) => argv.includes("list")
+    ? OK(JSON.stringify([{ title: "PR", body: `hive-task: ${predecessor}`, url: prUrl }]))
+    : { code: 1, stdout: "", stderr: "skip" });
+  await reconcileOnce(db, { exec: gh });
+
+  const requeue = getTask(db, successor);
+  expect(requeue.resume_pr_url).toBe(prUrl);
+  expect(requeue.resume_branch).toBe(branch);
+  expect(requeue.brief.startsWith("<!-- hive:resume -->\n**RESUME")).toBe(true);
+  expect(requeue.brief).toContain(`- Open PR: ${prUrl}`);
+  expect(requeue.brief).toContain("Keep this original brief.");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'resume_pr_backfilled'").get(successor)).toBeTruthy();
 });
 
 test("reconciler never throws; a failing sub-step broadcasts at most one error", async () => {

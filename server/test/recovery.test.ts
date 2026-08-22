@@ -10,6 +10,7 @@ process.env.HIVE_HOME = HOME;
 const { openDb, newId, now } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
 const { reconcileOnce } = await import("../src/reconciler.ts");
+const { requeueTask } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { getTask } = await import("../src/state.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
@@ -93,6 +94,360 @@ test("dead agent → capture pane tail, fail, auto-requeue (attempt 1)", async (
   expect(requeue.state).toBe("queued");
   const requeued: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'requeued'").get(id);
   expect(JSON.parse(requeued.payload).attempt).toBe(1);
+});
+
+// hive-1090: a requeue used to copy only the original brief, dropping the
+// failed attempt's branch/PR — a fresh agent, blind to that, could rebuild the
+// whole feature as a second conflicting PR (the exact incident this closes:
+// task #1123 died with PR 819 open, its auto-requeue opened PR 825 instead of
+// adopting it). requeueTask now prepends a RESUME section and records the
+// pointer structurally on the new row.
+test("dead agent with an open PR → requeue's brief leads with the adopt-this-PR pointer, and the original keeps its pr_url (never orphaned/cleared)", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent: "a1" });
+  const branch = `hive/${id}`;
+  const prUrl = "https://github.com/acme/web/pull/819";
+  const headSha = "abc819";
+  db.query("UPDATE tasks SET branch = ?, worktree_path = ?, pr_url = ?, head_sha = ? WHERE id = ?").run(branch, `/tmp/wt-${id}`, prUrl, headSha, id);
+  putEvent(db, id, "spawned");
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  const requeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(id);
+  expect(requeue).toBeTruthy();
+  expect(requeue.resume_branch).toBe(branch);
+  expect(requeue.resume_pr_url).toBe(prUrl);
+  expect(requeue.brief.startsWith("<!-- hive:resume -->\n**RESUME")).toBe(true); // leads the brief, not buried
+  expect(requeue.brief).toContain(prUrl);
+  expect(requeue.brief).toContain(branch);
+  expect(requeue.brief).toContain(`- Branch to merge in: \`${branch}\`\n`);
+  expect(requeue.brief).toContain(`- Open PR: ${prUrl} (last known head \`${headSha}\`)`);
+  expect(requeue.brief.toLowerCase()).toContain("do not rebuild");
+
+  // the failed predecessor's own pr_url is never cleared/orphaned by the
+  // recovery it just went through — it's the thing the requeue points back at.
+  expect(getTask(db, id).pr_url).toBe(prUrl);
+});
+
+test("requeue of a task whose PR already closed adopts the branch but drops the (stale) PR pointer", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent: "a1" });
+  const branch = `hive/${id}`;
+  const prUrl = "https://github.com/acme/web/pull/819";
+  const headSha = "abc819";
+  db.query("UPDATE tasks SET branch = ?, worktree_path = ?, pr_url = ?, head_sha = ? WHERE id = ?").run(branch, `/tmp/wt-${id}`, prUrl, headSha, id);
+  putEvent(db, id, "spawned");
+  putEvent(db, id, "pr_closed", { pr_url: prUrl }); // reconciler already saw it closed
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  const requeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(id);
+  expect(requeue.resume_branch).toBe(branch);
+  expect(requeue.resume_pr_url).toBeNull();
+  expect(requeue.brief).not.toContain(prUrl);
+  expect(requeue.brief).not.toContain(headSha);
+});
+
+test("a historical PR closure does not hide an open replacement PR", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent: "a1" });
+  const branch = `hive/${id}`;
+  const closedPrUrl = "https://github.com/acme/web/pull/819";
+  const replacementPrUrl = "https://github.com/acme/web/pull/825";
+  db.query("UPDATE tasks SET branch = ?, pr_url = ? WHERE id = ?").run(branch, closedPrUrl, id);
+  putEvent(db, id, "pr_closed", { pr_url: closedPrUrl });
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run(replacementPrUrl, id);
+  putEvent(db, id, "spawned");
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  const requeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(id);
+  expect(requeue.resume_pr_url).toBe(replacementPrUrl);
+  expect(requeue.brief).toContain(replacementPrUrl);
+  expect(requeue.brief).not.toContain(closedPrUrl);
+});
+
+test("requeueTask refreshes a stale source snapshot before creating the successor", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  const staleBranch = `hive/stale-${id}`;
+  const currentBranch = `hive/current-${id}`;
+  const stalePr = "https://github.com/acme/web/pull/100";
+  const currentPr = "https://github.com/acme/web/pull/200";
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, pr_url = ?, brief = ? WHERE id = ?")
+    .run(staleBranch, stalePr, "stale brief", id);
+  const stale = { ...getTask(db, id) };
+  db.query("UPDATE tasks SET branch = ?, pr_url = ?, brief = ? WHERE id = ?")
+    .run(currentBranch, currentPr, "current brief", id);
+
+  const successorId = requeueTask(db, stale);
+  const successor = getTask(db, successorId);
+
+  expect(successor.parent_task_id).toBe(id);
+  expect(successor.resume_branch).toBe(currentBranch);
+  expect(successor.resume_pr_url).toBe(currentPr);
+  expect(successor.brief).toContain("current brief");
+  expect(successor.brief).toContain(currentPr);
+  expect(successor.brief).not.toContain("stale brief");
+  expect(successor.brief).not.toContain(stalePr);
+});
+
+test("a second requeue preserves resume pointers inherited from the original attempt", async () => {
+  const { db, projectId } = freshDb();
+  const original = makeTask(db, projectId);
+  const branch = `hive/${original}`;
+  const ghostBranch = `ghost-${original}`;
+  const prUrl = "https://github.com/acme/web/pull/819";
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, pr_url = ? WHERE id = ?")
+    .run(branch, prUrl, original);
+
+  const firstRequeue = makeTask(db, projectId, { source: "requeue", parent: original, agent: "a2" });
+  db.query("UPDATE tasks SET resume_branch = ?, resume_ghost_branch = ?, resume_pr_url = ? WHERE id = ?")
+    .run(branch, ghostBranch, prUrl, firstRequeue);
+  putEvent(db, firstRequeue, "spawned");
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  const secondRequeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(firstRequeue);
+  expect(secondRequeue).toBeTruthy();
+  expect(secondRequeue.resume_branch).toBe(branch);
+  expect(secondRequeue.resume_ghost_branch).toBe(ghostBranch);
+  expect(secondRequeue.resume_pr_url).toBe(prUrl);
+  expect(secondRequeue.brief).toContain(branch);
+  expect(secondRequeue.brief).toContain(ghostBranch);
+  expect(secondRequeue.brief).toContain(prUrl);
+  expect(secondRequeue.brief).toContain("An earlier attempt also had uncommitted WIP separately rescued");
+});
+
+test("a spawned requeue surfaces its own and inherited branches", async () => {
+  const { db, projectId } = freshDb();
+  const original = makeTask(db, projectId);
+  const inheritedBranch = `hive/${original}`;
+  const inheritedPrUrl = "https://github.com/acme/web/pull/819";
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, pr_url = ? WHERE id = ?")
+    .run(inheritedBranch, inheritedPrUrl, original);
+
+  const firstRequeue = makeTask(db, projectId, { source: "requeue", parent: original, agent: "a2" });
+  const spawnedBranch = `hive/${firstRequeue}`;
+  db.query("UPDATE tasks SET branch = ?, resume_branch = ?, resume_pr_url = ? WHERE id = ?")
+    .run(spawnedBranch, inheritedBranch, inheritedPrUrl, firstRequeue);
+  putEvent(db, firstRequeue, "spawned");
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  const secondRequeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(firstRequeue);
+  expect(secondRequeue.resume_branch).toBe(spawnedBranch);
+  expect(secondRequeue.resume_pr_url).toBe(inheritedPrUrl);
+  expect(secondRequeue.brief).toContain(spawnedBranch);
+  expect(secondRequeue.brief).toContain(inheritedBranch);
+});
+
+test("a copied inherited PR remains independent from branch selection", async () => {
+  const { db, projectId } = freshDb();
+  const original = makeTask(db, projectId);
+  const inheritedBranch = `hive/${original}`;
+  const inheritedPrUrl = "https://github.com/acme/web/pull/819";
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, pr_url = ? WHERE id = ?")
+    .run(inheritedBranch, inheritedPrUrl, original);
+
+  const firstRequeue = makeTask(db, projectId, { source: "requeue", parent: original, agent: "a2" });
+  const spawnedBranch = `hive/${firstRequeue}`;
+  db.query("UPDATE tasks SET branch = ?, pr_url = ?, resume_branch = ?, resume_pr_url = ? WHERE id = ?")
+    .run(spawnedBranch, inheritedPrUrl, inheritedBranch, inheritedPrUrl, firstRequeue);
+  putEvent(db, firstRequeue, "spawned");
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  const secondRequeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(firstRequeue);
+  expect(secondRequeue.resume_branch).toBe(spawnedBranch);
+  expect(secondRequeue.resume_pr_url).toBe(inheritedPrUrl);
+  expect(secondRequeue.brief).toContain(spawnedBranch);
+  expect(secondRequeue.brief).toContain(inheritedBranch);
+});
+
+test("a spawned requeue keeps its own PR while surfacing its inherited branch", async () => {
+  const { db, projectId } = freshDb();
+  const original = makeTask(db, projectId);
+  const inheritedBranch = `hive/${original}`;
+  const inheritedPrUrl = "https://github.com/acme/web/pull/819";
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, pr_url = ? WHERE id = ?")
+    .run(inheritedBranch, inheritedPrUrl, original);
+
+  const firstRequeue = makeTask(db, projectId, { source: "requeue", parent: original, agent: "a2" });
+  const ownBranch = `hive/${firstRequeue}`;
+  const ownPrUrl = "https://github.com/acme/web/pull/825";
+  db.query("UPDATE tasks SET branch = ?, pr_url = ?, resume_branch = ?, resume_pr_url = ? WHERE id = ?")
+    .run(ownBranch, ownPrUrl, inheritedBranch, inheritedPrUrl, firstRequeue);
+  putEvent(db, firstRequeue, "spawned");
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  const secondRequeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(firstRequeue);
+  expect(secondRequeue.resume_branch).toBe(ownBranch);
+  expect(secondRequeue.resume_pr_url).toBe(ownPrUrl);
+  expect(secondRequeue.brief).toContain(ownBranch);
+  expect(secondRequeue.brief).toContain(inheritedBranch);
+});
+
+test("a closed own PR falls back to a still-open inherited PR", async () => {
+  const { db, projectId } = freshDb();
+  const original = makeTask(db, projectId);
+  const inheritedBranch = `hive/${original}`;
+  const inheritedPrUrl = "https://github.com/acme/web/pull/819";
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, pr_url = ? WHERE id = ?")
+    .run(inheritedBranch, inheritedPrUrl, original);
+
+  const firstRequeue = makeTask(db, projectId, { source: "requeue", parent: original, agent: "a2" });
+  const ownBranch = `hive/${firstRequeue}`;
+  const closedOwnPrUrl = "https://github.com/acme/web/pull/825";
+  db.query("UPDATE tasks SET branch = ?, pr_url = ?, resume_branch = ?, resume_pr_url = ?, head_sha = ?, ci_status = ? WHERE id = ?")
+    .run(ownBranch, closedOwnPrUrl, inheritedBranch, inheritedPrUrl, "closed-own-head", "failing", firstRequeue);
+  putEvent(db, firstRequeue, "pr_closed", { pr_url: closedOwnPrUrl });
+  putEvent(db, firstRequeue, "spawned");
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  const secondRequeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(firstRequeue);
+  expect(secondRequeue.resume_pr_url).toBe(inheritedPrUrl);
+  expect(secondRequeue.brief).toContain(inheritedPrUrl);
+  expect(secondRequeue.brief).not.toContain(closedOwnPrUrl);
+  expect(secondRequeue.brief).not.toContain("closed-own-head");
+  expect(secondRequeue.brief).not.toContain("Last known CI status");
+});
+
+test("a merged own PR does not resurrect an inherited PR", async () => {
+  const { db, projectId } = freshDb();
+  const original = makeTask(db, projectId);
+  const inheritedBranch = `hive/${original}`;
+  const inheritedPrUrl = "https://github.com/acme/web/pull/819";
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, pr_url = ? WHERE id = ?")
+    .run(inheritedBranch, inheritedPrUrl, original);
+
+  const firstRequeue = makeTask(db, projectId, { source: "requeue", parent: original, agent: "a2" });
+  const ownBranch = `hive/${firstRequeue}`;
+  const mergedOwnPrUrl = "https://github.com/acme/web/pull/825";
+  db.query("UPDATE tasks SET branch = ?, pr_url = ?, resume_branch = ?, resume_pr_url = ? WHERE id = ?")
+    .run(ownBranch, mergedOwnPrUrl, inheritedBranch, inheritedPrUrl, firstRequeue);
+  putEvent(db, firstRequeue, "pr_merged", { pr_url: mergedOwnPrUrl });
+  putEvent(db, firstRequeue, "spawned");
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  const secondRequeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(firstRequeue);
+  expect(secondRequeue.resume_pr_url).toBeNull();
+  expect(secondRequeue.brief).not.toContain(mergedOwnPrUrl);
+  expect(secondRequeue.brief).not.toContain(inheritedPrUrl);
+});
+
+test("a requeue with its own ghost also preserves inherited branch and ghost pointers", async () => {
+  const { db, projectId } = freshDb();
+  const original = makeTask(db, projectId);
+  const inheritedBranch = `hive/${original}`;
+  const inheritedGhost = `ghost-${original}`;
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ? WHERE id = ?")
+    .run(inheritedBranch, original);
+
+  const firstRequeue = makeTask(db, projectId, { source: "requeue", parent: original, agent: "a2" });
+  const ownBranch = `hive/${firstRequeue}`;
+  const ownGhost = `ghost-${firstRequeue}`;
+  db.query("UPDATE tasks SET branch = ?, resume_branch = ?, resume_ghost_branch = ? WHERE id = ?")
+    .run(ownBranch, inheritedBranch, inheritedGhost, firstRequeue);
+  putEvent(db, firstRequeue, "worktree_reclaimed", { ghost_branch: ownGhost });
+  putEvent(db, firstRequeue, "spawned");
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  const secondRequeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(firstRequeue);
+  expect(secondRequeue.resume_branch).toBe(ownBranch);
+  expect(secondRequeue.resume_ghost_branch).toBe(ownGhost);
+  expect(secondRequeue.brief).toContain(ownBranch);
+  expect(secondRequeue.brief).toContain(ownGhost);
+  expect(secondRequeue.brief).toContain(inheritedBranch);
+  expect(secondRequeue.brief).toContain(inheritedGhost);
+});
+
+test("a second requeue drops an inherited PR pointer closed on the original attempt", async () => {
+  const { db, projectId } = freshDb();
+  const original = makeTask(db, projectId);
+  const branch = `hive/${original}`;
+  const prUrl = "https://github.com/acme/web/pull/819";
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, pr_url = ? WHERE id = ?")
+    .run(branch, prUrl, original);
+  putEvent(db, original, "pr_closed", { pr_url: prUrl });
+
+  const firstRequeue = makeTask(db, projectId, { source: "requeue", parent: original, agent: "a2" });
+  db.query("UPDATE tasks SET pr_url = ?, resume_branch = ?, resume_pr_url = ? WHERE id = ?")
+    .run(prUrl, branch, prUrl, firstRequeue);
+  putEvent(db, firstRequeue, "spawned");
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  const secondRequeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(firstRequeue);
+  expect(secondRequeue.resume_branch).toBe(branch);
+  expect(secondRequeue.resume_pr_url).toBeNull();
+  expect(secondRequeue.brief).not.toContain(prUrl);
+});
+
+test("a second requeue strips a prior RESUME block that references a closed PR", async () => {
+  const { db, projectId } = freshDb();
+  const original = makeTask(db, projectId);
+  const branch = `hive/${original}`;
+  const closedPrUrl = "https://github.com/acme/web/pull/819";
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, pr_url = ? WHERE id = ?")
+    .run(branch, closedPrUrl, original);
+  putEvent(db, original, "pr_closed", { pr_url: closedPrUrl });
+
+  const firstRequeue = makeTask(db, projectId, { source: "requeue", parent: original, agent: "a2" });
+  const brief = `Director note before resume.\n<!-- hive:resume -->\n**RESUME — adopt PR ${closedPrUrl} / branch \`${branch}\`.**\n<!-- /hive:resume -->\nImplement the original request.`;
+  db.query("UPDATE tasks SET brief = ?, branch = ?, resume_branch = ?, resume_pr_url = ? WHERE id = ?")
+    .run(brief, `hive/${firstRequeue}`, branch, closedPrUrl, firstRequeue);
+  putEvent(db, firstRequeue, "spawned");
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  const secondRequeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(firstRequeue);
+  expect(secondRequeue.resume_pr_url).toBeNull();
+  expect(secondRequeue.brief).not.toContain(closedPrUrl);
+  expect(secondRequeue.brief).toContain("Director note before resume.");
+  expect(secondRequeue.brief).toContain("Implement the original request.");
+});
+
+test("requeue context includes answer notes, answerer identity, and section-only self-reviews", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent: "a1" });
+  const branch = `hive/${id}`;
+  db.query("UPDATE tasks SET branch = ? WHERE id = ?").run(branch, id);
+  const answeredAt = now();
+  db.query(
+    `INSERT INTO decisions (id, task_id, ts, title, options, status, answer_key, answer_note, answered_at, answered_by)
+     VALUES (?,?,?,?,?, 'answered', ?,?,?,?)`
+  ).run(
+    newId("dec"), id, answeredAt, "Which rollout?",
+    JSON.stringify([{ key: "staged", label: "Use staged rollout" }]),
+    "staged", "Keep the beta cohort isolated", answeredAt, "chat_supervisor"
+  );
+  putEvent(db, id, "review_summary", { testing: ["focused tests passed"], followups: ["watch rollout"] });
+  putEvent(db, id, "spawned");
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  const requeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(id);
+  expect(requeue.brief).toContain("Which rollout? — Use staged rollout; note: Keep the beta cohort isolated");
+  expect(requeue.brief).toContain("[answered by chat_supervisor, not director]");
+  expect(requeue.brief).toContain("testing, followups section(s) included");
 });
 
 test("a source=external task with agent_target set (regression guard: should be unreachable post-#996) is still recovered sanely, not stuck forever", async () => {

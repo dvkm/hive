@@ -163,10 +163,7 @@ recorded as `agent_status: gone` (so health shows `dead` within one cycle).
 (recovered the SAME cycle — the SPEC requires catching a ghost within one cycle)
 or whose newest meaningful event is `stale`:
 
-- **Dead** → capture the pane tail (`herdr agent read`) as `log` evidence, mark
-  the task `failed`, and auto-requeue a fresh `source="requeue"` task under a cap
-  of 2 (lineage counted via `parent_task_id`); the 3rd death opens a decision
-  card (`openRecoveryDecision`, answer `requeue` → another fresh task).
+- **Dead** → capture the pane tail (`herdr agent read`) as `log` evidence, mark the task `failed`, and auto-requeue a fresh `source="requeue"` task under a cap of 2 (lineage counted via `parent_task_id`); the 3rd death opens a decision card (`openRecoveryDecision`, answer `requeue` → another fresh task). Every fresh task carries prior work through the [Task resume contract](API.md#task).
 - **Alive but silent** → nudge via `herdr agent send`; after 3 silent cycles,
   fail + open the same decision card.
 

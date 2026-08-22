@@ -156,6 +156,27 @@ test("cleanupTask closes the session even when the worktree was already gone fro
   expect(out.session.via).toBe("tab wF:t9"); // the session was NOT left dangling
 });
 
+// hive-1090 item 3: a requeue's resume_pr_url only means anything if the
+// predecessor's pr_url survives its own teardown. cleanupTask tears down the
+// worktree/session for a terminal (e.g. failed) task, and must never touch
+// pr_url — the open PR needs to stay linked so the requeue can adopt it.
+test("cleanupTask never clears pr_url on a failed task — its open PR stays linked, never silently orphaned", async () => {
+  const { db, projectId } = freshDb();
+  const branch = "hive/CT-PR";
+  const prUrl = "https://github.com/acme/web/pull/819";
+  const id = seedTask(db, projectId, { state: "failed", branch, worktree_path: "/wt/hive-CT-PR" });
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run(prUrl, id);
+  const exec: Exec = async (argv) => {
+    if (argv[0] === "git" && argv.includes("ls-remote")) return OK("sha\trefs/heads/" + branch); // pushed
+    return OK();
+  };
+  const herdr = new Herdr(exec, "herdr");
+
+  const out = await cleanupTask(db, herdr, id);
+  expect(out.cleaned).toBe(true);
+  expect((db.query("SELECT pr_url FROM tasks WHERE id = ?").get(id) as any).pr_url).toBe(prUrl);
+});
+
 // ---- runStackCmd: shared setup/teardown hook runner ----
 
 test("runStackCmd (setup) substitutes {worktree}, resolves relative argv[0], emits stack_setup ok", async () => {
