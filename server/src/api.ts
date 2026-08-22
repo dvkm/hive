@@ -7,7 +7,7 @@ import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db
 import { taskWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
 import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
-import { addClient, removeClient, broadcast } from "./bus.ts";
+import { addClient, removeClient, broadcast, appClientCount } from "./bus.ts";
 import {
   transition,
   writeEvent,
@@ -45,7 +45,7 @@ import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, stee
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
-import { enqueue, ackNotifications } from "./notifications.ts";
+import { enqueue, ackNotifications, markShown, recordDeliveryError, lastDeliveryError } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, resolveDenyGuardrailForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
 import { runPlanner, resolvePlanForDecision, decisionPlan, selectedPlanIndices, type PlannerExec } from "./planner.ts";
@@ -248,7 +248,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
     try {
       // ---- SSE stream ----
-      if (pathname === "/api/stream" && method === "GET") return sseStream();
+      if (pathname === "/api/stream" && method === "GET") return sseStream(url.searchParams.get("client") === "app");
 
       // ---- health ----
       if (pathname === "/api/health" && method === "GET") {
@@ -561,6 +561,19 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       // ---- notifications ----
       if (pathname === "/api/notifications" && method === "GET") return listNotifications(db, url);
+      // The desktop app reports what macOS did with a native notification:
+      // {shown:true} it rendered, or {error} it refused.
+      m = pathname.match(/^\/api\/notifications\/([^/]+)\/delivery$/);
+      if (m && method === "POST") {
+        const b = await req.json().catch(() => ({} as any));
+        if (b?.error) {
+          recordDeliveryError(m[1], String(b.error));
+          return json({ ok: false });
+        }
+        return json({ ok: markShown(db, m[1]) });
+      }
+      // `hive notify --test`: fire one real notification through the live path.
+      if (pathname === "/api/notifications/test" && method === "POST") return testNotification(db);
       if (pathname === "/api/notifications/ack" && method === "POST")
         return json({ ok: true, acked: ackNotifications(db) });
 
@@ -4514,7 +4527,21 @@ function listNotifications(db: DB, url: URL): Response {
     ? db.query("SELECT * FROM notifications WHERE ts > ? ORDER BY ts DESC").all(since)
     : db.query("SELECT * FROM notifications ORDER BY ts DESC LIMIT 100").all();
   const unread = (db.query("SELECT COUNT(*) AS n FROM notifications WHERE delivered_at IS NULL").get() as { n: number }).n;
-  return json({ notifications: rows, unread });
+  return json({ notifications: rows, unread, last_delivery_error: lastDeliveryError() });
+}
+
+// POST /api/notifications/test — fire one real urgent notification down the
+// same path a decision uses, so the whole chain can be checked without waiting
+// for a real event. The caller polls GET /api/notifications for delivered_at:
+// the desktop app sets it only after macOS actually rendered the notification.
+function testNotification(db: DB): Response {
+  const row = enqueue(db, {
+    kind: "test",
+    urgency: "urgent",
+    title: "hive test notification",
+    body: "If you can see this, native notifications work. Clicking it opens hive.",
+  });
+  return json({ id: row.id, app_clients: appClientCount() }, 201);
 }
 
 // ---------------------------------------------------------------- secrets (metadata only)
@@ -5342,14 +5369,16 @@ export function createDecision(
   // Enrich AFTER the transition so the bundle's spend/PR reflect current state.
   const decision = withBundle(db, parseDecision(row));
   broadcast({ type: "decision", decision });
-  // Notify: a high-risk decision is urgent (immediate push); others batch.
+  // Every open decision parks an agent until the director answers it, so all of
+  // them are urgent. They used to batch unless risk was "high", which meant the
+  // common case waited up to HIVE_DIGEST_MS for a summary line.
   enqueue(db, {
     kind: "decision",
     task_id: d.task_id,
     decision_id: row.id,
     title: `Decision needed: ${row.title}`,
     body: row.blast_radius ?? row.context ?? undefined,
-    urgency: (row.risk ?? "").toLowerCase() === "high" ? "urgent" : "normal",
+    urgency: "urgent",
   });
   return decision;
 }
@@ -5762,14 +5791,15 @@ function updatePolicy(db: DB, id: string, body: any): Response {
 }
 
 // ---------------------------------------------------------------- SSE
-function sseStream(): Response {
-  let self: { id: string; send: (d: string) => void };
+function sseStream(isApp = false): Response {
+  let self: { id: string; send: (d: string) => void; app?: boolean };
   const stream = new ReadableStream({
     start(controller) {
       const enc = new TextEncoder();
       self = {
         id: newId(),
         send: (data: string) => controller.enqueue(enc.encode(`data: ${data}\n\n`)),
+        app: isApp,
       };
       addClient(self);
       // headline so clients know the stream is live

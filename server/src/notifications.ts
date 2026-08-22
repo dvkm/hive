@@ -11,7 +11,7 @@
 // count is the rows where delivered_at IS NULL.
 import type { DB } from "./db.ts";
 import { newId, now } from "./db.ts";
-import { broadcast } from "./bus.ts";
+import { broadcast, appClientCount } from "./bus.ts";
 import { pushToAll } from "./push.ts";
 import type { Exec } from "./exec.ts";
 import { notTestProjectSql } from "./testProjects.ts";
@@ -34,16 +34,46 @@ export function setNotifier(exec: Exec | null): void {
   notifier = exec;
 }
 
-async function appNotify(exec: Exec, title: string, message: string, path = "/"): Promise<void> {
+// Where clicking a notification should land in the app. These are the same
+// paths the web UI already uses, so a deeplink is just a normal route.
+export function deeplinkPath(n: { task_id?: string | null; decision_id?: string | null }): string {
+  if (n.decision_id) return `/decisions#dcard-${n.decision_id}`;
+  if (n.task_id) return `/tasks/${n.task_id}`;
+  return "/";
+}
+
+// Cold-start path only: the desktop app is not attached to the stream, so hand
+// macOS the whole notification in a hive:// URL and let LaunchServices start
+// the app to render it.
+async function launchAndNotify(exec: Exec, n: { id: string; title: string; body: string; path: string }): Promise<void> {
   try {
     const url = new URL("hive://notify");
-    url.searchParams.set("title", title);
-    url.searchParams.set("body", message);
-    url.searchParams.set("path", path);
+    url.searchParams.set("id", n.id);
+    url.searchParams.set("title", n.title);
+    url.searchParams.set("body", n.body);
+    url.searchParams.set("path", n.path);
     await exec(["open", "-g", "-b", "dev.hive.app", url.toString()]);
   } catch {
     /* non-fatal: hive.app missing / not macOS */
   }
+}
+
+// Deliver one native notification. The desktop app is the only thing that can
+// raise one, so prefer the live SSE connection it already holds: no shell-out,
+// no LaunchServices lookup, and the app confirms it rendered by POSTing
+// /api/notifications/<id>/shown. With no app attached, fall back to launching
+// it through the hive:// scheme.
+export function deliverNative(n: { id: string; title: string; body?: string | null; path: string }, exec: Exec | null): "stream" | "launch" | "none" {
+  const msg = { type: "notify", id: n.id, title: n.title, body: n.body ?? "", path: n.path };
+  if (appClientCount() > 0) {
+    broadcast(msg);
+    return "stream";
+  }
+  if (exec) {
+    void launchAndNotify(exec, { id: n.id, title: n.title, body: n.body ?? "", path: n.path });
+    return "launch";
+  }
+  return "none";
 }
 
 // A task under a test/ephemeral project (see testProjects.ts) never pushes a
@@ -57,8 +87,13 @@ function isTestProjectTask(db: DB, taskId: string): boolean {
 }
 
 // Enqueue a notification: insert the row + SSE broadcast. Urgent notifications
-// deliver immediately (marking delivered_at) via the configured exec; normal
-// ones wait for the digest. `deps.exec` overrides the module notifier (tests).
+// deliver immediately as a native notification; normal ones wait for the
+// digest. `deps.exec` overrides the module notifier (tests).
+//
+// An urgent row is NOT pre-marked delivered. `delivered_at` now means the
+// desktop app told us it actually rendered the notification (or the digest ran,
+// or the bell was opened). Before, the server stamped it the moment it shelled
+// out, so a notification macOS never showed still counted as seen.
 export function enqueue(db: DB, n: NotifInput, deps: { exec?: Exec } = {}): any {
   if (n.task_id && isTestProjectTask(db, n.task_id)) return null;
   const urgency: Urgency = n.urgency ?? "normal";
@@ -72,26 +107,18 @@ export function enqueue(db: DB, n: NotifInput, deps: { exec?: Exec } = {}): any 
     title: n.title,
     body: n.body ?? null,
     urgency,
-    delivered_at: urgency === "urgent" && exec ? now() : null,
+    delivered_at: null,
   };
   db.query(
     "INSERT INTO notifications (id, ts, kind, task_id, decision_id, title, body, urgency, delivered_at) VALUES (?,?,?,?,?,?,?,?,?)"
   ).run(row.id, row.ts, row.kind, row.task_id, row.decision_id, row.title, row.body, row.urgency, row.delivered_at);
   broadcast({ type: "notification", notification: row });
-  if (urgency === "urgent" && exec)
-    void appNotify(
-      exec,
-      n.title,
-      n.body ?? "",
-      n.decision_id ? "/decisions" : n.task_id ? `/tasks/${n.task_id}` : "/"
-    );
-  // Urgent → also push to the phone (PWA web push). Best-effort, never throws.
-  if (urgency === "urgent")
-    void pushToAll(db, {
-      title: n.title,
-      body: n.body ?? null,
-      url: n.task_id ? `/tasks/${n.task_id}` : n.decision_id ? "/decisions" : "/",
-    }).catch(() => {});
+  const path = deeplinkPath(row);
+  if (urgency === "urgent") {
+    deliverNative({ id: row.id, title: row.title, body: row.body, path }, exec);
+    // Urgent → also push to the phone (PWA web push). Best-effort, never throws.
+    void pushToAll(db, { title: n.title, body: n.body ?? null, url: path }).catch(() => {});
+  }
   return row;
 }
 
@@ -101,6 +128,7 @@ const KIND_LABEL: Record<string, string> = {
   failed: "failed",
   incident: "incident",
   stale: "stale",
+  review: "in review",
   answer: "answered",
   auto_resume: "stopped mid-commitment",
 };
@@ -134,9 +162,30 @@ export function runDigest(db: DB, deps: DigestDeps = {}): { delivered: boolean; 
   db.query(
     `UPDATE notifications SET delivered_at = ? WHERE id IN (${ids.map(() => "?").join(",")})`
   ).run(at, ...ids);
-  const exec = deps.exec ?? notifier;
-  if (exec) void appNotify(exec, "hive digest", summary);
+  deliverNative({ id: `digest-${at}`, title: "hive digest", body: summary, path: "/inbox" }, deps.exec ?? notifier);
   return { delivered: true, count: pending.length, summary };
+}
+
+// The desktop app confirms it actually rendered a native notification. This is
+// the only signal that a macOS notification really fired; a digest id (not a
+// row) is accepted and ignored.
+export function markShown(db: DB, id: string): boolean {
+  const r = db.query("UPDATE notifications SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL").run(now(), id);
+  return r.changes > 0;
+}
+
+// The app can also report that macOS REFUSED to render one. The common refusal
+// is UNErrorDomain error 1 — notifications are switched off for hive — and it
+// used to be invisible: the old path swallowed every error and marked the row
+// delivered anyway. Keep the latest so `hive notify --test` can name the cause.
+// ponytail: last-one-wins in memory, not a table. It only has to answer "why
+// did the notification I just fired not appear?".
+let lastError: { id: string; error: string; at: string } | null = null;
+export function recordDeliveryError(id: string, error: string): void {
+  lastError = { id, error, at: now() };
+}
+export function lastDeliveryError(): { id: string; error: string; at: string } | null {
+  return lastError;
 }
 
 // Mark undelivered notifications as seen (the header bell was opened). Returns

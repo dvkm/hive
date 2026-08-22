@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
 import { transition } from "../src/state.ts";
-import { enqueue, runDigest, ackNotifications, summarize } from "../src/notifications.ts";
+import { enqueue, runDigest, ackNotifications, summarize, markShown, deeplinkPath } from "../src/notifications.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
 function freshDb(): { db: DB; projectId: string } {
@@ -49,7 +49,7 @@ test("normal notifications batch into ONE digest, then never repeat", () => {
   expect(notification.hostname).toBe("notify");
   expect(notification.searchParams.get("title")).toBe("hive digest");
   expect(notification.searchParams.get("body")).toBe("2 done, 1 needs decision");
-  expect(notification.searchParams.get("path")).toBe("/");
+  expect(notification.searchParams.get("path")).toBe("/inbox");
 
   // all marked delivered; a second digest with nothing pending is a no-op
   const second = runDigest(db, { exec });
@@ -57,7 +57,7 @@ test("normal notifications batch into ONE digest, then never repeat", () => {
   expect(calls.length).toBe(1);
 });
 
-test("urgent notification opens hive.app with its click destination and is pre-delivered", () => {
+test("urgent notification opens hive.app with its click destination", () => {
   const { db } = freshDb();
   const { exec, calls } = recordingExec();
   const row = enqueue(
@@ -72,13 +72,20 @@ test("urgent notification opens hive.app with its click destination and is pre-d
     { exec }
   );
 
-  expect(row.delivered_at).toBeTruthy(); // urgent is delivered on enqueue
+  // NOT pre-delivered: only the desktop app confirming it rendered counts.
+  expect(row.delivered_at).toBeNull();
   expect(calls.length).toBe(1);
   expect(calls[0].slice(0, 4)).toEqual(["open", "-g", "-b", "dev.hive.app"]);
   const notification = new URL(calls[0][4]);
+  expect(notification.searchParams.get("id")).toBe(row.id);
   expect(notification.searchParams.get("title")).toBe("Decision needed: ship prod?");
   expect(notification.searchParams.get("body")).toBe("Production DB acme-prod-db.");
-  expect(notification.searchParams.get("path")).toBe("/decisions");
+  expect(notification.searchParams.get("path")).toBe("/decisions#dcard-dec_123");
+
+  // the app reports back that macOS rendered it — that is what marks it seen
+  expect(markShown(db, row.id)).toBe(true);
+  expect(markShown(db, row.id)).toBe(false); // idempotent
+  expect((db.query("SELECT delivered_at FROM notifications WHERE id = ?").get(row.id) as any).delivered_at).toBeTruthy();
 
   // urgent is not pending for the digest
   const digest = runDigest(db, { exec });
@@ -130,4 +137,24 @@ test("ack marks all undelivered notifications as seen", () => {
   expect(acked).toBe(2);
   const undelivered = db.query("SELECT COUNT(*) AS n FROM notifications WHERE delivered_at IS NULL").get() as { n: number };
   expect(undelivered.n).toBe(0);
+});
+
+test("deeplink path: decision card beats task page beats the board", () => {
+  expect(deeplinkPath({ decision_id: "dec_1", task_id: "t1" })).toBe("/decisions#dcard-dec_1");
+  expect(deeplinkPath({ task_id: "t1" })).toBe("/tasks/t1");
+  expect(deeplinkPath({})).toBe("/");
+});
+
+test("a task handed to review notifies urgently", () => {
+  const { db, projectId } = freshDb();
+  const id = newId();
+  const t = now();
+  db.query(
+    "INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at) VALUES (?,?,?, 'in_progress','ship', ?, ?)"
+  ).run(id, projectId, "ship it", t, t);
+
+  transition(db, id, "in_review");
+  const notif = db.query("SELECT * FROM notifications WHERE task_id = ? AND kind = 'review'").get(id) as any;
+  expect(notif).toBeTruthy();
+  expect(notif.urgency).toBe("urgent");
 });

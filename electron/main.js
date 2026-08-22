@@ -5,13 +5,17 @@
 // client only and reconnects politely when the daemon is down.
 const { app, BrowserWindow, Notification, shell, screen } = require("electron");
 const http = require("node:http");
+const { routeFor } = require("./deeplink.js");
 
 const BASE = process.env.HIVE_URL || "http://127.0.0.1:4700";
 const SMOKE = !!process.env.HIVE_SMOKE; // load, print ok, quit — used by CI/verification
 
 let win = null;
-let launchedByNotification = false;
-const pendingNotifications = [];
+let launchedByDeeplink = false;
+const pendingUrls = [];
+// Notification ids already rendered. The server can deliver the same one over
+// the stream and (on a cold start) through the hive:// URL; show it once.
+const shown = new Set();
 
 function createWindow() {
   // Clamp the initial size to the display's work area. At a fixed 1440x920 the
@@ -69,32 +73,80 @@ function goto(path) {
   win.loadURL(BASE + path).catch(() => {});
 }
 
-// The server opens hive://notify for alerts so macOS attributes them to this
-// app and their click can focus the right Hive screen. Queue cold-start URLs
-// until Electron is ready to create a native notification.
-function showNotification(rawUrl) {
-  const url = new URL(rawUrl);
-  if (url.protocol !== "hive:" || url.hostname !== "notify") return;
-  const path = url.searchParams.get("path") || "/";
-  const note = new Notification({
-    title: url.searchParams.get("title") || "hive",
-    body: url.searchParams.get("body") || "",
+// ---- hive:// deeplinks ----
+// Registered by the app bundle (electron/package.json "protocols"). Anything
+// can open one — Terminal, another app, a notification click:
+//   hive://task/1247          a task by number or id
+//   hive://decision/dec_abc   the decision card, scrolled to and highlighted
+//   hive://quiz/<task-id>     the understanding check on that task
+//   hive://open?path=/inbox   any app route, escape hatch
+//   hive://notify?...         internal: render a notification on a cold start
+// Route mapping lives in deeplink.js (checked by `node electron/deeplink.js`).
+function handleUrl(rawUrl) {
+  // hive://notify is internal: the server uses it to hand a whole notification
+  // to a cold-started app, and it is not a navigation.
+  if (rawUrl.startsWith("hive://notify")) {
+    const url = new URL(rawUrl);
+    showNotification({
+      id: url.searchParams.get("id"),
+      title: url.searchParams.get("title") || "hive",
+      body: url.searchParams.get("body") || "",
+      path: url.searchParams.get("path") || "/",
+    });
+    return;
+  }
+  const route = routeFor(rawUrl);
+  if (route) goto(route);
+}
+
+// One native macOS notification. Electron routes it through the app bundle, so
+// it carries the hive icon and obeys Do Not Disturb / Focus like any other app.
+function showNotification(n) {
+  if (n.id) {
+    if (shown.has(n.id)) return;
+    shown.add(n.id);
+  }
+  const report = (payload) => {
+    if (!n.id) return;
+    fetch(`${BASE}/api/notifications/${encodeURIComponent(n.id)}/delivery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(() => {});
+  };
+  const note = new Notification({ title: n.title || "hive", body: n.body || "" });
+  note.on("click", () => goto(n.path && n.path.startsWith("/") ? n.path : "/"));
+  // macOS refusing is the failure the director actually hit. Report it instead
+  // of swallowing it: `hive notify --test` prints the reason.
+  note.on("failed", (_event, error) => {
+    console.error("[hive] notification failed:", error);
+    report({ error: String(error) });
   });
-  note.on("click", () => goto(path.startsWith("/") ? path : "/"));
-  note.on("failed", (_event, error) => console.error("[hive] notification failed:", error));
+  // `show` is the only honest delivery signal: it fires when macOS accepted it.
+  note.on("show", () => report({ shown: true }));
   note.show();
 }
 
 app.on("open-url", (event, url) => {
   event.preventDefault();
-  launchedByNotification = true;
-  if (app.isReady()) showNotification(url);
-  else pendingNotifications.push(url);
+  launchedByDeeplink = true;
+  if (app.isReady()) handleUrl(url);
+  else pendingUrls.push(url);
+});
+
+// A second copy (three builds of this bundle can exist across worktrees) would
+// double every notification and split the deeplinks. Hand its URLs to the
+// original and quit.
+if (!app.requestSingleInstanceLock()) app.quit();
+app.on("second-instance", (_event, argv) => {
+  const url = argv.find((a) => a.startsWith("hive://"));
+  if (url) handleUrl(url);
+  else if (win) goto("/");
 });
 
 // ---- live state from the server's SSE stream ----
 function subscribe() {
-  const req = http.get(BASE + "/api/stream", { headers: { Accept: "text/event-stream" } }, (res) => {
+  const req = http.get(BASE + "/api/stream?client=app", { headers: { Accept: "text/event-stream" } }, (res) => {
     let buf = "";
     res.on("data", (chunk) => {
       buf += chunk.toString();
@@ -122,6 +174,11 @@ function subscribe() {
 }
 
 function handle(msg) {
+  // The server pushes one `notify` frame per notification it wants rendered
+  // natively. This is the primary delivery path: no shell-out, no bundle-id
+  // lookup, and it reaches THIS running copy rather than whichever build
+  // LaunchServices happens to pick.
+  if (msg.type === "notify") showNotification(msg);
   // Anything that can change the inbox count refreshes the badge.
   if (["decision", "event", "task", "notification"].includes(msg.type)) refreshBadge();
 }
@@ -145,8 +202,11 @@ function refreshBadge() {
 }
 
 app.whenReady().then(() => {
-  if (!launchedByNotification || SMOKE) createWindow();
-  pendingNotifications.splice(0).forEach(showNotification);
+  // Dev runs (`electron .`) are not launched from the bundle, so claim the
+  // scheme explicitly; from the built app this is already true.
+  app.setAsDefaultProtocolClient("hive");
+  if (!launchedByDeeplink || SMOKE) createWindow();
+  pendingUrls.splice(0).forEach(handleUrl);
   subscribe();
   refreshBadge();
   if (SMOKE) {
