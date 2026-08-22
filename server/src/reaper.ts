@@ -71,7 +71,10 @@ export async function reapOnce(db: DB, deps: ReaperDeps = {}): Promise<void> {
         const task = getTask(db, taskId);
         // A live/queued task keeps its worktree — never touch non-terminal work.
         if (task && !TERMINAL.includes(task.state as State)) continue;
-        if (task) {
+        // The row's path/branch is what cleanupTask removes. Once they are
+        // NULL it can no longer touch the checkout, so use the worktree the
+        // reaper actually enumerated (same guarded removal, minus the row).
+        if (task?.worktree_path && task.branch) {
           await cleanupTask(db, herdr, taskId, { force: true });
         } else {
           await reapOrphan(db, herdr, p.repo_path, wt.branch!, wt.path);
@@ -241,8 +244,9 @@ export function sweepFinishedTestProjects(db: DB): void {
   }
 }
 
-// A worktree whose task record no longer exists: no task to attach an event to,
-// so remove it (guarded) and broadcast a signal instead.
+// A worktree with no usable task metadata — the row is gone, or it lost its
+// worktree_path/branch. Either way there is nothing to attach an event to, so
+// remove it (guarded) and broadcast a signal instead.
 async function reapOrphan(db: DB, herdr: Herdr, repoPath: string, branch: string, worktreePath: string): Promise<void> {
   const taskId = taskIdFromBranch(branch)!;
   const r = await herdr.cleanupWorktree({ repoPath, branch, worktreePath, taskId });

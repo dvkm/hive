@@ -49,19 +49,14 @@ test("offline mode skips the sweep entirely (no closes, no worktree removals)", 
   expect(getSetting(db, "last_reap_at")).not.toBeNull(); // the loop is alive, just idle
 });
 
-// Task #1112 / 2026-08-20. The live loop, reproduced: six ancient terminal tasks
-// whose rows had lost worktree_path (so cleanupTask can no longer remove the
-// checkout) but whose worktrees git STILL lists. The reaper handed them back
-// every 300s lap and cleanupTask re-fired tab.close at a tab id from the
-// immutable `spawned` event — ~5 dead closes and 11,458 duplicate `cleaned_up`
-// events per task. The teardown must converge after ONE lap.
+// Task #1112 / 2026-08-20. Six ancient terminal tasks whose worktrees git STILL
+// lists were handed back every 300s lap, and cleanupTask re-fired tab.close at a
+// tab id from the immutable `spawned` event — ~5 dead closes and 11,458
+// duplicate `cleaned_up` events per task. The teardown must converge after ONE lap.
 test("two reaper laps over an already-cleaned terminal task: the second issues no herdr closes", async () => {
   const { db, projectId } = freshDb();
   const t = now();
-  db.query(
-    `INSERT INTO tasks (id, project_id, title, state, kind, agent_target, worktree_path, branch, created_at, updated_at)
-     VALUES (?,?,?, 'cancelled', 'ship', NULL, NULL, NULL, ?, ?)`
-  ).run("ANCIENT", projectId, "t", t, t);
+  seedTask(db, projectId, "ANCIENT", "cancelled");
   db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
     newId("evt"), "ANCIENT", t, "herdr", "spawned", JSON.stringify({ tab_id: "wR:t11", workspace_id: "wKT11" })
   );
@@ -72,6 +67,7 @@ test("two reaper laps over an already-cleaned terminal task: the second issues n
     calls.push(argv);
     if (argv[0] === "git" && has(argv, "worktree", "list"))
       return OK("worktree /repo\nHEAD r0\nbranch refs/heads/main\n\nworktree /wt/hive-ANCIENT\nHEAD r1\nbranch refs/heads/hive/ANCIENT\n");
+    if (argv[0] === "git" && argv.includes("--merged")) return OK("  main\n  hive/ANCIENT");
     return OK();
   };
   const herdr = new Herdr(exec, "herdr");
@@ -86,6 +82,54 @@ test("two reaper laps over an already-cleaned terminal task: the second issues n
   expect(calls.some((c) => c[0] === "git" && has(c, "worktree", "list"))).toBe(true); // still re-entered...
   expect(closes()).toEqual([]); // ...but did nothing
   expect((db.query("SELECT COUNT(*) n FROM events WHERE task_id = ?").get("ANCIENT") as { n: number }).n).toBe(events.n);
+});
+
+// Task #1280 / 2026-08-21. cleanupTask removes the path stored on the TASK ROW.
+// Six terminal tasks had lost worktree_path, so the removal block was skipped
+// and the checkout stayed on disk while git kept listing it. The reaper must
+// fall back to the worktree it actually enumerated.
+test("reapOnce removes a listed terminal worktree whose task row lost its path", async () => {
+  const { db, projectId } = freshDb();
+  const t = now();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, agent_target, worktree_path, branch, created_at, updated_at)
+     VALUES (?,?,?, 'cancelled', 'ship', NULL, NULL, NULL, ?, ?)`
+  ).run("STRANDED", projectId, "t", t, t);
+  // The old teardown already ran and marked itself done, so cleanupTask's
+  // converge guard returns early — the fallback has to bypass it entirely.
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    newId("evt"), "STRANDED", t, "reaper", "cleaned_up", "{}"
+  );
+
+  const calls: string[][] = [];
+  const removed: string[] = [];
+  let listed = true;
+  const exec: Exec = async (argv) => {
+    calls.push(argv);
+    if (argv[0] === "git" && has(argv, "worktree", "list"))
+      return OK(
+        "worktree /repo\nHEAD r0\nbranch refs/heads/main\n" +
+          (listed ? "\nworktree /wt/hive-STRANDED\nHEAD r1\nbranch refs/heads/hive/STRANDED\n" : "")
+      );
+    if (argv[0] === "git" && argv.includes("ls-remote")) return OK("");
+    if (argv[0] === "git" && argv.includes("--merged")) return OK("  main\n  hive/STRANDED");
+    if (argv[0] === "git" && has(argv, "worktree", "remove")) {
+      removed.push(argv[argv.length - 1]);
+      listed = false; // git stops listing it, exactly as on disk
+      return OK();
+    }
+    return OK();
+  };
+  const herdr = new Herdr(exec, "herdr");
+
+  await reapOnce(db, { herdr, exec });
+  expect(calls.some((c) => c[0] === "git" && c.includes("--merged"))).toBe(true); // guarded, not forced
+  expect(removed).toEqual(["/wt/hive-STRANDED"]);
+
+  calls.length = 0;
+  await reapOnce(db, { herdr, exec });
+  expect(calls.some((c) => c[0] === "git" && has(c, "worktree", "list"))).toBe(true); // second lap runs...
+  expect(calls.some((c) => c[0] === "git" && has(c, "worktree", "remove"))).toBe(false); // ...and finds nothing
 });
 
 test("taskIdFromBranch extracts only hive/<id>; ghosts and others are ignored", () => {

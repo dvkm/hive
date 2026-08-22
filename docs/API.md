@@ -1460,6 +1460,9 @@ herdr sessions never pile up (`server/src/cleanup.ts`, `server/src/reaper.ts`).
   min (`HIVE_REAP_MS`). Enumerates hive worker worktrees (`git worktree list`
   across every project repo) and, for each on a `hive/<task-id>` branch whose
   task id maps to a **terminal** task or to **no task at all**, tears it down.
+  A terminal task whose row has lost `worktree_path`/`branch` (cleared by an
+  earlier successful removal) can no longer name its own checkout, so it takes
+  the same orphan path and is torn down with the path and branch git enumerated.
   A non-terminal task keeps its worktree (never touched). Isolated try/catch per
   item; a failure never crashes the server. The same cycle also runs
   `sweepOrphanedAgents` (diffs `herdr agent list` against live DB tasks, reaping
