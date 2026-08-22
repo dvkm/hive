@@ -63,6 +63,11 @@ export function breakerTripped(db: DB): boolean {
 export function teardownBlocked(db: DB, nowMs: number = Date.now(), instanceId?: string): string | null {
   if (withinBootGrace(db, nowMs)) return "boot grace";
   if (breakerTripped(db)) return "circuit breaker open";
+  // A server that has lost the DB lease is on its way out (it exits within one
+  // heartbeat) but its 60s reconciler / reaper loops can still fire once in that
+  // window. It must not reap: from a displaced server every agent looks gone
+  // because the NEW server now owns herdr's registry. Only the lease holder may
+  // tear anything down. (No instanceId — tests, embedded use — keeps prior behaviour.)
   if (instanceId && !holdsLease(db, instanceId)) return "not the lease holder";
   return null;
 }

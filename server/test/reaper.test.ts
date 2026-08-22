@@ -403,30 +403,30 @@ test("sweepFinishedTestProjects never touches a non-test project", () => {
   expect(isArchived(db, projectId)).toBe(false);
 });
 
-test("a server that lost the lease reaps nothing", async () => {
+// 2026-08-22 (hive c1d4a7e8f971). A server that lost the DB lease still runs its
+// reaper loop once before it exits (up to one heartbeat). From a displaced server
+// every agent looks gone — the NEW server owns herdr's registry — so it must not
+// reap. Only the lease holder may tear anything down.
+test("a displaced server (lost lease) reaps nothing", async () => {
   const { db, projectId } = freshDb();
   const { claimLease } = await import("../src/lease.ts");
-  seedTask(db, projectId, "DONE", "done");
+  seedTask(db, projectId, "DONE", "done"); // a terminal task a live reaper WOULD clean
   const mine = claimLease(db, 100).instance;
-  claimLease(db, 200);
+  claimLease(db, 200); // a newer server takes the lease; `mine` is now displaced
   const calls: string[][] = [];
   const herdr = new Herdr(async (argv) => (calls.push(argv), OK()), "herdr");
-
   await reapOnce(db, { herdr, exec: async (argv) => (calls.push(argv), OK()), instanceId: mine });
-
-  expect(calls.length).toBe(0);
-  expect(getSetting(db, "last_reap_at")).not.toBeNull();
+  expect(calls.length).toBe(0); // no closes, no worktree removals
+  expect(getSetting(db, "last_reap_at")).not.toBeNull(); // loop alive, just held
 });
 
-test("the current lease holder can reap", async () => {
+test("the current lease holder reaps normally", async () => {
   const { db, projectId } = freshDb();
   const { claimLease } = await import("../src/lease.ts");
   seedTask(db, projectId, "DONE", "done");
-  const mine = claimLease(db, 100).instance;
+  const mine = claimLease(db, 100).instance; // still the holder
   const calls: string[][] = [];
   const herdr = new Herdr(async (argv) => (calls.push(argv), OK()), "herdr");
-
   await reapOnce(db, { herdr, exec: async (argv) => (calls.push(argv), OK()), instanceId: mine });
-
-  expect(getSetting(db, "last_reap_at")).not.toBeNull();
+  expect(getSetting(db, "last_reap_at")).not.toBeNull(); // ran (holder is not blocked)
 });

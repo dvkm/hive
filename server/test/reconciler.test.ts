@@ -1416,3 +1416,38 @@ test("reconcileOnce heartbeats last_reconcile_at and tracks a failing step's err
   await reconcileOnce(db, { exec: stub(() => OK("[]")) });
   expect(getSetting(db, "reconciler_error_streak")).toBe("0");
 });
+
+test("reAdoptAgentsOnBoot re-adopts a live-but-unregistered agent and skips terminal tasks", async () => {
+  const { reAdoptAgentsOnBoot } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb();
+  // A live agent whose registry record was lost (herdr wipe): agent get → not
+  // found, but its pane is still in `pane list` (addressable by terminal id).
+  const live = makeTask(db, projectId, { agent_target: "t-live", state: "in_progress" });
+  writeEvent(db, { task_id: live, source: "herdr", type: "spawned", payload: { agent_target: "t-live", terminal_id: "term_X", tab_id: "w1:t1" } });
+  db.query("UPDATE tasks SET worktree_path = ? WHERE id = ?").run("/wt/live", live);
+  // A finished task that still carries an agent_target must NOT be probed/readopted.
+  const done = makeTask(db, projectId, { agent_target: "t-done", state: "in_progress" });
+  transition(db, done, "cancelled"); // terminal, no evidence gate — must be skipped by the boot pass
+
+  let reReported = false; // report-agent flips `agent get` from not_found → alive
+  // herdr.run() prepends the bin, so the stub sees argv[0] === "herdr".
+  const herdr = new Herdr(async (argv) => {
+    const [, verb, sub, target] = argv;
+    if (verb === "agent" && sub === "get") {
+      if (target === "t-done") return OK('{"result":{"agent":{"pane_id":"pd","agent_status":"working"}}}');
+      return reReported
+        ? OK('{"result":{"agent":{"pane_id":"pl","agent_status":"working"}}}')
+        : OK('{"error":{"code":"agent_not_found"}}');
+    }
+    if (verb === "pane" && sub === "list")
+      return OK(JSON.stringify({ result: { panes: [{ pane_id: "pl", tab_id: "w1:t1", cwd: "/wt/live", terminal_id: "term_X", label: null }] } }));
+    if (verb === "pane" && sub === "report-agent") { reReported = true; return OK(); }
+    return OK();
+  }, "herdr");
+
+  const r = await reAdoptAgentsOnBoot(db, { herdr });
+  expect(r.probed).toBe(1);      // only the in_progress task, not the done one
+  expect(r.readopted).toBe(1);   // the wiped-but-live agent came back
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'readopted'").get(live)).toBeTruthy();
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'readopted'").get(done)).toBeFalsy();
+});

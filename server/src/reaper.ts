@@ -21,7 +21,7 @@ import { defaultExec } from "./exec.ts";
 export interface ReaperDeps {
   herdr?: Herdr;
   exec?: Exec; // for `git worktree list`
-  instanceId?: string;
+  instanceId?: string; // this server's lease instance; a displaced server must not reap
 }
 
 // A hive worker worktree is checked out on `hive/<taskId>`. Ghost branches

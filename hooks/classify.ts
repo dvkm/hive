@@ -26,13 +26,6 @@ export interface Classification {
 // Destructive / high-blast patterns. Matched against the whole command string,
 // so chaining (`ok; rm -rf /`) or piping into a shell can't hide them.
 const DANGEROUS: [RegExp, string][] = [
-  [/\blaunchctl\s+(kickstart|bootout)\b/i, "live Hive server control"],
-  [/(^|[\s;&|])(?:\.\/)?scripts\/sync-main\.sh\b/i, "live Hive server control"],
-  [/(^|[\s;&|])(?:\.\/)?electron\/install-app\.sh\b/i, "live Hive server control"],
-  [/(^|[\s;&|])(?:\$HIVE_CLI|(?:\.\/)?bin\/hive|hive)\s+serve\b/i, "live Hive server control"],
-  [/(^|[\s;&|])(?:env\s+)?HIVE_PORT=4700\b/i, "live Hive server control"],
-  [/^(?![\s\S]*\bHIVE_PORT=(?!4700\b)\d+\b)[\s\S]*(^|[\s;&|])(?:bun|node)\b[^\n;&|]*server\/src\/index\.ts\b/i, "live Hive server control"],
-  [/(^|[\s;&|])(?:bun|node|npm|npx|pnpm|yarn|vite|python3?|ruby|go|socat)\b[^\n;&|]*(?:--port(?:=|\s+)4700\b|\bhttp\.server\s+4700\b|TCP-LISTEN:4700\b)/i, "live Hive server control"],
   [/(^|[\s;&|("'])rm\s+(-[a-z]*\s+)*-[a-z]*[rf]/i, "recursive/forced rm"],
   [/(^|[\s;&|(])(sudo|doas)\b/i, "privilege escalation"],
   [/(curl|wget|fetch)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh|python|perl|ruby|node)\b/i, "pipe-to-shell from network"],
@@ -48,6 +41,20 @@ const DANGEROUS: [RegExp, string][] = [
   [/\bchmod\s+(-[a-z]*R[a-z]*\s+)?[0-7]*777\b/i, "world-writable chmod"],
   [/\bchown\s+-[a-z]*R\b/i, "recursive chown"],
   [/\b(kill(all)?|pkill)\b/i, "process kill"],
+  // Restarting the LIVE hive server (launchd dev.hive.server / sync-main.sh's
+  // kickstart / a second `hive serve` taking the DB lease) makes every running
+  // agent look vanished: the new server re-adopts nobody, the reconciler's
+  // nudges fail, and the reaper tears down live worktrees. 12 takeovers on
+  // 2026-08-22 alone, each followed by a batch of "agent vanished" requeues
+  // (hive task c1d4a7e8f971). Gate it: agents must ask before restarting it.
+  [/\blaunchctl\s+(kickstart|bootout|bootstrap|unload|load|stop)\b/i, "hive server restart"],
+  [/(^|[\s;&|(])((sh|bash|zsh|source|\.)\s+\S*sync-main\.sh|\.?\/\S*sync-main\.sh)/i, "hive server restart"],
+  [/(^|[\s;&|])(?:\.\/)?electron\/install-app\.sh\b/i, "hive server restart"],
+  [/(^|[\s;&|])(?:\$HIVE_CLI|(?:\.\/)?bin\/hive)\s+serve\b/i, "hive server restart"],
+  [/(^|[\s;&|(\/])hive\s+serve\b/i, "hive server restart"],
+  [/(^|[\s;&|])(?:env\s+)?HIVE_PORT=4700\b/i, "hive server restart"],
+  [/^(?![\s\S]*\bHIVE_PORT=(?!4700\b)\d+\b)[\s\S]*(^|[\s;&|])(?:bun|node)\b[^\n;&|]*server\/src\/index\.ts\b/i, "hive server restart"],
+  [/(^|[\s;&|])(?:bun|node|npm|npx|pnpm|yarn|vite|python3?|ruby|go|socat)\b[^\n;&|]*(?:--port(?:=|\s+)4700\b|\bhttp\.server\s+4700\b|TCP-LISTEN:4700\b)/i, "hive server restart"],
   [/:\s*\(\s*\)\s*\{.*:\s*\|\s*:.*&\s*\}\s*;\s*:/, "fork bomb"],
   // Types/clicks into whatever has focus on the HUMAN's desktop — seen live
   // 2026-07-10 (an agent probing Korean IME via System Events keystroke).
@@ -65,7 +72,7 @@ const DANGEROUS: [RegExp, string][] = [
 // executable shell text — matched against the RAW command, never the
 // data-stripped scan target (the argument is usually quoted).
 const DANGEROUS_RAW: [RegExp, string][] = [
-  [/(^|[\s;&|])"\$HIVE_CLI"\s+serve\b/i, "live Hive server control"],
+  [/(^|[\s;&|])"\$HIVE_CLI"\s+serve\b/i, "hive server restart"],
   // Agents answering their own decision cards / minting authority rules defeats
   // the whole escalation model — attempted live 2026-07-10 (dec_c698522e5c30).
   [/\/api\/decisions\/[^\s"']+\/(answer|dismiss)/i, "hive decision tampering"],

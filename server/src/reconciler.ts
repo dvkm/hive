@@ -44,7 +44,7 @@ export interface ReconcilerDeps {
   smoke?: MonitorDeps; // deps for smokeThenAdvance on merge->verifying
   nowMs?: () => number; // injectable clock (tests)
   supervise?: boolean; // start the herdr push-wait loop on agents this loop spawns
-  instanceId?: string;
+  instanceId?: string; // this server's lease instance; a displaced server must not reap
 }
 
 const DEFAULT_STALE_MS = 15 * 60 * 1000;
@@ -173,6 +173,38 @@ export function surfaceTrackingBindings(db: DB): void {
       body: `Inspect ${location} before cancelling the task, then run cleanup once it is terminal. The binding was preserved.`,
     });
   }
+}
+
+// ---- proactive boot re-adoption ----
+// probeAgent already re-registers a live-but-unregistered pane (readopt), but
+// that only runs on the reconciler's 60s lap — after a server restart an agent
+// sits unaddressable for up to a full lap, which is exactly when the fleet looks
+// dead. Drive ONE immediate pass at boot so a restart is transparent from t=0.
+// It only probes/readopts: it never fails or requeues, and teardown stays gated
+// by boot grace + the breaker, so it is safe to run before the loops start.
+export async function reAdoptAgentsOnBoot(db: DB, deps: ReconcilerDeps = {}): Promise<{ probed: number; readopted: number }> {
+  const h = deps.herdr ?? defaultHerdr;
+  const tasks = db
+    .query(`SELECT id, agent_target FROM tasks WHERE agent_target IS NOT NULL AND state IN ${NON_TERMINAL}`)
+    .all() as { id: string; agent_target: string }[];
+  const countReadopts = (taskId: string) =>
+    (db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'readopted'").get(taskId) as { n: number }).n;
+  let probed = 0;
+  let readopted = 0;
+  for (const t of tasks) {
+    if (isJiraMirrorId(db, t.id)) continue;
+    probed++;
+    const before = countReadopts(t.id);
+    try {
+      await probeAgent(h, db, t.id, t.agent_target); // re-registers a live pane; writes a `readopted` event
+    } catch (e) {
+      console.error(`[hive] boot re-adopt ${t.id}:`, e);
+      continue;
+    }
+    if (countReadopts(t.id) > before) readopted++;
+  }
+  if (probed) console.log(`[hive] boot re-adopt: probed ${probed} agent-bearing task(s), re-adopted ${readopted}`);
+  return { probed, readopted };
 }
 
 // ---- agent status sync ----
