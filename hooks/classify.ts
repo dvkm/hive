@@ -41,6 +41,16 @@ const DANGEROUS: [RegExp, string][] = [
   [/\bchmod\s+(-[a-z]*R[a-z]*\s+)?[0-7]*777\b/i, "world-writable chmod"],
   [/\bchown\s+-[a-z]*R\b/i, "recursive chown"],
   [/\b(kill(all)?|pkill)\b/i, "process kill"],
+  // Restarting the LIVE hive server (launchd dev.hive.server / sync-main.sh's
+  // kickstart / a second `hive serve` taking the DB lease) makes every running
+  // agent look vanished: the new server re-adopts nobody, the reconciler's
+  // nudges fail, and the reaper tears down live worktrees. 12 takeovers on
+  // 2026-08-22 alone, each followed by a batch of "agent vanished" requeues
+  // (hive task c1d4a7e8f971). Gate it: agents must ask before restarting it.
+  [/\blaunchctl\s+(kickstart|bootout|bootstrap|unload|load|stop)\b/i, "hive server restart"],
+  [/(^|[\s;&|(])((sh|bash|zsh|source|\.)\s+\S*sync-main\.sh|\.?\/\S*sync-main\.sh)/i, "hive server restart"],
+  [/(^|[\s;&|(\/])hive\s+serve\b/i, "hive server restart"],
+  [/\bbun\s+(run\s+)?(--watch\s+)?server\/src\/index\.ts\b/i, "hive server restart"],
   [/:\s*\(\s*\)\s*\{.*:\s*\|\s*:.*&\s*\}\s*;\s*:/, "fork bomb"],
   // Types/clicks into whatever has focus on the HUMAN's desktop — seen live
   // 2026-07-10 (an agent probing Korean IME via System Events keystroke).
