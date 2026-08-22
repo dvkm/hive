@@ -812,6 +812,34 @@ test("autoMergeReady merges only director-approved, opted-in, green, clean-revie
   expect(getTask(db, unapproved).state).toBe("in_review"); // quiz not passed → director boundary
 });
 
+test("autoMergeReady leaves a Focus-reviewed task for an explicit ship or request-changes choice", async () => {
+  const { autoMergeReady } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
+  const id = makeTask(db, projectId, { kind: "chore" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x' WHERE id = ?").run(id);
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
+  );
+  const review = writeEvent(db, {
+    task_id: id,
+    source: "agent",
+    type: "review_summary",
+    payload: { understanding: { check: { question: "safe?", options: [{ key: "yes", label: "yes" }, { key: "no", label: "no" }], answer_key: "yes" } } },
+  });
+  writeEvent(db, {
+    task_id: id,
+    source: "director",
+    type: "understanding_quiz_passed",
+    payload: { review_event_id: review.id, answer_key: "yes", surface: "focus" },
+  });
+  writeEvent(db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
+
+  await autoMergeReady(db, { exec: stub(() => { throw new Error("Focus review must not auto-merge"); }) });
+  expect(getTask(db, id).state).toBe("in_review");
+});
+
 test("autoMergeReady never auto-merges a PR-backed task on a review taken against an earlier head (HIVE-307)", async () => {
   const { autoMergeReady } = await import("../src/reconciler.ts");
   const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
