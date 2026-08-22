@@ -11,7 +11,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, isTrackingOnlyTask, queuedInputRecoveryPending, TERMINAL, type State } from "./state.ts";
+import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
 import { spawnMeta } from "./cleanup.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent, resumeReviewForDeliveredSteers } from "./steer.ts";
@@ -427,6 +427,7 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     const live = getTask(db, t.id);
     if (!live || TERMINAL.includes(live.state as State) || live.pr_url !== t.pr_url) continue;
     const state: string = live.state;
+    const deferred = isDeferred(live);
     // Record a new pushed commit as `pr_synchronized` (hive's stand-in for
     // GitHub's synchronize webhook) so changesRequestUnaddressed can tell "the
     // agent pushed a fix" from "CI is still green on the same old head". The
@@ -544,6 +545,27 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       );
       transition(db, t.id, "in_progress", { source: "reconciler", reason: "PR closed without merging — returned to the agent" });
       broadcast({ type: "task", task: getTask(db, t.id) });
+    } else if (deferred && state === "in_progress" && ["MERGED", "CLOSED"].includes(String(data.state).toUpperCase())) {
+      // A deferred task has no agent driving it forward, so unlike the
+      // non-deferred case below it can't just sit and wait to be noticed — a
+      // terminal PR state is the one thing that must still cut through the
+      // park (hive-303). Clear the deferral and run it through the same
+      // merged/closed handling as an in_review task would get.
+      undeferTask(db, t.id, { source: "reconciler", note: "PR reached a terminal state while deferred" });
+      if (String(data.state).toUpperCase() === "MERGED") {
+        writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_merged", payload: { pr_url: t.pr_url } });
+        // in_progress can't jump straight to verifying — hop through in_review
+        // first, same path a non-deferred task takes on its way to merge.
+        transition(db, t.id, "in_review", { source: "reconciler", reason: "PR merged while deferred — catching up review" });
+        transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged (deferred task undeferred)" });
+        try {
+          await smokeThenAdvance(db, t.id, deps.smoke ?? {});
+        } catch (e) {
+          console.error(`[hive] smoke run failed for ${t.id}:`, e);
+        }
+      } else {
+        writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_closed", payload: { pr_url: t.pr_url } });
+      }
     } else if (state === "in_progress" && ["MERGED", "CLOSED"].includes(String(data.state).toUpperCase())) {
       // A PR can be merged/closed by a human while its task is still held in
       // in_progress (handoff to in_review is held on pending/failing CI — see
@@ -563,7 +585,11 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       await nudgeCiFailure(db, h, t, data.headRefOid ?? null);
       transition(db, t.id, "in_progress", { source: "reconciler", reason: "CI failing — returned to the agent to iterate" });
       broadcast({ type: "task", task: getTask(db, t.id) });
-    } else if (String(data.mergeable).toUpperCase() === "CONFLICTING") {
+    } else if (!deferred && String(data.mergeable).toUpperCase() === "CONFLICTING") {
+      // A deliberately parked task (deferred_until in the future) shouldn't
+      // draw pr_conflict noise or steer an inactive agent (hive-303). No event
+      // is written while deferred, so undefer's next cycle sees a fresh
+      // head_sha/dedup state and nudges once, immediately.
       await nudgeConflict(db, h, t, data.headRefOid ?? null, exec);
     }
   }

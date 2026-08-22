@@ -1152,6 +1152,59 @@ test("conflict watchdog follows GitHub's remote base even when local main is an 
   expect(ev.every((e) => JSON.parse(e.payload).delivered === true)).toBe(true);
 });
 
+test("conflict watchdog: a deferred task emits no pr_conflict and steers nobody; undefer makes the next cycle nudge once", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "a1", pr_url: "https://gh/pr/9" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  db.query("UPDATE tasks SET deferred_until = ? WHERE id = ?").run("9999-12-31T00:00:00.000Z", id);
+  const { h, sends } = sendCapturingHerdr("idle");
+  const gh: Exec = stub((argv) =>
+    argv[0] === "gh"
+      ? OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], mergeable: "CONFLICTING", headRefOid: "sha1" }))
+      : OK()
+  );
+
+  await reconcileOnce(db, { herdr: h, exec: gh });
+  expect(sends.length).toBe(0);
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_conflict'").all(id).length).toBe(0);
+  expect(getTask(db, id).state).toBe("in_review"); // no wake, lifecycle untouched
+
+  // still deferred next cycle -> still nothing
+  await reconcileOnce(db, { herdr: h, exec: gh });
+  expect(sends.length).toBe(0);
+
+  // clearing the deferral makes the very next cycle nudge once (not
+  // suppressed by a dedup event that was never written while parked)
+  db.query("UPDATE tasks SET deferred_until = NULL WHERE id = ?").run(id);
+  await reconcileOnce(db, { herdr: h, exec: gh });
+  expect(sends.length).toBe(1);
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_conflict'").all(id) as { payload: string }[];
+  expect(ev.length).toBe(1);
+});
+
+test("syncPRs advances a merged deferred PR through verifying instead of leaving it parked forever (hive-303)", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/847", agent_target: "t-agent" });
+  transition(db, id, "in_progress");
+  db.query("UPDATE tasks SET deferred_until = ? WHERE id = ?").run("9999-12-31T00:00:00.000Z", id);
+
+  const gh: Exec = stub((argv) =>
+    argv[0] === "gh" ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] })) : OK()
+  );
+  const herdr = new Herdr(
+    stub((argv) => (argv.includes("get") ? OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}') : OK())),
+    "herdr"
+  );
+  await reconcileOnce(db, { exec: gh, herdr });
+
+  const task = getTask(db, id);
+  expect(task.state).toBe("verifying");
+  expect(task.deferred_until).toBeNull();
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_merged'").all(id).length).toBe(1);
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'undeferred'").all(id).length).toBe(1);
+});
+
 test("advanceFinished: in_progress + pr_url + idle agent -> in_review (+ event)", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { agent_target: "a1", pr_url: "https://gh/pr/1" });
