@@ -139,7 +139,7 @@ export interface Evidence {
   id: string;
   task_id: string;
   ts: string;
-  kind: "screenshot" | "test_run" | "log" | "report" | "link";
+  kind: "screenshot" | "test_run" | "log" | "report" | "explanation" | "link";
   path: string | null;
   url: string | null;
   caption: string | null;

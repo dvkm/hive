@@ -435,6 +435,9 @@ export function ReviewCard({
       : quizStatus === "required"
         ? "Pass the understanding check, or explicitly save it for later."
         : "";
+  // #1249: hive writes one page per PR head explaining the change. It is stored
+  // as ordinary evidence, so the newest one is the current one.
+  const explainPage = [...evidence].reverse().find((e) => e.kind === "explanation" && e.url);
   // Live, not the agent's evidence prose (task #1000): recomputed on every
   // review via GET .../branch-check, same as CI/quiz below.
   const unmetDeps = branchCheck?.unmet_deps ?? [];
@@ -620,7 +623,14 @@ export function ReviewCard({
         )}
       </div>
 
-      <EvidenceStrip evidence={evidence} task={task} />
+      {explainPage?.url && (
+        <a className="review-explain" href={explainPage.url} target="_blank" rel="noreferrer">
+          <span className="review-explain-title">Read the walkthrough</span>
+          <span className="review-explain-hint">Background, intuition, code tour and the quiz for this change</span>
+        </a>
+      )}
+
+      <EvidenceStrip evidence={evidence.filter((e) => e.kind !== "explanation")} task={task} />
 
       <details className="review-details" open={quizStatus === "required"}>
         <summary>

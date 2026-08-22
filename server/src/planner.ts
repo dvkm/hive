@@ -53,11 +53,11 @@ const DEFAULT_ARGV = [claudeBin(), "-p", "--model", "sonnet"];
 // default implementation kills the process on timeout (hard cap, no runaway).
 export type PlannerExec = (
   argv: string[],
-  opts: { timeoutMs: number }
+  opts: { timeoutMs: number; cwd?: string }
 ) => Promise<{ code: number; stdout: string; stderr: string; timedOut?: boolean }>;
 
 export const defaultPlannerExec: PlannerExec = async (argv, opts) => {
-  const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+  const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe", stdin: "ignore", ...(opts.cwd ? { cwd: opts.cwd } : {}) });
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
