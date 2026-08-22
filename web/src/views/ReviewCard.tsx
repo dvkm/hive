@@ -318,9 +318,11 @@ type ActionMode = null | "changes" | "reject";
 export function ReviewCard({
   task,
   onDone,
+  surface,
 }: {
   task: Task;
   onDone?: () => void;
+  surface?: "focus";
 }) {
   const { projects, tasks = [], quizzes: understandingQuizzes } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
@@ -704,6 +706,7 @@ export function ReviewCard({
             version: "version" in quiz ? quiz.version : `${reviewEventId}:0`,
           }}
           allowDefer
+          surface={surface}
           onPassed={() => setQuizOverride("passed")}
           onDeferred={() => setQuizOverride("deferred")}
         />
@@ -713,7 +716,7 @@ export function ReviewCard({
 
       <div className="review-actions">
         <button className="btn btn-primary" onClick={() => merge()} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
-          {busy ? "Working…" : reportOnly ? "Accept report" : "Approve & merge"}
+          {busy ? "Working…" : reportOnly ? "Accept report" : surface === "focus" ? "Ship" : "Approve & merge"}
         </button>
         {!task.never_dispatched && (
           <button className="btn" onClick={() => setMode(mode === "changes" ? null : "changes")}>

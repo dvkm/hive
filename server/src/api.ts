@@ -3723,7 +3723,7 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
     task_id: taskId,
     source: "director",
     type: "understanding_quiz_attempt",
-    payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey, correct: true, actor },
+    payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey, correct: true, actor, surface: body?.surface === "focus" ? "focus" : undefined },
   });
   const next = activeUnderstandingCheck(db, taskId, quiz);
   if (next.completed < quiz.checks.length) {
@@ -3741,7 +3741,7 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
     task_id: taskId,
     source: "director",
     type: "understanding_quiz_passed",
-    payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey, actor },
+    payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey, actor, surface: body?.surface === "focus" ? "focus" : undefined },
   });
   return json({ ok: true, correct: true, passed: true, explanation: check.explanation ?? null, completed: next.completed, total: quiz.checks.length });
 }

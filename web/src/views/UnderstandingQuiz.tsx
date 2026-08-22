@@ -7,12 +7,14 @@ export function UnderstandingQuiz({
   quiz,
   label = "Before you approve",
   allowDefer = false,
+  surface,
   onPassed,
   onDeferred,
 }: {
   quiz: Pick<Quiz, "task_id" | "question" | "options" | "version" | "completed" | "total">;
   label?: string;
   allowDefer?: boolean;
+  surface?: "focus";
   onPassed?: (explanation: string | null) => void;
   onDeferred?: () => void;
 }) {
@@ -44,7 +46,7 @@ export function UnderstandingQuiz({
     if (!answer || busy) return;
     setBusy(true);
     try {
-      const result = await api.answerUnderstandingQuiz(currentQuiz.task_id, answer, currentQuiz.version);
+      const result = await api.answerUnderstandingQuiz(currentQuiz.task_id, answer, currentQuiz.version, surface);
       if (result.passed) {
         toast("Understanding confirmed");
         onPassed?.(result.explanation);

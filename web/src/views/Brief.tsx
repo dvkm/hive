@@ -205,6 +205,7 @@ export default function Brief() {
               </details>
               <UnderstandingQuiz
                 quiz={focusItem.quiz}
+                surface="focus"
                 onPassed={() => {
                   setPassedQuizzes((items) => new Set(items).add(focusItem.id));
                   reloadQuizzes();
@@ -213,7 +214,7 @@ export default function Brief() {
             </div>
           )}
           {focusItem.kind === "review" && (
-            <ReviewCard task={focusItem.task} onDone={() => setReviewed((items) => new Set(items).add(focusItem.id))} />
+            <ReviewCard task={focusItem.task} surface="focus" onDone={() => setReviewed((items) => new Set(items).add(focusItem.id))} />
           )}
           {focusItem.kind === "attention" && <div className="brief-attn"><AttentionRows tasks={[focusItem.task]} /></div>}
           {focusItem.kind !== "review" && (

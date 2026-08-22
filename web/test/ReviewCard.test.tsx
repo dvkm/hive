@@ -58,6 +58,27 @@ function tree(t: Task) {
   );
 }
 
+test("Focus keeps explicit Ship and Request changes actions after understanding is confirmed", async () => {
+  const originalTask = api.task;
+  api.task = (async (id: string) => passingDetail(id)) as typeof api.task;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(
+        <MemoryRouter>
+          <Ctx.Provider value={fakeStore}>
+            <LightboxProvider><ReviewCard task={task("focus-review")} surface="focus" /></LightboxProvider>
+          </Ctx.Provider>
+        </MemoryRouter>
+      );
+    });
+    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Ship"))).toHaveLength(1);
+    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Request changes"))).toHaveLength(1);
+  } finally {
+    api.task = originalTask;
+  }
+});
+
 test("re-rendering ReviewCard in place with a different task resets mode/notes", async () => {
   const taskA = task("task-a");
   const taskB = task("task-b", "external");

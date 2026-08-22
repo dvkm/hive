@@ -284,10 +284,12 @@ test("understanding quiz blocks merge until the director answers correctly", asy
   merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
   expect(merge.status).toBe(409);
 
-  const right = await post(s.base, `/api/tasks/${taskId}/understanding-quiz/answer`, { answer_key: "tests", source: "director" });
+  const right = await post(s.base, `/api/tasks/${taskId}/understanding-quiz/answer`, { answer_key: "tests", source: "director", surface: "focus" });
   expect(right.json.correct).toBe(true);
   expect(right.json.passed).toBe(true);
   expect(right.json.explanation).toContain("focused tests");
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  expect(events.json.find((event: any) => event.type === "understanding_quiz_passed")?.payload.surface).toBe("focus");
   merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
   expect(merge.status).toBe(200);
   quizzes = await get(s.base, "/api/understanding-quizzes");

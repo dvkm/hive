@@ -670,10 +670,10 @@ export const api = {
       body: JSON.stringify({ verdict, note, source: "director", actor: directorActor() }),
     }),
   understandingQuizzes: () => req<{ quizzes: UnderstandingQuiz[] }>(`/api/understanding-quizzes`),
-  answerUnderstandingQuiz: (taskId: string, answerKey: string, version: string) =>
+  answerUnderstandingQuiz: (taskId: string, answerKey: string, version: string, surface?: "focus") =>
     req<{ ok: boolean; correct: boolean; passed: boolean; explanation: string | null; completed?: number; total?: number; quiz?: Pick<UnderstandingQuiz, "question" | "options" | "version" | "completed" | "total"> }>(`/api/tasks/${taskId}/understanding-quiz/answer`, {
       method: "POST",
-      body: JSON.stringify({ answer_key: answerKey, version, source: "director", actor: directorActor() }),
+      body: JSON.stringify({ answer_key: answerKey, version, source: "director", actor: directorActor(), surface }),
     }),
   deferUnderstandingQuiz: (taskId: string) =>
     req<{ ok: boolean; status: "deferred" | "passed" }>(`/api/tasks/${taskId}/understanding-quiz/defer`, {
