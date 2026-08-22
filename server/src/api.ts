@@ -1499,14 +1499,21 @@ function recordManagerVerification(db: DB, threadId: string, body: any): Respons
   const evidenceIds = stringList(body?.evidence_ids);
   for (const id of targetTaskIds) {
     const target = getTask(db, id);
-    if (!target || target.project_id !== thread.project_id) return err(`target task is outside this run's project: ${id}`, 409);
+    if (!target) return err(`target task not found: ${id}`, 409);
+    // A project-scoped thread may only cite its own project's tasks. A
+    // portfolio thread (project_id is null, e.g. the Chief of Staff)
+    // supervises every project, so no project filter applies to it.
+    if (thread.project_id && target.project_id !== thread.project_id) return err(`target task is outside this run's project: ${id}`, 409);
   }
   if (status === "passed") {
     if (!result) return err("passed verification requires result");
     if (!evidenceIds.length) return err("passed verification requires evidence_ids");
-    for (const id of evidenceIds)
-      if (!db.query("SELECT 1 FROM evidence e JOIN tasks t ON t.id = e.task_id WHERE e.id = ? AND t.project_id = ?").get(id, thread.project_id))
-        return err(`evidence is unknown or outside this run's project: ${id}`);
+    for (const id of evidenceIds) {
+      const row = thread.project_id
+        ? db.query("SELECT 1 FROM evidence e JOIN tasks t ON t.id = e.task_id WHERE e.id = ? AND t.project_id = ?").get(id, thread.project_id)
+        : db.query("SELECT 1 FROM evidence e WHERE e.id = ?").get(id);
+      if (!row) return err(`evidence is unknown or outside this run's project: ${id}`);
+    }
   }
   const verificationId = newId("verify");
   const event = writeEvent(db, {
