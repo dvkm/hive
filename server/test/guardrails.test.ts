@@ -120,6 +120,77 @@ test("crossing the cap opens a decision; continue doubles it; wrap_up steers", a
   expect(steers.at(-1).payload.message).toContain("WRAP UP");
 });
 
+// Raw usage guardrails protect unpriced models. Tiny thresholds keep these
+// tests readable; production defaults are 75M/200M processed tokens and
+// 25/100 wait calls.
+let rawProjectId = "";
+async function newRawTask(title: string) {
+  if (!rawProjectId) {
+    const p = await post("/api/projects", {
+      name: "raw-usage-p",
+      repo_path: "/repo",
+      config: {
+        processed_token_warn: 100,
+        processed_token_cap: 200,
+        wait_call_warn: 2,
+        wait_call_cap: 4,
+      },
+    });
+    rawProjectId = p.json.id;
+  }
+  const id = (await post("/api/tasks", { project_id: rawProjectId, title })).json.id;
+  await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
+  return id;
+}
+
+test("processed-token guardrails warn and park an unpriced task, then double on continue", async () => {
+  const id = await newRawTask("unpriced token cap");
+  await post(`/api/tasks/${id}/events`, {
+    type: "usage",
+    model: "gpt-unpriced",
+    input_tokens: 40,
+    output_tokens: 10,
+    cache_read_tokens: 70,
+  });
+  expect(await events(id, "processed_token_warning")).toHaveLength(1);
+
+  await post(`/api/tasks/${id}/events`, { type: "usage", model: "gpt-unpriced", input_tokens: 100 });
+  expect(await events(id, "processed_token_cap")).toHaveLength(1);
+  expect((await get(`/api/tasks/${id}`)).json.state).toBe("needs_decision");
+  let cards = openDecisions(id);
+  expect(cards).toHaveLength(1);
+  expect(cards[0].title).toContain("processed tokens cap");
+  expect((await events(id, "steer")).at(-1).payload.message).toContain("End this turn now");
+
+  await post(`/api/decisions/${cards[0].id}/answer`, { answer_key: "continue" });
+  expect((await get(`/api/tasks/${id}`)).json.state).toBe("in_progress");
+  await post(`/api/tasks/${id}/events`, { type: "usage", model: "gpt-unpriced", input_tokens: 170 });
+  expect(openDecisions(id)).toHaveLength(0); // 390 < doubled cap 400
+  await post(`/api/tasks/${id}/events`, { type: "usage", model: "gpt-unpriced", input_tokens: 20 });
+  cards = openDecisions(id);
+  expect(cards).toHaveLength(1);
+  expect(cards[0].title).toContain("400");
+});
+
+test("wait-call guardrails ignore other tools, warn once, and park repeated polling", async () => {
+  const id = await newRawTask("polling cap");
+  const tool = (name: string) => post(`/api/tasks/${id}/events`, {
+    type: "tool_use",
+    source: "hook",
+    payload: { tool: name, summary: "" },
+  });
+  await tool("wait");
+  await tool("Bash");
+  await tool("wait");
+  expect(await events(id, "wait_call_warning")).toHaveLength(1);
+  await tool("wait");
+  await tool("wait");
+  expect(await events(id, "wait_call_cap")).toHaveLength(1);
+  expect((await get(`/api/tasks/${id}`)).json.state).toBe("needs_decision");
+  expect(openDecisions(id)[0].title).toContain("wait calls cap");
+  expect((await events(id, "steer")).at(-1).payload.message).toContain("Do not poll");
+});
+
 test("usage posts with a session_id upsert: cumulative Stops converge to one row", async () => {
   const id = await newTask("usage upsert");
   const send = (tokens: any) =>

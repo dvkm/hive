@@ -12,7 +12,7 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-chat-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb, newId, now } = await import("../src/db.ts");
-const { makeHandler, notifyManagerOfEvent, sweepManagerInboxes, projectInboxCounts } = await import("../src/api.ts");
+const { makeHandler, notifyManagerOfEvent, flushManagerUpdate, MANAGER_WAKEUP_DEBOUNCE_MS, sweepManagerInboxes, projectInboxCounts } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { composeSupervisorBrief, createThread, managingThreadForTask } = await import("../src/chat.ts");
 const { composeBrief } = await import("../src/briefs.ts");
@@ -125,6 +125,8 @@ test("a leftover shell pane is respawned instead of receiving the director messa
 });
 
 test("descendant worker events wake the manager once with a batched update", async () => {
+  expect(MANAGER_WAKEUP_DEBOUNCE_MS).toBeGreaterThanOrEqual(30_000);
+  expect(MANAGER_WAKEUP_DEBOUNCE_MS).toBeLessThanOrEqual(60_000);
   const thread = (await get(`/api/chat/threads/${threadId}`)).json;
   const worker = (await post("/api/tasks", {
     project_id: projectId,
@@ -149,7 +151,7 @@ test("descendant worker events wake the manager once with a batched update", asy
     writeEvent(db, { task_id: worker.id, source: "agent", type: "blocked", payload: { note: "need the session contract" } });
     writeEvent(db, { task_id: followup.id, source: "system", type: "smoke_failed", payload: { note: "expired session still accepted" } });
     writeEvent(db, { task_id: worker.id, source: "agent", type: "checkpoint", payload: { note: "kept the existing cookie format" } });
-    await new Promise((r) => setTimeout(r, 20));
+    await flushManagerUpdate(threadId);
   } finally {
     setEventHook(null);
   }
@@ -159,6 +161,7 @@ test("descendant worker events wake the manager once with a batched update", asy
   expect(sends.at(-1)).toContain("implement login");
   expect(sends.at(-1)).toContain("verify login edge cases");
   expect(sends.at(-1)).toContain("checkpoint");
+  expect(sends.at(-1)).not.toContain("need the session contract");
   expect(sends.at(-1)).toContain("Act on anything you can resolve");
 });
 

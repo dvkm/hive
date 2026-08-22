@@ -34,6 +34,8 @@ const bool: Check = (v) => (typeof v === "boolean" ? null : "must be a boolean")
 const num: Check = (v) => (typeof v === "number" && Number.isFinite(v) ? null : "must be a number");
 const positiveInt: Check = (v) =>
   typeof v === "number" && Number.isInteger(v) && v > 0 ? null : "must be a positive integer";
+const nonnegativeInt: Check = (v) =>
+  typeof v === "number" && Number.isInteger(v) && v >= 0 ? null : "must be a non-negative integer";
 const obj: Check = (v) => (v !== null && typeof v === "object" && !Array.isArray(v) ? null : "must be an object");
 const strArray: Check = (v) =>
   Array.isArray(v) && v.every((x) => typeof x === "string") ? null : "must be an array of strings";
@@ -170,6 +172,10 @@ const CHECKS: Record<string, Check> = {
   // budgets / bookkeeping
   cost_warn_usd: num,
   cost_cap_usd: num,
+  processed_token_warn: nonnegativeInt,
+  processed_token_cap: nonnegativeInt,
+  wait_call_warn: nonnegativeInt,
+  wait_call_cap: nonnegativeInt,
   decision_auto_answer_hours: num,
   pricing: obj,
   // stored by the director, read by nothing in server/ today

@@ -67,7 +67,7 @@ import {
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
 import { noteRepoMismatch, resolveRepoMismatchForDecision } from "./repoTarget.ts";
 import { costUsd } from "./pricing.ts";
-import { checkCostGuardrails, resolveCostCapForDecision, taskSpend } from "./costs.ts";
+import { checkUsageGuardrails, resolveUsageCapForDecision, taskSpend } from "./costs.ts";
 import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
 import { vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
@@ -979,9 +979,10 @@ type ManagerPending = {
   db: DB;
   herdr: Herdr;
   deps: HandlerDeps;
-  events: any[];
+  events: Map<string, any>;
 };
 const pendingManagerUpdates = new Map<string, ManagerPending>();
+export const MANAGER_WAKEUP_DEBOUNCE_MS = 45_000;
 
 function managerEventRelevant(event: any): boolean {
   if (event.type === "state_change")
@@ -1000,7 +1001,7 @@ function managerEventLine(db: DB, event: any): string {
   return `- #${task?.number ?? "?"} ${task?.title ?? event.task_id} [${task?.state ?? "unknown"}]: ${event.type}${suffix}`;
 }
 
-async function flushManagerUpdate(threadId: string): Promise<void> {
+export async function flushManagerUpdate(threadId: string): Promise<void> {
   const pending = pendingManagerUpdates.get(threadId);
   if (!pending) return;
   pendingManagerUpdates.delete(threadId);
@@ -1008,10 +1009,11 @@ async function flushManagerUpdate(threadId: string): Promise<void> {
   if (!current?.task_id) return;
   const manager = getTask(pending.db, current.task_id);
   if (!manager || TERMINAL.includes(manager.state as State)) return; // explicitly closed thread
-  const lines = pending.events.slice(-20).map((event) => managerEventLine(pending.db, event));
+  const events = [...pending.events.values()].slice(-20);
+  const lines = events.map((event) => managerEventLine(pending.db, event));
   const projectIds = [
     ...new Set(
-      pending.events
+      events
         .map((event) => getTask(pending.db, event.task_id)?.project_id)
         .filter((projectId): projectId is string => !!projectId)
     ),
@@ -1040,13 +1042,17 @@ export function notifyManagerOfEvent(db: DB, herdr: Herdr, deps: HandlerDeps, ev
 
   const existing = pendingManagerUpdates.get(thread.id);
   if (existing) {
-    existing.events.push(event);
+    // One task can emit several lifecycle events in a burst. Keep only its
+    // latest state so a manager gets one actionable line, not a replay.
+    existing.events.delete(event.task_id);
+    existing.events.set(event.task_id, event);
     return;
   }
-  queueMicrotask(() => {
+  const timer = setTimeout(() => {
     flushManagerUpdate(thread.id).catch((e) => console.error(`[hive] manager wakeup ${thread.id}:`, e));
-  });
-  pendingManagerUpdates.set(thread.id, { db, herdr, deps, events: [event] });
+  }, MANAGER_WAKEUP_DEBOUNCE_MS);
+  timer.unref?.();
+  pendingManagerUpdates.set(thread.id, { db, herdr, deps, events: new Map([[event.task_id, event]]) });
 }
 
 export function projectInboxCounts(db: DB, projectId: string): { checkpoints: number; decisions: number; reviews: number; attention: number } {
@@ -5024,6 +5030,13 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       try { payload = JSON.parse(fields.payload); } catch { /* ignore */ }
     }
     const event = writeEvent(db, { task_id: taskId, source, type, payload });
+    if (type === "tool_use") {
+      try {
+        checkUsageGuardrails(db, taskId);
+      } catch (e) {
+        console.error("[hive] usage guardrails:", e);
+      }
+    }
     // Turn ENDED (the Stop hook, not a subagent finishing): if the agent's own
     // final message named work it has not done, resume it with its own words.
     // Best-effort — a supervision check must never fail the agent's heartbeat.
@@ -5242,12 +5255,12 @@ function ingestUsage(db: DB, taskId: string, fields: Record<string, any>, source
      VALUES (?,?,?,?,?,?,?,?,?,?)`
   ).run(row.id, row.task_id, row.ts, row.model, row.input_tokens, row.output_tokens, row.cache_read_tokens, row.cache_write_tokens, row.cost_usd, row.source);
   broadcast({ type: "usage", usage: row });
-  // Cost lands here per turn — the guardrail check belongs where the number is
-  // freshest (warn steer at cost_warn_usd, decision card at cost_cap_usd).
+  // Usage lands here per turn, so token and dollar guardrails check the current
+  // cumulative session totals at the same boundary.
   try {
-    checkCostGuardrails(db, taskId);
+    checkUsageGuardrails(db, taskId);
   } catch (e) {
-    console.error("[hive] cost guardrails:", e);
+    console.error("[hive] usage guardrails:", e);
   }
   return json({ usage: row }, 201);
 }
@@ -5665,7 +5678,7 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     resolveBlockedForDecision(db, herdr, id, answerKey),
     resolveDuplicateForDecision(db, id, answerKey),
     resolveRepoMismatchForDecision(db, id, answerKey),
-    resolveCostCapForDecision(db, id, answerKey),
+    resolveUsageCapForDecision(db, id, answerKey),
     resolveScopeDriftForDecision(db, id, answerKey),
     resolveRefCaptureForDecision(db, id, answerKey, answerNote),
   ].some(Boolean);

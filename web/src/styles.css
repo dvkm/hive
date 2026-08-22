@@ -2773,6 +2773,10 @@ a.dbundle-fact:hover {
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;
 }
+.tu-breakdown {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
 .tu-cost {
   color: var(--green);
   font-weight: 600;

@@ -3,7 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faDiamond } from "@fortawesome/free-solid-svg-icons";
 import { api } from "../lib/api";
-import type { Decision, Evidence, JiraTaskState, TaskDetail } from "../lib/api";
+import type { Decision, Evidence, JiraTaskState, TaskDetail, UsageTotals } from "../lib/api";
 import { useStore } from "../lib/store";
 import { splitAttachments } from "../lib/attachments";
 import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
@@ -25,7 +25,7 @@ import { PrReference, ReferenceText, TaskRef, prLabel } from "../lib/references"
 
 // Compact per-task usage line: tokens + estimated cost, only when usage exists.
 function UsageLine({ id, rev }: { id: string; rev: number }) {
-  const [tot, setTot] = useState<{ total_tokens: number; cost_usd: number; unpriced: number; calls: number } | null>(null);
+  const [tot, setTot] = useState<UsageTotals | null>(null);
   useEffect(() => {
     let live = true;
     api.taskUsage(id).then((d) => live && setTot(d.totals)).catch(() => {});
@@ -36,7 +36,8 @@ function UsageLine({ id, rev }: { id: string; rev: number }) {
   if (!tot || tot.calls === 0) return null;
   return (
     <div className="task-usage" title={`${tot.calls} LLM call(s)`}>
-      <span className="tu-tok">{fmtTokens(tot.total_tokens)} tokens</span>
+      <span className="tu-tok">{fmtTokens(tot.total_tokens)} processed</span>
+      <span className="tu-breakdown">{fmtTokens(tot.input_tokens)} fresh · {fmtTokens(tot.cache_read_tokens)} cached · {fmtTokens(tot.output_tokens)} output · {fmtTokens(tot.cache_write_tokens)} cache write</span>
       <span className="tu-cost">
         {tot.unpriced > 0 && tot.cost_usd === 0 ? "unpriced" : `~${fmtUsd(tot.cost_usd)}`}
       </span>

@@ -65,10 +65,10 @@ export default function Analytics() {
 
       <div className="an-tiles">
         <Tile label="Total spend" value={fmtUsd(t.cost_usd)} sub={t.unpriced > 0 ? `${t.unpriced} unpriced` : undefined} />
-        <Tile label="Total tokens" value={fmtTokens(t.total_tokens)} sub={`${t.calls} calls`} />
-        <Tile label="Input" value={fmtTokens(t.input_tokens)} />
+        <Tile label="Processed tokens" value={fmtTokens(t.total_tokens)} sub={`${t.calls} calls`} />
+        <Tile label="Fresh input" value={fmtTokens(t.input_tokens)} />
         <Tile label="Output" value={fmtTokens(t.output_tokens)} />
-        <Tile label="Cache read" value={fmtTokens(t.cache_read_tokens)} />
+        <Tile label="Cached input" value={fmtTokens(t.cache_read_tokens)} />
         <Tile label="Cache write" value={fmtTokens(t.cache_write_tokens)} />
       </div>
 
@@ -144,10 +144,11 @@ function UsageTable<T extends UsageTotals>({
           <tr>
             <th></th>
             <th className="num">Cost</th>
-            <th className="num">Tokens</th>
-            <th className="num">Input</th>
+            <th className="num">Processed</th>
+            <th className="num">Fresh</th>
             <th className="num">Output</th>
-            <th className="num">Cache</th>
+            <th className="num">Cached</th>
+            <th className="num">Cache write</th>
             <th className="num">Calls</th>
           </tr>
         </thead>
@@ -162,7 +163,8 @@ function UsageTable<T extends UsageTotals>({
               <td className="num">{fmtTokens(r.total_tokens)}</td>
               <td className="num dim">{fmtTokens(r.input_tokens)}</td>
               <td className="num dim">{fmtTokens(r.output_tokens)}</td>
-              <td className="num dim">{fmtTokens(r.cache_read_tokens + r.cache_write_tokens)}</td>
+              <td className="num dim">{fmtTokens(r.cache_read_tokens)}</td>
+              <td className="num dim">{fmtTokens(r.cache_write_tokens)}</td>
               <td className="num dim">{r.calls}</td>
             </tr>
           ))}

@@ -39,7 +39,16 @@ const detail = (t: Task): TaskDetail => ({ ...t, events: [], evidence: [], decis
 api.taskUsage = (async (id: string) => ({
   task_id: id,
   usage: [],
-  totals: { total_tokens: 0, cost_usd: 0, unpriced: 0, calls: 0 },
+  totals: {
+    total_tokens: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 0,
+    cache_write_tokens: 0,
+    cost_usd: 0,
+    unpriced: 0,
+    calls: 0,
+  },
 })) as typeof api.taskUsage;
 
 function tree(t: Task, store: Store = fakeStore, taskDetail: TaskDetail = detail(t)) {
