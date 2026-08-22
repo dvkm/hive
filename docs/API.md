@@ -135,6 +135,7 @@ timeout — a failed hook never blocks spawn nor teardown.
   "branch": null,
   "pr_url": "https://github.com/acme/web/pull/1",
   "ci_status": "passing",
+  "ci_checked_at": "...",
   "head_sha": "a1b2c3d...",
   "summary": "Shipped dark mode toggle; all tests green.",
   "source": null,
@@ -152,6 +153,16 @@ still-`open` decision on it is auto-expired (`status=expired`, a
 `decision_expired` event each, broadcast) — a terminal task can no longer act on
 a card, so it must not linger in the inbox. Legacy orphans are swept on startup.
 `kind ∈ {ship, scout, chore}`
+`ci_status ∈ {passing, pending, failing, unavailable}`. `unavailable` means every
+red check is INFRA-red — GitHub never started the job, the job ran zero steps and
+ended in seconds, or the same check is already red on the base branch without
+this PR. Infra-red never holds a handoff and is never steered at the agent: the
+reconciler opens ONE `chore` task for the signal itself (deduped fleet-wide on a
+`ci-signal: <key>` line in its brief) and every PR hitting that signal shares it.
+Code-red (anything a commit could plausibly have caused) still steers the PR's
+own agent to fix forward, once per pushed head SHA.
+`ci_checked_at` is when hive last LOOKED at the checks — `ci_status` only moves
+when the answer moves, so this is the timestamp a decision card cites.
 `head_sha` is the PR's current head commit, refreshed by the reconciler's PR
 poll alongside `ci_status`; `null` until the first poll after a PR links. The
 review card compares it against each evidence item's `meta.commit_sha` to flag
@@ -252,7 +263,8 @@ Understanding quiz API:
 - `queued_input_recovered` — a queued-input recovery attempt. `payload: {delivered: boolean|null, excerpt}` (`null` while the pane write is pending). See "Blocked agents (dialog handling)" for the recovery and retry contract.
 - `requeued` — a failed task was auto-requeued as a fresh task. `payload: {new_task_id, attempt?}`
 - `recovery_card` — a recovery escalation opened a decision card. `payload: {decision_id, source_task_id}`
-- `ci_status` — reconciler synced CI. `payload: {ci_status}` (`passing|pending|failing`)
+- `ci_status` — reconciler synced CI. `payload: {ci_status}` (`passing|pending|failing|unavailable`)
+- `ci_infra` — the red checks on this PR are all infra-red, not the diff. `payload: {signal, checks: [{name, infra}], head_sha}`. One event per (head, signal); the signal keys the shared diagnostic task and the director's one ruling.
 - `pr_merged` — reconciler detected the PR merged. `payload: {pr_url}`
 - `pr_conflict` — reconciler saw the PR CONFLICTING with its base and nudged the agent to resolve (once per head SHA; lifecycle untouched). `payload: {pr_url, head_sha, delivered}`
 - `ready_for_review` — records an `in_progress → in_review` handoff. `payload: {pr_url, via, kind}` (`via ∈ {emit, idle, done, gone}`). See "Review experience" for the explicit and automatic handoff contracts.
@@ -339,6 +351,13 @@ rev-parse HEAD` in the CLI's cwd. The review card compares it to the task's
     "pr_url": "https://github.com/example-org/hive/pull/42",
     "branch": "hive/rich-cards",
     "spend_usd": 3.2,
+    "ci": {
+      "at_card": "unavailable",
+      "status": "unavailable",
+      "checked_at": "...",
+      "changed": false,
+      "outage": { "signal": "parity,syntax:no-steps", "fix_task_number": 1261 }
+    },
     "prior_decisions": [
       { "id": "dec_...", "title": "Merge strategy?", "answer": "Fast-forward", "answered_at": "..." }
     ]
@@ -360,6 +379,22 @@ the affected `pr_url`/`branch`, task `spend_usd` so far, and `prior_decisions` �
 the last 3 answered cards on the same project, each with the option `label` the
 director chose. Computed at fetch/broadcast time so it stays fresh; absent on
 older SSE payloads and terminal-card broadcasts.
+
+`bundle.ci` is present only on a card raised on a task whose checks are actually
+red or unavailable AND whose own title or context is about those checks — the
+words alone are not enough, since "red", "green" and "check" are ordinary
+English. It is what keeps such a card honest: `at_card` is the CI status when
+the card was written, `status` and `checked_at` are the live re-check, and
+`changed` says the two disagree. When the checks turn green under a card that
+cited red, the reconciler closes the card itself (`status=expired`, reason
+`ci_signal_changed`) and tells the agent — a moot question is never shown.
+`outage` is non-null when the card was blocked by an infra outage, naming the
+signal and the task hive dispatched to fix it. Answering ONE such card settles
+it: a later card blocked by the same signal on the same project is auto-answered
+with that ruling (`answered_by: "system"`, actor `ci-outage-ruling`) and raises
+no notification, provided the earlier answer's key is one of its own options.
+The ruling holds only while the outage does: once the diagnostic task hive
+dispatched for that signal is closed, the next card asks the director again.
 
 `plan` is likewise derived (from the `planned` event, keyed by `decision_id`) —
 non-null only for a planner breakdown card produced by

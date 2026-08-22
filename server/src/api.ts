@@ -74,7 +74,7 @@ import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts"
 import { vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
-import { ciStatusOf, ciStatusProbed, reclaimDeadWorktree } from "./reconciler.ts";
+import { ciStatusOf, ciStatusProbed, reclaimDeadWorktree, infraTaskOpen } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
@@ -4635,14 +4635,16 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       const pr = prUrl ?? t.pr_url;
       if (pr) {
         let ci: string | null = null;
-        const probe = await exec(["gh", "pr", "view", pr, "--json", "statusCheckRollup"]);
+        const probe = await exec(["gh", "pr", "view", pr, "--json", "statusCheckRollup,baseRefOid"]);
         if (probe.code === 0) {
           try {
-            ci = await ciStatusProbed(exec, JSON.parse(probe.stdout || "{}").statusCheckRollup);
+            const view = JSON.parse(probe.stdout || "{}");
+            ci = await ciStatusProbed(exec, view.statusCheckRollup, view.baseRefOid ?? null);
           } catch {
             ci = null;
           }
         }
+        db.query("UPDATE tasks SET ci_checked_at = ? WHERE id = ?").run(now(), taskId);
         if (ci === "failing" || ci === "pending") {
           db.query("UPDATE tasks SET ci_status = ?, updated_at = ? WHERE id = ?").run(ci, now(), taskId);
           writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { pr_url: pr, ci_status: ci } });
@@ -5007,10 +5009,32 @@ export function decisionBundle(db: DB, taskId: string, decisionId: string): any 
   return {
     task_number: task.number ?? null,
     task_display_id: taskIdentifier(db, task),
+    ci: ciFreshness(db, task, decisionId),
     pr_url: task.pr_url ?? null,
     branch: task.branch ?? null,
     spend_usd: +taskSpend(db, taskId).toFixed(2),
     prior_decisions: prior,
+  };
+}
+
+// Freshness for a card that cites CI: what it cited, what the checks say NOW,
+// and when hive last looked. Rendered on the card so nobody has to guess whether
+// the facts in front of them are still true.
+function ciFreshness(db: DB, task: any, decisionId: string): any {
+  const d: any = db.query("SELECT ci_status_at_card, ci_signal FROM decisions WHERE id = ?").get(decisionId);
+  if (!d?.ci_status_at_card) return null;
+  // Blocked by an infra outage: name the task hive already dispatched to fix
+  // the signal, so the answer reads as one ruling for every PR it hits.
+  const fixer: any = d.ci_signal
+    ? db.query(`SELECT number FROM tasks WHERE brief LIKE ? AND state NOT IN ('done','failed','cancelled') ORDER BY created_at DESC LIMIT 1`)
+        .get(`%ci-signal: ${d.ci_signal}%`)
+    : null;
+  return {
+    at_card: d.ci_status_at_card,
+    status: task.ci_status ?? null,
+    checked_at: task.ci_checked_at ?? null,
+    changed: (task.ci_status ?? null) !== d.ci_status_at_card,
+    outage: d.ci_signal ? { signal: d.ci_signal, fix_task_number: fixer?.number ?? null } : null,
   };
 }
 
@@ -5022,12 +5046,65 @@ export function withBundle(db: DB, d: any): any {
   return { ...d, bundle: decisionBundle(db, d.task_id, d.id), plan: decisionPlan(db, d.task_id, d.id) };
 }
 
+// A card "cites CI" when the task's checks are actually not passing AND the
+// card's own words are about them. The status is the gate: the words alone
+// match ordinary English ("keep the red icon", "add a permission check"), and
+// mislabelling a card as CI-related would let it be auto-dismissed or
+// auto-answered by an unrelated outage.
+const CITES_CI = /\bCI\b|\bchecks?\b|\bred\b|\bfailing\b|\bgreen\b/i;
+const CI_BLOCKED = new Set(["failing", "unavailable"]);
+
+// What the CI signal looked like when a card was written: the status it cited,
+// and the infra-outage signal (from the reconciler's ci_infra event for the
+// PR's current head) that was blocking it, if any.
+function ciCitation(db: DB, task: any, text: string): { status: string | null; signal: string | null } {
+  if (!task?.pr_url || !CI_BLOCKED.has(task.ci_status ?? "") || !CITES_CI.test(text)) return { status: null, signal: null };
+  const row: any = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'ci_infra' ORDER BY rowid DESC LIMIT 1")
+    .get(task.id);
+  let signal: string | null = null;
+  if (row && task.ci_status === "unavailable") {
+    try {
+      const p = JSON.parse(row.payload);
+      if (!p.head_sha || !task.head_sha || p.head_sha === task.head_sha) signal = p.signal ?? null;
+    } catch {}
+  }
+  return { status: task.ci_status ?? null, signal };
+}
+
+// The director rules ONCE per outage. A later card blocked by the same signal
+// inherits that answer instead of interrupting again — but only if the answer
+// is one of this card's own options, otherwise the inherited key would be
+// meaningless here.
+function standingCiRuling(db: DB, projectId: string, signal: string, options: any[]): { key: string; note: string } | null {
+  // The ruling holds only while the outage does. hive tracks the outage as one
+  // diagnostic task; once that task is closed, the next card asks again.
+  if (!infraTaskOpen(db, projectId, signal)) return null;
+  const prior: any = db
+    .query(
+      `SELECT dc.id, dc.answer_key, dc.answer_note, dc.answered_at, dc.title FROM decisions dc
+         JOIN tasks t ON t.id = dc.task_id
+        WHERE t.project_id = ? AND dc.ci_signal = ? AND dc.status = 'answered' AND dc.answer_key IS NOT NULL
+        ORDER BY dc.answered_at DESC LIMIT 1`
+    )
+    .get(projectId, signal);
+  if (!prior) return null;
+  if (!options.some((o: any) => o.key === prior.answer_key)) return null;
+  return {
+    key: prior.answer_key,
+    note:
+      `Answered automatically: you already ruled on this exact CI outage ("${prior.title}") and that ruling still stands. ` +
+      `The same checks block this PR, and nothing about them has changed.` + (prior.answer_note ? ` Your note then: ${prior.answer_note}` : ""),
+  };
+}
+
 export function createDecision(
   db: DB,
   d: { task_id: string; title: string; context?: string | null; risk?: string | null; blast_radius?: string | null; options?: any[] }
 ): any {
   if (!getTask(db, d.task_id)) throw new Error("unknown task_id");
   const options = Array.isArray(d.options) && d.options.length ? d.options : DEFAULT_OPTIONS;
+  const cited = ciCitation(db, getTask(db, d.task_id), `${d.title}\n${d.context ?? ""}`);
   const row = {
     id: newId("dec"),
     task_id: d.task_id,
@@ -5042,21 +5119,38 @@ export function createDecision(
     answer_note: null,
     draft_note: null,
     answered_at: null,
+    ci_status_at_card: cited.status,
+    ci_signal: cited.signal,
   };
   db.query(
     `INSERT INTO decisions (id, task_id, ts, title, context, risk, blast_radius,
-      options, status, answer_key, answer_note, draft_note, answered_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      options, status, answer_key, answer_note, draft_note, answered_at, ci_status_at_card, ci_signal)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.task_id, row.ts, row.title, row.context, row.risk,
     row.blast_radius, row.options, row.status, row.answer_key, row.answer_note,
-    row.draft_note, row.answered_at
+    row.draft_note, row.answered_at, row.ci_status_at_card, row.ci_signal
   );
   writeEvent(db, { task_id: d.task_id, source: "agent", type: "needs-decision", payload: { decision_id: row.id, title: row.title } });
   // Move task into needs_decision if the current state allows it.
   const task = getTask(db, d.task_id);
   if (canTransition(task.state, "needs_decision")) {
     transition(db, d.task_id, "needs_decision", { source: "agent", reason: row.title });
+  }
+  // Same outage, same ruling: answer it now with what the director already
+  // decided, and do NOT notify — a second identical question is the interruption
+  // this exists to remove.
+  const ruling = row.ci_signal ? standingCiRuling(db, task.project_id, row.ci_signal, options) : null;
+  if (ruling) {
+    const res = apiAnswerDecision(db, defaultHerdr, row.id, {
+      answer_key: ruling.key,
+      answer_note: ruling.note,
+      source: "system",
+      actor: "ci-outage-ruling",
+    });
+    // If the auto-answer failed the card is still open — fall through and
+    // notify, rather than leaving an orphan nobody was told about.
+    if (res.ok) return withBundle(db, parseDecision(db.query("SELECT * FROM decisions WHERE id = ?").get(row.id)));
   }
   // Enrich AFTER the transition so the bundle's spend/PR reflect current state.
   const decision = withBundle(db, parseDecision(row));
@@ -5304,12 +5398,13 @@ export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: an
 // no usable options, or one that's simply no longer relevant). Expires it and
 // broadcasts so the inbox clears live. No resolver hooks fire — dismissing is
 // explicitly "take no action".
-function apiDismissDecision(db: DB, id: string): Response {
+export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; steer: string }): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
   if (!r) return err("decision not found", 404);
   if (r.status !== "open") return err(`decision already ${r.status}`, 409);
+  const source = moot ? "reconciler" : "director";
   db.query("UPDATE decisions SET status = 'expired' WHERE id = ?").run(id);
-  writeEvent(db, { task_id: r.task_id, source: "director", type: "decision_expired", payload: { decision_id: id, reason: "dismissed" } });
+  writeEvent(db, { task_id: r.task_id, source, type: "decision_expired", payload: { decision_id: id, reason: moot?.reason ?? "dismissed" } });
   // An authority card's pending grant must die with it: left 'pending', every
   // retry of the gated command resolves to this expired decision id and the
   // agent waits on it forever (19 of 28 approval cards expired exactly this way).
@@ -5321,6 +5416,7 @@ function apiDismissDecision(db: DB, id: string): Response {
       queueSteerEvent(
         db,
         r.task_id,
+        moot ? moot.steer :
         `The director dismissed your decision card "${r.title}" without answering — it is gone, do not wait ` +
           `on it or retry the same request. ${wasAuthority ? "The gated command stays unapproved; find another way (or narrow the command so the gate passes). " : ""}` +
           `Proceed with your best judgment and note the call as a checkpoint.`,
@@ -5335,7 +5431,7 @@ function apiDismissDecision(db: DB, id: string): Response {
     .get(r.task_id);
   const task = getTask(db, r.task_id);
   if (!remaining && task && task.state === "needs_decision")
-    transition(db, r.task_id, "in_progress", { source: "director", reason: "last open decision dismissed" });
+    transition(db, r.task_id, "in_progress", { source, reason: moot?.reason ?? "last open decision dismissed" });
   const decision = parseDecision({ ...r, status: "expired" });
   broadcast({ type: "decision", decision });
   return json(decision);
