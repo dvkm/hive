@@ -373,20 +373,33 @@ function sqlTargetsSandboxed(cmd: string, env: Record<string, string | undefined
   });
 }
 
-// SQL dangerous rules must never fire on a pure read-only search/inspection
-// pipeline (grep/rg/sed/cat/awk/…) whose argument text merely CONTAINS
-// SQL-looking words — the string being searched FOR is not a statement being
-// executed. Task 1022: `grep -rn "UPDATE tasks SET" src | grep -i source`
-// classified dangerous because the bare word "source" (an EXECUTOR name) in
-// the second grep's search pattern disabled data-text stripping for the
-// whole command, so the SQL regex matched the first grep's quoted argument.
-// Reuses the SAFE allowlist rather than a second list of read-only tools —
-// a command this waives is, by construction, a command SAFE would already
-// allow once the SQL false-positive stops hiding that.
-function sqlKeywordIsSearchData(cmd: string): boolean {
+// No DANGEROUS rule may fire on a pure read-only search/inspection pipeline
+// (grep/rg/sed/cat/awk/echo/printf/…) whose argument text merely CONTAINS a
+// trigger word — the string being searched for or echoed is DATA, not a
+// command being executed. Task 1022 (SQL only): `grep -rn "UPDATE tasks SET"
+// src | grep -i source` classified dangerous because the bare word "source"
+// (an EXECUTOR name) in the second grep's search pattern disabled data-text
+// stripping for the whole command, so the SQL regex matched the first grep's
+// quoted argument. Task 1246: the same mechanism hit process-kill — an
+// `echo "... SWEEP-KILL EVIDENCE ..."` tripped command.dangerous.process-kill
+// though no kill/pkill was invoked. #1022 only waived it for SQL reasons;
+// generalized here to every DANGEROUS category.
+//
+// Two conditions must BOTH hold, so this can never waive a real invocation:
+//   1. every segment is already on the SAFE read-only allowlist (proves the
+//      pipeline itself does nothing but read/print — reused rather than a
+//      second tool list, same as #1022);
+//   2. the trigger regex stops matching once quotes/heredocs are stripped —
+//      proves THIS PARTICULAR match lives only inside quoted/heredoc text,
+//      not in the command's actual (unquoted) invocation. Without this half,
+//      `echo hi > /dev/sda` would wrongly waive too: "echo" is SAFE, but the
+//      device-write target sits outside any quotes, so it's a real write,
+//      not searched-for data, and condition 2 correctly keeps it dangerous.
+function dangerousKeywordIsSearchData(cmd: string, rx: RegExp): boolean {
   if (/\$\(|`|<\(/.test(cmd)) return false; // subshell: can't prove read-only
   const segs = segments(cmd);
-  return segs.length > 0 && segs.every((seg) => SAFE.some((rx) => rx.test(seg)));
+  if (!(segs.length > 0 && segs.every((seg) => SAFE.some((s) => s.test(seg))))) return false;
+  return !rx.test(stripDataText(cmd));
 }
 
 // A lone `hive emit …` (any invocation form, optionally preceded by VAR=
@@ -503,9 +516,10 @@ export function classify(
       continue;
     if (
       reason.startsWith("SQL ") &&
-      (sqlTargetsSandboxed(cmd, env) || dockerDbTargetsSandboxed(cmd, env, cwd) || sqlKeywordIsSearchData(cmd))
+      (sqlTargetsSandboxed(cmd, env) || dockerDbTargetsSandboxed(cmd, env, cwd))
     )
       continue;
+    if (dangerousKeywordIsSearchData(cmd, rx)) continue;
     return { decision: "dangerous", reason };
   }
 
