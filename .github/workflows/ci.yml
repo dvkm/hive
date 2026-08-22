@@ -1,0 +1,55 @@
+name: CI
+
+# DORMANT ON PURPOSE — manual trigger only (dec_102596014f42).
+#
+# This repo's Actions jobs are currently refused a runner ("the job was not
+# started because recent account payments have failed or your spending limit
+# needs to be increased"). GitHub still creates the check run and marks it
+# FAILURE, which hive reads as an ordinary red (ciStatusOf, reconciler.ts) and
+# uses to HOLD the ready handoff — telling the agent to fix a failure no push
+# can clear. Triggering on pull_request today would do that to every hive PR.
+#
+# TO TURN CI ON: once the runner situation resolves (billing raise, or the
+# CodeBuild migration, task f060e570b75c), uncomment the two triggers below,
+# re-run one PR, and confirm the check actually goes green before treating
+# "CI is green" as evidence.
+on:
+  workflow_dispatch:
+  # pull_request:
+  # push:
+  #   branches: [main]
+
+# Agents push to many branches at once; drop superseded runs so the
+# "wait for checks" handoff gate isn't stuck behind a stale queue.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # This job only reads the tree. Narrow the default GITHUB_TOKEN so a
+    # compromised dependency in a PR run can't write to the repo.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # Pinned, not 'latest': a bun release that changes test-runner or
+          # tsc behaviour should break in a bump PR, not silently on an
+          # unrelated branch. Bump this alongside the bun agents run locally.
+          bun-version: 1.3.14
+
+      # Two separate manifests: the root install does NOT cover web/.
+      - run: bun install
+      - run: bun install
+        working-directory: web
+
+      # 'bun run test', not bare 'bun test'. The run form also executes
+      # docs:jira:check, which fails when README's generated Jira
+      # write-scope section drifts from the registry.
+      - run: bun run test
+
+      - run: bunx tsc -b --noEmit
+        working-directory: web
