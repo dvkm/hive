@@ -2377,6 +2377,12 @@ a.dbundle-fact:hover {
   padding: 20px;
   animation: cardIn 0.16s ease;
 }
+.token-dialog {
+  color: var(--text);
+}
+.token-dialog::backdrop {
+  background: rgba(6, 9, 14, 0.6);
+}
 .modal h2 {
   font-size: 16px;
   margin: 0 0 14px;

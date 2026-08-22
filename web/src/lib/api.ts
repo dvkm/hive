@@ -30,11 +30,47 @@ function authHeaders(): Record<string, string> {
   const t = apiToken();
   return t ? { Authorization: `Bearer ${t}` } : {};
 }
-function promptForToken(): boolean {
-  const t = window.prompt("hive API token (run `hive remote` on the Mac):");
-  if (!t?.trim()) return false;
-  localStorage.setItem("hive_token", t.trim());
-  return true;
+let tokenPrompt: Promise<boolean> | null = null;
+function promptForToken(): Promise<boolean> {
+  if (tokenPrompt) return tokenPrompt;
+  tokenPrompt = new Promise((resolve) => {
+    const dialog = document.createElement("dialog");
+    dialog.className = "modal token-dialog";
+    dialog.innerHTML = `
+      <form method="dialog">
+        <h2>Hive API token</h2>
+        <label class="fld">
+          <span>Run \`hive remote\` on the Mac</span>
+          <input type="password" autocomplete="current-password" autofocus />
+        </label>
+        <div class="modal-foot">
+          <div class="spacer"></div>
+          <button type="button" class="btn">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </div>
+      </form>`;
+    const input = dialog.querySelector("input")!;
+    const finish = (saved: boolean) => {
+      dialog.remove();
+      tokenPrompt = null;
+      resolve(saved);
+    };
+    dialog.querySelector<HTMLButtonElement>('button[type="button"]')!.onclick = () => finish(false);
+    dialog.oncancel = (event) => {
+      event.preventDefault();
+      finish(false);
+    };
+    dialog.querySelector("form")!.onsubmit = (event) => {
+      event.preventDefault();
+      const token = input.value.trim();
+      if (!token) return;
+      localStorage.setItem("hive_token", token);
+      finish(true);
+    };
+    document.body.appendChild(dialog);
+    dialog.showModal();
+  });
+  return tokenPrompt;
 }
 
 export type State =
@@ -481,7 +517,7 @@ async function req<T>(path: string, init?: RequestInit, retried = false): Promis
       ? { ...authHeaders(), ...(init?.headers || {}) }
       : { "Content-Type": "application/json", ...authHeaders(), ...(init?.headers || {}) },
   });
-  if (res.status === 401 && !retried && promptForToken()) {
+  if (res.status === 401 && !retried && await promptForToken()) {
     return req<T>(path, init, true); // token just entered — replay once, then reload streams
   }
   if (!res.ok) {
