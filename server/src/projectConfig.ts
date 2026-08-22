@@ -18,6 +18,8 @@
 // CHECKS is the allowlist: an unknown top-level key is rejected, so a new config
 // key cannot be wired into a reader without someone landing here and choosing
 // its check. Keys hive stores but never reads are listed with `any` explicitly.
+import { isSafeRef } from "./exec.ts";
+
 // Lives here, not in api.ts: this schema needs it, and api.ts already imports
 // this file, so importing back would be a cycle. api.ts re-exports the name.
 export const AGENTS = ["claude", "codex"] as const;
@@ -110,6 +112,14 @@ const gchatSpaces: Check = (v) => {
   return null;
 };
 
+const promote: Check = (v) => {
+  const bad = obj(v);
+  if (bad) return bad;
+  const p = v as Record<string, unknown>;
+  for (const key of ["from", "to"]) if (!isSafeRef(p[key])) return `.${key} must be a git branch name`;
+  return null;
+};
+
 const CHECKS: Record<string, Check> = {
   // dispatch / autonomy
   auto_dispatch: bool,
@@ -144,7 +154,7 @@ const CHECKS: Record<string, Check> = {
   // git / merge
   default_branch: str,
   merge_method: str,
-  promote: obj,
+  promote,
   auto_merge: obj,
   auto_review: bool,
   release_review_agents: bool,
