@@ -502,6 +502,20 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       END`,
     ],
   },
+  // Red-CI freshness. `ci_checked_at` records when the reconciler last LOOKED at
+  // a PR's checks (ci_status only changes when the answer changes), and the two
+  // decision columns pin what a card actually cited: the CI status at the moment
+  // it was written, and the infra-outage signal (if any) it was blocked by. A
+  // card can then be re-checked when rendered, and a second PR hitting the same
+  // outage inherits the director's one ruling instead of asking again.
+  {
+    name: "v26-ci-signal-freshness",
+    statements: [
+      `ALTER TABLE tasks ADD COLUMN ci_checked_at TEXT`,
+      `ALTER TABLE decisions ADD COLUMN ci_status_at_card TEXT`,
+      `ALTER TABLE decisions ADD COLUMN ci_signal TEXT`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings

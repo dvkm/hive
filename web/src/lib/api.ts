@@ -164,6 +164,15 @@ export interface DecisionPlan {
 export interface DecisionBundle {
   task_number: number | null;
   task_display_id?: string | null;
+  // Only on cards whose own words are about CI: what they cited, what the
+  // checks say now, and when hive last looked.
+  ci?: {
+    at_card: string;
+    status: string | null;
+    checked_at: string | null;
+    changed: boolean;
+    outage?: { signal: string; fix_task_number: number | null } | null;
+  } | null;
   pr_url: string | null;
   branch: string | null;
   spend_usd: number;
