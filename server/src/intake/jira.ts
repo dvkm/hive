@@ -55,6 +55,7 @@ import { broadcastTask } from "../health.ts";
 import { resolveProjectSecrets } from "../secrets.ts";
 import type { Exec } from "../exec.ts";
 import { defaultExec } from "../exec.ts";
+import { taskDiff } from "../diff.ts";
 import {
   NEEDS_DECISION_LABEL,
   assertJiraWriteAllowed,
@@ -611,7 +612,9 @@ export class JiraClient {
       headers: {
         Authorization: this.auth(),
         Accept: "application/json",
-        ...(init.body ? { "Content-Type": "application/json" } : {}),
+        // FormData sets its own multipart Content-Type with the boundary;
+        // forcing JSON here would make Jira reject every attachment upload.
+        ...(init.body && !(init.body instanceof FormData) ? { "Content-Type": "application/json" } : {}),
         ...(init.headers ?? {}),
       },
     });
@@ -792,6 +795,34 @@ export class JiraClient {
       }),
     }, { field: "comments" });
     return { ...posted, id: jiraScalarId(posted.id, `invalid Jira comment response for ${key}`) };
+  }
+
+  // Attachment FILENAMES already on the issue. Jira attachments carry no
+  // properties, so unlike comments they have no place to stamp the local row id
+  // — the hive-stamped filename is the idempotency key, and this read is how a
+  // lost upload response is recovered instead of re-uploaded.
+  async attachmentNames(key: string): Promise<Set<string>> {
+    const body = await this.json(`/rest/api/3/issue/${encodeURIComponent(key)}?fields=attachment`);
+    const list = body?.fields?.attachment;
+    if (!Array.isArray(list)) throw new Error(`invalid Jira attachment list for ${key}`);
+    return new Set(list.map((a: any) => String(a?.filename ?? "")).filter(Boolean));
+  }
+
+  // One file, one request. `X-Atlassian-Token: no-check` is required by Jira for
+  // every attachment upload; without it the request is refused as XSRF.
+  async addAttachment(key: string, filename: string, bytes: Uint8Array, contentType: string): Promise<{ id: string; filename: string }> {
+    const form = new FormData();
+    form.append("file", new Blob([bytes], { type: contentType }), filename);
+    const posted = await this.call(
+      `/rest/api/3/issue/${encodeURIComponent(key)}/attachments`,
+      { method: "POST", body: form, headers: { "X-Atlassian-Token": "no-check" } },
+      { field: "attachments" }
+    );
+    const first = Array.isArray(posted) ? posted[0] : null;
+    return {
+      id: jiraScalarId(first?.id, `invalid Jira attachment response for ${key}`),
+      filename: String(first?.filename ?? filename),
+    };
   }
 
   async resolveTransitionId(key: string, statusName: string): Promise<string> {
@@ -1392,6 +1423,7 @@ export interface SyncStats {
   comments_pulled: number;
   comments_pushed: number;
   receipts: number; // hive reports/evidence delivered to Jira
+  attachments: number; // screenshots uploaded to the Jira issue
   shadow: number; // outbound calls suppressed by write:false
   unmapped: number; // Jira statuses hive has no mapping for
   aborted: number; // writes dropped because the boundary re-read disagreed
@@ -1404,7 +1436,7 @@ export interface SyncStats {
 
 const emptyStats = (): SyncStats => ({
   imported: 0, pushed: 0, pulled: 0, labeled: 0,
-  comments_pulled: 0, comments_pushed: 0, receipts: 0,
+  comments_pulled: 0, comments_pushed: 0, receipts: 0, attachments: 0,
   shadow: 0, unmapped: 0, aborted: 0, blocked: 0, skipped: 0, cancelled: 0, errors: 0, failures: [],
 });
 
@@ -1413,6 +1445,7 @@ interface Ctx {
   cfg: JiraConfig;
   client: JiraClient;
   stats: SyncStats;
+  exec: Exec; // reads the task's diff, to tell UI work from everything else
   log: (msg: string, err?: unknown) => void;
 }
 
@@ -1512,7 +1545,8 @@ async function guardedWrite<T>(
     // stay failed so the row retries after the client or endpoint is repaired.
     // A 5xx or transport failure cannot prove nothing happened and stays contained.
     const failure = jiraFailureKind(e);
-    const immutableDelivery = args.entry.action === "comment_push" || args.entry.action === "receipt";
+    const immutableDelivery =
+      args.entry.action === "comment_push" || args.entry.action === "receipt" || args.entry.action === "attachment";
     if (failure === "row_rejected" && immutableDelivery) {
       logSync(db, args.taskId, { ...args.entry, outcome: "rejected", error: String(e) });
       return;
@@ -1691,6 +1725,9 @@ async function reconcileIssue(ctx: Ctx, read: IssueRead, task: any): Promise<voi
   // holds absolutely if hive never writes the field at all, so it does not.
   // hive still READS the assignee, to show it on the board.
 
+  // ---- image proofs first, so the context comment below can name them
+  await syncAttachments(ctx, key, current);
+
   // ---- review context: one plain comment when the ticket reaches In Review/Done
   queueReviewContext(ctx, current);
 
@@ -1834,6 +1871,159 @@ async function syncCommentsAndReceipts(
   }
 }
 
+// ---- image proofs --------------------------------------------------------
+// Status and text told the reporter what happened; a screenshot shows it. When
+// a mirrored task reaches In Review or Done, hive uploads the screenshots it
+// ALREADY holds as task evidence to the Jira issue itself, so the reporter can
+// see what shipped without a hive login.
+//
+// Only UI work, and only a few images: the director's rule is a couple of
+// captioned proofs, never a dump of every viewport.
+//
+// ponytail: uploads existing evidence only. Rendering fresh screenshots at
+// review time would mean driving the TARGET repo's browser harness from the
+// sync loop; that is its own job, and most UI tasks already attach e2e shots.
+const ATTACHMENT_LIMIT = 3;
+const IMAGE_EXT = /\.(png|jpe?g|webp|gif)$/i;
+const UI_DIFF_PATH = /(^|\/)(web|cms)\//;
+const IMAGE_TYPES: Record<string, string> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp", gif: "image/gif",
+};
+
+// Stamped with the evidence row id, because a Jira attachment has nowhere else
+// to carry one. Same job the comment property does for comments: it is what
+// makes a re-sync recognise its own upload instead of posting a second copy.
+export function attachmentName(evidenceId: string, path: string): string {
+  const base = (path.split("/").pop() || "image.png").replace(/[^\w.\-]/g, "_");
+  return `hive-${evidenceId}-${base}`;
+}
+
+// Does this task's change touch the UI? Decided ONCE per task and recorded as a
+// sync event: the answer needs a full `gh pr diff`, and re-deriving it every
+// cycle would spend a network round trip per mirrored task to learn the same
+// thing. A task with no branch or PR yet is left UNDECIDED, so a later cycle
+// answers it properly once there is something to diff.
+async function touchesUi(ctx: Ctx, taskId: string, key: string): Promise<boolean> {
+  const prior = ctx.db
+    .query(
+      `SELECT json_extract(payload, '$.ui') AS ui FROM events
+       WHERE task_id = ? AND type = 'jira_sync' AND json_extract(payload, '$.action') = 'attachment_scope'
+         AND json_extract(payload, '$.ui') IS NOT NULL
+       ORDER BY rowid DESC LIMIT 1`
+    )
+    .get(taskId) as { ui: number } | undefined;
+  if (prior) return prior.ui === 1;
+
+  const diff = await taskDiff(ctx.db, taskId, ctx.exec);
+  if (!diff.ok) {
+    logSyncOnce(ctx.db, taskId, { action: "attachment_scope", issue: key, undecided: diff.error });
+    return false;
+  }
+  const ui = diff.diff.files.some((file) => UI_DIFF_PATH.test(file.path));
+  logSync(ctx.db, taskId, { action: "attachment_scope", issue: key, ui: ui ? 1 : 0 });
+  return ui;
+}
+
+function imageEvidence(db: DB, taskId: string): { id: string; path: string; caption: string | null }[] {
+  return (
+    db
+      .query("SELECT id, path, caption FROM evidence WHERE task_id = ? AND path IS NOT NULL ORDER BY ts")
+      .all(taskId) as { id: string; path: string; caption: string | null }[]
+  )
+    .filter((row) => IMAGE_EXT.test(row.path))
+    .slice(0, ATTACHMENT_LIMIT);
+}
+
+// Screenshots hive has confirmed on the issue, newest ledger entry per row.
+function attachedProofs(db: DB, taskId: string): { filename: string; caption: string | null }[] {
+  return (
+    db
+      .query(
+        `SELECT payload FROM events WHERE task_id = ? AND type = 'jira_sync'
+           AND json_extract(payload, '$.action') = 'attachment'
+           AND ${deliveredReceiptSql("events")}
+           AND ${latestReceiptSql("events")}
+         ORDER BY rowid`
+      )
+      .all(taskId) as { payload: string }[]
+  ).flatMap((row) => {
+    try {
+      const payload = JSON.parse(row.payload);
+      return payload.filename ? [{ filename: String(payload.filename), caption: payload.caption ?? null }] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+async function syncAttachments(ctx: Ctx, key: string, task: any): Promise<void> {
+  const { db, cfg, stats } = ctx;
+  const jiraStatus = stateToJiraStatus(task.state);
+  if (!jiraStatus || !CONTEXT_STATUSES.includes(jiraStatus)) return;
+
+  // A row left mid-flight ("sending") is still a candidate: it has to reach the
+  // loop to be settled as terminal_unknown, exactly like a comment or a receipt.
+  const candidates = imageEvidence(db, task.id).filter(
+    (row) =>
+      !deliveryRecorded(db, task.id, "attachment", row.id) &&
+      (latestDeliveryOutcome(db, task.id, "attachment", row.id) === "sending" ||
+        !deliveryContained(db, task.id, "attachment", row.id))
+  );
+  if (!candidates.length) return;
+  if (!(await touchesUi(ctx, task.id, key))) return;
+
+  // One read for the whole task: every candidate is checked against the same
+  // filename list, so a crash between upload and receipt cannot double-post.
+  let onIssue: Set<string>;
+  try {
+    onIssue = cfg.write ? await ctx.client.attachmentNames(key) : new Set<string>();
+  } catch (e) {
+    recordFailure(ctx, `${key} attachment: ${String(e instanceof Error ? e.message : e)}`);
+    return;
+  }
+
+  for (const row of candidates) {
+    const filename = attachmentName(row.id, row.path);
+    const caption = row.caption?.trim() || null;
+    if (onIssue.has(filename)) {
+      logSync(db, task.id, {
+        action: "attachment", issue: key, source_id: row.id, filename, caption,
+        outcome: "recovered", recovered: true,
+      });
+      continue;
+    }
+    if (latestDeliveryOutcome(db, task.id, "attachment", row.id) === "sending") {
+      logSync(db, task.id, {
+        action: "attachment", issue: key, source_id: row.id, filename,
+        outcome: "terminal_unknown", error: "Hive stopped before Jira confirmed the upload",
+      });
+      continue;
+    }
+    if (deliveryContained(db, task.id, "attachment", row.id)) continue;
+    const file = Bun.file(row.path);
+    if (!(await file.exists())) {
+      logSync(db, task.id, {
+        action: "attachment", issue: key, source_id: row.id, filename,
+        outcome: "rejected", error: "evidence file is no longer on disk",
+      });
+      continue;
+    }
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const type = IMAGE_TYPES[(row.path.split(".").pop() ?? "").toLowerCase()] ?? "application/octet-stream";
+    const action = cfg.write ? "attachment" : "attachment_shadow";
+    if (!cfg.write && syncEntryRecorded(db, task.id, action, row.id)) continue;
+    await guardedWrite(ctx, {
+      taskId: task.id,
+      key,
+      entry: { action, issue: key, source_id: row.id, filename, caption },
+      premise: () => null,
+      act: (fresh) => ctx.client.addAttachment(fresh.key, filename, bytes, type),
+      success: (posted) => ({ jira_attachment_id: posted.id }),
+      onDone: () => { stats.attachments++; },
+    });
+  }
+}
+
 // ---- review context ------------------------------------------------------
 // A status push alone tells the reporter nothing: they open the ticket, see the
 // column move, and still have no PR, no summary, and no evidence. This composes
@@ -1925,9 +2115,13 @@ export function reviewContextText(db: DB, task: any, jiraStatus: string): string
   if (pr && !lines[0].includes(pr)) lines.push(`PR: ${pr}`);
   if (explain) lines.push(`What changed, explained: ${explain}`);
   if (caveats.length) lines.push(`Heads-up: ${clampText(caveats.join("; "), CONTEXT_TEXT_MAX)}`);
-  // ponytail: evidence is LINKED, not uploaded. Jira has an attachment API, but
-  // using it widens the declared write scope (jira-write-scope.ts) on a live
-  // corporate project for files hive already serves.
+  // Screenshots are UPLOADED to the issue (see syncAttachments); everything
+  // else is linked back to hive, which already serves it.
+  const proofs = attachedProofs(db, task.id);
+  if (proofs.length) {
+    lines.push("", `Screenshot${proofs.length === 1 ? "" : "s"} attached to this issue:`);
+    for (const proof of proofs) lines.push(`- ${proof.filename}${proof.caption ? ` — ${proof.caption}` : ""}`);
+  }
   if (evidence.length) {
     lines.push("", "Evidence:");
     for (const row of evidence.slice(0, CONTEXT_EVIDENCE_LIMIT)) {
@@ -2066,7 +2260,7 @@ export async function syncProjectOnce(
 ): Promise<SyncStats> {
   assertJiraTargetOwner(db, projectId, cfg);
   const log = deps.log ?? ((m: string, e?: unknown) => console.error(`[hive] jira: ${m}`, e ?? ""));
-  const ctx: Ctx = { db, cfg, client, stats: emptyStats(), log };
+  const ctx: Ctx = { db, cfg, client, stats: emptyStats(), exec: deps.exec ?? defaultExec, log };
 
   // Discovery must succeed before any verified absence can advance: a failed
   // scope check is not evidence that anything went missing.
@@ -2233,13 +2427,14 @@ export async function runProjectCycle(
     });
     const touched =
       stats.imported || stats.pushed || stats.pulled || stats.labeled || stats.comments_pulled ||
-      stats.comments_pushed || stats.receipts || stats.shadow || stats.unmapped || stats.aborted ||
+      stats.comments_pushed || stats.receipts || stats.attachments || stats.shadow || stats.unmapped || stats.aborted ||
       stats.blocked || stats.skipped || stats.errors;
     if (touched)
       console.log(
         `[hive] jira ${cfg.project_key}${cfg.write ? "" : " (shadow)"}: ` +
           `+${stats.imported} imported, ${stats.pushed} pushed, ${stats.pulled} pulled, ${stats.labeled} labeled, ` +
           `${stats.comments_pulled} comments in, ${stats.comments_pushed} comments out, ${stats.receipts} receipts, ` +
+          `${stats.attachments} attachments, ` +
           `${stats.shadow} shadow, ${stats.unmapped} unmapped, ${stats.aborted} aborted, ${stats.blocked} blocked, ` +
           `${stats.skipped} skipped, ${stats.errors} errors`
       );

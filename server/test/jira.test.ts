@@ -47,6 +47,7 @@ interface FakeIssue {
   updated?: string;
   history?: { at: string; to: string }[]; // status transitions, oldest first
   rawHistory?: any[] | null;
+  attachments?: { id: string; filename: string }[];
   comments?: { id?: string; author?: string; text?: string; created?: string; properties?: { key: string; value: unknown }[]; raw?: any }[];
 }
 
@@ -69,6 +70,7 @@ interface FakeOpts {
   failComments?: string[];
   missingComments?: string[];
   failCommentPosts?: number;
+  failAttachmentPosts?: boolean;
   rejectCommentPosts?: number;
   rejectCommentStatus?: number;
   commentPostResponse?: any;
@@ -88,7 +90,7 @@ interface FakeOpts {
 }
 
 function fakeJira(opts: FakeOpts) {
-  const byKey = new Map(opts.issues.map((i) => [i.key, { labels: [], assignee: null, projectKey: "WEB", summary: "s", created: "2026-01-01T00:00:00.000Z", updated: "2026-01-01T00:00:00.000Z", history: [], rawHistory: null, comments: [], ...i } as Required<FakeIssue>]));
+  const byKey = new Map(opts.issues.map((i) => [i.key, { labels: [], assignee: null, projectKey: "WEB", summary: "s", created: "2026-01-01T00:00:00.000Z", updated: "2026-01-01T00:00:00.000Z", history: [], rawHistory: null, comments: [], attachments: [], ...i } as Required<FakeIssue>]));
   const calls: { method: string; path: string; body?: any }[] = [];
   const reads = new Map<string, number>();
   const changelogReads = new Map<string, number>();
@@ -102,7 +104,7 @@ function fakeJira(opts: FakeOpts) {
     const u = new URL(String(url));
     const method = (init.method ?? "GET").toUpperCase();
     const path = u.pathname;
-    const body = init.body ? JSON.parse(init.body) : undefined;
+    const body = typeof init.body === "string" ? JSON.parse(init.body) : undefined;
     calls.push({ method, path: path + u.search, body });
 
     // Auth is asserted on EVERY call: a request that reached the network
@@ -174,6 +176,7 @@ function fakeJira(opts: FakeOpts) {
             assignee: iss.assignee ? { accountId: iss.assignee } : null,
             priority: { name: "Medium" }, issuetype: { name: "Story" },
             project: iss.projectKey == null ? undefined : { key: iss.projectKey },
+            attachment: iss.attachments.map((a) => ({ id: a.id, filename: a.filename })),
           };
           for (const field of opts.omitIssueFields ?? []) delete fields[field];
           return json({ key, id: iss.id, fields });
@@ -246,6 +249,15 @@ function fakeJira(opts: FakeOpts) {
           return json({ comments: [], startAt, maxResults: max, total: opts.commentTotalAt?.[startAt] ?? iss.comments.length });
         if (opts.omitCommentPagination) return json({ comments: page });
         return json({ comments: page, startAt, maxResults: max, total: opts.commentTotalAt?.[startAt] ?? iss.comments.length });
+      }
+      if (sub === "attachments" && method === "POST") {
+        if (opts.failAttachmentPosts) return new Response("attachment exploded", { status: 500 });
+        if (init.headers?.["X-Atlassian-Token"] !== "no-check")
+          return new Response("XSRF check failed", { status: 403 });
+        const file = (init.body as FormData).get("file") as File;
+        const id = `att${iss.attachments.length + 1}-${key}`;
+        iss.attachments = [...iss.attachments, { id, filename: file.name }];
+        return json([{ id, filename: file.name, size: file.size }]);
       }
       if (sub === "transitions") {
         if (method === "GET")
@@ -1567,9 +1579,19 @@ test("the declared Jira write scope matches observed connector mutations", async
   db.query("UPDATE tasks SET state = 'in_progress' WHERE id = ?").run(task.id);
   await run(db, projectId, jira.fetchImpl);
 
+  // and the image-proof path: a UI change reaching review uploads a screenshot
+  const shot = join(HOME, `${task.id}-scope.png`);
+  await Bun.write(shot, PNG_1PX);
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,'{}')")
+    .run(newId("ev"), task.id, now(), "screenshot", shot, `/evidence/${task.id}/scope.png`, "scope proof");
+  db.query("UPDATE tasks SET state = 'in_review', branch = 'hive/x' WHERE id = ?").run(task.id);
+  writeEvent(db, { task_id: task.id, source: "director", type: "state_change", payload: { from: "in_progress", to: "in_review" } });
+  await run(db, projectId, jira.fetchImpl, CFG, { exec: execWithPatch(UI_PATCH) });
+
   const observed = new Set<string>();
   for (const call of jira.writes()) {
     if (call.path.includes("/transitions")) observed.add("status");
+    else if (call.path.includes("/attachments")) observed.add("attachments");
     else if (call.path.includes("/comment")) observed.add("comments");
     else {
       const labelOps = call.body?.update?.labels;
@@ -1585,10 +1607,11 @@ test("the declared Jira write scope matches observed connector mutations", async
   expect(J.JIRA_WRITE_SCOPE).toEqual({
     status: true,
     comments: true,
+    attachments: true,
     labels: [J.NEEDS_DECISION_LABEL],
     assignee: false,
   });
-  expect([...observed].sort()).toEqual(["comments", "labels", "status"]);
+  expect([...observed].sort()).toEqual(["attachments", "comments", "labels", "status"]);
   expect(jira.calls.some((call) => call.path.includes("/assignee") || call.path.includes("/myself"))).toBe(false);
 });
 
@@ -2530,6 +2553,139 @@ test("shadow mode logs the receipt it WOULD deliver, and sends nothing", async (
   expect(String(intent.text)).toContain("the thing hive found");
   expect(stats.receipts).toBe(0);
   expect(jira.writes()).toEqual([]); // the real client was never invoked
+});
+
+// ============================================================================
+// IMAGE PROOFS: SCREENSHOTS ON THE JIRA ISSUE
+// ============================================================================
+// Status and text told the reporter what happened; nothing SHOWED it. A UI task
+// reaching review uploads the screenshots hive already holds, at most once, and
+// only when the change actually touched UI.
+const UI_PATCH = [
+  "diff --git a/web/src/App.tsx b/web/src/App.tsx",
+  "--- a/web/src/App.tsx",
+  "+++ b/web/src/App.tsx",
+  "@@ -1 +1 @@",
+  "-old",
+  "+new",
+].join("\n");
+const SERVER_PATCH = UI_PATCH.replaceAll("web/src/App.tsx", "server/src/api.ts");
+
+const execWithPatch = (patch: string) => async () => ({ code: 0, stdout: patch, stderr: "" });
+
+// A real 1x1 PNG on disk: the upload reads the file, so a fixture path is not enough.
+const PNG_1PX = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+  "base64"
+);
+
+async function uiTaskInReview(jira: any, name = "shot.png"): Promise<{ db: DB; projectId: string; task: any; path: string }> {
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const task = tasks(db)[0];
+  const path = join(HOME, `${task.id}-${name}`);
+  await Bun.write(path, PNG_1PX);
+  const id = newId("ev");
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,'{}')")
+    .run(id, task.id, now(), "screenshot", path, `/evidence/${task.id}/${name}`, "board after the change");
+  db.query("UPDATE tasks SET branch = ? WHERE id = ?").run("hive/x", task.id);
+  return { db, projectId, task, path };
+}
+
+test("a UI task at In Review attaches its screenshot once; a second sync adds nothing", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, task } = await uiTaskInReview(jira);
+  const deps = { exec: execWithPatch(UI_PATCH) };
+
+  const first = await run(db, projectId, jira.fetchImpl, CFG, deps);
+  expect(first.errors).toBe(0);
+  expect(first.attachments).toBe(1);
+  const uploaded = jira.byKey.get("WEB-1")!.attachments;
+  expect(uploaded).toHaveLength(1);
+  expect(uploaded[0].filename).toStartWith("hive-");
+
+  const second = await run(db, projectId, jira.fetchImpl, CFG, deps);
+  expect(second.attachments).toBe(0);
+  expect(jira.byKey.get("WEB-1")!.attachments).toHaveLength(1);
+
+  // and the context comment names the image, so the reporter knows to scroll
+  const comment = jira.byKey.get("WEB-1")!.comments.find((c: any) => String(c.text).includes("Screenshot"));
+  expect(String(comment?.text)).toContain(uploaded[0].filename);
+  expect(String(comment?.text)).toContain("board after the change");
+});
+
+test("a task whose diff touches no UI attaches nothing", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId } = await uiTaskInReview(jira);
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec: execWithPatch(SERVER_PATCH) });
+  expect(stats.attachments).toBe(0);
+  expect(jira.byKey.get("WEB-1")!.attachments).toEqual([]);
+  expect(syncEvents(db).find((e) => e.action === "attachment_scope")?.ui).toBe(0);
+});
+
+test("only the first few screenshots go up, never every viewport", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, task } = await uiTaskInReview(jira);
+  for (const n of [2, 3, 4, 5]) {
+    const path = join(HOME, `${task.id}-shot${n}.png`);
+    await Bun.write(path, PNG_1PX);
+    db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,'{}')")
+      .run(newId("ev"), task.id, now(), "screenshot", path, `/evidence/${task.id}/shot${n}.png`, `viewport ${n}`);
+  }
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec: execWithPatch(UI_PATCH) });
+  expect(stats.attachments).toBe(3);
+});
+
+test("an upload whose acknowledgement was lost is not uploaded twice", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId } = await uiTaskInReview(jira);
+  const deps = { exec: execWithPatch(UI_PATCH) };
+  // The file is already on the issue under hive's stamped name, but hive has no receipt.
+  const evidenceId = (db.query("SELECT id FROM evidence").get() as any).id;
+  const path = (db.query("SELECT path FROM evidence").get() as any).path;
+  jira.byKey.get("WEB-1")!.attachments = [{ id: "att-old", filename: J.attachmentName(evidenceId, path) }];
+
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, deps);
+  expect(stats.attachments).toBe(0);
+  expect(jira.byKey.get("WEB-1")!.attachments).toHaveLength(1);
+  expect(syncEvents(db).find((e) => e.action === "attachment")?.recovered).toBe(true);
+});
+
+test("an upload interrupted mid-flight is settled as unknown, not re-uploaded", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId } = await uiTaskInReview(jira);
+  const task = tasks(db)[0];
+  const evidenceId = (db.query("SELECT id FROM evidence").get() as any).id;
+  // hive recorded the intent and then died before Jira answered.
+  writeEvent(db, {
+    task_id: task.id, source: "jira-sync", type: "jira_sync",
+    payload: { action: "attachment", issue: "WEB-1", source_id: evidenceId, outcome: "sending" },
+  });
+
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec: execWithPatch(UI_PATCH) });
+  expect(stats.attachments).toBe(0);
+  expect(jira.byKey.get("WEB-1")!.attachments).toEqual([]);
+  expect(syncEvents(db).some((e) => e.action === "attachment" && e.outcome === "terminal_unknown")).toBe(true);
+});
+
+test("shadow mode logs the upload it WOULD make, and sends nothing", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId } = freshDb();
+  const shadow = { ...CFG, write: false };
+  await run(db, projectId, jira.fetchImpl, shadow);
+  const task = tasks(db)[0];
+  const path = join(HOME, `${task.id}-shadow.png`);
+  await Bun.write(path, PNG_1PX);
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,'{}')")
+    .run(newId("ev"), task.id, now(), "screenshot", path, `/evidence/${task.id}/shadow.png`, "would be attached");
+  db.query("UPDATE tasks SET branch = ? WHERE id = ?").run("hive/x", task.id);
+
+  const stats = await run(db, projectId, jira.fetchImpl, shadow, { exec: execWithPatch(UI_PATCH) });
+  expect(stats.attachments).toBe(0);
+  expect(jira.writes()).toEqual([]);
+  const intent = syncEvents(db).find((e) => e.action === "attachment_shadow");
+  expect(intent?.shadow).toBe(true);
+  expect(String(intent?.filename)).toContain("shadow.png");
 });
 
 // ============================================================================

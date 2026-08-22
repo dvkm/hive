@@ -5,6 +5,7 @@ export const JIRA_OWNERSHIP = {
   writes: {
     status: true,
     comments: true,
+    attachments: true,
     labels: [NEEDS_DECISION_LABEL],
     assignee: false,
   },
@@ -32,6 +33,7 @@ export function jiraOwnershipMarkdown(): string {
   const writes = [
     scope.status ? "`status`" : null,
     scope.comments ? "`comments` and evidence receipts" : null,
+    scope.attachments ? "`attachments` (up to 3 screenshots hive already holds as evidence, on UI work only)" : null,
     labels.length ? `${markdownList(labels)} label${labels.length === 1 ? "" : "s"}` : null,
     scope.assignee ? "`assignee`" : null,
   ].filter((item): item is string => item !== null);
