@@ -1559,6 +1559,14 @@ a {
   gap: 10px;
   margin-bottom: 16px;
 }
+/* freshness line on a card that cites CI: is what it says still true? */
+.dbundle-ci {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.dbundle-ci-changed {
+  color: var(--red);
+}
 .dbundle-facts {
   display: flex;
   flex-wrap: wrap;
