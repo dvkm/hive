@@ -196,6 +196,16 @@ test("needs_decision <-> in_progress round trip", () => {
   expect(getTask(db, id).state).toBe("in_progress");
 });
 
+test("queued <-> needs_decision round trip (hive-1264 gap A: director parks a task born ambiguous)", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  expect(getTask(db, id).state).toBe("queued");
+  transition(db, id, "needs_decision", { reason: "irreversible action needs a policy call" });
+  expect(getTask(db, id).state).toBe("needs_decision");
+  transition(db, id, "queued", { reason: "director resolved it" });
+  expect(getTask(db, id).state).toBe("queued");
+});
+
 test("cancelling a task expires its open decisions + writes decision_expired events", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId);

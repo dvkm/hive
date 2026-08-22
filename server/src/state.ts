@@ -1,6 +1,6 @@
 // Task state machine + event writing. Server-enforced per SPEC.md.
 //
-// queued -> in_progress -> (needs_decision <-> in_progress) -> in_review
+// queued -> in_progress -> (needs_decision <-> in_progress|queued) -> in_review
 //        -> verifying -> done
 // Any non-terminal state -> failed | cancelled (with a reason event).
 // Transition to `done` is REJECTED unless >= 1 evidence row exists
@@ -38,9 +38,14 @@ export const TRACKING_ONLY_OWNERSHIP_ERROR = "tracking-only tasks cannot create 
 // Allowed "forward" transitions. failed/cancelled are handled separately
 // because they are reachable from any non-terminal state.
 const FORWARD: Record<State, State[]> = {
-  queued: ["in_progress"],
+  // queued -> needs_decision lets the director park a task that is ambiguous
+  // before any agent even starts (e.g. a Jira mirror born unscopable, hive-1264
+  // gap A): the needs_decision label rides on top without an agent-raised
+  // decision card. needs_decision -> queued is the matching way back, so
+  // clearing it never has to fake an in_progress a queued task never had.
+  queued: ["in_progress", "needs_decision"],
   in_progress: ["needs_decision", "in_review"],
-  needs_decision: ["in_progress"],
+  needs_decision: ["in_progress", "queued"],
   in_review: ["verifying", "in_progress"], // in_progress = captain requested changes
 
   verifying: ["done", "in_progress"], // failed smoke checks bounce back
