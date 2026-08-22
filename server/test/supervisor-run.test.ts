@@ -226,6 +226,72 @@ test("verification replay records a new attempt and wakes the persistent manager
   expect(blockedCompletion.status).toBe(409);
 });
 
+test("a portfolio thread (project_id null) can verify tasks and evidence from any project it supervises", async () => {
+  const portfolioThreadId = createThread(db, { project_id: null, task_id: managerId, title: "Chief of Staff" }).id;
+  const otherProjectId = newId("proj");
+  const t = now();
+  db.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run(otherProjectId, "corebeat", "{}", t);
+  const crossTaskId = newId("task");
+  db.query(
+    "INSERT INTO tasks (id, project_id, title, state, kind, source, created_at, updated_at) VALUES (?,?,?, 'in_progress', 'ship', 'agent', ?, ?)"
+  ).run(crossTaskId, otherProjectId, "cross-project work", t, t);
+  const crossEvidenceId = newId("ev");
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, caption, meta) VALUES (?,?,?,?,?,?)")
+    .run(crossEvidenceId, crossTaskId, t, "test_run", "independently verified", "{}");
+
+  const started = await call(`/api/chat/threads/${portfolioThreadId}/verifications`, "POST", {
+    status: "started",
+    method: "independently re-run the corebeat test suite",
+    target_task_ids: [crossTaskId],
+  });
+  expect(started.status).toBe(201);
+
+  // Evidence attached to the manager task itself (not the target task) counts too.
+  const managerEvidenceId = newId("ev");
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, caption, meta) VALUES (?,?,?,?,?,?)")
+    .run(managerEvidenceId, managerId, t, "test_run", "manager-recorded proof", "{}");
+
+  const passed = await call(`/api/chat/threads/${portfolioThreadId}/verifications`, "POST", {
+    status: "passed",
+    method: "independently re-run the corebeat test suite",
+    result: "all green on corebeat",
+    target_task_ids: [crossTaskId, managerId],
+    evidence_ids: [crossEvidenceId, managerEvidenceId],
+  });
+  expect(passed.status).toBe(201);
+  expect(passed.json.target_task_ids).toEqual([crossTaskId, managerId]);
+});
+
+test("a project-scoped thread still cannot cite tasks or evidence from another project", async () => {
+  const otherProjectId = newId("proj");
+  const t = now();
+  db.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run(otherProjectId, "other", "{}", t);
+  const otherTaskId = newId("task");
+  db.query(
+    "INSERT INTO tasks (id, project_id, title, state, kind, source, created_at, updated_at) VALUES (?,?,?, 'in_progress', 'ship', 'agent', ?, ?)"
+  ).run(otherTaskId, otherProjectId, "other project work", t, t);
+  const otherEvidenceId = newId("ev");
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, caption, meta) VALUES (?,?,?,?,?,?)")
+    .run(otherEvidenceId, otherTaskId, t, "test_run", "not this project's proof", "{}");
+
+  const rejectedTask = await call(`/api/chat/threads/${threadId}/verifications`, "POST", {
+    status: "started",
+    method: "check the other project",
+    target_task_ids: [otherTaskId],
+  });
+  expect(rejectedTask.status).toBe(409);
+
+  const ownTaskId = worker("in-project target");
+  const rejectedEvidence = await call(`/api/chat/threads/${threadId}/verifications`, "POST", {
+    status: "passed",
+    method: "check the other project",
+    result: "borrowed evidence",
+    target_task_ids: [ownTaskId],
+    evidence_ids: [otherEvidenceId],
+  });
+  expect(rejectedEvidence.status).toBe(400);
+});
+
 test("a due run wakeup clears the wait cursor and resumes the manager once", async () => {
   await call(`/api/chat/threads/${threadId}/run`, "PUT", {
     phase: "waiting",
