@@ -538,6 +538,19 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v27-task-pr-state",
     statements: [`ALTER TABLE tasks ADD COLUMN pr_state TEXT`],
   },
+  // A requeue row's parent_task_id is trusted only once its creation event has
+  // been verified (state.ts: verifyRequeueProvenance) — a hand-inserted or
+  // otherwise provenance-less row must never be treated as recovery lineage.
+  // The partial index is what lets the startup/reconciler sweep scan only rows
+  // still awaiting a verdict, instead of every source='requeue' task ever
+  // created (hive-305).
+  {
+    name: "v28-requeue-provenance",
+    statements: [
+      `ALTER TABLE tasks ADD COLUMN requeue_provenance_verified INTEGER NOT NULL DEFAULT 0`,
+      `CREATE INDEX idx_tasks_unverified_requeue ON tasks(id) WHERE source = 'requeue' AND requeue_provenance_verified = 0`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings

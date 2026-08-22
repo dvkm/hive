@@ -62,6 +62,12 @@ function makeTask(db: DB, projectId: string, extra: Partial<{ source: string; pa
   db.query(
     "INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, agent_target, created_at, updated_at) VALUES (?,?,?,?, 'in_progress', 'ship', ?, ?, ?, ?, ?)"
   ).run(id, projectId, "t", "do it", extra.source ?? null, extra.parent ?? null, extra.agent ?? "a" + id.slice(0, 4), t, t);
+  // Mirror requeueTask()'s own creation event so a synthetic 'requeue' row here
+  // reads as trusted provenance (state.ts: verifyRequeueProvenance), same as a
+  // real requeue chain would.
+  if (extra.source === "requeue" && extra.parent)
+    db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+      .run(newId("evt"), id, t, "reconciler", "created", JSON.stringify({ title: "t", requeue_of: extra.parent }));
   return id;
 }
 // Insert an event with an explicit, ordered ts so DESC ordering is deterministic.

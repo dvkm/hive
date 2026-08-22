@@ -275,6 +275,85 @@ export function expireOrphanedDecisions(db: DB): number {
   return n;
 }
 
+// A requeue's parent_task_id is trusted only if it was created through
+// requeueTask's own insert+event pair (api.ts): a 'created' event from
+// source='reconciler' whose payload.requeue_of names this row's parent, and
+// that parent still exists in the same project. Anything else — a
+// hand-inserted row, a rewritten/missing creation event, a cross-project
+// parent — is untrusted lineage a recovery path must not follow.
+function trustedRequeueParent(db: DB, task: any): boolean {
+  if (!task.parent_task_id) return false;
+  const parent = getTask(db, task.parent_task_id);
+  if (!parent || parent.project_id !== task.project_id) return false;
+  return Boolean(
+    db
+      .query(
+        `SELECT 1 FROM events WHERE task_id = ? AND type = 'created' AND source = 'reconciler'
+           AND json_valid(payload) AND json_extract(payload, '$.requeue_of') = ? LIMIT 1`
+      )
+      .get(task.id, task.parent_task_id)
+  );
+}
+
+// Verify (or quarantine) one requeue task's provenance. Idempotent: a
+// verified row is marked once (requeue_provenance_verified=1) so the indexed
+// sweep below never rechecks it. An unverifiable row is detached from its
+// claimed lineage — source flips to 'requeue_quarantined' so nothing
+// downstream ever again treats its parent chain as trusted recovery context
+// — but the task itself stays queued and dispatchable as ordinary work.
+export function verifyRequeueProvenance(db: DB, task: any | null): any | null {
+  if (!task || task.source !== "requeue") return task;
+  if (trustedRequeueParent(db, task)) {
+    if (!task.requeue_provenance_verified) {
+      db.query("UPDATE tasks SET requeue_provenance_verified = 1 WHERE id = ?").run(task.id);
+      return getTask(db, task.id);
+    }
+    return task;
+  }
+  db.transaction(() => {
+    db.query(
+      `UPDATE tasks SET source = 'requeue_quarantined', parent_task_id = NULL, requeue_provenance_verified = 1, updated_at = ? WHERE id = ?`
+    ).run(now(), task.id);
+    writeEvent(db, {
+      task_id: task.id,
+      source: "system",
+      type: "requeue_provenance_rejected",
+      payload: { parent_task_id: task.parent_task_id ?? null },
+    });
+  })();
+  const updated = getTask(db, task.id);
+  broadcastTask(db, updated);
+  return updated;
+}
+
+// Startup/reconciliation sweep. The partial index (db.ts:
+// idx_tasks_unverified_requeue) means this only ever scans rows a prior sweep
+// has not yet resolved — never every historical source='requeue' task —
+// and a verified or quarantined row is never rechecked. Fails closed: if
+// checking a row throws, it is left unverified (picked up again next cycle)
+// rather than assumed trustworthy. Idempotent — safe on every startup and
+// every reconciler cycle.
+export function repairRequeueProvenance(db: DB): number {
+  const rows = db
+    .query(
+      "SELECT id FROM tasks INDEXED BY idx_tasks_unverified_requeue WHERE source = 'requeue' AND requeue_provenance_verified = 0"
+    )
+    .all() as { id: string }[];
+  let quarantined = 0;
+  for (const row of rows) {
+    const task = getTask(db, row.id);
+    if (!task) continue;
+    try {
+      const trusted = trustedRequeueParent(db, task);
+      verifyRequeueProvenance(db, task);
+      if (!trusted) quarantined++;
+    } catch (e) {
+      console.error(`[state] requeue provenance check failed for ${row.id}: ${String((e as any)?.message ?? e)}`);
+    }
+  }
+  return quarantined;
+}
+
 // The one guard against re-queuing a PR whose latest review verdict is "changes
 // requested" before the agent has actually acted (#163, #234). Returns true =
 // still unaddressed = DON'T insert into the review queue. "Addressed" means
