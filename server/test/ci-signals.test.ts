@@ -84,6 +84,9 @@ test("a second PR blocked by the same outage inherits the director's ruling inst
       newId("ev"), taskId, now(), "reconciler", "ci_infra", JSON.stringify({ signal: "parity,syntax:no-steps", head_sha: "abc" })
     );
 
+  // The outage's own diagnostic task: the ruling stands only while this is open.
+  ensureInfraTask(db, projectId, "parity,syntax:no-steps", [{ name: "syntax", infra: "no-steps" }], "https://gh/pr/811");
+
   const a = makeTask(db, projectId, { pr_url: "https://gh/pr/811", ci_status: "unavailable", head_sha: "abc" });
   signalled(a);
   const first = createDecision(db, { task_id: a, title: "Merge PR #811 with CI red?", context: "two checks are red", options });
@@ -97,6 +100,31 @@ test("a second PR blocked by the same outage inherits the director's ruling inst
   expect(second.answer_key).toBe("merge");
   // No second interruption for the same outage.
   expect(db.query("SELECT COUNT(*) AS n FROM notifications WHERE kind = 'decision'").get()).toEqual({ n: 1 } as any);
+
+  // Once the outage's diagnostic task is closed, the ruling has expired with
+  // it: the next PR asks the director again instead of inheriting a stale call.
+  db.query("UPDATE tasks SET state = 'done' WHERE kind = 'chore'").run();
+  const c = makeTask(db, projectId, { pr_url: "https://gh/pr/900", ci_status: "unavailable", head_sha: "abc" });
+  signalled(c);
+  const third = createDecision(db, { task_id: c, title: "Merge PR #900 with CI red?", context: "same two checks are red", options });
+  expect(third.status).toBe("open");
+});
+
+// The false positive two reviewers caught: ordinary English words like "red",
+// "green" and "check" must not tag an unrelated question as a CI card.
+test("a card on a task whose checks are passing is never treated as a CI card", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/1", ci_status: "passing", head_sha: "abc" });
+  const d = createDecision(db, {
+    task_id: id,
+    title: "Keep the red icon or switch to green?",
+    context: "the failing state uses red today",
+    options: [{ key: "a", label: "Red" }, { key: "b", label: "Green" }],
+  });
+  expect(d.bundle.ci).toBeNull();
+  expect((db.query("SELECT ci_status_at_card, ci_signal FROM decisions WHERE id = ?").get(d.id) as any)).toEqual(
+    { ci_status_at_card: null, ci_signal: null } as any
+  );
 });
 
 test("a card citing red checks closes itself once the checks are green, and shows how fresh it is", () => {

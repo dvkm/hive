@@ -854,22 +854,36 @@ function notifyCiUnavailable(db: DB, taskId: string, prUrl: string): void {
 
 const INFRA_TASK_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
+// LIKE pattern for the `ci-signal:` marker a diagnostic task carries in its
+// brief. Check names are workflow/job names, but nothing stops one containing a
+// % or _, which LIKE would read as a wildcard — escape them.
+function signalMarkerLike(signal: string): string {
+  return `%ci-signal: ${signal.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+}
+
+// Is the diagnostic task for this outage still live? A standing ruling on an
+// outage only holds while the outage does, and this task is how hive tracks it:
+// once it is done/failed/cancelled, the next red card asks the director again.
+export function infraTaskOpen(db: DB, projectId: string, signal: string): boolean {
+  return !!db
+    .query(`SELECT id FROM tasks WHERE project_id = ? AND brief LIKE ? ESCAPE '\\' AND state IN ${NON_TERMINAL} LIMIT 1`)
+    .get(projectId, signalMarkerLike(signal));
+}
+
 // One diagnostic task per outage signal, for the whole fleet — not one per
 // blocked PR. Deduped on the `ci-signal:` marker in the brief, so the six PRs
 // that shared today's billing block share one task. Skipped while an earlier
 // task for the same signal is still open.
 export function ensureInfraTask(db: DB, projectId: string, signal: string, red: RedCheck[], prUrl: string): string | null {
-  // ponytail: the marker is matched with LIKE, so a check name containing % or _
-  // would over-match; check names are workflow/job names, which don't.
-  const marker = `ci-signal: ${signal}`;
+  const marker = signalMarkerLike(signal);
   // Still open, or closed within a day: an outage nobody can fix from here (a
   // billing lapse) would otherwise mint a fresh task every cycle after the last
   // one is closed.
   const recent = db
     .query(
-      `SELECT id FROM tasks WHERE brief LIKE ? AND (state IN ${NON_TERMINAL} OR created_at > ?) LIMIT 1`
+      `SELECT id FROM tasks WHERE brief LIKE ? ESCAPE '\\' AND (state IN ${NON_TERMINAL} OR created_at > ?) LIMIT 1`
     )
-    .get(`%${marker}%`, new Date(Date.now() - INFRA_TASK_COOLDOWN_MS).toISOString()) as { id: string } | undefined;
+    .get(marker, new Date(Date.now() - INFRA_TASK_COOLDOWN_MS).toISOString()) as { id: string } | undefined;
   if (recent) return null;
   const t = now();
   const id = newId();
