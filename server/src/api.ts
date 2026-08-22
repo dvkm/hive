@@ -2597,9 +2597,19 @@ export async function mergeTask(
   // reverts base commits outside its original scope, refuse the merge. The
   // director can override with body.override_destructive_check.
   if (!body?.override_destructive_check && project?.repo_path && task.branch) {
+    const linked = db
+      .query("SELECT ts, payload FROM events WHERE task_id = ? AND type = 'pr_linked' ORDER BY ts DESC")
+      .all(id) as { ts: string; payload: string }[];
+    const replacementAt = linked.find((event) => {
+      try {
+        return Boolean(JSON.parse(event.payload)?.replaced);
+      } catch {
+        return false;
+      }
+    })?.ts ?? "";
     const snapEvent: any = db
-      .query("SELECT payload FROM events WHERE task_id = ? AND type = 'branch_scope' ORDER BY ts ASC LIMIT 1")
-      .get(id);
+      .query("SELECT payload FROM events WHERE task_id = ? AND type = 'branch_scope' AND ts > ? ORDER BY ts ASC LIMIT 1")
+      .get(id, replacementAt);
     if (snapEvent) {
       let snapshot: BranchScope | null = null;
       try {
@@ -2610,8 +2620,8 @@ export async function mergeTask(
         // can point somewhere other than the PR head. Rebuild their intended
         // file set from the first exact PR head observed in the same cycle.
         const firstSync = db
-          .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_synchronized' ORDER BY ts ASC LIMIT 1")
-          .get(id) as { payload: string } | undefined;
+          .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_synchronized' AND ts > ? ORDER BY ts ASC LIMIT 1")
+          .get(id, replacementAt) as { payload: string } | undefined;
         let originalHead: string | null = (snapshot as BranchScope & { head_sha?: string | null }).head_sha ?? null;
         try {
           originalHead ||= firstSync ? JSON.parse(firstSync.payload).head_sha ?? null : null;
