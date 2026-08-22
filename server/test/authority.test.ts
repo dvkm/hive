@@ -172,7 +172,7 @@ test("bootstrapAuthority seeds the standing rules and is idempotent", () => {
   expect(bootstrapAuthority(db)).toBe(0); // second boot is a no-op
   const rule = resolveRule(db, projectId, "command.dangerous")!;
   expect(rule.effect).toBe("require_decision");
-  const live = resolveRule(db, projectId, "command.dangerous.live-hive-server-control")!;
+  const live = resolveRule(db, projectId, "command.dangerous.hive-server-restart")!;
   expect(live.effect).toBe("require_decision");
   expect(db.query("SELECT COUNT(*) AS n FROM authority_rules").get() as any).toMatchObject({ n: 2 });
 });
@@ -361,7 +361,7 @@ test("live Hive server control never offers a standing bypass", () => {
   bootstrapAuthority(db);
   const r = authorize(db, {
     project_id: projectId,
-    action: "command.dangerous.live-hive-server-control",
+    action: "command.dangerous.hive-server-restart",
     target: "./scripts/sync-main.sh",
     task_id: taskId,
     summary: "restart the live Hive server",

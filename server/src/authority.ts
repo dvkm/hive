@@ -17,7 +17,7 @@ import { createDecision } from "./api.ts";
 import { queueSteerEvent } from "./steer.ts";
 
 const GRANT_TTL_MS = 24 * 60 * 60 * 1000;
-const LIVE_SERVER_ACTION = "command.dangerous.live-hive-server-control";
+const LIVE_SERVER_ACTION = "command.dangerous.hive-server-restart";
 
 // Actions that require an answered decision even with NO matching rule. A fresh
 // install, a wiped DB, or a deleted rule must not silently auto-run `rm -rf`.

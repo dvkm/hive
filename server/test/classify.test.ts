@@ -141,6 +141,28 @@ test("dangerous commands never classify as safe", () => {
   }
 });
 
+test("restarting the live hive server is dangerous (agents die in batches)", () => {
+  for (const cmd of [
+    "launchctl kickstart -k gui/501/dev.hive.server",
+    "launchctl bootout gui/501/dev.hive.server",
+    "./scripts/sync-main.sh",
+    "bash scripts/sync-main.sh",
+    "/Users/you/projects/hive-live/bin/hive serve",
+    "hive serve",
+    "bun run server/src/index.ts",
+    "bun --watch server/src/index.ts",
+  ]) {
+    const r = classify(cmd);
+    expect(r.decision, cmd).toBe("dangerous");
+    expect(r.reason, cmd).toContain("hive server restart");
+  }
+  expect(actionFor("dangerous", "hive server restart")).toBe("command.dangerous.hive-server-restart");
+  // reading about it is not restarting it
+  for (const cmd of ["grep -rn 'launchctl kickstart' scripts", "sed -n '1,40p' scripts/sync-main.sh", "hive task list"]) {
+    expect(classify(cmd).decision, cmd).not.toBe("dangerous");
+  }
+});
+
 test("safe commands classify as safe", () => {
   for (const cmd of safe) {
     const r = classify(cmd);
