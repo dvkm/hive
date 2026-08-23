@@ -168,11 +168,13 @@ test("require_decision with no task to answer it fails closed (deny, no crash)",
 
 test("bootstrapAuthority seeds the standing rules and is idempotent", () => {
   const { db, projectId } = freshDb();
-  expect(bootstrapAuthority(db)).toBe(1);
+  expect(bootstrapAuthority(db)).toBe(2);
   expect(bootstrapAuthority(db)).toBe(0); // second boot is a no-op
   const rule = resolveRule(db, projectId, "command.dangerous")!;
   expect(rule.effect).toBe("require_decision");
-  expect(db.query("SELECT COUNT(*) AS n FROM authority_rules").get() as any).toMatchObject({ n: 1 });
+  const live = resolveRule(db, projectId, "command.dangerous.hive-server-restart")!;
+  expect(live.effect).toBe("require_decision");
+  expect(db.query("SELECT COUNT(*) AS n FROM authority_rules").get() as any).toMatchObject({ n: 2 });
 });
 
 // ---------------------------------------------------------------- grants: single-use + expiry
@@ -351,6 +353,21 @@ test("non-command actions do NOT offer approve_always", () => {
   const r = authorize(db, { project_id: projectId, action: "deploy.prod", target: "acme-web", task_id: taskId });
   const decisionId = r.effect === "require_decision" ? r.decision_id : "";
   const d: any = db.query("SELECT * FROM decisions WHERE id = ?").get(decisionId);
+  expect(JSON.parse(d.options).some((o: any) => o.key === "approve_always")).toBe(false);
+});
+
+test("live Hive server control never offers a standing bypass", () => {
+  const { db, taskId, projectId } = freshDb();
+  bootstrapAuthority(db);
+  const r = authorize(db, {
+    project_id: projectId,
+    action: "command.dangerous.hive-server-restart",
+    target: "./scripts/sync-main.sh",
+    task_id: taskId,
+    summary: "restart the live Hive server",
+  });
+  const decisionId = r.effect === "require_decision" ? r.decision_id : "";
+  const d: any = db.query("SELECT options FROM decisions WHERE id = ?").get(decisionId);
   expect(JSON.parse(d.options).some((o: any) => o.key === "approve_always")).toBe(false);
 });
 

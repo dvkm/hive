@@ -284,6 +284,12 @@ async function probeAgent(
 ): Promise<{ alive: boolean; status: AgentStatus; unconfirmed?: boolean }> {
   const p = await h.probe(target);
   if (p.alive) return p;
+  // A server takeover can briefly make `agent get` miss an agent that is
+  // already present in herdr's live registry. Trust the fleet snapshot before
+  // consulting pane absence, which can otherwise turn that startup race into
+  // a false death verdict.
+  if ((await h.listAgents()).some((agent) => agent.name === target))
+    return { alive: true, status: "unknown" };
   const task = getTask(db, taskId);
   const meta = spawnMeta(db, taskId);
   const hint = { cwd: task?.worktree_path ?? null, tabId: meta.tab_id, terminalId: meta.terminal_id };

@@ -803,6 +803,7 @@ export class Herdr {
   // unregistered. An empty/unavailable pane list is NOT evidence of death
   // either — that is exactly what a down daemon looks like.
   async confirmGone(hint: { cwd?: string | null; tabId?: string | null; terminalId?: string | null }): Promise<boolean> {
+    if (!hint.cwd && !hint.tabId && !hint.terminalId) return false;
     const panes = await this.listPanes();
     if (!panes.length) return false;
     return !panes.some(

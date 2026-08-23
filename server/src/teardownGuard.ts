@@ -1,5 +1,5 @@
-// Two gates that must both be open before hive tears anything down (fails a
-// task, requeues it, removes a worktree, closes a tab). Both exist because the
+// Three gates that must all be open before hive tears anything down (fails a
+// task, requeues it, removes a worktree, closes a tab). They exist because the
 // same class of accident keeps happening: hive loses VISIBILITY of a healthy
 // fleet and reads it as a fleet of dead agents.
 //
@@ -12,6 +12,8 @@
 //      failure, not N simultaneous agent deaths. Stop sweeping and put ONE card
 //      in front of the director instead of reaping the whole fleet one lap at a
 //      time (2026-08-19: 12+ live agents failed with their tabs closed).
+//   3. Lease ownership — a displaced server can run one last loop before its
+//      lease heartbeat exits. It must not act on its stale view of the fleet.
 import type { DB } from "./db.ts";
 import { getSetting } from "./db.ts";
 import { holdsLease } from "./lease.ts";
