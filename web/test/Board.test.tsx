@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { act, create } from "react-test-renderer";
 import { MemoryRouter } from "react-router-dom";
 import { Ctx, type Store } from "../src/lib/store";
-import type { Task } from "../src/lib/api";
-import { Card } from "../src/views/Board";
+import type { LandGraph, Task } from "../src/lib/api";
+import { Card, LandChips } from "../src/views/Board";
 
 const fakeStore = {
   projects: [],
@@ -82,4 +82,47 @@ test("dispatch now shows normally for an ordinary (non-external) queued task", a
     renderer = create(tree(t));
   });
   expect(btn(renderer, "dispatch now").length).toBe(1);
+});
+
+// The board says WHY a review card will wait its turn — one line, and only
+// when an edge actually exists (ADHD policy: no chip with nothing to say).
+const chipText = (renderer: ReturnType<typeof create>) =>
+  renderer.root
+    .findAll((n) => typeof n.type === "string" && n.type === "span" && String(n.props.className ?? "").includes("chip"))
+    .map((n) => n.children.join(""))
+    .join(" | ");
+
+const chips = async (t: Task, graph: LandGraph, tasks: Task[]) => {
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(<LandChips task={t} graph={graph} tasks={tasks} />);
+  });
+  return chipText(renderer);
+};
+
+test("land chips name the dependency and the conflicting PR", async () => {
+  const a = task("a", { number: 11, state: "in_review" });
+  const b = task("b", { number: 12, state: "in_review" });
+  const c = task("c", { number: 13, state: "in_review", land_queued_at: "2026-01-01T00:00:00.000Z" });
+  const graph: LandGraph = {
+    nodes: [],
+    edges: [
+      { from: a.id, to: c.id, kind: "depends" },
+      { from: b.id, to: c.id, kind: "conflict", files: ["src/autosave.ts"] },
+    ],
+  };
+  const text = await chips(c, graph, [a, b, c]);
+  expect(text).toContain("queued to land");
+  expect(text).toContain("lands after #11");
+  expect(text).toContain("conflicts with #12");
+  expect(await chips(b, graph, [a, b, c])).toContain("conflicts with #13");
+});
+
+test("a review card with no edges and no mark shows no land line at all", async () => {
+  const a = task("a", { number: 11, state: "in_review" });
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(<LandChips task={a} graph={{ nodes: [], edges: [] }} tasks={[a]} />);
+  });
+  expect(renderer.toJSON()).toBeNull();
 });

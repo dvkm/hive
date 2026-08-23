@@ -119,6 +119,7 @@ export interface Task {
   duplicate_of: string | null; // survivor id when cancelled as a duplicate
   depends_on: string[]; // task ids governed by the server dependency gate (docs/API.md)
   deferred_until?: string | null; // parked pending an offline human action; nudges suppressed while future-dated
+  land_queued_at?: string | null; // marked approved-to-land; the land queue merges it in graph order
   health?: Health | null;
   requeued_to?: string | null; // successor id when failed + auto-requeued
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
@@ -421,6 +422,14 @@ export const MAX_DIFF_LINES = 20000;
 export interface BranchCheck {
   unmet_deps: { id: string; number: number; title: string; state: State }[];
   embedded_tasks: { id: string; number: number; title: string }[];
+}
+
+// The land queue's ordering graph (server/src/landQueue.ts). `from` lands
+// before `to`: "depends" is declared (depends_on or a brief line), "conflict"
+// is inferred from two branches touching the same files.
+export interface LandGraph {
+  nodes: { id: string; number: number; project_number: number | null; title: string; land_queued_at: string | null }[];
+  edges: { from: string; to: string; kind: "depends" | "conflict"; files?: string[] }[];
 }
 
 // One global-search hit. task_state/project_id are present only for task hits.
@@ -752,6 +761,12 @@ export const api = {
   duplicates: () =>
     req<{ clusters: { project_id: string; tasks: Pick<Task, "id" | "title" | "project_id" | "state">[] }[] }>(`/api/tasks/duplicates`),
   diff: (id: string) => req<DiffResult>(`/api/tasks/${id}/diff`),
+  landGraph: (project?: string) => req<LandGraph>(`/api/tasks/land-graph${project ? `?project=${project}` : ""}`),
+  landQueue: (task_ids: string[], queued = true) =>
+    req<{ changed: string[]; queued: boolean }>(`/api/tasks/land-queue`, {
+      method: "POST",
+      body: JSON.stringify({ task_ids, queued }),
+    }),
   branchCheck: (id: string) => req<BranchCheck>(`/api/tasks/${id}/branch-check`),
   merge: (id: string, strategy?: "local_ff") =>
     req<Task>(`/api/tasks/${id}/merge`, {

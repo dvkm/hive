@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
-import type { Health, Kind, State, Task } from "../lib/api";
+import type { Health, Kind, LandGraph, State, Task } from "../lib/api";
 import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
@@ -192,6 +192,48 @@ export function Card({ task }: { task: Task }) {
   );
 }
 
+// ---- land queue (task #1257) --------------------------------------------
+// Tick the PRs you want landed, hit the button once, and hive merges them in
+// graph order: declared dependencies first, and never two conflicting branches
+// in the same sweep. The chips say why a card will wait.
+function useLandGraph(signature: string, project: string): LandGraph {
+  const [graph, setGraph] = useState<LandGraph>({ nodes: [], edges: [] });
+  useEffect(() => {
+    api.landGraph(project || undefined).then(setGraph).catch(() => {});
+  }, [signature, project]);
+  return graph;
+}
+
+export function LandChips({ task, graph, tasks }: { task: Task; graph: LandGraph; tasks: Task[] }) {
+  const incoming = graph.edges.filter((e) => e.to === task.id);
+  const conflicts = graph.edges.filter((e) => e.kind === "conflict" && (e.from === task.id || e.to === task.id));
+  if (!incoming.length && !conflicts.length && !task.land_queued_at) return null;
+  const name = (id: string) => {
+    const t = tasks.find((x) => x.id === id);
+    return t ? taskLabel(t) : id.slice(0, 6);
+  };
+  const after = incoming.filter((e) => e.kind === "depends").map((e) => name(e.from));
+  const clash = conflicts.map((e) => ({ ...e, peer: e.from === task.id ? e.to : e.from }));
+  return (
+    <div className="card-meta card-land">
+      {task.land_queued_at && <span className="chip chip-land" title="Approved to land; waiting for its turn in the queue">⏳ queued to land</span>}
+      {after.length > 0 && (
+        <span className="chip chip-blocked" title="Declared dependency: this lands only after those have merged">
+          lands after {after.join(", ")}
+        </span>
+      )}
+      {clash.length > 0 && (
+        <span
+          className="chip chip-blocked"
+          title={clash.map((e) => `${name(e.peer)}: ${(e.files ?? []).join(", ")}`).join("\n")}
+        >
+          conflicts with {clash.map((e) => name(e.peer)).join(", ")}
+        </span>
+      )}
+    </div>
+  );
+}
+
 const BANNER_DISMISS_KEY = "hive.brief.bannerDismissed";
 
 // Slim, dismissible banner nudging the director to Needs you when there are
@@ -238,6 +280,7 @@ export default function Board() {
   const setFilter = setProjectFilter;
   // Instant client-side card filter (title/summary substring), no server call.
   const [cardFilter, setCardFilter] = useState("");
+  const [landSel, setLandSel] = useState<string[]>([]);
   const scoped = projectFilter ? tasks.filter((t) => t.project_id === projectFilter) : tasks;
   const q = cardFilter.trim().toLowerCase();
   const matches = (task: Task) => task.title.toLowerCase().includes(q) || (task.summary || "").toLowerCase().includes(q);
@@ -251,6 +294,20 @@ export default function Board() {
     return list;
   };
   const verifying = visible.filter((task) => !isTrackingOnly(task) && task.state === "verifying");
+  // Refetch the ordering graph whenever the review column changes: an edge is
+  // only meaningful between two PRs that are both still open.
+  const reviewIds = visible.filter((t) => t.state === "in_review").map((t) => t.id).sort().join(",");
+  const landGraph = useLandGraph(reviewIds, projectFilter);
+  const toggleLand = (id: string) => setLandSel((sel) => (sel.includes(id) ? sel.filter((x) => x !== id) : [...sel, id]));
+  const queueLand = async () => {
+    try {
+      const { changed } = await api.landQueue(landSel);
+      setLandSel([]);
+      toast(`${changed.length} queued to land`);
+    } catch (err) {
+      toast((err as Error).message);
+    }
+  };
   const tracked = visible.filter((task) => isTrackingOnly(task) && BOARD_STATES.has(task.state));
 
   return (
@@ -320,11 +377,30 @@ export default function Board() {
                         + New task
                       </button>
                     )}
+                    {state === "in_review" && landSel.length > 0 && (
+                      <button className="btn btn-primary btn-new" onClick={queueLand} title="Hive merges these in dependency order, one conflicting branch at a time">
+                        Land {landSel.length}
+                      </button>
+                    )}
                     <span className="col-count">{list.length}</span>
                   </div>
                 </header>
                 <div className="col-body">
-                  {list.map((t) => <Card key={t.id} task={t} />)}
+                  {list.map((t) =>
+                    state === "in_review" ? (
+                      <div className="land-row" key={t.id}>
+                        <label className="land-pick" title="Select for the land queue">
+                          <input type="checkbox" checked={landSel.includes(t.id)} onChange={() => toggleLand(t.id)} />
+                        </label>
+                        <div className="land-card">
+                          <Card task={t} />
+                          <LandChips task={t} graph={landGraph} tasks={visible} />
+                        </div>
+                      </div>
+                    ) : (
+                      <Card key={t.id} task={t} />
+                    )
+                  )}
                   {list.length === 0 && <Empty compact {...COL_EMPTY[state]} />}
                 </div>
               </section>

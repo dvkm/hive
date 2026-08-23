@@ -878,6 +878,27 @@ a {
   color: var(--text-dim);
   border-color: var(--border);
 }
+/* Land queue: the tick box beside a review card, and the "why it waits" line. */
+.chip-land {
+  color: var(--green);
+  border-color: var(--border);
+}
+.land-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+.land-pick {
+  padding-top: 10px;
+  cursor: pointer;
+}
+.land-card {
+  flex: 1;
+  min-width: 0;
+}
+.card-land {
+  padding: 0 2px 4px;
+}
 .chip-duplicate {
   color: var(--text-dim);
   border-color: var(--border);

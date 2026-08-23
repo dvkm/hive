@@ -44,6 +44,9 @@ Usage:
         [--body <s>] [--task <src-task-id>] [--root-cause]  (root-cause: failure only, auto-spawns a chore task)
   hive learning list [--project <id>] [--status active|resolved]
   hive learning recur <learning-id>
+  hive land <task-id...> [--off]          mark in-review tasks approved-to-land; hive merges
+        them in graph order (declared dependencies first, one conflicting branch per sweep)
+  hive land-graph [--project <id>]        show the review column's ordering edges
   hive recall <keywords>                  search project knowledge (references, learnings, policies)
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
@@ -247,6 +250,28 @@ async function main() {
       return;
     }
     die(`unknown 'task' subcommand: ${sub}\n\n${USAGE}`);
+  }
+
+  if (cmd === "land") {
+    const { _, flags } = parseFlags(argv.slice(1));
+    if (!_.length) die("usage: hive land <task-id...> [--off]");
+    const res = await api("POST", "/api/tasks/land-queue", { task_ids: _, queued: !flags.off });
+    console.log(`${res.changed.length} task(s) ${res.queued ? "queued to land" : "removed from the land queue"}`);
+    return;
+  }
+
+  if (cmd === "land-graph") {
+    const { flags } = parseFlags(argv.slice(1));
+    const qs = flags.project ? `?project=${encodeURIComponent(String(flags.project))}` : "";
+    const g = await api("GET", `/api/tasks/land-graph${qs}`);
+    const name = (id: string) => {
+      const n = g.nodes.find((x: any) => x.id === id);
+      return n ? `#${n.number} ${n.title}` : id;
+    };
+    if (!g.edges.length) return console.log("(no ordering edges — every open PR can land on its own)");
+    for (const e of g.edges)
+      console.log(`${name(e.to)}  ${e.kind === "depends" ? "lands after" : "conflicts with"}  ${name(e.from)}${e.files ? ` (${e.files.join(", ")})` : ""}`);
+    return;
   }
 
   if (cmd === "emit") {

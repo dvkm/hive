@@ -77,6 +77,7 @@ import { autoResumeOnTurnEnd } from "./resume.ts";
 import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
+import { landGraph, markLand } from "./landQueue.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, isSafeRef, projectBaseBranch, projectComparisonBase, preferSafeRef } from "./exec.ts";
@@ -359,6 +360,27 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (pathname === "/api/tasks") {
         if (method === "GET") return listTasks(db, url);
         if (method === "POST") return await createTask(db, req);
+      }
+      // Land queue (task #1257). Both must precede the /:id route so their
+      // path segment isn't parsed as a task id.
+      // POST /api/tasks/land-queue {task_ids: [...], queued?: bool} — mark (or
+      // unmark) in-review tasks as approved-to-land, in ONE call.
+      if (pathname === "/api/tasks/land-queue" && method === "POST") {
+        const body = await safeJson(req);
+        const ids = Array.isArray(body?.task_ids) ? body.task_ids.map(String) : [];
+        if (!ids.length) return err("task_ids must be a non-empty array", 400);
+        const queued = body?.queued !== false;
+        return json({ changed: markLand(db, ids, queued), queued });
+      }
+      // GET /api/tasks/land-graph?project=<id> — the review column's ordering
+      // edges (declared dependencies + inferred file conflicts) for the board.
+      if (pathname === "/api/tasks/land-graph" && method === "GET") {
+        const projectId = url.searchParams.get("project");
+        const projects = projectId
+          ? [{ id: projectId }]
+          : (db.query("SELECT id FROM projects").all() as { id: string }[]);
+        const graphs = await Promise.all(projects.map((p) => landGraph(db, p.id, deps.exec ?? defaultExec)));
+        return json({ nodes: graphs.flatMap((g) => g.nodes), edges: graphs.flatMap((g) => g.edges) });
       }
       // Duplicate CLUSTERS among current non-terminal tasks (backfill/UI). Must
       // precede the /:id route so "duplicates" isn't parsed as a task id.
