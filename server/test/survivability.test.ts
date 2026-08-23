@@ -13,6 +13,7 @@ const { openDb, newId, now, setSetting } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
 const { reconcileOnce } = await import("../src/reconciler.ts");
 const { reapOnce } = await import("../src/reaper.ts");
+const { claimLease } = await import("../src/lease.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { getTask } = await import("../src/state.ts");
 const { teardownBlocked } = await import("../src/teardownGuard.ts");
@@ -119,6 +120,49 @@ test("a wiped herdr registry does NOT cost the agent its task: hive re-adopts th
   // Status flows again on the very same cycle.
   const status: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'agent_status' ORDER BY ts DESC LIMIT 1").get(id);
   expect(JSON.parse(status.payload).status).toBe("working");
+});
+
+test("a server takeover preserves every agent in herdr's live registry and reaps nothing", async () => {
+  const { db, projectId } = freshDb();
+  claimLease(db, 100);
+  const replacement = claimLease(db, 200);
+  const ids = Array.from({ length: 5 }, (_, i) => makeTask(db, projectId, `fleet-${i}`, `/wt/hive-fleet-${i}`));
+  for (const id of ids) db.query("UPDATE tasks SET agent_target = ?, worktree_path = ? WHERE id = ?").run(id, `/wt/hive-${id}`, id);
+  for (const id of ids) putEvent(db, id, "spawned");
+  setSetting(db, "server_started_at", new Date(Date.now() - 10 * 60_000).toISOString());
+
+  const calls: string[][] = [];
+  const agents = ids.map((id, i) => ({ name: id, pane_id: `w1:p${i}`, tab_id: `w1:t${i}`, cwd: `/wt/hive-${id}` }));
+  const panes = agents.map((agent) => ({
+    pane_id: agent.pane_id,
+    tab_id: agent.tab_id,
+    workspace_id: "w1",
+    cwd: agent.cwd,
+    agent: "claude",
+    label: agent.name,
+  }));
+  const herdr = new Herdr(async (argv) => {
+    calls.push(argv);
+    if (has(argv, "agent", "list")) return OK(JSON.stringify({ result: { agents } }));
+    if (has(argv, "agent", "get")) return NOT_FOUND;
+    if (has(argv, "pane", "list")) return OK(JSON.stringify({ result: { panes } }));
+    return OK();
+  }, "herdr");
+
+  await reconcileOnce(db, { ...inert, herdr, nowMs: () => Date.now(), instanceId: replacement.instance });
+
+  const worktrees = ids.map((id) => `worktree /wt/hive-${id}\nbranch refs/heads/hive/${id}\n`).join("\n");
+  const reapCalls: string[][] = [];
+  await reapOnce(db, { herdr, exec: async (argv) => {
+    reapCalls.push(argv);
+    return OK(worktrees);
+  }, instanceId: replacement.instance });
+
+  expect(ids.every((id) => getTask(db, id).state === "in_progress")).toBe(true);
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE type = 'agent_status' AND json_extract(payload, '$.status') = 'gone'").get()).toMatchObject({ n: 0 });
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE type = 'recovery' AND json_extract(payload, '$.decision') = 'dead'").get()).toMatchObject({ n: 0 });
+  expect(calls.filter((argv) => has(argv, "agent", "close") || has(argv, "tab", "close") || has(argv, "worktree", "remove"))).toEqual([]);
+  expect(reapCalls.filter((argv) => argv.includes("remove"))).toEqual([]);
 });
 
 test("re-adoption never binds a steer to the tab's shell pane", async () => {

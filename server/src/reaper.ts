@@ -40,7 +40,7 @@ export async function reapOnce(db: DB, deps: ReaperDeps = {}): Promise<void> {
     setSetting(db, "last_reap_at", now()); // the loop is healthy, just idle
     return;
   }
-  // Same two gates the reconciler's recovery path uses: don't remove worktrees
+  // Same gates the reconciler's recovery path uses: don't remove worktrees
   // or close tabs while hive's own view of the fleet is unreliable (the minutes
   // right after a boot/self-deploy, or while the death-burst breaker is open).
   const blocked = teardownBlocked(db, Date.now(), deps.instanceId);
