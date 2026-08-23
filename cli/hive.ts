@@ -84,7 +84,7 @@ Usage:
         the desktop app rendered it (proves the whole chain without a real event)
   hive open                               open the board in a browser
   hive app                                open the hive desktop app (native notifications
-        + dock badge; build once: cd electron && bun install && bun run build)
+        + dock badge; install once: cd electron && bun install && bun run install-app)
 
 Env: HIVE_URL, HIVE_PORT, HIVE_DB, BW_SESSION`;
 
@@ -945,13 +945,15 @@ async function main() {
     return;
   }
 
-  // The hive desktop app (Electron: native notifications + dock badge), built
-  // at electron/dist by `bun run build` in electron/. Falls back to a
-  // chromeless Chrome window, then the default browser.
+  // The hive desktop app (Electron: native notifications + dock badge). Always
+  // the installed bundle, never a checkout copy: launching a bundle re-registers
+  // it with LaunchServices, so opening a worktree build would steal `dev.hive.app`
+  // and the hive:// deeplinks back from the canonical install.
+  // Falls back to a chromeless Chrome window, then the default browser.
   if (cmd === "app") {
     const url = BASE + "/";
     const { existsSync } = await import("node:fs");
-    const appPath = new URL("../electron/dist/mac-arm64/hive.app", import.meta.url).pathname;
+    const appPath = "/Applications/hive.app";
     if (existsSync(appPath)) {
       Bun.spawn(["open", appPath], { stdout: "ignore", stderr: "ignore" });
       console.log(`opening hive.app (${appPath})`);
@@ -960,7 +962,7 @@ async function main() {
     const chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
     try {
       Bun.spawn([chrome, `--app=${url}`], { stdout: "ignore", stderr: "ignore" });
-      console.log(`hive.app not built (cd electron && bun install && bun run build) — Chrome app window on ${url}`);
+      console.log(`hive.app not installed (cd electron && bun install && bun run install-app) — Chrome app window on ${url}`);
     } catch {
       Bun.spawn(["open", url]);
       console.log(`opened ${url} in the default browser`);

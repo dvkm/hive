@@ -153,6 +153,12 @@ server/test/ bun test suite
   is attached does it fall back to launching the app with a `hive://` URL.
   `delivered_at` is set when the app reports the notification actually rendered,
   not when the server tried. Clicking one opens the exact task or decision.
+  `cd electron && bun install && bun run build` builds the app into the checkout;
+  `bun run install-app` in `electron/` builds and then installs that bundle to
+  `/Applications/hive.app`, the canonical copy macOS resolves `dev.hive.app` and
+  `hive://` to. Everything that launches the app (`hive app`, the post-deploy
+  restart) opens that installed copy, so a checkout build never re-registers
+  itself as `dev.hive.app`.
   `hive://` deeplinks work from anywhere (Terminal, another app, a script):
 
   ```

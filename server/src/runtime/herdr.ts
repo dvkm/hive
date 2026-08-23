@@ -962,6 +962,8 @@ export class Herdr {
       if (commit.code !== 0) throw new HerdrError(`ghost commit failed: ${commit.stderr.trim() || commit.stdout.trim()}`);
     }
 
+    await this.unregisterBuiltApp(wt.path);
+
     const rm = await this.exec(["git", "-C", args.repoPath, "worktree", "remove", "--force", wt.path]);
     if (rm.code !== 0) throw new HerdrError(`worktree remove failed: ${rm.stderr.trim() || rm.stdout.trim()}`);
     return {
@@ -997,6 +999,7 @@ export class Herdr {
     return withWorktreeLock(args.repoPath, args.branch, async () => {
       const safe = await this.branchIsSafe(args.repoPath, args.branch, args.defaultBranch ?? "main");
       if (!safe.safe) return { removed: false, reason: safe.reason };
+      await this.unregisterBuiltApp(args.worktreePath);
       const r = await this.run(worktreeRemoveArgv({ workspaceId: args.workspaceId }));
       if (r.code !== 0)
         throw new HerdrError(`worktree remove failed: ${r.stderr.trim() || r.stdout.trim()}`);
@@ -1043,6 +1046,22 @@ export class Herdr {
     return withWorktreeLock(args.repoPath, args.branch, () => this.cleanupWorktreeCore(args));
   }
 
+  // Best-effort: drop a worktree's built hive.app from LaunchServices before the
+  // worktree disappears, so 'open -b dev.hive.app' / hive:// deeplinks stop being
+  // able to resolve to a now-gone path (task #1288 / hive-313). Never throws: a
+  // missing lsregister (non-macOS, sandboxed runner) must not block removal.
+  private async unregisterBuiltApp(worktreePath: string): Promise<void> {
+    try {
+      await this.exec([
+        "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
+        "-u",
+        join(worktreePath, "electron/dist/mac-arm64/hive.app"),
+      ]);
+    } catch {
+      // ignored
+    }
+  }
+
   private async cleanupWorktreeCore(args: {
     repoPath: string;
     branch: string;
@@ -1052,6 +1071,8 @@ export class Herdr {
   }): Promise<{ removed: boolean; reason: string; ghost_branch: string | null }> {
     const safe = await this.branchIsSafe(args.repoPath, args.branch, args.defaultBranch ?? "main");
     if (!safe.safe) return { removed: false, reason: safe.reason, ghost_branch: null };
+
+    await this.unregisterBuiltApp(args.worktreePath);
 
     const status = await this.exec(["git", "-C", args.worktreePath, "status", "--porcelain"]);
     const trackedDirty =

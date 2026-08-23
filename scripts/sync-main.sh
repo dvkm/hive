@@ -49,7 +49,10 @@ if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
   git merge --ff-only FETCH_HEAD --quiet
   (cd server && bun install --silent >/dev/null)
   (cd web && bun install --silent >/dev/null && bun run build >/dev/null)
-  (cd electron && bun install --silent >/dev/null && bun run build >/dev/null)
+  # Non-fatal: a failed /Applications write must not strand the server on old
+  # code — the ff-merge already happened, so a hard exit here is never retried.
+  (cd electron && bun install --silent >/dev/null && bun run install-app >/dev/null) ||
+    echo "[$(date '+%F %T')] WARNING: electron install-app failed; /Applications/hive.app is stale"
   # bun --watch hot reload is unreliable; always kickstart after a live merge
   launchctl kickstart -k "gui/$(id -u)/dev.hive.server"
   # kickstart -k kills the JOB, not the tree: on 2026-08-19 four `bun --watch`
@@ -70,7 +73,7 @@ if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
   fi
   # The desktop app keeps its existing Chromium renderer across server deploys.
   # Restart it when it is already open so the user sees the deployed assets.
-  APP="$LIVE/electron/dist/mac-arm64/hive.app"
+  APP="/Applications/hive.app"
   if pgrep -f "$APP/Contents/MacOS/hive" >/dev/null; then
     osascript -e 'tell application id "dev.hive.app" to quit' || true
     for _ in {1..50}; do
