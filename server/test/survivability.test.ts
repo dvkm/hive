@@ -245,9 +245,13 @@ test("a burst of death verdicts trips the breaker: sweeps pause and ONE card is 
   await reapOnce(db, { exec: async (argv) => (calls.push(argv), OK()) });
   expect(calls).toEqual([]);
 
-  // Answering the card resumes everything.
-  db.query("UPDATE decisions SET status = 'answered' WHERE status = 'open'").run();
+  // Answering the card resumes everything without immediately reusing the
+  // same three death verdicts to open another card.
+  db.query("UPDATE decisions SET status = 'answered', answered_at = ? WHERE status = 'open'").run(now());
   expect(teardownBlocked(db)).toBeNull();
+  await reconcileOnce(db, { ...inert, herdr: reallyDead() });
+  expect(db.query("SELECT COUNT(*) AS n FROM decisions").get()).toMatchObject({ n: 1 });
+  expect(getTask(db, id).state).toBe("failed");
 });
 
 test("closeSession refuses a recycled tab id that now holds someone else", async () => {

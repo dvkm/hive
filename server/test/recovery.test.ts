@@ -102,13 +102,7 @@ test("dead agent → capture pane tail, fail, auto-requeue (attempt 1)", async (
   expect(JSON.parse(requeued.payload).attempt).toBe(1);
 });
 
-// hive-1090: a requeue used to copy only the original brief, dropping the
-// failed attempt's branch/PR — a fresh agent, blind to that, could rebuild the
-// whole feature as a second conflicting PR (the exact incident this closes:
-// task #1123 died with PR 819 open, its auto-requeue opened PR 825 instead of
-// adopting it). requeueTask now prepends a RESUME section and records the
-// pointer structurally on the new row.
-test("dead agent with an open PR → requeue's brief leads with the adopt-this-PR pointer, and the original keeps its pr_url (never orphaned/cleared)", async () => {
+test("dead agent with an open PR is a completion, not a recovery death", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { agent: "a1" });
   const branch = `hive/${id}`;
@@ -120,20 +114,23 @@ test("dead agent with an open PR → requeue's brief leads with the adopt-this-P
 
   await reconcileOnce(db, { ...inert, herdr });
 
-  const requeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(id);
-  expect(requeue).toBeTruthy();
-  expect(requeue.resume_branch).toBe(branch);
-  expect(requeue.resume_pr_url).toBe(prUrl);
-  expect(requeue.brief.startsWith("<!-- hive:resume -->\n**RESUME")).toBe(true); // leads the brief, not buried
-  expect(requeue.brief).toContain(prUrl);
-  expect(requeue.brief).toContain(branch);
-  expect(requeue.brief).toContain(`- Branch to merge in: \`${branch}\`\n`);
-  expect(requeue.brief).toContain(`- Open PR: ${prUrl} (last known head \`${headSha}\`)`);
-  expect(requeue.brief.toLowerCase()).toContain("do not rebuild");
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery'").get(id)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(id)).toBeFalsy();
+});
 
-  // the failed predecessor's own pr_url is never cleared/orphaned by the
-  // recovery it just went through — it's the thing the requeue points back at.
-  expect(getTask(db, id).pr_url).toBe(prUrl);
+test("dead agent after reaching review is a completion, even if the task returned to in_progress", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent: "a1" });
+  putEvent(db, id, "state_change", { from: "in_progress", to: "in_review" });
+  putEvent(db, id, "state_change", { from: "in_review", to: "in_progress" });
+  putEvent(db, id, "spawned");
+  const { herdr } = herdrProbe("dead");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery'").get(id)).toBeFalsy();
 });
 
 test("requeue of a task whose PR already closed adopts the branch but drops the (stale) PR pointer", async () => {
@@ -156,7 +153,7 @@ test("requeue of a task whose PR already closed adopts the branch but drops the 
   expect(requeue.brief).not.toContain(headSha);
 });
 
-test("a historical PR closure does not hide an open replacement PR", async () => {
+test("a historical PR closure does not hide an open replacement PR completion", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { agent: "a1" });
   const branch = `hive/${id}`;
@@ -170,10 +167,9 @@ test("a historical PR closure does not hide an open replacement PR", async () =>
 
   await reconcileOnce(db, { ...inert, herdr });
 
-  const requeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(id);
-  expect(requeue.resume_pr_url).toBe(replacementPrUrl);
-  expect(requeue.brief).toContain(replacementPrUrl);
-  expect(requeue.brief).not.toContain(closedPrUrl);
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery'").get(id)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(id)).toBeFalsy();
 });
 
 test("requeueTask refreshes a stale source snapshot before creating the successor", () => {
@@ -253,7 +249,7 @@ test("a spawned requeue surfaces its own and inherited branches", async () => {
   expect(secondRequeue.brief).toContain(inheritedBranch);
 });
 
-test("a copied inherited PR remains independent from branch selection", async () => {
+test("a copied inherited open PR marks the retry as completed agent work", async () => {
   const { db, projectId } = freshDb();
   const original = makeTask(db, projectId);
   const inheritedBranch = `hive/${original}`;
@@ -270,14 +266,12 @@ test("a copied inherited PR remains independent from branch selection", async ()
 
   await reconcileOnce(db, { ...inert, herdr });
 
-  const secondRequeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(firstRequeue);
-  expect(secondRequeue.resume_branch).toBe(spawnedBranch);
-  expect(secondRequeue.resume_pr_url).toBe(inheritedPrUrl);
-  expect(secondRequeue.brief).toContain(spawnedBranch);
-  expect(secondRequeue.brief).toContain(inheritedBranch);
+  expect(getTask(db, firstRequeue).state).toBe("in_progress");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery'").get(firstRequeue)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(firstRequeue)).toBeFalsy();
 });
 
-test("a spawned requeue keeps its own PR while surfacing its inherited branch", async () => {
+test("a spawned requeue with its own open PR marks the retry as completed agent work", async () => {
   const { db, projectId } = freshDb();
   const original = makeTask(db, projectId);
   const inheritedBranch = `hive/${original}`;
@@ -295,11 +289,9 @@ test("a spawned requeue keeps its own PR while surfacing its inherited branch", 
 
   await reconcileOnce(db, { ...inert, herdr });
 
-  const secondRequeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(firstRequeue);
-  expect(secondRequeue.resume_branch).toBe(ownBranch);
-  expect(secondRequeue.resume_pr_url).toBe(ownPrUrl);
-  expect(secondRequeue.brief).toContain(ownBranch);
-  expect(secondRequeue.brief).toContain(inheritedBranch);
+  expect(getTask(db, firstRequeue).state).toBe("in_progress");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery'").get(firstRequeue)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(firstRequeue)).toBeFalsy();
 });
 
 test("a closed own PR falls back to a still-open inherited PR", async () => {
@@ -329,7 +321,7 @@ test("a closed own PR falls back to a still-open inherited PR", async () => {
   expect(secondRequeue.brief).not.toContain("Last known CI status");
 });
 
-test("a merged own PR does not resurrect an inherited PR", async () => {
+test("a merged own PR marks the retry as completed agent work", async () => {
   const { db, projectId } = freshDb();
   const original = makeTask(db, projectId);
   const inheritedBranch = `hive/${original}`;
@@ -348,10 +340,9 @@ test("a merged own PR does not resurrect an inherited PR", async () => {
 
   await reconcileOnce(db, { ...inert, herdr });
 
-  const secondRequeue: any = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(firstRequeue);
-  expect(secondRequeue.resume_pr_url).toBeNull();
-  expect(secondRequeue.brief).not.toContain(mergedOwnPrUrl);
-  expect(secondRequeue.brief).not.toContain(inheritedPrUrl);
+  expect(getTask(db, firstRequeue).state).toBe("in_progress");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery'").get(firstRequeue)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(firstRequeue)).toBeFalsy();
 });
 
 test("a requeue with its own ghost also preserves inherited branch and ghost pointers", async () => {
