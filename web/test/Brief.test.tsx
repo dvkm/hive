@@ -195,3 +195,64 @@ test("the project picker scopes Focus to the chosen project", async () => {
   expect(chip("All").props.className).not.toContain("board-chip-on");
   values.delete("hive.board.project");
 });
+
+test("Focus shows every checkpoint for its current task on one page", async () => {
+  values.set("hive.inbox.mode", "focus");
+  values.delete("hive.board.project");
+  const second = { ...checkpoint, id: "checkpoint-2", note: "Check this too" };
+  const otherTask = { ...task, id: "task-2", number: 2, title: "Other task" };
+  const other = { ...checkpoint, id: "checkpoint-3", task_id: otherTask.id, task_number: 2, task_title: otherTask.title, note: "Later" };
+  api.evidence = (async () => ({ evidence: [] })) as typeof api.evidence;
+  const checkpoints = [checkpoint, second, other];
+  const store = {
+    tasks: [task, otherTask],
+    projects: [{ id: task.project_id, name: "Project" }],
+    needsYou: checkpoints.map((item) => ({ kind: "checkpoint", id: item.id, checkpoint: item })),
+    checkpoints,
+    rev: {},
+    reloadCheckpoints: () => {},
+    reloadQuizzes: () => {},
+  } as unknown as Store;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(
+      <MemoryRouter initialEntries={["/inbox"]}>
+        <Ctx.Provider value={store}>
+          <LightboxProvider><Brief /></LightboxProvider>
+        </Ctx.Provider>
+      </MemoryRouter>
+    );
+  });
+
+  expect(renderer.root.findAll((node) => String(node.props.className ?? "").startsWith("cp-row"))).toHaveLength(2);
+  expect(renderer.root.findByProps({ className: "brief-focus-meta" }).findAll((node) => node.type === "span")[1].children.join("")).toBe("1 of 2");
+  expect(renderer.root.findAll((node) => node.props.className === "cp-note").map((node) => node.children.join(""))).toEqual(["Check this", "Check this too"]);
+});
+
+test("Backlog task links open against the backlog location for modal history", async () => {
+  values.set("hive.inbox.mode", "backlogs");
+  values.delete("hive.board.project");
+  api.evidence = (async () => ({ evidence: [] })) as typeof api.evidence;
+  const store = {
+    tasks: [task],
+    projects: [{ id: task.project_id, name: "Project" }],
+    needsYou: [{ kind: "checkpoint", id: checkpoint.id, checkpoint }],
+    checkpoints: [checkpoint],
+    rev: {},
+    reloadCheckpoints: () => {},
+    reloadQuizzes: () => {},
+  } as unknown as Store;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(
+      <MemoryRouter initialEntries={["/inbox"]}>
+        <Ctx.Provider value={store}>
+          <LightboxProvider><Brief /></LightboxProvider>
+        </Ctx.Provider>
+      </MemoryRouter>
+    );
+  });
+
+  const taskLink = renderer.root.findAll((node) => node.props.to === `/tasks/${task.id}`)[0];
+  expect(taskLink.props.state.backgroundLocation.pathname).toBe("/inbox");
+});
