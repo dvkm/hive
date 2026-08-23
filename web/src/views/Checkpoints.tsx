@@ -151,14 +151,14 @@ export function CheckpointsInbox({ limit, heading = true }: { limit?: number; he
   const [busy, setBusy] = useState(false);
   const scoped = checkpoints.filter((c) => inProjectFilter(c.project_id, projectFilter));
   if (!scoped.length) return null;
-  const visible = limit ? scoped.slice(0, limit) : scoped;
 
   const groups = new Map<string, Checkpoint[]>();
-  for (const c of visible) {
+  for (const c of scoped) {
     const g = groups.get(c.task_id) ?? [];
     g.push(c);
     groups.set(c.task_id, g);
   }
+  const visibleGroups = limit ? [...groups.values()].slice(0, limit) : [...groups.values()];
 
   const approveAll = async (items: Checkpoint[]) => {
     if (busy) return;
@@ -182,7 +182,7 @@ export function CheckpointsInbox({ limit, heading = true }: { limit?: number; he
           <span className="muted"> — agents&apos; judgment calls; tick to approve, flag to steer (or spawn a fix if already shipped)</span>
         </div>
       )}
-      {[...groups.values()].map((items) => {
+      {visibleGroups.map((items) => {
         const c0 = items[0];
         const finished = ["done", "failed"].includes(c0.task_state);
         return (
