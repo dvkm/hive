@@ -62,13 +62,6 @@ function PushButton() {
 
 const SECONDARY_NAV: { label: string; items: [string, string, IconDefinition][] }[] = [
   {
-    label: "Focus",
-    items: [
-      ["/work", "Work", faClipboard],
-      ["/inbox", "Needs you", faBell],
-    ],
-  },
-  {
     label: "Observe",
     items: [
       ["/feed", "Activity", faSatelliteDish],
@@ -262,9 +255,11 @@ export default function App() {
   const managerIsRendered = (background || location).pathname === "/";
   return (
     <div className="app">
+      <a className="skip-link" href="#main-content">Skip to content</a>
       <header className="topbar">
         <NavLink className="brand" to="/">
-          <span className="brand-mark">◆</span> hive
+          <span className="brand-mark" aria-hidden="true"><span /></span>
+          <span className="brand-name">hive</span>
         </NavLink>
         <button
           className="command-trigger"
@@ -275,6 +270,7 @@ export default function App() {
           <kbd>⌘K</kbd>
         </button>
         <nav className="nav" aria-label="Workspace">
+          <NavLink to="/work">Work</NavLink>
           <NavLink className="needs-you-link" to="/inbox">
             <span>{inboxCount > 0 ? "Needs you" : "All clear"}</span>
             {inboxCount > 0 && <span className="badge">{inboxCount}</span>}
@@ -285,7 +281,7 @@ export default function App() {
         <ConnDot />
       </header>
       <MobileNav inboxCount={inboxCount} offline={offline} setOffline={setOffline} />
-      <main className="content">
+      <main className="content" id="main-content">
         <Routes location={background || location}>
           <Route path="/" element={<Chat embedded />} />
           <Route path="/work" element={<Board />} />

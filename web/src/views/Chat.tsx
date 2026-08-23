@@ -462,6 +462,10 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
   useEffect(() => {
     const scroll = scrollRef.current;
     if (!open || !scroll) return;
+    if (chatMessages.length === 0) {
+      scroll.scrollTo({ top: 0 });
+      return;
+    }
     if (historyOpen) {
       scroll.scrollTo({ top: 0 });
       return;
@@ -486,10 +490,10 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
       <header className={embedded ? "manager-head" : "chat-head"}>
         {embedded && (
           <div className="manager-heading">
-            <div className="manager-eyebrow">Chief of Staff</div>
+            <div className="manager-eyebrow">Chief of staff</div>
             <div className={`chief-presence ${awaiting ? "chief-presence-working" : ""}`}>
               <span className="manager-live-dot" />
-              {awaiting ? "Coordinating" : "Ready"}
+              {awaiting ? "Coordinating" : "Standing by"}
             </div>
           </div>
         )}
@@ -527,7 +531,14 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
                     "Ask your Chief of Staff to start work, catch you up, or resolve a blocker."
                   )
                 ) : (
-                  "Add a project first. The Chief of Staff needs one repository to run from."
+                  <div className="manager-project-empty">
+                    <div className="manager-project-mark" aria-hidden="true">01</div>
+                    <div>
+                      <div className="manager-empty-title">Connect your first project.</div>
+                      <div className="manager-empty-copy">Give Hive one repository, then your Chief of Staff can plan, delegate, and follow the work through.</div>
+                    </div>
+                    <Link className="manager-project-cta" to="/projects">Add a project <span aria-hidden="true">→</span></Link>
+                  </div>
                 )}
               </div>
             )}
@@ -538,7 +549,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
           </div>
           <div className="chat-compose">
             <textarea
-              placeholder="Tell Hive the outcome you want…"
+              placeholder={projects.length ? "Tell Hive the outcome you want…" : "Add a project to start"}
               value={text}
               disabled={!projects.length}
               onChange={(e) => setText(e.target.value)}
@@ -556,7 +567,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
         </div>
         {embedded && (
           <details className="chief-details">
-            <summary>Activity and agent details</summary>
+            <summary>Operations log</summary>
             <ManagerActivity thread={managerThread} events={activityEvents} tasks={tasks} awaiting={awaiting} managerTask={managerTask} onRefresh={refreshManager} />
           </details>
         )}
