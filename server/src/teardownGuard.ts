@@ -31,22 +31,28 @@ export function withinBootGrace(db: DB, nowMs: number = Date.now()): boolean {
   return Number.isFinite(started) && nowMs - started < BOOT_GRACE_MS && nowMs >= started;
 }
 
-// Dead verdicts across the WHOLE fleet in the trailing window — the reconciler
-// writes one `recovery {decision:"dead"}` event per agent it declares dead.
+// Dead verdicts across the WHOLE fleet since the latest acknowledged breaker
+// card, limited to the trailing window. The reconciler writes one
+// `recovery {decision:"dead"}` event per agent it declares dead.
 export function recentDeadVerdicts(db: DB, nowMs: number = Date.now()): number {
   const since = new Date(nowMs - DEAD_BURST_MS).toISOString();
   const r = db
     .query(
       `SELECT COUNT(*) AS n FROM events
-        WHERE type = 'recovery' AND ts > ? AND json_extract(payload, '$.decision') = 'dead'`
+        WHERE type = 'recovery' AND ts > ? AND json_extract(payload, '$.decision') = 'dead'
+          AND rowid > COALESCE((
+            SELECT MAX(e.rowid) FROM events e JOIN decisions d
+              ON e.type = 'breaker_card' AND json_extract(e.payload, '$.decision_id') = d.id
+            WHERE d.status = 'answered'
+          ), 0)`
     )
     .get(since) as { n: number };
   return r.n;
 }
 
-// The breaker is TRIPPED for exactly as long as its card is open: answering it
-// (either way) is the director saying "I looked", and sweeps resume. That keeps
-// the whole thing in one place — no second piece of state to expire or leak.
+// The breaker is TRIPPED for exactly as long as its card is open. Answering it
+// means "I looked": sweeps resume, and recentDeadVerdicts starts after that
+// card so the acknowledged deaths cannot immediately open another one.
 export function breakerTripped(db: DB): boolean {
   return !!db
     .query(

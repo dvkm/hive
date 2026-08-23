@@ -72,6 +72,17 @@ function isJiraMirrorId(db: DB, id: string): boolean {
   return !!task && isJiraMirror(task);
 }
 
+function agentWorkComplete(db: DB, task: any): boolean {
+  if (TERMINAL.includes(task.state as State) || task.state === "in_review" || task.state === "verifying") return true;
+  if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'state_change' AND json_extract(payload, '$.to') = 'in_review' LIMIT 1").get(task.id)) return true;
+  if (!task.pr_url) return false;
+  const parentId = task.pr_url === task.resume_pr_url && task.parent_task_id ? task.parent_task_id : task.id;
+  const outcome = db
+    .query("SELECT type FROM events WHERE task_id IN (?, ?) AND type IN ('pr_closed','pr_merged','merged') AND json_extract(payload, '$.pr_url') = ? ORDER BY rowid DESC LIMIT 1")
+    .get(task.id, parentId, task.pr_url) as { type: string } | undefined;
+  return task.pr_state === "MERGED" || (task.pr_state !== "CLOSED" && outcome?.type !== "pr_closed");
+}
+
 export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<void> {
   const startedAt = Date.now();
   let errored = false;
@@ -1468,7 +1479,7 @@ async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
     // dead agent there must still be failed rather than left in_progress
     // forever — scoping this to mirrors is what keeps both true.
     if (cur && isJiraMirror(cur)) continue;
-    if (cur && (cur.state === "in_review" || cur.state === "verifying")) continue;
+    if (cur && agentWorkComplete(db, cur)) continue;
     // Deferred pending a human action: neither nudge nor fail it (the goneNow
     // branch below would otherwise fail an idle-but-deferred task) — task #679.
     if (cur && isDeferred(cur)) continue;
