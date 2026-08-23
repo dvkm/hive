@@ -4233,6 +4233,14 @@ a.dbundle-fact:hover {
 .understanding-quiz-options label.selected {
   border-color: var(--accent);
 }
+.understanding-quiz-options label.correct {
+  border-color: var(--green);
+  background: color-mix(in srgb, var(--bg-elev) 82%, var(--green) 18%);
+}
+.understanding-quiz-options label.incorrect {
+  border-color: var(--red);
+  background: color-mix(in srgb, var(--bg-elev) 86%, var(--red) 14%);
+}
 .understanding-quiz-options input {
   margin-top: 2px;
 }
@@ -4245,6 +4253,11 @@ a.dbundle-fact:hover {
 .understanding-quiz-wrong {
   margin: var(--s2) 0 0;
   color: var(--red);
+  font-size: var(--t-sm);
+}
+.understanding-quiz-correct {
+  margin: var(--s2) 0 0;
+  color: var(--green);
   font-size: var(--t-sm);
 }
 .understanding-quiz-escape {
