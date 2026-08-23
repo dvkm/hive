@@ -122,6 +122,59 @@ test("cleanupWorktree preserves TRACKED uncommitted work to a ghost before remov
   expect(calls.some((c) => has(c, "checkout", "-b", "ghost-t1"))).toBe(true);
 });
 
+test("cleanupWorktree unregisters the worktree's hive.app from LaunchServices before removing", async () => {
+  const { exec, calls } = stubExec((argv) => {
+    if (argv[0] === "git" && argv.includes("ls-remote")) return OK(""); // not pushed
+    if (argv[0] === "git" && argv.includes("--merged")) return OK("  main\n  hive/t1"); // merged
+    if (argv[0] === "git" && has(argv, "status", "--porcelain")) return OK("?? .serena/\n");
+    return OK();
+  });
+  const h = new Herdr(exec, "herdr");
+  await h.cleanupWorktree({ repoPath: "/repo", branch: "hive/t1", worktreePath: "/wt", taskId: "t1" });
+  expect(
+    calls.some((c) => c[0].includes("lsregister") && c[1] === "-u" && c[2] === "/wt/electron/dist/mac-arm64/hive.app")
+  ).toBe(true);
+});
+
+test("a throwing lsregister never blocks worktree removal", async () => {
+  const calls: string[][] = [];
+  const exec = async (argv: string[]) => {
+    calls.push(argv);
+    if (argv[0].includes("lsregister")) throw new Error("spawn ENOENT");
+    if (argv[0] === "git" && argv.includes("ls-remote")) return OK("sha\trefs/heads/hive/t1");
+    return OK();
+  };
+  const h = new Herdr(exec as Exec, "herdr");
+  const r = await h.cleanupWorktree({ repoPath: "/repo", branch: "hive/t1", worktreePath: "/wt", taskId: "t1" });
+  expect(r.removed).toBe(true);
+  expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(true);
+});
+
+test("reclaimWorktree unregisters the worktree's hive.app before removing it", async () => {
+  const { exec, calls } = stubExec((argv) =>
+    has(argv, "worktree", "list") ? OK("worktree /wt\nbranch refs/heads/hive/t1\n") : OK()
+  );
+  const h = new Herdr(exec, "herdr");
+  await h.reclaimWorktree({ repoPath: "/repo", branch: "hive/t1", taskId: "t1", hintPath: "/wt" });
+  const ls = calls.findIndex((c) => c[0].includes("lsregister") && c[2] === "/wt/electron/dist/mac-arm64/hive.app");
+  const rm = calls.findIndex((c) => has(c, "worktree", "remove"));
+  expect(ls).toBeGreaterThanOrEqual(0);
+  expect(ls).toBeLessThan(rm);
+});
+
+test("teardown unregisters the worktree's hive.app before removing it", async () => {
+  const { exec, calls } = stubExec((argv) =>
+    argv[0] === "git" && argv.includes("ls-remote") ? OK("sha\trefs/heads/hive/t1") : OK()
+  );
+  const h = new Herdr(exec, "herdr");
+  const r = await h.teardown({ repoPath: "/repo", branch: "hive/t1", worktreePath: "/wt", workspaceId: "wF" });
+  expect(r.removed).toBe(true);
+  const ls = calls.findIndex((c) => c[0].includes("lsregister") && c[2] === "/wt/electron/dist/mac-arm64/hive.app");
+  const rm = calls.findIndex((c) => has(c, "worktree", "remove"));
+  expect(ls).toBeGreaterThanOrEqual(0);
+  expect(ls).toBeLessThan(rm);
+});
+
 test("cleanupWorktree treats an already-gone worktree (not a working tree) as removed, not preserved", async () => {
   const { exec, calls } = stubExec((argv) => {
     if (argv[0] === "git" && argv.includes("ls-remote")) return OK("sha\trefs/heads/hive/t1"); // pushed

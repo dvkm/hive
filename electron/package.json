@@ -6,7 +6,8 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder --mac --dir && codesign --force --sign - --requirements '=designated => identifier \"dev.hive.app\"' dist/mac-arm64/hive.app"
+    "build": "electron-builder --mac --dir && codesign --force --sign - --requirements '=designated => identifier \"dev.hive.app\"' dist/mac-arm64/hive.app",
+    "install-app": "bun run build && ./install-app.sh"
   },
   "build": {
     "appId": "dev.hive.app",
