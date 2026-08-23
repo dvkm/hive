@@ -28,6 +28,7 @@ import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectBaseBranch, preferSafeRef } from "./exec.ts";
 import { captureBranchScope } from "./rebaseGuard.ts";
+import { landOnce } from "./landQueue.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
@@ -140,6 +141,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("recoverStale", () => recoverStale(db, deps));
   await step("sweepVerifying", () => sweepVerifying(db, deps));
   await step("autoMergeReady", () => autoMergeReady(db, deps));
+  await step("landOnce", () => landOnce(db, { exec: deps.exec }));
   await step("autoAnswerStale", () => autoAnswerStale(db, deps.herdr ?? defaultHerdr, (deps.nowMs ?? (() => Date.now()))()));
   logRun(errors > 0 ? "error" : "ok");
   heartbeat();

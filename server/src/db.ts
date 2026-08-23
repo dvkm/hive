@@ -551,6 +551,14 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       `CREATE INDEX idx_tasks_unverified_requeue ON tasks(id) WHERE source = 'requeue' AND requeue_provenance_verified = 0`,
     ],
   },
+  // Land queue (task #1257): when the director marks an in-review task
+  // approved-to-land, this stamps the approval. The reconciler's land sweep
+  // merges every marked task whose graph edges are satisfied and clears the
+  // stamp; a task that leaves review loses the stamp and needs a fresh mark.
+  {
+    name: "v29-task-land-queue",
+    statements: [`ALTER TABLE tasks ADD COLUMN land_queued_at TEXT`],
+  },
 ];
 
 // -------------------------------------------------------------- settings

@@ -796,6 +796,36 @@ that arrives during earlier merge checks still prevents the mutation.
   `[]` when clean; a git read failure silently skips that candidate rather than
   flagging it (can't tell ≠ blocked).
 
+### Land queue (task #1257)
+
+The director marks a set of in-review tasks approved-to-land in one call; the
+reconciler's `landOnce` sweep merges them in graph order instead of the director
+hand-ordering PRs. `from` lands before `to` on every edge.
+
+- `POST /api/tasks/land-queue` body `{task_ids: [...], queued?: true}` → `200 {changed: [ids], queued}` | `400` (empty `task_ids`).
+  Stamps `tasks.land_queued_at`. Only `in_review` tasks can be marked; unmarking
+  (`queued: false`) works from any state. A task that leaves review loses the
+  mark — the approval was for that diff, so it needs a fresh one.
+
+- `GET /api/tasks/land-graph[?project=<id>]` → `200 {nodes, edges}`.
+  Nodes are the project's `in_review` tasks. An edge is either
+  `{from, to, kind: "depends"}` — `to` declares `from` in `depends_on`, or its
+  brief says "lands after #N" / "depends on #N" — or
+  `{from, to, kind: "conflict", files: [...]}`, inferred from two branches whose
+  `git diff --name-only <base>...<branch>` sets overlap (server/src/rebaseGuard.ts
+  `authoredFiles`). Nothing is stored; a git read failure means that branch just
+  gets no conflict edges, never a blocked merge.
+
+Each sweep lands every marked task whose edges are satisfied, in task-number
+order. A `depends` edge holds a task until its predecessor has actually merged.
+A `conflict` edge only holds it when the peer lands in the SAME sweep — merging
+one moves the base out from under the other, so the second waits for its agent
+to rebase, and a peer that is not landing (red CI, unmarked) holds nothing.
+Failing or pending CI holds a task in the queue; `unavailable` (no CI at all)
+does not. A merge that actually fails drops out of the queue and the whole sweep
+raises ONE notification naming what stopped, so a broken PR is not retried every
+cycle.
+
 - `POST /api/tasks/:id/merge` body `{merge_strategy?: "local_ff", override_destructive_check?: boolean, actor?}` → `200 Task` (now `verifying`) | `409` (not `in_review`, missing/unpassed understanding check, or the merge failed: conflict / not a fast-forward / gh refused / **destructive auto-rebase**) | `403` (denied by a `task.merge` authority rule) | `404` | `400` (local merge but no `repo_path`/`branch`). The optional director `actor` is recorded on `merged`, `merge_failed`, and `merge_blocked_destructive` events.
   Approve & merge. When `pr_url` is set: `gh pr merge <url> <method>` where
   `method` is the project's `config.merge_method` (`squash` default, or `merge` /
