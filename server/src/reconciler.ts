@@ -804,12 +804,38 @@ function isFailedCheck(c: any): boolean {
   );
 }
 
+// A PR rollup can retain several executions of the same workflow job. GitHub
+// gives us the workflow + job identity and the execution time, so only the
+// newest execution should vote. Keep distinct heads separate when supplied;
+// gh's PR rollup is already scoped to the current head.
+function latestChecks(rollup: any): any[] {
+  if (!Array.isArray(rollup)) return [];
+  const latest = new Map<string, { check: any; order: number }>();
+  const ungrouped: any[] = [];
+  for (const c of rollup) {
+    const type = String(c?.__typename ?? "");
+    const identity = type === "CheckRun" && c.workflowName && c.name
+      ? `${type}:${c.workflowName}:${c.name}`
+      : type === "StatusContext" && c.context ? `${type}:${c.context}` : null;
+    if (!identity) {
+      ungrouped.push(c);
+      continue;
+    }
+    const key = `${String(c.headSha ?? c.head_sha ?? "")}:${identity}`;
+    const run = Number(/\/actions\/runs\/(\d+)/.exec(String(c.detailsUrl ?? ""))?.[1] ?? 0);
+    const order = Date.parse(c.startedAt ?? c.createdAt ?? c.completedAt ?? "") || run;
+    if (!latest.has(key) || order > latest.get(key)!.order) latest.set(key, { check: c, order });
+  }
+  return [...ungrouped, ...[...latest.values()].map(({ check }) => check)];
+}
+
 // Derive a coarse ci_status from gh's statusCheckRollup (a mix of CheckRun and
 // StatusContext objects). failing > pending > passing.
 export function ciStatusOf(rollup: any): string | null {
-  if (!Array.isArray(rollup) || rollup.length === 0) return null;
+  const checks = latestChecks(rollup);
+  if (checks.length === 0) return null;
   let anyPending = false;
-  for (const c of rollup) {
+  for (const c of checks) {
     const status = String(c.status ?? "").toUpperCase();
     const state = String(c.state ?? "").toUpperCase(); // StatusContext
     if (isFailedCheck(c)) return "failing";
@@ -907,7 +933,7 @@ export type RedCheck = { name: string; infra: string | null };
 // Classify every red check on a rollup as infra or code. Only ever called on a
 // rollup that is already red.
 export async function classifyRed(exec: Exec, rollup: any, baseSha?: string | null): Promise<RedCheck[]> {
-  const red = (Array.isArray(rollup) ? rollup : []).filter(isFailedCheck);
+  const red = latestChecks(rollup).filter(isFailedCheck);
   let base: Set<string> | null = null;
   const out: RedCheck[] = [];
   for (const c of red) {

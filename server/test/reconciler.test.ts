@@ -33,6 +33,37 @@ test("ciStatusOf derives failing > pending > passing", () => {
   expect(ciStatusOf([])).toBeNull();
 });
 
+const check = (conclusion: string | null, startedAt: string, extra: Record<string, unknown> = {}) => ({
+  __typename: "CheckRun",
+  workflowName: "Node mirror guard",
+  name: "guard",
+  status: conclusion ? "COMPLETED" : "IN_PROGRESS",
+  conclusion,
+  startedAt,
+  ...extra,
+});
+
+test("ciStatusOf uses only the newest execution of each workflow job", () => {
+  const old = "2026-08-23T07:38:57Z";
+  const newer = "2026-08-23T07:40:06Z";
+  expect(ciStatusOf([check("FAILURE", old), check("SUCCESS", newer)])).toBe("passing");
+  expect(ciStatusOf([check("SUCCESS", old), check("FAILURE", newer)])).toBe("failing");
+  expect(ciStatusOf([check("FAILURE", old), check(null, newer)])).toBe("pending");
+});
+
+test("ciStatusOf keeps different checks and heads independently blocking", () => {
+  const old = "2026-08-23T07:38:57Z";
+  const newer = "2026-08-23T07:40:06Z";
+  expect(ciStatusOf([
+    check("FAILURE", old, { workflowName: "Required lint", name: "lint" }),
+    check("SUCCESS", newer),
+  ])).toBe("failing");
+  expect(ciStatusOf([
+    check("FAILURE", old, { headSha: "old-head" }),
+    check("SUCCESS", newer, { headSha: "new-head" }),
+  ])).toBe("failing");
+});
+
 // GitHub marks a check FAILURE even when it refuses to START the job (unpaid
 // Actions billing, no runner). No commit can fix that, so hive must call it
 // "unavailable" and let the handoff through instead of steering the agent to
