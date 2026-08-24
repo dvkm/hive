@@ -207,6 +207,7 @@ export async function cleanupTask(
     session = await herdr.closeSession({
       agentTarget: task.agent_target,
       tabId: meta.tab_id,
+      request: { caller: "cleanup.cleanupTask", reason: "terminal task cleanup", taskId },
       // Prove the tab is still THIS task's before closing it: herdr recycles tab
       // ids, so a stale one recorded at spawn can name another agent's live tab.
       expectTerminalId: meta.terminal_id,
@@ -219,7 +220,11 @@ export async function cleanupTask(
     // every preserved-task sweep. Never the fleet workspace — spawnMeta returns
     // only the worktree's own id. The pane sweep is the backstop for tasks whose
     // spawned event predates this field.
-    if (meta.workspace_id) await herdr.closeWorkspace(meta.workspace_id);
+    if (meta.workspace_id && task.worktree_path) await herdr.closeWorkspace({
+      workspaceId: meta.workspace_id,
+      expectCwd: task.worktree_path,
+      request: { caller: "cleanup.cleanupTask", reason: "terminal task cleanup", taskId },
+    });
   }
 
   // 3) emit + record.
@@ -319,12 +324,22 @@ export async function releaseReviewAgent(
   if (!gone && !(probe.alive && (probe.status === "idle" || probe.status === "done")))
     return { released: false, reason: `agent is ${probe.alive ? probe.status : "unconfirmed-gone"}` };
 
-  const session = await herdr.closeSession({ agentTarget: task.agent_target, tabId: meta.tab_id });
+  const reason = gone ? "agent gone" : `${probe.status} in review`;
+  const session = await herdr.closeSession({
+    agentTarget: task.agent_target,
+    tabId: meta.tab_id,
+    expectTerminalId: meta.terminal_id,
+    expectCwd: task.worktree_path,
+    request: { caller: "cleanup.releaseReviewAgent", reason, taskId },
+  });
   // The worktree's OWN workspace holds a second pty the agent never used (see
   // cleanupTask). The checkout on disk is untouched by a workspace close.
-  if (meta.workspace_id) await herdr.closeWorkspace(meta.workspace_id);
+  if (meta.workspace_id && task.worktree_path) await herdr.closeWorkspace({
+    workspaceId: meta.workspace_id,
+    expectCwd: task.worktree_path,
+    request: { caller: "cleanup.releaseReviewAgent", reason, taskId },
+  });
   db.query("UPDATE tasks SET agent_target = NULL, updated_at = ? WHERE id = ?").run(now(), taskId);
-  const reason = gone ? "agent gone" : `${probe.status} in review`;
   writeEvent(db, {
     task_id: taskId,
     source: "reaper",

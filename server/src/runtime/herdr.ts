@@ -74,6 +74,23 @@ export interface SpawnResult {
   label: string;
 }
 
+export interface CloseRequest {
+  caller: string;
+  reason: string;
+  taskId: string;
+}
+
+function logClose(request: CloseRequest, targetType: "tab" | "pane" | "workspace", targetId: string): void {
+  console.info(JSON.stringify({
+    event: "herdr_close_request",
+    caller: request.caller,
+    reason: request.reason,
+    task_id: request.taskId,
+    target_type: targetType,
+    target_id: targetId,
+  }));
+}
+
 // Tab/agent label for a task: id + short title, kept compact for the tab bar.
 export function fleetLabel(taskId: string, title: string): string {
   return `${taskId} ${(title || "").trim()}`.slice(0, 60).trim();
@@ -1113,6 +1130,7 @@ export class Herdr {
   async closeSession(args: {
     agentTarget?: string | null;
     tabId?: string | null;
+    request: CloseRequest;
     // Verify the tab still holds THIS task before closing it. Either is enough.
     expectTerminalId?: string | null;
     expectCwd?: string | null;
@@ -1127,19 +1145,17 @@ export class Herdr {
         // through to the agent's own pane, which resolves by name.
         const expect = args.expectTerminalId || args.expectCwd;
         const held = expect ? (await this.listPanes()).filter((p) => p.tabId === args.tabId) : [];
-        // Refuse only on POSITIVE evidence of a stranger: the tab has panes and
-        // none of them is ours. An empty/unavailable pane list proves nothing
-        // (that is what a down daemon looks like) and must not block cleanup —
-        // the same asymmetry confirmGone uses for death verdicts.
         const stranger =
+          !!expect &&
           held.length > 0 &&
-          !held.some(
+          !held.every(
             (p) =>
               (args.expectTerminalId && p.terminalId === args.expectTerminalId) ||
               (args.expectCwd && p.cwd === args.expectCwd)
           );
         if (stranger) refused = `tab ${args.tabId} no longer holds ${expect}`;
         else {
+          logClose(args.request, "tab", args.tabId);
           const r = await this.run(tabCloseArgv(args.tabId));
           if (r.code === 0) return { closed: true, via: `tab ${args.tabId}` };
         }
@@ -1148,6 +1164,7 @@ export class Herdr {
         const got = await this.run(agentGetArgv(args.agentTarget));
         const paneId = parsePaneId(got.stdout);
         if (paneId) {
+          logClose(args.request, "pane", paneId);
           const r = await this.run(paneCloseArgv(paneId));
           if (r.code === 0) return { closed: true, via: `pane ${paneId}` };
         }
@@ -1188,8 +1205,13 @@ export class Herdr {
 
   // Close a worktree's own herdr workspace (reclaims its pty) without touching
   // the checkout. Best-effort; a stale/already-closed id just returns non-zero.
-  async closeWorkspace(workspaceId: string): Promise<ExecResult> {
-    return this.run(workspaceCloseArgv(workspaceId));
+  async closeWorkspace(args: { workspaceId: string; expectCwd: string; request: CloseRequest }): Promise<ExecResult> {
+    const held = (await this.listPanes()).filter((pane) => pane.workspaceId === args.workspaceId);
+    if (held.length > 0 && !held.every((pane) => pane.cwd === args.expectCwd)) {
+      return { code: 1, stdout: "", stderr: `refused workspace ${args.workspaceId}: not owned by task ${args.request.taskId}` };
+    }
+    logClose(args.request, "workspace", args.workspaceId);
+    return this.run(workspaceCloseArgv(args.workspaceId));
   }
 
   // Resolve the shared fleet workspace id READ-ONLY (never creates it, unlike

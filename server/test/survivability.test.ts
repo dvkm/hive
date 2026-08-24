@@ -265,7 +265,7 @@ test("closeSession refuses a recycled tab id that now holds someone else", async
   };
   const h = new Herdr(exec, "herdr");
 
-  const r = await h.closeSession({ agentTarget: "t1", tabId: "w6:t4", expectTerminalId: "term_agent", expectCwd: WT });
+  const r = await h.closeSession({ agentTarget: "t1", tabId: "w6:t4", expectTerminalId: "term_agent", expectCwd: WT, request: { caller: "test", reason: "test cleanup", taskId: "t1" } });
 
   expect(r.closed).toBe(false);
   expect(r.refused).toContain("w6:t4");
@@ -278,7 +278,7 @@ test("closeSession still closes the tab when it is provably ours", async () => {
       return OK(`{"result":{"panes":[{"pane_id":"w6:p7","tab_id":"w6:t4","workspace_id":"w6","cwd":"${WT}","terminal_id":"term_agent"}]}}`);
     return OK();
   };
-  const r = await new Herdr(exec, "herdr").closeSession({ agentTarget: "t1", tabId: "w6:t4", expectTerminalId: "term_agent", expectCwd: WT });
+  const r = await new Herdr(exec, "herdr").closeSession({ agentTarget: "t1", tabId: "w6:t4", expectTerminalId: "term_agent", expectCwd: WT, request: { caller: "test", reason: "test cleanup", taskId: "t1" } });
   expect(r).toMatchObject({ closed: true, via: "tab w6:t4" });
 });
 
