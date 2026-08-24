@@ -4740,14 +4740,22 @@ function buildResumeSection(
   const ghostBranch = ownGhostBranch || inheritedGhost;
   const prUrl = predecessorOpenPrUrl(db, source);
   const prFactsApply = !!prUrl && prUrl === source.pr_url;
-  const owner =
-    ownGhostBranch || prFactsApply || !source.parent_task_id ? source : getTask(db, source.parent_task_id) ?? source;
+  const chain = [source];
+  const seen = new Set([source.id]);
+  let owner = source;
+  while (!ownGhostBranch && !(prUrl && prUrl === owner.pr_url) && owner.parent_task_id) {
+    const parent = getTask(db, owner.parent_task_id);
+    if (!parent || seen.has(parent.id)) break;
+    chain.push(parent);
+    seen.add(parent.id);
+    owner = parent;
+    if (latestGhostBranch(db, owner.id)) break;
+  }
   const ownerPrFactsApply = owner.id !== source.id && !!prUrl && prUrl === owner.pr_url;
   const headSha = prFactsApply ? source.head_sha : ownerPrFactsApply ? owner.head_sha : null;
   const ciStatus = prFactsApply ? source.ci_status : ownerPrFactsApply ? owner.ci_status : null;
-  const decisions = answeredDecisionSummaries(db, source.id);
-  if (owner.id !== source.id) decisions.push(...answeredDecisionSummaries(db, owner.id));
-  const review = lastReviewHeadline(db, source.id) || (owner.id !== source.id ? lastReviewHeadline(db, owner.id) : null);
+  const decisions = chain.flatMap((task) => answeredDecisionSummaries(db, task.id));
+  const review = chain.map((task) => lastReviewHeadline(db, task.id)).find(Boolean) ?? null;
   const lead = prUrl
     ? `**RESUME — adopt PR ${prUrl} / branch \`${branch}\`. Do NOT rebuild this feature from scratch.**`
     : `**RESUME — adopt branch \`${branch}\`. Do NOT rebuild this feature from scratch.**`;

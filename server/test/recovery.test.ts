@@ -499,12 +499,14 @@ test("a chained requeue still surfaces the original attempt's head_sha, CI statu
 
   const firstRequeue = requeueTask(db, getTask(db, original));
   db.query("UPDATE tasks SET state = 'failed', agent_target = NULL WHERE id = ?").run(firstRequeue);
-  const secondRequeue = getTask(db, requeueTask(db, getTask(db, firstRequeue)));
+  const secondRequeue = requeueTask(db, getTask(db, firstRequeue));
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL WHERE id = ?").run(secondRequeue);
+  const thirdRequeue = getTask(db, requeueTask(db, getTask(db, secondRequeue)));
 
-  expect(secondRequeue.brief).toContain("last known head `abc123head`");
-  expect(secondRequeue.brief).toContain("Last known CI status: passing");
-  expect(secondRequeue.brief).toContain("Which rollout? — Use staged rollout");
-  expect(secondRequeue.brief).toContain("a self-review was already submitted (1 item(s) done");
+  expect(thirdRequeue.brief).toContain("last known head `abc123head`");
+  expect(thirdRequeue.brief).toContain("Last known CI status: passing");
+  expect(thirdRequeue.brief).toContain("Which rollout? — Use staged rollout");
+  expect(thirdRequeue.brief).toContain("a self-review was already submitted (1 item(s) done");
 });
 
 test("a source=external task with agent_target set (regression guard: should be unreachable post-#996) is still recovered sanely, not stuck forever", async () => {
