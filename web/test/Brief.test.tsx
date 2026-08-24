@@ -188,7 +188,7 @@ test("the project picker scopes Focus to the chosen project", async () => {
   });
 
   // Only the chosen project's checkpoint counts, so the queue reads "1 of 1".
-  expect(renderer.root.findByProps({ className: "brief-focus-meta" }).findAll((node) => node.type === "span")[1].children.join("")).toBe("1 of 1");
+  expect(renderer.root.findByProps({ className: "brief-focus-nav" }).children.filter((c) => typeof c === "string").join("")).toBe("1 of 1");
   // "Project two" is the selected chip; "All" is not.
   const chip = (name: string) => renderer.root.findAll((node) => node.type === "button" && node.children.includes(name))[0];
   expect(chip("Project two").props.className).toContain("board-chip-on");
@@ -225,8 +225,52 @@ test("Focus shows every checkpoint for its current task on one page", async () =
   });
 
   expect(renderer.root.findAll((node) => String(node.props.className ?? "").startsWith("cp-row"))).toHaveLength(2);
-  expect(renderer.root.findByProps({ className: "brief-focus-meta" }).findAll((node) => node.type === "span")[1].children.join("")).toBe("1 of 2");
+  expect(renderer.root.findByProps({ className: "brief-focus-nav" }).children.filter((c) => typeof c === "string").join("")).toBe("1 of 2");
   expect(renderer.root.findAll((node) => node.props.className === "cp-note").map((node) => node.children.join(""))).toEqual(["Check this", "Check this too"]);
+});
+
+test("Focus arrows step past an item you cannot act on", async () => {
+  values.set("hive.inbox.mode", "focus");
+  values.delete("hive.board.project");
+  const otherTask = { ...task, id: "task-2", number: 2, title: "Other task" };
+  const other = { ...checkpoint, id: "checkpoint-3", task_id: otherTask.id, task_number: 2, task_title: otherTask.title, note: "Later" };
+  api.evidence = (async () => ({ evidence: [] })) as typeof api.evidence;
+  const checkpoints = [checkpoint, other];
+  const store = {
+    tasks: [task, otherTask],
+    projects: [{ id: task.project_id, name: "Project" }],
+    needsYou: checkpoints.map((item) => ({ kind: "checkpoint", id: item.id, checkpoint: item })),
+    checkpoints,
+    rev: {},
+    reloadCheckpoints: () => {},
+    reloadQuizzes: () => {},
+  } as unknown as Store;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(
+      <MemoryRouter initialEntries={["/inbox"]}>
+        <Ctx.Provider value={store}>
+          <LightboxProvider><Brief /></LightboxProvider>
+        </Ctx.Provider>
+      </MemoryRouter>
+    );
+  });
+  const counter = () => renderer.root.findByProps({ className: "brief-focus-nav" }).children.filter((c) => typeof c === "string").join("");
+  const arrow = (label: string) => renderer.root.findByProps({ "aria-label": label });
+  const notes = () => renderer.root.findAll((node) => node.props.className === "cp-note").map((node) => node.children.join(""));
+
+  expect(counter()).toBe("1 of 2");
+  expect(notes()).toEqual(["Check this"]);
+  expect(arrow("Previous item").props.disabled).toBe(true);
+
+  await act(async () => { arrow("Next item").props.onClick(); });
+  expect(counter()).toBe("2 of 2");
+  expect(notes()).toEqual(["Later"]);
+  expect(arrow("Next item").props.disabled).toBe(true);
+
+  await act(async () => { arrow("Previous item").props.onClick(); });
+  expect(counter()).toBe("1 of 2");
+  expect(notes()).toEqual(["Check this"]);
 });
 
 test("Backlog task links open against the backlog location for modal history", async () => {
