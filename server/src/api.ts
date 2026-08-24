@@ -4743,13 +4743,13 @@ function buildResumeSection(
   const chain = [source];
   const seen = new Set([source.id]);
   let owner = source;
-  while (!ownGhostBranch && !(prUrl && prUrl === owner.pr_url) && owner.parent_task_id) {
+  const ownsContext = (task: any) => prUrl ? task.pr_url === prUrl : task.branch === branch;
+  while (!ownsContext(owner) && owner.parent_task_id) {
     const parent = getTask(db, owner.parent_task_id);
     if (!parent || seen.has(parent.id)) break;
     chain.push(parent);
     seen.add(parent.id);
     owner = parent;
-    if (latestGhostBranch(db, owner.id)) break;
   }
   const ownerPrFactsApply = owner.id !== source.id && !!prUrl && prUrl === owner.pr_url;
   const headSha = prFactsApply ? source.head_sha : ownerPrFactsApply ? owner.head_sha : null;

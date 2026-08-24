@@ -501,11 +501,22 @@ test("a chained requeue still surfaces the original attempt's head_sha, CI statu
   db.query("UPDATE tasks SET state = 'failed', agent_target = NULL WHERE id = ?").run(firstRequeue);
   const secondRequeue = requeueTask(db, getTask(db, firstRequeue));
   db.query("UPDATE tasks SET state = 'failed', agent_target = NULL WHERE id = ?").run(secondRequeue);
+  putEvent(db, secondRequeue, "worktree_reclaimed", { ghost_branch: `ghost-${secondRequeue}` });
+  db.query(
+    `INSERT INTO decisions (id, task_id, ts, title, options, status, answer_key, answered_at, answered_by)
+     VALUES (?,?,?,?,?, 'answered', ?,?, 'director')`
+  ).run(
+    newId("dec"), secondRequeue, answeredAt, "Which retry?",
+    JSON.stringify([{ key: "continue", label: "Continue the original PR" }]),
+    "continue", answeredAt
+  );
   const thirdRequeue = getTask(db, requeueTask(db, getTask(db, secondRequeue)));
 
+  expect(thirdRequeue.resume_pr_url).toBe(prUrl);
   expect(thirdRequeue.brief).toContain("last known head `abc123head`");
   expect(thirdRequeue.brief).toContain("Last known CI status: passing");
   expect(thirdRequeue.brief).toContain("Which rollout? — Use staged rollout");
+  expect(thirdRequeue.brief).toContain("Which retry? — Continue the original PR");
   expect(thirdRequeue.brief).toContain("a self-review was already submitted (1 item(s) done");
 });
 
