@@ -6,6 +6,7 @@
 // revoked) and is pruned. Best-effort: a push failure never touches the
 // server-side notification row.
 import webpush from "web-push";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import type { DB } from "./db.ts";
 import { getSetting, setSetting, now } from "./db.ts";
 
@@ -51,9 +52,32 @@ export function removeSubscription(db: DB, endpoint: string): void {
   db.query("DELETE FROM push_subscriptions WHERE endpoint = ?").run(endpoint);
 }
 
+export interface PushPayload {
+  title: string;
+  body?: string | null;
+  url?: string;
+  decisionId?: string;
+  actions?: { action: string; title: string }[];
+}
+
+export function decisionAnswerToken(db: DB, decisionId: string): string | null {
+  const secret = getSetting(db, "api_token");
+  return secret ? createHmac("sha256", secret).update(`decision-answer:${decisionId}`).digest("base64url") : null;
+}
+
+export function decisionAnswerTokenOk(db: DB, decisionId: string, presented: string | null): boolean {
+  const expected = decisionAnswerToken(db, decisionId);
+  if (!expected || !presented || expected.length !== presented.length) return false;
+  return timingSafeEqual(Buffer.from(expected), Buffer.from(presented));
+}
+
 // Fan a notification out to every subscribed device. Dead subscriptions
 // (404/410) are pruned. Fire-and-forget from the notification path.
-export async function pushToAll(db: DB, payload: { title: string; body?: string | null; url?: string }): Promise<void> {
+export async function pushToAll(
+  db: DB,
+  payload: PushPayload,
+  sendNotification = webpush.sendNotification
+): Promise<void> {
   if (!ensureVapid(db)) return;
   const subs = db.query("SELECT endpoint, p256dh, auth FROM push_subscriptions").all() as {
     endpoint: string;
@@ -61,11 +85,22 @@ export async function pushToAll(db: DB, payload: { title: string; body?: string 
     auth: string;
   }[];
   if (!subs.length) return;
-  const body = JSON.stringify({ title: payload.title, body: payload.body ?? "", url: payload.url ?? "/" });
+  const body = JSON.stringify({
+    title: payload.title,
+    body: payload.body ?? "",
+    url: payload.url ?? "/",
+    ...(payload.decisionId
+      ? {
+          decisionId: payload.decisionId,
+          actions: payload.actions ?? [],
+          answerToken: decisionAnswerToken(db, payload.decisionId) ?? undefined,
+        }
+      : {}),
+  });
   await Promise.all(
     subs.map(async (s) => {
       try {
-        await webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, body, {
+        await sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, body, {
           TTL: 600,
         });
         db.query("UPDATE push_subscriptions SET last_ok = ? WHERE endpoint = ?").run(now(), s.endpoint);

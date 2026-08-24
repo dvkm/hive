@@ -804,6 +804,7 @@ test("emit answer writes the event and pushes an urgent notification", async () 
 
 test("remote requests need the API token; loopback never does", async () => {
   const { remoteAuthOk } = await import("../src/api.ts");
+  const { decisionAnswerToken } = await import("../src/push.ts");
   const { setSetting } = await import("../src/db.ts");
   const u = new URL("http://x/api/tasks");
   const r = (auth?: string) => new Request("http://x/api/tasks", auth ? { headers: { authorization: auth } } : {});
@@ -817,6 +818,14 @@ test("remote requests need the API token; loopback never does", async () => {
   expect(remoteAuthOk(db, r(), u, "192.168.1.20")).toBe(false);
   // EventSource can't set headers → query-param form
   expect(remoteAuthOk(db, r(), new URL("http://x/api/stream?token=sekrit"), "10.0.0.9")).toBe(true);
+  const answerToken = decisionAnswerToken(db, "dec_1")!;
+  const answerRequest = new Request("http://x/api/decisions/dec_1/answer", {
+    method: "POST",
+    headers: { authorization: `Bearer ${answerToken}` },
+  });
+  expect(remoteAuthOk(db, answerRequest, new URL(answerRequest.url), "192.168.1.20")).toBe(true);
+  expect(remoteAuthOk(db, answerRequest, new URL("http://x/api/decisions/dec_2/answer"), "192.168.1.20")).toBe(false);
+  expect(remoteAuthOk(db, answerRequest, u, "192.168.1.20")).toBe(false);
 });
 
 // ---- intake noise -------------------------------------------------------------

@@ -70,7 +70,7 @@ import { costUsd } from "./pricing.ts";
 import { checkUsageGuardrails, resolveUsageCapForDecision, taskSpend } from "./costs.ts";
 import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
-import { vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
+import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { explanationGate } from "./explainDiff.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
@@ -200,28 +200,32 @@ function tokenOk(db: DB, req: Request, url: URL): boolean {
   return presented === token;
 }
 
-// Remote requests (a phone on the LAN / Tailscale) must present the API token;
-// loopback (CLI, hooks, agents, the desktop app) stays trustless as before.
+// Remote requests (a phone on the LAN / Tailscale) must present the API token.
+// A push action may instead present the token scoped to that exact decision.
+// Loopback (CLI, hooks, agents, the desktop app) stays trustless as before.
 // Exported for tests.
 export function remoteAuthOk(db: DB, req: Request, url: URL, ip: string | null): boolean {
   if (!ip || ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1") return true;
-  return tokenOk(db, req, url);
+  if (tokenOk(db, req, url)) return true;
+  const answer = req.method === "POST" && url.pathname.match(/^\/api\/decisions\/([^/]+)\/answer$/);
+  const presented = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim() || null;
+  return !!answer && decisionAnswerTokenOk(db, answer[1], presented);
 }
 
-// Writes to the config and secret stores need the token even from loopback.
-// Those two stores are the only place a caller-supplied value gets paired with
-// a credential and handed to a network/subprocess destination (scout #991), so
-// they are the exfil chokepoint; reads and the task flow stay trustless so
-// every CLI/hook/agent call keeps working untouched.
+// Credential-bearing writes need the API token even from loopback. Config and
+// secret values can reach network/subprocess destinations (scout #991), while
+// a push subscription can redirect notification payloads to an attacker.
+// Reads and the task flow stay trustless so CLI/hook/agent calls keep working.
 //
 // The local capability that satisfies this is filesystem access to hive's DB:
 // the CLI reads the minted token out of ~/.hive/hive.db (see cli/hive.ts) the
 // same way `hive remote` does, while a caller that only holds an HTTP socket
-// cannot. ANY future config-plus-secret store belongs on this list.
+// cannot. Any future credential-bearing write belongs on this list.
 const WRITE_AUTH_ROUTES: { method: string; path: RegExp }[] = [
   { method: "PUT", path: /^\/api\/projects\/[^/]+$/ },
   { method: "POST", path: /^\/api\/projects\/[^/]+\/secrets$/ },
   { method: "DELETE", path: /^\/api\/projects\/[^/]+\/secrets\/[^/]+$/ },
+  { method: "POST", path: /^\/api\/push\/subscribe$/ },
 ];
 
 // True when the request may proceed: either it is not a gated write, or it
@@ -245,7 +249,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       const ip = server?.requestIP?.(req)?.address ?? null;
       if (!remoteAuthOk(db, req, url, ip)) return err("unauthorized (see `hive remote` for the token)", 401);
       if (!requireWriteAuth(db, req, url))
-        return err("unauthorized: config and secret writes require the API token (see `hive remote`)", 401);
+        return err("unauthorized: this write requires the API token (see `hive remote`)", 401);
     }
 
     try {
