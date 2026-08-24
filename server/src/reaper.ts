@@ -136,7 +136,14 @@ export async function sweepOrphanedAgents(db: DB, deps: ReaperDeps = {}): Promis
         await cleanupTask(db, herdr, a.name, { force: true });
         continue;
       }
-      const r = await herdr.closeSession({ agentTarget: a.name, tabId: a.tabId });
+      const r = await herdr.closeSession({
+        agentTarget: a.name,
+        // A vanished task row leaves no cwd or terminal id with which to prove
+        // ownership of the recorded tab. Resolve the named agent's exact pane
+        // instead, so an orphan sweep can never close a reused or mixed tab.
+        tabId: null,
+        request: { caller: "reaper.sweepOrphanedAgents", reason: "orphan task agent", taskId: a.name },
+      });
       broadcast({ type: "reaped_orphan_agent", name: a.name, closed: r.closed, via: r.via });
     } catch (e) {
       console.error(`[hive] reaper orphan agent ${a.name}:`, e); // isolated; never crash the sweep
@@ -155,6 +162,11 @@ export function taskIdFromCwd(cwd: string | null): string | null {
   const base = (cwd.replace(/\/+$/, "").split("/").pop() ?? "");
   const m = /^hive-([0-9a-f]{6,})$/.exec(base);
   return m ? m[1] : null;
+}
+
+function targetBelongsOnlyToTask(panes: Awaited<ReturnType<Herdr["listPanes"]>>, key: "tabId" | "workspaceId", id: string, taskId: string): boolean {
+  const held = panes.filter((pane) => pane[key] === id);
+  return held.length > 0 && held.every((pane) => taskIdFromCwd(pane.cwd) === taskId);
 }
 
 // The pty-leak sweep. The leak is held by PANES (one pty each), and the two
@@ -200,13 +212,24 @@ export async function sweepOrphanedPanes(db: DB, deps: ReaperDeps = {}): Promise
         // Fleet tab of a terminal/orphan task: close the tab, NOT the shared
         // fleet workspace (that would kill every live agent).
         if (p.tabId) {
-          const r = await herdr.closeSession({ agentTarget: taskId, tabId: p.tabId });
+          if (!targetBelongsOnlyToTask(panes, "tabId", p.tabId, taskId)) continue;
+          const r = await herdr.closeSession({
+            agentTarget: taskId,
+            tabId: p.tabId,
+            expectCwd: p.cwd,
+            request: { caller: "reaper.sweepOrphanedPanes", reason: task ? "terminal task pane" : "orphan task pane", taskId },
+          });
           if (r.closed) broadcast({ type: "reaped_orphan_pane", task_id: taskId, via: r.via });
         }
       } else if (p.workspaceId && p.workspaceId !== fleetWs) {
         // The worktree's own workspace: close it whole (its single pane is the
         // leaked pty). Guarded above so the fleet workspace is never closed here.
-        const r = await herdr.closeWorkspace(p.workspaceId);
+        if (!targetBelongsOnlyToTask(panes, "workspaceId", p.workspaceId, taskId)) continue;
+        const r = await herdr.closeWorkspace({
+          workspaceId: p.workspaceId,
+          expectCwd: p.cwd,
+          request: { caller: "reaper.sweepOrphanedPanes", reason: task ? "terminal task workspace" : "orphan task workspace", taskId },
+        });
         if (r.code === 0) broadcast({ type: "reaped_orphan_pane", task_id: taskId, via: `workspace ${p.workspaceId}` });
       }
     } catch (e) {

@@ -267,9 +267,14 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
         tabId: meta.tab_id,
         expectTerminalId: meta.terminal_id,
         expectCwd: task?.worktree_path,
+        request: { caller: "reconciler.reconcileOnce", reason: "completed turn has queued steer", taskId: t.id },
       });
       if (!session.closed) continue;
-      if (meta.workspace_id) await h.closeWorkspace(meta.workspace_id);
+      if (meta.workspace_id && task?.worktree_path) await h.closeWorkspace({
+        workspaceId: meta.workspace_id,
+        expectCwd: task.worktree_path,
+        request: { caller: "reconciler.reconcileOnce", reason: "completed turn has queued steer", taskId: t.id },
+      });
       db.query("UPDATE tasks SET agent_target = NULL, updated_at = ? WHERE id = ?").run(now(), t.id);
       writeEvent(db, {
         task_id: t.id,

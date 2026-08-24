@@ -216,11 +216,13 @@ test("sweepOrphanedAgents closes a session with NO matching task row at all", as
   const exec: Exec = async (argv) => {
     calls.push(argv);
     if (has(argv, "agent", "list")) return OK(listJson);
+    if (has(argv, "agent", "get", "ghost-task-id")) return OK(JSON.stringify({ result: { agent: { pane_id: "wF:p7" } } }));
     return OK();
   };
   const herdr = new Herdr(exec, "herdr");
   await sweepOrphanedAgents(db, { herdr });
-  expect(calls.some((c) => has(c, "tab", "close", "wF:t7"))).toBe(true);
+  expect(calls.some((c) => has(c, "pane", "close", "wF:p7"))).toBe(true);
+  expect(calls.some((c) => has(c, "tab", "close"))).toBe(false);
 });
 
 test("sweepOrphanedAgents leaves a LIVE task's agent alone", async () => {
@@ -308,6 +310,34 @@ test("sweepOrphanedPanes reaps terminal + orphan panes, keeps live ones, never c
   expect(closed.some((c) => has(c, "workspace", "close", "w2"))).toBe(false);
   // David's own pane (w4) untouched
   expect(closed.some((c) => c.includes("w4") || c.includes("w4:t1"))).toBe(false);
+});
+
+test("sweepOrphanedPanes refuses mixed targets that also contain active agents or user panes", async () => {
+  const { db, projectId } = freshDb();
+  seedTask(db, projectId, "aaaaaaaaaaaa", "done");
+  seedTask(db, projectId, "bbbbbbbbbbbb", "in_progress");
+  seedTask(db, projectId, "cccccccccccc", "in_progress");
+  const closed: string[][] = [];
+  const paneJson = JSON.stringify({ result: { panes: [
+    { pane_id: "wR:p1", tab_id: "wR:t1", workspace_id: "wR", cwd: "/wt/hive-aaaaaaaaaaaa" },
+    { pane_id: "wR:p2", tab_id: "wR:t1", workspace_id: "wR", cwd: "/wt/hive-bbbbbbbbbbbb" },
+    { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", cwd: "/wt/hive-aaaaaaaaaaaa" },
+    { pane_id: "w1:p2", tab_id: "w1:t2", workspace_id: "w1", cwd: "/wt/hive-cccccccccccc" },
+    { pane_id: "w1:p3", tab_id: "w1:t3", workspace_id: "w1", cwd: "/Users/david/projects/foo" },
+    { pane_id: "w2:p1", tab_id: "w2:t1", workspace_id: "w2", cwd: "/wt/hive-aaaaaaaaaaaa" },
+  ] } });
+  const exec: Exec = async (argv) => {
+    if (has(argv, "pane", "list")) return OK(paneJson);
+    if (has(argv, "workspace", "list")) return OK(JSON.stringify({ result: { workspaces: [{ workspace_id: "wR", label: "hive-fleet" }] } }));
+    if (has(argv, "tab", "close") || has(argv, "workspace", "close")) closed.push(argv);
+    return OK();
+  };
+
+  await sweepOrphanedPanes(db, { herdr: new Herdr(exec, "herdr") });
+
+  expect(closed.some((c) => has(c, "tab", "close", "wR:t1"))).toBe(false);
+  expect(closed.some((c) => has(c, "workspace", "close", "w1"))).toBe(false);
+  expect(closed.some((c) => has(c, "workspace", "close", "w2"))).toBe(true);
 });
 
 test("sweepOrphanedPanes closes NOTHING when the fleet workspace id can't be resolved (never risk the whole fleet)", async () => {

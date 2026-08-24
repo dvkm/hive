@@ -46,10 +46,12 @@ function seedTask(
 
 // ---- adapter: closeSession argv ----
 
+const closeRequest = { caller: "test", reason: "test cleanup", taskId: "t1" };
+
 test("closeSession closes the tab when a tab id is known", async () => {
   const { exec, calls } = stubExec(() => OK());
   const h = new Herdr(exec, "herdr");
-  const r = await h.closeSession({ agentTarget: "t1", tabId: "wF:t2" });
+  const r = await h.closeSession({ agentTarget: "t1", tabId: "wF:t2", request: closeRequest });
   expect(r).toEqual({ closed: true, via: "tab wF:t2" });
   expect(calls[0].slice(1)).toEqual(tabCloseArgv("wF:t2"));
   // tab close took the pane with it — no agent get / pane close needed
@@ -62,7 +64,7 @@ test("closeSession falls back to closing the agent's pane when no tab id", async
     return OK();
   });
   const h = new Herdr(exec, "herdr");
-  const r = await h.closeSession({ agentTarget: "t1", tabId: null });
+  const r = await h.closeSession({ agentTarget: "t1", tabId: null, request: closeRequest });
   expect(r).toEqual({ closed: true, via: "pane wR:p7" });
   expect(calls.some((c) => c.slice(1).join(" ") === paneCloseArgv("wR:p7").join(" "))).toBe(true);
 });
@@ -70,7 +72,7 @@ test("closeSession falls back to closing the agent's pane when no tab id", async
 test("closeSession never throws and reports not-closed on failure", async () => {
   const { exec } = stubExec(() => FAIL());
   const h = new Herdr(exec, "herdr");
-  expect(await h.closeSession({ agentTarget: "gone", tabId: "wF:t9" })).toEqual({ closed: false, via: null });
+  expect(await h.closeSession({ agentTarget: "gone", tabId: "wF:t9", request: closeRequest })).toEqual({ closed: false, via: null });
 });
 
 // ---- adapter: cleanupWorktree (branch guard + WIP preservation) ----
