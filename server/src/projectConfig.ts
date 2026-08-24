@@ -128,6 +128,8 @@ const CHECKS: Record<string, Check> = {
   autonomy_profile: oneOf(...AUTONOMY_PROFILES),
   dispatch_kinds: strArray,
   max_agents: num,
+  failed_triage_requeue_hours: (v) =>
+    typeof v === "number" && Number.isFinite(v) && v >= 0 ? null : "must be a non-negative number",
   archived: bool,
   test: bool, // test/ephemeral project, hidden from director surfaces (testProjects.ts)
   plan_intake: bool,
