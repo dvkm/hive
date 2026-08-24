@@ -424,7 +424,8 @@ test("syncPRs updates ci_status and transitions in_review->verifying on merge", 
   const task = getTask(db, id);
   expect(task.ci_status).toBe("passing");
   expect(task.state).toBe("verifying");
-  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_merged'").all(id).length).toBe(1);
+  const merged = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_merged'").get(id) as any;
+  expect(JSON.parse(merged.payload)).toEqual({ pr_url: "https://gh/pr/1" });
 });
 
 test("syncPRs skips a task that raced ahead to done instead of throwing (task #621)", async () => {
@@ -678,6 +679,8 @@ test("syncPRs bounces an in_review task whose PR was closed without merging", as
   );
   await reconcileOnce(db, { exec: gh, herdr });
   expect(getTask(db, id).state).toBe("in_progress");
+  const closed = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_closed'").get(id) as any;
+  expect(JSON.parse(closed.payload)).toEqual({ pr_url: "https://gh/pr/3" });
   const steers = db.query("SELECT payload FROM events WHERE task_id = ? AND type='steer'").all(id) as any[];
   expect(JSON.parse(steers.at(-1).payload).message).toContain("CLOSED (not merged)");
 });

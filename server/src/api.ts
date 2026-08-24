@@ -3054,6 +3054,15 @@ export async function spawnAgent(
     writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error } });
     return { ok: false, error };
   }
+  if (task.resume_pr_url) {
+    const ids = task.parent_task_id ? [id, task.parent_task_id] : [id];
+    const outcome = prOutcome(db, ids, task.resume_pr_url);
+    if (outcome !== "open") {
+      const error = `refusing to dispatch: predecessor's PR ${task.resume_pr_url} is already ${outcome}. The resume pointer is stale; reattach to the current PR (or clear resume_pr_url) before dispatching`;
+      writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error } });
+      return { ok: false, error };
+    }
+  }
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   if (!project?.repo_path) return { ok: false, error: "project has no repo_path" };
   const config = JSON.parse(project.config ?? "{}");

@@ -9,6 +9,7 @@ process.env.HIVE_HOME = HOME;
 const { openDb, setSetting } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
+const { writeEvent } = await import("../src/state.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
 
 const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
@@ -379,3 +380,19 @@ test("spawn proceeds once the brief carries the resume_pr_url pointer", async ()
   expect(r.status).toBe(200);
   expect(r.json.ok).toBe(true);
 });
+for (const [eventType, outcome] of [["pr_closed", "closed"], ["pr_merged", "merged"]] as const) {
+  test(`spawn refuses when resume_pr_url's brief-referenced PR has since ${outcome}`, async () => {
+    const prUrl = "https://github.com/acme/web/pull/819";
+    const t = await post("/api/tasks", { project_id: projectId, title: `resume onto a ${outcome} PR`, brief: `**RESUME** — adopt PR ${prUrl}.` });
+    db.query("UPDATE tasks SET resume_pr_url = ? WHERE id = ?").run(prUrl, t.json.id);
+    writeEvent(db, { task_id: t.json.id, source: "reconciler", type: eventType, payload: { pr_url: prUrl } });
+
+    const r = await post(`/api/tasks/${t.json.id}/spawn`, {});
+    expect(r.status).toBe(502);
+    expect(r.json.error).toContain("pull/819");
+    expect(r.json.error).toContain(outcome);
+
+    const task = (await get(`/api/tasks/${t.json.id}`)).json;
+    expect(task.state).toBe("queued"); // never dispatched
+  });
+}
