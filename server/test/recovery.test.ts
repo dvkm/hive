@@ -9,10 +9,11 @@ process.env.HIVE_HOME = HOME;
 
 const { openDb, newId, now } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
-const { reconcileOnce } = await import("../src/reconciler.ts");
+const { reconcileOnce, requeueStaleFailed } = await import("../src/reconciler.ts");
 const { requeueTask } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { getTask } = await import("../src/state.ts");
+const { DEAD_BURST_N } = await import("../src/teardownGuard.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
 
 const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
@@ -49,11 +50,11 @@ function herdrProbe(verdict: "dead" | "alive", status = "idle", sendLost = false
   return { herdr: new Herdr(exec, "herdr"), sends };
 }
 
-function freshDb(): { db: DB; projectId: string } {
+function freshDb(config: Record<string, unknown> = {}): { db: DB; projectId: string } {
   const db = openDb(":memory:");
   const projectId = newId("proj");
   db.query("INSERT INTO projects (id, name, repo_path, config, created_at) VALUES (?,?,?,?,?)")
-    .run(projectId, "p", "/repo", "{}", now());
+    .run(projectId, "p", "/repo", JSON.stringify(config), now());
   return { db, projectId };
 }
 function makeTask(db: DB, projectId: string, extra: Partial<{ source: string; parent: string; agent: string }> = {}): string {
@@ -76,6 +77,36 @@ function putEvent(db: DB, taskId: string, type: string, payload: any = {}): void
   const ts = new Date(Date.now() + seq++ * 1000).toISOString();
   db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
     .run(newId("evt"), taskId, ts, "reconciler", type, JSON.stringify(payload));
+}
+
+function failAt(db: DB, taskId: string, ageMs: number, source = "reconciler"): void {
+  const ts = new Date(Date.now() - ageMs).toISOString();
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, updated_at = ? WHERE id = ?").run(ts, taskId);
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run(newId("evt"), taskId, ts, source, "state_change", JSON.stringify({ from: "in_progress", to: "failed", reason: "awaiting triage" }));
+}
+
+function completedTurnHerdr() {
+  const { herdr } = herdrProbe("alive", "idle");
+  const briefs: string[] = [];
+  let spawns = 0;
+  herdr.send = async () => ({ code: 1, stdout: "", stderr: "agent turn is complete; respawn required" });
+  herdr.spawn = async (args: any) => {
+    spawns++;
+    briefs.push(args.brief);
+    return {
+      agent_target: args.taskId,
+      worktree_path: `/wt/${args.taskId}`,
+      branch: `hive/${args.taskId}`,
+      workspace_id: "w1",
+      fleet_workspace_id: "wf",
+      tab_id: "wf:t1",
+      terminal_id: "term1",
+      pane_id: "pane1",
+      label: "recovered",
+    };
+  };
+  return { herdr, briefs, spawnCount: () => spawns };
 }
 
 // Large staleMs so flagStale never fires on its own; we control the stale flag.
@@ -501,6 +532,65 @@ test("requeue cap reached → decision card, no further auto-requeue", async () 
   expect(grand.length).toBe(0);
 });
 
+test("failed task past the triage window auto-requeues once", () => {
+  const { db, projectId } = freshDb({ failed_triage_requeue_hours: 1 });
+  const id = makeTask(db, projectId);
+  failAt(db, id, 2 * 60 * 60 * 1000);
+
+  requeueStaleFailed(db);
+  requeueStaleFailed(db);
+
+  const successors = db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").all(id) as any[];
+  expect(successors).toHaveLength(1);
+  expect(successors[0].state).toBe("queued");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery' AND json_extract(payload, '$.decision') = 'failed-triage-auto-requeue'").all(id)).toHaveLength(1);
+});
+
+test("failed triage requeue defaults to four hours and zero disables it", () => {
+  const enabled = freshDb();
+  const old = makeTask(enabled.db, enabled.projectId);
+  failAt(enabled.db, old, 5 * 60 * 60 * 1000);
+  requeueStaleFailed(enabled.db);
+  expect(enabled.db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(old)).toBeTruthy();
+
+  const disabled = freshDb({ failed_triage_requeue_hours: 0 });
+  const parked = makeTask(disabled.db, disabled.projectId);
+  failAt(disabled.db, parked, 24 * 60 * 60 * 1000);
+  requeueStaleFailed(disabled.db);
+  expect(disabled.db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(parked)).toBeFalsy();
+});
+
+test("director failures, change requests, and failed requeues stay parked", () => {
+  const { db, projectId } = freshDb({ failed_triage_requeue_hours: 1 });
+  const directorFailed = makeTask(db, projectId);
+  failAt(db, directorFailed, 2 * 60 * 60 * 1000, "director");
+
+  const rejected = makeTask(db, projectId);
+  failAt(db, rejected, 2 * 60 * 60 * 1000);
+  putEvent(db, rejected, "changes_requested", { notes: "do not retry" });
+
+  const original = makeTask(db, projectId);
+  const failedRequeue = makeTask(db, projectId, { source: "requeue", parent: original });
+  failAt(db, failedRequeue, 2 * 60 * 60 * 1000);
+
+  requeueStaleFailed(db);
+
+  for (const id of [directorFailed, rejected, failedRequeue])
+    expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(id)).toBeFalsy();
+});
+
+test("a failed task with an existing successor is never auto-requeued again", () => {
+  const { db, projectId } = freshDb({ failed_triage_requeue_hours: 1 });
+  const id = makeTask(db, projectId);
+  failAt(db, id, 2 * 60 * 60 * 1000);
+  const successor = requeueTask(db, getTask(db, id));
+  putEvent(db, id, "requeued", { new_task_id: successor, attempt: 1 });
+
+  requeueStaleFailed(db);
+
+  expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").all(id)).toHaveLength(1);
+});
+
 test("alive but silent → status nudge via herdr agent send", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { agent: "a3" });
@@ -528,6 +618,65 @@ test("a lost nudge (exit 0 + agent_not_found) records delivered:false and doesn'
 
   const nudge: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery_nudge'").get(id);
   expect(JSON.parse(nudge.payload)).toMatchObject({ nudge: 1, delivered: false, error: "gone" });
+});
+
+test("a turn-complete nudge failure respawns exactly once with queued context", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent: "old-agent" });
+  db.query("UPDATE tasks SET branch = ? WHERE id = ?").run(`hive/${id}`, id);
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run(newId("evt"), id, new Date(Date.now() - 1000).toISOString(), "reconciler", "stale", JSON.stringify({ silent_ms: 999 }));
+  const probe = completedTurnHerdr();
+
+  await reconcileOnce(db, { ...inert, herdr: probe.herdr });
+  await reconcileOnce(db, { ...inert, herdr: probe.herdr });
+
+  expect(probe.spawnCount()).toBe(1);
+  expect(probe.briefs[0]).toContain("The prior agent turn completed");
+  expect(getTask(db, id).agent_target).toBe(id);
+  const recovery = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery' AND json_extract(payload, '$.decision') = 'turn-complete-respawn'").get(id) as any;
+  expect(JSON.parse(recovery.payload).respawned).toBe(true);
+});
+
+test("turn-complete recovery respects spawn backoff", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  putEvent(db, id, "spawn_error", { error: "worktree busy" });
+  putEvent(db, id, "stale", { silent_ms: 999 });
+  const probe = completedTurnHerdr();
+
+  await reconcileOnce(db, { ...inert, herdr: probe.herdr });
+
+  expect(probe.spawnCount()).toBe(0);
+  const held = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery' ORDER BY ts DESC LIMIT 1").get(id) as any;
+  expect(JSON.parse(held.payload)).toMatchObject({ decision: "turn-complete-respawn-held", reason: "spawn backoff" });
+});
+
+test("turn-complete recovery respects the project agent cap", async () => {
+  const { db, projectId } = freshDb({ max_agents: 1 });
+  const id = makeTask(db, projectId);
+  makeTask(db, projectId, { agent: "other-agent" });
+  putEvent(db, id, "stale", { silent_ms: 999 });
+  const probe = completedTurnHerdr();
+
+  await reconcileOnce(db, { ...inert, herdr: probe.herdr });
+
+  expect(probe.spawnCount()).toBe(0);
+  const held = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery' ORDER BY ts DESC LIMIT 1").get(id) as any;
+  expect(JSON.parse(held.payload)).toMatchObject({ decision: "turn-complete-respawn-held", reason: "project max_agents" });
+});
+
+test("turn-complete recovery parks when the death breaker trips", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  for (let i = 0; i < DEAD_BURST_N; i++) putEvent(db, id, "recovery", { decision: "dead" });
+  putEvent(db, id, "stale", { silent_ms: 999 });
+  const probe = completedTurnHerdr();
+
+  await reconcileOnce(db, { ...inert, herdr: probe.herdr });
+
+  expect(probe.spawnCount()).toBe(0);
+  expect(db.query("SELECT 1 FROM events WHERE type = 'breaker_card'").get()).toBeTruthy();
 });
 
 test("undelivered nudges never trip the cap: three lost nudges still nudge, never fail", async () => {

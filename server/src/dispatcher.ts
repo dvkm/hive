@@ -46,7 +46,7 @@ import type { Exec } from "./exec.ts";
 // guards that matter stay: manager delegation/auto_dispatch, intake review,
 // max_agents, authority. Exclude chores per project via config.dispatch_kinds.
 const DISPATCH_KINDS_DEFAULT = ["ship", "scout", "chore"];
-const MAX_AGENTS_DEFAULT = 3;
+export const MAX_AGENTS_DEFAULT = 3;
 const BACKOFF_BASE_MS = 30_000;
 // Global herdr-daemon-down circuit breaker. When a spawn fails because the herdr
 // control socket is unreachable (not a per-task fault), pause ALL dispatch for a

@@ -15,7 +15,7 @@ import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDepe
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
 import { spawnMeta } from "./cleanup.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent, resumeReviewForDeliveredSteers } from "./steer.ts";
-import { isReviewed } from "./dispatcher.ts";
+import { inBackoff, isReviewed, MAX_AGENTS_DEFAULT } from "./dispatcher.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
@@ -37,6 +37,8 @@ const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
 const MAX_AUTO_REQUEUE = 2;
 // Nudge an alive-but-silent agent up to 3 times, then escalate to a card.
 const MAX_SILENT_NUDGES = 3;
+const DEFAULT_FAILED_TRIAGE_REQUEUE_HOURS = 4;
+const TURN_COMPLETE_RESPAWN = "agent turn is complete; respawn required";
 
 export interface ReconcilerDeps {
   herdr?: Herdr;
@@ -148,6 +150,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("revalidateCiDecisions", () => revalidateCiDecisions(db));
   await step("linkPRs", () => linkPRs(db, deps));
   await step("resumeUsageLimited", () => resumeUsageLimited(db, (deps.nowMs ?? (() => Date.now()))()));
+  await step("requeueStaleFailed", () => requeueStaleFailed(db, (deps.nowMs ?? (() => Date.now()))()));
   await step("flagStale", () => flagStale(db, deps));
   await step("recoverStale", () => recoverStale(db, deps));
   await step("sweepVerifying", () => sweepVerifying(db, deps));
@@ -1720,6 +1723,64 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string, d
       payload: { nudge: nudges + 1, delivered: error === null, ...(error ? { error } : {}) },
     });
     broadcastTask(db, getTask(db, taskId));
+    if (error?.toLowerCase().includes(TURN_COMPLETE_RESPAWN)) await respawnCompletedTurn(db, h, task, deps);
+  }
+}
+
+async function respawnCompletedTurn(db: DB, h: Herdr, task: any, deps: ReconcilerDeps): Promise<void> {
+  const nowMs = (deps.nowMs ?? (() => Date.now()))();
+  const blocked = teardownBlocked(db, nowMs, deps.instanceId);
+  if (blocked) {
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: blocked } });
+    return;
+  }
+  const dead = recentDeadVerdicts(db, nowMs);
+  if (dead >= DEAD_BURST_N) {
+    openBreakerDecision(db, task, dead, Math.round(DEAD_BURST_MS / 60_000));
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "recovery breaker" } });
+    return;
+  }
+  if (inBackoff(db, task.id, nowMs)) {
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "spawn backoff" } });
+    return;
+  }
+  const project = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id) as { config: string | null } | undefined;
+  const config = JSON.parse(project?.config ?? "{}");
+  const cap = Number.isFinite(config.max_agents) ? Number(config.max_agents) : MAX_AGENTS_DEFAULT;
+  const otherAgents = db.query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND id != ? AND agent_target IS NOT NULL AND COALESCE(source, '') != 'chat_supervisor' AND state IN ('in_progress','needs_decision')`).get(task.project_id, task.id) as { n: number };
+  if (otherAgents.n >= cap) {
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "project max_agents" } });
+    return;
+  }
+
+  queueSteerEvent(db, task.id, `The prior agent turn completed before it received Hive's recovery nudge. Continue task ${task.id} from the existing branch and worktree.`, "queued for turn-complete respawn");
+  const result = await spawnAgent(db, h, task.id, { supervise: deps.supervise, exec: deps.exec });
+  writeEvent(db, {
+    task_id: task.id,
+    source: "reconciler",
+    type: "recovery",
+    payload: { decision: "turn-complete-respawn", respawned: result.ok, ...(result.ok ? { agent_target: result.agent_target } : { error: result.error }) },
+  });
+  broadcastTask(db, getTask(db, task.id));
+}
+
+export function requeueStaleFailed(db: DB, nowMs: number = Date.now()): void {
+  const failed = db.query(`SELECT t.*, p.config AS project_config,
+      COALESCE((SELECT MAX(ts) FROM events WHERE task_id = t.id AND type = 'state_change' AND json_extract(payload, '$.to') = 'failed'), t.updated_at) AS failed_at
+    FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.state = 'failed'`).all() as any[];
+  for (const task of failed) {
+    const configured = JSON.parse(task.project_config ?? "{}").failed_triage_requeue_hours;
+    const hours = configured === undefined ? DEFAULT_FAILED_TRIAGE_REQUEUE_HOURS : Number(configured);
+    if (!Number.isFinite(hours) || hours <= 0 || nowMs - Date.parse(task.failed_at) < hours * 60 * 60 * 1000) continue;
+    if (task.source === "requeue") continue;
+    if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type IN ('changes_requested','requeued') LIMIT 1").get(task.id)) continue;
+    const failure = db.query("SELECT source FROM events WHERE task_id = ? AND type = 'state_change' AND json_extract(payload, '$.to') = 'failed' ORDER BY ts DESC LIMIT 1").get(task.id) as { source: string } | undefined;
+    if (failure?.source === "director") continue;
+
+    const newId = requeueTask(db, task);
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "requeued", payload: { new_task_id: newId, attempt: 1, reason: "failed task exceeded triage window" } });
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "failed-triage-auto-requeue", new_task_id: newId, attempt: 1 } });
+    enqueue(db, { kind: "failed", task_id: task.id, title: `Auto-requeued after ${hours}h awaiting triage: ${task.title}` });
   }
 }
 
