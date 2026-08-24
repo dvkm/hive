@@ -2980,6 +2980,7 @@ export function codexAgentArgv(
   const argv = [
     "codex",
     "--sandbox", "workspace-write",
+    "-c", "sandbox_workspace_write.network_access=true",
     "--ask-for-approval", "on-request",
     "--dangerously-bypass-hook-trust",
     "-c", "features.hooks=true",

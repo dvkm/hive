@@ -103,6 +103,7 @@ test("a ChatGPT project starts an interactive Codex worker with Hive hooks", asy
   expect(start).toContain("HIVE_AGENT=codex");
   expect(agent[0]).toBe("codex");
   expect(agent).toContain("workspace-write");
+  expect(agent).toContain("sandbox_workspace_write.network_access=true");
   expect(agent).toContain("on-request");
   expect(agent).toContain("--dangerously-bypass-hook-trust");
   expect(agent.some((arg) => arg.includes("hooks.PermissionRequest") && arg.includes("hive-approve.sh"))).toBe(true);
