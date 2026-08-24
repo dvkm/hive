@@ -3512,6 +3512,15 @@ a.dbundle-fact:hover {
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
+.brief-focus-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.brief-focus-nav .btn-mini {
+  padding: 0 6px;
+  line-height: 18px;
+}
 .brief-focus .brief-queue-note {
   margin-top: 14px;
 }
