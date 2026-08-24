@@ -92,6 +92,39 @@ test("urgent notification opens hive.app with its click destination", () => {
   expect(digest.delivered).toBe(false);
 });
 
+test("an urgent open decision pushes the question and inline answers", async () => {
+  const { db, projectId } = freshDb();
+  const taskId = newId();
+  const decisionId = newId("dec");
+  const t = now();
+  db.query(
+    "INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at) VALUES (?,?,?, 'needs_decision','ship', ?, ?)"
+  ).run(taskId, projectId, "ship it", t, t);
+  db.query("INSERT INTO decisions (id, task_id, ts, title, options, status) VALUES (?,?,?,?,?,'open')").run(
+    decisionId,
+    taskId,
+    t,
+    "Ship it?",
+    JSON.stringify([{ key: "approve", label: "Approve" }, { key: "deny", label: "Deny" }])
+  );
+  let pushed: any;
+
+  enqueue(
+    db,
+    { kind: "decision", task_id: taskId, decision_id: decisionId, title: "Decision needed: Ship it?", urgency: "urgent" },
+    { push: async (_db, payload) => { pushed = payload; } }
+  );
+  await Promise.resolve();
+
+  expect(pushed).toEqual({
+    title: "Ship it?",
+    body: null,
+    url: `/decisions#dcard-${decisionId}`,
+    decisionId,
+    actions: [{ action: "approve", title: "Approve" }, { action: "deny", title: "Deny" }],
+  });
+});
+
 test("transition to done/failed enqueues a normal notification", () => {
   const { db, projectId } = freshDb();
   const id = newId();
