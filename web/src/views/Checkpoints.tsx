@@ -145,11 +145,11 @@ export function CheckpointList({ events }: { events: Event[] }) {
 // an approve-all per group. Live via the store's SSE-driven checkpoint list.
 // Un-acked checkpoints survive task completion (marked "shipped") — a late
 // flag becomes a corrective follow-up task instead of a dead steer.
-export function CheckpointsInbox({ limit, heading = true }: { limit?: number; heading?: boolean } = {}) {
+export function CheckpointsInbox({ taskId, heading = true }: { taskId?: string; heading?: boolean } = {}) {
   const { checkpoints, reloadCheckpoints, tasks } = useStore();
   const projectFilter = useProjectFilter();
   const [busy, setBusy] = useState(false);
-  const scoped = checkpoints.filter((c) => inProjectFilter(c.project_id, projectFilter));
+  const scoped = checkpoints.filter((c) => inProjectFilter(c.project_id, projectFilter) && (!taskId || c.task_id === taskId));
   if (!scoped.length) return null;
 
   const groups = new Map<string, Checkpoint[]>();
@@ -158,7 +158,7 @@ export function CheckpointsInbox({ limit, heading = true }: { limit?: number; he
     g.push(c);
     groups.set(c.task_id, g);
   }
-  const visibleGroups = limit ? [...groups.values()].slice(0, limit) : [...groups.values()];
+  const visibleGroups = [...groups.values()];
 
   const approveAll = async (items: Checkpoint[]) => {
     if (busy) return;
