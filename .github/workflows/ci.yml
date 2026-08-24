@@ -27,7 +27,11 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Self-hosted runner on David's Mac (mac-hive-runner). GitHub-hosted minutes
+    # are billing-blocked on the example-org account and hive is a solo, locally-deployed
+    # project (sync-main.sh builds + restarts on this same Mac), so a local runner
+    # is free CI with no GitHub-hosted dependency. bun comes from setup-bun below.
+    runs-on: self-hosted
     # This job only reads the tree. Narrow the default GITHUB_TOKEN so a
     # compromised dependency in a PR run can't write to the repo.
     permissions:
