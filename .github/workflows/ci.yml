@@ -1,21 +1,8 @@
 name: CI
 
-# DORMANT ON PURPOSE — manual trigger only (dec_102596014f42).
-#
-# This repo's Actions jobs are currently refused a runner ("the job was not
-# started because recent account payments have failed or your spending limit
-# needs to be increased"). GitHub still creates the check run and marks it
-# FAILURE, which hive reads as an ordinary red (ciStatusOf, reconciler.ts) and
-# uses to HOLD the ready handoff — telling the agent to fix a failure no push
-# can clear. Triggering on pull_request today would do that to every hive PR.
-#
-# TO TURN CI ON: once the runner situation resolves (billing raise, or the
-# CodeBuild migration, task f060e570b75c), uncomment the two triggers below,
-# re-run one PR, and confirm the check actually goes green before treating
-# "CI is green" as evidence.
 on:
   workflow_dispatch:
-  # pull_request:
+  pull_request:
   # push:
   #   branches: [main]
 
@@ -31,7 +18,7 @@ jobs:
     # are billing-blocked on the example-org account and hive is a solo, locally-deployed
     # project (sync-main.sh builds + restarts on this same Mac), so a local runner
     # is free CI with no GitHub-hosted dependency. bun comes from setup-bun below.
-    runs-on: self-hosted
+    runs-on: [self-hosted, macOS, ARM64]
     # This job only reads the tree. Narrow the default GITHUB_TOKEN so a
     # compromised dependency in a PR run can't write to the repo.
     permissions:
