@@ -483,9 +483,20 @@ export function ReviewCard({
         : task.ci_status === "passing"
           ? "CI passed and Hive found no blocking issue."
           : "Hive completed its review and is ready for your approval.");
+  // Focus is a queue: picking an action moves to the next item right away
+  // instead of holding the card through the round trip. A failure still toasts
+  // its reason. Elsewhere (task page, review queue) the card stays put until the
+  // call lands, so the error can render on the card itself.
+  const start = () => {
+    setBusy(true);
+    if (surface === "focus") onDone?.();
+  };
+  const finish = () => {
+    if (surface !== "focus") onDone?.();
+  };
   const merge = async (strategy?: "local_ff") => {
     if (busy) return;
-    setBusy(true);
+    start();
     try {
       if (reportOnly) {
         await api.transition(task.id, "verifying");
@@ -494,7 +505,7 @@ export function ReviewCard({
         await api.merge(task.id, strategy);
         toast(strategy ? "Merged locally → Verifying" : "Merged → Verifying");
       }
-      onDone?.();
+      finish();
     } catch (e) {
       const msg = (e as Error).message;
       // Keep the reason ON the card — a vanishing toast made failed merges
@@ -510,13 +521,13 @@ export function ReviewCard({
   };
   const requestChanges = async () => {
     if (!notes.trim() || busy) return;
-    setBusy(true);
+    start();
     try {
       const r = await api.requestChanges(task.id, notes);
       toast(r.delivered ? "Changes requested — sent to agent" : "Changes requested (agent offline; recorded)");
       setNotes("");
       setMode(null);
-      onDone?.();
+      finish();
     } catch (e) {
       toast((e as Error).message);
     } finally {
@@ -525,14 +536,14 @@ export function ReviewCard({
   };
   const refreshUnderstandingCheck = async () => {
     if (busy) return;
-    setBusy(true);
+    start();
     try {
       await api.requestChanges(
         task.id,
         "Refresh the existing review_summary without changing the implementation. Preserve the review findings, regenerate the explanation in the current format, and add 1-5 multiple-choice understanding.checks. Each question must help the director understand this specific change or report: its behavior, user impact, risk, tradeoff, or evidence, with the answer taught in the explanation. Do not quiz agent procedures, debugging, merging, tools, or policy. Then submit the task for review again."
       );
       toast("Agent asked to add the understanding check");
-      onDone?.();
+      finish();
     } catch (e) {
       toast((e as Error).message);
     } finally {
@@ -541,13 +552,13 @@ export function ReviewCard({
   };
   const reject = async () => {
     if (!notes.trim() || busy) return;
-    setBusy(true);
+    start();
     try {
       await api.transition(task.id, "cancelled", notes);
       toast("Rejected — task cancelled");
       setNotes("");
       setMode(null);
-      onDone?.();
+      finish();
     } catch (e) {
       toast((e as Error).message);
     } finally {

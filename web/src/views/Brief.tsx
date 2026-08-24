@@ -123,14 +123,27 @@ export default function Brief() {
   const spendCount = spend ? spend.totals.calls : 0;
 
   const actionCount = openDecisions.length + checkpoints.length + quizzes.length + toReview.length + attention.length;
-  const focusCount = actionCount - checkpoints.length + new Set(checkpoints.map((checkpoint) => checkpoint.task_id)).size;
-  const focusItem = needsYou.find((item) => {
-    if (item.kind === "decision") return !answered.has(item.id);
-    if (item.kind === "quiz") return !passedQuizzes.has(item.id);
-    if (item.kind === "review") return !reviewed.has(item.id);
-    if (item.kind === "waiting") return false;
-    return true;
-  });
+  // The focus queue, in order. Handled items drop out, so the index naturally
+  // lands on the next one; the arrows let you step past anything you can't act on.
+  const focusItems = useMemo(() => {
+    const seenCheckpointTasks = new Set<string>();
+    return needsYou.filter((item) => {
+      if (item.kind === "decision") return !answered.has(item.id);
+      if (item.kind === "quiz") return !passedQuizzes.has(item.id);
+      if (item.kind === "review") return !reviewed.has(item.id);
+      if (item.kind === "waiting") return false;
+      // One card per task: CheckpointsInbox already shows the task's checkpoints together.
+      if (item.kind === "checkpoint") {
+        if (seenCheckpointTasks.has(item.checkpoint.task_id)) return false;
+        seenCheckpointTasks.add(item.checkpoint.task_id);
+      }
+      return true;
+    });
+  }, [needsYou, answered, passedQuizzes, reviewed]);
+  const focusCount = focusItems.length;
+  const [focusIdx, setFocusIdx] = useState(0);
+  const at = Math.min(focusIdx, Math.max(0, focusCount - 1));
+  const focusItem = focusItems[at];
   const chooseMode = (next: "focus" | "backlogs") => {
     setMode(next);
     localStorage.setItem(MODE_KEY, next);
@@ -183,12 +196,16 @@ export default function Brief() {
         <section className="brief-focus" key={`${focusItem.kind}:${focusItem.id}`}>
           <div className="brief-focus-meta">
             <span>{ITEM_LABELS[focusItem.kind]}</span>
-            <span>1 of {focusCount}</span>
+            <span className="brief-focus-nav">
+              <button className="btn btn-mini" aria-label="Previous item" disabled={at === 0} onClick={() => setFocusIdx(at - 1)}>&larr;</button>
+              {at + 1} of {focusCount}
+              <button className="btn btn-mini" aria-label="Next item" disabled={at >= focusCount - 1} onClick={() => setFocusIdx(at + 1)}>&rarr;</button>
+            </span>
           </div>
           {focusItem.kind === "decision" && (
             <DecisionCard d={focusItem.decision} onDone={(id) => setAnswered((items) => new Set(items).add(id))} />
           )}
-          {focusItem.kind === "checkpoint" && <CheckpointsInbox limit={1} heading={false} />}
+          {focusItem.kind === "checkpoint" && <CheckpointsInbox taskId={focusItem.checkpoint.task_id} heading={false} />}
           {focusItem.kind === "quiz" && (
             <div className="brief-quiz">
               <Link to={`/tasks/${focusItem.quiz.task_id}`}>{taskIdLabel(focusItem.quiz.task_id, focusItem.quiz.task_number)} {focusItem.quiz.task_title}</Link>
@@ -224,7 +241,7 @@ export default function Brief() {
               title={focusItem.kind === "decision" ? focusItem.decision.title : focusItem.kind === "checkpoint" ? focusItem.checkpoint.task_title : focusItem.kind === "quiz" ? focusItem.quiz.task_title : focusItem.task.title}
             />
           )}
-          {focusCount > 1 && <div className="brief-queue-note">{focusCount - 1} more waiting. Finish this one to continue.</div>}
+          {focusCount > 1 && <div className="brief-queue-note">{focusCount - 1} more waiting.</div>}
         </section>
       )}
 
