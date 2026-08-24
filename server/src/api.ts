@@ -4740,8 +4740,14 @@ function buildResumeSection(
   const ghostBranch = ownGhostBranch || inheritedGhost;
   const prUrl = predecessorOpenPrUrl(db, source);
   const prFactsApply = !!prUrl && prUrl === source.pr_url;
+  const owner =
+    ownGhostBranch || prFactsApply || !source.parent_task_id ? source : getTask(db, source.parent_task_id) ?? source;
+  const ownerPrFactsApply = owner.id !== source.id && !!prUrl && prUrl === owner.pr_url;
+  const headSha = prFactsApply ? source.head_sha : ownerPrFactsApply ? owner.head_sha : null;
+  const ciStatus = prFactsApply ? source.ci_status : ownerPrFactsApply ? owner.ci_status : null;
   const decisions = answeredDecisionSummaries(db, source.id);
-  const review = lastReviewHeadline(db, source.id);
+  if (owner.id !== source.id) decisions.push(...answeredDecisionSummaries(db, owner.id));
+  const review = lastReviewHeadline(db, source.id) || (owner.id !== source.id ? lastReviewHeadline(db, owner.id) : null);
   const lead = prUrl
     ? `**RESUME — adopt PR ${prUrl} / branch \`${branch}\`. Do NOT rebuild this feature from scratch.**`
     : `**RESUME — adopt branch \`${branch}\`. Do NOT rebuild this feature from scratch.**`;
@@ -4758,8 +4764,8 @@ function buildResumeSection(
     lines.push(`- This attempt itself inherited \`${inheritedBranch}\` from an earlier failed attempt but never confirmed merging it before it also died. Fetch it too, check whether it holds work the branch above is missing, and merge whichever has the real content.`);
   if (inheritedGhost)
     lines.push(`- An earlier attempt also had uncommitted WIP separately rescued onto \`${inheritedGhost}\`. Check it too and merge any missing work into your own current branch.`);
-  if (prUrl) lines.push(`- Open PR: ${prUrl}${prFactsApply && source.head_sha ? ` (last known head \`${source.head_sha}\`)` : ""} — push your fixes to this PR. Do not open a second PR for this feature.`);
-  if (prFactsApply && source.ci_status) lines.push(`- Last known CI status: ${source.ci_status}`);
+  if (prUrl) lines.push(`- Open PR: ${prUrl}${headSha ? ` (last known head \`${headSha}\`)` : ""} — push your fixes to this PR. Do not open a second PR for this feature.`);
+  if (ciStatus) lines.push(`- Last known CI status: ${ciStatus}`);
   if (decisions.length) {
     lines.push(`- Decisions the director already answered on the failed attempt (don't re-ask):`);
     for (const d of decisions) lines.push(`  - ${d}`);

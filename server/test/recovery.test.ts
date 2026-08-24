@@ -478,6 +478,35 @@ test("requeue context includes answer notes, answerer identity, and section-only
   expect(requeue.brief).toContain("testing, followups section(s) included");
 });
 
+test("a chained requeue still surfaces the original attempt's head_sha, CI status, decisions, and review", () => {
+  const { db, projectId } = freshDb();
+  const original = makeTask(db, projectId);
+  const branch = `hive/${original}`;
+  const prUrl = "https://github.com/acme/web/pull/819";
+  db.query(
+    "UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, pr_url = ?, head_sha = ?, ci_status = ? WHERE id = ?"
+  ).run(branch, prUrl, "abc123head", "passing", original);
+  const answeredAt = now();
+  db.query(
+    `INSERT INTO decisions (id, task_id, ts, title, options, status, answer_key, answered_at, answered_by)
+     VALUES (?,?,?,?,?, 'answered', ?,?, 'director')`
+  ).run(
+    newId("dec"), original, answeredAt, "Which rollout?",
+    JSON.stringify([{ key: "staged", label: "Use staged rollout" }]),
+    "staged", answeredAt
+  );
+  putEvent(db, original, "review_summary", { done: ["shipped the thing"] });
+
+  const firstRequeue = requeueTask(db, getTask(db, original));
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL WHERE id = ?").run(firstRequeue);
+  const secondRequeue = getTask(db, requeueTask(db, getTask(db, firstRequeue)));
+
+  expect(secondRequeue.brief).toContain("last known head `abc123head`");
+  expect(secondRequeue.brief).toContain("Last known CI status: passing");
+  expect(secondRequeue.brief).toContain("Which rollout? — Use staged rollout");
+  expect(secondRequeue.brief).toContain("a self-review was already submitted (1 item(s) done");
+});
+
 test("a source=external task with agent_target set (regression guard: should be unreachable post-#996) is still recovered sanely, not stuck forever", async () => {
   // supervision.ts's neverDispatched, plus the createTask/spawnAgent guards in
   // api.ts, should make this state unreachable going forward — this guards the
