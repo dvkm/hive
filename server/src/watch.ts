@@ -22,6 +22,7 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, hiveHome, isOffline } from "./db.ts";
 import { writeEvent, getTask } from "./state.ts";
+import { triageIntake } from "./intake/triage.ts";
 import { broadcast } from "./bus.ts";
 import { getCursor, setCursor } from "./intake/gchat.ts";
 import type { Exec } from "./exec.ts";
@@ -136,6 +137,10 @@ export async function checkWatcher(db: DB, projectId: string, w: Watcher, deps: 
   );
   writeEvent(db, { task_id: id, source: "system", type: "created", payload: { watcher: w.name, url: w.url } });
   broadcast({ type: "task", task: getTask(db, id) });
+  // Intake triage (config.intake_triage): a doc change that reads two ways asks
+  // the director which reading to build before this dispatches. No-op when the
+  // project has not opted in, and never throws.
+  await triageIntake(db, getTask(db, id));
 
   writeFileSync(snap, body);
   setCursor(db, "watch", cursorKey, hash);

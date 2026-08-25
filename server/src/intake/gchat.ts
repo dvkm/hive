@@ -28,6 +28,7 @@ import { enqueue } from "../notifications.ts";
 import { providerFor } from "../secrets.ts";
 import type { Exec } from "../exec.ts";
 import { defaultExec } from "../exec.ts";
+import { triageIntake } from "./triage.ts";
 import { runPlanner, type PlannerExec } from "../planner.ts";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
@@ -308,6 +309,10 @@ async function createIntakeTask(
       /* runPlanner records its own planner_error event; never fail the intake */
     }
   }
+  // Intake triage (config.intake_triage): mechanical messages clear the
+  // unreviewed hold themselves, ambiguous ones raise the director's card.
+  // triageIntake never throws and is a no-op when the project has not opted in.
+  await triageIntake(db, task);
   return task;
 }
 

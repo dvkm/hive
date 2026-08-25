@@ -78,6 +78,7 @@ import {
   type JiraDeps,
 } from "./intake/jira.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
+import { triageIntake, resolveIntakeTriageForDecision } from "./intake/triage.ts";
 import { noteRepoMismatch, resolveRepoMismatchForDecision } from "./repoTarget.ts";
 import { costUsd } from "./pricing.ts";
 import { checkUsageGuardrails, resolveUsageCapForDecision, taskSpend } from "./costs.ts";
@@ -2009,6 +2010,10 @@ async function createTask(db: DB, req: Request): Promise<Response> {
   // never gets a card it can't act on. A strong mismatch rides back on the
   // response as `warning` (the CLI prints it) and holds dispatch via its card.
   const warning = noteRepoMismatch(db, getTask(db, row.id));
+  // Ambient intake only (source intake_*/watch), and only when the project opted
+  // in. Deliberately not awaited: a 60s classifier must not hold the create
+  // response, and the dispatcher holds the task meanwhile.
+  triageIntake(db, getTask(db, row.id)).catch((e) => console.error(`[hive] intake triage ${row.id}:`, e));
   return json({ ...taskWithHealth(db, getTask(db, row.id)), ...(warning ? { warning } : {}) }, 201);
 }
 
@@ -6433,6 +6438,7 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     resolveRefCaptureForDecision(db, id, answerKey, answerNote),
     resolveDependentsWedgedForDecision(db, id, answerKey, successorId, answeredBy),
     resolveLandPauseForDecision(db, id, answerKey),
+    resolveIntakeTriageForDecision(db, id, answerKey, answerNote),
   ].some(Boolean);
   if (!claimed) {
     const label = options.find((o) => o.key === answerKey)?.label ?? answerKey;
