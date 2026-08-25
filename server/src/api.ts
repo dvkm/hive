@@ -92,10 +92,11 @@ import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./pla
 import { autoResumeOnTurnEnd } from "./resume.ts";
 import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen, probeAgent } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
-import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
+import { authoredFiles, captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { landGraph, markLand, resolveLandPauseForDecision } from "./landQueue.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
+import { autonomyStats } from "./autonomyStats.ts";
 import { defaultExec, isSafeRef, projectBaseBranch, projectComparisonBase, preferSafeRef } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
 import { projectPrefix, taskIdentifier } from "./taskIdentifier.ts";
@@ -540,6 +541,15 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (b?.endpoint) removeSubscription(db, b.endpoint);
         return json({ ok: true });
       }
+
+      if (pathname === "/api/stats/autonomy" && method === "GET")
+        return json(
+          await autonomyStats(db, {
+            days: Number(url.searchParams.get("days")) || undefined,
+            projectId: url.searchParams.get("project_id"),
+            exec: url.searchParams.get("reverts") === "0" ? null : deps.exec,
+          })
+        );
 
       if (pathname === "/api/checkpoints" && method === "GET") return listOpenCheckpoints(db, url);
       if (pathname === "/api/understanding-quizzes" && method === "GET") return listUnderstandingQuizzes(db, url);
@@ -2867,6 +2877,33 @@ function staleBaseRefusal(prView: any): boolean {
   return ci !== "failing" && ci !== "pending";
 }
 
+// Files a merge landed. GitHub is the only authority for a PR — after a squash
+// merge the PR head may not exist locally at all, so there is deliberately no
+// local fallback on that path. A PR-less local ff reads the branch's own
+// authored diff instead. Returns null when neither can be read: merged_files is
+// then simply absent, and the autonomy stats treat that merge as unmeasurable
+// for file overlap. Never throws, never blocks the merge.
+async function mergedFileList(
+  exec: Exec,
+  task: any,
+  repoPath: string | null,
+  base: string,
+  head: string | null
+): Promise<string[] | null> {
+  if (task.pr_url) {
+    const r = await exec(["gh", "pr", "view", task.pr_url, "--json", "files"]);
+    if (r.code !== 0) return null;
+    try {
+      const files = JSON.parse(r.stdout || "{}").files;
+      return Array.isArray(files) ? files.map((f: any) => String(f?.path ?? "")).filter(Boolean).sort() : null;
+    } catch {
+      return null;
+    }
+  }
+  if (!repoPath || !head) return null;
+  return await authoredFiles(exec, repoPath, base, head);
+}
+
 // POST /api/tasks/:id/merge — approve & merge an in-review task.
 // PR-backed: `gh pr merge <url> <method>`. Otherwise a local fast-forward of the
 // task branch into the project's default branch. On success: `merged` event,
@@ -3174,7 +3211,11 @@ export async function mergeTask(
       },
     });
   }
-  writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url, actor } });
+  // What this merge actually landed, recorded at merge time so autonomy stats
+  // (server/src/autonomyStats.ts) can later ask "did a fix touch these files?".
+  // Best effort: an unreadable repo or a deleted PR head just leaves it absent.
+  const merged_files = await mergedFileList(exec, task, project?.repo_path ?? null, guardBase, guardHead);
+  writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url, actor, ...(merged_files ? { merged_files } : {}) } });
   // in_review → verifying (runs post-deploy smoke once).
   transition(db, id, "verifying", { source: "director", reason: `merged (${method})` });
   await smokeThenAdvance(db, id, { fetch: deps.fetch }).catch((e) => console.error("[hive] smoke run failed:", e));
@@ -6348,11 +6389,48 @@ function closedDecisionResponse(db: DB, r: any): Response | null {
   });
 }
 
+// Someone answered a card that is already answered, and picked a DIFFERENT
+// option. That is a disagreement with whoever answered first — the signal the
+// agreement metric in autonomyStats.ts counts. The answer itself is still
+// refused (an answered card stays answered); this only records that it happened,
+// once, carrying who answered first so auto-answers can be told from human ones.
+function recordContradiction(db: DB, decision: any, body: any): void {
+  const answerKey = body?.answer_key;
+  if (!answerKey || decision.status !== "answered" || answerKey === decision.answer_key) return;
+  const already = db
+    .query(
+      `SELECT 1 FROM events WHERE task_id = ? AND type = 'decision_contradicted'
+        AND json_extract(payload, '$.decision_id') = ? LIMIT 1`
+    )
+    .get(decision.task_id, decision.id);
+  if (already) return;
+  // Identity is not validated yet on this path (the answer is refused, not
+  // applied), so clamp it rather than writing an arbitrary caller string.
+  const claimed = body?.source ?? "unknown";
+  const source = ANSWER_SOURCES.includes(claimed) ? claimed : "unknown";
+  writeEvent(db, {
+    task_id: decision.task_id,
+    source,
+    type: "decision_contradicted",
+    payload: {
+      decision_id: decision.id,
+      prior_answer_key: decision.answer_key,
+      prior_source: decision.answered_by ?? "unknown",
+      attempted_answer_key: answerKey,
+      source,
+      actor: actorOf(body),
+    },
+  });
+}
+
 export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, supervisorVerified = false): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
   if (!r) return err("decision not found", 404);
   const closed = closedDecisionResponse(db, r);
-  if (closed) return closed;
+  if (closed) {
+    recordContradiction(db, r, body);
+    return closed;
+  }
   const answerKey = body?.answer_key;
   if (!answerKey) return err("answer_key is required");
   const options: any[] = JSON.parse(r.options || "[]");
