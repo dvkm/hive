@@ -26,6 +26,10 @@ import {
   deferTask,
   undeferTask,
   unmetDeps,
+  repointDependents,
+  dependsTransitivelyOn,
+  dependentsWedgedForDecision,
+  resolveDependentsWedgedForDecision,
   queuedInputRecoveryPending,
   type State,
 } from "./state.ts";
@@ -1663,6 +1667,7 @@ function parseDeps(db: DB, raw: any, selfId?: string): string[] | Response {
   for (const d of deps) {
     if (selfId && d === selfId) return err("a task cannot depend on itself", 400);
     if (!db.query("SELECT 1 FROM tasks WHERE id = ?").get(d)) return err(`unknown depends_on task: ${d}`, 400);
+    if (selfId && dependsTransitivelyOn(db, d, selfId)) return err("depends_on would create a dependency cycle", 400);
   }
   return deps;
 }
@@ -4339,6 +4344,7 @@ export function requeueTask(db: DB, source: any): string {
     resume?.branch ?? null, resume?.ghostBranch ?? null, resume?.prUrl ?? null, t, t
   );
   writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title: fresh.title, requeue_of: fresh.id } });
+  repointDependents(db, fresh.id, id, "reconciler");
   broadcastTask(db, getTask(db, id));
   // Re-broadcast the failed original: its earlier `failed` SSE frame predates
   // this successor, so clients still show it as awaiting triage without this.
@@ -5729,6 +5735,17 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
   const bodyError = decisionAnswerBodyError(body);
   if (bodyError) return err(bodyError, 400);
   const submittedAnswerNote = body?.answer_note;
+  const answerNote = submittedAnswerNote ?? r.draft_note ?? null;
+  const wedged = dependentsWedgedForDecision(db, id);
+  let successorId: string | null = null;
+  if (wedged && answerKey === "repoint") {
+    const successor = getTask(db, String(answerNote ?? "").trim());
+    if (!successor) return err("repoint requires a valid successor task ID in the answer note", 400);
+    if (["failed", "cancelled"].includes(successor.state)) return err("repoint successor must not be failed or cancelled", 400);
+    if (wedged.dependentTaskIds.some((dependentId) => dependsTransitivelyOn(db, successor.id, dependentId)))
+      return err("repoint would create a dependency cycle", 400);
+    successorId = successor.id;
+  }
 
   // Caller identity. A missing source is NOT assumed to be the director — the
   // web UI now sends source:"director" explicitly, so a bare call is a caller
@@ -5760,7 +5777,6 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     return err("Cannot approve a planner breakdown with no tasks; answer 'reject' instead.", 400);
 
   const answeredAt = now();
-  const answerNote = submittedAnswerNote ?? r.draft_note ?? null;
   db.query(
     "UPDATE decisions SET status = 'answered', answer_key = ?, answer_note = ?, answered_at = ?, answered_by = ?, answered_actor = ? WHERE id = ?"
   ).run(answerKey, answerNote, answeredAt, answeredBy, answeredActor, id);
@@ -5788,6 +5804,7 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     resolveUsageCapForDecision(db, id, answerKey),
     resolveScopeDriftForDecision(db, id, answerKey),
     resolveRefCaptureForDecision(db, id, answerKey, answerNote),
+    resolveDependentsWedgedForDecision(db, id, answerKey, successorId, answeredBy),
   ].some(Boolean);
   if (!claimed) {
     const label = options.find((o) => o.key === answerKey)?.label ?? answerKey;

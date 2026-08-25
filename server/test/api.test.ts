@@ -219,10 +219,37 @@ test("PUT /api/tasks/:id can declare a dependency after creation, mid-task", asy
   const selfDep = await put(`/api/tasks/${b.json.id}`, { depends_on: b.json.id });
   expect(selfDep.status).toBe(400);
 
+  const cycle = await put(`/api/tasks/${a.json.id}`, { depends_on: b.json.id });
+  expect(cycle.status).toBe(400);
+  expect(cycle.json.error).toContain("cycle");
+
   // omitting depends_on entirely leaves it alone (only title/brief change)
   const titleOnly = await put(`/api/tasks/${b.json.id}`, { title: "renamed" });
   expect(titleOnly.status).toBe(200);
   expect(titleOnly.json.depends_on).toEqual([a.json.id]);
+});
+
+test("answering a cancelled-dependency card repoints its dependents", async () => {
+  const dependency = await post("/api/tasks", { project_id: projectId, title: "cancelled dependency resolver source" });
+  const successor = await post("/api/tasks", { project_id: projectId, title: "cancelled dependency resolver successor" });
+  const dependent = await post("/api/tasks", {
+    project_id: projectId,
+    title: "cancelled dependency resolver dependent",
+    depends_on: dependency.json.id,
+  });
+
+  await post(`/api/tasks/${dependency.json.id}/transition`, { to: "cancelled" });
+  const card = (await get(`/api/tasks/${dependent.json.id}`)).json.decisions.find(
+    (d: any) => d.status === "open" && d.options.some((option: any) => option.key === "repoint")
+  );
+  const answered = await post(`/api/decisions/${card.id}/answer`, {
+    answer_key: "repoint",
+    answer_note: successor.json.id,
+    source: "director",
+  });
+
+  expect(answered.status).toBe(200);
+  expect((await get(`/api/tasks/${dependent.json.id}`)).json.depends_on).toEqual([successor.json.id]);
 });
 
 test("tracking-only tasks cannot mint direct, checkpoint, or learning work", async () => {

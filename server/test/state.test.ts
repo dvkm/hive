@@ -252,6 +252,36 @@ test("cancelling a task expires its open decisions + writes decision_expired eve
   expect(evts.length).toBe(2);
 });
 
+test("cancelling a task with dependents opens one decision naming every affected task", () => {
+  const { db, projectId } = freshDb();
+  const dependency = makeTask(db, projectId);
+  const first = makeTask(db, projectId);
+  const second = makeTask(db, projectId);
+  db.query("UPDATE tasks SET title = ?, depends_on = ? WHERE id = ?").run("first dependent", JSON.stringify([dependency]), first);
+  db.query("UPDATE tasks SET title = ?, depends_on = ? WHERE id = ?").run("second dependent", JSON.stringify([dependency]), second);
+
+  transition(db, dependency, "cancelled", { source: "director", reason: "no longer needed" });
+
+  const decision = db.query("SELECT * FROM decisions WHERE status = 'open'").get() as any;
+  expect(decision).toBeTruthy();
+  expect(decision.context).toContain(first);
+  expect(decision.context).toContain(second);
+  expect(JSON.parse(decision.options).map((option: any) => option.key)).toEqual(["repoint", "cancel"]);
+});
+
+test("cancelling a task also surfaces an active dependent", () => {
+  const { db, projectId } = freshDb();
+  const dependency = makeTask(db, projectId);
+  const dependent = makeTask(db, projectId);
+  transition(db, dependent, "in_progress");
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([dependency]), dependent);
+
+  transition(db, dependency, "cancelled", { source: "director", reason: "no longer needed" });
+
+  const decision = db.query("SELECT * FROM decisions WHERE status = 'open'").get() as any;
+  expect(decision.context).toContain(dependent);
+});
+
 test("reaching done also expires open decisions; already-answered ones are untouched", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId);

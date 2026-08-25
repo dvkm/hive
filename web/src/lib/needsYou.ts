@@ -84,6 +84,7 @@ function reviewIsActionable(task: Task): boolean {
 // Browser-safe mirror of server/src/state.ts's dependency gate. Exported so
 // BlockedBy and the needs-you queue use the same threshold.
 export const DEP_MET_STATES = new Set(["verifying", "done"]);
+const DEAD_DEP_STATES = new Set(["failed", "cancelled"]);
 export function unmetDeps(task: Task, tasks: Task[]): BlockingTaskRef[] {
   return (task.depends_on ?? []).flatMap((id) => {
     const dep = tasks.find((t) => t.id === id);
@@ -95,11 +96,12 @@ export function unmetDeps(task: Task, tasks: Task[]): BlockingTaskRef[] {
 }
 
 // A task needing attention is either genuinely stuck/dead (needs routing) or
-// purely blocked on another task's PR landing (needs nothing from the
+// purely blocked on another task's pull request landing (needs nothing from the
 // director but time). Failed tasks always need routing regardless of
 // declared deps — the human chooses requeue/edit/cancel.
 export function isWaiting(task: Task, tasks: Task[]): boolean {
-  return task.state !== "failed" && unmetDeps(task, tasks).length > 0;
+  const blocking = unmetDeps(task, tasks);
+  return task.state !== "failed" && blocking.length > 0 && !blocking.every((dep) => DEAD_DEP_STATES.has(dep.state));
 }
 
 export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoints: Checkpoint[], quizzes: UnderstandingQuiz[]): NeedsYouItem[] {
@@ -118,7 +120,7 @@ export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoin
       .map((task) => ({ kind: "review" as const, id: task.id, task })),
     ...tasks.filter(taskNeedsAttention).map((task): NeedsYouItem => {
       const blockedBy = task.state === "failed" ? [] : unmetDeps(task, tasks);
-      return blockedBy.length
+      return blockedBy.length && !blockedBy.every((dep) => DEAD_DEP_STATES.has(dep.state))
         ? { kind: "waiting", id: task.id, task, blockedBy }
         : { kind: "attention", id: task.id, task };
     }),

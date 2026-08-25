@@ -101,6 +101,24 @@ test("a dependency landing (verifying/done) moves its dependent from 'waiting' b
   expect(items.map((item) => item.kind)).toEqual(["attention"]);
 });
 
+test("a task blocked only by dead dependencies needs attention instead of waiting", () => {
+  const items = getNeedsYouItems(
+    [],
+    [
+      task("failed-blocker", "failed"),
+      task("cancelled-blocker", "cancelled"),
+      task("wedged", "queued", {
+        depends_on: ["failed-blocker", "cancelled-blocker"],
+        health: { status: "stuck", reason: "all blocking dependencies ended without completing", since: "now" },
+      }),
+    ],
+    [],
+    []
+  );
+
+  expect(items.map((item) => ({ id: item.id, kind: item.kind }))).toContainEqual({ id: "wedged", kind: "attention" });
+});
+
 test("a failed task always needs routing, even with an unmet dependency", () => {
   const items = getNeedsYouItems(
     [],
