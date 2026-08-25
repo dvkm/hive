@@ -109,6 +109,7 @@ import {
   type ChatThread,
 } from "./chat.ts";
 import { validateProjectConfig, type Agent } from "./projectConfig.ts";
+import { gardenerQueue, resolveGardenerDecision, setGardenerOverride } from "./prGardener.ts";
 
 export interface HandlerDeps {
   herdr?: Herdr; // injectable for tests
@@ -231,6 +232,7 @@ const WRITE_AUTH_ROUTES: { method: string; path: RegExp }[] = [
   { method: "PUT", path: /^\/api\/projects\/[^/]+$/ },
   { method: "POST", path: /^\/api\/projects\/[^/]+\/secrets$/ },
   { method: "DELETE", path: /^\/api\/projects\/[^/]+\/secrets\/[^/]+$/ },
+  { method: "POST", path: /^\/api\/projects\/[^/]+\/pr-gardener\/\d+$/ },
   { method: "POST", path: /^\/api\/push\/subscribe$/ },
 ];
 
@@ -289,6 +291,29 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
           return json(db.query(sql).all().map(projectPayload));
         }
         if (method === "POST") return createProject(db, await req.json());
+      }
+      {
+        const match = pathname.match(/^\/api\/projects\/([^/]+)\/pr-gardener$/);
+        if (match && method === "GET") {
+          if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(match[1])) return err("project not found", 404);
+          return json(gardenerQueue(db, match[1]));
+        }
+      }
+      {
+        const match = pathname.match(/^\/api\/projects\/([^/]+)\/pr-gardener\/(\d+)$/);
+        if (match && method === "POST") {
+          const body = await req.json() as any;
+          const prNumber = Number(match[2]);
+          const item: any = db.query("SELECT * FROM pr_gardener_items WHERE project_id = ? AND pr_number = ?").get(match[1], prNumber);
+          if (!item) return err("PR Gardener item not found", 404);
+          if (item.decision_id && body.override !== null) {
+            const answered = apiAnswerDecision(db, herdr, item.decision_id, { answer_key: body.override, source: "director" });
+            if (!answered.ok) return answered;
+          } else if (!setGardenerOverride(db, match[1], prNumber, body.override)) {
+            return err("override must be force_land, force_close, hold, or null", 400);
+          }
+          return json(gardenerQueue(db, match[1]).find((row) => row.pr_number === prNumber));
+        }
       }
       let m = pathname.match(/^\/api\/projects\/([^/]+)$/);
       if (m && method === "GET") {
@@ -5830,6 +5855,7 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     resolveRepoMismatchForDecision(db, id, answerKey),
     resolveUsageCapForDecision(db, id, answerKey),
     resolveScopeDriftForDecision(db, id, answerKey),
+    resolveGardenerDecision(db, id, answerKey),
     resolveRefCaptureForDecision(db, id, answerKey, answerNote),
     resolveDependentsWedgedForDecision(db, id, answerKey, successorId, answeredBy),
     resolveLandPauseForDecision(db, id, answerKey),

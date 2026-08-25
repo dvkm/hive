@@ -266,12 +266,36 @@ export interface Project {
     autonomy_profile?: "conservative" | "balanced" | "autopilot";
     archived?: boolean;
     test?: boolean;
+    pr_gardener?: {
+      enabled?: boolean;
+      cadence?: string;
+      land_when?: "green_and_clean";
+      close_stale_after?: string;
+      auto_close_superseded?: boolean;
+      sensitive_paths?: string[];
+      max_actions_per_sweep?: number;
+      max_fix_attempts?: number;
+    };
     [k: string]: unknown;
   };
   // Server-canonicalized Jira site (null unless the project's config passes the
   // credential gate). The only trusted base for a browse link in the UI.
   jira_site: string | null;
   created_at: string;
+}
+
+export interface PrGardenerItem {
+  project_id: string;
+  pr_number: number;
+  pr_url: string;
+  title: string;
+  classification: "land" | "rebase" | "fix" | "close" | "decision" | "hold" | "wait";
+  reason: string;
+  sensitive: number;
+  override: "force_land" | "force_close" | "hold" | null;
+  decision_id: string | null;
+  linked_task_id: string | null;
+  linked_task_state: State | null;
 }
 
 export interface Incident {
@@ -828,6 +852,9 @@ export const api = {
     req<Project>(`/api/projects`, { method: "POST", body: JSON.stringify(b) }),
   updateProject: (id: string, b: { config?: Project["config"]; name?: string; repo_path?: string | null }) =>
     req<Project>(`/api/projects/${id}`, { method: "PUT", body: JSON.stringify(b) }),
+  prGardener: (id: string) => req<PrGardenerItem[]>(`/api/projects/${id}/pr-gardener`),
+  setPrGardenerOverride: (id: string, prNumber: number, override: PrGardenerItem["override"]) =>
+    req<PrGardenerItem>(`/api/projects/${id}/pr-gardener/${prNumber}`, { method: "POST", body: JSON.stringify({ override }) }),
   // Incidents API is built in parallel; treat absence (404/network) as "not running yet".
   incidents: (status: "open" | "resolved") =>
     req<{ incidents: Incident[] }>(`/api/incidents?status=${status}`),
