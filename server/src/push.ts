@@ -44,7 +44,7 @@ export function saveSubscription(db: DB, sub: PushSub): void {
   if (!sub?.endpoint || !sub.keys?.p256dh || !sub.keys?.auth) throw new Error("invalid subscription");
   db.query(
     `INSERT INTO push_subscriptions (endpoint, p256dh, auth, created_at) VALUES (?,?,?,?)
-     ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth`
+     ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, created_at = excluded.created_at`
   ).run(sub.endpoint, sub.keys.p256dh, sub.keys.auth, now());
 }
 

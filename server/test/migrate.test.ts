@@ -5,6 +5,7 @@
 // one against a DB that already had its effect.
 import { test, expect } from "bun:test";
 import { openDb, alreadyApplied, MIGRATIONS, CREATES, ADD_COLUMN, DROPS, type DB } from "../src/db.ts";
+import { saveSubscription } from "../src/push.ts";
 import { Database } from "bun:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -53,9 +54,9 @@ test("migrations are well-formed", () => {
         created.add(key);
       } else if (!add && !drop) {
         // alreadyApplied can't detect this statement's effect, so it re-runs on
-        // every heal. Only a backfill may do that, and the heal tests below are
+        // every heal. Only a data migration may do that, and the heal tests below are
         // what prove this one is a no-op once applied.
-        expect(stmt).toMatch(/^\s*UPDATE\b/i);
+        expect(stmt).toMatch(/^\s*(?:UPDATE|DELETE)\b/i);
       }
     }
   }
@@ -207,6 +208,34 @@ test("adopting a fully-migrated legacy DB is a no-op that preserves data", () =>
     const names = (db2.query("SELECT name FROM schema_migrations").all() as { name: string }[]).map((r) => r.name);
     expect(names).toContain("v1-initial-schema");
     expect(names).toContain("v11-task-numbers");
+    db2.close();
+  } finally {
+    cleanup(path);
+  }
+});
+
+test("push subscription cleanup removes pre-auth rows and keeps authenticated rows", () => {
+  const path = tmpDb("push-auth-cleanup");
+  try {
+    const db1 = openDb(path);
+    const insert = db1.query(
+      "INSERT INTO push_subscriptions (endpoint, p256dh, auth, created_at) VALUES (?,?,?,?)"
+    );
+    insert.run("https://push.example/old", "old-key", "old-auth", "2026-08-24T21:58:33Z");
+    insert.run("https://push.example/new", "new-key", "new-auth", "2026-08-24T21:58:35Z");
+    insert.run("https://push.example/resubscribed", "old-key", "old-auth", "2026-08-24T21:58:33Z");
+    saveSubscription(db1, {
+      endpoint: "https://push.example/resubscribed",
+      keys: { p256dh: "new-key", auth: "new-auth" },
+    });
+    db1.query("DELETE FROM schema_migrations WHERE name = 'v32-prune-unauthenticated-push-subscriptions'").run();
+    db1.close();
+
+    const db2 = openDb(path);
+    expect(db2.query("SELECT endpoint FROM push_subscriptions").all()).toEqual([
+      { endpoint: "https://push.example/new" },
+      { endpoint: "https://push.example/resubscribed" },
+    ]);
     db2.close();
   } finally {
     cleanup(path);
