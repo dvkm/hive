@@ -557,15 +557,19 @@ test("a corrupted parent_task_id cycle does not hang requeue and still resolves 
   const a = makeTask(db, projectId);
   const b = makeTask(db, projectId);
   const c = makeTask(db, projectId);
-  const branch = `hive/${a}`;
-  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, parent_task_id = ? WHERE id = ?").run(branch, c, a);
-  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, parent_task_id = ? WHERE id = ?").run(branch, a, b);
-  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, parent_task_id = ? WHERE id = ?").run(branch, b, c);
+  // None of a/b/c owns the target branch directly — only a's resume_branch
+  // points at it (e.g. inherited from a since-deleted predecessor). Parent
+  // pointers form a genuine cycle a->b->c->a, so a real chain walk is
+  // required and only the seen-set guard stops it from spinning forever.
+  const branch = "hive/orphan-branch";
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, resume_branch = ?, parent_task_id = ? WHERE id = ?").run(branch, b, a);
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, parent_task_id = ? WHERE id = ?").run(c, b);
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, parent_task_id = ? WHERE id = ?").run(a, c);
 
   const requeueId = requeueTask(db, getTask(db, a));
 
   expect(getTask(db, requeueId).resume_branch).toBe(branch);
-});
+}, 2000);
 
 test("a source=external task with agent_target set (regression guard: should be unreachable post-#996) is still recovered sanely, not stuck forever", async () => {
   // supervision.ts's neverDispatched, plus the createTask/spawnAgent guards in
