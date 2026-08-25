@@ -94,12 +94,29 @@ function SecondaryNav({ offline, setOffline }: { offline: boolean; setOffline: (
   useEffect(() => {
     if (detailsRef.current) detailsRef.current.open = false;
   }, [location.pathname]);
+  useEffect(() => {
+    const close = () => {
+      if (detailsRef.current) detailsRef.current.open = false;
+    };
+    window.addEventListener("hive:palette", close);
+    window.addEventListener("hive:notifications", close);
+    return () => {
+      window.removeEventListener("hive:palette", close);
+      window.removeEventListener("hive:notifications", close);
+    };
+  }, []);
   const close = (event: React.MouseEvent<HTMLAnchorElement>) => {
     const details = event.currentTarget.closest("details");
     if (details) details.open = false;
   };
   return (
-    <details ref={detailsRef} className={`more-menu ${active ? "more-menu-active" : ""}`}>
+    <details
+      ref={detailsRef}
+      className={`more-menu ${active ? "more-menu-active" : ""}`}
+      onToggle={(event) => {
+        if (event.currentTarget.open) window.dispatchEvent(new Event("hive:browse"));
+      }}
+    >
       <summary>Browse <span aria-hidden="true">⌄</span></summary>
       <div className="more-popover">
         {SECONDARY_NAV.map((group) => (
@@ -205,19 +222,43 @@ function ConnDot() {
 
 // Header bell: unread count (notifications not yet delivered/seen) + a dropdown
 // of recent notifications. Opening marks everything read.
-function Bell() {
+export function Bell() {
   const { notifications, ackNotifications } = useStore();
   const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
   const unread = notifications.filter((n) => !n.delivered_at).length;
+
+  useEffect(() => {
+    const close = () => setOpen(false);
+    const onPointerDown = (event: PointerEvent) => {
+      if (!wrapRef.current?.contains(event.target as Node)) close();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("hive:palette", close);
+    window.addEventListener("hive:browse", close);
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("hive:palette", close);
+      window.removeEventListener("hive:browse", close);
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
 
   const toggle = () => {
     const next = !open;
     setOpen(next);
-    if (next && unread > 0) ackNotifications();
+    if (next) {
+      window.dispatchEvent(new Event("hive:notifications"));
+      if (unread > 0) ackNotifications();
+    }
   };
 
   return (
-    <div className="bell-wrap">
+    <div className="bell-wrap" ref={wrapRef}>
       <button className="bell" onClick={toggle} title="Notifications" aria-label="Notifications">
         <span className="bell-icon"><FontAwesomeIcon icon={faBell} /></span>
         {unread > 0 && <span className="badge bell-badge">{unread}</span>}
