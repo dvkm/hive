@@ -85,6 +85,15 @@ test("startPromoter skips a tick while a cycle is already running", async () => 
   let active = 0;
   let maxActive = 0;
   let cycles = 0;
+  // Ticks are driven by hand (setInterval is stubbed) so the overlap is exact
+  // instead of racing wall-clock timers on a loaded CI box.
+  let tick: () => void = () => {};
+  let releaseFetch!: () => void;
+  let fetchStarted!: () => void;
+  let fetchFinished!: () => void;
+  const blocked = new Promise<void>((resolve) => (releaseFetch = resolve));
+  const started = new Promise<void>((resolve) => (fetchStarted = resolve));
+  const finished = new Promise<void>((resolve) => (fetchFinished = resolve));
   // Never "ahead" -> no task ever created, so the in-flight-task dedup never
   // blocks a later tick and every tick re-runs the (slow) fetch.
   const slowExec: Exec = async (argv) => {
@@ -92,8 +101,10 @@ test("startPromoter skips a tick while a cycle is already running", async () => 
       cycles++;
       active++;
       maxActive = Math.max(maxActive, active);
-      await new Promise((r) => setTimeout(r, 60));
+      fetchStarted();
+      await blocked;
       active--;
+      fetchFinished();
       return OK();
     }
     if (argv.includes("rev-list")) return OK("0\n");
@@ -101,19 +112,33 @@ test("startPromoter skips a tick while a cycle is already running", async () => 
   };
 
   const origError = console.error;
+  const origSetInterval = globalThis.setInterval;
+  const origClearInterval = globalThis.clearInterval;
   const logs: string[] = [];
   console.error = ((...args: any[]) => logs.push(String(args[0]))) as typeof console.error;
+  globalThis.setInterval = ((callback: () => void) => {
+    tick = callback;
+    return 1;
+  }) as typeof setInterval;
+  globalThis.clearInterval = (() => {}) as typeof clearInterval;
   let stop: () => void;
   try {
     stop = startPromoter(db, { exec: slowExec, intervalMs: 15 });
-    await new Promise((r) => setTimeout(r, 140)); // ~9 ticks at 15ms while each cycle takes 60ms
+    tick();
+    await started;
+    tick(); // second tick lands mid-cycle -> must be skipped, not queued
+    releaseFetch();
+    await finished;
+    await new Promise(setImmediate);
     stop();
   } finally {
     console.error = origError;
+    globalThis.setInterval = origSetInterval;
+    globalThis.clearInterval = origClearInterval;
   }
 
   expect(maxActive).toBe(1); // never two cycles in flight at once
-  expect(cycles).toBeLessThan(6); // most ticks were skipped, not queued
+  expect(cycles).toBe(1); // the overlapping tick was skipped, not queued
   expect(logs.some((m) => m.includes("skipped"))).toBe(true);
 });
 

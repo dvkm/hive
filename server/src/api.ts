@@ -4381,16 +4381,125 @@ export function requeueTask(db: DB, source: any): string {
   return id;
 }
 
+// ---- root-cause scout on the second park ----
+// One agent dying is bad luck. Two agents dying the same way is a fact about
+// the task, and a third blind attempt is a third coin flip. So the park that
+// follows a requeue also files ONE scout, with the corpse attached: every
+// failed task id, its worktree, its pane-tail evidence, and its recovery
+// timeline. Exactly one per lineage, ever — the marker event lives on the
+// ORIGINAL task, so every later park in the chain finds it and stays quiet.
+const RECOVERY_SCOUT_SOURCE = "recovery-scout";
+
+// original → … → task, walking the source='requeue' parent chain.
+function requeueLineage(db: DB, task: any): any[] {
+  const chain: any[] = [];
+  let cur: any = task;
+  while (cur) {
+    chain.unshift(cur);
+    cur = cur.source === "requeue" && cur.parent_task_id ? getTask(db, cur.parent_task_id) : null;
+  }
+  return chain;
+}
+
+function recoveryScoutMarker(db: DB, originalId: string): { scout_task_id: string } | null {
+  const row = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'scout_spawned' ORDER BY ts LIMIT 1")
+    .get(originalId) as { payload: string } | undefined;
+  if (!row) return null;
+  try {
+    return JSON.parse(row.payload);
+  } catch {
+    return null;
+  }
+}
+
+// Scouts hand off a kind='report' evidence row — that's what a later park links.
+function recoveryScoutReport(db: DB, scoutTaskId: string): string | null {
+  const row = db
+    .query("SELECT url FROM evidence WHERE task_id = ? AND kind = 'report' ORDER BY ts DESC LIMIT 1")
+    .get(scoutTaskId) as { url: string | null } | undefined;
+  return row?.url ?? null;
+}
+
+function recoveryScoutBrief(db: DB, chain: any[]): string {
+  const corpse = chain
+    .map((t, i) => {
+      const lines = [`Attempt ${i + 1} — task ${t.id} (state: ${t.state})`];
+      if (t.worktree_path) lines.push(`  worktree: ${t.worktree_path}`);
+      if (t.branch) lines.push(`  branch: ${t.branch}`);
+      if (t.agent_target) lines.push(`  agent transcript: herdr agent read ${t.agent_target}`);
+      lines.push(`  saved pane tails and other evidence: ${join(evidenceDir(), t.id)}`);
+      const events = db
+        .query(
+          `SELECT ts, type, payload FROM events WHERE task_id = ?
+             AND type IN ('stale','recovery','recovery_nudge','requeued','worktree_reclaimed','state_change')
+           ORDER BY ts`
+        )
+        .all(t.id) as { ts: string; type: string; payload: string }[];
+      for (const e of events) lines.push(`  ${e.ts}  ${e.type}  ${e.payload}`);
+      return lines.join("\n");
+    })
+    .join("\n\n");
+  return [
+    `${chain.length} agents have now failed this same task. Find out why.`,
+    ``,
+    `Failed task ids: ${chain.map((t) => t.id).join(", ")}`,
+    ``,
+    `What each attempt left behind:`,
+    ``,
+    corpse,
+    ``,
+    `Agent transcripts also live under ~/.herdr/worktrees/<project>/<task-id> and in the herdr session logs for the agent targets above.`,
+    ``,
+    `Your ask: reproduce the failure, or explain it. Then recommend the one change that would make attempt ${chain.length + 1} succeed.`,
+    `Report only. Change nothing: no code edits, no commits, no PR. Hand off with a report (hive emit <task-id> evidence --kind report --file report.md).`,
+  ].join("\n");
+}
+
+// Returns the new scout's task id, or null when this park has not earned one
+// (a single attempt so far) or the lineage already has its scout.
+function spawnRecoveryScout(db: DB, task: any, chain: any[]): string | null {
+  if (chain.length < 2) return null; // one failure is not yet a pattern
+  if (recoveryScoutMarker(db, chain[0].id)) return null; // exactly one per lineage
+  const id = newId();
+  const t = now();
+  const title = `Why does ${task.title} keep failing?`;
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, created_at, updated_at)
+     VALUES (?,?,?,?, 'queued', 'scout', ?, ?, ?, ?)`
+  ).run(id, task.project_id, title, recoveryScoutBrief(db, chain), RECOVERY_SCOUT_SOURCE, task.id, t, t);
+  writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title, recovery_scout_of: task.id } });
+  writeEvent(db, {
+    task_id: chain[0].id,
+    source: "reconciler",
+    type: "scout_spawned",
+    payload: { scout_task_id: id, parked_task_id: task.id, failed_task_ids: chain.map((c) => c.id) },
+  });
+  broadcastTask(db, getTask(db, id));
+  return id;
+}
+
 // Open the "recovery cap reached / agent unresponsive" decision card. A
 // `recovery_card` event links it to the source task so answering `requeue`
 // resolves to a fresh task (resolveRecoveryForDecision).
 export function openRecoveryDecision(db: DB, task: any, attempts: number): any {
+  const chain = requeueLineage(db, task);
+  const scoutId = spawnRecoveryScout(db, task, chain);
+  const marker = recoveryScoutMarker(db, chain[0].id);
+  const reportUrl = marker ? recoveryScoutReport(db, marker.scout_task_id) : null;
+  const scoutLine = reportUrl
+    ? ` A root-cause scout already looked into this. Read its report before you decide: ${reportUrl} (task ${marker!.scout_task_id}).`
+    : scoutId
+      ? ` A root-cause scout (task ${scoutId}) is now digging into why this keeps failing. Its report will say what to change.`
+      : marker
+        ? ` Root-cause scout ${marker.scout_task_id} is already investigating this task; its report is not in yet.`
+        : "";
   const decision = createDecision(db, {
     task_id: task.id,
     title: `Recover failed task: ${task.title}`,
     context:
       `The agent for this task could not be kept alive (auto-requeued ${attempts} time(s) without success). ` +
-      `Requeue once more or abandon it?`,
+      `Requeue once more or abandon it?` + scoutLine,
     risk: "normal",
     blast_radius: `Task ${task.id} (${task.title}).`,
     options: [
@@ -4398,7 +4507,17 @@ export function openRecoveryDecision(db: DB, task: any, attempts: number): any {
       { key: "abandon", label: "Abandon", detail: "Leave the task failed." },
     ],
   });
-  writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery_card", payload: { decision_id: decision.id, source_task_id: task.id } });
+  writeEvent(db, {
+    task_id: task.id,
+    source: "reconciler",
+    type: "recovery_card",
+    payload: {
+      decision_id: decision.id,
+      source_task_id: task.id,
+      ...(marker ? { scout_task_id: marker.scout_task_id } : {}),
+      ...(reportUrl ? { scout_report_url: reportUrl } : {}),
+    },
+  });
   return decision;
 }
 
