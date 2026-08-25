@@ -532,6 +532,78 @@ test("requeue cap reached → decision card, no further auto-requeue", async () 
   expect(grand.length).toBe(0);
 });
 
+// ---- root-cause scout on the second park (HIVE-416) ----
+
+// Park a task by exhausting its silent-nudge budget (the cheapest park path).
+async function parkBySilence(db: DB, taskId: string): Promise<void> {
+  putEvent(db, taskId, "status", { note: "working" });
+  for (const n of [1, 2, 3]) putEvent(db, taskId, "recovery_nudge", { nudge: n });
+  putEvent(db, taskId, "stale", { silent_ms: 999 });
+  await reconcileOnce(db, { ...inert, herdr: herdrProbe("alive", "idle").herdr });
+}
+const scoutsIn = (db: DB) => db.query("SELECT * FROM tasks WHERE source = 'recovery-scout'").all() as any[];
+
+test("the second park in a lineage spawns exactly one scout carrying both failed ids", async () => {
+  const { db, projectId } = freshDb();
+  const orig = makeTask(db, projectId);
+  const req1 = makeTask(db, projectId, { source: "requeue", parent: orig, agent: "a1" });
+
+  await parkBySilence(db, req1);
+
+  const scouts = scoutsIn(db);
+  expect(scouts).toHaveLength(1);
+  expect(scouts[0].kind).toBe("scout");
+  expect(scouts[0].state).toBe("queued");
+  expect(scouts[0].title).toBe("Why does t keep failing?");
+  expect(scouts[0].brief).toContain(orig); // both attempts' ids are in the corpse
+  expect(scouts[0].brief).toContain(req1);
+  expect(scouts[0].brief).toContain("/wt/" + req1); // worktree path
+  expect(scouts[0].brief).toContain("herdr agent read a1"); // transcript location
+  expect(scouts[0].brief).toContain("recovery_nudge"); // the recovery timeline
+  expect(scouts[0].brief).toContain("Report only");
+  // marker lives on the ORIGINAL task, so later parks in the chain can find it
+  const marker: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'scout_spawned'").get(orig);
+  expect(JSON.parse(marker.payload).scout_task_id).toBe(scouts[0].id);
+  // and the parked card points at it
+  const dec: any = db.query("SELECT * FROM decisions WHERE task_id = ?").get(req1);
+  expect(dec.context).toContain(scouts[0].id);
+});
+
+test("a first park spawns no scout, and a third failure in the lineage spawns no second one", async () => {
+  const { db, projectId } = freshDb();
+  const lone = makeTask(db, projectId, { agent: "solo" });
+  await parkBySilence(db, lone);
+  expect(scoutsIn(db)).toHaveLength(0); // one failure is not yet a pattern
+
+  const orig = makeTask(db, projectId);
+  const req1 = makeTask(db, projectId, { source: "requeue", parent: orig, agent: "a1" });
+  await parkBySilence(db, req1);
+  expect(scoutsIn(db)).toHaveLength(1);
+
+  const req2 = makeTask(db, projectId, { source: "requeue", parent: req1, agent: "a2" });
+  await parkBySilence(db, req2);
+  expect(scoutsIn(db)).toHaveLength(1); // still exactly one, for the whole lineage
+  expect(db.query("SELECT 1 FROM events WHERE type = 'scout_spawned'").all()).toHaveLength(1);
+});
+
+test("a later park links the scout's report once the scout has written one", async () => {
+  const { db, projectId } = freshDb();
+  const orig = makeTask(db, projectId);
+  const req1 = makeTask(db, projectId, { source: "requeue", parent: orig, agent: "a1" });
+  await parkBySilence(db, req1);
+  const scout = scoutsIn(db)[0];
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,?)")
+    .run(newId("ev"), scout.id, now(), "report", "/tmp/report.md", `/evidence/${scout.id}/report.md`, "root cause", "{}");
+
+  const req2 = makeTask(db, projectId, { source: "requeue", parent: req1, agent: "a2" });
+  await parkBySilence(db, req2);
+
+  const dec: any = db.query("SELECT * FROM decisions WHERE task_id = ?").get(req2);
+  expect(dec.context).toContain(`/evidence/${scout.id}/report.md`);
+  const card: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery_card'").get(req2);
+  expect(JSON.parse(card.payload).scout_report_url).toBe(`/evidence/${scout.id}/report.md`);
+});
+
 test("failed task past the triage window auto-requeues once", () => {
   const { db, projectId } = freshDb({ failed_triage_requeue_hours: 1 });
   const id = makeTask(db, projectId);
