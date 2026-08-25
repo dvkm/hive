@@ -288,3 +288,83 @@ test("Have agent add it is hidden for a never-dispatched external task", async (
   expect(blockedText).not.toContain("Ask the agent to refresh its review");
   expect(blockedText).toContain("never been dispatched");
 });
+
+// #1556: the explanation page is the mental model, so it is embedded in the
+// card. A page written for an older head is shown but labelled; while hive is
+// still writing one, the card says so instead of showing nothing.
+function explainDetail(id: string, evidenceSha: string | null, headSha: string | null, generating = false): TaskDetail {
+  const base = passingDetail(id);
+  return {
+    ...base,
+    head_sha: headSha,
+    events: generating
+      ? [...base.events, { id: "gen-1", task_id: id, ts: "2026-01-01T00:00:02.000Z", source: "hive", type: "explanation_generating", payload: { head_sha: headSha } } as any]
+      : base.events,
+    evidence: evidenceSha === null
+      ? []
+      : [{ id: "ev-1", task_id: id, ts: "2026-01-01T00:00:03.000Z", kind: "explanation", url: `/evidence/${id}/1_explanation.html`, caption: "Explanation of this change", meta: { commit_sha: evidenceSha } } as any],
+  };
+}
+
+async function renderReview(t: Task) {
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t));
+  });
+  return renderer;
+}
+
+test("the explanation page for the current head is embedded as a sandboxed iframe", async () => {
+  const originalTask = api.task;
+  api.task = (async (id: string) => explainDetail(id, "abc123", "abc123")) as typeof api.task;
+  try {
+    const renderer = await renderReview({ ...task("explain-current"), head_sha: "abc123" });
+    const frame = renderer.root.findAllByType("iframe").find((f) => String(f.props.className).includes("explain-embed-frame"));
+    expect(frame).toBeTruthy();
+    expect(frame!.props.sandbox).toBe("allow-scripts");
+    expect(frame!.props.src).toBe("/evidence/explain-current/1_explanation.html");
+    expect(JSON.stringify(renderer.toJSON())).not.toContain("older commit");
+  } finally {
+    api.task = originalTask;
+  }
+});
+
+test("an explanation written for an older head is labelled stale", async () => {
+  const originalTask = api.task;
+  api.task = (async (id: string) => explainDetail(id, "old111", "new222")) as typeof api.task;
+  try {
+    const renderer = await renderReview({ ...task("explain-stale"), head_sha: "new222" });
+    expect(JSON.stringify(renderer.toJSON())).toContain("older commit");
+  } finally {
+    api.task = originalTask;
+  }
+});
+
+test("while the explanation is generating the card says so instead of showing nothing", async () => {
+  const originalTask = api.task;
+  api.task = (async (id: string) => explainDetail(id, null, "new222", true)) as typeof api.task;
+  try {
+    const renderer = await renderReview({ ...task("explain-generating"), head_sha: "new222" });
+    const json = JSON.stringify(renderer.toJSON());
+    expect(json).toContain("Hive is drawing it for this commit");
+    expect(renderer.root.findAllByType("iframe").filter((f) => String(f.props.className).includes("explain-embed-frame")).length).toBe(0);
+  } finally {
+    api.task = originalTask;
+  }
+});
+
+test("on a phone the embed collapses to an Open visual explanation button", async () => {
+  const originalTask = api.task;
+  // No DOM in this runner, so ExplainEmbed's width probe sees no window and
+  // defaults to expanded; a stub window is how a phone viewport is expressed here.
+  (globalThis as any).window = { innerWidth: 390 };
+  api.task = (async (id: string) => explainDetail(id, "abc123", "abc123")) as typeof api.task;
+  try {
+    const renderer = await renderReview({ ...task("explain-phone"), head_sha: "abc123" });
+    expect(JSON.stringify(renderer.toJSON())).toContain("Open visual explanation");
+    expect(renderer.root.findAllByType("iframe").filter((f) => String(f.props.className).includes("explain-embed-frame")).length).toBe(0);
+  } finally {
+    api.task = originalTask;
+    delete (globalThis as any).window;
+  }
+});
