@@ -2,9 +2,22 @@ import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
 import { landGraph, landOnce, markLand } from "../src/landQueue.ts";
 import { transition } from "../src/state.ts";
+import { apiAnswerDecision } from "../src/api.ts";
+import type { Herdr } from "../src/runtime/herdr.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
 const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
+
+const stubHerdr = { send: async () => ({ ok: true }) } as unknown as Herdr;
+
+// Backdate this task's land attempts so the next sweep is past its backoff
+// window. Cheaper and more honest than injecting a clock: the backoff is read
+// from the events themselves.
+function ageLandAttempts(db: DB, taskId: string, byMs: number): void {
+  const rows = db.query("SELECT id, ts FROM events WHERE task_id = ? AND type = 'land_attempted'").all(taskId) as any[];
+  for (const r of rows)
+    db.query("UPDATE events SET ts = ? WHERE id = ?").run(new Date(Date.parse(r.ts) - byMs).toISOString(), r.id);
+}
 
 function freshDb(): { db: DB; projectId: string } {
   const db = openDb(":memory:");
@@ -142,29 +155,165 @@ test("a declared dependency lands first, and holds its dependent until it has me
   expect(go.calls).toEqual([a, b]);
 });
 
-test("failed merges drop out of the queue and raise one decision", async () => {
+test("a non-transient failure opens exactly one card and keeps the sticky mark", async () => {
   const { db, projectId } = freshDb();
   const a = makeTask(db, projectId, { branch: "a" });
   const b = makeTask(db, projectId, { branch: "b" });
   markLand(db, [a, b], true);
-  const { calls, merge } = mergeStub(db, { [a]: "PR has merge conflicts", [b]: "CI blocked" });
+  const { calls, merge } = mergeStub(db, { [a]: "CI is red", [b]: "CI blocked" });
   await landOnce(db, { exec: filesExec({}), merge });
   expect(calls).toEqual([a, b]);
+  // The approval survives the failure: no re-marking to land it later.
   for (const id of [a, b])
-    expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(id) as any).land_queued_at).toBeNull();
-  const notes = db.query("SELECT title, body FROM notifications").all() as any[];
-  expect(notes.length).toBe(1);
-  expect(notes[0].title).toContain("2 PRs paused");
-  expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(1);
+    expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(id) as any).land_queued_at).toBeTruthy();
+  // One card per task, not one card listing both.
+  const open = db.query("SELECT task_id, title FROM decisions WHERE status = 'open' ORDER BY ts").all() as any[];
+  expect(open.map((d) => d.task_id).sort()).toEqual([a, b].sort());
+
+  // A second sweep must not stack a duplicate card, and must not re-attempt
+  // while the director still owes an answer.
+  const again = mergeStub(db, { [a]: "CI is red", [b]: "CI blocked" });
+  await landOnce(db, { exec: filesExec({}), merge: again.merge });
+  expect(again.calls).toEqual([]);
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(2);
 });
 
-test("leaving review clears the mark: the approval was for that diff", async () => {
+test("a transient failure opens no card and retries after the backoff", async () => {
   const { db, projectId } = freshDb();
   const a = makeTask(db, projectId, { branch: "a" });
   markLand(db, [a], true);
-  transition(db, a, "in_progress", { source: "director", reason: "changes requested" });
+
+  const first = mergeStub(db, { [a]: "Base branch was modified. Review and try the merge again." });
+  await landOnce(db, { exec: filesExec({}), merge: first.merge });
+  expect(first.calls).toEqual([a]);
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+  expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(a) as any).land_queued_at).toBeTruthy();
+
+  // Immediately after, the task is inside its backoff window: no second attempt.
+  const tooSoon = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: tooSoon.merge });
+  expect(tooSoon.calls).toEqual([]);
+
+  // Age the attempt past the first backoff step; the retry lands with no
+  // re-marking and no card in between.
+  ageLandAttempts(db, a, 60_000);
+  const retry = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: retry.merge });
+  expect(retry.calls).toEqual([a]);
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+  expect((db.query("SELECT state, land_queued_at FROM tasks WHERE id = ?").get(a) as any).state).toBe("verifying");
+});
+
+test("a transient cause that never clears becomes a card once the retries run out", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  const reason = "Base branch was modified.";
+  for (let i = 0; i < 6; i++) {
+    const { merge } = mergeStub(db, { [a]: reason });
+    await landOnce(db, { exec: filesExec({}), merge });
+    ageLandAttempts(db, a, 3_600_000);
+  }
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(1);
+});
+
+test("the mark is sticky across a rebase round-trip through in_progress", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+
+  // A conflict bounces the task to its agent, the way mergeTask does.
+  const bounce = mergeStub(db, { [a]: "PR has merge conflicts" });
+  await landOnce(db, {
+    exec: filesExec({}),
+    merge: async (id) => {
+      const r = await bounce.merge(id);
+      transition(db, id, "in_progress", { source: "director", reason: "merge conflict" });
+      return r;
+    },
+  });
+  // Hive already routed the fix to the agent, so no card asks the director.
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+  expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(a) as any).land_queued_at).toBeTruthy();
+
+  // Agent rebases and hands back. The mark is still there: it lands untouched.
+  transition(db, a, "in_review", { source: "agent", reason: "rebased" });
+  ageLandAttempts(db, a, 3_600_000);
   const { calls, merge } = mergeStub(db);
   await landOnce(db, { exec: filesExec({}), merge });
-  expect(calls).toEqual([]);
+  expect(calls).toEqual([a]);
   expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(a) as any).land_queued_at).toBeNull();
+});
+
+test("a pending understanding check holds the queue instead of opening a card", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  const quizPending = "Pass the understanding check before merging, or choose 'Continue now, quiz me later'.";
+
+  for (let i = 0; i < 3; i++) {
+    const { merge } = mergeStub(db, { [a]: quizPending });
+    await landOnce(db, { exec: filesExec({}), merge });
+  }
+  // No card, no retry budget burned, no timeline noise, and the mark stands.
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'land_attempted'").get(a) as any).n).toBe(0);
+  expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(a) as any).land_queued_at).toBeTruthy();
+
+  // The director answers the new quiz; the very next sweep lands it.
+  const { calls, merge } = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge });
+  expect(calls).toEqual([a]);
+});
+
+test("answering the pause card administratively never bounces the agent", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  const { merge } = mergeStub(db, { [a]: "CI is red" });
+  await landOnce(db, { exec: filesExec({}), merge });
+  const card = db.query("SELECT id FROM decisions WHERE task_id = ? AND status = 'open'").get(a) as any;
+  expect(card).toBeTruthy();
+
+  const res = apiAnswerDecision(db, stubHerdr, card.id, { answer_key: "retry", source: "director" });
+  expect(res.status).toBe(200);
+  // The PR is finished work. It must stay in review with its mark intact, and
+  // nothing may be queued that would land as a changes_requested.
+  const task = db.query("SELECT state, land_queued_at FROM tasks WHERE id = ?").get(a) as any;
+  expect(task.state).toBe("in_review");
+  expect(task.land_queued_at).toBeTruthy();
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'steer'").get(a) as any).n).toBe(0);
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'changes_requested'").get(a) as any).n).toBe(0);
+
+  // With the card answered, the next sweep re-attempts with no re-marking.
+  const retry = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: retry.merge });
+  expect(retry.calls).toEqual([a]);
+});
+
+test("only the send-back answer steers the agent, and it clears the mark", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  const { merge } = mergeStub(db, { [a]: "CI is red" });
+  await landOnce(db, { exec: filesExec({}), merge });
+  const card = db.query("SELECT id FROM decisions WHERE task_id = ? AND status = 'open'").get(a) as any;
+
+  expect(apiAnswerDecision(db, stubHerdr, card.id, { answer_key: "send_back", source: "director" }).status).toBe(200);
+  expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(a) as any).land_queued_at).toBeNull();
+  const steer = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'steer'").get(a) as any;
+  expect(JSON.parse(steer.payload).message).toContain("sent this PR back from the land queue");
+});
+
+test("a stale pause card closes itself once the PR leaves the queue", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  const { merge } = mergeStub(db, { [a]: "CI is red" });
+  await landOnce(db, { exec: filesExec({}), merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(1);
+
+  markLand(db, [a], false); // director unmarks it
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db).merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(0);
 });
