@@ -124,6 +124,15 @@ textarea { font-family: inherit; }
   flex-shrink: 0;
   backdrop-filter: blur(18px) saturate(120%);
   -webkit-backdrop-filter: blur(18px) saturate(120%);
+  -webkit-app-region: drag;
+}
+.topbar button,
+.topbar a,
+.topbar input,
+.topbar select,
+.topbar summary,
+.topbar [role="button"] {
+  -webkit-app-region: no-drag;
 }
 /* Electron: clear the macOS traffic lights (hiddenInset) that float over the
    top-left. ~78px covers the three buttons plus breathing room. */
