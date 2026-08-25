@@ -436,6 +436,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         }
       }
       if (pathname === "/api/push/unsubscribe" && method === "POST") {
+        // Excluded from WRITE_AUTH_ROUTES (no token required) because this route
+        // can only remove the named endpoint, but it still runs through the
+        // remoteAuthOk check above like every other /api/ route.
         const b: any = await safeJson(req);
         if (b?.endpoint) removeSubscription(db, b.endpoint);
         return json({ ok: true });

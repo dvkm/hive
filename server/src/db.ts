@@ -576,6 +576,12 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       `CREATE UNIQUE INDEX idx_tasks_jira_key_kind ON tasks(jira_key, jira_link_kind) WHERE jira_key IS NOT NULL`,
     ],
   },
+  // PR #186 token-gated subscription creation at 2026-08-24T21:58:34Z.
+  // Remove endpoints registered before that protection existed.
+  {
+    name: "v32-prune-unauthenticated-push-subscriptions",
+    statements: [`DELETE FROM push_subscriptions WHERE created_at < '2026-08-24T21:58:34Z'`],
+  },
 ];
 
 // -------------------------------------------------------------- settings
