@@ -6,6 +6,7 @@ import { prTitlePrefix, prBodyFooter } from "./marker.ts";
 import { managingThreadForTask } from "./chat.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
+import { planGateKinds } from "./planCritic.ts";
 
 // The PR marker contract (documented in docs/API.md). Both halves are REQUIRED
 // on any PR the agent opens so hive can link the PR back to this task.
@@ -85,6 +86,26 @@ Emit assumptions, shortcuts, and real tradeoffs when you make them, then KEEP WO
 
 Checkpoints are non-blocking; flags return as steers. Prod, destructive work,
 and feature flags still use \`hive decision ask\` or the guarded-action gate.`;
+
+// Plan gate (HIVE-412): for the kinds a project opts in via config.plan_gate,
+// the plan is posted as a checkpoint before the first edit, and hive critiques
+// it automatically. Nothing blocks; a serious concern comes back as a steer.
+const PLAN_CHECKPOINT = `## Plan checkpoint (before your first edit)
+Post your plan before you change any file:
+
+  hive emit <task-id> checkpoint --json plan.json
+
+Write plan.json first, with exactly these fields:
+
+  {"kind":"plan",
+   "goal":"what done looks like, in one sentence",
+   "approach":"how you will get there, in a few sentences",
+   "files_expected":["path/to/file.ts"],
+   "verification_planned":"the check that proves it works"}
+
+Hive reviews the plan and sends any concerns back as a steer. Keep working
+while it reviews; this checkpoint never blocks you. If a concern comes back,
+fix the plan and post it again before you carry on editing.`;
 
 // Agents may fan work out instead of scope-creeping their own task. HIVE_TASK_ID
 // is set in every spawned agent's env, so the CLI auto-attributes the new task
@@ -214,6 +235,8 @@ export function composeBrief(db: DB, taskId: string): string {
   parts.push(EMIT_PROTOCOL);
   parts.push(PLAIN_ENGLISH);
   parts.push(CHECKPOINTS);
+  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+  if (planGateKinds(JSON.parse(project?.config ?? "{}")).includes(task.kind)) parts.push(PLAN_CHECKPOINT);
   parts.push(spawnTasksSection(task.project_id));
   const team = teamSection(db, taskId);
   if (team) parts.push(team);

@@ -78,6 +78,7 @@ import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts"
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { explanationGate } from "./explainDiff.ts";
+import { critiquePlan, parsePlan } from "./planCritic.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
 import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
@@ -5292,6 +5293,29 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     if (wasDeferred)
       queueSteerEvent(db, taskId, `This task was un-deferred${note ? `: ${note}` : ""} — re-read your last steps, emit a status note, and continue.`, "un-deferred");
     return json({ task }, 201);
+  }
+
+  // --- checkpoint ---
+  // Ordinary checkpoints are plain notes and fall through to the generic path.
+  // A PLAN checkpoint (HIVE-412) carries structured fields, which are kept on
+  // the payload and critiqued in the background — the agent gets its 201 now and
+  // hears about any concern as a steer.
+  if (type === "checkpoint") {
+    const plan = parsePlan(fields);
+    if (plan) {
+      const event = writeEvent(db, {
+        task_id: taskId,
+        source,
+        type,
+        payload: { note: note ?? plan.goal, ...plan },
+      });
+      const herdr = deps.herdr ?? defaultHerdr;
+      critiquePlan(db, task, event.id, plan, {
+        plannerExec: deps.plannerExec,
+        steer: (id, message) => internalSteer(db, herdr, id, message),
+      }).catch((e) => console.error(`[hive] plan critic for ${taskId}:`, e));
+      return json({ event }, 201);
+    }
   }
 
   // --- status / blocked / generic ---
