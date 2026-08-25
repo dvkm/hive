@@ -262,9 +262,9 @@ test("merge success writes a merged event and moves the task to verifying", asyn
   s.server.stop(true);
 });
 
-test("understanding quiz blocks merge until the director answers correctly", async () => {
+test("a kind outside auto_merge.kinds blocks merge until the director answers correctly", async () => {
   const s = makeServer();
-  const { taskId } = await inReviewTask(s.base, {}, false);
+  const { taskId } = await inReviewTask(s.base, { auto_merge: { kinds: ["chore"] } }, false);
 
   let quizzes = await get(s.base, "/api/understanding-quizzes");
   const quiz = quizzes.json.quizzes.find((item: any) => item.task_id === taskId);
@@ -294,6 +294,41 @@ test("understanding quiz blocks merge until the director answers correctly", asy
   expect(merge.status).toBe(200);
   quizzes = await get(s.base, "/api/understanding-quizzes");
   expect(quizzes.json.quizzes.some((item: any) => item.task_id === taskId)).toBe(false);
+  s.server.stop(true);
+});
+
+test("an auto-ship kind defers its required quiz and keeps it in the backlog", async () => {
+  const s = makeServer();
+  const { taskId } = await inReviewTask(s.base, { auto_merge: { kinds: ["ship"] } }, false);
+
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(200);
+
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  const deferred = events.json.find((event: any) => event.type === "understanding_quiz_deferred");
+  expect(deferred.source).toBe("system");
+  expect(deferred.payload.review_event_id).toBeTruthy();
+  expect(deferred.payload.note).toContain("auto_merge.kinds");
+
+  const quizzes = await get(s.base, "/api/understanding-quizzes");
+  expect(quizzes.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("deferred");
+  s.server.stop(true);
+});
+
+test("a failed merge on an auto-ship kind leaves the required quiz undeferred", async () => {
+  const s = makeServer();
+  const { taskId } = await inReviewTask(s.base, { auto_merge: { kinds: ["ship"] } }, false);
+  s.db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify(["no-such-task"]), taskId);
+
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(409);
+  expect(merge.json.error).toContain("unmet dependenc");
+
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  expect(events.json.some((event: any) => event.type === "understanding_quiz_deferred")).toBe(false);
+
+  const quizzes = await get(s.base, "/api/understanding-quizzes");
+  expect(quizzes.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("required");
   s.server.stop(true);
 });
 
