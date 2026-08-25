@@ -1322,12 +1322,13 @@ export function projectInboxCounts(db: DB, projectId: string): { checkpoints: nu
   const checkpoints = Number(
     (db
       .query(
-        `SELECT COUNT(*) AS n FROM events e JOIN tasks t ON t.id = e.task_id
+        `SELECT COUNT(*) AS n FROM events e JOIN tasks t ON t.id = e.task_id JOIN projects p ON p.id = t.project_id
           WHERE e.type = 'checkpoint' AND t.project_id = ? AND t.state != 'cancelled' AND ${supervisedSql("t.source", "t.agent_target")}
             AND NOT EXISTS (
               SELECT 1 FROM events a
                WHERE a.task_id = e.task_id AND a.type = 'checkpoint_ack'
-                 AND json_extract(a.payload, '$.checkpoint_id') = e.id)`
+                 AND json_extract(a.payload, '$.checkpoint_id') = e.id)
+            AND ${CHECKPOINT_NOT_EXPIRED_SQL}`
       )
       .get(projectId) as { n: number }).n
   );
@@ -4301,6 +4302,24 @@ function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   return json({ ok: true, status: "deferred" });
 }
 
+// A checkpoint is a note, not a blocker: the agent kept working after emitting
+// it. So an un-acked one stops asking for the director once it has gone quiet
+// (project config checkpoint_expiry_hours, default 24; 0 disables) AND its task
+// moved forward on its own afterwards. It stays on the task timeline either
+// way — only the attention inbox drops it. A flagged checkpoint (payload.flag,
+// or any ack, which already excludes it here) never expires.
+const CHECKPOINT_EXPIRY_DEFAULT_HOURS = 24;
+const EXPIRY_HOURS_SQL = `COALESCE(json_extract(p.config, '$.checkpoint_expiry_hours'), ${CHECKPOINT_EXPIRY_DEFAULT_HOURS})`;
+const CHECKPOINT_NOT_EXPIRED_SQL = `NOT (
+  ${EXPIRY_HOURS_SQL} > 0
+  AND julianday(e.ts) < julianday('now') - ${EXPIRY_HOURS_SQL} / 24.0
+  AND COALESCE(json_extract(e.payload, '$.flag'), 0) = 0
+  AND EXISTS (
+    SELECT 1 FROM events s
+     WHERE s.task_id = e.task_id AND s.type = 'state_change' AND s.ts > e.ts
+       AND json_extract(s.payload, '$.to') IN ('in_review', 'verifying', 'done'))
+)`;
+
 function openCheckpointRows(db: DB, projectId: string | null, includeTest = false): any[] {
   // Un-acked checkpoints stay reviewable AFTER the task finishes — agents
   // finish faster than the director's attention cycle, and 21 of the first 25
@@ -4320,6 +4339,7 @@ function openCheckpointRows(db: DB, projectId: string | null, includeTest = fals
             SELECT 1 FROM events a
              WHERE a.task_id = e.task_id AND a.type = 'checkpoint_ack'
                AND json_extract(a.payload, '$.checkpoint_id') = e.id)
+          AND ${CHECKPOINT_NOT_EXPIRED_SQL}
         ORDER BY t.number DESC, e.ts ASC`
     )
     .all(projectId, projectId, includeTest ? 1 : 0) as any[];
@@ -5910,7 +5930,14 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
   }
 
   // --- status / blocked / generic ---
-  const event = writeEvent(db, { task_id: taskId, source, type, payload: { note } });
+  // A checkpoint may carry flag:true — the agent marking its own note as one
+  // the director must actually see. Flagged checkpoints never auto-expire.
+  const event = writeEvent(db, {
+    task_id: taskId,
+    source,
+    type,
+    payload: type === "checkpoint" && fields.flag ? { note, flag: true } : { note },
+  });
   if (type === "status" && typeof note === "string" && note.trim() && task.jira_key && task.jira_link_kind === "subtask"
     && jiraConfigStatusFor(db, task.project_id).config?.status_notes_to_comments === true) {
     writeEvent(db, {
