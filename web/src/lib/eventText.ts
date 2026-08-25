@@ -96,6 +96,11 @@ export function eventText(e: EventLike): string {
         : `scope checked at ${s(p.commits)} commits`;
     case "action_failed":
       return `${s(p.action) || "task action"} failed: ${s(p.reason) || `HTTP ${s(p.status)}`}`;
+    case "sidecar_report": {
+      const findings = Array.isArray(p.findings) ? (p.findings as { tool?: unknown; summary?: unknown }[]) : [];
+      if (!findings.length) return "quick checks passed on the latest commit";
+      return `quick checks found problems: ${findings.map((f) => `${s(f.tool)}: ${s(f.summary)}`).join("; ")}`;
+    }
     case "auto_merged":
       return p.ok === false ? `automatic merge failed: ${s(p.error) || `HTTP ${s(p.status)}`}` : "automatically merged";
     case "cleanup_skipped":

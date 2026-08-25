@@ -29,6 +29,7 @@ import type { Exec } from "./exec.ts";
 import { defaultExec, projectBaseBranch, preferSafeRef } from "./exec.ts";
 import { captureBranchScope } from "./rebaseGuard.ts";
 import { landOnce } from "./landQueue.ts";
+import { sidecarOnce } from "./sidecar.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
@@ -157,6 +158,12 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("sweepVerifying", () => sweepVerifying(db, deps));
   await step("autoMergeReady", () => autoMergeReady(db, deps));
   await step("landOnce", () => landOnce(db, { exec: deps.exec }));
+  // Started, not awaited: sidecar checks can take minutes, and the rest of
+  // the cycle (plus the health heartbeat below) must not wait on them. It
+  // single-flights internally, so a still-running pass just skips this cycle.
+  await step("sidecar", () => {
+    void sidecarOnce(db, { exec: deps.exec });
+  });
   await step("autoAnswerStale", () => autoAnswerStale(db, deps.herdr ?? defaultHerdr, (deps.nowMs ?? (() => Date.now()))()));
   logRun(errors > 0 ? "error" : "ok");
   heartbeat();
