@@ -138,6 +138,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("remindUnreviewedIntake", () => remindUnreviewedIntake(db, (deps.nowMs ?? (() => Date.now()))()));
   await step("captureRecurringRefs", () => captureRecurringRefs(db));
   await step("repairRequeueProvenance", () => repairRequeueProvenance(db));
+  await step("surfaceDeadDependencies", () => surfaceDeadDependencies(db));
   // Offline mode: everything above is local (herdr + sqlite) and keeps state
   // honest; everything below either needs the network (gh) or would punish
   // agents for being offline (stale flags, nudges, failure escalation). Stop here.
@@ -159,6 +160,31 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("autoAnswerStale", () => autoAnswerStale(db, deps.herdr ?? defaultHerdr, (deps.nowMs ?? (() => Date.now()))()));
   logRun(errors > 0 ? "error" : "ok");
   heartbeat();
+}
+
+export function surfaceDeadDependencies(db: DB): void {
+  const tasks = db.query("SELECT id FROM tasks WHERE state = 'queued' AND depends_on IS NOT NULL").all() as { id: string }[];
+  for (const { id } of tasks) {
+    const task = getTask(db, id);
+    const blocking = unmetDeps(db, task);
+    if (!blocking.length || !blocking.every((dep) => TERMINAL.includes(dep.state as State))) continue;
+    const blockingTaskIds = blocking.map((dep) => dep.id).sort();
+    const last = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'dead_dependencies' ORDER BY ts DESC, rowid DESC LIMIT 1").get(id) as { payload: string } | undefined;
+    if (last) {
+      const previous = JSON.parse(last.payload).blocking_task_ids;
+      if (Array.isArray(previous) && JSON.stringify(previous.sort()) === JSON.stringify(blockingTaskIds)) continue;
+    }
+    writeEvent(db, {
+      task_id: id,
+      source: "reconciler",
+      type: "dead_dependencies",
+      payload: {
+        note: `This queued task cannot start because every blocking dependency ended without completing: ${blocking.map((dep) => `#${dep.number} ${dep.title} (${dep.state})`).join(", ")}.`,
+        blocking_task_ids: blockingTaskIds,
+      },
+    });
+    broadcastTask(db, getTask(db, id));
+  }
 }
 
 export function surfaceTrackingBindings(db: DB): void {

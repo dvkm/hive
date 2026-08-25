@@ -134,10 +134,31 @@ test("same title in a DIFFERENT project is not a duplicate", async () => {
 test("POST /merge-into folds a task into a target and cancels it", async () => {
   const target = await mkTask("Keeper task A");
   const loser = await mkTask("Totally separate task B");
+  const dependent = await mkTask("Task depending on loser B");
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([loser.id]), target.id);
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([loser.id]), dependent.id);
   const r = await post(`/api/tasks/${loser.id}/merge-into`, { target_id: target.id });
   expect(r.status).toBe(200);
   expect(r.json.state).toBe("cancelled");
   expect(r.json.duplicate_of).toBe(target.id);
+  expect((await get(`/api/tasks/${target.id}`)).json.depends_on).toEqual([]);
+  expect((await get(`/api/tasks/${dependent.id}`)).json.depends_on).toEqual([target.id]);
+});
+
+test("POST /merge-into does not create a dependency cycle while repointing", async () => {
+  const source = await mkTask("Cycle source task");
+  const target = await mkTask("Cycle target task");
+  const dependent = await mkTask("Cycle dependent task");
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([dependent.id]), target.id);
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([source.id]), dependent.id);
+
+  const r = await post(`/api/tasks/${source.id}/merge-into`, { target_id: target.id });
+
+  expect(r.status).toBe(200);
+  expect((await get(`/api/tasks/${dependent.id}`)).json.depends_on).toEqual([source.id]);
+  const skipped = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'dependency_repoint_skipped'").get(dependent.id) as any;
+  expect(JSON.parse(skipped.payload)).toMatchObject({ from_task_id: source.id, to_task_id: target.id, reason: "dependency cycle" });
+  expect((await openDecisionsFor(dependent.id)).length).toBe(1);
 });
 
 test("POST /merge-into rejects self-merge and a terminal source", async () => {

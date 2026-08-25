@@ -4,6 +4,7 @@ import { transition, getTask, writeEvent } from "../src/state.ts";
 import { reconcileOnce, ciStatusOf, ciStatusProbed } from "../src/reconciler.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
 import { addClient, removeClient } from "../src/bus.ts";
+import { taskWithHealth, needsAttention } from "../src/health.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
 function freshDb(config: any = {}): { db: DB; projectId: string } {
@@ -24,6 +25,36 @@ function makeTask(db: DB, projectId: string, extra: Partial<{ agent_target: stri
 }
 const stub = (fn: (argv: string[]) => ExecResult): Exec => async (argv) => fn(argv);
 const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
+
+test("reconciler flags a queued task whose blocking dependencies all ended without completing", async () => {
+  const { db, projectId } = freshDb();
+  const failed = makeTask(db, projectId, { state: "failed" });
+  const cancelled = makeTask(db, projectId, { state: "cancelled" });
+  const wedged = makeTask(db, projectId);
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([failed, cancelled]), wedged);
+
+  await reconcileOnce(db, { exec: stub(() => OK("[]")) });
+
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dead_dependencies'").get(wedged)).toBeTruthy();
+  const task = taskWithHealth(db, getTask(db, wedged));
+  expect(task.health).toMatchObject({ status: "stuck" });
+  expect(needsAttention(task)).toBe(true);
+});
+
+test("reconciler flags the same task again when a different dependency set wedges it", async () => {
+  const { db, projectId } = freshDb();
+  const first = makeTask(db, projectId, { state: "failed" });
+  const second = makeTask(db, projectId, { state: "cancelled" });
+  const wedged = makeTask(db, projectId);
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([first]), wedged);
+
+  await reconcileOnce(db, { exec: stub(() => OK("[]")) });
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([second]), wedged);
+  await reconcileOnce(db, { exec: stub(() => OK("[]")) });
+
+  const events = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'dead_dependencies' ORDER BY ts, rowid").all(wedged) as { payload: string }[];
+  expect(events.map((event) => JSON.parse(event.payload).blocking_task_ids)).toEqual([[first], [second]]);
+});
 
 test("ciStatusOf derives failing > pending > passing", () => {
   expect(ciStatusOf([{ conclusion: "SUCCESS" }, { conclusion: "SUCCESS" }])).toBe("passing");
