@@ -520,6 +520,53 @@ test("a chained requeue still surfaces the original attempt's head_sha, CI statu
   expect(thirdRequeue.brief).toContain("a self-review was already submitted (1 item(s) done");
 });
 
+test("a five-hop requeue chain still surfaces the original attempt's head_sha and decisions", () => {
+  const { db, projectId } = freshDb();
+  const original = makeTask(db, projectId);
+  const branch = `hive/${original}`;
+  const prUrl = "https://github.com/acme/web/pull/900";
+  db.query(
+    "UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, pr_url = ?, head_sha = ?, ci_status = ? WHERE id = ?"
+  ).run(branch, prUrl, "deadbeef", "passing", original);
+  const answeredAt = now();
+  db.query(
+    `INSERT INTO decisions (id, task_id, ts, title, options, status, answer_key, answered_at, answered_by)
+     VALUES (?,?,?,?,?, 'answered', ?,?, 'director')`
+  ).run(
+    newId("dec"), original, answeredAt, "Which rollout?",
+    JSON.stringify([{ key: "staged", label: "Use staged rollout" }]),
+    "staged", answeredAt
+  );
+
+  let current = original;
+  for (let hop = 0; hop < 5; hop++) {
+    const next = requeueTask(db, getTask(db, current));
+    db.query("UPDATE tasks SET state = 'failed', agent_target = NULL WHERE id = ?").run(next);
+    current = next;
+  }
+  const fifthRequeue = getTask(db, requeueTask(db, getTask(db, current)));
+
+  expect(fifthRequeue.resume_pr_url).toBe(prUrl);
+  expect(fifthRequeue.brief).toContain("last known head `deadbeef`");
+  expect(fifthRequeue.brief).toContain("Last known CI status: passing");
+  expect(fifthRequeue.brief).toContain("Which rollout? — Use staged rollout");
+});
+
+test("a corrupted parent_task_id cycle does not hang requeue and still resolves sane recovery state", () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId);
+  const b = makeTask(db, projectId);
+  const c = makeTask(db, projectId);
+  const branch = `hive/${a}`;
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, parent_task_id = ? WHERE id = ?").run(branch, c, a);
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, parent_task_id = ? WHERE id = ?").run(branch, a, b);
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, parent_task_id = ? WHERE id = ?").run(branch, b, c);
+
+  const requeueId = requeueTask(db, getTask(db, a));
+
+  expect(getTask(db, requeueId).resume_branch).toBe(branch);
+});
+
 test("a source=external task with agent_target set (regression guard: should be unreachable post-#996) is still recovered sanely, not stuck forever", async () => {
   // supervision.ts's neverDispatched, plus the createTask/spawnAgent guards in
   // api.ts, should make this state unreachable going forward — this guards the
