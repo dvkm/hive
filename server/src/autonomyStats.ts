@@ -54,6 +54,7 @@ export interface AutoMergeCase {
   merged_at: string;
   pr_url: string | null;
   merged_files: number;
+  measurable: boolean;
   fix_signal: null | { kind: "file_overlap"; task_id: string; overlap: number } | { kind: "revert"; commit: string; subject: string };
 }
 
@@ -200,10 +201,19 @@ export async function autonomyStats(db: DB, opts: AutonomyStatsOptions = {}) {
       merged_at: m.ts,
       pr_url: m.pr_url,
       merged_files: files.length,
+      // Could a fix signal have fired for this merge at all? A merge with no
+      // recorded merged_files and no PR number is unmeasurable: it can only ever
+      // come back "clean", which is absence of data, not evidence of a good merge.
+      measurable: files.length > 0 || (!!exec && prNumber(m.pr_url) !== null),
       fix_signal: signal,
     });
   }
   const fixed = cases.filter((c) => c.fix_signal);
+  // Precision is measured over the merges we could actually have caught a fix
+  // for. Merges predating merged_files (and, with reverts off, every merge) are
+  // excluded rather than silently counted as clean: a denominator of unmeasurable
+  // merges returns a confident 1.0 that means "we looked at nothing".
+  const measurable = cases.filter((c) => c.measurable);
 
   // --- 2. inbox load, per day by class
   const inboxRows = db
@@ -275,9 +285,10 @@ export async function autonomyStats(db: DB, opts: AutonomyStatsOptions = {}) {
     window: { days, since: from, until: to },
     auto_merge_precision: {
       merges: cases.length,
-      clean: cases.length - fixed.length,
+      measurable: measurable.length,
+      clean: measurable.length - fixed.length,
       fixed: fixed.length,
-      precision: cases.length ? (cases.length - fixed.length) / cases.length : null,
+      precision: measurable.length ? (measurable.length - fixed.length) / measurable.length : null,
       revert_detection: exec ? "on" : "off",
       cases,
     },

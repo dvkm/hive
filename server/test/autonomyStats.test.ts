@@ -102,6 +102,37 @@ test("auto-merge precision: no merges in the window returns null, not a fake 100
   expect(s.auto_merge_precision.precision).toBeNull();
 });
 
+// Found against a copy of the real fleet DB: every merge predating the
+// merged_files change reports 0 files, so no fix signal can ever fire and the
+// old denominator returned a confident precision of 1. Unmeasurable merges are
+// still counted as merges, but they must not prop up the precision figure.
+test("auto-merge precision: merges we cannot measure are excluded, not counted clean", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: null });
+  ev(db, id, "merged", at(10), { method: "pr squash", base: "main" }); // no merged_files
+  ev(db, id, "auto_merged", at(10, 0.01), { ok: true, status: 200 });
+
+  const s = await autonomyStats(db, { days: 30, now: clock, exec: null });
+  expect(s.auto_merge_precision.merges).toBe(1);
+  expect(s.auto_merge_precision.measurable).toBe(0);
+  expect(s.auto_merge_precision.cases[0].measurable).toBe(false);
+  expect(s.auto_merge_precision.precision).toBeNull();
+});
+
+// With reverts on, a PR number alone makes a merge measurable: a revert naming
+// it would have been found, so "clean" is a real answer here.
+test("auto-merge precision: a PR number alone makes a merge measurable when reverts are on", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://github.com/o/r/pull/7" });
+  ev(db, id, "merged", at(10), { method: "pr squash", base: "main" }); // no merged_files
+  ev(db, id, "auto_merged", at(10, 0.01), { ok: true, status: 200 });
+
+  const exec: Exec = async (): Promise<ExecResult> => ({ code: 0, stdout: "", stderr: "" });
+  const s = await autonomyStats(db, { days: 30, now: clock, exec });
+  expect(s.auto_merge_precision.measurable).toBe(1);
+  expect(s.auto_merge_precision.precision).toBe(1);
+});
+
 test("inbox load: one row per day, split by class", async () => {
   const { db, projectId } = freshDb();
   const task = makeTask(db, projectId);
