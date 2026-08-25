@@ -50,12 +50,13 @@
 //   (state.ts), since a ticket a human closed in Jira will never have a hive PR.
 import type { DB } from "../db.ts";
 import { isOffline, newId, now } from "../db.ts";
-import { writeEvent, mutateWithEvent, getTask, transition, TERMINAL, type State } from "../state.ts";
+import { writeEvent, mutateWithEvent, getTask, transition, TERMINAL, queueJiraCancellationComment, type State } from "../state.ts";
 import { broadcastTask } from "../health.ts";
 import { resolveProjectSecrets } from "../secrets.ts";
 import type { Exec } from "../exec.ts";
 import { defaultExec } from "../exec.ts";
 import { taskDiff } from "../diff.ts";
+import { taskIdentifier } from "../taskIdentifier.ts";
 import {
   NEEDS_DECISION_LABEL,
   assertJiraWriteAllowed,
@@ -111,7 +112,6 @@ const ABSENT_STOPPED = "stopped"; // terminal marker value in intake_cursors
 // cost is the point.
 const ALLOWED_HOST = "corebeat.atlassian.net";
 export const ALLOWED_SITE = `https://${ALLOWED_HOST}`;
-export const JIRA_SITE = ALLOWED_SITE; // legacy alias
 export const ALLOWED_EMAIL = "corebeat@vid.kim";
 const ALLOWED_PROJECT_KEYS = ["WEB"] as const;
 
@@ -166,6 +166,8 @@ export interface JiraConfig {
   enabled: boolean;
   write: boolean; // false = shadow mode (compute + log, never send)
   jql?: string; // extra filter, ANDed with project = <key>
+  write_scope?: { create_subtask?: boolean };
+  status_notes_to_comments?: boolean;
 }
 
 export interface JiraConfigStatus {
@@ -227,12 +229,14 @@ function jiraConfigStatus(raw: any): JiraConfigStatus {
       // Canonicalized to the compiled-in constants on purpose: the strings that
       // reach fetch() and the Authorization header are hive's own, never the
       // caller's, so no unvalidated remnant of the config value can survive.
-      site: JIRA_SITE,
+      site: ALLOWED_SITE,
       email: ALLOWED_EMAIL,
       project_key: projectKey,
       enabled: j.enabled === true,
       write: j.write === true,
       jql,
+      write_scope: { create_subtask: j.write_scope?.create_subtask === true },
+      status_notes_to_comments: j.status_notes_to_comments === true,
     },
     error: null,
   };
@@ -272,6 +276,10 @@ export const STATE_TO_JIRA: Partial<Record<State, string>> = {
   done: "Done",
 };
 
+export function linkedStateToJiraStatus(state: string): string | null {
+  return state === "cancelled" ? "Done" : stateToJiraStatus(state);
+}
+
 export function jiraStatusToState(name: string | undefined | null): State | null {
   const key = String(name ?? "").trim().toLowerCase();
   return Object.hasOwn(JIRA_TO_STATE, key) ? JIRA_TO_STATE[key] : null;
@@ -297,6 +305,13 @@ export function adfToText(node: any): string {
   if (node.type === "paragraph" || node.type === "heading" || node.type === "listItem") out += "\n";
   if (node.type === "hardBreak") out += "\n";
   return out;
+}
+
+export function hiveTaskMarker(issue: any): string | null {
+  const property = issue?.properties?.["hive.task_id"];
+  if (typeof property === "string" && property.trim()) return property.trim();
+  const match = /^hive-task:\s*([a-z0-9]+)\s*$/im.exec(adfToText(issue?.fields?.description));
+  return match?.[1] ?? null;
 }
 
 // The inverse of adfToText, for the comments hive writes. Jira rejects a bare
@@ -602,7 +617,11 @@ export class JiraClient {
     const method = String(init.method ?? "GET").toUpperCase();
     if (method !== "GET") {
       if (!write) throw new Error(`Jira ${method} ${path} has no declared write scope`);
-      assertJiraWriteAllowed(write.field, write.value);
+      assertJiraWriteAllowed(
+        write.field,
+        write.value,
+        write.field === "create_subtask" && this.cfg.write_scope?.create_subtask === true
+      );
     }
     const res = await this.fetchImpl(`${this.cfg.site}${path}`, {
       // A hung request must not stall the whole cycle (and, with the in-flight
@@ -644,8 +663,12 @@ export class JiraClient {
   // tighter than OR, so `project = WEB AND a OR b` means `(project = WEB AND a)
   // OR b` and an OR in the user's filter would escape the project scope
   // entirely, handing hive write access to issues outside WEB.
+  projectJql(): string {
+    return `project = ${this.cfg.project_key}`;
+  }
+
   jql(): string {
-    const base = `project = ${this.cfg.project_key}`;
+    const base = this.projectJql();
     return this.cfg.jql ? `${base} AND (${this.cfg.jql})` : base;
   }
 
@@ -658,7 +681,7 @@ export class JiraClient {
       "Jira discovery",
       null,
       async (cursor) => {
-        const q = new URLSearchParams({ jql: this.jql(), fields: "key", maxResults: "100" });
+        const q = new URLSearchParams({ jql: this.projectJql(), fields: "key", maxResults: "100" });
         if (typeof cursor === "string") q.set("nextPageToken", cursor);
         return this.json(`/rest/api/3/search/jql?${q}`);
       },
@@ -671,7 +694,8 @@ export class JiraClient {
   // decision is derived from.
   async issue(key: string): Promise<any> {
     const q = new URLSearchParams({
-      fields: JIRA_ISSUE_FIELDS.join(","),
+      fields: `${JIRA_ISSUE_FIELDS.join(",")},parent`,
+      properties: "hive.task_id",
     });
     return this.json(`/rest/api/3/issue/${encodeURIComponent(key)}?${q}`);
   }
@@ -714,17 +738,17 @@ export class JiraClient {
     return out;
   }
 
-  // Strongly-consistent membership answer for the optional jql filter, via
-  // search's `reconcileIssues` parameter (verified supported on this site).
+  // Strongly-consistent membership answer for the configured or project-only
+  // scope, via search's `reconcileIssues` parameter (verified supported here).
   // Throws on failure so the caller can fail CLOSED rather than fall back to
   // the stale snapshot — a silent fallback is the same mistake with extra steps.
-  async scopeProbe(key: string, issueId: string): Promise<{ matches: boolean; statusName: string | null; version: string | null }> {
+  async scopeProbe(key: string, issueId: string, projectOnly = false): Promise<{ matches: boolean; statusName: string | null; version: string | null }> {
     const issues = await paginateJira<any>(
       `Jira scope query for ${key}`,
       null,
       async (cursor) => {
         const q = new URLSearchParams({
-          jql: `(${this.jql()}) AND key = ${key}`,
+          jql: `(${projectOnly ? this.projectJql() : this.jql()}) AND key = ${key}`,
           fields: "key,status,updated",
           maxResults: "100",
           reconcileIssues: issueId,
@@ -848,6 +872,52 @@ export class JiraClient {
     }, { field: "labels", value: label });
   }
 
+  async myself(): Promise<{ accountId: string }> {
+    const body = await this.json("/rest/api/3/myself");
+    const accountId = String(body?.accountId ?? "");
+    if (!accountId) throw new Error("Jira API user has no accountId");
+    return { accountId };
+  }
+
+  async createSubtask(input: {
+    parentKey: string;
+    summary: string;
+    description: string;
+    reporterAccountId: string;
+    hiveTaskId: string;
+  }): Promise<{ key: string }> {
+    const body = await this.json("/rest/api/3/issue", {
+      method: "POST",
+      body: JSON.stringify({
+        fields: {
+          project: { key: this.cfg.project_key },
+          parent: { key: input.parentKey },
+          issuetype: { id: "10002" },
+          summary: input.summary,
+          description: textToAdf(input.description),
+          reporter: { accountId: input.reporterAccountId },
+        },
+        properties: [{ key: "hive.task_id", value: input.hiveTaskId }],
+      }),
+    }, { field: "create_subtask" });
+    const key = String(body?.key ?? "");
+    if (!key) throw new Error("Jira sub-task create response has no key");
+    return { key };
+  }
+
+  async deleteIssue(key: string): Promise<void> {
+    await this.call(`/rest/api/3/issue/${encodeURIComponent(key)}`, {
+      method: "DELETE",
+    }, { field: "create_subtask" });
+  }
+
+  async addRemoteLink(key: string, title: string, url: string): Promise<void> {
+    await this.call(`/rest/api/3/issue/${encodeURIComponent(key)}/remotelink`, {
+      method: "POST",
+      body: JSON.stringify({ object: { title, url } }),
+    }, { field: "create_subtask" });
+  }
+
 }
 
 // ============================================================================
@@ -905,7 +975,13 @@ function movedPayload(read: IssueMoved): Record<string, unknown> {
 // Returns a typed missing observation when the issue GET returns 404 and a moved
 // observation when its version changes during the read. Operational failures
 // propagate so the cycle cannot report success without a trustworthy answer.
-export async function readIssue(client: JiraClient, cfg: JiraConfig, key: string, includeComments = false): Promise<IssueObservation> {
+export async function readIssue(
+  client: JiraClient,
+  cfg: JiraConfig,
+  key: string,
+  includeComments = false,
+  projectOnly = false
+): Promise<IssueObservation> {
   let issue: any;
   try {
     issue = await client.issue(key);
@@ -931,8 +1007,8 @@ export async function readIssue(client: JiraClient, cfg: JiraConfig, key: string
   const inProject = projectKey === cfg.project_key;
   const comments = includeComments && inProject ? await client.comments(key) : undefined;
 
-  const probe = await client.scopeProbe(key, issueId);
-  if ((!inProject && probe.matches) || (!cfg.jql && inProject && !probe.matches)) {
+  const probe = await client.scopeProbe(key, issueId, projectOnly);
+  if ((!inProject && probe.matches) || ((!cfg.jql || projectOnly) && inProject && !probe.matches)) {
     return {
       moved: true,
       initialStatus: fieldStatus,
@@ -1415,6 +1491,77 @@ export interface JiraDeps {
   token?: string; // bypass keychain (tests)
 }
 
+export async function linkTaskToJira(
+  db: DB,
+  taskId: string,
+  parentKey: string,
+  deps: JiraDeps = {}
+): Promise<{ jira_key: string; browse_url: string; warnings: string[] }> {
+  const task = getTask(db, taskId) as any;
+  if (!task) throw new Error("task not found");
+  if (task.source === "external" || task.jira_link_kind === "mirror")
+    throw new Error("Jira mirror tasks cannot create Jira sub-tasks");
+  if (task.jira_key) throw new Error(`task is already linked to ${task.jira_key}`);
+  if (isOffline(db)) throw new Error("Jira linking is unavailable in offline mode");
+
+  const status = jiraConfigStatusFor(db, task.project_id);
+  if (status.error) throw new Error(status.error);
+  const cfg = status.config;
+  if (!cfg?.enabled || !cfg.write) throw new Error("config.jira.enabled and config.jira.write must both be true");
+  if (cfg.write_scope?.create_subtask !== true)
+    throw new Error("config.jira.write_scope.create_subtask must be true");
+  const parent = parentKey.trim().toUpperCase();
+  if (!new RegExp(`^${cfg.project_key}-\\d+$`).test(parent))
+    throw new Error(`parent_key must be a ${cfg.project_key} issue key`);
+  assertJiraTargetOwner(db, task.project_id, cfg);
+
+  const token = deps.token ?? (await resolveProjectSecrets(db, task.project_id, deps.exec ?? defaultExec)).JIRA_API_TOKEN;
+  if (!token) throw new Error("JIRA_API_TOKEN is not resolvable for this project");
+  const client = new JiraClient(cfg, token, deps.fetch ?? fetch);
+  const reporter = await client.myself();
+  const displayId = taskIdentifier(db, task);
+  const created = await client.createSubtask({
+    parentKey: parent,
+    summary: `${displayId} · ${task.title}`,
+    description: `hive-task: ${task.id}\n\nHive task: ${hiveBaseUrl()}/tasks/${task.id}`,
+    reporterAccountId: reporter.accountId,
+    hiveTaskId: task.id,
+  });
+  const linked = db.query("UPDATE tasks SET jira_key = ?, jira_link_kind = 'subtask', updated_at = ? WHERE id = ? AND jira_key IS NULL")
+    .run(created.key, now(), task.id);
+  if (linked.changes !== 1) {
+    try {
+      await client.deleteIssue(created.key);
+    } catch (error) {
+      throw new Error(`task was linked while Jira sub-task ${created.key} was being created; cleanup of the unlinked sub-task failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    throw new Error(`task was linked while Jira sub-task ${created.key} was being created; the new sub-task was deleted`);
+  }
+  if (task.state === "cancelled") queueJiraCancellationComment(db, task.id, "jira-sync");
+  writeEvent(db, {
+    task_id: task.id,
+    source: "jira-sync",
+    type: "jira_sync",
+    payload: { action: "link_created", issue: created.key, parent: parent },
+  });
+  broadcastTask(db, getTask(db, task.id));
+
+  const warnings: string[] = [];
+  const links = [
+    ["Hive task", `${hiveBaseUrl()}/tasks/${task.id}`],
+    ...(task.pr_url ? [["Pull request", String(task.pr_url)]] : []),
+  ];
+  for (const [title, url] of links) {
+    try { await client.addRemoteLink(created.key, title, url); }
+    catch (error) { warnings.push(String(error instanceof Error ? error.message : error)); }
+  }
+  return {
+    jira_key: created.key,
+    browse_url: `${cfg.site}/browse/${encodeURIComponent(created.key)}`,
+    warnings,
+  };
+}
+
 export interface SyncStats {
   imported: number;
   pushed: number;
@@ -1447,6 +1594,7 @@ interface Ctx {
   stats: SyncStats;
   exec: Exec; // reads the task's diff, to tell UI work from everything else
   log: (msg: string, err?: unknown) => void;
+  projectScope?: boolean;
 }
 
 function recordFailure(ctx: Ctx, message: string): void {
@@ -1494,7 +1642,7 @@ async function guardedWrite<T>(
     return;
   }
 
-  const fresh = await readIssue(ctx.client, cfg, args.key);
+  const fresh = await readIssue(ctx.client, cfg, args.key, false, ctx.projectScope);
   if (isIssueMissing(fresh)) {
     logSync(db, args.taskId, { ...args.entry, aborted: "issue missing at write boundary", http_status: fresh.httpStatus });
     stats.aborted++;
@@ -1733,6 +1881,32 @@ async function reconcileIssue(ctx: Ctx, read: IssueRead, task: any): Promise<voi
 
   // ---- comments and receipts: everything hive says to Jira, with remote keys
   await syncCommentsAndReceipts(ctx, key, current, remoteComments);
+}
+
+async function reconcileLinkedTask(ctx: Ctx, read: IssueRead, task: any): Promise<void> {
+  const { db, cfg, stats } = ctx;
+  if (!Array.isArray(read.comments)) throw new Error(`incomplete Jira comment observation for ${read.key}`);
+
+  const target = linkedStateToJiraStatus(task.state);
+  if (target && !sameStatus(read.statusName, target)) {
+    const transitionId = cfg.write ? await ctx.client.resolveTransitionId(read.key, target) : undefined;
+    await guardedWrite(ctx, {
+      taskId: task.id,
+      key: read.key,
+      entry: { action: "push", issue: read.key, field: "status", from: read.statusName, to: target, linked: true },
+      premise: (fresh, freshTask) => {
+        const freshTarget = linkedStateToJiraStatus(freshTask.state);
+        return sameStatus(fresh.statusName, target) || !sameStatus(freshTarget, target)
+          ? { aborted: "linked status decision changed", fresh_target: freshTarget }
+          : null;
+      },
+      act: (fresh) => ctx.client.transition(fresh.key, transitionId!),
+      onDone: () => { stats.pushed++; },
+    });
+  }
+
+  const remote = importRemoteComments(ctx, read.key, task, read.comments);
+  await syncCommentsAndReceipts(ctx, read.key, task, remote);
 }
 
 // One pass over the issue's comments, covering all three directions of text:
@@ -2200,9 +2374,9 @@ async function importAndReconcile(ctx: Ctx, projectId: string, read: IssueRead):
   const t = now();
   const task = mutateWithEvent(db, () => {
     db.query(
-      `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, source_ref, created_at, updated_at)
-       VALUES (?,?,?,?,?, 'ship', 'external', ?, ?, ?)`
-    ).run(id, projectId, titleFor(read.issue), briefFor(read.issue, cfg.site), jiraState ?? "queued", ref, t, t);
+      `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, source_ref, jira_key, jira_link_kind, created_at, updated_at)
+       VALUES (?,?,?,?,?, 'ship', 'external', ?, ?, 'mirror', ?, ?)`
+    ).run(id, projectId, titleFor(read.issue), briefFor(read.issue, cfg.site), jiraState ?? "queued", ref, read.key, t, t);
     return getTask(db, id);
   }, {
     task_id: id,
@@ -2229,8 +2403,8 @@ function jiraTargetKey(cfg: JiraConfig): string {
 
 function jiraTargetOwner(db: DB, projectId: string, cfg: JiraConfig): string {
   const linkedOwners = db.query(
-    "SELECT project_id FROM tasks WHERE source_ref LIKE ? GROUP BY project_id ORDER BY MIN(created_at), project_id"
-  ).all(`${REF_PREFIX}${cfg.project_key}-%`) as { project_id: string }[];
+    "SELECT project_id FROM tasks WHERE jira_key LIKE ? GROUP BY project_id ORDER BY MIN(created_at), project_id"
+  ).all(`${cfg.project_key}-%`) as { project_id: string }[];
   if (linkedOwners.length > 1)
     throw new Error(`jira target ${jiraTargetKey(cfg)} already has linked tasks in multiple Hive projects`);
   if (linkedOwners.length === 1) return linkedOwners[0].project_id;
@@ -2265,10 +2439,21 @@ export async function syncProjectOnce(
   // Discovery must succeed before any verified absence can advance: a failed
   // scope check is not evidence that anything went missing.
   const discovered = await client.discover();
-  const linked = db
-    .query("SELECT id, source_ref FROM tasks WHERE project_id = ? AND source_ref LIKE ?")
-    .all(projectId, REF_PREFIX + "%") as { id: string; source_ref: string }[];
-  const linkedByKey = new Map(linked.map((row) => [row.source_ref.slice(REF_PREFIX.length), row]));
+  const linked = (db
+    .query(
+      `SELECT id, jira_key, jira_link_kind, source_ref FROM tasks
+       WHERE project_id = ? AND (jira_key IS NOT NULL OR source_ref LIKE 'jira:%')`
+    )
+    .all(projectId) as { id: string; jira_key: string | null; jira_link_kind: "mirror" | "subtask" | null; source_ref: string | null }[])
+    .map((row) => {
+      const jiraKey = row.jira_key ?? String(row.source_ref).slice("jira:".length);
+      if (!row.jira_key) {
+        db.query("UPDATE tasks SET jira_key = ?, jira_link_kind = 'mirror' WHERE id = ?").run(jiraKey, row.id);
+      }
+      return { id: row.id, jira_key: jiraKey, jira_link_kind: row.jira_link_kind ?? "mirror" };
+    });
+  const linkedByKey = new Map<string, typeof linked>();
+  for (const row of linked) linkedByKey.set(row.jira_key, [...(linkedByKey.get(row.jira_key) ?? []), row]);
   const keys = [...new Set([...discovered, ...linkedByKey.keys()])];
 
   for (const key of keys) {
@@ -2281,7 +2466,8 @@ export async function syncProjectOnce(
       log(`issue ${key} failed`, e);
       continue;
     }
-    const linkedTask = linkedByKey.get(key);
+    let linkedTasks = linkedByKey.get(key) ?? [];
+    let mirrorTask = linkedTasks.find((task) => task.jira_link_kind === "mirror");
     if (isIssueMissing(read)) {
       // A direct per-issue GET answering 404 is POSITIVE proof, which is a
       // different fact from "search did not return it" (that only nominates a
@@ -2298,14 +2484,14 @@ export async function syncProjectOnce(
       // strictly of deletion, and a presumptive terminal state must not be a
       // one-way trapdoor. See the reappearance branch in reconcileIssue.
       clearAbsentStreak(db, key);
-      if (!linkedTask) {
+      if (!mirrorTask) {
         ctx.stats.skipped++;
         continue;
       }
-      const linkedState = (getTask(db, linkedTask.id) as any)?.state;
+      const linkedState = (getTask(db, mirrorTask.id) as any)?.state;
       if (!TERMINAL.includes(linkedState as State)) {
-        logSync(db, linkedTask.id, { action: "source_deleted", issue: key, proof: "direct GET returned 404" });
-        transition(db, linkedTask.id, "cancelled", {
+        logSync(db, mirrorTask.id, { action: "source_deleted", issue: key, proof: "direct GET returned 404" });
+        transition(db, mirrorTask.id, "cancelled", {
           source: "jira-sync",
           reason: `jira ${key} no longer exists (direct read returned 404)`,
         });
@@ -2315,24 +2501,68 @@ export async function syncProjectOnce(
     }
     if (isIssueMoved(read) || read.scope === "in") clearAbsentStreak(db, key);
     if (isIssueMoved(read)) {
-      if (linkedTask) logSync(db, linkedTask.id, { action: "read_aborted", issue: key, ...movedPayload(read) });
+      for (const task of linkedTasks) logSync(db, task.id, { action: "read_aborted", issue: key, ...movedPayload(read) });
       ctx.stats.skipped++;
       continue;
     }
+    try {
+      const marker = hiveTaskMarker(read.issue);
+      if (marker) {
+        const marked = db.query("SELECT * FROM tasks WHERE id = ? AND project_id = ?").get(marker, projectId) as any;
+        if (marked && !marked.jira_key) {
+          const linked = db.query("UPDATE tasks SET jira_key = ?, jira_link_kind = 'subtask', updated_at = ? WHERE id = ? AND jira_key IS NULL")
+            .run(key, now(), marked.id);
+          if (linked.changes !== 1) continue;
+          if (marked.state === "cancelled") queueJiraCancellationComment(db, marked.id, "jira-sync");
+          writeEvent(db, {
+            task_id: marked.id,
+            source: "jira-sync",
+            type: "jira_sync",
+            payload: { action: "link_discovered", issue: key, parent: read.issue.fields?.parent?.key ?? null },
+          });
+          broadcastTask(db, getTask(db, marked.id));
+          linkedTasks = [...linkedTasks, { id: marked.id, jira_key: key, jira_link_kind: "subtask" }];
+          linkedByKey.set(key, linkedTasks);
+        }
+      }
+    } catch (e) {
+      const message = String(e instanceof Error ? e.message : e);
+      recordFailure(ctx, `${key}: ${message}`);
+      log(`issue ${key} marker link failed`, e);
+      continue;
+    }
+    mirrorTask = linkedTasks.find((task) => task.jira_link_kind === "mirror");
+    let linkedRead = read;
     if (read.scope !== "in") {
-      if (!linkedTask) {
+      if (mirrorTask) {
+        logSyncOnce(db, mirrorTask.id, { action: "out_of_scope", issue: key, scope: read.scope });
+        advanceAbsence(db, mirrorTask.id, key);
+      }
+      if (!linkedTasks.some((task) => task.jira_link_kind === "subtask")) {
         ctx.stats.skipped++;
         continue;
       }
-      logSyncOnce(db, linkedTask.id, { action: "out_of_scope", issue: key, scope: read.scope });
-      advanceAbsence(db, linkedTask.id, key);
-      continue;
+      try {
+        linkedRead = await readIssue(client, cfg, key, true, true);
+      } catch (e) {
+        const message = String(e instanceof Error ? e.message : e);
+        recordFailure(ctx, `${key}: ${message}`);
+        log(`linked issue ${key} failed`, e);
+        continue;
+      }
+      if (isIssueMissing(linkedRead) || isIssueMoved(linkedRead) || linkedRead.scope !== "in") {
+        ctx.stats.skipped++;
+        continue;
+      }
     }
 
     try {
-      const task = db.query("SELECT * FROM tasks WHERE project_id = ? AND source_ref = ?").get(projectId, REF_PREFIX + key) as any;
-      if (!task) await importAndReconcile(ctx, projectId, read);
-      else await reconcileIssue(ctx, read, task);
+      const tasks = db.query("SELECT * FROM tasks WHERE project_id = ? AND jira_key = ?").all(projectId, key) as any[];
+      if (!tasks.length) await importAndReconcile(ctx, projectId, read);
+      for (const task of tasks) {
+        if (task.jira_link_kind === "subtask") await reconcileLinkedTask({ ...ctx, projectScope: true }, linkedRead, task);
+        else if (read.scope === "in") await reconcileIssue(ctx, read, task);
+      }
     } catch (e) {
       const message = String(e instanceof Error ? e.message : e);
       recordFailure(ctx, `${key}: ${message}`);

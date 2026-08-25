@@ -52,9 +52,9 @@ import { runPlanner, resolvePlanForDecision, decisionPlan, selectedPlanIndices, 
 import { routeIntakeProject } from "./intake/route.ts";
 import {
   REF_PREFIX as JIRA_REF_PREFIX,
-  JIRA_SITE,
   JIRA_COMMENT_MAX_LENGTH,
   JIRA_WRITE_SCOPE,
+  jiraConfig,
   jiraConfigStatusFor,
   readSyncState as readJiraSyncState,
   runProjectCycle as runJiraProjectCycle,
@@ -62,6 +62,7 @@ import {
   deliveredOutbound,
   resolveUnknownOutbound,
   resolveEvidenceUrl,
+  linkTaskToJira,
   type JiraDeps,
 } from "./intake/jira.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
@@ -280,14 +281,14 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
           if (!includeArchived) conds.push("COALESCE(json_extract(config, '$.archived'), 0) = 0");
           if (!includeTest) conds.push(notTestProjectSql());
           const sql = "SELECT * FROM projects" + (conds.length ? " WHERE " + conds.join(" AND ") : "") + " ORDER BY created_at";
-          return json(db.query(sql).all().map(parseProject));
+          return json(db.query(sql).all().map(projectPayload));
         }
         if (method === "POST") return createProject(db, await req.json());
       }
       let m = pathname.match(/^\/api\/projects\/([^/]+)$/);
       if (m && method === "GET") {
         const r = db.query("SELECT * FROM projects WHERE id = ?").get(m[1]);
-        return r ? json(parseProject(r)) : err("project not found", 404);
+        return r ? json(projectPayload(r)) : err("project not found", 404);
       }
       if (m && method === "PUT") return updateProject(db, m[1], await req.json());
 
@@ -490,6 +491,13 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/jira\/sync$/);
       if (m && method === "POST") return await jiraManualSync(db, m[1], deps.jira);
 
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/jira\/link$/);
+      if (m && method === "POST") {
+        const body = await safeJson(req);
+        if (!body?.parent_key) return err("parent_key is required");
+        return json(await linkTaskToJira(db, m[1], String(body.parent_key), deps.jira), 201);
+      }
+
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/jira\/delivery\/resolve$/);
       if (m && method === "POST") return jiraResolveDelivery(db, m[1], await safeJson(req));
 
@@ -674,7 +682,7 @@ function createProject(db: DB, body: any): Response {
   db.query(
     "INSERT INTO projects (id, name, repo_path, config, created_at) VALUES (?,?,?,?,?)"
   ).run(row.id, row.name, row.repo_path, row.config, row.created_at);
-  return json(parseProject(row), 201);
+  return json(projectPayload(row), 201);
 }
 
 // Update a project's mutable fields. `config` is REPLACED wholesale (the web UI
@@ -690,7 +698,16 @@ function updateProject(db: DB, id: string, body: any): Response {
   }
   const config = body?.config !== undefined ? JSON.stringify(body.config) : existing.config;
   db.query("UPDATE projects SET name = ?, repo_path = ?, config = ? WHERE id = ?").run(name, repo_path, config, id);
-  return json(parseProject(db.query("SELECT * FROM projects WHERE id = ?").get(id)));
+  return json(projectPayload(db.query("SELECT * FROM projects WHERE id = ?").get(id)));
+}
+
+// The project payload the UI reads. `jira_site` is the CANONICALIZED site from
+// the credential gate, never the raw config value: a client that builds a
+// browse URL must not be able to be pointed at an attacker-named host by a
+// config write, which is the same guarantee jiraTaskState's browse_url makes.
+function projectPayload(row: any) {
+  const project = parseProject(row);
+  return { ...project, jira_site: jiraConfig(project.config)?.site ?? null };
 }
 
 // ---------------------------------------------------------------- jira
@@ -698,24 +715,51 @@ function updateProject(db: DB, id: string, body: any): Response {
 // lives, when it last synced, what is still unresolved, and any error
 // that has NOT been cleared by a later success. A director should never have to
 // guess whether the sync ran, which is what makes people re-submit work.
+function jiraIssueKey(task: { jira_key?: string | null; source_ref?: string | null }): string {
+  if (task.jira_key) return task.jira_key;
+  const ref = String(task.source_ref ?? "");
+  return ref.startsWith(JIRA_REF_PREFIX) ? ref.slice(JIRA_REF_PREFIX.length) : "";
+}
+
 function jiraTaskState(db: DB, taskId: string): Response {
   const task = getTask(db, taskId);
   if (!task) return err("task not found", 404);
-  const ref = String(task.source_ref ?? "");
-  if (!ref.startsWith(JIRA_REF_PREFIX)) return json({ linked: false });
-
-  const key = ref.slice(JIRA_REF_PREFIX.length);
+  const key = jiraIssueKey(task);
+  if (!key) return json({ linked: false });
   const configStatus = jiraConfigStatusFor(db, task.project_id);
   const cfg = configStatus.config;
   const state = readJiraSyncState(db, task.project_id);
   const pending = pendingOutbound(db, taskId);
   const assignee = /^Assignee: (.+)$/m.exec(String(task.brief ?? ""))?.[1] ?? null;
   const delivered = deliveredOutbound(db, taskId);
+  const site = cfg?.site ?? null;
+  const linkedSubtasks = (task.jira_link_kind === "mirror" || isJiraMirror(task))
+    ? (db.query(
+        `SELECT id, project_id, number, project_number, title, state, jira_key
+         FROM tasks
+         WHERE project_id = ? AND jira_link_kind = 'subtask' AND (
+           parent_task_id = ? OR EXISTS (
+             SELECT 1 FROM events
+             WHERE task_id = tasks.id AND type = 'jira_sync'
+               AND json_extract(payload, '$.action') IN ('link_created', 'link_discovered')
+               AND json_extract(payload, '$.parent') = ?
+           )
+         )
+         ORDER BY number`
+      ).all(task.project_id, task.id, key) as any[]).map((row) => ({
+        id: row.id,
+        display_id: taskIdentifier(db, row),
+        title: row.title,
+        state: row.state,
+        jira_key: row.jira_key,
+        browse_url: site ? `${site}/browse/${encodeURIComponent(row.jira_key)}` : null,
+      }))
+    : [];
 
   return json({
     linked: true,
     issue_key: key,
-    browse_url: key ? `${JIRA_SITE}/browse/${encodeURIComponent(key)}` : null,
+    browse_url: key && site ? `${site}/browse/${encodeURIComponent(key)}` : null,
     enabled: cfg?.enabled ?? false,
     write: cfg?.write ?? false,
     // A configured-but-not-allowlisted target reads as "not configured" here on
@@ -726,18 +770,19 @@ function jiraTaskState(db: DB, taskId: string): Response {
     // The automatic cycle is OFF for it, so the board shows this reason from the
     // first read rather than waiting for a failure count to climb.
     config_error: configStatus.error,
-    write_scope: JIRA_WRITE_SCOPE,
+    write_scope: { ...JIRA_WRITE_SCOPE, create_subtask: cfg?.write_scope?.create_subtask === true },
     assignee: assignee === "-" ? null : assignee,
     sync: configStatus.error ? { ...state, last_error: `jira cycle could not run: ${configStatus.error}` } : state,
     pending,
     delivered,
+    linked_subtasks: linkedSubtasks,
   });
 }
 
 function jiraResolveDelivery(db: DB, taskId: string, body: any): Response {
   const task = getTask(db, taskId);
   if (!task) return err("task not found", 404);
-  if (!String(task.source_ref ?? "").startsWith(JIRA_REF_PREFIX)) return err("task is not linked to a Jira issue", 400);
+  if (!jiraIssueKey(task)) return err("task is not linked to a Jira issue", 400);
   const action = String(body?.action ?? "");
   const sourceId = String(body?.source_id ?? "");
   if ((action !== "comment_push" && action !== "receipt") || !sourceId)
@@ -753,7 +798,7 @@ function jiraResolveDelivery(db: DB, taskId: string, body: any): Response {
 async function jiraManualSync(db: DB, taskId: string, deps?: JiraDeps): Promise<Response> {
   const task = getTask(db, taskId);
   if (!task) return err("task not found", 404);
-  if (!String(task.source_ref ?? "").startsWith(JIRA_REF_PREFIX)) return err("task is not linked to a Jira issue", 400);
+  if (!jiraIssueKey(task)) return err("task is not linked to a Jira issue", 400);
   const r = await runJiraProjectCycle(db, task.project_id, deps);
   return json({ ok: r.ok, error: r.error ?? null, stats: r.stats ?? null, sync: r.state }, r.ok ? 200 : 502);
 }
@@ -5242,6 +5287,15 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
 
   // --- status / blocked / generic ---
   const event = writeEvent(db, { task_id: taskId, source, type, payload: { note } });
+  if (type === "status" && typeof note === "string" && note.trim() && task.jira_key && task.jira_link_kind === "subtask"
+    && jiraConfigStatusFor(db, task.project_id).config?.status_notes_to_comments === true) {
+    writeEvent(db, {
+      task_id: taskId,
+      source,
+      type: "jira_comment",
+      payload: { direction: "outbound", text: note.trim(), status_event_id: event.id },
+    });
+  }
   return json({ event }, 201);
 }
 

@@ -43,6 +43,9 @@ interface FakeIssue {
   assignee?: string | null;
   projectKey?: string | null; // defaults to WEB; null omits the field
   summary?: string;
+  description?: any;
+  properties?: Record<string, unknown>;
+  parentKey?: string | null;
   created?: string | null;
   updated?: string;
   history?: { at: string; to: string }[]; // status transitions, oldest first
@@ -87,10 +90,12 @@ interface FakeOpts {
   onChangelog?: (key: string, issue: FakeIssue, nth: number) => void;
   onComments?: (key: string, issue: FakeIssue, nth: number) => void;
   onScopeProbe?: (key: string, issue: FakeIssue, nth: number) => void;
+  onCreate?: () => void;
+  failDelete?: boolean;
 }
 
 function fakeJira(opts: FakeOpts) {
-  const byKey = new Map(opts.issues.map((i) => [i.key, { labels: [], assignee: null, projectKey: "WEB", summary: "s", created: "2026-01-01T00:00:00.000Z", updated: "2026-01-01T00:00:00.000Z", history: [], rawHistory: null, comments: [], attachments: [], ...i } as Required<FakeIssue>]));
+  const byKey = new Map(opts.issues.map((i) => [i.key, { labels: [], assignee: null, projectKey: "WEB", summary: "s", description: null, properties: {}, parentKey: null, created: "2026-01-01T00:00:00.000Z", updated: "2026-01-01T00:00:00.000Z", history: [], rawHistory: null, comments: [], attachments: [], ...i } as Required<FakeIssue>]));
   const calls: { method: string; path: string; body?: any }[] = [];
   const reads = new Map<string, number>();
   const changelogReads = new Map<string, number>();
@@ -119,6 +124,11 @@ function fakeJira(opts: FakeOpts) {
       return json(opts.myself === "missing" ? {} : { accountId: SELF });
     }
 
+    if (path === "/rest/api/3/issue" && method === "POST") {
+      opts.onCreate?.();
+      return json({ id: "99", key: "WEB-99" }, 201);
+    }
+
     if (path === "/rest/api/3/search/jql") {
       if (opts.failSearch) return new Response("boom", { status: 500 });
       const recon = u.searchParams.get("reconcileIssues");
@@ -132,7 +142,9 @@ function fakeJira(opts: FakeOpts) {
           opts.onScopeProbe?.(key, byKey.get(key)!, n);
         }
         if (opts.scopeRows) return json({ issues: opts.scopeRows, isLast: true });
-        const allow = (opts.jqlOnly ?? [...byKey.keys()]).filter((candidate) => byKey.get(candidate)?.projectKey === "WEB");
+        const projectOnly = /^\(project = WEB\) AND key =/i.test(u.searchParams.get("jql") ?? "");
+        const allow = (projectOnly ? [...byKey.keys()] : opts.jqlOnly ?? [...byKey.keys()])
+          .filter((candidate) => byKey.get(candidate)?.projectKey === "WEB");
         const matches = key ? allow.filter((k) => k === key) : allow;
         const page = Number(u.searchParams.get("nextPageToken") ?? 0);
         const start = page * 100;
@@ -158,6 +170,11 @@ function fakeJira(opts: FakeOpts) {
     if (m) {
       const key = decodeURIComponent(m[1]);
       const sub = m[3];
+      if (sub === "remotelink" && method === "POST")
+        return new Response(null, { status: 201 });
+      if (!sub && method === "DELETE") return opts.failDelete
+        ? new Response("delete failed", { status: 500 })
+        : new Response(null, { status: 204 });
       const iss = byKey.get(key);
       if (!iss) return new Response("not found", { status: 404 });
 
@@ -171,15 +188,16 @@ function fakeJira(opts: FakeOpts) {
           reads.set(key, n);
           opts.onRead?.(key, iss, n); // the world may move between reads
           const fields: Record<string, unknown> = {
-            summary: iss.summary, description: null, created: iss.created, updated: iss.updated,
+            summary: iss.summary, description: iss.description, created: iss.created, updated: iss.updated,
             status: { name: iss.status }, labels: [...iss.labels],
             assignee: iss.assignee ? { accountId: iss.assignee } : null,
             priority: { name: "Medium" }, issuetype: { name: "Story" },
             project: iss.projectKey == null ? undefined : { key: iss.projectKey },
+            parent: iss.parentKey ? { key: iss.parentKey } : null,
             attachment: iss.attachments.map((a) => ({ id: a.id, filename: a.filename })),
           };
           for (const field of opts.omitIssueFields ?? []) delete fields[field];
-          return json({ key, id: iss.id, fields });
+          return json({ key, id: iss.id, fields, properties: iss.properties });
         }
         if (method === "PUT") {
           for (const op of body?.update?.labels ?? []) {
@@ -1610,6 +1628,7 @@ test("the declared Jira write scope matches observed connector mutations", async
     attachments: true,
     labels: [J.NEEDS_DECISION_LABEL],
     assignee: false,
+    create_subtask: false,
   });
   expect([...observed].sort()).toEqual(["attachments", "comments", "labels", "status"]);
   expect(jira.calls.some((call) => call.path.includes("/assignee") || call.path.includes("/myself"))).toBe(false);
@@ -1892,6 +1911,177 @@ test("comments fetched before the final scope check are not imported after the i
 // ============================================================================
 const queueComment = (db: DB, taskId: string, text: string) =>
   writeEvent(db, { task_id: taskId, source: "director", type: "jira_comment", payload: { direction: "outbound", text, delivery: "queued" } });
+
+test("link creation sends Jira's sub-task payload and stores the link", async () => {
+  const jira = fakeJira({ issues: [] });
+  const { db, projectId } = freshDb({ ...CFG, write_scope: { create_subtask: true } });
+  const taskId = newId();
+  const ts = now();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, pr_url, state, kind, created_at, updated_at)
+     VALUES (?, ?, 'Ship outbound links', 'https://github.com/corebeat/hive/pull/1', 'queued', 'ship', ?, ?)`
+  ).run(taskId, projectId, ts, ts);
+
+  const linked = await J.linkTaskToJira(db, taskId, "web-7", { fetch: jira.fetchImpl, token: "tok" });
+
+  expect(linked).toMatchObject({ jira_key: "WEB-99", browse_url: `${SITE}/browse/WEB-99`, warnings: [] });
+  expect(db.query("SELECT jira_key, jira_link_kind FROM tasks WHERE id = ?").get(taskId)).toEqual({
+    jira_key: "WEB-99", jira_link_kind: "subtask",
+  });
+  const create = jira.calls.find((call) => call.method === "POST" && call.path === "/rest/api/3/issue");
+  expect(create?.body.fields).toMatchObject({
+    project: { key: "WEB" }, parent: { key: "WEB-7" }, issuetype: { id: "10002" },
+    reporter: { accountId: SELF }, summary: "P-1 · Ship outbound links",
+  });
+  expect(J.adfToText(create?.body.fields.description)).toContain(`hive-task: ${taskId}`);
+  expect(create?.body.properties).toEqual([{ key: "hive.task_id", value: taskId }]);
+  expect(jira.calls.filter((call) => call.method === "POST" && call.path.endsWith("/remotelink"))).toHaveLength(2);
+});
+
+test("link creation deletes the Jira sub-task when another link wins the database race", async () => {
+  const { db, projectId } = freshDb({ ...CFG, write_scope: { create_subtask: true } });
+  const taskId = newId();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at)
+     VALUES (?, ?, 'Race', 'queued', 'ship', ?, ?)`
+  ).run(taskId, projectId, now(), now());
+  const jira = fakeJira({
+    issues: [],
+    onCreate: () => db.query("UPDATE tasks SET jira_key = 'WEB-98', jira_link_kind = 'subtask' WHERE id = ?").run(taskId),
+  });
+
+  await expect(J.linkTaskToJira(db, taskId, "WEB-7", { fetch: jira.fetchImpl, token: "tok" })).rejects.toThrow(/was deleted/);
+  expect(db.query("SELECT jira_key FROM tasks WHERE id = ?").get(taskId)).toEqual({ jira_key: "WEB-98" });
+  expect(jira.calls).toContainEqual(expect.objectContaining({ method: "DELETE", path: "/rest/api/3/issue/WEB-99" }));
+});
+
+test("link creation reports an orphan when race cleanup fails", async () => {
+  const { db, projectId } = freshDb({ ...CFG, write_scope: { create_subtask: true } });
+  const taskId = newId();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at)
+     VALUES (?, ?, 'Race cleanup', 'queued', 'ship', ?, ?)`
+  ).run(taskId, projectId, now(), now());
+  const jira = fakeJira({
+    issues: [],
+    failDelete: true,
+    onCreate: () => db.query("UPDATE tasks SET jira_key = 'WEB-98', jira_link_kind = 'subtask' WHERE id = ?").run(taskId),
+  });
+
+  await expect(J.linkTaskToJira(db, taskId, "WEB-7", { fetch: jira.fetchImpl, token: "tok" }))
+    .rejects.toThrow(/cleanup of the unlinked sub-task failed/);
+  expect(db.query("SELECT jira_key FROM tasks WHERE id = ?").get(taskId)).toEqual({ jira_key: "WEB-98" });
+});
+
+test("linking an already-cancelled task queues its cancellation comment once", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-99", id: "99", status: "To Do" }] });
+  const { db, projectId } = freshDb({ ...CFG, write_scope: { create_subtask: true } });
+  const taskId = newId();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at)
+     VALUES (?, ?, 'Already cancelled', 'cancelled', 'ship', ?, ?)`
+  ).run(taskId, projectId, now(), now());
+
+  await J.linkTaskToJira(db, taskId, "WEB-7", { fetch: jira.fetchImpl, token: "tok" });
+  await run(db, projectId, jira.fetchImpl);
+  await run(db, projectId, jira.fetchImpl);
+
+  expect(jira.byKey.get("WEB-99")!.comments).toHaveLength(1);
+  expect(db.query(
+    `SELECT COUNT(*) AS count FROM events WHERE task_id = ? AND type = 'jira_comment'
+       AND json_extract(payload, '$.linked_cancelled') = 1`
+  ).get(taskId)).toEqual({ count: 1 });
+});
+
+test("cancelling a linked task queues one comment for normal outbound delivery", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-23", id: "23", status: "To Do" }] });
+  const { db, projectId } = freshDb();
+  const taskId = newId();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, jira_key, jira_link_kind, created_at, updated_at)
+     VALUES (?, ?, 'Cancel linked task', 'queued', 'ship', 'WEB-23', 'subtask', ?, ?)`
+  ).run(taskId, projectId, now(), now());
+
+  transition(db, taskId, "cancelled", { source: "director", reason: "no longer needed" });
+
+  const queued = db.query("SELECT source, payload FROM events WHERE task_id = ? AND type = 'jira_comment'").all(taskId) as any[];
+  expect(queued).toHaveLength(1);
+  expect(queued[0].source).toBe("director");
+  expect(JSON.parse(queued[0].payload)).toMatchObject({
+    direction: "outbound", linked_cancelled: true, text: "Hive marked this task cancelled.",
+  });
+
+  await run(db, projectId, jira.fetchImpl);
+  await run(db, projectId, jira.fetchImpl);
+
+  expect(jira.byKey.get("WEB-23")!.status).toBe("Done");
+  expect(jira.byKey.get("WEB-23")!.comments).toHaveLength(1);
+  expect(db.query(
+    `SELECT COUNT(*) AS count FROM events WHERE task_id = ? AND type = 'jira_sync'
+     AND json_extract(payload, '$.action') = 'comment_push' AND json_extract(payload, '$.outcome') = 'ok'`
+  ).get(taskId)).toEqual({ count: 1 });
+});
+
+test("a Jira marker discovers a native task and linked writes are delivered once", async () => {
+  const taskId = newId();
+  const jira = fakeJira({ issues: [{
+    key: "WEB-23", id: "23", status: "To Do", parentKey: "WEB-7",
+    description: J.textToAdf(`implementation notes\nhive-task: ${taskId}`),
+  }], jqlOnly: [] });
+  const { db, projectId } = freshDb();
+  const ts = now();
+  db.query(
+    "INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at) VALUES (?, ?, 'Native task', 'queued', 'ship', ?, ?)"
+  ).run(taskId, projectId, ts, ts);
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, source, source_ref, jira_key, jira_link_kind, created_at, updated_at)
+     VALUES (?, ?, 'Mirror', 'queued', 'ship', 'external', 'jira:WEB-23', 'WEB-23', 'mirror', ?, ?)`
+  ).run(newId(), projectId, ts, ts);
+
+  const cfg = { ...CFG, jql: "labels = CMS" };
+  const first = await run(db, projectId, jira.fetchImpl, cfg);
+  expect(first.errors).toBe(0);
+  expect(first.failures).toEqual([]);
+  expect(db.query("SELECT jira_link_kind FROM tasks WHERE jira_key = 'WEB-23' ORDER BY jira_link_kind").all()).toEqual([
+    { jira_link_kind: "mirror" }, { jira_link_kind: "subtask" },
+  ]);
+  expect(db.query("SELECT jira_key, jira_link_kind FROM tasks WHERE id = ?").get(taskId)).toEqual({
+    jira_key: "WEB-23", jira_link_kind: "subtask",
+  });
+  expect(syncEvents(db)).toContainEqual(expect.objectContaining({ action: "link_discovered", issue: "WEB-23", parent: "WEB-7" }));
+
+  db.query("UPDATE tasks SET state = 'in_progress' WHERE id = ?").run(taskId);
+  writeEvent(db, { task_id: taskId, source: "director", type: "state_change", payload: { from: "queued", to: "in_progress" } });
+  queueComment(db, taskId, "status note");
+  await run(db, projectId, jira.fetchImpl, cfg);
+  await run(db, projectId, jira.fetchImpl, cfg);
+
+  expect(jira.byKey.get("WEB-23")!.status).toBe("In Progress");
+  expect(jira.calls.filter((call) => call.method === "POST" && call.path.endsWith("/transitions"))).toHaveLength(1);
+  expect(jira.byKey.get("WEB-23")!.comments).toHaveLength(1);
+  expect(new URL(jira.calls.find((call) => call.path.startsWith("/rest/api/3/search/jql?"))!.path, SITE).searchParams.get("jql"))
+    .toBe("project = WEB");
+});
+
+test("a rejected marker link does not stop the rest of the sync cycle", async () => {
+  const taskId = newId();
+  const jira = fakeJira({ issues: [
+    { key: "WEB-23", id: "23", status: "To Do", description: J.textToAdf(`hive-task: ${taskId}`) },
+    { key: "WEB-24", id: "24", status: "To Do" },
+  ] });
+  const { db, projectId } = freshDb();
+  db.query(
+    "INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at) VALUES (?, ?, 'Rejected marker', 'queued', 'ship', ?, ?)"
+  ).run(taskId, projectId, now(), now());
+  db.exec(`CREATE TRIGGER reject_marker BEFORE UPDATE OF jira_key ON tasks WHEN NEW.id = '${taskId}' BEGIN SELECT RAISE(FAIL, 'marker rejected'); END`);
+
+  const stats = await run(db, projectId, jira.fetchImpl);
+
+  expect(stats.errors).toBe(1);
+  expect(stats.imported).toBe(1);
+  expect(db.query("SELECT jira_key FROM tasks WHERE id = ?").get(taskId)).toEqual({ jira_key: null });
+  expect(db.query("SELECT id FROM tasks WHERE jira_key = 'WEB-24'").get()).toBeTruthy();
+});
 
 test("an acknowledged outbound comment is not redelivered across repeated cycles", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }] });
