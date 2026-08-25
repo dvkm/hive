@@ -185,3 +185,61 @@ test("the in-flight hold is released even when the classifier throws", async () 
   expect(triageHold(db, getTask(db, id))).toBe(false);
   expect(isReviewed(db, id)).toBe(true);
 });
+
+// A triage card asks the director which reading to build. If any automation
+// answers it for them, the feature has silently defeated itself: the task
+// dispatches on a reading nobody chose. Every auto-answer path must refuse.
+test("a triage card survives every auto-answer sweep", async () => {
+  const { autoAnswerStale } = await import("../src/reconciler.ts");
+  const { evaluateAutoApprove, evaluateAutopilotApprove } = await import("../src/autoapprove.ts");
+  const { apiAnswerDecision } = await import("../src/api.ts");
+  const { defaultHerdr } = await import("../src/runtime/herdr.ts");
+
+  // decision_auto_answer_hours: 1 — the sweep would normally take any open
+  // normal-risk card with a recommended option after an hour.
+  const { db, id, task } = setup({ intake_triage: true, decision_auto_answer_hours: 1 }, "watch");
+  await triageIntake(db, task, { exec: stub(AMBIGUOUS) });
+  const card = openCards(db, id)[0];
+  expect(card).toBeTruthy();
+  expect(card.decision_class).toBe("intake_triage");
+  // It has a recommended option, so nothing but the class is keeping it safe.
+  expect(JSON.parse(card.options).some((o: any) => o.recommended)).toBe(true);
+
+  // 1. the reconciler's stale-card timeout, two days late.
+  autoAnswerStale(db, defaultHerdr, Date.parse(card.ts) + 48 * 3600_000);
+  expect(openCards(db, id)).toHaveLength(1);
+
+  // 2. the chat supervisor, on both its balanced and autopilot paths.
+  expect(evaluateAutoApprove(db, card, "first-load").allow).toBe(false);
+  expect(evaluateAutopilotApprove(db, card, "first-load").allow).toBe(false);
+
+  // 3. the answer endpoint itself, for any automated caller.
+  for (const source of ["system", "chat_supervisor"]) {
+    const res = apiAnswerDecision(db, defaultHerdr, card.id, { answer_key: "first-load", source, actor: "sweep" });
+    expect(res.status).toBe(403);
+  }
+  expect(openCards(db, id)).toHaveLength(1);
+  expect(isReviewed(db, id)).toBe(false); // still held: nobody chose a reading
+
+  // The director still answers it normally, and that releases the task.
+  const ok = apiAnswerDecision(db, defaultHerdr, card.id, { answer_key: "first-load", source: "director" });
+  expect(ok.status).toBe(200);
+  expect(openCards(db, id)).toHaveLength(0);
+  expect(isReviewed(db, id)).toBe(true);
+});
+
+// The standing-CI ruling fires inside createDecision, before any later gate can
+// see the card. A classed card must be excluded there too.
+test("createDecision never applies a standing CI ruling to a classed card", async () => {
+  const { createDecision } = await import("../src/api.ts");
+  const { db, id } = setup({ intake_triage: true }, "watch");
+  const card = createDecision(db, {
+    task_id: id,
+    title: "Which reading?",
+    context: "c",
+    options: [{ key: "a", label: "A", recommended: true }],
+    decision_class: "intake_triage",
+  });
+  expect(card.status).toBe("open");
+  expect(card.decision_class).toBe("intake_triage");
+});

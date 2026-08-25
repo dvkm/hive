@@ -311,8 +311,11 @@ async function createIntakeTask(
   }
   // Intake triage (config.intake_triage): mechanical messages clear the
   // unreviewed hold themselves, ambiguous ones raise the director's card.
-  // triageIntake never throws and is a no-op when the project has not opted in.
-  await triageIntake(db, task);
+  // Deliberately NOT awaited — the classifier can take up to 60s, and one slow
+  // message must not stall the rest of the poll cycle. The task is already held
+  // (created unreviewed) and triageIntake takes its own hold synchronously
+  // before its first await, so there is no window where it could dispatch.
+  triageIntake(db, task).catch((e) => console.error(`[hive] gchat: intake triage ${id}:`, e));
   return task;
 }
 

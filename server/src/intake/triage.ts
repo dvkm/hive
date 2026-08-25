@@ -22,6 +22,9 @@ import { writeEvent, getTask } from "../state.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "../planner.ts";
 import { createDecision } from "../api.ts";
 
+// Stamped on every triage card. Automation refuses to answer a classed card.
+export const TRIAGE_DECISION_CLASS = "intake_triage";
+
 const TIMEOUT_MS = 60_000;
 const BRIEF_LIMIT = 4000;
 // Same reasoning as drift.ts: the classifier judges the text it is handed, and
@@ -167,6 +170,11 @@ export async function triageIntake(db: DB, task: any, deps: TriageDeps = {}): Pr
 
   // Held from here so the task cannot dispatch while we are still deciding —
   // 'watch' tasks have no unreviewed-intake hold of their own.
+  //
+  // LOAD-BEARING: every line above this one is synchronous, and so is this one.
+  // All three callers fire this function without awaiting it, so the hold must
+  // land in the caller's own tick — before the dispatcher can run again. Keep
+  // any new `await` below this point.
   inFlight.add(task.id);
   let verdict: Triage;
   try {
@@ -195,6 +203,10 @@ export async function triageIntake(db: DB, task: any, deps: TriageDeps = {}): Pr
       `Nothing is built until you answer; the task then dispatches on the reading you choose.`,
     risk: "normal",
     blast_radius: `Task ${task.id} stays queued until this is answered.`,
+    // The whole point of this card is that a human picks the reading. Every
+    // auto-answer path refuses a classed card, so the question always reaches
+    // the director instead of being resolved on their behalf.
+    decision_class: TRIAGE_DECISION_CLASS,
     options: verdict.interpretations!.map((i) => ({
       key: i.key,
       label: i.label,

@@ -622,6 +622,13 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v35-task-priority",
     statements: [`ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'`],
   },
+  // A decision that names its own class. Set on cards no automation may ever
+  // answer for the director (today: intake triage), and checked by every
+  // auto-answer path.
+  {
+    name: "v36-decision-class",
+    statements: [`ALTER TABLE decisions ADD COLUMN decision_class TEXT`],
+  },
 ];
 
 // -------------------------------------------------------------- settings

@@ -18,6 +18,13 @@
 //     its recommended `deny` remains fail-closed and safe to clear.
 import type { DB } from "./db.ts";
 
+// A decision row carrying a `decision_class` is off-limits to every automated
+// answer path: the balanced allow-list, autopilot, the standing CI ruling, and
+// the reconciler's decision_auto_answer_hours sweep. Intake triage sets it — a
+// card asking the director which reading to build is defeated the moment
+// something answers it for them.
+export const NO_AUTO_ANSWER_REASON = "this card is reserved for the director and is never answered automatically";
+
 export interface AutoApproveVerdict {
   allow: boolean;
   category: string;
@@ -57,6 +64,10 @@ function safetyBar(db: DB, d: any, answerKey: string): AutoApproveVerdict | null
   const options: any[] = Array.isArray(d.options) ? d.options : JSON.parse(d.options || "[]");
   const chosen = options.find((o) => o.key === answerKey);
   const no = (category: string, reason: string): AutoApproveVerdict => ({ allow: false, category, reason });
+  // A classed card exists precisely because a human has to choose. It sits in
+  // front of every other rule so neither the balanced allow-list nor autopilot
+  // can reach past it.
+  if (d.decision_class) return no(String(d.decision_class), NO_AUTO_ANSWER_REASON);
   const pendingAuthority = db.query("SELECT 1 FROM authority_grants WHERE decision_id = ? AND status = 'pending'").get(d.id);
   if (pendingAuthority) {
     if (answerKey !== "deny")

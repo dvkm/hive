@@ -83,7 +83,7 @@ import { noteRepoMismatch, resolveRepoMismatchForDecision } from "./repoTarget.t
 import { costUsd } from "./pricing.ts";
 import { checkUsageGuardrails, resolveUsageCapForDecision, taskSpend } from "./costs.ts";
 import { resolveScopeDriftForDecision } from "./drift.ts";
-import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
+import { evaluateAutoApprove, evaluateAutopilotApprove, NO_AUTO_ANSWER_REASON } from "./autoapprove.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { confirmedRisks, cautionCleared, latestAutoReviewVerdict } from "./reviewer.ts";
@@ -6199,7 +6199,17 @@ function standingCiRuling(db: DB, projectId: string, signal: string, options: an
 
 export function createDecision(
   db: DB,
-  d: { task_id: string; title: string; context?: string | null; risk?: string | null; blast_radius?: string | null; options?: any[] }
+  d: {
+    task_id: string;
+    title: string;
+    context?: string | null;
+    risk?: string | null;
+    blast_radius?: string | null;
+    options?: any[];
+    // Set this on a card only the director may ever answer. Every auto-answer
+    // path refuses a classed card (see NO_AUTO_ANSWER_REASON in autoapprove.ts).
+    decision_class?: string | null;
+  }
 ): any {
   if (!getTask(db, d.task_id)) throw new Error("unknown task_id");
   const options = Array.isArray(d.options) && d.options.length ? d.options : DEFAULT_OPTIONS;
@@ -6220,15 +6230,16 @@ export function createDecision(
     answered_at: null,
     ci_status_at_card: cited.status,
     ci_signal: cited.signal,
+    decision_class: d.decision_class ?? null,
   };
   db.query(
     `INSERT INTO decisions (id, task_id, ts, title, context, risk, blast_radius,
-      options, status, answer_key, answer_note, draft_note, answered_at, ci_status_at_card, ci_signal)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      options, status, answer_key, answer_note, draft_note, answered_at, ci_status_at_card, ci_signal, decision_class)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.task_id, row.ts, row.title, row.context, row.risk,
     row.blast_radius, row.options, row.status, row.answer_key, row.answer_note,
-    row.draft_note, row.answered_at, row.ci_status_at_card, row.ci_signal
+    row.draft_note, row.answered_at, row.ci_status_at_card, row.ci_signal, row.decision_class
   );
   writeEvent(db, { task_id: d.task_id, source: "agent", type: "needs-decision", payload: { decision_id: row.id, title: row.title } });
   // Move task into needs_decision only from in_progress — an agent mid-work
@@ -6244,7 +6255,10 @@ export function createDecision(
   // Same outage, same ruling: answer it now with what the director already
   // decided, and do NOT notify — a second identical question is the interruption
   // this exists to remove.
-  const ruling = row.ci_signal ? standingCiRuling(db, task.project_id, row.ci_signal, options) : null;
+  // A classed card is never answered by automation, this standing ruling
+  // included — the director has to see it.
+  const ruling =
+    row.ci_signal && !row.decision_class ? standingCiRuling(db, task.project_id, row.ci_signal, options) : null;
   if (ruling) {
     const res = apiAnswerDecision(db, defaultHerdr, row.id, {
       answer_key: ruling.key,
@@ -6385,6 +6399,11 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
   if (!ANSWER_SOURCES.includes(answeredBy))
     return err(`source '${answeredBy}' is not one of ${ANSWER_SOURCES.join("|")}`, 400);
   const answeredActor = actorOf(body);
+  // Backstop for the classed cards. The sweeps that could reach here are gated
+  // at their own source too, so this only ever fires on a new automated caller
+  // — which is exactly when we want it to.
+  if (r.decision_class && (answeredBy === "system" || answeredBy === "chat_supervisor"))
+    return json({ effect: "escalate", category: String(r.decision_class), reason: NO_AUTO_ANSWER_REASON }, 403);
   if (answeredBy === "chat_supervisor" && !supervisorVerified) {
     if (!answeredActor || !getThread(db, String(answeredActor)))
       return err("chat_supervisor decision answers require a valid thread actor", 403);
