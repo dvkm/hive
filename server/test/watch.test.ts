@@ -76,35 +76,56 @@ test("watchOnce respects per-watcher cadence and offline mode", async () => {
 });
 
 test("startWatchers skips a tick while a cycle is already running", async () => {
-  // interval_minutes tiny-but-nonzero so the per-watcher cadence gate never
-  // blocks a tick; the overlap guard is what's under test here.
   const { db } = freshDb([{ ...W, interval_minutes: 0.0001 }]);
   let active = 0;
   let maxActive = 0;
   let cycles = 0;
+  let tick: () => void = () => {};
+  let releaseFetch!: () => void;
+  let fetchStarted!: () => void;
+  let fetchFinished!: () => void;
+  const blocked = new Promise<void>((resolve) => (releaseFetch = resolve));
+  const started = new Promise<void>((resolve) => (fetchStarted = resolve));
+  const finished = new Promise<void>((resolve) => (fetchFinished = resolve));
   const slowFetch = (async () => {
     cycles++;
     active++;
     maxActive = Math.max(maxActive, active);
-    await new Promise((r) => setTimeout(r, 60));
+    fetchStarted();
+    await blocked;
     active--;
+    fetchFinished();
     return new Response(`v${cycles}`, { status: 200 });
   }) as unknown as typeof fetch;
 
   const origError = console.error;
+  const origSetInterval = globalThis.setInterval;
+  const origClearInterval = globalThis.clearInterval;
   const logs: string[] = [];
   console.error = ((...args: any[]) => logs.push(String(args[0]))) as typeof console.error;
+  globalThis.setInterval = ((callback: () => void) => {
+    tick = callback;
+    return 1;
+  }) as typeof setInterval;
+  globalThis.clearInterval = (() => {}) as typeof clearInterval;
   let stop: () => void;
   try {
     stop = startWatchers(db, { fetchImpl: slowFetch, intervalMs: 15 });
-    await new Promise((r) => setTimeout(r, 140)); // ~9 ticks at 15ms while each cycle takes 60ms
+    tick();
+    await started;
+    tick();
+    releaseFetch();
+    await finished;
+    await new Promise(setImmediate);
     stop();
   } finally {
     console.error = origError;
+    globalThis.setInterval = origSetInterval;
+    globalThis.clearInterval = origClearInterval;
   }
 
-  expect(maxActive).toBe(1); // never two cycles in flight at once
-  expect(cycles).toBeLessThan(6); // most ticks were skipped, not queued
+  expect(maxActive).toBe(1);
+  expect(cycles).toBe(1);
   expect(logs.some((m) => m.includes("skipped"))).toBe(true);
 });
 
