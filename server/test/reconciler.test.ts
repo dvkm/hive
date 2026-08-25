@@ -1483,6 +1483,47 @@ test("reconcileOnce heartbeats last_reconcile_at and tracks a failing step's err
   expect(getSetting(db, "reconciler_error_streak")).toBe("0");
 });
 
+// task #1667: the same ENOENT no longer errors the cycle, so it would stop
+// counting anywhere at all. Three cycles of "gh never started" must show up on
+// /api/health as degraded, and clear as soon as one cycle gets gh running.
+test("a tool that repeatedly fails to start marks health degraded and clears on recovery (task #1667)", async () => {
+  const { degradedTools } = await import("../src/api.ts");
+  const { db } = freshDb(); // repo_path '/repo'
+  const cannotStart: Exec = async () => ({ code: 127, stdout: "", stderr: "gh: ENOENT: no such file or directory, posix_spawn 'gh' (cwd /repo)" });
+
+  await reconcileOnce(db, { exec: cannotStart });
+  await reconcileOnce(db, { exec: cannotStart });
+  // Not degraded yet, and crucially not burning the cycle error streak either.
+  expect(degradedTools(db)).toEqual([]);
+  expect(getSetting(db, "reconciler_error_streak")).toBe("0");
+
+  await reconcileOnce(db, { exec: cannotStart });
+  expect(degradedTools(db)[0]).toContain("gh:");
+  expect(degradedTools(db)[0]).toContain("cwd /repo");
+  expect(getSetting(db, "reconciler_error_streak")).toBe("0");
+
+  await reconcileOnce(db, { exec: stub(() => OK("[]")) });
+  expect(degradedTools(db)).toEqual([]);
+});
+
+// A project registered by someone's E2E run points repo_path at a scratch dir
+// that gets cleaned up. Running gh in a directory that no longer exists is what
+// wedged linkPRs for ~10h, and such a project has no real PRs anyway (#1667).
+test("linkPRs skips test/ephemeral projects entirely (task #1667)", async () => {
+  const { db, projectId } = freshDb({ test: true });
+  const task = makeTask(db, projectId);
+  let ghCalls = 0;
+  const exec: Exec = async (argv) => {
+    if (argv[0] === "gh" && argv[1] === "pr" && argv[2] === "list") ghCalls++;
+    return OK("[]");
+  };
+
+  await reconcileOnce(db, { exec });
+
+  expect(ghCalls).toBe(0);
+  expect(getTask(db, task).pr_url).toBeNull();
+});
+
 test("reAdoptAgentsOnBoot re-adopts a live-but-unregistered agent and skips terminal tasks", async () => {
   const { reAdoptAgentsOnBoot } = await import("../src/reconciler.ts");
   const { db, projectId } = freshDb();
