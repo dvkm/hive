@@ -138,9 +138,64 @@ function reviewItemText(item: ReviewItem): string {
   return typeof item === "string" ? item : item.what;
 }
 
-export function ReviewUnderstanding({ packet, report = false, caveats = [] }: { packet: UnderstandingPacket; report?: boolean; caveats?: ReviewItem[] }) {
+export type ExplainState =
+  | { status: "ready"; url: string; stale: boolean }
+  | { status: "generating" }
+  | null;
+
+// #1556: the generated page IS the explanation — diagrams, mockups, data flow,
+// quiz — so it belongs in the card, not behind an evidence link. Sandboxed with
+// allow-scripts only: the page is self-contained, and withholding same-origin
+// keeps it out of the app's cookies and storage.
+function ExplainEmbed({ explain }: { explain: ExplainState }) {
+  // Phones get a button, not a squeezed iframe (ADHD-first: one tap, full screen).
+  const [open, setOpen] = useState(() => typeof window === "undefined" || window.innerWidth > 720);
+  const [tall, setTall] = useState(false);
+  if (!explain) return null;
+  if (explain.status === "generating")
+    return (
+      <div className="explain-embed explain-embed-pending">
+        <b>Visual explanation</b>
+        <p>Hive is drawing it for this commit. It shows up here when it is ready.</p>
+      </div>
+    );
+  return (
+    <div className="explain-embed">
+      <div className="explain-embed-head">
+        <button className="explain-embed-toggle" onClick={() => setOpen((o) => !o)}>
+          <span className="diff-caret">{open ? "\u25be" : "\u25b8"}</span>
+          {open ? "Visual explanation" : "Open visual explanation"}
+        </button>
+        {explain.stale && (
+          <span className="explain-embed-stale" title="This page was written for an earlier commit on this PR.">
+            {"\u26a0"} older commit
+          </span>
+        )}
+        <a className="explain-embed-ext" href={explain.url} target="_blank" rel="noreferrer">
+          New tab {"\u2197"}
+        </a>
+      </div>
+      {open && (
+        <>
+          <iframe
+            className={`explain-embed-frame ${tall ? "explain-embed-tall" : ""}`}
+            src={explain.url}
+            sandbox="allow-scripts"
+            title="Visual explanation of this change"
+            loading="lazy"
+          />
+          <button className="explain-embed-expand" onClick={() => setTall((t) => !t)}>
+            {tall ? "Shrink" : "Expand"}
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+export function ReviewUnderstanding({ packet, report = false, caveats = [], explain = null }: { packet: UnderstandingPacket; report?: boolean; caveats?: ReviewItem[]; explain?: ExplainState }) {
   const hasContent = packet.background || packet.scope || packet.essence || packet.walkthrough?.length || packet.affected_areas?.length || packet.risk_assessment || packet.participate;
-  if (!hasContent) return null;
+  if (!hasContent && !explain) return null;
 
   if (report) {
     const risk = packet.risk_assessment || caveats.map(reviewItemText).join(" ");
@@ -189,6 +244,7 @@ export function ReviewUnderstanding({ packet, report = false, caveats = [] }: { 
             <p>{packet.participate}</p>
           </div>
         )}
+        <ExplainEmbed explain={explain} />
       </section>
     );
   }
@@ -222,6 +278,7 @@ export function ReviewUnderstanding({ packet, report = false, caveats = [] }: { 
           <p>{packet.participate}</p>
         </div>
       )}
+      <ExplainEmbed explain={explain} />
     </section>
   );
 }
@@ -438,8 +495,23 @@ export function ReviewCard({
         ? "Pass the understanding check, or explicitly save it for later."
         : "";
   // #1249: hive writes one page per PR head explaining the change. It is stored
-  // as ordinary evidence, so the newest one is the current one.
-  const explainPage = [...evidence].reverse().find((e) => e.kind === "explanation" && e.url);
+  // as ordinary evidence, so the newest one is the current one. #1556: a page
+  // written for an older head is shown but labelled, never passed off as current.
+  const explainPages = [...evidence].reverse().filter((e) => e.kind === "explanation" && e.url);
+  // Same match rule as the server's explanationFor(): a page counts as current
+  // only when its recorded commit is the PR's head.
+  const explainCurrent = task.head_sha ? explainPages.find((e) => e.meta?.commit_sha === task.head_sha) : explainPages[0];
+  const explainPage = explainCurrent ?? explainPages[0];
+  const explainStale = !!explainPage && !explainCurrent;
+  const lastExplainEvent = [...events].reverse().find((e) => e.type.startsWith("explanation_"))?.type;
+  const explain: ExplainState =
+    explainPage?.url && !explainStale
+      ? { status: "ready", url: explainPage.url, stale: false }
+      : lastExplainEvent === "explanation_generating"
+        ? { status: "generating" }
+        : explainPage?.url
+          ? { status: "ready", url: explainPage.url, stale: true }
+          : null;
   // Live, not the agent's evidence prose (task #1000): recomputed on every
   // review via GET .../branch-check, same as CI/quiz below.
   const unmetDeps = branchCheck?.unmet_deps ?? [];
@@ -636,13 +708,6 @@ export function ReviewCard({
         )}
       </div>
 
-      {explainPage?.url && (
-        <a className="review-explain" href={explainPage.url} target="_blank" rel="noreferrer">
-          <span className="review-explain-title">Read the walkthrough</span>
-          <span className="review-explain-hint">Background, intuition, code tour and the quiz for this change</span>
-        </a>
-      )}
-
       <EvidenceStrip evidence={evidence.filter((e) => e.kind !== "explanation")} task={task} />
 
       <details className="review-details" open={quizStatus === "required"}>
@@ -657,7 +722,9 @@ export function ReviewCard({
           </small>
         </summary>
         <div className="review-details-body">
-          {review?.understanding && <ReviewUnderstanding packet={review.understanding} report={reportOnly} caveats={caveats} />}
+          {(review?.understanding || explain) && (
+            <ReviewUnderstanding packet={review?.understanding ?? {}} report={reportOnly} caveats={caveats} explain={explain} />
+          )}
 
           <details className="report-audit">
             <summary>

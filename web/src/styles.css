@@ -5847,20 +5847,63 @@ a.chip-jira:hover { background: #2d5488; }
 
 .jira-move-note { margin-top: 0.5rem; font-size: 0.8rem; }
 
-/* #1249: the literate-diff walkthrough for a PR, linked from the review card. */
-.review-explain {
-  display: block;
-  margin: 10px 0;
-  padding: 10px 12px;
+/* #1249/#1556: the literate-diff walkthrough for a PR, embedded in the card's
+   Mental model section instead of hiding behind an evidence link. */
+.explain-embed { margin-top: 14px; }
+.explain-embed-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.explain-embed-toggle {
+  padding: 6px 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg-elev);
-  text-decoration: none;
+  color: inherit;
+  font-weight: 600;
+  cursor: pointer;
 }
-.review-explain:hover { border-color: var(--accent); }
-.review-explain-title { display: block; font-weight: 600; }
-.review-explain-title::after { content: " ↗"; opacity: 0.6; }
-.review-explain-hint { display: block; font-size: 12px; color: var(--muted); }
+.explain-embed-toggle:hover { border-color: var(--accent); }
+.explain-embed-stale {
+  font-size: 12px;
+  color: var(--warn, #d7a43a);
+}
+.explain-embed-ext {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--muted);
+}
+.explain-embed-frame {
+  display: block;
+  width: 100%;
+  height: 520px;
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #fff;
+}
+.explain-embed-tall { height: 85vh; }
+.explain-embed-expand {
+  margin-top: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.explain-embed-pending {
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  color: var(--muted);
+}
+@media (max-width: 720px) {
+  .explain-embed-frame { height: 70vh; }
+}
 
 /* The focus/backlogs project chips reuse the board's switcher, minus its
    board-only page padding. */
