@@ -624,10 +624,15 @@ export class Herdr {
     // The task's previous agent (crashed run, requeue) can still hold the name.
     // The error body names its pane/tab: close the stale session and retry once.
     if (start.code !== 0 && isAgentNameTakenError(start)) {
-      const stale = parseStaleAgentRef(`${start.stdout}\n${start.stderr}`);
-      if (stale.tabId) await this.run(tabCloseArgv(stale.tabId));
-      else if (stale.paneId) await this.run(paneCloseArgv(stale.paneId));
-      if (stale.tabId || stale.paneId) start = await this.run(startArgv);
+      // INCIDENT HOTFIX 2026-08-25 (task b6fb44583e96): closing the name-holder
+      // here killed LIVE agents whenever recovery respawned a quiet-but-alive
+      // task (turn-complete auto-respawn from PR #190 made this constant).
+      // Until a liveness probe guards the close, never close: fail the spawn so
+      // recovery parks with a card instead of murdering the running agent.
+      throw new HerdrError(
+        `agent start refused: task ${args.taskId} already has an agent holding its name (possibly alive). ` +
+        `Verify it is dead (no panes, no worktree processes) before respawning.`
+      );
     }
     if (start.code !== 0)
       throw new HerdrError(`agent start failed: ${start.stderr.trim() || start.stdout.trim()}`);

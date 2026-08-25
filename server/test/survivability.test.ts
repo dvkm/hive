@@ -254,6 +254,29 @@ test("a burst of death verdicts trips the breaker: sweeps pause and ONE card is 
   expect(getTask(db, id).state).toBe("failed");
 });
 
+// INCIDENT b6fb44583e96: a server on a scratch DB shares the ONE global herdr
+// daemon with the fleet. Its own lease is uncontested and its own DB is clean,
+// so every other gate opens — and then its reaper reads the whole machine's
+// panes against 5 smoke rows and closes the live fleet as "orphans". A server
+// that is not on the fleet DB must tear NOTHING down, however healthy it looks.
+test("a server on a scratch DB never reaps: it shares herdr with the fleet", async () => {
+  const { db, projectId } = freshDb();
+  makeTask(db, projectId, "t1");
+  const prior = process.env.HIVE_DB;
+  process.env.HIVE_DB = join(tmpdir(), "hive-smoke-test.db");
+  try {
+    expect(teardownBlocked(db)).toBe("not the fleet database");
+    const calls: string[][] = [];
+    await reapOnce(db, { exec: async (argv) => (calls.push(argv), OK()) });
+    expect(calls).toEqual([]); // no `git worktree list`, no pane/agent sweep, no closes
+  } finally {
+    if (prior === undefined) delete process.env.HIVE_DB;
+    else process.env.HIVE_DB = prior;
+  }
+  // Same server, same fleet DB as everyone else: gates behave as before.
+  expect(teardownBlocked(db)).toBeNull();
+});
+
 test("closeSession refuses a recycled tab id that now holds someone else", async () => {
   const calls: string[][] = [];
   const exec: Exec = async (argv) => {
