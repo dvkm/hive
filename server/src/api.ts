@@ -180,6 +180,16 @@ function reconcilerHealth(db: DB): { last_run: string | null; stale: boolean; co
   };
 }
 
+// Tools the reconciler could not start for several cycles running (task #1667:
+// `gh` against a repo_path that no longer existed). Those are skipped and
+// retried rather than raised as cycle errors, so without this they would be
+// invisible: PR linking off, /api/health saying ok. Written by reconciler.ts's
+// noteToolStart; an empty value means recovered.
+export function degradedTools(db: DB): string[] {
+  const rows = db.query("SELECT key, value FROM settings WHERE key LIKE 'tool_degraded_%' AND value <> ''").all() as { key: string; value: string }[];
+  return rows.map((r) => `${r.key.replace("tool_degraded_", "")}: ${r.value}`).sort();
+}
+
 // Standing-authority gate for the internal risky paths (spawn, steer, verify,
 // done). Returns a blocking Response when the action is denied (403) or needs a
 // decision (409 {decision_id}); returns null when it may proceed.
@@ -267,8 +277,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // ---- health ----
       if (pathname === "/api/health" && method === "GET") {
         const reconciler = reconcilerHealth(db);
-        const ok = reconciler.consecutive_errors < RECONCILE_ERROR_STREAK_THRESHOLD;
-        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
+        const degraded = degradedTools(db);
+        const ok = reconciler.consecutive_errors < RECONCILE_ERROR_STREAK_THRESHOLD && degraded.length === 0;
+        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, degraded, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
       }
 
       // ---- evidence static files ----

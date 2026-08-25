@@ -35,13 +35,43 @@ function spawnEnv(): Record<string, string | undefined> {
 // returned). `proc.kill()` is best-effort cleanup; the Promise.race is what
 // actually bounds the caller, since a leaked pipe writer can outlive the kill.
 export const defaultExec: Exec = async (argv, opts = {}) => {
-  const proc = Bun.spawn(argv, {
+  const spawn = (bin: string) => Bun.spawn([bin, ...argv.slice(1)], {
     cwd: opts.cwd,
     env: spawnEnv(),
     stdin: opts.input != null ? "pipe" : "ignore",
     stdout: "pipe",
     stderr: "pipe",
   });
+  let proc: ReturnType<typeof spawn>;
+  try {
+    proc = spawn(argv[0]);
+  } catch (e) {
+    // Bun.spawn THROWS when the child can't start at all, instead of returning
+    // a non-zero code like every other failure. Task #1667: a leftover project
+    // row pointed repo_path at `/repo`, which no longer exists. posix_spawn
+    // reports a missing cwd as ENOENT against argv[0], so the reconciler logged
+    // "posix_spawn 'gh'" and it read as a missing gh binary. gh was installed
+    // and on PATH the whole time, yet linkPRs threw on every cycle for ~10h
+    // (593 consecutive errors).
+    //
+    // Two guards, in order:
+    // 1. Retry once against the binary's ABSOLUTE path, resolved over the PATH
+    //    we build above. That removes any dependence on how the spawn call
+    //    itself resolves a bare name (the #1096 suspicion), so if resolution is
+    //    ever the real problem the retry silently fixes it.
+    // 2. If that fails too, report it as an exit code instead of throwing.
+    //    Every caller already branches on `code`, so this lands in their normal
+    //    skip-and-retry path. 127 is the shell's "cannot execute". The cwd is
+    //    named in stderr so this never again reads as a missing binary.
+    const absolute = argv[0].includes("/") ? null : Bun.which(argv[0], { PATH: String(spawnEnv().PATH ?? "") });
+    try {
+      if (!absolute) throw e;
+      proc = spawn(absolute);
+    } catch (retryErr) {
+      const why = String((retryErr as any)?.message ?? retryErr);
+      return { code: 127, stdout: "", stderr: `${argv[0]}: ${why}${opts.cwd ? ` (cwd ${opts.cwd})` : ""}` };
+    }
+  }
   if (opts.input != null) {
     proc.stdin!.write(opts.input);
     await proc.stdin!.end();

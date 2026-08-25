@@ -21,6 +21,7 @@ import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
 import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
+import { notTestProjectSql } from "./testProjects.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
 import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent } from "./api.ts";
@@ -830,11 +831,19 @@ async function nudgeConflict(
 // tool with a handful of repos. Add a since-cursor if repos ever have many PRs.
 async function linkPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   const exec = deps.exec ?? defaultExec;
+  // Test/ephemeral projects are excluded (task #1667): their repo_path is a
+  // scratch dir that gets cleaned up, and running gh against a directory that
+  // no longer exists is what wedged this step for ~10h. They have no real PRs
+  // to link either.
   const projects = db
-    .query("SELECT id, repo_path FROM projects WHERE repo_path IS NOT NULL")
+    .query(`SELECT id, repo_path FROM projects WHERE repo_path IS NOT NULL AND ${notTestProjectSql()}`)
     .all() as { id: string; repo_path: string }[];
+  let startFailure: string | null = null;
   for (const p of projects) {
     const r = await exec(["gh", "pr", "list", "--state", "open", "--json", "number,title,body,url"], { cwd: p.repo_path });
+    // 127 is defaultExec's "the child never started" (missing binary, or a
+    // repo_path that no longer exists), as opposed to gh running and failing.
+    if (r.code === 127 && startFailure === null) startFailure = r.stderr.trim();
     if (r.code !== 0) continue; // gh unavailable / not a gh repo: skip, retry next cycle
     let list: any;
     try {
@@ -845,6 +854,28 @@ async function linkPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     if (!Array.isArray(list)) continue;
     for (const pr of list) linkPrIfMarked(db, { title: pr.title, body: pr.body, url: pr.url });
   }
+  noteToolStart(db, "gh", startFailure);
+}
+
+// A tool that cannot start is skipped and retried forever by design, so once it
+// stops throwing it also stops counting toward reconciler_error_streak and
+// would go completely silent. That is the #1096 failure mode again: PR linking
+// quietly off, /api/health saying ok. Three consecutive cycles of start
+// failures log once and mark health degraded; the first good cycle clears it.
+const TOOL_DEGRADED_AFTER = 3;
+export function noteToolStart(db: DB, tool: string, failure: string | null): void {
+  const streakKey = `tool_start_failures_${tool}`;
+  const degradedKey = `tool_degraded_${tool}`;
+  if (!failure) {
+    if (getSetting(db, streakKey)) setSetting(db, streakKey, "0");
+    if (getSetting(db, degradedKey)) setSetting(db, degradedKey, "");
+    return;
+  }
+  const streak = Number(getSetting(db, streakKey) ?? "0") + 1;
+  setSetting(db, streakKey, String(streak));
+  if (streak < TOOL_DEGRADED_AFTER) return;
+  if (!getSetting(db, degradedKey)) console.error(`[hive] ${tool} failed to start on ${streak} cycles in a row; marking health degraded: ${failure}`);
+  setSetting(db, degradedKey, failure);
 }
 
 // One rollup entry counts as red. Shared by ciStatusOf and the non-start probe
