@@ -1974,6 +1974,36 @@ a.dbundle-fact:hover {
   align-items: center;
   gap: 6px;
 }
+.gardener-queue {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+  font-size: 12px;
+}
+.gardener-title {
+  margin-bottom: 8px;
+  font-weight: 650;
+}
+.gardener-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 0;
+}
+.gardener-row a {
+  color: var(--text);
+  font-weight: 600;
+}
+.gardener-reason {
+  color: var(--text-dim);
+  flex: 1;
+}
+.gardener-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
 .proj-editor {
   margin-top: 14px;
   padding-top: 14px;

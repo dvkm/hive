@@ -31,6 +31,7 @@ import { captureBranchScope } from "./rebaseGuard.ts";
 import { landOnce } from "./landQueue.ts";
 import { sidecarOnce } from "./sidecar.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
+import { runPrGardener } from "./prGardener.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
 const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
@@ -151,6 +152,18 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("syncPRs", () => syncPRs(db, deps));
   await step("revalidateCiDecisions", () => revalidateCiDecisions(db));
   await step("linkPRs", () => linkPRs(db, deps));
+  await step("prGardener", () => runPrGardener(db, {
+    exec: deps.exec ?? defaultExec,
+    nowMs: deps.nowMs,
+    land: async (taskId) => {
+      const response = await mergeTask(db, deps.herdr ?? defaultHerdr, taskId, { actor: "pr-gardener" }, { exec: deps.exec });
+      if (response.ok) return { ok: true };
+      const body = await response.json().catch(() => ({})) as any;
+      return { ok: false, error: body.error ?? `HTTP ${response.status}` };
+    },
+    directorDeciding: (taskId) => passedInFocus(db, taskId),
+    decide: (input) => createDecision(db, input),
+  }));
   await step("resumeUsageLimited", () => resumeUsageLimited(db, (deps.nowMs ?? (() => Date.now()))()));
   await step("requeueStaleFailed", () => requeueStaleFailed(db, (deps.nowMs ?? (() => Date.now()))()));
   await step("flagStale", () => flagStale(db, deps));
@@ -1203,7 +1216,7 @@ export function nagOpenDecisions(db: DB, nowMs: number = Date.now()): void {
 // those without waiting. Anything contested (caution verdict, risks, red CI,
 // a changes_requested in history) still parks for the human. A notification
 // reports every auto-merge; the existing verifying/smoke gates still run.
-function passedInFocus(db: DB, taskId: string): boolean {
+export function passedInFocus(db: DB, taskId: string): boolean {
   return !!db.query(
     `SELECT 1 FROM events passed
       WHERE passed.task_id = ? AND passed.type = 'understanding_quiz_passed'

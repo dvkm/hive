@@ -132,6 +132,31 @@ const promote: Check = (v) => {
   return null;
 };
 
+const duration: Check = (v) =>
+  typeof v === "string" && /^\d+(?:s|m|h|d)$/.test(v) ? null : "must be a duration such as 30m, 12h, or 14d";
+
+const prGardener: Check = (v) => {
+  const bad = obj(v);
+  if (bad) return bad;
+  const checks: Record<string, Check> = {
+    enabled: bool,
+    cadence: duration,
+    land_when: oneOf("green_and_clean"),
+    close_stale_after: duration,
+    auto_close_superseded: bool,
+    sensitive_paths: strArray,
+    max_actions_per_sweep: positiveInt,
+    max_fix_attempts: positiveInt,
+    max_gardener_agents: positiveInt,
+  };
+  for (const [key, value] of Object.entries(v as Record<string, unknown>)) {
+    if (!Object.hasOwn(checks, key)) return `.${key} is not a known PR gardener key`;
+    const invalid = checks[key]!(value);
+    if (invalid) return `.${key} ${invalid}`;
+  }
+  return null;
+};
+
 // Which task kinds must post a plan checkpoint before their first edit, and
 // (later) whether a vetoed plan blocks. See server/src/planCritic.ts.
 const plan_gate: Check = (v) => {
@@ -186,6 +211,7 @@ const CHECKS: Record<string, Check> = {
   merge_method: str,
   promote,
   auto_merge: obj,
+  pr_gardener: prGardener,
   auto_review: bool,
   release_review_agents: bool,
   scope_drift: bool,

@@ -582,6 +582,29 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v32-prune-unauthenticated-push-subscriptions",
     statements: [`DELETE FROM push_subscriptions WHERE created_at < '2026-08-24T21:58:34Z'`],
   },
+  {
+    name: "v33-pr-gardener",
+    statements: [
+      `CREATE TABLE pr_gardener_items (
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        pr_number INTEGER NOT NULL,
+        pr_url TEXT NOT NULL,
+        title TEXT NOT NULL,
+        classification TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        sensitive INTEGER NOT NULL DEFAULT 0,
+        override TEXT,
+        action_task_id TEXT REFERENCES tasks(id),
+        decision_id TEXT REFERENCES decisions(id),
+        fix_attempts INTEGER NOT NULL DEFAULT 0,
+        last_action TEXT,
+        last_action_at TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (project_id, pr_number)
+      )`,
+      `CREATE INDEX idx_pr_gardener_action_task ON pr_gardener_items(action_task_id)`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings
