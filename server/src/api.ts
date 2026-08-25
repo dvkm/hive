@@ -2578,11 +2578,18 @@ export async function mergeTask(
   const blocked = authzBlock(db, { project_id: task.project_id, action: "task.merge", target: task.title, task_id: id });
   if (blocked) return blocked;
 
+  const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
+  const config = JSON.parse(project?.config ?? "{}");
+  const autoShipKind = Array.isArray(config.auto_merge?.kinds) && config.auto_merge.kinds.includes(task.kind);
   const quiz = latestUnderstandingQuiz(db, id);
-  if (!quiz)
+  if (!quiz && !autoShipKind)
     return err("Understanding check required. Ask the agent to submit one in its latest review before merging.", 409);
-  if (understandingQuizStatus(db, id, quiz.reviewEventId) === "required")
-    return err("Pass the understanding check before merging, or choose 'Continue now, quiz me later'.", 409);
+  let deferQuizReviewEventId: string | null = null;
+  if (quiz && understandingQuizStatus(db, id, quiz.reviewEventId) === "required") {
+    if (!autoShipKind)
+      return err("Pass the understanding check before merging, or choose 'Continue now, quiz me later'.", 409);
+    deferQuizReviewEventId = quiz.reviewEventId;
+  }
 
   // Recompute the dependency claim live rather than trusting evidence prose
   // (task #1000: #977 claimed its dependency had landed on main; it hadn't).
@@ -2596,8 +2603,6 @@ export async function mergeTask(
   }
 
   const exec = deps.exec ?? defaultExec;
-  const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
-  const config = JSON.parse(project?.config ?? "{}");
   let prView: any = null;
   if (task.pr_url) {
     const probe = await exec([
@@ -2811,6 +2816,18 @@ export async function mergeTask(
     }
   }
 
+  if (deferQuizReviewEventId) {
+    writeEvent(db, {
+      task_id: id,
+      source: "system",
+      type: "understanding_quiz_deferred",
+      payload: {
+        review_event_id: deferQuizReviewEventId,
+        actor,
+        note: "Automatically deferred because this task kind is enabled in auto_merge.kinds.",
+      },
+    });
+  }
   writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url, actor } });
   // in_review → verifying (runs post-deploy smoke once).
   transition(db, id, "verifying", { source: "director", reason: `merged (${method})` });
