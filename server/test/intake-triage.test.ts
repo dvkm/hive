@@ -159,3 +159,29 @@ test("extractTriage reads bare JSON, fenced prose and the claude -p envelope", (
   expect(extractTriage("not json at all")).toBeNull();
   expect(extractTriage('{"bucket":"maybe"}')).toBeNull();
 });
+
+// A 'watch' task has no unreviewed-intake hold of its own, so without an
+// in-flight hold the dispatcher could spawn it while the classifier is still
+// deciding — and the card would open on an already-running task.
+test("watch: the task is held while the classifier is still running", async () => {
+  const { db, id, task } = setup({ intake_triage: true }, "watch");
+  let holdDuringCall: boolean | undefined;
+  const slow = async (_argv: string[]) => {
+    holdDuringCall = triageHold(db, getTask(db, id));
+    return { code: 0, stdout: JSON.stringify({ result: JSON.stringify(AMBIGUOUS) }), stderr: "", timedOut: false };
+  };
+  await triageIntake(db, task, { exec: slow });
+  expect(holdDuringCall).toBe(true); // held before any card existed
+  expect(triageHold(db, getTask(db, id))).toBe(true); // still held: card is open
+});
+
+test("the in-flight hold is released even when the classifier throws", async () => {
+  const { db, id, task } = setup({ intake_triage: true }, "watch");
+  const boom = async () => {
+    throw new Error("classifier exploded");
+  };
+  await triageIntake(db, task, { exec: boom });
+  // failed open to mechanical, so nothing holds this task any more
+  expect(triageHold(db, getTask(db, id))).toBe(false);
+  expect(isReviewed(db, id)).toBe(true);
+});

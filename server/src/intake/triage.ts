@@ -29,6 +29,11 @@ const BRIEF_LIMIT = 4000;
 const NO_TOOLS =
   "--disallowed-tools=Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch,Task,TodoWrite,NotebookEdit,SlashCommand,Skill";
 
+// Tasks whose classifier call is running right now. In memory on purpose, the
+// same reasoning as explainDiff.ts: a server restart mid-classification must
+// drop the hold rather than strand the task forever.
+const inFlight = new Set<string>();
+
 export interface Interpretation {
   key: string;
   label: string;
@@ -160,7 +165,15 @@ export async function triageIntake(db: DB, task: any, deps: TriageDeps = {}): Pr
   if (!task || !isTriageSource(task.source)) return null;
   if (!triageEnabled(db, task.project_id)) return null;
 
-  const verdict = await classifyIntake(db, task, deps);
+  // Held from here so the task cannot dispatch while we are still deciding —
+  // 'watch' tasks have no unreviewed-intake hold of their own.
+  inFlight.add(task.id);
+  let verdict: Triage;
+  try {
+    verdict = await classifyIntake(db, task, deps);
+  } finally {
+    inFlight.delete(task.id);
+  }
   writeEvent(db, {
     task_id: task.id,
     source: "system",
@@ -205,6 +218,7 @@ const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "…"
 // server restart mid-classification must not strand the task forever.
 export function triageHold(db: DB, task: any): boolean {
   if (!task || !isTriageSource(task.source)) return false;
+  if (inFlight.has(task.id)) return true; // still classifying
   return !!db
     .query(
       `SELECT 1 FROM decisions d
