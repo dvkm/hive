@@ -124,6 +124,18 @@ export function Card({ task }: { task: Task }) {
             tracked
           </span>
         )}
+        {task.jira_key && project?.jira_site && (
+          <a
+            className="chip chip-jira"
+            href={`${project.jira_site}/browse/${encodeURIComponent(task.jira_key)}`}
+            target="_blank"
+            rel="noreferrer"
+            title={`Open ${task.jira_key} in Jira`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {task.jira_key} ↗
+          </a>
+        )}
         {trackingOnly && <span className="chip">{STATE_LABEL[task.state]}</span>}
         {task.source === "planner" && (
           <span className="chip chip-planned" title="Created from an approved planner breakdown">

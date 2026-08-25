@@ -609,6 +609,26 @@ once; caps park an in-progress task behind a wrap-up-or-continue decision. A
 - `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher and reconciler won't advance the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban. It is never auto-dispatched or staleness-supervised, is exempt from the done-evidence gate, and moves freely via transitions (`hive task move <id> <state>`). The board keeps these tasks in its separate Tracked view with the external state visible. Jira-keyed Hive work is grouped beneath the matching tracked card, with requeue chains collapsed to their latest attempt. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
+- `POST /api/tasks/:id/jira/link` body `{parent_key (required)}` → `201 {jira_key, browse_url, warnings}` | `400` | `404`
+  Creates a Jira sub-task for a Hive-native task, then stores `jira_key` with
+  `jira_link_kind: "subtask"`. The summary is `<display_id> · <title>`. The
+  description and issue property carry `hive-task: <id>`, and Jira remote links
+  point to the Hive task and its PR when present. This requires Jira writes plus
+  the default-off `config.jira.write_scope.create_subtask` permission. External
+  mirror tasks cannot use this route. CLI: `hive jira link <task-id> --parent WEB-7`.
+- `GET /api/tasks/:id/jira` → `200` sync state | `404`
+  Returns the linked Jira key, browse URL, write scope, delivery state, and any
+  native sub-tasks linked beneath a mirror. A sync cycle discovers an empty
+  `jira_key` from a Jira `hive-task: <id>` description marker or `hive.task_id`
+  issue property. No Jira custom field or site-admin setup is required. Linked
+  native task states push as `queued → To Do`, `in_progress → In Progress`,
+  `in_review` or `verifying → In Review`, and `done` or `cancelled → Done`.
+  Cancellation also posts a comment. When
+  `config.jira.status_notes_to_comments` is true, status notes emitted with
+  `hive emit <id> status` use the same at-most-once comment ledger as mirrors.
+  The setting defaults to false.
+- `POST /api/tasks/:id/jira/sync` body `{}` → `200` sync result | `404`
+  Runs the same project Jira cycle used by the scheduler.
 - `POST /api/tasks/:id/transition` body `{to (required), reason?, source?}` → `200 Task` | `409` (invalid transition or `done` without evidence) | `404`
   When `to` is `verifying`, the project's post-deploy smoke list (`config.smoke`) runs once before the response returns. A smoke failure bounces the task back to `in_progress`, so the returned Task may be `in_progress`, not `verifying`.
 - `POST /api/tasks/:id/spawn` body `{hive_url?}` → `200 {"ok":true, "task": Task, "agent_target":"..."}` | `400` (project has no `repo_path`) | `404` | `502` (dispatch refused or herdr spawn failed; a `spawn_error` event is recorded)

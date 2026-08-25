@@ -364,7 +364,7 @@ export function JiraPanel({
 }) {
   const [busy, setBusy] = useState(false);
   const [resolving, setResolving] = useState<string | null>(null);
-  const key = jira?.issue_key ?? String(task.source_ref ?? "").replace(/^jira:/, "");
+  const key = jira?.issue_key ?? task.jira_key ?? String(task.source_ref ?? "").replace(/^jira:/, "");
   const sync = jira?.sync;
   const pending = jira?.pending;
   const pendingTotal = (pending?.comments ?? 0) + (pending?.receipts ?? 0);
@@ -430,6 +430,25 @@ export function JiraPanel({
           )}
         </dd>
       </dl>
+
+      {(jira?.linked_subtasks?.length ?? 0) > 0 && (
+        <div>
+          <strong>Linked sub-tasks</strong>
+          <ul className="breakdown">
+            {jira!.linked_subtasks!.map((subtask) => (
+              <li key={subtask.id}>
+                <StatusDot state={subtask.state} />
+                <Link to={`/tasks/${subtask.id}`}>{subtask.display_id} · {subtask.title}</Link>
+                {subtask.browse_url ? (
+                  <a className="chip chip-jira" href={subtask.browse_url} target="_blank" rel="noreferrer">{subtask.jira_key} ↗</a>
+                ) : (
+                  <span className="chip chip-jira">{subtask.jira_key}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {unknown.length > 0 && (
         <div className="jira-error" role="alert">
@@ -678,13 +697,13 @@ export function TaskBody({ id }: { id: string }) {
               <span className="chip">{STATE_LABEL[t.state]}</span>
               {/* At a glance: this row IS a Jira ticket, and one click opens it.
                   The link used to be plain text buried in the brief. */}
-              {isJira && (
+              {(isJira || t.jira_key) && (
                 jira?.browse_url ? (
                   <a className="chip chip-jira" href={jira.browse_url} target="_blank" rel="noreferrer" title="Open this ticket in Jira">
                     {jira.issue_key} ↗
                   </a>
                 ) : (
-                  <span className="chip chip-jira">{String(t.source_ref ?? "").replace(/^jira:/, "")}</span>
+                  <span className="chip chip-jira">{t.jira_key ?? String(t.source_ref ?? "").replace(/^jira:/, "")}</span>
                 )
               )}
               <BlockedBy depends_on={t.depends_on} tasks={tasks} />
@@ -876,7 +895,7 @@ export function TaskBody({ id }: { id: string }) {
         {/* A mirrored Jira ticket is tracking-only: hive never builds it, so
             there is no branch, no PR and no CI to report. Showing "No PR yet"
             there reads as work pending rather than work that will never exist. */}
-        {isJira ? (
+        {(isJira || t.jira_key) ? (
           <JiraPanel task={t} jira={jira} onSynced={setJira} />
         ) : !trackingOnly ? (
           <section className="panel">

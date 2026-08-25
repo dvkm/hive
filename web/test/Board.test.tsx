@@ -84,6 +84,50 @@ test("dispatch now shows normally for an ordinary (non-external) queued task", a
   expect(btn(renderer, "dispatch now").length).toBe(1);
 });
 
+// The browse chip must come from the server-canonicalized jira_site, never
+// from the raw project config: a config write naming another host would
+// otherwise turn every card into a link to it.
+function cardWith(t: Task, project: Record<string, unknown>) {
+  const store = { ...fakeStore, projects: [project] } as unknown as Store;
+  return (
+    <MemoryRouter>
+      <Ctx.Provider value={store}>
+        <Card task={t} />
+      </Ctx.Provider>
+    </MemoryRouter>
+  );
+}
+
+const links = async (t: Task, project: Record<string, unknown>) => {
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(cardWith(t, project));
+  });
+  return renderer.root.findAll((n) => n.type === "a").map((n) => String(n.props.href));
+};
+
+test("the Jira chip links to the server-canonicalized site", async () => {
+  const hrefs = await links(task("j1", { jira_key: "WEB-123" }), {
+    id: "project",
+    name: "p",
+    config: { jira: { site: "https://evil.atlassian.net" } },
+    jira_site: "https://example.atlassian.net",
+  });
+  expect(hrefs).toContain("https://example.atlassian.net/browse/WEB-123");
+  expect(hrefs.join(" ")).not.toContain("evil.atlassian.net");
+});
+
+test("no Jira chip is rendered when the server validated no site", async () => {
+  const hrefs = await links(task("j2", { jira_key: "WEB-124" }), {
+    id: "project",
+    name: "p",
+    config: { jira: { site: "https://evil.atlassian.net" } },
+    jira_site: null,
+  });
+  expect(hrefs.join(" ")).not.toContain("browse/WEB-124");
+  expect(hrefs.join(" ")).not.toContain("evil.atlassian.net");
+});
+
 // The board says WHY a review card will wait its turn — one line, and only
 // when an edge actually exists (ADHD policy: no chip with nothing to say).
 const chipText = (renderer: ReturnType<typeof create>) =>

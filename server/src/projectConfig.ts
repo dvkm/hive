@@ -97,7 +97,17 @@ const jira: Check = (v) => {
   const j = v as Record<string, unknown>;
   for (const k of ["site", "email", "project_key"]) if (typeof j[k] !== "string") return `.${k} must be a string`;
   for (const k of ["enabled", "write"]) if (j[k] !== undefined && typeof j[k] !== "boolean") return `.${k} must be a boolean`;
+  if (j.status_notes_to_comments !== undefined && typeof j.status_notes_to_comments !== "boolean")
+    return ".status_notes_to_comments must be a boolean";
   if (j.jql !== undefined && typeof j.jql !== "string") return ".jql must be a string";
+  if (j.write_scope !== undefined) {
+    const invalid = obj(j.write_scope);
+    if (invalid) return `.write_scope ${invalid}`;
+    const scope = j.write_scope as Record<string, unknown>;
+    for (const key of Object.keys(scope)) if (key !== "create_subtask") return `.write_scope.${key} is not supported`;
+    if (scope.create_subtask !== undefined && typeof scope.create_subtask !== "boolean")
+      return ".write_scope.create_subtask must be a boolean";
+  }
   return null;
 };
 

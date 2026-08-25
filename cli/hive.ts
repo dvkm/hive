@@ -48,6 +48,7 @@ Usage:
         them in graph order (declared dependencies first, one conflicting branch per sweep)
   hive land-graph [--project <id>]        show the review column's ordering edges
   hive recall <keywords>                  search project knowledge (references, learnings, policies)
+  hive jira link <task-id> --parent <KEY> create and link a Jira sub-task
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
   hive chat reply <thread-id> "<text>" [--decision <id> ...]
@@ -628,6 +629,16 @@ async function main() {
     // The prefix already ends with a space; the agent prepends it to the PR title.
     console.log(`title-prefix: ${prTitlePrefix(t.number)}`);
     console.log(`body-footer:  ${prBodyFooter(t.id)}`);
+    return;
+  }
+
+  if (cmd === "jira") {
+    const sub = argv[1];
+    const { _, flags } = parseFlags(argv.slice(2));
+    if (sub !== "link" || !_[0] || !flags.parent) die("usage: hive jira link <task-id> --parent <KEY>");
+    const linked = await api("POST", `/api/tasks/${_[0]}/jira/link`, { parent_key: String(flags.parent) });
+    console.log(`linked ${_[0]} to ${linked.jira_key} (${linked.browse_url})`);
+    for (const warning of linked.warnings ?? []) console.warn(`warning: ${warning}`);
     return;
   }
 

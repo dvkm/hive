@@ -115,6 +115,8 @@ export interface Task {
   summary: string | null;
   source: string | null;
   source_ref: string | null;
+  jira_key: string | null;
+  jira_link_kind: "mirror" | "subtask" | null;
   parent_task_id: string | null;
   duplicate_of: string | null; // survivor id when cancelled as a duplicate
   depends_on: string[]; // task ids governed by the server dependency gate (docs/API.md)
@@ -266,6 +268,9 @@ export interface Project {
     test?: boolean;
     [k: string]: unknown;
   };
+  // Server-canonicalized Jira site (null unless the project's config passes the
+  // credential gate). The only trusted base for a browse link in the UI.
+  jira_site: string | null;
   created_at: string;
 }
 
@@ -647,6 +652,7 @@ export interface JiraTaskState {
     comments: boolean;
     labels: readonly string[];
     assignee: boolean;
+    create_subtask: boolean;
   };
   assignee?: string | null;
   sync?: JiraSyncState;
@@ -656,6 +662,14 @@ export interface JiraTaskState {
     unknown: { action: "comment_push" | "receipt"; source_id: string; error: string | null; text: string | null; ts: string }[];
   };
   delivered?: Record<string, unknown>[];
+  linked_subtasks?: {
+    id: string;
+    display_id: string;
+    title: string;
+    state: State;
+    jira_key: string;
+    browse_url: string | null;
+  }[];
 }
 
 export const api = {

@@ -33,6 +33,20 @@ export const TERMINAL: State[] = ["done", "failed", "cancelled"];
 // Re-exported here because the existing callers import it from state.
 export { isTrackingOnlyTask };
 
+export function queueJiraCancellationComment(db: DB, taskId: string, source: string): void {
+  const queued = db.query(
+    `SELECT 1 FROM events WHERE task_id = ? AND type = 'jira_comment'
+       AND json_extract(payload, '$.linked_cancelled') = 1 LIMIT 1`
+  ).get(taskId);
+  if (queued) return;
+  writeEvent(db, {
+    task_id: taskId,
+    source,
+    type: "jira_comment",
+    payload: { direction: "outbound", linked_cancelled: true, text: "Hive marked this task cancelled." },
+  });
+}
+
 export const TRACKING_ONLY_REQUEUE_ERROR = "a mirrored Jira task has no agent work to requeue";
 export const TRACKING_ONLY_OWNERSHIP_ERROR = "tracking-only tasks cannot create Hive-owned agent work";
 
@@ -569,6 +583,9 @@ export function transition(
     type: "state_change",
     payload: { from, to, reason: opts.reason ?? null },
   });
+  if (to === "cancelled" && task.jira_key && task.jira_link_kind === "subtask") {
+    queueJiraCancellationComment(db, taskId, source);
+  }
   broadcastTask(db, updated);
   // A terminal task can no longer act on any open decision — expire them so the
   // inbox clears and the answer endpoint can't be hit against a dead task.

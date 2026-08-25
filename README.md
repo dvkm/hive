@@ -182,8 +182,8 @@ server/test/ bun test suite
 
 - **Google Chat intake** (`server/src/intake/gchat.ts`, migration v5) schedules checks of each project's `config.gchat_spaces` (`[{space, label?}]`) via `HIVE_GCHAT_POLL_MS` (default 60s) and drafts a `queued` ship task per new message, tagged `source: intake_gchat` and marked UNREVIEWED. Message text is untrusted (stored verbatim, never executed). Images (≤5MB, png/jpg/gif/webp) become evidence; messages dedupe by resource name; self/bot messages skip. OAuth (scope `chat.messages.readonly`) is set up once with `hive gchat auth`; the connector is a hard no-op until a space is configured. Simplest durable home for the allowlist: the existing per-project `config` column (the owning project is the target), so no new table or endpoint.
 
-- **JIRA bidirectional sync** (`server/src/intake/jira.ts`, no migration). Mirrors
-  one Jira Cloud project onto the board and keeps `status` in step BOTH ways, on
+- **JIRA bidirectional sync** (`server/src/intake/jira.ts`). Mirrors one Jira
+  Cloud project onto the board, links native tasks to Jira sub-tasks, and keeps `status` in step BOTH ways, on
   a `HIVE_JIRA_SYNC_MS` (default 60s) cycle. Two independent switches, both off
   by default: `config.jira.enabled` turns the connector on at all, and
   `config.jira.write` releases outbound writes — with `enabled` on and `write`
@@ -194,6 +194,8 @@ server/test/ bun test suite
   ```jsonc
   "jira": { "site": "https://example.atlassian.net", "email": "jira@example.com",
             "project_key": "WEB", "enabled": false, "write": false,
+            "write_scope": { "create_subtask": false },
+            "status_notes_to_comments": false,
             "jql": "labels = sync" }   // optional, ANDed with project = <key>
   ```
 
@@ -214,8 +216,10 @@ server/test/ bun test suite
   so it would let an unrelated edit win a status tiebreak). Every overwrite
   writes a `jira_sync` event carrying both sides, both timestamps and the winner.
 
-  hive never CREATES Jira issues — it only mirrors existing ones, which keeps a
-  curated backlog from turning into hive's activity log. Imported issues are
+  Hive creates only explicitly requested sub-tasks for native work through
+  `hive jira link <task-id> --parent WEB-7`. The project must set
+  `write_scope.create_subtask: true`; the default is false. Mirror tasks never
+  create issues. Imported issues are
   tracking-only (`source: external`), so the dispatcher never auto-spawns agents
   on them and the done-gate evidence requirement is skipped (a ticket a human
   closed upstream has no hive PR). Because hive binds loopback with no public
@@ -271,19 +275,29 @@ server/test/ bun test suite
 
 ## v5 notes (JIRA bidirectional sync)
 
-- **JIRA sync** (`server/src/intake/jira.ts`) mirrors one Atlassian Jira project
-  onto the board and keeps `status` in step BOTH ways, every `HIVE_JIRA_SYNC_MS`
-  (default 60s). No new tables: `tasks.source_ref` (`jira:WEB-7`, already
-  UNIQUE-indexed) is the task↔issue link and `intake_cursors` holds the distinct
+- **JIRA sync** (`server/src/intake/jira.ts`) mirrors one Atlassian Jira project,
+  discovers native task links, and keeps `status` in step BOTH ways, every
+  `HIVE_JIRA_SYNC_MS` (default 60s). `tasks.jira_key` is the shared issue link,
+  `tasks.jira_link_kind` distinguishes inbound mirrors from outbound sub-tasks,
+  and `intake_cursors` holds the distinct
   direct-missing and scope-absence streaks. Per-project `config.jira`:
-  `{site, email, project_key, enabled, write, jql?}`. Two independent gates —
+  `{site, email, project_key, enabled, write, jql?, write_scope?, status_notes_to_comments?}`. Two independent gates —
   `enabled` (master switch) and `write` (shadow mode) — both default to **false**,
   so the connector is a hard no-op until opted in, and read-only until opted in
   again. Under `write: false` every outbound call is computed and LOGGED but never
   sent, including on the first cycle, so a director can read one full
   "would have done X" pass before hive touches a real issue.
+- **Native task links.** `hive jira link <task-id> --parent WEB-7` creates one
+  Jira sub-task with a `hive-task: <id>` description marker, an issue property,
+  and remote links to Hive and the task PR. This requires
+  `write_scope.create_subtask: true`. Each cycle also finds Jira issues with the
+  marker or property and fills an empty `jira_key`, so manually created sub-tasks
+  self-link without Jira custom fields or site-admin access. Linked native task
+  states map to To Do, In Progress, In Review, or Done. With
+  `status_notes_to_comments: true`, `hive emit <id> status` notes become Jira
+  comments through the existing at-most-once delivery ledger. The default is false.
 <!-- BEGIN GENERATED JIRA WRITE SCOPE -->
-- **Field ownership.** Jira owns `summary`, `description`, `issue type`, `priority`, and all labels except `hive:needs-decision`. Hive's generated write scope is `status`, `comments` and evidence receipts, `attachments` (up to 3 screenshots hive already holds as evidence, on UI work only), and `hive:needs-decision` label; everything else flows Jira → hive only. **hive never writes the assignee at all.** It reads the field to display it and stops there because Jira Cloud has no compare-and-swap across the separate check and write requests, so "a human's assignment is never touched" only holds absolutely if hive never touches it (dec_234877ea4617). `GET /api/tasks/:id/jira` exposes the same registry as `write_scope`. `needs_decision` has no Jira status, `verifying` maps to In Review, and `failed` and `cancelled` never move Jira.
+- **Field ownership.** Jira owns `summary`, `description`, `issue type`, `priority`, and all labels except `hive:needs-decision`. Hive's generated write scope is `status`, `comments` and evidence receipts, `attachments` (up to 3 screenshots hive already holds as evidence, on UI work only), and `hive:needs-decision` label; everything else flows Jira → hive only. Creating a Jira sub-task is a separate, default-off project opt-in through `write_scope.create_subtask`. **hive never writes the assignee at all.** It reads the field to display it and stops there because Jira Cloud has no compare-and-swap across the separate check and write requests, so "a human's assignment is never touched" only holds absolutely if hive never touches it (dec_234877ea4617). `GET /api/tasks/:id/jira` exposes the same registry as `write_scope`. `needs_decision` has no Jira status, `verifying` maps to In Review, and `failed` never moves Jira. A linked native task maps `cancelled` to Done and posts a cancellation comment.
 <!-- END GENERATED JIRA WRITE SCOPE -->
 - **Idempotent comments and receipts with contained unknowns.** Jira comments
   become timeline entries; hive-side comments are an outbox drained on the next

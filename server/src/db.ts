@@ -559,6 +559,23 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v29-task-land-queue",
     statements: [`ALTER TABLE tasks ADD COLUMN land_queued_at TEXT`],
   },
+  {
+    name: "v30-task-jira-link",
+    statements: [
+      `ALTER TABLE tasks ADD COLUMN jira_key TEXT`,
+      `ALTER TABLE tasks ADD COLUMN jira_link_kind TEXT CHECK (jira_link_kind IN ('mirror', 'subtask'))`,
+      `CREATE UNIQUE INDEX idx_tasks_jira_key ON tasks(jira_key) WHERE jira_key IS NOT NULL`,
+      `UPDATE tasks SET jira_key = substr(source_ref, 6), jira_link_kind = 'mirror'
+       WHERE source_ref LIKE 'jira:%' AND jira_key IS NULL`,
+    ],
+  },
+  {
+    name: "v31-task-jira-link-kind-uniqueness",
+    statements: [
+      `DROP INDEX IF EXISTS idx_tasks_jira_key`,
+      `CREATE UNIQUE INDEX idx_tasks_jira_key_kind ON tasks(jira_key, jira_link_kind) WHERE jira_key IS NOT NULL`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings
@@ -596,6 +613,7 @@ export function openDb(path: string = defaultDbPath()): DB {
 
 export const CREATES = /^\s*CREATE\s+(?:UNIQUE\s+)?(TABLE|INDEX|TRIGGER|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)/i;
 export const ADD_COLUMN = /^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+(?:COLUMN\s+)?(\w+)/i;
+export const DROPS = /^\s*DROP\s+(TABLE|INDEX|TRIGGER|VIEW)\s+(?:IF\s+EXISTS\s+)?(\w+)/i;
 
 // Does the schema already have what this statement would create? SQLite has no
 // IF NOT EXISTS for ALTER TABLE ADD COLUMN, and we want the same skip-if-present
@@ -611,6 +629,11 @@ export const ADD_COLUMN = /^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+(?:COLUMN\s+)?(\w+)
 // where that collision would actually come from. Compare sqlite_master.sql here
 // if a migration ever has to reconcile a foreign object of the same name.
 export function alreadyApplied(db: DB, stmt: string): boolean {
+  const dropped = DROPS.exec(stmt);
+  if (dropped) {
+    const [, kind, name] = dropped;
+    return db.query("SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?").get(kind.toLowerCase(), name) == null;
+  }
   const created = CREATES.exec(stmt);
   if (created) {
     const [, kind, name] = created;

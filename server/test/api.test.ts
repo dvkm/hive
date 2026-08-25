@@ -509,6 +509,32 @@ test("event ingestion: status event is recorded", async () => {
   expect(events.json.some((e: any) => e.type === "status" && e.payload.note === "working")).toBe(true);
 });
 
+test("status notes only queue Jira comments when the project opts in", async () => {
+  const task = await post("/api/tasks", { project_id: projectId, title: "linked status note" });
+  db.query("UPDATE tasks SET jira_key = 'WEB-123', jira_link_kind = 'subtask' WHERE id = ?").run(task.json.id);
+
+  const off = await post(`/api/tasks/${task.json.id}/events`, { type: "status", note: "routine progress" });
+  expect(off.status).toBe(201);
+  expect((await get(`/api/tasks/${task.json.id}/events`)).json.filter((e: any) => e.type === "jira_comment")).toHaveLength(0);
+
+  db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify({ jira: {
+    site: "https://example.atlassian.net", email: "jira@example.com", project_key: "WEB",
+    enabled: true, write: true, status_notes_to_comments: true,
+  } }), projectId);
+  const r = await post(`/api/tasks/${task.json.id}/events`, { type: "status", note: "  implementation complete  " });
+  expect(r.status).toBe(201);
+
+  const events = (await get(`/api/tasks/${task.json.id}/events`)).json;
+  const comments = events.filter((e: any) => e.type === "jira_comment");
+  expect(comments).toHaveLength(1);
+  expect(comments[0].payload).toMatchObject({
+    direction: "outbound",
+    text: "implementation complete",
+    status_event_id: r.json.event.id,
+  });
+  db.query("UPDATE projects SET config = '{}' WHERE id = ?").run(projectId);
+});
+
 test("transition endpoint enforces the state machine", async () => {
   const bad = await post(`/api/tasks/${taskId}/events`, { type: "done" });
   expect(bad.status).toBe(409); // no evidence yet
