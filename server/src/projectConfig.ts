@@ -132,6 +132,21 @@ const promote: Check = (v) => {
   return null;
 };
 
+// Which task kinds must post a plan checkpoint before their first edit, and
+// (later) whether a vetoed plan blocks. See server/src/planCritic.ts.
+const plan_gate: Check = (v) => {
+  const bad = obj(v);
+  if (bad) return bad;
+  const g = v as Record<string, unknown>;
+  for (const key of Object.keys(g)) if (key !== "kinds" && key !== "block") return `.${key} is not supported`;
+  if (g.kinds !== undefined) {
+    const invalid = strArray(g.kinds);
+    if (invalid) return `.kinds ${invalid}`;
+  }
+  if (g.block !== undefined && typeof g.block !== "boolean") return ".block must be a boolean";
+  return null;
+};
+
 const CHECKS: Record<string, Check> = {
   // dispatch / autonomy
   auto_dispatch: bool,
@@ -143,6 +158,7 @@ const CHECKS: Record<string, Check> = {
   archived: bool,
   test: bool, // test/ephemeral project, hidden from director surfaces (testProjects.ts)
   plan_intake: bool,
+  plan_gate,
   intake_keywords: strArray,
   // subprocess argv overrides (see above)
   agent_argv: argv,
