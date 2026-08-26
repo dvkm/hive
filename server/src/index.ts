@@ -1,4 +1,13 @@
 // hive daemon entrypoint. Bun.serve on 127.0.0.1:4700 (override HIVE_PORT).
+// INCIDENT HOTFIX 2026-08-25 (task 4917e8ecd667): an unhandled async rejection
+// escaping a spawned subprocess (gh ENOENT via exec.ts) exits the Bun process,
+// crash-looping the server under launchd. Log and survive instead; the error
+// streak machinery already surfaces degradation in /api/health. Applied
+// straight to the live checkout during the incident; carried onto main here so
+// the next deploy does not silently drop it.
+process.on("unhandledRejection", (e) => {
+  console.error("[hive] unhandledRejection (survived):", e);
+});
 import { openDb, defaultDbPath } from "./db.ts";
 import { makeHandler, keepSupervisorWarm, notifyManagerOfEvent, repairDuplicateQuizPasses, sweepManagerInboxes, wakeDueManagers } from "./api.ts";
 import { startReconciler, reAdoptAgentsOnBoot } from "./reconciler.ts";

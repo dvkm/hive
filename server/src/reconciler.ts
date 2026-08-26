@@ -11,6 +11,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
+import { startLoop } from "./loop.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, repairRequeueProvenance, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
 import { spawnMeta } from "./cleanup.ts";
@@ -2257,9 +2258,5 @@ function nudgesSinceActivity(db: DB, taskId: string): number {
 
 // Background loop. Started only from index.ts (never in tests).
 export function startReconciler(db: DB, deps: ReconcilerDeps & { intervalMs?: number } = {}): () => void {
-  const intervalMs = deps.intervalMs ?? 60_000;
-  const timer = setInterval(() => {
-    reconcileOnce(db, deps).catch((e) => console.error("[hive] reconciler cycle crashed:", e));
-  }, intervalMs);
-  return () => clearInterval(timer);
+  return startLoop("reconciler", deps.intervalMs ?? 60_000, () => reconcileOnce(db, deps));
 }
