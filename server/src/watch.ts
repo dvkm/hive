@@ -26,6 +26,7 @@ import { broadcast } from "./bus.ts";
 import { getCursor, setCursor } from "./intake/gchat.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
+import { activeProjects } from "./testProjects.ts";
 
 export interface Watcher {
   name: string;
@@ -149,7 +150,7 @@ const lastPoll = new Map<string, number>();
 export async function watchOnce(db: DB, deps: WatchDeps = {}): Promise<void> {
   if (isOffline(db)) return;
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
-  const projects = db.query("SELECT id, config FROM projects").all() as { id: string; config: string }[];
+  const projects = activeProjects(db) as { id: string; config: string }[];
   for (const p of projects) {
     let watchers: Watcher[] = [];
     try {

@@ -5,6 +5,7 @@ import { projectBaseBranch } from "./exec.ts";
 import { enqueue } from "./notifications.ts";
 import { getTask, transition, writeEvent, TERMINAL, type State } from "./state.ts";
 import { broadcastTask } from "./health.ts";
+import { activeProjects, type ProjectRow } from "./testProjects.ts";
 
 export interface PrGardenerConfig {
   enabled?: boolean;
@@ -201,7 +202,7 @@ function openDecision(db: DB, deps: GardenerDeps, projectId: string, pr: GhPr, r
 }
 
 export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
-  const projects = db.query("SELECT * FROM projects WHERE repo_path IS NOT NULL").all() as any[];
+  const projects = activeProjects(db).filter((p): p is ProjectRow & { repo_path: string } => !!p.repo_path);
   for (const project of projects) {
     const config = JSON.parse(project.config || "{}");
     const gardener: PrGardenerConfig = config.pr_gardener ?? {};

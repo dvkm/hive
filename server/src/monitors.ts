@@ -13,6 +13,7 @@ import { newId, now, evidenceDir, isOffline } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { writeEvent, transition, getTask, isTrackingOnlyTask } from "./state.ts";
 import { recordSystemLearning } from "./learn.ts";
+import { activeProjects } from "./testProjects.ts";
 import { parseIncident, parseProject } from "./rows.ts";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
@@ -135,7 +136,7 @@ function createIncidentTask(db: DB, projectId: string, mon: Check, detail: strin
 // stop the rest.
 export async function checkAllMonitors(db: DB, deps: MonitorDeps = {}): Promise<void> {
   if (isOffline(db)) return; // offline mode: every URL check would false-alarm
-  const projects = db.query("SELECT * FROM projects").all().map(parseProject);
+  const projects = activeProjects(db).map(parseProject);
   for (const p of projects) {
     try {
       await checkProjectMonitors(db, p, deps);

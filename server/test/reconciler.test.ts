@@ -1598,6 +1598,39 @@ test("linkPRs skips test/ephemeral projects entirely (task #1667)", async () => 
   expect(getTask(db, task).pr_url).toBeNull();
 });
 
+// task #1693: a project already marked BOTH test AND archived (the
+// hive-1560 scratch seed proj_c964ebadad88) still had its repo_path swept by
+// every project loop, spawning tools (gh, git) against a cleaned-up cwd every
+// cycle and keeping reconciler_error_streak climbing forever.
+test("an archived project with a dead repo_path is skipped by every sweep, and the error streak resets clean (task #1693)", async () => {
+  const { db } = freshDb({ test: true, archived: true });
+  const cannotStart: Exec = async () => ({ code: 127, stdout: "", stderr: "posix_spawn gh ENOENT (cwd /nonexistent)" });
+
+  await reconcileOnce(db, { exec: cannotStart });
+  await reconcileOnce(db, { exec: cannotStart });
+  await reconcileOnce(db, { exec: cannotStart });
+
+  expect(getSetting(db, "reconciler_error_streak")).toBe("0");
+  const { degradedTools } = await import("../src/api.ts");
+  expect(degradedTools(db)).toEqual([]);
+});
+
+// archived alone (not test) must also be excluded — the reconciler sweep, not
+// just the reaper's test/no-tasks archiver, is the thing that must honor it.
+test("linkPRs skips an archived (non-test) project with a dead repo_path", async () => {
+  const { db, projectId } = freshDb({ archived: true });
+  db.query("UPDATE projects SET repo_path = ? WHERE id = ?").run("/nonexistent/repo", projectId);
+  let ghCalls = 0;
+  const exec: Exec = async (argv) => {
+    if (argv[0] === "gh" && argv[1] === "pr" && argv[2] === "list") ghCalls++;
+    return OK("[]");
+  };
+
+  await reconcileOnce(db, { exec });
+
+  expect(ghCalls).toBe(0);
+});
+
 test("reAdoptAgentsOnBoot re-adopts a live-but-unregistered agent and skips terminal tasks", async () => {
   const { reAdoptAgentsOnBoot } = await import("../src/reconciler.ts");
   const { db, projectId } = freshDb();
