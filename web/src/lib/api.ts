@@ -599,6 +599,13 @@ function bodyFor(fields: Record<string, unknown>, files?: File[]): string | Form
 }
 
 // An open (un-acked) build-time checkpoint, as returned by GET /api/checkpoints.
+export interface CheckpointPlan {
+  goal: string;
+  approach: string;
+  files_expected: string[];
+  verification_planned: string;
+}
+
 export interface Checkpoint {
   id: string;
   task_id: string;
@@ -608,6 +615,11 @@ export interface Checkpoint {
   task_state: string;
   project_id: string;
   note: string;
+  // Plan checkpoints only (HIVE-412/413). `blocking` means the agent is parked
+  // until this is acked; `concerns` is the critic's verdict, [] until it lands.
+  blocking?: boolean;
+  plan?: CheckpointPlan;
+  concerns?: { severity: "note" | "veto"; text: string }[];
 }
 
 export type ReviewItem = string | { what: string; why?: string };

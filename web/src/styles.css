@@ -4481,6 +4481,15 @@ a.dbundle-fact:hover {
 .cp-row.cp-acked { opacity: 0.55; }
 .cp-row.cp-ok .cp-note { text-decoration: line-through; text-decoration-color: #2da44e88; }
 .cp-flag-note { color: #cf222e; margin-left: 6px; }
+/* Blocking plan checkpoint (HIVE-413): the plan and the critic's concerns sit
+   on the card so approval is a glance, not a task-page visit. */
+.cp-waiting { margin-left: 6px; background: #bf871155; color: inherit; }
+.cp-plan { margin-top: 6px; padding-left: 10px; border-left: 2px solid currentColor; opacity: 0.85; font-size: 0.92em; }
+.cp-plan-line { margin: 2px 0; }
+.cp-plan-line b { margin-right: 6px; opacity: 0.7; font-weight: 600; }
+.cp-concerns { margin: 6px 0 0; padding-left: 18px; }
+.cp-concerns li { margin: 2px 0; }
+.cp-concern-veto { color: #cf222e; font-weight: 600; }
 .cp-flag {
   flex: none;
   border: 1px solid #cf222e55;

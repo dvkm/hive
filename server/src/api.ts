@@ -78,7 +78,7 @@ import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts"
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { explanationGate } from "./explainDiff.ts";
-import { critiquePlan, parsePlan } from "./planCritic.ts";
+import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
 import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
@@ -3380,7 +3380,7 @@ async function sendOnce(herdr: Herdr, target: string, message: string): Promise<
 // Programmatic steer for hive's own subsystems (offline prep, checkpoint
 // flags): same delivery-receipt semantics as the HTTP path, no Request object,
 // no authz gate (the server is steering, not an agent).
-async function internalSteer(db: DB, herdr: Herdr, id: string, message: string, actor: string | null = null): Promise<boolean> {
+export async function internalSteer(db: DB, herdr: Herdr, id: string, message: string, actor: string | null = null): Promise<boolean> {
   const task = getTask(db, id);
   if (!task || isTrackingOnlyTask(task)) return false;
   const target = task.agent_target;
@@ -3608,6 +3608,32 @@ function checkpointNote(payload: string): string {
     return String(JSON.parse(payload).note ?? "");
   } catch {
     return "";
+  }
+}
+
+// Is this checkpoint a plan the agent is parked on (HIVE-413)?
+function planCheckpointBlocks(payload: string): boolean {
+  try {
+    return JSON.parse(payload)?.blocking === true;
+  } catch {
+    return false;
+  }
+}
+
+// The plan fields on a plan checkpoint, for the Needs You card. Null for an
+// ordinary note-only checkpoint.
+function checkpointPlan(payload: string): Record<string, unknown> | null {
+  try {
+    const p = JSON.parse(payload);
+    if (p?.kind !== "plan") return null;
+    return {
+      goal: String(p.goal ?? ""),
+      approach: String(p.approach ?? ""),
+      files_expected: Array.isArray(p.files_expected) ? p.files_expected.map(String) : [],
+      verification_planned: String(p.verification_planned ?? ""),
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -3988,17 +4014,41 @@ function openCheckpointRows(db: DB, projectId: string | null, includeTest = fals
 function listOpenCheckpoints(db: DB, url: URL): Response {
   const rows = openCheckpointRows(db, url.searchParams.get("project_id"), url.searchParams.get("test") === "all");
   return json({
-    checkpoints: rows.map((r) => ({
-      id: r.id,
-      task_id: r.task_id,
-      ts: r.ts,
-      task_number: r.number,
-      task_title: r.title,
-      task_state: r.state,
-      project_id: r.project_id,
-      note: checkpointNote(r.payload),
-    })),
+    checkpoints: rows.map((r) => {
+      const plan = checkpointPlan(r.payload);
+      return {
+        id: r.id,
+        task_id: r.task_id,
+        ts: r.ts,
+        task_number: r.number,
+        task_title: r.title,
+        task_state: r.state,
+        project_id: r.project_id,
+        note: checkpointNote(r.payload),
+        // A blocking plan is the whole card: the director approves from the
+        // plan plus the critic's concerns, without opening the task.
+        ...(planCheckpointBlocks(r.payload) ? { blocking: true } : {}),
+        ...(plan ? { plan, concerns: planConcerns(db, r.task_id, r.id) } : {}),
+      };
+    }),
   });
+}
+
+// The critic's concerns for a plan checkpoint, or [] when the critique has not
+// landed yet (it runs in the background).
+function planConcerns(db: DB, taskId: string, checkpointId: string): { severity: string; text: string }[] {
+  const row: any = db
+    .query(
+      `SELECT payload FROM events WHERE task_id = ? AND type = 'plan_critique'
+        AND json_extract(payload, '$.checkpoint_id') = ? ORDER BY rowid DESC LIMIT 1`
+    )
+    .get(taskId, checkpointId);
+  try {
+    const concerns = JSON.parse(row?.payload ?? "{}")?.concerns;
+    return Array.isArray(concerns) ? concerns : [];
+  } catch {
+    return [];
+  }
 }
 
 async function ackCheckpoint(db: DB, herdr: Herdr, taskId: string, eventId: string, body: any): Promise<Response> {
@@ -4046,15 +4096,32 @@ async function ackCheckpoint(db: DB, herdr: Herdr, taskId: string, eventId: stri
   });
   let delivered = false;
   let followup_task_id: string | null = null;
+  // A blocking plan checkpoint (HIVE-413) parked the agent: the ack is what
+  // restarts it, on both verdicts. An approval says nothing else, so it steers
+  // here; a flag falls through to the flag steer below, which already carries
+  // the correction.
+  if (planCheckpointBlocks(ev.payload) && verdict === "ok") {
+    delivered = await internalSteer(db, herdr, taskId, planReleaseSteer("ok", note));
+    return json({ ok: true, delivered, followup_task_id });
+  }
   if (verdict === "flag") {
     const cpText = checkpointNote(ev.payload);
-    const live = task && !["done", "cancelled", "failed"].includes(task.state) && task.agent_target;
+    // A blocking plan (HIVE-413) parked its agent before any edit: a flag must
+    // reach it even with no agent_target right now (internalSteer queues the
+    // steer onto the next spawn). Nothing shipped, so a corrective follow-up
+    // task would be the wrong answer.
+    const live =
+      task &&
+      !["done", "cancelled", "failed"].includes(task.state) &&
+      (task.agent_target || planCheckpointBlocks(ev.payload));
     if (live) {
       delivered = await internalSteer(
         db,
         herdr,
         taskId,
-        `${source === "chat_supervisor" ? "The project supervisor" : "Director"} FLAGGED your checkpoint: "${cpText}"${note ? ` — ${note}` : ""}. Address this now, before continuing.`
+        planCheckpointBlocks(ev.payload)
+          ? planReleaseSteer("flag", note)
+          : `${source === "chat_supervisor" ? "The project supervisor" : "Director"} FLAGGED your checkpoint: "${cpText}"${note ? ` — ${note}` : ""}. Address this now, before continuing.`
       );
     }
     // Late flag (task finished / agent gone): the work already shipped, so the
@@ -5511,11 +5578,15 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
   if (type === "checkpoint") {
     const plan = parsePlan(fields);
     if (plan) {
+      // Blocking mode (HIVE-413): the marker rides on the payload, so an ack
+      // knows to release the agent even if the project config changes later.
+      const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+      const blocking = planGateBlocks(JSON.parse(project?.config ?? "{}"), task.kind);
       const event = writeEvent(db, {
         task_id: taskId,
         source,
         type,
-        payload: { note: note ?? plan.goal, ...plan },
+        payload: { note: note ?? plan.goal, ...plan, ...(blocking ? { blocking: true } : {}) },
       });
       const herdr = deps.herdr ?? defaultHerdr;
       critiquePlan(db, task, event.id, plan, {
