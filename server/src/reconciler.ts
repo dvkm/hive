@@ -357,7 +357,7 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
 // death. Herdr.confirmGone cross-checks the pane list; an unconfirmed death
 // degrades to alive+unknown, which every caller already treats as "leave it
 // alone" (2026-08-19 incident: 12+ live agents failed and their tabs closed).
-async function probeAgent(
+export async function probeAgent(
   h: Herdr,
   db: DB,
   taskId: string,
