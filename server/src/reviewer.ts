@@ -220,6 +220,12 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
   }
   writeEvent(db, { task_id: t.id, source: "system", type: "auto_review", payload: { ...review, ...reviewIdentity } as any });
   broadcast({ type: "task", task: getTask(db, t.id) });
+  // A cautious verdict's risks are suspicions — check each one against the
+  // real code before the director acts on them. PR-backed tasks only: without
+  // a PR head there is nothing to key the verdicts to.
+  if (review.verdict === "caution" && review.risks.length && reviewedHead) {
+    await verifyRisks(db, t, review.risks, reviewedHead, diff.text, deps);
+  }
 }
 
 export function startAutoReviewer(db: DB, deps: ReviewerDeps & { intervalMs?: number } = {}): () => void {
@@ -227,4 +233,131 @@ export function startAutoReviewer(db: DB, deps: ReviewerDeps & { intervalMs?: nu
     autoReviewOnce(db, deps).catch((e) => console.error("[hive] auto-review crashed:", e));
   }, deps.intervalMs ?? 60_000);
   return () => clearInterval(timer);
+}
+
+// ---------------------------------------------------------------------------
+// Per-risk adversarial verification (task HIVE-406).
+//
+// A `caution` pre-review lists risks the sonnet reviewer *suspects*. Some are
+// real bugs, some are the model pattern-matching on a diff it can only see a
+// window of. So each risk gets its own opus one-shot that can read the actual
+// worktree, and answers one question: does this risk hold up? The verdicts land
+// as ONE `risk_verdicts` event on the card, so the director reads "3 of 5 were
+// refuted" instead of five maybes.
+//
+// Keyed to the reviewed PR head: it re-runs only when the pre-review itself
+// re-runs for a new head, and never twice for the same one.
+const MAX_VERIFIED_RISKS = 5;
+const VERIFY_MODEL = "opus";
+
+export interface RiskVerdict {
+  risk: string;
+  verdict: "confirmed" | "refuted";
+  why: string;
+  evidence_path?: string;
+}
+
+// Same loose parsing as extractReview: whole JSON, the `--output-format json`
+// {result:"..."} envelope, or a braces slice of prose.
+export function extractVerdict(raw: string): { verdict: "confirmed" | "refuted"; why: string; evidence_path?: string } | null {
+  const norm = (o: any) => {
+    if (!o || (o.verdict !== "confirmed" && o.verdict !== "refuted")) return null;
+    const out: any = { verdict: o.verdict, why: String(o.why ?? "").trim().slice(0, 300) };
+    if (typeof o.evidence_path === "string" && o.evidence_path.trim()) out.evidence_path = o.evidence_path.trim();
+    return out;
+  };
+  const tryParse = (s: string) => {
+    try {
+      return norm(JSON.parse(s));
+    } catch {
+      return null;
+    }
+  };
+  const braces = (s: string) => {
+    const a = s.indexOf("{");
+    const b = s.lastIndexOf("}");
+    return a >= 0 && b > a ? tryParse(s.slice(a, b + 1)) : null;
+  };
+  const whole = tryParse(raw);
+  if (whole) return whole;
+  try {
+    const env = JSON.parse(raw);
+    if (env && typeof env.result === "string") return tryParse(env.result) ?? braces(env.result);
+  } catch {}
+  return braces(raw);
+}
+
+function verifyPrompt(task: any, risk: string, diff: string): string {
+  return [
+    `A code reviewer flagged ONE risk on a pull request. Decide whether it is real.`,
+    `Be adversarial: try to refute it. Say 'confirmed' only if you can point at the code that makes it true.`,
+    ``,
+    `Risk: ${risk}`,
+    ``,
+    `Task #${task.number}: ${task.title}`,
+    task.worktree_path ? `The full checkout is at ${task.worktree_path} — read files there to check. Do not edit anything.` : ``,
+    ``,
+    `Diff (may be truncated):`,
+    diff.slice(0, DIFF_LIMIT),
+    ``,
+    PLAIN_ENGLISH,
+    ``,
+    `Answer as ONLY a JSON object, no prose around it:`,
+    `{"verdict": "confirmed" | "refuted",`,
+    ` "why": "one or two sentences, 300 characters or fewer",`,
+    ` "evidence_path": "file:line you checked, if any"}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+// Already verified for this exact PR head? Then don't spend the model again.
+function hasRiskVerdicts(db: DB, taskId: string, head: string): boolean {
+  const rows = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts'").all(taskId) as { payload: string }[];
+  return rows.some((r) => {
+    try {
+      return JSON.parse(r.payload)?.reviewed_head_sha === head;
+    } catch {
+      return false;
+    }
+  });
+}
+
+// One opus run per risk, in sequence, capped at MAX_VERIFIED_RISKS. A run that
+// fails or returns junk is left out of `verdicts` and counted in `unverified`,
+// so a broken run never reads as an all-clear.
+export async function verifyRisks(
+  db: DB,
+  task: any,
+  risks: string[],
+  head: string,
+  diff: string,
+  deps: ReviewerDeps = {}
+): Promise<void> {
+  if (!risks.length || hasRiskVerdicts(db, task.id, head)) return;
+  const exec = deps.exec ?? defaultPlannerExec;
+  const verdicts: RiskVerdict[] = [];
+  let unverified = 0;
+  for (const risk of risks.slice(0, MAX_VERIFIED_RISKS)) {
+    let res;
+    try {
+      res = await exec([claudeBin(), "-p", "--model", VERIFY_MODEL, verifyPrompt(task, risk, diff), "--output-format", "json"], {
+        timeoutMs: TIMEOUT_MS,
+        cwd: task.worktree_path ?? undefined,
+      });
+    } catch {
+      unverified++;
+      continue;
+    }
+    const v = res.timedOut || res.code !== 0 ? null : extractVerdict(res.stdout);
+    if (v) verdicts.push({ risk, ...v });
+    else unverified++;
+  }
+  writeEvent(db, {
+    task_id: task.id,
+    source: "system",
+    type: "risk_verdicts",
+    payload: { reviewed_head_sha: head, verdicts, ...(unverified ? { unverified } : {}) } as any,
+  });
+  broadcast({ type: "task", task: getTask(db, task.id) });
 }
