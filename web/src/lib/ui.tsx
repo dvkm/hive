@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import type { State, CiStatus, Health } from "./api";
+import type { State, CiStatus, Health, SidecarReport } from "./api";
 import { STATE_LABEL, HEALTH_LABEL } from "./labels";
 import { DEP_MET_STATES } from "./needsYou";
 
@@ -47,6 +47,30 @@ export function Empty({
 export function CiBadge({ status }: { status: CiStatus }) {
   if (!status) return null;
   return <span className={`ci ci-${status}`}>{status === "unavailable" ? "CI never ran" : `CI ${status}`}</span>;
+}
+
+// Background check chip (task HIVE-405). Hive type-checks and lints an agent's
+// commits while it works; this is the latest result on the card, green when the
+// last commit was clean and amber with a count when it was not. Hover lists what
+// was found. Nothing here blocks a merge: CI is still the gate.
+export function SidecarChip({ sidecar }: { sidecar?: SidecarReport | null }) {
+  if (!sidecar) return null;
+  const sha = sidecar.sha.slice(0, 7);
+  const n = sidecar.findings.length;
+  if (sidecar.ok)
+    return (
+      <span className="chip chip-check-ok" title={`Hive's background checks passed on commit ${sha}`}>
+        ✓ checks
+      </span>
+    );
+  return (
+    <span
+      className="chip chip-check-warn"
+      title={`Commit ${sha}:\n${sidecar.findings.map((f) => `${f.tool}: ${f.summary}`).join("\n")}`}
+    >
+      ⚠ checks {n}
+    </span>
+  );
 }
 
 // "Blocked by #N, #M" chip. Uses the browser-side dependency gate mirror from

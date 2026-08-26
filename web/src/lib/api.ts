@@ -96,6 +96,15 @@ export interface Health {
   since: string;
 }
 
+// Latest background check on a task's own commits (server/src/sidecar.ts):
+// hive runs tsc and the project's lint script on an agent's fresh commits while
+// it works. Advisory only; CI is still the merge gate.
+export interface SidecarReport {
+  sha: string;
+  ok: boolean;
+  findings: { tool: string; summary: string }[];
+}
+
 export interface Task {
   id: string;
   number: number; // legacy global handle retained for PR markers and API compatibility
@@ -123,6 +132,7 @@ export interface Task {
   deferred_until?: string | null; // parked pending an offline human action; nudges suppressed while future-dated
   land_queued_at?: string | null; // marked approved-to-land; the land queue merges it in graph order
   health?: Health | null;
+  sidecar?: SidecarReport | null; // latest background check on this task's commits
   requeued_to?: string | null; // successor id when failed + auto-requeued
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
   created_at: string;

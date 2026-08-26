@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import type { BranchCheck, DiffFile, DiffResult, Evidence, ReviewItem, ReviewSummary, Task, UnderstandingPacket } from "../lib/api";
 import { useStore } from "../lib/store";
-import { CiBadge, toast } from "../lib/ui";
+import { CiBadge, SidecarChip, toast } from "../lib/ui";
 import { MAX_DIFF_LINES } from "../lib/api";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
@@ -657,6 +657,7 @@ export function ReviewCard({
           ) : (
             <span className="muted mono-sm">branch {task.branch || "?"}</span>
           )}
+          <SidecarChip sidecar={task.sidecar} />
           <CiBadge status={task.ci_status} />
         </div>
       </div>

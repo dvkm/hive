@@ -152,6 +152,7 @@ timeout — a failed hook never blocks spawn nor teardown.
   "verification_cmds": null,
   "duplicate_of": null,
   "health": { "status": "healthy", "reason": null, "since": "..." },
+  "sidecar": { "sha": "a1b2c3d...", "ok": false, "findings": [{ "tool": "tsc", "summary": "src/a.ts(3,1): error TS2345" }] },
   "created_at": "...",
   "updated_at": "..."
 }
@@ -170,6 +171,12 @@ reconciler opens ONE `chore` task for the signal itself (deduped fleet-wide on a
 `ci-signal: <key>` line in its brief) and every PR hitting that signal shares it.
 Code-red (anything a commit could plausibly have caused) still steers the PR's
 own agent to fix forward, once per pushed head SHA.
+`sidecar` is the latest background check on the task's OWN commits
+(`server/src/sidecar.ts`): hive runs `tsc --noEmit` and the project's `lint`
+script in a working agent's worktree whenever its HEAD moves. `null` until the
+first check. It is advisory — the board and review cards show it as a chip, and
+a broken build (a `tsc` finding) queues ONE non-blocking FYI steer per commit to
+that task's agent. CI on the PR is still the merge gate.
 `ci_checked_at` is when hive last LOOKED at the checks — `ci_status` only moves
 when the answer moves, so this is the timestamp a decision card cites.
 `head_sha` is the PR's current head commit, refreshed by the reconciler's PR

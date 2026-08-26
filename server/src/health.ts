@@ -13,6 +13,7 @@ import { broadcast } from "./bus.ts";
 import { isSupervisedTask, neverDispatched } from "./supervision.ts";
 import { isDeferred, unmetDeps, TERMINAL, type State } from "./state.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
+import { latestSidecar } from "./sidecar.ts";
 
 export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
 
@@ -261,7 +262,9 @@ export function taskWithHealth(db: DB, task: any): any {
       : null;
   // Server-computed so the web app never has to re-derive "was this ever
   // spawned" from raw event history — see supervision.ts's neverDispatched.
-  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, never_dispatched: neverDispatched(db, task) };
+  // `sidecar` is the latest background check on this task's own commits, so the
+  // board card and the review card can show it without fetching every event.
+  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, never_dispatched: neverDispatched(db, task), sidecar: latestSidecar(db, task.id) };
 }
 
 // "Needs attention" tray eligibility (the single rule; the web mirrors it):

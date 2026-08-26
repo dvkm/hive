@@ -757,6 +757,11 @@ async function main() {
       `SELECT COUNT(*) n, SUM(status='expired') expired,
               ROUND(AVG(CASE WHEN answered_at IS NOT NULL THEN (julianday(answered_at)-julianday(ts))*24*60 END),0) med_min
          FROM decisions WHERE ts > ?`, since);
+    // Sidecar: background type/lint checks on an agent's fresh commits, and how
+    // often they caught something. Per-day, so it compares across --days values.
+    const sidecar = one(
+      `SELECT COUNT(*) n, SUM(json_extract(payload,'$.ok') = 0) caught
+         FROM events WHERE type='sidecar_report' AND ts > ?`, since);
     const held = one("SELECT COUNT(*) n FROM events WHERE type='ready_held' AND ts > ?", since).n;
     const bounced = one("SELECT COUNT(*) n FROM events WHERE type IN ('ci_failure','pr_closed') AND ts > ?", since).n;
     const cost = db.query(
@@ -772,6 +777,7 @@ async function main() {
     console.log(`  spawns:         ${spawns} ok, ${spawnErr} errors${spawns ? ` (${Math.round((100 * spawnErr) / (spawns + spawnErr))}% failure)` : ""}`);
     console.log(`  intervention:   ${steers} steers, ${nudges} gone-quiet nudges`);
     console.log(`  decisions:      ${dec.n} opened, ${dec.expired ?? 0} expired, avg answer ${dec.med_min ?? "-"}m`);
+    console.log(`  sidecar:        ${sidecar.n} checks, ${sidecar.caught ?? 0} caught problems (${(sidecar.n / days).toFixed(1)}/day)`);
     console.log(`  CI gate:        ${held} handoffs held, ${bounced} bounced out of review`);
     console.log(`  review->merge:  avg ${review.h ?? "-"}h`);
     for (const c of cost) console.log(`  cost:           ${c.model}  $${c.c}  (${c.t} tasks)`);
