@@ -42,7 +42,7 @@ async function resetRepo() {
 async function lifecycle(label: string, agentArgv: string[], full: boolean) {
   const taskId = "vf" + Math.random().toString(16).slice(2, 8);
   hr(`${label}: spawn (worktree create + agent start)`);
-  const s = await h.spawn({ taskId, repoPath: repo, hiveUrl: "http://127.0.0.1:4700", title: label, brief: "verification run", agentArgv });
+  const s = await h.spawn({ taskId, repoPath: repo, hiveUrl: "http://127.0.0.1:4700", briefFile: "/dev/null", agentArgv });
   log("SpawnResult:", JSON.stringify(s));
   log(ok(!!s.worktree_path && !!s.workspace_id), "worktree created + workspace_id captured");
 
@@ -69,14 +69,14 @@ async function lifecycle(label: string, agentArgv: string[], full: boolean) {
     await git(["-C", s.worktree_path, "commit", "--allow-empty", "-m", "unpushed work"]);
 
     hr(`${label}: teardown BEFORE push (must REFUSE)`);
-    const before = await h.teardown({ repoPath: repo, branch: s.branch, worktreePath: s.worktree_path, workspaceId: s.workspace_id ?? "", defaultBranch: "main" });
+    const before = await h.teardown({ repoPath: repo, branch: s.branch, worktreePath: s.worktree_path, workspaceId: s.workspace_id, defaultBranch: "main" });
     log("teardown:", JSON.stringify(before), "-", ok(before.removed === false));
 
     hr(`${label}: push the branch (simulate merged/pushed)`);
     await git(["-C", s.worktree_path, "push", "-u", "origin", s.branch]);
 
     hr(`${label}: teardown AFTER push (must SUCCEED)`);
-    const after = await h.teardown({ repoPath: repo, branch: s.branch, worktreePath: s.worktree_path, workspaceId: s.workspace_id ?? "", defaultBranch: "main" });
+    const after = await h.teardown({ repoPath: repo, branch: s.branch, worktreePath: s.worktree_path, workspaceId: s.workspace_id, defaultBranch: "main" });
     log("teardown:", JSON.stringify(after), "-", ok(after.removed === true));
 
     hr(`${label}: verify worktree gone`);
@@ -87,7 +87,7 @@ async function lifecycle(label: string, agentArgv: string[], full: boolean) {
     hr(`${label}: cleanup (push empty branch, teardown)`);
     await git(["-C", s.worktree_path, "commit", "--allow-empty", "-m", "cleanup"]);
     await git(["-C", s.worktree_path, "push", "-u", "origin", s.branch]);
-    const after = await h.teardown({ repoPath: repo, branch: s.branch, worktreePath: s.worktree_path, workspaceId: s.workspace_id ?? "", defaultBranch: "main" });
+    const after = await h.teardown({ repoPath: repo, branch: s.branch, worktreePath: s.worktree_path, workspaceId: s.workspace_id, defaultBranch: "main" });
     log("teardown:", JSON.stringify(after), "-", ok(after.removed === true));
   }
 }
