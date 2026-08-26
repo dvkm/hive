@@ -77,6 +77,7 @@ import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
+import { confirmedRisks, cautionCleared } from "./reviewer.ts";
 import { explanationGate } from "./explainDiff.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
@@ -2752,6 +2753,19 @@ export async function mergeTask(
     return err(`blocked by unmet dependenc${blockingDeps.length === 1 ? "y" : "ies"}: ${names} — not yet merged/done`, 409);
   }
 
+  // The risk check (HIVE-406) re-read the real code for this exact head. Risks
+  // it CONFIRMED are the ones that survived an adversarial second look, so the
+  // director sees that short list verbatim instead of the whole caution blob.
+  // Refuted risks say nothing here. Overridable, like the rebase guard below.
+  const confirmed = body?.override_confirmed_risks ? [] : confirmedRisks(db, id, task.head_sha);
+  if (confirmed.length)
+    return err(
+      `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
+        confirmed.map((c) => `“${c.risk}” — ${c.why}${c.evidence_path ? ` (${c.evidence_path})` : ""}`).join("; ") +
+        `. Fix them, or merge with override_confirmed_risks=true.`,
+      409
+    );
+
   const exec = deps.exec ?? defaultExec;
   let prView: any = null;
   if (task.pr_url) {
@@ -3758,7 +3772,10 @@ function touchesSensitivePath(files: string[], tokens: string[]): boolean {
 
 // The newest verdict from the auto reviewer, or null when it never produced one
 // (never ran, errored, or was skipped by project config).
-function latestAutoReviewVerdict(db: DB, taskId: string): { verdict: string; files: string[] } | null {
+function latestAutoReviewVerdict(
+  db: DB,
+  taskId: string
+): { verdict: string; files: string[]; risks: string[]; questions: string[]; reviewed_head_sha?: string } | null {
   const row = db
     .query(
       `SELECT type, payload FROM events WHERE task_id = ? AND type IN ('auto_review', 'auto_review_error')
@@ -3769,7 +3786,13 @@ function latestAutoReviewVerdict(db: DB, taskId: string): { verdict: string; fil
   try {
     const payload = JSON.parse(row.payload);
     if (payload?.skipped || typeof payload?.verdict !== "string") return null;
-    return { verdict: payload.verdict, files: Array.isArray(payload.files) ? payload.files.map(String) : [] };
+    return {
+      verdict: payload.verdict,
+      files: Array.isArray(payload.files) ? payload.files.map(String) : [],
+      risks: Array.isArray(payload.risks) ? payload.risks.map(String) : [],
+      questions: Array.isArray(payload.questions) ? payload.questions.map(String) : [],
+      reviewed_head_sha: typeof payload.reviewed_head_sha === "string" ? payload.reviewed_head_sha : undefined,
+    };
   } catch {
     return null;
   }
@@ -3794,7 +3817,12 @@ export function understandingChecksRequired(db: DB, task: { id: string; kind: st
     .get(task.id);
   if (flagged) return true;
   const review = latestAutoReviewVerdict(db, task.id);
-  if (!review || review.verdict !== "looks_good") return true;
+  if (!review) return true;
+  // A caution whose every risk was refuted and every question answered from the
+  // code is not judgment-class either (HIVE-407) — the same rule the reconciler
+  // uses to auto-merge it. Anything still confirmed or human-only needs the
+  // director, so it keeps its quiz.
+  if (review.verdict !== "looks_good" && !cautionCleared(db, task.id, review.reviewed_head_sha, review)) return true;
   const tokens = Array.isArray(config.understanding_checks?.sensitive_paths)
     ? config.understanding_checks.sensitive_paths.map(String)
     : DEFAULT_SENSITIVE_PATHS;

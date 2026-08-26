@@ -4141,6 +4141,66 @@ a.dbundle-fact:hover {
   flex: none;
   color: var(--text-faint);
 }
+.risk-verdicts {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-soft);
+  font-size: var(--t-sm);
+}
+.risk-verdicts-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text-faint);
+  font-size: var(--t-eyebrow);
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.risk-verdicts ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.risk-verdicts li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.rv-chip {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: var(--t-eyebrow);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.rv-confirmed .rv-chip {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 16%, transparent);
+}
+.rv-refuted .rv-chip {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 16%, transparent);
+}
+.rv-human .rv-chip {
+  color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 16%, transparent);
+}
+.rv-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+.rv-confirmed .rv-text {
+  color: var(--text);
+}
 .review-details {
   border: 1px solid var(--border-soft);
   border-radius: 8px;

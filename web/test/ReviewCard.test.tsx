@@ -480,3 +480,63 @@ test("on a phone the embed collapses to an Open visual explanation button", asyn
     delete (globalThis as any).window;
   }
 });
+
+// HIVE-407: the card shows what the risk check decided, one chip per item, so
+// the director reads "confirmed" or "refuted" instead of the raw caution blob.
+function verdictDetail(id: string, verdictHead: string): TaskDetail {
+  const base = passingDetail(id);
+  return {
+    ...base,
+    head_sha: "head-1",
+    events: [
+      ...base.events,
+      {
+        id: "rev-auto",
+        task_id: id,
+        ts: "2026-01-01T00:00:04.000Z",
+        source: "system",
+        type: "auto_review",
+        payload: { verdict: "caution", summary: "s", risks: ["drops the lock early"], questions: ["is the flag on?"], reviewed_head_sha: "head-1" },
+      } as any,
+      {
+        id: "rev-verdicts",
+        task_id: id,
+        ts: "2026-01-01T00:00:05.000Z",
+        source: "system",
+        type: "risk_verdicts",
+        payload: {
+          reviewed_head_sha: verdictHead,
+          verdicts: [{ risk: "drops the lock early", verdict: "confirmed", why: "line 12 releases it" }],
+          question_verdicts: [{ question: "is the flag on?", answerable: "human", answer: "check the console" }],
+        },
+      } as any,
+    ],
+  };
+}
+
+test("risk verdicts render as per-item chips on the review card", async () => {
+  const originalTask = api.task;
+  api.task = (async (id: string) => verdictDetail(id, "head-1")) as typeof api.task;
+  try {
+    const renderer = await renderReview({ ...task("verdicts"), head_sha: "head-1" });
+    const json = JSON.stringify(renderer.toJSON());
+    expect(json).toContain("drops the lock early");
+    expect(json).toContain("confirmed");
+    expect(json).toContain("you answer");
+    expect(json).toContain("rv-confirmed");
+    expect(json).toContain("rv-human");
+  } finally {
+    api.task = originalTask;
+  }
+});
+
+test("verdicts recorded for an older head are not shown against this one", async () => {
+  const originalTask = api.task;
+  api.task = (async (id: string) => verdictDetail(id, "older-head")) as typeof api.task;
+  try {
+    const renderer = await renderReview({ ...task("verdicts-stale"), head_sha: "head-1" });
+    expect(JSON.stringify(renderer.toJSON())).not.toContain("rv-confirmed");
+  } finally {
+    api.task = originalTask;
+  }
+});

@@ -86,10 +86,16 @@ export function eventText(e: EventLike): string {
       return `pre-review failed: ${s(p.error)}`;
     case "risk_verdicts": {
       const vs = Array.isArray(p.verdicts) ? (p.verdicts as any[]) : [];
-      if (!vs.length) return `risk check produced no verdicts`;
+      const qs = Array.isArray(p.question_verdicts) ? (p.question_verdicts as any[]) : [];
+      if (!vs.length && !qs.length) return `risk check produced no verdicts`;
       const confirmed = vs.filter((v) => v?.verdict === "confirmed");
-      const head = `risk check: ${confirmed.length} of ${vs.length} risks confirmed`;
-      return confirmed.length ? `${head} — ${confirmed.map((v) => s(v.risk)).join("; ")}` : head;
+      const forYou = qs.filter((q) => q?.answerable === "human");
+      const parts = [];
+      if (vs.length) parts.push(`${confirmed.length} of ${vs.length} risks confirmed`);
+      if (qs.length) parts.push(`${forYou.length} of ${qs.length} questions need you`);
+      const head = `risk check: ${parts.join(", ")}`;
+      const named = [...confirmed.map((v) => s(v.risk)), ...forYou.map((q) => s(q.question))];
+      return named.length ? `${head} — ${named.join("; ")}` : head;
     }
     case "scope_drift": {
       const beyond = Array.isArray(p.beyond) ? (p.beyond as string[]) : [];

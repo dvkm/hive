@@ -884,6 +884,70 @@ test("autoMergeReady merges opted-in, green, clean-review, uncontested tasks wit
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_deferred'").get(sensitive)).toBeTruthy();
 });
 
+// HIVE-407: risks and questions are suspicions until the per-risk check re-reads
+// the code. A set that refutes everything for THIS head clears the ambiguity veto.
+test("autoMergeReady merges a caution whose risks were all refuted, and parks one with a confirmed risk", async () => {
+  const { autoMergeReady } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
+  const mk = (head: string) => {
+    const id = makeTask(db, projectId, { kind: "chore" });
+    transition(db, id, "in_progress");
+    transition(db, id, "in_review");
+    db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x', head_sha = ? WHERE id = ?").run(head, id);
+    db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+      newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
+    );
+    writeEvent(db, { task_id: id, source: "agent", type: "review_summary", payload: { done: ["done"] } });
+    return id;
+  };
+  const review = (id: string, head: string, verdict: string) =>
+    writeEvent(db, {
+      task_id: id,
+      source: "system",
+      type: "auto_review",
+      payload: { verdict, summary: "s", risks: ["maybe a leak"], questions: ["is the flag on?"], reviewed_head_sha: head },
+    });
+  const verdicts = (id: string, head: string, riskVerdict: string, answerable = "machine") =>
+    writeEvent(db, {
+      task_id: id,
+      source: "system",
+      type: "risk_verdicts",
+      payload: {
+        reviewed_head_sha: head,
+        verdicts: [{ risk: "maybe a leak", verdict: riskVerdict, why: "w" }],
+        question_verdicts: [{ question: "is the flag on?", answerable, answer: "a" }],
+      },
+    });
+
+  const refuted = mk("head-1");
+  const confirmedRisk = mk("head-2");
+  const humanQuestion = mk("head-3");
+  const staleVerdicts = mk("head-4");
+  const cleanLooksGood = mk("head-5");
+  review(refuted, "head-1", "caution");
+  verdicts(refuted, "head-1", "refuted");
+  review(confirmedRisk, "head-2", "caution");
+  verdicts(confirmedRisk, "head-2", "confirmed");
+  review(humanQuestion, "head-3", "looks_good");
+  verdicts(humanQuestion, "head-3", "refuted", "human");
+  review(staleVerdicts, "head-4", "caution");
+  verdicts(staleVerdicts, "older-head", "refuted"); // verified before a force-push
+  review(cleanLooksGood, "head-5", "looks_good");
+  verdicts(cleanLooksGood, "head-5", "refuted");
+
+  const git: Exec = stub((argv) => {
+    if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
+    return argv.includes("symbolic-ref") ? OK("main\n") : OK();
+  });
+  await autoMergeReady(db, { exec: git });
+
+  expect(getTask(db, refuted).state).toBe("done"); // caution, everything refuted → lands like looks_good
+  expect(getTask(db, cleanLooksGood).state).toBe("done"); // looks_good with soft notes, all cleared
+  expect(getTask(db, confirmedRisk).state).toBe("in_review"); // one confirmed risk → the director decides
+  expect(getTask(db, humanQuestion).state).toBe("in_review"); // only a human can answer it
+  expect(getTask(db, staleVerdicts).state).toBe("in_review"); // verdicts belong to an older head
+});
+
 test("autoMergeReady leaves a quiz-passed task for an explicit ship or request-changes choice, whatever surface passed it (HIVE-421)", async () => {
   const { autoMergeReady } = await import("../src/reconciler.ts");
   const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
