@@ -12,6 +12,7 @@ import { startWatchers } from "./watch.ts";
 import { startAutoReviewer } from "./reviewer.ts";
 import { startDriftWatch } from "./drift.ts";
 import { startPromoter } from "./promoter.ts";
+import { followServingBranchOnBoot } from "./servingBranch.ts";
 import { setEventHook, setTerminalHook, expireOrphanedDecisions, repairRequeueProvenance } from "./state.ts";
 import { bootstrapAuthority } from "./authority.ts";
 import { cleanupTask } from "./cleanup.ts";
@@ -138,6 +139,11 @@ const { instance, displaced } = claimLease(db);
 // reaped in the first minutes after a restart/self-deploy, when herdr's agent
 // registry may still be cold and every live agent probes as gone.
 setSetting(db, "server_started_at", now());
+
+// Whatever landed while this server was down has not reached its checkout yet.
+// Bring the serving checkout up to the base branch before the loops start, so
+// boot runs the code that actually landed. (`bun --watch` reloads on the merge.)
+followServingBranchOnBoot(db).catch((e) => console.error("[hive] serving-branch follow on boot:", e));
 
 // Background supervision: coarse reconciler (herdr status + gh PR sync + stale
 // flagging) and per-project URL monitors. Both are failure-isolated internally.

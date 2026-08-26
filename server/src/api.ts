@@ -94,6 +94,7 @@ import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infr
 import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { landGraph, markLand, resolveLandPauseForDecision } from "./landQueue.ts";
+import { followServingBranch, resolveServingFollowForDecision } from "./servingBranch.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, isSafeRef, projectBaseBranch, projectComparisonBase, preferSafeRef } from "./exec.ts";
@@ -3167,6 +3168,14 @@ export async function mergeTask(
     });
   }
   writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url, actor } });
+  // The running server serves from its own checkout, which may sit on a branch
+  // that is not `base` — so a landed change does not run until that checkout
+  // follows. Done BEFORE the smoke run below, so smoke tests the code that just
+  // landed rather than the code it replaced. Never fails the merge: the work IS
+  // on base either way.
+  await followServingBranch(db, { exec, repoPath: project?.repo_path ?? null, projectId: task.project_id, base, taskId: id }).catch(
+    (e) => console.error("[hive] serving-branch follow failed:", e)
+  );
   // in_review → verifying (runs post-deploy smoke once).
   transition(db, id, "verifying", { source: "director", reason: `merged (${method})` });
   await smokeThenAdvance(db, id, { fetch: deps.fetch }).catch((e) => console.error("[hive] smoke run failed:", e));
@@ -6425,6 +6434,7 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     resolveRefCaptureForDecision(db, id, answerKey, answerNote),
     resolveDependentsWedgedForDecision(db, id, answerKey, successorId, answeredBy),
     resolveLandPauseForDecision(db, id, answerKey),
+    resolveServingFollowForDecision(db, id, answerKey),
   ].some(Boolean);
   if (!claimed) {
     const label = options.find((o) => o.key === answerKey)?.label ?? answerKey;
