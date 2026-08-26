@@ -6006,3 +6006,86 @@ a.chip-jira:hover { background: #2d5488; }
   padding: 0;
   margin: -16px 0 20px;
 }
+
+/* ---- Deployments (production releases + the deploy/rollback buttons) ---- */
+.deployments {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 22px 20px;
+}
+.dep-project + .dep-project {
+  margin-top: 18px;
+}
+.dep-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.dep-head h2 {
+  margin: 0;
+}
+/* Two cards side by side: what is live, and what is waiting on the branch. */
+.dep-now {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 14px 0;
+}
+@media (max-width: 640px) {
+  .dep-now {
+    grid-template-columns: 1fr;
+  }
+}
+.dep-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: var(--bg);
+}
+.dep-card-label {
+  color: var(--text-faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-bottom: 6px;
+}
+.dep-tag {
+  font-size: 14px;
+}
+.dep-subject {
+  margin: 2px 0 4px;
+}
+.dep-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.dep-flags,
+.dep-releases,
+.dep-runs {
+  margin-top: 18px;
+}
+.dep-flags h3,
+.dep-releases h3,
+.dep-runs h3 {
+  font-size: 12px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin: 0;
+}
+.dep-current td {
+  background: var(--panel);
+}
+.dep-current .chip {
+  margin-left: 8px;
+}
+.dep-run {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 13px;
+}
