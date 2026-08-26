@@ -337,6 +337,22 @@ export function paneRunsAgentCommand(stdout: string): boolean {
   }
 }
 
+// Stricter than paneRunsAgentCommand (which only asks "not a login shell"): a
+// zombie pane's process is gone ENTIRELY, not just idled at a shell prompt, so
+// an empty foreground_processes list is the signal. An unparseable/errored
+// result returns true (alive) — a herdr hiccup must never be read as proof of
+// death (same rule as Herdr.probe/confirmGone).
+export function paneHasLiveProcess(stdout: string): boolean {
+  try {
+    const info = (JSON.parse(stdout).result ?? {}).process_info;
+    if (!info) return true;
+    const procs: any[] = info.foreground_processes ?? [];
+    return procs.length > 0;
+  } catch {
+    return true;
+  }
+}
+
 // Close a whole herdr workspace (its tabs + panes + ptys) WITHOUT removing the
 // git worktree — verified live against 0.7.1: `workspace close` is a terminal-UI
 // op, the checkout on disk is untouched (`herdr worktree open` re-attaches on
@@ -1205,6 +1221,32 @@ export class Herdr {
       return parsePaneList(r.stdout);
     } catch {
       return [];
+    }
+  }
+
+  // Raw `pane process-info` output for one pane, for callers that judge
+  // liveness themselves (paneHasLiveProcess/paneRunsAgentCommand). Never
+  // throws: an empty result reads as "unknown" to those parsers, which treat
+  // unparseable input as alive.
+  async paneProcessInfo(paneId: string): Promise<string> {
+    try {
+      const r = await this.run(paneProcessInfoArgv(paneId));
+      return r.stdout;
+    } catch {
+      return "";
+    }
+  }
+
+  // Close one exact pane by id — used by the zombie-pane sweep, which already
+  // has the paneId from `pane list` and has verified zero processes at it
+  // (unlike closeSession, there is no tab/workspace/agentTarget to resolve).
+  async closePane(paneId: string, request: CloseRequest): Promise<{ closed: boolean }> {
+    try {
+      logClose(request, "pane", paneId);
+      const r = await this.run(paneCloseArgv(paneId));
+      return { closed: r.code === 0 };
+    } catch {
+      return { closed: false };
     }
   }
 
