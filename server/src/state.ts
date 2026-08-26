@@ -678,6 +678,8 @@ export function transition(
     const hint =
       to === "done" && (from === "in_progress" || from === "in_review")
         ? " — done is reached via review: emit `ready --pr-url <url>` (in_review), then the director merges (verifying -> done)"
+        : to === "queued" && ["in_progress", "in_review", "verifying"].includes(from)
+        ? `; to retry a live task, POST /api/tasks/${taskId}/requeue (fails and requeues atomically)`
         : "";
     throw new TransitionError(`invalid transition: '${from}' -> '${to}'${hint}`);
   }
