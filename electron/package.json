@@ -1,7 +1,7 @@
 {
   "name": "hive-app",
   "productName": "hive",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "main": "main.js",
   "scripts": {
@@ -21,7 +21,7 @@
     "directories": {
       "output": "dist"
     },
-    "files": ["main.js", "deeplink.js"],
+    "files": ["main.js", "deeplink.js", "preload.js", "versionCheck.js"],
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "build/icon.png",

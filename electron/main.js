@@ -3,12 +3,16 @@
 // notification stream and a dock badge counting open decisions + checkpoints.
 // The server itself stays the LaunchAgent (dev.hive.server); this app is a
 // client only and reconnects politely when the daemon is down.
-const { app, BrowserWindow, Notification, shell, screen } = require("electron");
+const { app, BrowserWindow, Notification, shell, screen, ipcMain } = require("electron");
 const http = require("node:http");
+const path = require("node:path");
+const { spawn } = require("node:child_process");
 const { routeFor } = require("./deeplink.js");
+const { shouldUpdate } = require("./versionCheck.js");
 
 const BASE = process.env.HIVE_URL || "http://127.0.0.1:4700";
 const SMOKE = !!process.env.HIVE_SMOKE; // load, print ok, quit — used by CI/verification
+const OWN_VERSION = require("./package.json").version;
 
 let win = null;
 let launchedByDeeplink = false;
@@ -31,7 +35,7 @@ function createWindow() {
     resizable: true,
     titleBarStyle: "hiddenInset",
     backgroundColor: "#1c1c1e",
-    webPreferences: { contextIsolation: true },
+    webPreferences: { contextIsolation: true, preload: path.join(__dirname, "preload.js") },
   });
   // External links (PRs, evidence raw files on other hosts) open in the browser.
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -42,6 +46,7 @@ function createWindow() {
     return { action: "allow" };
   });
   loadWithRetry();
+  win.on("focus", () => checkForShellUpdate());
   win.on("closed", () => (win = null));
 }
 
@@ -201,6 +206,75 @@ function refreshBadge() {
   }, 500); // debounce bursts
 }
 
+// ---- shell self-update (HIVE-420) ----
+// Only shell files (this file, deeplink.js, ...) need a reinstall; web/server
+// changes need none, since this window just loads BASE. Poll the server for
+// the shell version its own repo checkout expects and offer a one-click
+// reinstall when the running app is behind.
+let lastShellCheckAt = 0;
+const SHELL_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+let lastShellRepoPath = null;
+
+async function checkForShellUpdate() {
+  if (Date.now() - lastShellCheckAt < SHELL_CHECK_INTERVAL_MS) return;
+  lastShellCheckAt = Date.now();
+  try {
+    const res = await fetch(`${BASE}/api/shell-version`);
+    const data = await res.json();
+    lastShellRepoPath = data.repo_path || null;
+    if (shouldUpdate(OWN_VERSION, data.version)) showShellUpdateBanner();
+  } catch {
+    /* server unreachable or too old for this endpoint — try again next hour */
+  }
+}
+
+function showShellUpdateBanner() {
+  if (!win) return;
+  win.webContents
+    .executeJavaScript(
+      `(function(){
+        if (document.getElementById('hive-shell-update-banner')) return;
+        var b = document.createElement('div');
+        b.id = 'hive-shell-update-banner';
+        b.textContent = 'App shell update available: Restart to update';
+        b.style.cssText = 'position:fixed;bottom:12px;right:12px;z-index:2147483647;background:#2c2c2e;color:#fff;padding:8px 14px;border-radius:8px;font:13px -apple-system,system-ui;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.4)';
+        b.onclick = function () {
+          b.textContent = 'Updating…';
+          window.hiveShell.relaunchUpdate();
+        };
+        window.hiveShell.onRelaunchError(function (message) {
+          b.textContent = 'Update failed: ' + message;
+          b.onclick = null;
+        });
+        document.body.appendChild(b);
+      })();`
+    )
+    .catch(() => {});
+}
+
+// Runs electron/install-app.sh from the repo the server told us about, then
+// relaunches on success. Any failure is reported back to the banner, never
+// crashes the running app.
+ipcMain.on("shell-update-relaunch", (event) => {
+  if (!lastShellRepoPath) {
+    event.sender.send("shell-update-relaunch-error", "no repo path from the server");
+    return;
+  }
+  const scriptDir = path.join(lastShellRepoPath, "electron");
+  const child = spawn("./install-app.sh", { cwd: scriptDir, shell: true });
+  let stderr = "";
+  child.stderr.on("data", (d) => (stderr += d));
+  child.on("error", (e) => event.sender.send("shell-update-relaunch-error", String(e.message || e)));
+  child.on("exit", (code) => {
+    if (code === 0) {
+      app.relaunch();
+      app.exit();
+    } else {
+      event.sender.send("shell-update-relaunch-error", stderr.trim() || `install script exited ${code}`);
+    }
+  });
+});
+
 app.whenReady().then(() => {
   // Dev runs (`electron .`) are not launched from the bundle, so claim the
   // scheme explicitly; from the built app this is already true.
@@ -209,6 +283,7 @@ app.whenReady().then(() => {
   pendingUrls.splice(0).forEach(handleUrl);
   subscribe();
   refreshBadge();
+  checkForShellUpdate();
   if (SMOKE) {
     win.webContents.once("did-finish-load", () => {
       console.log("SMOKE_OK " + win.webContents.getURL());
