@@ -14,6 +14,7 @@ import {
   faFolder,
   faScaleBalanced,
   faHeart,
+  faRocket,
 } from "@fortawesome/free-solid-svg-icons";
 import { useStore } from "./lib/store";
 import { itemProject } from "./lib/needsYou";
@@ -38,6 +39,7 @@ import Projects from "./views/Projects";
 import Palette from "./views/Palette";
 import Chat from "./views/Chat";
 import Supervisors from "./views/Supervisors";
+import Deployments from "./views/Deployments";
 
 // Enable web-push on this device (phone PWA). Hidden once granted or where
 // unsupported (desktop keeps the osascript notifier). iOS only offers this on
@@ -76,6 +78,7 @@ const SECONDARY_NAV: { label: string; items: [string, string, IconDefinition][] 
       ["/learnings", "Learnings", faBookOpen],
       ["/analytics", "Analytics", faChartColumn],
       ["/monitors", "Monitors", faHeart],
+      ["/deployments", "Deployments", faRocket],
     ],
   },
   {
@@ -341,6 +344,7 @@ export default function App() {
           <Route path="/projects" element={<Projects />} />
           <Route path="/policies" element={<Policies />} />
           <Route path="/monitors" element={<Monitors />} />
+          <Route path="/deployments" element={<Deployments />} />
         </Routes>
       </main>
       {background && (

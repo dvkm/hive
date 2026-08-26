@@ -49,6 +49,12 @@ import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, stee
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
+import {
+  deploymentsStatus,
+  startDeploy,
+  startRollback,
+  type DeploymentsConfig,
+} from "./deployments.ts";
 import { enqueue, ackNotifications, markShown, recordDeliveryError, lastDeliveryError } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, resolveDenyGuardrailForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
@@ -204,6 +210,23 @@ function authzBlock(db: DB, input: AuthzInput): Response | null {
   );
 }
 
+// Resolve a project for the deployments routes. The tab is opt-in: a project
+// without a config.deployments block has no production release model, so it 404s
+// rather than guessing one.
+type DeploymentsProject =
+  | { ok: true; repoPath: string; branch: string; config: DeploymentsConfig }
+  | { ok: false; res: Response };
+
+function deploymentsProject(db: DB, id: string): DeploymentsProject {
+  const row = db.query("SELECT * FROM projects WHERE id = ?").get(id);
+  if (!row) return { ok: false, res: err("project not found", 404) };
+  const project = parseProject(row);
+  const config = (project.config as any)?.deployments as DeploymentsConfig | undefined;
+  if (!config) return { ok: false, res: err("deployments are not configured for this project", 404) };
+  if (!project.repo_path) return { ok: false, res: err("project has no repo_path", 400) };
+  return { ok: true, repoPath: project.repo_path, branch: projectBaseBranch(project.config), config };
+}
+
 const WEB_DIST = join(import.meta.dir, "..", "..", "web", "dist");
 const HOOKS_DIR = join(import.meta.dir, "..", "..", "hooks");
 
@@ -245,6 +268,11 @@ const WRITE_AUTH_ROUTES: { method: string; path: RegExp }[] = [
   { method: "DELETE", path: /^\/api\/projects\/[^/]+\/secrets\/[^/]+$/ },
   { method: "POST", path: /^\/api\/projects\/[^/]+\/pr-gardener\/\d+$/ },
   { method: "POST", path: /^\/api\/push\/subscribe$/ },
+  // Deploying and rolling back production. Hive has no user accounts, so the
+  // API token IS the super-admin check: holding it means filesystem access to
+  // hive's own DB, which an agent's HTTP socket or a stray browser tab does not
+  // have. Reading the release list stays open; only pressing the button is gated.
+  { method: "POST", path: /^\/api\/projects\/[^/]+\/deployments\/(deploy|rollback)$/ },
 ];
 
 // True when the request may proceed: either it is not a gated write, or it
@@ -325,6 +353,34 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
             return err("override must be force_land, force_close, hold, or null", 400);
           }
           return json(gardenerQueue(db, match[1]).find((row) => row.pr_number === prNumber));
+        }
+      }
+      // ---- deployments (production releases: what is live + the two buttons) ----
+      {
+        const match = pathname.match(/^\/api\/projects\/([^/]+)\/deployments(\/deploy|\/rollback)?$/);
+        if (match) {
+          const project = deploymentsProject(db, match[1]);
+          if (!project.ok) return project.res;
+          const { repoPath, branch, config } = project;
+          const exec = deps.exec ?? defaultExec;
+          if (!match[2] && method === "GET") {
+            // The PostHog key is only resolved when the project actually asked
+            // for flag states, so the keychain is left alone otherwise.
+            const posthogKey = config.flags?.length
+              ? (await resolveProjectSecrets(db, match[1], exec)).POSTHOG_API_KEY
+              : undefined;
+            return json(
+              await deploymentsStatus(repoPath, branch, config, { exec, fetcher: deps.fetch, posthogKey })
+            );
+          }
+          if (match[2] && method === "POST") {
+            const body = (await safeJson(req)) as any;
+            const r =
+              match[2] === "/deploy"
+                ? await startDeploy(exec, repoPath, branch, config, body?.commit)
+                : await startRollback(exec, repoPath, branch, config, body?.tag);
+            return r.ok ? json(r) : err(r.error, r.status);
+          }
         }
       }
       let m = pathname.match(/^\/api\/projects\/([^/]+)$/);
