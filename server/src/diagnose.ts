@@ -86,6 +86,14 @@ export function diagnosePane(tail: string): PaneDiagnosis {
   const trust = find(/Quick safety check:|Yes, I trust this folder/i);
   if (trust !== -1 && /Quick safety check:/i.test(tail) && /Yes, I trust this folder/i.test(tail))
     return { kind: "trust_dialog", excerpt: excerptAround(lines, trust, 12, 6) };
+  // Checked before the dialog scan below: the CLI's own park message contains
+  // "esc to cancel" ("Continuing automatically at 8:30pm - esc to cancel"),
+  // which would otherwise match the blocked-dialog regex and send a parked,
+  // limit-waiting agent through the interactive-dialog recovery path instead
+  // (task HIVE-451, 2026-08-26 stale wave).
+  const limit = find(/hit your (?:session|usage|weekly) limit|usage limit reached/i);
+  if (limit !== -1) return { kind: "usage_limit", excerpt: excerptAround(lines, limit) };
+
   const dialog = find(/Do you want to proceed\?|Esc to cancel|requested permissions to/i);
   if (dialog !== -1) return { kind: "blocked_dialog", excerpt: excerptAround(lines, dialog, 12, 6) };
 
@@ -94,9 +102,6 @@ export function diagnosePane(tail: string): PaneDiagnosis {
 
   const ctx = find(/\/clear to save [\d.]+k tokens|[Cc]ontext (window is )?(low|full)|approaching.*context limit|Conversation compacted/);
   if (ctx !== -1) return { kind: "context_full", excerpt: excerptAround(lines, ctx) };
-
-  const limit = find(/hit your (session|usage|weekly) limit/i);
-  if (limit !== -1) return { kind: "usage_limit", excerpt: excerptAround(lines, limit) };
 
   const api = find(/rate.?limit|overloaded_error|529|API Error|ETIMEDOUT|ENOTFOUND|ECONNRESET|fetch failed|network error|Unable to connect/i);
   if (api !== -1) return { kind: "api_error", excerpt: excerptAround(lines, api) };
