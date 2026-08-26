@@ -1454,7 +1454,21 @@ When herdr reports an agent `blocked`, the reconciler reads the pane immediately
 (`get_*`/`list_*`/`search_*`/`read_*`/`whoami`) are auto-approved with
 "don't ask again" and logged as a `dialog_auto_approved` event; projects extend
 the allowlist with `config.dialog_auto_approve` (array of regex strings matched
-against the dialog text). Anything else opens an URGENT decision card whose
+against the dialog text).
+
+Projects that set `config.auto_answer_dialogs: true` also let the server answer
+codex file-write confirmations ("Would you like to make the following edits?")
+by itself. It sends `1` (yes, proceed — this edit only, never "don't ask again")
+and logs a `dialog_auto_answered` event with the files touched, source
+`supervisor`. Every file must be the task's own: inside its `worktree_path`, or a
+`/tmp`, `/private/tmp` or `/var/folders` path whose name carries the task id or
+`-<number>-`. A `..` escape, a relative path, a file outside those, or any other
+dialog shape (a shell-command approval such as `rm -rf` is a different prompt and
+never matches) parks for the director as before. `GET /api/brief` returns
+`auto_answered_dialogs`, the count over the `since` window (default 24h), so the
+director sees one number instead of a card per write.
+
+Anything else opens an URGENT decision card whose
 Approve/Deny answer sends the keystroke to the pane remotely
 (`blocked_card`/`dialog_answered` events); the task parks in `needs_decision`.
 Silent-path diagnosis (auth lost, context exhausted, transient API errors) is

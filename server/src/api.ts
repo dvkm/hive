@@ -2248,8 +2248,17 @@ function brief(db: DB, url: URL): Response {
     )
     .all(...(since ? [since] : []));
 
+  // ⑩ dialogs the server answered for the agent — a count, not a card each
+  // (task #1562). Windowed like the other "what happened" sections; a day is
+  // the default because that is how often the director reads this.
+  const dialogsSince = since ?? new Date(Date.now() - 24 * 3600_000).toISOString();
+  const auto_answered_dialogs = (db
+    .query("SELECT COUNT(*) AS n FROM events WHERE type = 'dialog_auto_answered' AND ts >= ?")
+    .get(dialogsSince) as { n: number }).n;
+
   return json({
     since: since ?? null,
+    auto_answered_dialogs,
     done,
     director_required_task_ids: [...directorRequiredTaskIds],
     failed_or_attention,
