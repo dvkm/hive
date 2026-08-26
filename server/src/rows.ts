@@ -5,8 +5,13 @@ export function parseProject(r: any) {
 }
 
 export function parseTask(r: any) {
-  // depends_on is the one JSON column: a (possibly null) array of task ids.
-  return { ...r, depends_on: r.depends_on ? JSON.parse(r.depends_on) : [] };
+  // depends_on and verification_cmds are the JSON columns: a (possibly null)
+  // array of task ids, and a (possibly null) array of {name, cmd}.
+  return {
+    ...r,
+    depends_on: r.depends_on ? JSON.parse(r.depends_on) : [],
+    verification_cmds: r.verification_cmds ? JSON.parse(r.verification_cmds) : null,
+  };
 }
 
 export function parseEvent(r: any) {

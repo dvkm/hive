@@ -208,6 +208,28 @@ flip, destructive op), call the guarded-action gate and act ONLY on its answer:
     once approved it passes (a single-use grant is spent).`;
 }
 
+// The task's verification contract, when the director set one. Named commands
+// the agent runs before handing off, each with its real output attached back
+// under the same name. Nothing is gated on this yet (see HIVE-401 A2) — the
+// brief just states the contract.
+function verificationContract(taskId: string, cmds: { name: string; cmd: string }[] | null): string | null {
+  if (!cmds?.length) return null;
+  const lines = cmds.map((c) => `- \`${c.name}\`\n\n      ${c.cmd}`).join("\n\n");
+  return `## Verification contract (run every one before \`ready\`)
+This task has ${cmds.length} named verification command${cmds.length === 1 ? "" : "s"}. Run each one
+exactly as written, from your worktree, before you emit \`ready\`:
+
+${lines}
+
+Attach the REAL output of each run as evidence, tagged with its name:
+
+  hive emit ${taskId} evidence --verify-name <name> --file ./out.txt --note "<name> output"
+
+Use the exact name from the list. Do not paraphrase, summarize, or invent
+output — attach what the command actually printed. If a command fails, fix the
+cause and run it again, or emit \`blocked\` explaining why it cannot pass.`;
+}
+
 function definitionOfDone(kind: string): string {
   if (kind === "scout") {
     return "## Definition of done\nA written report captured as evidence (kind=report) that answers the question. No code changes required.";
@@ -232,6 +254,8 @@ export function composeBrief(db: DB, taskId: string): string {
   parts.push(`Task identifier: ${displayId}\nLegacy task number: ${task.number}\nTask id: ${task.id}\nKind: ${task.kind}`);
   parts.push(`## Brief\n${task.brief?.trim() || "(no description provided)"}`);
   parts.push(definitionOfDone(task.kind));
+  const contract = verificationContract(task.id, task.verification_cmds);
+  if (contract) parts.push(contract);
   parts.push(EMIT_PROTOCOL);
   parts.push(PLAIN_ENGLISH);
   parts.push(CHECKPOINTS);

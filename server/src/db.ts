@@ -605,6 +605,14 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       `CREATE INDEX idx_pr_gardener_action_task ON pr_gardener_items(action_task_id)`,
     ],
   },
+  // Per-task verification contract: a JSON array of {name, cmd} the agent must
+  // run before handing off, each piece of evidence tagged with the name it
+  // came from (`hive emit ... --verify-name <name>`). Data only for now —
+  // nothing is gated on it yet.
+  {
+    name: "v34-task-verification-cmds",
+    statements: [`ALTER TABLE tasks ADD COLUMN verification_cmds TEXT`],
+  },
 ];
 
 // -------------------------------------------------------------- settings
