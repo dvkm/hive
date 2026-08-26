@@ -103,3 +103,57 @@ export function diagnosePane(tail: string): PaneDiagnosis {
 
   return null;
 }
+
+// ---- codex edit confirmations --------------------------------------------
+// Codex asks before writing files: "Would you like to make the following
+// edits?" with its 1/2/3 choices. That is a WRITE, not a command — an `rm -rf`
+// or any other shell approval is a different prompt and never matches here.
+// Returns the files the pending edit touches, or null when the tail is not a
+// codex edit confirmation (or names no file we can read). The caller decides
+// whether those paths are the agent's to write (reconciler.autoAnswerDialog).
+const EDIT_PROMPT = /Would you like to make the following edits\?/;
+const EDIT_CHOICES = /don't ask again for these files/i;
+
+// The pane hard-wraps: a long path continues on the next line, so a bullet is
+// complete only once its "(+N -M)" tail shows up. Join until it does.
+function unwrapBullet(lines: string[], i: number): string {
+  let s = lines[i].trim();
+  for (let j = i + 1; j < lines.length && !/\(\+\d+\s+-\d+\)/.test(s); j++) {
+    const next = lines[j].trim();
+    if (!next) break;
+    s += next;
+  }
+  return s;
+}
+
+export function editDialogPaths(tail: string): string[] | null {
+  const lines = (tail ?? "").split("\n");
+  const prompt = lines.findLastIndex((l) => EDIT_PROMPT.test(l));
+  if (prompt === -1 || !EDIT_CHOICES.test(tail)) return null;
+
+  const paths: string[] = [];
+  // "Destination:" names the file outright; its path may wrap over several
+  // lines and ends at the blank line before the choices.
+  const dest = lines.findLastIndex((l, i) => i > prompt && /^\s*Destination:\s*$/.test(l));
+  if (dest !== -1) {
+    let p = "";
+    for (let i = dest + 1; i < lines.length && lines[i].trim(); i++) p += lines[i].trim();
+    if (p) paths.push(p);
+  }
+  // Otherwise the diff above the prompt is headed by codex's own file bullet.
+  // Only THIS dialog's diff counts: the pane still holds bullets from edits
+  // approved minutes ago, and approving a dialog whose real files were never
+  // checked is the one failure this feature cannot have. So take the single
+  // contiguous block directly above the prompt (blank lines bound it) and
+  // never widen — no bullet in that block means we do not know what the edit
+  // touches, and the caller parks it for the director.
+  let end = prompt;
+  while (end > 0 && !lines[end - 1].trim()) end--; // blank separator above the prompt
+  let start = end;
+  while (start > 0 && lines[start - 1].trim()) start--;
+  for (let i = start; i < end; i++) {
+    const m = /^[•*]\s+(?:Added|Edited|Updated|Created|Deleted)\s+(\S.*)$/.exec(lines[i].trim());
+    if (m) paths.push(unwrapBullet(lines, i).replace(/^[•*]\s+\w+\s+/, "").replace(/\s*\(\+\d+\s+-\d+\).*$/, ""));
+  }
+  return paths.length ? paths : null;
+}

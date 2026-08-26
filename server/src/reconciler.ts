@@ -23,7 +23,7 @@ import { broadcastTask } from "./health.ts";
 import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { notTestProjectSql } from "./testProjects.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
-import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
+import { diagnosePane, dialogAutoApprovable, editDialogPaths, parseResetClock } from "./diagnose.ts";
 import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount } from "./api.ts";
 import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
@@ -1936,12 +1936,15 @@ export async function handleBlockedAgent(db: DB, h: Herdr, taskId: string, targe
   if (diag?.kind !== "blocked_dialog") return false; // blocked but no visible dialog: leave to the silent path
 
   const project = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id) as { config: string } | undefined;
-  let extra: string[] = [];
+  let config: any = {};
   try {
-    extra = JSON.parse(project?.config ?? "{}").dialog_auto_approve ?? [];
+    config = JSON.parse(project?.config ?? "{}");
   } catch {
     /* bad config never breaks recovery */
   }
+  const extra: string[] = config.dialog_auto_approve ?? [];
+
+  if (config.auto_answer_dialogs === true && (await autoAnswerBenignWrite(db, h, task, target, tail))) return true;
 
   if (dialogAutoApprovable(diag.excerpt, extra)) {
     const r = await h.answerDialog(target, "2");
@@ -2027,6 +2030,41 @@ async function recoverQueuedInput(db: DB, h: Herdr, task: any, target: string, e
 }
 
 // ---- graceful failure-class handlers (pane-diagnosed) ----
+
+// The dialog is a codex file-write confirmation and every file it touches is
+// the agent's own: answer it here instead of waking the director. Three of
+// these were hand-approved on 2026-08-25, all of them review.json writes the
+// agent had just been told to make. Opt-in per project (config.auto_answer_dialogs).
+//
+// "The agent's own" means its worktree, or a temp file named for this task —
+// the two places a worker is told to write. Anything else (a path outside
+// both, a `..` escape, a relative path we cannot resolve, a command approval
+// rather than an edit) fails the check and still parks for the director.
+const TEMP_ROOTS = ["/tmp/", "/private/tmp/", "/var/folders/"];
+
+function ownedByTask(path: string, task: { id: string; number?: number | null; worktree_path?: string | null }): boolean {
+  if (!path.startsWith("/") || path.includes("..")) return false;
+  const wt = task.worktree_path;
+  if (wt && path.startsWith(wt.replace(/\/$/, "") + "/")) return true;
+  if (!TEMP_ROOTS.some((r) => path.startsWith(r))) return false;
+  // A shared temp root is only "its own" when the name carries this task.
+  return path.includes(task.id) || (task.number != null && path.includes(`-${task.number}-`));
+}
+
+async function autoAnswerBenignWrite(db: DB, h: Herdr, task: any, target: string, tail: string): Promise<boolean> {
+  const paths = editDialogPaths(tail);
+  if (!paths || !paths.every((p) => ownedByTask(p, task))) return false;
+  // "1" = yes, proceed for THIS edit only. Never "2" (don't ask again for
+  // these files): each write should re-clear the same bar.
+  const r = await h.answerDialog(target, "1");
+  writeEvent(db, {
+    task_id: task.id,
+    source: "supervisor",
+    type: "dialog_auto_answered",
+    payload: { delivered: r.code === 0, key: "1", paths, reason: "codex write inside the task's own worktree or scratchpad" },
+  });
+  return true;
+}
 
 // A dialog froze the agent: open ONE answerable card (approve/deny resolve by
 // sending the keystroke to the pane — resolveBlockedForDecision in api.ts).

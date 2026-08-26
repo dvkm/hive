@@ -155,6 +155,8 @@ export function eventText(e: EventLike): string {
       return s(p.kind) === "workspace_trust" ? "accepted the workspace trust prompt" : "approved a safe agent dialog";
     case "dialog_auto_declined":
       return "dismissed an optional agent dialog";
+    case "dialog_auto_answered":
+      return `approved a file write in the task's own files${Array.isArray(p.paths) && p.paths.length ? ` (${p.paths.join(", ")})` : ""}`;
     case "ci_status":
       return `CI ${s(p.ci_status)}`;
     case "pr_merged":
@@ -340,7 +342,7 @@ export function isFailureEvent(e: EventLike): boolean {
   if (e.type === "state_change") return p.to === "failed";
   if (e.type === "auto_merged" || e.type === "stack_setup" || e.type === "stack_teardown") return p.ok === false;
   if (e.type === "steer") return p.delivery === "failed";
-  if (e.type === "recovery_nudge" || e.type === "dialog_answered" || e.type === "dialog_auto_approved" || e.type === "dialog_auto_declined")
+  if (e.type === "recovery_nudge" || e.type === "dialog_answered" || e.type === "dialog_auto_approved" || e.type === "dialog_auto_declined" || e.type === "dialog_auto_answered")
     return p.delivered === false;
   // "Jira may have accepted it but we never saw the response" is a real, durable unknown:
   // it must not read the same as a clean success in the failure history.

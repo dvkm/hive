@@ -143,7 +143,7 @@ export interface Event {
   id: string;
   task_id: string;
   ts: string;
-  source: "agent" | "hook" | "herdr" | "reconciler" | "monitor" | "director" | "system" | "chat_supervisor" | "jira" | "jira-sync" | "unknown";
+  source: "agent" | "hook" | "herdr" | "reconciler" | "monitor" | "director" | "system" | "supervisor" | "chat_supervisor" | "jira" | "jira-sync" | "unknown";
   type: string;
   payload: Record<string, unknown>;
 }
@@ -552,6 +552,7 @@ export interface BriefLearning extends Learning {
 // windowed by `since`.
 export interface Brief {
   since: string | null;
+  auto_answered_dialogs: number; // benign agent dialogs the server answered itself
   done: BriefDone[];
   director_required_task_ids: string[];
   failed_or_attention: Task[];

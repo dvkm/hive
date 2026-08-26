@@ -226,6 +226,7 @@ const CHECKS: Record<string, Check> = {
   playbook: str,
   command_approval: oneOf("escalate", "allow", "prompt"),
   dialog_auto_approve: strArray,
+  auto_answer_dialogs: bool,
   // git / merge
   default_branch: str,
   merge_method: str,

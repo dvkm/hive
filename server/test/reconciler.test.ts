@@ -1564,3 +1564,146 @@ test("reAdoptAgentsOnBoot re-adopts a live-but-unregistered agent and skips term
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'readopted'").get(live)).toBeTruthy();
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'readopted'").get(done)).toBeFalsy();
 });
+
+// ---- benign codex write dialogs (task #1562) --------------------------------
+// The real pane text, wrapping and all, from the cards the director hand-approved
+// on 2026-08-25 (evidence ev_2b8c2dd07d74).
+const CODEX_EDIT_TAIL = (path: string) =>
+  [
+    "• Added " + path.slice(0, 20),
+    path.slice(20) + " (+44 -0)",
+    "     1 +{",
+    "     2 +}",
+    "",
+    "  Would you like to make the following edits?",
+    "",
+    "› 1. Yes, proceed (y)",
+    "  2. Yes, and don't ask again for these files",
+    "     (a)",
+    "  3. No, and tell Codex what to do differently",
+    "     (esc)",
+    "",
+    "  Press enter to confirm or esc to cancel",
+  ].join("\n");
+
+function blockedAgentHerdr(tail: string, keys: string[]): Herdr {
+  return new Herdr(stub((argv) => {
+    if (argv.includes("read")) return OK(JSON.stringify({ result: { read: { text: tail } } }));
+    if (argv.includes("send-keys")) {
+      keys.push(argv.at(-1)!);
+      return OK();
+    }
+    return OK('{"result":{"agent":{"agent_status":"blocked","pane_id":"w1:p1"}}}');
+  }), "herdr");
+}
+
+const noGh = () => stub(() => ({ code: 1, stdout: "", stderr: "no gh" }));
+
+test("a codex write inside the task's own worktree is auto-answered and logged", async () => {
+  const { db, projectId } = freshDb({ auto_answer_dialogs: true });
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  db.query("UPDATE tasks SET worktree_path = ? WHERE id = ?").run("/wt/mine", id);
+  const keys: string[] = [];
+
+  await reconcileOnce(db, { herdr: blockedAgentHerdr(CODEX_EDIT_TAIL("/wt/mine/review.json"), keys), exec: noGh() });
+
+  expect(keys).toEqual(["1", "Enter"]);
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'dialog_auto_answered'").get(id) as any;
+  expect(JSON.parse(ev.payload).paths).toEqual(["/wt/mine/review.json"]);
+  expect(db.query("SELECT 1 FROM decisions WHERE task_id = ?").get(id)).toBeFalsy();
+  expect(getTask(db, id)!.state).toBe("in_progress");
+});
+
+test("a codex write to a temp file named for the task is auto-answered", async () => {
+  const { db, projectId } = freshDb({ auto_answer_dialogs: true });
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  const keys: string[] = [];
+
+  await reconcileOnce(db, { herdr: blockedAgentHerdr(CODEX_EDIT_TAIL(`/private/tmp/hive-${id}-review.json`), keys), exec: noGh() });
+
+  expect(keys).toEqual(["1", "Enter"]);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dialog_auto_answered'").get(id)).toBeTruthy();
+});
+
+test("a write outside the task's own worktree still parks for the director", async () => {
+  const { db, projectId } = freshDb({ auto_answer_dialogs: true });
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  db.query("UPDATE tasks SET worktree_path = ? WHERE id = ?").run("/wt/mine", id);
+  const keys: string[] = [];
+
+  await reconcileOnce(db, { herdr: blockedAgentHerdr(CODEX_EDIT_TAIL("/wt/someone-else/secrets.env"), keys), exec: noGh() });
+
+  expect(keys).toEqual([]);
+  expect(db.query("SELECT 1 FROM decisions WHERE task_id = ? AND status = 'open'").get(id)).toBeTruthy();
+});
+
+// The pane keeps scrollback: bullets from an edit approved minutes ago sit
+// above the current dialog. Only the current dialog's files may be evaluated.
+test("stale bullets above the dialog are not mistaken for the pending edit", async () => {
+  const { db, projectId } = freshDb({ auto_answer_dialogs: true });
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  db.query("UPDATE tasks SET worktree_path = ? WHERE id = ?").run("/wt/mine", id);
+  const keys: string[] = [];
+  const tail = [
+    "• Edited /wt/mine/review.json (+2 -0)", // approved earlier, already written
+    "     1 +{}",
+    "",
+    CODEX_EDIT_TAIL("/wt/someone-else/secrets.env"),
+  ].join("\n");
+
+  await reconcileOnce(db, { herdr: blockedAgentHerdr(tail, keys), exec: noGh() });
+
+  expect(keys).toEqual([]); // the old in-worktree file must not vouch for the new one
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dialog_auto_answered'").get(id)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM decisions WHERE task_id = ? AND status = 'open'").get(id)).toBeTruthy();
+});
+
+test("only the current dialog's file is logged when older bullets sit above it", async () => {
+  const { db, projectId } = freshDb({ auto_answer_dialogs: true });
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  db.query("UPDATE tasks SET worktree_path = ? WHERE id = ?").run("/wt/mine", id);
+  const keys: string[] = [];
+  const tail = ["• Edited /wt/mine/notes.md (+9 -1)", "", CODEX_EDIT_TAIL("/wt/mine/review.json")].join("\n");
+
+  await reconcileOnce(db, { herdr: blockedAgentHerdr(tail, keys), exec: noGh() });
+
+  expect(keys).toEqual(["1", "Enter"]);
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'dialog_auto_answered'").get(id) as any;
+  expect(JSON.parse(ev.payload).paths).toEqual(["/wt/mine/review.json"]);
+});
+
+test("an rm -rf command approval is never auto-answered, opt-in or not", async () => {
+  const { db, projectId } = freshDb({ auto_answer_dialogs: true });
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  db.query("UPDATE tasks SET worktree_path = ? WHERE id = ?").run("/wt/mine", id);
+  const keys: string[] = [];
+  const tail = [
+    "  Codex wants to run a command",
+    "",
+    "  $ rm -rf /wt/mine",
+    "",
+    "› 1. Yes, proceed (y)",
+    "  3. No, and tell Codex what to do differently",
+    "",
+    "  Press enter to confirm or esc to cancel",
+  ].join("\n");
+
+  await reconcileOnce(db, { herdr: blockedAgentHerdr(tail, keys), exec: noGh() });
+
+  expect(keys).toEqual([]);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dialog_auto_answered'").get(id)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM decisions WHERE task_id = ? AND status = 'open'").get(id)).toBeTruthy();
+});
+
+test("a project that did not opt in keeps getting a card per dialog", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  db.query("UPDATE tasks SET worktree_path = ? WHERE id = ?").run("/wt/mine", id);
+  const keys: string[] = [];
+
+  await reconcileOnce(db, { herdr: blockedAgentHerdr(CODEX_EDIT_TAIL("/wt/mine/review.json"), keys), exec: noGh() });
+
+  expect(keys).toEqual([]);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dialog_auto_answered'").get(id)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM decisions WHERE task_id = ? AND status = 'open'").get(id)).toBeTruthy();
+});

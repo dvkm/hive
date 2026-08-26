@@ -126,6 +126,9 @@ export default function Brief() {
   const incidents = scope(data?.incidents ?? []);
   const intake = scope(data?.intake ?? []);
   const learnings = scope(data?.learnings_new ?? []);
+  // Fleet-wide on purpose: the count is a reassurance line, not a work item,
+  // and events carry no project column to filter on here.
+  const autoAnsweredDialogs = data?.auto_answered_dialogs ?? 0;
   const spend = data?.spend;
   const spendCount = spend ? spend.totals.calls : 0;
 
@@ -346,6 +349,16 @@ export default function Brief() {
                 ))}
               </ul>
             </Section>
+
+            {autoAnsweredDialogs > 0 && (
+              <section className="brief-section">
+                <h2 className="brief-h">Dialogs</h2>
+                <div className="muted">
+                  Hive answered {autoAnsweredDialogs} agent {autoAnsweredDialogs === 1 ? "dialog" : "dialogs"} for you. Each one was a
+                  file write inside the agent's own worktree or scratchpad.
+                </div>
+              </section>
+            )}
 
             <Section title="Fleet now" count={fleet.length}>
               <ul className="brief-list">
