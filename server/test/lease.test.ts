@@ -115,7 +115,9 @@ test("a server on a non-fleet port refuses the live fleet database", () => {
 test("a throwaway server that forgets HIVE_DB exits instead of attaching to the fleet db", async () => {
   const home = mkdtempSync(join(tmpdir(), "hive-fakehome-"));
   const proc = Bun.spawn([process.execPath, "run", join(import.meta.dir, "..", "src", "index.ts")], {
-    env: { ...process.env, HOME: home, USERPROFILE: home, HIVE_DB: "", HIVE_PORT: "4791", HIVE_HOME: home },
+    // NODE_ENV: "" — this spawns a real server process, not a test; it must hit
+    // index.ts's own interloperReason refusal below, not openDb's test-only guard.
+    env: { ...process.env, HOME: home, USERPROFILE: home, HIVE_DB: "", HIVE_PORT: "4791", HIVE_HOME: home, NODE_ENV: "" },
     stdout: "pipe",
     stderr: "pipe",
   });
