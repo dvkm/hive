@@ -124,6 +124,39 @@ const gchatSpaces: Check = (v) => {
   return null;
 };
 
+// Production releases (server/src/deployments.ts). Presence of this key is what
+// opts a project into the Deployments tab, so every field is optional. The two
+// name-shaped fields become git/gh arguments and posthog_host becomes a fetch
+// destination, so those are pinned here; deployments.ts still falls back to a
+// default rather than trusting a name that reaches it another way.
+const deployments: Check = (v) => {
+  const bad = obj(v);
+  if (bad) return bad;
+  const d = v as Record<string, unknown>;
+  for (const key of ["deploy_workflow", "rollback_workflow", "tag_prefix"])
+    // Leading character pinned to alphanumeric: "--version" is otherwise a
+    // valid "name" that `gh workflow run` would read as a flag.
+    if (d[key] !== undefined && !(typeof d[key] === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(d[key] as string)))
+      return `.${key} must be a plain name starting with a letter or digit`;
+  if (d.workflow_ref !== undefined && !isSafeRef(d.workflow_ref)) return ".workflow_ref must be a git branch name";
+  for (const key of ["health_url", "posthog_host"]) {
+    if (d[key] === undefined) continue;
+    const invalid = httpUrl(d[key]);
+    if (invalid) return `.${key} ${invalid}`;
+  }
+  for (const key of ["health_substring", "posthog_project"])
+    if (d[key] !== undefined && typeof d[key] !== "string") return `.${key} must be a string`;
+  if (d.flags !== undefined) {
+    const invalid = strArray(d.flags);
+    if (invalid) return `.flags ${invalid}`;
+  }
+  if (d.history !== undefined) {
+    const invalid = positiveInt(d.history);
+    if (invalid) return `.history ${invalid}`;
+  }
+  return null;
+};
+
 const promote: Check = (v) => {
   const bad = obj(v);
   if (bad) return bad;
@@ -245,6 +278,7 @@ const CHECKS: Record<string, Check> = {
   monitors: urlList,
   monitors_auto_task: bool,
   smoke: urlList,
+  deployments,
   jira,
   gchat_spaces: gchatSpaces,
   // budgets / bookkeeping

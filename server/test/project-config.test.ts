@@ -233,3 +233,38 @@ test("the token gate answers before the schema does", async () => {
   expect(res.status).toBe(401);
   expect((await get(`/api/projects/${projectId}`)).json.config).toEqual(before);
 });
+
+// The Deployments tab is opt-in through this key, and three of its fields become
+// git/gh arguments or a fetch destination — so the schema is the first gate.
+test("deployments config accepts a real block and rejects argument-shaped values", async () => {
+  const ok = await put(`/api/projects/${projectId}`, {
+    config: {
+      deployments: {
+        health_url: "https://acme.co.kr/",
+        tag_prefix: "prod-",
+        workflow_ref: "main",
+        flags: ["insights-page-redesign"],
+        history: 15,
+      },
+    },
+  });
+  expect(ok.status).toBe(200);
+  expect(ok.json.config.deployments.tag_prefix).toBe("prod-");
+
+  const badWorkflow = await put(`/api/projects/${projectId}`, {
+    config: { deployments: { deploy_workflow: "--version" } },
+  });
+  expect(badWorkflow.status).toBe(400);
+  expect(badWorkflow.json.error).toContain("deploy_workflow");
+
+  const badRef = await put(`/api/projects/${projectId}`, {
+    config: { deployments: { workflow_ref: "--upload-pack=evil" } },
+  });
+  expect(badRef.status).toBe(400);
+
+  const badUrl = await put(`/api/projects/${projectId}`, {
+    config: { deployments: { health_url: "file:///etc/passwd" } },
+  });
+  expect(badUrl.status).toBe(400);
+  expect(badUrl.json.error).toContain("http(s)");
+});

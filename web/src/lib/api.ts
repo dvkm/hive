@@ -274,6 +274,19 @@ export interface Project {
     wait_call_warn?: number;
     wait_call_cap?: number;
     autonomy_profile?: "conservative" | "balanced" | "autopilot";
+    // Opt-in: presence of this key is what puts the project on /deployments.
+    deployments?: {
+      deploy_workflow?: string;
+      rollback_workflow?: string;
+      tag_prefix?: string;
+      workflow_ref?: string;
+      health_url?: string;
+      health_substring?: string;
+      posthog_project?: string;
+      posthog_host?: string;
+      flags?: string[];
+      history?: number;
+    };
     archived?: boolean;
     test?: boolean;
     pr_gardener?: {
@@ -306,6 +319,44 @@ export interface PrGardenerItem {
   decision_id: string | null;
   linked_task_id: string | null;
   linked_task_state: State | null;
+}
+
+// Production releases for a project (server/src/deployments.ts). The newest
+// `prod-*` tag is what is live; there is no branch that means "production".
+export interface Release {
+  tag: string;
+  sha: string;
+  short: string;
+  subject: string;
+  created_at: string;
+  current: boolean;
+}
+export interface FlagState {
+  key: string;
+  name: string | null;
+  active: boolean | null; // null = PostHog has no such flag, or hive could not ask
+  rollout: number | null;
+}
+export interface WorkflowRun {
+  id: number;
+  name: string;
+  event: string;
+  status: string;
+  conclusion: string | null;
+  url: string;
+  created_at: string;
+  head_sha: string;
+}
+export interface DeploymentsStatus {
+  branch: string;
+  head: { sha: string; short: string; subject: string } | null;
+  current: Release | null;
+  releases: Release[];
+  ahead: number | null;
+  health: { ok: boolean; detail: string; url: string } | null;
+  flags: { available: boolean; reason: string | null; items: FlagState[] };
+  runs: WorkflowRun[];
+  errors: string[];
 }
 
 export interface Incident {
@@ -886,6 +937,19 @@ export const api = {
   updateProject: (id: string, b: { config?: Project["config"]; name?: string; repo_path?: string | null }) =>
     req<Project>(`/api/projects/${id}`, { method: "PUT", body: JSON.stringify(b) }),
   prGardener: (id: string) => req<PrGardenerItem[]>(`/api/projects/${id}/pr-gardener`),
+  // The GitHub credential stays on the server: these two POSTs ask hive to run
+  // the workflow, and the browser never holds a token that could.
+  deployments: (id: string) => req<DeploymentsStatus>(`/api/projects/${id}/deployments`),
+  deploy: (id: string, commit?: string) =>
+    req<{ ok: true; workflow: string; ref: string }>(`/api/projects/${id}/deployments/deploy`, {
+      method: "POST",
+      body: JSON.stringify({ commit: commit ?? "" }),
+    }),
+  rollback: (id: string, tag?: string) =>
+    req<{ ok: true; workflow: string; ref: string }>(`/api/projects/${id}/deployments/rollback`, {
+      method: "POST",
+      body: JSON.stringify({ tag: tag ?? "" }),
+    }),
   setPrGardenerOverride: (id: string, prNumber: number, override: PrGardenerItem["override"]) =>
     req<PrGardenerItem>(`/api/projects/${id}/pr-gardener/${prNumber}`, { method: "POST", body: JSON.stringify({ override }) }),
   // Incidents API is built in parallel; treat absence (404/network) as "not running yet".
