@@ -1098,3 +1098,47 @@ test("diff endpoint rejects tracking-only review tasks", async () => {
 });
 
 afterAll(() => {});
+
+test("five deferred quizzes push ONE catch-up digest, not five notifications", async () => {
+  const { notifyQuizDigest, QUIZ_DIGEST_MS } = await import("../src/reconciler.ts");
+  const s = makeServer();
+  const digests = () =>
+    s.db.query("SELECT title, urgency FROM notifications WHERE kind = 'quiz_digest' ORDER BY rowid").all() as { title: string; urgency: string }[];
+
+  // Two shipped changes waiting: below the "three pending" bar, so only the
+  // daily nudge fires, and it fires exactly once.
+  const t0 = Date.parse("2026-08-25T09:00:00.000Z");
+  const taskIds: string[] = [];
+  for (let n = 0; n < 2; n += 1) {
+    const { taskId } = await inReviewTask(s.base, {}, false);
+    await post(s.base, `/api/tasks/${taskId}/understanding-quiz/defer`, { confirm: "quiz_later", source: "director" });
+    await post(s.base, `/api/tasks/${taskId}/transition`, { to: "verifying" });
+    taskIds.push(taskId);
+  }
+  notifyQuizDigest(s.db, t0);
+  notifyQuizDigest(s.db, t0 + 60 * 1000);
+  expect(digests().map((row) => row.title)).toEqual(["Catch up on 2 shipped changes"]);
+  expect(digests()[0].urgency).toBe("urgent"); // urgent is what reaches the phone
+
+  // Three more pile up. Reaching three nudges once, early — then goes quiet again.
+  for (let n = 0; n < 3; n += 1) {
+    const { taskId } = await inReviewTask(s.base, {}, false);
+    await post(s.base, `/api/tasks/${taskId}/understanding-quiz/defer`, { confirm: "quiz_later", source: "director" });
+    await post(s.base, `/api/tasks/${taskId}/transition`, { to: "verifying" });
+    taskIds.push(taskId);
+  }
+  notifyQuizDigest(s.db, t0 + 2 * 60 * 1000);
+  notifyQuizDigest(s.db, t0 + 3 * 60 * 1000);
+  expect(digests().map((row) => row.title)).toEqual([
+    "Catch up on 2 shipped changes",
+    "Catch up on 5 shipped changes",
+  ]);
+
+  // Working through all five empties the digest, so a day later there is nothing to say.
+  for (const taskId of taskIds)
+    await post(s.base, `/api/tasks/${taskId}/understanding-quiz/answer`, { answer_key: "tests", source: "director" });
+  expect((await get(s.base, "/api/understanding-quizzes")).json.quizzes).toHaveLength(0);
+  notifyQuizDigest(s.db, t0 + QUIZ_DIGEST_MS + 60 * 1000);
+  expect(digests()).toHaveLength(2);
+  s.server.stop(true);
+});

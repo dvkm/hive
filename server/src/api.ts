@@ -3829,6 +3829,32 @@ export function repairDuplicateQuizPasses(db: DB): number {
   return repaired;
 }
 
+// Quizzes on tasks that already shipped: the post-ship catch-up backlog. The
+// web UI shows these as ONE digest, so the count here is what that digest says,
+// not a number of separate attention items. Quizzes on tasks still in review
+// are excluded — those gate their own review card.
+const POST_SHIP_QUIZ_STATES = ["verifying", "done", "failed"];
+export function pendingPostShipQuizCount(db: DB): number {
+  const placeholders = POST_SHIP_QUIZ_STATES.map(() => "?").join(",");
+  const rows = db
+    .query(
+      `SELECT e.id, e.task_id, e.payload FROM events e JOIN tasks t ON t.id = e.task_id
+        WHERE e.type = 'review_summary'
+          AND t.state IN (${placeholders})
+          AND NOT EXISTS (
+            SELECT 1 FROM events newer
+             WHERE newer.task_id = e.task_id AND newer.type = 'review_summary'
+               AND (newer.ts > e.ts OR (newer.ts = e.ts AND newer.rowid > e.rowid)))`
+    )
+    .all(...POST_SHIP_QUIZ_STATES) as { id: string; task_id: string; payload: string }[];
+  return rows.filter((row) => {
+    let payload: any;
+    try { payload = JSON.parse(row.payload); } catch { return false; }
+    if (!normalizeUnderstandingChecks(payload?.understanding).length) return false;
+    return understandingQuizStatus(db, row.task_id, row.id) !== "passed";
+  }).length;
+}
+
 function listUnderstandingQuizzes(db: DB, url: URL): Response {
   const projectId = url.searchParams.get("project_id");
   const statePlaceholders = UNDERSTANDING_QUIZ_ANSWERABLE_STATES.map(() => "?").join(",");
