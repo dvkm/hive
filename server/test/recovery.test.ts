@@ -632,7 +632,7 @@ test("failed triage requeue defaults to four hours and zero disables it", () => 
   expect(disabled.db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(parked)).toBeFalsy();
 });
 
-test("director failures, change requests, and failed requeues stay parked", () => {
+test("director failures and change requests stay parked", () => {
   const { db, projectId } = freshDb({ failed_triage_requeue_hours: 1 });
   const directorFailed = makeTask(db, projectId);
   failAt(db, directorFailed, 2 * 60 * 60 * 1000, "director");
@@ -641,14 +641,33 @@ test("director failures, change requests, and failed requeues stay parked", () =
   failAt(db, rejected, 2 * 60 * 60 * 1000);
   putEvent(db, rejected, "changes_requested", { notes: "do not retry" });
 
+  requeueStaleFailed(db);
+
+  for (const id of [directorFailed, rejected])
+    expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(id)).toBeFalsy();
+});
+
+test("a depth-1 requeue lineage still auto-requeues past the triage window", () => {
+  const { db, projectId } = freshDb({ failed_triage_requeue_hours: 1 });
   const original = makeTask(db, projectId);
   const failedRequeue = makeTask(db, projectId, { source: "requeue", parent: original });
   failAt(db, failedRequeue, 2 * 60 * 60 * 1000);
 
   requeueStaleFailed(db);
 
-  for (const id of [directorFailed, rejected, failedRequeue])
-    expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(id)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(failedRequeue)).toBeTruthy();
+});
+
+test("a depth-2 requeue lineage (requeue of a requeue) stays parked", () => {
+  const { db, projectId } = freshDb({ failed_triage_requeue_hours: 1 });
+  const original = makeTask(db, projectId);
+  const firstRequeue = makeTask(db, projectId, { source: "requeue", parent: original });
+  const secondRequeue = makeTask(db, projectId, { source: "requeue", parent: firstRequeue });
+  failAt(db, secondRequeue, 2 * 60 * 60 * 1000);
+
+  requeueStaleFailed(db);
+
+  expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(secondRequeue)).toBeFalsy();
 });
 
 test("a failed task with an existing successor is never auto-requeued again", () => {

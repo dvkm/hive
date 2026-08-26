@@ -59,6 +59,13 @@ test("invalid transition is rejected with a clear error", () => {
   expect(() => transition(db, id, "verifying")).toThrow(/invalid transition/);
 });
 
+test("an invalid in_progress -> queued transition hints at /requeue", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  transition(db, id, "in_progress");
+  expect(() => transition(db, id, "queued")).toThrow(new RegExp(`/api/tasks/${id}/requeue`));
+});
+
 test("done is rejected without evidence", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId);
