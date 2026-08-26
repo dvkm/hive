@@ -98,7 +98,7 @@ test("two servers on one DB: the predecessor stands down, one keeps running laps
 // custom port opened the LIVE db and its reconciler evicted working agents for
 // 25 minutes, until a human killed it by hand.
 
-const { interloperReason, registerInstance, listInstances, evictContenders, isHiveServerCommand } = await import(
+const { interloperReason, interloperAdvice, registerInstance, listInstances, evictContenders, isHiveServerCommand } = await import(
   "../src/lease.ts"
 );
 const { homeDbPath } = await import("../src/db.ts");
@@ -107,6 +107,18 @@ test("a server on a non-fleet port refuses the live fleet database", () => {
   expect(interloperReason(homeDbPath(), 4791)).toContain("not the fleet port");
   expect(interloperReason(homeDbPath(), 4700)).toBeNull(); // the real server
   expect(interloperReason("/tmp/smoke.db", 4791)).toBeNull(); // scratch db: fine
+});
+
+// The refusal advice used to read as "use a scratch DB" with no end to it. An
+// agent followed it during a smoke test on 2026-08-25 and left that server up;
+// it closed the live fleet's herdr panes every 5 minutes for 7 hours. The advice
+// must never again describe a second server you can walk away from.
+test("the refusal advice tells the operator to stop the scratch server", () => {
+  const advice = interloperAdvice(4791);
+  expect(advice).toContain("HIVE_PORT=4791");
+  expect(advice.toLowerCase()).toContain("smoke test");
+  expect(advice).toMatch(/stop it \(Ctrl-C\)/);
+  expect(advice).toContain("Never leave one running");
 });
 
 // The end-to-end shape of the incident, in a fake HOME so it can never touch the
