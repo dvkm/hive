@@ -1423,6 +1423,26 @@ A state change therefore produces both an `event` message (`type:"state_change"`
 and a `task` message. The client should upsert by `id`. There is no replay/backfill
 on connect; load current state via the REST endpoints, then apply stream deltas.
 
+**`project_id` on frames.** Every frame that belongs to a project carries a
+top-level `project_id`, so a client never has to join task → project itself. It
+is filled in from the task the frame names (`task`, `event`, `decision`,
+`evidence`, `incident`, `notification`, `usage`, `chat_message`) or from the row
+itself (`learning`). Fleet-wide frames have no project scope and carry no
+`project_id`: `hello`, `offline`, `chat_thread`, `notify`, `reconciler_error`,
+and the reaper frames.
+
+**Query parameters (all optional).** With none, the stream behaves exactly as it
+always has: every frame, to every client. Filtering happens per client, so a
+filtered subscriber costs nothing extra for anyone else.
+
+| param | meaning |
+|-------|---------|
+| `client=app` | marks the Electron desktop client, which is the only client that can raise a native notification |
+| `project=<project_id>` | drop frames belonging to other projects. Frames with no project scope always pass |
+| `classes=<comma list>` | keep only these frame types, e.g. `classes=decision,event,task`. The `hello` headline is always sent |
+
+Example: `GET /api/stream?project=proj_e60f3994fbf7&classes=decision,event`
+
 ### Braindump intake — `POST /api/intake`
 Body `{project_id (required), text (required)}` → `202 {"ok":true, "task": Task}`
 | `400` (blank text, unknown `project_id`).
