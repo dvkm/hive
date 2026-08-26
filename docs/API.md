@@ -1391,8 +1391,8 @@ Holds low-urgency phone pushes overnight and batches them into one summary.
 Every urgent notification pushes to the phone the moment it happens. Away mode
 classifies each outgoing push and holds the ones that can wait. The class comes
 from the notification `kind` (`decision`, `decision_nag`, `review` → `decision`;
-`circuit_breaker`, `agent_unreachable`, `auth_lost`, `incident` → `fleet_down`;
-everything else → `info`), and an `enqueue` can override it with an explicit
+`quiz_digest` → `quiz-digest`; `circuit_breaker`, `agent_unreachable`,
+`auth_lost`, `incident` → `fleet_down`; everything else → `info`), and an `enqueue` can override it with an explicit
 `class`. A class listed in `always_through` is pushed immediately even while
 away; everything else is appended to a held list.
 

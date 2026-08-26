@@ -57,6 +57,7 @@ const KIND_CLASS: Record<string, PushClass> = {
   decision: "decision",
   decision_nag: "decision",
   review: "decision",
+  quiz_digest: "quiz-digest",
   circuit_breaker: "fleet_down",
   agent_unreachable: "fleet_down",
   auth_lost: "fleet_down",

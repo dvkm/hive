@@ -60,7 +60,26 @@ test("kinds map to push classes; unknown kinds are info", () => {
   expect(classOfKind("review")).toBe("decision");
   expect(classOfKind("circuit_breaker")).toBe("fleet_down");
   expect(classOfKind("auth_lost")).toBe("fleet_down");
+  expect(classOfKind("quiz_digest")).toBe("quiz-digest");
   expect(classOfKind("done")).toBe("info");
+});
+
+// The catch-up digest is its own class so it can be let through on its own,
+// without also letting every other low-urgency push through.
+test("a quiz digest is held by default but passes when allowed through", () => {
+  const db = freshDb();
+  setAway(db, { on: true, always_through: ["security", "spend", "fleet_down", "second_failure"] });
+  const held = recordingPush();
+  enqueue(db, { kind: "quiz_digest", urgency: "urgent", title: "Catch up on 3 shipped changes" }, { push: held.push });
+  expect(held.sent.length).toBe(0);
+  expect(heldPushes(db)[0].class).toBe("quiz-digest");
+
+  const db2 = freshDb();
+  setAway(db2, { on: true, always_through: ["quiz-digest"] });
+  const through = recordingPush();
+  enqueue(db2, { kind: "quiz_digest", urgency: "urgent", title: "Catch up on 3 shipped changes" }, { push: through.push });
+  expect(through.sent.length).toBe(1);
+  expect(heldPushes(db2).length).toBe(0);
 });
 
 test("while away, a decision push is held and a fleet_down push still goes out", () => {
@@ -147,10 +166,10 @@ test("GET/POST /api/away toggles, holds, and flushes on the way out", async () =
   const { push, sent } = recordingPush();
   const server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr }) });
   const BASE = `http://127.0.0.1:${server.port}`;
-  const post = (body: any) =>
+  const post = (body: any): Promise<any> =>
     fetch(`${BASE}/api/away`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) => r.json());
   try {
-    let r = await (await fetch(`${BASE}/api/away`)).json();
+    let r: any = await (await fetch(`${BASE}/api/away`)).json();
     expect(r.on).toBe(false);
     expect(r.active).toBe(false);
     expect(r.always_through).toEqual(["security", "spend", "fleet_down", "second_failure"]);
