@@ -1712,6 +1712,39 @@ function parseDeps(db: DB, raw: any, selfId?: string): string[] | Response {
   return deps;
 }
 
+// The verification contract: named commands an agent must run before it hands
+// off, so its evidence can be tagged with the name it came from
+// (`hive emit ... --verify-name <name>`). Stored as a JSON array on the task.
+// Names are short slugs so they read well in a brief and in evidence payloads.
+// Nothing is gated on this yet — it is data the brief renders.
+function parseVerificationCmds(raw: any): { name: string; cmd: string }[] | null | Response {
+  if (raw === null || raw === "") return null;
+  let list = raw;
+  if (typeof raw === "string") {
+    try {
+      list = JSON.parse(raw);
+    } catch {
+      return err("verification_cmds must be a JSON array of {name, cmd}", 400);
+    }
+  }
+  if (!Array.isArray(list)) return err("verification_cmds must be an array of {name, cmd}", 400);
+  const seen = new Set<string>();
+  const out: { name: string; cmd: string }[] = [];
+  for (const entry of list) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry))
+      return err("each verification_cmds entry must be an object with 'name' and 'cmd'", 400);
+    const name = String((entry as any).name ?? "");
+    const cmd = String((entry as any).cmd ?? "");
+    if (!/^[a-z0-9-]{1,32}$/.test(name))
+      return err(`invalid verification_cmds name: ${JSON.stringify(name)} (use 1-32 chars of a-z, 0-9, -)`, 400);
+    if (seen.has(name)) return err(`duplicate verification_cmds name: ${name}`, 400);
+    if (!cmd.trim()) return err(`verification_cmds entry '${name}' needs a non-empty cmd`, 400);
+    seen.add(name);
+    out.push({ name, cmd });
+  }
+  return out.length ? out : null;
+}
+
 // Accepts JSON or multipart; attached files are saved under the new task's id
 // and their absolute paths appended to the brief, so the agent that picks the
 // task up can read them.
@@ -1739,6 +1772,8 @@ async function createTask(db: DB, req: Request): Promise<Response> {
     return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
   const deps = parseDeps(db, body.depends_on);
   if (deps instanceof Response) return deps;
+  const verifyCmds = body.verification_cmds !== undefined ? parseVerificationCmds(body.verification_cmds) : null;
+  if (verifyCmds instanceof Response) return verifyCmds;
   // A follow-up task's brief often describes code that only exists in the
   // parent's still-open PR (HIVE-299). Auto-depend on the parent until its PR
   // has merged so the dispatcher holds this task the same way unmetDeps
@@ -1768,17 +1803,19 @@ async function createTask(db: DB, req: Request): Promise<Response> {
     source: body.source ? String(body.source) : null,
     parent_task_id: parent,
     depends_on: deps.length ? JSON.stringify(deps) : null,
+    verification_cmds: verifyCmds ? JSON.stringify(verifyCmds) : null,
     created_at: t,
     updated_at: t,
   };
   db.query(
     `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
-      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.project_id, row.title, row.brief, row.state, row.kind,
     row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
-    row.summary, row.source, row.parent_task_id, row.depends_on, row.created_at, row.updated_at
+    row.summary, row.source, row.parent_task_id, row.depends_on, row.verification_cmds,
+    row.created_at, row.updated_at
   );
   writeEvent(db, {
     task_id: row.id,
@@ -1922,8 +1959,16 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
     if (parsed instanceof Response) return parsed;
     deps = parsed;
   }
-  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, updated_at = ? WHERE id = ?")
-    .run(title, brief, deps.length ? JSON.stringify(deps) : null, now(), id);
+  // verification_cmds is full-replace too: omit to leave it alone, send [] or
+  // null to clear it.
+  let verify: string | null = task.verification_cmds ? JSON.stringify(task.verification_cmds) : null;
+  if (body?.verification_cmds !== undefined) {
+    const parsed = parseVerificationCmds(body.verification_cmds);
+    if (parsed instanceof Response) return parsed;
+    verify = parsed ? JSON.stringify(parsed) : null;
+  }
+  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, updated_at = ? WHERE id = ?")
+    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, now(), id);
   const updated = getTask(db, id);
   broadcastTask(db, updated);
   return json(taskWithHealth(db, updated));
@@ -5054,7 +5099,15 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     ).run(ev.id, ev.task_id, ev.ts, ev.kind, ev.path, ev.url, ev.caption, ev.meta);
     const evidence = parseEvidence(ev);
     broadcast({ type: "evidence", evidence });
-    const event = writeEvent(db, { task_id: taskId, source, type: "evidence", payload: { evidence_id: ev.id, kind, caption: ev.caption } });
+    // `--verify-name <name>` ties this artifact back to one entry of the task's
+    // verification contract. Recorded on the event; nothing is gated on it yet.
+    const verifyName = String(fields.verify_name ?? "").trim() || null;
+    const event = writeEvent(db, {
+      task_id: taskId,
+      source,
+      type: "evidence",
+      payload: { evidence_id: ev.id, kind, caption: ev.caption, ...(verifyName ? { verify_name: verifyName } : {}) },
+    });
     return json({ evidence, event }, 201);
   }
 

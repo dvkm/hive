@@ -20,12 +20,14 @@ Usage:
   hive task update <task-id> --depends-on <id,id>   declare a dependency discovered mid-task
         (e.g. "my PR needs #993's to merge first"); full replace, so pass every
         id this task should still wait on, not just the new one
-  hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>] [--landing-commit <sha>]
+  hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>] [--landing-commit <sha>] [--verify-name <name>]
         types: status | evidence | needs-decision | ready | done | unmergeable | blocked | deferred | undefer | review_summary | <custom>
         unmergeable: this task's PR has nothing left to merge (GitHub refused to
         reopen it) but the work landed via a different PR/commit. Pass
         --landing-commit <sha>; hive verifies it's on the base branch, then closes
         the task without a merge step.
+        --verify-name <name>: on evidence, tags the artifact with the named
+        verification command it came from (see the brief's Verification contract)
         review_summary: --json review.json with {done[], iffy[], decisions[], testing[], followups[], understanding{check{question,options[],answer_key}}}
         deferred: park a task waiting on an OFFLINE human action (no more "gone quiet" nudges);
                   [--until <iso>] or [--days <n>] to auto-resume, else indefinite. undefer to resume early.
@@ -289,6 +291,7 @@ async function main() {
       if (flags.note) form.set("note", String(flags.note));
       if (flags.caption) form.set("caption", String(flags.caption));
       if (flags.source) form.set("source", String(flags.source));
+      if (flags["verify-name"]) form.set("verify_name", String(flags["verify-name"]));
       if (sha) form.set("meta", JSON.stringify({ commit_sha: sha }));
       const file = Bun.file(String(flags.file));
       form.set("file", file);
@@ -311,6 +314,7 @@ async function main() {
         days: flags.days,
         pr_url: flags["pr-url"] ?? flags.url,
         landing_commit: flags["landing-commit"],
+        verify_name: flags["verify-name"],
         ...(sha && !extra.meta ? { meta: JSON.stringify({ commit_sha: sha }) } : {}),
         ...extra,
       });
