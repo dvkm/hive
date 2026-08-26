@@ -227,7 +227,7 @@ export async function sweepOrphanedPanes(db: DB, deps: ReaperDeps = {}): Promise
         if (!targetBelongsOnlyToTask(panes, "workspaceId", p.workspaceId, taskId)) continue;
         const r = await herdr.closeWorkspace({
           workspaceId: p.workspaceId,
-          expectCwd: p.cwd,
+          expectCwd: p.cwd ?? "",
           request: { caller: "reaper.sweepOrphanedPanes", reason: task ? "terminal task workspace" : "orphan task workspace", taskId },
         });
         if (r.code === 0) broadcast({ type: "reaped_orphan_pane", task_id: taskId, via: `workspace ${p.workspaceId}` });

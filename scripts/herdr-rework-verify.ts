@@ -79,9 +79,9 @@ async function main() {
   const BASE = `http://127.0.0.1:${server.port}`;
   log("scratch hive server:", BASE, " home:", HOME);
 
-  const post = async (p: string, body: unknown) =>
+  const post = async (p: string, body: unknown): Promise<any> =>
     (await fetch(BASE + p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })).json();
-  const get = async (p: string) => (await fetch(BASE + p)).json();
+  const get = async (p: string): Promise<any> => (await fetch(BASE + p)).json();
 
   // ---- PHASE 1: real interactive claude spawns into the visible fleet ----
   hr("PHASE 1: interactive claude — visible, labelled fleet tab");

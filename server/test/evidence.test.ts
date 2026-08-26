@@ -21,11 +21,11 @@ async function post(path: string, body: unknown) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 async function get(path: string) {
   const res = await fetch(BASE + path);
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 
 let projectId = "";
@@ -130,7 +130,7 @@ test("empty nameless file part is dropped, event still ingests (no 500)", async 
   form.set("file", new Blob([])); // no filename, zero bytes → File w/ name undefined
   const res = await fetch(`${BASE}/api/tasks/${taskId}/events`, { method: "POST", body: form });
   expect(res.status).toBe(201);
-  const body = await res.json();
+  const body = await res.json() as any;
   expect(body.evidence.path).toBeNull(); // junk part skipped, ingested as a log
 });
 
@@ -142,6 +142,6 @@ test("nameless file WITH content is saved under a fallback name", async () => {
   form.set("file", new File(["real log content"], "")); // empty name → parses as undefined
   const res = await fetch(`${BASE}/api/tasks/${taskId}/events`, { method: "POST", body: form });
   expect(res.status).toBe(201);
-  const body = await res.json();
+  const body = await res.json() as any;
   expect(body.evidence.path).toContain("_file"); // stamped with the fallback name
 });

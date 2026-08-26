@@ -52,23 +52,23 @@ beforeAll(async () => {
   const p = await (await fetch(BASE + "/api/projects", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: "p", repo_path: "/repo", config: {} }),
-  })).json();
+  })).json() as any;
   projectId = p.id;
   const t = await (await fetch(BASE + "/api/tasks", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_id: projectId, title: "spawn me" }),
-  })).json();
+  })).json() as any;
   taskId = t.id;
 });
 afterAll(() => server.stop(true));
 
 async function post(path: string, body: unknown) {
   const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` }, body: JSON.stringify(body) });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 async function get(path: string) {
   const res = await fetch(BASE + path);
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 
 test("spawn endpoint starts the agent and moves the task to in_progress", async () => {
@@ -234,11 +234,11 @@ test("send surfaces a herdr failure without throwing", async () => {
   const db2 = openDb(":memory:");
   const srv = Bun.serve({ port: 0, fetch: makeHandler(db2, { herdr: failHerdr }) });
   const base2 = `http://127.0.0.1:${srv.port}`;
-  const p = await (await fetch(base2 + "/api/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "p2", repo_path: "/r" }) })).json();
-  const t = await (await fetch(base2 + "/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ project_id: p.id, title: "t" }) })).json();
+  const p = await (await fetch(base2 + "/api/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "p2", repo_path: "/r" }) })).json() as any;
+  const t = await (await fetch(base2 + "/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ project_id: p.id, title: "t" }) })).json() as any;
   await fetch(base2 + `/api/tasks/${t.id}/spawn`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
   const res = await fetch(base2 + `/api/tasks/${t.id}/send`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: "go" }) });
-  const jsonBody = await res.json();
+  const jsonBody = await res.json() as any;
   expect(jsonBody.ok).toBe(false);
   expect(jsonBody.error).toContain("agent not found");
   srv.stop(true);

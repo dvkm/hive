@@ -17,11 +17,11 @@ afterAll(() => server.stop(true));
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function post(path: string, body: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 async function get(path: string): Promise<{ status: number; json: any }> {
   const res = await fetch(BASE + path);
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 function addEvidence(taskId: string) {
   db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?, '{}')")
@@ -231,7 +231,7 @@ test("empty brief on a fresh DB has all sections empty", async () => {
   const srv = Bun.serve({ port: 0, fetch: makeHandler(fresh) });
   try {
     const res = await fetch(`http://127.0.0.1:${srv.port}/api/brief`);
-    const json: any = await res.json();
+    const json: any = await res.json() as any;
     expect(json.done).toEqual([]);
     expect(json.director_required_task_ids).toEqual([]);
     expect(json.failed_or_attention).toEqual([]);

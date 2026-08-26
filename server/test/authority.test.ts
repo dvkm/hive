@@ -248,11 +248,11 @@ afterAll(() => server.stop(true));
 
 async function post(path: string, body: unknown) {
   const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 async function get(path: string) {
   const res = await fetch(BASE + path);
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 
 let projectId = "";
@@ -272,7 +272,7 @@ test("authority rules CRUD over HTTP", async () => {
   const list = await get(`/api/authority/rules?project_id=${projectId}`);
   expect(list.json.some((x: any) => x.id === c.json.id)).toBe(true);
   const upd = await fetch(`${BASE}/api/authority/rules/${c.json.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ active: false }) });
-  expect((await upd.json()).active).toBe(false);
+  expect((await upd.json() as any).active).toBe(false);
 });
 
 test("guarded-action: require_decision → approve → retry passes → single-use", async () => {

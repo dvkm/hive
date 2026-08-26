@@ -62,7 +62,7 @@ test("mergeTask BLOCKS a branch that reverts base work outside its scope (#314)"
   const { db, taskId } = seed();
   const res = await mergeTask(db, herdr, taskId, {}, { exec: destructiveExec });
   expect(res.status).toBe(409);
-  const body: any = await res.json();
+  const body: any = await res.json() as any;
   expect(body.error).toContain("health.ts");
   // Bounced back to the agent, and the block is recorded for the director.
   expect(getTask(db, taskId).state).toBe("in_progress");
@@ -190,7 +190,7 @@ test("mergeTask BLOCKS while a declared dependency hasn't actually merged/done y
 
   const res = await mergeTask(db, herdr, taskId, {}, { exec: destructiveExec });
   expect(res.status).toBe(409);
-  const body: any = await res.json();
+  const body: any = await res.json() as any;
   expect(body.error).toContain("unmet dependency");
   expect(body.error).toContain("dependency task");
   // Refused outright, not bounced to the agent — this isn't the agent's fix to make.

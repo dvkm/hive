@@ -647,7 +647,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // {shown:true} it rendered, or {error} it refused.
       m = pathname.match(/^\/api\/notifications\/([^/]+)\/delivery$/);
       if (m && method === "POST") {
-        const b = await req.json().catch(() => ({} as any));
+        const b: any = await req.json().catch(() => ({}));
         if (b?.error) {
           recordDeliveryError(m[1], String(b.error));
           return json({ ok: false });

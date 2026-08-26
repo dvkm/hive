@@ -24,11 +24,11 @@ async function post(path: string, body: unknown) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 async function get(path: string) {
   const res = await fetch(BASE + path);
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 async function put(path: string, body: unknown) {
   const res = await fetch(BASE + path, {
@@ -36,7 +36,7 @@ async function put(path: string, body: unknown) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 
 let projectId = "";
@@ -618,7 +618,7 @@ test("ready emit refreshes stale branch metadata for an already-linked PR", asyn
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    return { status: response.status, json: await response.json() };
+    return { status: response.status, json: await response.json() as any };
   };
 
   try {
@@ -724,7 +724,7 @@ test("POST /merge returns instead of hanging when the post-merge smoke check fai
   const base2 = `http://127.0.0.1:${srv.port}`;
   const post2 = async (path: string, body: unknown) => {
     const res = await fetch(base2 + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    return { status: res.status, json: await res.json() };
+    return { status: res.status, json: await res.json() as any };
   };
   try {
     const p = await post2("/api/projects", {
@@ -769,7 +769,7 @@ test("evidence upload round-trips through /evidence", async () => {
   form.set("file", new File([new Uint8Array([1, 2, 3, 4])], "shot.png", { type: "image/png" }));
   const res = await fetch(`${BASE}/api/tasks/${taskId}/events`, { method: "POST", body: form });
   expect(res.status).toBe(201);
-  const data = await res.json();
+  const data = await res.json() as any;
   expect(data.evidence.url).toStartWith(`/evidence/${taskId}/`);
 
   const fetched = await fetch(BASE + data.evidence.url);
@@ -800,7 +800,7 @@ test("evidence kind is inferred from the uploaded file's extension", async () =>
     form.set("note", name);
     form.set("file", new File([new Uint8Array([1])], name, { type }));
     const res = await fetch(`${BASE}/api/tasks/${t.json.id}/events`, { method: "POST", body: form });
-    return (await res.json()).evidence.kind;
+    return (await res.json() as any).evidence.kind;
   };
   expect(await up("shot.png", "image/png")).toBe("screenshot");
   expect(await up("report.md", "text/markdown")).toBe("report");
@@ -811,7 +811,7 @@ test("evidence kind is inferred from the uploaded file's extension", async () =>
   form.set("kind", "report");
   form.set("file", new File([new Uint8Array([1])], "notes.txt", { type: "text/plain" }));
   const res = await fetch(`${BASE}/api/tasks/${t.json.id}/events`, { method: "POST", body: form });
-  expect((await res.json()).evidence.kind).toBe("report");
+  expect((await res.json() as any).evidence.kind).toBe("report");
 });
 
 test("task reaches done once evidence exists (verifying auto-advances: no smoke configured)", async () => {
@@ -1108,7 +1108,7 @@ test("policies CRUD", async () => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ active: false }),
   });
-  expect((await upd.json()).active).toBe(false);
+  expect((await upd.json() as any).active).toBe(false);
 
   const del = await fetch(`${BASE}/api/policies/${p.json.id}`, { method: "DELETE" });
   expect(del.status).toBe(200);

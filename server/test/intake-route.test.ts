@@ -75,7 +75,7 @@ test("POST /api/intake files the braindump in the routed project", async () => {
       body: JSON.stringify({ project_id: hive, text: "redesign the CoreData share sheet" }),
     })
   );
-  const body: any = await res.json();
+  const body: any = await res.json() as any;
   expect(res.status).toBe(202);
   expect(body.task.project_id).toBe(corebeat);
 

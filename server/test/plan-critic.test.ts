@@ -58,11 +58,11 @@ async function post(base: string, path: string, body: unknown) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  return { status: res.status, json: (await res.json()) as any };
+  return { status: res.status, json: (await res.json() as any) as any };
 }
 async function get(base: string, path: string) {
   const res = await fetch(base + path);
-  return { status: res.status, json: (await res.json()) as any };
+  return { status: res.status, json: (await res.json() as any) as any };
 }
 
 async function makeTask(base: string, config: any = {}) {

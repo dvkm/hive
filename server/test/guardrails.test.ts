@@ -49,11 +49,11 @@ afterAll(() => server.stop(true));
 
 async function post(path: string, body: unknown) {
   const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 async function get(path: string) {
   const res = await fetch(BASE + path);
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 const newTask = async (title: string) => (await post("/api/tasks", { project_id: projectId, title })).json.id;
 const events = async (id: string, type: string) =>
@@ -779,7 +779,7 @@ test("GET /pane returns the agent's pane text with ANSI stripped; 404 when agent
   // so exercise the strip logic through a direct fetch and shape-check the response.
   const r = await fetch(`${BASE}/api/tasks/${id}/pane?lines=50`);
   expect(r.status).toBe(200);
-  const body: any = await r.json();
+  const body: any = await r.json() as any;
   expect(body.agent_target).toBe(id);
   expect(typeof body.text).toBe("string");
   expect(body.lines).toBe(50);

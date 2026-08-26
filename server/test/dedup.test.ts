@@ -17,11 +17,11 @@ afterAll(() => server.stop(true));
 
 async function post(path: string, body: unknown) {
   const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 async function get(path: string) {
   const res = await fetch(BASE + path);
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 const mkTask = async (title: string, brief?: string) =>
   (await post("/api/tasks", { project_id: projectId, title, brief })).json;

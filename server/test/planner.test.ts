@@ -43,7 +43,7 @@ beforeAll(async () => {
       name: "acme", repo_path: "/repo",
       config: { supervisor_persona: "Pragmatic staff engineer.", playbook: "Ship small PRs." },
     }),
-  })).json();
+  })).json() as any;
   projectId = p.id;
   // one global policy + one active learning so we can assert prompt composition
   await fetch(BASE + "/api/policies", {
@@ -59,11 +59,11 @@ afterAll(() => server.stop(true));
 
 async function post(path: string, body: unknown) {
   const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 async function get(path: string) {
   const res = await fetch(BASE + path);
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 async function mkTask(title = "Build onboarding flow", brief = "New users need a guided setup.") {
   return (await post("/api/tasks", { project_id: projectId, title, brief })).json;
@@ -132,7 +132,7 @@ test("plan endpoint -> decision card; approve creates linked child tasks", async
   const s2 = Bun.serve({ port: 0, fetch: handler });
   const base2 = `http://127.0.0.1:${s2.port}`;
   try {
-    const r = await (await fetch(base2 + `/api/tasks/${t.id}/plan`, { method: "POST", body: "{}" })).json();
+    const r = await (await fetch(base2 + `/api/tasks/${t.id}/plan`, { method: "POST", body: "{}" })).json() as any;
     expect(r.ok).toBe(true);
     expect(r.decision.title).toContain("Proposed breakdown");
     expect(r.decision.plan.proposed_tasks.length).toBe(2);
@@ -267,7 +267,7 @@ test("braindump intake -> queued chore + decision card; approve queues children 
       body: JSON.stringify({ project_id: projectId, text: "sso login is a mess\nalso the docs lie" }),
     });
     expect(res.status).toBe(202);
-    const { task } = await res.json();
+    const { task } = await res.json() as any;
     expect(task.state).toBe("queued");
     expect(task.kind).toBe("chore");
     expect(task.source).toBe("intake_braindump");
@@ -311,7 +311,7 @@ test("a long braindump first line is elided into the title", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ project_id: projectId, text: long }),
     });
-    const { task } = await res.json();
+    const { task } = await res.json() as any;
     expect(task.title).toBe(`[braindump] ${"a".repeat(71)}…`);
     expect(task.brief).toBe(long); // the full text is never truncated
   } finally {

@@ -21,11 +21,11 @@ async function post(path: string, body: unknown) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 async function get(path: string) {
   const res = await fetch(BASE + path);
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 
 let projectId = "";
@@ -87,7 +87,7 @@ test("usage ingestion (multipart): string fields coerced", async () => {
   form.set("cache_read_tokens", "0");
   const res = await fetch(`${BASE}/api/tasks/${taskId}/events`, { method: "POST", body: form });
   expect(res.status).toBe(201);
-  const j = await res.json();
+  const j = await res.json() as any;
   expect(j.usage.input_tokens).toBe(1_000_000);
   expect(j.usage.cost_usd).toBeCloseTo(1, 6); // haiku input $1.00/MTok
   expect(j.usage.source).toBe("hook");

@@ -60,7 +60,7 @@ test("answering a plain question persists it as decision knowledge; recall + bri
 
   // recall finds it
   const res = await handle(new Request(`http://x/api/knowledge?project_id=${projectId}&q=export`));
-  const knowledge = await res.json();
+  const knowledge = await res.json() as any;
   expect(knowledge.decisions).toHaveLength(1);
   expect(knowledge.decisions[0].title).toContain("Which format");
 

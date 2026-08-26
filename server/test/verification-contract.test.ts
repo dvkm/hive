@@ -24,7 +24,7 @@ async function post(path: string, body: unknown) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  return { status: res.status, json: (await res.json()) as any };
+  return { status: res.status, json: (await res.json() as any) as any };
 }
 async function put(path: string, body: unknown) {
   const res = await fetch(BASE + path, {
@@ -32,11 +32,11 @@ async function put(path: string, body: unknown) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  return { status: res.status, json: (await res.json()) as any };
+  return { status: res.status, json: (await res.json() as any) as any };
 }
 async function get(path: string) {
   const res = await fetch(BASE + path);
-  return { status: res.status, json: (await res.json()) as any };
+  return { status: res.status, json: (await res.json() as any) as any };
 }
 
 let projectId = "";
@@ -138,7 +138,7 @@ test("emit evidence --verify-name lands on the evidence event payload", async ()
   form.set("file", new File([new TextEncoder().encode("42 pass 0 fail")], "unit.txt", { type: "text/plain" }));
   const res = await fetch(`${BASE}/api/tasks/${id}/events`, { method: "POST", body: form });
   expect(res.status).toBe(201);
-  expect(((await res.json()) as any).event.payload.verify_name).toBe("unit");
+  expect(((await res.json() as any) as any).event.payload.verify_name).toBe("unit");
 
   // JSON path (no file) carries it too, and an untagged item has no key at all.
   const tagged = await post(`/api/tasks/${id}/events`, { type: "evidence", note: "link", url: "https://example.com/ci", verify_name: "typecheck" });

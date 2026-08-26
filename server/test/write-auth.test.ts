@@ -32,7 +32,7 @@ const call = (path: string, init: RequestInit & { token?: string } = {}) =>
 const project = await (await call("/api/projects", {
   method: "POST",
   body: JSON.stringify({ name: "gated", repo_path: "/repo", config: { auto_dispatch: true } }),
-})).json();
+})).json() as any;
 const configOf = () =>
   (db.query("SELECT config FROM projects WHERE id = ?").get(project.id) as { config: string }).config;
 const secretNames = () =>
@@ -122,7 +122,7 @@ test("reads and the task flow stay trustless on loopback", async () => {
     body: JSON.stringify({ project_id: project.id, title: "untokened task" }),
   });
   expect(task.status).toBe(201);
-  const id = (await task.json()).id;
+  const id = (await task.json() as any).id;
   const event = await call(`/api/tasks/${id}/events`, {
     method: "POST",
     body: JSON.stringify({ type: "status", note: "still trustless" }),
@@ -137,7 +137,7 @@ test("no token minted → the gate fails closed while reads keep working", async
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: "bare", repo_path: "/repo" }),
-  })).json();
+  })).json() as any;
   const res = await fetch(`http://127.0.0.1:${bareServer.port}/api/projects/${p.id}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json", Authorization: "Bearer anything" },

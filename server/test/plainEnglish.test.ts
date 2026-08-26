@@ -64,7 +64,7 @@ test("a review summary states each fact once: repeated bullets and repeated quiz
   const base = `http://127.0.0.1:${server.port}`;
   const post = async (path: string, body: unknown) => {
     const res = await fetch(base + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    return { status: res.status, json: await res.json() };
+    return { status: res.status, json: await res.json() as any };
   };
   try {
     const p = await post("/api/projects", { name: "proj", repo_path: "/tmp/x" });

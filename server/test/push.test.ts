@@ -79,7 +79,7 @@ test("the /api/push routes serve the key, subscribe, and unsubscribe", async () 
   const db = openDb(":memory:");
   setSetting(db, "api_token", "phone-secret");
   const handle = makeHandler(db, {});
-  const vapid = await (await handle(new Request("http://x/api/push/vapid"))).json();
+  const vapid = await (await handle(new Request("http://x/api/push/vapid"))).json() as any;
   expect(vapid.key).toBeTruthy();
   const unauthenticated = await handle(
     new Request("http://x/api/push/subscribe", { method: "POST", body: JSON.stringify(SUB) })
@@ -92,7 +92,7 @@ test("the /api/push routes serve the key, subscribe, and unsubscribe", async () 
       body: JSON.stringify(SUB),
     })
   );
-  expect((await sub.json()).ok).toBe(true);
+  expect((await sub.json() as any).ok).toBe(true);
   expect(db.query("SELECT * FROM push_subscriptions").all()).toHaveLength(1);
   await handle(new Request("http://x/api/push/unsubscribe", { method: "POST", body: JSON.stringify({ endpoint: SUB.endpoint }) }));
   expect(db.query("SELECT * FROM push_subscriptions").all()).toHaveLength(0);

@@ -61,18 +61,18 @@ beforeAll(async () => {
   const p: any = await (await fetch(BASE + "/api/projects", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: "acme", repo_path: WT }),
-  })).json();
+  })).json() as any;
   projectId = p.id;
 });
 afterAll(() => server.stop(true));
 
 async function post(path: string, body: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 async function get(path: string): Promise<{ status: number; json: any }> {
   const res = await fetch(BASE + path);
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 
 let threadId = "";
@@ -381,7 +381,7 @@ test("an arbitrary body.task_id cannot hijack an unrelated task as the chat supe
   const victim: any = await (await fetch(BASE + "/api/tasks", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_id: projectId, title: "unrelated ship task" }),
-  })).json();
+  })).json() as any;
   expect(victim.source).not.toBe("chat_supervisor");
 
   const { status, json } = await post("/api/chat/turn", {

@@ -34,6 +34,7 @@ let tokenPrompt: Promise<boolean> | null = null;
 function promptForToken(): Promise<boolean> {
   if (tokenPrompt) return tokenPrompt;
   tokenPrompt = new Promise((resolve) => {
+    // @ts-ignore this file is only type-checked for DOM globals when built by web/tsconfig.json (which has lib: DOM); the root tsconfig checking server/cli/scripts pulls it in transitively for its non-DOM type exports
     const dialog = document.createElement("dialog");
     dialog.className = "modal token-dialog";
     dialog.innerHTML = `
@@ -55,11 +56,14 @@ function promptForToken(): Promise<boolean> {
       tokenPrompt = null;
       resolve(saved);
     };
+    // @ts-ignore see note above
     dialog.querySelector<HTMLButtonElement>('button[type="button"]')!.onclick = () => finish(false);
+    // @ts-ignore see note above
     dialog.oncancel = (event) => {
       event.preventDefault();
       finish(false);
     };
+    // @ts-ignore see note above
     dialog.querySelector("form")!.onsubmit = (event) => {
       event.preventDefault();
       const token = input.value.trim();
@@ -67,6 +71,7 @@ function promptForToken(): Promise<boolean> {
       localStorage.setItem("hive_token", token);
       finish(true);
     };
+    // @ts-ignore see note above
     document.body.appendChild(dialog);
     dialog.showModal();
   });
@@ -581,7 +586,7 @@ async function req<T>(path: string, init?: RequestInit, retried = false): Promis
   if (!res.ok) {
     let msg = res.statusText;
     try {
-      msg = (await res.json()).error || msg;
+      msg = (await res.json() as any).error || msg;
     } catch {
       /* noop */
     }

@@ -102,7 +102,7 @@ test("knowledgeSearch scopes to a project and AND-matches keywords across kinds"
   const handle = makeHandler(db, {});
   const search = async (q: string) => {
     const res = await handle(new Request(`http://x/api/knowledge?project_id=${projectId}&q=${encodeURIComponent(q)}`));
-    return res.json();
+    return res.json() as any;
   };
   expect((await search("figma")).references).toHaveLength(1);
   expect((await search("migration collation")).learnings).toHaveLength(1); // both terms present
@@ -111,7 +111,7 @@ test("knowledgeSearch scopes to a project and AND-matches keywords across kinds"
   // task_id resolves the project
   const tid = task(db, projectId, "t");
   const byTask = await handle(new Request(`http://x/api/knowledge?task_id=${tid}&q=figma`));
-  expect((await byTask.json()).references).toHaveLength(1);
+  expect((await byTask.json() as any).references).toHaveLength(1);
 });
 
 test("localhost / PR / non-doc links are not captured", () => {

@@ -175,7 +175,7 @@ test("agent-dialog deny only closes a stale card from the current agent generati
   });
   const response = apiAutoAnswerDecision(db, herdr as any, unrelated, { answer_key: "deny" });
   expect(response.status).toBe(403);
-  expect((await response.json()).reason).toBe("only the raiser's recommended option can be auto-approved");
+  expect((await response.json() as any).reason).toBe("only the raiser's recommended option can be auto-approved");
 });
 
 test("high risk, prod blast radius, and non-recommended options each escalate", () => {
@@ -227,10 +227,10 @@ test("apiAutoAnswerDecision: malformed body is rejected before audit", async () 
   });
   const note = apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "save", answer_note: 123 });
   expect(note.status).toBe(400);
-  expect(await note.json()).toEqual({ error: "answer_note must be a string" });
+  expect(await note.json() as any).toEqual({ error: "answer_note must be a string" });
   const indices = apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "save", selected_indices: "[]" });
   expect(indices.status).toBe(400);
-  expect(await indices.json()).toEqual({ error: "selected_indices must be an array of indices" });
+  expect(await indices.json() as any).toEqual({ error: "selected_indices must be an array of indices" });
   expect((db.query("SELECT status FROM decisions WHERE id=?").get(d.id) as any).status).toBe("open");
   expect(db.query("SELECT 1 FROM events WHERE type='auto_approved' AND json_extract(payload,'$.decision_id')=?").get(d.id)).toBeFalsy();
 });
@@ -247,7 +247,7 @@ test("apiAutoAnswerDecision: unsafe card is left OPEN and escalated with a reaso
   );
   const res = apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "wrap_up" });
   expect(res.status).toBe(403);
-  const body = await res.json();
+  const body = await res.json() as any;
   expect(body.effect).toBe("escalate");
   expect(body.reason).toBeTruthy();
 

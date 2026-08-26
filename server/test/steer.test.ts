@@ -64,11 +64,11 @@ afterAll(() => server.stop(true));
 
 async function post(path: string, body: unknown) {
   const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 async function get(path: string) {
   const res = await fetch(BASE + path);
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 const newTask = async (title: string) => (await post("/api/tasks", { project_id: projectId, title })).json.id;
 const steerEvents = async (id: string) =>
@@ -179,15 +179,15 @@ test("a failing herdr send retries once, then queues the steer", async () => {
   const db2 = openDb(":memory:");
   const srv = Bun.serve({ port: 0, fetch: makeHandler(db2, { herdr: fail.herdr }) });
   const b2 = `http://127.0.0.1:${srv.port}`;
-  const p = await (await fetch(b2 + "/api/projects", { method: "POST", body: JSON.stringify({ name: "p", repo_path: "/r" }) })).json();
-  const t = await (await fetch(b2 + "/api/tasks", { method: "POST", body: JSON.stringify({ project_id: p.id, title: "dead agent" }) })).json();
+  const p = await (await fetch(b2 + "/api/projects", { method: "POST", body: JSON.stringify({ name: "p", repo_path: "/r" }) })).json() as any;
+  const t = await (await fetch(b2 + "/api/tasks", { method: "POST", body: JSON.stringify({ project_id: p.id, title: "dead agent" }) })).json() as any;
   await fetch(b2 + `/api/tasks/${t.id}/spawn`, { method: "POST", body: "{}" });
 
-  const res = await (await fetch(b2 + `/api/tasks/${t.id}/send`, { method: "POST", body: JSON.stringify({ message: "retry me" }) })).json();
+  const res = await (await fetch(b2 + `/api/tasks/${t.id}/send`, { method: "POST", body: JSON.stringify({ message: "retry me" }) })).json() as any;
   expect(res.delivery).toBe("queued");
   expect(res.error).toBe("agent_not_found");
   expect(fail.sends).toEqual(["retry me", "retry me"]); // tried twice
-  const events = await (await fetch(b2 + `/api/tasks/${t.id}/events`)).json();
+  const events = await (await fetch(b2 + `/api/tasks/${t.id}/events`)).json() as any;
   expect(events.some((e: any) => e.type === "steer_error")).toBe(true);
 
   // A respawn drains the queue.
@@ -205,7 +205,7 @@ async function drainFixture(sendResult: () => ExecResult, getResult: () => ExecR
   const srv = Bun.serve({ port: 0, fetch: makeHandler(db2, { herdr: s.herdr }) });
   const b = `http://127.0.0.1:${srv.port}`;
   const call = async (p: string, body?: unknown) =>
-    (await fetch(b + p, body === undefined ? {} : { method: "POST", body: JSON.stringify(body) })).json();
+    (await fetch(b + p, body === undefined ? {} : { method: "POST", body: JSON.stringify(body) })).json() as any;
   const proj = await call("/api/projects", { name: "p", repo_path: "/r" });
   const task = await call("/api/tasks", { project_id: proj.id, title: "live agent, blipping socket" });
   await call(`/api/tasks/${task.id}/spawn`, {}); // sets agent_target, -> in_progress
@@ -482,7 +482,7 @@ test("a queued steer's attachment path rides along into the respawn brief", asyn
   const fd = new FormData();
   fd.append("message", "review this trace");
   fd.append("files", new File([new Uint8Array([1, 2, 3, 4])], "trace.log", { type: "text/plain" }));
-  const res = await (await fetch(BASE + `/api/tasks/${id}/send`, { method: "POST", body: fd })).json();
+  const res = await (await fetch(BASE + `/api/tasks/${id}/send`, { method: "POST", body: fd })).json() as any;
   expect(res.delivery).toBe("queued");
   expect(res.attachments?.[0]).toMatch(/trace\.log$/);
 

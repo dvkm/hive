@@ -542,7 +542,7 @@ test("POST /cleanup: 404 unknown, 409 on a live task, 200 forces teardown on a t
   const done = seedTask(db, projectId, { state: "done", branch: "hive/EP1", worktree_path: "/wt/hive-EP1" });
   const res = await call(done);
   expect(res.status).toBe(200);
-  const body = (await res.json()) as any;
+  const body = (await res.json() as any) as any;
   expect(body.ok).toBe(true);
   expect(body.worktree.removed).toBe(true);
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'cleaned_up'").all(done).length).toBe(1);

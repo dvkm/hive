@@ -30,11 +30,11 @@ beforeEach(() => {
 
 const get = async (p: string) => {
   const r = await fetch(BASE + p);
-  return { status: r.status, json: (await r.json()) as any };
+  return { status: r.status, json: (await r.json() as any) as any };
 };
 const post = async (p: string) => {
   const r = await fetch(BASE + p, { method: "POST" });
-  return { status: r.status, json: (await r.json()) as any };
+  return { status: r.status, json: (await r.json() as any) as any };
 };
 const postJson = async (p: string, body: unknown) => {
   const r = await fetch(BASE + p, {
@@ -42,7 +42,7 @@ const postJson = async (p: string, body: unknown) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  return { status: r.status, json: (await r.json()) as any };
+  return { status: r.status, json: (await r.json() as any) as any };
 };
 
 // tasks.source_ref carries a UNIQUE index, so each seeded project needs its own

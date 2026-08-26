@@ -37,7 +37,7 @@ function makeServer(head: { sha: string }) {
 
 async function post(base: string, path: string, body: unknown) {
   const res = await fetch(base + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 
 test("evidence is stamped with the worktree HEAD sha, and the ready gate rejects stale evidence", async () => {
@@ -65,7 +65,7 @@ test("evidence is stamped with the worktree HEAD sha, and the ready gate rejects
   const r2 = await post(s.base, `/api/tasks/${id}/events`, { type: "ready" });
   expect(r2.json.held).toBe(true);
   expect(r2.json.reason).toBe("stale_evidence");
-  const held = await (await fetch(`${s.base}/api/tasks/${id}`)).json();
+  const held = await (await fetch(`${s.base}/api/tasks/${id}`)).json() as any;
   expect(held.state).toBe("in_progress");
 
   // Re-capture against the new commit → gate passes, hands off.

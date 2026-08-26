@@ -206,11 +206,11 @@ function makeServer(
 
 async function post(base: string, path: string, body: unknown) {
   const res = await fetch(base + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 async function get(base: string, path: string) {
   const res = await fetch(base + path);
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 
 // Drive a task to in_review with a branch set (via a stubbed spawn).

@@ -31,7 +31,7 @@ test("reports an unmet dependency live, regardless of any stale claim elsewhere"
 
   const res = await taskBranchCheckEndpoint(db, taskId, { exec: async () => OK() });
   expect(res.status).toBe(200);
-  const body: any = await res.json();
+  const body: any = await res.json() as any;
   expect(body.unmet_deps).toEqual([{ id: depId, number: expect.any(Number), title: "consolidate the shared definition", state: "in_progress" }]);
   expect(body.embedded_tasks).toEqual([]);
 });
@@ -55,7 +55,7 @@ test("flags a branch that shares history with another open task's branch", async
 
   const res = await taskBranchCheckEndpoint(db, taskId, { exec });
   expect(res.status).toBe(200);
-  const body: any = await res.json();
+  const body: any = await res.json() as any;
   expect(body.unmet_deps).toEqual([]);
   expect(body.embedded_tasks).toEqual([{ id: otherId, number: expect.any(Number), title: "other in-flight task" }]);
 });
@@ -84,6 +84,6 @@ test("a failed task's branch is not a stacked-branch candidate", async () => {
   };
 
   const res = await taskBranchCheckEndpoint(db, taskId, { exec });
-  const body: any = await res.json();
+  const body: any = await res.json() as any;
   expect(body.embedded_tasks).toEqual([]);
 });

@@ -119,7 +119,7 @@ test("startPromoter skips a tick while a cycle is already running", async () => 
   globalThis.setInterval = ((callback: () => void) => {
     tick = callback;
     return 1;
-  }) as typeof setInterval;
+  }) as unknown as typeof setInterval;
   globalThis.clearInterval = (() => {}) as typeof clearInterval;
   let stop: () => void;
   try {

@@ -105,7 +105,7 @@ test("manual POST /api/tasks/:id/requeue reclaims a dirty worktree before failin
 
   const res = await handle(new Request(`http://x/api/tasks/${id}/requeue`, { method: "POST" }));
   expect(res.status).toBe(200);
-  const body: any = await res.json();
+  const body: any = await res.json() as any;
   expect(body.ok).toBe(true);
 
   expect(getTask(db, id).state).toBe("failed");

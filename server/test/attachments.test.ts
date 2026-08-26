@@ -38,7 +38,7 @@ async function postForm(path: string, fields: Record<string, string>, files: Fil
   for (const [k, v] of Object.entries(fields)) fd.append(k, v);
   for (const f of files) fd.append("files", f);
   const res = await fetch(BASE + path, { method, body: fd });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 async function postJson(path: string, body: unknown) {
   const res = await fetch(BASE + path, {
@@ -46,7 +46,7 @@ async function postJson(path: string, body: unknown) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, json: await res.json() as any };
 }
 
 let projectId = "";
@@ -82,7 +82,7 @@ test("steer with an attachment: file stored, absolute path delivered to the agen
   expect(sent.at(-1)).toContain(path);
 
   // ...and the steer event records it for the timeline.
-  const events = await (await fetch(`${BASE}/api/tasks/${taskId}/events`)).json();
+  const events = await (await fetch(`${BASE}/api/tasks/${taskId}/events`)).json() as any;
   const steer = events.filter((e: any) => e.type === "steer").at(-1);
   expect(steer.payload.attachments).toEqual([path]);
 });
@@ -120,7 +120,7 @@ test("task create with attachments: paths appended to the brief under Attachment
   expect(paths[0]).toContain(join(HOME, "evidence", task.id));
 
   // The composed agent brief carries them through to the agent.
-  const brief = (await (await fetch(`${BASE}/api/tasks/${task.id}/brief`)).json()).brief;
+  const brief = (await (await fetch(`${BASE}/api/tasks/${task.id}/brief`)).json() as any).brief;
   expect(brief).toContain(paths[0]);
 });
 
@@ -137,7 +137,7 @@ test("task edit appends attachments to the existing brief", async () => {
   fd.append("files", png("extra.png"));
   const res = await fetch(`${BASE}/api/tasks/${taskId}`, { method: "PUT", body: fd });
   expect(res.status).toBe(200);
-  const task = await res.json();
+  const task = await res.json() as any;
   expect(task.brief).toContain("new brief");
   expect(task.brief).toContain("## Attachments");
   const path = task.brief.split("\n").filter((l: string) => l.startsWith("- "))[0].slice(2);
@@ -152,7 +152,7 @@ test("task edit without files leaves a null brief null", async () => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title: "Renamed" }),
   });
-  const task = await res.json();
+  const task = await res.json() as any;
   expect(task.title).toBe("Renamed");
   expect(task.brief).toBeNull();
 });
@@ -163,7 +163,7 @@ test("task edit without files leaves a null brief null", async () => {
 test("attachments do not count as evidence", async () => {
   const r = await postForm("/api/tasks", { project_id: projectId, title: "Gate check" }, [png()]);
   const taskId = r.json.id;
-  const detail = await (await fetch(`${BASE}/api/tasks/${taskId}`)).json();
+  const detail = await (await fetch(`${BASE}/api/tasks/${taskId}`)).json() as any;
   expect(detail.evidence).toHaveLength(0);
 
   db.query("UPDATE tasks SET state = 'verifying' WHERE id = ?").run(taskId);
@@ -202,7 +202,7 @@ test("attachments from a later edit surface too", async () => {
     fd.append("files", png(n));
     await fetch(`${BASE}/api/tasks/${taskId}`, { method: "PUT", body: fd });
   }
-  const task = await (await fetch(`${BASE}/api/tasks/${taskId}`)).json();
+  const task = await (await fetch(`${BASE}/api/tasks/${taskId}`)).json() as any;
   const { body, files } = splitAttachments(task.brief);
   expect(files.map((f) => f.name)).toEqual(["one.png", "two.png"]);
   expect(body).toBe("");

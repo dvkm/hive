@@ -51,19 +51,19 @@ test("offline endpoint: toggles, broadcasts, steers working agents with prep/res
   const server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr }) });
   const BASE = `http://127.0.0.1:${server.port}`;
   try {
-    let r = await (await fetch(`${BASE}/api/offline`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on: true }) })).json();
+    let r = await (await fetch(`${BASE}/api/offline`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on: true }) })).json() as any;
     expect(r.on).toBe(true);
     expect(isOffline(db)).toBe(true);
 
     // idempotent re-set steers nothing extra
-    r = await (await fetch(`${BASE}/api/offline`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on: true }) })).json();
+    r = await (await fetch(`${BASE}/api/offline`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on: true }) })).json() as any;
     expect(r.steered).toBe(0);
 
-    r = await (await fetch(`${BASE}/api/offline`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on: false }) })).json();
+    r = await (await fetch(`${BASE}/api/offline`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on: false }) })).json() as any;
     expect(r.on).toBe(false);
     expect(isOffline(db)).toBe(false);
 
-    const g = await (await fetch(`${BASE}/api/offline`)).json();
+    const g = await (await fetch(`${BASE}/api/offline`)).json() as any;
     expect(g.on).toBe(false);
   } finally {
     server.stop(true);

@@ -296,7 +296,7 @@ async function main() {
       const file = Bun.file(String(flags.file));
       form.set("file", file);
       const res = await fetch(BASE + path, { method: "POST", body: form });
-      const data = await res.json();
+      const data = await res.json() as any;
       if (!res.ok) die(`error ${res.status}: ${data.error}`);
       result = data;
     } else {

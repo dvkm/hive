@@ -1451,7 +1451,7 @@ test("a push aborts (visibly) when Jira moves between the decision and the write
       if (nth === 3) {
         issue.status = "Done";
         issue.updated = "2026-06-01T00:00:00.000Z";
-        issue.history = [...issue.history, { at: "2026-06-01T00:00:00.000Z", to: "Done" }];
+        issue.history = [...(issue.history ?? []), { at: "2026-06-01T00:00:00.000Z", to: "Done" }];
       }
     },
   });
@@ -3023,7 +3023,7 @@ test("a cycle with an issue write failure remains failed and names the write", a
   expect(result.error).toContain("completed with 1 issue failure");
   expect(result.error).toContain("WEB-1 comment_push");
   expect(result.error).toContain("comment exploded");
-  expect(result.state.last_error).toBe(result.error);
+  expect(result.state.last_error).toBe(result.error ?? null);
   expect(result.state.consecutive_failures).toBe(1);
 });
 
@@ -3035,7 +3035,7 @@ test("an operational issue read failure remains visible as a cycle failure", asy
   expect(result.error).toContain("completed with 1 issue failure");
   expect(result.error).toContain("jira GET /rest/api/3/issue/WEB-1?");
   expect(result.error).toContain("500 nope");
-  expect(result.state.last_error).toBe(result.error);
+  expect(result.state.last_error).toBe(result.error ?? null);
   expect(result.state.consecutive_failures).toBe(1);
 });
 
