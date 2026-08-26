@@ -170,3 +170,47 @@ test("a review card with no edges and no mark shows no land line at all", async 
   });
   expect(renderer.toJSON()).toBeNull();
 });
+
+// The background-check chip (task HIVE-405). Green when the agent's last commit
+// passed hive's own tsc/lint pass, amber with a count when it didn't, and absent
+// before the first check — a card with no chip must not read as "clean".
+const checkChips = async (t: Task) => {
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t));
+  });
+  return renderer.root
+    .findAll((n) => n.type === "span" && String(n.props.className ?? "").includes("chip-check"))
+    .map((n) => ({ className: String(n.props.className), title: String(n.props.title), text: n.children.join("") }));
+};
+
+test("a clean sidecar report renders one green checks chip", async () => {
+  const [chip, ...rest] = await checkChips(task("s-ok", { sidecar: { sha: "abc1234def", ok: true, findings: [] } }));
+  expect(rest).toEqual([]);
+  expect(chip.className).toContain("chip-check-ok");
+  expect(chip.text).toContain("checks");
+  expect(chip.title).toContain("abc1234");
+});
+
+test("a sidecar report with findings renders an amber chip counting them, and lists them on hover", async () => {
+  const [chip] = await checkChips(
+    task("s-bad", {
+      sidecar: {
+        sha: "abc1234def",
+        ok: false,
+        findings: [
+          { tool: "tsc", summary: "src/a.ts(3,1): error TS2345" },
+          { tool: "lint", summary: "src/b.ts:9 semi" },
+        ],
+      },
+    })
+  );
+  expect(chip.className).toContain("chip-check-warn");
+  expect(chip.text).toContain("2");
+  expect(chip.title).toContain("tsc: src/a.ts(3,1): error TS2345");
+  expect(chip.title).toContain("lint: src/b.ts:9 semi");
+});
+
+test("no chip at all before the first background check", async () => {
+  expect(await checkChips(task("s-none"))).toEqual([]);
+});

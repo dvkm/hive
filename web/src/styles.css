@@ -1004,6 +1004,16 @@ textarea { font-family: inherit; }
   color: var(--text);
   border-color: var(--text-faint);
 }
+/* Background check chip (sidecar): green when the agent's last commit passed,
+   amber with a count when it did not. Advisory, never a merge gate. */
+.chip-check-ok {
+  color: var(--green);
+  border-color: var(--border);
+}
+.chip-check-warn {
+  color: var(--amber);
+  border-color: rgba(226, 165, 66, 0.5);
+}
 .chip-blocked {
   color: var(--amber);
   border-color: rgba(226, 165, 66, 0.5);
