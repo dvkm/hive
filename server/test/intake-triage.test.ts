@@ -193,7 +193,7 @@ test("a triage card survives every auto-answer sweep", async () => {
   const { autoAnswerStale } = await import("../src/reconciler.ts");
   const { evaluateAutoApprove, evaluateAutopilotApprove } = await import("../src/autoapprove.ts");
   const { apiAnswerDecision } = await import("../src/api.ts");
-  const { defaultHerdr } = await import("../src/runtime/herdr.ts");
+  const { herdr: defaultHerdr } = await import("../src/runtime/herdr.ts");
 
   // decision_auto_answer_hours: 1 — the sweep would normally take any open
   // normal-risk card with a recommended option after an hour.
