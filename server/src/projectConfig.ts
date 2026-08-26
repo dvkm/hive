@@ -157,18 +157,22 @@ const prGardener: Check = (v) => {
   return null;
 };
 
-// Which task kinds must post a plan checkpoint before their first edit, and
-// (later) whether a vetoed plan blocks. See server/src/planCritic.ts.
+// Which task kinds must post a plan checkpoint before their first edit, whether
+// that checkpoint blocks the agent until it is acked, and how long a blocked
+// plan may wait before hive acks it. See server/src/planCritic.ts.
 const plan_gate: Check = (v) => {
   const bad = obj(v);
   if (bad) return bad;
   const g = v as Record<string, unknown>;
-  for (const key of Object.keys(g)) if (key !== "kinds" && key !== "block") return `.${key} is not supported`;
+  for (const key of Object.keys(g))
+    if (key !== "kinds" && key !== "block" && key !== "auto_ack_hours") return `.${key} is not supported`;
   if (g.kinds !== undefined) {
     const invalid = strArray(g.kinds);
     if (invalid) return `.kinds ${invalid}`;
   }
   if (g.block !== undefined && typeof g.block !== "boolean") return ".block must be a boolean";
+  if (g.auto_ack_hours !== undefined && !(typeof g.auto_ack_hours === "number" && Number.isFinite(g.auto_ack_hours) && g.auto_ack_hours > 0))
+    return ".auto_ack_hours must be a positive number of hours";
   return null;
 };
 

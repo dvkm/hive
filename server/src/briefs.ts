@@ -6,7 +6,7 @@ import { prTitlePrefix, prBodyFooter } from "./marker.ts";
 import { managingThreadForTask } from "./chat.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
-import { planGateKinds } from "./planCritic.ts";
+import { planGateKinds, planGateBlocks } from "./planCritic.ts";
 
 // The PR marker contract (documented in docs/API.md). Both halves are REQUIRED
 // on any PR the agent opens so hive can link the PR back to this task.
@@ -90,6 +90,8 @@ and feature flags still use \`hive decision ask\` or the guarded-action gate.`;
 // Plan gate (HIVE-412): for the kinds a project opts in via config.plan_gate,
 // the plan is posted as a checkpoint before the first edit, and hive critiques
 // it automatically. Nothing blocks; a serious concern comes back as a steer.
+// With plan_gate.block on (HIVE-413) the last paragraph is swapped for a wait
+// instruction — see BLOCKING_PLAN_TAIL.
 const PLAN_CHECKPOINT = `## Plan checkpoint (before your first edit)
 Post your plan before you change any file:
 
@@ -104,6 +106,23 @@ Write plan.json first, with exactly these fields:
    "verification_planned":"the check that proves it works"}
 
 Hive reviews the plan and sends any concerns back as a steer. Keep working
+while it reviews; this checkpoint never blocks you. If a concern comes back,
+fix the plan and post it again before you carry on editing.`;
+
+// Blocking mode. The agent posts the plan and then STOPS. The director's ack
+// (or the auto-ack sweep) delivers a steer that releases it, so the only safe
+// thing an agent can do here is end its turn and wait to be woken.
+const BLOCKING_PLAN_TAIL = `This project BLOCKS on the plan. After you post it, do NOT edit any file.
+Emit the plan, say in one line that you are waiting, and END YOUR TURN.
+
+A steer wakes you with the verdict:
+- "Your plan is APPROVED" — start editing and finish the task.
+- "Your plan was FLAGGED" — fix the plan, post it again, and wait again.
+
+Do not poll, do not ask again, and do not start work while you wait.`;
+
+// The non-blocking tail, replaced wholesale in blocking mode.
+const PLAN_TAIL_OPEN = `Hive reviews the plan and sends any concerns back as a steer. Keep working
 while it reviews; this checkpoint never blocks you. If a concern comes back,
 fix the plan and post it again before you carry on editing.`;
 
@@ -260,7 +279,13 @@ export function composeBrief(db: DB, taskId: string): string {
   parts.push(PLAIN_ENGLISH);
   parts.push(CHECKPOINTS);
   const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
-  if (planGateKinds(JSON.parse(project?.config ?? "{}")).includes(task.kind)) parts.push(PLAN_CHECKPOINT);
+  const projectConfig = JSON.parse(project?.config ?? "{}");
+  if (planGateKinds(projectConfig).includes(task.kind))
+    parts.push(
+      planGateBlocks(projectConfig, task.kind)
+        ? PLAN_CHECKPOINT.replace(PLAN_TAIL_OPEN, BLOCKING_PLAN_TAIL)
+        : PLAN_CHECKPOINT
+    );
   parts.push(spawnTasksSection(task.project_id));
   const team = teamSection(db, taskId);
   if (team) parts.push(team);

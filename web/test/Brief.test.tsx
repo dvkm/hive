@@ -300,3 +300,52 @@ test("Backlog task links open against the backlog location for modal history", a
   const taskLink = renderer.root.findAll((node) => node.props.to === `/tasks/${task.id}`)[0];
   expect(taskLink.props.state.backgroundLocation.pathname).toBe("/inbox");
 });
+
+// HIVE-413: a blocking plan checkpoint is approved from the card itself, so the
+// card must carry the plan and the critic's concerns without a task-page visit.
+test("Focus shows a blocking plan's fields and the critic's concerns on the card", async () => {
+  values.set("hive.inbox.mode", "focus");
+  values.delete("hive.board.project");
+  api.evidence = (async () => ({ evidence: [] })) as typeof api.evidence;
+  const planCheckpoint = {
+    ...checkpoint,
+    id: "checkpoint-plan",
+    note: "add the release steer",
+    blocking: true,
+    plan: {
+      goal: "add the release steer",
+      approach: "steer the agent from the ack endpoint",
+      files_expected: ["server/src/api.ts"],
+      verification_planned: "bun test server/test/plan-critic.test.ts",
+    },
+    concerns: [{ severity: "veto" as const, text: "The plan never says how auto-ack is scheduled." }],
+  };
+  const store = {
+    tasks: [task],
+    projects: [{ id: task.project_id, name: "Project" }],
+    needsYou: [{ kind: "checkpoint", id: planCheckpoint.id, checkpoint: planCheckpoint }],
+    checkpoints: [planCheckpoint],
+    rev: {},
+    reloadCheckpoints: () => {},
+    reloadQuizzes: () => {},
+  } as unknown as Store;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(
+      <MemoryRouter initialEntries={["/inbox"]}>
+        <Ctx.Provider value={store}>
+          <LightboxProvider><Brief /></LightboxProvider>
+        </Ctx.Provider>
+      </MemoryRouter>
+    );
+  });
+
+  const text = JSON.stringify(renderer.toJSON());
+  expect(text).toContain("steer the agent from the ack endpoint");
+  expect(text).toContain("server/src/api.ts");
+  expect(text).toContain("bun test server/test/plan-critic.test.ts");
+  expect(text).toContain("The plan never says how auto-ack is scheduled.");
+  expect(text).toContain("VETO");
+  // The agent is parked, and the card says so.
+  expect(renderer.root.findAll((node) => String(node.props.className ?? "").includes("cp-waiting"))).toHaveLength(1);
+});

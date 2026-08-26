@@ -24,7 +24,7 @@ import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { notTestProjectSql } from "./testProjects.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
-import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent } from "./api.ts";
+import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer } from "./api.ts";
 import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectBaseBranch, preferSafeRef } from "./exec.ts";
@@ -33,6 +33,7 @@ import { landOnce } from "./landQueue.ts";
 import { sidecarOnce } from "./sidecar.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
 import { runPrGardener } from "./prGardener.ts";
+import { autoAckPlans } from "./planCritic.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
 const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
@@ -138,6 +139,16 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("advanceFinished", () => advanceFinished(db, deps));
   await step("nagOpenDecisions", () => nagOpenDecisions(db, (deps.nowMs ?? (() => Date.now()))()));
   await step("unparkAnswered", () => unparkAnswered(db, (deps.nowMs ?? (() => Date.now()))()));
+  // Away-mode release valve: a plan the director never acked frees its agent
+  // after the project's plan_gate.auto_ack_hours. Local (herdr + sqlite), so it
+  // sits above the offline cutoff — an offline director is exactly the case it
+  // exists for.
+  await step("autoAckPlans", () =>
+    autoAckPlans(db, {
+      steer: (id, message) => internalSteer(db, deps.herdr ?? defaultHerdr, id, message),
+      nowMs: (deps.nowMs ?? (() => Date.now()))(),
+    })
+  );
   await step("remindUnreviewedIntake", () => remindUnreviewedIntake(db, (deps.nowMs ?? (() => Date.now()))()));
   await step("captureRecurringRefs", () => captureRecurringRefs(db));
   await step("repairRequeueProvenance", () => repairRequeueProvenance(db));
