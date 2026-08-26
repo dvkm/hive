@@ -19,7 +19,7 @@ async function request(path: string, method = "GET", body?: unknown): Promise<an
     headers: body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  const data: any = await response.json();
+  const data = await response.json();
   if (!response.ok) throw new Error(`${response.status}: ${data.error || response.statusText}`);
   return data;
 }
