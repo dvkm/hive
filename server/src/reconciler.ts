@@ -34,6 +34,7 @@ import { sidecarOnce } from "./sidecar.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
 import { runPrGardener } from "./prGardener.ts";
 import { autoAckPlans } from "./planCritic.ts";
+import { ambiguityCleared, cautionCleared } from "./reviewer.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
 const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
@@ -1311,21 +1312,29 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     } catch {
       continue;
     }
-    if (verdict.skipped || verdict.verdict !== "looks_good") continue;
+    if (verdict.skipped) continue;
+    if (verdict.verdict !== "looks_good" && verdict.verdict !== "caution") continue;
     // A PR-backed task's most recent review must have been taken against the
     // PR head that's about to be merged — a delayed review from before a
     // force-push or PR replacement must never auto-merge the new head
     // (task HIVE-307). Not fatal: just wait for autoReviewOnce to catch up.
     if (r.pr_url && (verdict.reviewed_pr_url !== r.pr_url || verdict.reviewed_head_sha !== r.head_sha)) continue;
+    // The pre-review's risks and questions are the ambiguity signal, but they
+    // are suspicions until checked: the per-risk verification pass (HIVE-406)
+    // re-reads the real code for this exact head. When it refuted every risk
+    // and answered every question from the code, the ambiguity is gone and a
+    // caution verdict lands like a clean one; one confirmed risk, one
+    // human-only question, or any gap keeps the card parked for the director.
+    const cleared = ambiguityCleared(db, r.id, verdict.reviewed_head_sha, verdict);
+    if (verdict.verdict === "caution" && !cautionCleared(db, r.id, verdict.reviewed_head_sha, verdict)) continue;
     // Same policy the planner uses for its breakdown cards: a PR merge is
     // always revertible (reversible=true) and touches the shared main branch
-    // (blastRadius="shared"); the pre-review's own risks/questions are the
-    // ambiguity signal, and the project's auto_merge.kinds allow-list IS the
-    // stored preference — unset/not-listed means "preference unknown".
+    // (blastRadius="shared"), and the project's auto_merge.kinds allow-list IS
+    // the stored preference — unset/not-listed means "preference unknown".
     const escalation = classifyEscalation({
       reversible: true,
       blastRadius: "shared",
-      ambiguous: Boolean(verdict.risks?.length || verdict.questions?.length),
+      ambiguous: !cleared,
       preferenceKnown: kinds.includes(r.kind),
     });
     if (escalation.effect !== "auto_handle") continue;

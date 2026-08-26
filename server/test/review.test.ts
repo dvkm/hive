@@ -1125,7 +1125,14 @@ test("diff endpoint rejects tracking-only review tasks", async () => {
 // case needs. `kind` decides whether it is inside the project's auto_merge list.
 async function judgmentTask(
   s: ReturnType<typeof makeServer>,
-  opts: { kind?: string; verdict?: "looks_good" | "caution"; files?: string[]; config?: Record<string, unknown> } = {}
+  opts: {
+    kind?: string;
+    verdict?: "looks_good" | "caution";
+    files?: string[];
+    risks?: string[];
+    head?: string;
+    config?: Record<string, unknown>;
+  } = {}
 ) {
   const p = await post(s.base, "/api/projects", {
     name: "p",
@@ -1143,9 +1150,29 @@ async function judgmentTask(
       new Date().toISOString(),
       "system",
       "auto_review",
-      JSON.stringify({ verdict: opts.verdict, summary: "s", risks: [], questions: [], files: opts.files ?? ["server/src/rows.ts"] })
+      JSON.stringify({
+        verdict: opts.verdict,
+        summary: "s",
+        risks: opts.risks ?? [],
+        questions: [],
+        files: opts.files ?? ["server/src/rows.ts"],
+        ...(opts.head ? { reviewed_head_sha: opts.head } : {}),
+      })
     );
+  if (opts.head) s.db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run(opts.head, t.json.id);
   return { projectId: p.json.id, taskId: t.json.id };
+}
+
+// The verification pass's answer for one head, as the reviewer would write it.
+function addRiskVerdicts(s: ReturnType<typeof makeServer>, taskId: string, head: string, verdict: "confirmed" | "refuted") {
+  s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    `ev-rv-${head}-${taskId}`,
+    taskId,
+    new Date().toISOString(),
+    "system",
+    "risk_verdicts",
+    JSON.stringify({ reviewed_head_sha: head, verdicts: [{ risk: "maybe a leak", verdict, why: "checked it" }] })
+  );
 }
 
 test("a mechanical looks_good chore mints no quiz anywhere", async () => {
@@ -1182,6 +1209,47 @@ test("a caution verdict keeps the quiz required for the same chore", async () =>
   expect(merge.status).toBe(200);
   const events = await get(s.base, `/api/tasks/${taskId}/events`);
   expect(events.json.some((event: any) => event.type === "understanding_quiz_deferred")).toBe(true);
+  s.server.stop(true);
+});
+
+// HIVE-407: the per-risk check (HIVE-406) re-read the code for this head and
+// refuted everything, so the caution is no longer judgment-class — it lands
+// like a clean review. A risk that survives the check does the opposite.
+test("a caution whose risks were all refuted stops being judgment-class", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
+  addRiskVerdicts(s, taskId, "head-1", "refuted");
+
+  const check = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(check.json.understanding_required).toBe(false);
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(200);
+  s.server.stop(true);
+});
+
+test("a confirmed risk blocks the merge and the 409 names it", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
+  addRiskVerdicts(s, taskId, "head-1", "confirmed");
+
+  const blocked = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(blocked.status).toBe(409);
+  expect(blocked.json.error).toContain("maybe a leak");
+  expect(blocked.json.error).toContain("checked it");
+
+  // Verdicts from an older head say nothing about the head being merged.
+  s.db.query("UPDATE tasks SET head_sha = 'head-2' WHERE id = ?").run(taskId);
+  const stale = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(stale.status).not.toBe(409);
+  s.server.stop(true);
+});
+
+test("the director can merge over a confirmed risk on purpose", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
+  addRiskVerdicts(s, taskId, "head-1", "confirmed");
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, { override_confirmed_risks: true });
+  expect(merge.status).toBe(200);
   s.server.stop(true);
 });
 

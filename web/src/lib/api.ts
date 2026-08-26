@@ -835,10 +835,14 @@ export const api = {
       body: JSON.stringify({ task_ids, queued }),
     }),
   branchCheck: (id: string) => req<BranchCheck>(`/api/tasks/${id}/branch-check`),
-  merge: (id: string, strategy?: "local_ff") =>
+  merge: (id: string, strategy?: "local_ff", overrideConfirmedRisks?: boolean) =>
     req<Task>(`/api/tasks/${id}/merge`, {
       method: "POST",
-      body: JSON.stringify({ ...(strategy ? { merge_strategy: strategy } : {}), actor: directorActor() }),
+      body: JSON.stringify({
+        ...(strategy ? { merge_strategy: strategy } : {}),
+        ...(overrideConfirmedRisks ? { override_confirmed_risks: true } : {}),
+        actor: directorActor(),
+      }),
     }),
   requestChanges: (id: string, notes: string) =>
     req<{ ok: boolean; delivered: boolean; task: Task }>(`/api/tasks/${id}/request-changes`, {

@@ -104,6 +104,60 @@ import type { Decision, Event } from "../lib/api";
 // The request-changes exchange: the director's notes and the agent's replies,
 // in order. Without this, "Request changes" fired into the void — the agent's
 // response only existed in the buried timeline.
+// The pre-review's risks and questions, after the per-risk check re-read the
+// real code for this head (HIVE-406/407). Confirmed risks are red, refuted ones
+// green, and a question only the human can answer stays amber — so the director
+// reads a short verdict list instead of a wall of maybes. Verdicts recorded for
+// an older head are ignored: they say nothing about what is about to merge.
+export function RiskVerdicts({ events, headSha }: { events: Event[]; headSha: string | null }) {
+  const review = [...events].reverse().find((e) => e.type === "auto_review" && !e.payload.skipped);
+  const verdictEvent = headSha
+    ? [...events].reverse().find((e) => e.type === "risk_verdicts" && e.payload.reviewed_head_sha === headSha)
+    : undefined;
+  if (!review || !verdictEvent) return null;
+  const risks = (verdictEvent.payload.verdicts ?? []) as { risk: string; verdict: string; why?: string; evidence_path?: string }[];
+  const questions = (verdictEvent.payload.question_verdicts ?? []) as { question: string; answerable: string; answer?: string }[];
+  const unverified = Number(verdictEvent.payload.unverified) || 0;
+  if (!risks.length && !questions.length && !unverified) return null;
+  // "Still open" is what the director must act on: a risk the check confirmed,
+  // a question only they can answer, or an item the check could not reach.
+  const noted = risks.length + questions.length;
+  const open =
+    risks.filter((r) => r.verdict === "confirmed").length + questions.filter((q) => q.answerable === "human").length + unverified;
+  return (
+    <div className="risk-verdicts">
+      <span className="risk-verdicts-label">
+        Pre-review {review.payload.verdict === "caution" ? "flagged" : "noted"} {noted} thing{noted === 1 ? "" : "s"} — {open || "none"}{" "}
+        still open
+      </span>
+      <ul>
+        {risks.map((r, i) => (
+          <li key={`r${i}`} className={r.verdict === "confirmed" ? "rv-confirmed" : "rv-refuted"}>
+            <span className="rv-chip">{r.verdict === "confirmed" ? "confirmed" : "refuted"}</span>
+            <span className="rv-text" title={[r.why, r.evidence_path].filter(Boolean).join(" · ")}>
+              {r.risk}
+            </span>
+          </li>
+        ))}
+        {questions.map((q, i) => (
+          <li key={`q${i}`} className={q.answerable === "human" ? "rv-human" : "rv-refuted"}>
+            <span className="rv-chip">{q.answerable === "human" ? "you answer" : "answered"}</span>
+            <span className="rv-text" title={q.answer ?? ""}>
+              {q.question}
+            </span>
+          </li>
+        ))}
+        {unverified > 0 && (
+          <li className="rv-human">
+            <span className="rv-chip">unchecked</span>
+            <span className="rv-text">{unverified} could not be checked</span>
+          </li>
+        )}
+      </ul>
+    </div>
+  );
+}
+
 function ChangesThread({ events }: { events: Event[] }) {
   const firstReq = events.findIndex((e) => e.type === "changes_requested");
   if (firstReq === -1) return null;
@@ -619,7 +673,7 @@ export function ReviewCard({
       setBusy(false);
     }
   };
-  const merge = async (strategy?: "local_ff") => {
+  const merge = async (strategy?: "local_ff", overrideConfirmedRisks?: boolean) => {
     if (busy) return;
     start();
     try {
@@ -627,7 +681,7 @@ export function ReviewCard({
         await api.transition(task.id, "verifying");
         toast("Report accepted");
       } else {
-        await api.merge(task.id, strategy);
+        await api.merge(task.id, strategy, overrideConfirmedRisks);
         toast(strategy ? "Merged locally → Verifying" : "Merged → Verifying");
       }
       finish();
@@ -775,6 +829,7 @@ export function ReviewCard({
             {caveats.length > 1 && <small>+{caveats.length - 1} more</small>}
           </div>
         )}
+        <RiskVerdicts events={events} headSha={task.head_sha} />
       </div>
 
       <EvidenceStrip evidence={evidence.filter((e) => e.kind !== "explanation")} task={task} />
@@ -899,6 +954,17 @@ export function ReviewCard({
       {mergeErr && (
         <div className="review-merge-error">
           Merge failed: {mergeErr}
+          {mergeErr.includes("override_confirmed_risks") && (
+            <button
+              className="btn"
+              style={{ marginLeft: "var(--s2)" }}
+              disabled={busy || !!mergeBlocked}
+              title="Merge anyway. The risks above stay on the card as the record of what you accepted."
+              onClick={() => merge(undefined, true)}
+            >
+              Merge anyway
+            </button>
+          )}
           {task.pr_url && !mergeErr.includes("CLOSED (not merged)") && (
             <button
               className="btn"
