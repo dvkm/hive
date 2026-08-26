@@ -1946,6 +1946,13 @@ export async function handleBlockedAgent(db: DB, h: Herdr, taskId: string, targe
     await recoverQueuedInput(db, h, task, target, diag.excerpt);
     return true;
   }
+  if (diag?.kind === "usage_limit") {
+    // Catch the park the moment status flips (~60s), same as every other
+    // dialog kind here — waiting for the 15-minute stale timer is exactly the
+    // churn window that burned quota on 2026-08-26 (HIVE-451).
+    recoverUsageLimit(db, task, diag.excerpt);
+    return true;
+  }
   if (diag?.kind !== "blocked_dialog") return false; // blocked but no visible dialog: leave to the silent path
 
   const project = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id) as { config: string } | undefined;
