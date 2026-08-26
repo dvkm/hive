@@ -181,6 +181,28 @@ export function isQuizHold(reason: string): boolean {
   return QUIZ_HOLD_RE.test(reason);
 }
 
+// The mark predates the insight. A director who marks a PR approved-to-land and
+// only THEN passes its understanding check has just learned what the change
+// actually does — and may no longer want it. So a pass recorded after the mark
+// freezes the queue for that task until the director taps "Land now" on the
+// review card, which re-marks it and postdates the pass (director ruling,
+// HIVE-421). Unmarking clears it the other way.
+// ponytail: derived from event order, no new column — "Land now" is the
+// existing land-queue mark call, not a new endpoint.
+export function landHeldForQuiz(db: DB, taskId: string): boolean {
+  const row = db
+    .query(
+      `SELECT (SELECT MAX(rowid) FROM events WHERE task_id = ? AND type = 'land_queued') AS marked,
+              (SELECT MAX(rowid) FROM events
+                 WHERE task_id = ? AND type = 'understanding_quiz_passed'
+                   AND json_extract(payload, '$.review_event_id') = (
+                     SELECT id FROM events WHERE task_id = ? AND type = 'review_summary'
+                      ORDER BY ts DESC, rowid DESC LIMIT 1)) AS passed`
+    )
+    .get(taskId, taskId, taskId) as { marked: number | null; passed: number | null };
+  return !!(row?.marked && row?.passed && row.passed > row.marked);
+}
+
 // Retry spacing after consecutive transient failures. The reconciler sweeps
 // every 30s; without this a base that keeps moving would be re-merged every
 // sweep forever. After MAX_TRANSIENT_RETRIES the failure stops being treated as
@@ -347,6 +369,8 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         // otherwise every sweep would re-attempt and re-ask the same question.
         if (openPauseDecisionId(db, n.id)) continue;
         if (backingOff(retryState(db, n.id), nowMs)) continue;
+        // Quiz passed after the mark: wait for the director's "Land now" tap.
+        if (landHeldForQuiz(db, n.id)) continue;
         const waiting = edges.some((e) => {
           if (e.to !== n.id) return false;
           if (e.kind === "depends")

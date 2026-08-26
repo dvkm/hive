@@ -174,7 +174,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
       const body = await response.json().catch(() => ({})) as any;
       return { ok: false, error: body.error ?? `HTTP ${response.status}` };
     },
-    directorDeciding: (taskId) => passedInFocus(db, taskId),
+    directorDeciding: (taskId) => passedByDirector(db, taskId),
     decide: (input) => createDecision(db, input),
   }));
   await step("resumeUsageLimited", () => resumeUsageLimited(db, (deps.nowMs ?? (() => Date.now()))()));
@@ -1259,11 +1259,15 @@ export function nagOpenDecisions(db: DB, nowMs: number = Date.now()): void {
 // those without waiting. Anything contested (caution verdict, risks, red CI,
 // a changes_requested in history) still parks for the human. A notification
 // reports every auto-merge; the existing verifying/smoke gates still run.
-export function passedInFocus(db: DB, taskId: string): boolean {
+// Passing the understanding check proves the director READ the change. It is
+// never approval to ship: having understood it, they may well decide it is not
+// what they wanted. So any pass on the latest review — Focus, the review card,
+// the task page, it makes no difference — parks the task for an explicit Ship or
+// Request changes click (director ruling, HIVE-421).
+export function passedByDirector(db: DB, taskId: string): boolean {
   return !!db.query(
     `SELECT 1 FROM events passed
       WHERE passed.task_id = ? AND passed.type = 'understanding_quiz_passed'
-        AND json_extract(passed.payload, '$.surface') = 'focus'
         AND json_extract(passed.payload, '$.review_event_id') = (
           SELECT id FROM events
            WHERE task_id = ? AND type = 'review_summary'
@@ -1281,9 +1285,9 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     .all() as { id: string; number: number; title: string; kind: string; pr_url: string | null; head_sha: string | null; config: string }[];
   for (const r of rows) {
     if (isTrackingOnlyId(db, r.id)) continue;
-    // Passing Focus proves understanding, not approval to ship. Leave the task
+    // A quiz pass proves understanding, not approval to ship. Leave the task
     // parked so the director can still choose Ship or Request changes.
-    if (passedInFocus(db, r.id)) continue;
+    if (passedByDirector(db, r.id)) continue;
     // A queued steer is requested work the agent has not received yet. Never
     // merge the branch before a fresh turn can address it.
     if (queuedSteers(db, r.id).length) continue;
@@ -1335,7 +1339,7 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
       const beforeMutation = () => {
         const task = getTask(db, r.id);
         if (!task || task.state !== "in_review" || task.ci_status !== "passing") return false;
-        if (passedInFocus(db, r.id)) return false;
+        if (passedByDirector(db, r.id)) return false;
         if (queuedSteers(db, r.id).length || queuedInputRecoveryPending(db, r.id)) return false;
         return !db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'changes_requested' LIMIT 1").get(r.id);
       };

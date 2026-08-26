@@ -884,7 +884,7 @@ test("autoMergeReady merges opted-in, green, clean-review, uncontested tasks wit
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_deferred'").get(sensitive)).toBeTruthy();
 });
 
-test("autoMergeReady leaves a Focus-reviewed task for an explicit ship or request-changes choice", async () => {
+test("autoMergeReady leaves a quiz-passed task for an explicit ship or request-changes choice, whatever surface passed it (HIVE-421)", async () => {
   const { autoMergeReady } = await import("../src/reconciler.ts");
   const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
   const id = makeTask(db, projectId, { kind: "chore" });
@@ -900,15 +900,17 @@ test("autoMergeReady leaves a Focus-reviewed task for an explicit ship or reques
     type: "review_summary",
     payload: { understanding: { check: { question: "safe?", options: [{ key: "yes", label: "yes" }, { key: "no", label: "no" }], answer_key: "yes" } } },
   });
+  // No surface field: this is the review card / task page pass, which used to
+  // slip past the Focus-only guard and auto-merge on the next sweep.
   writeEvent(db, {
     task_id: id,
     source: "director",
     type: "understanding_quiz_passed",
-    payload: { review_event_id: review.id, answer_key: "yes", surface: "focus" },
+    payload: { review_event_id: review.id, answer_key: "yes" },
   });
   writeEvent(db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
 
-  await autoMergeReady(db, { exec: stub(() => { throw new Error("Focus review must not auto-merge"); }) });
+  await autoMergeReady(db, { exec: stub(() => { throw new Error("a passed quiz must not auto-merge"); }) });
   expect(getTask(db, id).state).toBe("in_review");
 });
 
@@ -1027,13 +1029,15 @@ test("autoMergeReady rechecks queued work at every destructive merge boundary", 
     db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
       newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
     );
-    const review = writeEvent(db, {
+    writeEvent(db, {
       task_id: id,
       source: "agent",
       type: "review_summary",
       payload: { understanding: { check: { question: "safe?", options: [{ key: "review", label: "yes" }, { key: "guess", label: "no" }], answer_key: "review" } } },
     });
-    writeEvent(db, { task_id: id, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "review" } });
+    // No quiz pass: a passed quiz parks the task for an explicit Ship click
+    // (HIVE-421), and this test is about the pre-mutation recheck. An auto-ship
+    // kind defers the unanswered check instead.
     writeEvent(db, {
       task_id: id,
       source: "system",
