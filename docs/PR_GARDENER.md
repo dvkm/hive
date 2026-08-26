@@ -28,7 +28,7 @@ It is off by default. Enable it by adding `pr_gardener` to a project's config:
 
 Hive checks every open pull request against the configured base branch. If `promote.from` is set, that branch is the base. Otherwise Hive uses `default_branch` or `main`. The promote flow itself is unchanged.
 
-The gardener never lands a task while the director is still deciding on it. Passing the Focus understanding quiz proves the director read the change. It is never approval to ship. Such a task waits until the director clicks Ship or answers a gardener card.
+The gardener never lands a task while the director is still deciding on it. Passing the understanding quiz proves the director read the change, on any surface: Focus, the review card, or the task page. It is never approval to ship. Such a task waits until the director clicks Ship or answers a gardener card.
 
 Sensitive pull requests always create a decision card. They are never landed or closed automatically. Hive always protects `.github/workflows/**`, `.env`, `**/*.env`, and files inside `secrets` directories. `sensitive_paths` adds project-specific patterns to those built-ins. A stale pull request also creates a card unless Git proves that every patch is already present on the base branch. `auto_close_superseded` defaults to false, so proven supersession still requires a card unless a project opts into automatic closure.
 

@@ -6,6 +6,7 @@ import { LightboxProvider } from "../src/lib/lightbox";
 import { api } from "../src/lib/api";
 import type { Task, TaskDetail } from "../src/lib/api";
 import { ReviewCard } from "../src/views/ReviewCard";
+import { UnderstandingQuiz } from "../src/views/UnderstandingQuiz";
 
 const fakeStore = { projects: [], quizzes: [] } as unknown as Store;
 
@@ -149,6 +150,117 @@ function passingDetail(id: string): TaskDetail {
     decisions: [],
   };
 }
+
+// HIVE-421: approved to land FIRST, understanding check passed AFTER. The
+// approval predates the insight, so the queue must ask before it merges.
+function landMarkedThenPassedDetail(id: string): TaskDetail {
+  const base = passingDetail(id);
+  return {
+    ...base,
+    land_queued_at: "2026-01-01T00:00:00.500Z",
+    events: [
+      base.events[0],
+      { id: "land-1", task_id: id, ts: "2026-01-01T00:00:00.500Z", source: "director", type: "land_queued", payload: {} } as any,
+      base.events[1],
+    ],
+  };
+}
+
+test("a quiz passed after the land mark asks for a Land now tap instead of merging (HIVE-421)", async () => {
+  const originalTask = api.task;
+  const originalLandQueue = api.landQueue;
+  const calls: { ids: string[]; queued: boolean }[] = [];
+  api.task = (async (id: string) => landMarkedThenPassedDetail(id)) as typeof api.task;
+  api.landQueue = (async (ids: string[], queued = true) => {
+    calls.push({ ids, queued });
+    return { changed: ids, queued };
+  }) as typeof api.landQueue;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree({ ...task("land-held"), land_queued_at: "2026-01-01T00:00:00.500Z" }));
+    });
+    const landNow = renderer.root.findAll((n) => n.type === "button" && n.children.includes("Land now"));
+    const unmark = renderer.root.findAll((n) => n.type === "button" && n.children.includes("Unmark"));
+    expect(landNow).toHaveLength(1);
+    expect(unmark).toHaveLength(1);
+
+    // toast() reaches for a DOM this renderer has none of; the tap itself is
+    // what matters here.
+    const doc = (globalThis as any).document;
+    (globalThis as any).document = { createElement: () => ({ style: {}, className: "", classList: { add() {}, remove() {} }, remove() {} }), body: { appendChild() {} } };
+    try {
+      await act(async () => {
+        await landNow[0].props.onClick();
+      });
+    } finally {
+      (globalThis as any).document = doc;
+    }
+    expect(calls).toEqual([{ ids: ["land-held"], queued: true }]);
+  } finally {
+    api.task = originalTask;
+    api.landQueue = originalLandQueue;
+  }
+});
+
+// HIVE-421 steer: the pass happens in THIS session (no quiz_passed event yet),
+// so the hold comes from the in-session pass. Tapping "Land now" must clear it
+// right away — the director just confirmed, the card must not still read held.
+test("passing the quiz then tapping Land now clears the hold in the same session", async () => {
+  const originalTask = api.task;
+  const originalLandQueue = api.landQueue;
+  const calls: { ids: string[]; queued: boolean }[] = [];
+  // Only the review_summary — the quiz is passed below, in-session.
+  api.task = (async (id: string) => ({ ...passingDetail(id), events: [passingDetail(id).events[0]] })) as typeof api.task;
+  api.landQueue = (async (ids: string[], queued = true) => {
+    calls.push({ ids, queued });
+    return { changed: ids, queued };
+  }) as typeof api.landQueue;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree({ ...task("land-same-session"), land_queued_at: "2026-01-01T00:00:00.500Z" }));
+    });
+    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Land now"))).toHaveLength(0);
+
+    await act(async () => {
+      renderer.root.findByType(UnderstandingQuiz).props.onPassed();
+    });
+    const landNow = renderer.root.findAll((n) => n.type === "button" && n.children.includes("Land now"));
+    expect(landNow).toHaveLength(1);
+
+    const doc = (globalThis as any).document;
+    (globalThis as any).document = { createElement: () => ({ style: {}, className: "", classList: { add() {}, remove() {} }, remove() {} }), body: { appendChild() {} } };
+    try {
+      await act(async () => {
+        await landNow[0].props.onClick();
+      });
+    } finally {
+      (globalThis as any).document = doc;
+    }
+    expect(calls).toEqual([{ ids: ["land-same-session"], queued: true }]);
+    // The card now reads as queued to land, not as held awaiting a tap.
+    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Land now"))).toHaveLength(0);
+    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Unmark"))).toHaveLength(0);
+  } finally {
+    api.task = originalTask;
+    api.landQueue = originalLandQueue;
+  }
+});
+
+test("a task that is not queued to land shows no land prompt", async () => {
+  const originalTask = api.task;
+  api.task = (async (id: string) => passingDetail(id)) as typeof api.task;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree(task("not-queued")));
+    });
+    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Land now"))).toHaveLength(0);
+  } finally {
+    api.task = originalTask;
+  }
+});
 
 // task #1000: the merge decision must reflect the LIVE branch-check, not just
 // whatever the agent's own review_summary claims. An unmet dependency

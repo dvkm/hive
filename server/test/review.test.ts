@@ -883,6 +883,27 @@ test("report acceptance requires its understanding quiz", async () => {
   s.server.stop(true);
 });
 
+test("passing a scout's quiz never accepts the report on its own (HIVE-421)", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "scout it", kind: "scout" });
+  await post(s.base, `/api/tasks/${t.json.id}/spawn`, {});
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+  await addQuiz(s.base, t.json.id);
+
+  const pass = await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "tests", source: "director" });
+  expect(pass.json.passed).toBe(true);
+  // The quiz is a precondition for accepting the report, never the trigger:
+  // the task sits in review until the director takes the distinct accept action.
+  expect((await get(s.base, `/api/tasks/${t.json.id}`)).json.state).toBe("in_review");
+  const events = await get(s.base, `/api/tasks/${t.json.id}/events`);
+  expect(events.json.some((e: any) => e.type === "state_change" && e.payload.to === "verifying")).toBe(false);
+
+  const accept = await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "verifying" });
+  expect(accept.status).toBe(200);
+  s.server.stop(true);
+});
+
 test("request-changes returns the task to in_progress, sends notes, records an event", async () => {
   const s = makeServer();
   const { taskId } = await inReviewTask(s.base);

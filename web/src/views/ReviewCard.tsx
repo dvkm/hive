@@ -367,6 +367,32 @@ function DiffFileView({ f, wrap }: { f: DiffFile; wrap: boolean }) {
 
 type ActionMode = null | "changes" | "reject";
 
+// Approved-to-land, then understood. The mark was made BEFORE the director knew
+// what the change does, so the queue stops and asks rather than merging on the
+// next sweep (HIVE-421). "Land now" re-marks it, which puts the approval after
+// the quiz again; "Unmark" takes it out of the queue. Either tap sets landActed,
+// so the hold clears on the tap itself, because the task prop and the events
+// still carry the pre-tap state until the refetch lands.
+export function isLandHeld(o: {
+  landActed: boolean;
+  landQueuedAt?: string | null;
+  quizStatus: string;
+  passedThisSession: boolean;
+  events: Event[];
+  reviewEventId: string | null;
+}): boolean {
+  if (o.landActed || !o.landQueuedAt || o.quizStatus !== "passed") return false;
+  if (o.passedThisSession) return true;
+  const lastIndexOf = (match: (e: Event) => boolean) => {
+    for (let i = o.events.length - 1; i >= 0; i--) if (match(o.events[i])) return i;
+    return -1;
+  };
+  return (
+    lastIndexOf((e) => e.type === "understanding_quiz_passed" && e.payload.review_event_id === o.reviewEventId) >
+    lastIndexOf((e) => e.type === "land_queued")
+  );
+}
+
 // The one review surface, shared by the task page, the /review queue, and the
 // Needs you view. Renders: title/project/summary, PR+CI status, a compact diff
 // stat with an expandable inline diff, and the three primary actions
@@ -388,6 +414,9 @@ export function ReviewCard({
   const [expanded, setExpanded] = useState(false);
   const [wrap, setWrap] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Tapping Land now / Unmark settles the question; the task prop still carries
+  // the old land_queued_at until the parent refetches, so hide the prompt here.
+  const [landActed, setLandActed] = useState(false);
   const [mode, setMode] = useState<ActionMode>(null);
   const [notes, setNotes] = useState("");
   const [review, setReview] = useState<ReviewSummary | null>(null);
@@ -538,6 +567,14 @@ export function ReviewCard({
           ? "No PR and no branch — nothing to merge"
           : "";
   const mergeBlocked = quizBlocked || depBlocked || deliveryBlocked;
+  const landHeld = isLandHeld({
+    landActed,
+    landQueuedAt: task.land_queued_at,
+    quizStatus,
+    passedThisSession: quizOverride === "passed",
+    events,
+    reviewEventId,
+  });
   const embeddedTasks = branchCheck?.embedded_tasks ?? [];
   const failures = [...events]
     .reverse()
@@ -632,6 +669,21 @@ export function ReviewCard({
       );
       toast("Agent asked to add the understanding check");
       finish();
+    } catch (e) {
+      toast((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const setLandMark = async (queued: boolean) => {
+    if (busy) return;
+    setBusy(true);
+    setLandActed(true);
+    try {
+      await api.landQueue([task.id], queued);
+      toast(queued ? "Landing — the queue will merge it" : "Taken out of the land queue");
+      const t = await api.task(task.id).catch(() => null);
+      if (t) setEvents(t.events ?? []);
     } catch (e) {
       toast((e as Error).message);
     } finally {
@@ -807,6 +859,13 @@ export function ReviewCard({
         />
       )}
       {quizRequired && quizStatus === "passed" && <div className="understanding-quiz-status passed">Understanding confirmed. Approval unlocked.</div>}
+      {landHeld && (
+        <div className="review-blocked review-blocked-action">
+          You marked this approved to land before you took the check. It will not merge until you say so.
+          <button className="btn btn-mini" disabled={busy} onClick={() => setLandMark(true)}>Land now</button>
+          <button className="btn btn-mini" disabled={busy} onClick={() => setLandMark(false)}>Unmark</button>
+        </div>
+      )}
       {quizStatus === "deferred" && <div className="understanding-quiz-status deferred">Quiz saved in Needs You. You can continue now.</div>}
       {!quizRequired && (
         <div className="understanding-quiz-status deferred">
