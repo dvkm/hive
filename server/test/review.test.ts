@@ -1097,6 +1097,134 @@ test("diff endpoint rejects tracking-only review tasks", async () => {
   s.server.stop(true);
 });
 
+
+// ---- judgment-class understanding checks (hive-1559) ----
+
+// A task in review with checks submitted, plus whatever auto-review verdict the
+// case needs. `kind` decides whether it is inside the project's auto_merge list.
+async function judgmentTask(
+  s: ReturnType<typeof makeServer>,
+  opts: { kind?: string; verdict?: "looks_good" | "caution"; files?: string[]; config?: Record<string, unknown> } = {}
+) {
+  const p = await post(s.base, "/api/projects", {
+    name: "p",
+    repo_path: "/repo",
+    config: { default_branch: "main", auto_merge: { kinds: ["chore"] }, ...(opts.config ?? {}) },
+  });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "mechanical bump", brief: "b", kind: opts.kind ?? "chore" });
+  await post(s.base, `/api/tasks/${t.json.id}/spawn`, {});
+  await addQuiz(s.base, t.json.id);
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+  if (opts.verdict)
+    s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+      `ev-auto-${t.json.id}`,
+      t.json.id,
+      new Date().toISOString(),
+      "system",
+      "auto_review",
+      JSON.stringify({ verdict: opts.verdict, summary: "s", risks: [], questions: [], files: opts.files ?? ["server/src/rows.ts"] })
+    );
+  return { projectId: p.json.id, taskId: t.json.id };
+}
+
+test("a mechanical looks_good chore mints no quiz anywhere", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "looks_good" });
+
+  const check = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(check.json.understanding_required).toBe(false);
+
+  const quizzes = await get(s.base, "/api/understanding-quizzes");
+  expect(quizzes.json.quizzes.some((item: any) => item.task_id === taskId)).toBe(false);
+
+  // Merges with the quiz unanswered, and leaves no deferred backlog entry behind.
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(200);
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  expect(events.json.some((event: any) => event.type === "understanding_quiz_deferred")).toBe(false);
+  const after = await get(s.base, "/api/understanding-quizzes");
+  expect(after.json.quizzes.some((item: any) => item.task_id === taskId)).toBe(false);
+  s.server.stop(true);
+});
+
+test("a caution verdict keeps the quiz required for the same chore", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "caution" });
+
+  const check = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(check.json.understanding_required).toBe(true);
+  const quizzes = await get(s.base, "/api/understanding-quizzes");
+  expect(quizzes.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("required");
+
+  // Inside auto_merge.kinds, so it merges — but the quiz is deferred, not dropped.
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(200);
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  expect(events.json.some((event: any) => event.type === "understanding_quiz_deferred")).toBe(true);
+  s.server.stop(true);
+});
+
+test("a looks_good chore touching a sensitive path stays judgment-class", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "looks_good", files: ["server/src/auth.ts"] });
+  const check = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(check.json.understanding_required).toBe(true);
+
+  // A project can name its own sensitive paths; "auth" then stops matching.
+  const s2 = makeServer();
+  const custom = await judgmentTask(s2, {
+    verdict: "looks_good",
+    files: ["server/src/auth.ts"],
+    config: { understanding_checks: { sensitive_paths: ["payments"] } },
+  });
+  const check2 = await get(s2.base, `/api/tasks/${custom.taskId}/branch-check`);
+  expect(check2.json.understanding_required).toBe(false);
+  s.server.stop(true);
+  s2.server.stop(true);
+});
+
+test("camelCase sensitive filenames still count as judgment-class", async () => {
+  // The match is a case-insensitive substring of a path segment, so a token
+  // buried inside a camelCase filename cannot sneak through as mechanical.
+  const sensitive = [
+    "web/src/lib/authTokens.ts",
+    "web/src/lib/paymentUtils.tsx",
+    "server/src/RefreshSecretStore.ts",
+    "server/src/db/addBillingColumnMigration.ts",
+    "server/src/resetPasswordFlow.ts",
+    "server/src/tokenStore.ts",
+  ];
+  for (const file of sensitive) {
+    const s = makeServer();
+    const { taskId } = await judgmentTask(s, { verdict: "looks_good", files: [file] });
+    const check = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+    expect([file, check.json.understanding_required]).toEqual([file, true]);
+    s.server.stop(true);
+  }
+
+  // A path with no sensitive token anywhere stays mechanical.
+  const plain = makeServer();
+  const { taskId } = await judgmentTask(plain, { verdict: "looks_good", files: ["web/src/views/Board.tsx"] });
+  expect((await get(plain.base, `/api/tasks/${taskId}/branch-check`)).json.understanding_required).toBe(false);
+  plain.server.stop(true);
+});
+
+test("the director can flag a mechanical task to require its quiz again", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "looks_good" });
+  expect((await get(s.base, `/api/tasks/${taskId}/branch-check`)).json.understanding_required).toBe(false);
+
+  const denied = await post(s.base, `/api/tasks/${taskId}/understanding-quiz/require`, {});
+  expect(denied.status).toBe(403);
+
+  const flagged = await post(s.base, `/api/tasks/${taskId}/understanding-quiz/require`, { source: "director" });
+  expect(flagged.status).toBe(200);
+  expect((await get(s.base, `/api/tasks/${taskId}/branch-check`)).json.understanding_required).toBe(true);
+  const quizzes = await get(s.base, "/api/understanding-quizzes");
+  expect(quizzes.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("required");
+  s.server.stop(true);
+});
+
 afterAll(() => {});
 
 test("five deferred quizzes push ONE catch-up digest, not five notifications", async () => {

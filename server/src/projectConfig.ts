@@ -132,6 +132,22 @@ const promote: Check = (v) => {
   return null;
 };
 
+// {sensitive_paths: ["auth", "payments", ...]} — path tokens whose changes stay
+// judgment-class no matter how clean the auto-review was. Each token matches as
+// a case-insensitive substring of any path segment, so "auth" also catches
+// `authTokens.ts`.
+const understandingChecks: Check = (v) => {
+  const bad = obj(v);
+  if (bad) return bad;
+  const u = v as Record<string, unknown>;
+  for (const key of Object.keys(u)) if (key !== "sensitive_paths") return `.${key} is not supported`;
+  if (u.sensitive_paths !== undefined) {
+    const invalid = strArray(u.sensitive_paths);
+    if (invalid) return `.sensitive_paths ${invalid}`;
+  }
+  return null;
+};
+
 const duration: Check = (v) =>
   typeof v === "string" && /^\d+(?:s|m|h|d)$/.test(v) ? null : "must be a duration such as 30m, 12h, or 14d";
 
@@ -217,6 +233,8 @@ const CHECKS: Record<string, Check> = {
   auto_merge: obj,
   pr_gardener: prGardener,
   auto_review: bool,
+  // Which changes still need a director understanding check (hive-1559).
+  understanding_checks: understandingChecks,
   release_review_agents: bool,
   scope_drift: bool,
   scope_drift_commits: num,

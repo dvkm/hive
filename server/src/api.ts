@@ -494,6 +494,8 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (m && method === "POST") return answerUnderstandingQuiz(db, m[1], await req.json());
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/understanding-quiz\/defer$/);
       if (m && method === "POST") return deferUnderstandingQuiz(db, m[1], await req.json());
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/understanding-quiz\/require$/);
+      if (m && method === "POST") return requireUnderstandingQuiz(db, m[1], await req.json());
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/focus-agent$/);
       if (m && method === "POST") return await focusAgent(db, herdr, m[1]);
@@ -2460,7 +2462,7 @@ async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {
     const t = getTask(db, id);
     if (t) {
       const hiveOwnedReview = !isTrackingOnlyTask(t);
-      if (hiveOwnedReview && to === "verifying" && t.state === "in_review" && t.kind === "scout") {
+      if (hiveOwnedReview && to === "verifying" && t.state === "in_review" && t.kind === "scout" && understandingChecksRequired(db, t)) {
         const quiz = latestUnderstandingQuiz(db, id);
         if (!quiz)
           return err("Understanding check required. Ask the agent to add one before accepting this report.", 409);
@@ -2536,7 +2538,8 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
     const found = await findEmbeddedTasks(deps.exec ?? defaultExec, project.repo_path, base, task.branch, others);
     if (found) embedded_tasks = found;
   }
-  return json({ unmet_deps, embedded_tasks });
+  // The review card only blocks on the understanding check when this says so.
+  return json({ unmet_deps, embedded_tasks, understanding_required: understandingChecksRequired(db, task) });
 }
 
 // Map our merge_method config onto gh's flag. Squash is the default.
@@ -2716,14 +2719,17 @@ export async function mergeTask(
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   const config = JSON.parse(project?.config ?? "{}");
   const autoShipKind = Array.isArray(config.auto_merge?.kinds) && config.auto_merge.kinds.includes(task.kind);
-  const quiz = latestUnderstandingQuiz(db, id);
-  if (!quiz && !autoShipKind)
-    return err("Understanding check required. Ask the agent to submit one in its latest review before merging.", 409);
+  // Mechanical changes (hive-1559) never mint a quiz, so nothing here to gate on.
   let deferQuizReviewEventId: string | null = null;
-  if (quiz && understandingQuizStatus(db, id, quiz.reviewEventId) === "required") {
-    if (!autoShipKind)
-      return err("Pass the understanding check before merging, or choose 'Continue now, quiz me later'.", 409);
-    deferQuizReviewEventId = quiz.reviewEventId;
+  if (understandingChecksRequired(db, task)) {
+    const quiz = latestUnderstandingQuiz(db, id);
+    if (!quiz)
+      return err("Understanding check required. Ask the agent to submit one in its latest review before merging.", 409);
+    if (understandingQuizStatus(db, id, quiz.reviewEventId) === "required") {
+      if (!autoShipKind)
+        return err("Pass the understanding check before merging, or choose 'Continue now, quiz me later'.", 409);
+      deferQuizReviewEventId = quiz.reviewEventId;
+    }
   }
 
   // Recompute the dependency claim live rather than trusting evidence prose
@@ -3723,6 +3729,69 @@ function normalizeUnderstandingChecks(understanding: unknown): UnderstandingChec
 // endpoint then rejects (hive-1006).
 const UNDERSTANDING_QUIZ_ANSWERABLE_STATES = ["in_review", "verifying", "done", "failed"];
 
+// Paths whose changes always deserve a director quiz, whatever the reviewer
+// said. Per-project override: config.understanding_checks.sensitive_paths.
+const DEFAULT_SENSITIVE_PATHS = ["auth", "token", "security", "payment", "billing", "migration", "secret", "credential", "password"];
+
+// Match a token anywhere inside a path segment, case-insensitively, so "auth"
+// hits `server/src/auth.ts`, `web/authGuard.ts` AND `src/authTokens.ts`.
+// Deliberately biased to false positives: quizzing a mechanical change costs
+// the director one question, missing a sensitive one costs a blind merge.
+// ponytail: substring matching, not globs. Swap in a glob matcher only if a
+// project needs a path shape this cannot express.
+function touchesSensitivePath(files: string[], tokens: string[]): boolean {
+  const needles = tokens.map((token) => token.toLowerCase()).filter(Boolean);
+  return files.some((file) => {
+    const segments = file.toLowerCase().split("/");
+    return needles.some((needle) => segments.some((segment) => segment.includes(needle)));
+  });
+}
+
+// The newest verdict from the auto reviewer, or null when it never produced one
+// (never ran, errored, or was skipped by project config).
+function latestAutoReviewVerdict(db: DB, taskId: string): { verdict: string; files: string[] } | null {
+  const row = db
+    .query(
+      `SELECT type, payload FROM events WHERE task_id = ? AND type IN ('auto_review', 'auto_review_error')
+        ORDER BY ts DESC, rowid DESC LIMIT 1`
+    )
+    .get(taskId) as { type: string; payload: string } | undefined;
+  if (!row || row.type !== "auto_review") return null;
+  try {
+    const payload = JSON.parse(row.payload);
+    if (payload?.skipped || typeof payload?.verdict !== "string") return null;
+    return { verdict: payload.verdict, files: Array.isArray(payload.files) ? payload.files.map(String) : [] };
+  } catch {
+    return null;
+  }
+}
+
+// Judgment-class or not (hive-1559). Hive raises only the few changes that
+// actually need the director's head; everything mechanical merges without a
+// quiz and never lands in the post-ship backlog. A task is judgment-class when
+// ANY of these holds:
+//   1. the latest auto_review verdict is not `looks_good` (missing, errored,
+//      skipped and `caution` all count — no clean verdict means no free pass),
+//   2. its reviewed diff touches a sensitive path (auth/security/payments/
+//      migrations by default, per-project via config.understanding_checks),
+//   3. its kind is outside the project's auto_merge.kinds allow-list, or
+//   4. the director flagged the task (POST .../understanding-quiz/require).
+export function understandingChecksRequired(db: DB, task: { id: string; kind: string; project_id: string }): boolean {
+  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+  const config = JSON.parse(project?.config ?? "{}");
+  if (!(Array.isArray(config.auto_merge?.kinds) && config.auto_merge.kinds.includes(task.kind))) return true;
+  const flagged = db
+    .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1")
+    .get(task.id);
+  if (flagged) return true;
+  const review = latestAutoReviewVerdict(db, task.id);
+  if (!review || review.verdict !== "looks_good") return true;
+  const tokens = Array.isArray(config.understanding_checks?.sensitive_paths)
+    ? config.understanding_checks.sensitive_paths.map(String)
+    : DEFAULT_SENSITIVE_PATHS;
+  return touchesSensitivePath(review.files, tokens);
+}
+
 function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; checks: UnderstandingCheck[] } | null {
   const row: any = db
     .query("SELECT id, payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY ts DESC, rowid DESC LIMIT 1")
@@ -3877,6 +3946,9 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
     try { payload = JSON.parse(row.payload); } catch { return []; }
     const checks = normalizeUnderstandingChecks(payload?.understanding);
     if (!checks.length) return [];
+    // A mechanical change gets no backlog entry even when its agent submitted
+    // checks anyway (hive-1559).
+    if (!understandingChecksRequired(db, { id: row.task_id, kind: row.kind, project_id: row.project_id })) return [];
     const understanding = payload?.understanding && typeof payload.understanding === "object" && !Array.isArray(payload.understanding)
       ? Object.fromEntries(Object.entries(payload.understanding).filter(([key]) => key !== "check" && key !== "checks"))
       : {};
@@ -3990,6 +4062,18 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
     payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey, actor, surface: body?.surface === "focus" ? "focus" : undefined },
   });
   return json({ ok: true, correct: true, passed: true, explanation: check.explanation ?? null, completed: next.completed, total: quiz.checks.length });
+}
+
+// The director's own "quiz me on this one" flag (hive-1559): it makes an
+// otherwise mechanical task judgment-class, so its checks are required again.
+function requireUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
+  const task = getTask(db, taskId);
+  if (!task) return err("task not found", 404);
+  if (body?.source !== "director") return err("only the director can require understanding checks", 403);
+  const already = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1").get(taskId);
+  if (!already)
+    writeEvent(db, { task_id: taskId, source: "director", type: "understanding_required", payload: { actor: actorOf(body) } });
+  return json({ ok: true, understanding_required: true });
 }
 
 function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {

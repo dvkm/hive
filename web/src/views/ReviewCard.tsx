@@ -484,8 +484,13 @@ export function ReviewCard({
       ? "deferred"
       : "required";
   const quizStatus = quizOverride ?? recordedQuizStatus;
+  // Mechanical changes are not judgment-class (hive-1559): no quiz is minted,
+  // and its absence blocks nothing. Undefined (older server) keeps the old gate.
+  const quizRequired = branchCheck?.understanding_required !== false;
   const missingQuiz = reviewLoaded && (!quiz || !reviewEventId);
-  const quizBlocked = !reviewLoaded
+  const quizBlocked = !quizRequired
+    ? ""
+    : !reviewLoaded
     ? "Loading the understanding check"
     : missingQuiz
       ? task.never_dispatched
@@ -547,7 +552,7 @@ export function ReviewCard({
         : "Approve and merge";
   const recommendationReason = openDecisions.length
     ? `${openDecisions.length} decision${openDecisions.length === 1 ? "" : "s"} still need your judgment.`
-    : missingQuiz
+    : quizRequired && missingQuiz
       ? "This older review has no understanding check."
       : mergeBlocked ||
       (reportOnly
@@ -565,6 +570,17 @@ export function ReviewCard({
   };
   const finish = () => {
     if (surface !== "focus") onDone?.();
+  };
+  // Flagging the card makes it judgment-class, so its checks are required again.
+  const requireQuiz = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await api.requireUnderstandingQuiz(task.id);
+      setBranchCheck((prev) => (prev ? { ...prev, understanding_required: true } : prev));
+    } finally {
+      setBusy(false);
+    }
   };
   const merge = async (strategy?: "local_ff") => {
     if (busy) return;
@@ -776,7 +792,7 @@ export function ReviewCard({
         </div>
       </details>
 
-      {quiz && reviewEventId && quizStatus === "required" && (
+      {quizRequired && quiz && reviewEventId && quizStatus === "required" && (
         <UnderstandingQuiz
           quiz={{
             task_id: task.id,
@@ -790,8 +806,14 @@ export function ReviewCard({
           onDeferred={() => setQuizOverride("deferred")}
         />
       )}
-      {quizStatus === "passed" && <div className="understanding-quiz-status passed">Understanding confirmed. Approval unlocked.</div>}
+      {quizRequired && quizStatus === "passed" && <div className="understanding-quiz-status passed">Understanding confirmed. Approval unlocked.</div>}
       {quizStatus === "deferred" && <div className="understanding-quiz-status deferred">Quiz saved in Needs You. You can continue now.</div>}
+      {!quizRequired && (
+        <div className="understanding-quiz-status deferred">
+          Mechanical change: no understanding check needed.{" "}
+          <button className="btn btn-mini" onClick={requireQuiz} disabled={busy}>Quiz me on this one</button>
+        </div>
+      )}
 
       <div className="review-actions">
         <button className="btn btn-primary" onClick={() => merge()} disabled={busy || !!mergeBlocked} title={mergeBlocked}>

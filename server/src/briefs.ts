@@ -53,7 +53,11 @@ Rules:
   "essence":"","walkthrough":[],"affected_areas":[],"risk_assessment":"",
   "participate":"","checks":[{"question":"","options":[{"key":"a",
   "label":""},{"key":"b","label":""}],"answer_key":"a","explanation":""}]}}
-  Omit empty sections, but \`understanding.checks\` is required.
+  Omit empty sections. \`understanding.checks\` is REQUIRED only for
+  judgment-class work: the auto-review verdict is not \`looks_good\`, the diff
+  touches security, auth, payments or migrations, the task kind is outside the
+  project's auto-merge list, or the director asked for a quiz on this card. For
+  everything else the checks are OPTIONAL, and leaving them out blocks nothing.
   Every question must help them understand this specific change: behavior, impact, risk,
   tradeoff, or evidence. Never test whether the agent can code, debug, merge,
   use tools, follow policy, or operate Hive; agent competence belongs in internal
