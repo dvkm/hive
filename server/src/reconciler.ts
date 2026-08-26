@@ -18,6 +18,7 @@ import { queuedSteers, markSteersDelivered, queueSteerEvent, resumeReviewForDeli
 import { inBackoff, isReviewed, MAX_AGENTS_DEFAULT } from "./dispatcher.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
+import { syncAway } from "./away.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask } from "./health.ts";
 import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
@@ -155,6 +156,9 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("captureRecurringRefs", () => captureRecurringRefs(db));
   await step("repairRequeueProvenance", () => repairRequeueProvenance(db));
   await step("surfaceDeadDependencies", () => surfaceDeadDependencies(db));
+  // Away mode flips on/off by its schedule here. On waking it sends ONE
+  // "while you were away" push for everything that was held.
+  await step("syncAway", () => syncAway(db, (deps.nowMs ?? (() => Date.now()))()));
   // Offline mode: everything above is local (herdr + sqlite) and keeps state
   // honest; everything below either needs the network (gh) or would punish
   // agents for being offline (stale flags, nudges, failure escalation). Stop here.

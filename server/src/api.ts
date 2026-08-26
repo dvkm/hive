@@ -91,6 +91,8 @@ import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
 import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen, probeAgent } from "./reconciler.ts";
+import { getAway, setAway, awayNow, heldPushes, syncAway } from "./away.ts";
+import type { AwayConfig } from "./away.ts";
 import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { landGraph, markLand, resolveLandPauseForDecision } from "./landQueue.ts";
@@ -548,6 +550,10 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         return json({ on: isOffline(db) });
       if (pathname === "/api/offline" && method === "POST")
         return await setOffline(db, herdr, await req.json());
+
+      if (pathname === "/api/away" && method === "GET")
+        return json({ ...getAway(db), active: awayNow(db), held: heldPushes(db).length });
+      if (pathname === "/api/away" && method === "POST") return setAwayMode(db, await req.json());
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/checkpoints\/([^/]+)\/ack$/);
       if (m && method === "POST") return await ackCheckpoint(db, herdr, m[1], m[2], await req.json());
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/understanding-quiz\/answer$/);
@@ -3825,6 +3831,23 @@ function writeEvent2Offline(db: DB, on: boolean, steered: number): void {
   } catch {
     /* marker only */
   }
+}
+
+// ---- away mode ----
+// Hold low-urgency phone pushes and batch them. POST accepts any subset of
+// {on, schedule, always_through}; anything omitted keeps its current value.
+// Turning away mode off (or clearing the schedule) flushes the held list right
+// away, so the summary push does not wait for the next reconciler tick.
+function setAwayMode(db: DB, body: any): Response {
+  const current = getAway(db);
+  const next: AwayConfig = {
+    on: body?.on === undefined ? current.on : !!body.on,
+    schedule: body?.schedule === undefined ? current.schedule : body.schedule || undefined,
+    always_through: Array.isArray(body?.always_through) ? body.always_through : current.always_through,
+  };
+  setAway(db, next);
+  const { active, flushed } = syncAway(db);
+  return json({ ...getAway(db), active, flushed, held: heldPushes(db).length });
 }
 
 // ---- checkpoints (live build-time checklist) ----
