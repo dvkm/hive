@@ -32,6 +32,7 @@ export interface LandNode {
   branch: string | null;
   ci_status: string | null;
   land_queued_at: string | null;
+  priority: string;
 }
 
 export interface LandEdge {
@@ -47,6 +48,13 @@ export interface LandGraph {
 }
 
 const MERGED_STATES = ["verifying", "done"];
+
+// now > next > normal > later. Anything unrecognised sorts last with 'later'.
+const PRIORITY_ORDER = ["now", "next", "normal"];
+function priorityRank(p: string | null | undefined): number {
+  const i = PRIORITY_ORDER.indexOf(p ?? "normal");
+  return i === -1 ? PRIORITY_ORDER.length : i;
+}
 
 // "lands after #12" / "land after #12" / "depends on #12" in a brief. The
 // director's ordering notes are prose today (the 832 → 823 → 825 batch), so
@@ -70,7 +78,7 @@ function addEdge(edges: LandEdge[], e: LandEdge): void {
 export async function landGraph(db: DB, projectId: string, exec: Exec = defaultExec): Promise<LandGraph> {
   const nodes = db
     .query(
-      `SELECT id, number, project_number, title, state, branch, ci_status, land_queued_at
+      `SELECT id, number, project_number, title, state, branch, ci_status, land_queued_at, priority
          FROM tasks WHERE project_id = ? AND state = 'in_review' ORDER BY number`
     )
     .all(projectId) as LandNode[];
@@ -361,7 +369,13 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
     while (pending.size) {
       const batch: LandNode[] = [];
       const selected = new Set<string>();
-      for (const n of nodes.filter((x) => pending.has(x.id)).sort((a, b) => a.number - b.number)) {
+      // Dependency and conflict EDGES decide the order first — they are hard
+      // constraints checked below and priority never overrides them. Priority
+      // only breaks the tie among nodes that are all ready to land in this
+      // batch, with the task number as the final, stable tiebreak. Edge
+      // construction still keys on the number alone, so a conflicting pair
+      // resolves the same way every sweep.
+      for (const n of nodes.filter((x) => pending.has(x.id)).sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority) || a.number - b.number)) {
         // Red or still-running CI holds only this node. Independent nodes can
         // still enter the same concurrent batch.
         if (n.ci_status === "failing" || n.ci_status === "pending") continue;
@@ -372,10 +386,17 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         // Quiz passed after the mark: wait for the director's "Land now" tap.
         if (landHeldForQuiz(db, n.id)) continue;
         const waiting = edges.some((e) => {
-          if (e.to !== n.id) return false;
+          // depends is directional and hard: `to` waits until `from` has merged.
           if (e.kind === "depends")
-            return !landed.has(e.from) && !MERGED_STATES.includes(byId.get(e.from)?.state ?? "");
-          return landed.has(e.from) || selected.has(e.from);
+            return e.to === n.id && !landed.has(e.from) && !MERGED_STATES.includes(byId.get(e.from)?.state ?? "");
+          // conflict is SYMMETRIC: only one of the pair may land per sweep, and
+          // whichever side is picked first holds the other. The edge direction
+          // is just the stable default (lower number first); with priority in
+          // the scan order the `to` side can now be visited first, so the check
+          // must look at both ends — reading only `to` would let a conflicting
+          // pair land together.
+          const other = e.to === n.id ? e.from : e.from === n.id ? e.to : null;
+          return other != null && (landed.has(other) || selected.has(other));
         });
         if (waiting) continue;
         batch.push(n);

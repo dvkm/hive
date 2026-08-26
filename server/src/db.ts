@@ -613,6 +613,15 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v34-task-verification-cmds",
     statements: [`ALTER TABLE tasks ADD COLUMN verification_cmds TEXT`],
   },
+  // Four-level ordinal priority: now > next > normal > later. ORDERING ONLY —
+  // it decides which queued task is picked up first and which approved PR lands
+  // first. It never preempts: a running agent is never killed to make room.
+  // Validated in the app (api.ts), not by a CHECK constraint, so the vocabulary
+  // can grow without a table rebuild.
+  {
+    name: "v35-task-priority",
+    statements: [`ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'`],
+  },
 ];
 
 // -------------------------------------------------------------- settings

@@ -1748,6 +1748,19 @@ function parseVerificationCmds(raw: any): { name: string; cmd: string }[] | null
   return out.length ? out : null;
 }
 
+// Priority is ordering only, never preemption: it decides which queued task is
+// picked up first (dispatcher.ts) and which approved PR lands first
+// (landQueue.ts). Highest to lowest: now, next, normal, later.
+export const TASK_PRIORITIES = ["now", "next", "normal", "later"] as const;
+
+// Returns the validated value, or a 400 for anything outside the vocabulary.
+function parsePriority(raw: any): string | Response {
+  const p = String(raw);
+  if (!(TASK_PRIORITIES as readonly string[]).includes(p))
+    return err(`invalid priority: ${JSON.stringify(p)} (use ${TASK_PRIORITIES.join(", ")})`, 400);
+  return p;
+}
+
 // Accepts JSON or multipart; attached files are saved under the new task's id
 // and their absolute paths appended to the brief, so the agent that picks the
 // task up can read them.
@@ -1777,6 +1790,8 @@ async function createTask(db: DB, req: Request): Promise<Response> {
   if (deps instanceof Response) return deps;
   const verifyCmds = body.verification_cmds !== undefined ? parseVerificationCmds(body.verification_cmds) : null;
   if (verifyCmds instanceof Response) return verifyCmds;
+  const priority = body.priority !== undefined ? parsePriority(body.priority) : "normal";
+  if (priority instanceof Response) return priority;
   // A follow-up task's brief often describes code that only exists in the
   // parent's still-open PR (HIVE-299). Auto-depend on the parent until its PR
   // has merged so the dispatcher holds this task the same way unmetDeps
@@ -1807,18 +1822,19 @@ async function createTask(db: DB, req: Request): Promise<Response> {
     parent_task_id: parent,
     depends_on: deps.length ? JSON.stringify(deps) : null,
     verification_cmds: verifyCmds ? JSON.stringify(verifyCmds) : null,
+    priority,
     created_at: t,
     updated_at: t,
   };
   db.query(
     `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
-      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, priority, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.project_id, row.title, row.brief, row.state, row.kind,
     row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
     row.summary, row.source, row.parent_task_id, row.depends_on, row.verification_cmds,
-    row.created_at, row.updated_at
+    row.priority, row.created_at, row.updated_at
   );
   writeEvent(db, {
     task_id: row.id,
@@ -1970,8 +1986,15 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
     if (parsed instanceof Response) return parsed;
     verify = parsed ? JSON.stringify(parsed) : null;
   }
-  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, updated_at = ? WHERE id = ?")
-    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, now(), id);
+  // priority is a plain scalar: omit it to leave it alone.
+  let priority: string = task.priority ?? "normal";
+  if (body?.priority !== undefined) {
+    const parsed = parsePriority(body.priority);
+    if (parsed instanceof Response) return parsed;
+    priority = parsed;
+  }
+  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, updated_at = ? WHERE id = ?")
+    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, now(), id);
   const updated = getTask(db, id);
   broadcastTask(db, updated);
   return json(taskWithHealth(db, updated));

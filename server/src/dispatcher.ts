@@ -72,6 +72,10 @@ const ACTIVE_STATES = "('in_progress','needs_decision','in_review','verifying')"
 // agents rather than review depth, which is what it was always meant to bound —
 // 10 idle review agents held corebeat at 3 running against 19 queued.
 const REVIEW_OVERHANG = 2;
+// Ordinal priority as a sort key. Anything outside the vocabulary (only
+// reachable by a hand-edited row) sorts last, with 'later'.
+export const PRIORITY_RANK_SQL =
+  "CASE priority WHEN 'now' THEN 0 WHEN 'next' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END";
 
 export interface DispatcherDeps {
   herdr?: Herdr;
@@ -109,8 +113,10 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     return;
   }
 
+  // Priority first, then age. Ordering only — nothing running is ever killed to
+  // make room for a higher-priority task (see the borrowed slot in hasCapacity).
   const queued = db
-    .query("SELECT * FROM tasks WHERE state = 'queued' ORDER BY created_at ASC")
+    .query(`SELECT * FROM tasks WHERE state = 'queued' ORDER BY ${PRIORITY_RANK_SQL}, created_at ASC`)
     .all()
     .map(parseTask);
 
@@ -151,6 +157,10 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     }
     return cache.get(pid)!;
   };
+  const nowInFlight = (pid: string) =>
+    (db
+      .query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND priority = 'now' AND agent_target IS NOT NULL AND state IN ${WORKING_STATES}`)
+      .get(pid) as { n: number }).n;
   const workingFor = (pid: string) => countFor(workingCount, WORKING_STATES, pid, false);
   const activeFor = (pid: string) => countFor(activeCount, ACTIVE_STATES, pid, false);
   const gardenerWorkingFor = (pid: string) => countFor(gardenerWorkingCount, WORKING_STATES, pid, true);
@@ -161,7 +171,16 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
       return gardenerWorkingFor(task.project_id) < cap && gardenerActiveFor(task.project_id) < cap * REVIEW_OVERHANG;
     }
     const cap = Number.isFinite(cfg.max_agents) ? Number(cfg.max_agents) : MAX_AGENTS_DEFAULT;
-    return workingFor(task.project_id) < cap && activeFor(task.project_id) < cap * REVIEW_OVERHANG;
+    const working = workingFor(task.project_id);
+    // Borrowed slot: a `now` task may start at cap+1 when the cap is exactly
+    // full and no other now-task is already in flight for this project. That is
+    // the whole ceiling — at most ONE borrowed slot per project at a time, so a
+    // pile of now-tasks cannot inflate max_agents. Priority NEVER preempts: no
+    // running agent is stopped to free a slot. Uncached on purpose: spawnFor
+    // writes the new task's agent_target before the next candidate is checked,
+    // so this count is self-updating within a cycle.
+    const borrowing = working === cap && task.priority === "now" && nowInFlight(task.project_id) === 0;
+    return (working < cap || borrowing) && activeFor(task.project_id) < cap * REVIEW_OVERHANG;
   };
 
   // One project's queued tasks, spawned serially. spawnAgent runs the project's
