@@ -3865,6 +3865,15 @@ interface UnderstandingCheck {
   explanation?: string;
 }
 
+// Server-side lint floor: only the egregious wording gets flagged (a question
+// past ~400 chars, or an option past ~150), and even then it's a steer asking
+// the agent to tighten the wording, never a rejection — the length rule is
+// soft guidance (director feedback 2026-08-25), so a long-but-reasonable quiz
+// for a genuinely complex change must sail through untouched.
+function isEgregiousCheckWording(check: { question: string; options: { label: string }[] }): boolean {
+  return check.question.length > 400 || check.options.some((option) => option.label.length > 150);
+}
+
 function isAgentProcedureQuestion(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const question = typeof (value as Record<string, unknown>).question === "string"
@@ -5840,6 +5849,15 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     )
       return json({ event: parseEvent(latest), duplicate: true }, 201);
     const event = writeEvent(db, { task_id: taskId, source, type, payload });
+    const understandingChecks = (payload.understanding as any)?.checks
+      ?? ((payload.understanding as any)?.check ? [(payload.understanding as any).check] : []);
+    if (understandingChecks.some(isEgregiousCheckWording))
+      queueSteerEvent(
+        db,
+        taskId,
+        "Your understanding-quiz wording is egregiously long (a question over ~400 chars or an option over ~150). Tighten the wording: plain everyday words, one idea per sentence, no nested clauses.",
+        "egregious quiz wording"
+      );
     return json({ event }, 201);
   }
 
