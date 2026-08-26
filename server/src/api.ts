@@ -2991,7 +2991,7 @@ export async function mergeTask(
       }
     })?.ts ?? "";
     const snapEvent: any = db
-      .query("SELECT payload FROM events WHERE task_id = ? AND type = 'branch_scope' AND ts > ? ORDER BY ts ASC LIMIT 1")
+      .query("SELECT payload FROM events WHERE task_id = ? AND type = 'branch_scope' AND ts > ? ORDER BY ts DESC LIMIT 1")
       .get(id, replacementAt);
     if (snapEvent) {
       let snapshot: BranchScope | null = null;
@@ -3009,11 +3009,26 @@ export async function mergeTask(
         try {
           originalHead ||= firstSync ? JSON.parse(firstSync.payload).head_sha ?? null : null;
         } catch {}
+        // A same-branch re-cut (force-push/rebuild) leaves the recorded snapshot
+        // commit outside the new head's history: comparing against it reads
+        // every file the rebuilt branch re-touches as a "revert" of base work,
+        // even when the branch is now strictly ahead (task #1696). Detect that
+        // the snapshot commit is no longer an ancestor of the new head and
+        // re-baseline against the CURRENT head instead of the stale snapshot.
+        let invalidated = false;
         if (originalHead) {
+          const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", originalHead, guardHead]);
+          invalidated = anc.code !== 0;
+        }
+        if (invalidated) {
+          const fresh = await captureBranchScope(exec, project.repo_path, guardBase, guardHead);
+          snapshot = fresh;
+          if (fresh) writeEvent(db, { task_id: id, source: "director", type: "branch_scope", payload: { ...fresh, head_sha: guardHead } });
+        } else if (originalHead) {
           const exact = await captureBranchScope(exec, project.repo_path, guardBase, originalHead);
           if (exact) snapshot = { ...snapshot, files: exact.files };
         }
-        const regressed = await detectDestructiveRebase(exec, project.repo_path, guardBase, guardHead, snapshot);
+        const regressed = snapshot ? await detectDestructiveRebase(exec, project.repo_path, guardBase, guardHead, snapshot) : null;
         if (regressed && regressed.length) {
           const files = regressed.slice(0, 10).join(", ") + (regressed.length > 10 ? `, …(+${regressed.length - 10})` : "");
           const reason = `branch '${task.branch}' reverts base work outside this task's scope (${files})`;

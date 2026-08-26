@@ -254,6 +254,67 @@ test("mergeTask never lets an option-shaped PR baseRefName reach git argv (task 
   expect(JSON.parse(merged.payload).base).toBe("main");
 });
 
+test("a same-branch re-cut (force-push) invalidates a stale snapshot and re-baselines instead of blocking (#1696)", async () => {
+  const { db, taskId } = seed();
+  const prUrl = "https://gh/pr/recut";
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run(prUrl, taskId);
+  // Simulate a snapshot taken long ago, against a head that got force-pushed
+  // away — it is no longer an ancestor of the rebuilt branch's current head.
+  writeEvent(db, { task_id: taskId, source: "reconciler", type: "branch_scope", payload: { base_sha: "old-base-sha", files: ["src/task.ts"], head_sha: "old-head" } });
+  const rebuiltFiles = "db.ts\nreconciler.ts\nsrc/task.ts\n";
+  const exec: Exec = stub((argv) => {
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(JSON.stringify({ state: "OPEN", baseRefName: "main", baseRefOid: "base-sha-now", headRefOid: "rebuilt-head", mergeStateStatus: "CLEAN", statusCheckRollup: [] }));
+    if (argv[0] === "gh" && argv.includes("merge")) return OK();
+    if (argv.includes("merge-base") && argv.includes("--is-ancestor")) return { code: 1, stdout: "", stderr: "not an ancestor" };
+    if (argv.includes("diff") && argv.includes("--name-only")) return OK(rebuiltFiles);
+    if (argv.includes("rev-parse")) return OK(`${argv.at(-1)}\n`);
+    return OK();
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec });
+
+  expect(res.status).toBe(200);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_blocked_destructive'").get(taskId)).toBeFalsy();
+  const latest: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'branch_scope' ORDER BY ts DESC LIMIT 1").get(taskId);
+  expect(JSON.parse(latest.payload).head_sha).toBe("rebuilt-head");
+});
+
+test("a real revert still blocks after the snapshot was re-baselined (#1696)", async () => {
+  const { db, taskId } = seed();
+  const prUrl = "https://gh/pr/recut2";
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run(prUrl, taskId);
+  // A prior merge attempt already re-baselined against the rebuilt branch.
+  writeEvent(db, {
+    task_id: taskId,
+    source: "director",
+    type: "branch_scope",
+    payload: { base_sha: "base-sha-now", files: ["db.ts", "reconciler.ts", "src/task.ts"], head_sha: "rebuilt-head" },
+  });
+  const exec: Exec = stub((argv) => {
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(JSON.stringify({ state: "OPEN", baseRefName: "main", baseRefOid: "base-sha-later", headRefOid: "rebuilt-head-2", mergeStateStatus: "CLEAN", statusCheckRollup: [] }));
+    if (argv[0] === "gh" && argv.includes("merge")) return OK();
+    if (argv.includes("merge-base") && argv.includes("--is-ancestor")) return OK(); // rebuilt-head is still an ancestor: a legit follow-up push
+    if (argv.includes("diff") && argv.includes("--name-only")) {
+      const range = argv.at(-1);
+      if (range === "base-sha-later...rebuilt-head") return OK("db.ts\nreconciler.ts\nsrc/task.ts\n"); // original intent, unchanged
+      if (range === "base-sha-later...rebuilt-head-2") return OK("db.ts\nreconciler.ts\nsrc/task.ts\nhealth.ts\n"); // health.ts newly reverted
+      return OK();
+    }
+    if (argv[3] === "log") return OK(argv.at(-1) === "health.ts" ? "abc base commit\n" : "");
+    if (argv.includes("rev-parse")) return OK(`${argv.at(-1)}\n`);
+    return OK();
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec });
+
+  expect(res.status).toBe(409);
+  const body: any = await res.json();
+  expect(body.error).toContain("health.ts");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_blocked_destructive'").get(taskId)).toBeTruthy();
+});
+
 test("PR merge fails closed when its base metadata is unavailable", async () => {
   const { db, taskId } = seed();
   db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/1", taskId);
