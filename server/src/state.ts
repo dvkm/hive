@@ -597,6 +597,59 @@ export function queuedInputRecoveryPending(db: DB, taskId: string): boolean {
   return !movedOn;
 }
 
+// ---- HIVE-402: the verification contract, enforced at the review handoff ----
+
+// The contract command names that still have no matching evidence. Empty when
+// the task carries no contract, so tasks without one are never gated.
+//
+// Freshness: when the task's head commit is known, evidence must have been
+// attached AFTER that commit landed — the same rule that already governs
+// screenshots (#223), applied to test runs. The commit's arrival time is the
+// first moment any event on the task recorded that head_sha; if nothing did,
+// the name merely has to be present. The comparison is >= because event
+// timestamps are millisecond strings: evidence attached in the same tick as the
+// commit's own event is fresh, not stale.
+export function missingVerifications(db: DB, task: any): string[] {
+  const cmds = task?.verification_cmds;
+  if (!Array.isArray(cmds) || cmds.length === 0) return [];
+  let since = "";
+  if (task.head_sha) {
+    const r = db
+      .query("SELECT MIN(ts) AS ts FROM events WHERE task_id = ? AND json_extract(payload, '$.head_sha') = ?")
+      .get(task.id, task.head_sha) as { ts: string | null } | undefined;
+    since = r?.ts ?? "";
+  }
+  const rows = db
+    .query(
+      `SELECT DISTINCT json_extract(payload, '$.verify_name') AS name FROM events
+       WHERE task_id = ? AND type = 'evidence'
+         AND json_extract(payload, '$.verify_name') IS NOT NULL AND ts >= ?`
+    )
+    .all(task.id, since) as { name: string }[];
+  const have = new Set(rows.map((r) => r.name));
+  return cmds.map((c: any) => String(c?.name ?? "")).filter((n) => !have.has(n));
+}
+
+// Same check, plus a `verification_missing` event the agent's next steer can
+// cite. Deduped on the name set so the polling callers (the reconciler asks
+// every cycle) log the gap once instead of forever.
+export function verificationGate(db: DB, task: any, source: string): string[] {
+  const missing = missingVerifications(db, task);
+  if (missing.length === 0) return missing;
+  const last = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'verification_missing' ORDER BY ts DESC LIMIT 1")
+    .get(task.id) as { payload: string } | undefined;
+  let same = false;
+  if (last) {
+    try {
+      same = JSON.stringify(JSON.parse(last.payload).names) === JSON.stringify(missing);
+    } catch {}
+  }
+  if (!same)
+    writeEvent(db, { task_id: task.id, source, type: "verification_missing", payload: { names: missing } });
+  return missing;
+}
+
 // The finished-handoff, shared by every herdr-signal path (the reconciler's
 // poll backstop and the supervise wait loop): an agent observed idle/done/gone on an
 // in_progress task that has a real work product (a pr_url, or a scout report)
@@ -630,6 +683,8 @@ export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, s
   // #1249: no explanation page yet → hold here and let the generation (kicked
   // off by the gate) hand the task off when the page is stored.
   if (explanationGate(db, task) !== "ready") return false;
+  // HIVE-402: a contract with nothing behind it isn't reviewable either.
+  if (verificationGate(db, task, source).length > 0) return false;
   writeEvent(db, {
     task_id: taskId,
     source,
@@ -649,7 +704,7 @@ export function transition(
   db: DB,
   taskId: string,
   to: State,
-  opts: { source?: string; reason?: string; force?: boolean } = {}
+  opts: { source?: string; reason?: string; force?: boolean; skipVerification?: boolean } = {}
 ): any {
   const task = getTask(db, taskId);
   if (!task) throw new TransitionError(`unknown task: ${taskId}`);
@@ -682,6 +737,21 @@ export function transition(
         ? `; to retry a live task, POST /api/tasks/${taskId}/requeue (fails and requeues atomically)`
         : "";
     throw new TransitionError(`invalid transition: '${from}' -> '${to}'${hint}`);
+  }
+
+  // HIVE-402: the verification contract is enforced HERE, at the one helper every
+  // route to review funnels through (director move, agent `ready`, PR-link
+  // handoff, the reconciler's CI-green promote). skipVerification is for the one
+  // caller catching up on a PR that already merged — the work has landed, so
+  // holding it in_progress would strand it forever.
+  if (from === "in_progress" && to === "in_review" && !isTrackingOnlyTask(task) && !opts.skipVerification) {
+    const missing = verificationGate(db, task, source);
+    if (missing.length > 0)
+      throw new TransitionError(
+        `cannot hand off to review: the verification contract is unmet — no fresh evidence for: ${missing.join(", ")}. ` +
+          `Run each command from the task's verification contract and attach its output with ` +
+          `\`hive emit ${taskId} evidence --verify-name <name> --file <output>\`, then hand off again.`
+      );
   }
 
   // Evidence gates apply to hive-driven work. Tracking-only tasks (source
