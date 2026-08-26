@@ -81,7 +81,7 @@ import { confirmedRisks, cautionCleared } from "./reviewer.ts";
 import { explanationGate } from "./explainDiff.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
-import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen } from "./reconciler.ts";
+import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen, probeAgent } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { landGraph, markLand, resolveLandPauseForDecision } from "./landQueue.ts";
@@ -1024,9 +1024,13 @@ async function deliverToSupervisor(
     task = getTask(db, taskId);
   }
 
-  // Is the session already live? If so, just send into it (fast path).
+  // Is the session already live? If so, just send into it (fast path). Uses
+  // probeAgent (not a raw herdr.probe) so a herdr registry eviction — the
+  // supervisor pane is still alive, only its registration was wiped — is
+  // re-adopted here instead of read as dead and sent through spawnAgent, where
+  // the spawn guard would correctly refuse (name still held) and drop the turn.
   if (task.agent_target) {
-    const { alive } = await herdr.probe(task.agent_target).catch(() => ({ alive: false }));
+    const { alive } = await probeAgent(herdr, db, taskId!, task.agent_target).catch(() => ({ alive: false }));
     if (alive) {
       const error = await sendOnce(herdr, task.agent_target, wireMessage);
       if (!error) {
