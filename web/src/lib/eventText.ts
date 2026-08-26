@@ -84,6 +84,13 @@ export function eventText(e: EventLike): string {
     }
     case "auto_review_error":
       return `pre-review failed: ${s(p.error)}`;
+    case "risk_verdicts": {
+      const vs = Array.isArray(p.verdicts) ? (p.verdicts as any[]) : [];
+      if (!vs.length) return `risk check produced no verdicts`;
+      const confirmed = vs.filter((v) => v?.verdict === "confirmed");
+      const head = `risk check: ${confirmed.length} of ${vs.length} risks confirmed`;
+      return confirmed.length ? `${head} — ${confirmed.map((v) => s(v.risk)).join("; ")}` : head;
+    }
     case "scope_drift": {
       const beyond = Array.isArray(p.beyond) ? (p.beyond as string[]) : [];
       const listed = beyond.slice(0, 6).join(", ") + (beyond.length > 6 ? `, …(+${beyond.length - 6})` : "");

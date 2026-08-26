@@ -208,3 +208,81 @@ test("extractReview parses whole JSON, envelope, and prose-wrapped output", () =
   expect(extractReview(`Sure! Here you go:\n${body}\nHope that helps.`)?.summary).toBe("fine");
   expect(extractReview("no json at all")).toBeNull();
 });
+
+// --- per-risk adversarial verification (task HIVE-406) ---------------------
+
+const { verifyRisks, extractVerdict } = await import("../src/reviewer.ts");
+
+// A pre-review that flags `n` risks, so autoReviewOnce triggers verification.
+const cautionWith = (risks: string[]) =>
+  JSON.stringify({ result: JSON.stringify({ verdict: "caution", summary: "risky", risks, questions: [] }) });
+
+test("caution risks each get a verification run, capped at 5", async () => {
+  const { db, id } = setup();
+  const argvs: string[][] = [];
+  const claude = async (argv: string[]) => {
+    argvs.push(argv);
+    return argv.includes("opus")
+      ? { code: 0, stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"guarded upstream","evidence_path":"x.ts:3"}' }), stderr: "" }
+      : { code: 0, stdout: cautionWith(["r1", "r2", "r3", "r4", "r5", "r6", "r7"]), stderr: "" };
+  };
+  await autoReviewOnce(db, { exec: claude, shellExec: ghDiff });
+
+  const opusRuns = argvs.filter((a) => a.includes("opus"));
+  expect(opusRuns).toHaveLength(5); // 7 risks in, 5 verified
+  expect(opusRuns[0].join(" ")).toContain("r1"); // the risk text reaches the prompt
+  expect(opusRuns[0].join(" ")).toContain("--output-format json");
+
+  const evs = events(db, id, "risk_verdicts");
+  expect(evs).toHaveLength(1);
+  expect(evs[0].payload.reviewed_head_sha).toBe("review-head");
+  expect(evs[0].payload.verdicts).toHaveLength(5);
+  expect(evs[0].payload.verdicts[0]).toEqual({ risk: "r1", verdict: "refuted", why: "guarded upstream", evidence_path: "x.ts:3" });
+});
+
+test("a looks_good review verifies nothing", async () => {
+  const { db, id } = setup();
+  const claude = async (argv: string[]) => {
+    if (argv.includes("opus")) throw new Error("should not verify");
+    return { code: 0, stdout: JSON.stringify({ result: '{"verdict":"looks_good","summary":"fine","risks":["nit"],"questions":[]}' }), stderr: "" };
+  };
+  await autoReviewOnce(db, { exec: claude, shellExec: ghDiff });
+  expect(events(db, id, "risk_verdicts")).toHaveLength(0);
+});
+
+test("verification is keyed to the reviewed head: same head skips, new head re-runs", async () => {
+  const { db, id } = setup();
+  let calls = 0;
+  const claude = async () => {
+    calls++;
+    return { code: 0, stdout: JSON.stringify({ result: '{"verdict":"confirmed","why":"real"}' }), stderr: "" };
+  };
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+
+  await verifyRisks(db, task, ["r1"], "head-a", "diff", { exec: claude });
+  await verifyRisks(db, task, ["r1"], "head-a", "diff", { exec: claude }); // same head — no second run
+  expect(calls).toBe(1);
+  expect(events(db, id, "risk_verdicts")).toHaveLength(1);
+
+  await verifyRisks(db, task, ["r1"], "head-b", "diff", { exec: claude }); // new head — runs again
+  expect(calls).toBe(2);
+  expect(events(db, id, "risk_verdicts").map((e: any) => e.payload.reviewed_head_sha).sort()).toEqual(["head-a", "head-b"]);
+});
+
+test("a failed verification run is counted, never reported as an all-clear", async () => {
+  const { db, id } = setup();
+  const claude = async () => ({ code: 1, stdout: "", stderr: "boom" });
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+  await verifyRisks(db, task, ["r1", "r2"], "head-a", "diff", { exec: claude });
+  const p = events(db, id, "risk_verdicts")[0].payload;
+  expect(p.verdicts).toEqual([]);
+  expect(p.unverified).toBe(2);
+});
+
+test("extractVerdict parses envelope and prose, and rejects anything else", () => {
+  const body = '{"verdict":"confirmed","why":"y is unused"}';
+  expect(extractVerdict(JSON.stringify({ result: body }))?.verdict).toBe("confirmed");
+  expect(extractVerdict(`Here: ${body} done`)?.why).toBe("y is unused");
+  expect(extractVerdict('{"verdict":"maybe","why":"hm"}')).toBeNull();
+  expect(extractVerdict("no json")).toBeNull();
+});
