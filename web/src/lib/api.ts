@@ -461,6 +461,7 @@ export const MAX_DIFF_LINES = 20000;
 export interface BranchCheck {
   unmet_deps: { id: string; number: number; title: string; state: State }[];
   embedded_tasks: { id: string; number: number; title: string }[];
+  understanding_required?: boolean; // judgment-class change; the quiz gates approval (hive-1559)
 }
 
 // The land queue's ordering graph (server/src/landQueue.ts). `from` lands
@@ -752,6 +753,11 @@ export const api = {
     req<{ ok: boolean; status: "deferred" | "passed" }>(`/api/tasks/${taskId}/understanding-quiz/defer`, {
       method: "POST",
       body: JSON.stringify({ confirm: "quiz_later", source: "director", actor: directorActor() }),
+    }),
+  requireUnderstandingQuiz: (taskId: string) =>
+    req<{ ok: boolean; understanding_required: boolean }>(`/api/tasks/${taskId}/understanding-quiz/require`, {
+      method: "POST",
+      body: JSON.stringify({ source: "director", actor: directorActor() }),
     }),
   tasks: (q: { state?: State; project_id?: string } = {}) => {
     const p = new URLSearchParams(q as Record<string, string>).toString();

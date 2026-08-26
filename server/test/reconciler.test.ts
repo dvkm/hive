@@ -862,10 +862,12 @@ test("autoMergeReady merges opted-in, green, clean-review, uncontested tasks wit
   };
   const clean = mk({}, "missing");
   const risky = mk({});
-  const deferred = mk({}, "required");
+  const mechanical = mk({}, "required");
+  const sensitive = mk({}, "required");
   writeEvent(db, { task_id: clean, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
   writeEvent(db, { task_id: risky, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: ["a real risk"], questions: [] } });
-  writeEvent(db, { task_id: deferred, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
+  writeEvent(db, { task_id: mechanical, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [], files: ["server/src/rows.ts"] } });
+  writeEvent(db, { task_id: sensitive, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [], files: ["db/migrations/007.sql"] } });
   // primary checkout sits on the base branch; git merge-base/merge succeed for the local-ff path
   const git: Exec = stub((argv) => {
     if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
@@ -874,8 +876,12 @@ test("autoMergeReady merges opted-in, green, clean-review, uncontested tasks wit
   await autoMergeReady(db, { exec: git });
   expect(getTask(db, clean).state).toBe("done"); // merged; no smoke configured → straight through verifying
   expect(getTask(db, risky).state).toBe("in_review"); // risks → human review
-  expect(getTask(db, deferred).state).toBe("done");
-  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_deferred'").get(deferred)).toBeTruthy();
+  // Mechanical change (hive-1559): its quiz is not judgment-class, so nothing is
+  // deferred into the post-ship backlog. A sensitive path still parks one there.
+  expect(getTask(db, mechanical).state).toBe("done");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_deferred'").get(mechanical)).toBeNull();
+  expect(getTask(db, sensitive).state).toBe("done");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_deferred'").get(sensitive)).toBeTruthy();
 });
 
 test("autoMergeReady leaves a Focus-reviewed task for an explicit ship or request-changes choice", async () => {

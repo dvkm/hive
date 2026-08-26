@@ -18,6 +18,7 @@ import { defaultExec, projectComparisonBase } from "./exec.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
 import { supervisedSql } from "./supervision.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
+import { parseUnifiedDiff } from "./diff.ts";
 
 const TIMEOUT_MS = Number(process.env.HIVE_REVIEWER_TIMEOUT_MS || 180_000);
 const DIFF_LIMIT = 60_000;
@@ -218,7 +219,11 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
     });
     return;
   }
-  writeEvent(db, { task_id: t.id, source: "system", type: "auto_review", payload: { ...review, ...reviewIdentity } as any });
+  // `files` is what the reviewed diff touched. Read back by
+  // understandingChecksRequired (hive-1559) to spot sensitive paths without
+  // re-shelling out to git for every task on a director surface.
+  const files = parseUnifiedDiff(diff.text).files.map((f) => f.path);
+  writeEvent(db, { task_id: t.id, source: "system", type: "auto_review", payload: { ...review, files, ...reviewIdentity } as any });
   broadcast({ type: "task", task: getTask(db, t.id) });
   // A cautious verdict's risks are suspicions — check each one against the
   // real code before the director acts on them. PR-backed tasks only: without
