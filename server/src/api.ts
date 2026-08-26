@@ -182,6 +182,13 @@ function loopLiveness(db: DB, settingKey: string, staleMs: number): { last_run: 
 // every fresh boot before the first cycle completes) is the sustained-failure
 // signal that flips top-level `ok`.
 const RECONCILE_ERROR_STREAK_THRESHOLD = 3;
+// reviewer.ts's reviewer_parse_failure_streak (task HIVE-446): the model kept
+// producing unparseable output on every attempt, same sustained-failure signal
+// as the reconciler's error streak above.
+const REVIEWER_PARSE_FAILURE_STREAK_THRESHOLD = 3;
+function reviewerHealth(db: DB): { parse_failure_streak: number } {
+  return { parse_failure_streak: Number(getSetting(db, "reviewer_parse_failure_streak") ?? "0") };
+}
 function reconcilerHealth(db: DB): { last_run: string | null; stale: boolean; consecutive_errors: number; last_error: string | null } {
   return {
     ...loopLiveness(db, "last_reconcile_at", RECONCILE_STALE_MS),
@@ -309,9 +316,12 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // ---- health ----
       if (pathname === "/api/health" && method === "GET") {
         const reconciler = reconcilerHealth(db);
+        const reviewer = reviewerHealth(db);
         const degraded = degradedTools(db);
-        const ok = reconciler.consecutive_errors < RECONCILE_ERROR_STREAK_THRESHOLD && degraded.length === 0;
-        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, degraded, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
+        const ok = reconciler.consecutive_errors < RECONCILE_ERROR_STREAK_THRESHOLD
+          && reviewer.parse_failure_streak < REVIEWER_PARSE_FAILURE_STREAK_THRESHOLD
+          && degraded.length === 0;
+        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, reviewer, degraded, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
       }
 
       // ---- evidence static files ----
