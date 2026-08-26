@@ -234,6 +234,7 @@ const CHECKS: Record<string, Check> = {
   auto_merge: obj,
   pr_gardener: prGardener,
   auto_review: bool,
+  render_proof: bool,
   // Which changes still need a director understanding check (hive-1559).
   understanding_checks: understandingChecks,
   release_review_agents: bool,

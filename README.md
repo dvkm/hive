@@ -297,8 +297,15 @@ server/test/ bun test suite
   `status_notes_to_comments: true`, `hive emit <id> status` notes become Jira
   comments through the existing at-most-once delivery ledger. The default is false.
 <!-- BEGIN GENERATED JIRA WRITE SCOPE -->
-- **Field ownership.** Jira owns `summary`, `description`, `issue type`, `priority`, and all labels except `hive:needs-decision`. Hive's generated write scope is `status`, `comments` and evidence receipts, `attachments` (up to 3 screenshots hive already holds as evidence, on UI work only), and `hive:needs-decision` label; everything else flows Jira → hive only. Creating a Jira sub-task is a separate, default-off project opt-in through `write_scope.create_subtask`. **hive never writes the assignee at all.** It reads the field to display it and stops there because Jira Cloud has no compare-and-swap across the separate check and write requests, so "a human's assignment is never touched" only holds absolutely if hive never touches it (dec_234877ea4617). `GET /api/tasks/:id/jira` exposes the same registry as `write_scope`. `needs_decision` has no Jira status, `verifying` maps to In Review, and `failed` never moves Jira. A linked native task maps `cancelled` to Done and posts a cancellation comment.
+- **Field ownership.** Jira owns `summary`, `description`, `issue type`, `priority`, and all labels except `hive:needs-decision`. Hive's generated write scope is `status`, `comments` and evidence receipts, `attachments` (up to 3 screenshots on UI work only: evidence hive already holds, or one it renders at review when the task has none), and `hive:needs-decision` label; everything else flows Jira → hive only. Creating a Jira sub-task is a separate, default-off project opt-in through `write_scope.create_subtask`. **hive never writes the assignee at all.** It reads the field to display it and stops there because Jira Cloud has no compare-and-swap across the separate check and write requests, so "a human's assignment is never touched" only holds absolutely if hive never touches it (dec_234877ea4617). `GET /api/tasks/:id/jira` exposes the same registry as `write_scope`. `needs_decision` has no Jira status, `verifying` maps to In Review, and `failed` never moves Jira. A linked native task maps `cancelled` to Done and posts a cancellation comment.
 <!-- END GENERATED JIRA WRITE SCOPE -->
+- **Rendered screenshots are opt-in and sandboxed.** A UI task that attached no
+  screenshot can have one rendered at review time with the target repo's own
+  Playwright harness. That runs the PR branch's own config, so it is off unless
+  the project config sets `render_proof: true`, and the run happens inside a
+  macOS seatbelt that may write only to the task's worktree and the temp dirs.
+  On any host without seatbelt, or any repo whose harness cannot boot the app
+  itself, nothing is rendered and the reason is logged.
 - **Idempotent comments and receipts with contained unknowns.** Jira comments
   become timeline entries; hive-side comments are an outbox drained on the next
   cycle; and hive's reports and evidence reach the ticket with links back into

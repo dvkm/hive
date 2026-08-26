@@ -56,6 +56,8 @@ import { resolveProjectSecrets } from "../secrets.ts";
 import type { Exec } from "../exec.ts";
 import { defaultExec } from "../exec.ts";
 import { taskDiff } from "../diff.ts";
+import type { TaskDiff } from "../diff.ts";
+import { renderProofAttempted, renderProofTrusted, renderProofsOnce } from "./renderProof.ts";
 import { taskIdentifier } from "../taskIdentifier.ts";
 import {
   NEEDS_DECISION_LABEL,
@@ -1571,6 +1573,7 @@ export interface SyncStats {
   comments_pushed: number;
   receipts: number; // hive reports/evidence delivered to Jira
   attachments: number; // screenshots uploaded to the Jira issue
+  rendered: number; // screenshots hive rendered because the task had none
   shadow: number; // outbound calls suppressed by write:false
   unmapped: number; // Jira statuses hive has no mapping for
   aborted: number; // writes dropped because the boundary re-read disagreed
@@ -1583,7 +1586,7 @@ export interface SyncStats {
 
 const emptyStats = (): SyncStats => ({
   imported: 0, pushed: 0, pulled: 0, labeled: 0,
-  comments_pulled: 0, comments_pushed: 0, receipts: 0, attachments: 0,
+  comments_pulled: 0, comments_pushed: 0, receipts: 0, attachments: 0, rendered: 0,
   shadow: 0, unmapped: 0, aborted: 0, blocked: 0, skipped: 0, cancelled: 0, errors: 0, failures: [],
 });
 
@@ -1593,8 +1596,20 @@ interface Ctx {
   client: JiraClient;
   stats: SyncStats;
   exec: Exec; // reads the task's diff, to tell UI work from everything else
+  diffs: Map<string, TaskDiff>; // one diff read per task per cycle (see cycleDiff)
   log: (msg: string, err?: unknown) => void;
   projectScope?: boolean;
+}
+
+// `gh pr diff` is a network round trip, and two callers want the same file list
+// for the same task: the UI-scope check and the screenshot renderer. Read it
+// once per cycle and hand both the same answer.
+async function cycleDiff(ctx: Ctx, taskId: string): Promise<TaskDiff> {
+  const cached = ctx.diffs.get(taskId);
+  if (cached) return cached;
+  const diff = await taskDiff(ctx.db, taskId, ctx.exec);
+  ctx.diffs.set(taskId, diff);
+  return diff;
 }
 
 function recordFailure(ctx: Ctx, message: string): void {
@@ -2054,9 +2069,6 @@ async function syncCommentsAndReceipts(
 // Only UI work, and only a few images: the director's rule is a couple of
 // captioned proofs, never a dump of every viewport.
 //
-// ponytail: uploads existing evidence only. Rendering fresh screenshots at
-// review time would mean driving the TARGET repo's browser harness from the
-// sync loop; that is its own job, and most UI tasks already attach e2e shots.
 const ATTACHMENT_LIMIT = 3;
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif)$/i;
 const UI_DIFF_PATH = /(^|\/)(web|cms)\//;
@@ -2088,7 +2100,7 @@ async function touchesUi(ctx: Ctx, taskId: string, key: string): Promise<boolean
     .get(taskId) as { ui: number } | undefined;
   if (prior) return prior.ui === 1;
 
-  const diff = await taskDiff(ctx.db, taskId, ctx.exec);
+  const diff = await cycleDiff(ctx, taskId);
   if (!diff.ok) {
     logSyncOnce(ctx.db, taskId, { action: "attachment_scope", issue: key, undecided: diff.error });
     return false;
@@ -2130,21 +2142,65 @@ function attachedProofs(db: DB, taskId: string): { filename: string; caption: st
   });
 }
 
+// A row left mid-flight ("sending") is still a candidate: it has to reach the
+// loop to be settled as terminal_unknown, exactly like a comment or a receipt.
+function pendingProofs(db: DB, taskId: string): { id: string; path: string; caption: string | null }[] {
+  return imageEvidence(db, taskId).filter(
+    (row) =>
+      !deliveryRecorded(db, taskId, "attachment", row.id) &&
+      (latestDeliveryOutcome(db, taskId, "attachment", row.id) === "sending" ||
+        !deliveryContained(db, taskId, "attachment", row.id))
+  );
+}
+
+// A UI task that never attached a screenshot has nothing for the upload path to
+// carry, so the ticket lands as a wall of text. Render one or two now with the
+// target repo's own browser harness and save them as ordinary evidence — from
+// there they are indistinguishable from screenshots an agent attached itself.
+// Runs at most once per task, whatever the outcome; a repo with no harness logs
+// its reason and the ticket falls back to text, exactly as before.
+async function renderMissingProofs(ctx: Ctx, key: string, task: any): Promise<number> {
+  const diff = await cycleDiff(ctx, task.id);
+  if (!diff.ok) return 0;
+  const created = await renderProofsOnce(ctx.db, task, diff.diff.files.map((file) => file.path), ctx.exec);
+  if (created) {
+    ctx.stats.rendered += created;
+    logSync(ctx.db, task.id, { action: "attachment_render", issue: key, created });
+  }
+  return created;
+}
+
 async function syncAttachments(ctx: Ctx, key: string, task: any): Promise<void> {
   const { db, cfg, stats } = ctx;
   const jiraStatus = stateToJiraStatus(task.state);
   if (!jiraStatus || !CONTEXT_STATUSES.includes(jiraStatus)) return;
 
-  // A row left mid-flight ("sending") is still a candidate: it has to reach the
-  // loop to be settled as terminal_unknown, exactly like a comment or a receipt.
-  const candidates = imageEvidence(db, task.id).filter(
-    (row) =>
-      !deliveryRecorded(db, task.id, "attachment", row.id) &&
-      (latestDeliveryOutcome(db, task.id, "attachment", row.id) === "sending" ||
-        !deliveryContained(db, task.id, "attachment", row.id))
-  );
-  if (!candidates.length) return;
+  let candidates = pendingProofs(db, task.id);
+  if (!candidates.length) {
+    // Distinguish "already delivered" from "never had one": only the second is
+    // worth starting a browser for. The cheap local checks come first, so a task
+    // that can never render does not read its diff once per poll to find out.
+    if (imageEvidence(db, task.id).length) return;
+    if (renderProofAttempted(db, task.id)) return;
+    // Rendering runs the PR branch's own Playwright config, so it only happens
+    // for a repo the director marked trusted. Logged, never recorded as an
+    // attempt: flipping the flag on later lets the same task render.
+    if (!renderProofTrusted(db, task.project_id)) {
+      logSyncOnce(db, task.id, {
+        action: "render_proof_scope", issue: key,
+        reason: "project config does not set render_proof: true, so hive will not run this repo's browser harness",
+      });
+      return;
+    }
+    if (!task.branch && !task.pr_url) return; // nothing to diff, nothing to check out
+  }
   if (!(await touchesUi(ctx, task.id, key))) return;
+
+  if (!candidates.length) {
+    if (!(await renderMissingProofs(ctx, key, task))) return;
+    candidates = pendingProofs(db, task.id);
+    if (!candidates.length) return;
+  }
 
   // One read for the whole task: every candidate is checked against the same
   // filename list, so a crash between upload and receipt cannot double-post.
@@ -2434,7 +2490,7 @@ export async function syncProjectOnce(
 ): Promise<SyncStats> {
   assertJiraTargetOwner(db, projectId, cfg);
   const log = deps.log ?? ((m: string, e?: unknown) => console.error(`[hive] jira: ${m}`, e ?? ""));
-  const ctx: Ctx = { db, cfg, client, stats: emptyStats(), exec: deps.exec ?? defaultExec, log };
+  const ctx: Ctx = { db, cfg, client, stats: emptyStats(), exec: deps.exec ?? defaultExec, diffs: new Map(), log };
 
   // Discovery must succeed before any verified absence can advance: a failed
   // scope check is not evidence that anything went missing.
@@ -2664,7 +2720,7 @@ export async function runProjectCycle(
         `[hive] jira ${cfg.project_key}${cfg.write ? "" : " (shadow)"}: ` +
           `+${stats.imported} imported, ${stats.pushed} pushed, ${stats.pulled} pulled, ${stats.labeled} labeled, ` +
           `${stats.comments_pulled} comments in, ${stats.comments_pushed} comments out, ${stats.receipts} receipts, ` +
-          `${stats.attachments} attachments, ` +
+          `${stats.attachments} attachments, ${stats.rendered} rendered, ` +
           `${stats.shadow} shadow, ${stats.unmapped} unmapped, ${stats.aborted} aborted, ${stats.blocked} blocked, ` +
           `${stats.skipped} skipped, ${stats.errors} errors`
       );
