@@ -3590,7 +3590,8 @@ a.dbundle-fact:hover {
   border-top: 1px solid var(--border-soft);
 }
 .brief-backlog-list li:first-child { border-top: 0; }
-.brief-backlog-list a {
+.brief-backlog-list a,
+.brief-backlog-list .link-btn {
   min-width: 0;
   overflow: hidden;
   color: var(--text);
@@ -3599,7 +3600,14 @@ a.dbundle-fact:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.brief-backlog-list a:hover { text-decoration: underline; }
+.brief-backlog-list a:hover,
+.brief-backlog-list .link-btn:hover { text-decoration: underline; }
+/* The catch-up row's title is a button (it opens the flow), so match the links. */
+.brief-backlog-list .link-btn {
+  padding: 0;
+  font-size: inherit;
+  text-align: left;
+}
 .brief-backlog-list li > span {
   overflow: hidden;
   color: var(--text-faint);
@@ -4347,6 +4355,14 @@ a.dbundle-fact:hover {
 }
 .understanding-quiz-panel .understanding-quiz {
   margin-top: var(--s3);
+}
+.brief-digest-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s2);
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: var(--s2);
 }
 .brief-quiz > a {
   display: inline-block;

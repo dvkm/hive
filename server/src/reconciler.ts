@@ -24,7 +24,7 @@ import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { notTestProjectSql } from "./testProjects.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
-import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer } from "./api.ts";
+import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount } from "./api.ts";
 import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectBaseBranch, preferSafeRef } from "./exec.ts";
@@ -150,6 +150,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
     })
   );
   await step("remindUnreviewedIntake", () => remindUnreviewedIntake(db, (deps.nowMs ?? (() => Date.now()))()));
+  await step("notifyQuizDigest", () => notifyQuizDigest(db, (deps.nowMs ?? (() => Date.now()))()));
   await step("captureRecurringRefs", () => captureRecurringRefs(db));
   await step("repairRequeueProvenance", () => repairRequeueProvenance(db));
   await step("surfaceDeadDependencies", () => surfaceDeadDependencies(db));
@@ -1466,6 +1467,31 @@ export async function sweepVerifying(db: DB, deps: ReconcilerDeps = {}): Promise
 // Intake tasks wait for the director's review before dispatch — correct, but a
 // forgotten one rots in `queued` invisibly. One reminder after a day.
 const INTAKE_REMINDER_MS = 24 * 60 * 60 * 1000;
+
+// ONE push for the whole post-ship catch-up, never one per shipped change.
+// It fires at most once a day, and early only when the pile first reaches
+// three. The last notified count lives in settings so the "reached three" nudge
+// cannot repeat on every cycle.
+export const QUIZ_DIGEST_MS = 24 * 60 * 60 * 1000;
+export function notifyQuizDigest(db: DB, nowMs: number = Date.now()): void {
+  const count = pendingPostShipQuizCount(db);
+  if (count === 0) {
+    setSetting(db, "quiz_digest_last_count", "0");
+    return;
+  }
+  const lastCount = Number(getSetting(db, "quiz_digest_last_count") ?? "0");
+  const last = db.query("SELECT ts FROM notifications WHERE kind = 'quiz_digest' ORDER BY ts DESC LIMIT 1").get() as { ts: string } | undefined;
+  const dueDaily = !last || nowMs - Date.parse(last.ts) >= QUIZ_DIGEST_MS;
+  const reachedThree = count >= 3 && lastCount < 3;
+  if (!dueDaily && !reachedThree) return;
+  setSetting(db, "quiz_digest_last_count", String(count));
+  enqueue(db, {
+    kind: "quiz_digest",
+    urgency: "urgent",
+    title: `Catch up on ${count} shipped ${count === 1 ? "change" : "changes"}`,
+    body: "One pass, one question at a time. Open Needs you when you have a minute.",
+  });
+}
 
 export function remindUnreviewedIntake(db: DB, nowMs: number = Date.now()): void {
   const rows = db

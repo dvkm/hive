@@ -2,12 +2,13 @@ import { expect, test } from "bun:test";
 import { act, create } from "react-test-renderer";
 import { MemoryRouter } from "react-router-dom";
 import { api } from "../src/lib/api";
-import type { Brief as BriefData, Decision, Evidence, Task } from "../src/lib/api";
+import type { Brief as BriefData, Decision, Evidence, Task, UnderstandingQuiz as UnderstandingQuizData } from "../src/lib/api";
 import { LightboxProvider } from "../src/lib/lightbox";
 import { Ctx, type Store } from "../src/lib/store";
 import Brief from "../src/views/Brief";
 import { DecisionCard } from "../src/views/DecisionCard";
 import { ReferenceText } from "../src/lib/references";
+import { UnderstandingQuiz } from "../src/views/UnderstandingQuiz";
 
 (globalThis as unknown as { window: typeof globalThis }).window = globalThis;
 const values = new Map([["hive.inbox.mode", "backlogs"]]);
@@ -299,6 +300,68 @@ test("Backlog task links open against the backlog location for modal history", a
 
   const taskLink = renderer.root.findAll((node) => node.props.to === `/tasks/${task.id}`)[0];
   expect(taskLink.props.state.backgroundLocation.pathname).toBe("/inbox");
+});
+
+test("five deferred quizzes are one catch-up row, and finishing the flow clears all five", async () => {
+  values.delete("hive.board.project");
+  api.evidence = (async () => ({ evidence: [] })) as typeof api.evidence;
+  const quizzes = [1, 2, 3, 4, 5].map((n) => ({
+    id: `quiz-${n}`,
+    task_id: `shipped-${n}`,
+    ts: task.updated_at,
+    task_number: n,
+    task_title: `Shipped change ${n}`,
+    task_state: "done",
+    task_kind: "ship",
+    project_id: task.project_id,
+    report: { done: [], iffy: [], decisions: [], testing: [], followups: [] },
+    question: `Question ${n}?`,
+    options: [{ key: "a", label: "A" }, { key: "b", label: "B" }],
+    version: `v${n}`,
+    status: "deferred",
+  })) as unknown as UnderstandingQuizData[];
+  const store = {
+    tasks: quizzes.map((quiz, i) => ({ ...task, id: quiz.task_id, number: i + 1, title: quiz.task_title, state: "done" })),
+    projects: [{ id: task.project_id, name: "Project" }],
+    needsYou: [{ kind: "quiz_digest", id: `quiz-digest:${task.project_id}`, quizzes }],
+    checkpoints: [],
+    quizzes,
+    rev: {},
+    reloadCheckpoints: () => {},
+    reloadQuizzes: () => {},
+  } as unknown as Store;
+
+  values.set("hive.inbox.mode", "backlogs");
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(
+      <MemoryRouter>
+        <Ctx.Provider value={store}>
+          <LightboxProvider><Brief /></LightboxProvider>
+        </Ctx.Provider>
+      </MemoryRouter>
+    );
+  });
+  // One row for all five, not five rows, and the Backlogs count agrees.
+  const rows = renderer.root.findAll((node) => node.type === "li" && node.props.className === undefined);
+  expect(rows).toHaveLength(1);
+  expect(renderer.root.findAll((node) => node.type === "button" && String(node.children[0]).startsWith("Catch up on"))[0].children.join(""))
+    .toBe("Catch up on 5 shipped changes");
+  expect(renderer.root.findByProps({ className: "brief-count" }).children).toEqual(["1"]);
+
+  // The row opens the single sequential flow: one question at a time, in order.
+  await act(async () => {
+    renderer.root.findAll((node) => node.type === "button" && String(node.children[0]).startsWith("Catch up on"))[0].props.onClick();
+  });
+  for (let n = 1; n <= 5; n += 1) {
+    expect(renderer.root.findByType(UnderstandingQuiz).props.quiz.question).toBe(`Question ${n}?`);
+    await act(async () => {
+      renderer.root.findByType(UnderstandingQuiz).props.onPassed(null);
+    });
+  }
+  // All five cleared by the one flow — nothing left in the queue.
+  expect(renderer.root.findAll((node) => node.type === UnderstandingQuiz)).toHaveLength(0);
+  expect(renderer.root.findByProps({ className: "empty-big" }).children).toContain("All quiet.");
 });
 
 // HIVE-413: a blocking plan checkpoint is approved from the card itself, so the
