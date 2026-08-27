@@ -22,6 +22,7 @@ import { parseDecision } from "./rows.ts";
 import { listReferences } from "./learn.ts";
 import { classifyEscalation, factorsFromPlan, type EscalationVerdict } from "./policy.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
+import { teamclaudeEnv, applyTeamclaudeEnv } from "./teamclaude.ts";
 import { homedir } from "node:os";
 import { join, win32 } from "node:path";
 
@@ -61,7 +62,10 @@ export type PlannerExec = (
 ) => Promise<{ code: number; stdout: string; stderr: string; timedOut?: boolean }>;
 
 export const defaultPlannerExec: PlannerExec = async (argv, opts) => {
-  const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe", stdin: "ignore", ...(opts.cwd ? { cwd: opts.cwd } : {}) });
+  // Route through the TeamClaude proxy when it's up (multi-account balancing);
+  // null → inherit-equivalent env, claude runs direct.
+  const env = applyTeamclaudeEnv({ ...process.env }, await teamclaudeEnv());
+  const proc = Bun.spawn(argv, { env, stdout: "pipe", stderr: "pipe", stdin: "ignore", ...(opts.cwd ? { cwd: opts.cwd } : {}) });
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;

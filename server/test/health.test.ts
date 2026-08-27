@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
-import { computeHealth, needsAttention } from "../src/health.ts";
+import { computeHealth, needsAttention, tasksWithHealth } from "../src/health.ts";
 import { getTask } from "../src/state.ts";
 
 function freshDb(): { db: DB; projectId: string } {
@@ -286,4 +286,23 @@ test("needs_decision / in_review are waiting on the director — never silent/st
   const id = makeTask(db, projectId, "in_review");
   putEvent(db, id, "agent_status", { status: "gone" });
   expect(computeHealth(db, getTask(db, id), Date.now())?.status).toBe("dead");
+});
+
+test("tasksWithHealth: sidecar lookup stays a single query regardless of task count (HIVE-447)", () => {
+  const { db, projectId } = freshDb();
+  const ids = Array.from({ length: 5 }, () => makeTask(db, projectId));
+  for (const id of ids) putEvent(db, id, "sidecar_report", { sha: "abc123", ok: true, findings: [] });
+
+  const origQuery = db.query.bind(db);
+  let sidecarQueries = 0;
+  (db as any).query = (sql: string) => {
+    if (sql.includes("sidecar_report")) sidecarQueries++;
+    return origQuery(sql);
+  };
+
+  const tasks = tasksWithHealth(db, ids.map((id) => getTask(db, id)));
+
+  (db as any).query = origQuery;
+  expect(sidecarQueries).toBe(1);
+  for (const t of tasks) expect(t.sidecar?.sha).toBe("abc123");
 });

@@ -182,7 +182,14 @@ server/test/ bun test suite
   `cd electron && bun install && bun run build` builds the app into the checkout;
   `bun run install-app` in `electron/` builds and then installs that bundle to
   `/Applications/hive.app` on macOS or `%LOCALAPPDATA%\Programs\hive` on
-  Windows. The installer registers `hive://` per-user on both platforms.
+  Windows. Windows build staging lives in `%LOCALAPPDATA%\Hive\electron-builds`
+  so editors and antivirus cannot lock a checkout-local bundle during updates.
+  The Windows installer records the Bun executable and checkout paths beside
+  the app; when the default loopback server is unavailable, the app starts it
+  hidden on demand and keeps retrying. Remote/custom `HIVE_URL` values never
+  start a local process. Closing and reopening the window restores the board
+  through the same installed app.
+  The installer registers `hive://` per-user on both platforms.
   Everything that launches the app (`hive app`, the post-deploy
   restart) opens that installed copy, so a checkout build never re-registers
   itself as `dev.hive.app`.
