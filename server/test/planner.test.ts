@@ -1,10 +1,17 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const HOME = mkdtempSync(join(tmpdir(), "hive-planner-"));
 process.env.HIVE_HOME = HOME;
+writeFileSync(
+  join(HOME, "claude-profiles.json"),
+  JSON.stringify({
+    default_config_dir: "/profiles/personal",
+    routes: [{ root: "/repo", config_dir: "/profiles/company" }],
+  })
+);
 
 const { openDb } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
@@ -21,14 +28,17 @@ const db = openDb(":memory:");
 function stubExec(stdout: string, opts: { code?: number; hang?: boolean } = {}): {
   exec: PlannerExec;
   calls: string[][];
+  callOptions: Parameters<PlannerExec>[1][];
 } {
   const calls: string[][] = [];
+  const callOptions: Parameters<PlannerExec>[1][] = [];
   const exec: PlannerExec = async (argv, o) => {
     calls.push(argv);
+    callOptions.push(o);
     if (opts.hang) return { code: 143, stdout: "", stderr: "killed", timedOut: true };
     return { code: opts.code ?? 0, stdout, stderr: "" };
   };
-  return { exec, calls };
+  return { exec, calls, callOptions };
 }
 
 let server: any;
@@ -87,6 +97,18 @@ test("prompt composition includes persona, playbook, policies and learnings", as
   expect(prompt).toContain("flaky smoke on empty list"); // learning
   expect(prompt).toContain("Build onboarding flow"); // source task
   expect(prompt).toContain("STRICT JSON");
+});
+
+test("planner runs from the project repo with its routed Claude profile", async () => {
+  const t = await mkTask("Route this planner", "Use the company profile.");
+  const stub = stubExec(VALID);
+  const result = await runPlanner(db, t.id, { exec: stub.exec });
+  expect(result.ok).toBe(true);
+  expect(stub.callOptions).toHaveLength(1);
+  expect(stub.callOptions[0]).toMatchObject({
+    cwd: "/repo",
+    env: { CLAUDE_CONFIG_DIR: "/profiles/company" },
+  });
 });
 
 test("strict JSON parses; defensive extraction handles envelope + prose", () => {

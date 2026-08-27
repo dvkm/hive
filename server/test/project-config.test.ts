@@ -4,12 +4,16 @@
 // both halves: malformed values are REJECTED at the API, and a valid config with
 // those same keys set still drives a real spawn.
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const HOME = mkdtempSync(join(tmpdir(), "hive-projcfg-"));
 process.env.HIVE_HOME = HOME;
+writeFileSync(
+  join(HOME, "claude-profiles.json"),
+  JSON.stringify({ routes: [{ root: "/repo", config_dir: "/profiles/company" }] })
+);
 
 const { openDb, setSetting } = await import("../src/db.ts");
 const { makeHandler, spawnAgent } = await import("../src/api.ts");
@@ -108,6 +112,7 @@ test("a valid agent_argv/setup_argv config still spawns: the override IS the sub
   // agent_argv reached herdr verbatim as the command after `--`.
   const start = herdrCalls.find((argv) => has(argv, "agent", "start"));
   expect(start).toBeDefined();
+  expect(start).toContain("CLAUDE_CONFIG_DIR=/profiles/company");
   expect(start!.slice(start!.indexOf("--") + 1)).toEqual(GOOD_CONFIG.agent_argv);
 
   const task = await get(`/api/tasks/${t.json.id}`);
