@@ -15,6 +15,7 @@
 import type { DB } from "./db.ts";
 import { writeEvent } from "./state.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 
 const MODEL = "sonnet";
 const TIMEOUT_MS = 60_000;
@@ -174,7 +175,11 @@ export async function critiquePlan(
   try {
     res = await plannerExec(
       [claudeBin(), "-p", "--model", MODEL, buildCriticPrompt(task, plan), "--output-format", "json"],
-      { timeoutMs: TIMEOUT_MS, ...(task.worktree_path ? { cwd: task.worktree_path } : {}) }
+      {
+        timeoutMs: TIMEOUT_MS,
+        ...(task.worktree_path ? { cwd: task.worktree_path } : {}),
+        env: claudeProfileEnvForProject(db, task.project_id),
+      }
     );
   } catch (e: any) {
     return attach([], `critic spawn failed: ${e?.message ?? e}`);

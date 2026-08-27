@@ -60,6 +60,7 @@ import { enqueue, ackNotifications, markShown, recordDeliveryError, lastDelivery
 import { authorize, resolveGrantForDecision, resolveDenyGuardrailForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
 import { runPlanner, resolvePlanForDecision, decisionPlan, selectedPlanIndices, type PlannerExec } from "./planner.ts";
+import { claudeProfileEnvForRepo } from "./claudeProfiles.ts";
 import { routeIntakeProject } from "./intake/route.ts";
 import {
   REF_PREFIX as JIRA_REF_PREFIX,
@@ -3363,12 +3364,14 @@ export async function spawnAgent(
   const brief = steerPreamble(pending) + (opts.briefOverride ?? composeBrief(db, id));
   const hiveUrl = opts.hiveUrl || process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
   // TeamClaude proxy env first when the project opted in (agent="teamclaude";
-  // null when the proxy is down → agent runs direct), then secrets so a
-  // same-named secret wins.
+  // null when the proxy is down → agent runs direct), then secrets/platform.
+  // Machine account routing is applied last so a same-named project secret
+  // cannot silently replace the selected Claude profile.
   const env = {
     ...(usesTeamclaude(config) ? (await teamclaudeEnv())?.set ?? {} : {}),
     ...(await resolveProjectSecrets(db, task.project_id)),
     ...agentPlatformEnv(),
+    ...claudeProfileEnvForRepo(project.repo_path),
     HIVE_AGENT: agent,
   };
 

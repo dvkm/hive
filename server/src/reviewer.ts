@@ -16,6 +16,7 @@ import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectComparisonBase } from "./exec.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 import { supervisedSql } from "./supervision.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { parseUnifiedDiff } from "./diff.ts";
@@ -154,7 +155,7 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
       && current.branch === t.branch
       && (!t.pr_url || current.head_sha === t.head_sha);
   };
-  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(t.project_id);
+  const project: any = db.query("SELECT repo_path, config FROM projects WHERE id = ?").get(t.project_id);
   const config = JSON.parse(project?.config ?? "{}");
   if (config.auto_review === false) {
     writeEvent(db, { task_id: t.id, source: "system", type: "auto_review", payload: { skipped: "disabled by project config" } });
@@ -188,7 +189,11 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
   const exec = deps.exec ?? defaultPlannerExec;
   let res;
   try {
-    res = await exec(argv, { timeoutMs: TIMEOUT_MS });
+    res = await exec(argv, {
+      timeoutMs: TIMEOUT_MS,
+      ...(project?.repo_path ? { cwd: project.repo_path } : {}),
+      env: claudeProfileEnvForProject(db, t.project_id),
+    });
   } catch (e: any) {
     if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
     writeEvent(db, { task_id: t.id, source: "system", type: "auto_review_error", payload: { error: String(e?.message ?? e), ...reviewIdentity } });
@@ -411,6 +416,7 @@ export async function verifyRisks(
       return await exec([claudeBin(), "-p", "--model", VERIFY_MODEL, prompt, "--output-format", "json"], {
         timeoutMs: TIMEOUT_MS,
         cwd: task.worktree_path ?? undefined,
+        env: claudeProfileEnvForProject(db, task.project_id),
       });
     } catch {
       return null;
