@@ -1,6 +1,6 @@
 const { spawnSync } = require("node:child_process");
-const { cpSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync } = require("node:fs");
-const { tmpdir } = require("node:os");
+const { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync } = require("node:fs");
+const { homedir, tmpdir } = require("node:os");
 const { join } = require("node:path");
 
 const bin = join(__dirname, "node_modules", "electron-builder", "out", "cli", "cli.js");
@@ -8,7 +8,10 @@ const target = process.platform === "darwin" ? "--mac" : process.platform === "w
 // Electron Builder extracts to `<output>.tmp` and renames that directory. On
 // Windows, Defender/indexers commonly hold one freshly extracted file long
 // enough for that rename to fail with EPERM. Stage outside the checkout, then
-// copy the completed app into dist; this also keeps partial builds out of dist.
+// move the completed app into a per-user cache. Checkout directories are
+// aggressively indexed by editors and antivirus, so replacing dist/win-unpacked
+// is not reliable even after the app exits. A unique cache directory never
+// needs an in-use Electron file to be renamed or deleted.
 const staging = process.platform === "win32" ? mkdtempSync(join(tmpdir(), "hive-electron-build-")) : null;
 const args = [bin, target, "--dir"];
 if (staging) args.push(`--config.directories.output=${staging}`);
@@ -17,22 +20,26 @@ if (build.status !== 0) process.exit(build.status || 1);
 
 if (staging) {
   const source = join(staging, "win-unpacked");
-  const destination = join(__dirname, "dist", "win-unpacked");
-  const previous = join(__dirname, "dist", `win-unpacked.previous-${process.pid}`);
-  mkdirSync(join(__dirname, "dist"), { recursive: true });
-  // Never hollow out the previous usable build one file at a time. Rename it
-  // first (atomic on the same volume), install the new directory, then remove
-  // the backup. If Windows has the app open, the rename fails before damage.
-  if (existsSync(destination)) renameSync(destination, previous);
+  const local = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+  const buildRoot = process.env.HIVE_ELECTRON_BUILD_DIR || join(local, "Hive", "electron-builds");
+  const destination = join(buildRoot, `win-unpacked-${Date.now()}-${process.pid}`);
+  const pointer = join(buildRoot, "latest.txt");
+  mkdirSync(buildRoot, { recursive: true });
   try {
-    cpSync(source, destination, { recursive: true });
+    renameSync(source, destination);
   } catch (error) {
-    rmSync(destination, { recursive: true, force: true });
-    if (existsSync(previous)) renameSync(previous, destination);
-    throw error;
+    if (existsSync(destination)) rmSync(destination, { recursive: true, force: true });
+    cpSync(source, destination, { recursive: true });
   }
-  try { rmSync(previous, { recursive: true, force: true }); } catch { /* a scanner may release the old build later */ }
+  writeFileSync(pointer, destination, "utf8");
+  for (const entry of readdirSync(buildRoot)) {
+    const old = join(buildRoot, entry);
+    if (entry.startsWith("win-unpacked-") && old !== destination) {
+      try { rmSync(old, { recursive: true, force: true }); } catch { /* an old smoke run may still hold it */ }
+    }
+  }
   try { rmSync(staging, { recursive: true, force: true }); } catch { /* transient scanner lock; OS temp cleanup can reclaim it */ }
+  console.log(`Windows bundle staged at ${destination}`);
 }
 
 if (process.platform === "darwin") {

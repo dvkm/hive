@@ -22,7 +22,9 @@ import { isSafeRef } from "./exec.ts";
 
 // Lives here, not in api.ts: this schema needs it, and api.ts already imports
 // this file, so importing back would be a cycle. api.ts re-exports the name.
-export const AGENTS = ["claude", "codex"] as const;
+// "teamclaude" is Claude Code routed through the local TeamClaude proxy
+// (multi-account API balancing); it runs the same claude binary + hooks.
+export const AGENTS = ["claude", "codex", "teamclaude"] as const;
 export type Agent = (typeof AGENTS)[number];
 export const AUTONOMY_PROFILES = ["conservative", "balanced", "autopilot"] as const;
 

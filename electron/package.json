@@ -23,7 +23,7 @@
     "directories": {
       "output": "dist"
     },
-    "files": ["main.js", "deeplink.js"],
+    "files": ["main.js", "deeplink.js", "windows-server.js"],
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "build/icon.png",

@@ -71,13 +71,38 @@ export function latestSidecar(db: DB, taskId: string): SidecarReport | null {
     )
     .get(taskId) as { payload: string } | undefined;
   if (!row) return null;
+  return parseSidecarPayload(row.payload);
+}
+
+function parseSidecarPayload(payload: string): SidecarReport | null {
   try {
-    const p = JSON.parse(row.payload);
+    const p = JSON.parse(payload);
     if (typeof p?.sha !== "string") return null;
     return { sha: p.sha, ok: !!p.ok, findings: Array.isArray(p.findings) ? p.findings : [] };
   } catch {
     return null;
   }
+}
+
+// Batched form of latestSidecar (task HIVE-447): one grouped query for a whole
+// task list instead of one query per task, so list endpoints (board,
+// needs-attention, brief) stay O(1) queries regardless of list size.
+export function latestSidecarBatch(db: DB, taskIds: string[]): Map<string, SidecarReport | null> {
+  const result = new Map<string, SidecarReport | null>();
+  const ids = [...new Set(taskIds)];
+  if (ids.length === 0) return result;
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = db
+    .query(
+      `SELECT e.task_id AS task_id, e.payload AS payload FROM events e
+        JOIN (SELECT task_id, MAX(rowid) AS rid FROM events
+               WHERE type = 'sidecar_report' AND task_id IN (${placeholders})
+               GROUP BY task_id) latest
+          ON e.rowid = latest.rid`
+    )
+    .all(...ids) as { task_id: string; payload: string }[];
+  for (const row of rows) result.set(row.task_id, parseSidecarPayload(row.payload));
+  return result;
 }
 
 // A broken build is the one finding worth interrupting an agent for: everything

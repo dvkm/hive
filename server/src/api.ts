@@ -4,7 +4,7 @@ import { dirname, join, normalize } from "node:path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
-import { taskWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
+import { taskWithHealth, tasksWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
 import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
 import { addClient, removeClient, broadcast, appClientCount } from "./bus.ts";
@@ -48,6 +48,7 @@ import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from ".
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { resolveProjectSecrets, serviceName } from "./secrets.ts";
+import { teamclaudeEnv, usesTeamclaude } from "./teamclaude.ts";
 import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
 import {
   deploymentsStatus,
@@ -1257,7 +1258,7 @@ export function projectInboxCounts(db: DB, projectId: string): { checkpoints: nu
   const reviews = Number(
     (db.query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND state = 'in_review' AND ${supervisedSql()} AND COALESCE(source_ref, '') NOT LIKE 'jira:%'`).get(projectId) as { n: number }).n
   );
-  const tasks = db.query("SELECT * FROM tasks WHERE project_id = ?").all(projectId).map((task) => taskWithHealth(db, parseTask(task)));
+  const tasks = tasksWithHealth(db, db.query("SELECT * FROM tasks WHERE project_id = ?").all(projectId).map(parseTask));
   const attention = tasks.filter(needsAttention).length;
   return { checkpoints, decisions, reviews, attention };
 }
@@ -2091,7 +2092,7 @@ function listTasks(db: DB, url: URL): Response {
     "SELECT t.* FROM tasks t JOIN projects p ON p.id = t.project_id" +
     (where.length ? " WHERE " + where.join(" AND ") : "") +
     " ORDER BY t.updated_at DESC";
-  return json(db.query(sql).all(...args).map(parseTask).map((t) => taskWithHealth(db, t)));
+  return json(tasksWithHealth(db, db.query(sql).all(...args).map(parseTask)));
 }
 
 // Activity feed: reverse-chronological events across ALL tasks, each enriched
@@ -2239,13 +2240,15 @@ function brief(db: DB, url: URL): Response {
   // ② needs attention uses the shared eligibility rule over full task objects
   // (with health), so the web can reuse the tray rows.
   // Not windowed: these persist until you act on them.
-  const attnCandidates = db
-    .query(
-      "SELECT * FROM tasks WHERE state = 'failed' OR (agent_target IS NOT NULL AND state IN ('in_progress','needs_decision','in_review','verifying'))"
-    )
-    .all()
-    .map(parseTask)
-    .map((t: any) => taskWithHealth(db, t));
+  const attnCandidates = tasksWithHealth(
+    db,
+    db
+      .query(
+        "SELECT * FROM tasks WHERE state = 'failed' OR (agent_target IS NOT NULL AND state IN ('in_progress','needs_decision','in_review','verifying'))"
+      )
+      .all()
+      .map(parseTask)
+  );
   const failed_or_attention = attnCandidates.filter((t: any) => needsAttention(t));
 
   // ③ decisions — open cards ARE the action items (full objects, rendered inline).
@@ -2274,13 +2277,15 @@ function brief(db: DB, url: URL): Response {
   }
 
   // ④ fleet now — currently live agents (task + health).
-  const fleet = db
-    .query(
-      "SELECT * FROM tasks WHERE agent_target IS NOT NULL AND state IN ('in_progress','needs_decision','in_review','verifying') ORDER BY updated_at DESC"
-    )
-    .all()
-    .map(parseTask)
-    .map((t: any) => taskWithHealth(db, t));
+  const fleet = tasksWithHealth(
+    db,
+    db
+      .query(
+        "SELECT * FROM tasks WHERE agent_target IS NOT NULL AND state IN ('in_progress','needs_decision','in_review','verifying') ORDER BY updated_at DESC"
+      )
+      .all()
+      .map(parseTask)
+  );
 
   // ⑤ incidents opened/resolved since.
   const incidents = db
@@ -2302,12 +2307,14 @@ function brief(db: DB, url: URL): Response {
 
   // ⑦ to review — Hive-owned in-review tasks awaiting the captain's review
   // and merge. Full task objects (with health) so the web renders review cards inline.
-  const to_review = db
-    .query("SELECT * FROM tasks WHERE state = 'in_review' ORDER BY updated_at DESC")
-    .all()
-    .map(parseTask)
-    .filter((task: any) => !isTrackingOnlyTask(task))
-    .map((t: any) => taskWithHealth(db, t));
+  const to_review = tasksWithHealth(
+    db,
+    db
+      .query("SELECT * FROM tasks WHERE state = 'in_review' ORDER BY updated_at DESC")
+      .all()
+      .map(parseTask)
+      .filter((task: any) => !isTrackingOnlyTask(task))
+  );
 
   // ⑧ spend since — reuse the analytics rollup (totals + by-model for top model).
   // `?project` scopes it, so a reader who filtered the brief to one project does
@@ -3355,7 +3362,11 @@ export async function spawnAgent(
   const pending = queuedSteers(db, id);
   const brief = steerPreamble(pending) + (opts.briefOverride ?? composeBrief(db, id));
   const hiveUrl = opts.hiveUrl || process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
+  // TeamClaude proxy env first when the project opted in (agent="teamclaude";
+  // null when the proxy is down → agent runs direct), then secrets so a
+  // same-named secret wins.
   const env = {
+    ...(usesTeamclaude(config) ? (await teamclaudeEnv())?.set ?? {} : {}),
     ...(await resolveProjectSecrets(db, task.project_id)),
     ...agentPlatformEnv(),
     HIVE_AGENT: agent,
