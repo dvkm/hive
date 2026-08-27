@@ -69,6 +69,23 @@ Environment:
 - `HIVE_HOME` — base dir for evidence files (default `~/.hive`).
 - `HIVE_URL` — base URL the CLI talks to (default `http://127.0.0.1:$HIVE_PORT`).
 
+Claude Code accounts can be routed by original project path with the
+machine-local `$HIVE_HOME/claude-profiles.json` file. Hive applies the selected
+`CLAUDE_CONFIG_DIR` to planners, reviewers, critics, and Herdr workers; matching
+uses the original repository path even though workers run in separate
+worktrees. The longest containing root wins. Projects outside every route use
+`default_config_dir` when provided; omitting it preserves Claude's normal
+personal default with no `CLAUDE_CONFIG_DIR` override:
+
+```json
+{
+  "default_config_dir": "/Users/me/.claude",
+  "routes": [
+    { "root": "/Users/me/work/company", "config_dir": "/Users/me/.claude-company" }
+  ]
+}
+```
+
 ## Seed a demo board
 
 ```bash

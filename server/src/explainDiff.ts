@@ -21,6 +21,7 @@ import { parseEvidence } from "./rows.ts";
 import { writeEvent, getTask } from "./state.ts";
 import { broadcastTask } from "./health.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 import { defaultExec, type Exec } from "./exec.ts";
 import { handOffToReview } from "./api.ts";
 
@@ -205,7 +206,11 @@ async function generateExplanation(db: DB, task: any, head: string | null, deps:
 
   const res = await plannerExec(
     [claudeBin(), "-p", "--model", MODEL, buildPrompt(task, diff.slice(0, MAX_DIFF_CHARS), reviewChecks(db, task.id)), "--output-format", "json"],
-    { timeoutMs: TIMEOUT_MS, cwd: task.worktree_path }
+    {
+      timeoutMs: TIMEOUT_MS,
+      cwd: task.worktree_path,
+      env: claudeProfileEnvForProject(db, task.project_id),
+    }
   );
   if (res.timedOut) return fail(`explanation run timed out after ${TIMEOUT_MS}ms`);
   if (res.code !== 0) return fail(`explanation run exited ${res.code}: ${(res.stderr || res.stdout).slice(0, 400)}`);

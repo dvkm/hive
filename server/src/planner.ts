@@ -23,6 +23,7 @@ import { listReferences } from "./learn.ts";
 import { classifyEscalation, factorsFromPlan, type EscalationVerdict } from "./policy.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { teamclaudeEnv, applyTeamclaudeEnv } from "./teamclaude.ts";
+import { claudeProfileEnvForRepo } from "./claudeProfiles.ts";
 import { homedir } from "node:os";
 import { join, win32 } from "node:path";
 
@@ -58,14 +59,23 @@ const DEFAULT_ARGV = [claudeBin(), "-p", "--model", "sonnet"];
 // default implementation kills the process on timeout (hard cap, no runaway).
 export type PlannerExec = (
   argv: string[],
-  opts: { timeoutMs: number; cwd?: string }
+  opts: { timeoutMs: number; cwd?: string; env?: Record<string, string> }
 ) => Promise<{ code: number; stdout: string; stderr: string; timedOut?: boolean }>;
 
 export const defaultPlannerExec: PlannerExec = async (argv, opts) => {
-  // Route through the TeamClaude proxy when it's up (multi-account balancing);
-  // null → inherit-equivalent env, claude runs direct.
-  const env = applyTeamclaudeEnv({ ...process.env }, await teamclaudeEnv());
-  const proc = Bun.spawn(argv, { env, stdout: "pipe", stderr: "pipe", stdin: "ignore", ...(opts.cwd ? { cwd: opts.cwd } : {}) });
+  // A project-scoped env, including an empty one for the personal default,
+  // deliberately wins over TeamClaude's multi-account proxy. This guarantees
+  // that path routing selects the requested account. Callers with no project
+  // env retain TeamClaude's existing fail-open behavior.
+  const env = opts.env === undefined
+    ? applyTeamclaudeEnv({ ...process.env }, await teamclaudeEnv())
+    : { ...process.env };
+  // No route means Claude's normal personal profile, which is represented by
+  // an UNSET variable rather than CLAUDE_CONFIG_DIR=~/.claude (that directory
+  // uses a different on-disk layout).
+  delete env.CLAUDE_CONFIG_DIR;
+  Object.assign(env, opts.env);
+  const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe", stdin: "ignore", env, ...(opts.cwd ? { cwd: opts.cwd } : {}) });
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
@@ -256,7 +266,11 @@ export async function runPlanner(db: DB, taskId: string, deps: PlannerDeps = {})
 
   let res: Awaited<ReturnType<PlannerExec>>;
   try {
-    res = await exec(argv, { timeoutMs });
+    res = await exec(argv, {
+      timeoutMs,
+      ...(project?.repo_path ? { cwd: project.repo_path } : {}),
+      env: claudeProfileEnvForRepo(project?.repo_path),
+    });
   } catch (e: any) {
     return plannerError(db, taskId, `planner spawn failed: ${e?.message ?? e}`);
   }
