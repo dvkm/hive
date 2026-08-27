@@ -48,6 +48,7 @@ import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from ".
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { resolveProjectSecrets, serviceName } from "./secrets.ts";
+import { teamclaudeEnv } from "./teamclaude.ts";
 import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
 import {
   deploymentsStatus,
@@ -3346,7 +3347,9 @@ export async function spawnAgent(
   const pending = queuedSteers(db, id);
   const brief = steerPreamble(pending) + (opts.briefOverride ?? composeBrief(db, id));
   const hiveUrl = opts.hiveUrl || process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
-  const env = { ...(await resolveProjectSecrets(db, task.project_id)), HIVE_AGENT: agent };
+  // TeamClaude proxy env first (multi-account API routing; null when the proxy
+  // is down → agent runs direct), then secrets so a same-named secret wins.
+  const env = { ...((await teamclaudeEnv())?.set ?? {}), ...(await resolveProjectSecrets(db, task.project_id)), HIVE_AGENT: agent };
 
   let result;
   try {
