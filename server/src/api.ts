@@ -6,7 +6,7 @@ import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { taskWithHealth, tasksWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
 import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
-import { isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
+import { activeProjects, isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
 import { addClient, removeClient, broadcast, appClientCount } from "./bus.ts";
 import {
   transition,
@@ -482,9 +482,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // edges (declared dependencies + inferred file conflicts) for the board.
       if (pathname === "/api/tasks/land-graph" && method === "GET") {
         const projectId = url.searchParams.get("project");
-        const projects = projectId
-          ? [{ id: projectId }]
-          : (db.query("SELECT id FROM projects").all() as { id: string }[]);
+        const projects = projectId ? [{ id: projectId }] : activeProjects(db).map((p) => ({ id: p.id }));
         const graphs = await Promise.all(projects.map((p) => landGraph(db, p.id, deps.exec ?? defaultExec)));
         return json({ nodes: graphs.flatMap((g) => g.nodes), edges: graphs.flatMap((g) => g.edges) });
       }
@@ -1363,7 +1361,7 @@ export async function sweepManagerInboxes(db: DB, herdr: Herdr, deps: HandlerDep
   const byProject = new Map(active.filter((thread) => thread.project_id).map((thread) => [thread.project_id!, thread]));
   const fallback = chief ?? active[0];
   const assignments = new Map<string, { thread: ChatThread; projects: { id: string; name: string; counts: ReturnType<typeof projectInboxCounts> }[] }>();
-  for (const project of db.query("SELECT id, name FROM projects ORDER BY created_at").all() as { id: string; name: string }[]) {
+  for (const project of activeProjects(db)) {
     const counts = projectInboxCounts(db, project.id);
     const total = counts.checkpoints + counts.decisions + counts.reviews + counts.attention;
     if (!total) continue;
