@@ -10,7 +10,7 @@
 //  - near: word-set Jaccard title similarity above NEAR_THRESHOLD.
 import type { DB } from "./db.ts";
 import { now } from "./db.ts";
-import { getTask, transition, writeEvent, canTransition } from "./state.ts";
+import { getTask, transition, writeEvent, canTransition, repointDependents } from "./state.ts";
 import { broadcastTask } from "./health.ts";
 import { createDecision } from "./api.ts";
 
@@ -102,6 +102,7 @@ export function mergeInto(db: DB, sourceId: string, targetId: string, reason?: s
 
   db.query("UPDATE tasks SET duplicate_of = ?, updated_at = ? WHERE id = ?").run(targetId, now(), sourceId);
   writeEvent(db, { task_id: sourceId, source: "system", type: "duplicate_merged", payload: { duplicate_of: targetId } });
+  repointDependents(db, sourceId, targetId);
   const cancelled = transition(db, sourceId, "cancelled", {
     source: "system",
     reason: reason ?? `duplicate of ${targetId}`,

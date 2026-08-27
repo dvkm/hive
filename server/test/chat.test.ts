@@ -28,6 +28,11 @@ const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x
 const briefs: string[] = [];
 const sends: string[] = [];
 let probeStatus = "working";
+// Simulates a herdr registry wipe: `agent get`/`agent list` forget the name
+// entirely (agent_not_found) while the pane itself is still running at `evictedCwd`,
+// until `pane report-agent` re-registers it (readopt).
+let evictedCwd: string | null = null;
+let reregistered = false;
 const exec: Exec = async (argv) => {
   if (has(argv, "worktree", "create")) {
     // A real worktree create/reclaim takes real time; without the per-thread
@@ -36,8 +41,28 @@ const exec: Exec = async (argv) => {
     await new Promise((r) => setTimeout(r, 15));
     return OK(`{"result":{"worktree":{"path":${JSON.stringify(WT)},"branch":"hive/x","open_workspace_id":"w1"}}}`);
   }
-  if (has(argv, "agent", "get"))
+  if (has(argv, "agent", "get")) {
+    if (evictedCwd && !reregistered) return OK('{"error":{"code":"agent_not_found"}}');
     return OK(`{"result":{"agent":{"pane_id":"p1","agent_status":"${probeStatus}"}}}`);
+  }
+  if (has(argv, "agent", "list")) return OK("{\"result\":{\"agents\":[]}}");
+  if (has(argv, "pane", "list")) {
+    if (!evictedCwd) return OK('{"result":{"panes":[]}}');
+    if (evictedCwd === WT)
+      // Matches the fleet tab created for the supervisor spawn (cwd + tab_id
+      // "wF:t2"), so confirmGone sees it as still-live and readopt finds it.
+      return OK('{"result":{"panes":[{"pane_id":"pE","tab_id":"wF:t2","cwd":' + JSON.stringify(WT) + ',"terminal_id":"term_E","label":null}]}}');
+    // A real death: some unrelated pane exists, but none at this task's cwd/tab —
+    // confirmGone has positive evidence (a live pane list) and finds no match.
+    return OK('{"result":{"panes":[{"pane_id":"pZ","tab_id":"wZ:tZ","cwd":"/unrelated","terminal_id":"term_Z","label":null}]}}');
+  }
+  if (has(argv, "pane", "process-info"))
+    return OK('{"result":{"process_info":{"shell_pid":1,"foreground_processes":[{"pid":1,"argv0":"claude"}]}}}');
+  if (has(argv, "pane", "report-agent")) {
+    reregistered = true;
+    return OK();
+  }
+  if (has(argv, "agent", "rename")) return OK();
   if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
   if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t2"}}}');
   if (has(argv, "agent", "start")) {
@@ -121,6 +146,38 @@ test("a leftover shell pane is respawned instead of receiving the director messa
     expect(briefs.at(-1)).toContain("resume the sweep");
   } finally {
     probeStatus = "working";
+  }
+});
+
+test("a supervisor whose herdr registry entry was evicted receives the turn as a steer, not a respawn (hive-448)", async () => {
+  const before = briefs.length;
+  evictedCwd = WT; // the pane is still alive at the supervisor task's worktree cwd
+  reregistered = false;
+  try {
+    const { status, json } = await post("/api/chat/turn", { thread_id: threadId, text: "still there?" });
+    expect(status).toBe(202);
+    expect(json.delivery).toBe("delivered"); // re-adopted and steered, not respawned
+    expect(briefs.length).toBe(before); // no new spawn
+    expect(sends.at(-1)).toContain("still there?");
+  } finally {
+    evictedCwd = null;
+    reregistered = false;
+  }
+});
+
+test("a genuinely dead supervisor (no matching pane) still respawns", async () => {
+  const before = briefs.length;
+  probeStatus = "unknown";
+  evictedCwd = "/dead"; // no pane at the task's real worktree cwd -> confirmGone confirms death
+  try {
+    const { status, json } = await post("/api/chat/turn", { thread_id: threadId, text: "resume after real death" });
+    expect(status).toBe(202);
+    expect(json.delivery).toBe("spawned");
+    expect(briefs.length).toBe(before + 1);
+    expect(briefs.at(-1)).toContain("resume after real death");
+  } finally {
+    probeStatus = "working";
+    evictedCwd = null;
   }
 });
 

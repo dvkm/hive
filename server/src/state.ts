@@ -33,6 +33,20 @@ export const TERMINAL: State[] = ["done", "failed", "cancelled"];
 // Re-exported here because the existing callers import it from state.
 export { isTrackingOnlyTask };
 
+export function queueJiraCancellationComment(db: DB, taskId: string, source: string): void {
+  const queued = db.query(
+    `SELECT 1 FROM events WHERE task_id = ? AND type = 'jira_comment'
+       AND json_extract(payload, '$.linked_cancelled') = 1 LIMIT 1`
+  ).get(taskId);
+  if (queued) return;
+  writeEvent(db, {
+    task_id: taskId,
+    source,
+    type: "jira_comment",
+    payload: { direction: "outbound", linked_cancelled: true, text: "Hive marked this task cancelled." },
+  });
+}
+
 export const TRACKING_ONLY_REQUEUE_ERROR = "a mirrored Jira task has no agent work to requeue";
 export const TRACKING_ONLY_OWNERSHIP_ERROR = "tracking-only tasks cannot create Hive-owned agent work";
 
@@ -92,9 +106,6 @@ export function getTask(db: DB, id: string): any | null {
 // fully done. Every other state — still queued/working/in review, or failed/
 // cancelled — blocks the dependent. Returns the blocking dep rows (id, number,
 // title, state) so callers can name them in a visible 'blocked by task X'.
-// ponytail: a failed dep auto-requeues under a NEW id, so a task depending on
-// the old (now-failed) id blocks until the director edits/cancels it. Visible,
-// not silent — upgrade to re-point deps at the requeue successor if it bites.
 const DEP_MET_STATES = ["verifying", "done"];
 export function unmetDeps(db: DB, task: { depends_on?: string[] } | null | undefined): { id: string; number: number; title: string; state: string }[] {
   const ids = task?.depends_on ?? [];
@@ -108,6 +119,141 @@ export function unmetDeps(db: DB, task: { depends_on?: string[] } | null | undef
     if (!dep || !DEP_MET_STATES.includes(dep.state)) blocking.push(dep ?? { id, number: 0, title: "(unknown task)", state: "missing" });
   }
   return blocking;
+}
+
+function activeDependents(db: DB, dependencyId: string): any[] {
+  return (db
+    .query("SELECT * FROM tasks WHERE depends_on IS NOT NULL AND state NOT IN ('done','failed','cancelled')")
+    .all() as any[])
+    .map(parseTask)
+    .filter((task) => task.depends_on.includes(dependencyId));
+}
+
+export function dependsTransitivelyOn(db: DB, taskId: string, dependencyId: string): boolean {
+  const pending = [taskId];
+  const seen = new Set<string>();
+  while (pending.length) {
+    const id = pending.pop()!;
+    if (id === dependencyId) return true;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    pending.push(...(getTask(db, id)?.depends_on ?? []));
+  }
+  return false;
+}
+
+export function repointDependents(db: DB, fromId: string, toId: string, source = "system"): string[] {
+  const changed: string[] = [];
+  for (const task of activeDependents(db, fromId)) {
+    if (task.id !== toId && dependsTransitivelyOn(db, toId, task.id)) {
+      writeEvent(db, {
+        task_id: task.id,
+        source,
+        type: "dependency_repoint_skipped",
+        payload: {
+          note: `Dependency on ${fromId} was not repointed to ${toId} because that would create a cycle.`,
+          from_task_id: fromId,
+          to_task_id: toId,
+          reason: "dependency cycle",
+        },
+      });
+      broadcastTask(db, getTask(db, task.id));
+      continue;
+    }
+    const dependsOn = [...new Set(task.depends_on.map((id: string) => id === fromId ? toId : id))]
+      .filter((id) => id !== task.id);
+    db.query("UPDATE tasks SET depends_on = ?, updated_at = ? WHERE id = ?").run(JSON.stringify(dependsOn), now(), task.id);
+    writeEvent(db, {
+      task_id: task.id,
+      source,
+      type: "dependency_repointed",
+      payload: { from_task_id: fromId, to_task_id: toId },
+    });
+    broadcastTask(db, getTask(db, task.id));
+    changed.push(task.id);
+  }
+  return changed;
+}
+
+export function dependentsWedgedForDecision(db: DB, decisionId: string): { cancelledTaskId: string; dependentTaskIds: string[] } | null {
+  const event = db.query(
+    "SELECT task_id, payload FROM events WHERE type = 'dependents_wedged' AND json_extract(payload, '$.decision_id') = ? ORDER BY ts DESC LIMIT 1"
+  ).get(decisionId) as { task_id: string; payload: string } | undefined;
+  if (!event) return null;
+  return { cancelledTaskId: event.task_id, dependentTaskIds: JSON.parse(event.payload).dependent_task_ids ?? [] };
+}
+
+export function resolveDependentsWedgedForDecision(
+  db: DB,
+  decisionId: string,
+  answerKey: string,
+  successorId: string | null,
+  source: string
+): boolean {
+  const marker = dependentsWedgedForDecision(db, decisionId);
+  if (!marker) return false;
+  if (answerKey === "repoint" && successorId) {
+    repointDependents(db, marker.cancelledTaskId, successorId, source);
+  } else if (answerKey === "cancel") {
+    for (const id of marker.dependentTaskIds) {
+      const task = getTask(db, id);
+      if (task && canTransition(task.state, "cancelled"))
+        transition(db, id, "cancelled", { source, reason: `dependency ${marker.cancelledTaskId} was cancelled` });
+    }
+  }
+  return true;
+}
+
+function openCancelledDependencyDecision(db: DB, cancelled: any, source: string): void {
+  const dependents = activeDependents(db, cancelled.id);
+  if (!dependents.length) return;
+  const host = dependents[0];
+  const affected = dependents.map((task) => `#${task.number} ${task.title} (${task.id})`);
+  const row = {
+    id: newId("dec"),
+    task_id: host.id,
+    ts: now(),
+    title: `Resolve dependencies on cancelled task #${cancelled.number}`,
+    context: `Task #${cancelled.number} ${cancelled.title} was cancelled. These tasks still depend on it and cannot proceed: ${affected.join(", ")}. Repoint them to a successor or cancel them. For repoint, enter the successor task ID in the answer note.`,
+    risk: "normal",
+    blast_radius: affected.join(", "),
+    options: JSON.stringify([
+      { key: "repoint", label: "Repoint dependencies", detail: "Enter the successor task ID in the answer note, then update the listed tasks to depend on it.", recommended: true },
+      { key: "cancel", label: "Cancel dependents", detail: "Cancel the listed tasks if their work is no longer needed." },
+    ]),
+    status: "open",
+    answer_key: null,
+    answer_note: null,
+    draft_note: null,
+    answered_at: null,
+    ci_status_at_card: null,
+    ci_signal: null,
+  };
+  db.query(
+    `INSERT INTO decisions (id, task_id, ts, title, context, risk, blast_radius,
+      options, status, answer_key, answer_note, draft_note, answered_at, ci_status_at_card, ci_signal)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(
+    row.id, row.task_id, row.ts, row.title, row.context, row.risk,
+    row.blast_radius, row.options, row.status, row.answer_key, row.answer_note,
+    row.draft_note, row.answered_at, row.ci_status_at_card, row.ci_signal
+  );
+  writeEvent(db, { task_id: host.id, source, type: "needs-decision", payload: { decision_id: row.id, title: row.title } });
+  writeEvent(db, {
+    task_id: cancelled.id,
+    source,
+    type: "dependents_wedged",
+    payload: { decision_id: row.id, dependent_task_ids: dependents.map((task) => task.id) },
+  });
+  broadcast({ type: "decision", decision: parseDecision(row) });
+  enqueue(db, {
+    kind: "decision",
+    urgency: "urgent",
+    task_id: host.id,
+    decision_id: row.id,
+    title: `Decision needed: ${row.title}`,
+    body: row.context,
+  });
 }
 
 // Record a visible 'blocked by task X' — but only when the blocking set changed
@@ -532,6 +678,8 @@ export function transition(
     const hint =
       to === "done" && (from === "in_progress" || from === "in_review")
         ? " — done is reached via review: emit `ready --pr-url <url>` (in_review), then the director merges (verifying -> done)"
+        : to === "queued" && ["in_progress", "in_review", "verifying"].includes(from)
+        ? `; to retry a live task, POST /api/tasks/${taskId}/requeue (fails and requeues atomically)`
         : "";
     throw new TransitionError(`invalid transition: '${from}' -> '${to}'${hint}`);
   }
@@ -569,10 +717,14 @@ export function transition(
     type: "state_change",
     payload: { from, to, reason: opts.reason ?? null },
   });
+  if (to === "cancelled" && task.jira_key && task.jira_link_kind === "subtask") {
+    queueJiraCancellationComment(db, taskId, source);
+  }
   broadcastTask(db, updated);
   // A terminal task can no longer act on any open decision — expire them so the
   // inbox clears and the answer endpoint can't be hit against a dead task.
   if (TERMINAL.includes(to)) expireOpenDecisions(db, taskId, `task ${to}`);
+  if (to === "cancelled") openCancelledDependencyDecision(db, updated, source);
   // Notify on notable terminal-ish outcomes (batched into the digest).
   if (to === "done")
     enqueue(db, { kind: "done", task_id: taskId, title: `Task done: ${task.title}`, body: task.summary ?? undefined });

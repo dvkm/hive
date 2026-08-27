@@ -14,8 +14,9 @@
 //      time (2026-08-19: 12+ live agents failed with their tabs closed).
 //   3. Lease ownership — a displaced server can run one last loop before its
 //      lease heartbeat exits. It must not act on its stale view of the fleet.
+//   4. Fleet DB ownership — see fleetDbBlocked below.
 import type { DB } from "./db.ts";
-import { getSetting } from "./db.ts";
+import { getSetting, defaultDbPath, homeDbPath } from "./db.ts";
 import { holdsLease } from "./lease.ts";
 
 export const BOOT_GRACE_MS = Number(process.env.HIVE_BOOT_GRACE_MS || 5 * 60_000);
@@ -63,10 +64,28 @@ export function breakerTripped(db: DB): boolean {
     .get();
 }
 
+// INCIDENT b6fb44583e96 (2026-08-25): the lease guards the DATABASE, but every
+// hive server drives the ONE global herdr daemon. A server on a scratch DB
+// (HIVE_DB=/tmp/smoke.db — precisely what index.ts tells a refused server to
+// use) holds its own uncontested lease, so gates 1-3 all pass, and then its
+// reaper enumerates every pane on the machine, finds no row for the live fleet
+// in its own tiny DB, and closes them as "orphan task panes". An agent's leaked
+// smoke server (pid 29704, HIVE_DB=.../scratchpad/smoke.db, 5 rows) reaped the
+// working fleet every 5 minutes for 7 hours this way — unlogged, because its
+// logClose went to a dead stdout, which is why no herdr_close_request named the
+// victims. Only a server on the fleet's own DB may tear fleet resources down.
+// Read at call time, not module load: `defaultDbPath` answers with whatever
+// HIVE_DB the process was started with, and tests never set it in-process.
+export function fleetDbBlocked(): string | null {
+  return defaultDbPath() === homeDbPath() ? null : "not the fleet database";
+}
+
 // May hive tear something down right now? One call, used by every destructive
 // path (stale recovery, the reaper sweep). Returns the reason it may not, so the
 // caller can log something a human can act on.
 export function teardownBlocked(db: DB, nowMs: number = Date.now(), instanceId?: string): string | null {
+  const notFleet = fleetDbBlocked();
+  if (notFleet) return notFleet;
   if (withinBootGrace(db, nowMs)) return "boot grace";
   if (breakerTripped(db)) return "circuit breaker open";
   // A server that has lost the DB lease is on its way out (it exits within one

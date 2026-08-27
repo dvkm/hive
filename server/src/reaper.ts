@@ -11,7 +11,7 @@
 import type { DB } from "./db.ts";
 import { setSetting, now, isOffline } from "./db.ts";
 import { getTask, TERMINAL, type State } from "./state.ts";
-import { Herdr, herdr as defaultHerdr, parseWorktreeList } from "./runtime/herdr.ts";
+import { Herdr, herdr as defaultHerdr, parseWorktreeList, paneHasLiveProcess, type PaneInfo } from "./runtime/herdr.ts";
 import { cleanupTask, releaseReviewAgents } from "./cleanup.ts";
 import { teardownBlocked } from "./teardownGuard.ts";
 import { broadcast } from "./bus.ts";
@@ -107,6 +107,12 @@ export async function reapOnce(db: DB, deps: ReaperDeps = {}): Promise<void> {
   }
 
   try {
+    await sweepZombiePanes(db, deps);
+  } catch (e) {
+    console.error("[hive] reaper zombie-pane sweep:", e); // isolated; never crash the sweep
+  }
+
+  try {
     sweepFinishedTestProjects(db);
   } catch (e) {
     console.error("[hive] reaper test-project sweep:", e); // isolated; never crash the sweep
@@ -136,7 +142,14 @@ export async function sweepOrphanedAgents(db: DB, deps: ReaperDeps = {}): Promis
         await cleanupTask(db, herdr, a.name, { force: true });
         continue;
       }
-      const r = await herdr.closeSession({ agentTarget: a.name, tabId: a.tabId });
+      const r = await herdr.closeSession({
+        agentTarget: a.name,
+        // A vanished task row leaves no cwd or terminal id with which to prove
+        // ownership of the recorded tab. Resolve the named agent's exact pane
+        // instead, so an orphan sweep can never close a reused or mixed tab.
+        tabId: null,
+        request: { caller: "reaper.sweepOrphanedAgents", reason: "orphan task agent", taskId: a.name },
+      });
       broadcast({ type: "reaped_orphan_agent", name: a.name, closed: r.closed, via: r.via });
     } catch (e) {
       console.error(`[hive] reaper orphan agent ${a.name}:`, e); // isolated; never crash the sweep
@@ -155,6 +168,11 @@ export function taskIdFromCwd(cwd: string | null): string | null {
   const base = (cwd.replace(/\/+$/, "").split("/").pop() ?? "");
   const m = /^hive-([0-9a-f]{6,})$/.exec(base);
   return m ? m[1] : null;
+}
+
+function targetBelongsOnlyToTask(panes: Awaited<ReturnType<Herdr["listPanes"]>>, key: "tabId" | "workspaceId", id: string, taskId: string): boolean {
+  const held = panes.filter((pane) => pane[key] === id);
+  return held.length > 0 && held.every((pane) => taskIdFromCwd(pane.cwd) === taskId);
 }
 
 // The pty-leak sweep. The leak is held by PANES (one pty each), and the two
@@ -200,17 +218,82 @@ export async function sweepOrphanedPanes(db: DB, deps: ReaperDeps = {}): Promise
         // Fleet tab of a terminal/orphan task: close the tab, NOT the shared
         // fleet workspace (that would kill every live agent).
         if (p.tabId) {
-          const r = await herdr.closeSession({ agentTarget: taskId, tabId: p.tabId });
+          if (!targetBelongsOnlyToTask(panes, "tabId", p.tabId, taskId)) continue;
+          const r = await herdr.closeSession({
+            agentTarget: taskId,
+            tabId: p.tabId,
+            expectCwd: p.cwd,
+            request: { caller: "reaper.sweepOrphanedPanes", reason: task ? "terminal task pane" : "orphan task pane", taskId },
+          });
           if (r.closed) broadcast({ type: "reaped_orphan_pane", task_id: taskId, via: r.via });
         }
       } else if (p.workspaceId && p.workspaceId !== fleetWs) {
         // The worktree's own workspace: close it whole (its single pane is the
         // leaked pty). Guarded above so the fleet workspace is never closed here.
-        const r = await herdr.closeWorkspace(p.workspaceId);
+        if (!targetBelongsOnlyToTask(panes, "workspaceId", p.workspaceId, taskId)) continue;
+        const r = await herdr.closeWorkspace({
+          workspaceId: p.workspaceId,
+          expectCwd: p.cwd ?? "",
+          request: { caller: "reaper.sweepOrphanedPanes", reason: task ? "terminal task workspace" : "orphan task workspace", taskId },
+        });
         if (r.code === 0) broadcast({ type: "reaped_orphan_pane", task_id: taskId, via: `workspace ${p.workspaceId}` });
       }
     } catch (e) {
       console.error(`[hive] reaper orphan pane ${taskId}:`, e); // isolated; never crash the sweep
+    }
+  }
+}
+
+// Reap ZOMBIE panes: pane rows whose process already exited but whose herdr
+// row lingers (task #1706 / 2026-08-26 — a session restart left 3 dead agents
+// with ~5 pane rows apiece, fleet tab + own workspace, all at zero processes).
+// This is what blocks a respawn: `Herdr.spawn` refuses as long as the task's
+// name still resolves to a pane, and the dispatcher's own respawn query only
+// considers tasks with agent_target IS NULL (dispatcher.ts). Both stay stuck
+// until these panes and that binding are cleared.
+//
+// Independent of task state on purpose — that's what makes it safe to run
+// even while the row shows non-terminal (e.g. queued for respawn): a genuinely
+// live agent always has a live process in at least one of its panes, so the
+// per-worktree liveness check below can never mistake it for dead. Grouped by
+// taskId (all panes sharing that worktree's cwd) so a fleet tab's second pane
+// or the worktree's own workspace pane can't be judged in isolation.
+export async function sweepZombiePanes(db: DB, deps: ReaperDeps = {}): Promise<void> {
+  const herdr = deps.herdr ?? defaultHerdr;
+  const panes = await herdr.listPanes();
+  const byTask = new Map<string, PaneInfo[]>();
+  for (const p of panes) {
+    const taskId = taskIdFromCwd(p.cwd);
+    if (!taskId) continue; // not a hive-managed pane
+    const group = byTask.get(taskId);
+    if (group) group.push(p);
+    else byTask.set(taskId, [p]);
+  }
+
+  for (const [taskId, group] of byTask) {
+    try {
+      let anyLive = false;
+      for (const p of group) {
+        if (paneHasLiveProcess(await herdr.paneProcessInfo(p.paneId))) {
+          anyLive = true;
+          break;
+        }
+      }
+      if (anyLive) continue; // SAFETY: never touch a worktree with any live process
+
+      for (const p of group) {
+        const r = await herdr.closePane(p.paneId, {
+          caller: "reaper.zombiePanes",
+          reason: "pane process gone but row still held the agent name",
+          taskId,
+        });
+        if (r.closed) broadcast({ type: "reaped_zombie_pane", task_id: taskId, pane_id: p.paneId });
+      }
+      // Unblock the next spawn attempt: dispatcher.ts only respawns tasks with
+      // agent_target IS NULL.
+      db.query("UPDATE tasks SET agent_target = NULL, updated_at = ? WHERE id = ? AND agent_target IS NOT NULL").run(now(), taskId);
+    } catch (e) {
+      console.error(`[hive] reaper zombie pane ${taskId}:`, e); // isolated; never crash the sweep
     }
   }
 }

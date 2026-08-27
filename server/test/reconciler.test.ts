@@ -4,6 +4,7 @@ import { transition, getTask, writeEvent } from "../src/state.ts";
 import { reconcileOnce, ciStatusOf, ciStatusProbed } from "../src/reconciler.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
 import { addClient, removeClient } from "../src/bus.ts";
+import { taskWithHealth, needsAttention } from "../src/health.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
 function freshDb(config: any = {}): { db: DB; projectId: string } {
@@ -24,6 +25,36 @@ function makeTask(db: DB, projectId: string, extra: Partial<{ agent_target: stri
 }
 const stub = (fn: (argv: string[]) => ExecResult): Exec => async (argv) => fn(argv);
 const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
+
+test("reconciler flags a queued task whose blocking dependencies all ended without completing", async () => {
+  const { db, projectId } = freshDb();
+  const failed = makeTask(db, projectId, { state: "failed" });
+  const cancelled = makeTask(db, projectId, { state: "cancelled" });
+  const wedged = makeTask(db, projectId);
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([failed, cancelled]), wedged);
+
+  await reconcileOnce(db, { exec: stub(() => OK("[]")) });
+
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dead_dependencies'").get(wedged)).toBeTruthy();
+  const task = taskWithHealth(db, getTask(db, wedged));
+  expect(task.health).toMatchObject({ status: "stuck" });
+  expect(needsAttention(task)).toBe(true);
+});
+
+test("reconciler flags the same task again when a different dependency set wedges it", async () => {
+  const { db, projectId } = freshDb();
+  const first = makeTask(db, projectId, { state: "failed" });
+  const second = makeTask(db, projectId, { state: "cancelled" });
+  const wedged = makeTask(db, projectId);
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([first]), wedged);
+
+  await reconcileOnce(db, { exec: stub(() => OK("[]")) });
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([second]), wedged);
+  await reconcileOnce(db, { exec: stub(() => OK("[]")) });
+
+  const events = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'dead_dependencies' ORDER BY ts, rowid").all(wedged) as { payload: string }[];
+  expect(events.map((event) => JSON.parse(event.payload).blocking_task_ids)).toEqual([[first], [second]]);
+});
 
 test("ciStatusOf derives failing > pending > passing", () => {
   expect(ciStatusOf([{ conclusion: "SUCCESS" }, { conclusion: "SUCCESS" }])).toBe("passing");
@@ -424,7 +455,8 @@ test("syncPRs updates ci_status and transitions in_review->verifying on merge", 
   const task = getTask(db, id);
   expect(task.ci_status).toBe("passing");
   expect(task.state).toBe("verifying");
-  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_merged'").all(id).length).toBe(1);
+  const merged = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_merged'").get(id) as any;
+  expect(JSON.parse(merged.payload)).toEqual({ pr_url: "https://gh/pr/1" });
 });
 
 test("syncPRs skips a task that raced ahead to done instead of throwing (task #621)", async () => {
@@ -678,6 +710,8 @@ test("syncPRs bounces an in_review task whose PR was closed without merging", as
   );
   await reconcileOnce(db, { exec: gh, herdr });
   expect(getTask(db, id).state).toBe("in_progress");
+  const closed = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_closed'").get(id) as any;
+  expect(JSON.parse(closed.payload)).toEqual({ pr_url: "https://gh/pr/3" });
   const steers = db.query("SELECT payload FROM events WHERE task_id = ? AND type='steer'").all(id) as any[];
   expect(JSON.parse(steers.at(-1).payload).message).toContain("CLOSED (not merged)");
 });
@@ -797,10 +831,10 @@ test("sweepVerifying re-runs the advance and flags evidence-wedged tasks once", 
   expect(getTask(db, id).state).toBe("done");
 });
 
-test("autoMergeReady merges only director-approved, opted-in, green, clean-review, uncontested tasks", async () => {
+test("autoMergeReady merges opted-in, green, clean-review, uncontested tasks without requiring a quiz", async () => {
   const { autoMergeReady } = await import("../src/reconciler.ts");
   const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
-  const mk = (extra: any, approved = true) => {
+  const mk = (extra: any, quiz: "passed" | "required" | "missing" = "passed") => {
     const id = makeTask(db, projectId, { kind: "chore", ...extra });
     transition(db, id, "in_progress");
     transition(db, id, "in_review");
@@ -812,7 +846,7 @@ test("autoMergeReady merges only director-approved, opted-in, green, clean-revie
       task_id: id,
       source: "agent",
       type: "review_summary",
-      payload: {
+      payload: quiz === "missing" ? { done: ["done"] } : {
         understanding: {
           check: {
             question: "Why is this safe to merge?",
@@ -822,16 +856,18 @@ test("autoMergeReady merges only director-approved, opted-in, green, clean-revie
         },
       },
     });
-    if (approved)
+    if (quiz === "passed")
       writeEvent(db, { task_id: id, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "review" } });
     return id;
   };
-  const clean = mk({});
+  const clean = mk({}, "missing");
   const risky = mk({});
-  const unapproved = mk({}, false);
+  const mechanical = mk({}, "required");
+  const sensitive = mk({}, "required");
   writeEvent(db, { task_id: clean, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
   writeEvent(db, { task_id: risky, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: ["a real risk"], questions: [] } });
-  writeEvent(db, { task_id: unapproved, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
+  writeEvent(db, { task_id: mechanical, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [], files: ["server/src/rows.ts"] } });
+  writeEvent(db, { task_id: sensitive, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [], files: ["db/migrations/007.sql"] } });
   // primary checkout sits on the base branch; git merge-base/merge succeed for the local-ff path
   const git: Exec = stub((argv) => {
     if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
@@ -840,10 +876,79 @@ test("autoMergeReady merges only director-approved, opted-in, green, clean-revie
   await autoMergeReady(db, { exec: git });
   expect(getTask(db, clean).state).toBe("done"); // merged; no smoke configured → straight through verifying
   expect(getTask(db, risky).state).toBe("in_review"); // risks → human review
-  expect(getTask(db, unapproved).state).toBe("in_review"); // quiz not passed → director boundary
+  // Mechanical change (hive-1559): its quiz is not judgment-class, so nothing is
+  // deferred into the post-ship backlog. A sensitive path still parks one there.
+  expect(getTask(db, mechanical).state).toBe("done");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_deferred'").get(mechanical)).toBeNull();
+  expect(getTask(db, sensitive).state).toBe("done");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_deferred'").get(sensitive)).toBeTruthy();
 });
 
-test("autoMergeReady leaves a Focus-reviewed task for an explicit ship or request-changes choice", async () => {
+// HIVE-407: risks and questions are suspicions until the per-risk check re-reads
+// the code. A set that refutes everything for THIS head clears the ambiguity veto.
+test("autoMergeReady merges a caution whose risks were all refuted, and parks one with a confirmed risk", async () => {
+  const { autoMergeReady } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
+  const mk = (head: string) => {
+    const id = makeTask(db, projectId, { kind: "chore" });
+    transition(db, id, "in_progress");
+    transition(db, id, "in_review");
+    db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x', head_sha = ? WHERE id = ?").run(head, id);
+    db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+      newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
+    );
+    writeEvent(db, { task_id: id, source: "agent", type: "review_summary", payload: { done: ["done"] } });
+    return id;
+  };
+  const review = (id: string, head: string, verdict: string) =>
+    writeEvent(db, {
+      task_id: id,
+      source: "system",
+      type: "auto_review",
+      payload: { verdict, summary: "s", risks: ["maybe a leak"], questions: ["is the flag on?"], reviewed_head_sha: head },
+    });
+  const verdicts = (id: string, head: string, riskVerdict: string, answerable = "machine") =>
+    writeEvent(db, {
+      task_id: id,
+      source: "system",
+      type: "risk_verdicts",
+      payload: {
+        reviewed_head_sha: head,
+        verdicts: [{ risk: "maybe a leak", verdict: riskVerdict, why: "w" }],
+        question_verdicts: [{ question: "is the flag on?", answerable, answer: "a" }],
+      },
+    });
+
+  const refuted = mk("head-1");
+  const confirmedRisk = mk("head-2");
+  const humanQuestion = mk("head-3");
+  const staleVerdicts = mk("head-4");
+  const cleanLooksGood = mk("head-5");
+  review(refuted, "head-1", "caution");
+  verdicts(refuted, "head-1", "refuted");
+  review(confirmedRisk, "head-2", "caution");
+  verdicts(confirmedRisk, "head-2", "confirmed");
+  review(humanQuestion, "head-3", "looks_good");
+  verdicts(humanQuestion, "head-3", "refuted", "human");
+  review(staleVerdicts, "head-4", "caution");
+  verdicts(staleVerdicts, "older-head", "refuted"); // verified before a force-push
+  review(cleanLooksGood, "head-5", "looks_good");
+  verdicts(cleanLooksGood, "head-5", "refuted");
+
+  const git: Exec = stub((argv) => {
+    if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
+    return argv.includes("symbolic-ref") ? OK("main\n") : OK();
+  });
+  await autoMergeReady(db, { exec: git });
+
+  expect(getTask(db, refuted).state).toBe("done"); // caution, everything refuted → lands like looks_good
+  expect(getTask(db, cleanLooksGood).state).toBe("done"); // looks_good with soft notes, all cleared
+  expect(getTask(db, confirmedRisk).state).toBe("in_review"); // one confirmed risk → the director decides
+  expect(getTask(db, humanQuestion).state).toBe("in_review"); // only a human can answer it
+  expect(getTask(db, staleVerdicts).state).toBe("in_review"); // verdicts belong to an older head
+});
+
+test("autoMergeReady leaves a quiz-passed task for an explicit ship or request-changes choice, whatever surface passed it (HIVE-421)", async () => {
   const { autoMergeReady } = await import("../src/reconciler.ts");
   const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
   const id = makeTask(db, projectId, { kind: "chore" });
@@ -859,15 +964,17 @@ test("autoMergeReady leaves a Focus-reviewed task for an explicit ship or reques
     type: "review_summary",
     payload: { understanding: { check: { question: "safe?", options: [{ key: "yes", label: "yes" }, { key: "no", label: "no" }], answer_key: "yes" } } },
   });
+  // No surface field: this is the review card / task page pass, which used to
+  // slip past the Focus-only guard and auto-merge on the next sweep.
   writeEvent(db, {
     task_id: id,
     source: "director",
     type: "understanding_quiz_passed",
-    payload: { review_event_id: review.id, answer_key: "yes", surface: "focus" },
+    payload: { review_event_id: review.id, answer_key: "yes" },
   });
   writeEvent(db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
 
-  await autoMergeReady(db, { exec: stub(() => { throw new Error("Focus review must not auto-merge"); }) });
+  await autoMergeReady(db, { exec: stub(() => { throw new Error("a passed quiz must not auto-merge"); }) });
   expect(getTask(db, id).state).toBe("in_review");
 });
 
@@ -986,13 +1093,15 @@ test("autoMergeReady rechecks queued work at every destructive merge boundary", 
     db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
       newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
     );
-    const review = writeEvent(db, {
+    writeEvent(db, {
       task_id: id,
       source: "agent",
       type: "review_summary",
       payload: { understanding: { check: { question: "safe?", options: [{ key: "review", label: "yes" }, { key: "guess", label: "no" }], answer_key: "review" } } },
     });
-    writeEvent(db, { task_id: id, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "review" } });
+    // No quiz pass: a passed quiz parks the task for an explicit Ship click
+    // (HIVE-421), and this test is about the pre-mutation recheck. An auto-ship
+    // kind defers the unanswered check instead.
     writeEvent(db, {
       task_id: id,
       source: "system",
@@ -1448,6 +1557,47 @@ test("reconcileOnce heartbeats last_reconcile_at and tracks a failing step's err
   expect(getSetting(db, "reconciler_error_streak")).toBe("0");
 });
 
+// task #1667: the same ENOENT no longer errors the cycle, so it would stop
+// counting anywhere at all. Three cycles of "gh never started" must show up on
+// /api/health as degraded, and clear as soon as one cycle gets gh running.
+test("a tool that repeatedly fails to start marks health degraded and clears on recovery (task #1667)", async () => {
+  const { degradedTools } = await import("../src/api.ts");
+  const { db } = freshDb(); // repo_path '/repo'
+  const cannotStart: Exec = async () => ({ code: 127, stdout: "", stderr: "gh: ENOENT: no such file or directory, posix_spawn 'gh' (cwd /repo)" });
+
+  await reconcileOnce(db, { exec: cannotStart });
+  await reconcileOnce(db, { exec: cannotStart });
+  // Not degraded yet, and crucially not burning the cycle error streak either.
+  expect(degradedTools(db)).toEqual([]);
+  expect(getSetting(db, "reconciler_error_streak")).toBe("0");
+
+  await reconcileOnce(db, { exec: cannotStart });
+  expect(degradedTools(db)[0]).toContain("gh:");
+  expect(degradedTools(db)[0]).toContain("cwd /repo");
+  expect(getSetting(db, "reconciler_error_streak")).toBe("0");
+
+  await reconcileOnce(db, { exec: stub(() => OK("[]")) });
+  expect(degradedTools(db)).toEqual([]);
+});
+
+// A project registered by someone's E2E run points repo_path at a scratch dir
+// that gets cleaned up. Running gh in a directory that no longer exists is what
+// wedged linkPRs for ~10h, and such a project has no real PRs anyway (#1667).
+test("linkPRs skips test/ephemeral projects entirely (task #1667)", async () => {
+  const { db, projectId } = freshDb({ test: true });
+  const task = makeTask(db, projectId);
+  let ghCalls = 0;
+  const exec: Exec = async (argv) => {
+    if (argv[0] === "gh" && argv[1] === "pr" && argv[2] === "list") ghCalls++;
+    return OK("[]");
+  };
+
+  await reconcileOnce(db, { exec });
+
+  expect(ghCalls).toBe(0);
+  expect(getTask(db, task).pr_url).toBeNull();
+});
+
 test("reAdoptAgentsOnBoot re-adopts a live-but-unregistered agent and skips terminal tasks", async () => {
   const { reAdoptAgentsOnBoot } = await import("../src/reconciler.ts");
   const { db, projectId } = freshDb();
@@ -1481,4 +1631,147 @@ test("reAdoptAgentsOnBoot re-adopts a live-but-unregistered agent and skips term
   expect(r.readopted).toBe(1);   // the wiped-but-live agent came back
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'readopted'").get(live)).toBeTruthy();
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'readopted'").get(done)).toBeFalsy();
+});
+
+// ---- benign codex write dialogs (task #1562) --------------------------------
+// The real pane text, wrapping and all, from the cards the director hand-approved
+// on 2026-08-25 (evidence ev_2b8c2dd07d74).
+const CODEX_EDIT_TAIL = (path: string) =>
+  [
+    "• Added " + path.slice(0, 20),
+    path.slice(20) + " (+44 -0)",
+    "     1 +{",
+    "     2 +}",
+    "",
+    "  Would you like to make the following edits?",
+    "",
+    "› 1. Yes, proceed (y)",
+    "  2. Yes, and don't ask again for these files",
+    "     (a)",
+    "  3. No, and tell Codex what to do differently",
+    "     (esc)",
+    "",
+    "  Press enter to confirm or esc to cancel",
+  ].join("\n");
+
+function blockedAgentHerdr(tail: string, keys: string[]): Herdr {
+  return new Herdr(stub((argv) => {
+    if (argv.includes("read")) return OK(JSON.stringify({ result: { read: { text: tail } } }));
+    if (argv.includes("send-keys")) {
+      keys.push(argv.at(-1)!);
+      return OK();
+    }
+    return OK('{"result":{"agent":{"agent_status":"blocked","pane_id":"w1:p1"}}}');
+  }), "herdr");
+}
+
+const noGh = () => stub(() => ({ code: 1, stdout: "", stderr: "no gh" }));
+
+test("a codex write inside the task's own worktree is auto-answered and logged", async () => {
+  const { db, projectId } = freshDb({ auto_answer_dialogs: true });
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  db.query("UPDATE tasks SET worktree_path = ? WHERE id = ?").run("/wt/mine", id);
+  const keys: string[] = [];
+
+  await reconcileOnce(db, { herdr: blockedAgentHerdr(CODEX_EDIT_TAIL("/wt/mine/review.json"), keys), exec: noGh() });
+
+  expect(keys).toEqual(["1", "Enter"]);
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'dialog_auto_answered'").get(id) as any;
+  expect(JSON.parse(ev.payload).paths).toEqual(["/wt/mine/review.json"]);
+  expect(db.query("SELECT 1 FROM decisions WHERE task_id = ?").get(id)).toBeFalsy();
+  expect(getTask(db, id)!.state).toBe("in_progress");
+});
+
+test("a codex write to a temp file named for the task is auto-answered", async () => {
+  const { db, projectId } = freshDb({ auto_answer_dialogs: true });
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  const keys: string[] = [];
+
+  await reconcileOnce(db, { herdr: blockedAgentHerdr(CODEX_EDIT_TAIL(`/private/tmp/hive-${id}-review.json`), keys), exec: noGh() });
+
+  expect(keys).toEqual(["1", "Enter"]);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dialog_auto_answered'").get(id)).toBeTruthy();
+});
+
+test("a write outside the task's own worktree still parks for the director", async () => {
+  const { db, projectId } = freshDb({ auto_answer_dialogs: true });
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  db.query("UPDATE tasks SET worktree_path = ? WHERE id = ?").run("/wt/mine", id);
+  const keys: string[] = [];
+
+  await reconcileOnce(db, { herdr: blockedAgentHerdr(CODEX_EDIT_TAIL("/wt/someone-else/secrets.env"), keys), exec: noGh() });
+
+  expect(keys).toEqual([]);
+  expect(db.query("SELECT 1 FROM decisions WHERE task_id = ? AND status = 'open'").get(id)).toBeTruthy();
+});
+
+// The pane keeps scrollback: bullets from an edit approved minutes ago sit
+// above the current dialog. Only the current dialog's files may be evaluated.
+test("stale bullets above the dialog are not mistaken for the pending edit", async () => {
+  const { db, projectId } = freshDb({ auto_answer_dialogs: true });
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  db.query("UPDATE tasks SET worktree_path = ? WHERE id = ?").run("/wt/mine", id);
+  const keys: string[] = [];
+  const tail = [
+    "• Edited /wt/mine/review.json (+2 -0)", // approved earlier, already written
+    "     1 +{}",
+    "",
+    CODEX_EDIT_TAIL("/wt/someone-else/secrets.env"),
+  ].join("\n");
+
+  await reconcileOnce(db, { herdr: blockedAgentHerdr(tail, keys), exec: noGh() });
+
+  expect(keys).toEqual([]); // the old in-worktree file must not vouch for the new one
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dialog_auto_answered'").get(id)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM decisions WHERE task_id = ? AND status = 'open'").get(id)).toBeTruthy();
+});
+
+test("only the current dialog's file is logged when older bullets sit above it", async () => {
+  const { db, projectId } = freshDb({ auto_answer_dialogs: true });
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  db.query("UPDATE tasks SET worktree_path = ? WHERE id = ?").run("/wt/mine", id);
+  const keys: string[] = [];
+  const tail = ["• Edited /wt/mine/notes.md (+9 -1)", "", CODEX_EDIT_TAIL("/wt/mine/review.json")].join("\n");
+
+  await reconcileOnce(db, { herdr: blockedAgentHerdr(tail, keys), exec: noGh() });
+
+  expect(keys).toEqual(["1", "Enter"]);
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'dialog_auto_answered'").get(id) as any;
+  expect(JSON.parse(ev.payload).paths).toEqual(["/wt/mine/review.json"]);
+});
+
+test("an rm -rf command approval is never auto-answered, opt-in or not", async () => {
+  const { db, projectId } = freshDb({ auto_answer_dialogs: true });
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  db.query("UPDATE tasks SET worktree_path = ? WHERE id = ?").run("/wt/mine", id);
+  const keys: string[] = [];
+  const tail = [
+    "  Codex wants to run a command",
+    "",
+    "  $ rm -rf /wt/mine",
+    "",
+    "› 1. Yes, proceed (y)",
+    "  3. No, and tell Codex what to do differently",
+    "",
+    "  Press enter to confirm or esc to cancel",
+  ].join("\n");
+
+  await reconcileOnce(db, { herdr: blockedAgentHerdr(tail, keys), exec: noGh() });
+
+  expect(keys).toEqual([]);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dialog_auto_answered'").get(id)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM decisions WHERE task_id = ? AND status = 'open'").get(id)).toBeTruthy();
+});
+
+test("a project that did not opt in keeps getting a card per dialog", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "t-agent", state: "in_progress" });
+  db.query("UPDATE tasks SET worktree_path = ? WHERE id = ?").run("/wt/mine", id);
+  const keys: string[] = [];
+
+  await reconcileOnce(db, { herdr: blockedAgentHerdr(CODEX_EDIT_TAIL("/wt/mine/review.json"), keys), exec: noGh() });
+
+  expect(keys).toEqual([]);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dialog_auto_answered'").get(id)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM decisions WHERE task_id = ? AND status = 'open'").get(id)).toBeTruthy();
 });

@@ -84,6 +84,50 @@ test("dispatch now shows normally for an ordinary (non-external) queued task", a
   expect(btn(renderer, "dispatch now").length).toBe(1);
 });
 
+// The browse chip must come from the server-canonicalized jira_site, never
+// from the raw project config: a config write naming another host would
+// otherwise turn every card into a link to it.
+function cardWith(t: Task, project: Record<string, unknown>) {
+  const store = { ...fakeStore, projects: [project] } as unknown as Store;
+  return (
+    <MemoryRouter>
+      <Ctx.Provider value={store}>
+        <Card task={t} />
+      </Ctx.Provider>
+    </MemoryRouter>
+  );
+}
+
+const links = async (t: Task, project: Record<string, unknown>) => {
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(cardWith(t, project));
+  });
+  return renderer.root.findAll((n) => n.type === "a").map((n) => String(n.props.href));
+};
+
+test("the Jira chip links to the server-canonicalized site", async () => {
+  const hrefs = await links(task("j1", { jira_key: "WEB-123" }), {
+    id: "project",
+    name: "p",
+    config: { jira: { site: "https://evil.atlassian.net" } },
+    jira_site: "https://corebeat.atlassian.net",
+  });
+  expect(hrefs).toContain("https://corebeat.atlassian.net/browse/WEB-123");
+  expect(hrefs.join(" ")).not.toContain("evil.atlassian.net");
+});
+
+test("no Jira chip is rendered when the server validated no site", async () => {
+  const hrefs = await links(task("j2", { jira_key: "WEB-124" }), {
+    id: "project",
+    name: "p",
+    config: { jira: { site: "https://evil.atlassian.net" } },
+    jira_site: null,
+  });
+  expect(hrefs.join(" ")).not.toContain("browse/WEB-124");
+  expect(hrefs.join(" ")).not.toContain("evil.atlassian.net");
+});
+
 // The board says WHY a review card will wait its turn — one line, and only
 // when an edge actually exists (ADHD policy: no chip with nothing to say).
 const chipText = (renderer: ReturnType<typeof create>) =>
@@ -125,4 +169,48 @@ test("a review card with no edges and no mark shows no land line at all", async 
     renderer = create(<LandChips task={a} graph={{ nodes: [], edges: [] }} tasks={[a]} />);
   });
   expect(renderer.toJSON()).toBeNull();
+});
+
+// The background-check chip (task HIVE-405). Green when the agent's last commit
+// passed hive's own tsc/lint pass, amber with a count when it didn't, and absent
+// before the first check — a card with no chip must not read as "clean".
+const checkChips = async (t: Task) => {
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t));
+  });
+  return renderer.root
+    .findAll((n) => n.type === "span" && String(n.props.className ?? "").includes("chip-check"))
+    .map((n) => ({ className: String(n.props.className), title: String(n.props.title), text: n.children.join("") }));
+};
+
+test("a clean sidecar report renders one green checks chip", async () => {
+  const [chip, ...rest] = await checkChips(task("s-ok", { sidecar: { sha: "abc1234def", ok: true, findings: [] } }));
+  expect(rest).toEqual([]);
+  expect(chip.className).toContain("chip-check-ok");
+  expect(chip.text).toContain("checks");
+  expect(chip.title).toContain("abc1234");
+});
+
+test("a sidecar report with findings renders an amber chip counting them, and lists them on hover", async () => {
+  const [chip] = await checkChips(
+    task("s-bad", {
+      sidecar: {
+        sha: "abc1234def",
+        ok: false,
+        findings: [
+          { tool: "tsc", summary: "src/a.ts(3,1): error TS2345" },
+          { tool: "lint", summary: "src/b.ts:9 semi" },
+        ],
+      },
+    })
+  );
+  expect(chip.className).toContain("chip-check-warn");
+  expect(chip.text).toContain("2");
+  expect(chip.title).toContain("tsc: src/a.ts(3,1): error TS2345");
+  expect(chip.title).toContain("lint: src/b.ts:9 semi");
+});
+
+test("no chip at all before the first background check", async () => {
+  expect(await checkChips(task("s-none"))).toEqual([]);
 });

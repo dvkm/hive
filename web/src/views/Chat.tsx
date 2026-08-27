@@ -288,7 +288,7 @@ function ChiefBriefing({
   const actionCount = needsYou.filter((item) => {
     if (item.kind === "decision") return directorRequired.has(item.decision.task_id);
     if (item.kind === "checkpoint") return directorRequired.has(item.checkpoint.task_id);
-    if (item.kind === "quiz") return true;
+    if (item.kind === "quiz_digest") return true;
     return false;
   }).length;
   const working = tasks.filter((task) => task.source !== "chat_supervisor" && ["in_progress", "needs_decision", "in_review", "verifying"].includes(task.state));

@@ -3,7 +3,7 @@ import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
 import type { Health, Kind, LandGraph, State, Task } from "../lib/api";
-import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, SidecarChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
 import { AttentionTray, needsAttention, isWaiting } from "./attention";
@@ -124,6 +124,18 @@ export function Card({ task }: { task: Task }) {
             tracked
           </span>
         )}
+        {task.jira_key && project?.jira_site && (
+          <a
+            className="chip chip-jira"
+            href={`${project.jira_site}/browse/${encodeURIComponent(task.jira_key)}`}
+            target="_blank"
+            rel="noreferrer"
+            title={`Open ${task.jira_key} in Jira`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {task.jira_key} ↗
+          </a>
+        )}
         {trackingOnly && <span className="chip">{STATE_LABEL[task.state]}</span>}
         {task.source === "planner" && (
           <span className="chip chip-planned" title="Created from an approved planner breakdown">
@@ -135,6 +147,7 @@ export function Card({ task }: { task: Task }) {
             ⚠ spawn failed
           </span>
         )}
+        <SidecarChip sidecar={task.sidecar} />
         <BlockedBy depends_on={task.depends_on} tasks={tasks} />
         {task.deferred_until && Date.parse(task.deferred_until) > Date.now() && (
           <span className="chip chip-deferred" title="Deferred pending an offline human action; nudges suppressed">

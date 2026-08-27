@@ -12,7 +12,7 @@ export interface BlockingTaskRef {
 export type NeedsYouItem =
   | { kind: "decision"; id: string; decision: Decision }
   | { kind: "checkpoint"; id: string; checkpoint: Checkpoint }
-  | { kind: "quiz"; id: string; quiz: UnderstandingQuiz }
+  | { kind: "quiz_digest"; id: string; quizzes: UnderstandingQuiz[] }
   | { kind: "review"; id: string; task: Task }
   | { kind: "attention"; id: string; task: Task }
   | { kind: "waiting"; id: string; task: Task; blockedBy: BlockingTaskRef[] };
@@ -84,6 +84,7 @@ function reviewIsActionable(task: Task): boolean {
 // Browser-safe mirror of server/src/state.ts's dependency gate. Exported so
 // BlockedBy and the needs-you queue use the same threshold.
 export const DEP_MET_STATES = new Set(["verifying", "done"]);
+const DEAD_DEP_STATES = new Set(["failed", "cancelled"]);
 export function unmetDeps(task: Task, tasks: Task[]): BlockingTaskRef[] {
   return (task.depends_on ?? []).flatMap((id) => {
     const dep = tasks.find((t) => t.id === id);
@@ -95,30 +96,47 @@ export function unmetDeps(task: Task, tasks: Task[]): BlockingTaskRef[] {
 }
 
 // A task needing attention is either genuinely stuck/dead (needs routing) or
-// purely blocked on another task's PR landing (needs nothing from the
+// purely blocked on another task's pull request landing (needs nothing from the
 // director but time). Failed tasks always need routing regardless of
 // declared deps — the human chooses requeue/edit/cancel.
 export function isWaiting(task: Task, tasks: Task[]): boolean {
-  return task.state !== "failed" && unmetDeps(task, tasks).length > 0;
+  const blocking = unmetDeps(task, tasks);
+  return task.state !== "failed" && blocking.length > 0 && !blocking.every((dep) => DEAD_DEP_STATES.has(dep.state));
+}
+
+// A quiz on a shipped task is a catch-up, not a gate. Five of them are still
+// one thing to sit down and do, so they collapse into ONE digest the director
+// works through in order. Grouped by project so the project filter (and the
+// digest's own heading) still names exactly one project. Quizzes on tasks still
+// in review are NOT here — those block the review card itself.
+export function quizDigests(tasks: Task[], quizzes: UnderstandingQuiz[]): NeedsYouItem[] {
+  const byProject = new Map<string, UnderstandingQuiz[]>();
+  for (const quiz of quizzes) {
+    const state = tasks.find((task) => task.id === quiz.task_id)?.state ?? quiz.task_state;
+    if (!["verifying", "done", "failed"].includes(state)) continue;
+    const group = byProject.get(quiz.project_id);
+    if (group) group.push(quiz);
+    else byProject.set(quiz.project_id, [quiz]);
+  }
+  return [...byProject].map(([projectId, group]) => ({
+    kind: "quiz_digest" as const,
+    id: `quiz-digest:${projectId}`,
+    quizzes: group,
+  }));
 }
 
 export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoints: Checkpoint[], quizzes: UnderstandingQuiz[]): NeedsYouItem[] {
   return [
     ...decisions.map((decision) => ({ kind: "decision" as const, id: decision.id, decision })),
     ...checkpoints.map((checkpoint) => ({ kind: "checkpoint" as const, id: checkpoint.id, checkpoint })),
-    ...quizzes
-      .filter((quiz) => {
-        const state = tasks.find((task) => task.id === quiz.task_id)?.state ?? quiz.task_state;
-        return ["verifying", "done", "failed"].includes(state);
-      })
-      .map((quiz) => ({ kind: "quiz" as const, id: quiz.id, quiz })),
+    ...quizDigests(tasks, quizzes),
     ...tasks
       .filter((task) => task.state === "in_review" && !isTrackingOnly(task))
       .sort((a, b) => Number(reviewIsActionable(b)) - Number(reviewIsActionable(a)))
       .map((task) => ({ kind: "review" as const, id: task.id, task })),
     ...tasks.filter(taskNeedsAttention).map((task): NeedsYouItem => {
       const blockedBy = task.state === "failed" ? [] : unmetDeps(task, tasks);
-      return blockedBy.length
+      return blockedBy.length && !blockedBy.every((dep) => DEAD_DEP_STATES.has(dep.state))
         ? { kind: "waiting", id: task.id, task, blockedBy }
         : { kind: "attention", id: task.id, task };
     }),
@@ -131,6 +149,6 @@ export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoin
 export function itemProject(item: NeedsYouItem, tasks: Task[]): string | undefined {
   if (item.kind === "decision") return tasks.find((task) => task.id === item.decision.task_id)?.project_id;
   if (item.kind === "checkpoint") return item.checkpoint.project_id;
-  if (item.kind === "quiz") return item.quiz.project_id;
+  if (item.kind === "quiz_digest") return item.quizzes[0]?.project_id;
   return item.task.project_id;
 }

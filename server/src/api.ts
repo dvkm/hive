@@ -26,6 +26,10 @@ import {
   deferTask,
   undeferTask,
   unmetDeps,
+  repointDependents,
+  dependsTransitivelyOn,
+  dependentsWedgedForDecision,
+  resolveDependentsWedgedForDecision,
   queuedInputRecoveryPending,
   type State,
 } from "./state.ts";
@@ -45,6 +49,12 @@ import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, stee
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
+import {
+  deploymentsStatus,
+  startDeploy,
+  startRollback,
+  type DeploymentsConfig,
+} from "./deployments.ts";
 import { enqueue, ackNotifications, markShown, recordDeliveryError, lastDeliveryError } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, resolveDenyGuardrailForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
@@ -52,9 +62,9 @@ import { runPlanner, resolvePlanForDecision, decisionPlan, selectedPlanIndices, 
 import { routeIntakeProject } from "./intake/route.ts";
 import {
   REF_PREFIX as JIRA_REF_PREFIX,
-  JIRA_SITE,
   JIRA_COMMENT_MAX_LENGTH,
   JIRA_WRITE_SCOPE,
+  jiraConfig,
   jiraConfigStatusFor,
   readSyncState as readJiraSyncState,
   runProjectCycle as runJiraProjectCycle,
@@ -62,6 +72,7 @@ import {
   deliveredOutbound,
   resolveUnknownOutbound,
   resolveEvidenceUrl,
+  linkTaskToJira,
   type JiraDeps,
 } from "./intake/jira.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
@@ -70,15 +81,17 @@ import { costUsd } from "./pricing.ts";
 import { checkUsageGuardrails, resolveUsageCapForDecision, taskSpend } from "./costs.ts";
 import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
-import { vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
+import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
+import { confirmedRisks, cautionCleared } from "./reviewer.ts";
 import { explanationGate } from "./explainDiff.ts";
 import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
+import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
-import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen } from "./reconciler.ts";
+import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen, probeAgent } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
-import { landGraph, markLand } from "./landQueue.ts";
+import { landGraph, markLand, resolveLandPauseForDecision } from "./landQueue.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, isSafeRef, projectBaseBranch, projectComparisonBase, preferSafeRef } from "./exec.ts";
@@ -104,6 +117,7 @@ import {
   type ChatThread,
 } from "./chat.ts";
 import { validateProjectConfig, type Agent } from "./projectConfig.ts";
+import { gardenerQueue, resolveGardenerDecision, setGardenerOverride } from "./prGardener.ts";
 
 export interface HandlerDeps {
   herdr?: Herdr; // injectable for tests
@@ -174,6 +188,16 @@ function reconcilerHealth(db: DB): { last_run: string | null; stale: boolean; co
   };
 }
 
+// Tools the reconciler could not start for several cycles running (task #1667:
+// `gh` against a repo_path that no longer existed). Those are skipped and
+// retried rather than raised as cycle errors, so without this they would be
+// invisible: PR linking off, /api/health saying ok. Written by reconciler.ts's
+// noteToolStart; an empty value means recovered.
+export function degradedTools(db: DB): string[] {
+  const rows = db.query("SELECT key, value FROM settings WHERE key LIKE 'tool_degraded_%' AND value <> ''").all() as { key: string; value: string }[];
+  return rows.map((r) => `${r.key.replace("tool_degraded_", "")}: ${r.value}`).sort();
+}
+
 // Standing-authority gate for the internal risky paths (spawn, steer, verify,
 // done). Returns a blocking Response when the action is denied (403) or needs a
 // decision (409 {decision_id}); returns null when it may proceed.
@@ -185,6 +209,23 @@ function authzBlock(db: DB, input: AuthzInput): Response | null {
     { error: "requires a decision", effect: "require_decision", decision_id: r.decision_id },
     409
   );
+}
+
+// Resolve a project for the deployments routes. The tab is opt-in: a project
+// without a config.deployments block has no production release model, so it 404s
+// rather than guessing one.
+type DeploymentsProject =
+  | { ok: true; repoPath: string; branch: string; config: DeploymentsConfig }
+  | { ok: false; res: Response };
+
+function deploymentsProject(db: DB, id: string): DeploymentsProject {
+  const row = db.query("SELECT * FROM projects WHERE id = ?").get(id);
+  if (!row) return { ok: false, res: err("project not found", 404) };
+  const project = parseProject(row);
+  const config = (project.config as any)?.deployments as DeploymentsConfig | undefined;
+  if (!config) return { ok: false, res: err("deployments are not configured for this project", 404) };
+  if (!project.repo_path) return { ok: false, res: err("project has no repo_path", 400) };
+  return { ok: true, repoPath: project.repo_path, branch: projectBaseBranch(project.config), config };
 }
 
 const WEB_DIST = join(import.meta.dir, "..", "..", "web", "dist");
@@ -201,28 +242,38 @@ function tokenOk(db: DB, req: Request, url: URL): boolean {
   return presented === token;
 }
 
-// Remote requests (a phone on the LAN / Tailscale) must present the API token;
-// loopback (CLI, hooks, agents, the desktop app) stays trustless as before.
+// Remote requests (a phone on the LAN / Tailscale) must present the API token.
+// A push action may instead present the token scoped to that exact decision.
+// Loopback (CLI, hooks, agents, the desktop app) stays trustless as before.
 // Exported for tests.
 export function remoteAuthOk(db: DB, req: Request, url: URL, ip: string | null): boolean {
   if (!ip || ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1") return true;
-  return tokenOk(db, req, url);
+  if (tokenOk(db, req, url)) return true;
+  const answer = req.method === "POST" && url.pathname.match(/^\/api\/decisions\/([^/]+)\/answer$/);
+  const presented = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim() || null;
+  return !!answer && decisionAnswerTokenOk(db, answer[1], presented);
 }
 
-// Writes to the config and secret stores need the token even from loopback.
-// Those two stores are the only place a caller-supplied value gets paired with
-// a credential and handed to a network/subprocess destination (scout #991), so
-// they are the exfil chokepoint; reads and the task flow stay trustless so
-// every CLI/hook/agent call keeps working untouched.
+// Credential-bearing writes need the API token even from loopback. Config and
+// secret values can reach network/subprocess destinations (scout #991), while
+// a push subscription can redirect notification payloads to an attacker.
+// Reads and the task flow stay trustless so CLI/hook/agent calls keep working.
 //
 // The local capability that satisfies this is filesystem access to hive's DB:
 // the CLI reads the minted token out of ~/.hive/hive.db (see cli/hive.ts) the
 // same way `hive remote` does, while a caller that only holds an HTTP socket
-// cannot. ANY future config-plus-secret store belongs on this list.
+// cannot. Any future credential-bearing write belongs on this list.
 const WRITE_AUTH_ROUTES: { method: string; path: RegExp }[] = [
   { method: "PUT", path: /^\/api\/projects\/[^/]+$/ },
   { method: "POST", path: /^\/api\/projects\/[^/]+\/secrets$/ },
   { method: "DELETE", path: /^\/api\/projects\/[^/]+\/secrets\/[^/]+$/ },
+  { method: "POST", path: /^\/api\/projects\/[^/]+\/pr-gardener\/\d+$/ },
+  { method: "POST", path: /^\/api\/push\/subscribe$/ },
+  // Deploying and rolling back production. Hive has no user accounts, so the
+  // API token IS the super-admin check: holding it means filesystem access to
+  // hive's own DB, which an agent's HTTP socket or a stray browser tab does not
+  // have. Reading the release list stays open; only pressing the button is gated.
+  { method: "POST", path: /^\/api\/projects\/[^/]+\/deployments\/(deploy|rollback)$/ },
 ];
 
 // True when the request may proceed: either it is not a gated write, or it
@@ -246,7 +297,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       const ip = server?.requestIP?.(req)?.address ?? null;
       if (!remoteAuthOk(db, req, url, ip)) return err("unauthorized (see `hive remote` for the token)", 401);
       if (!requireWriteAuth(db, req, url))
-        return err("unauthorized: config and secret writes require the API token (see `hive remote`)", 401);
+        return err("unauthorized: this write requires the API token (see `hive remote`)", 401);
     }
 
     try {
@@ -256,8 +307,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // ---- health ----
       if (pathname === "/api/health" && method === "GET") {
         const reconciler = reconcilerHealth(db);
-        const ok = reconciler.consecutive_errors < RECONCILE_ERROR_STREAK_THRESHOLD;
-        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
+        const degraded = degradedTools(db);
+        const ok = reconciler.consecutive_errors < RECONCILE_ERROR_STREAK_THRESHOLD && degraded.length === 0;
+        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, degraded, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
       }
 
       // ---- evidence static files ----
@@ -277,14 +329,65 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
           if (!includeArchived) conds.push("COALESCE(json_extract(config, '$.archived'), 0) = 0");
           if (!includeTest) conds.push(notTestProjectSql());
           const sql = "SELECT * FROM projects" + (conds.length ? " WHERE " + conds.join(" AND ") : "") + " ORDER BY created_at";
-          return json(db.query(sql).all().map(parseProject));
+          return json(db.query(sql).all().map(projectPayload));
         }
         if (method === "POST") return createProject(db, await req.json());
+      }
+      {
+        const match = pathname.match(/^\/api\/projects\/([^/]+)\/pr-gardener$/);
+        if (match && method === "GET") {
+          if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(match[1])) return err("project not found", 404);
+          return json(gardenerQueue(db, match[1]));
+        }
+      }
+      {
+        const match = pathname.match(/^\/api\/projects\/([^/]+)\/pr-gardener\/(\d+)$/);
+        if (match && method === "POST") {
+          const body = await req.json() as any;
+          const prNumber = Number(match[2]);
+          const item: any = db.query("SELECT * FROM pr_gardener_items WHERE project_id = ? AND pr_number = ?").get(match[1], prNumber);
+          if (!item) return err("PR Gardener item not found", 404);
+          if (item.decision_id && body.override !== null) {
+            const answered = apiAnswerDecision(db, herdr, item.decision_id, { answer_key: body.override, source: "director" });
+            if (!answered.ok) return answered;
+          } else if (!setGardenerOverride(db, match[1], prNumber, body.override)) {
+            return err("override must be force_land, force_close, hold, or null", 400);
+          }
+          return json(gardenerQueue(db, match[1]).find((row) => row.pr_number === prNumber));
+        }
+      }
+      // ---- deployments (production releases: what is live + the two buttons) ----
+      {
+        const match = pathname.match(/^\/api\/projects\/([^/]+)\/deployments(\/deploy|\/rollback)?$/);
+        if (match) {
+          const project = deploymentsProject(db, match[1]);
+          if (!project.ok) return project.res;
+          const { repoPath, branch, config } = project;
+          const exec = deps.exec ?? defaultExec;
+          if (!match[2] && method === "GET") {
+            // The PostHog key is only resolved when the project actually asked
+            // for flag states, so the keychain is left alone otherwise.
+            const posthogKey = config.flags?.length
+              ? (await resolveProjectSecrets(db, match[1], exec)).POSTHOG_API_KEY
+              : undefined;
+            return json(
+              await deploymentsStatus(repoPath, branch, config, { exec, fetcher: deps.fetch, posthogKey })
+            );
+          }
+          if (match[2] && method === "POST") {
+            const body = (await safeJson(req)) as any;
+            const r =
+              match[2] === "/deploy"
+                ? await startDeploy(exec, repoPath, branch, config, body?.commit)
+                : await startRollback(exec, repoPath, branch, config, body?.tag);
+            return r.ok ? json(r) : err(r.error, r.status);
+          }
+        }
       }
       let m = pathname.match(/^\/api\/projects\/([^/]+)$/);
       if (m && method === "GET") {
         const r = db.query("SELECT * FROM projects WHERE id = ?").get(m[1]);
-        return r ? json(parseProject(r)) : err("project not found", 404);
+        return r ? json(projectPayload(r)) : err("project not found", 404);
       }
       if (m && method === "PUT") return updateProject(db, m[1], await req.json());
 
@@ -428,6 +531,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         }
       }
       if (pathname === "/api/push/unsubscribe" && method === "POST") {
+        // Excluded from WRITE_AUTH_ROUTES (no token required) because this route
+        // can only remove the named endpoint, but it still runs through the
+        // remoteAuthOk check above like every other /api/ route.
         const b: any = await safeJson(req);
         if (b?.endpoint) removeSubscription(db, b.endpoint);
         return json({ ok: true });
@@ -446,6 +552,8 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (m && method === "POST") return answerUnderstandingQuiz(db, m[1], await req.json());
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/understanding-quiz\/defer$/);
       if (m && method === "POST") return deferUnderstandingQuiz(db, m[1], await req.json());
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/understanding-quiz\/require$/);
+      if (m && method === "POST") return requireUnderstandingQuiz(db, m[1], await req.json());
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/focus-agent$/);
       if (m && method === "POST") return await focusAgent(db, herdr, m[1]);
@@ -486,6 +594,13 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/jira\/sync$/);
       if (m && method === "POST") return await jiraManualSync(db, m[1], deps.jira);
+
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/jira\/link$/);
+      if (m && method === "POST") {
+        const body = await safeJson(req);
+        if (!body?.parent_key) return err("parent_key is required");
+        return json(await linkTaskToJira(db, m[1], String(body.parent_key), deps.jira), 201);
+      }
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/jira\/delivery\/resolve$/);
       if (m && method === "POST") return jiraResolveDelivery(db, m[1], await safeJson(req));
@@ -589,7 +704,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // {shown:true} it rendered, or {error} it refused.
       m = pathname.match(/^\/api\/notifications\/([^/]+)\/delivery$/);
       if (m && method === "POST") {
-        const b = await req.json().catch(() => ({} as any));
+        const b: any = await req.json().catch(() => ({}));
         if (b?.error) {
           recordDeliveryError(m[1], String(b.error));
           return json({ ok: false });
@@ -671,7 +786,7 @@ function createProject(db: DB, body: any): Response {
   db.query(
     "INSERT INTO projects (id, name, repo_path, config, created_at) VALUES (?,?,?,?,?)"
   ).run(row.id, row.name, row.repo_path, row.config, row.created_at);
-  return json(parseProject(row), 201);
+  return json(projectPayload(row), 201);
 }
 
 // Update a project's mutable fields. `config` is REPLACED wholesale (the web UI
@@ -687,7 +802,16 @@ function updateProject(db: DB, id: string, body: any): Response {
   }
   const config = body?.config !== undefined ? JSON.stringify(body.config) : existing.config;
   db.query("UPDATE projects SET name = ?, repo_path = ?, config = ? WHERE id = ?").run(name, repo_path, config, id);
-  return json(parseProject(db.query("SELECT * FROM projects WHERE id = ?").get(id)));
+  return json(projectPayload(db.query("SELECT * FROM projects WHERE id = ?").get(id)));
+}
+
+// The project payload the UI reads. `jira_site` is the CANONICALIZED site from
+// the credential gate, never the raw config value: a client that builds a
+// browse URL must not be able to be pointed at an attacker-named host by a
+// config write, which is the same guarantee jiraTaskState's browse_url makes.
+function projectPayload(row: any) {
+  const project = parseProject(row);
+  return { ...project, jira_site: jiraConfig(project.config)?.site ?? null };
 }
 
 // ---------------------------------------------------------------- jira
@@ -695,24 +819,51 @@ function updateProject(db: DB, id: string, body: any): Response {
 // lives, when it last synced, what is still unresolved, and any error
 // that has NOT been cleared by a later success. A director should never have to
 // guess whether the sync ran, which is what makes people re-submit work.
+function jiraIssueKey(task: { jira_key?: string | null; source_ref?: string | null }): string {
+  if (task.jira_key) return task.jira_key;
+  const ref = String(task.source_ref ?? "");
+  return ref.startsWith(JIRA_REF_PREFIX) ? ref.slice(JIRA_REF_PREFIX.length) : "";
+}
+
 function jiraTaskState(db: DB, taskId: string): Response {
   const task = getTask(db, taskId);
   if (!task) return err("task not found", 404);
-  const ref = String(task.source_ref ?? "");
-  if (!ref.startsWith(JIRA_REF_PREFIX)) return json({ linked: false });
-
-  const key = ref.slice(JIRA_REF_PREFIX.length);
+  const key = jiraIssueKey(task);
+  if (!key) return json({ linked: false });
   const configStatus = jiraConfigStatusFor(db, task.project_id);
   const cfg = configStatus.config;
   const state = readJiraSyncState(db, task.project_id);
   const pending = pendingOutbound(db, taskId);
   const assignee = /^Assignee: (.+)$/m.exec(String(task.brief ?? ""))?.[1] ?? null;
   const delivered = deliveredOutbound(db, taskId);
+  const site = cfg?.site ?? null;
+  const linkedSubtasks = (task.jira_link_kind === "mirror" || isJiraMirror(task))
+    ? (db.query(
+        `SELECT id, project_id, number, project_number, title, state, jira_key
+         FROM tasks
+         WHERE project_id = ? AND jira_link_kind = 'subtask' AND (
+           parent_task_id = ? OR EXISTS (
+             SELECT 1 FROM events
+             WHERE task_id = tasks.id AND type = 'jira_sync'
+               AND json_extract(payload, '$.action') IN ('link_created', 'link_discovered')
+               AND json_extract(payload, '$.parent') = ?
+           )
+         )
+         ORDER BY number`
+      ).all(task.project_id, task.id, key) as any[]).map((row) => ({
+        id: row.id,
+        display_id: taskIdentifier(db, row),
+        title: row.title,
+        state: row.state,
+        jira_key: row.jira_key,
+        browse_url: site ? `${site}/browse/${encodeURIComponent(row.jira_key)}` : null,
+      }))
+    : [];
 
   return json({
     linked: true,
     issue_key: key,
-    browse_url: key ? `${JIRA_SITE}/browse/${encodeURIComponent(key)}` : null,
+    browse_url: key && site ? `${site}/browse/${encodeURIComponent(key)}` : null,
     enabled: cfg?.enabled ?? false,
     write: cfg?.write ?? false,
     // A configured-but-not-allowlisted target reads as "not configured" here on
@@ -723,18 +874,19 @@ function jiraTaskState(db: DB, taskId: string): Response {
     // The automatic cycle is OFF for it, so the board shows this reason from the
     // first read rather than waiting for a failure count to climb.
     config_error: configStatus.error,
-    write_scope: JIRA_WRITE_SCOPE,
+    write_scope: { ...JIRA_WRITE_SCOPE, create_subtask: cfg?.write_scope?.create_subtask === true },
     assignee: assignee === "-" ? null : assignee,
     sync: configStatus.error ? { ...state, last_error: `jira cycle could not run: ${configStatus.error}` } : state,
     pending,
     delivered,
+    linked_subtasks: linkedSubtasks,
   });
 }
 
 function jiraResolveDelivery(db: DB, taskId: string, body: any): Response {
   const task = getTask(db, taskId);
   if (!task) return err("task not found", 404);
-  if (!String(task.source_ref ?? "").startsWith(JIRA_REF_PREFIX)) return err("task is not linked to a Jira issue", 400);
+  if (!jiraIssueKey(task)) return err("task is not linked to a Jira issue", 400);
   const action = String(body?.action ?? "");
   const sourceId = String(body?.source_id ?? "");
   if ((action !== "comment_push" && action !== "receipt") || !sourceId)
@@ -750,7 +902,7 @@ function jiraResolveDelivery(db: DB, taskId: string, body: any): Response {
 async function jiraManualSync(db: DB, taskId: string, deps?: JiraDeps): Promise<Response> {
   const task = getTask(db, taskId);
   if (!task) return err("task not found", 404);
-  if (!String(task.source_ref ?? "").startsWith(JIRA_REF_PREFIX)) return err("task is not linked to a Jira issue", 400);
+  if (!jiraIssueKey(task)) return err("task is not linked to a Jira issue", 400);
   const r = await runJiraProjectCycle(db, task.project_id, deps);
   return json({ ok: r.ok, error: r.error ?? null, stats: r.stats ?? null, sync: r.state }, r.ok ? 200 : 502);
 }
@@ -929,9 +1081,13 @@ async function deliverToSupervisor(
     task = getTask(db, taskId);
   }
 
-  // Is the session already live? If so, just send into it (fast path).
+  // Is the session already live? If so, just send into it (fast path). Uses
+  // probeAgent (not a raw herdr.probe) so a herdr registry eviction — the
+  // supervisor pane is still alive, only its registration was wiped — is
+  // re-adopted here instead of read as dead and sent through spawnAgent, where
+  // the spawn guard would correctly refuse (name still held) and drop the turn.
   if (task.agent_target) {
-    const { alive } = await herdr.probe(task.agent_target).catch(() => ({ alive: false }));
+    const { alive } = await probeAgent(herdr, db, taskId!, task.agent_target).catch(() => ({ alive: false }));
     if (alive) {
       const error = await sendOnce(herdr, task.agent_target, wireMessage);
       if (!error) {
@@ -1615,8 +1771,55 @@ function parseDeps(db: DB, raw: any, selfId?: string): string[] | Response {
   for (const d of deps) {
     if (selfId && d === selfId) return err("a task cannot depend on itself", 400);
     if (!db.query("SELECT 1 FROM tasks WHERE id = ?").get(d)) return err(`unknown depends_on task: ${d}`, 400);
+    if (selfId && dependsTransitivelyOn(db, d, selfId)) return err("depends_on would create a dependency cycle", 400);
   }
   return deps;
+}
+
+// The verification contract: named commands an agent must run before it hands
+// off, so its evidence can be tagged with the name it came from
+// (`hive emit ... --verify-name <name>`). Stored as a JSON array on the task.
+// Names are short slugs so they read well in a brief and in evidence payloads.
+// Nothing is gated on this yet — it is data the brief renders.
+function parseVerificationCmds(raw: any): { name: string; cmd: string }[] | null | Response {
+  if (raw === null || raw === "") return null;
+  let list = raw;
+  if (typeof raw === "string") {
+    try {
+      list = JSON.parse(raw);
+    } catch {
+      return err("verification_cmds must be a JSON array of {name, cmd}", 400);
+    }
+  }
+  if (!Array.isArray(list)) return err("verification_cmds must be an array of {name, cmd}", 400);
+  const seen = new Set<string>();
+  const out: { name: string; cmd: string }[] = [];
+  for (const entry of list) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry))
+      return err("each verification_cmds entry must be an object with 'name' and 'cmd'", 400);
+    const name = String((entry as any).name ?? "");
+    const cmd = String((entry as any).cmd ?? "");
+    if (!/^[a-z0-9-]{1,32}$/.test(name))
+      return err(`invalid verification_cmds name: ${JSON.stringify(name)} (use 1-32 chars of a-z, 0-9, -)`, 400);
+    if (seen.has(name)) return err(`duplicate verification_cmds name: ${name}`, 400);
+    if (!cmd.trim()) return err(`verification_cmds entry '${name}' needs a non-empty cmd`, 400);
+    seen.add(name);
+    out.push({ name, cmd });
+  }
+  return out.length ? out : null;
+}
+
+// Priority is ordering only, never preemption: it decides which queued task is
+// picked up first (dispatcher.ts) and which approved PR lands first
+// (landQueue.ts). Highest to lowest: now, next, normal, later.
+export const TASK_PRIORITIES = ["now", "next", "normal", "later"] as const;
+
+// Returns the validated value, or a 400 for anything outside the vocabulary.
+function parsePriority(raw: any): string | Response {
+  const p = String(raw);
+  if (!(TASK_PRIORITIES as readonly string[]).includes(p))
+    return err(`invalid priority: ${JSON.stringify(p)} (use ${TASK_PRIORITIES.join(", ")})`, 400);
+  return p;
 }
 
 // Accepts JSON or multipart; attached files are saved under the new task's id
@@ -1646,6 +1849,10 @@ async function createTask(db: DB, req: Request): Promise<Response> {
     return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
   const deps = parseDeps(db, body.depends_on);
   if (deps instanceof Response) return deps;
+  const verifyCmds = body.verification_cmds !== undefined ? parseVerificationCmds(body.verification_cmds) : null;
+  if (verifyCmds instanceof Response) return verifyCmds;
+  const priority = body.priority !== undefined ? parsePriority(body.priority) : "normal";
+  if (priority instanceof Response) return priority;
   // A follow-up task's brief often describes code that only exists in the
   // parent's still-open PR (HIVE-299). Auto-depend on the parent until its PR
   // has merged so the dispatcher holds this task the same way unmetDeps
@@ -1675,17 +1882,20 @@ async function createTask(db: DB, req: Request): Promise<Response> {
     source: body.source ? String(body.source) : null,
     parent_task_id: parent,
     depends_on: deps.length ? JSON.stringify(deps) : null,
+    verification_cmds: verifyCmds ? JSON.stringify(verifyCmds) : null,
+    priority,
     created_at: t,
     updated_at: t,
   };
   db.query(
     `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
-      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, priority, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.project_id, row.title, row.brief, row.state, row.kind,
     row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
-    row.summary, row.source, row.parent_task_id, row.depends_on, row.created_at, row.updated_at
+    row.summary, row.source, row.parent_task_id, row.depends_on, row.verification_cmds,
+    row.priority, row.created_at, row.updated_at
   );
   writeEvent(db, {
     task_id: row.id,
@@ -1829,8 +2039,23 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
     if (parsed instanceof Response) return parsed;
     deps = parsed;
   }
-  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, updated_at = ? WHERE id = ?")
-    .run(title, brief, deps.length ? JSON.stringify(deps) : null, now(), id);
+  // verification_cmds is full-replace too: omit to leave it alone, send [] or
+  // null to clear it.
+  let verify: string | null = task.verification_cmds ? JSON.stringify(task.verification_cmds) : null;
+  if (body?.verification_cmds !== undefined) {
+    const parsed = parseVerificationCmds(body.verification_cmds);
+    if (parsed instanceof Response) return parsed;
+    verify = parsed ? JSON.stringify(parsed) : null;
+  }
+  // priority is a plain scalar: omit it to leave it alone.
+  let priority: string = task.priority ?? "normal";
+  if (body?.priority !== undefined) {
+    const parsed = parsePriority(body.priority);
+    if (parsed instanceof Response) return parsed;
+    priority = parsed;
+  }
+  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, updated_at = ? WHERE id = ?")
+    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, now(), id);
   const updated = getTask(db, id);
   broadcastTask(db, updated);
   return json(taskWithHealth(db, updated));
@@ -2108,8 +2333,17 @@ function brief(db: DB, url: URL): Response {
     )
     .all(...(since ? [since] : []));
 
+  // ⑩ dialogs the server answered for the agent — a count, not a card each
+  // (task #1562). Windowed like the other "what happened" sections; a day is
+  // the default because that is how often the director reads this.
+  const dialogsSince = since ?? new Date(Date.now() - 24 * 3600_000).toISOString();
+  const auto_answered_dialogs = (db
+    .query("SELECT COUNT(*) AS n FROM events WHERE type = 'dialog_auto_answered' AND ts >= ?")
+    .get(dialogsSince) as { n: number }).n;
+
   return json({
     since: since ?? null,
+    auto_answered_dialogs,
     done,
     director_required_task_ids: [...directorRequiredTaskIds],
     failed_or_attention,
@@ -2322,7 +2556,7 @@ async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {
     const t = getTask(db, id);
     if (t) {
       const hiveOwnedReview = !isTrackingOnlyTask(t);
-      if (hiveOwnedReview && to === "verifying" && t.state === "in_review" && t.kind === "scout") {
+      if (hiveOwnedReview && to === "verifying" && t.state === "in_review" && t.kind === "scout" && understandingChecksRequired(db, t)) {
         const quiz = latestUnderstandingQuiz(db, id);
         if (!quiz)
           return err("Understanding check required. Ask the agent to add one before accepting this report.", 409);
@@ -2398,7 +2632,8 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
     const found = await findEmbeddedTasks(deps.exec ?? defaultExec, project.repo_path, base, task.branch, others);
     if (found) embedded_tasks = found;
   }
-  return json({ unmet_deps, embedded_tasks });
+  // The review card only blocks on the understanding check when this says so.
+  return json({ unmet_deps, embedded_tasks, understanding_required: understandingChecksRequired(db, task) });
 }
 
 // Map our merge_method config onto gh's flag. Squash is the default.
@@ -2575,11 +2810,21 @@ export async function mergeTask(
   const blocked = authzBlock(db, { project_id: task.project_id, action: "task.merge", target: task.title, task_id: id });
   if (blocked) return blocked;
 
-  const quiz = latestUnderstandingQuiz(db, id);
-  if (!quiz)
-    return err("Understanding check required. Ask the agent to submit one in its latest review before merging.", 409);
-  if (understandingQuizStatus(db, id, quiz.reviewEventId) === "required")
-    return err("Pass the understanding check before merging, or choose 'Continue now, quiz me later'.", 409);
+  const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
+  const config = JSON.parse(project?.config ?? "{}");
+  const autoShipKind = Array.isArray(config.auto_merge?.kinds) && config.auto_merge.kinds.includes(task.kind);
+  // Mechanical changes (hive-1559) never mint a quiz, so nothing here to gate on.
+  let deferQuizReviewEventId: string | null = null;
+  if (understandingChecksRequired(db, task)) {
+    const quiz = latestUnderstandingQuiz(db, id);
+    if (!quiz)
+      return err("Understanding check required. Ask the agent to submit one in its latest review before merging.", 409);
+    if (understandingQuizStatus(db, id, quiz.reviewEventId) === "required") {
+      if (!autoShipKind)
+        return err("Pass the understanding check before merging, or choose 'Continue now, quiz me later'.", 409);
+      deferQuizReviewEventId = quiz.reviewEventId;
+    }
+  }
 
   // Recompute the dependency claim live rather than trusting evidence prose
   // (task #1000: #977 claimed its dependency had landed on main; it hadn't).
@@ -2592,9 +2837,20 @@ export async function mergeTask(
     return err(`blocked by unmet dependenc${blockingDeps.length === 1 ? "y" : "ies"}: ${names} — not yet merged/done`, 409);
   }
 
+  // The risk check (HIVE-406) re-read the real code for this exact head. Risks
+  // it CONFIRMED are the ones that survived an adversarial second look, so the
+  // director sees that short list verbatim instead of the whole caution blob.
+  // Refuted risks say nothing here. Overridable, like the rebase guard below.
+  const confirmed = body?.override_confirmed_risks ? [] : confirmedRisks(db, id, task.head_sha);
+  if (confirmed.length)
+    return err(
+      `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
+        confirmed.map((c) => `“${c.risk}” — ${c.why}${c.evidence_path ? ` (${c.evidence_path})` : ""}`).join("; ") +
+        `. Fix them, or merge with override_confirmed_risks=true.`,
+      409
+    );
+
   const exec = deps.exec ?? defaultExec;
-  const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
-  const config = JSON.parse(project?.config ?? "{}");
   let prView: any = null;
   if (task.pr_url) {
     const probe = await exec([
@@ -2808,6 +3064,18 @@ export async function mergeTask(
     }
   }
 
+  if (deferQuizReviewEventId) {
+    writeEvent(db, {
+      task_id: id,
+      source: "system",
+      type: "understanding_quiz_deferred",
+      payload: {
+        review_event_id: deferQuizReviewEventId,
+        actor,
+        note: "Automatically deferred because this task kind is enabled in auto_merge.kinds.",
+      },
+    });
+  }
   writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url, actor } });
   // in_review → verifying (runs post-deploy smoke once).
   transition(db, id, "verifying", { source: "director", reason: `merged (${method})` });
@@ -2989,6 +3257,7 @@ export function codexAgentArgv(
   const argv = [
     "codex",
     "--sandbox", "workspace-write",
+    "-c", "sandbox_workspace_write.network_access=true",
     "--ask-for-approval", "on-request",
     "--dangerously-bypass-hook-trust",
     "-c", "features.hooks=true",
@@ -3062,6 +3331,15 @@ export async function spawnAgent(
     const error = `refusing to dispatch: predecessor's open PR ${task.resume_pr_url} is not referenced in this task's brief — restore the RESUME/adoption pointer before dispatching`;
     writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error } });
     return { ok: false, error };
+  }
+  if (task.resume_pr_url) {
+    const ids = task.parent_task_id ? [id, task.parent_task_id] : [id];
+    const outcome = prOutcome(db, ids, task.resume_pr_url);
+    if (outcome !== "open") {
+      const error = `refusing to dispatch: predecessor's PR ${task.resume_pr_url} is already ${outcome}. The resume pointer is stale; reattach to the current PR (or clear resume_pr_url) before dispatching`;
+      writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error } });
+      return { ok: false, error };
+    }
   }
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   if (!project?.repo_path) return { ok: false, error: "project has no repo_path" };
@@ -3227,7 +3505,7 @@ async function sendOnce(herdr: Herdr, target: string, message: string): Promise<
 // Programmatic steer for hive's own subsystems (offline prep, checkpoint
 // flags): same delivery-receipt semantics as the HTTP path, no Request object,
 // no authz gate (the server is steering, not an agent).
-async function internalSteer(db: DB, herdr: Herdr, id: string, message: string, actor: string | null = null): Promise<boolean> {
+export async function internalSteer(db: DB, herdr: Herdr, id: string, message: string, actor: string | null = null): Promise<boolean> {
   const task = getTask(db, id);
   if (!task || isTrackingOnlyTask(task)) return false;
   const target = task.agent_target;
@@ -3458,6 +3736,32 @@ function checkpointNote(payload: string): string {
   }
 }
 
+// Is this checkpoint a plan the agent is parked on (HIVE-413)?
+function planCheckpointBlocks(payload: string): boolean {
+  try {
+    return JSON.parse(payload)?.blocking === true;
+  } catch {
+    return false;
+  }
+}
+
+// The plan fields on a plan checkpoint, for the Needs You card. Null for an
+// ordinary note-only checkpoint.
+function checkpointPlan(payload: string): Record<string, unknown> | null {
+  try {
+    const p = JSON.parse(payload);
+    if (p?.kind !== "plan") return null;
+    return {
+      goal: String(p.goal ?? ""),
+      approach: String(p.approach ?? ""),
+      files_expected: Array.isArray(p.files_expected) ? p.files_expected.map(String) : [],
+      verification_planned: String(p.verification_planned ?? ""),
+    };
+  } catch {
+    return null;
+  }
+}
+
 interface UnderstandingCheck {
   question: string;
   options: { key: string; label: string }[];
@@ -3543,6 +3847,83 @@ function normalizeUnderstandingChecks(understanding: unknown): UnderstandingChec
 // states have an actionable quiz, or the list can advertise an item the answer
 // endpoint then rejects (hive-1006).
 const UNDERSTANDING_QUIZ_ANSWERABLE_STATES = ["in_review", "verifying", "done", "failed"];
+
+// Paths whose changes always deserve a director quiz, whatever the reviewer
+// said. Per-project override: config.understanding_checks.sensitive_paths.
+const DEFAULT_SENSITIVE_PATHS = ["auth", "token", "security", "payment", "billing", "migration", "secret", "credential", "password"];
+
+// Match a token anywhere inside a path segment, case-insensitively, so "auth"
+// hits `server/src/auth.ts`, `web/authGuard.ts` AND `src/authTokens.ts`.
+// Deliberately biased to false positives: quizzing a mechanical change costs
+// the director one question, missing a sensitive one costs a blind merge.
+// ponytail: substring matching, not globs. Swap in a glob matcher only if a
+// project needs a path shape this cannot express.
+function touchesSensitivePath(files: string[], tokens: string[]): boolean {
+  const needles = tokens.map((token) => token.toLowerCase()).filter(Boolean);
+  return files.some((file) => {
+    const segments = file.toLowerCase().split("/");
+    return needles.some((needle) => segments.some((segment) => segment.includes(needle)));
+  });
+}
+
+// The newest verdict from the auto reviewer, or null when it never produced one
+// (never ran, errored, or was skipped by project config).
+function latestAutoReviewVerdict(
+  db: DB,
+  taskId: string
+): { verdict: string; files: string[]; risks: string[]; questions: string[]; reviewed_head_sha?: string } | null {
+  const row = db
+    .query(
+      `SELECT type, payload FROM events WHERE task_id = ? AND type IN ('auto_review', 'auto_review_error')
+        ORDER BY ts DESC, rowid DESC LIMIT 1`
+    )
+    .get(taskId) as { type: string; payload: string } | undefined;
+  if (!row || row.type !== "auto_review") return null;
+  try {
+    const payload = JSON.parse(row.payload);
+    if (payload?.skipped || typeof payload?.verdict !== "string") return null;
+    return {
+      verdict: payload.verdict,
+      files: Array.isArray(payload.files) ? payload.files.map(String) : [],
+      risks: Array.isArray(payload.risks) ? payload.risks.map(String) : [],
+      questions: Array.isArray(payload.questions) ? payload.questions.map(String) : [],
+      reviewed_head_sha: typeof payload.reviewed_head_sha === "string" ? payload.reviewed_head_sha : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Judgment-class or not (hive-1559). Hive raises only the few changes that
+// actually need the director's head; everything mechanical merges without a
+// quiz and never lands in the post-ship backlog. A task is judgment-class when
+// ANY of these holds:
+//   1. the latest auto_review verdict is not `looks_good` (missing, errored,
+//      skipped and `caution` all count — no clean verdict means no free pass),
+//   2. its reviewed diff touches a sensitive path (auth/security/payments/
+//      migrations by default, per-project via config.understanding_checks),
+//   3. its kind is outside the project's auto_merge.kinds allow-list, or
+//   4. the director flagged the task (POST .../understanding-quiz/require).
+export function understandingChecksRequired(db: DB, task: { id: string; kind: string; project_id: string }): boolean {
+  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+  const config = JSON.parse(project?.config ?? "{}");
+  if (!(Array.isArray(config.auto_merge?.kinds) && config.auto_merge.kinds.includes(task.kind))) return true;
+  const flagged = db
+    .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1")
+    .get(task.id);
+  if (flagged) return true;
+  const review = latestAutoReviewVerdict(db, task.id);
+  if (!review) return true;
+  // A caution whose every risk was refuted and every question answered from the
+  // code is not judgment-class either (HIVE-407) — the same rule the reconciler
+  // uses to auto-merge it. Anything still confirmed or human-only needs the
+  // director, so it keeps its quiz.
+  if (review.verdict !== "looks_good" && !cautionCleared(db, task.id, review.reviewed_head_sha, review)) return true;
+  const tokens = Array.isArray(config.understanding_checks?.sensitive_paths)
+    ? config.understanding_checks.sensitive_paths.map(String)
+    : DEFAULT_SENSITIVE_PATHS;
+  return touchesSensitivePath(review.files, tokens);
+}
 
 function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; checks: UnderstandingCheck[] } | null {
   const row: any = db
@@ -3650,6 +4031,32 @@ export function repairDuplicateQuizPasses(db: DB): number {
   return repaired;
 }
 
+// Quizzes on tasks that already shipped: the post-ship catch-up backlog. The
+// web UI shows these as ONE digest, so the count here is what that digest says,
+// not a number of separate attention items. Quizzes on tasks still in review
+// are excluded — those gate their own review card.
+const POST_SHIP_QUIZ_STATES = ["verifying", "done", "failed"];
+export function pendingPostShipQuizCount(db: DB): number {
+  const placeholders = POST_SHIP_QUIZ_STATES.map(() => "?").join(",");
+  const rows = db
+    .query(
+      `SELECT e.id, e.task_id, e.payload FROM events e JOIN tasks t ON t.id = e.task_id
+        WHERE e.type = 'review_summary'
+          AND t.state IN (${placeholders})
+          AND NOT EXISTS (
+            SELECT 1 FROM events newer
+             WHERE newer.task_id = e.task_id AND newer.type = 'review_summary'
+               AND (newer.ts > e.ts OR (newer.ts = e.ts AND newer.rowid > e.rowid)))`
+    )
+    .all(...POST_SHIP_QUIZ_STATES) as { id: string; task_id: string; payload: string }[];
+  return rows.filter((row) => {
+    let payload: any;
+    try { payload = JSON.parse(row.payload); } catch { return false; }
+    if (!normalizeUnderstandingChecks(payload?.understanding).length) return false;
+    return understandingQuizStatus(db, row.task_id, row.id) !== "passed";
+  }).length;
+}
+
 function listUnderstandingQuizzes(db: DB, url: URL): Response {
   const projectId = url.searchParams.get("project_id");
   const statePlaceholders = UNDERSTANDING_QUIZ_ANSWERABLE_STATES.map(() => "?").join(",");
@@ -3672,6 +4079,9 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
     try { payload = JSON.parse(row.payload); } catch { return []; }
     const checks = normalizeUnderstandingChecks(payload?.understanding);
     if (!checks.length) return [];
+    // A mechanical change gets no backlog entry even when its agent submitted
+    // checks anyway (hive-1559).
+    if (!understandingChecksRequired(db, { id: row.task_id, kind: row.kind, project_id: row.project_id })) return [];
     const understanding = payload?.understanding && typeof payload.understanding === "object" && !Array.isArray(payload.understanding)
       ? Object.fromEntries(Object.entries(payload.understanding).filter(([key]) => key !== "check" && key !== "checks"))
       : {};
@@ -3787,6 +4197,18 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   return json({ ok: true, correct: true, passed: true, explanation: check.explanation ?? null, completed: next.completed, total: quiz.checks.length });
 }
 
+// The director's own "quiz me on this one" flag (hive-1559): it makes an
+// otherwise mechanical task judgment-class, so its checks are required again.
+function requireUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
+  const task = getTask(db, taskId);
+  if (!task) return err("task not found", 404);
+  if (body?.source !== "director") return err("only the director can require understanding checks", 403);
+  const already = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1").get(taskId);
+  if (!already)
+    writeEvent(db, { task_id: taskId, source: "director", type: "understanding_required", payload: { actor: actorOf(body) } });
+  return json({ ok: true, understanding_required: true });
+}
+
 function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   const task = getTask(db, taskId);
   if (!task) return err("task not found", 404);
@@ -3835,17 +4257,41 @@ function openCheckpointRows(db: DB, projectId: string | null, includeTest = fals
 function listOpenCheckpoints(db: DB, url: URL): Response {
   const rows = openCheckpointRows(db, url.searchParams.get("project_id"), url.searchParams.get("test") === "all");
   return json({
-    checkpoints: rows.map((r) => ({
-      id: r.id,
-      task_id: r.task_id,
-      ts: r.ts,
-      task_number: r.number,
-      task_title: r.title,
-      task_state: r.state,
-      project_id: r.project_id,
-      note: checkpointNote(r.payload),
-    })),
+    checkpoints: rows.map((r) => {
+      const plan = checkpointPlan(r.payload);
+      return {
+        id: r.id,
+        task_id: r.task_id,
+        ts: r.ts,
+        task_number: r.number,
+        task_title: r.title,
+        task_state: r.state,
+        project_id: r.project_id,
+        note: checkpointNote(r.payload),
+        // A blocking plan is the whole card: the director approves from the
+        // plan plus the critic's concerns, without opening the task.
+        ...(planCheckpointBlocks(r.payload) ? { blocking: true } : {}),
+        ...(plan ? { plan, concerns: planConcerns(db, r.task_id, r.id) } : {}),
+      };
+    }),
   });
+}
+
+// The critic's concerns for a plan checkpoint, or [] when the critique has not
+// landed yet (it runs in the background).
+function planConcerns(db: DB, taskId: string, checkpointId: string): { severity: string; text: string }[] {
+  const row: any = db
+    .query(
+      `SELECT payload FROM events WHERE task_id = ? AND type = 'plan_critique'
+        AND json_extract(payload, '$.checkpoint_id') = ? ORDER BY rowid DESC LIMIT 1`
+    )
+    .get(taskId, checkpointId);
+  try {
+    const concerns = JSON.parse(row?.payload ?? "{}")?.concerns;
+    return Array.isArray(concerns) ? concerns : [];
+  } catch {
+    return [];
+  }
 }
 
 async function ackCheckpoint(db: DB, herdr: Herdr, taskId: string, eventId: string, body: any): Promise<Response> {
@@ -3893,15 +4339,32 @@ async function ackCheckpoint(db: DB, herdr: Herdr, taskId: string, eventId: stri
   });
   let delivered = false;
   let followup_task_id: string | null = null;
+  // A blocking plan checkpoint (HIVE-413) parked the agent: the ack is what
+  // restarts it, on both verdicts. An approval says nothing else, so it steers
+  // here; a flag falls through to the flag steer below, which already carries
+  // the correction.
+  if (planCheckpointBlocks(ev.payload) && verdict === "ok") {
+    delivered = await internalSteer(db, herdr, taskId, planReleaseSteer("ok", note));
+    return json({ ok: true, delivered, followup_task_id });
+  }
   if (verdict === "flag") {
     const cpText = checkpointNote(ev.payload);
-    const live = task && !["done", "cancelled", "failed"].includes(task.state) && task.agent_target;
+    // A blocking plan (HIVE-413) parked its agent before any edit: a flag must
+    // reach it even with no agent_target right now (internalSteer queues the
+    // steer onto the next spawn). Nothing shipped, so a corrective follow-up
+    // task would be the wrong answer.
+    const live =
+      task &&
+      !["done", "cancelled", "failed"].includes(task.state) &&
+      (task.agent_target || planCheckpointBlocks(ev.payload));
     if (live) {
       delivered = await internalSteer(
         db,
         herdr,
         taskId,
-        `${source === "chat_supervisor" ? "The project supervisor" : "Director"} FLAGGED your checkpoint: "${cpText}"${note ? ` — ${note}` : ""}. Address this now, before continuing.`
+        planCheckpointBlocks(ev.payload)
+          ? planReleaseSteer("flag", note)
+          : `${source === "chat_supervisor" ? "The project supervisor" : "Director"} FLAGGED your checkpoint: "${cpText}"${note ? ` — ${note}` : ""}. Address this now, before continuing.`
       );
     }
     // Late flag (task finished / agent gone): the work already shipped, so the
@@ -4274,6 +4737,7 @@ export function requeueTask(db: DB, source: any): string {
     resume?.branch ?? null, resume?.ghostBranch ?? null, resume?.prUrl ?? null, t, t
   );
   writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title: fresh.title, requeue_of: fresh.id } });
+  repointDependents(db, fresh.id, id, "reconciler");
   broadcastTask(db, getTask(db, id));
   // Re-broadcast the failed original: its earlier `failed` SSE frame predates
   // this successor, so clients still show it as awaiting triage without this.
@@ -4281,16 +4745,125 @@ export function requeueTask(db: DB, source: any): string {
   return id;
 }
 
+// ---- root-cause scout on the second park ----
+// One agent dying is bad luck. Two agents dying the same way is a fact about
+// the task, and a third blind attempt is a third coin flip. So the park that
+// follows a requeue also files ONE scout, with the corpse attached: every
+// failed task id, its worktree, its pane-tail evidence, and its recovery
+// timeline. Exactly one per lineage, ever — the marker event lives on the
+// ORIGINAL task, so every later park in the chain finds it and stays quiet.
+const RECOVERY_SCOUT_SOURCE = "recovery-scout";
+
+// original → … → task, walking the source='requeue' parent chain.
+function requeueLineage(db: DB, task: any): any[] {
+  const chain: any[] = [];
+  let cur: any = task;
+  while (cur) {
+    chain.unshift(cur);
+    cur = cur.source === "requeue" && cur.parent_task_id ? getTask(db, cur.parent_task_id) : null;
+  }
+  return chain;
+}
+
+function recoveryScoutMarker(db: DB, originalId: string): { scout_task_id: string } | null {
+  const row = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'scout_spawned' ORDER BY ts LIMIT 1")
+    .get(originalId) as { payload: string } | undefined;
+  if (!row) return null;
+  try {
+    return JSON.parse(row.payload);
+  } catch {
+    return null;
+  }
+}
+
+// Scouts hand off a kind='report' evidence row — that's what a later park links.
+function recoveryScoutReport(db: DB, scoutTaskId: string): string | null {
+  const row = db
+    .query("SELECT url FROM evidence WHERE task_id = ? AND kind = 'report' ORDER BY ts DESC LIMIT 1")
+    .get(scoutTaskId) as { url: string | null } | undefined;
+  return row?.url ?? null;
+}
+
+function recoveryScoutBrief(db: DB, chain: any[]): string {
+  const corpse = chain
+    .map((t, i) => {
+      const lines = [`Attempt ${i + 1} — task ${t.id} (state: ${t.state})`];
+      if (t.worktree_path) lines.push(`  worktree: ${t.worktree_path}`);
+      if (t.branch) lines.push(`  branch: ${t.branch}`);
+      if (t.agent_target) lines.push(`  agent transcript: herdr agent read ${t.agent_target}`);
+      lines.push(`  saved pane tails and other evidence: ${join(evidenceDir(), t.id)}`);
+      const events = db
+        .query(
+          `SELECT ts, type, payload FROM events WHERE task_id = ?
+             AND type IN ('stale','recovery','recovery_nudge','requeued','worktree_reclaimed','state_change')
+           ORDER BY ts`
+        )
+        .all(t.id) as { ts: string; type: string; payload: string }[];
+      for (const e of events) lines.push(`  ${e.ts}  ${e.type}  ${e.payload}`);
+      return lines.join("\n");
+    })
+    .join("\n\n");
+  return [
+    `${chain.length} agents have now failed this same task. Find out why.`,
+    ``,
+    `Failed task ids: ${chain.map((t) => t.id).join(", ")}`,
+    ``,
+    `What each attempt left behind:`,
+    ``,
+    corpse,
+    ``,
+    `Agent transcripts also live under ~/.herdr/worktrees/<project>/<task-id> and in the herdr session logs for the agent targets above.`,
+    ``,
+    `Your ask: reproduce the failure, or explain it. Then recommend the one change that would make attempt ${chain.length + 1} succeed.`,
+    `Report only. Change nothing: no code edits, no commits, no PR. Hand off with a report (hive emit <task-id> evidence --kind report --file report.md).`,
+  ].join("\n");
+}
+
+// Returns the new scout's task id, or null when this park has not earned one
+// (a single attempt so far) or the lineage already has its scout.
+function spawnRecoveryScout(db: DB, task: any, chain: any[]): string | null {
+  if (chain.length < 2) return null; // one failure is not yet a pattern
+  if (recoveryScoutMarker(db, chain[0].id)) return null; // exactly one per lineage
+  const id = newId();
+  const t = now();
+  const title = `Why does ${task.title} keep failing?`;
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, created_at, updated_at)
+     VALUES (?,?,?,?, 'queued', 'scout', ?, ?, ?, ?)`
+  ).run(id, task.project_id, title, recoveryScoutBrief(db, chain), RECOVERY_SCOUT_SOURCE, task.id, t, t);
+  writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title, recovery_scout_of: task.id } });
+  writeEvent(db, {
+    task_id: chain[0].id,
+    source: "reconciler",
+    type: "scout_spawned",
+    payload: { scout_task_id: id, parked_task_id: task.id, failed_task_ids: chain.map((c) => c.id) },
+  });
+  broadcastTask(db, getTask(db, id));
+  return id;
+}
+
 // Open the "recovery cap reached / agent unresponsive" decision card. A
 // `recovery_card` event links it to the source task so answering `requeue`
 // resolves to a fresh task (resolveRecoveryForDecision).
 export function openRecoveryDecision(db: DB, task: any, attempts: number): any {
+  const chain = requeueLineage(db, task);
+  const scoutId = spawnRecoveryScout(db, task, chain);
+  const marker = recoveryScoutMarker(db, chain[0].id);
+  const reportUrl = marker ? recoveryScoutReport(db, marker.scout_task_id) : null;
+  const scoutLine = reportUrl
+    ? ` A root-cause scout already looked into this. Read its report before you decide: ${reportUrl} (task ${marker!.scout_task_id}).`
+    : scoutId
+      ? ` A root-cause scout (task ${scoutId}) is now digging into why this keeps failing. Its report will say what to change.`
+      : marker
+        ? ` Root-cause scout ${marker.scout_task_id} is already investigating this task; its report is not in yet.`
+        : "";
   const decision = createDecision(db, {
     task_id: task.id,
     title: `Recover failed task: ${task.title}`,
     context:
       `The agent for this task could not be kept alive (auto-requeued ${attempts} time(s) without success). ` +
-      `Requeue once more or abandon it?`,
+      `Requeue once more or abandon it?` + scoutLine,
     risk: "normal",
     blast_radius: `Task ${task.id} (${task.title}).`,
     options: [
@@ -4298,7 +4871,17 @@ export function openRecoveryDecision(db: DB, task: any, attempts: number): any {
       { key: "abandon", label: "Abandon", detail: "Leave the task failed." },
     ],
   });
-  writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery_card", payload: { decision_id: decision.id, source_task_id: task.id } });
+  writeEvent(db, {
+    task_id: task.id,
+    source: "reconciler",
+    type: "recovery_card",
+    payload: {
+      decision_id: decision.id,
+      source_task_id: task.id,
+      ...(marker ? { scout_task_id: marker.scout_task_id } : {}),
+      ...(reportUrl ? { scout_report_url: reportUrl } : {}),
+    },
+  });
   return decision;
 }
 
@@ -4824,7 +5407,15 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     ).run(ev.id, ev.task_id, ev.ts, ev.kind, ev.path, ev.url, ev.caption, ev.meta);
     const evidence = parseEvidence(ev);
     broadcast({ type: "evidence", evidence });
-    const event = writeEvent(db, { task_id: taskId, source, type: "evidence", payload: { evidence_id: ev.id, kind, caption: ev.caption } });
+    // `--verify-name <name>` ties this artifact back to one entry of the task's
+    // verification contract. Recorded on the event; nothing is gated on it yet.
+    const verifyName = String(fields.verify_name ?? "").trim() || null;
+    const event = writeEvent(db, {
+      task_id: taskId,
+      source,
+      type: "evidence",
+      payload: { evidence_id: ev.id, kind, caption: ev.caption, ...(verifyName ? { verify_name: verifyName } : {}) },
+    });
     return json({ evidence, event }, 201);
   }
 
@@ -5220,8 +5811,44 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     return json({ task }, 201);
   }
 
+  // --- checkpoint ---
+  // Ordinary checkpoints are plain notes and fall through to the generic path.
+  // A PLAN checkpoint (HIVE-412) carries structured fields, which are kept on
+  // the payload and critiqued in the background — the agent gets its 201 now and
+  // hears about any concern as a steer.
+  if (type === "checkpoint") {
+    const plan = parsePlan(fields);
+    if (plan) {
+      // Blocking mode (HIVE-413): the marker rides on the payload, so an ack
+      // knows to release the agent even if the project config changes later.
+      const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+      const blocking = planGateBlocks(JSON.parse(project?.config ?? "{}"), task.kind);
+      const event = writeEvent(db, {
+        task_id: taskId,
+        source,
+        type,
+        payload: { note: note ?? plan.goal, ...plan, ...(blocking ? { blocking: true } : {}) },
+      });
+      const herdr = deps.herdr ?? defaultHerdr;
+      critiquePlan(db, task, event.id, plan, {
+        plannerExec: deps.plannerExec,
+        steer: (id, message) => internalSteer(db, herdr, id, message),
+      }).catch((e) => console.error(`[hive] plan critic for ${taskId}:`, e));
+      return json({ event }, 201);
+    }
+  }
+
   // --- status / blocked / generic ---
   const event = writeEvent(db, { task_id: taskId, source, type, payload: { note } });
+  if (type === "status" && typeof note === "string" && note.trim() && task.jira_key && task.jira_link_kind === "subtask"
+    && jiraConfigStatusFor(db, task.project_id).config?.status_notes_to_comments === true) {
+    writeEvent(db, {
+      task_id: taskId,
+      source,
+      type: "jira_comment",
+      payload: { direction: "outbound", text: note.trim(), status_event_id: event.id },
+    });
+  }
   return json({ event }, 201);
 }
 
@@ -5655,6 +6282,17 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
   const bodyError = decisionAnswerBodyError(body);
   if (bodyError) return err(bodyError, 400);
   const submittedAnswerNote = body?.answer_note;
+  const answerNote = submittedAnswerNote ?? r.draft_note ?? null;
+  const wedged = dependentsWedgedForDecision(db, id);
+  let successorId: string | null = null;
+  if (wedged && answerKey === "repoint") {
+    const successor = getTask(db, String(answerNote ?? "").trim());
+    if (!successor) return err("repoint requires a valid successor task ID in the answer note", 400);
+    if (["failed", "cancelled"].includes(successor.state)) return err("repoint successor must not be failed or cancelled", 400);
+    if (wedged.dependentTaskIds.some((dependentId) => dependsTransitivelyOn(db, successor.id, dependentId)))
+      return err("repoint would create a dependency cycle", 400);
+    successorId = successor.id;
+  }
 
   // Caller identity. A missing source is NOT assumed to be the director — the
   // web UI now sends source:"director" explicitly, so a bare call is a caller
@@ -5686,7 +6324,6 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     return err("Cannot approve a planner breakdown with no tasks; answer 'reject' instead.", 400);
 
   const answeredAt = now();
-  const answerNote = submittedAnswerNote ?? r.draft_note ?? null;
   db.query(
     "UPDATE decisions SET status = 'answered', answer_key = ?, answer_note = ?, answered_at = ?, answered_by = ?, answered_actor = ? WHERE id = ?"
   ).run(answerKey, answerNote, answeredAt, answeredBy, answeredActor, id);
@@ -5713,7 +6350,10 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     resolveRepoMismatchForDecision(db, id, answerKey),
     resolveUsageCapForDecision(db, id, answerKey),
     resolveScopeDriftForDecision(db, id, answerKey),
+    resolveGardenerDecision(db, id, answerKey),
     resolveRefCaptureForDecision(db, id, answerKey, answerNote),
+    resolveDependentsWedgedForDecision(db, id, answerKey, successorId, answeredBy),
+    resolveLandPauseForDecision(db, id, answerKey),
   ].some(Boolean);
   if (!claimed) {
     const label = options.find((o) => o.key === answerKey)?.label ?? answerKey;

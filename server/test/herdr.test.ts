@@ -527,7 +527,11 @@ test("agent_name_taken error parsing", () => {
   expect(parseStaleAgentRef("no ids here")).toEqual({ tabId: null, paneId: null });
 });
 
-test("spawn closes the stale agent's tab and retries once on agent_name_taken", async () => {
+// INCIDENT b6fb44583e96 (hotfix d50db56): spawn used to close whatever held the
+// name and retry. The name holder is very often ALIVE — a quiet agent that
+// turn-complete auto-respawn (#190) tried to respawn — so that close murdered
+// live agents fleet-wide. Spawn must now refuse and let recovery park a card.
+test("spawn refuses on agent_name_taken instead of closing the name holder", async () => {
   const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x));
   let starts = 0;
   const { exec, calls } = stubExec((argv) => {
@@ -536,17 +540,16 @@ test("spawn closes the stale agent's tab and retries once on agent_name_taken", 
     if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t9"}}}');
     if (has(argv, "agent", "start")) {
       starts++;
-      if (starts === 1)
-        return FAIL('{"error":{"code":"agent_name_taken","message":"agent name x is already used; candidates: terminal_id=term_1 pane_id=wR:p7X workspace_id=wR tab_id=wR:t40 cwd=/x"}}');
-      return OK("started");
+      return FAIL('{"error":{"code":"agent_name_taken","message":"agent name x is already used; candidates: terminal_id=term_1 pane_id=wR:p7X workspace_id=wR tab_id=wR:t40 cwd=/x"}}');
     }
     return OK();
   });
   const h = new Herdr(exec, "herdr");
-  const res = await h.spawn({ taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b" });
-  expect(res.agent_target).toBe("x");
-  expect(starts).toBe(2);
-  expect(calls.some((c) => has(c, "tab", "close", "wR:t40"))).toBe(true);
+  await expect(h.spawn({ taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b" })).rejects.toThrow(/already has an agent holding its name/);
+  expect(starts).toBe(1); // refused, not retried
+  // The name holder's tab and pane are left strictly alone.
+  expect(calls.some((c) => has(c, "tab", "close", "wR:t40"))).toBe(false);
+  expect(calls.some((c) => has(c, "pane", "close", "wR:p7X"))).toBe(false);
 });
 
 test("spawn retries once when herdr's worktree op lock is busy", async () => {

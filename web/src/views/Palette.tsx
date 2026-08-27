@@ -90,11 +90,18 @@ export default function Palette() {
 
   // Global open shortcuts: Cmd/Ctrl+K, or "/" when not typing in a field.
   useEffect(() => {
+    const openPalette = () => {
+      window.dispatchEvent(new Event("hive:palette"));
+      setOpen(true);
+    };
     const onKey = (e: KeyboardEvent) => {
       const k = e.key;
       if ((e.metaKey || e.ctrlKey) && (k === "k" || k === "K")) {
         e.preventDefault();
-        setOpen((o) => !o);
+        setOpen((o) => {
+          if (!o) window.dispatchEvent(new Event("hive:palette"));
+          return !o;
+        });
         return;
       }
       if (k === "/" && !open) {
@@ -102,15 +109,20 @@ export default function Palette() {
         const tag = el?.tagName;
         if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el?.isContentEditable) return;
         e.preventDefault();
-        setOpen(true);
+        openPalette();
       }
     };
     const onOpen = () => setOpen(true);
+    const onPopoverOpen = () => close();
     window.addEventListener("keydown", onKey);
     window.addEventListener("hive:palette", onOpen);
+    window.addEventListener("hive:notifications", onPopoverOpen);
+    window.addEventListener("hive:browse", onPopoverOpen);
     return () => {
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("hive:palette", onOpen);
+      window.removeEventListener("hive:notifications", onPopoverOpen);
+      window.removeEventListener("hive:browse", onPopoverOpen);
     };
   }, [open]);
 

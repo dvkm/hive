@@ -97,7 +97,17 @@ const jira: Check = (v) => {
   const j = v as Record<string, unknown>;
   for (const k of ["site", "email", "project_key"]) if (typeof j[k] !== "string") return `.${k} must be a string`;
   for (const k of ["enabled", "write"]) if (j[k] !== undefined && typeof j[k] !== "boolean") return `.${k} must be a boolean`;
+  if (j.status_notes_to_comments !== undefined && typeof j.status_notes_to_comments !== "boolean")
+    return ".status_notes_to_comments must be a boolean";
   if (j.jql !== undefined && typeof j.jql !== "string") return ".jql must be a string";
+  if (j.write_scope !== undefined) {
+    const invalid = obj(j.write_scope);
+    if (invalid) return `.write_scope ${invalid}`;
+    const scope = j.write_scope as Record<string, unknown>;
+    for (const key of Object.keys(scope)) if (key !== "create_subtask") return `.write_scope.${key} is not supported`;
+    if (scope.create_subtask !== undefined && typeof scope.create_subtask !== "boolean")
+      return ".write_scope.create_subtask must be a boolean";
+  }
   return null;
 };
 
@@ -114,11 +124,104 @@ const gchatSpaces: Check = (v) => {
   return null;
 };
 
+// Production releases (server/src/deployments.ts). Presence of this key is what
+// opts a project into the Deployments tab, so every field is optional. The two
+// name-shaped fields become git/gh arguments and posthog_host becomes a fetch
+// destination, so those are pinned here; deployments.ts still falls back to a
+// default rather than trusting a name that reaches it another way.
+const deployments: Check = (v) => {
+  const bad = obj(v);
+  if (bad) return bad;
+  const d = v as Record<string, unknown>;
+  for (const key of ["deploy_workflow", "rollback_workflow", "tag_prefix"])
+    // Leading character pinned to alphanumeric: "--version" is otherwise a
+    // valid "name" that `gh workflow run` would read as a flag.
+    if (d[key] !== undefined && !(typeof d[key] === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(d[key] as string)))
+      return `.${key} must be a plain name starting with a letter or digit`;
+  if (d.workflow_ref !== undefined && !isSafeRef(d.workflow_ref)) return ".workflow_ref must be a git branch name";
+  for (const key of ["health_url", "posthog_host"]) {
+    if (d[key] === undefined) continue;
+    const invalid = httpUrl(d[key]);
+    if (invalid) return `.${key} ${invalid}`;
+  }
+  for (const key of ["health_substring", "posthog_project"])
+    if (d[key] !== undefined && typeof d[key] !== "string") return `.${key} must be a string`;
+  if (d.flags !== undefined) {
+    const invalid = strArray(d.flags);
+    if (invalid) return `.flags ${invalid}`;
+  }
+  if (d.history !== undefined) {
+    const invalid = positiveInt(d.history);
+    if (invalid) return `.history ${invalid}`;
+  }
+  return null;
+};
+
 const promote: Check = (v) => {
   const bad = obj(v);
   if (bad) return bad;
   const p = v as Record<string, unknown>;
   for (const key of ["from", "to"]) if (!isSafeRef(p[key])) return `.${key} must be a git branch name`;
+  return null;
+};
+
+// {sensitive_paths: ["auth", "payments", ...]} — path tokens whose changes stay
+// judgment-class no matter how clean the auto-review was. Each token matches as
+// a case-insensitive substring of any path segment, so "auth" also catches
+// `authTokens.ts`.
+const understandingChecks: Check = (v) => {
+  const bad = obj(v);
+  if (bad) return bad;
+  const u = v as Record<string, unknown>;
+  for (const key of Object.keys(u)) if (key !== "sensitive_paths") return `.${key} is not supported`;
+  if (u.sensitive_paths !== undefined) {
+    const invalid = strArray(u.sensitive_paths);
+    if (invalid) return `.sensitive_paths ${invalid}`;
+  }
+  return null;
+};
+
+const duration: Check = (v) =>
+  typeof v === "string" && /^\d+(?:s|m|h|d)$/.test(v) ? null : "must be a duration such as 30m, 12h, or 14d";
+
+const prGardener: Check = (v) => {
+  const bad = obj(v);
+  if (bad) return bad;
+  const checks: Record<string, Check> = {
+    enabled: bool,
+    cadence: duration,
+    land_when: oneOf("green_and_clean"),
+    close_stale_after: duration,
+    auto_close_superseded: bool,
+    sensitive_paths: strArray,
+    max_actions_per_sweep: positiveInt,
+    max_fix_attempts: positiveInt,
+    max_gardener_agents: positiveInt,
+  };
+  for (const [key, value] of Object.entries(v as Record<string, unknown>)) {
+    if (!Object.hasOwn(checks, key)) return `.${key} is not a known PR gardener key`;
+    const invalid = checks[key]!(value);
+    if (invalid) return `.${key} ${invalid}`;
+  }
+  return null;
+};
+
+// Which task kinds must post a plan checkpoint before their first edit, whether
+// that checkpoint blocks the agent until it is acked, and how long a blocked
+// plan may wait before hive acks it. See server/src/planCritic.ts.
+const plan_gate: Check = (v) => {
+  const bad = obj(v);
+  if (bad) return bad;
+  const g = v as Record<string, unknown>;
+  for (const key of Object.keys(g))
+    if (key !== "kinds" && key !== "block" && key !== "auto_ack_hours") return `.${key} is not supported`;
+  if (g.kinds !== undefined) {
+    const invalid = strArray(g.kinds);
+    if (invalid) return `.kinds ${invalid}`;
+  }
+  if (g.block !== undefined && typeof g.block !== "boolean") return ".block must be a boolean";
+  if (g.auto_ack_hours !== undefined && !(typeof g.auto_ack_hours === "number" && Number.isFinite(g.auto_ack_hours) && g.auto_ack_hours > 0))
+    return ".auto_ack_hours must be a positive number of hours";
   return null;
 };
 
@@ -128,9 +231,12 @@ const CHECKS: Record<string, Check> = {
   autonomy_profile: oneOf(...AUTONOMY_PROFILES),
   dispatch_kinds: strArray,
   max_agents: num,
+  failed_triage_requeue_hours: (v) =>
+    typeof v === "number" && Number.isFinite(v) && v >= 0 ? null : "must be a non-negative number",
   archived: bool,
   test: bool, // test/ephemeral project, hidden from director surfaces (testProjects.ts)
   plan_intake: bool,
+  plan_gate,
   intake_keywords: strArray,
   // subprocess argv overrides (see above)
   agent_argv: argv,
@@ -153,12 +259,17 @@ const CHECKS: Record<string, Check> = {
   playbook: str,
   command_approval: oneOf("escalate", "allow", "prompt"),
   dialog_auto_approve: strArray,
+  auto_answer_dialogs: bool,
   // git / merge
   default_branch: str,
   merge_method: str,
   promote,
   auto_merge: obj,
+  pr_gardener: prGardener,
   auto_review: bool,
+  render_proof: bool,
+  // Which changes still need a director understanding check (hive-1559).
+  understanding_checks: understandingChecks,
   release_review_agents: bool,
   scope_drift: bool,
   scope_drift_commits: num,
@@ -167,6 +278,7 @@ const CHECKS: Record<string, Check> = {
   monitors: urlList,
   monitors_auto_task: bool,
   smoke: urlList,
+  deployments,
   jira,
   gchat_spaces: gchatSpaces,
   // budgets / bookkeeping

@@ -28,6 +28,20 @@ test("defaultExec resolves a PATH-only binary name even with a stripped-down inh
   }
 });
 
+// task #1667: a project row whose repo_path had been deleted made Bun.spawn
+// THROW (posix_spawn reports a missing cwd as ENOENT against argv[0], reading
+// as "gh is missing"), which escaped linkPRs and errored every reconciler cycle
+// for ~10h. A child that can't start must come back as a normal non-zero result
+// so the caller's existing skip-and-retry branch handles it.
+test("defaultExec reports a child that cannot start as a non-zero result, never a throw (task #1667)", async () => {
+  const missingCwd = await defaultExec(["echo", "hi"], { cwd: "/no/such/dir" });
+  expect(missingCwd.code).toBe(127);
+  expect(missingCwd.stderr).toContain("/no/such/dir");
+
+  const missingBinary = await defaultExec(["hive-definitely-not-a-real-binary"]);
+  expect(missingBinary.code).toBe(127);
+});
+
 // A stalled subprocess (network hang, or a detached grandchild still holding
 // the stdio pipes open after the direct child exits) used to hang the caller
 // forever — observed live wedging POST /merge (task #621). This asserts the

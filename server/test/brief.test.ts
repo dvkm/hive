@@ -264,3 +264,15 @@ test("?project scopes the spend rollup to that project only", async () => {
   // The other project keeps its own two calls, so scoping is a filter, not a reset.
   expect(original.spend.totals.calls).toBe(2);
 });
+
+test("the brief counts dialogs hive answered itself in the last day, not older ones", async () => {
+  const taskId = (await post("/api/tasks", { project_id: projectId, title: "Dialog task" })).json.id;
+  const put = (ts: string) =>
+    db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+      .run(newId("ev"), taskId, ts, "supervisor", "dialog_auto_answered", JSON.stringify({ paths: ["/wt/x/review.json"] }));
+  put(now());
+  put(now());
+  put(new Date(Date.now() - 40 * 3600_000).toISOString()); // two days ago
+
+  expect((await get("/api/brief")).json.auto_answered_dialogs).toBe(2);
+});

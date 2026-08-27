@@ -263,8 +263,17 @@ test("startGchatPoll skips a tick while a cycle is already running", async () =>
   let maxActive = 0;
   let cycles = 0;
   const logs: string[] = [];
-  // The messages.list call is slow (60ms) and runs on every cycle (unlike the
-  // token fetch, which caches) — it's the reliable signal for overlap.
+  // Ticks are driven by hand (setInterval is stubbed) so the overlap is exact
+  // instead of racing wall-clock timers on a loaded CI box.
+  let tick: () => void = () => {};
+  let releaseList!: () => void;
+  let listStarted!: () => void;
+  let listFinished!: () => void;
+  const blocked = new Promise<void>((resolve) => (releaseList = resolve));
+  const started = new Promise<void>((resolve) => (listStarted = resolve));
+  const finished = new Promise<void>((resolve) => (listFinished = resolve));
+  // The messages.list call blocks until released and runs on every cycle
+  // (unlike the token fetch, which caches) — it's the reliable overlap signal.
   const slowFetch: FetchLike = (async (input: any) => {
     const u = String(input);
     if (u.includes("oauth2.googleapis.com/token"))
@@ -273,25 +282,45 @@ test("startGchatPoll skips a tick while a cycle is already running", async () =>
       cycles++;
       active++;
       maxActive = Math.max(maxActive, active);
-      await new Promise((r) => setTimeout(r, 60));
+      listStarted();
+      await blocked;
       active--;
+      listFinished();
       return new Response(JSON.stringify({ messages: [] }), { status: 200 });
     }
     return new Response("{}", { status: 200 });
   }) as unknown as FetchLike;
 
-  const stop = startGchatPoll(db, {
-    fetch: slowFetch,
-    secrets: SECRETS,
-    notify: false,
-    intervalMs: 15,
-    log: (m: string) => logs.push(m),
-  });
-  await new Promise((r) => setTimeout(r, 140)); // ~9 ticks at 15ms while each cycle takes 60ms
-  stop();
+  const origSetInterval = globalThis.setInterval;
+  const origClearInterval = globalThis.clearInterval;
+  globalThis.setInterval = ((callback: () => void) => {
+    tick = callback;
+    return 1;
+  }) as typeof setInterval;
+  globalThis.clearInterval = (() => {}) as typeof clearInterval;
+  let stop: () => void;
+  try {
+    stop = startGchatPoll(db, {
+      fetch: slowFetch,
+      secrets: SECRETS,
+      notify: false,
+      intervalMs: 15,
+      log: (m: string) => logs.push(m),
+    });
+    tick();
+    await started;
+    tick(); // second tick lands mid-cycle -> must be skipped, not queued
+    releaseList();
+    await finished;
+    await new Promise(setImmediate);
+    stop();
+  } finally {
+    globalThis.setInterval = origSetInterval;
+    globalThis.clearInterval = origClearInterval;
+  }
 
   expect(maxActive).toBe(1); // never two cycles in flight at once
-  expect(cycles).toBeLessThan(6); // most ticks were skipped, not queued
+  expect(cycles).toBe(1); // the overlapping tick was skipped, not queued
   expect(logs.some((m) => m.includes("skipped"))).toBe(true);
 });
 

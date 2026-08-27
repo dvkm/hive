@@ -208,3 +208,151 @@ test("extractReview parses whole JSON, envelope, and prose-wrapped output", () =
   expect(extractReview(`Sure! Here you go:\n${body}\nHope that helps.`)?.summary).toBe("fine");
   expect(extractReview("no json at all")).toBeNull();
 });
+
+// --- per-risk adversarial verification (task HIVE-406) ---------------------
+
+const { verifyRisks, extractVerdict, extractAnswer, ambiguityCleared, confirmedRisks } = await import("../src/reviewer.ts");
+
+// A pre-review that flags `n` risks, so autoReviewOnce triggers verification.
+const cautionWith = (risks: string[]) =>
+  JSON.stringify({ result: JSON.stringify({ verdict: "caution", summary: "risky", risks, questions: [] }) });
+
+test("caution risks each get a verification run, capped at 5", async () => {
+  const { db, id } = setup();
+  const argvs: string[][] = [];
+  const claude = async (argv: string[]) => {
+    argvs.push(argv);
+    return argv.includes("opus")
+      ? { code: 0, stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"guarded upstream","evidence_path":"x.ts:3"}' }), stderr: "" }
+      : { code: 0, stdout: cautionWith(["r1", "r2", "r3", "r4", "r5", "r6", "r7"]), stderr: "" };
+  };
+  await autoReviewOnce(db, { exec: claude, shellExec: ghDiff });
+
+  const opusRuns = argvs.filter((a) => a.includes("opus"));
+  expect(opusRuns).toHaveLength(5); // 7 risks in, 5 verified
+  expect(opusRuns[0].join(" ")).toContain("r1"); // the risk text reaches the prompt
+  expect(opusRuns[0].join(" ")).toContain("--output-format json");
+
+  const evs = events(db, id, "risk_verdicts");
+  expect(evs).toHaveLength(1);
+  expect(evs[0].payload.reviewed_head_sha).toBe("review-head");
+  expect(evs[0].payload.verdicts).toHaveLength(5);
+  expect(evs[0].payload.verdicts[0]).toEqual({ risk: "r1", verdict: "refuted", why: "guarded upstream", evidence_path: "x.ts:3" });
+});
+
+test("a clean looks_good review with no notes verifies nothing", async () => {
+  const { db, id } = setup();
+  const claude = async (argv: string[]) => {
+    if (argv.includes("opus")) throw new Error("should not verify");
+    return { code: 0, stdout: JSON.stringify({ result: '{"verdict":"looks_good","summary":"fine","risks":[],"questions":[]}' }), stderr: "" };
+  };
+  await autoReviewOnce(db, { exec: claude, shellExec: ghDiff });
+  expect(events(db, id, "risk_verdicts")).toHaveLength(0);
+});
+
+// HIVE-407: the pre-reviewer almost always writes at least one soft note, and
+// a looks_good-with-notes review used to veto its own auto-merge forever.
+test("a looks_good review with a soft risk or question is still verified", async () => {
+  const { db, id } = setup();
+  const claude = async (argv: string[]) =>
+    argv.includes("opus")
+      ? {
+          code: 0,
+          stdout: argv.join(" ").includes("q1")
+            ? JSON.stringify({ result: '{"answerable":"machine","answer":"yes, line 4 covers it"}' })
+            : JSON.stringify({ result: '{"verdict":"refuted","why":"guarded upstream"}' }),
+          stderr: "",
+        }
+      : { code: 0, stdout: JSON.stringify({ result: '{"verdict":"looks_good","summary":"fine","risks":["nit"],"questions":["q1"]}' }), stderr: "" };
+  await autoReviewOnce(db, { exec: claude, shellExec: ghDiff });
+  const p = events(db, id, "risk_verdicts")[0].payload;
+  expect(p.verdicts).toEqual([{ risk: "nit", verdict: "refuted", why: "guarded upstream" }]);
+  expect(p.question_verdicts).toEqual([{ question: "q1", answerable: "machine", answer: "yes, line 4 covers it" }]);
+});
+
+test("a question only the human can answer is recorded as human-only", async () => {
+  const { db, id } = setup();
+  const claude = async () => ({ code: 0, stdout: JSON.stringify({ result: '{"answerable":"human","answer":"check the installed app"}' }), stderr: "" });
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+  await verifyRisks(db, task, { questions: ["did you verify on the installed app?"], head: "head-a", diff: "d" }, { exec: claude });
+  expect(events(db, id, "risk_verdicts")[0].payload.question_verdicts[0].answerable).toBe("human");
+});
+
+test("a verdict set is not written when the head moved during verification", async () => {
+  const { db, id } = setup();
+  const claude = async () => ({ code: 0, stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"no"}' }), stderr: "" });
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+  let calls = 0;
+  await verifyRisks(
+    db,
+    task,
+    { risks: ["r1", "r2"], head: "head-a", diff: "d", stillCurrent: () => ++calls <= 1 },
+    { exec: claude }
+  );
+  expect(events(db, id, "risk_verdicts")).toHaveLength(0);
+});
+
+test("ambiguityCleared: all refuted and machine-answered clears; anything else does not", async () => {
+  const { db, id } = setup();
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+  const refuted = async () => ({ code: 0, stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"no"}' }), stderr: "" });
+
+  expect(ambiguityCleared(db, id, "head-a", { risks: [], questions: [] })).toBe(true); // nothing to clear
+  expect(ambiguityCleared(db, id, "head-a", { risks: ["r1"], questions: [] })).toBe(false); // never verified
+
+  await verifyRisks(db, task, { risks: ["r1"], head: "head-a", diff: "d" }, { exec: refuted });
+  expect(ambiguityCleared(db, id, "head-a", { risks: ["r1"], questions: [] })).toBe(true);
+  expect(ambiguityCleared(db, id, "head-b", { risks: ["r1"], questions: [] })).toBe(false); // stale head ignored
+  expect(ambiguityCleared(db, id, "head-a", { risks: ["r1", "r2"], questions: [] })).toBe(false); // uncovered risk
+
+  const confirmedExec = async () => ({ code: 0, stdout: JSON.stringify({ result: '{"verdict":"confirmed","why":"real"}' }), stderr: "" });
+  await verifyRisks(db, task, { risks: ["r1"], head: "head-c", diff: "d" }, { exec: confirmedExec });
+  expect(ambiguityCleared(db, id, "head-c", { risks: ["r1"], questions: [] })).toBe(false);
+  expect(confirmedRisks(db, id, "head-c").map((c: any) => c.risk)).toEqual(["r1"]);
+  expect(confirmedRisks(db, id, "head-a")).toEqual([]);
+});
+
+test("extractAnswer parses envelope and prose, and rejects anything else", () => {
+  const body = '{"answerable":"machine","answer":"line 4"}';
+  expect(extractAnswer(JSON.stringify({ result: body }))?.answerable).toBe("machine");
+  expect(extractAnswer(`Here: ${body} done`)?.answer).toBe("line 4");
+  expect(extractAnswer('{"answerable":"maybe","answer":"hm"}')).toBeNull();
+  expect(extractAnswer("no json")).toBeNull();
+});
+
+test("verification is keyed to the reviewed head: same head skips, new head re-runs", async () => {
+  const { db, id } = setup();
+  let calls = 0;
+  const claude = async () => {
+    calls++;
+    return { code: 0, stdout: JSON.stringify({ result: '{"verdict":"confirmed","why":"real"}' }), stderr: "" };
+  };
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+
+  await verifyRisks(db, task, { risks: ["r1"], head: "head-a", diff: "diff" }, { exec: claude });
+  await verifyRisks(db, task, { risks: ["r1"], head: "head-a", diff: "diff" }, { exec: claude }); // same head — no second run
+  expect(calls).toBe(1);
+  expect(events(db, id, "risk_verdicts")).toHaveLength(1);
+
+  await verifyRisks(db, task, { risks: ["r1"], head: "head-b", diff: "diff" }, { exec: claude }); // new head — runs again
+  expect(calls).toBe(2);
+  expect(events(db, id, "risk_verdicts").map((e: any) => e.payload.reviewed_head_sha).sort()).toEqual(["head-a", "head-b"]);
+});
+
+test("a failed verification run is counted, never reported as an all-clear", async () => {
+  const { db, id } = setup();
+  const claude = async () => ({ code: 1, stdout: "", stderr: "boom" });
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+  await verifyRisks(db, task, { risks: ["r1", "r2"], head: "head-a", diff: "diff" }, { exec: claude });
+  const p = events(db, id, "risk_verdicts")[0].payload;
+  expect(p.verdicts).toEqual([]);
+  expect(p.unverified).toBe(2);
+});
+
+test("extractVerdict parses envelope and prose, and rejects anything else", () => {
+  const body = '{"verdict":"confirmed","why":"y is unused"}';
+  expect(extractVerdict(JSON.stringify({ result: body }))?.verdict).toBe("confirmed");
+  expect(extractVerdict(`Here: ${body} done`)?.why).toBe("y is unused");
+  expect(extractVerdict('{"verdict":"maybe","why":"hm"}')).toBeNull();
+  expect(extractVerdict("no json")).toBeNull();
+});
