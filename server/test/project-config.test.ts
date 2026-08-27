@@ -167,14 +167,14 @@ for (const [label, config, mentions] of BAD) {
 // must survive that round-trip.
 test("stored-but-unread keys still round-trip", async () => {
   const p = await post("/api/projects", {
-    name: "altcfg-like",
+    name: "alt-config-like",
     repo_path: "/repo",
-    config: { auto_dispatch: true, env: { CLAUDE_CONFIG_DIR: "/Users/x/.claude-altcfg" }, default_branch: "staging", open_prs: false },
+    config: { auto_dispatch: true, env: { CLAUDE_CONFIG_DIR: "/Users/x/.claude-alt" }, default_branch: "staging", open_prs: false },
   });
   expect(p.status).toBe(201);
   const r = await put(`/api/projects/${p.json.id}`, { config: { ...p.json.config, auto_dispatch: false } });
   expect(r.status).toBe(200);
-  expect(r.json.config.env).toEqual({ CLAUDE_CONFIG_DIR: "/Users/x/.claude-altcfg" });
+  expect(r.json.config.env).toEqual({ CLAUDE_CONFIG_DIR: "/Users/x/.claude-alt" });
   expect(r.json.config.open_prs).toBe(false);
 });
 
@@ -240,7 +240,7 @@ test("deployments config accepts a real block and rejects argument-shaped values
   const ok = await put(`/api/projects/${projectId}`, {
     config: {
       deployments: {
-        health_url: "https://acme.co.kr/",
+        health_url: "https://example.com/",
         tag_prefix: "prod-",
         workflow_ref: "main",
         flags: ["insights-page-redesign"],

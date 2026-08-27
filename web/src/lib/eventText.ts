@@ -63,7 +63,7 @@ export function eventText(e: EventLike): string {
         : `auto-resumed (#${s(p.resumes)}) — it had said: “${quote}”`;
     }
     case "steer": {
-      // The delivery receipt: David must never wonder whether a steer landed.
+      // The delivery receipt: the director must never wonder whether a steer landed.
       // Pre-receipt events (no `delivery`) stay bare rather than claim delivery.
       const badges: Record<string, string> = { delivered: "✓ ", queued: "⏳ queued — ", failed: "⚠ undelivered — " };
       const badge = badges[s(p.delivery)] ?? "";

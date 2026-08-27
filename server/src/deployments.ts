@@ -1,7 +1,7 @@
 // Production releases for a project: what is live, what is on the branch, and
 // the two buttons that change it.
 //
-// The model is acme's one-branch deploy (docs/branch-structure-proposal.md
+// The model is a consuming project's one-branch deploy (docs/branch-structure-proposal.md
 // in that repo): merging into the default branch deploys staging, and
 // production is a workflow the director runs by hand. That workflow stamps an
 // immutable tag `prod-YYYY-MM-DD-<short sha>`, so the newest such tag IS what is

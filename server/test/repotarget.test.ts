@@ -63,7 +63,7 @@ test("extractPaths: only repo-relative paths with a source extension", () => {
   // no slash, no extension, bare directory → not a path
   expect(extractPaths("update jira.ts and the server/src dir and the intake module")).toEqual([]);
   // absolute / home paths are not repo-relative
-  expect(extractPaths("open /Users/you/projects/hive/server/src/api.ts or ~/projects/hive/README.md")).toEqual([]);
+  expect(extractPaths("open /Users/ada/projects/hive/server/src/api.ts or ~/projects/hive/README.md")).toEqual([]);
   // never resolve outside the repo
   expect(extractPaths("../other/thing.ts")).toEqual([]);
   expect(extractPaths(null)).toEqual([]);

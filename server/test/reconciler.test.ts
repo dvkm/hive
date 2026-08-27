@@ -99,8 +99,8 @@ test("ciStatusOf keeps different checks and heads independently blocking", () =>
 // Actions billing, no runner). No commit can fix that, so hive must call it
 // "unavailable" and let the handoff through instead of steering the agent to
 // go fix it (task #1210).
-const JOB_URL = "https://github.com/example-org/hive/actions/runs/32422454730/job/96597180562";
-const RED_URL = "https://github.com/example-org/hive/actions/runs/32422454730/job/11111111111";
+const JOB_URL = "https://github.com/example-org/example-repo/actions/runs/32422454730/job/96597180562";
+const RED_URL = "https://github.com/example-org/example-repo/actions/runs/32422454730/job/11111111111";
 // Verbatim from the live billing-blocked run on PR #121.
 const BILLING_ANNOTATION = JSON.stringify([
   {

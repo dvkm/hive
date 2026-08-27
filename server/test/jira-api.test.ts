@@ -117,10 +117,10 @@ test("a linked ticket exposes the browse URL and effective write scope", async (
   expect(r.json.write_scope).toEqual({ ...J.JIRA_WRITE_SCOPE, create_subtask: true });
 });
 
-test("a config pointing somewhere not allow-listed reports unconfigured, and never echoes that host", async () => {
+test("a malformed config reports unconfigured, and never echoes that host", async () => {
   // The credential gate refused it, so the board must not imply the site it
   // names is in use — that would make an attacker-supplied host look adopted.
-  const { jiraTask } = seed({ ...CFG, site: "https://evil.atlassian.net" });
+  const { jiraTask } = seed({ ...CFG, site: "https://example.atlassian.net@evil.atlassian.net" });
   const r = await get(`/api/tasks/${jiraTask}/jira`);
   expect(r.json.configured).toBe(false);
   expect(r.json.browse_url).toBeNull();
@@ -131,7 +131,7 @@ test("the project payload carries the canonicalized Jira site, never the configu
   // The board card builds its browse chip from the project payload, so this
   // field has to survive the same credential gate the per-task browse_url does.
   const allowed = seed(CFG);
-  const evil = seed({ ...CFG, site: "https://evil.atlassian.net" });
+  const evil = seed({ ...CFG, site: "https://example.atlassian.net@evil.atlassian.net" });
 
   const one = await get(`/api/projects/${allowed.projectId}`);
   expect(one.json.jira_site).toBe("https://example.atlassian.net");

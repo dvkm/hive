@@ -189,7 +189,7 @@ test("config.release_review_agents=false opts a project out of the sweep", async
 });
 
 test("releasing frees the slot so a queued task finally dispatches", async () => {
-  // The 2026-08-19 acme shape in miniature: room under the working cap, but
+  // The 2026-08-19 consuming-project shape in miniature: room under the working cap, but
   // idle review agents push live agents past max_agents * REVIEW_OVERHANG, so
   // the queue freezes. max_agents 2, one worker + three review-parked = 4 live.
   const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 2 });

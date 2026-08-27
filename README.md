@@ -7,12 +7,26 @@ This repo contains **Phase 1** (server core + CLI) and **Phase 2b** (the runtime
 ## Requirements
 
 - [Bun](https://bun.sh) (tested on 1.3.x and 1.4.x).
-- [Git](https://git-scm.com/) and [Herdr](https://herdr.dev/). GitHub CLI (`gh`)
-  is optional but required for pull-request review and merge automation.
-- Claude Code or Codex for the worker selected by a project's `config.agent`.
+- [Git](https://git-scm.com/) and [Herdr](https://herdr.dev/) — **Herdr is a
+  hard prerequisite for running agents.** Without it installed and running,
+  hive's server and web UI still work and you can browse the board, but no
+  agents will spawn. GitHub CLI (`gh`) is optional but required for
+  pull-request review and merge automation.
+- The [Claude Code](https://claude.com/product/claude-code) or
+  [Codex](https://developer.openai.com/codex/cli/) CLI — these are the agent
+  binaries workers run through Herdr, selected per project by
+  `config.agent`.
 - On Windows, install Git for Windows. Hive automatically supplies its
   `bash.exe` location to native Claude Code through
   `CLAUDE_CODE_GIT_BASH_PATH`.
+
+## Install
+
+```bash
+bun install                    # root: server + CLI deps
+(cd web && bun install)        # web app deps
+(cd electron && bun install)   # desktop app deps
+```
 
 ## Run
 
@@ -27,6 +41,16 @@ Native Windows PowerShell/cmd:
 ```powershell
 bun run server/src/index.ts
 bin\hive.cmd serve
+```
+
+### Web app
+
+The server serves `web/dist` statically once built. For development:
+
+```bash
+cd web
+bun run dev      # Vite dev server with hot reload
+bun run build    # production build to web/dist
 ```
 
 For deployments, `scripts\sync-main.ps1` is the native Windows counterpart to
@@ -155,8 +179,7 @@ server/test/ bun test suite
   the herdr daemon is unreachable so a dead socket isn't pounded once per queued
   task). Shares the spawn core with the
   manual `POST /api/tasks/:id/spawn`. The herdr adapter is verified against a
-  live herdr server — see `docs/runtime.md` and
-  `docs/evidence/herdr-live-verification.txt`.
+  live herdr server — see `docs/runtime.md`.
   On Windows, Hive discovers the standard per-user Herdr install under
   `%LOCALAPPDATA%\Programs\Herdr\bin`, augments child `PATH` without corrupting
   drive letters, and treats PowerShell/cmd panes as shells rather than agents.
@@ -236,12 +259,13 @@ server/test/ bun test suite
             "jql": "labels = sync" }   // optional, ANDed with project = <key>
   ```
 
-  `site`, `email` and `project_key` must match a compiled-in allowlist
-  (`credentialTargetAllowed` in `server/src/intake/jira.ts`) or the connector
-  is a silent no-op; config alone can't repoint it elsewhere, since
-  `projects.config` is writable over hive's unauthenticated loopback API and a
-  config-supplied site would otherwise be able to send `JIRA_API_TOKEN`
-  anywhere. Changing the allowed target is a code change, not a config edit.
+  `site`, `email` and `project_key` are per-project and must be well-formed
+  (`credentialTargetValid` in `server/src/intake/jira.ts`): an `https` site with
+  no userinfo and a real hostname, a syntactically valid email, an uppercase
+  project key. Anything else is a silent no-op. The site that reaches `fetch()`
+  is rebuilt from the parsed URL, so no path, query or trailing slash from the
+  config survives into a request. The API token is never in the config — it is
+  the keychain secret `JIRA_API_TOKEN`, resolved by name at spawn.
 
   Auth is HTTP Basic (`email:api_token`) — a personal API token sent as `Bearer`
   is rejected as an unparseable Connect JWT. The token is the project secret
@@ -268,7 +292,7 @@ server/test/ bun test suite
 
 - **On-demand planners** (`server/src/planner.ts`, migration v7). A per-project
   planner triages a task and proposes a breakdown. hive rejects long-running LLM
-  supervisor sessions (priortool's failure mode): "persistent" means the ROLE +
+  supervisor sessions (a prior orchestration tool's failure mode): "persistent" means the ROLE +
   CONTEXT live in the DB (project config `supervisor_persona`, `playbook`,
   `plan_intake`, `planner_argv`), while the LLM runs as a short-lived subprocess
   `claude -p <prompt> --output-format json` (timeout-capped by
@@ -368,12 +392,13 @@ server/test/ bun test suite
   structural rather than a marker every code path must remember to check. The
   agreement test compares JIRA-STATUS space, not hive-state space, because the
   mapping is 2:1 (`in_review` and `verifying` both show as "In Review").
-- **Credential gate.** `config` is writable through the loopback API, so the site
-  and email are pinned to compiled-in constants (`credentialTargetAllowed`),
-  matched EXACTLY — https only, no userinfo, no suffix match, since Atlassian
-  Cloud sites are self-serve and `*.atlassian.net` would be free for an attacker
-  to register. The gate runs before secret resolution and before any auth header
-  exists; a mismatch yields `null` (hard no-op). Adding a site is a PR.
+- **Credential gate.** `config` is writable through the loopback API, so the
+  target's SHAPE is validated before anything else (`credentialTargetValid`):
+  https only, no userinfo, a real hostname, a valid email, an uppercase project
+  key, and the site rebuilt from parsed components so no remnant of the config
+  string reaches `fetch()` or the auth header. The gate runs before secret
+  resolution and before any auth header exists; a malformed target yields `null`
+  (hard no-op).
 - **Eventual consistency.** Jira's enhanced search is treated as DISCOVERY-ONLY:
   it returns candidate keys, and every per-issue action derives from one fresh,
   strongly-consistent read (status and its timestamp taken from the same

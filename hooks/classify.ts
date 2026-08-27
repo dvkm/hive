@@ -142,7 +142,7 @@ function segments(command: string): string[] {
 // Destructive ops provably confined to the agent's OWN sandbox (its scratchpad
 // under /tmp, macOS temp dirs, herdr worktrees) are routine cleanup, not
 // incidents — every one used to open a decision card and stall the agent until
-// David answered (4 cards on 2026-07-10 alone, all scratchpad rm / headless-
+// the director answered (4 cards on 2026-07-10 alone, all scratchpad rm / headless-
 // chrome pkill). A waived match downgrades to "unknown", which the authority
 // engine allows-and-logs — never silently, never "safe".
 

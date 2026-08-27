@@ -184,7 +184,7 @@ test("re-adoption never binds a steer to the tab's shell pane", async () => {
 // A herdr that reports the agent as really gone, with no pane left at its cwd.
 function reallyDead() {
   const exec: Exec = async (argv) => {
-    if (has(argv, "pane", "list")) return OK('{"result":{"panes":[{"pane_id":"w6:p1","tab_id":"w6:t1","workspace_id":"w6","cwd":"/Users/you"}]}}');
+    if (has(argv, "pane", "list")) return OK('{"result":{"panes":[{"pane_id":"w6:p1","tab_id":"w6:t1","workspace_id":"w6","cwd":"/Users/ada"}]}}');
     if (has(argv, "agent", "get")) return NOT_FOUND;
     if (has(argv, "agent", "read")) return OK("... pane tail ...");
     return OK();

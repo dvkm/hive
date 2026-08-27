@@ -20,7 +20,7 @@ export const NON_TERMINAL = ["queued", "in_progress", "needs_decision", "in_revi
 
 // Near-duplicate threshold: fuzzy matches at/above this open a decision card.
 // STRONG marks "so close we recommend merging" (drives the recommended option).
-// 0.6 is deliberately conservative — David said "only bother me when truly
+// 0.6 is deliberately conservative — the director said "only bother me when truly
 // needed", so we tolerate misses over false-positive cards. Filler words shared
 // across unrelated titles ("task", "fix", "add") cap most false pairs at 0.5.
 // ponytail: no stopword list; raise NEAR_THRESHOLD or add one if cards get noisy.

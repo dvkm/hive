@@ -1,6 +1,6 @@
 // Steer delivery receipts + queued redelivery.
 //
-// A steer to a task with no live agent used to vanish silently, so David
+// A steer to a task with no live agent used to vanish silently, so the director
 // re-sent the same message up to 3× (2026-07-09/10). Every steer now carries a
 // delivery status on its own `steer` event payload:
 //

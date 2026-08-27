@@ -104,22 +104,22 @@ test("parseWorktreeJson probes several key shapes", () => {
 });
 
 test("workspace/tab parse helpers unwrap the herdr envelopes", () => {
-  const list = '{"result":{"workspaces":[{"workspace_id":"w6","label":"priortool"},{"workspace_id":"wF","label":"hive-fleet"}]}}';
+  const list = '{"result":{"workspaces":[{"workspace_id":"w6","label":"sidecar"},{"workspace_id":"wF","label":"hive-fleet"}]}}';
   expect(parseWorkspaceIdByLabel(list, "hive-fleet")).toBe("wF");
   expect(parseWorkspaceIdByLabel(list, "nope")).toBeNull();
   expect(parseCreatedWorkspaceId('{"result":{"workspace":{"workspace_id":"wG"}}}')).toBe("wG");
   expect(parseTabId('{"result":{"tab":{"tab_id":"wF:t2"}}}')).toBe("wF:t2");
 });
 
-test("agentListArgv + parseAgentList: only named (hive-spawned) agents survive, David's own session is filtered out", () => {
+test("agentListArgv + parseAgentList: only named (hive-spawned) agents survive, the director's own session is filtered out", () => {
   expect(agentListArgv()).toEqual(["agent", "list"]);
-  // Real shape from docs/evidence/herdr-live-verification.txt: David's own
+  // Real shape from a live herdr verification run: the director's own
   // interactive session has no `name`; a hive-spawned worker does (= task id).
   const stdout = JSON.stringify({
     id: "cli:agent:list",
     result: {
       agents: [
-        { agent: "claude", cwd: "/Users/you/projects/priortool", pane_id: "w6:p1", tab_id: "w6:t1", agent_status: "working" },
+        { agent: "claude", cwd: "/Users/ada/projects/sidecar", pane_id: "w6:p1", tab_id: "w6:t1", agent_status: "working" },
         { name: "vfeabd2a", cwd: "/wt/hive-vfeabd2a", pane_id: "w6:p2C", tab_id: "w6:t1", agent_status: "unknown" },
       ],
       type: "agent_list",

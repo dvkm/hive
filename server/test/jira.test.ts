@@ -324,48 +324,47 @@ const syncEvents = (db: DB) =>
 // ============================================================================
 // CREDENTIAL GATE  (the security-critical path)
 // ============================================================================
-test("credential gate: only the exact compiled-in https host + email is allowed", () => {
-  expect(J.credentialTargetAllowed(SITE, EMAIL)).toBe(true);
+test("credential gate: only a well-formed https site + email passes", () => {
+  expect(J.credentialTargetValid(SITE, EMAIL)).toBe(true);
+  // any Jira Cloud/Data Center host is legitimate now — the target is per-project
+  expect(J.credentialTargetValid("https://other.atlassian.net", EMAIL)).toBe(true);
+  expect(J.credentialTargetValid("https://jira.example.co.uk", EMAIL)).toBe(true);
 
   // http is rejected outright — Basic auth over http is base64, not encryption.
-  expect(J.credentialTargetAllowed("http://example.atlassian.net", EMAIL)).toBe(false);
-
-  // A SUFFIX check would pass these. Atlassian Cloud sites are self-serve, so an
-  // attacker registers `evil.atlassian.net` for free; that is exactly why the
-  // check is an exact host match and not `*.atlassian.net`.
-  expect(J.credentialTargetAllowed("https://evil.atlassian.net", EMAIL)).toBe(false);
-  expect(J.credentialTargetAllowed("https://example.atlassian.net.evil.com", EMAIL)).toBe(false);
-  expect(J.credentialTargetAllowed("https://notexample.atlassian.net", EMAIL)).toBe(false);
+  expect(J.credentialTargetValid("http://example.atlassian.net", EMAIL)).toBe(false);
 
   // userinfo trick: parses to host evil.tld, reads as the real site to a human.
-  expect(J.credentialTargetAllowed("https://example.atlassian.net@evil.tld/", EMAIL)).toBe(false);
+  expect(J.credentialTargetValid("https://example.atlassian.net@evil.tld/", EMAIL)).toBe(false);
   // new URL() reports username="" for a bare delimiter, so a falsy-userinfo
-  // check alone lets these through. Not an exfil path (the host still resolves
-  // correctly) but the parse must not be laxer than it reads.
-  expect(J.credentialTargetAllowed("https://@example.atlassian.net", EMAIL)).toBe(false);
-  expect(J.credentialTargetAllowed("https://:@example.atlassian.net", EMAIL)).toBe(false);
-  // a different port is a different endpoint
-  expect(J.credentialTargetAllowed("https://example.atlassian.net:8443", EMAIL)).toBe(false);
+  // check alone lets these through; the parse must not be laxer than it reads.
+  expect(J.credentialTargetValid("https://@example.atlassian.net", EMAIL)).toBe(false);
+  expect(J.credentialTargetValid("https://:@example.atlassian.net", EMAIL)).toBe(false);
+  // not a hostname
+  expect(J.credentialTargetValid("https://localhost", EMAIL)).toBe(false);
   // garbage / empty
-  expect(J.credentialTargetAllowed("not a url", EMAIL)).toBe(false);
-  expect(J.credentialTargetAllowed("", EMAIL)).toBe(false);
-  expect(J.credentialTargetAllowed(null, EMAIL)).toBe(false);
+  expect(J.credentialTargetValid("not a url", EMAIL)).toBe(false);
+  expect(J.credentialTargetValid("", EMAIL)).toBe(false);
+  expect(J.credentialTargetValid(null, EMAIL)).toBe(false);
 
   // the gate covers the WHOLE credential pair, not just the host
-  expect(J.credentialTargetAllowed(SITE, "attacker@evil.tld")).toBe(false);
-  expect(J.credentialTargetAllowed(SITE, "")).toBe(false);
-  expect(J.credentialTargetAllowed(SITE, null)).toBe(false);
+  expect(J.credentialTargetValid(SITE, "not-an-email")).toBe(false);
+  expect(J.credentialTargetValid(SITE, "")).toBe(false);
+  expect(J.credentialTargetValid(SITE, null)).toBe(false);
+
+  // canonicalSite rebuilds the string that reaches fetch(), dropping path/query
+  expect(J.canonicalSite(SITE + "/wiki?x=1")).toBe(SITE);
 });
 
-test("credential gate: a mutated config is a hard no-op, and jiraConfig canonicalizes", () => {
+test("credential gate: a malformed config is a hard no-op, and jiraConfig canonicalizes", () => {
   // jiraConfig returns null (not a throw a catch could swallow into 'carry on')
-  expect(J.jiraConfig({ jira: { ...CFG, site: "https://evil.atlassian.net" } })).toBeNull();
   expect(J.jiraConfig({ jira: { ...CFG, site: "http://example.atlassian.net" } })).toBeNull();
-  expect(J.jiraConfig({ jira: { ...CFG, email: "attacker@evil.tld" } })).toBeNull();
-  expect(J.jiraConfig({ jira: { ...CFG, project_key: "OTHER" } })).toBeNull();
+  expect(J.jiraConfig({ jira: { ...CFG, site: "https://example.atlassian.net@evil.tld" } })).toBeNull();
+  expect(J.jiraConfig({ jira: { ...CFG, email: "not-an-email" } })).toBeNull();
+  expect(J.jiraConfig({ jira: { ...CFG, project_key: "web" } })).toBeNull();
+  expect(J.jiraConfig({ jira: { ...CFG, project_key: "" } })).toBeNull();
   expect(J.jiraConfig({ jira: { ...CFG, jql: "labels = sync) OR project = OPS OR (project = WEB" } })).toBeNull();
 
-  // and a passing config carries hive's OWN constants forward, not the caller's
+  // a passing config carries the CANONICALIZED site forward, not the caller's
   // string, so no unvalidated remnant can reach fetch().
   const ok = J.jiraConfig({ jira: { ...CFG, site: SITE + "/" } });
   expect(ok!.site).toBe(SITE);
@@ -373,9 +372,9 @@ test("credential gate: a mutated config is a hard no-op, and jiraConfig canonica
   expect(ok!.project_key).toBe("WEB");
 
   // the client refuses a hand-built config that bypassed jiraConfig()
-  expect(() => new J.JiraClient({ ...CFG, site: "https://evil.tld" } as any, "tok")).toThrow(/allowlisted/);
-  expect(() => new J.JiraClient({ ...CFG, project_key: "OTHER" } as any, "tok")).toThrow(/allowlisted/);
-  expect(() => new J.JiraClient({ ...CFG, jql: "labels = sync) OR project = OPS OR (project = WEB" } as any, "tok")).toThrow(/allowlisted/);
+  expect(() => new J.JiraClient({ ...CFG, site: "http://evil.tld" } as any, "tok")).toThrow(/malformed/);
+  expect(() => new J.JiraClient({ ...CFG, project_key: "lower" } as any, "tok")).toThrow(/malformed/);
+  expect(() => new J.JiraClient({ ...CFG, jql: "labels = sync) OR project = OPS OR (project = WEB" } as any, "tok")).toThrow(/malformed/);
 });
 
 test("SECURITY: escaping JQL disables sync before an outside project can be observed", async () => {
@@ -420,7 +419,7 @@ test("SECURITY: a mutated target NEVER produces a request, even on the read path
   // This is the actual guarantee, so this asserts the OUTPUT (no network call at
   // all) rather than merely that the validator exists. write:false is included
   // deliberately because shadow mode still exercises the read path.
-  for (const target of [{ site: "https://evil.atlassian.net" }, { project_key: "OTHER" }]) {
+  for (const target of [{ site: "http://example.atlassian.net" }, { project_key: "lower" }]) {
     for (const write of [true, false]) {
       const { db } = freshDb({ ...CFG, write, ...target });
       let called = 0;
@@ -3057,18 +3056,18 @@ test("a failing cycle records a PERSISTENT error a director can see, and counts 
   expect(r3.state.consecutive_failures).toBe(0);
 });
 
-test("a disabled or non-allowlisted project reports WHY rather than failing silently", async () => {
+test("a disabled or malformed project reports WHY rather than failing silently", async () => {
   const off = freshDb({ ...CFG, enabled: false });
   const r1 = await J.runProjectCycle(off.db, off.projectId, { token: "tok" });
   expect(r1.ok).toBe(false);
   expect(r1.state.last_error).toContain("disabled");
 
-  const bad = freshDb({ ...CFG, site: "https://evil.atlassian.net" });
+  const bad = freshDb({ ...CFG, site: "http://example.atlassian.net" });
   let called = 0;
   const spy = (async () => { called++; return new Response("{}"); }) as unknown as typeof fetch;
   const r2 = await J.runProjectCycle(bad.db, bad.projectId, { fetch: spy, token: "tok" });
   expect(r2.ok).toBe(false);
-  expect(r2.state.last_error).toMatch(/allow-listed|config missing/);
+  expect(r2.state.last_error).toMatch(/malformed|config missing/);
   expect(called).toBe(0); // still no request to the mutated host
 });
 

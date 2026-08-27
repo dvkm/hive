@@ -47,7 +47,7 @@ export async function findEmbeddedTasks(
     // already contain are in-flight work one branch carries for the other —
     // the thing a later rewrite over there would silently strand here.
     // Without this test the flag fires on every branch ever cut near base
-    // (task #1134: 103 of acme's tasks, ~80 of them dead).
+    // (task #1134: 103 of a consuming project's tasks, ~80 of them dead).
     if (await isAncestor(exec, repoPath, pairMerge, base)) continue;
     embedded.push({ id: o.id, number: o.number, title: o.title });
   }

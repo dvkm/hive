@@ -23,7 +23,7 @@ const gh: Exec = async () => ({ code: 1, stdout: "", stderr: "no gh" }); // PR s
 // own pane really is gone from herdr. `panes(cwd)` puts a pane back at that cwd,
 // which is what a live-but-unregistered agent looks like (herdr's agent registry
 // is wiped by a desktop-app restart while the panes keep running).
-const NO_TASK_PANE = OK('{"result":{"panes":[{"pane_id":"w6:p1","tab_id":"w6:t1","workspace_id":"w6","cwd":"/Users/you"}]}}');
+const NO_TASK_PANE = OK('{"result":{"panes":[{"pane_id":"w6:p1","tab_id":"w6:t1","workspace_id":"w6","cwd":"/Users/ada"}]}}');
 const panes = (cwd: string) =>
   OK(`{"result":{"panes":[{"pane_id":"w6:p9","tab_id":"w6:t9","workspace_id":"w6","cwd":"${cwd}"}]}}`);
 const isPaneList = (argv: string[]) => argv.includes("pane") && argv.includes("list");

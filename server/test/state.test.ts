@@ -323,7 +323,7 @@ test("defer/undefer parks a task in_progress and toggles isDeferred", () => {
   transition(db, id, "in_progress");
 
   // indefinite defer (no until) sets a far-future sentinel -> isDeferred true, still in_progress
-  deferTask(db, id, "9999-12-31T00:00:00.000Z", { source: "agent", note: "waiting on David's sudo" });
+  deferTask(db, id, "9999-12-31T00:00:00.000Z", { source: "agent", note: "waiting on the director's sudo" });
   expect(getTask(db, id).state).toBe("in_progress");
   expect(isDeferred(getTask(db, id))).toBe(true);
   expect(db.query("SELECT COUNT(*) n FROM events WHERE task_id = ? AND type = 'deferred'").get(id) as any).toEqual({ n: 1 });

@@ -291,7 +291,7 @@ test("an unmet dependency from branch-check disables Approve & merge", async () 
 });
 
 // task #1134: the flag used to spell out every task's title inline — 80+ of
-// them on one acme card, with the actual risk buried at the very end. It
+// them on one consuming-project card, with the actual risk buried at the very end. It
 // must stay one glanceable sentence no matter how many tasks are involved.
 test("many stacked branches collapse to one sentence, not a title dump", async () => {
   const originalTask = api.task;

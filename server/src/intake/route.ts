@@ -3,15 +3,15 @@
 // A braindump arrives with a project_id from the caller (the web picker defaults
 // to whatever project is in view — often the wrong one). Before filing, we score
 // the raw text against every registered project's identifying signals and
-// re-route to a better match when one clearly wins. This is what stops a
-// acme braindump (a Figma link, "CoreData", "acme") from landing in the
+// re-route to a better match when one clearly wins. This is what stops an
+// acme braindump (a Figma link, "AcmeData", "acme") from landing in the
 // hive repo where the spawned agent can only read, not act.
 //
 // Signals per project (all case-insensitive):
 //   - the project NAME (word-boundary match, e.g. \bacme\b)
 //   - the repo_path basename (word-boundary)
 //   - config.intake_keywords: string[] — director-registered domains / links /
-//     keywords the braindump might mention (e.g. "coredata", "figma.com/file/…",
+//     keywords the braindump might mention (e.g. "acmedata", "figma.com/file/…",
 //     "acme.io"), matched as plain substrings so URLs and dotted hosts work.
 //
 // ponytail: pure keyword scoring, no LLM. Re-routes ONLY when another project

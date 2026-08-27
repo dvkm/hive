@@ -159,7 +159,7 @@ export async function sweepOrphanedAgents(db: DB, deps: ReaperDeps = {}): Promis
 
 // A pane's cwd basename is the worktree dir `hive-<taskId>` (branch
 // hive/<taskId>), the same shape across every project repo. This maps a pane
-// back to its task without a fragile per-repo label scheme; David's own shells
+// back to its task without a fragile per-repo label scheme; the director's own shells
 // and non-hive checkouts have a different cwd and never match, so the sweep
 // never touches them. Task ids are 12 lowercase-hex (db.newId); `{6,}` tolerates
 // any future length while still excluding plain names like `hive-fleet`.

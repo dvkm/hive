@@ -12,7 +12,7 @@ function freshDb(): { db: DB; projectId: string } {
 }
 
 test("signature normalizes ids, paths, and numbers into a stable key", () => {
-  const a = signature('agent start failed: No viable candidates found in PATH "/Users/you/projects/hive-live/bin"');
+  const a = signature('agent start failed: No viable candidates found in PATH "/Users/ada/projects/hive-live/bin"');
   const b = signature('agent start failed: No viable candidates found in PATH "/opt/other/place/bin"');
   expect(a).toBe(b);
   expect(signature("worktree create failed for task a1b2c3d4e5f6 attempt 3")).toBe(

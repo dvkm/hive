@@ -4,7 +4,7 @@
 // new pipeline and the stale-recovery loop, printing each step so the run can be
 // captured as committed evidence. Not part of the test suite (needs live herdr).
 //
-//   bun run scripts/herdr-rework-verify.ts 2>&1 | tee docs/evidence/herdr-rework-verification.txt
+//   bun run scripts/herdr-rework-verify.ts
 import { mkdtempSync } from "node:fs";
 import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";

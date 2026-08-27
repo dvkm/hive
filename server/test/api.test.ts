@@ -1150,11 +1150,11 @@ test("a repo_path inside a worktree/scratchpad auto-flags the project test; a no
 
   const worktreePath = await post("/api/projects", {
     name: "auto-flagged-2",
-    repo_path: "/Users/you/.herdr/worktrees/hive/hive-abc123",
+    repo_path: "/Users/ada/.herdr/worktrees/hive/hive-abc123",
   });
   expect(worktreePath.json.config.test).toBe(true);
 
-  const normal = await post("/api/projects", { name: "normal", repo_path: "/Users/you/projects/hive" });
+  const normal = await post("/api/projects", { name: "normal", repo_path: "/Users/ada/projects/hive" });
   expect(normal.json.config.test).toBeUndefined();
 
   // an explicit config.test always wins over the heuristic

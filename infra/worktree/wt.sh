@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Per-worktree bootstrap for hive task agents. Unlike Acme's stack, hive is a
+# Per-worktree bootstrap for hive task agents. Unlike the consuming project's stack, hive is a
 # bun server + SQLite with NO docker stack, so "up" just makes a fresh worktree
 # buildable/testable by installing its deps; "down" is a best-effort no-op —
 # removing the worktree IS the whole teardown, there are no per-worktree
@@ -12,7 +12,7 @@
 # The hook (runStackCmd, server/src/cleanup.ts) runs with cwd = the MAIN checkout
 # and passes the target worktree path as $2, so this script MUST cd into it. It is
 # best-effort with a hard 120s timeout upstream, idempotent, and never fails a
-# spawn or a teardown — mirroring Acme's infra/worktree/wt.sh arg contract.
+# spawn or a teardown — mirroring the consuming project's infra/worktree/wt.sh arg contract.
 #
 #   wt.sh up   [worktree]   install deps into the worktree (idempotent, ~no-op if present)
 #   wt.sh down [worktree]   no-op today; the home for teardown if hive ever grows a stack

@@ -26,7 +26,7 @@ function makeTask(db: DB, projectId: string, extra: Record<string, any> = {}): s
   return id;
 }
 
-const url = (job: string) => `https://github.com/example-org/hive/actions/runs/1/job/${job}`;
+const url = (job: string) => `https://github.com/example-org/example-repo/actions/runs/1/job/${job}`;
 // One gh stub for all three probes: job 1 ran zero steps in 2s (no runner),
 // job 2 is a genuine test failure, and 'parity' is already red on the base
 // commit. Annotations never say "job was not started" here.

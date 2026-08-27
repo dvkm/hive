@@ -198,7 +198,7 @@ export async function runSmoke(db: DB, taskId: string, deps: MonitorDeps = {}): 
 // runSmoke + auto-advance: a verifying task with passing smoke — or with NO
 // smoke configured (nothing to wait for; the merge + CI was the verification)
 // — moves to done without a manual click. Before this, verifying was a dead
-// end (merged acme tasks parked forever, pinning dispatcher slots,
+// end (merged tasks from a consuming project parked forever, pinning dispatcher slots,
 // 2026-07-10). The done transition still enforces evidence; a task without any
 // stays verifying for the director rather than sneaking through.
 export async function smokeThenAdvance(db: DB, taskId: string, deps: MonitorDeps = {}): Promise<{ ran: boolean; passed: boolean }> {

@@ -1,5 +1,6 @@
-// TeamClaude integration. TeamClaude (`/opt/homebrew/bin/teamclaude`) is a
-// local proxy that routes Anthropic API calls across multiple Claude accounts.
+// TeamClaude integration. TeamClaude (`teamclaude`, resolved from PATH — see
+// buildExecutablePath in platform.ts) is a local proxy that routes Anthropic
+// API calls across multiple Claude accounts.
 // Its supported hook is environment variables: `teamclaude env` prints
 // `export K=V` / `unset K` lines (proxy address + CA cert in MITM mode, or an
 // ANTHROPIC_BASE_URL in base-URL mode). Hive injects those into every claude

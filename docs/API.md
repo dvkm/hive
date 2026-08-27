@@ -377,7 +377,7 @@ rev-parse HEAD` in the CLI's cwd. The review card compares it to the task's
   "answered_actor": null,
   "bundle": {
     "task_number": 262,
-    "pr_url": "https://github.com/example-org/hive/pull/42",
+    "pr_url": "https://github.com/example-org/example-repo/pull/42",
     "branch": "hive/rich-cards",
     "spend_usd": 3.2,
     "ci": {
@@ -529,7 +529,7 @@ learnings table doubles as the project knowledge store:
 (`intake` is a new Google-Chat draft task; `planned` is an approved planner
 breakdown — both always `normal`, batched into the digest. `review` is a task
 handed to the director for approval, always `urgent`.)
-`task_id` / `decision_id` may be null. `delivered_at` is set once David has been
+`task_id` / `decision_id` may be null. `delivered_at` is set once the director has been
 made aware — for an urgent notification that means the desktop app reported that
 macOS actually rendered it (`POST /api/notifications/:id/shown`), NOT that the
 server tried to send it; normal ones are batched into a single digest every
@@ -730,7 +730,7 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   value changes nothing.
 - `POST /api/tasks/:id/focus-agent` body `{}` → `200 {"ok":true, "focused":true, "target":"..."}` | `404`
   The board's "view agent" affordance: focuses the task's herdr tab via
-  `herdr agent focus` so David can watch/attach. Records a `focus_agent` event.
+  `herdr agent focus` so the director can watch/attach. Records a `focus_agent` event.
   Degrades gracefully (never throws): `200 {"ok":false, "focused":false, "error":"..."}`
   when the task has no agent or herdr fails.
 - `POST /api/tasks/:id/requeue` body `{}` → `200 {"ok":true, "new_task_id":"..."}` | `404`
@@ -1373,7 +1373,7 @@ same destinations are reachable from anywhere: `hive://task/<number-or-id>`,
 `hive://decision/<id>`, `hive://quiz/<task-id>`, `hive://open?path=/<route>`.
 Task routes accept a task NUMBER as well as an id (`hive://task/1247`).
 
-[Apple documents Mobile Web Push](https://developer.apple.com/documentation/usernotifications/sending-web-push-notifications-in-web-apps-and-browsers) on iOS and iPadOS 16.4 or later after Hive is added to the Home Screen and notification permission is requested from a user action. This standards-based path uses Apple's push service but does not require Apple Developer Program membership or native app plumbing. An open decision uses the decision title as the notification question. Browsers that expose Web Notification action buttons can answer a fixed option without opening Hive. Tapping the notification body, a free-text answer, or a failed inline answer opens `/decisions#dcard-<decision_id>` instead. The answer request carries a token that can answer only the named decision. Apple documents Home Screen Web Push support, but not notification action buttons. Verify whether actions appear on David's installed PWA. If iOS shows only View, the decision deep link is the supported fallback.
+[Apple documents Mobile Web Push](https://developer.apple.com/documentation/usernotifications/sending-web-push-notifications-in-web-apps-and-browsers) on iOS and iPadOS 16.4 or later after Hive is added to the Home Screen and notification permission is requested from a user action. This standards-based path uses Apple's push service but does not require Apple Developer Program membership or native app plumbing. An open decision uses the decision title as the notification question. Browsers that expose Web Notification action buttons can answer a fixed option without opening Hive. Tapping the notification body, a free-text answer, or a failed inline answer opens `/decisions#dcard-<decision_id>` instead. The answer request carries a token that can answer only the named decision. Apple documents Home Screen Web Push support, but not notification action buttons. Verify whether actions appear on the director's installed PWA. If iOS shows only View, the decision deep link is the supported fallback.
 
 `POST /api/push/subscribe` requires the API token from every caller, including loopback. The PWA sends its saved token and prompts for one after a `401` response. `POST /api/push/unsubscribe` remains available to remove an existing endpoint.
 
@@ -1468,7 +1468,7 @@ bot messages are skipped; each message is deduped by its resource name (unique
 
 ### Domain supervisors (on-demand planners)
 A per-project planner that triages a task and proposes a breakdown. hive's core
-design REJECTS long-running LLM supervisor sessions (priortool's failure mode):
+design REJECTS long-running LLM supervisor sessions (a prior orchestration tool's failure mode):
 the supervisor is "persistent" only in that its ROLE and CONTEXT live in the DB
 (the `supervisor_persona`, `playbook`, `plan_intake`, `planner_argv` config
 keys). The LLM itself runs as a short-lived, on-demand subprocess:

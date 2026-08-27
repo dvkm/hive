@@ -6,7 +6,7 @@
 // herdr 0.7.1): agents are VISIBLE and INTERACTIVE, never invisible one-shot
 // `claude -p` processes. Every hive worker is a long-running interactive
 // `claude` session in a dedicated, named fleet workspace, one labelled tab per
-// task (label = task id + short title), cwd = the task worktree. David can open
+// task (label = task id + short title), cwd = the task worktree. The director can open
 // herdr any time, see the whole fleet, attach to any tab, and type into it.
 //
 // Reference (herdr <sub>, verified live):
@@ -64,7 +64,7 @@ export const HERDR_BIN = discoverHerdrBin();
 // "hive": herdr auto-labels a worktree's own workspace by repo name, and this
 // repo is literally named `hive`, so a plain "hive" label would collide with
 // (and adopt) the hive checkout's workspace — exactly the label-collision class
-// priortool's 2026-07-02 self-kill incident documents. "hive-fleet" is distinct.
+// an earlier tool's 2026-07-02 self-kill incident documents. "hive-fleet" is distinct.
 export const FLEET_LABEL = process.env.HIVE_FLEET_LABEL || "hive-fleet";
 
 export class HerdrError extends Error {}
@@ -133,10 +133,10 @@ export function worktreeCreateArgv(repoPath: string, branch: string, base?: stri
 // INTERACTIVE claude (NOT `-p`). The brief is delivered as claude's first
 // prompt argument: an interactive long-running session that submits the brief
 // itself, with no fragile send-text/composer-autocomplete step (the hazard
-// priortool's herdr-backend doc documents). The agent stays live afterward and
+// an earlier herdr-backend doc documents). The agent stays live afterward and
 // tolerates the captain attaching and typing.
 export function defaultAgentArgv(brief: string, model?: string): string[] {
-  // auto (was acceptEdits, David 2026-07-12): the model classifier judges each
+  // auto (was acceptEdits, director's call 2026-07-12): the model classifier judges each
   // action instead of prompting — nobody is at a worker's pane to answer, and
   // acceptEdits still let non-edit dialogs stall sessions. hive's PreToolUse
   // hook keeps first say on Bash (safe allowlist / authority escalation); auto
@@ -207,7 +207,7 @@ export function agentFocusArgv(target: string): string[] {
 }
 
 // Pane tail for evidence capture. Requests a generous line floor (herdr's
-// `--lines N` returns EMPTY for small N below the pane viewport, per priortool's
+// `--lines N` returns EMPTY for small N below the pane viewport, per an earlier
 // verified bug); the caller keeps whatever comes back.
 export function agentReadArgv(target: string, lines = 200): string[] {
   return ["agent", "read", target, "--source", "recent", "--lines", String(lines)];
@@ -426,11 +426,11 @@ export function parsePaneList(stdout: string): PaneInfo[] {
   }
 }
 
-// `herdr agent list` (verified live, docs/evidence/herdr-live-verification.txt):
+// `herdr agent list` (verified live):
 // {"result":{"agents":[{"agent":"claude","cwd":...,"pane_id":"w6:p1",...},
 // {"name":"<taskId>","cwd":...,"pane_id":"w6:p2C","tab_id":"w6:t1",...}]}}.
 // Only hive-spawned agents carry `name` (agentStartArgv names the agent after
-// the task id) — a bare interactive session (David's own) has none; filter to
+// the task id) — a bare interactive session (the director's own) has none; filter to
 // the named ones so the orphan sweep never touches a human's own pane.
 export function parseAgentList(stdout: string): { name: string; tabId: string | null; cwd: string | null }[] {
   try {
@@ -764,8 +764,8 @@ export class Herdr {
     return wt as { path: string; branch: string | null; workspaceId: string | null };
   }
 
-  // Adopt the existing hive-fleet workspace (find-before-create, like
-  // priortool), else create it. `--no-focus` so a spawn never steals whatever
+  // Adopt the existing hive-fleet workspace (find-before-create, like an
+  // earlier tool), else create it. `--no-focus` so a spawn never steals whatever
   // space the captain is watching. Returns null if it can't be established.
   async ensureFleetWorkspace(): Promise<string | null> {
     try {

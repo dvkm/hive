@@ -16,12 +16,12 @@ function mkProject(db: any, name: string, opts: { repo_path?: string; keywords?:
   return id;
 }
 
-// The bug: a acme braindump filed under hive. The fix must re-route it.
-test("re-routes a acme braindump away from the requested hive project", () => {
+// The bug: an acme braindump filed under hive. The fix must re-route it.
+test("re-routes an acme braindump away from the requested hive project", () => {
   const db = openDb(":memory:");
-  const hive = mkProject(db, "hive", { repo_path: "/Users/you/projects/hive" });
+  const hive = mkProject(db, "hive", { repo_path: "/Users/ada/projects/hive" });
   const acme = mkProject(db, "acme", {
-    repo_path: "/Users/you/projects/acme",
+    repo_path: "/Users/ada/projects/acme",
     keywords: ["coredata", "figma.com/file/CoreData"],
   });
 

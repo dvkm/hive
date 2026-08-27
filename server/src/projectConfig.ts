@@ -90,9 +90,9 @@ const urlList: Check = (v) => {
 };
 
 // Mirrors what intake/jira.ts's jiraConfigStatus() needs to build a usable
-// config. The credential target itself is pinned there against compiled-in
-// constants (credentialTargetAllowed); this only keeps a malformed value from
-// reaching it at all.
+// config. The credential target's own shape (https site, real email, uppercase
+// project key) is enforced there (credentialTargetValid / canonicalSite); this
+// only keeps a wrong-typed value from reaching it at all.
 const jira: Check = (v) => {
   const bad = obj(v);
   if (bad) return bad;

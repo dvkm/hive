@@ -52,7 +52,7 @@ test("project numbers start at 1 independently while global numbers stay unique"
   expect([a.number, b.number, c.number]).toEqual([1, 2, 3]);
   expect(taskIdentifier(db, a)).toBe("P-1");
   expect(taskIdentifier(db, b)).toBe("OTHE-1");
-  expect(projectPrefix("acme")).toBe("CORE");
+  expect(projectPrefix("acmebase")).toBe("ACME");
 });
 
 test("number is unique — a duplicate explicit number is rejected", () => {
