@@ -1004,27 +1004,66 @@ async function chatTurn(db: DB, herdr: Herdr, deps: HandlerDeps, body: any): Pro
       return chatTurnOnThread(db, herdr, deps, thread, text);
     })();
     pendingNewChats.set(dedupeKey, pending);
-    pending.finally(() => pendingNewChats.delete(dedupeKey)).catch(() => {});
+    // The turn itself now returns before delivery, so the dedupe window must be
+    // held open until the thread's delivery settles — otherwise the second
+    // submit of a double-send arrives after the entry is gone and starts its
+    // own thread/task/spawn.
+    pending
+      .then((r) => threadIdle(r.thread_id))
+      .catch(() => {})
+      .finally(() => pendingNewChats.delete(dedupeKey));
   }
   return json(await pending, 202);
 }
 
-const pendingNewChats = new Map<string, Promise<{ thread_id: string; delivery: string; agent_target?: string; error?: string }>>();
+const pendingNewChats = new Map<string, Promise<{ thread_id: string; delivery: string }>>();
 
+// Persist the message and return; delivery runs asynchronously under the same
+// per-thread lock. A cold session spawns a worktree and the project stack (up
+// to stack_setup_timeout_ms), which must never hold the director's HTTP request
+// open. Progress and failures reach the UI over SSE — chat_delivery for the
+// transient status, a visible thread message when it fails.
 async function chatTurnOnThread(
   db: DB,
   herdr: Herdr,
   deps: HandlerDeps,
   thread: ChatThread,
   text: string
-): Promise<{ thread_id: string; delivery: string; agent_target?: string; error?: string }> {
+): Promise<{ thread_id: string; delivery: string }> {
   broadcast({ type: "chat_message", message: appendMessage(db, thread.id, "director", text) });
+  keepWarmAttempts.delete(thread.id); // a director turn restarts keep-warm's patience
 
   // The message the session receives is prefixed so it always knows which thread
   // to reply to, even mid-conversation.
   const wire = `[director → chat thread ${thread.id}]\n${text}`;
-  const delivery = await withThreadLock(thread.id, () => deliverToSupervisor(db, herdr, deps, thread.id, wire));
-  return { thread_id: thread.id, ...delivery };
+  chatDeliveryStatus(thread.id, "queued");
+  withThreadLock(thread.id, async () => {
+    const delivery = await deliverToSupervisor(db, herdr, deps, thread.id, wire);
+    if (delivery.delivery === "failed")
+      postThreadNotice(db, thread.id, `Your Chief of Staff could not start: ${delivery.error ?? "spawn failed"}. Send the message again to retry.`);
+  }).catch((e) => {
+    chatDeliveryStatus(thread.id, "failed", String((e as any)?.message ?? e));
+    postThreadNotice(db, thread.id, `Your Chief of Staff could not start: ${String((e as any)?.message ?? e)}. Send the message again to retry.`);
+  });
+  return { thread_id: thread.id, delivery: "queued" };
+}
+
+// Transient delivery status for the open chat panel. Not durable: a reload
+// falls back to the thread's own message history, which is.
+function chatDeliveryStatus(threadId: string, status: string, error?: string): void {
+  broadcast({ type: "chat_delivery", thread_id: threadId, status, ...(error ? { error } : {}) });
+}
+
+// A failed turn must be visible in the conversation, not a silent hang. Message
+// roles are director|assistant, so the notice rides in as an assistant message.
+function postThreadNotice(db: DB, threadId: string, text: string): void {
+  broadcast({ type: "chat_message", message: appendMessage(db, threadId, "assistant", text) });
+}
+
+// Tests (and any caller that must observe a settled turn) await the thread's
+// in-flight delivery; the lock chain IS that handle.
+export function threadIdle(threadId: string): Promise<unknown> {
+  return (threadLocks.get(threadId) ?? Promise.resolve()).catch(() => {});
 }
 
 // Serializes concurrent turns on the same chat thread. Without this, two
@@ -1071,7 +1110,11 @@ async function deliverToSupervisor(
   // a message to a closed thread starts a fresh session, same thread.
   if (!task || TERMINAL.includes(task.state as State)) {
     const runtimeProjectId = thread.project_id ?? coordinatorProjectId(db);
-    if (!runtimeProjectId) return { delivery: "failed", error: "no project repository is available for the Chief of Staff session" };
+    if (!runtimeProjectId) {
+      const error = "no project repository is available for the Chief of Staff session";
+      chatDeliveryStatus(threadId, "failed", error);
+      return { delivery: "failed", error };
+    }
     taskId = newId();
     const t = now();
     db.query(
@@ -1091,9 +1134,12 @@ async function deliverToSupervisor(
   if (task.agent_target) {
     const { alive } = await probeAgent(herdr, db, taskId!, task.agent_target).catch(() => ({ alive: false }));
     if (alive) {
+      chatDeliveryStatus(threadId, "delivering");
       const error = await sendOnce(herdr, task.agent_target, wireMessage);
       if (!error) {
         writeEvent(db, { task_id: taskId!, source: "director", type: "steer", payload: { message: wireMessage, target: task.agent_target, delivery: "delivered", delivered_at: now() } });
+        keepWarmAttempts.delete(threadId); // a live session took the message: it is warm
+        chatDeliveryStatus(threadId, "delivered");
         return { delivery: "delivered", agent_target: task.agent_target };
       }
       // fall through to respawn on a send failure to a supposedly-live agent
@@ -1102,12 +1148,48 @@ async function deliverToSupervisor(
 
   // Not live: queue the message (it rides in the spawn brief) and spawn.
   queueSteerEvent(db, taskId!, wireMessage, "queued for chat supervisor spawn");
+  chatDeliveryStatus(threadId, "spawning");
   const r = await spawnAgent(db, herdr, taskId!, {
     supervise: false, // a standing session never "finishes into review"
     briefOverride: composeSupervisorBrief(db, thread),
   });
-  if (!r.ok) return { delivery: "failed", error: r.error };
+  if (!r.ok) {
+    chatDeliveryStatus(threadId, "failed", r.error);
+    return { delivery: "failed", error: r.error };
+  }
+  chatDeliveryStatus(threadId, "spawned");
   return { delivery: "spawned", agent_target: r.agent_target };
+}
+
+// ---- keep-warm ----
+// A supervisor session that dies between director messages otherwise makes the
+// NEXT message pay the full cold start (worktree + project stack). Respawn it
+// where the death is already observed — syncAgents writes agent_status=gone —
+// instead of polling for it. A closed thread has a terminal backing task and is
+// never respawned. Attempts only reset on a delivery into a LIVE session, so a
+// session that dies right after each spawn backs off instead of looping.
+const KEEP_WARM_MAX_ATTEMPTS = 3;
+const keepWarmAttempts = new Map<string, number>();
+
+export function keepSupervisorWarm(db: DB, herdr: Herdr, deps: HandlerDeps, event: any): void {
+  if (event.type !== "agent_status" || event.payload?.status !== "gone") return;
+  const task = getTask(db, event.task_id);
+  if (!task || task.source !== "chat_supervisor" || TERMINAL.includes(task.state as State)) return;
+  const thread = managingThreadForTask(db, task.id);
+  if (thread?.task_id !== task.id) return;
+  const attempt = (keepWarmAttempts.get(thread.id) ?? 0) + 1;
+  if (attempt > KEEP_WARM_MAX_ATTEMPTS) return;
+  keepWarmAttempts.set(thread.id, attempt);
+  const message = [
+    `[hive keep-warm]`,
+    `Your session was restarted after the previous one ended. Read the thread and run ledger, then continue the current run silently.`,
+    `Do not message the director just because you restarted.`,
+  ].join("\n");
+  withThreadLock(thread.id, async () => {
+    const r = await deliverToSupervisor(db, herdr, deps, thread.id, message);
+    if (r.delivery === "failed" && attempt >= KEEP_WARM_MAX_ATTEMPTS)
+      postThreadNotice(db, thread.id, `Your Chief of Staff session could not be restarted (${r.error ?? "spawn failed"}). Send a message to try again.`);
+  }).catch((e) => console.error(`[hive] keep-warm ${thread.id}:`, e));
 }
 
 function coordinatorProjectId(db: DB): string | null {

@@ -987,7 +987,9 @@ export const api = {
     req<ChatThread[]>(`/api/chat/threads${project_id ? "?project_id=" + project_id : ""}`),
   chatThread: (id: string) => req<ChatThread & { messages: ChatMessage[] }>(`/api/chat/threads/${id}`),
   chatTurn: (b: { project_id?: string; thread_id?: string; scope?: "chief"; text: string }) =>
-    req<{ thread_id: string; delivery: "delivered" | "spawned" | "failed"; error?: string }>(`/api/chat/turn`, {
+    // Non-blocking: the turn is persisted and answered as "queued"; the real
+    // delivery status arrives over SSE (chat_delivery).
+    req<{ thread_id: string; delivery: "queued" }>(`/api/chat/turn`, {
       method: "POST",
       body: JSON.stringify(b),
     }),

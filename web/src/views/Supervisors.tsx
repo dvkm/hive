@@ -83,7 +83,7 @@ function SupervisorColumn({
       const r = await api.chatTurn(
         col.thread_id ? { thread_id: col.thread_id, text: body } : { project_id: col.project_id, text: body }
       );
-      if (r.delivery === "failed") toast(`Supervisor unavailable: ${r.error ?? "spawn failed"}`);
+      // A failed delivery posts a visible message on the thread over SSE.
       if (r.thread_id !== col.thread_id) onThreadCreated(col.key, r.thread_id);
     } catch (e: any) {
       toast(`Chat failed: ${e?.message ?? e}`);

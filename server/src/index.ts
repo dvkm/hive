@@ -1,6 +1,6 @@
 // hive daemon entrypoint. Bun.serve on 127.0.0.1:4700 (override HIVE_PORT).
 import { openDb, defaultDbPath } from "./db.ts";
-import { makeHandler, notifyManagerOfEvent, repairDuplicateQuizPasses, sweepManagerInboxes, wakeDueManagers } from "./api.ts";
+import { makeHandler, keepSupervisorWarm, notifyManagerOfEvent, repairDuplicateQuizPasses, sweepManagerInboxes, wakeDueManagers } from "./api.ts";
 import { startReconciler, reAdoptAgentsOnBoot } from "./reconciler.ts";
 import { startDispatcher } from "./dispatcher.ts";
 import { startReaper } from "./reaper.ts";
@@ -168,7 +168,12 @@ setTerminalHook((db, taskId) => {
 });
 // Close the autonomous management loop: meaningful descendant events wake the
 // chat supervisor that delegated the work, including after nested follow-ups.
-setEventHook((db, event) => notifyManagerOfEvent(db, defaultHerdr, { supervise: true }, event));
+// The same hook keeps a still-open thread's session warm when syncAgents
+// observes it die, so the next director message doesn't pay the cold start.
+setEventHook((db, event) => {
+  notifyManagerOfEvent(db, defaultHerdr, { supervise: true }, event);
+  keepSupervisorWarm(db, defaultHerdr, { supervise: true }, event);
+});
 sweepManagerInboxes(db, defaultHerdr, { supervise: true })
   .then((count) => {
     if (count) console.log(`[hive] woke ${count} project manager(s) for inbox sweep`);

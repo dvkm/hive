@@ -31,6 +31,10 @@ export interface Store {
   // messages are held; SSE appends live as the supervisor replies.
   chatThreadId: string | null;
   chatMessages: ChatMessage[];
+  // Transient delivery status of the open thread's newest turn
+  // ("queued"|"delivering"|"spawning"|"delivered"|"spawned"|"failed"). Pushed
+  // over SSE while the turn is in flight; null once the supervisor answers.
+  chatDelivery: string | null;
   openChatThread: (id: string | null) => void;
   // Fan-out for EVERY incoming chat message regardless of the open thread —
   // the Supervisors board runs one live column per thread. Returns unsubscribe.
@@ -81,6 +85,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   // handler (closed over once) knows which thread's messages to append.
   const [chatThreadId, setChatThreadId] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatDelivery, setChatDelivery] = useState<string | null>(null);
   const chatThreadRef = useRef<string | null>(null);
   const hydrateChatDecisions = (messages: ChatMessage[]) => {
     const decisionIds = new Set(
@@ -97,6 +102,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const openChatThread = (id: string | null) => {
     chatThreadRef.current = id;
     setChatThreadId(id);
+    setChatDelivery(null);
     if (id) api.chatThread(id).then((t) => {
       setChatMessages(t.messages);
       hydrateChatDecisions(t.messages);
@@ -216,9 +222,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         } else if (msg.type === "chat_message") {
           const cm: ChatMessage = msg.message;
           hydrateChatDecisions([cm]);
-          if (cm.thread_id === chatThreadRef.current)
+          if (cm.thread_id === chatThreadRef.current) {
             setChatMessages((prev) => (prev.some((m) => m.id === cm.id) ? prev : [...prev, cm]));
+            if (cm.role === "assistant") setChatDelivery(null); // the supervisor answered
+          }
           chatSubs.current.forEach((cb) => cb(cm));
+        } else if (msg.type === "chat_delivery") {
+          if (msg.thread_id === chatThreadRef.current) setChatDelivery(String(msg.status));
         }
       };
     };
@@ -233,7 +243,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, quizzes, reloadQuizzes, needsYou, offline, setOffline, sse, chatThreadId, chatMessages, openChatThread, onChatMessage }}>
+    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, quizzes, reloadQuizzes, needsYou, offline, setOffline, sse, chatThreadId, chatMessages, chatDelivery, openChatThread, onChatMessage }}>
       {children}
     </Ctx.Provider>
   );

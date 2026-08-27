@@ -342,7 +342,7 @@ function ChiefBriefing({
 }
 
 export default function Chat({ embedded = false }: { embedded?: boolean }) {
-  const { projects, tasks, decisions, feedEvents, chatThreadId, chatMessages, openChatThread } = useStore();
+  const { projects, tasks, decisions, feedEvents, chatThreadId, chatMessages, chatDelivery, openChatThread } = useStore();
   const [lastSeen] = useState(() => localStorage.getItem(CHIEF_LAST_SEEN));
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -382,12 +382,15 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
       });
   }, [open, projects.length]);
 
+  // Ledger, commitment and verification updates all write an event on the
+  // supervisor task, and every one of those arrives on the SSE feed — so the
+  // thread refetches on change instead of on a timer. chatDelivery covers a
+  // respawn, which binds the thread to a NEW task id no old event carries.
+  const managerEventCursor = feedEvents.find((e) => e.task_id === managerTaskId)?.id ?? "";
   useEffect(() => {
     if (!open || !chatThreadId) return;
     refreshManager();
-    const timer = setInterval(refreshManager, 5_000);
-    return () => clearInterval(timer);
-  }, [open, chatThreadId, refreshManager]);
+  }, [open, chatThreadId, refreshManager, managerEventCursor, chatDelivery, chatMessages.length]);
 
   useEffect(() => {
     let live = true;
@@ -417,7 +420,8 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
     setText("");
     try {
       const r = await api.chatTurn(chatThreadId ? { thread_id: chatThreadId, text: body } : { scope: "chief", text: body });
-      if (r.delivery === "failed") toast(`Chief of Staff unavailable: ${r.error ?? "spawn failed"}`);
+      // The turn returns before delivery: progress and any failure arrive over
+      // SSE (chat_delivery, plus a visible message on the thread when it fails).
       // First message of a new thread: adopt the id so SSE replies land here.
       if (r.thread_id !== chatThreadId) openChatThread(r.thread_id);
       api.chatThread(r.thread_id).then((thread) => { setManagerThread(thread); setManagerTaskId(thread.task_id); }).catch(() => {});
@@ -432,6 +436,10 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
   // Supervisor is thinking whenever the last thing said was the director's.
   const managerStopped = !!managerTask && ["done", "failed", "cancelled"].includes(managerTask.state);
   const awaiting = !managerStopped && chatMessages.length > 0 && chatMessages[chatMessages.length - 1].role === "director";
+  const deliveryLabel =
+    chatDelivery === "spawning" ? "supervisor starting…"
+    : chatDelivery === "queued" || chatDelivery === "delivering" ? "delivering…"
+    : null;
   const activityEvents = useMemo(() => {
     const rows = new Map(managerEvents.map((e) => [e.id, e]));
     for (const e of feedEvents) if (e.task_id === managerTaskId) rows.set(e.id, e);
@@ -545,7 +553,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
             {visibleMessages.map((m) => (
               <Bubble key={m.id} m={m} />
             ))}
-            {awaiting && <div className="chat-typing muted">manager is working…</div>}
+            {(awaiting || deliveryLabel) && <div className="chat-typing muted">{deliveryLabel ?? "manager is working…"}</div>}
           </div>
           <div className="chat-compose">
             <textarea

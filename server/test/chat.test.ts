@@ -12,7 +12,8 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-chat-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb, newId, now } = await import("../src/db.ts");
-const { makeHandler, notifyManagerOfEvent, flushManagerUpdate, MANAGER_WAKEUP_DEBOUNCE_MS, sweepManagerInboxes, projectInboxCounts } = await import("../src/api.ts");
+const { makeHandler, notifyManagerOfEvent, keepSupervisorWarm, flushManagerUpdate, MANAGER_WAKEUP_DEBOUNCE_MS, sweepManagerInboxes, projectInboxCounts, threadIdle } = await import("../src/api.ts");
+const { addClient } = await import("../src/bus.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { composeSupervisorBrief, createThread, managingThreadForTask } = await import("../src/chat.ts");
 const { composeBrief } = await import("../src/briefs.ts");
@@ -33,8 +34,14 @@ let probeStatus = "working";
 // until `pane report-agent` re-registers it (readopt).
 let evictedCwd: string | null = null;
 let reregistered = false;
+// Set to a promise to hold a spawn open (the real thing creates a worktree and
+// sets up the project stack, which is what the non-blocking turn must not wait
+// on); set to fail an `agent start` outright.
+let spawnGate: Promise<void> | null = null;
+let spawnFails = false;
 const exec: Exec = async (argv) => {
   if (has(argv, "worktree", "create")) {
+    if (spawnGate) await spawnGate;
     // A real worktree create/reclaim takes real time; without the per-thread
     // spawn lock this window is exactly where a concurrent double-send races
     // a second spawnAgent for the same task.
@@ -67,6 +74,7 @@ const exec: Exec = async (argv) => {
   if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t2"}}}');
   if (has(argv, "agent", "start")) {
     briefs.push(argv[argv.indexOf("--") + 2]); // `-- claude <brief> …`
+    if (spawnFails) return { code: 1, stdout: "", stderr: "herdr: agent start refused" };
     return OK();
   }
   if (has(argv, "agent", "send")) {
@@ -100,12 +108,37 @@ async function get(path: string): Promise<{ status: number; json: any }> {
   return { status: res.status, json: await res.json() };
 }
 
+// The turn is non-blocking, so the delivery outcome arrives on the SSE bus, not
+// in the response. Subscribe like a browser tab does and wait for the thread's
+// in-flight delivery to settle.
+const deliveries: { thread_id: string; status: string; error?: string }[] = [];
+const notices: { thread_id: string; role: string; text: string }[] = [];
+addClient({
+  id: "test",
+  send: (data) => {
+    const msg = JSON.parse(data);
+    if (msg.type === "chat_delivery") deliveries.push(msg);
+    if (msg.type === "chat_message") notices.push({ thread_id: msg.message.thread_id, role: msg.message.role, text: msg.message.text });
+  },
+});
+function lastDelivery(threadId: string) {
+  return [...deliveries].reverse().find((d) => d.thread_id === threadId);
+}
+async function turn(body: unknown): Promise<{ status: number; json: any; delivery?: string; error?: string }> {
+  const r = await post("/api/chat/turn", body);
+  if (!r.json?.thread_id) return r;
+  await threadIdle(r.json.thread_id);
+  const last = lastDelivery(r.json.thread_id);
+  return { ...r, delivery: last?.status, error: last?.error };
+}
+
 let threadId = "";
 
 test("first message spawns a persistent supervisor session (202, non-blocking)", async () => {
-  const { status, json } = await post("/api/chat/turn", { project_id: projectId, text: "spin up the login work" });
+  const { status, json, delivery } = await turn({ project_id: projectId, text: "spin up the login work" });
   expect(status).toBe(202);
-  expect(json.delivery).toBe("spawned");
+  expect(json.delivery).toBe("queued"); // returns before the spawn, not after it
+  expect(delivery).toBe("spawned");
   expect(json.thread_id).toBeTruthy();
   threadId = json.thread_id;
 
@@ -127,9 +160,9 @@ test("first message spawns a persistent supervisor session (202, non-blocking)",
 
 test("later message is delivered into the live session (not a respawn)", async () => {
   const before = briefs.length;
-  const { status, json } = await post("/api/chat/turn", { thread_id: threadId, text: "what's the status?" });
+  const { status, delivery } = await turn({ thread_id: threadId, text: "what's the status?" });
   expect(status).toBe(202);
-  expect(json.delivery).toBe("delivered");
+  expect(delivery).toBe("delivered");
   expect(briefs.length).toBe(before); // no new spawn
   expect(sends.at(-1)).toContain("what's the status?");
   expect(sends.at(-1)).toContain(threadId); // wire prefix tells the session where to reply
@@ -139,9 +172,9 @@ test("a leftover shell pane is respawned instead of receiving the director messa
   const before = briefs.length;
   probeStatus = "unknown";
   try {
-    const { status, json } = await post("/api/chat/turn", { thread_id: threadId, text: "resume the sweep" });
+    const { status, delivery } = await turn({ thread_id: threadId, text: "resume the sweep" });
     expect(status).toBe(202);
-    expect(json.delivery).toBe("spawned");
+    expect(delivery).toBe("spawned");
     expect(briefs.length).toBe(before + 1);
     expect(briefs.at(-1)).toContain("resume the sweep");
   } finally {
@@ -154,9 +187,9 @@ test("a supervisor whose herdr registry entry was evicted receives the turn as a
   evictedCwd = WT; // the pane is still alive at the supervisor task's worktree cwd
   reregistered = false;
   try {
-    const { status, json } = await post("/api/chat/turn", { thread_id: threadId, text: "still there?" });
+    const { status, delivery } = await turn({ thread_id: threadId, text: "still there?" });
     expect(status).toBe(202);
-    expect(json.delivery).toBe("delivered"); // re-adopted and steered, not respawned
+    expect(delivery).toBe("delivered"); // re-adopted and steered, not respawned
     expect(briefs.length).toBe(before); // no new spawn
     expect(sends.at(-1)).toContain("still there?");
   } finally {
@@ -170,9 +203,9 @@ test("a genuinely dead supervisor (no matching pane) still respawns", async () =
   probeStatus = "unknown";
   evictedCwd = "/dead"; // no pane at the task's real worktree cwd -> confirmGone confirms death
   try {
-    const { status, json } = await post("/api/chat/turn", { thread_id: threadId, text: "resume after real death" });
+    const { status, delivery } = await turn({ thread_id: threadId, text: "resume after real death" });
     expect(status).toBe(202);
-    expect(json.delivery).toBe("spawned");
+    expect(delivery).toBe("spawned");
     expect(briefs.length).toBe(before + 1);
     expect(briefs.at(-1)).toContain("resume after real death");
   } finally {
@@ -344,10 +377,11 @@ test("a concurrent double-send on the same thread spawns only once", async () =>
   ]);
   expect(a.status).toBe(202);
   expect(b.status).toBe(202);
+  await threadIdle(thread.id);
   expect(briefs.length).toBe(before + 1); // exactly one spawn, not two
 
-  const deliveries = [a.json.delivery, b.json.delivery].sort();
-  expect(deliveries).toEqual(["delivered", "spawned"]); // winner spawns, waiter delivers into it
+  const outcomes = deliveries.filter((d) => d.thread_id === thread.id).map((d) => d.status).sort();
+  expect(outcomes).toEqual(["delivered", "delivering", "queued", "queued", "spawned", "spawning"]); // winner spawns, waiter delivers into it
 
   const combined = briefs.at(-1)! + sends.join(" ");
   expect(combined).toContain("message A"); // whichever one won, neither message is dropped
@@ -368,12 +402,9 @@ test("a concurrent double-send on a BRAND-NEW chat (no thread_id yet) creates on
   expect(a.status).toBe(202);
   expect(b.status).toBe(202);
   expect(a.json.thread_id).toBe(b.json.thread_id); // same thread, not two
+  await threadIdle(a.json.thread_id);
   expect(briefs.length).toBe(before + 1); // exactly one spawn, not two
-
-  // Both requests ride the SAME underlying call (not two lock-serialized
-  // calls like the existing-thread race below), so both see its one result.
-  expect(a.json.delivery).toBe("spawned");
-  expect(b.json.delivery).toBe("spawned");
+  expect(lastDelivery(a.json.thread_id)?.status).toBe("spawned");
 
   const thread = (await get(`/api/chat/threads/${a.json.thread_id}`)).json;
   expect(thread.messages.length).toBe(1); // the duplicate submit did not double-post the message
@@ -416,9 +447,9 @@ test("closing an unknown thread 404s", async () => {
 test("a message to a closed thread spawns a fresh session, not a resurrection", async () => {
   const before = (await get(`/api/chat/threads/${threadId}`)).json;
   const briefsBefore = briefs.length;
-  const { status, json } = await post("/api/chat/turn", { thread_id: threadId, text: "still there?" });
+  const { status, delivery } = await turn({ thread_id: threadId, text: "still there?" });
   expect(status).toBe(202);
-  expect(json.delivery).toBe("spawned"); // fresh task, not "delivered" into the dead one
+  expect(delivery).toBe("spawned"); // fresh task, not "delivered" into the dead one
   expect(briefs.length).toBe(briefsBefore + 1);
 
   const after = (await get(`/api/chat/threads/${threadId}`)).json;
@@ -441,7 +472,7 @@ test("an arbitrary body.task_id cannot hijack an unrelated task as the chat supe
   })).json();
   expect(victim.source).not.toBe("chat_supervisor");
 
-  const { status, json } = await post("/api/chat/turn", {
+  const { status, json } = await turn({
     project_id: projectId, text: "hijack attempt", task_id: victim.id,
   });
   expect(status).toBe(202);
@@ -462,7 +493,8 @@ test("Chief of Staff is one durable cross-project thread backed by the hive coor
   expect(first.status).toBe(202);
   expect(second.status).toBe(202);
   expect(first.json.thread_id).toBe(second.json.thread_id);
-  expect([first.json.delivery, second.json.delivery].sort()).toEqual(["delivered", "spawned"]);
+  await threadIdle(first.json.thread_id);
+  expect(lastDelivery(first.json.thread_id)?.status).toBe("delivered");
 
   const thread = (await get(`/api/chat/threads/${first.json.thread_id}`)).json;
   expect(thread.project_id).toBeNull();
@@ -482,9 +514,9 @@ test("Chief of Staff is one durable cross-project thread backed by the hive coor
   expect(briefs.at(-1)).toContain("target project's current autonomy profile");
   expect(briefs.at(-1)).not.toContain("The autonomy profile is `balanced`");
 
-  const followup = await post("/api/chat/turn", { scope: "chief", text: "where did I leave off?" });
+  const followup = await turn({ scope: "chief", text: "where did I leave off?" });
   expect(followup.status).toBe(202);
-  expect(followup.json.delivery).toBe("delivered");
+  expect(followup.delivery).toBe("delivered");
   expect(followup.json.thread_id).toBe(thread.id);
   expect(sends.at(-1)).toContain("[chief reply policy]");
   expect(sends.at(-1)).toContain("--decision <id>");
@@ -515,7 +547,7 @@ test("Chief bundles real decisions into actionable message data and does not res
       { key: "fast", label: "Fast rollout" },
     ],
   })).json;
-  await post("/api/chat/turn", { thread_id: chief.id, text: "Anything you actually need from me?" });
+  await turn({ thread_id: chief.id, text: "Anything you actually need from me?" });
 
   const reply = await post(`/api/chat/threads/${chief.id}/reply`, {
     text: "I need one call from you.",
@@ -526,7 +558,7 @@ test("Chief bundles real decisions into actionable message data and does not res
     { type: "decision", decision_id: decision.id, label: "Which launch mode should we use?" },
   ]);
 
-  await post("/api/chat/turn", { thread_id: chief.id, text: "Do you still need anything from me?" });
+  await turn({ thread_id: chief.id, text: "Do you still need anything from me?" });
   const before = (await get(`/api/chat/threads/${chief.id}`)).json.messages.length;
 
   const duplicate = await post(`/api/chat/threads/${chief.id}/reply`, {
@@ -538,7 +570,7 @@ test("Chief bundles real decisions into actionable message data and does not res
 });
 
 test("starting a chat with no project is rejected (session needs a repo)", async () => {
-  const { status, json } = await post("/api/chat/turn", { text: "hello" });
+  const { status, json } = await turn({ text: "hello" });
   expect(status).toBe(400);
   expect(json.error).toContain("project_id is required");
 });
@@ -575,4 +607,100 @@ test("Chief brief requires quiet bundled decision cards", () => {
   expect(brief).toContain("Do not send the director a progress message or task list");
   expect(brief).toContain("core intuition");
   expect(brief).toContain("shared mental model");
+});
+
+// ---------------------------------------------------------- non-blocking turn
+test("the turn returns before the spawn completes (director is never blocked)", async () => {
+  const thread = createThread(db, { project_id: projectId, title: "slow spawn" });
+  let release = () => {};
+  spawnGate = new Promise<void>((r) => (release = () => r()));
+  try {
+    const before = briefs.length;
+    const { status, json } = await post("/api/chat/turn", { thread_id: thread.id, text: "start the long thing" });
+    expect(status).toBe(202);
+    expect(json.delivery).toBe("queued");
+    expect(briefs.length).toBe(before); // the response landed while the spawn is still held
+    // The director's message is already durable and visible.
+    expect((await get(`/api/chat/threads/${thread.id}`)).json.messages.at(-1).text).toBe("start the long thing");
+    expect(lastDelivery(thread.id)?.status).toBe("spawning");
+
+    release();
+    await threadIdle(thread.id);
+    expect(briefs.length).toBe(before + 1);
+    expect(lastDelivery(thread.id)?.status).toBe("spawned");
+  } finally {
+    spawnGate = null;
+  }
+});
+
+test("a failed spawn posts a visible message on the thread instead of hanging", async () => {
+  const thread = createThread(db, { project_id: projectId, title: "doomed" });
+  spawnFails = true;
+  try {
+    const { status } = await post("/api/chat/turn", { thread_id: thread.id, text: "this cannot start" });
+    expect(status).toBe(202);
+    await threadIdle(thread.id);
+    expect(lastDelivery(thread.id)?.status).toBe("failed");
+    const last = (await get(`/api/chat/threads/${thread.id}`)).json.messages.at(-1);
+    expect(last.role).toBe("assistant");
+    expect(last.text).toContain("could not start");
+    expect(notices.at(-1)?.thread_id).toBe(thread.id); // streamed, not only stored
+  } finally {
+    spawnFails = false;
+  }
+});
+
+// ------------------------------------------------------------------ keep-warm
+test("keep-warm respawns an open thread's dead session without a director message", async () => {
+  const start = await turn({ project_id: projectId, text: "keep this session warm" });
+  const warmThread = start.json.thread_id;
+  const task = (await get(`/api/chat/threads/${warmThread}`)).json.task_id;
+
+  const before = briefs.length;
+  probeStatus = "unknown";
+  evictedCwd = "/dead"; // confirmGone has positive evidence: the session is really gone
+  try {
+    keepSupervisorWarm(db, herdr, {}, { task_id: task, type: "agent_status", payload: { status: "gone" } });
+    await threadIdle(warmThread);
+    expect(briefs.length).toBe(before + 1);
+    expect(briefs.at(-1)).toContain("keep-warm");
+  } finally {
+    probeStatus = "working";
+    evictedCwd = null;
+  }
+});
+
+test("keep-warm backs off after repeated failures and says so on the thread", async () => {
+  const start = await turn({ project_id: projectId, text: "session that keeps dying" });
+  const warmThread = start.json.thread_id;
+  const before = briefs.length;
+  probeStatus = "unknown";
+  evictedCwd = "/dead";
+  spawnFails = true;
+  try {
+    for (let i = 0; i < 5; i++) {
+      const task = (await get(`/api/chat/threads/${warmThread}`)).json.task_id;
+      keepSupervisorWarm(db, herdr, {}, { task_id: task, type: "agent_status", payload: { status: "gone" } });
+      await threadIdle(warmThread);
+    }
+    expect(briefs.length).toBe(before + 3); // capped, not one respawn per death forever
+    const last = (await get(`/api/chat/threads/${warmThread}`)).json.messages.at(-1);
+    expect(last.text).toContain("could not be restarted");
+  } finally {
+    probeStatus = "working";
+    evictedCwd = null;
+    spawnFails = false;
+  }
+});
+
+test("keep-warm never respawns a closed thread", async () => {
+  const start = await turn({ project_id: projectId, text: "closing this one" });
+  const closedThread = start.json.thread_id;
+  const task = (await get(`/api/chat/threads/${closedThread}`)).json.task_id;
+  await post(`/api/chat/threads/${closedThread}/close`, {});
+
+  const before = briefs.length;
+  keepSupervisorWarm(db, herdr, {}, { task_id: task, type: "agent_status", payload: { status: "gone" } });
+  await threadIdle(closedThread);
+  expect(briefs.length).toBe(before);
 });
