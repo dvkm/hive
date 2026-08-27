@@ -509,6 +509,137 @@ test("cleanupTask on a NON-terminal task is a no-op unless forced", async () => 
   expect(db.query("SELECT * FROM events WHERE task_id = ?").all(id).length).toBe(0);
 });
 
+// ---- remote branch deletion (origin litter: 500+ stale hive/* refs) ----
+
+// git world for a terminal task: worktree merged+clean, and origin either holds
+// the branch at `remoteSha` or doesn't. `ancestor` is whether that remote tip is
+// already in the default branch.
+function remoteWorld(opts: { branch: string; onOrigin?: boolean; ancestor?: boolean; pushOk?: boolean }) {
+  const calls: string[][] = [];
+  const exec: Exec = async (argv) => {
+    calls.push(argv);
+    if (argv[0] !== "git") return OK();
+    if (argv.includes("--merged")) return OK(`  main\n  ${opts.branch}`); // worktree safe to remove
+    if (argv.includes("ls-remote")) return opts.onOrigin ? OK(`sha1\trefs/heads/${opts.branch}\n`) : OK("");
+    if (has(argv, "merge-base", "--is-ancestor")) return opts.ancestor ? OK() : FAIL("");
+    if (has(argv, "push", "origin", "--delete")) return opts.pushOk === false ? FAIL("remote: permission denied") : OK();
+    return OK();
+  };
+  return { herdr: new Herdr(exec, "herdr"), calls };
+}
+
+const cleanedUpPayload = (db: DB, id: string) =>
+  JSON.parse((db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'cleaned_up'").get(id) as any).payload);
+
+test("cleanupTask deletes the task's MERGED branch on origin and records it", async () => {
+  const { db, projectId } = freshDb();
+  const branch = "hive/RB1";
+  const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-RB1" });
+  const { herdr, calls } = remoteWorld({ branch, onOrigin: true, ancestor: true });
+
+  const out = await cleanupTask(db, herdr, id);
+  expect(out.cleaned).toBe(true);
+  expect(calls.some((c) => has(c, "push", "origin", "--delete", branch))).toBe(true);
+  // the ancestry check asks about the REMOTE tip, against the default branch
+  expect(calls.some((c) => has(c, "merge-base", "--is-ancestor", "sha1", "main"))).toBe(true);
+  expect(cleanedUpPayload(db, id).remote_branch_deleted).toBe(true);
+});
+
+test("cleanupTask never deletes an UNMERGED origin branch (it holds the only copy)", async () => {
+  const { db, projectId } = freshDb();
+  const branch = "hive/RB2";
+  const id = seedTask(db, projectId, { state: "cancelled", branch, worktree_path: "/wt/hive-RB2" });
+  const { herdr, calls } = remoteWorld({ branch, onOrigin: true, ancestor: false });
+
+  const out = await cleanupTask(db, herdr, id);
+  expect(out.cleaned).toBe(true); // local teardown still happened
+  expect(calls.some((c) => has(c, "push", "--delete"))).toBe(false);
+  const p = cleanedUpPayload(db, id);
+  expect(p.remote_branch_deleted).toBe(false);
+  expect(p.remote_branch_reason).toContain("not merged into main");
+});
+
+test("a project that never pushes no-ops gracefully (no branch on origin, no push)", async () => {
+  const { db, projectId } = freshDb();
+  const branch = "hive/RB3";
+  const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-RB3" });
+  const { herdr, calls } = remoteWorld({ branch, onOrigin: false });
+
+  expect((await cleanupTask(db, herdr, id)).cleaned).toBe(true);
+  expect(calls.some((c) => has(c, "push", "--delete"))).toBe(false);
+  expect(cleanedUpPayload(db, id).remote_branch_reason).toBe("no remote branch");
+});
+
+test("config.delete_remote_branches = false opts a project out entirely", async () => {
+  const { db, projectId } = freshDb();
+  db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify({ delete_remote_branches: false }), projectId);
+  const branch = "hive/RB4";
+  const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-RB4" });
+  const { herdr, calls } = remoteWorld({ branch, onOrigin: true, ancestor: true });
+
+  expect((await cleanupTask(db, herdr, id)).cleaned).toBe(true);
+  expect(calls.some((c) => has(c, "push", "--delete"))).toBe(false);
+  const p = cleanedUpPayload(db, id);
+  expect(p.remote_branch_deleted).toBe(false);
+  expect(p.remote_branch_reason).toBeUndefined(); // not attempted at all
+});
+
+test("a failing remote deletion never blocks the rest of cleanup", async () => {
+  const { db, projectId } = freshDb();
+  const branch = "hive/RB5";
+  const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-RB5" });
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    newId("evt"), id, now(), "herdr", "spawned", JSON.stringify({ tab_id: "wF:t5" })
+  );
+  const { herdr, calls } = remoteWorld({ branch, onOrigin: true, ancestor: true, pushOk: false });
+
+  const out = await cleanupTask(db, herdr, id);
+  expect(out.cleaned).toBe(true);
+  expect(out.worktree?.removed).toBe(true);
+  expect(out.session.via).toBe("tab wF:t5");
+  expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(true);
+  expect(cleanedUpPayload(db, id).remote_branch_reason).toContain("permission denied");
+});
+
+test("a PRESERVED (unmerged) worktree keeps its origin branch untouched", async () => {
+  const { db, projectId } = freshDb();
+  const branch = "hive/RB6";
+  const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-RB6" });
+  const calls: string[][] = [];
+  const exec: Exec = async (argv) => {
+    calls.push(argv);
+    if (argv[0] === "git" && argv.includes("--merged")) return OK("* main"); // not merged
+    if (argv[0] === "git" && argv.includes("ls-remote")) return OK(""); // not pushed
+    return OK();
+  };
+  const out = await cleanupTask(db, new Herdr(exec, "herdr"), id);
+  expect(out.cleaned).toBe(false);
+  expect(calls.some((c) => has(c, "push", "--delete"))).toBe(false);
+});
+
+test("deleteRemoteBranch refuses any branch hive did not name", async () => {
+  const { exec, calls } = stubExec(() => OK("sha1\trefs/heads/x"));
+  const h = new Herdr(exec, "herdr");
+  for (const branch of ["main", "ghost-t1", "hive/t1/extra", "release/1.2"]) {
+    expect(await h.deleteRemoteBranch({ repoPath: "/repo", branch })).toEqual({
+      deleted: false,
+      reason: "not a hive task branch",
+    });
+  }
+  expect(calls.length).toBe(0); // never even asked origin
+});
+
+test("deleteRemoteBranch reports, rather than throws, when git blows up", async () => {
+  const exec: Exec = async () => {
+    throw new Error("spawn ENOENT");
+  };
+  const h = new Herdr(exec, "herdr");
+  expect(await h.deleteRemoteBranch({ repoPath: "/repo", branch: "hive/t1" })).toEqual({
+    deleted: false,
+    reason: "spawn ENOENT",
+  });
+});
+
 // ---- terminal transition hook: fires on done/cancelled, NOT on retriable failed ----
 
 test("the terminal hook fires on done and cancelled but never on failed", () => {

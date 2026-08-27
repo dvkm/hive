@@ -273,6 +273,8 @@ const CHECKS: Record<string, Check> = {
   // Which changes still need a director understanding check (hive-1559).
   understanding_checks: understandingChecks,
   release_review_agents: bool,
+  // false keeps a finished task's `hive/<id>` branch on origin (cleanup.ts).
+  delete_remote_branches: bool,
   scope_drift: bool,
   scope_drift_commits: num,
   // config-driven network destinations

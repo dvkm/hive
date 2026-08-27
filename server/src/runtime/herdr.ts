@@ -1093,6 +1093,52 @@ export class Herdr {
     return { safe: false, reason: "branch not pushed to origin nor merged; refusing to remove worktree" };
   }
 
+  // Delete a finished task's branch on origin. hive pushes task branches (to open
+  // PRs) and nothing ever removed them, so origins accumulate them forever —
+  // 500+ stale `hive/*` refs by 2026-08.
+  //
+  // Three guards, all required, none of which can be satisfied by a branch that
+  // isn't hive's own finished work:
+  //   1. the name is `hive/<taskId>` — never the default branch, never a human's
+  //      branch, never a `ghost-*` WIP rescue (those hold unmerged work by
+  //      definition);
+  //   2. the ref actually exists on origin (a project that never pushes no-ops);
+  //   3. the REMOTE tip is already an ancestor of the local default branch, i.e.
+  //      the remote holds no commit the default branch doesn't. That is the same
+  //      "merged" notion branchIsSafe uses, asked of the remote tip rather than
+  //      the local one, so a branch that was pushed but never merged keeps its
+  //      only upstream copy.
+  // Never throws and never reports a failure as success: no network, no
+  // permission, or an already-deleted ref all come back deleted:false with a
+  // reason for the caller to log.
+  async deleteRemoteBranch(args: {
+    repoPath: string;
+    branch: string;
+    defaultBranch?: string;
+  }): Promise<{ deleted: boolean; reason: string }> {
+    const base = args.defaultBranch ?? "main";
+    // Same shape reaper.taskIdFromBranch matches (duplicated rather than
+    // imported: reaper.ts imports this file).
+    if (!/^hive\/[^/]+$/.test(args.branch) || args.branch === base)
+      return { deleted: false, reason: "not a hive task branch" };
+    try {
+      const ls = await this.exec(["git", "-C", args.repoPath, "ls-remote", "--heads", "origin", args.branch]);
+      if (ls.code !== 0) return { deleted: false, reason: `ls-remote failed: ${ls.stderr.trim().slice(0, 200)}` };
+      const sha = ls.stdout.trim().split(/\s+/)[0];
+      if (!sha) return { deleted: false, reason: "no remote branch" };
+      // Unknown sha (never fetched) fails here too — refusing beats deleting a
+      // ref whose contents this clone cannot see.
+      const merged = await this.exec(["git", "-C", args.repoPath, "merge-base", "--is-ancestor", sha, base]);
+      if (merged.code !== 0) return { deleted: false, reason: `remote tip not merged into ${base}` };
+      const del = await this.exec(["git", "-C", args.repoPath, "push", "origin", "--delete", args.branch]);
+      if (del.code !== 0)
+        return { deleted: false, reason: `push --delete failed: ${(del.stderr || del.stdout).trim().slice(0, 200)}` };
+      return { deleted: true, reason: `merged into ${base}` };
+    } catch (e: any) {
+      return { deleted: false, reason: String(e?.message ?? e).slice(0, 200) };
+    }
+  }
+
   // Cleanup removal for a FINISHED task's worktree. Keeps teardown's guard (only
   // removes once the branch is pushed/merged, so committed work is safe upstream)
   // and additionally never drops uncommitted WORK: if the tree carries tracked
