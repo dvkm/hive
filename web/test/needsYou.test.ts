@@ -49,7 +49,7 @@ test("tracked Jira cards show logical subtasks with retry chains collapsed", () 
 test("needs-you queue includes every actionable item", () => {
   const decision = { id: "decision-1" } as Decision;
   const checkpoint = { id: "checkpoint-1" } as Checkpoint;
-  const quiz = { id: "quiz-1", task_id: "quiz-task", task_state: "in_review" } as UnderstandingQuiz;
+  const quiz = { id: "quiz-1", task_id: "quiz-task", project_id: "p1", task_state: "in_review" } as UnderstandingQuiz;
   const activeQuiz = { id: "quiz-active", task_id: "review-1", task_state: "done" } as UnderstandingQuiz;
   const cancelledQuiz = { id: "quiz-cancelled", task_id: "cancelled-1", task_state: "in_review" } as UnderstandingQuiz;
   const items = getNeedsYouItems(
@@ -68,8 +68,8 @@ test("needs-you queue includes every actionable item", () => {
     [quiz, activeQuiz, cancelledQuiz]
   );
 
-  expect(items.map((item) => item.kind)).toEqual(["decision", "checkpoint", "quiz", "review", "attention", "attention"]);
-  expect(items.map((item) => item.id)).toEqual(["decision-1", "checkpoint-1", "quiz-1", "review-1", "failed-1", "stuck-1"]);
+  expect(items.map((item) => item.kind)).toEqual(["decision", "checkpoint", "quiz_digest", "review", "attention", "attention"]);
+  expect(items.map((item) => item.id)).toEqual(["decision-1", "checkpoint-1", "quiz-digest:p1", "review-1", "failed-1", "stuck-1"]);
 });
 
 test("a stuck/dead task blocked on an unmerged dependency is 'waiting', not 'attention', and contributes no attention item", () => {
@@ -99,6 +99,24 @@ test("a dependency landing (verifying/done) moves its dependent from 'waiting' b
   );
 
   expect(items.map((item) => item.kind)).toEqual(["attention"]);
+});
+
+test("a task blocked only by dead dependencies needs attention instead of waiting", () => {
+  const items = getNeedsYouItems(
+    [],
+    [
+      task("failed-blocker", "failed"),
+      task("cancelled-blocker", "cancelled"),
+      task("wedged", "queued", {
+        depends_on: ["failed-blocker", "cancelled-blocker"],
+        health: { status: "stuck", reason: "all blocking dependencies ended without completing", since: "now" },
+      }),
+    ],
+    [],
+    []
+  );
+
+  expect(items.map((item) => ({ id: item.id, kind: item.kind }))).toContainEqual({ id: "wedged", kind: "attention" });
 });
 
 test("a failed task always needs routing, even with an unmet dependency", () => {
@@ -288,7 +306,7 @@ test("itemProject resolves the project for every needs-you item kind", () => {
 
   const items = getNeedsYouItems([decision], tasks, [checkpoint], [quiz]);
   const projects = Object.fromEntries(items.map((item) => [item.kind, itemProject(item, tasks)]));
-  expect(projects).toEqual({ decision: "p2", checkpoint: "p3", quiz: "p4", review: "p1" });
+  expect(projects).toEqual({ decision: "p2", checkpoint: "p3", quiz_digest: "p4", review: "p1" });
 
   // "All" (empty filter) keeps everything; a project filter keeps only its own.
   expect(items.filter((item) => inProjectFilter(itemProject(item, tasks), "")).length).toBe(4);

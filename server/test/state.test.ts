@@ -59,6 +59,13 @@ test("invalid transition is rejected with a clear error", () => {
   expect(() => transition(db, id, "verifying")).toThrow(/invalid transition/);
 });
 
+test("an invalid in_progress -> queued transition hints at /requeue", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  transition(db, id, "in_progress");
+  expect(() => transition(db, id, "queued")).toThrow(new RegExp(`/api/tasks/${id}/requeue`));
+});
+
 test("done is rejected without evidence", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId);
@@ -250,6 +257,36 @@ test("cancelling a task expires its open decisions + writes decision_expired eve
   expect((db.query("SELECT status FROM decisions WHERE id = ?").get(d2) as any).status).toBe("expired");
   const evts = db.query("SELECT * FROM events WHERE task_id = ? AND type = 'decision_expired'").all(id);
   expect(evts.length).toBe(2);
+});
+
+test("cancelling a task with dependents opens one decision naming every affected task", () => {
+  const { db, projectId } = freshDb();
+  const dependency = makeTask(db, projectId);
+  const first = makeTask(db, projectId);
+  const second = makeTask(db, projectId);
+  db.query("UPDATE tasks SET title = ?, depends_on = ? WHERE id = ?").run("first dependent", JSON.stringify([dependency]), first);
+  db.query("UPDATE tasks SET title = ?, depends_on = ? WHERE id = ?").run("second dependent", JSON.stringify([dependency]), second);
+
+  transition(db, dependency, "cancelled", { source: "director", reason: "no longer needed" });
+
+  const decision = db.query("SELECT * FROM decisions WHERE status = 'open'").get() as any;
+  expect(decision).toBeTruthy();
+  expect(decision.context).toContain(first);
+  expect(decision.context).toContain(second);
+  expect(JSON.parse(decision.options).map((option: any) => option.key)).toEqual(["repoint", "cancel"]);
+});
+
+test("cancelling a task also surfaces an active dependent", () => {
+  const { db, projectId } = freshDb();
+  const dependency = makeTask(db, projectId);
+  const dependent = makeTask(db, projectId);
+  transition(db, dependent, "in_progress");
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([dependency]), dependent);
+
+  transition(db, dependency, "cancelled", { source: "director", reason: "no longer needed" });
+
+  const decision = db.query("SELECT * FROM decisions WHERE status = 'open'").get() as any;
+  expect(decision.context).toContain(dependent);
 });
 
 test("reaching done also expires open decisions; already-answered ones are untouched", () => {

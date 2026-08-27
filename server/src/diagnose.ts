@@ -86,6 +86,14 @@ export function diagnosePane(tail: string): PaneDiagnosis {
   const trust = find(/Quick safety check:|Yes, I trust this folder/i);
   if (trust !== -1 && /Quick safety check:/i.test(tail) && /Yes, I trust this folder/i.test(tail))
     return { kind: "trust_dialog", excerpt: excerptAround(lines, trust, 12, 6) };
+  // Checked before the dialog scan below: the CLI's own park message contains
+  // "esc to cancel" ("Continuing automatically at 8:30pm - esc to cancel"),
+  // which would otherwise match the blocked-dialog regex and send a parked,
+  // limit-waiting agent through the interactive-dialog recovery path instead
+  // (task HIVE-451, 2026-08-26 stale wave).
+  const limit = find(/hit your (?:session|usage|weekly) limit|usage limit reached/i);
+  if (limit !== -1) return { kind: "usage_limit", excerpt: excerptAround(lines, limit) };
+
   const dialog = find(/Do you want to proceed\?|Esc to cancel|requested permissions to/i);
   if (dialog !== -1) return { kind: "blocked_dialog", excerpt: excerptAround(lines, dialog, 12, 6) };
 
@@ -95,11 +103,62 @@ export function diagnosePane(tail: string): PaneDiagnosis {
   const ctx = find(/\/clear to save [\d.]+k tokens|[Cc]ontext (window is )?(low|full)|approaching.*context limit|Conversation compacted/);
   if (ctx !== -1) return { kind: "context_full", excerpt: excerptAround(lines, ctx) };
 
-  const limit = find(/hit your (session|usage|weekly) limit/i);
-  if (limit !== -1) return { kind: "usage_limit", excerpt: excerptAround(lines, limit) };
-
   const api = find(/rate.?limit|overloaded_error|529|API Error|ETIMEDOUT|ENOTFOUND|ECONNRESET|fetch failed|network error|Unable to connect/i);
   if (api !== -1) return { kind: "api_error", excerpt: excerptAround(lines, api) };
 
   return null;
+}
+
+// ---- codex edit confirmations --------------------------------------------
+// Codex asks before writing files: "Would you like to make the following
+// edits?" with its 1/2/3 choices. That is a WRITE, not a command — an `rm -rf`
+// or any other shell approval is a different prompt and never matches here.
+// Returns the files the pending edit touches, or null when the tail is not a
+// codex edit confirmation (or names no file we can read). The caller decides
+// whether those paths are the agent's to write (reconciler.autoAnswerDialog).
+const EDIT_PROMPT = /Would you like to make the following edits\?/;
+const EDIT_CHOICES = /don't ask again for these files/i;
+
+// The pane hard-wraps: a long path continues on the next line, so a bullet is
+// complete only once its "(+N -M)" tail shows up. Join until it does.
+function unwrapBullet(lines: string[], i: number): string {
+  let s = lines[i].trim();
+  for (let j = i + 1; j < lines.length && !/\(\+\d+\s+-\d+\)/.test(s); j++) {
+    const next = lines[j].trim();
+    if (!next) break;
+    s += next;
+  }
+  return s;
+}
+
+export function editDialogPaths(tail: string): string[] | null {
+  const lines = (tail ?? "").split("\n");
+  const prompt = lines.findLastIndex((l) => EDIT_PROMPT.test(l));
+  if (prompt === -1 || !EDIT_CHOICES.test(tail)) return null;
+
+  const paths: string[] = [];
+  // "Destination:" names the file outright; its path may wrap over several
+  // lines and ends at the blank line before the choices.
+  const dest = lines.findLastIndex((l, i) => i > prompt && /^\s*Destination:\s*$/.test(l));
+  if (dest !== -1) {
+    let p = "";
+    for (let i = dest + 1; i < lines.length && lines[i].trim(); i++) p += lines[i].trim();
+    if (p) paths.push(p);
+  }
+  // Otherwise the diff above the prompt is headed by codex's own file bullet.
+  // Only THIS dialog's diff counts: the pane still holds bullets from edits
+  // approved minutes ago, and approving a dialog whose real files were never
+  // checked is the one failure this feature cannot have. So take the single
+  // contiguous block directly above the prompt (blank lines bound it) and
+  // never widen — no bullet in that block means we do not know what the edit
+  // touches, and the caller parks it for the director.
+  let end = prompt;
+  while (end > 0 && !lines[end - 1].trim()) end--; // blank separator above the prompt
+  let start = end;
+  while (start > 0 && lines[start - 1].trim()) start--;
+  for (let i = start; i < end; i++) {
+    const m = /^[•*]\s+(?:Added|Edited|Updated|Created|Deleted)\s+(\S.*)$/.exec(lines[i].trim());
+    if (m) paths.push(unwrapBullet(lines, i).replace(/^[•*]\s+\w+\s+/, "").replace(/\s*\(\+\d+\s+-\d+\).*$/, ""));
+  }
+  return paths.length ? paths : null;
 }

@@ -105,8 +105,8 @@ test("a task with no Jira link reports linked:false rather than inventing a tick
   expect(r.json.linked).toBe(false);
 });
 
-test("a linked ticket exposes the browse URL the board turns into an Open in Jira action", async () => {
-  const { jiraTask, key } = seed(CFG);
+test("a linked ticket exposes the browse URL and effective write scope", async () => {
+  const { jiraTask, key } = seed({ ...CFG, write_scope: { create_subtask: true } });
   db.query("UPDATE tasks SET brief = ? WHERE id = ?").run("Assignee: Alex Kim\n\nTicket", jiraTask);
   const r = await get(`/api/tasks/${jiraTask}/jira`);
   expect(r.json.linked).toBe(true);
@@ -114,7 +114,7 @@ test("a linked ticket exposes the browse URL the board turns into an Open in Jir
   expect(r.json.browse_url).toBe(`https://example.atlassian.net/browse/${key}`);
   expect(r.json.enabled).toBe(true);
   expect(r.json.assignee).toBe("Alex Kim");
-  expect(r.json.write_scope).toEqual(J.JIRA_WRITE_SCOPE);
+  expect(r.json.write_scope).toEqual({ ...J.JIRA_WRITE_SCOPE, create_subtask: true });
 });
 
 test("a config pointing somewhere not allow-listed reports unconfigured, and never echoes that host", async () => {
@@ -123,8 +123,26 @@ test("a config pointing somewhere not allow-listed reports unconfigured, and nev
   const { jiraTask } = seed({ ...CFG, site: "https://evil.atlassian.net" });
   const r = await get(`/api/tasks/${jiraTask}/jira`);
   expect(r.json.configured).toBe(false);
-  expect(r.json.browse_url).toMatch(/^https:\/\/acme\.atlassian\.net\/browse\/WEB-\d+$/);
+  expect(r.json.browse_url).toBeNull();
   expect(JSON.stringify(r.json)).not.toContain("evil.atlassian.net");
+});
+
+test("the project payload carries the canonicalized Jira site, never the configured host", async () => {
+  // The board card builds its browse chip from the project payload, so this
+  // field has to survive the same credential gate the per-task browse_url does.
+  const allowed = seed(CFG);
+  const evil = seed({ ...CFG, site: "https://evil.atlassian.net" });
+
+  const one = await get(`/api/projects/${allowed.projectId}`);
+  expect(one.json.jira_site).toBe("https://example.atlassian.net");
+
+  const bad = await get(`/api/projects/${evil.projectId}`);
+  expect(bad.json.jira_site).toBeNull();
+  expect(JSON.stringify(bad.json)).not.toContain("evil.atlassian.net/browse");
+
+  const list = await get("/api/projects");
+  expect(list.json.find((p: any) => p.id === allowed.projectId).jira_site).toBe("https://example.atlassian.net");
+  expect(list.json.find((p: any) => p.id === evil.projectId).jira_site).toBeNull();
 });
 
 test("an invalid Jira filter is surfaced through sync state and manual retry", async () => {

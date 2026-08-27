@@ -262,9 +262,9 @@ test("merge success writes a merged event and moves the task to verifying", asyn
   s.server.stop(true);
 });
 
-test("understanding quiz blocks merge until the director answers correctly", async () => {
+test("a kind outside auto_merge.kinds blocks merge until the director answers correctly", async () => {
   const s = makeServer();
-  const { taskId } = await inReviewTask(s.base, {}, false);
+  const { taskId } = await inReviewTask(s.base, { auto_merge: { kinds: ["chore"] } }, false);
 
   let quizzes = await get(s.base, "/api/understanding-quizzes");
   const quiz = quizzes.json.quizzes.find((item: any) => item.task_id === taskId);
@@ -294,6 +294,41 @@ test("understanding quiz blocks merge until the director answers correctly", asy
   expect(merge.status).toBe(200);
   quizzes = await get(s.base, "/api/understanding-quizzes");
   expect(quizzes.json.quizzes.some((item: any) => item.task_id === taskId)).toBe(false);
+  s.server.stop(true);
+});
+
+test("an auto-ship kind defers its required quiz and keeps it in the backlog", async () => {
+  const s = makeServer();
+  const { taskId } = await inReviewTask(s.base, { auto_merge: { kinds: ["ship"] } }, false);
+
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(200);
+
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  const deferred = events.json.find((event: any) => event.type === "understanding_quiz_deferred");
+  expect(deferred.source).toBe("system");
+  expect(deferred.payload.review_event_id).toBeTruthy();
+  expect(deferred.payload.note).toContain("auto_merge.kinds");
+
+  const quizzes = await get(s.base, "/api/understanding-quizzes");
+  expect(quizzes.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("deferred");
+  s.server.stop(true);
+});
+
+test("a failed merge on an auto-ship kind leaves the required quiz undeferred", async () => {
+  const s = makeServer();
+  const { taskId } = await inReviewTask(s.base, { auto_merge: { kinds: ["ship"] } }, false);
+  s.db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify(["no-such-task"]), taskId);
+
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(409);
+  expect(merge.json.error).toContain("unmet dependenc");
+
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  expect(events.json.some((event: any) => event.type === "understanding_quiz_deferred")).toBe(false);
+
+  const quizzes = await get(s.base, "/api/understanding-quizzes");
+  expect(quizzes.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("required");
   s.server.stop(true);
 });
 
@@ -848,6 +883,27 @@ test("report acceptance requires its understanding quiz", async () => {
   s.server.stop(true);
 });
 
+test("passing a scout's quiz never accepts the report on its own (HIVE-421)", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "scout it", kind: "scout" });
+  await post(s.base, `/api/tasks/${t.json.id}/spawn`, {});
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+  await addQuiz(s.base, t.json.id);
+
+  const pass = await post(s.base, `/api/tasks/${t.json.id}/understanding-quiz/answer`, { answer_key: "tests", source: "director" });
+  expect(pass.json.passed).toBe(true);
+  // The quiz is a precondition for accepting the report, never the trigger:
+  // the task sits in review until the director takes the distinct accept action.
+  expect((await get(s.base, `/api/tasks/${t.json.id}`)).json.state).toBe("in_review");
+  const events = await get(s.base, `/api/tasks/${t.json.id}/events`);
+  expect(events.json.some((e: any) => e.type === "state_change" && e.payload.to === "verifying")).toBe(false);
+
+  const accept = await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "verifying" });
+  expect(accept.status).toBe(200);
+  s.server.stop(true);
+});
+
 test("request-changes returns the task to in_progress, sends notes, records an event", async () => {
   const s = makeServer();
   const { taskId } = await inReviewTask(s.base);
@@ -1062,4 +1118,244 @@ test("diff endpoint rejects tracking-only review tasks", async () => {
   s.server.stop(true);
 });
 
+
+// ---- judgment-class understanding checks (hive-1559) ----
+
+// A task in review with checks submitted, plus whatever auto-review verdict the
+// case needs. `kind` decides whether it is inside the project's auto_merge list.
+async function judgmentTask(
+  s: ReturnType<typeof makeServer>,
+  opts: {
+    kind?: string;
+    verdict?: "looks_good" | "caution";
+    files?: string[];
+    risks?: string[];
+    head?: string;
+    config?: Record<string, unknown>;
+  } = {}
+) {
+  const p = await post(s.base, "/api/projects", {
+    name: "p",
+    repo_path: "/repo",
+    config: { default_branch: "main", auto_merge: { kinds: ["chore"] }, ...(opts.config ?? {}) },
+  });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "mechanical bump", brief: "b", kind: opts.kind ?? "chore" });
+  await post(s.base, `/api/tasks/${t.json.id}/spawn`, {});
+  await addQuiz(s.base, t.json.id);
+  await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+  if (opts.verdict)
+    s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+      `ev-auto-${t.json.id}`,
+      t.json.id,
+      new Date().toISOString(),
+      "system",
+      "auto_review",
+      JSON.stringify({
+        verdict: opts.verdict,
+        summary: "s",
+        risks: opts.risks ?? [],
+        questions: [],
+        files: opts.files ?? ["server/src/rows.ts"],
+        ...(opts.head ? { reviewed_head_sha: opts.head } : {}),
+      })
+    );
+  if (opts.head) s.db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run(opts.head, t.json.id);
+  return { projectId: p.json.id, taskId: t.json.id };
+}
+
+// The verification pass's answer for one head, as the reviewer would write it.
+function addRiskVerdicts(s: ReturnType<typeof makeServer>, taskId: string, head: string, verdict: "confirmed" | "refuted") {
+  s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    `ev-rv-${head}-${taskId}`,
+    taskId,
+    new Date().toISOString(),
+    "system",
+    "risk_verdicts",
+    JSON.stringify({ reviewed_head_sha: head, verdicts: [{ risk: "maybe a leak", verdict, why: "checked it" }] })
+  );
+}
+
+test("a mechanical looks_good chore mints no quiz anywhere", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "looks_good" });
+
+  const check = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(check.json.understanding_required).toBe(false);
+
+  const quizzes = await get(s.base, "/api/understanding-quizzes");
+  expect(quizzes.json.quizzes.some((item: any) => item.task_id === taskId)).toBe(false);
+
+  // Merges with the quiz unanswered, and leaves no deferred backlog entry behind.
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(200);
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  expect(events.json.some((event: any) => event.type === "understanding_quiz_deferred")).toBe(false);
+  const after = await get(s.base, "/api/understanding-quizzes");
+  expect(after.json.quizzes.some((item: any) => item.task_id === taskId)).toBe(false);
+  s.server.stop(true);
+});
+
+test("a caution verdict keeps the quiz required for the same chore", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "caution" });
+
+  const check = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(check.json.understanding_required).toBe(true);
+  const quizzes = await get(s.base, "/api/understanding-quizzes");
+  expect(quizzes.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("required");
+
+  // Inside auto_merge.kinds, so it merges — but the quiz is deferred, not dropped.
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(200);
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  expect(events.json.some((event: any) => event.type === "understanding_quiz_deferred")).toBe(true);
+  s.server.stop(true);
+});
+
+// HIVE-407: the per-risk check (HIVE-406) re-read the code for this head and
+// refuted everything, so the caution is no longer judgment-class — it lands
+// like a clean review. A risk that survives the check does the opposite.
+test("a caution whose risks were all refuted stops being judgment-class", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
+  addRiskVerdicts(s, taskId, "head-1", "refuted");
+
+  const check = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(check.json.understanding_required).toBe(false);
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(200);
+  s.server.stop(true);
+});
+
+test("a confirmed risk blocks the merge and the 409 names it", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
+  addRiskVerdicts(s, taskId, "head-1", "confirmed");
+
+  const blocked = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(blocked.status).toBe(409);
+  expect(blocked.json.error).toContain("maybe a leak");
+  expect(blocked.json.error).toContain("checked it");
+
+  // Verdicts from an older head say nothing about the head being merged.
+  s.db.query("UPDATE tasks SET head_sha = 'head-2' WHERE id = ?").run(taskId);
+  const stale = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(stale.status).not.toBe(409);
+  s.server.stop(true);
+});
+
+test("the director can merge over a confirmed risk on purpose", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
+  addRiskVerdicts(s, taskId, "head-1", "confirmed");
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, { override_confirmed_risks: true });
+  expect(merge.status).toBe(200);
+  s.server.stop(true);
+});
+
+test("a looks_good chore touching a sensitive path stays judgment-class", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "looks_good", files: ["server/src/auth.ts"] });
+  const check = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(check.json.understanding_required).toBe(true);
+
+  // A project can name its own sensitive paths; "auth" then stops matching.
+  const s2 = makeServer();
+  const custom = await judgmentTask(s2, {
+    verdict: "looks_good",
+    files: ["server/src/auth.ts"],
+    config: { understanding_checks: { sensitive_paths: ["payments"] } },
+  });
+  const check2 = await get(s2.base, `/api/tasks/${custom.taskId}/branch-check`);
+  expect(check2.json.understanding_required).toBe(false);
+  s.server.stop(true);
+  s2.server.stop(true);
+});
+
+test("camelCase sensitive filenames still count as judgment-class", async () => {
+  // The match is a case-insensitive substring of a path segment, so a token
+  // buried inside a camelCase filename cannot sneak through as mechanical.
+  const sensitive = [
+    "web/src/lib/authTokens.ts",
+    "web/src/lib/paymentUtils.tsx",
+    "server/src/RefreshSecretStore.ts",
+    "server/src/db/addBillingColumnMigration.ts",
+    "server/src/resetPasswordFlow.ts",
+    "server/src/tokenStore.ts",
+  ];
+  for (const file of sensitive) {
+    const s = makeServer();
+    const { taskId } = await judgmentTask(s, { verdict: "looks_good", files: [file] });
+    const check = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+    expect([file, check.json.understanding_required]).toEqual([file, true]);
+    s.server.stop(true);
+  }
+
+  // A path with no sensitive token anywhere stays mechanical.
+  const plain = makeServer();
+  const { taskId } = await judgmentTask(plain, { verdict: "looks_good", files: ["web/src/views/Board.tsx"] });
+  expect((await get(plain.base, `/api/tasks/${taskId}/branch-check`)).json.understanding_required).toBe(false);
+  plain.server.stop(true);
+});
+
+test("the director can flag a mechanical task to require its quiz again", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "looks_good" });
+  expect((await get(s.base, `/api/tasks/${taskId}/branch-check`)).json.understanding_required).toBe(false);
+
+  const denied = await post(s.base, `/api/tasks/${taskId}/understanding-quiz/require`, {});
+  expect(denied.status).toBe(403);
+
+  const flagged = await post(s.base, `/api/tasks/${taskId}/understanding-quiz/require`, { source: "director" });
+  expect(flagged.status).toBe(200);
+  expect((await get(s.base, `/api/tasks/${taskId}/branch-check`)).json.understanding_required).toBe(true);
+  const quizzes = await get(s.base, "/api/understanding-quizzes");
+  expect(quizzes.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("required");
+  s.server.stop(true);
+});
+
 afterAll(() => {});
+
+test("five deferred quizzes push ONE catch-up digest, not five notifications", async () => {
+  const { notifyQuizDigest, QUIZ_DIGEST_MS } = await import("../src/reconciler.ts");
+  const s = makeServer();
+  const digests = () =>
+    s.db.query("SELECT title, urgency FROM notifications WHERE kind = 'quiz_digest' ORDER BY rowid").all() as { title: string; urgency: string }[];
+
+  // Two shipped changes waiting: below the "three pending" bar, so only the
+  // daily nudge fires, and it fires exactly once.
+  const t0 = Date.parse("2026-08-25T09:00:00.000Z");
+  const taskIds: string[] = [];
+  for (let n = 0; n < 2; n += 1) {
+    const { taskId } = await inReviewTask(s.base, {}, false);
+    await post(s.base, `/api/tasks/${taskId}/understanding-quiz/defer`, { confirm: "quiz_later", source: "director" });
+    await post(s.base, `/api/tasks/${taskId}/transition`, { to: "verifying" });
+    taskIds.push(taskId);
+  }
+  notifyQuizDigest(s.db, t0);
+  notifyQuizDigest(s.db, t0 + 60 * 1000);
+  expect(digests().map((row) => row.title)).toEqual(["Catch up on 2 shipped changes"]);
+  expect(digests()[0].urgency).toBe("urgent"); // urgent is what reaches the phone
+
+  // Three more pile up. Reaching three nudges once, early — then goes quiet again.
+  for (let n = 0; n < 3; n += 1) {
+    const { taskId } = await inReviewTask(s.base, {}, false);
+    await post(s.base, `/api/tasks/${taskId}/understanding-quiz/defer`, { confirm: "quiz_later", source: "director" });
+    await post(s.base, `/api/tasks/${taskId}/transition`, { to: "verifying" });
+    taskIds.push(taskId);
+  }
+  notifyQuizDigest(s.db, t0 + 2 * 60 * 1000);
+  notifyQuizDigest(s.db, t0 + 3 * 60 * 1000);
+  expect(digests().map((row) => row.title)).toEqual([
+    "Catch up on 2 shipped changes",
+    "Catch up on 5 shipped changes",
+  ]);
+
+  // Working through all five empties the digest, so a day later there is nothing to say.
+  for (const taskId of taskIds)
+    await post(s.base, `/api/tasks/${taskId}/understanding-quiz/answer`, { answer_key: "tests", source: "director" });
+  expect((await get(s.base, "/api/understanding-quizzes")).json.quizzes).toHaveLength(0);
+  notifyQuizDigest(s.db, t0 + QUIZ_DIGEST_MS + 60 * 1000);
+  expect(digests()).toHaveLength(2);
+  s.server.stop(true);
+});

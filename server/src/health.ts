@@ -11,8 +11,9 @@ import type { DB } from "./db.ts";
 import { getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { isSupervisedTask, neverDispatched } from "./supervision.ts";
-import { isDeferred } from "./state.ts";
+import { isDeferred, unmetDeps, TERMINAL, type State } from "./state.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
+import { latestSidecar } from "./sidecar.ts";
 
 export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
 
@@ -28,8 +29,8 @@ export interface Health {
   since: string; // ISO ts the current condition began
 }
 
-// Only tasks that hold (or should hold) a live agent get a health verdict.
-// Queued / done / failed / cancelled tasks get `null`.
+// Tasks that hold (or should hold) a live agent get a health verdict. Queued
+// tasks also get one after the reconciler identifies dead dependencies.
 const HEALTH_STATES = new Set(["in_progress", "needs_decision", "in_review", "verifying"]);
 
 // Did anything after the merge_failed at `sinceTs` actually resolve it?
@@ -95,6 +96,13 @@ function staleMs(): number {
 //   silent — no activity events past the stale threshold, agent still alive.
 //   healthy — otherwise.
 export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | null {
+  if (task.state === "queued") {
+    const blocking = unmetDeps(db, task);
+    const marker = blocking.length && blocking.every((dep) => TERMINAL.includes(dep.state as State))
+      ? db.query("SELECT ts FROM events WHERE task_id = ? AND type = 'dead_dependencies' ORDER BY ts DESC LIMIT 1").get(task.id) as { ts: string } | undefined
+      : undefined;
+    if (marker) return { status: "stuck", reason: "all blocking dependencies ended without completing", since: marker.ts };
+  }
   if (!HEALTH_STATES.has(task.state)) return null;
   // Health is agent-derived, so it needs a bound agent — with one exception: a
   // task in review whose agent was RELEASED (cleanup.releaseReviewAgent) is
@@ -254,7 +262,9 @@ export function taskWithHealth(db: DB, task: any): any {
       : null;
   // Server-computed so the web app never has to re-derive "was this ever
   // spawned" from raw event history — see supervision.ts's neverDispatched.
-  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, never_dispatched: neverDispatched(db, task) };
+  // `sidecar` is the latest background check on this task's own commits, so the
+  // board card and the review card can show it without fetching every event.
+  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, never_dispatched: neverDispatched(db, task), sidecar: latestSidecar(db, task.id) };
 }
 
 // "Needs attention" tray eligibility (the single rule; the web mirrors it):

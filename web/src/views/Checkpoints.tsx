@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
-import type { Checkpoint, Event } from "../lib/api";
+import type { Checkpoint, CheckpointPlan, Event } from "../lib/api";
 import { useStore } from "../lib/store";
 import { useProjectFilter, inProjectFilter } from "../lib/projectFilter";
 import { taskLabel } from "../lib/references";
@@ -19,6 +19,34 @@ interface Row {
   note: string;
   verdict?: "ok" | "flag"; // acked state (task-page view only)
   flagNote?: string | null;
+  blocking?: boolean; // agent is parked until this is acked
+  plan?: CheckpointPlan;
+  concerns?: { severity: "note" | "veto"; text: string }[];
+}
+
+// A blocking plan is approved from the card itself, so the card carries the
+// whole plan and the critic's concerns. Everything the director needs to say
+// yes is on screen; no task page, no digging.
+function PlanBody({ plan, concerns }: { plan: CheckpointPlan; concerns?: Row["concerns"] }) {
+  return (
+    <div className="cp-plan">
+      <div className="cp-plan-line"><b>Goal</b> {plan.goal}</div>
+      <div className="cp-plan-line"><b>Approach</b> {plan.approach}</div>
+      {plan.files_expected.length > 0 && (
+        <div className="cp-plan-line"><b>Files</b> <code>{plan.files_expected.join(", ")}</code></div>
+      )}
+      <div className="cp-plan-line"><b>Check</b> {plan.verification_planned}</div>
+      {concerns && concerns.length > 0 && (
+        <ul className="cp-concerns">
+          {concerns.map((c, i) => (
+            <li key={i} className={c.severity === "veto" ? "cp-concern-veto" : ""}>
+              {c.severity === "veto" ? "VETO" : "Note"}: {c.text}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 function CheckpointRow({
@@ -78,7 +106,9 @@ function CheckpointRow({
           </Link>
         )}
         <span className="cp-note">{row.note}</span>
+        {row.blocking && !acked && <span className="chip cp-waiting" title="The agent posted this plan and stopped. It starts editing when you approve.">waiting on you</span>}
         {row.verdict === "flag" && row.flagNote && <span className="cp-flag-note">— {row.flagNote}</span>}
+        {row.plan && <PlanBody plan={row.plan} concerns={row.concerns} />}
       </div>
       {!acked && (
         <button className="cp-flag" title="Flag: send back to the agent" disabled={busy} onClick={() => setFlagging((f) => !f)}>
@@ -145,11 +175,11 @@ export function CheckpointList({ events }: { events: Event[] }) {
 // an approve-all per group. Live via the store's SSE-driven checkpoint list.
 // Un-acked checkpoints survive task completion (marked "shipped") — a late
 // flag becomes a corrective follow-up task instead of a dead steer.
-export function CheckpointsInbox({ limit, heading = true }: { limit?: number; heading?: boolean } = {}) {
+export function CheckpointsInbox({ taskId, heading = true }: { taskId?: string; heading?: boolean } = {}) {
   const { checkpoints, reloadCheckpoints, tasks } = useStore();
   const projectFilter = useProjectFilter();
   const [busy, setBusy] = useState(false);
-  const scoped = checkpoints.filter((c) => inProjectFilter(c.project_id, projectFilter));
+  const scoped = checkpoints.filter((c) => inProjectFilter(c.project_id, projectFilter) && (!taskId || c.task_id === taskId));
   if (!scoped.length) return null;
 
   const groups = new Map<string, Checkpoint[]>();
@@ -158,7 +188,7 @@ export function CheckpointsInbox({ limit, heading = true }: { limit?: number; he
     g.push(c);
     groups.set(c.task_id, g);
   }
-  const visibleGroups = limit ? [...groups.values()].slice(0, limit) : [...groups.values()];
+  const visibleGroups = [...groups.values()];
 
   const approveAll = async (items: Checkpoint[]) => {
     if (busy) return;
@@ -201,7 +231,7 @@ export function CheckpointsInbox({ limit, heading = true }: { limit?: number; he
             {items.map((c) => (
               <CheckpointRow
                 key={c.id}
-                row={{ id: c.id, task_id: c.task_id, ts: c.ts, note: c.note }}
+                row={{ id: c.id, task_id: c.task_id, ts: c.ts, note: c.note, blocking: c.blocking, plan: c.plan, concerns: c.concerns }}
                 onAcked={() => reloadCheckpoints()}
               />
             ))}

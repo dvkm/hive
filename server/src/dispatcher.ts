@@ -12,6 +12,7 @@
 //     "reviewed"; the intake connector's own "UNREVIEWED ..." marker does NOT
 //     count — see isReviewed()). Intake text is raw input, never a brief.
 //   - `max_agents` (default 3) — concurrency cap per project.
+//   - PR Gardener repair tasks use their own `max_gardener_agents` lane.
 //   - authority gate: authorize(action="task.dispatch") must resolve to `allow`;
 //     a `deny` or `require_decision` rule blocks the auto-spawn.
 //   - spawn failures back off exponentially per task (30s * 2^(n-1), capped at
@@ -46,7 +47,8 @@ import type { Exec } from "./exec.ts";
 // guards that matter stay: manager delegation/auto_dispatch, intake review,
 // max_agents, authority. Exclude chores per project via config.dispatch_kinds.
 const DISPATCH_KINDS_DEFAULT = ["ship", "scout", "chore"];
-const MAX_AGENTS_DEFAULT = 3;
+export const MAX_AGENTS_DEFAULT = 3;
+const MAX_GARDENER_AGENTS_DEFAULT = 1;
 const BACKOFF_BASE_MS = 30_000;
 // Global herdr-daemon-down circuit breaker. When a spawn fails because the herdr
 // control socket is unreachable (not a per-task fault), pause ALL dispatch for a
@@ -70,6 +72,10 @@ const ACTIVE_STATES = "('in_progress','needs_decision','in_review','verifying')"
 // agents rather than review depth, which is what it was always meant to bound —
 // 10 idle review agents held acme at 3 running against 19 queued.
 const REVIEW_OVERHANG = 2;
+// Ordinal priority as a sort key. Anything outside the vocabulary (only
+// reachable by a hand-edited row) sorts last, with 'later'.
+export const PRIORITY_RANK_SQL =
+  "CASE priority WHEN 'now' THEN 0 WHEN 'next' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END";
 
 export interface DispatcherDeps {
   herdr?: Herdr;
@@ -107,8 +113,10 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     return;
   }
 
+  // Priority first, then age. Ordering only — nothing running is ever killed to
+  // make room for a higher-priority task (see the borrowed slot in hasCapacity).
   const queued = db
-    .query("SELECT * FROM tasks WHERE state = 'queued' ORDER BY created_at ASC")
+    .query(`SELECT * FROM tasks WHERE state = 'queued' ORDER BY ${PRIORITY_RANK_SQL}, created_at ASC`)
     .all()
     .map(parseTask);
 
@@ -124,12 +132,14 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     .query(`SELECT * FROM tasks WHERE agent_target IS NULL AND state IN ('in_progress','in_review','verifying') ORDER BY updated_at ASC`)
     .all()
     .map(parseTask)
-    .filter((t: any) => !isTrackingOnlyTask(t) && t.source !== "chat_supervisor" && queuedSteers(db, t.id).length > 0);
+    .filter((t: any) => !isTrackingOnlyTask(t) && !["chat_supervisor", "pr-gardener-decision"].includes(t.source) && queuedSteers(db, t.id).length > 0);
 
   let errors = 0;
   const projectCache = new Map<string, { repo_path: string | null; config: any } | null>();
   const workingCount = new Map<string, number>(); // per-project working slots used
   const activeCount = new Map<string, number>(); // per-project live agents incl. review-parked
+  const gardenerWorkingCount = new Map<string, number>();
+  const gardenerActiveCount = new Map<string, number>();
 
   const getProject = (pid: string) => {
     if (!projectCache.has(pid)) {
@@ -138,17 +148,40 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     }
     return projectCache.get(pid)!;
   };
-  const countFor = (cache: Map<string, number>, states: string, pid: string) => {
+  const countFor = (cache: Map<string, number>, states: string, pid: string, gardener: boolean) => {
     if (!cache.has(pid)) {
       const row: any = db
-        .query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND agent_target IS NOT NULL AND COALESCE(source, '') != 'chat_supervisor' AND state IN ${states}`)
+        .query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND agent_target IS NOT NULL AND ${gardener ? "source = 'pr-gardener'" : "COALESCE(source, '') NOT IN ('chat_supervisor', 'pr-gardener', 'pr-gardener-decision')"} AND state IN ${states}`)
         .get(pid);
       cache.set(pid, row.n as number);
     }
     return cache.get(pid)!;
   };
-  const workingFor = (pid: string) => countFor(workingCount, WORKING_STATES, pid);
-  const activeFor = (pid: string) => countFor(activeCount, ACTIVE_STATES, pid);
+  const nowInFlight = (pid: string) =>
+    (db
+      .query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND priority = 'now' AND agent_target IS NOT NULL AND state IN ${WORKING_STATES}`)
+      .get(pid) as { n: number }).n;
+  const workingFor = (pid: string) => countFor(workingCount, WORKING_STATES, pid, false);
+  const activeFor = (pid: string) => countFor(activeCount, ACTIVE_STATES, pid, false);
+  const gardenerWorkingFor = (pid: string) => countFor(gardenerWorkingCount, WORKING_STATES, pid, true);
+  const gardenerActiveFor = (pid: string) => countFor(gardenerActiveCount, ACTIVE_STATES, pid, true);
+  const hasCapacity = (task: any, cfg: any) => {
+    if (task.source === "pr-gardener") {
+      const cap = Number.isFinite(cfg.pr_gardener?.max_gardener_agents) ? Number(cfg.pr_gardener.max_gardener_agents) : MAX_GARDENER_AGENTS_DEFAULT;
+      return gardenerWorkingFor(task.project_id) < cap && gardenerActiveFor(task.project_id) < cap * REVIEW_OVERHANG;
+    }
+    const cap = Number.isFinite(cfg.max_agents) ? Number(cfg.max_agents) : MAX_AGENTS_DEFAULT;
+    const working = workingFor(task.project_id);
+    // Borrowed slot: a `now` task may start at cap+1 when the cap is exactly
+    // full and no other now-task is already in flight for this project. That is
+    // the whole ceiling — at most ONE borrowed slot per project at a time, so a
+    // pile of now-tasks cannot inflate max_agents. Priority NEVER preempts: no
+    // running agent is stopped to free a slot. Uncached on purpose: spawnFor
+    // writes the new task's agent_target before the next candidate is checked,
+    // so this count is self-updating within a cycle.
+    const borrowing = working === cap && task.priority === "now" && nowInFlight(task.project_id) === 0;
+    return (working < cap || borrowing) && activeFor(task.project_id) < cap * REVIEW_OVERHANG;
+  };
 
   // One project's queued tasks, spawned serially. spawnAgent runs the project's
   // setup_argv hook inside the worktree-ready callback (api.ts), which can take
@@ -166,8 +199,13 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   const spawnFor = async (task: any): Promise<boolean> => {
     const r = await spawnAgent(db, h, task.id, { hiveUrl: deps.hiveUrl, supervise: deps.supervise, exec: deps.exec });
     if (r.ok) {
-      workingCount.set(task.project_id, workingFor(task.project_id) + 1);
-      activeCount.set(task.project_id, activeFor(task.project_id) + 1);
+      if (task.source === "pr-gardener") {
+        gardenerWorkingCount.set(task.project_id, gardenerWorkingFor(task.project_id) + 1);
+        gardenerActiveCount.set(task.project_id, gardenerActiveFor(task.project_id) + 1);
+      } else {
+        workingCount.set(task.project_id, workingFor(task.project_id) + 1);
+        activeCount.set(task.project_id, activeFor(task.project_id) + 1);
+      }
       clearHerdrOutage(db); // daemon answered — reset the outage streak
     } else if (isHerdrUnreachable(r.error) && !herdrDown) {
       herdrDown = true; // first hit sets the global cooldown; rest of the cycle bails
@@ -193,8 +231,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         const proj = getProject(task.project_id);
         if (!proj?.repo_path) continue;
         const cfg = proj.config ?? {};
-        const cap = Number.isFinite(cfg.max_agents) ? Number(cfg.max_agents) : MAX_AGENTS_DEFAULT;
-        if (workingFor(task.project_id) >= cap) continue;
+        if (!hasCapacity(task, cfg)) continue;
         if (inBackoff(db, task.id, nowMs)) continue;
         if (!(await spawnFor(task))) return;
       } catch (e) {
@@ -206,6 +243,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     for (const task of group.queued) {
       if (herdrDown) return; // daemon down this cycle — stop, cooldown already set
       try {
+        if (task.source === "pr-gardener-decision") continue;
         const proj = getProject(task.project_id);
         if (!proj?.repo_path) continue; // no repo -> can't spawn
         const cfg = proj.config ?? {};
@@ -215,21 +253,21 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         const managed = managingThreadForTask(db, task.id);
         const manager = managed?.task_id ? db.query("SELECT state FROM tasks WHERE id = ?").get(managed.task_id) as { state: string } | undefined : null;
         const managerDelegated = !!manager && !["done", "failed", "cancelled"].includes(manager.state);
-        if (cfg.auto_dispatch !== true && !managerDelegated) continue;
+        const gardenerTask = task.source === "pr-gardener";
+        if (gardenerTask && cfg.pr_gardener?.enabled !== true) continue;
+        if (cfg.auto_dispatch !== true && !managerDelegated && !gardenerTask) continue;
 
         const kinds = Array.isArray(cfg.dispatch_kinds) ? cfg.dispatch_kinds : DISPATCH_KINDS_DEFAULT;
         // A requeue is recovery for work already dispatched once (auto-requeue on
         // context-full/death, or the director's recovery card) — excluding chores
         // here stranded every requeued braindump in 'queued' forever ("failed —
         // awaiting triage" with a successor nobody spawns, task #135).
-        if (!kinds.includes(task.kind) && task.source !== "requeue") continue; // chore / human-titled tasks excluded
+        if (!kinds.includes(task.kind) && task.source !== "requeue" && !gardenerTask) continue; // chore / human-titled tasks excluded
 
         if (task.source?.startsWith("intake_") && !isReviewed(db, task.id)) continue; // unreviewed intake
         if (isTrackingOnlyTask(task)) continue; // tracking-only: never spawned
 
-        const cap = Number.isFinite(cfg.max_agents) ? Number(cfg.max_agents) : MAX_AGENTS_DEFAULT;
-        if (workingFor(task.project_id) >= cap) continue; // working-concurrency cap
-        if (activeFor(task.project_id) >= cap * REVIEW_OVERHANG) continue; // review overhang bound
+        if (!hasCapacity(task, cfg)) continue;
 
         if (inBackoff(db, task.id, nowMs)) continue; // still cooling down after a spawn failure
 

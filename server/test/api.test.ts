@@ -219,10 +219,37 @@ test("PUT /api/tasks/:id can declare a dependency after creation, mid-task", asy
   const selfDep = await put(`/api/tasks/${b.json.id}`, { depends_on: b.json.id });
   expect(selfDep.status).toBe(400);
 
+  const cycle = await put(`/api/tasks/${a.json.id}`, { depends_on: b.json.id });
+  expect(cycle.status).toBe(400);
+  expect(cycle.json.error).toContain("cycle");
+
   // omitting depends_on entirely leaves it alone (only title/brief change)
   const titleOnly = await put(`/api/tasks/${b.json.id}`, { title: "renamed" });
   expect(titleOnly.status).toBe(200);
   expect(titleOnly.json.depends_on).toEqual([a.json.id]);
+});
+
+test("answering a cancelled-dependency card repoints its dependents", async () => {
+  const dependency = await post("/api/tasks", { project_id: projectId, title: "cancelled dependency resolver source" });
+  const successor = await post("/api/tasks", { project_id: projectId, title: "cancelled dependency resolver successor" });
+  const dependent = await post("/api/tasks", {
+    project_id: projectId,
+    title: "cancelled dependency resolver dependent",
+    depends_on: dependency.json.id,
+  });
+
+  await post(`/api/tasks/${dependency.json.id}/transition`, { to: "cancelled" });
+  const card = (await get(`/api/tasks/${dependent.json.id}`)).json.decisions.find(
+    (d: any) => d.status === "open" && d.options.some((option: any) => option.key === "repoint")
+  );
+  const answered = await post(`/api/decisions/${card.id}/answer`, {
+    answer_key: "repoint",
+    answer_note: successor.json.id,
+    source: "director",
+  });
+
+  expect(answered.status).toBe(200);
+  expect((await get(`/api/tasks/${dependent.json.id}`)).json.depends_on).toEqual([successor.json.id]);
 });
 
 test("tracking-only tasks cannot mint direct, checkpoint, or learning work", async () => {
@@ -507,6 +534,32 @@ test("event ingestion: status event is recorded", async () => {
   expect(r.status).toBe(201);
   const events = await get(`/api/tasks/${taskId}/events`);
   expect(events.json.some((e: any) => e.type === "status" && e.payload.note === "working")).toBe(true);
+});
+
+test("status notes only queue Jira comments when the project opts in", async () => {
+  const task = await post("/api/tasks", { project_id: projectId, title: "linked status note" });
+  db.query("UPDATE tasks SET jira_key = 'WEB-123', jira_link_kind = 'subtask' WHERE id = ?").run(task.json.id);
+
+  const off = await post(`/api/tasks/${task.json.id}/events`, { type: "status", note: "routine progress" });
+  expect(off.status).toBe(201);
+  expect((await get(`/api/tasks/${task.json.id}/events`)).json.filter((e: any) => e.type === "jira_comment")).toHaveLength(0);
+
+  db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify({ jira: {
+    site: "https://example.atlassian.net", email: "jira@example.com", project_key: "WEB",
+    enabled: true, write: true, status_notes_to_comments: true,
+  } }), projectId);
+  const r = await post(`/api/tasks/${task.json.id}/events`, { type: "status", note: "  implementation complete  " });
+  expect(r.status).toBe(201);
+
+  const events = (await get(`/api/tasks/${task.json.id}/events`)).json;
+  const comments = events.filter((e: any) => e.type === "jira_comment");
+  expect(comments).toHaveLength(1);
+  expect(comments[0].payload).toMatchObject({
+    direction: "outbound",
+    text: "implementation complete",
+    status_event_id: r.json.event.id,
+  });
+  db.query("UPDATE projects SET config = '{}' WHERE id = ?").run(projectId);
 });
 
 test("transition endpoint enforces the state machine", async () => {

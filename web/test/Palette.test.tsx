@@ -5,6 +5,7 @@ import { Ctx, type Store } from "../src/lib/store";
 import { api } from "../src/lib/api";
 import type { Task } from "../src/lib/api";
 import Palette from "../src/views/Palette";
+import { Bell } from "../src/App";
 
 // Bun's test environment has no DOM: globalThis already implements
 // addEventListener/dispatchEvent, but the bare `window`/`document` globals
@@ -93,4 +94,33 @@ test("Dispatch command shows for an ordinary (non-external) queued task", async 
   const t = task("ordinary", { title: "Ordinary Task", source: "agent" });
   const renderer = await openWithQuery([t], "dispatch");
   expect(dispatchLabels(renderer)).toContain("Dispatch Ordinary Task");
+});
+
+test("topbar popovers close the palette", async () => {
+  const renderer = await openWithQuery([], "");
+  expect(renderer.root.findAll((node) => node.props.className?.includes("palette-backdrop"))).toHaveLength(1);
+
+  await act(async () => {
+    window.dispatchEvent(new Event("hive:notifications"));
+  });
+
+  expect(renderer.root.findAll((node) => node.props.className?.includes("palette-backdrop"))).toHaveLength(0);
+});
+
+test("opening the palette closes notifications", async () => {
+  const store = { notifications: [], ackNotifications: () => {} } as unknown as Store;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(
+      <Ctx.Provider value={store}>
+        <Bell />
+      </Ctx.Provider>
+    );
+  });
+  await act(async () => renderer.root.findByProps({ className: "bell" }).props.onClick());
+  expect(renderer.root.findAllByProps({ className: "bell-drop" })).toHaveLength(1);
+
+  await act(async () => window.dispatchEvent(new Event("hive:palette")));
+
+  expect(renderer.root.findAllByProps({ className: "bell-drop" })).toHaveLength(0);
 });

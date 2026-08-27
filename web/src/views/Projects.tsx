@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import type { Project, Kind, State } from "../lib/api";
+import type { Project, PrGardenerItem, Kind, State } from "../lib/api";
 import { useStore } from "../lib/store";
 import { STATE_LABEL, toast } from "../lib/ui";
 import { isAbsoluteRepoPath, repoPathPlaceholder } from "../lib/paths";
@@ -108,6 +108,7 @@ function ProjectCard({
   const autoDispatch = p.config?.auto_dispatch === true;
   const agent = p.config?.agent === "codex" ? "codex" : "claude";
   const monitors = (p.config?.monitors?.length as number) || 0;
+  const gardenerEnabled = p.config?.pr_gardener?.enabled === true;
   const total = COUNT_STATES.reduce((n, s) => n + (counts[s] || 0), 0);
 
   const toggleArchive = async () => {
@@ -143,6 +144,7 @@ function ProjectCard({
         </span>
         <span className="chip">{agent === "codex" ? "ChatGPT · Codex" : "Claude Code"}</span>
         <span className="chip">{monitors} monitor{monitors === 1 ? "" : "s"}</span>
+        <span className={`chip ${gardenerEnabled ? "effect-allow" : ""}`}>PR Gardener {gardenerEnabled ? "on" : "off"}</span>
         <span className="chip">{total} task{total === 1 ? "" : "s"}</span>
       </div>
 
@@ -157,7 +159,48 @@ function ProjectCard({
         )}
       </div>
 
+      {gardenerEnabled && <GardenerQueue projectId={p.id} />}
+
       {open && <ProjectEditor p={p} onSaved={onChanged} onClose={onToggleOpen} />}
+    </div>
+  );
+}
+
+function GardenerQueue({ projectId }: { projectId: string }) {
+  const [items, setItems] = useState<PrGardenerItem[]>([]);
+  const load = () => api.prGardener(projectId).then(setItems).catch(() => setItems([]));
+  useEffect(() => { load(); }, [projectId]);
+
+  const setOverride = async (item: PrGardenerItem, override: PrGardenerItem["override"]) => {
+    try {
+      await api.setPrGardenerOverride(projectId, item.pr_number, override);
+      toast(override === "hold" ? `PR #${item.pr_number} held` : override ? `PR #${item.pr_number} queued for the next sweep` : `PR #${item.pr_number} released`);
+      load();
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  };
+
+  return (
+    <div className="gardener-queue">
+      <div className="gardener-title">PR Gardener queue</div>
+      {items.length === 0 ? <span className="muted">No open PRs have been classified yet.</span> : items.map((item) => (
+        <div className="gardener-row" key={item.pr_number}>
+          <a href={item.pr_url} target="_blank" rel="noreferrer">#{item.pr_number} {item.title}</a>
+          <span className="chip">{item.classification}</span>
+          {item.sensitive === 1 && <span className="chip chip-off">sensitive</span>}
+          <span className="gardener-reason">{item.reason}</span>
+          <div className="gardener-actions">
+            {item.override === "hold" ? (
+              <button className="link-btn" onClick={() => setOverride(item, null)}>release</button>
+            ) : (
+              <button className="link-btn" onClick={() => setOverride(item, "hold")}>hold</button>
+            )}
+            {item.linked_task_state === "in_review" && <button className="link-btn" onClick={() => setOverride(item, "force_land")}>land</button>}
+            <button className="link-btn" onClick={() => setOverride(item, "force_close")}>close</button>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }

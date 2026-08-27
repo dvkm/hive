@@ -96,6 +96,10 @@ test("context-full auto-requeue reclaims a dirty worktree before requeuing (reco
 test("manual POST /api/tasks/:id/requeue reclaims a dirty worktree before failing+requeuing", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, "a2");
+  const dependent = newId();
+  const t = now();
+  db.query("INSERT INTO tasks (id, project_id, title, state, kind, depends_on, created_at, updated_at) VALUES (?,?,?, 'queued', 'ship', ?, ?, ?)")
+    .run(dependent, projectId, "dependent", JSON.stringify([id]), t, t);
   const herdr = herdrWithDirtyWorktree("{}", "");
   const handle = makeHandler(db, { herdr });
 
@@ -112,4 +116,5 @@ test("manual POST /api/tasks/:id/requeue reclaims a dirty worktree before failin
   const requeue: any = db.query("SELECT * FROM tasks WHERE id = ?").get(body.new_task_id);
   expect(requeue.state).toBe("queued");
   expect(requeue.parent_task_id).toBe(id);
+  expect(getTask(db, dependent).depends_on).toEqual([body.new_task_id]);
 });

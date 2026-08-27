@@ -2,12 +2,13 @@ import { expect, test } from "bun:test";
 import { act, create } from "react-test-renderer";
 import { MemoryRouter } from "react-router-dom";
 import { api } from "../src/lib/api";
-import type { Brief as BriefData, Decision, Evidence, Task } from "../src/lib/api";
+import type { Brief as BriefData, Decision, Evidence, Task, UnderstandingQuiz as UnderstandingQuizData } from "../src/lib/api";
 import { LightboxProvider } from "../src/lib/lightbox";
 import { Ctx, type Store } from "../src/lib/store";
 import Brief from "../src/views/Brief";
 import { DecisionCard } from "../src/views/DecisionCard";
 import { ReferenceText } from "../src/lib/references";
+import { UnderstandingQuiz } from "../src/views/UnderstandingQuiz";
 
 (globalThis as unknown as { window: typeof globalThis }).window = globalThis;
 const values = new Map([["hive.inbox.mode", "backlogs"]]);
@@ -188,7 +189,7 @@ test("the project picker scopes Focus to the chosen project", async () => {
   });
 
   // Only the chosen project's checkpoint counts, so the queue reads "1 of 1".
-  expect(renderer.root.findByProps({ className: "brief-focus-meta" }).findAll((node) => node.type === "span")[1].children.join("")).toBe("1 of 1");
+  expect(renderer.root.findByProps({ className: "brief-focus-nav" }).children.filter((c) => typeof c === "string").join("")).toBe("1 of 1");
   // "Project two" is the selected chip; "All" is not.
   const chip = (name: string) => renderer.root.findAll((node) => node.type === "button" && node.children.includes(name))[0];
   expect(chip("Project two").props.className).toContain("board-chip-on");
@@ -225,8 +226,52 @@ test("Focus shows every checkpoint for its current task on one page", async () =
   });
 
   expect(renderer.root.findAll((node) => String(node.props.className ?? "").startsWith("cp-row"))).toHaveLength(2);
-  expect(renderer.root.findByProps({ className: "brief-focus-meta" }).findAll((node) => node.type === "span")[1].children.join("")).toBe("1 of 2");
+  expect(renderer.root.findByProps({ className: "brief-focus-nav" }).children.filter((c) => typeof c === "string").join("")).toBe("1 of 2");
   expect(renderer.root.findAll((node) => node.props.className === "cp-note").map((node) => node.children.join(""))).toEqual(["Check this", "Check this too"]);
+});
+
+test("Focus arrows step past an item you cannot act on", async () => {
+  values.set("hive.inbox.mode", "focus");
+  values.delete("hive.board.project");
+  const otherTask = { ...task, id: "task-2", number: 2, title: "Other task" };
+  const other = { ...checkpoint, id: "checkpoint-3", task_id: otherTask.id, task_number: 2, task_title: otherTask.title, note: "Later" };
+  api.evidence = (async () => ({ evidence: [] })) as typeof api.evidence;
+  const checkpoints = [checkpoint, other];
+  const store = {
+    tasks: [task, otherTask],
+    projects: [{ id: task.project_id, name: "Project" }],
+    needsYou: checkpoints.map((item) => ({ kind: "checkpoint", id: item.id, checkpoint: item })),
+    checkpoints,
+    rev: {},
+    reloadCheckpoints: () => {},
+    reloadQuizzes: () => {},
+  } as unknown as Store;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(
+      <MemoryRouter initialEntries={["/inbox"]}>
+        <Ctx.Provider value={store}>
+          <LightboxProvider><Brief /></LightboxProvider>
+        </Ctx.Provider>
+      </MemoryRouter>
+    );
+  });
+  const counter = () => renderer.root.findByProps({ className: "brief-focus-nav" }).children.filter((c) => typeof c === "string").join("");
+  const arrow = (label: string) => renderer.root.findByProps({ "aria-label": label });
+  const notes = () => renderer.root.findAll((node) => node.props.className === "cp-note").map((node) => node.children.join(""));
+
+  expect(counter()).toBe("1 of 2");
+  expect(notes()).toEqual(["Check this"]);
+  expect(arrow("Previous item").props.disabled).toBe(true);
+
+  await act(async () => { arrow("Next item").props.onClick(); });
+  expect(counter()).toBe("2 of 2");
+  expect(notes()).toEqual(["Later"]);
+  expect(arrow("Next item").props.disabled).toBe(true);
+
+  await act(async () => { arrow("Previous item").props.onClick(); });
+  expect(counter()).toBe("1 of 2");
+  expect(notes()).toEqual(["Check this"]);
 });
 
 test("Backlog task links open against the backlog location for modal history", async () => {
@@ -255,4 +300,115 @@ test("Backlog task links open against the backlog location for modal history", a
 
   const taskLink = renderer.root.findAll((node) => node.props.to === `/tasks/${task.id}`)[0];
   expect(taskLink.props.state.backgroundLocation.pathname).toBe("/inbox");
+});
+
+test("five deferred quizzes are one catch-up row, and finishing the flow clears all five", async () => {
+  values.delete("hive.board.project");
+  api.evidence = (async () => ({ evidence: [] })) as typeof api.evidence;
+  const quizzes = [1, 2, 3, 4, 5].map((n) => ({
+    id: `quiz-${n}`,
+    task_id: `shipped-${n}`,
+    ts: task.updated_at,
+    task_number: n,
+    task_title: `Shipped change ${n}`,
+    task_state: "done",
+    task_kind: "ship",
+    project_id: task.project_id,
+    report: { done: [], iffy: [], decisions: [], testing: [], followups: [] },
+    question: `Question ${n}?`,
+    options: [{ key: "a", label: "A" }, { key: "b", label: "B" }],
+    version: `v${n}`,
+    status: "deferred",
+  })) as unknown as UnderstandingQuizData[];
+  const store = {
+    tasks: quizzes.map((quiz, i) => ({ ...task, id: quiz.task_id, number: i + 1, title: quiz.task_title, state: "done" })),
+    projects: [{ id: task.project_id, name: "Project" }],
+    needsYou: [{ kind: "quiz_digest", id: `quiz-digest:${task.project_id}`, quizzes }],
+    checkpoints: [],
+    quizzes,
+    rev: {},
+    reloadCheckpoints: () => {},
+    reloadQuizzes: () => {},
+  } as unknown as Store;
+
+  values.set("hive.inbox.mode", "backlogs");
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(
+      <MemoryRouter>
+        <Ctx.Provider value={store}>
+          <LightboxProvider><Brief /></LightboxProvider>
+        </Ctx.Provider>
+      </MemoryRouter>
+    );
+  });
+  // One row for all five, not five rows, and the Backlogs count agrees.
+  const rows = renderer.root.findAll((node) => node.type === "li" && node.props.className === undefined);
+  expect(rows).toHaveLength(1);
+  expect(renderer.root.findAll((node) => node.type === "button" && String(node.children[0]).startsWith("Catch up on"))[0].children.join(""))
+    .toBe("Catch up on 5 shipped changes");
+  expect(renderer.root.findByProps({ className: "brief-count" }).children).toEqual(["1"]);
+
+  // The row opens the single sequential flow: one question at a time, in order.
+  await act(async () => {
+    renderer.root.findAll((node) => node.type === "button" && String(node.children[0]).startsWith("Catch up on"))[0].props.onClick();
+  });
+  for (let n = 1; n <= 5; n += 1) {
+    expect(renderer.root.findByType(UnderstandingQuiz).props.quiz.question).toBe(`Question ${n}?`);
+    await act(async () => {
+      renderer.root.findByType(UnderstandingQuiz).props.onPassed(null);
+    });
+  }
+  // All five cleared by the one flow — nothing left in the queue.
+  expect(renderer.root.findAll((node) => node.type === UnderstandingQuiz)).toHaveLength(0);
+  expect(renderer.root.findByProps({ className: "empty-big" }).children).toContain("All quiet.");
+});
+
+// HIVE-413: a blocking plan checkpoint is approved from the card itself, so the
+// card must carry the plan and the critic's concerns without a task-page visit.
+test("Focus shows a blocking plan's fields and the critic's concerns on the card", async () => {
+  values.set("hive.inbox.mode", "focus");
+  values.delete("hive.board.project");
+  api.evidence = (async () => ({ evidence: [] })) as typeof api.evidence;
+  const planCheckpoint = {
+    ...checkpoint,
+    id: "checkpoint-plan",
+    note: "add the release steer",
+    blocking: true,
+    plan: {
+      goal: "add the release steer",
+      approach: "steer the agent from the ack endpoint",
+      files_expected: ["server/src/api.ts"],
+      verification_planned: "bun test server/test/plan-critic.test.ts",
+    },
+    concerns: [{ severity: "veto" as const, text: "The plan never says how auto-ack is scheduled." }],
+  };
+  const store = {
+    tasks: [task],
+    projects: [{ id: task.project_id, name: "Project" }],
+    needsYou: [{ kind: "checkpoint", id: planCheckpoint.id, checkpoint: planCheckpoint }],
+    checkpoints: [planCheckpoint],
+    rev: {},
+    reloadCheckpoints: () => {},
+    reloadQuizzes: () => {},
+  } as unknown as Store;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(
+      <MemoryRouter initialEntries={["/inbox"]}>
+        <Ctx.Provider value={store}>
+          <LightboxProvider><Brief /></LightboxProvider>
+        </Ctx.Provider>
+      </MemoryRouter>
+    );
+  });
+
+  const text = JSON.stringify(renderer.toJSON());
+  expect(text).toContain("steer the agent from the ack endpoint");
+  expect(text).toContain("server/src/api.ts");
+  expect(text).toContain("bun test server/test/plan-critic.test.ts");
+  expect(text).toContain("The plan never says how auto-ack is scheduled.");
+  expect(text).toContain("VETO");
+  // The agent is parked, and the card says so.
+  expect(renderer.root.findAll((node) => String(node.props.className ?? "").includes("cp-waiting"))).toHaveLength(1);
 });

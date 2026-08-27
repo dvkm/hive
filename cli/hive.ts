@@ -21,12 +21,14 @@ Usage:
   hive task update <task-id> --depends-on <id,id>   declare a dependency discovered mid-task
         (e.g. "my PR needs #993's to merge first"); full replace, so pass every
         id this task should still wait on, not just the new one
-  hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>] [--landing-commit <sha>]
+  hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>] [--landing-commit <sha>] [--verify-name <name>]
         types: status | evidence | needs-decision | ready | done | unmergeable | blocked | deferred | undefer | review_summary | <custom>
         unmergeable: this task's PR has nothing left to merge (GitHub refused to
         reopen it) but the work landed via a different PR/commit. Pass
         --landing-commit <sha>; hive verifies it's on the base branch, then closes
         the task without a merge step.
+        --verify-name <name>: on evidence, tags the artifact with the named
+        verification command it came from (see the brief's Verification contract)
         review_summary: --json review.json with {done[], iffy[], decisions[], testing[], followups[], understanding{check{question,options[],answer_key}}}
         deferred: park a task waiting on an OFFLINE human action (no more "gone quiet" nudges);
                   [--until <iso>] or [--days <n>] to auto-resume, else indefinite. undefer to resume early.
@@ -49,6 +51,7 @@ Usage:
         them in graph order (declared dependencies first, one conflicting branch per sweep)
   hive land-graph [--project <id>]        show the review column's ordering edges
   hive recall <keywords>                  search project knowledge (references, learnings, policies)
+  hive jira link <task-id> --parent <KEY> create and link a Jira sub-task
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
   hive chat reply <thread-id> "<text>" [--decision <id> ...]
@@ -289,11 +292,12 @@ async function main() {
       if (flags.note) form.set("note", String(flags.note));
       if (flags.caption) form.set("caption", String(flags.caption));
       if (flags.source) form.set("source", String(flags.source));
+      if (flags["verify-name"]) form.set("verify_name", String(flags["verify-name"]));
       if (sha) form.set("meta", JSON.stringify({ commit_sha: sha }));
       const file = Bun.file(String(flags.file));
       form.set("file", file);
       const res = await fetch(BASE + path, { method: "POST", body: form });
-      const data = await res.json();
+      const data: any = await res.json();
       if (!res.ok) die(`error ${res.status}: ${data.error}`);
       result = data;
     } else {
@@ -311,6 +315,7 @@ async function main() {
         days: flags.days,
         pr_url: flags["pr-url"] ?? flags.url,
         landing_commit: flags["landing-commit"],
+        verify_name: flags["verify-name"],
         ...(sha && !extra.meta ? { meta: JSON.stringify({ commit_sha: sha }) } : {}),
         ...extra,
       });
@@ -632,6 +637,16 @@ async function main() {
     return;
   }
 
+  if (cmd === "jira") {
+    const sub = argv[1];
+    const { _, flags } = parseFlags(argv.slice(2));
+    if (sub !== "link" || !_[0] || !flags.parent) die("usage: hive jira link <task-id> --parent <KEY>");
+    const linked = await api("POST", `/api/tasks/${_[0]}/jira/link`, { parent_key: String(flags.parent) });
+    console.log(`linked ${_[0]} to ${linked.jira_key} (${linked.browse_url})`);
+    for (const warning of linked.warnings ?? []) console.warn(`warning: ${warning}`);
+    return;
+  }
+
   if (cmd === "secret") {
     const sub = argv[1];
     const { flags } = parseFlags(argv.slice(2));
@@ -743,6 +758,11 @@ async function main() {
       `SELECT COUNT(*) n, SUM(status='expired') expired,
               ROUND(AVG(CASE WHEN answered_at IS NOT NULL THEN (julianday(answered_at)-julianday(ts))*24*60 END),0) med_min
          FROM decisions WHERE ts > ?`, since);
+    // Sidecar: background type/lint checks on an agent's fresh commits, and how
+    // often they caught something. Per-day, so it compares across --days values.
+    const sidecar = one(
+      `SELECT COUNT(*) n, SUM(json_extract(payload,'$.ok') = 0) caught
+         FROM events WHERE type='sidecar_report' AND ts > ?`, since);
     const held = one("SELECT COUNT(*) n FROM events WHERE type='ready_held' AND ts > ?", since).n;
     const bounced = one("SELECT COUNT(*) n FROM events WHERE type IN ('ci_failure','pr_closed') AND ts > ?", since).n;
     const cost = db.query(
@@ -758,6 +778,7 @@ async function main() {
     console.log(`  spawns:         ${spawns} ok, ${spawnErr} errors${spawns ? ` (${Math.round((100 * spawnErr) / (spawns + spawnErr))}% failure)` : ""}`);
     console.log(`  intervention:   ${steers} steers, ${nudges} gone-quiet nudges`);
     console.log(`  decisions:      ${dec.n} opened, ${dec.expired ?? 0} expired, avg answer ${dec.med_min ?? "-"}m`);
+    console.log(`  sidecar:        ${sidecar.n} checks, ${sidecar.caught ?? 0} caught problems (${(sidecar.n / days).toFixed(1)}/day)`);
     console.log(`  CI gate:        ${held} handoffs held, ${bounced} bounced out of review`);
     console.log(`  review->merge:  avg ${review.h ?? "-"}h`);
     for (const c of cost) console.log(`  cost:           ${c.model}  $${c.c}  (${c.t} tasks)`);

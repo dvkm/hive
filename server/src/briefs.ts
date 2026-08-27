@@ -6,6 +6,7 @@ import { prTitlePrefix, prBodyFooter } from "./marker.ts";
 import { managingThreadForTask } from "./chat.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
+import { planGateKinds, planGateBlocks } from "./planCritic.ts";
 
 // The PR marker contract (documented in docs/API.md). Both halves are REQUIRED
 // on any PR the agent opens so hive can link the PR back to this task.
@@ -52,7 +53,11 @@ Rules:
   "essence":"","walkthrough":[],"affected_areas":[],"risk_assessment":"",
   "participate":"","checks":[{"question":"","options":[{"key":"a",
   "label":""},{"key":"b","label":""}],"answer_key":"a","explanation":""}]}}
-  Omit empty sections, but \`understanding.checks\` is required.
+  Omit empty sections. \`understanding.checks\` is REQUIRED only for
+  judgment-class work: the auto-review verdict is not \`looks_good\`, the diff
+  touches security, auth, payments or migrations, the task kind is outside the
+  project's auto-merge list, or the director asked for a quiz on this card. For
+  everything else the checks are OPTIONAL, and leaving them out blocks nothing.
   Every question must help them understand this specific change: behavior, impact, risk,
   tradeoff, or evidence. Never test whether the agent can code, debug, merge,
   use tools, follow policy, or operate Hive; agent competence belongs in internal
@@ -85,6 +90,45 @@ Emit assumptions, shortcuts, and real tradeoffs when you make them, then KEEP WO
 
 Checkpoints are non-blocking; flags return as steers. Prod, destructive work,
 and feature flags still use \`hive decision ask\` or the guarded-action gate.`;
+
+// Plan gate (HIVE-412): for the kinds a project opts in via config.plan_gate,
+// the plan is posted as a checkpoint before the first edit, and hive critiques
+// it automatically. Nothing blocks; a serious concern comes back as a steer.
+// With plan_gate.block on (HIVE-413) the last paragraph is swapped for a wait
+// instruction — see BLOCKING_PLAN_TAIL.
+const PLAN_CHECKPOINT = `## Plan checkpoint (before your first edit)
+Post your plan before you change any file:
+
+  hive emit <task-id> checkpoint --json plan.json
+
+Write plan.json first, with exactly these fields:
+
+  {"kind":"plan",
+   "goal":"what done looks like, in one sentence",
+   "approach":"how you will get there, in a few sentences",
+   "files_expected":["path/to/file.ts"],
+   "verification_planned":"the check that proves it works"}
+
+Hive reviews the plan and sends any concerns back as a steer. Keep working
+while it reviews; this checkpoint never blocks you. If a concern comes back,
+fix the plan and post it again before you carry on editing.`;
+
+// Blocking mode. The agent posts the plan and then STOPS. The director's ack
+// (or the auto-ack sweep) delivers a steer that releases it, so the only safe
+// thing an agent can do here is end its turn and wait to be woken.
+const BLOCKING_PLAN_TAIL = `This project BLOCKS on the plan. After you post it, do NOT edit any file.
+Emit the plan, say in one line that you are waiting, and END YOUR TURN.
+
+A steer wakes you with the verdict:
+- "Your plan is APPROVED" — start editing and finish the task.
+- "Your plan was FLAGGED" — fix the plan, post it again, and wait again.
+
+Do not poll, do not ask again, and do not start work while you wait.`;
+
+// The non-blocking tail, replaced wholesale in blocking mode.
+const PLAN_TAIL_OPEN = `Hive reviews the plan and sends any concerns back as a steer. Keep working
+while it reviews; this checkpoint never blocks you. If a concern comes back,
+fix the plan and post it again before you carry on editing.`;
 
 // Agents may fan work out instead of scope-creeping their own task. HIVE_TASK_ID
 // is set in every spawned agent's env, so the CLI auto-attributes the new task
@@ -187,6 +231,28 @@ flip, destructive op), call the guarded-action gate and act ONLY on its answer:
     once approved it passes (a single-use grant is spent).`;
 }
 
+// The task's verification contract, when the director set one. Named commands
+// the agent runs before handing off, each with its real output attached back
+// under the same name. Nothing is gated on this yet (see HIVE-401 A2) — the
+// brief just states the contract.
+function verificationContract(taskId: string, cmds: { name: string; cmd: string }[] | null): string | null {
+  if (!cmds?.length) return null;
+  const lines = cmds.map((c) => `- \`${c.name}\`\n\n      ${c.cmd}`).join("\n\n");
+  return `## Verification contract (run every one before \`ready\`)
+This task has ${cmds.length} named verification command${cmds.length === 1 ? "" : "s"}. Run each one
+exactly as written, from your worktree, before you emit \`ready\`:
+
+${lines}
+
+Attach the REAL output of each run as evidence, tagged with its name:
+
+  hive emit ${taskId} evidence --verify-name <name> --file ./out.txt --note "<name> output"
+
+Use the exact name from the list. Do not paraphrase, summarize, or invent
+output — attach what the command actually printed. If a command fails, fix the
+cause and run it again, or emit \`blocked\` explaining why it cannot pass.`;
+}
+
 function definitionOfDone(kind: string): string {
   if (kind === "scout") {
     return "## Definition of done\nA written report captured as evidence (kind=report) that answers the question. No code changes required.";
@@ -211,9 +277,19 @@ export function composeBrief(db: DB, taskId: string): string {
   parts.push(`Task identifier: ${displayId}\nLegacy task number: ${task.number}\nTask id: ${task.id}\nKind: ${task.kind}`);
   parts.push(`## Brief\n${task.brief?.trim() || "(no description provided)"}`);
   parts.push(definitionOfDone(task.kind));
+  const contract = verificationContract(task.id, task.verification_cmds);
+  if (contract) parts.push(contract);
   parts.push(EMIT_PROTOCOL);
   parts.push(PLAIN_ENGLISH);
   parts.push(CHECKPOINTS);
+  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+  const projectConfig = JSON.parse(project?.config ?? "{}");
+  if (planGateKinds(projectConfig).includes(task.kind))
+    parts.push(
+      planGateBlocks(projectConfig, task.kind)
+        ? PLAN_CHECKPOINT.replace(PLAN_TAIL_OPEN, BLOCKING_PLAN_TAIL)
+        : PLAN_CHECKPOINT
+    );
   parts.push(spawnTasksSection(task.project_id));
   const team = teamSection(db, taskId);
   if (team) parts.push(team);

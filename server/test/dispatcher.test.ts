@@ -174,6 +174,44 @@ test("concurrency cap (max_agents) limits new spawns per project", async () => {
   expect(spawns.length).toBe(1);
 });
 
+test("PR Gardener repair agents use their own capped lane", async () => {
+  const full = freshDb({ max_agents: 1, pr_gardener: { enabled: true, max_gardener_agents: 1 } });
+  makeTask(full.db, full.projectId, { state: "in_progress", agent_target: "feature" });
+  const repair = makeTask(full.db, full.projectId, { source: "pr-gardener" });
+  const queuedRepair = makeTask(full.db, full.projectId, { source: "pr-gardener" });
+  const first = stubHerdr();
+
+  await dispatchOnce(full.db, { herdr: first.herdr });
+
+  expect(first.spawns.length).toBe(1);
+  expect(getTask(full.db, repair).state).toBe("in_progress");
+  expect(getTask(full.db, queuedRepair).state).toBe("queued");
+
+  const feature = freshDb({ auto_dispatch: true, max_agents: 1, pr_gardener: { enabled: true } });
+  makeTask(feature.db, feature.projectId, { source: "pr-gardener", state: "in_progress", agent_target: "repair" });
+  const featureTask = makeTask(feature.db, feature.projectId);
+  const second = stubHerdr();
+
+  await dispatchOnce(feature.db, { herdr: second.herdr });
+
+  expect(second.spawns.length).toBe(1);
+  expect(getTask(feature.db, featureTask).state).toBe("in_progress");
+});
+
+test("PR Gardener decision placeholders never dispatch or consume an agent slot", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 1, pr_gardener: { enabled: true } });
+  makeTask(db, projectId, { source: "pr-gardener-decision", state: "in_progress", agent_target: "legacy" });
+  const decision = makeTask(db, projectId, { kind: "chore", source: "pr-gardener-decision" });
+  const feature = makeTask(db, projectId);
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr });
+
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, decision).state).toBe("queued");
+  expect(getTask(db, feature).state).toBe("in_progress");
+});
+
 test("review-parked agents don't consume working slots, but bound overhang at 2x cap", async () => {
   const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 2 });
   // two agents parked in review -> 0 working slots used -> dispatch proceeds

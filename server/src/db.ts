@@ -559,6 +559,69 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v29-task-land-queue",
     statements: [`ALTER TABLE tasks ADD COLUMN land_queued_at TEXT`],
   },
+  {
+    name: "v30-task-jira-link",
+    statements: [
+      `ALTER TABLE tasks ADD COLUMN jira_key TEXT`,
+      `ALTER TABLE tasks ADD COLUMN jira_link_kind TEXT CHECK (jira_link_kind IN ('mirror', 'subtask'))`,
+      `CREATE UNIQUE INDEX idx_tasks_jira_key ON tasks(jira_key) WHERE jira_key IS NOT NULL`,
+      `UPDATE tasks SET jira_key = substr(source_ref, 6), jira_link_kind = 'mirror'
+       WHERE source_ref LIKE 'jira:%' AND jira_key IS NULL`,
+    ],
+  },
+  {
+    name: "v31-task-jira-link-kind-uniqueness",
+    statements: [
+      `DROP INDEX IF EXISTS idx_tasks_jira_key`,
+      `CREATE UNIQUE INDEX idx_tasks_jira_key_kind ON tasks(jira_key, jira_link_kind) WHERE jira_key IS NOT NULL`,
+    ],
+  },
+  // PR #186 token-gated subscription creation at 2026-08-24T21:58:34Z.
+  // Remove endpoints registered before that protection existed.
+  {
+    name: "v32-prune-unauthenticated-push-subscriptions",
+    statements: [`DELETE FROM push_subscriptions WHERE created_at < '2026-08-24T21:58:34Z'`],
+  },
+  {
+    name: "v33-pr-gardener",
+    statements: [
+      `CREATE TABLE pr_gardener_items (
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        pr_number INTEGER NOT NULL,
+        pr_url TEXT NOT NULL,
+        title TEXT NOT NULL,
+        classification TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        sensitive INTEGER NOT NULL DEFAULT 0,
+        override TEXT,
+        action_task_id TEXT REFERENCES tasks(id),
+        decision_id TEXT REFERENCES decisions(id),
+        fix_attempts INTEGER NOT NULL DEFAULT 0,
+        last_action TEXT,
+        last_action_at TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (project_id, pr_number)
+      )`,
+      `CREATE INDEX idx_pr_gardener_action_task ON pr_gardener_items(action_task_id)`,
+    ],
+  },
+  // Per-task verification contract: a JSON array of {name, cmd} the agent must
+  // run before handing off, each piece of evidence tagged with the name it
+  // came from (`hive emit ... --verify-name <name>`). Data only for now —
+  // nothing is gated on it yet.
+  {
+    name: "v34-task-verification-cmds",
+    statements: [`ALTER TABLE tasks ADD COLUMN verification_cmds TEXT`],
+  },
+  // Four-level ordinal priority: now > next > normal > later. ORDERING ONLY —
+  // it decides which queued task is picked up first and which approved PR lands
+  // first. It never preempts: a running agent is never killed to make room.
+  // Validated in the app (api.ts), not by a CHECK constraint, so the vocabulary
+  // can grow without a table rebuild.
+  {
+    name: "v35-task-priority",
+    statements: [`ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'`],
+  },
 ];
 
 // -------------------------------------------------------------- settings
@@ -604,6 +667,7 @@ export function openDb(path: string = defaultDbPath()): DB {
 
 export const CREATES = /^\s*CREATE\s+(?:UNIQUE\s+)?(TABLE|INDEX|TRIGGER|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)/i;
 export const ADD_COLUMN = /^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+(?:COLUMN\s+)?(\w+)/i;
+export const DROPS = /^\s*DROP\s+(TABLE|INDEX|TRIGGER|VIEW)\s+(?:IF\s+EXISTS\s+)?(\w+)/i;
 
 // Does the schema already have what this statement would create? SQLite has no
 // IF NOT EXISTS for ALTER TABLE ADD COLUMN, and we want the same skip-if-present
@@ -619,6 +683,11 @@ export const ADD_COLUMN = /^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+(?:COLUMN\s+)?(\w+)
 // where that collision would actually come from. Compare sqlite_master.sql here
 // if a migration ever has to reconcile a foreign object of the same name.
 export function alreadyApplied(db: DB, stmt: string): boolean {
+  const dropped = DROPS.exec(stmt);
+  if (dropped) {
+    const [, kind, name] = dropped;
+    return db.query("SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?").get(kind.toLowerCase(), name) == null;
+  }
   const created = CREATES.exec(stmt);
   if (created) {
     const [, kind, name] = created;

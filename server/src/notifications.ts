@@ -13,6 +13,7 @@ import type { DB } from "./db.ts";
 import { newId, now } from "./db.ts";
 import { broadcast, appClientCount } from "./bus.ts";
 import { pushToAll } from "./push.ts";
+import type { PushPayload } from "./push.ts";
 import type { Exec } from "./exec.ts";
 import { notTestProjectSql } from "./testProjects.ts";
 
@@ -36,7 +37,9 @@ export function setNotifier(exec: Exec | null): void {
 
 // Where clicking a notification should land in the app. These are the same
 // paths the web UI already uses, so a deeplink is just a normal route.
-export function deeplinkPath(n: { task_id?: string | null; decision_id?: string | null }): string {
+export function deeplinkPath(n: { kind?: string; task_id?: string | null; decision_id?: string | null }): string {
+  // The catch-up digest is one pass over many tasks, so it opens the queue, not a task.
+  if (n.kind === "quiz_digest") return "/inbox";
   if (n.decision_id) return `/decisions#dcard-${n.decision_id}`;
   if (n.task_id) return `/tasks/${n.task_id}`;
   return "/";
@@ -103,7 +106,7 @@ function isTestProjectTask(db: DB, taskId: string): boolean {
 // desktop app told us it actually rendered the notification (or the digest ran,
 // or the bell was opened). Before, the server stamped it the moment it shelled
 // out, so a notification macOS never showed still counted as seen.
-export function enqueue(db: DB, n: NotifInput, deps: { exec?: Exec } = {}): any {
+export function enqueue(db: DB, n: NotifInput, deps: { exec?: Exec; push?: typeof pushToAll } = {}): any {
   if (n.task_id && isTestProjectTask(db, n.task_id)) return null;
   const urgency: Urgency = n.urgency ?? "normal";
   const exec = deps.exec ?? notifier;
@@ -126,7 +129,24 @@ export function enqueue(db: DB, n: NotifInput, deps: { exec?: Exec } = {}): any 
   if (urgency === "urgent") {
     deliverNative({ id: row.id, title: row.title, body: row.body, path }, exec);
     // Urgent → also push to the phone (PWA web push). Best-effort, never throws.
-    void pushToAll(db, { title: n.title, body: n.body ?? null, url: path }).catch(() => {});
+    const payload: PushPayload = { title: n.title, body: n.body ?? null, url: path };
+    if (n.decision_id) {
+      const decision = db.query("SELECT title, options FROM decisions WHERE id = ? AND status = 'open'").get(n.decision_id) as
+        | { title: string; options: string }
+        | null;
+      if (decision) {
+        payload.title = decision.title;
+        payload.decisionId = n.decision_id;
+        try {
+          payload.actions = (JSON.parse(decision.options || "[]") as { key?: unknown; label?: unknown }[])
+            .filter((option) => typeof option.key === "string" && !!option.key && typeof option.label === "string" && !!option.label)
+            .map((option) => ({ action: option.key as string, title: option.label as string }));
+        } catch {
+          payload.actions = [];
+        }
+      }
+    }
+    void (deps.push ?? pushToAll)(db, payload).catch(() => {});
   }
   return row;
 }

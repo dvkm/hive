@@ -4,7 +4,8 @@
 // one, and the position counter both skipped a migration and re-ran a different
 // one against a DB that already had its effect.
 import { test, expect } from "bun:test";
-import { openDb, alreadyApplied, MIGRATIONS, CREATES, ADD_COLUMN, type DB } from "../src/db.ts";
+import { openDb, alreadyApplied, MIGRATIONS, CREATES, ADD_COLUMN, DROPS, type DB } from "../src/db.ts";
+import { saveSubscription } from "../src/push.ts";
 import { Database } from "bun:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -37,6 +38,7 @@ test("migrations are well-formed", () => {
     for (const stmt of m.statements) {
       const create = CREATES.exec(stmt);
       const add = ADD_COLUMN.exec(stmt);
+      const drop = DROPS.exec(stmt);
 
       // One statement per element. A trigger body is the only legal `;`.
       const isTrigger = /^\s*CREATE\s+TRIGGER/i.test(stmt);
@@ -50,11 +52,11 @@ test("migrations are well-formed", () => {
         const key = `${create[1].toLowerCase()}:${create[2]}`;
         expect(created.has(key)).toBe(false);
         created.add(key);
-      } else if (!add) {
+      } else if (!add && !drop) {
         // alreadyApplied can't detect this statement's effect, so it re-runs on
-        // every heal. Only a backfill may do that, and the heal tests below are
+        // every heal. Only a data migration may do that, and the heal tests below are
         // what prove this one is a no-op once applied.
-        expect(stmt).toMatch(/^\s*UPDATE\b/i);
+        expect(stmt).toMatch(/^\s*(?:UPDATE|DELETE)\b/i);
       }
     }
   }
@@ -73,9 +75,47 @@ test("alreadyApplied asks the schema, for every statement kind", () => {
   // Type is matched too: an index named after an existing table is not "applied".
   expect(alreadyApplied(db, "CREATE INDEX tasks ON events(ts)")).toBe(false);
   expect(alreadyApplied(db, "CREATE TABLE idx_events_ts (x TEXT)")).toBe(false);
+  expect(alreadyApplied(db, "DROP INDEX idx_events_ts")).toBe(false);
+  expect(alreadyApplied(db, "DROP INDEX IF EXISTS idx_not_there")).toBe(true);
   // Non-DDL always runs: backfills must be written re-runnable.
   expect(alreadyApplied(db, "UPDATE tasks SET number = 1 WHERE number IS NULL")).toBe(false);
   db.close();
+});
+
+test("the Jira link migration adds its columns and backfills mirrors", () => {
+  const path = tmpDb("jira-link");
+  try {
+    const seed = openDb(path);
+    seed.query("INSERT INTO projects (id, name, config, created_at) VALUES ('p','p','{}','2026-01-01T00:00:00Z')").run();
+    seed.query(
+      `INSERT INTO tasks (id, project_id, title, state, kind, source, source_ref, created_at, updated_at)
+       VALUES ('t','p','mirror','queued','ship','external','jira:WEB-123','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`
+    ).run();
+    seed.exec("DROP INDEX idx_tasks_jira_key_kind");
+    seed.exec("ALTER TABLE tasks DROP COLUMN jira_link_kind");
+    seed.exec("ALTER TABLE tasks DROP COLUMN jira_key");
+    seed.query("DELETE FROM schema_migrations WHERE name IN ('v30-task-jira-link', 'v31-task-jira-link-kind-uniqueness')").run();
+    seed.close();
+
+    const migrated = openDb(path);
+    expect(columns(migrated, "tasks")).toEqual(expect.arrayContaining(["jira_key", "jira_link_kind"]));
+    expect(migrated.query("SELECT jira_key, jira_link_kind FROM tasks WHERE id = 't'").get()).toEqual({
+      jira_key: "WEB-123", jira_link_kind: "mirror",
+    });
+    migrated.query(
+      `INSERT INTO tasks (id, project_id, title, state, kind, jira_key, jira_link_kind, created_at, updated_at)
+       VALUES ('native','p','native','queued','ship','WEB-123','subtask','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`
+    ).run();
+    expect(migrated.query("SELECT count(*) AS count FROM tasks WHERE jira_key = 'WEB-123'").get()).toEqual({ count: 2 });
+    expect(() => migrated.query(
+      `INSERT INTO tasks (id, project_id, title, state, kind, jira_key, jira_link_kind, created_at, updated_at)
+       VALUES ('duplicate','p','duplicate','queued','ship','WEB-123','subtask','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`
+    ).run()).toThrow(/UNIQUE/);
+    expect(() => migrated.query("UPDATE tasks SET jira_link_kind = 'invalid' WHERE id = 't'").run()).toThrow(/CHECK/);
+    migrated.close();
+  } finally {
+    cleanup(path);
+  }
 });
 
 // Two bun:sqlite behaviours pin migrate()'s choice of executor. Both are silent
@@ -168,6 +208,34 @@ test("adopting a fully-migrated legacy DB is a no-op that preserves data", () =>
     const names = (db2.query("SELECT name FROM schema_migrations").all() as { name: string }[]).map((r) => r.name);
     expect(names).toContain("v1-initial-schema");
     expect(names).toContain("v11-task-numbers");
+    db2.close();
+  } finally {
+    cleanup(path);
+  }
+});
+
+test("push subscription cleanup removes pre-auth rows and keeps authenticated rows", () => {
+  const path = tmpDb("push-auth-cleanup");
+  try {
+    const db1 = openDb(path);
+    const insert = db1.query(
+      "INSERT INTO push_subscriptions (endpoint, p256dh, auth, created_at) VALUES (?,?,?,?)"
+    );
+    insert.run("https://push.example/old", "old-key", "old-auth", "2026-08-24T21:58:33Z");
+    insert.run("https://push.example/new", "new-key", "new-auth", "2026-08-24T21:58:35Z");
+    insert.run("https://push.example/resubscribed", "old-key", "old-auth", "2026-08-24T21:58:33Z");
+    saveSubscription(db1, {
+      endpoint: "https://push.example/resubscribed",
+      keys: { p256dh: "new-key", auth: "new-auth" },
+    });
+    db1.query("DELETE FROM schema_migrations WHERE name = 'v32-prune-unauthenticated-push-subscriptions'").run();
+    db1.close();
+
+    const db2 = openDb(path);
+    expect(db2.query("SELECT endpoint FROM push_subscriptions").all()).toEqual([
+      { endpoint: "https://push.example/new" },
+      { endpoint: "https://push.example/resubscribed" },
+    ]);
     db2.close();
   } finally {
     cleanup(path);
