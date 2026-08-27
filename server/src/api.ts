@@ -48,7 +48,14 @@ import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from ".
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { resolveProjectSecrets, serviceName } from "./secrets.ts";
+import { teamclaudeEnv, usesTeamclaude } from "./teamclaude.ts";
 import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
+import {
+  deploymentsStatus,
+  startDeploy,
+  startRollback,
+  type DeploymentsConfig,
+} from "./deployments.ts";
 import { enqueue, ackNotifications, markShown, recordDeliveryError, lastDeliveryError } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, resolveDenyGuardrailForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
@@ -79,9 +86,10 @@ import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscrip
 import { explainCommandDecision } from "./explain.ts";
 import { confirmedRisks, cautionCleared } from "./reviewer.ts";
 import { explanationGate } from "./explainDiff.ts";
+import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
-import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen } from "./reconciler.ts";
+import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen, probeAgent } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { landGraph, markLand, resolveLandPauseForDecision } from "./landQueue.ts";
@@ -204,6 +212,23 @@ function authzBlock(db: DB, input: AuthzInput): Response | null {
   );
 }
 
+// Resolve a project for the deployments routes. The tab is opt-in: a project
+// without a config.deployments block has no production release model, so it 404s
+// rather than guessing one.
+type DeploymentsProject =
+  | { ok: true; repoPath: string; branch: string; config: DeploymentsConfig }
+  | { ok: false; res: Response };
+
+function deploymentsProject(db: DB, id: string): DeploymentsProject {
+  const row = db.query("SELECT * FROM projects WHERE id = ?").get(id);
+  if (!row) return { ok: false, res: err("project not found", 404) };
+  const project = parseProject(row);
+  const config = (project.config as any)?.deployments as DeploymentsConfig | undefined;
+  if (!config) return { ok: false, res: err("deployments are not configured for this project", 404) };
+  if (!project.repo_path) return { ok: false, res: err("project has no repo_path", 400) };
+  return { ok: true, repoPath: project.repo_path, branch: projectBaseBranch(project.config), config };
+}
+
 const WEB_DIST = join(import.meta.dir, "..", "..", "web", "dist");
 const HOOKS_DIR = join(import.meta.dir, "..", "..", "hooks");
 
@@ -245,6 +270,11 @@ const WRITE_AUTH_ROUTES: { method: string; path: RegExp }[] = [
   { method: "DELETE", path: /^\/api\/projects\/[^/]+\/secrets\/[^/]+$/ },
   { method: "POST", path: /^\/api\/projects\/[^/]+\/pr-gardener\/\d+$/ },
   { method: "POST", path: /^\/api\/push\/subscribe$/ },
+  // Deploying and rolling back production. Hive has no user accounts, so the
+  // API token IS the super-admin check: holding it means filesystem access to
+  // hive's own DB, which an agent's HTTP socket or a stray browser tab does not
+  // have. Reading the release list stays open; only pressing the button is gated.
+  { method: "POST", path: /^\/api\/projects\/[^/]+\/deployments\/(deploy|rollback)$/ },
 ];
 
 // True when the request may proceed: either it is not a gated write, or it
@@ -325,6 +355,34 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
             return err("override must be force_land, force_close, hold, or null", 400);
           }
           return json(gardenerQueue(db, match[1]).find((row) => row.pr_number === prNumber));
+        }
+      }
+      // ---- deployments (production releases: what is live + the two buttons) ----
+      {
+        const match = pathname.match(/^\/api\/projects\/([^/]+)\/deployments(\/deploy|\/rollback)?$/);
+        if (match) {
+          const project = deploymentsProject(db, match[1]);
+          if (!project.ok) return project.res;
+          const { repoPath, branch, config } = project;
+          const exec = deps.exec ?? defaultExec;
+          if (!match[2] && method === "GET") {
+            // The PostHog key is only resolved when the project actually asked
+            // for flag states, so the keychain is left alone otherwise.
+            const posthogKey = config.flags?.length
+              ? (await resolveProjectSecrets(db, match[1], exec)).POSTHOG_API_KEY
+              : undefined;
+            return json(
+              await deploymentsStatus(repoPath, branch, config, { exec, fetcher: deps.fetch, posthogKey })
+            );
+          }
+          if (match[2] && method === "POST") {
+            const body = (await safeJson(req)) as any;
+            const r =
+              match[2] === "/deploy"
+                ? await startDeploy(exec, repoPath, branch, config, body?.commit)
+                : await startRollback(exec, repoPath, branch, config, body?.tag);
+            return r.ok ? json(r) : err(r.error, r.status);
+          }
         }
       }
       let m = pathname.match(/^\/api\/projects\/([^/]+)$/);
@@ -647,7 +705,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // {shown:true} it rendered, or {error} it refused.
       m = pathname.match(/^\/api\/notifications\/([^/]+)\/delivery$/);
       if (m && method === "POST") {
-        const b = await req.json().catch(() => ({} as any));
+        const b: any = await req.json().catch(() => ({}));
         if (b?.error) {
           recordDeliveryError(m[1], String(b.error));
           return json({ ok: false });
@@ -1024,9 +1082,13 @@ async function deliverToSupervisor(
     task = getTask(db, taskId);
   }
 
-  // Is the session already live? If so, just send into it (fast path).
+  // Is the session already live? If so, just send into it (fast path). Uses
+  // probeAgent (not a raw herdr.probe) so a herdr registry eviction — the
+  // supervisor pane is still alive, only its registration was wiped — is
+  // re-adopted here instead of read as dead and sent through spawnAgent, where
+  // the spawn guard would correctly refuse (name still held) and drop the turn.
   if (task.agent_target) {
-    const { alive } = await herdr.probe(task.agent_target).catch(() => ({ alive: false }));
+    const { alive } = await probeAgent(herdr, db, taskId!, task.agent_target).catch(() => ({ alive: false }));
     if (alive) {
       const error = await sendOnce(herdr, task.agent_target, wireMessage);
       if (!error) {
@@ -3179,6 +3241,14 @@ function codexHookOverride(event: string, command: string, matcher?: string): st
   return `hooks.${event}=[{${group}}]`;
 }
 
+export function hookScriptCommand(
+  script: "hive-hook.ts" | "classify.ts",
+  args: string[] = [],
+  platform: NodeJS.Platform = process.platform
+): string {
+  return commandForCurrentShell(["bun", join(HOOKS_DIR, script), ...args], platform);
+}
+
 export function codexAgentArgv(
   brief: string,
   model?: string,
@@ -3189,8 +3259,8 @@ export function codexAgentArgv(
     toolOutputTokenLimit: 6_000,
   }
 ): string[] {
-  const hook = join(HOOKS_DIR, "hive-hook.sh");
-  const approve = join(HOOKS_DIR, "hive-approve.sh");
+  const hook = (event: string) => hookScriptCommand("hive-hook.ts", [event]);
+  const approve = hookScriptCommand("classify.ts", [commandApproval]);
   const argv = [
     "codex",
     "--sandbox", "workspace-write",
@@ -3198,11 +3268,11 @@ export function codexAgentArgv(
     "--ask-for-approval", "on-request",
     "--dangerously-bypass-hook-trust",
     "-c", "features.hooks=true",
-    "-c", codexHookOverride("PreToolUse", `${approve} ${commandApproval}`, "^Bash$"),
-    "-c", codexHookOverride("PermissionRequest", `${approve} ${commandApproval}`, "^Bash$"),
-    "-c", codexHookOverride("PostToolUse", `${hook} PostToolUse`),
-    "-c", codexHookOverride("Stop", `${hook} Stop`),
-    "-c", codexHookOverride("SubagentStop", `${hook} SubagentStop`),
+    "-c", codexHookOverride("PreToolUse", approve, "^Bash$"),
+    "-c", codexHookOverride("PermissionRequest", approve, "^Bash$"),
+    "-c", codexHookOverride("PostToolUse", hook("PostToolUse")),
+    "-c", codexHookOverride("Stop", hook("Stop")),
+    "-c", codexHookOverride("SubagentStop", hook("SubagentStop")),
     "-c", `model_reasoning_effort=${JSON.stringify(settings.reasoningEffort)}`,
     "-c", `model_auto_compact_token_limit=${settings.autoCompactTokenLimit}`,
     "-c", `tool_output_token_limit=${settings.toolOutputTokenLimit}`,
@@ -3292,7 +3362,15 @@ export async function spawnAgent(
   const pending = queuedSteers(db, id);
   const brief = steerPreamble(pending) + (opts.briefOverride ?? composeBrief(db, id));
   const hiveUrl = opts.hiveUrl || process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
-  const env = { ...(await resolveProjectSecrets(db, task.project_id)), HIVE_AGENT: agent };
+  // TeamClaude proxy env first when the project opted in (agent="teamclaude";
+  // null when the proxy is down → agent runs direct), then secrets so a
+  // same-named secret wins.
+  const env = {
+    ...(usesTeamclaude(config) ? (await teamclaudeEnv())?.set ?? {} : {}),
+    ...(await resolveProjectSecrets(db, task.project_id)),
+    ...agentPlatformEnv(),
+    HIVE_AGENT: agent,
+  };
 
   let result;
   try {
@@ -4416,20 +4494,18 @@ function writeHookSettings(
   hiveUrl: string,
   commandApproval: "escalate" | "allow" | "prompt" = "escalate"
 ): void {
-  const hook = join(HOOKS_DIR, "hive-hook.sh");
-  const approve = join(HOOKS_DIR, "hive-approve.sh");
   const settings = {
     permissions: { allow: SAFE_TOOL_ALLOWLIST, deny: DENIED_MCP_SERVERS },
     hooks: {
       // Gate Bash before it runs: safe commands auto-approve, risky ones escalate
       // to the authority engine so an autonomous worker never hangs on a dialog.
       PreToolUse: [
-        { matcher: "Bash", hooks: [{ type: "command", command: `${approve} ${commandApproval}` }] },
+        { matcher: "Bash", hooks: [{ type: "command", command: hookScriptCommand("classify.ts", [commandApproval]) }] },
       ],
-      Stop: [{ hooks: [{ type: "command", command: `${hook} Stop` }] }],
-      SubagentStop: [{ hooks: [{ type: "command", command: `${hook} SubagentStop` }] }],
+      Stop: [{ hooks: [{ type: "command", command: hookScriptCommand("hive-hook.ts", ["Stop"]) }] }],
+      SubagentStop: [{ hooks: [{ type: "command", command: hookScriptCommand("hive-hook.ts", ["SubagentStop"]) }] }],
       PostToolUse: [
-        { matcher: "Bash|Write|Edit", hooks: [{ type: "command", command: `${hook} PostToolUse` }] },
+        { matcher: "Bash|Write|Edit", hooks: [{ type: "command", command: hookScriptCommand("hive-hook.ts", ["PostToolUse"]) }] },
       ],
     },
   };

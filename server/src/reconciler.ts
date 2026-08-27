@@ -357,7 +357,7 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
 // death. Herdr.confirmGone cross-checks the pane list; an unconfirmed death
 // degrades to alive+unknown, which every caller already treats as "leave it
 // alone" (2026-08-19 incident: 12+ live agents failed and their tabs closed).
-async function probeAgent(
+export async function probeAgent(
   h: Herdr,
   db: DB,
   taskId: string,
@@ -1899,14 +1899,21 @@ export function requeueStaleFailed(db: DB, nowMs: number = Date.now()): void {
     const configured = JSON.parse(task.project_config ?? "{}").failed_triage_requeue_hours;
     const hours = configured === undefined ? DEFAULT_FAILED_TRIAGE_REQUEUE_HOURS : Number(configured);
     if (!Number.isFinite(hours) || hours <= 0 || nowMs - Date.parse(task.failed_at) < hours * 60 * 60 * 1000) continue;
-    if (task.source === "requeue") continue;
+    // A blanket skip on source='requeue' parked a lineage forever the moment
+    // it was requeued once — including by a fleet-wide death wave, which kills
+    // requeued tasks same as any other. Cap by depth instead, same escalation
+    // line the dead-agent recovery path (recoverDead) uses: first/second
+    // generation still auto-requeues past the triage window, deeper than that
+    // parks for a human.
+    const depth = requeueDepth(db, task);
+    if (depth >= MAX_AUTO_REQUEUE) continue;
     if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type IN ('changes_requested','requeued') LIMIT 1").get(task.id)) continue;
     const failure = db.query("SELECT source FROM events WHERE task_id = ? AND type = 'state_change' AND json_extract(payload, '$.to') = 'failed' ORDER BY ts DESC LIMIT 1").get(task.id) as { source: string } | undefined;
     if (failure?.source === "director") continue;
 
     const newId = requeueTask(db, task);
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "requeued", payload: { new_task_id: newId, attempt: 1, reason: "failed task exceeded triage window" } });
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "failed-triage-auto-requeue", new_task_id: newId, attempt: 1 } });
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "requeued", payload: { new_task_id: newId, attempt: depth + 1, reason: "failed task exceeded triage window" } });
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "failed-triage-auto-requeue", new_task_id: newId, attempt: depth + 1 } });
     enqueue(db, { kind: "failed", task_id: task.id, title: `Auto-requeued after ${hours}h awaiting triage: ${task.title}` });
   }
 }
@@ -1944,6 +1951,13 @@ export async function handleBlockedAgent(db: DB, h: Herdr, taskId: string, targe
   }
   if (diag?.kind === "queued_input") {
     await recoverQueuedInput(db, h, task, target, diag.excerpt);
+    return true;
+  }
+  if (diag?.kind === "usage_limit") {
+    // Catch the park the moment status flips (~60s), same as every other
+    // dialog kind here — waiting for the 15-minute stale timer is exactly the
+    // churn window that burned quota on 2026-08-26 (HIVE-451).
+    recoverUsageLimit(db, task, diag.excerpt);
     return true;
   }
   if (diag?.kind !== "blocked_dialog") return false; // blocked but no visible dialog: leave to the silent path

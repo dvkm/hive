@@ -2588,7 +2588,7 @@ export async function syncProjectOnce(
       continue;
     }
     mirrorTask = linkedTasks.find((task) => task.jira_link_kind === "mirror");
-    let linkedRead = read;
+    let linkedRead: IssueObservation = read;
     if (read.scope !== "in") {
       if (mirrorTask) {
         logSyncOnce(db, mirrorTask.id, { action: "out_of_scope", issue: key, scope: read.scope });

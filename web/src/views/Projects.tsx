@@ -3,11 +3,12 @@ import { api } from "../lib/api";
 import type { Project, PrGardenerItem, Kind, State } from "../lib/api";
 import { useStore } from "../lib/store";
 import { STATE_LABEL, toast } from "../lib/ui";
+import { isAbsoluteRepoPath, repoPathPlaceholder } from "../lib/paths";
 
 // Config keys the structured editor owns; everything else is edited as raw JSON.
 const STRUCTURED_KEYS = ["agent", "auto_dispatch", "max_agents", "dispatch_kinds", "supervisor_persona", "playbook"];
 const ALL_KINDS: Kind[] = ["ship", "scout", "chore"];
-type Agent = "claude" | "codex";
+type Agent = "claude" | "codex" | "teamclaude";
 // States worth surfacing as per-project counts (skip terminal cancelled).
 const COUNT_STATES: State[] = ["queued", "in_progress", "needs_decision", "in_review", "verifying", "done", "failed"];
 
@@ -105,7 +106,7 @@ function ProjectCard({
   const archived = p.config?.archived === true;
   const isTest = p.config?.test === true;
   const autoDispatch = p.config?.auto_dispatch === true;
-  const agent = p.config?.agent === "codex" ? "codex" : "claude";
+  const agent: Agent = p.config?.agent === "codex" ? "codex" : p.config?.agent === "teamclaude" ? "teamclaude" : "claude";
   const monitors = (p.config?.monitors?.length as number) || 0;
   const gardenerEnabled = p.config?.pr_gardener?.enabled === true;
   const total = COUNT_STATES.reduce((n, s) => n + (counts[s] || 0), 0);
@@ -141,7 +142,7 @@ function ProjectCard({
         <span className={`chip ${autoDispatch ? "effect-allow" : ""}`}>
           auto-dispatch {autoDispatch ? "on" : "off"}
         </span>
-        <span className="chip">{agent === "codex" ? "ChatGPT · Codex" : "Claude Code"}</span>
+        <span className="chip">{agent === "codex" ? "ChatGPT · Codex" : agent === "teamclaude" ? "Claude · TeamClaude" : "Claude Code"}</span>
         <span className="chip">{monitors} monitor{monitors === 1 ? "" : "s"}</span>
         <span className={`chip ${gardenerEnabled ? "effect-allow" : ""}`}>PR Gardener {gardenerEnabled ? "on" : "off"}</span>
         <span className="chip">{total} task{total === 1 ? "" : "s"}</span>
@@ -210,7 +211,9 @@ function GardenerQueue({ projectId }: { projectId: string }) {
 function ProjectEditor({ p, onSaved, onClose }: { p: Project; onSaved: () => void; onClose: () => void }) {
   const [name, setName] = useState(p.name);
   const [repoPath, setRepoPath] = useState(p.repo_path || "");
-  const [agent, setAgent] = useState<Agent>(p.config?.agent === "codex" ? "codex" : "claude");
+  const [agent, setAgent] = useState<Agent>(
+    p.config?.agent === "codex" ? "codex" : p.config?.agent === "teamclaude" ? "teamclaude" : "claude"
+  );
   const [autoDispatch, setAutoDispatch] = useState(p.config?.auto_dispatch === true);
   const [maxAgents, setMaxAgents] = useState(
     p.config?.max_agents != null ? String(p.config.max_agents) : ""
@@ -263,7 +266,7 @@ function ProjectEditor({ p, onSaved, onClose }: { p: Project; onSaved: () => voi
       </label>
       <label className="fld">
         <span>Repo path (absolute)</span>
-        <input className="mono-input" value={repoPath} onChange={(e) => setRepoPath(e.target.value)} placeholder="/Users/you/code/project" />
+        <input className="mono-input" value={repoPath} onChange={(e) => setRepoPath(e.target.value)} placeholder={repoPathPlaceholder} />
       </label>
 
       <div className="proj-config">
@@ -272,6 +275,7 @@ function ProjectEditor({ p, onSaved, onClose }: { p: Project; onSaved: () => voi
           <span>Worker</span>
           <select value={agent} onChange={(e) => setAgent(e.target.value as Agent)}>
             <option value="claude">Claude Code</option>
+            <option value="teamclaude">Claude Code via TeamClaude (multi-account proxy)</option>
             <option value="codex">ChatGPT (Codex CLI)</option>
           </select>
         </label>
@@ -343,7 +347,7 @@ function NewProjectModal({ onClose, onCreated }: { onClose: () => void; onCreate
 
   const submit = async () => {
     if (!name.trim() || !repoPath.trim() || busy) return;
-    if (!repoPath.trim().startsWith("/")) {
+    if (!isAbsoluteRepoPath(repoPath)) {
       toast("Repo path must be absolute");
       return;
     }
@@ -374,12 +378,13 @@ function NewProjectModal({ onClose, onCreated }: { onClose: () => void; onCreate
         </label>
         <label className="fld">
           <span>Repo path (absolute)</span>
-          <input className="mono-input" placeholder="/Users/you/code/acme-web" value={repoPath} onChange={(e) => setRepoPath(e.target.value)} />
+          <input className="mono-input" placeholder={repoPathPlaceholder} value={repoPath} onChange={(e) => setRepoPath(e.target.value)} />
         </label>
         <label className="fld">
           <span>Worker</span>
           <select value={agent} onChange={(e) => setAgent(e.target.value as Agent)}>
             <option value="claude">Claude Code</option>
+            <option value="teamclaude">Claude Code via TeamClaude (multi-account proxy)</option>
             <option value="codex">ChatGPT (Codex CLI)</option>
           </select>
         </label>

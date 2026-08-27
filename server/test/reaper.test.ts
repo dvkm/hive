@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, getSetting, setSetting, type DB } from "../src/db.ts";
-import { reapOnce, taskIdFromBranch, taskIdFromCwd, sweepOrphanedAgents, sweepOrphanedPanes, sweepFinishedTestProjects } from "../src/reaper.ts";
+import { reapOnce, taskIdFromBranch, taskIdFromCwd, sweepOrphanedAgents, sweepOrphanedPanes, sweepZombiePanes, sweepFinishedTestProjects } from "../src/reaper.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -459,4 +459,82 @@ test("the current lease holder reaps normally", async () => {
   const herdr = new Herdr(async (argv) => (calls.push(argv), OK()), "herdr");
   await reapOnce(db, { herdr, exec: async (argv) => (calls.push(argv), OK()), instanceId: mine });
   expect(getSetting(db, "last_reap_at")).not.toBeNull(); // ran (holder is not blocked)
+});
+
+// ---- sweepZombiePanes: task #1706 (HIVE-450) ----
+// A pane row whose process already exited but which herdr still lists at all
+// (dead pty, not garbage-collected). Fixture: two panes at the SAME worktree
+// (fleet tab + own workspace, per the incident), an unrelated live task's pane,
+// and David's own shell (not hive-managed).
+function zombieWorld(opts: { deadTaskAlive?: boolean } = {}) {
+  const closed: string[][] = [];
+  const panes = JSON.stringify({
+    result: {
+      panes: [
+        { pane_id: "wR:p1", tab_id: "wR:t1", workspace_id: "wR", cwd: "/wt/hive-deaddeaddead" },
+        { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", cwd: "/wt/hive-deaddeaddead" },
+        { pane_id: "w2:p1", tab_id: "w2:t1", workspace_id: "w2", cwd: "/wt/hive-cafecafecafe" },
+        { pane_id: "w3:p1", tab_id: "w3:t1", workspace_id: "w3", cwd: "/Users/you/projects/foo" },
+      ],
+    },
+  });
+  const dead = JSON.stringify({ result: { process_info: { shell_pid: 1, foreground_processes: [] } } });
+  const running = JSON.stringify({
+    result: { process_info: { shell_pid: 1, foreground_processes: [{ pid: 1, argv0: "claude", name: "2.1" }] } },
+  });
+  const exec: Exec = async (argv) => {
+    if (has(argv, "pane", "list")) return OK(panes);
+    if (has(argv, "pane", "process-info")) {
+      const paneId = argv[argv.indexOf("--pane") + 1];
+      if (paneId === "w2:p1") return OK(running); // the live task — never touch
+      if (paneId === "wR:p1" && opts.deadTaskAlive) return OK(running); // one live pane in the "dead" group
+      return OK(dead);
+    }
+    if (has(argv, "pane", "close")) {
+      closed.push(argv);
+      return OK();
+    }
+    return OK();
+  };
+  return { herdr: new Herdr(exec, "herdr"), closed };
+}
+
+test("sweepZombiePanes closes every pane at a worktree with zero live processes", async () => {
+  const { db, projectId } = freshDb();
+  seedTask(db, projectId, "deaddeaddead", "in_progress"); // queued for respawn, stale binding
+  seedTask(db, projectId, "cafecafecafe", "in_progress");
+  const { herdr, closed } = zombieWorld();
+
+  await sweepZombiePanes(db, { herdr });
+
+  expect(closed.some((c) => has(c, "pane", "close", "wR:p1"))).toBe(true);
+  expect(closed.some((c) => has(c, "pane", "close", "w1:p1"))).toBe(true);
+  const task = db.query("SELECT agent_target FROM tasks WHERE id = ?").get("deaddeaddead") as { agent_target: string | null };
+  expect(task.agent_target).toBeNull(); // unblocks the dispatcher's respawn query
+});
+
+test("sweepZombiePanes never closes any pane at a worktree with at least one live process", async () => {
+  const { db, projectId } = freshDb();
+  seedTask(db, projectId, "deaddeaddead", "in_progress");
+  seedTask(db, projectId, "cafecafecafe", "in_progress");
+  const { herdr, closed } = zombieWorld({ deadTaskAlive: true }); // wR:p1 is running claude
+
+  await sweepZombiePanes(db, { herdr });
+
+  expect(closed.length).toBe(0); // neither wR:p1 nor its sibling w1:p1 is touched
+  const task = db.query("SELECT agent_target FROM tasks WHERE id = ?").get("deaddeaddead") as { agent_target: string | null };
+  expect(task.agent_target).not.toBeNull(); // binding untouched too
+});
+
+test("sweepZombiePanes leaves the live task's pane alone", async () => {
+  const { db, projectId } = freshDb();
+  seedTask(db, projectId, "deaddeaddead", "in_progress");
+  seedTask(db, projectId, "cafecafecafe", "in_progress");
+  const { herdr, closed } = zombieWorld();
+
+  await sweepZombiePanes(db, { herdr });
+
+  expect(closed.some((c) => has(c, "pane", "close", "w2:p1"))).toBe(false);
+  const task = db.query("SELECT agent_target FROM tasks WHERE id = ?").get("cafecafecafe") as { agent_target: string | null };
+  expect(task.agent_target).not.toBeNull();
 });

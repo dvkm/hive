@@ -57,12 +57,15 @@ downstream (see `agent_argv` below). Keys used elsewhere:
 `monitors` (`[{name, url, expect_status, expect_substring?, interval_s}]`),
 `monitors_auto_task` (bool; a monitor failure auto-creates a `chore` task),
 `smoke` (`[{name, url, expect_status, expect_substring?}]`, run once on
-`verifying`), `agent` (`"claude" | "codex"`, default `"claude"`; `"codex"` runs the interactive Codex CLI using the machine's ChatGPT login), `codex_model` / `codex_model_by_kind` (optional Codex model overrides; omitted means the current Codex default), `codex_reasoning_effort` / `codex_reasoning_effort_by_kind` (optional Codex reasoning overrides; defaults are `medium` for ship and `low` for scout/chore), `codex_auto_compact_token_limit` (default `64000`), `codex_tool_output_token_limit` (default `6000`), `processed_token_warn` / `processed_token_cap` (defaults `75000000` / `200000000`), `wait_call_warn` / `wait_call_cap` (defaults `25` / `100`; `0` disables a threshold), `agent_argv` (string[], advanced per-project override of the complete command herdr runs; verbatim and responsible for its own briefing),
+`verifying`),
+`deployments` (object; opts the project into the production release model and
+the Deployments tab — see [Deployments](#deployments-production-releases)),
+`agent` (`"claude" | "codex"`, default `"claude"`; `"codex"` runs the interactive Codex CLI using the machine's ChatGPT login), `codex_model` / `codex_model_by_kind` (optional Codex model overrides; omitted means the current Codex default), `codex_reasoning_effort` / `codex_reasoning_effort_by_kind` (optional Codex reasoning overrides; defaults are `medium` for ship and `low` for scout/chore), `codex_auto_compact_token_limit` (default `64000`), `codex_tool_output_token_limit` (default `6000`), `processed_token_warn` / `processed_token_cap` (defaults `75000000` / `200000000`), `wait_call_warn` / `wait_call_cap` (defaults `25` / `100`; `0` disables a threshold), `agent_argv` (string[], advanced per-project override of the complete command herdr runs; verbatim and responsible for its own briefing),
 `setup_argv` / `cleanup_argv` (string[], a symmetric per-project stack hook pair —
 `setup_argv` runs at spawn time once the worktree exists but before the agent
 starts, `cleanup_argv` runs before the worktree is removed; relative `argv[0]`
 resolves against the project repo path and `{worktree}` substitutes the task's
-worktree path, e.g. `["infra/worktree/wt.sh","up","{worktree}"]` /
+worktree path, e.g. `["bun","infra/worktree/wt.ts","up","{worktree}"]` /
 `[…,"down","{worktree}"]`; both best-effort with a 120s timeout, emitting a
 `stack_setup` / `stack_teardown` event — see the Auto-cleanup section),
 and `gchat_spaces` (`[{space, label?}]`, the Google Chat intake allowlist —
@@ -96,7 +99,7 @@ concurrently-running agents).
 Supervisor key: `autonomy_profile` (`"conservative" | "balanced" | "autopilot"`, default `"balanced"`). Conservative leaves every checkpoint and decision to the director. Balanced may acknowledge reversible checkpoints and use only the server's closed safe-decision allow-list. Autopilot may also answer a raiser-recommended low/normal-risk technical choice after the server excludes authority grants and production/shared blast radius. No profile bypasses standing-authority gates.
 Worktree stack hooks (symmetric per-project lifecycle commands, both `string[]`,
 `{worktree}` substitutes the task's worktree path, relative `argv[0]` resolves
-against `repo_path`): `setup_argv` (e.g. `["infra/worktree/wt.sh","up","{worktree}"]`,
+against `repo_path`): `setup_argv` (e.g. `["bun","infra/worktree/wt.ts","up","{worktree}"]`,
 run at spawn after the worktree exists but before the agent starts, so agents
 don't install deps / bring up their stack themselves; emits a `stack_setup`
 event) and `cleanup_argv` (e.g. `[...,"down","{worktree}"]`, run before the
@@ -122,7 +125,7 @@ notification. The reaper auto-sets `archived: true` on a `test` project once
 every task it owns is terminal.
 Worktree stack hooks (symmetric per-project lifecycle commands): `setup_argv`
 (string[], run AFTER the worktree exists but BEFORE the agent starts — e.g.
-`["infra/worktree/wt.sh", "up", "{worktree}"]` — so agents don't bring up their
+`["bun", "infra/worktree/wt.ts", "up", "{worktree}"]` — so agents don't bring up their
 stack themselves; emits a `stack_setup` event) and `cleanup_argv` (string[], run
 BEFORE the worktree is removed — e.g. `[..., "down", "{worktree}"]`; emits a
 `stack_teardown` event). Both: relative `argv[0]` resolves against `repo_path`,
@@ -626,6 +629,50 @@ once; caps park an in-progress task behind a wrap-up-or-continue decision. A
   Updates mutable fields. `config` is REPLACED wholesale when present (read the
   project, edit keys like `auto_dispatch`, write the object back). Used by the
   Policies-page auto-dispatch toggle.
+
+### Deployments (production releases)
+
+The one-branch deploy model: merging into the project's integration branch
+deploys staging, and production is a GitHub workflow the director runs by hand.
+That workflow stamps an immutable tag `prod-YYYY-MM-DD-<short sha>`, so the
+NEWEST such tag is what is live. There is no branch that means "production".
+
+Opt-in per project through `config.deployments`. Without that key these routes
+404 and the project does not appear on the Deployments tab. Every field is
+optional:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `deploy_workflow` | `prod-deploy.yml` | Workflow dispatched to deploy |
+| `rollback_workflow` | `prod-rollback.yml` | Workflow dispatched to roll back |
+| `tag_prefix` | `prod-` | Release tags are read and validated against this |
+| `workflow_ref` | the project's integration branch | Ref the workflow file is read from |
+| `health_url` | none | Probed on each read (same checker as `config.monitors`) |
+| `health_substring` | none | Required in the health response body |
+| `flags` | `[]` | Feature-flag keys to show, in order |
+| `posthog_project` | none | With a `POSTHOG_API_KEY` secret, resolves live flag states |
+| `posthog_host` | `https://us.posthog.com` | PostHog API base |
+| `history` | `15` | Releases listed |
+
+- `GET /api/projects/:id/deployments` → `200 DeploymentsStatus` | `404` when the project or its `deployments` config is missing
+  `{branch, head:{sha,short,subject}|null, current:Release|null, releases:[Release], ahead:number|null, health:{ok,detail,url}|null, flags:{available,reason,items:[{key,name,active,rollout}]}, runs:[WorkflowRun], errors:[string]}`.
+  `Release` is `{tag, sha, short, subject, created_at, current}`, where `sha` is
+  the release tag's DEREFERENCED commit (the workflow writes annotated tags).
+  `ahead` counts commits on `branch` that production does not have. A section
+  that could not be read degrades to null/`[]` and appends to `errors` rather
+  than failing the whole response.
+- `POST /api/projects/:id/deployments/deploy` body `{commit?}` → `200 {ok, workflow, ref}` | `400` | `401` without the API token | `502` when `gh` refuses
+  Blank `commit` means the workflow's own default (the current head of the
+  branch). Anything that is not a commit SHA → `400`.
+- `POST /api/projects/:id/deployments/rollback` body `{tag?}` → `200 {ok, workflow, ref}` | `400` | `401` without the API token | `502` when `gh` refuses
+  Blank `tag` means the workflow's own default (the release before the current
+  one). A tag outside `tag_prefix` → `400`, so production can never be pointed
+  at a commit that was never live.
+
+Both writes are token-gated (see Auth). Hive has no user accounts, so the API
+token IS the super-admin check: it is read out of hive's own DB, which an
+agent's HTTP socket cannot reach. The GitHub credential stays server-side —
+hive shells out to `gh`, and the browser only ever names a commit or a tag.
 
 ### Tasks
 - `GET /api/tasks?state=&project_id=&test=` → `200 [Task, ...]` (newest `updated_at` first; all filters optional). Tasks under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
