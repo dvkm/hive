@@ -1,8 +1,12 @@
 import { test, expect } from "bun:test";
 import { defaultExec } from "../src/exec.ts";
 
+const echoArgv = () => process.platform === "win32"
+  ? ["cmd.exe", "/d", "/c", "echo", "hi"]
+  : ["echo", "hi"];
+
 test("defaultExec returns real output and code for a normal command", async () => {
-  const r = await defaultExec(["echo", "hi"]);
+  const r = await defaultExec(echoArgv());
   expect(r.code).toBe(0);
   expect(r.stdout.trim()).toBe("hi");
 });
@@ -16,7 +20,7 @@ test("defaultExec resolves a PATH-only binary name even with a stripped-down inh
   const original = process.env.PATH;
   try {
     process.env.PATH = "";
-    const r = await defaultExec(["echo", "hi"]);
+    const r = await defaultExec(echoArgv());
     expect(r.code).toBe(0);
     expect(r.stdout.trim()).toBe("hi");
   } finally {
@@ -44,9 +48,32 @@ test("defaultExec reports a child that cannot start as a non-zero result, never 
 // bound actually fires instead of waiting out the full subprocess runtime.
 test("defaultExec bounds a hung subprocess with a timeout (task #621)", async () => {
   const start = Date.now();
-  const r = await defaultExec(["sleep", "5"], { timeoutMs: 100 });
+  const command = process.platform === "win32"
+    ? ["ping.exe", "-n", "6", "127.0.0.1"]
+    : ["sleep", "5"];
+  const r = await defaultExec(command, { timeoutMs: 100 });
   expect(Date.now() - start).toBeLessThan(2000);
   expect(r.code).toBe(124);
+});
+
+test("defaultExec reports a missing optional executable instead of throwing", async () => {
+  const r = await defaultExec([`hive-command-that-does-not-exist-${Date.now()}`]);
+  expect(r.code).toBe(127);
+  expect(r.stderr.length).toBeGreaterThan(0);
+});
+
+test("Windows executable PATH keeps drive-letter entries intact and uses semicolons", async () => {
+  const { buildExecutablePath } = await import("../src/platform.ts");
+  const path = buildExecutablePath("C:\\Tools;D:\\More", "win32", {
+    USERPROFILE: "C:\\Users\\Ada",
+    LOCALAPPDATA: "C:\\Users\\Ada\\AppData\\Local",
+    SystemRoot: "C:\\Windows",
+    ProgramFiles: "C:\\Program Files",
+    "ProgramFiles(x86)": "C:\\Program Files (x86)",
+  });
+  expect(path.split(";").slice(0, 2)).toEqual(["C:\\Tools", "D:\\More"]);
+  expect(path).toContain("C:\\Users\\Ada\\.bun\\bin");
+  expect(path).toContain("C:\\Users\\Ada\\AppData\\Local\\Programs\\Herdr\\bin");
 });
 
 // Config-sourced branch names become positional git arguments; git parses a

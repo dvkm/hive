@@ -5,6 +5,14 @@
 # the one state auto-resolution has burned us on (squash-merged reconcile PRs,
 # eaten commits from concurrent crew merges).
 set -euo pipefail
+
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+    exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$SCRIPT_DIR/sync-main.ps1")"
+    ;;
+esac
+
 REPO="$HOME/projects/hive"
 LIVE="$HOME/projects/hive-live"
 LOG="$HOME/.hive/logs/sync-main.log"
