@@ -150,29 +150,18 @@ textarea { font-family: inherit; }
   font-size: 17px;
 }
 .brand-mark {
-  position: relative;
+  display: inline-flex;
   width: 18px;
   height: 18px;
-  border: 1px solid rgba(215, 181, 109, 0.62);
-  transform: rotate(45deg);
-  transition: transform 240ms cubic-bezier(0.2, 0.8, 0.2, 1), border-color 240ms ease;
+  color: var(--accent);
+  transition: color 240ms ease;
 }
-.brand-mark::before,
-.brand-mark::after,
-.brand-mark span {
-  content: "";
-  position: absolute;
-  width: 4px;
-  height: 4px;
-  border-radius: 1px;
-  background: var(--accent);
+.brand-mark svg {
+  width: 100%;
+  height: 100%;
 }
-.brand-mark::before { top: 3px; left: 3px; }
-.brand-mark::after { right: 3px; bottom: 3px; }
-.brand-mark span { top: 3px; right: 3px; opacity: 0.42; }
 .brand:hover .brand-mark {
-  border-color: var(--accent-bright);
-  transform: rotate(135deg);
+  color: var(--accent-bright);
 }
 .nav {
   display: flex;
