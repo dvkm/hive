@@ -35,6 +35,7 @@ import { createDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectComparisonBase } from "./exec.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { supervisedSql } from "./supervision.ts";
 import { authoredFiles } from "./rebaseGuard.ts";
@@ -227,7 +228,11 @@ async function judge(db: DB, task: any, fp: Footprint, config: any, deps: DriftD
   const exec = deps.exec ?? defaultPlannerExec;
   let res;
   try {
-    res = await exec(argv, { timeoutMs: TIMEOUT_MS });
+    res = await exec(argv, {
+      timeoutMs: TIMEOUT_MS,
+      ...(task.worktree_path ? { cwd: task.worktree_path } : {}),
+      env: claudeProfileEnvForProject(db, task.project_id),
+    });
   } catch (e: any) {
     record({ error: String(e?.message ?? e) });
     return;
