@@ -1,6 +1,8 @@
 // Injectable subprocess layer. Every adapter that shells out (herdr, secrets,
 // gh, git, osascript) takes an `Exec` so it is fully unit-testable without
 // touching the real world. Tests pass a stub; production uses `defaultExec`.
+import { buildExecutablePath } from "./platform.ts";
+
 export type ExecResult = { code: number; stdout: string; stderr: string };
 
 export type Exec = (
@@ -18,11 +20,15 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 // `gh` fine — something about --watch's env handling loses PATH at the exact
 // spawn call. Rather than depend on inheritance working, build PATH explicitly
 // so resolution never depends on how the server process itself was started.
-const FALLBACK_PATH_DIRS = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin", `${process.env.HOME ?? ""}/.bun/bin`];
 function spawnEnv(): Record<string, string | undefined> {
-  const current = (process.env.PATH ?? "").split(":").filter(Boolean);
-  const path = Array.from(new Set([...current, ...FALLBACK_PATH_DIRS])).join(":");
-  return { ...process.env, PATH: path };
+  // Windows uses `;` and drive-letter paths contain `:`. Splitting/joining with
+  // the Unix delimiter corrupts every entry (`C:\\...` became `C`, `\\...`).
+  // Remove alternate-cased Path keys too: Bun/Windows treats env names as
+  // case-insensitive and duplicate PATH/Path entries have ambiguous precedence.
+  const inherited = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => key.toLowerCase() !== "path")
+  );
+  return { ...inherited, PATH: buildExecutablePath() };
 }
 
 // Real implementation over Bun.spawn. `input` is written to stdin (used by
@@ -35,30 +41,44 @@ function spawnEnv(): Record<string, string | undefined> {
 // returned). `proc.kill()` is best-effort cleanup; the Promise.race is what
 // actually bounds the caller, since a leaked pipe writer can outlive the kill.
 export const defaultExec: Exec = async (argv, opts = {}) => {
-  const proc = Bun.spawn(argv, {
-    cwd: opts.cwd,
-    env: spawnEnv(),
-    stdin: opts.input != null ? "pipe" : "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn(argv, {
+      cwd: opts.cwd,
+      env: spawnEnv(),
+      stdin: opts.input != null ? "pipe" : "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+  } catch (error) {
+    // A missing optional CLI (most often `gh` on a new Windows install) is a
+    // normal subprocess failure, not an exception that should turn an API call
+    // into HTTP 500. Preserve the Exec contract and let the caller degrade.
+    return { code: 127, stdout: "", stderr: error instanceof Error ? error.message : String(error) };
+  }
   if (opts.input != null) {
     proc.stdin!.write(opts.input);
     await proc.stdin!.end();
   }
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const timedOut = Symbol("timedOut");
-  const timer = setTimeout(() => proc.kill(), timeoutMs);
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<typeof timedOut>((resolve) => {
+    timer = setTimeout(() => {
+      proc.kill();
+      resolve(timedOut);
+    }, timeoutMs);
+  });
   try {
     const result = await Promise.race([
       Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]),
-      new Promise<typeof timedOut>((resolve) => setTimeout(() => resolve(timedOut), timeoutMs)),
+      timeout,
     ]);
     if (result === timedOut) return { code: 124, stdout: "", stderr: `timed out after ${timeoutMs}ms: ${argv.join(" ")}` };
     const [stdout, stderr, code] = result;
     return { code, stdout, stderr };
   } finally {
-    clearTimeout(timer);
+    clearTimeout(timer!);
   }
 };
 

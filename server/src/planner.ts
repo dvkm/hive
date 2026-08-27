@@ -22,6 +22,8 @@ import { parseDecision } from "./rows.ts";
 import { listReferences } from "./learn.ts";
 import { classifyEscalation, factorsFromPlan, type EscalationVerdict } from "./policy.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
+import { homedir } from "node:os";
+import { join, win32 } from "node:path";
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.HIVE_PLANNER_TIMEOUT_MS || 120_000);
 // Pinned to sonnet: a breakdown proposal is triage, not deep work, and an
@@ -30,12 +32,14 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.HIVE_PLANNER_TIMEOUT_MS || 120_000
 // minimal PATH and a bare "claude" fails with "Executable not found" — every
 // braindump auto-triage died this way (task #131 et al., 2026-07-11).
 export function claudeBin(): string {
-  const home = process.env.HOME ?? "";
+  const home = process.env.USERPROFILE || process.env.HOME || homedir();
+  const local = process.env.LOCALAPPDATA || win32.join(home, "AppData", "Local");
   for (const p of [
     process.env.HIVE_CLAUDE_BIN,
     Bun.which("claude"),
-    `${home}/.local/bin/claude`,
-    `${home}/.claude/local/claude`,
+    process.platform === "win32" ? win32.join(home, ".local", "bin", "claude.exe") : join(home, ".local", "bin", "claude"),
+    process.platform === "win32" ? win32.join(home, ".claude", "local", "claude.exe") : join(home, ".claude", "local", "claude"),
+    process.platform === "win32" ? win32.join(local, "Programs", "Claude", "claude.exe") : null,
     "/opt/homebrew/bin/claude",
     "/usr/local/bin/claude",
   ]) {

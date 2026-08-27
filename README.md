@@ -6,7 +6,13 @@ This repo contains **Phase 1** (server core + CLI) and **Phase 2b** (the runtime
 
 ## Requirements
 
-- [Bun](https://bun.sh) (tested on 1.3.x). No other dependencies.
+- [Bun](https://bun.sh) (tested on 1.3.x and 1.4.x).
+- [Git](https://git-scm.com/) and [Herdr](https://herdr.dev/). GitHub CLI (`gh`)
+  is optional but required for pull-request review and merge automation.
+- Claude Code or Codex for the worker selected by a project's `config.agent`.
+- On Windows, install Git for Windows. Hive automatically supplies its
+  `bash.exe` location to native Claude Code through
+  `CLAUDE_CODE_GIT_BASH_PATH`.
 
 ## Run
 
@@ -15,6 +21,23 @@ bun run server/src/index.ts     # start the daemon on 127.0.0.1:4700
 # or via the CLI:
 bin/hive serve
 ```
+
+Native Windows PowerShell/cmd:
+
+```powershell
+bun run server/src/index.ts
+bin\hive.cmd serve
+```
+
+For deployments, `scripts\sync-main.ps1` is the native Windows counterpart to
+`scripts/sync-main.sh`; invoking the shell script from Git Bash dispatches to it
+automatically. It syncs `main`, rebuilds and installs the desktop app, restarts
+the Hive server, and verifies `/api/health`.
+
+Repository paths may use the host's normal absolute syntax: `/Users/me/repo`,
+`C:\Users\me\repo`, `D:/src/repo`, or a UNC path such as
+`\\server\share\repo`. Relative paths and drive-relative forms such as
+`C:repo` are rejected.
 
 Environment:
 - `HIVE_DB` — SQLite file path (default `~/.hive/hive.db`; parent dir auto-created).
@@ -75,8 +98,8 @@ bin/hive open
 ```
 server/src/  db.ts state.ts briefs.ts api.ts bus.ts rows.ts exec.ts
              secrets.ts monitors.ts reconciler.ts runtime/herdr.ts index.ts
-cli/hive.ts  bin/hive        CLI
-hooks/       hive-hook.sh install.md   Claude Code lifecycle hooks
+cli/hive.ts  bin/hive bin/hive.cmd     CLI
+hooks/       hive-hook.ts hive-hook.sh install.md   Claude Code/Codex lifecycle hooks
 scripts/     demo-seed.ts
 docs/API.md  the HTTP contract (the web app builds against this)
 server/test/ bun test suite
@@ -134,6 +157,9 @@ server/test/ bun test suite
   manual `POST /api/tasks/:id/spawn`. The herdr adapter is verified against a
   live herdr server — see `docs/runtime.md` and
   `docs/evidence/herdr-live-verification.txt`.
+  On Windows, Hive discovers the standard per-user Herdr install under
+  `%LOCALAPPDATA%\Programs\Herdr\bin`, augments child `PATH` without corrupting
+  drive letters, and treats PowerShell/cmd panes as shells rather than agents.
 - **Reconciler** (`server/src/reconciler.ts`, 60s; `HIVE_RECONCILE_MS`) syncs
   herdr agent status, `gh pr view` CI/merge state, and flags tasks silent past
   `HIVE_STALE_MS` (default 15m) as `stale`. Every cycle is failure-isolated and
@@ -146,7 +172,7 @@ server/test/ bun test suite
   fail → back to `in_progress`.
 - **Native notifications + deeplinks** (`server/src/notifications.ts`,
   `electron/main.js`). Urgent events (a decision opened, a task handed to
-  review, an agent unreachable, a monitor incident) raise a real macOS
+  review, an agent unreachable, a monitor incident) raise a real desktop
   notification through the desktop app, so it carries the hive icon and obeys
   Do Not Disturb. The app already holds an SSE connection
   (`/api/stream?client=app`), so the server delivers over that; only when no app
@@ -155,28 +181,32 @@ server/test/ bun test suite
   not when the server tried. Clicking one opens the exact task or decision.
   `cd electron && bun install && bun run build` builds the app into the checkout;
   `bun run install-app` in `electron/` builds and then installs that bundle to
-  `/Applications/hive.app`, the canonical copy macOS resolves `dev.hive.app` and
-  `hive://` to. Everything that launches the app (`hive app`, the post-deploy
+  `/Applications/hive.app` on macOS or `%LOCALAPPDATA%\Programs\hive` on
+  Windows. The installer registers `hive://` per-user on both platforms.
+  Everything that launches the app (`hive app`, the post-deploy
   restart) opens that installed copy, so a checkout build never re-registers
   itself as `dev.hive.app`.
   `hive://` deeplinks work from anywhere (Terminal, another app, a script):
 
   ```
-  open "hive://task/1247"           # task by number or id
-  open "hive://decision/dec_ab12"   # the decision card, scrolled to + highlighted
-  open "hive://quiz/1b75826af9fb"   # the understanding check on that task
-  open "hive://open?path=/inbox"    # any app route
+  # macOS: open "hive://task/1247"
+  # Windows: Start-Process "hive://task/1247"
+  # Other routes: hive://decision/dec_ab12, hive://quiz/1b75826af9fb,
+  #               hive://open?path=/inbox
   ```
 
   Check the whole chain without waiting for a real event: `hive notify --test`
   fires one urgent notification and waits up to 10s for the app to confirm
-  macOS rendered it. It fails loudly if nothing did.
+  rendered it. It fails loudly if nothing did.
 - **Secrets** store names/refs only (migration v2). Values live in macOS
-  Keychain (`security`) or Bitwarden (`bw`), resolved at spawn and injected as
+  Keychain (`security`), Windows per-user DPAPI-encrypted storage, or Bitwarden
+  (`bw`), resolved at spawn and injected as
   env; the server redacts known secret values from stored payloads. Manage with
   `hive secret set|list|rm` (`set` reads the value from stdin).
 - **Hooks** (`hooks/`) POST liveness events to `$HIVE_URL` when `$HIVE_TASK_ID`
-  is set; fail silent + fast (2s curl cap). See `hooks/install.md`.
+  is set. New spawns run the Bun/TypeScript hook directly, so native Windows
+  does not depend on WSL; the shell wrapper remains for older Unix settings.
+  Hooks fail silent and fast. See `hooks/install.md`.
 
 ## v2 notes (intake connector)
 

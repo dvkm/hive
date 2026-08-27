@@ -608,6 +608,9 @@ test("unmergeable emit closes the task once the landing commit is verified on th
   git(cloneA, ["checkout", "-q", "-b", "main"]);
   git(cloneA, ["-c", "user.email=a@a.com", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "init"]);
   git(cloneA, ["push", "-q", "-u", "origin", "main"]);
+  // Do not depend on the machine's init.defaultBranch (Windows Git commonly
+  // still defaults bare repositories to master).
+  git(origin, ["symbolic-ref", "HEAD", "refs/heads/main"]);
 
   // A second clone lands a commit on main that cloneA (the project's repo_path)
   // has not fetched yet. This is the "work landed via a different PR" case.

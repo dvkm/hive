@@ -588,10 +588,18 @@ export function openDb(path: string = defaultDbPath()): DB {
     mkdirSync(dirname(path), { recursive: true });
   }
   const db = new Database(path, { create: true });
-  db.exec("PRAGMA journal_mode = WAL;");
-  db.exec("PRAGMA foreign_keys = ON;");
-  migrate(db);
-  return db;
+  try {
+    db.exec("PRAGMA journal_mode = WAL;");
+    db.exec("PRAGMA foreign_keys = ON;");
+    migrate(db);
+    return db;
+  } catch (error) {
+    // Windows refuses to reopen/delete a SQLite file while a failed migration's
+    // handle is still live. Close before rethrowing so recovery and tests can
+    // inspect the unchanged database immediately.
+    db.close();
+    throw error;
+  }
 }
 
 export const CREATES = /^\s*CREATE\s+(?:UNIQUE\s+)?(TABLE|INDEX|TRIGGER|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)/i;

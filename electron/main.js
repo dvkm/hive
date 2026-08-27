@@ -1,10 +1,11 @@
 // hive desktop app: a native window onto the local hive server, plus what a
-// browser tab can't do — native macOS notifications from the server's
-// notification stream and a dock badge counting open decisions + checkpoints.
+// browser tab can't do — native OS notifications from the server's stream and
+// an app badge counting open decisions + checkpoints where the OS supports it.
 // The server itself stays the LaunchAgent (dev.hive.server); this app is a
 // client only and reconnects politely when the daemon is down.
 const { app, BrowserWindow, Notification, shell, screen } = require("electron");
 const http = require("node:http");
+const path = require("node:path");
 const { routeFor } = require("./deeplink.js");
 
 const BASE = process.env.HIVE_URL || "http://127.0.0.1:4700";
@@ -29,7 +30,7 @@ function createWindow() {
     minWidth: 640,
     minHeight: 480,
     resizable: true,
-    titleBarStyle: "hiddenInset",
+    ...(process.platform === "darwin" ? { titleBarStyle: "hiddenInset" } : {}),
     backgroundColor: "#1c1c1e",
     webPreferences: { contextIsolation: true },
   });
@@ -99,7 +100,7 @@ function handleUrl(rawUrl) {
   if (route) goto(route);
 }
 
-// One native macOS notification. Electron routes it through the app bundle, so
+// One native desktop notification. Electron routes it through the app bundle, so
 // it carries the hive icon and obeys Do Not Disturb / Focus like any other app.
 function showNotification(n) {
   if (n.id) {
@@ -116,13 +117,13 @@ function showNotification(n) {
   };
   const note = new Notification({ title: n.title || "hive", body: n.body || "" });
   note.on("click", () => goto(n.path && n.path.startsWith("/") ? n.path : "/"));
-  // macOS refusing is the failure the director actually hit. Report it instead
+  // OS refusal is the failure the director actually hit. Report it instead
   // of swallowing it: `hive notify --test` prints the reason.
   note.on("failed", (_event, error) => {
     console.error("[hive] notification failed:", error);
     report({ error: String(error) });
   });
-  // `show` is the only honest delivery signal: it fires when macOS accepted it.
+  // `show` is the only honest delivery signal: it fires when the OS accepted it.
   note.on("show", () => report({ shown: true }));
   note.show();
 }
@@ -143,6 +144,14 @@ app.on("second-instance", (_event, argv) => {
   if (url) handleUrl(url);
   else if (win) goto("/");
 });
+
+// macOS delivers protocol URLs through `open-url`; Windows/Linux put them in
+// argv on the first launch. Queue those until Electron is ready.
+for (const arg of process.argv) {
+  if (!arg.startsWith("hive://")) continue;
+  launchedByDeeplink = true;
+  pendingUrls.push(arg);
+}
 
 // ---- live state from the server's SSE stream ----
 function subscribe() {
@@ -194,7 +203,8 @@ function refreshBadge() {
         fetch(BASE + "/api/checkpoints").then((r) => r.json()),
       ]);
       const n = (Array.isArray(d) ? d.length : 0) + (c?.checkpoints?.length ?? 0);
-      app.dock?.setBadge(n > 0 ? String(n) : "");
+      if (app.dock) app.dock.setBadge(n > 0 ? String(n) : "");
+      else app.setBadgeCount?.(n);
     } catch {
       /* server down — leave the badge alone */
     }
@@ -202,9 +212,12 @@ function refreshBadge() {
 }
 
 app.whenReady().then(() => {
+  if (process.platform === "win32") app.setAppUserModelId("dev.hive.app");
   // Dev runs (`electron .`) are not launched from the bundle, so claim the
   // scheme explicitly; from the built app this is already true.
-  app.setAsDefaultProtocolClient("hive");
+  if (process.defaultApp && process.argv[1])
+    app.setAsDefaultProtocolClient("hive", process.execPath, [path.resolve(process.argv[1])]);
+  else app.setAsDefaultProtocolClient("hive");
   if (!launchedByDeeplink || SMOKE) createWindow();
   pendingUrls.splice(0).forEach(handleUrl);
   subscribe();

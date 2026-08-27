@@ -44,7 +44,7 @@ test("two servers on one DB: the predecessor stands down, one keeps running laps
     HIVE_REAP_MS: "600000",
   };
   const start = () => {
-    const proc = Bun.spawn(["bun", "run", entry], { env, stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn([process.execPath, "run", entry], { env, stdout: "pipe", stderr: "pipe" });
     let text = "";
     // Both streams: the lease messages are console.warn/error (stderr), the
     // reconciler laps are console.log (stdout).
@@ -114,8 +114,8 @@ test("a server on a non-fleet port refuses the live fleet database", () => {
 // "live" db. The process must die before it serves, leases or reconciles.
 test("a throwaway server that forgets HIVE_DB exits instead of attaching to the fleet db", async () => {
   const home = mkdtempSync(join(tmpdir(), "hive-fakehome-"));
-  const proc = Bun.spawn(["bun", "run", join(import.meta.dir, "..", "src", "index.ts")], {
-    env: { ...process.env, HOME: home, HIVE_DB: "", HIVE_PORT: "4791", HIVE_HOME: home },
+  const proc = Bun.spawn([process.execPath, "run", join(import.meta.dir, "..", "src", "index.ts")], {
+    env: { ...process.env, HOME: home, USERPROFILE: home, HIVE_DB: "", HIVE_PORT: "4791", HIVE_HOME: home },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -146,6 +146,7 @@ function fakeProcs(procs: Record<number, string>) {
 }
 
 const SERVER_CMD = "/Users/d/.bun/bin/bun --watch /Users/d/projects/hive-live/server/src/index.ts";
+const WINDOWS_SERVER_CMD = "C:\\Users\\d\\.bun\\bin\\bun.exe --watch C:\\Users\\d\\projects\\hive-live\\server\\src\\index.ts";
 
 test("the lease holder terminates a second server that will not stand down", () => {
   const db = openDb(":memory:");
@@ -180,5 +181,6 @@ test("eviction never signals a dead or recycled pid", () => {
   expect(signals).toEqual([]);
   expect(listInstances(db).map((r) => r.instance)).toEqual(["srv_me"]); // both rows dropped
   expect(isHiveServerCommand(SERVER_CMD)).toBe(true);
+  expect(isHiveServerCommand(WINDOWS_SERVER_CMD)).toBe(true);
   expect(isHiveServerCommand("/Applications/Cursor.app/Contents/MacOS/Cursor")).toBe(false);
 });
