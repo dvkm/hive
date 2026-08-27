@@ -1,4 +1,6 @@
 #!/bin/bash
+# Local-deploy helper for a launchd-managed hive install. Optional: only
+# useful if you run hive this way on your own machine.
 # Keep local main <-> origin/main in sync and the live deploy on latest main.
 # Runs from launchd (dev.hive.sync) every 5 min. Everything is ff-only /
 # push-only: a diverged main is logged loudly and left for a human — that's
@@ -13,9 +15,9 @@ case "$(uname -s)" in
     ;;
 esac
 
-REPO="$HOME/projects/hive"
-LIVE="$HOME/projects/hive-live"
-LOG="$HOME/.hive/logs/sync-main.log"
+REPO="${HIVE_SYNC_REPO:-$HOME/projects/hive}"
+LIVE="${HIVE_SYNC_LIVE:-$HOME/projects/hive-live}"
+LOG="${HIVE_SYNC_LOG:-$HOME/.hive/logs/sync-main.log}"
 mkdir -p "$(dirname "$LOG")"
 exec >>"$LOG" 2>&1
 

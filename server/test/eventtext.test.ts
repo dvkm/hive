@@ -72,8 +72,8 @@ test("new transcript types are agent-lifecycle for the feed filter", () => {
 // It rides the generic `<type words>: <note>` fallback rather than its own case.
 test("a repo_mismatch event reads as a sentence on the timeline", () => {
   expect(
-    eventText({ type: "repo_mismatch", payload: { note: 'Brief targets files that exist in project "hive" but not in "corebeat": server/src/intake/jira.ts.' } })
-  ).toBe('repo mismatch: Brief targets files that exist in project "hive" but not in "corebeat": server/src/intake/jira.ts.');
+    eventText({ type: "repo_mismatch", payload: { note: 'Brief targets files that exist in project "hive" but not in "acme": server/src/intake/jira.ts.' } })
+  ).toBe('repo mismatch: Brief targets files that exist in project "hive" but not in "acme": server/src/intake/jira.ts.');
 });
 
 test("automatic dialog recovery is readable in the supervisor trajectory", () => {

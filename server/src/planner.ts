@@ -1,7 +1,7 @@
 // Domain supervisors (v3): on-demand planner agents per project.
 //
-// hive's core design REJECTS long-running LLM supervisor sessions (firstmate's
-// failure mode). "Persistent" here means the supervisor's ROLE and CONTEXT live
+// hive's core design REJECTS long-running LLM supervisor sessions (a prior
+// persistent-supervisor design's failure mode). "Persistent" here means the supervisor's ROLE and CONTEXT live
 // in the DB (project config: supervisor_persona, playbook, plan_intake); the LLM
 // itself runs only as a short-lived, on-demand subprocess:
 //

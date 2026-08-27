@@ -6,7 +6,7 @@
 //   - `normal` -> batched: startDigest() delivers ONE digest notification every
 //     HIVE_DIGEST_MS summarizing counts ("3 done, 1 needs decision"). Never
 //     per-event spam.
-// `delivered_at` doubles as "David has been made aware" (push, digest, or by
+// `delivered_at` doubles as "the director has been made aware" (push, digest, or by
 // opening the header bell via POST /api/notifications/ack); the bell's unread
 // count is the rows where delivered_at IS NULL.
 import type { DB } from "./db.ts";

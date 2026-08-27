@@ -8,7 +8,7 @@ export https_proxy=http://127.0.0.1:3456
 export http_proxy=http://127.0.0.1:3456
 export NO_PROXY=localhost,127.0.0.1,::1
 export no_proxy=localhost,127.0.0.1,::1
-export NODE_EXTRA_CA_CERTS=/Users/david/.config/teamclaude-ca.pem
+export NODE_EXTRA_CA_CERTS=/Users/ada/.config/teamclaude-ca.pem
 unset ANTHROPIC_BASE_URL
 # TeamClaude env: MITM forward-proxy mode, localhost:3456
 # apply to this shell:  eval "$(teamclaude env)"
@@ -18,7 +18,7 @@ describe("parseTeamclaudeEnv", () => {
   test("parses export and unset lines, skips comments", () => {
     const env = parseTeamclaudeEnv(MITM_OUTPUT);
     expect(env.set.HTTPS_PROXY).toBe("http://127.0.0.1:3456");
-    expect(env.set.NODE_EXTRA_CA_CERTS).toBe("/Users/david/.config/teamclaude-ca.pem");
+    expect(env.set.NODE_EXTRA_CA_CERTS).toBe("/Users/ada/.config/teamclaude-ca.pem");
     expect(env.unset).toEqual(["ANTHROPIC_BASE_URL"]);
     expect(Object.keys(env.set)).toHaveLength(7);
   });

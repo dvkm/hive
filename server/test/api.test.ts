@@ -545,7 +545,7 @@ test("status notes only queue Jira comments when the project opts in", async () 
   expect((await get(`/api/tasks/${task.json.id}/events`)).json.filter((e: any) => e.type === "jira_comment")).toHaveLength(0);
 
   db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify({ jira: {
-    site: "https://corebeat.atlassian.net", email: "corebeat@vid.kim", project_key: "WEB",
+    site: "https://example.atlassian.net", email: "jira@example.com", project_key: "WEB",
     enabled: true, write: true, status_notes_to_comments: true,
   } }), projectId);
   const r = await post(`/api/tasks/${task.json.id}/events`, { type: "status", note: "  implementation complete  " });
@@ -1144,17 +1144,17 @@ test("SSE stream sends a hello headline", async () => {
 test("a repo_path inside a worktree/scratchpad auto-flags the project test; a normal path does not", async () => {
   const wt = await post("/api/projects", {
     name: "auto-flagged",
-    repo_path: "/private/tmp/claude-501/some-session/scratchpad/corebeat",
+    repo_path: "/private/tmp/claude-501/some-session/scratchpad/acme",
   });
   expect(wt.json.config.test).toBe(true);
 
   const worktreePath = await post("/api/projects", {
     name: "auto-flagged-2",
-    repo_path: "/Users/david/.herdr/worktrees/hive/hive-abc123",
+    repo_path: "/Users/ada/.herdr/worktrees/hive/hive-abc123",
   });
   expect(worktreePath.json.config.test).toBe(true);
 
-  const normal = await post("/api/projects", { name: "normal", repo_path: "/Users/david/projects/hive" });
+  const normal = await post("/api/projects", { name: "normal", repo_path: "/Users/ada/projects/hive" });
   expect(normal.json.config.test).toBeUndefined();
 
   // an explicit config.test always wins over the heuristic

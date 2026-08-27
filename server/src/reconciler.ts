@@ -971,7 +971,7 @@ async function isNonStart(exec: Exec, check: any): Promise<boolean> {
   }
 }
 
-// The other two infra shapes, both seen on corebeat PR #811: the job "ran" but
+// The other two infra shapes, both seen on a consuming project's PR #811: the job "ran" but
 // executed ZERO steps in a couple of seconds (no runner picked it up), and the
 // exact same check is already red on the base branch, where this PR's diff does
 // not exist. Neither can be fixed by a commit on the PR.

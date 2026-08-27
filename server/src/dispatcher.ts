@@ -70,7 +70,7 @@ const ACTIVE_STATES = "('in_progress','needs_decision','in_review','verifying')"
 // Both counts key on agent_target, so a review agent RELEASED after handoff
 // (cleanup.releaseReviewAgent) drops out of them: the overhang now bounds live
 // agents rather than review depth, which is what it was always meant to bound —
-// 10 idle review agents held corebeat at 3 running against 19 queued.
+// 10 idle review agents held a consuming project at 3 running against 19 queued.
 const REVIEW_OVERHANG = 2;
 // Ordinal priority as a sort key. Anything outside the vocabulary (only
 // reachable by a hand-edited row) sorts last, with 'later'.

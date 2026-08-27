@@ -230,7 +230,7 @@ test("a portfolio thread (project_id null) can verify tasks and evidence from an
   const portfolioThreadId = createThread(db, { project_id: null, task_id: managerId, title: "Chief of Staff" }).id;
   const otherProjectId = newId("proj");
   const t = now();
-  db.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run(otherProjectId, "corebeat", "{}", t);
+  db.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run(otherProjectId, "acme", "{}", t);
   const crossTaskId = newId("task");
   db.query(
     "INSERT INTO tasks (id, project_id, title, state, kind, source, created_at, updated_at) VALUES (?,?,?, 'in_progress', 'ship', 'agent', ?, ?)"
@@ -241,7 +241,7 @@ test("a portfolio thread (project_id null) can verify tasks and evidence from an
 
   const started = await call(`/api/chat/threads/${portfolioThreadId}/verifications`, "POST", {
     status: "started",
-    method: "independently re-run the corebeat test suite",
+    method: "independently re-run the acme test suite",
     target_task_ids: [crossTaskId],
   });
   expect(started.status).toBe(201);
@@ -253,8 +253,8 @@ test("a portfolio thread (project_id null) can verify tasks and evidence from an
 
   const passed = await call(`/api/chat/threads/${portfolioThreadId}/verifications`, "POST", {
     status: "passed",
-    method: "independently re-run the corebeat test suite",
-    result: "all green on corebeat",
+    method: "independently re-run the acme test suite",
+    result: "all green on acme",
     target_task_ids: [crossTaskId, managerId],
     evidence_ids: [crossEvidenceId, managerEvidenceId],
   });

@@ -10,32 +10,32 @@ const task = (id: string, state: Task["state"], extra: Partial<Task> = {}) => ({
 
 test("tracked Jira cards show logical subtasks with retry chains collapsed", () => {
   const tracked = task("jira", "in_review", {
-    project_id: "corebeat",
+    project_id: "acme",
     title: "[WEB-7] Newsletter",
     source: "external",
     source_ref: "jira:WEB-7",
   });
   const shipped = task("shipped", "done", {
-    project_id: "corebeat",
+    project_id: "acme",
     title: "[WEB-7] Analytics",
     parent_task_id: "manager",
     updated_at: "2026-08-20T00:00:00Z",
   });
   const failed = task("failed", "failed", {
-    project_id: "corebeat",
+    project_id: "acme",
     title: "[WEB-7] Autosave",
     parent_task_id: "manager",
     updated_at: "2026-08-19T00:00:00Z",
   });
   const retry = task("retry", "in_progress", {
-    project_id: "corebeat",
+    project_id: "acme",
     title: failed.title,
     source: "requeue",
     parent_task_id: failed.id,
     updated_at: "2026-08-21T00:00:00Z",
   });
   const otherIssue = task("other", "done", {
-    project_id: "corebeat",
+    project_id: "acme",
     title: "[WEB-6] Intro",
     updated_at: "2026-08-21T00:00:00Z",
   });
@@ -247,13 +247,13 @@ test("the Jira panel keeps the safe browse action when sync is unconfigured", ()
     jira: {
       linked: true,
       issue_key: "WEB-1",
-      browse_url: "https://corebeat.atlassian.net/browse/WEB-1",
+      browse_url: "https://example.atlassian.net/browse/WEB-1",
       configured: false,
     },
     onSynced: () => {},
   }));
 
-  expect(html).toContain('href="https://corebeat.atlassian.net/browse/WEB-1"');
+  expect(html).toContain('href="https://example.atlassian.net/browse/WEB-1"');
   expect(html).toContain("unconfigured");
 });
 

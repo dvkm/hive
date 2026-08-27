@@ -71,7 +71,7 @@ db.query(
 ).run(
   projectId,
   "acme-web",
-  "/Users/david/code/acme-web",
+  "/Users/you/code/acme-web",
   JSON.stringify({
     default_branch: "main",
     deploy_notes: "Vercel prod deploy on merge to main.",

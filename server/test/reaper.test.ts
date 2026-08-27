@@ -243,10 +243,10 @@ test("sweepOrphanedAgents leaves a LIVE task's agent alone", async () => {
 // ---- taskIdFromCwd: map a herdr pane back to its task by worktree dir ----
 
 test("taskIdFromCwd extracts hive-<hexid> from a worktree cwd; ignores non-hive dirs", () => {
-  expect(taskIdFromCwd("/Users/david/.herdr/worktrees/hive/hive-5ba4edd2f39d")).toBe("5ba4edd2f39d");
+  expect(taskIdFromCwd("/Users/ada/.herdr/worktrees/hive/hive-5ba4edd2f39d")).toBe("5ba4edd2f39d");
   expect(taskIdFromCwd("/wt/hive-222a5d0a2b73/")).toBe("222a5d0a2b73"); // trailing slash tolerated
-  expect(taskIdFromCwd("/Users/david/projects/hive")).toBeNull(); // David's own checkout
-  expect(taskIdFromCwd("/Users/david/projects/notes")).toBeNull();
+  expect(taskIdFromCwd("/Users/ada/projects/hive")).toBeNull(); // the director's own checkout
+  expect(taskIdFromCwd("/Users/ada/projects/notes")).toBeNull();
   expect(taskIdFromCwd("/wt/ghost-5ba4edd2f39d")).toBeNull(); // ghost branch dir, not a live session
   expect(taskIdFromCwd(null)).toBeNull();
 });
@@ -259,7 +259,7 @@ test("taskIdFromCwd extracts hive-<hexid> from a worktree cwd; ignores non-hive 
 //   TERM worktree ws    -> close the whole workspace
 //   LIVE worktree ws    -> keep
 //   orphan worktree ws  -> no task row -> close the whole workspace
-//   David's own pane    -> cwd not hive-<hex> -> untouched
+//   the director's own pane    -> cwd not hive-<hex> -> untouched
 function paneWorld() {
   const closed: string[][] = [];
   const paneJson = JSON.stringify({
@@ -270,7 +270,7 @@ function paneWorld() {
         { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", cwd: "/wt/hive-cccccccccccc" },
         { pane_id: "w2:p1", tab_id: "w2:t1", workspace_id: "w2", cwd: "/wt/hive-dddddddddddd" },
         { pane_id: "w3:p1", tab_id: "w3:t1", workspace_id: "w3", cwd: "/wt/hive-eeeeeeeeeeee" },
-        { pane_id: "w4:p1", tab_id: "w4:t1", workspace_id: "w4", cwd: "/Users/david/projects/foo" },
+        { pane_id: "w4:p1", tab_id: "w4:t1", workspace_id: "w4", cwd: "/Users/ada/projects/foo" },
       ],
     },
   });
@@ -308,7 +308,7 @@ test("sweepOrphanedPanes reaps terminal + orphan panes, keeps live ones, never c
   // SAFETY: live tasks' panes are never touched (fleet tab wR:t2, worktree ws w2)
   expect(closed.some((c) => has(c, "tab", "close", "wR:t2"))).toBe(false);
   expect(closed.some((c) => has(c, "workspace", "close", "w2"))).toBe(false);
-  // David's own pane (w4) untouched
+  // the director's own pane (w4) untouched
   expect(closed.some((c) => c.includes("w4") || c.includes("w4:t1"))).toBe(false);
 });
 
@@ -323,7 +323,7 @@ test("sweepOrphanedPanes refuses mixed targets that also contain active agents o
     { pane_id: "wR:p2", tab_id: "wR:t1", workspace_id: "wR", cwd: "/wt/hive-bbbbbbbbbbbb" },
     { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", cwd: "/wt/hive-aaaaaaaaaaaa" },
     { pane_id: "w1:p2", tab_id: "w1:t2", workspace_id: "w1", cwd: "/wt/hive-cccccccccccc" },
-    { pane_id: "w1:p3", tab_id: "w1:t3", workspace_id: "w1", cwd: "/Users/david/projects/foo" },
+    { pane_id: "w1:p3", tab_id: "w1:t3", workspace_id: "w1", cwd: "/Users/ada/projects/foo" },
     { pane_id: "w2:p1", tab_id: "w2:t1", workspace_id: "w2", cwd: "/wt/hive-aaaaaaaaaaaa" },
   ] } });
   const exec: Exec = async (argv) => {
@@ -465,7 +465,7 @@ test("the current lease holder reaps normally", async () => {
 // A pane row whose process already exited but which herdr still lists at all
 // (dead pty, not garbage-collected). Fixture: two panes at the SAME worktree
 // (fleet tab + own workspace, per the incident), an unrelated live task's pane,
-// and David's own shell (not hive-managed).
+// and the director's own shell (not hive-managed).
 function zombieWorld(opts: { deadTaskAlive?: boolean } = {}) {
   const closed: string[][] = [];
   const panes = JSON.stringify({
@@ -474,7 +474,7 @@ function zombieWorld(opts: { deadTaskAlive?: boolean } = {}) {
         { pane_id: "wR:p1", tab_id: "wR:t1", workspace_id: "wR", cwd: "/wt/hive-deaddeaddead" },
         { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", cwd: "/wt/hive-deaddeaddead" },
         { pane_id: "w2:p1", tab_id: "w2:t1", workspace_id: "w2", cwd: "/wt/hive-cafecafecafe" },
-        { pane_id: "w3:p1", tab_id: "w3:t1", workspace_id: "w3", cwd: "/Users/david/projects/foo" },
+        { pane_id: "w3:p1", tab_id: "w3:t1", workspace_id: "w3", cwd: "/Users/ada/projects/foo" },
       ],
     },
   });

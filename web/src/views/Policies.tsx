@@ -6,7 +6,7 @@ import { toast } from "../lib/ui";
 
 // The Policies page is a settings surface for standing configuration: three
 // distinct concerns kept as well-separated sections on one scrollable page (not
-// tabs) so David can read his whole standing config at a glance and see how the
+// tabs) so the director can read their whole standing config at a glance and see how the
 // pieces relate (a "prod deploy" policy and a "deploy.prod*" authority rule are
 // conceptually linked). Each section leads with what it does and WHEN it applies.
 export default function Policies() {

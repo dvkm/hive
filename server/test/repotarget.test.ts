@@ -26,7 +26,7 @@ async function get(path: string) {
 
 // Two real repos on disk, so the check resolves against real files the way it
 // does in production. `hive` owns server/src/intake/jira.ts (the incident's
-// file); `corebeat` owns app/api/tickets.ts. Both carry a README.md, the
+// file); `acme` owns app/api/tickets.ts. Both carry a README.md, the
 // shared-path case.
 const mkRepo = (name: string, files: string[]) => {
   const root = mkdtempSync(join(tmpdir(), `hive-repotarget-${name}-`));
@@ -38,17 +38,17 @@ const mkRepo = (name: string, files: string[]) => {
 };
 
 let hiveId = "";
-let corebeatId = "";
+let acmeId = "";
 beforeAll(async () => {
   const hiveRepo = mkRepo("hive", ["server/src/intake/jira.ts", "server/src/api.ts", "README.md"]);
-  const corebeatRepo = mkRepo("corebeat", ["app/api/tickets.ts", "README.md"]);
+  const acmeRepo = mkRepo("acme", ["app/api/tickets.ts", "README.md"]);
   hiveId = (await post("/api/projects", { name: "hive", repo_path: hiveRepo })).json.id;
-  corebeatId = (await post("/api/projects", { name: "corebeat", repo_path: corebeatRepo })).json.id;
+  acmeId = (await post("/api/projects", { name: "acme", repo_path: acmeRepo })).json.id;
 });
 
 // Distinct titles per case: similar titles trip the duplicate detector and put
 // a second, unrelated card on the task.
-const mkTask = async (title: string, brief?: string, project_id = corebeatId) =>
+const mkTask = async (title: string, brief?: string, project_id = acmeId) =>
   (await post("/api/tasks", { project_id, title, brief })).json;
 const openCards = async (taskId: string) =>
   (await get(`/api/tasks/${taskId}`)).json.decisions.filter((d: any) => d.status === "open");
@@ -63,18 +63,18 @@ test("extractPaths: only repo-relative paths with a source extension", () => {
   // no slash, no extension, bare directory → not a path
   expect(extractPaths("update jira.ts and the server/src dir and the intake module")).toEqual([]);
   // absolute / home paths are not repo-relative
-  expect(extractPaths("open /Users/david/projects/hive/server/src/api.ts or ~/projects/hive/README.md")).toEqual([]);
+  expect(extractPaths("open /Users/ada/projects/hive/server/src/api.ts or ~/projects/hive/README.md")).toEqual([]);
   // never resolve outside the repo
   expect(extractPaths("../other/thing.ts")).toEqual([]);
   expect(extractPaths(null)).toEqual([]);
 });
 
-// ---- the incident: hive paths, corebeat project ----
+// ---- the incident: hive paths, acme project ----
 test("brief referencing only another project's files warns and names that project", async () => {
   const t = await mkTask("Add the Jira assignee marker", "Edit server/src/intake/jira.ts to add the assignee marker.");
   expect(t.warning).toContain("server/src/intake/jira.ts");
   expect(t.warning).toContain('"hive"');
-  expect(t.warning).toContain('"corebeat"');
+  expect(t.warning).toContain('"acme"');
 
   const ev = (await events(t.id)).find((e) => e.type === "repo_mismatch");
   expect(ev).toBeTruthy();
@@ -89,7 +89,7 @@ test("brief referencing only another project's files warns and names that projec
   // the open card is what holds dispatch
   expect(repoMismatchUnresolved(db, t.id)).toBe(true);
   // never auto-switched
-  expect((await get(`/api/tasks/${t.id}`)).json.project_id).toBe(corebeatId);
+  expect((await get(`/api/tasks/${t.id}`)).json.project_id).toBe(acmeId);
 });
 
 // ---- paths in the chosen project ----
@@ -140,7 +140,7 @@ test("answering keep closes the card and releases dispatch; project is untouched
   expect(repoMismatchUnresolved(db, t.id)).toBe(false);
   const after = (await get(`/api/tasks/${t.id}`)).json;
   expect(after.state).toBe("queued");
-  expect(after.project_id).toBe(corebeatId);
+  expect(after.project_id).toBe(acmeId);
 });
 
 test("answering cancel cancels the mis-filed task without moving it", async () => {
@@ -149,14 +149,14 @@ test("answering cancel cancels the mis-filed task without moving it", async () =
   await post(`/api/decisions/${card.id}/answer`, { answer_key: "cancel" });
   const after = (await get(`/api/tasks/${t.id}`)).json;
   expect(after.state).toBe("cancelled");
-  expect(after.project_id).toBe(corebeatId);
+  expect(after.project_id).toBe(acmeId);
   expect(repoMismatchUnresolved(db, t.id)).toBe(false);
 });
 
 // ---- tracking-only mirrors are never dispatched, so never carded ----
 test("source=external tracking tasks are not checked", async () => {
   const t = (await post("/api/tasks", {
-    project_id: corebeatId,
+    project_id: acmeId,
     title: "external mirror",
     brief: "Edit server/src/intake/jira.ts.",
     source: "external",

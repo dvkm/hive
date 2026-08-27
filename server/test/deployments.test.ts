@@ -16,8 +16,8 @@ const FAIL = (stderr = "boom"): ExecResult => ({ code: 1, stdout: "", stderr });
 // tag, TAG object sha, dereferenced COMMIT sha, creation date, commit subject,
 // tag message subject.
 const TAGS = [
-  ["prod-2026-08-25-abc1234", "tagobj1", "abc1234def5678", "2026-08-25T10:00:00+09:00", "Fix the byline fallback", "Deployed to production by david"],
-  ["prod-2026-08-24-9999999", "tagobj2", "9999999aaaa1111", "2026-08-24T09:00:00+09:00", "Add the quota column", "Deployed to production by david"],
+  ["prod-2026-08-25-abc1234", "tagobj1", "abc1234def5678", "2026-08-25T10:00:00+09:00", "Fix the byline fallback", "Deployed to production by the director"],
+  ["prod-2026-08-24-9999999", "tagobj2", "9999999aaaa1111", "2026-08-24T09:00:00+09:00", "Add the quota column", "Deployed to production by the director"],
 ]
   .map((row) => row.join("\t"))
   .join("\n");

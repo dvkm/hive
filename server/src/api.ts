@@ -867,7 +867,7 @@ function jiraTaskState(db: DB, taskId: string): Response {
     browse_url: key && site ? `${site}/browse/${encodeURIComponent(key)}` : null,
     enabled: cfg?.enabled ?? false,
     write: cfg?.write ?? false,
-    // A configured-but-not-allowlisted target reads as "not configured" here on
+    // A configured-but-malformed target reads as "not configured" here on
     // purpose: the credential gate refused it, and the UI should not imply the
     // site it names is in use.
     configured: !!cfg,
@@ -925,7 +925,7 @@ function intake(db: DB, body: any, deps: HandlerDeps): Response {
   // The caller's project_id is a DEFAULT, not gospel — the web picker defaults to
   // whatever project is in view. Classify the text against every project's
   // identifying signals and re-route when a different one clearly matches, so a
-  // corebeat braindump lands in the corebeat repo and not wherever the UI sat.
+  // braindump lands in the repo it is about and not wherever the UI sat.
   const route = routeIntakeProject(db, text, body.project_id);
   const projectId = route.project_id;
 
@@ -2628,7 +2628,7 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
     const config = JSON.parse(project.config ?? "{}");
     const base = projectComparisonBase(config);
     // TERMINAL, not just done/cancelled: a `failed` task's branch is as dead as
-    // a cancelled one, and corebeat's 109 failed tasks were 87 of the 103 rows
+    // a cancelled one, and one real project's 109 failed tasks were 87 of the 103 rows
     // this flag used to dump on one card (task #1134).
     const others = db
       .query(
@@ -4514,7 +4514,7 @@ function writeHookSettings(
   writeFileSync(join(dir, "settings.local.json"), JSON.stringify(settings, null, 2));
 }
 
-// "View agent" affordance: focus the task's herdr tab so David can watch/attach.
+// "View agent" affordance: focus the task's herdr tab so the director can watch/attach.
 async function focusAgent(db: DB, herdr: Herdr, id: string): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
@@ -5044,7 +5044,7 @@ function listLearnings(db: DB, url: URL): Response {
 
 // A learning that silently defaulted to kind='failure' when the caller forgot
 // --kind used to pollute the "Known failure patterns" brief section forever
-// (task #904/corebeat #901: a routine watcher-summary auto-spawned a bogus
+// (task #904: a routine watcher-summary auto-spawned a bogus
 // root-cause chore). kind is now required, not inferred.
 const CREATABLE_KINDS = new Set(["failure", "reference"]);
 

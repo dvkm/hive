@@ -5,10 +5,10 @@
 // gchat intake connector.
 //
 // Config lives on the project row (`projects.config.jira`):
-//   { site: "https://corebeat.atlassian.net", email: "corebeat@vid.kim",
+//   { site: "https://example.atlassian.net", email: "jira@example.com",
 //     project_key: "WEB", enabled: false, write: false, jql?: "..." }
-// It must pass the compiled-in credential and project allowlist below before
-// any secret resolves.
+// It must be well-formed (see the credential gate below) before any secret
+// resolves; the API token itself is never in the config, only in the keychain.
 // `enabled` is the master switch; `write` is a separate SHADOW-MODE gate — with
 // enabled:true / write:false the sync imports and computes every outbound call
 // but LOGS it instead of sending, so the director can read one cycle of "would
@@ -91,71 +91,69 @@ const ABSENT_STOPPED = "stopped"; // terminal marker value in intake_cursors
 // ============================================================================
 // CREDENTIAL GATE
 // ============================================================================
-// The ONE Jira deployment hive is compiled to talk to. Both halves of the
-// credential pair and the allowed projects are pinned HERE, IN CODE, precisely
-// because `projects.config` is attacker-writable through the loopback API:
-// `PATCH /api/projects/:id` replaces `config` wholesale with no validation
-// (api.ts, updateProject).
+// The Jira target lives in the project's own config (`projects.config.jira`),
+// but `projects.config` is writable through hive's unauthenticated loopback API
+// (`PATCH /api/projects/:id` replaces `config` wholesale), so the target still
+// has to be validated before a secret resolves.
 //
-// Without this gate, a mutated `config.jira.site` makes hive send
+// A mutated `config.jira.site` makes hive send
 // `Authorization: Basic base64(email:token)` — the real JIRA_API_TOKEN — to
-// whatever host the attacker named. That leak happens on the READ path, before
-// any `write` check runs, so `write: false` does NOT protect against it:
-// shadow mode still reads, and reading is all an exfiltration needs.
-// A mutated project key cannot exfiltrate the token, but it could silently make
-// hive edit issues outside the project this integration was scoped to.
-//
-// Deliberately an EXACT host match, NOT a `*.atlassian.net` suffix check.
-// Atlassian Cloud sites are self-serve: an attacker can register their own
-// atlassian.net site for free, so a suffix check would wave them straight
-// through and reduce the attack surface by approximately nothing.
-//
-// Adding a second Jira deployment is a PR, not a runtime config write. That
-// cost is the point.
-const ALLOWED_HOST = "corebeat.atlassian.net";
-export const ALLOWED_SITE = `https://${ALLOWED_HOST}`;
-export const ALLOWED_EMAIL = "corebeat@vid.kim";
-const ALLOWED_PROJECT_KEYS = ["WEB"] as const;
-
-function allowedProjectKey(value: unknown): string | null {
-  const candidate = String(value ?? "");
-  return ALLOWED_PROJECT_KEYS.find((key) => key === candidate) ?? null;
-}
-
-// True only for the exact compiled-in credential target. Exported for tests.
+// whatever host is named. That leak happens on the READ path, before any
+// `write` check runs, so `write: false` does NOT protect against it: shadow
+// mode still reads, and reading is all an exfiltration needs. What is enforced
+// here is therefore SHAPE, not identity: https only, no userinfo, a syntactically
+// valid host, a real email, an uppercase project key. Whoever can write the
+// config chooses the destination — that is the same trust level as
+// `config.agent_argv`, which is already a verbatim command line.
 //
 // Fails CLOSED in every direction: anything it cannot positively confirm is a
 // rejection, and the caller (jiraConfig) turns a rejection into `null` — a hard
 // no-op — rather than a throw that a `catch` upstream could swallow into
 // "log it and carry on".
-export function credentialTargetAllowed(site: unknown, email: unknown): boolean {
+
+// Jira project keys are uppercase alphanumeric, starting with a letter.
+const PROJECT_KEY_RE = /^[A-Z][A-Z0-9_]*$/;
+// Deliberately loose: an address is a credential half, not a routing decision.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Hostname labels, at least two of them (no bare "localhost" as a Jira site).
+const HOST_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+
+function validProjectKey(value: unknown): string | null {
+  return typeof value === "string" && PROJECT_KEY_RE.test(value) ? value : null;
+}
+
+// True when site+email are a well-formed Jira credential target. Exported for tests.
+export function credentialTargetValid(site: unknown, email: unknown): boolean {
+  return canonicalSite(site) !== null && typeof email === "string" && EMAIL_RE.test(email);
+}
+
+// The exact string that will be concatenated with every request path. Built
+// from parsed components, so nothing of the caller's spelling (path, query,
+// userinfo, trailing slash) survives into fetch() or the auth header.
+export function canonicalSite(site: unknown): string | null {
   // Type-reject rather than coerce: String(someObject) can manufacture a
   // passing value out of something that was never a string.
-  if (typeof site !== "string" || typeof email !== "string") return false;
+  if (typeof site !== "string") return null;
   let u: URL;
   try {
     u = new URL(site);
   } catch {
-    return false; // unparseable / empty
+    return null; // unparseable / empty
   }
   // Basic auth over http puts `email:token` on the wire in base64, which is
   // encoding, not encryption. Rejected outright — never downgraded, never
   // "upgraded" silently to https on the caller's behalf.
-  if (u.protocol !== "https:") return false;
+  if (u.protocol !== "https:") return null;
   // Reject ANY "@" in the raw string, before trusting parsed fields.
-  // `https://corebeat.atlassian.net@evil.tld/` parses with host `evil.tld` but
+  // `https://example.atlassian.net@evil.tld/` parses with host `evil.tld` but
   // reads as the real site to a human skimming config. new URL() also
   // normalizes away empty userinfo ("https://@host" -> username="") and
   // slash/backslash forms ("https:/@host", "https:////@host"), so
-  // u.username/u.password cannot catch every spelling. ALLOWED_SITE never
-  // contains "@", so this can never reject a legitimate value.
-  if (site.includes("@")) return false;
-  // Exact host, including port: `corebeat.atlassian.net:8443` is a different
-  // endpoint and does not inherit the real site's trust.
-  if (u.host !== ALLOWED_HOST) return false;
-  // The credential is the PAIR. Pinning only the host would still let a config
-  // write swap the identity half of `email:token`.
-  return email === ALLOWED_EMAIL;
+  // u.username/u.password cannot catch every spelling. A legitimate site value
+  // never contains "@".
+  if (site.includes("@")) return null;
+  if (!HOST_RE.test(u.hostname)) return null;
+  return `https://${u.host}`;
 }
 
 // ============================================================================
@@ -213,11 +211,12 @@ function validatedJqlFilter(value: unknown): string | undefined | null {
 function jiraConfigStatus(raw: any): JiraConfigStatus {
   const j = raw?.jira;
   if (!j || typeof j !== "object") return { config: null, error: null };
-  const projectKey = allowedProjectKey(j.project_key);
+  const projectKey = validProjectKey(j.project_key);
+  const site = canonicalSite(j.site);
   const jql = validatedJqlFilter(j.jql);
 
   // ---- credential gate, BEFORE anything else touches the network or a secret
-  if (!credentialTargetAllowed(j.site, j.email) || !projectKey) return { config: null, error: null };
+  if (!site || !credentialTargetValid(j.site, j.email) || !projectKey) return { config: null, error: null };
   if (jql === null) {
     const value = JSON.stringify(j.jql);
     return {
@@ -228,11 +227,11 @@ function jiraConfigStatus(raw: any): JiraConfigStatus {
 
   return {
     config: {
-      // Canonicalized to the compiled-in constants on purpose: the strings that
-      // reach fetch() and the Authorization header are hive's own, never the
-      // caller's, so no unvalidated remnant of the config value can survive.
-      site: ALLOWED_SITE,
-      email: ALLOWED_EMAIL,
+      // Canonicalized on purpose: the string that reaches fetch() is rebuilt
+      // from parsed components, so no unvalidated remnant of the config value
+      // (path, query, userinfo, trailing slash) can survive.
+      site,
+      email: j.email as string,
       project_key: projectKey,
       enabled: j.enabled === true,
       write: j.write === true,
@@ -599,12 +598,13 @@ export class JiraClient {
     // plain interface, so a hand-built object literal would otherwise satisfy
     // the type and reach auth(). Re-assert at the point of use so the host and
     // project scope hold structurally, not just by call-order convention.
-    const projectKey = allowedProjectKey(cfg.project_key);
+    const projectKey = validProjectKey(cfg.project_key);
+    const site = canonicalSite(cfg.site);
     const jql = validatedJqlFilter(cfg.jql);
-    if (!credentialTargetAllowed(cfg.site, cfg.email) || !projectKey || jql === null) {
-      throw new Error("refusing to build a Jira client for a non-allowlisted target");
+    if (!site || !credentialTargetValid(cfg.site, cfg.email) || !projectKey || jql === null) {
+      throw new Error("refusing to build a Jira client for a malformed target");
     }
-    this.cfg = { ...cfg, project_key: projectKey, jql };
+    this.cfg = { ...cfg, site, project_key: projectKey, jql };
   }
 
   private auth(): string {
@@ -2679,7 +2679,7 @@ export async function runProjectCycle(
   const configStatus = jiraConfigStatusFor(db, projectId);
   if (configStatus.error) return fail(`jira cycle could not run: ${configStatus.error}`);
   const cfg = configStatus.config;
-  if (!cfg) return fail("jira cycle could not run: config missing, or its site/email/project is not the allow-listed target");
+  if (!cfg) return fail("jira cycle could not run: config missing, or its site/email/project_key is malformed");
   if (!cfg.enabled) return fail("jira cycle could not run: sync is disabled for this project (config.jira.enabled is false)");
 
   const target = jiraTargetKey(cfg);

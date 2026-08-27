@@ -597,7 +597,7 @@ export function TaskBody({ id }: { id: string }) {
     try {
       const r = await api.send(t.id, steer, steerFiles);
       // Never a bare "sent" — a queued steer that read as delivered is what made
-      // David re-send the same message three times.
+      // the director re-send the same message three times.
       const files = r.attachments?.length ? ` with ${r.attachments.length} file(s)` : "";
       toast(
         isJira

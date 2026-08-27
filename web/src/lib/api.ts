@@ -189,7 +189,7 @@ export interface Decision {
   answer_note: string | null;
   draft_note: string | null;
   answered_at: string | null;
-  // Who answered (audit trail). director when David clicked in the inbox;
+  // Who answered (audit trail). director when the director clicked in the inbox;
   // chat_supervisor/agent/system for programmatic callers; unknown if unattributed.
   answered_by: "director" | "chat_supervisor" | "agent" | "system" | "unknown" | null;
   answered_actor: string | null;
@@ -911,7 +911,7 @@ export const api = {
   answerDecision: (id: string, answer_key: string, answer_note?: string, selected_indices?: number[]) =>
     req<Decision>(`/api/decisions/${id}/answer`, {
       method: "POST",
-      // The inbox is David's surface — answers from here are the director's.
+      // The inbox is the director's surface — answers from here are the director's.
       body: JSON.stringify({ answer_key, answer_note, selected_indices, source: "director", actor: directorActor() }),
     }),
   dismissDecision: (id: string) =>

@@ -111,9 +111,9 @@ test("the Jira chip links to the server-canonicalized site", async () => {
     id: "project",
     name: "p",
     config: { jira: { site: "https://evil.atlassian.net" } },
-    jira_site: "https://corebeat.atlassian.net",
+    jira_site: "https://example.atlassian.net",
   });
-  expect(hrefs).toContain("https://corebeat.atlassian.net/browse/WEB-123");
+  expect(hrefs).toContain("https://example.atlassian.net/browse/WEB-123");
   expect(hrefs.join(" ")).not.toContain("evil.atlassian.net");
 });
 

@@ -118,8 +118,8 @@ test("localhost / PR / non-doc links are not captured", () => {
   const { db, projectId } = freshDb();
   for (const u of [
     "http://localhost:5173/x",
-    "https://github.com/corebeatcokr/monorepo/pull/20",
-    "https://api-foo.test.corebeat.co.kr",
+    "https://github.com/acmecokr/monorepo/pull/20",
+    "https://api-foo.test.acme.co.kr",
   ]) {
     task(db, projectId, `a ${u}`);
     task(db, projectId, `b ${u}`);

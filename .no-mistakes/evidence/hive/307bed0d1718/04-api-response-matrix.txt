@@ -1,7 +1,0 @@
-POST /api/learnings body                                                 base      d8dd42f
---------------------------------------------------------------------------------------------
-{"title":"routine summary"}                                              201       400 kind is required: 'failure' or 'reference'
-{"title":"routine summary","kind":"bogus"}                               201       400 kind is required: 'failure' or 'reference'
-{"title":"routine summary","kind":"reference","create_root_cause_task":true} 201 reference 400 create_root_cause_task only applies to kind 'failure'
-{"title":"real regression","kind":"failure"}                             201       201 failure
-{"title":"durable fact","kind":"reference"}                              201 reference 201 reference

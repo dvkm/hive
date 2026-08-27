@@ -68,7 +68,7 @@ test("this branch itself unreadable against base → null (caller must not block
 
 // task #1134: the flag used to fire on ANY branch whose merge-base differed
 // from ours, which includes every branch cut from an earlier point on base —
-// 103 tasks on one corebeat card. A shared commit base already contains is
+// 103 tasks on one consuming-project card. A shared commit base already contains is
 // ordinary forking, not in-flight work that a rewrite could strand.
 test("a branch cut from an earlier point on base is not flagged", async () => {
   const exec = mergeBaseStub(

@@ -66,7 +66,7 @@ test("task not found → 404", async () => {
   expect(res.status).toBe(404);
 });
 
-// task #1134: `failed` is terminal too — corebeat had 109 failed tasks whose
+// task #1134: `failed` is terminal too — a consuming project had 109 failed tasks whose
 // dead branches made up most of a 103-row warning on a single review card.
 test("a failed task's branch is not a stacked-branch candidate", async () => {
   const { db, projectId, taskId } = seed();

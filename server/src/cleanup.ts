@@ -288,7 +288,7 @@ export async function cleanupTask(
 // A task in review is parked on the DIRECTOR: the PR is open, CI is green, and
 // nothing in hive asks its agent to act again until a human (or a red check)
 // does. Left alive that agent still holds a pty AND a dispatch slot — 10 idle
-// review agents starved corebeat to 3 running against 19 queued (2026-08-19).
+// review agents starved a consuming project to 3 running against 19 queued (2026-08-19).
 //
 // Release = close the session, KEEP the worktree and branch (the PR still needs
 // them), drop agent_target so the dispatcher stops counting it. Feedback brings

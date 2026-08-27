@@ -117,7 +117,7 @@ export class WindowsCredentialProvider implements SecretProvider {
   }
 }
 
-// ---- bitwarden: `bw` CLI (David's existing vault) ----
+// ---- bitwarden: `bw` CLI (the director's existing vault) ----
 // Writes require an unlocked session (BW_SESSION). `get` is the hot path used at
 // spawn injection. ref is the item name `hive/<project>/<name>`.
 // ponytail: item lifecycle here is thin (login-type item, name-based lookup);

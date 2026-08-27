@@ -192,7 +192,7 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       )`,
     ],
   },
-  // standing-authority policy engine. David grants scoped authority once; the
+  // standing-authority policy engine. The director grants scoped authority once; the
   // server enforces it before risky actions dispatch. authority_rules match an
   // action to an effect (allow | require_decision | deny); most-specific active
   // rule wins (project over global, longer pattern over shorter).
@@ -391,7 +391,7 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
   },
   // Who answered a decision. Before this, every answer was logged as the
   // director — a chat-supervisor or any API caller was indistinguishable from
-  // David in the audit trail. answered_by is the caller identity
+  // the director in the audit trail. answered_by is the caller identity
   // (director|chat_supervisor|agent|system|unknown), answered_actor an optional
   // free label (e.g. the supervisor session id). Audit only, no auto-approve.
   {

@@ -69,7 +69,7 @@ const GOOD_CONFIG = {
   cleanup_argv: ["infra/worktree/wt.sh", "down", "{worktree}"],
   promote: { from: "staging", to: "main" },
   render_proof: true,
-  jira: { site: "https://corebeat.atlassian.net", email: "corebeat@vid.kim", project_key: "WEB", enabled: true, write: true },
+  jira: { site: "https://example.atlassian.net", email: "jira@example.com", project_key: "WEB", enabled: true, write: true },
   watchers: [{ name: "doc", url: "https://docs.google.com/document/d/abc/edit" }],
   monitors: [{ name: "root", url: "http://127.0.0.1:1/", expect_status: 200 }],
   smoke: [{ name: "root", url: "http://127.0.0.1:1/", expect_status: 200 }],
@@ -125,7 +125,7 @@ const BAD: [string, unknown, string][] = [
   ["promote.to as a git option", { promote: { from: "staging", to: "--output=/tmp/x" } }, "promote.to"],
   ["promote.from as a number", { promote: { from: 3, to: "main" } }, "promote.from"],
   ["jira as a string", { jira: "https://evil.example.com" }, "jira"],
-  ["jira missing project_key", { jira: { site: "https://corebeat.atlassian.net", email: "a@b.c" } }, "project_key"],
+  ["jira missing project_key", { jira: { site: "https://example.atlassian.net", email: "a@b.c" } }, "project_key"],
   ["jira with a non-boolean write", { jira: { site: "https://s", email: "a@b.c", project_key: "WEB", write: "yes" } }, "write"],
   ["a watcher url with a file:// scheme", { watchers: [{ name: "w", url: "file:///etc/passwd" }] }, "watchers"],
   ["a monitor url that is not a URL", { monitors: [{ name: "m", url: "not a url" }] }, "monitors"],
@@ -167,14 +167,14 @@ for (const [label, config, mentions] of BAD) {
 // must survive that round-trip.
 test("stored-but-unread keys still round-trip", async () => {
   const p = await post("/api/projects", {
-    name: "mills-like",
+    name: "alt-config-like",
     repo_path: "/repo",
-    config: { auto_dispatch: true, env: { CLAUDE_CONFIG_DIR: "/Users/x/.claude-mills" }, default_branch: "staging", open_prs: false },
+    config: { auto_dispatch: true, env: { CLAUDE_CONFIG_DIR: "/Users/x/.claude-alt" }, default_branch: "staging", open_prs: false },
   });
   expect(p.status).toBe(201);
   const r = await put(`/api/projects/${p.json.id}`, { config: { ...p.json.config, auto_dispatch: false } });
   expect(r.status).toBe(200);
-  expect(r.json.config.env).toEqual({ CLAUDE_CONFIG_DIR: "/Users/x/.claude-mills" });
+  expect(r.json.config.env).toEqual({ CLAUDE_CONFIG_DIR: "/Users/x/.claude-alt" });
   expect(r.json.config.open_prs).toBe(false);
 });
 
@@ -240,7 +240,7 @@ test("deployments config accepts a real block and rejects argument-shaped values
   const ok = await put(`/api/projects/${projectId}`, {
     config: {
       deployments: {
-        health_url: "https://corebeat.co.kr/",
+        health_url: "https://example.com/",
         tag_prefix: "prod-",
         workflow_ref: "main",
         flags: ["insights-page-redesign"],
