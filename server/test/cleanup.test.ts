@@ -249,6 +249,22 @@ test("runStackCmd (setup) substitutes {worktree}, resolves relative argv[0], emi
   expect(JSON.parse(ev.payload).ok).toBe(true);
 });
 
+test("runStackCmd resolves a relative command against a Windows repo path", async () => {
+  const { db, projectId } = freshDb();
+  const id = seedTask(db, projectId, { state: "in_progress" });
+  const { exec, calls } = stubExec(() => OK());
+  await runStackCmd(
+    db,
+    id,
+    ["infra\\worktree\\up.cmd", "{worktree}"],
+    "C:\\src\\app",
+    "C:\\worktrees\\app-task",
+    exec,
+    { type: "stack_setup", source: "herdr" }
+  );
+  expect(calls[0]).toEqual(["C:\\src\\app\\infra\\worktree\\up.cmd", "C:\\worktrees\\app-task"]);
+});
+
 test("runStackCmd records ok:false + error when the hook exits non-zero", async () => {
   const { db, projectId } = freshDb();
   const id = seedTask(db, projectId, { state: "in_progress" });

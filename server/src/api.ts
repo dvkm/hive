@@ -86,6 +86,7 @@ import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscrip
 import { explainCommandDecision } from "./explain.ts";
 import { confirmedRisks, cautionCleared } from "./reviewer.ts";
 import { explanationGate } from "./explainDiff.ts";
+import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
 import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen, probeAgent } from "./reconciler.ts";
@@ -3234,6 +3235,14 @@ function codexHookOverride(event: string, command: string, matcher?: string): st
   return `hooks.${event}=[{${group}}]`;
 }
 
+export function hookScriptCommand(
+  script: "hive-hook.ts" | "classify.ts",
+  args: string[] = [],
+  platform: NodeJS.Platform = process.platform
+): string {
+  return commandForCurrentShell(["bun", join(HOOKS_DIR, script), ...args], platform);
+}
+
 export function codexAgentArgv(
   brief: string,
   model?: string,
@@ -3244,8 +3253,8 @@ export function codexAgentArgv(
     toolOutputTokenLimit: 6_000,
   }
 ): string[] {
-  const hook = join(HOOKS_DIR, "hive-hook.sh");
-  const approve = join(HOOKS_DIR, "hive-approve.sh");
+  const hook = (event: string) => hookScriptCommand("hive-hook.ts", [event]);
+  const approve = hookScriptCommand("classify.ts", [commandApproval]);
   const argv = [
     "codex",
     "--sandbox", "workspace-write",
@@ -3253,11 +3262,11 @@ export function codexAgentArgv(
     "--ask-for-approval", "on-request",
     "--dangerously-bypass-hook-trust",
     "-c", "features.hooks=true",
-    "-c", codexHookOverride("PreToolUse", `${approve} ${commandApproval}`, "^Bash$"),
-    "-c", codexHookOverride("PermissionRequest", `${approve} ${commandApproval}`, "^Bash$"),
-    "-c", codexHookOverride("PostToolUse", `${hook} PostToolUse`),
-    "-c", codexHookOverride("Stop", `${hook} Stop`),
-    "-c", codexHookOverride("SubagentStop", `${hook} SubagentStop`),
+    "-c", codexHookOverride("PreToolUse", approve, "^Bash$"),
+    "-c", codexHookOverride("PermissionRequest", approve, "^Bash$"),
+    "-c", codexHookOverride("PostToolUse", hook("PostToolUse")),
+    "-c", codexHookOverride("Stop", hook("Stop")),
+    "-c", codexHookOverride("SubagentStop", hook("SubagentStop")),
     "-c", `model_reasoning_effort=${JSON.stringify(settings.reasoningEffort)}`,
     "-c", `model_auto_compact_token_limit=${settings.autoCompactTokenLimit}`,
     "-c", `tool_output_token_limit=${settings.toolOutputTokenLimit}`,
@@ -3349,7 +3358,12 @@ export async function spawnAgent(
   const hiveUrl = opts.hiveUrl || process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
   // TeamClaude proxy env first (multi-account API routing; null when the proxy
   // is down → agent runs direct), then secrets so a same-named secret wins.
-  const env = { ...((await teamclaudeEnv())?.set ?? {}), ...(await resolveProjectSecrets(db, task.project_id)), HIVE_AGENT: agent };
+  const env = {
+    ...((await teamclaudeEnv())?.set ?? {}),
+    ...(await resolveProjectSecrets(db, task.project_id)),
+    ...agentPlatformEnv(),
+    HIVE_AGENT: agent,
+  };
 
   let result;
   try {
@@ -4473,20 +4487,18 @@ function writeHookSettings(
   hiveUrl: string,
   commandApproval: "escalate" | "allow" | "prompt" = "escalate"
 ): void {
-  const hook = join(HOOKS_DIR, "hive-hook.sh");
-  const approve = join(HOOKS_DIR, "hive-approve.sh");
   const settings = {
     permissions: { allow: SAFE_TOOL_ALLOWLIST, deny: DENIED_MCP_SERVERS },
     hooks: {
       // Gate Bash before it runs: safe commands auto-approve, risky ones escalate
       // to the authority engine so an autonomous worker never hangs on a dialog.
       PreToolUse: [
-        { matcher: "Bash", hooks: [{ type: "command", command: `${approve} ${commandApproval}` }] },
+        { matcher: "Bash", hooks: [{ type: "command", command: hookScriptCommand("classify.ts", [commandApproval]) }] },
       ],
-      Stop: [{ hooks: [{ type: "command", command: `${hook} Stop` }] }],
-      SubagentStop: [{ hooks: [{ type: "command", command: `${hook} SubagentStop` }] }],
+      Stop: [{ hooks: [{ type: "command", command: hookScriptCommand("hive-hook.ts", ["Stop"]) }] }],
+      SubagentStop: [{ hooks: [{ type: "command", command: hookScriptCommand("hive-hook.ts", ["SubagentStop"]) }] }],
       PostToolUse: [
-        { matcher: "Bash|Write|Edit", hooks: [{ type: "command", command: `${hook} PostToolUse` }] },
+        { matcher: "Bash|Write|Edit", hooks: [{ type: "command", command: hookScriptCommand("hive-hook.ts", ["PostToolUse"]) }] },
       ],
     },
   };

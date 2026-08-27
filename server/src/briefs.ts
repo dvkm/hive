@@ -179,10 +179,10 @@ Interactive browser MCPs (claude-in-chrome, computer-use) are denied because
 their dialogs strand unattended workers. Verify web changes headlessly:
 
   curl -sS -i http://127.0.0.1:<port>/<path>        # status, headers, HTML, JSON
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \\
-    --headless --disable-gpu --screenshot=out.png --window-size=1280,800 <url>
+  bunx playwright screenshot --viewport-size="1280,800" <url> out.png
 
-Prefer an existing Playwright or Puppeteer setup. Attach the result:
+Prefer an existing Playwright or Puppeteer setup. If invoking Chromium
+directly, include its \`--headless\` flag. Attach the result:
 
   hive emit <task-id> evidence --file out.png --note "logged-in dashboard"`;
 

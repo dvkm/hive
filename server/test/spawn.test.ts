@@ -106,8 +106,8 @@ test("a ChatGPT project starts an interactive Codex worker with Hive hooks", asy
   expect(agent).toContain("sandbox_workspace_write.network_access=true");
   expect(agent).toContain("on-request");
   expect(agent).toContain("--dangerously-bypass-hook-trust");
-  expect(agent.some((arg) => arg.includes("hooks.PermissionRequest") && arg.includes("hive-approve.sh"))).toBe(true);
-  expect(agent.some((arg) => arg.includes("hooks.Stop") && arg.includes("hive-hook.sh"))).toBe(true);
+  expect(agent.some((arg) => arg.includes("hooks.PermissionRequest") && arg.includes("classify.ts"))).toBe(true);
+  expect(agent.some((arg) => arg.includes("hooks.Stop") && arg.includes("hive-hook.ts"))).toBe(true);
   expect(agent).toContain('model_reasoning_effort="medium"');
   expect(agent).toContain("model_auto_compact_token_limit=64000");
   expect(agent).toContain("tool_output_token_limit=6000");
@@ -133,7 +133,7 @@ test("spawned worktree settings allow safe tools and wire the PreToolUse classif
   expect(settings.permissions.allow).toContain("Bash(bun test:*)");
   const pre = settings.hooks.PreToolUse?.[0];
   expect(pre.matcher).toBe("Bash");
-  expect(pre.hooks[0].command).toContain("hive-approve.sh");
+  expect(pre.hooks[0].command).toContain("classify.ts");
   expect(pre.hooks[0].command).toContain("escalate"); // default policy
 });
 
@@ -286,7 +286,7 @@ test("secrets API ignores a caller-supplied ref, so a secret cannot alias anothe
   const r = await post(`/api/projects/${projectId}/secrets`, { name: "STOLEN", provider: "keychain", ref: "AWS_PROD_ROOT" });
   expect(r.status).toBe(201);
 
-  const env = await resolveProjectSecrets(db, projectId, exec);
+  const env = await resolveProjectSecrets(db, projectId, exec, "darwin");
   expect(env.STOLEN).not.toBe("SUPERSECRET_NOT_YOURS");
   expect(JSON.stringify(env)).not.toContain("SUPERSECRET_NOT_YOURS");
   // it resolves this project's own namespaced item instead

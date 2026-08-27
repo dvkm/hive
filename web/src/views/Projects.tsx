@@ -3,6 +3,7 @@ import { api } from "../lib/api";
 import type { Project, PrGardenerItem, Kind, State } from "../lib/api";
 import { useStore } from "../lib/store";
 import { STATE_LABEL, toast } from "../lib/ui";
+import { isAbsoluteRepoPath, repoPathPlaceholder } from "../lib/paths";
 
 // Config keys the structured editor owns; everything else is edited as raw JSON.
 const STRUCTURED_KEYS = ["agent", "auto_dispatch", "max_agents", "dispatch_kinds", "supervisor_persona", "playbook"];
@@ -263,7 +264,7 @@ function ProjectEditor({ p, onSaved, onClose }: { p: Project; onSaved: () => voi
       </label>
       <label className="fld">
         <span>Repo path (absolute)</span>
-        <input className="mono-input" value={repoPath} onChange={(e) => setRepoPath(e.target.value)} placeholder="/Users/you/code/project" />
+        <input className="mono-input" value={repoPath} onChange={(e) => setRepoPath(e.target.value)} placeholder={repoPathPlaceholder} />
       </label>
 
       <div className="proj-config">
@@ -343,7 +344,7 @@ function NewProjectModal({ onClose, onCreated }: { onClose: () => void; onCreate
 
   const submit = async () => {
     if (!name.trim() || !repoPath.trim() || busy) return;
-    if (!repoPath.trim().startsWith("/")) {
+    if (!isAbsoluteRepoPath(repoPath)) {
       toast("Repo path must be absolute");
       return;
     }
@@ -374,7 +375,7 @@ function NewProjectModal({ onClose, onCreated }: { onClose: () => void; onCreate
         </label>
         <label className="fld">
           <span>Repo path (absolute)</span>
-          <input className="mono-input" placeholder="/Users/you/code/acme-web" value={repoPath} onChange={(e) => setRepoPath(e.target.value)} />
+          <input className="mono-input" placeholder={repoPathPlaceholder} value={repoPath} onChange={(e) => setRepoPath(e.target.value)} />
         </label>
         <label className="fld">
           <span>Worker</span>
