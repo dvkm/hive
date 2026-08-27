@@ -302,7 +302,13 @@ export default function App() {
       <a className="skip-link" href="#main-content">Skip to content</a>
       <header className="topbar">
         <NavLink className="brand" to="/">
-          <span className="brand-mark" aria-hidden="true"><span /></span>
+          <span className="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 18 18" fill="currentColor">
+              <path d="M9.55,4.67 L7.4,8.39 L3.1,8.39 L0.95,4.67 L3.1,0.95 L7.4,0.95 Z" />
+              <path d="M17.05,9 L14.9,12.72 L10.6,12.72 L8.45,9 L10.6,5.28 L14.9,5.28 Z" />
+              <path d="M9.55,13.33 L7.4,17.05 L3.1,17.05 L0.95,13.33 L3.1,9.61 L7.4,9.61 Z" />
+            </svg>
+          </span>
           <span className="brand-name">hive</span>
         </NavLink>
         <button
