@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
 import { transition } from "../src/state.ts";
-import { enqueue, runDigest, ackNotifications, summarize, markShown, deeplinkPath } from "../src/notifications.ts";
+import { enqueue, runDigest, ackNotifications, summarize, markShown, deeplinkPath, notificationLaunchArgv } from "../src/notifications.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
 function freshDb(): { db: DB; projectId: string } {
@@ -43,8 +43,7 @@ test("normal notifications batch into ONE digest, then never repeat", () => {
   expect(first.summary).toBe("2 done, 1 needs decision");
   // ONE digest handoff to hive.app, not one per event
   expect(calls.length).toBe(1);
-  expect(calls[0].slice(0, 4)).toEqual(["open", "-g", "-b", "dev.hive.app"]);
-  const notification = new URL(calls[0][4]);
+  const notification = new URL(calls[0].at(-1)!);
   expect(notification.protocol).toBe("hive:");
   expect(notification.hostname).toBe("notify");
   expect(notification.searchParams.get("title")).toBe("hive digest");
@@ -75,14 +74,13 @@ test("urgent notification opens hive.app with its click destination", () => {
   // NOT pre-delivered: only the desktop app confirming it rendered counts.
   expect(row.delivered_at).toBeNull();
   expect(calls.length).toBe(1);
-  expect(calls[0].slice(0, 4)).toEqual(["open", "-g", "-b", "dev.hive.app"]);
-  const notification = new URL(calls[0][4]);
+  const notification = new URL(calls[0].at(-1)!);
   expect(notification.searchParams.get("id")).toBe(row.id);
   expect(notification.searchParams.get("title")).toBe("Decision needed: ship prod?");
   expect(notification.searchParams.get("body")).toBe("Production DB acme-prod-db.");
   expect(notification.searchParams.get("path")).toBe("/decisions#dcard-dec_123");
 
-  // the app reports back that macOS rendered it — that is what marks it seen
+  // the app reports back that the OS rendered it — that is what marks it seen
   expect(markShown(db, row.id)).toBe(true);
   expect(markShown(db, row.id)).toBe(false); // idempotent
   expect((db.query("SELECT delivered_at FROM notifications WHERE id = ?").get(row.id) as any).delivered_at).toBeTruthy();
@@ -90,6 +88,18 @@ test("urgent notification opens hive.app with its click destination", () => {
   // urgent is not pending for the digest
   const digest = runDigest(db, { exec });
   expect(digest.delivered).toBe(false);
+});
+
+test("cold-start notification launching uses each OS protocol launcher", () => {
+  expect(notificationLaunchArgv("hive://notify?id=x", "darwin")).toEqual([
+    "open", "-g", "-b", "dev.hive.app", "hive://notify?id=x",
+  ]);
+  expect(notificationLaunchArgv("hive://notify?id=x", "win32")).toEqual([
+    "explorer.exe", "hive://notify?id=x",
+  ]);
+  expect(notificationLaunchArgv("hive://notify?id=x", "linux")).toEqual([
+    "xdg-open", "hive://notify?id=x",
+  ]);
 });
 
 test("an urgent open decision pushes the question and inline answers", async () => {

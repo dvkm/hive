@@ -3253,7 +3253,7 @@ async function uiTaskWithNoShots(
   return { db, projectId, root };
 }
 
-test("a UI task with no screenshot gets one rendered, and a second sync renders nothing", async () => {
+test.skipIf(process.platform !== "darwin")("a UI task with no screenshot gets one rendered, and a second sync renders nothing", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
   const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
   const deps = { exec: execRendering(root, 1) };
@@ -3307,7 +3307,7 @@ test.skipIf(process.platform !== "darwin")("the sandbox really refuses a write o
   rmSyncT(outside, { force: true });
 });
 
-test("an untrusted repo never starts a browser, and the gate does not burn the one attempt", async () => {
+test.skipIf(process.platform !== "darwin")("an untrusted repo never starts a browser, and the gate does not burn the one attempt", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
   const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
   db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify({ jira: CFG }), projectId);
@@ -3346,7 +3346,7 @@ test("a task that already has a screenshot never starts a browser", async () => 
   expect(browserRuns).toBe(0);
 });
 
-test("the harness is forced to boot the app itself, so the picture is the PR branch", async () => {
+test.skipIf(process.platform !== "darwin")("the harness is forced to boot the app itself, so the picture is the PR branch", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
   const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
   const seen: { argv: string[]; config?: string; cwd?: string }[] = [];
@@ -3427,7 +3427,7 @@ test("a Playwright testDir symlink outside the worktree is refused", async () =>
   expect(String(syncEvents(db).find((e) => e.action === "render_proof")?.reason)).toContain("outside the task worktree");
 });
 
-test("a failed harness run never becomes a picture on the issue", async () => {
+test.skipIf(process.platform !== "darwin")("a failed harness run never becomes a picture on the issue", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
   const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
   // The run wrote a PNG and THEN went red: an error page is still a PNG.
@@ -3457,7 +3457,7 @@ test("the scratch directory is gone even when the harness throws", async () => {
   expect(readdirSyncT(join(root, "web", "e2e")).some((name) => name.startsWith("hive-proof-"))).toBe(false);
 });
 
-test("the task's diff is read once per cycle, not once per check", async () => {
+test.skipIf(process.platform !== "darwin")("the task's diff is read once per cycle, not once per check", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
   const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
   let diffReads = 0;

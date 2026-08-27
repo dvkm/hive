@@ -37,7 +37,7 @@ export interface Watcher {
 
 export interface WatchDeps {
   fetchImpl?: typeof fetch;
-  exec?: Exec; // for /usr/bin/diff
+  exec?: Exec; // for git diff --no-index
   nowMs?: () => number;
 }
 
@@ -74,8 +74,10 @@ function activeWatchTask(db: DB, refPrefix: string): boolean {
 async function unifiedDiff(exec: Exec, oldPath: string, body: string): Promise<string> {
   const tmp = oldPath + ".new";
   writeFileSync(tmp, body);
-  // diff exits 1 on differences — that's the expected case, not an error.
-  const r = await exec(["/usr/bin/diff", "-u", oldPath, tmp]);
+  // `git` is already a Hive prerequisite and is portable; unlike
+  // `/usr/bin/diff`, it works in native Windows processes. It exits 1 on
+  // differences — that's the expected case, not an error.
+  const r = await exec(["git", "diff", "--no-index", "--no-ext-diff", "--text", "--unified=3", "--", oldPath, tmp]);
   return (r.stdout || "").slice(0, DIFF_LIMIT) || "(content changed; diff unavailable)";
 }
 

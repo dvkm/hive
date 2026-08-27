@@ -4,7 +4,7 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { splitAttachments } from "../../web/src/lib/attachments.ts";
 
 const HOME = mkdtempSync(join(tmpdir(), "hive-attach-test-"));
@@ -57,7 +57,7 @@ beforeAll(async () => {
 // The absolute path an agent is told to read must actually hold the bytes we
 // uploaded — that round trip is the whole feature.
 function assertReadable(path: string, bytes: number[]) {
-  expect(path.startsWith("/")).toBe(true);
+  expect(isAbsolute(path)).toBe(true);
   expect(existsSync(path)).toBe(true);
   return Bun.file(path)
     .arrayBuffer()

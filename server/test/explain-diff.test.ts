@@ -32,7 +32,7 @@ function makeServer(opts: { rollup?: any[]; html?: string; plannerCode?: number 
     if (has(argv, "gh", "pr", "view"))
       return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: opts.rollup ?? [] }));
     if (has(argv, "worktree", "create"))
-      return OK(`{"result":{"worktree":{"path":"${WT}","branch":"hive/x","open_workspace_id":"w1"}}}`);
+      return OK(JSON.stringify({ result: { worktree: { path: WT, branch: "hive/x", open_workspace_id: "w1" } } }));
     if (has(argv, "agent", "get")) return OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}');
     if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
     if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t2"}}}');
