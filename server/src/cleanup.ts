@@ -150,12 +150,13 @@ export async function cleanupTask(
     | { repo_path: string | null; config: string | null }
     | undefined;
   const repoPath = project?.repo_path ?? null;
-  let defaultBranch: string | undefined;
+  let config: Record<string, any> = {};
   try {
-    defaultBranch = projectBaseBranch(JSON.parse(project?.config ?? "{}"));
+    config = JSON.parse(project?.config ?? "{}") ?? {};
   } catch {
-    defaultBranch = undefined;
+    config = {};
   }
+  const defaultBranch = projectBaseBranch(config);
 
   // 0) per-project stack teardown (docker etc.) — BEFORE the worktree goes
   // away, since the command usually lives inside it.
@@ -165,13 +166,7 @@ export async function cleanupTask(
     .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'stack_teardown' LIMIT 1")
     .get(taskId);
   if (task.worktree_path && repoPath && !toreDown) {
-    let cleanupArgv: unknown;
-    try {
-      cleanupArgv = JSON.parse(project?.config ?? "{}").cleanup_argv;
-    } catch {
-      cleanupArgv = undefined;
-    }
-    await runStackCmd(db, taskId, cleanupArgv, repoPath, task.worktree_path, opts.exec ?? defaultExec, {
+    await runStackCmd(db, taskId, config.cleanup_argv, repoPath, task.worktree_path, opts.exec ?? defaultExec, {
       type: "stack_teardown",
       source: "reaper",
     });
@@ -193,6 +188,21 @@ export async function cleanupTask(
     }
   }
 
+  // 1b) origin branch — the task is over and its commits are already in the
+  // default branch, so the pushed copy is pure litter (500+ stale `hive/*` refs
+  // accumulated on one origin). Skipped for a PRESERVED worktree: that branch is
+  // exactly the one still holding work. Per-project opt-out:
+  // config.delete_remote_branches = false. Never blocks the rest of cleanup —
+  // deleteRemoteBranch swallows its own failures and the outcome is recorded on
+  // the cleaned_up event.
+  const preservedWorktree = !!worktree && !worktree.removed;
+  let remote: { deleted: boolean; reason: string } | null = null;
+  if (task.branch && repoPath && !preservedWorktree && config.delete_remote_branches !== false) {
+    remote = await herdr
+      .deleteRemoteBranch({ repoPath, branch: task.branch, defaultBranch })
+      .catch((e: any) => ({ deleted: false, reason: String(e?.message ?? e).slice(0, 200) }));
+  }
+
   // 2) session — close for ANY terminal task, preserved worktree or not. The
   // worktree + branch stay on disk for the director (`herdr worktree open`
   // re-attaches on demand), but the live tab must not stay: every kept session
@@ -201,7 +211,7 @@ export async function cleanupTask(
   // Preserved tasks keep agent_target until the close succeeds, then drop it so
   // later sweeps skip the herdr call instead of re-closing a dead tab.
   const meta = spawnMeta(db, taskId);
-  const preserved = !!worktree && !worktree.removed;
+  const preserved = preservedWorktree;
   let session = { closed: false, via: null as string | null };
   const attemptedClose = preserved ? !!task.agent_target : !!(task.agent_target || meta.tab_id);
   if (attemptedClose) {
@@ -274,6 +284,8 @@ export async function cleanupTask(
       branch: task.branch ?? null,
       worktree_removed: worktree?.removed ?? false,
       ghost_branch: worktree?.ghost_branch ?? null,
+      remote_branch_deleted: remote?.deleted ?? false,
+      ...(remote && !remote.deleted ? { remote_branch_reason: remote.reason } : {}),
       session_closed: session.closed,
       session_via: session.via,
       tab_id: meta.tab_id,
