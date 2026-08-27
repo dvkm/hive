@@ -7,7 +7,7 @@ paths (emit CLI, hooks, reconciler).
 
 ## What they do
 
-On every fire (`PostToolUse`, `Stop`, `SubagentStop`), `hive-hook.sh <event-label>`
+On every fire (`PostToolUse`, `Stop`, `SubagentStop`), `hive-hook.ts <event-label>`
 reads the `transcript_path` from Claude Code or Codex hook input and extracts the agent's
 **new turns since a per-transcript cursor** (`report-transcript.ts`), POSTing them
 to `$HIVE_URL/api/tasks/$HIVE_TASK_ID/events`:
@@ -33,12 +33,12 @@ drops below the cursor) it resyncs from the start.
 
 There is no more bare `status` "hook: <event>" POST — it was pure timeline noise.
 
-The script fails silent and fast: any error exits 0, curl is capped at 2s, and
+The script fails silent and fast: any error exits 0, network calls are capped, and
 it never blocks the agent.
 
 ## Token/cost usage (Stop hook)
 
-On `Stop` / `SubagentStop`, `hive-hook.sh` also reports **per-model token usage**
+On `Stop` / `SubagentStop`, `hive-hook.ts` also reports **per-model token usage**
 to hive's analytics via `report-usage.ts` (run with Bun).
 
 The Stop-hook input does not contain token counts directly, but `transcript_path` points at the session JSONL. Claude stores usage on assistant rows; Codex stores cumulative token counts in `event_msg` rows. `report-usage.ts` reads either format and posts cumulative usage by session, which Hive upserts instead of double-counting repeated Stops. Codex model switches inside one session are attributed to the latest active model because its transcript exposes one session total rather than a per-model split.
@@ -56,13 +56,13 @@ reads the project (or user) `settings.json`. Add:
 {
   "hooks": {
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "/ABSOLUTE/PATH/hooks/hive-hook.sh Stop" } ] }
+      { "hooks": [ { "type": "command", "command": "bun /ABSOLUTE/PATH/hooks/hive-hook.ts Stop" } ] }
     ],
     "SubagentStop": [
-      { "hooks": [ { "type": "command", "command": "/ABSOLUTE/PATH/hooks/hive-hook.sh SubagentStop" } ] }
+      { "hooks": [ { "type": "command", "command": "bun /ABSOLUTE/PATH/hooks/hive-hook.ts SubagentStop" } ] }
     ],
     "PostToolUse": [
-      { "matcher": "Bash|Write|Edit", "hooks": [ { "type": "command", "command": "/ABSOLUTE/PATH/hooks/hive-hook.sh PostToolUse" } ] }
+      { "matcher": "Bash|Write|Edit", "hooks": [ { "type": "command", "command": "bun /ABSOLUTE/PATH/hooks/hive-hook.ts PostToolUse" } ] }
     ]
   }
 }
@@ -73,9 +73,14 @@ scoped to the state-changing tools (`Bash|Write|Edit`) so the board sees real
 progress without a flood of read-only tool calls; drop it if you only want
 start/stop signals.
 
+On Windows, use forward slashes in the hook command, for example
+`bun C:/Users/me/code/hive/hooks/hive-hook.ts Stop`. Native Claude Code uses
+Git Bash; Hive supplies `CLAUDE_CODE_GIT_BASH_PATH` automatically to agents it
+starts. The legacy `hive-hook.sh` remains supported for existing Unix settings.
+
 Codex projects do not need a repository hook file. Hive passes equivalent `PreToolUse`, `PermissionRequest`, `PostToolUse`, `Stop`, and `SubagentStop` hooks as per-invocation Codex config and bypasses the interactive hook-trust prompt for that vetted command. Run `codex login` once on the Hive machine before selecting “ChatGPT (Codex CLI)” as a project's worker.
 
-## Make it executable
+## Make the legacy Unix wrapper executable
 
 ```bash
 chmod +x hooks/hive-hook.sh
@@ -87,6 +92,8 @@ chmod +x hooks/hive-hook.sh
 # Point the payload at a real Claude Code transcript JSONL:
 export HIVE_TASK_ID=<some-task-id> HIVE_URL=http://127.0.0.1:4700
 printf '{"transcript_path":"/path/to/transcript.jsonl"}' | hooks/hive-hook.sh Stop
+# Cross-platform equivalent:
+printf '{"transcript_path":"/path/to/transcript.jsonl"}' | bun hooks/hive-hook.ts Stop
 # then check the task timeline for `assistant_text` / `tool_use` events (source "hook").
 ```
 

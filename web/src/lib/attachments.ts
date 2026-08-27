@@ -22,7 +22,7 @@ const IMAGE = /\.(png|jpe?g|gif|webp|avif|bmp|svg)$/i;
 // /evidence/<task-id>/<file> — the last two segments of the stored path, which
 // is exactly what serveEvidence() resolves back against HIVE_HOME.
 export function attachmentUrl(path: string): string {
-  const [dir, name] = path.split("/").slice(-2);
+  const [dir, name] = path.split(/[\\/]/).slice(-2);
   return `/evidence/${encodeURIComponent(dir)}/${encodeURIComponent(name)}`;
 }
 
@@ -34,7 +34,7 @@ export function splitAttachments(brief: string | null | undefined): { body: stri
         const path = line.trim().slice(2).trim();
         // Stored as "<epoch-ms>[_<n>]_<original name>". The stamp is storage
         // plumbing (uniqueness); show the name the director recognises.
-        const name = (path.split("/").pop() || path).replace(/^\d{10,}_(\d+_)?/, "");
+        const name = (path.split(/[\\/]/).pop() || path).replace(/^\d{10,}_(\d+_)?/, "");
         files.push({ path, name, url: attachmentUrl(path), image: IMAGE.test(name) });
       }
       return "\n";
