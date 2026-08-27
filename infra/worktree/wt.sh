@@ -5,6 +5,7 @@
 # removing the worktree IS the whole teardown, there are no per-worktree
 # containers to orphan (the 256-orphaned-container class of bug can't happen here).
 #
+# Legacy Unix wrapper. New cross-platform configs should run wt.ts with Bun.
 # Wired via the project's spawn/cleanup hooks (projects.config in hive.db):
 #   config.setup_argv   = ["infra/worktree/wt.sh", "up",   "{worktree}"]
 #   config.cleanup_argv = ["infra/worktree/wt.sh", "down", "{worktree}"]

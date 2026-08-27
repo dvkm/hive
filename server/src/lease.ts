@@ -150,6 +150,19 @@ export interface ProcOps {
   signal(pid: number, sig: NodeJS.Signals): void;
 }
 
+export function processCommandArgv(pid: number, platform: NodeJS.Platform = process.platform): string[] {
+  if (platform === "win32") {
+    return [
+      "powershell.exe",
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `(Get-CimInstance Win32_Process -Filter \"ProcessId = ${pid}\").CommandLine`,
+    ];
+  }
+  return ["ps", "-p", String(pid), "-o", "command="];
+}
+
 export const defaultProcOps: ProcOps = {
   alive(pid) {
     try {
@@ -160,7 +173,7 @@ export const defaultProcOps: ProcOps = {
     }
   },
   command(pid) {
-    const r = Bun.spawnSync(["ps", "-p", String(pid), "-o", "command="]);
+    const r = Bun.spawnSync(processCommandArgv(pid));
     return r.success ? new TextDecoder().decode(r.stdout).trim() : "";
   },
   signal(pid, sig) {
@@ -173,7 +186,7 @@ export const defaultProcOps: ProcOps = {
 // director's editor. Only a command line that still reads as a hive server is
 // ever a target.
 export function isHiveServerCommand(cmd: string): boolean {
-  return /hive.*server\/src\/index\.ts/.test(cmd);
+  return /hive.*server[\\/]src[\\/]index\.ts/i.test(cmd);
 }
 
 // The lease holder's enforcement duty, run on every heartbeat. SIGTERM first;

@@ -27,7 +27,7 @@ export interface NotifInput {
   decision_id?: string | null;
 }
 
-// Module-level macOS app sink. Off by default (null) so tests and the CLI never
+// Module-level desktop app sink. Off by default (null) so tests and the CLI never
 // pop real notifications; the server turns it on with the real Exec (index.ts).
 let notifier: Exec | null = null;
 export function setNotifier(exec: Exec | null): void {
@@ -42,9 +42,18 @@ export function deeplinkPath(n: { task_id?: string | null; decision_id?: string 
   return "/";
 }
 
+export function notificationLaunchArgv(
+  url: string,
+  platform: NodeJS.Platform = process.platform
+): string[] {
+  if (platform === "darwin") return ["open", "-g", "-b", "dev.hive.app", url];
+  if (platform === "win32") return ["explorer.exe", url];
+  return ["xdg-open", url];
+}
+
 // Cold-start path only: the desktop app is not attached to the stream, so hand
-// macOS the whole notification in a hive:// URL and let LaunchServices start
-// the app to render it.
+// the whole notification to the OS through a hive:// URL and let the registered
+// desktop app render it.
 async function launchAndNotify(exec: Exec, n: { id: string; title: string; body: string; path: string }): Promise<void> {
   try {
     const url = new URL("hive://notify");
@@ -52,9 +61,9 @@ async function launchAndNotify(exec: Exec, n: { id: string; title: string; body:
     url.searchParams.set("title", n.title);
     url.searchParams.set("body", n.body);
     url.searchParams.set("path", n.path);
-    await exec(["open", "-g", "-b", "dev.hive.app", url.toString()]);
+    await exec(notificationLaunchArgv(url.toString()));
   } catch {
-    /* non-fatal: hive.app missing / not macOS */
+    /* non-fatal: desktop app missing or protocol not registered */
   }
 }
 

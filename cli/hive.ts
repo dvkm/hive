@@ -1,6 +1,7 @@
 // hive CLI — thin HTTP wrappers around the daemon. The server is the only DB writer.
 // Installed as bin/hive (bun shebang). Base URL: HIVE_URL or http://127.0.0.1:<HIVE_PORT|4700>.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { appBrowserCandidates, installedHiveAppCandidates, openUrlArgv, tailscaleCandidates } from "./platform.ts";
 
 const BASE =
   process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
@@ -83,11 +84,11 @@ Usage:
   hive secret list --project <id>
   hive secret rm --project <id> --name <n>
   hive offline [on|off]                   drain the fleet before losing internet / resume after
-  hive notify --test                      fire one real macOS notification and report whether
+  hive notify --test                      fire one real desktop notification and report whether
         the desktop app rendered it (proves the whole chain without a real event)
   hive open                               open the board in a browser
   hive app                                open the hive desktop app (native notifications
-        + dock badge; install once: cd electron && bun install && bun run install-app)
+        + badge; install once: cd electron && bun install && bun run install-app)
 
 Env: HIVE_URL, HIVE_PORT, HIVE_DB, BW_SESSION`;
 
@@ -769,7 +770,7 @@ async function main() {
   if (cmd === "tunnel") {
     const port = process.env.HIVE_PORT || 4700;
     const run = (args: string[]) => {
-      for (const bin of ["tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale"]) {
+      for (const bin of tailscaleCandidates()) {
         try {
           const r = Bun.spawnSync([bin, ...args]);
           if (r.exitCode !== 127) return { ...r, bin };
@@ -781,7 +782,7 @@ async function main() {
     };
     const setup =
       "Tailscale isn't set up yet. One-time steps (yours — it's your account):\n" +
-      "  1. Install Tailscale on this Mac (App Store 'Tailscale', or `brew install --cask tailscale`) and log in.\n" +
+      `  1. Install Tailscale on this ${process.platform === "win32" ? "Windows PC" : process.platform === "darwin" ? "Mac" : "Linux machine"} and log in.\n` +
       "  2. Install Tailscale on your iPhone and log into the SAME account.\n" +
       "  3. Re-run `hive tunnel`.";
     const status = run(["status"]);
@@ -952,8 +953,8 @@ async function main() {
       }
       if (last_delivery_error?.id === id)
         die(
-          `macOS REFUSED the notification: ${last_delivery_error.error}\n` +
-            "Turn hive's notifications on in System Settings > Notifications > hive, then run this again."
+          `The OS refused the notification: ${last_delivery_error.error}\n` +
+            "Turn hive's notifications on in system notification settings, then run this again."
         );
     }
     die(
@@ -964,8 +965,7 @@ async function main() {
 
   if (cmd === "open") {
     const url = BASE + "/";
-    const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-    Bun.spawn([opener, url]);
+    Bun.spawn(openUrlArgv(url), { stdout: "ignore", stderr: "ignore" });
     console.log(`opening ${url}`);
     return;
   }
@@ -977,21 +977,27 @@ async function main() {
   // Falls back to a chromeless Chrome window, then the default browser.
   if (cmd === "app") {
     const url = BASE + "/";
-    const { existsSync } = await import("node:fs");
-    const appPath = "/Applications/hive.app";
-    if (existsSync(appPath)) {
-      Bun.spawn(["open", appPath], { stdout: "ignore", stderr: "ignore" });
-      console.log(`opening hive.app (${appPath})`);
+    const appPath = installedHiveAppCandidates().find(existsSync);
+    if (appPath) {
+      const argv = process.platform === "darwin" ? ["open", appPath] : [appPath];
+      Bun.spawn(argv, { stdout: "ignore", stderr: "ignore" });
+      console.log(`opening hive desktop app (${appPath})`);
       return;
     }
-    const chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-    try {
-      Bun.spawn([chrome, `--app=${url}`], { stdout: "ignore", stderr: "ignore" });
-      console.log(`hive.app not installed (cd electron && bun install && bun run install-app) — Chrome app window on ${url}`);
-    } catch {
-      Bun.spawn(["open", url]);
-      console.log(`opened ${url} in the default browser`);
+    const browser = appBrowserCandidates().find(
+      (candidate) => (!candidate.includes("/") && !candidate.includes("\\")) || existsSync(candidate)
+    );
+    if (browser) {
+      try {
+        Bun.spawn([browser, `--app=${url}`], { stdout: "ignore", stderr: "ignore" });
+        console.log(`hive desktop app not installed (cd electron && bun install && bun run install-app) — app window on ${url}`);
+        return;
+      } catch {
+        // Fall through to the default browser.
+      }
     }
+    Bun.spawn(openUrlArgv(url), { stdout: "ignore", stderr: "ignore" });
+    console.log(`opened ${url} in the default browser`);
     return;
   }
 

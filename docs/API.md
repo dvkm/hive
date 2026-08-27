@@ -62,7 +62,7 @@ downstream (see `agent_argv` below). Keys used elsewhere:
 `setup_argv` runs at spawn time once the worktree exists but before the agent
 starts, `cleanup_argv` runs before the worktree is removed; relative `argv[0]`
 resolves against the project repo path and `{worktree}` substitutes the task's
-worktree path, e.g. `["infra/worktree/wt.sh","up","{worktree}"]` /
+worktree path, e.g. `["bun","infra/worktree/wt.ts","up","{worktree}"]` /
 `[…,"down","{worktree}"]`; both best-effort with a 120s timeout, emitting a
 `stack_setup` / `stack_teardown` event — see the Auto-cleanup section),
 and `gchat_spaces` (`[{space, label?}]`, the Google Chat intake allowlist —
@@ -87,7 +87,7 @@ concurrently-running agents).
 Supervisor key: `autonomy_profile` (`"conservative" | "balanced" | "autopilot"`, default `"balanced"`). Conservative leaves every checkpoint and decision to the director. Balanced may acknowledge reversible checkpoints and use only the server's closed safe-decision allow-list. Autopilot may also answer a raiser-recommended low/normal-risk technical choice after the server excludes authority grants and production/shared blast radius. No profile bypasses standing-authority gates.
 Worktree stack hooks (symmetric per-project lifecycle commands, both `string[]`,
 `{worktree}` substitutes the task's worktree path, relative `argv[0]` resolves
-against `repo_path`): `setup_argv` (e.g. `["infra/worktree/wt.sh","up","{worktree}"]`,
+against `repo_path`): `setup_argv` (e.g. `["bun","infra/worktree/wt.ts","up","{worktree}"]`,
 run at spawn after the worktree exists but before the agent starts, so agents
 don't install deps / bring up their stack themselves; emits a `stack_setup`
 event) and `cleanup_argv` (e.g. `[...,"down","{worktree}"]`, run before the
@@ -113,7 +113,7 @@ notification. The reaper auto-sets `archived: true` on a `test` project once
 every task it owns is terminal.
 Worktree stack hooks (symmetric per-project lifecycle commands): `setup_argv`
 (string[], run AFTER the worktree exists but BEFORE the agent starts — e.g.
-`["infra/worktree/wt.sh", "up", "{worktree}"]` — so agents don't bring up their
+`["bun", "infra/worktree/wt.ts", "up", "{worktree}"]` — so agents don't bring up their
 stack themselves; emits a `stack_setup` event) and `cleanup_argv` (string[], run
 BEFORE the worktree is removed — e.g. `[..., "down", "{worktree}"]`; emits a
 `stack_teardown` event). Both: relative `argv[0]` resolves against `repo_path`,

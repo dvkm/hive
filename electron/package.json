@@ -2,12 +2,14 @@
   "name": "hive-app",
   "productName": "hive",
   "version": "0.1.0",
+  "description": "Native desktop window and notification client for Hive",
+  "author": "Hive contributors",
   "private": true,
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder --mac --dir && codesign --force --sign - --requirements '=designated => identifier \"dev.hive.app\"' dist/mac-arm64/hive.app",
-    "install-app": "bun run build && ./install-app.sh"
+    "build": "node build.js",
+    "install-app": "bun run build && node install-app.js"
   },
   "build": {
     "appId": "dev.hive.app",
@@ -27,6 +29,9 @@
       "icon": "build/icon.png",
       "identity": "-",
       "hardenedRuntime": false
+    },
+    "win": {
+      "target": "dir"
     }
   },
   "devDependencies": {

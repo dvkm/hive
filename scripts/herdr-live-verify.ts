@@ -3,11 +3,11 @@
 // can be captured as evidence. Not part of the test suite (needs a live herdr).
 //
 //   bun run scripts/herdr-live-verify.ts /tmp/hive-herdr-verify
-import { Herdr } from "../server/src/runtime/herdr.ts";
+import { Herdr, HERDR_BIN } from "../server/src/runtime/herdr.ts";
 import { defaultExec } from "../server/src/exec.ts";
 
-const BIN = process.env.HERDR_BIN || "/opt/homebrew/bin/herdr";
-const repo = process.argv[2] || "/tmp/hive-herdr-verify";
+const BIN = HERDR_BIN;
+const repo = process.argv[2] || `${process.env.TEMP || process.env.TMPDIR || "/tmp"}/hive-herdr-verify`;
 const h = new Herdr(defaultExec);
 
 const log = (...a: unknown[]) => console.log(...a);
