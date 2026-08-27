@@ -171,7 +171,7 @@ test("safe commands classify as safe", () => {
 });
 
 test("Codex PermissionRequest receives the Codex allow shape", async () => {
-  const proc = Bun.spawn(["bun", join(import.meta.dir, "../../hooks/classify.ts")], {
+  const proc = Bun.spawn([process.execPath, join(import.meta.dir, "../../hooks/classify.ts")], {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -187,7 +187,7 @@ test("Codex PermissionRequest receives the Codex allow shape", async () => {
 });
 
 test("Codex PreToolUse continues safe commands without an unsupported allow decision", async () => {
-  const proc = Bun.spawn(["bun", join(import.meta.dir, "../../hooks/classify.ts")], {
+  const proc = Bun.spawn([process.execPath, join(import.meta.dir, "../../hooks/classify.ts")], {
     env: { ...process.env, HIVE_AGENT: "codex" },
     stdin: "pipe",
     stdout: "pipe",
@@ -197,6 +197,18 @@ test("Codex PreToolUse continues safe commands without an unsupported allow deci
   await proc.stdin.end();
   expect((await new Response(proc.stdout).text()).trim()).toBe("");
   expect(await proc.exited).toBe(0);
+});
+
+test("native Windows destructive commands are classified", () => {
+  expect(classify("Remove-Item C:\\work -Recurse -Force").decision).toBe("dangerous");
+  expect(classify("Stop-Process -Id 42").decision).toBe("dangerous");
+  expect(classify("Get-ChildItem C:\\work").decision).toBe("safe");
+});
+
+test("Windows and Git Bash worktree paths share the sandbox waiver", () => {
+  const env = { USERPROFILE: "C:\\Users\\Ada", TEMP: "C:\\Users\\Ada\\AppData\\Local\\Temp" };
+  expect(classify("git reset --hard", env, "C:\\Users\\Ada\\.herdr\\worktrees\\repo\\hive-x").decision).toBe("unknown");
+  expect(classify("git reset --hard", env, "/c/Users/Ada/.herdr/worktrees/repo/hive-x").decision).toBe("unknown");
 });
 
 test("unrecognized commands classify as unknown (never safe)", () => {

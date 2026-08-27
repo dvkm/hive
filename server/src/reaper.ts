@@ -11,7 +11,7 @@
 import type { DB } from "./db.ts";
 import { setSetting, now, isOffline } from "./db.ts";
 import { getTask, TERMINAL, type State } from "./state.ts";
-import { Herdr, herdr as defaultHerdr, parseWorktreeList } from "./runtime/herdr.ts";
+import { Herdr, herdr as defaultHerdr, parseWorktreeList, paneHasLiveProcess, type PaneInfo } from "./runtime/herdr.ts";
 import { cleanupTask, releaseReviewAgents } from "./cleanup.ts";
 import { teardownBlocked } from "./teardownGuard.ts";
 import { broadcast } from "./bus.ts";
@@ -104,6 +104,12 @@ export async function reapOnce(db: DB, deps: ReaperDeps = {}): Promise<void> {
     await sweepOrphanedPanes(db, deps);
   } catch (e) {
     console.error("[hive] reaper pane sweep:", e); // isolated; never crash the sweep
+  }
+
+  try {
+    await sweepZombiePanes(db, deps);
+  } catch (e) {
+    console.error("[hive] reaper zombie-pane sweep:", e); // isolated; never crash the sweep
   }
 
   try {
@@ -227,13 +233,67 @@ export async function sweepOrphanedPanes(db: DB, deps: ReaperDeps = {}): Promise
         if (!targetBelongsOnlyToTask(panes, "workspaceId", p.workspaceId, taskId)) continue;
         const r = await herdr.closeWorkspace({
           workspaceId: p.workspaceId,
-          expectCwd: p.cwd,
+          expectCwd: p.cwd ?? "",
           request: { caller: "reaper.sweepOrphanedPanes", reason: task ? "terminal task workspace" : "orphan task workspace", taskId },
         });
         if (r.code === 0) broadcast({ type: "reaped_orphan_pane", task_id: taskId, via: `workspace ${p.workspaceId}` });
       }
     } catch (e) {
       console.error(`[hive] reaper orphan pane ${taskId}:`, e); // isolated; never crash the sweep
+    }
+  }
+}
+
+// Reap ZOMBIE panes: pane rows whose process already exited but whose herdr
+// row lingers (task #1706 / 2026-08-26 — a session restart left 3 dead agents
+// with ~5 pane rows apiece, fleet tab + own workspace, all at zero processes).
+// This is what blocks a respawn: `Herdr.spawn` refuses as long as the task's
+// name still resolves to a pane, and the dispatcher's own respawn query only
+// considers tasks with agent_target IS NULL (dispatcher.ts). Both stay stuck
+// until these panes and that binding are cleared.
+//
+// Independent of task state on purpose — that's what makes it safe to run
+// even while the row shows non-terminal (e.g. queued for respawn): a genuinely
+// live agent always has a live process in at least one of its panes, so the
+// per-worktree liveness check below can never mistake it for dead. Grouped by
+// taskId (all panes sharing that worktree's cwd) so a fleet tab's second pane
+// or the worktree's own workspace pane can't be judged in isolation.
+export async function sweepZombiePanes(db: DB, deps: ReaperDeps = {}): Promise<void> {
+  const herdr = deps.herdr ?? defaultHerdr;
+  const panes = await herdr.listPanes();
+  const byTask = new Map<string, PaneInfo[]>();
+  for (const p of panes) {
+    const taskId = taskIdFromCwd(p.cwd);
+    if (!taskId) continue; // not a hive-managed pane
+    const group = byTask.get(taskId);
+    if (group) group.push(p);
+    else byTask.set(taskId, [p]);
+  }
+
+  for (const [taskId, group] of byTask) {
+    try {
+      let anyLive = false;
+      for (const p of group) {
+        if (paneHasLiveProcess(await herdr.paneProcessInfo(p.paneId))) {
+          anyLive = true;
+          break;
+        }
+      }
+      if (anyLive) continue; // SAFETY: never touch a worktree with any live process
+
+      for (const p of group) {
+        const r = await herdr.closePane(p.paneId, {
+          caller: "reaper.zombiePanes",
+          reason: "pane process gone but row still held the agent name",
+          taskId,
+        });
+        if (r.closed) broadcast({ type: "reaped_zombie_pane", task_id: taskId, pane_id: p.paneId });
+      }
+      // Unblock the next spawn attempt: dispatcher.ts only respawns tasks with
+      // agent_target IS NULL.
+      db.query("UPDATE tasks SET agent_target = NULL, updated_at = ? WHERE id = ? AND agent_target IS NOT NULL").run(now(), taskId);
+    } catch (e) {
+      console.error(`[hive] reaper zombie pane ${taskId}:`, e); // isolated; never crash the sweep
     }
   }
 }

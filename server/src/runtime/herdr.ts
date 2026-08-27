@@ -21,9 +21,12 @@
 // reject a `--json` flag (only worktree.* accepts it); `agent get` on a missing
 // target exits 0 with `{"error":{"code":"agent_not_found"}}` — aliveness must be
 // PARSED, never inferred from the exit code.
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, posix, win32 } from "node:path";
 import type { Exec, ExecResult } from "../exec.ts";
 import { defaultExec, isSafeRef } from "../exec.ts";
+import { toShellPath } from "../platform.ts";
 
 // Absolute path to the hive CLI (…/repo/bin/hive from server/src/runtime/),
 // handed to every spawned agent as $HIVE_CLI so `"$HIVE_CLI" emit …` works from
@@ -31,9 +34,31 @@ import { defaultExec, isSafeRef } from "../exec.ts";
 // auto-attribution (source=agent, parent task), seen live 2026-07-10.
 // NOT injected via PATH: overriding PATH clobbers the pane shell's user PATH
 // and breaks claude/cargo/pnpm resolution (broke all spawns, 2026-07-10).
-const HIVE_CLI = join(import.meta.dir, "..", "..", "..", "bin", "hive");
+export function hiveCliPath(platform: NodeJS.Platform = process.platform): string {
+  return toShellPath(join(import.meta.dir, "..", "..", "..", "bin", "hive"), platform);
+}
+const HIVE_CLI = hiveCliPath();
 
-export const HERDR_BIN = process.env.HERDR_BIN || "/opt/homebrew/bin/herdr";
+export function discoverHerdrBin(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  which: (name: string) => string | null = (name) => Bun.which(name),
+  exists: (path: string) => boolean = existsSync
+): string {
+  if (env.HERDR_BIN) return env.HERDR_BIN;
+  const home = env.USERPROFILE || env.HOME || homedir();
+  const local = env.LOCALAPPDATA || win32.join(home, "AppData", "Local");
+  const candidates = platform === "win32"
+    ? [
+        which("herdr"),
+        win32.join(local, "Programs", "Herdr", "bin", "herdr.exe"),
+        win32.join(home, ".local", "bin", "herdr.exe"),
+      ]
+    : [which("herdr"), "/opt/homebrew/bin/herdr", "/usr/local/bin/herdr", join(home, ".local", "bin", "herdr")];
+  return candidates.find((candidate): candidate is string => !!candidate && exists(candidate)) ?? "herdr";
+}
+
+export const HERDR_BIN = discoverHerdrBin();
 
 // The dedicated, named herdr workspace hive spawns every worker into. NOT
 // "hive": herdr auto-labels a worktree's own workspace by repo name, and this
@@ -321,7 +346,7 @@ export function paneProcessInfoArgv(paneId: string): string[] {
 // re-adopting the wrong one would wire every future steer into a bare zsh. This
 // is the positive evidence that tells them apart: the pane's shell pid is
 // running the agent command, not a login shell.
-const LOGIN_SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh"]);
+const LOGIN_SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "powershell", "pwsh", "cmd", "nu"]);
 
 export function paneRunsAgentCommand(stdout: string): boolean {
   try {
@@ -330,10 +355,28 @@ export function paneRunsAgentCommand(stdout: string): boolean {
     const procs: any[] = info.foreground_processes ?? [];
     const root = procs.find((x) => x.pid === info.shell_pid) ?? procs[0];
     if (!root) return false;
-    const name = String(root.argv0 ?? root.name ?? "").replace(/^-/, "");
+    const name = (String(root.argv0 ?? root.name ?? "").replace(/^-/, "").split(/[\\/]/).pop() ?? "")
+      .replace(/\.exe$/i, "")
+      .toLowerCase();
     return !!name && !LOGIN_SHELLS.has(name);
   } catch {
     return false;
+  }
+}
+
+// Stricter than paneRunsAgentCommand (which only asks "not a login shell"): a
+// zombie pane's process is gone ENTIRELY, not just idled at a shell prompt, so
+// an empty foreground_processes list is the signal. An unparseable/errored
+// result returns true (alive) — a herdr hiccup must never be read as proof of
+// death (same rule as Herdr.probe/confirmGone).
+export function paneHasLiveProcess(stdout: string): boolean {
+  try {
+    const info = (JSON.parse(stdout).result ?? {}).process_info;
+    if (!info) return true;
+    const procs: any[] = info.foreground_processes ?? [];
+    return procs.length > 0;
+  } catch {
+    return true;
   }
 }
 
@@ -1077,7 +1120,7 @@ export class Herdr {
       await this.exec([
         "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
         "-u",
-        join(worktreePath, "electron/dist/mac-arm64/hive.app"),
+        posix.join(worktreePath.replaceAll("\\", "/"), "electron/dist/mac-arm64/hive.app"),
       ]);
     } catch {
       // ignored
@@ -1205,6 +1248,32 @@ export class Herdr {
       return parsePaneList(r.stdout);
     } catch {
       return [];
+    }
+  }
+
+  // Raw `pane process-info` output for one pane, for callers that judge
+  // liveness themselves (paneHasLiveProcess/paneRunsAgentCommand). Never
+  // throws: an empty result reads as "unknown" to those parsers, which treat
+  // unparseable input as alive.
+  async paneProcessInfo(paneId: string): Promise<string> {
+    try {
+      const r = await this.run(paneProcessInfoArgv(paneId));
+      return r.stdout;
+    } catch {
+      return "";
+    }
+  }
+
+  // Close one exact pane by id — used by the zombie-pane sweep, which already
+  // has the paneId from `pane list` and has verified zero processes at it
+  // (unlike closeSession, there is no tab/workspace/agentTarget to resolve).
+  async closePane(paneId: string, request: CloseRequest): Promise<{ closed: boolean }> {
+    try {
+      logClose(request, "pane", paneId);
+      const r = await this.run(paneCloseArgv(paneId));
+      return { closed: r.code === 0 };
+    } catch {
+      return { closed: false };
     }
   }
 
