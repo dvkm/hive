@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { parseTeamclaudeEnv, proxyUrl, applyTeamclaudeEnv } from "../src/teamclaude.ts";
+import { parseTeamclaudeEnv, proxyUrl, applyTeamclaudeEnv, usesTeamclaude } from "../src/teamclaude.ts";
+import { agentForConfig, modelForTask } from "../src/api.ts";
 
 const MITM_OUTPUT = `export HTTPS_PROXY=http://127.0.0.1:3456
 export HTTP_PROXY=http://127.0.0.1:3456
@@ -31,6 +32,20 @@ describe("parseTeamclaudeEnv", () => {
     expect(proxyUrl(parseTeamclaudeEnv(MITM_OUTPUT))).toBe("http://127.0.0.1:3456");
     expect(proxyUrl(parseTeamclaudeEnv("export ANTHROPIC_BASE_URL=http://127.0.0.1:3456"))).toBe("http://127.0.0.1:3456");
     expect(proxyUrl(parseTeamclaudeEnv("# nothing"))).toBeNull();
+  });
+});
+
+describe("agent option", () => {
+  test("only agent=teamclaude opts a project in", () => {
+    expect(usesTeamclaude({ agent: "teamclaude" })).toBe(true);
+    expect(usesTeamclaude({ agent: "claude" })).toBe(false);
+    expect(usesTeamclaude({ agent: "codex" })).toBe(false);
+    expect(usesTeamclaude({})).toBe(false);
+  });
+
+  test("teamclaude behaves as claude everywhere else (binary, hooks, models)", () => {
+    expect(agentForConfig({ agent: "teamclaude" })).toBe("claude");
+    expect(modelForTask({ agent: "teamclaude" }, "ship")).toBe("opus");
   });
 });
 
