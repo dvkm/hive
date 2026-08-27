@@ -129,7 +129,7 @@ hive uses herdr the way priortool's `docs/herdr-backend.md` proved it should be 
 Read-only branch comparisons (review diffs, scope-drift footprints, and stacked-branch checks) likewise use `origin/<base>`. Local branch state is reserved for operations that intentionally act on the checkout, such as merging and cleanup.
 2. **Prepare the worktree** (callback) wires Hive's Stop/SubagentStop/PostToolUse hooks before the agent starts (`.claude/settings.local.json` for Claude; per-invocation Codex hook config for ChatGPT), so lifecycle reporting is structural, not brief-dependent (`hooks/`), then runs
    the per-project spawn hook `config.setup_argv` (e.g.
-   `["infra/worktree/wt.sh", "up", "{worktree}"]`) so agents don't have to
+   `["bun", "infra/worktree/wt.ts", "up", "{worktree}"]`) so agents don't have to
    install deps / bring up their stack themselves. It is the symmetric partner of
    `config.cleanup_argv` (teardown); both share `runStackCmd` in `cleanup.ts`,
    substitute `{worktree}`, resolve a relative `argv[0]` against `repo_path`, and
@@ -249,7 +249,9 @@ Quirks found and handled:
   since there is no work to lose. The refuse path triggers only once the agent
   has made an unpushed commit.
 
-`HERDR_BIN` overrides the binary path (default `/opt/homebrew/bin/herdr`).
+`HERDR_BIN` overrides binary discovery. Without it, Hive checks `PATH`, the
+standard Windows per-user Herdr install, `/opt/homebrew/bin`, `/usr/local/bin`,
+and the user's `.local/bin`.
 
 ## Re-running the live verification
 

@@ -14,7 +14,8 @@ export function isEphemeralRepoPath(repoPath: string | null | undefined): boolea
   if (!repoPath) return false;
   // A real project's repo_path is a durable checkout; a path living inside
   // another task's own worktree or scratchpad can only be a scratch artifact.
-  return repoPath.includes("/.herdr/worktrees/") || repoPath.includes("/scratchpad");
+  const normalized = repoPath.replaceAll("\\", "/").toLowerCase();
+  return normalized.includes("/.herdr/worktrees/") || normalized.includes("/scratchpad");
 }
 
 // SQL fragment for JOIN queries, e.g.

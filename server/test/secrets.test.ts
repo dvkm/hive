@@ -2,6 +2,7 @@ import { test, expect, beforeEach } from "bun:test";
 import type { Exec, ExecResult } from "../src/exec.ts";
 import {
   KeychainProvider,
+  WindowsCredentialProvider,
   BitwardenProvider,
   providerFor,
   serviceName,
@@ -12,6 +13,9 @@ import {
 } from "../src/secrets.ts";
 import { openDb, newId, now } from "../src/db.ts";
 import { writeEvent } from "../src/state.ts";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 function stubExec(handler: (argv: string[], input?: string) => ExecResult): { exec: Exec; calls: string[][] } {
   const calls: string[][] = [];
@@ -45,6 +49,24 @@ test("keychain get returns null when the item is missing", async () => {
   const { exec } = stubExec(() => ({ code: 44, stdout: "", stderr: "not found" }));
   const val = await new KeychainProvider(exec).get("p", "N", "hive/p/N");
   expect(val).toBeNull();
+});
+
+test("Windows credential provider keeps plaintext off argv and stores a DPAPI blob", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hive-dpapi-test-"));
+  const inputs: (string | undefined)[] = [];
+  const exec: Exec = async (argv, opts) => {
+    inputs.push(opts?.input);
+    const script = argv.at(-1) || "";
+    return script.includes("Unprotect") ? OK("hunter2") : OK("encrypted-base64");
+  };
+  const p = new WindowsCredentialProvider(exec, root);
+  const { ref } = await p.set("proj_1", "API_KEY", "hunter2");
+  expect(ref).toBe("hive/proj_1/API_KEY");
+  expect(inputs[0]).toBe("hunter2");
+  expect(await p.get("proj_1", "API_KEY", ref)).toBe("hunter2");
+  expect(inputs[1]).toBe("encrypted-base64");
+  await p.rm("proj_1", "API_KEY", ref);
+  expect(await p.get("proj_1", "API_KEY", ref)).toBeNull();
 });
 
 test("bitwarden provider builds bw commands and encodes the item", async () => {
@@ -105,7 +127,7 @@ test("resolveProjectSecrets resolves via the provider and registers values", asy
     newId("sec"), projectId, "API_KEY", "keychain", serviceName(projectId, "API_KEY"), now()
   );
   const { exec } = stubExec(() => OK("resolvedvalue99\n"));
-  const env = await resolveProjectSecrets(db, projectId, exec);
+  const env = await resolveProjectSecrets(db, projectId, exec, "darwin");
   expect(env).toEqual({ API_KEY: "resolvedvalue99" });
   // value is now registered for redaction
   expect(redact({ v: "resolvedvalue99" }).v).toBe("***");

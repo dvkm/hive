@@ -431,7 +431,19 @@ test("the explanation page for the current head is embedded as a sandboxed ifram
   api.task = (async (id: string) => explainDetail(id, "abc123", "abc123")) as typeof api.task;
   try {
     const renderer = await renderReview({ ...task("explain-current"), head_sha: "abc123" });
-    const frame = renderer.root.findAllByType("iframe").find((f) => String(f.props.className).includes("explain-embed-frame"));
+    // Other test files may install a phone-sized global window while Bun runs
+    // files concurrently. Open the responsive disclosure when needed; this
+    // test is about the iframe boundary, while the phone test below owns the
+    // initial collapsed-state assertion.
+    let frame = renderer.root.findAllByType("iframe").find((f) => String(f.props.className).includes("explain-embed-frame"));
+    if (!frame) {
+      const open = renderer.root.findAll(
+        (n) => n.type === "button" && n.children.includes("Open visual explanation")
+      )[0];
+      expect(open).toBeTruthy();
+      await act(async () => open.props.onClick());
+      frame = renderer.root.findAllByType("iframe").find((f) => String(f.props.className).includes("explain-embed-frame"));
+    }
     expect(frame).toBeTruthy();
     expect(frame!.props.sandbox).toBe("allow-scripts");
     expect(frame!.props.src).toBe("/evidence/explain-current/1_explanation.html");
