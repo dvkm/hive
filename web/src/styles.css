@@ -125,6 +125,16 @@ textarea { font-family: inherit; }
   backdrop-filter: blur(18px) saturate(120%);
   -webkit-backdrop-filter: blur(18px) saturate(120%);
   -webkit-app-region: drag;
+  /* backdrop-filter forces its own stacking context, but with no explicit
+     z-index the topbar still stacks at "auto" (~0) against page content, so
+     anything with a real z-index (sticky column headers, filter bars, card
+     hover actions...) painted after it in the DOM wins and shows through
+     the "opaque" dropdown panels nested inside (Browse, notifications).
+     Give the whole topbar a z-index above ordinary page content so its
+     popovers reliably win, while staying below true full-page overlays
+     (modals/palette/toasts use 100-1200). */
+  position: relative;
+  z-index: 100;
 }
 .topbar button,
 .topbar a,
