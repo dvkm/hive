@@ -262,7 +262,7 @@ export interface Project {
     max_agents?: number;
     supervisor_persona?: string;
     playbook?: string;
-    agent?: "claude" | "codex";
+    agent?: "claude" | "codex" | "teamclaude";
     codex_model?: string;
     codex_model_by_kind?: Partial<Record<Kind, string>>;
     codex_reasoning_effort?: "minimal" | "low" | "medium" | "high" | "xhigh";

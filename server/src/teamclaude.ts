@@ -14,6 +14,14 @@ import { defaultExec, type Exec } from "./exec.ts";
 
 export type TeamclaudeEnv = { set: Record<string, string>; unset: string[] };
 
+// Per-project opt-in for WORKER agents: config.agent = "teamclaude" runs the
+// claude binary with the proxy env injected; plain "claude" runs direct.
+// (Hive's own `claude -p` subprocesses — planner/review/drift/explain — always
+// prefer the proxy when it's up; HIVE_TEAMCLAUDE=0 turns that off.)
+export function usesTeamclaude(config: any): boolean {
+  return config?.agent === "teamclaude";
+}
+
 // Parse `teamclaude env` output. Only export/unset lines matter; comments and
 // blank lines are skipped. Values are printed unquoted today; strip a matching
 // quote pair defensively.
