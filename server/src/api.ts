@@ -2290,6 +2290,7 @@ function mergeIntoEndpoint(db: DB, id: string, body: any): Response {
 function listTasks(db: DB, url: URL): Response {
   const state = url.searchParams.get("state");
   const projectId = url.searchParams.get("project_id");
+  const compact = url.searchParams.get("compact") === "1";
   const includeTest = url.searchParams.get("test") === "all";
   const where: string[] = [];
   const args: any[] = [];
@@ -2305,6 +2306,7 @@ function listTasks(db: DB, url: URL): Response {
   const tasks = tasksWithHealth(db, db.query(sql).all(...args).map(parseTask));
   return json(tasks.map((task) => ({
     ...task,
+    ...(compact ? { brief: undefined } : {}),
     evidence_count: evidenceCount(db, task.id),
     spawn_error: task.state === "queued" &&
       !!db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawn_error' LIMIT 1").get(task.id) &&

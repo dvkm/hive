@@ -39,7 +39,7 @@ export function FailedRow({ task }: { task: Task }) {
   const { projects } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
   const age = useRelTime(task.updated_at);
-  const [editing, setEditing] = useState(false);
+  const [editing, setEditing] = useState<Task | null>(null);
   const trackingOnly = isTrackingOnly(task);
   const act = async (fn: () => Promise<unknown>, msg: string) => {
     try {
@@ -64,7 +64,7 @@ export function FailedRow({ task }: { task: Task }) {
             <button className="btn btn-mini" onClick={() => act(() => api.transition(task.id, "queued", "requeued"), "Re-queued")}>
               Requeue
             </button>
-            <button className="btn btn-mini" onClick={() => setEditing(true)}>
+            <button className="btn btn-mini" onClick={() => api.task(task.id).then(setEditing).catch((e) => toast((e as Error).message))}>
               Edit &amp; requeue
             </button>
           </>
@@ -73,7 +73,7 @@ export function FailedRow({ task }: { task: Task }) {
           Cancel
         </button>
       </div>
-      {editing && !trackingOnly && <EditRequeueModal task={task} onClose={() => setEditing(false)} />}
+      {editing && !trackingOnly && <EditRequeueModal task={editing} onClose={() => setEditing(null)} />}
     </div>
   );
 }

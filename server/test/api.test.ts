@@ -1270,13 +1270,15 @@ test("test projects, their tasks, decisions and checkpoints are hidden by defaul
 });
 
 test("task list includes board metadata without task-detail requests", async () => {
-  const task = await post("/api/tasks", { project_id: projectId, title: "list metadata" });
+  const task = await post("/api/tasks", { project_id: projectId, title: "list metadata", brief: "load only on detail" });
   await post(`/api/tasks/${task.json.id}/events`, { type: "evidence", kind: "log", note: "proof" });
   db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
     .run("evt_list_spawn_error", task.json.id, new Date().toISOString(), "herdr", "spawn_error", "{}");
 
   let listed = (await get("/api/tasks")).json.find((item: any) => item.id === task.json.id);
-  expect(listed).toMatchObject({ evidence_count: 1, spawn_error: true });
+  expect(listed).toMatchObject({ brief: "load only on detail", evidence_count: 1, spawn_error: true });
+  const compact = (await get("/api/tasks?compact=1")).json.find((item: any) => item.id === task.json.id);
+  expect(compact).not.toHaveProperty("brief");
 
   db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
     .run("evt_list_spawned", task.json.id, new Date().toISOString(), "herdr", "spawned", "{}");

@@ -117,18 +117,22 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   // Initial load.
   useEffect(() => {
-    api.tasks().then((ts) => {
+    let fresh = false;
+    const loadTasks = (ts: Task[]) => {
       setTasks(ts);
       setLastActivity(Object.fromEntries(ts.map((t) => [t.id, t.updated_at])));
       setEvidenceCount(Object.fromEntries(ts.map((t) => [t.id, t.evidence_count ?? 0])));
       setSpawnError(Object.fromEntries(ts.map((t) => [t.id, t.spawn_error ?? false])));
-    });
+    };
+    api.cachedTasks().then((ts) => { if (ts && !fresh) loadTasks(ts); });
+    api.tasks().then((ts) => { fresh = true; loadTasks(ts); });
     api.decisions("open").then(setDecisions);
     reloadCheckpoints();
     reloadQuizzes();
     api.offline().then((r) => setOfflineState(r.on)).catch(() => {});
     reloadProjects();
     api.notifications().then((n) => setNotifications(n.notifications)).catch(() => setNotifications([]));
+    return () => { fresh = true; };
   }, []);
 
   // Mark all as read: optimistic local update + server ack.
