@@ -1775,3 +1775,84 @@ test("a project that did not opt in keeps getting a card per dialog", async () =
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dialog_auto_answered'").get(id)).toBeFalsy();
   expect(db.query("SELECT 1 FROM decisions WHERE task_id = ? AND status = 'open'").get(id)).toBeTruthy();
 });
+
+// HIVE-499: a failed review attempt landing AFTER a good one used to erase it
+// for the merge gate but not for the reconciler, so the reconciler asked to
+// merge and the merge refused, once a cycle, forever.
+test("autoMergeReady merges a task whose good review is followed by a review error at the same head", async () => {
+  const { autoMergeReady } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
+  const id = makeTask(db, projectId, { kind: "chore", pr_url: "https://gh/pr/8" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x', head_sha = 'head-1' WHERE id = ?").run(id);
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
+  );
+  writeEvent(db, { task_id: id, source: "agent", type: "review_summary", payload: { done: ["done"] } });
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "auto_review",
+    payload: { verdict: "caution", summary: "s", risks: ["maybe a leak"], questions: [], reviewed_pr_url: "https://gh/pr/8", reviewed_head_sha: "head-1" },
+  });
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "risk_verdicts",
+    payload: { reviewed_head_sha: "head-1", verdicts: [{ risk: "maybe a leak", verdict: "refuted", why: "w" }], question_verdicts: [] },
+  });
+  // The retry-able failure #45 introduced, recorded after the review that stands.
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "auto_review_error",
+    payload: { error: "unparseable reviewer output", attempts: 1, reviewed_pr_url: "https://gh/pr/8", reviewed_head_sha: "head-1" },
+  });
+
+  const git: Exec = stub((argv) => {
+    if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(JSON.stringify({ state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", statusCheckRollup: [{ conclusion: "SUCCESS" }], baseRefName: "main", baseRefOid: "base-sha", headRefOid: "head-1" }));
+    return argv.includes("symbolic-ref") ? OK("main\n") : OK();
+  });
+  await autoMergeReady(db, { exec: git });
+  expect(getTask(db, id).state).toBe("done");
+});
+
+test("autoMergeReady stops retrying a merge that is refused at the same head, and says so once", async () => {
+  const { autoMergeReady } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
+  const id = makeTask(db, projectId, { kind: "chore" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x', head_sha = 'head-1' WHERE id = ?").run(id);
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
+  );
+  // Sensitive path with no quiz submitted: judgment-class, so every merge
+  // attempt is refused with the same 409.
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "auto_review",
+    payload: { verdict: "looks_good", summary: "s", risks: [], questions: [], files: ["db/migrations/007.sql"] },
+  });
+  const git: Exec = stub((argv) => {
+    if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
+    return argv.includes("symbolic-ref") ? OK("main\n") : OK();
+  });
+
+  for (let i = 0; i < 4; i++) await autoMergeReady(db, { exec: git });
+
+  expect(getTask(db, id).state).toBe("in_review");
+  const failures = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'auto_merge_failed'").all(id) as any[];
+  expect(failures.length).toBe(2); // one blip tolerated, never a third identical attempt
+  expect(JSON.parse(failures[1].payload).status).toBe(409);
+  expect(JSON.parse(failures[1].payload).gave_up).toBe(true);
+  // Failures no longer masquerade as merges in the event log.
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'auto_merged'").get(id)).toBeNull();
+  const notes = db.query("SELECT title FROM notifications WHERE task_id = ? AND kind = 'failed'").all(id) as any[];
+  expect(notes.length).toBe(1);
+  expect(notes[0].title).toContain("Auto-merge gave up");
+});

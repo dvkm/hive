@@ -1227,6 +1227,7 @@ const MANAGER_EVENT_TYPES = new Set([
   "pr_merged",
   "merge_failed",
   "auto_merged",
+  "auto_merge_failed",
   "smoke_failed",
   "smoke_passed",
   "verify_wedged",
@@ -2747,7 +2748,7 @@ function ghMergeFlag(method: string | undefined): string {
 // records everything for a respawned agent). Other failures (CI blocked, auth,
 // gh missing) keep the task in_review and just report the reason.
 const MERGE_CONFLICT_RE = /conflict|not mergeable|not an ancestor|fast-forward/i;
-const AUTO_MERGE_PAUSED = "auto-merge paused because task readiness changed; review the task again";
+export const AUTO_MERGE_PAUSED = "auto-merge paused because task readiness changed; review the task again";
 async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason: string, actor: string | null = null): Promise<Response> {
   const conflict = MERGE_CONFLICT_RE.test(reason);
   const msg = `hive: merge into '${base}' failed — ${reason}\nRebase your branch '${task.branch}' onto the latest '${base}', resolve the conflicts, rerun the tests, then push.`;

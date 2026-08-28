@@ -321,20 +321,35 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
   }
 }
 
-// The latest auto_review payload for a task, or null when the newest review
-// event is an error, a skip, or malformed. Lives with the code that WRITES
-// these events; api.ts imports it rather than keeping a second copy.
+// The latest usable review for a task, or null when there is none (only a skip
+// or a malformed payload). Lives with the code that WRITES these events; api.ts
+// and reconciler.ts import it rather than keeping a second copy.
+//
+// Failed attempts (`auto_review_error`) are NOT read here. A later failure does
+// not un-review an earlier success: the review happened, and its risk verdicts
+// are still keyed to that head. Counting it made autoMergeReady (which reads
+// successes only) and understandingChecksRequired (which read both) disagree
+// about the same task, so the reconciler asked for a merge every cycle and the
+// merge refused every cycle, forever (HIVE-499). Callers that care about
+// freshness compare `reviewed_head_sha` to the head they are about to act on.
 export function latestAutoReviewVerdict(
   db: DB,
   taskId: string
-): { verdict: string; files: string[]; risks: string[]; questions: string[]; reviewed_head_sha?: string } | null {
+): {
+  verdict: string;
+  files: string[];
+  risks: string[];
+  questions: string[];
+  reviewed_pr_url?: string;
+  reviewed_head_sha?: string;
+} | null {
   const row = db
     .query(
-      `SELECT type, payload FROM events WHERE task_id = ? AND type IN ('auto_review', 'auto_review_error')
+      `SELECT payload FROM events WHERE task_id = ? AND type = 'auto_review'
         ORDER BY ts DESC, rowid DESC LIMIT 1`
     )
-    .get(taskId) as { type: string; payload: string } | undefined;
-  if (!row || row.type !== "auto_review") return null;
+    .get(taskId) as { payload: string } | undefined;
+  if (!row) return null;
   try {
     const payload = JSON.parse(row.payload);
     if (payload?.skipped || typeof payload?.verdict !== "string") return null;
@@ -343,6 +358,7 @@ export function latestAutoReviewVerdict(
       files: Array.isArray(payload.files) ? payload.files.map(String) : [],
       risks: Array.isArray(payload.risks) ? payload.risks.map(String) : [],
       questions: Array.isArray(payload.questions) ? payload.questions.map(String) : [],
+      reviewed_pr_url: typeof payload.reviewed_pr_url === "string" ? payload.reviewed_pr_url : undefined,
       reviewed_head_sha: typeof payload.reviewed_head_sha === "string" ? payload.reviewed_head_sha : undefined,
     };
   } catch {
