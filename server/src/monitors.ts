@@ -123,9 +123,12 @@ function createIncidentTask(db: DB, projectId: string, mon: Check, detail: strin
   const id = newId();
   const title = `Monitor down: ${mon.name}`;
   const brief = `Automated: monitor "${mon.name}" (${mon.url}) failed.\n\n${detail}\n\nInvestigate and restore service.`;
+  // A monitor firing means something is already down, so the task starts at
+  // 'next' rather than the default 'normal'. Never 'now': only the director
+  // grants that level, and it can borrow a slot past the agent cap.
   db.query(
-    `INSERT INTO tasks (id, project_id, title, brief, state, kind, created_at, updated_at)
-     VALUES (?,?,?,?, 'queued', 'chore', ?, ?)`
+    `INSERT INTO tasks (id, project_id, title, brief, state, kind, priority, created_at, updated_at)
+     VALUES (?,?,?,?, 'queued', 'chore', 'next', ?, ?)`
   ).run(id, projectId, title, brief, t, t);
   writeEvent(db, { task_id: id, source: "monitor", type: "created", payload: { title, monitor: mon.name } });
   broadcast({ type: "task", task: getTask(db, id) });

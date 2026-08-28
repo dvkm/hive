@@ -8,7 +8,7 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-reviewer-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb, newId, now } = await import("../src/db.ts");
-const { autoReviewOnce, extractReview } = await import("../src/reviewer.ts");
+const { autoReviewOnce, extractReview, MAX_REVIEW_ATTEMPTS } = await import("../src/reviewer.ts");
 const { transition, writeEvent } = await import("../src/state.ts");
 import type { DB } from "../src/db.ts";
 import type { Exec } from "../src/exec.ts";
@@ -447,4 +447,67 @@ test("verifyPendingOnce leaves alone a review whose verdicts already cover it", 
   const claude = async () => { throw new Error("should not run"); };
   await verifyPendingOnce(db, { exec: claude as any, shellExec: ghDiff });
   expect(events(db, id, "risk_verdicts")).toHaveLength(1);
+});
+
+// HIVE-497: a failed pre-review used to retire the card at that head forever.
+// Any blip (model timeout, rate limit, expired login) took the task out of the
+// review queue permanently, and 31 of 36 cards ended up stuck that way.
+const ageEvents = (db: DB, id: string) =>
+  db.query("UPDATE events SET ts = ? WHERE task_id = ? AND type = 'auto_review_error'").run(
+    new Date(Date.now() - 6 * 3600_000).toISOString(),
+    id
+  );
+
+test("a failed pre-review is retried once the backoff has passed, and can then succeed", async () => {
+  const { db, id } = setup();
+  const failing = async () => ({ code: 1, stdout: "", stderr: "boom" });
+  const ok = async () => ({
+    code: 0,
+    stdout: JSON.stringify({ result: '{"verdict":"looks_good","summary":"fine","risks":[],"questions":[]}' }),
+    stderr: "",
+  });
+  await autoReviewOnce(db, { exec: failing, shellExec: ghDiff });
+  await autoReviewOnce(db, { exec: failing, shellExec: ghDiff }); // inside backoff: no retry
+  expect(events(db, id, "auto_review_error")).toHaveLength(1);
+  ageEvents(db, id);
+  await autoReviewOnce(db, { exec: ok, shellExec: ghDiff });
+  expect(events(db, id, "auto_review")).toHaveLength(1);
+});
+
+test("an auth outage never spends the retry budget, so those cards free themselves", async () => {
+  const { db, id } = setup();
+  const notLoggedIn = async () => ({
+    code: 1,
+    stdout: JSON.stringify({ is_error: true, result: "Not logged in - Please run /login" }),
+    stderr: "",
+  });
+  for (let i = 0; i < MAX_REVIEW_ATTEMPTS + 1; i++) {
+    await autoReviewOnce(db, { exec: notLoggedIn, shellExec: ghDiff });
+    ageEvents(db, id);
+  }
+  const errs = events(db, id, "auto_review_error");
+  expect(errs.length).toBe(MAX_REVIEW_ATTEMPTS + 1);
+  expect(errs.some((e: any) => e.payload.gave_up)).toBe(false);
+  const ok = async () => ({
+    code: 0,
+    stdout: JSON.stringify({ result: '{"verdict":"looks_good","summary":"fine","risks":[],"questions":[]}' }),
+    stderr: "",
+  });
+  await autoReviewOnce(db, { exec: ok, shellExec: ghDiff });
+  expect(events(db, id, "auto_review")).toHaveLength(1);
+});
+
+test("after the retry budget runs out the card is flagged for a human, not silently skipped", async () => {
+  const { db, id } = setup();
+  const failing = async () => ({ code: 1, stdout: "", stderr: "boom" });
+  for (let i = 0; i < MAX_REVIEW_ATTEMPTS + 2; i++) {
+    await autoReviewOnce(db, { exec: failing, shellExec: ghDiff });
+    ageEvents(db, id);
+  }
+  const errs = events(db, id, "auto_review_error");
+  expect(errs).toHaveLength(MAX_REVIEW_ATTEMPTS); // stops trying at the cap
+  expect(errs[MAX_REVIEW_ATTEMPTS - 1].payload.gave_up).toBe(true);
+  const notes: any[] = db.query("SELECT title FROM notifications WHERE task_id = ? AND kind = 'failed'").all(id);
+  expect(notes).toHaveLength(1);
+  expect(notes[0].title).toContain("gave up");
 });

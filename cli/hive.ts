@@ -12,13 +12,20 @@ Usage:
   hive serve                              start the daemon
   hive task create --project <id> --title <t> [--brief <file> | --brief-text <s>]
         [--kind ship|scout|chore] [--parent <task-id>] [--depends-on <id,id>] [--track]
+        [--priority now|next|normal|later]
         (under a hive agent, HIVE_TASK_ID makes source=agent + parent automatic;
          --track = tracking-only: never auto-dispatched, moves freely, no evidence gate)
+        (priority is queue ORDER, never preemption. Omit it and the task inherits
+         its parent's, or starts at 'next' when the brief is security-shaped,
+         else 'normal'. Tasks created together in a depends-on chain do NOT
+         inherit from the chain head: pass --priority on each one you want it on.
+         Only the director may set 'now' — under a hive agent it is refused.)
   hive task send <task-id> <message>   attributed teammate message under a hive agent
   hive task move <task-id> <state> [--note <s>]   states: queued in_progress needs_decision
         in_review verifying done failed cancelled
   hive task list [--state <s>] [--project <id>]
-  hive task update <task-id> --depends-on <id,id>   declare a dependency discovered mid-task
+  hive task update <task-id> [--depends-on <id,id>] [--priority now|next|normal|later]
+        --depends-on declares a dependency discovered mid-task
         (e.g. "my PR needs #993's to merge first"); full replace, so pass every
         id this task should still wait on, not just the new one
   hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>] [--landing-commit <sha>] [--verify-name <name>]
@@ -206,6 +213,7 @@ async function main() {
         parent_task_id: flags.parent ?? agentTask ?? undefined,
         depends_on: flags["depends-on"] ? String(flags["depends-on"]) : undefined,
         source: flags.track ? "external" : agentTask ? "agent" : undefined,
+        priority: flags.priority ? String(flags.priority) : undefined,
       });
       console.log(`created task ${t.id}  [${t.state}]  ${t.title}`);
       // #989: the server checks the brief's file paths against the chosen
@@ -247,10 +255,14 @@ async function main() {
     }
     if (sub === "update") {
       const taskId = _[0];
-      if (!taskId) die("usage: hive task update <task-id> --depends-on <id,id>");
-      if (flags["depends-on"] === undefined) die("--depends-on is required (full replace — pass every id this task should wait on)");
-      const t = await api("PUT", `/api/tasks/${taskId}`, { depends_on: String(flags["depends-on"]) });
-      console.log(`task ${t.id} depends_on: ${t.depends_on.length ? t.depends_on.join(", ") : "(none)"}`);
+      if (!taskId) die("usage: hive task update <task-id> [--depends-on <id,id>] [--priority now|next|normal|later]");
+      if (flags["depends-on"] === undefined && flags.priority === undefined)
+        die("pass --depends-on (full replace — every id this task should wait on) and/or --priority");
+      const t = await api("PUT", `/api/tasks/${taskId}`, {
+        depends_on: flags["depends-on"] !== undefined ? String(flags["depends-on"]) : undefined,
+        priority: flags.priority ? String(flags.priority) : undefined,
+      });
+      console.log(`task ${t.id} depends_on: ${t.depends_on.length ? t.depends_on.join(", ") : "(none)"}  priority: ${t.priority}`);
       return;
     }
     die(`unknown 'task' subcommand: ${sub}\n\n${USAGE}`);
