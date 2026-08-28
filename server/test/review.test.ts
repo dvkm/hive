@@ -233,13 +233,13 @@ async function get(base: string, path: string) {
 }
 
 test("makeServer skips occupied test ports", async () => {
-  const occupiedPort = nextTestPort();
-  const occupied = Bun.serve({ port: occupiedPort, fetch: () => new Response() });
+  const occupied = makeServer();
+  const occupiedPort = occupied.server.port;
   testPortCounter = occupiedPort;
   const s = makeServer();
   expect(s.server.port).toBeGreaterThan(occupiedPort);
   await s.server.stop(true);
-  await occupied.stop(true);
+  await occupied.server.stop(true);
 });
 
 // Drive a task to in_review with a branch set (via a stubbed spawn).
