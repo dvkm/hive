@@ -16,6 +16,7 @@ import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectComparisonBase } from "./exec.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { modelFailure, modelErrorText, noteModelCall } from "./modelCall.ts";
 import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 import { supervisedSql } from "./supervision.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
@@ -209,12 +210,13 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
       source: "system",
       type: "auto_review_error",
       payload: {
-        error: res.timedOut ? `timed out after ${TIMEOUT_MS}ms` : `exited ${res.code}: ${res.stderr.trim().slice(0, 300)}`,
+        error: modelFailure(db, res, { timeoutMs: TIMEOUT_MS }),
         ...reviewIdentity,
       },
     });
     return;
   }
+  noteModelCall(db, null);
   let review = extractReview(res.stdout);
   if (!review) {
     // Retry once with a stricter format instruction before giving up — most
@@ -555,17 +557,24 @@ export async function verifyRisks(
   const verdicts: RiskVerdict[] = [];
   const question_verdicts: QuestionVerdict[] = [];
   let unverified = 0;
+  // The reason the last run failed. `unverified` alone reads as "the model was
+  // unsure"; an auth outage is a completely different story (hive-1800).
+  let unverified_reason: string | null = null;
   for (const risk of risks) {
     if (!(await current())) return;
     const res = await run(verifyPrompt(task, risk, input.diff));
-    const v = !res || res.timedOut || res.code !== 0 ? null : extractVerdict(res.stdout);
+    const failed = !res || noteModelCall(db, res.code === 0 && !res.timedOut ? null : modelErrorText(res, { timeoutMs: TIMEOUT_MS }));
+    if (typeof failed === "string") unverified_reason = failed;
+    const v = failed ? null : extractVerdict(res!.stdout);
     if (v) verdicts.push({ risk, ...v });
     else unverified++;
   }
   for (const question of questions) {
     if (!(await current())) return;
     const res = await run(answerPrompt(task, question, input.diff));
-    const a = !res || res.timedOut || res.code !== 0 ? null : extractAnswer(res.stdout);
+    const failed = !res || noteModelCall(db, res.code === 0 && !res.timedOut ? null : modelErrorText(res, { timeoutMs: TIMEOUT_MS }));
+    if (typeof failed === "string") unverified_reason = failed;
+    const a = failed ? null : extractAnswer(res!.stdout);
     if (a) question_verdicts.push({ question, ...a });
     else unverified++;
   }
@@ -579,6 +588,7 @@ export async function verifyRisks(
       verdicts,
       ...(question_verdicts.length ? { question_verdicts } : {}),
       ...(unverified ? { unverified } : {}),
+      ...(unverified_reason ? { unverified_reason } : {}),
     } as any,
   });
   broadcast({ type: "task", task: getTask(db, task.id) });
@@ -612,6 +622,21 @@ export function riskVerdictsFor(
     };
   }
   return null;
+}
+
+// Has the review pipeline actually FINISHED for this head (HIVE-488)? Read
+// from the other side, this is the same test verifyPendingOnce uses to decide a
+// task needs no further verification: the newest review was written for this
+// exact head, and every risk and question it raised already has a verdict keyed
+// to that head. Until then the missing quiz answer is a pass that has not run,
+// not a question for the director — so the director surfaces must not count it.
+export function reviewCompleteForHead(db: DB, taskId: string, head: string | null | undefined): boolean {
+  if (!head) return false;
+  const review = latestAutoReviewVerdict(db, taskId);
+  if (!review || review.reviewed_head_sha !== head) return false;
+  const expected =
+    (review.risks ?? []).slice(0, MAX_VERIFIED_RISKS).length + (review.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS).length;
+  return expected === 0 || hasRiskVerdicts(db, taskId, head, expected);
 }
 
 export function confirmedRisks(db: DB, taskId: string, head: string | null | undefined): RiskVerdict[] {
