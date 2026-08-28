@@ -112,7 +112,7 @@ test("taskDiff uses git diff base...branch for a branch task, gh for a PR task",
 // still has a stale connection cached for that port — occasionally delivering
 // a stray/garbled response to a totally unrelated request (hive-1694). Every
 // server in this file gets its own never-reused port instead.
-let testPortCounter = 34567;
+let testPortCounter = 10_000 + ((process.pid + Math.floor(Math.random() * 10_000)) % 20_000);
 function nextTestPort(): number {
   return testPortCounter++;
 }
