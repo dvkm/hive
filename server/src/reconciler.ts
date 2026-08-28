@@ -703,7 +703,10 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
         writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_merged", payload: { pr_url: t.pr_url } });
         // in_progress can't jump straight to verifying — hop through in_review
         // first, same path a non-deferred task takes on its way to merge.
-        transition(db, t.id, "in_review", { source: "reconciler", reason: "PR merged while deferred — catching up review" });
+        // skipVerification: the PR already merged, so the verification contract
+        // has nothing left to hold back — a gate here would park the task in
+        // in_progress with no agent and no way out (HIVE-402).
+        transition(db, t.id, "in_review", { source: "reconciler", reason: "PR merged while deferred — catching up review", skipVerification: true });
         transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged (deferred task undeferred)" });
         await advanceAfterMerge(db, t.id, deps);
       } else {

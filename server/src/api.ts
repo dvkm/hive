@@ -15,6 +15,7 @@ import {
   TransitionError,
   TERMINAL,
   advanceIfFinished,
+  verificationGate,
   evidenceCount,
   evidenceAtSha,
   changesRequestUnaddressed,
@@ -2146,6 +2147,10 @@ export function handOffToReview(db: DB, taskId: string, source: string): boolean
   // missing one holds the task here and kicks off the generation, which calls
   // back into this function when the page lands.
   if (explanationGate(db, t) !== "ready") return false;
+  // #1579: every named verification command needs its own evidence before the
+  // director sees the card. Checked here (not left to transition's throw) so the
+  // reconciler's per-cycle poll holds quietly instead of raising.
+  if (verificationGate(db, t, source).length > 0) return false;
   transition(db, taskId, "in_review", { source, reason: "PR open, awaiting review" });
   return true;
 }
