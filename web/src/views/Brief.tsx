@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
-import type { Brief, Evidence } from "../lib/api";
+import type { AutonomyStats, Brief, Evidence } from "../lib/api";
 import { useStore } from "../lib/store";
 import { StatusDot, HEALTH_LABEL } from "../lib/ui";
 import { DecisionCard } from "./DecisionCard";
@@ -10,6 +10,7 @@ import { AttentionRows, BlockedByLine } from "./attention";
 import { CheckpointsInbox } from "./Checkpoints";
 import { UnderstandingQuiz } from "./UnderstandingQuiz";
 import { RequestChanges } from "./RequestChanges";
+import { HeldSummary } from "./Away";
 import { fmtUsd, fmtTokens } from "./Analytics";
 import { itemProject, orderFocusItems } from "../lib/needsYou";
 import type { NeedsYouItem } from "../lib/needsYou";
@@ -68,6 +69,68 @@ function TaskEvidence({ taskId, title, compact = false }: { taskId: string; titl
     return () => { live = false; };
   }, [taskId, rev[taskId]]);
   return <EvidenceStrip evidence={evidence} task={{ id: taskId, title, head_sha: task?.head_sha ?? null }} limit={compact ? 4 : undefined} />;
+}
+
+const BLOCKS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588";
+
+// Shape of the last 7 days, scaled to the tallest day. The per-day number next
+// to it carries the magnitude.
+function sparkbar(values: number[]): string {
+  const tail = values.slice(-7);
+  if (!tail.length) return "";
+  const max = Math.max(...tail);
+  return tail.map((v) => (max <= 0 ? BLOCKS[0] : BLOCKS[Math.min(7, Math.round((v / max) * 7))])).join("");
+}
+
+const pct = (r: number) => `${Math.round(r * 100)}%`;
+
+// The autonomy scoreboard: four read-only numbers on whether hive's automation
+// is earning trust. No thresholds and no alerts here on purpose — what counts
+// as "good enough to loosen the reins" stays the director's call.
+export function AutonomyPanel({ project }: { project?: string }) {
+  const [stats, setStats] = useState<AutonomyStats | null>(null);
+  useEffect(() => {
+    let live = true;
+    api.autonomyStats(7, project).then((s) => live && setStats(s)).catch(() => live && setStats(null));
+    return () => { live = false; };
+  }, [project]);
+  if (!stats) return null;
+  const { auto_merge_precision: merge, inbox_load: inbox, recovery, agreement } = stats;
+  return (
+    <section className="brief-section">
+      <h2 className="brief-h">Autonomy <span className="muted autonomy-window">last {stats.window.days}d</span></h2>
+      <div className="autonomy-grid">
+        <div className="autonomy-cell">
+          <span className="autonomy-label">Auto-merges that stuck</span>
+          <span className="autonomy-value">{merge.precision === null ? "no data" : pct(merge.precision)}</span>
+          <span className="muted">
+            {merge.precision === null
+              ? `${merge.merges} merges, none measurable`
+              : `${merge.clean} of ${merge.measurable} clean, ${merge.fixed} fixed after merge`}
+          </span>
+        </div>
+        <div className="autonomy-cell">
+          <span className="autonomy-label">Asks for you</span>
+          <span className="autonomy-value">{inbox.per_day.toFixed(1)}<small>/day</small></span>
+          <span className="muted"><span className="autonomy-spark">{sparkbar(inbox.by_day.map((d) => d.total))}</span> {inbox.totals.total} in {stats.window.days}d</span>
+        </div>
+        <div className="autonomy-cell">
+          <span className="autonomy-label">Unstuck itself</span>
+          <span className="autonomy-value">{recovery.auto_respawns}</span>
+          <span className="muted">{recovery.one_cap_parks} held at cap, {recovery.scouts_spawned} scouts</span>
+        </div>
+        <div className="autonomy-cell">
+          <span className="autonomy-label">You agreed with hive</span>
+          <span className="autonomy-value">{agreement.agreement_rate === null ? "no data" : pct(agreement.agreement_rate)}</span>
+          <span className="muted">
+            {agreement.agreement_rate === null
+              ? "hive answered nothing itself"
+              : `${agreement.auto_answered} decisions hive answered itself`}
+          </span>
+        </div>
+      </div>
+    </section>
+  );
 }
 
 export default function Brief() {
@@ -204,6 +267,8 @@ export default function Brief() {
           </button>
         ))}
       </div>
+
+      <HeldSummary />
 
       {data && actionCount === 0 && (
         <div className="brief-quiet">
@@ -430,6 +495,8 @@ export default function Brief() {
                 </div>
               </section>
             )}
+
+            <AutonomyPanel project={projectFilter} />
 
             <Section title="New learnings" count={learnings.length}>
               <ul className="brief-list">

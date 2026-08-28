@@ -12,7 +12,7 @@ import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { startLoop } from "./loop.ts";
-import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, repairRequeueProvenance, TERMINAL, type State } from "./state.ts";
+import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, verificationGate, repairRequeueProvenance, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
 import { spawnMeta } from "./cleanup.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent, resumeReviewForDeliveredSteers } from "./steer.ts";
@@ -1462,6 +1462,13 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     if (contested) continue; // a human pushed back once — never auto-merge this task
     const evidence = (db.query("SELECT COUNT(*) n FROM evidence WHERE task_id = ?").get(r.id) as any).n;
     if (!evidence) continue;
+    // HIVE-403: the task's own verification contract is part of "ready to
+    // ship". Any command the agent declared but never produced evidence for
+    // holds the auto-merge — same checker the review handoff uses, so the two
+    // gates can never disagree. verificationGate (not the bare check) logs the
+    // gap once per distinct name set, giving the agent's next steer something
+    // to cite instead of a silent skip every cycle.
+    if (verificationGate(db, getTask(db, r.id), "reconciler").length) continue;
     // Nothing about this task changes between reconciler cycles, so a refusal
     // at this head will be refused again next cycle, and the cycle after that.
     // HIVE-473 wrote three identical 409s in two minutes and would have kept

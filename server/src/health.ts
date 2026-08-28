@@ -15,6 +15,7 @@ import { isDeferred, unmetDeps, TERMINAL, type State } from "./state.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
 import { latestSidecar, latestSidecarBatch, type SidecarReport } from "./sidecar.ts";
 import { reviewActionable } from "./reviewer.ts";
+import { isReviewed } from "./dispatcher.ts";
 
 export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
 
@@ -293,7 +294,12 @@ export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null
   // `review_actionable` (HIVE-500) is server-computed for the same reason health
   // is: it reads events the browser never sees. Only in-review tasks carry it;
   // everywhere else it is false and means nothing.
-  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), review_actionable: reviewActionable(db, task), sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
+  //
+  // Intake tasks are held until reviewed (dispatcher.ts's isReviewed), and
+  // intake triage can mark one reviewed on its own — so the board needs the
+  // flag to know whether to say "unreviewed". Only intake tasks pay the query.
+  const reviewed = task.source?.startsWith("intake_") ? isReviewed(db, task.id) : undefined;
+  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), review_actionable: reviewActionable(db, task), reviewed, sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
 }
 
 // Batched form of taskWithHealth for list endpoints (task HIVE-447): looks up

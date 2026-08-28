@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
-import type { BranchCheck, DiffFile, DiffResult, Evidence, ReviewItem, ReviewSummary, Task, UnderstandingPacket } from "../lib/api";
+import type { BranchCheck, DiffFile, DiffResult, Evidence, ReviewItem, ReviewSummary, Task, UnderstandingPacket, VerificationItem } from "../lib/api";
 import { useStore } from "../lib/store";
 import { CiBadge, SidecarChip, toast } from "../lib/ui";
 import { MAX_DIFF_LINES } from "../lib/api";
@@ -71,6 +71,48 @@ function EvChip({ e, headSha }: { e: Evidence; headSha: string | null }) {
     <span className="rev-ev-chip" title={label}>
       {body}
     </span>
+  );
+}
+
+// The task's verification contract, as a checklist (HIVE-403). The director
+// should not have to infer from a pile of evidence chips whether the commands
+// the agent promised to run actually ran: one line per command, its evidence
+// linked, the unproven ones marked. The server resolves satisfied/missing with
+// the very same checker the merge gate uses, so this can't drift from it.
+export function VerificationChecklist({ items, evidence }: { items: VerificationItem[]; evidence: Evidence[] }) {
+  if (!items.length) return null;
+  const byId = new Map(evidence.map((e) => [e.id, e]));
+  const missing = items.filter((i) => !i.satisfied).length;
+  return (
+    <div className="review-verify">
+      <div className="review-verify-head">
+        <span>Verification contract</span>
+        <small>{missing ? `${missing} of ${items.length} unproven` : `all ${items.length} verified`}</small>
+      </div>
+      <ul>
+        {items.map((i) => {
+          const e = i.evidence_id ? byId.get(i.evidence_id) : undefined;
+          return (
+            <li key={i.name} className={i.satisfied ? "verify-ok" : "verify-missing"}>
+              <span className="verify-mark">{i.satisfied ? "✓" : "✗"}</span>
+              <span className="verify-name">{i.name}</span>
+              <code className="verify-cmd" title={i.cmd}>{i.cmd}</code>
+              {i.satisfied ? (
+                e?.url ? (
+                  <a className="verify-link" href={e.url} target="_blank" rel="noreferrer">
+                    {e.caption || "evidence"}
+                  </a>
+                ) : (
+                  <span className="verify-link muted">evidence attached</span>
+                )
+              ) : (
+                <span className="verify-link">no evidence</span>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
   );
 }
 
@@ -480,6 +522,7 @@ export function ReviewCard({
   const [mergeErr, setMergeErr] = useState("");
   const [branchCheck, setBranchCheck] = useState<BranchCheck | null>(null);
   const [evidence, setEvidence] = useState<Evidence[]>([]);
+  const [verification, setVerification] = useState<VerificationItem[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
   const [openDecisions, setOpenDecisions] = useState<Decision[]>([]);
 
@@ -492,6 +535,7 @@ export function ReviewCard({
     setReviewLoaded(false);
     setQuizOverride(null);
     setEvidence([]);
+    setVerification([]);
     setBranchCheck(null);
     // Same-route navigation between tasks re-renders this component in place
     // (no remount) — without this, a "Request changes" editor left open on
@@ -530,6 +574,7 @@ export function ReviewCard({
           setReviewEventId(ev.id);
         }
         setEvidence(t.evidence ?? []);
+        setVerification(t.verification ?? []);
         setEvents(t.events ?? []);
         setOpenDecisions((t.decisions ?? []).filter((d: Decision) => d.status === "open"));
         const mergeReason = t.health?.status === "stuck" && /^merge (?:failed|blocked): /.test(t.health.reason ?? "")
@@ -831,6 +876,8 @@ export function ReviewCard({
         )}
         <RiskVerdicts events={events} headSha={task.head_sha} />
       </div>
+
+      <VerificationChecklist items={verification} evidence={evidence} />
 
       <EvidenceStrip evidence={evidence.filter((e) => e.kind !== "explanation")} task={task} />
 

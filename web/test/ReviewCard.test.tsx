@@ -552,3 +552,58 @@ test("verdicts recorded for an older head are not shown against this one", async
     api.task = originalTask;
   }
 });
+
+// HIVE-403: the verification contract renders as a checklist on the card, with
+// each satisfied command linked to its evidence file and the unproven ones
+// marked, so the director sees what was actually run before shipping.
+test("the review card renders the verification contract as a checklist", async () => {
+  const originalTask = api.task;
+  api.task = (async (id: string) => ({
+    ...detail(id, "agent"),
+    evidence: [
+      {
+        id: "ev-1",
+        task_id: id,
+        ts: "2026-01-01T00:00:00.000Z",
+        kind: "test_run" as const,
+        path: "/tmp/unit.txt",
+        url: "http://hive/evidence/ev-1",
+        caption: "unit run",
+        meta: {},
+      },
+    ],
+    verification: [
+      { name: "unit", cmd: "bun test", satisfied: true, evidence_id: "ev-1" },
+      { name: "typecheck", cmd: "bun run tsc --noEmit", satisfied: false, evidence_id: null },
+    ],
+  })) as typeof api.task;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree(task("verify-card")));
+    });
+
+    const rows = renderer.root.findAll((n) => n.type === "li" && String(n.props.className ?? "").startsWith("verify-"));
+    expect(rows).toHaveLength(2);
+    expect(rows[0].props.className).toBe("verify-ok");
+    expect(rows[1].props.className).toBe("verify-missing");
+
+    // The satisfied one links to its evidence file; the missing one says so.
+    const link = renderer.root.findAll((n) => n.type === "a" && n.props.className === "verify-link")[0];
+    expect(link.props.href).toBe("http://hive/evidence/ev-1");
+    const rendered = JSON.stringify(renderer.toJSON());
+    expect(rendered).toContain("typecheck");
+    expect(rendered).toContain("no evidence");
+    expect(rendered).toContain("1 of 2 unproven");
+  } finally {
+    api.task = originalTask;
+  }
+});
+
+test("a task with no verification contract renders no checklist", async () => {
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(task("no-contract")));
+  });
+  expect(renderer.root.findAll((n) => n.props?.className === "review-verify")).toHaveLength(0);
+});

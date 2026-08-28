@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { api, apiToken } from "./api";
-import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Checkpoint, UnderstandingQuiz, ChatMessage } from "./api";
+import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Checkpoint, UnderstandingQuiz, ChatMessage, Away } from "./api";
 import { getNeedsYouItems } from "./needsYou";
 import type { NeedsYouItem } from "./needsYou";
 
@@ -26,6 +26,8 @@ export interface Store {
   needsYou: NeedsYouItem[];
   offline: boolean; // offline mode: fleet drained, nothing new spawns
   setOffline: (on: boolean) => void;
+  away: Away; // away mode: low-urgency phone pushes are held and batched
+  setAway: (on: boolean) => void; // the manual switch (the schedule still applies)
   sse: SseState;
   // Director chat (persistent supervisor session). Only the open thread's
   // messages are held; SSE appends live as the supervisor replies.
@@ -77,6 +79,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const setOffline = (on: boolean) => {
     setOfflineState(on); // optimistic; SSE confirms
     api.setOffline(on).catch(() => setOfflineState(!on));
+  };
+  const [away, setAwayState] = useState<Away>({ on: false, active: false, held: 0 });
+  const reloadAway = () => api.away().then(setAwayState).catch(() => {});
+  const setAway = (on: boolean) => {
+    setAwayState((a) => ({ ...a, on, active: on })); // optimistic; the response is the truth
+    api.setAway(on).then(setAwayState).catch(reloadAway);
   };
   const reloadCheckpoints = () => api.checkpoints().then((r) => setCheckpoints(r.checkpoints)).catch(() => {});
   const reloadQuizzes = () => api.understandingQuizzes().then((r) => setQuizzes(r.quizzes)).catch(() => {});
@@ -130,6 +138,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     reloadCheckpoints();
     reloadQuizzes();
     api.offline().then((r) => setOfflineState(r.on)).catch(() => {});
+    reloadAway();
     reloadProjects();
     api.notifications().then((n) => setNotifications(n.notifications)).catch(() => setNotifications([]));
     return () => { fresh = true; };
@@ -214,6 +223,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           setFeedEvents((prev) => [synthetic, ...prev].slice(0, FEED_CAP));
         } else if (msg.type === "offline") {
           setOfflineState(!!msg.on);
+        } else if (msg.type === "away") {
+          // The schedule flipped away mode. Refetch so the banner, the held
+          // count, and the wake-up summary all move together.
+          reloadAway();
         } else if (msg.type === "notification") {
           const n: Notification = msg.notification;
           setNotifications((prev) => (prev.some((x) => x.id === n.id) ? prev : [n, ...prev]));
@@ -241,7 +254,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, quizzes, reloadQuizzes, needsYou, offline, setOffline, sse, chatThreadId, chatMessages, chatDelivery, openChatThread, onChatMessage }}>
+    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, quizzes, reloadQuizzes, needsYou, offline, setOffline, away, setAway, sse, chatThreadId, chatMessages, chatDelivery, openChatThread, onChatMessage }}>
       {children}
     </Ctx.Provider>
   );

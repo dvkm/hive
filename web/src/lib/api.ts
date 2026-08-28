@@ -140,6 +140,7 @@ export interface Task {
   requeued_to?: string | null; // successor id when failed + auto-requeued
   review_actionable?: boolean; // in_review AND the director can act on it now (server-computed, HIVE-500)
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
+  reviewed?: boolean; // intake tasks only: the director (or intake triage) signalled it is free to dispatch
   created_at: string;
   updated_at: string;
 }
@@ -198,6 +199,9 @@ export interface Decision {
   // chat_supervisor/agent/system for programmatic callers; unknown if unattributed.
   answered_by: "director" | "chat_supervisor" | "agent" | "system" | "unknown" | null;
   answered_actor: string | null;
+  // Set on cards no automation may answer — today only "intake_triage", the
+  // "which reading should we build?" card raised by intake triage.
+  decision_class: string | null;
   bundle?: DecisionBundle | null;
   plan?: DecisionPlan | null;
 }
@@ -485,6 +489,17 @@ export interface TaskDetail extends Task {
   events: Event[];
   evidence: Evidence[];
   decisions: Decision[];
+  // The task's verification contract resolved against its evidence, server-side
+  // (HIVE-403). Absent when the task declared no commands.
+  verification?: VerificationItem[];
+}
+
+// One declared verification command and whether fresh evidence for it exists.
+export interface VerificationItem {
+  name: string;
+  cmd: string;
+  satisfied: boolean;
+  evidence_id: string | null;
 }
 
 // Structured branch diff for the in-review review panel (server/src/diff.ts).
@@ -678,6 +693,25 @@ function bodyFor(fields: Record<string, unknown>, files?: File[]): string | Form
   return fd;
 }
 
+// Away mode, as returned by GET/POST /api/away. `active` is the live state
+// (manual switch OR the schedule window); `on` is only the manual switch.
+export interface HeldPush {
+  at: string;
+  class: string;
+  title: string;
+  body: string | null;
+  url: string;
+}
+
+export interface Away {
+  on: boolean;
+  active: boolean;
+  schedule?: { start: string; end: string; tz: string };
+  held: number;
+  items?: HeldPush[];
+  last_flush?: { at: string; items: HeldPush[] } | null;
+}
+
 // An open (un-acked) build-time checkpoint, as returned by GET /api/checkpoints.
 export interface CheckpointPlan {
   goal: string;
@@ -798,6 +832,28 @@ export interface JiraTaskState {
   }[];
 }
 
+// GET /api/stats/autonomy — the read-only autonomy scoreboard. `precision` and
+// `agreement_rate` are null when there was nothing measurable, which the UI
+// shows as "no data" rather than a made-up 100%.
+export interface AutonomyStats {
+  window: { days: number; since: string; until: string };
+  auto_merge_precision: {
+    merges: number;
+    measurable: number;
+    clean: number;
+    fixed: number;
+    precision: number | null;
+    revert_detection: "on" | "off";
+  };
+  inbox_load: {
+    by_day: { day: string; total: number }[];
+    totals: { decision: number; quiz: number; checkpoint: number; dialog: number; stale: number; total: number };
+    per_day: number;
+  };
+  recovery: { auto_respawns: number; one_cap_parks: number; scouts_spawned: number };
+  agreement: { auto_answered: number; contradictions: number; auto_contradicted: number; agreement_rate: number | null };
+}
+
 export const api = {
   token: apiToken,
   jira: (taskId: string) => req<JiraTaskState>(`/api/tasks/${taskId}/jira`),
@@ -816,6 +872,8 @@ export const api = {
   offline: () => req<{ on: boolean }>(`/api/offline`),
   setOffline: (on: boolean) =>
     req<{ on: boolean; steered: number }>(`/api/offline`, { method: "POST", body: JSON.stringify({ on }) }),
+  away: () => req<Away>(`/api/away`),
+  setAway: (on: boolean) => req<Away>(`/api/away`, { method: "POST", body: JSON.stringify({ on }) }),
   checkpoints: () => req<{ checkpoints: Checkpoint[] }>(`/api/checkpoints`),
   ackCheckpoint: (taskId: string, eventId: string, verdict: "ok" | "flag", note?: string) =>
     req<{ ok: boolean; delivered: boolean; followup_task_id: string | null }>(`/api/tasks/${taskId}/checkpoints/${eventId}/ack`, {
@@ -1010,6 +1068,12 @@ export const api = {
 
   search: (q: string, limit = 50) =>
     req<{ hits: SearchHit[] }>(`/api/search?q=${encodeURIComponent(q)}&limit=${limit}`),
+
+  autonomyStats: (days = 7, project?: string) => {
+    const q = new URLSearchParams({ days: String(days) });
+    if (project) q.set("project_id", project);
+    return req<AutonomyStats>(`/api/stats/autonomy?${q}`);
+  },
 
   morningBrief: (since?: string, project?: string) => {
     const q = new URLSearchParams();

@@ -3839,6 +3839,41 @@ a.dbundle-fact:hover {
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
+.autonomy-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.autonomy-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+}
+.autonomy-label {
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.autonomy-value {
+  font-size: 20px;
+  font-weight: 600;
+}
+.autonomy-value small {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-dim);
+}
+.autonomy-window {
+  font-size: 11px;
+  font-weight: 400;
+}
+.autonomy-spark {
+  letter-spacing: 1px;
+}
+
 .brief-spend-model {
   margin-left: auto;
   color: var(--text-dim);
@@ -4593,6 +4628,37 @@ a.dbundle-fact:hover {
   background: transparent;
   color: inherit;
 }
+
+/* ---- verification contract checklist (HIVE-403) ---- */
+.review-verify {
+  margin: 10px 0 4px;
+  border: 1px solid var(--border, #3333);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.review-verify-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.review-verify-head small { font-weight: 400; opacity: 0.7; }
+.review-verify ul { list-style: none; margin: 0; padding: 0; }
+.review-verify li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+  flex-wrap: wrap;
+}
+.verify-mark { width: 1em; }
+.verify-ok .verify-mark { color: #1a7f37; }
+.verify-missing .verify-mark { color: #cf222e; }
+.verify-missing .verify-link { color: #cf222e; }
+.verify-name { font-weight: 600; }
+.verify-cmd { opacity: 0.7; font-size: 0.85em; }
+.verify-link { margin-left: auto; font-size: 0.85em; }
 
 /* ---- evidence strip on the review card ---- */
 .review-evidence {
@@ -6117,4 +6183,57 @@ a.chip-jira:hover { background: #2d5488; }
   margin: 0;
   font-size: 13px;
   color: var(--muted);
+}
+
+/* ---- away mode: topbar toggle, banner, held summary ---- */
+.away-toggle.away-on {
+  background: #5b6cff;
+  border-color: #5b6cff;
+  color: #f5f5f7;
+  font-weight: 700;
+}
+.away-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 24px;
+  background: rgba(91, 108, 255, 0.12);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 13px;
+  color: var(--text);
+}
+.away-banner-text {
+  font-weight: 500;
+}
+.away-held-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.away-held-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 13px;
+}
+.away-held-list li span:last-child {
+  margin-left: auto;
+  white-space: nowrap;
+}
+.dnote-wrap {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.dnote-wrap .dnote {
+  flex: 1;
+}
+.mic-btn.mic-on {
+  background: #d4a72c;
+  border-color: #d4a72c;
+  color: #1a1a1a;
 }

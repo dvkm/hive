@@ -16,6 +16,8 @@ import {
   TERMINAL,
   advanceIfFinished,
   verificationGate,
+  verificationChecklist,
+  missingVerifications,
   evidenceCount,
   evidenceAtSha,
   changesRequestUnaddressed,
@@ -94,7 +96,7 @@ import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
 import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen, probeAgent } from "./reconciler.ts";
-import { getAway, setAway, awayNow, heldPushes, syncAway } from "./away.ts";
+import { getAway, setAway, awayNow, heldPushes, lastFlush, syncAway } from "./away.ts";
 import type { AwayConfig } from "./away.ts";
 import { taskDiff } from "./diff.ts";
 import { authoredFiles, captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
@@ -132,6 +134,7 @@ export interface HandlerDeps {
   herdr?: Herdr; // injectable for tests
   supervise?: boolean; // start the herdr wait loop after spawn (true in prod wiring)
   plannerExec?: PlannerExec; // injectable planner subprocess (domain supervisors)
+  triageExec?: PlannerExec; // injectable intake-triage classifier (intake/triage.ts)
   exec?: Exec; // injectable gh/git subprocess (diff + merge); tests pass a stub
   fetch?: Fetcher; // injectable smoke-check fetcher (post-merge); tests pass a stub
   jira?: JiraDeps;
@@ -492,7 +495,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // ---- tasks ----
       if (pathname === "/api/tasks") {
         if (method === "GET") return listTasks(db, url);
-        if (method === "POST") return await createTask(db, req);
+        if (method === "POST") return await createTask(db, req, deps);
       }
       // Land queue (task #1257). Both must precede the /:id route so their
       // path segment isn't parsed as a task id.
@@ -584,7 +587,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         return await setOffline(db, herdr, await req.json());
 
       if (pathname === "/api/away" && method === "GET")
-        return json({ ...getAway(db), active: awayNow(db), held: heldPushes(db).length });
+        return json({ ...getAway(db), active: awayNow(db), held: heldPushes(db).length, items: heldPushes(db), last_flush: lastFlush(db) });
       if (pathname === "/api/away" && method === "POST") return setAwayMode(db, await req.json());
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/checkpoints\/([^/]+)\/ack$/);
       if (m && method === "POST") return await ackCheckpoint(db, herdr, m[1], m[2], await req.json());
@@ -2009,7 +2012,7 @@ export function looksSecuritySensitive(text: string): boolean {
 // Accepts JSON or multipart; attached files are saved under the new task's id
 // and their absolute paths appended to the brief, so the agent that picks the
 // task up can read them.
-async function createTask(db: DB, req: Request): Promise<Response> {
+async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): Promise<Response> {
   const { fields: body, files } = await bodyWithFiles(req);
   if (!body?.project_id) return err("project_id is required");
   if (!body?.title) return err("title is required");
@@ -2132,7 +2135,7 @@ async function createTask(db: DB, req: Request): Promise<Response> {
   // Ambient intake only (source intake_*/watch), and only when the project opted
   // in. Deliberately not awaited: a 60s classifier must not hold the create
   // response, and the dispatcher holds the task meanwhile.
-  triageIntake(db, getTask(db, row.id)).catch((e) => console.error(`[hive] intake triage ${row.id}:`, e));
+  triageIntake(db, getTask(db, row.id), { exec: handlerDeps.triageExec }).catch((e) => console.error(`[hive] intake triage ${row.id}:`, e));
   return json({ ...taskWithHealth(db, getTask(db, row.id)), ...(warning ? { warning } : {}) }, 201);
 }
 
@@ -2771,7 +2774,11 @@ function getTaskFull(db: DB, id: string): Response {
     .map(parseEvidence)
     .map((e: any) => ({ ...e, preview: evidencePreview(e.path, e.kind) }));
   const decisions = db.query("SELECT * FROM decisions WHERE task_id = ? ORDER BY ts").all(id).map((r) => withBundle(db, parseDecision(r)));
-  return json({ ...taskWithHealth(db, task), events, evidence, decisions });
+  // The verification contract, resolved against the evidence the merge gate
+  // reads, so the review card can show the checklist instead of restating the
+  // rule (HIVE-403). Absent entirely when the task declared no contract.
+  const verification = verificationChecklist(db, task);
+  return json({ ...taskWithHealth(db, task), events, evidence, decisions, ...(verification.length ? { verification } : {}) });
 }
 
 async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
@@ -3107,6 +3114,19 @@ export async function mergeTask(
     }
   }
 
+  // HIVE-403: the verification contract, at the merge gate. For a kind the
+  // project ships automatically, an unproven command blocks the merge outright
+  // — auto-merge must never land work whose declared checks were never run. A
+  // director landing any other kind by hand may proceed, but the response says
+  // which commands have no evidence so the choice is an informed one.
+  const missingVerify = missingVerifications(db, task);
+  if (missingVerify.length && autoShipKind)
+    return err(
+      `merge blocked — no evidence for ${missingVerify.length} declared verification${missingVerify.length === 1 ? "" : "s"}: ` +
+        `${missingVerify.join(", ")}. Run them and attach the output, or merge a kind that is not in auto_merge.kinds by hand.`,
+      409
+    );
+
   // Recompute the dependency claim live rather than trusting evidence prose
   // (task #1000: #977 claimed its dependency had landed on main; it hadn't).
   // Mirrors the dispatcher's own gate (state.ts unmetDeps) at the other end
@@ -3425,7 +3445,10 @@ export async function mergeTask(
     }
   }
 
-  return json(getTask(db, id));
+  return json({
+    ...getTask(db, id),
+    ...(missingVerify.length ? { warning: `merged without evidence for: ${missingVerify.join(", ")}` } : {}),
+  });
 }
 
 // Bounce an in-review task back to in_progress with reviewer feedback, and make
@@ -4088,7 +4111,7 @@ function setAwayMode(db: DB, body: any): Response {
   };
   setAway(db, next);
   const { active, flushed } = syncAway(db);
-  return json({ ...getAway(db), active, flushed, held: heldPushes(db).length });
+  return json({ ...getAway(db), active, flushed, held: heldPushes(db).length, items: heldPushes(db), last_flush: lastFlush(db) });
 }
 
 // ---- checkpoints (live build-time checklist) ----
