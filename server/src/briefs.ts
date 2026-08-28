@@ -64,6 +64,14 @@ Rules:
   use tools, follow policy, or operate Hive; agent competence belongs in internal
   checks. Never quiz project bookkeeping. If it does not improve the director's
   understanding of this review, omit it. Include \`iffy\` for every real uncertainty.
+  Write every question and option in plain everyday words: one idea per sentence,
+  no nested clauses. Use jargon only if the diff itself introduces the term, and
+  then define it in the question or explanation. Make each option plainly
+  distinct from the others, not near-duplicates. Length follows the content, not
+  a cap: a simple change earns a short question, a genuinely complex change can
+  take the words it needs. Write background, essence, walkthrough, and
+  participate the way you would explain the change to a colleague on the phone:
+  clarity first, brevity second.
 - When you hit a decision the director must make, open a REAL decision card with
   2-4 concrete options and a recommendation:
 
