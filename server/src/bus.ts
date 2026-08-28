@@ -51,28 +51,37 @@ export function setProjectResolver(fn: ProjectResolver | null): void {
   projectCache.clear();
 }
 
-function taskIdOf(msg: any): string | null {
-  return (
-    msg.task?.id ??
-    msg.task_id ??
-    msg.event?.task_id ??
-    msg.decision?.task_id ??
-    msg.notification?.task_id ??
-    msg.evidence?.task_id ??
-    msg.incident?.task_id ??
-    msg.usage?.task_id ??
-    msg.message?.task_id ??
-    null
-  );
+// Every frame wraps its row under one of these keys. A frame is scoped either
+// by a project_id on that row (incident, learning) or by a task_id we resolve
+// through the cache (event, decision, notification, evidence, usage).
+// `chat_thread` is deliberately absent: thread frames stay fleet-wide news.
+const PAYLOAD_KEYS = [
+  "task",
+  "event",
+  "decision",
+  "notification",
+  "evidence",
+  "incident",
+  "usage",
+  "learning",
+] as const;
+
+function payloadOf(msg: any): any {
+  for (const k of PAYLOAD_KEYS) if (msg[k] && typeof msg[k] === "object") return msg[k];
+  return null;
 }
 
 // The project a frame belongs to, or null when it has no project scope
-// (hello, offline, chat_thread, reconciler_error, ...).
+// (hello, offline, chat_thread, reconciler_error, ...). chat_message frames
+// carry no task and no project of their own; their scope lives on the parent
+// chat_threads row. api.ts stamps project_id on them at the call site, where
+// the thread is already in hand, and it is picked up as `direct` here.
 export function frameProject(msg: any): string | null {
   if (!msg || typeof msg !== "object") return null;
-  const direct = msg.project_id ?? msg.task?.project_id ?? msg.learning?.project_id;
+  const payload = payloadOf(msg);
+  const direct = msg.project_id ?? payload?.project_id;
   if (direct) return direct;
-  const taskId = taskIdOf(msg);
+  const taskId = msg.task?.id ?? msg.task_id ?? payload?.task_id ?? null;
   if (!taskId || !resolveProject) return null;
   if (!projectCache.has(taskId)) projectCache.set(taskId, resolveProject(taskId));
   return projectCache.get(taskId) ?? null;

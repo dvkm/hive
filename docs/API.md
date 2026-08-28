@@ -1425,11 +1425,19 @@ on connect; load current state via the REST endpoints, then apply stream deltas.
 
 **`project_id` on frames.** Every frame that belongs to a project carries a
 top-level `project_id`, so a client never has to join task → project itself. It
-is filled in from the task the frame names (`task`, `event`, `decision`,
-`evidence`, `incident`, `notification`, `usage`, `chat_message`) or from the row
-itself (`learning`). Fleet-wide frames have no project scope and carry no
-`project_id`: `hello`, `offline`, `chat_thread`, `notify`, `reconciler_error`,
-and the reaper frames.
+comes from one of three places:
+
+- the task the frame names, looked up once and cached: `task`, `event`,
+  `decision`, `evidence`, `notification`, `usage`
+- a `project_id` already on the row itself: `incident`, `learning`
+- the parent chat thread: `chat_message`. A chat message row has no task and no
+  project of its own, so the server stamps the scope of its `chat_threads` row.
+  Messages on the portfolio-wide Chief of Staff thread have no project, so they
+  carry `"project_id": null` and are treated as fleet-wide.
+
+Fleet-wide frames have no project scope and carry no `project_id`: `hello`,
+`offline`, `chat_thread`, `chat_delivery`, `notify`, `reconciler_error`, and the
+reaper frames.
 
 **Query parameters (all optional).** With none, the stream behaves exactly as it
 always has: every frame, to every client. Filtering happens per client, so a

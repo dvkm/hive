@@ -1032,7 +1032,11 @@ async function chatTurnOnThread(
   thread: ChatThread,
   text: string
 ): Promise<{ thread_id: string; delivery: string }> {
-  broadcast({ type: "chat_message", message: appendMessage(db, thread.id, "director", text) });
+  broadcast({
+    type: "chat_message",
+    project_id: thread.project_id,
+    message: appendMessage(db, thread.id, "director", text),
+  });
   keepWarmAttempts.delete(thread.id); // a director turn restarts keep-warm's patience
 
   // The message the session receives is prefixed so it always knows which thread
@@ -1059,7 +1063,11 @@ function chatDeliveryStatus(threadId: string, status: string, error?: string): v
 // A failed turn must be visible in the conversation, not a silent hang. Message
 // roles are director|assistant, so the notice rides in as an assistant message.
 function postThreadNotice(db: DB, threadId: string, text: string): void {
-  broadcast({ type: "chat_message", message: appendMessage(db, threadId, "assistant", text) });
+  broadcast({
+    type: "chat_message",
+    project_id: getThread(db, threadId)?.project_id ?? null,
+    message: appendMessage(db, threadId, "assistant", text),
+  });
 }
 
 // Tests (and any caller that must observe a settled turn) await the thread's
@@ -1487,7 +1495,7 @@ function chatReply(db: DB, threadId: string, body: any): Response {
     return json({ ok: true, suppressed: true });
 
   const message = appendMessage(db, threadId, "assistant", text, freshActions);
-  broadcast({ type: "chat_message", message });
+  broadcast({ type: "chat_message", project_id: thread.project_id, message });
   return json({ ok: true, message });
 }
 

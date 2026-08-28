@@ -75,3 +75,96 @@ test("no params: unchanged fan-out, and frames carry project_id where derivable"
   expect(frames.find((f) => f.type === "event").project_id).toBe(a);
   expect(frames.find((f) => f.type === "offline").project_id).toBeUndefined();
 });
+
+// Every frame type, one case each. A filter that silently passes everything is
+// worse than no filter, so each frame is asserted on both sides of ?project=:
+// scoped frames must be stamped and must be dropped for the other project,
+// scopeless frames must always pass.
+test("every frame type: scoped frames are stamped and filtered, scopeless ones always pass", async () => {
+  const { db, a, b, taskA, taskB } = seed();
+  const threadA = newId("thr"), threadChief = newId("thr");
+  const t = now();
+  for (const [id, proj] of [[threadA, a], [threadChief, null]] as const)
+    db.query("INSERT INTO chat_threads (id, project_id, created_at, updated_at) VALUES (?,?,?,?)").run(id, proj, t, t);
+
+  const res = sseStream(new URLSearchParams({ project: a }));
+
+  // One frame per type for project a, then the same type for project b.
+  broadcast({ type: "task", task: { id: taskA, project_id: a } });
+  broadcast({ type: "task", task: { id: taskB, project_id: b } });
+  broadcast({ type: "event", event: { id: "e1", task_id: taskA, type: "status" } });
+  broadcast({ type: "event", event: { id: "e2", task_id: taskB, type: "status" } });
+  broadcast({ type: "decision", decision: { id: "d1", task_id: taskA } });
+  broadcast({ type: "decision", decision: { id: "d2", task_id: taskB } });
+  broadcast({ type: "notification", notification: { id: "n1", task_id: taskA } });
+  broadcast({ type: "notification", notification: { id: "n2", task_id: taskB } });
+  broadcast({ type: "evidence", evidence: { id: "ev1", task_id: taskA } });
+  broadcast({ type: "evidence", evidence: { id: "ev2", task_id: taskB } });
+  broadcast({ type: "usage", usage: { id: "u1", task_id: taskA } });
+  broadcast({ type: "usage", usage: { id: "u2", task_id: taskB } });
+  // incident and learning are scoped by their own project_id, not a task.
+  broadcast({ type: "incident", incident: { id: "inc1", project_id: a } });
+  broadcast({ type: "incident", incident: { id: "inc2", project_id: b } });
+  broadcast({ type: "learning", learning: { id: "l1", project_id: a } });
+  broadcast({ type: "learning", learning: { id: "l2", project_id: b } });
+  // chat_message rows carry no scope of their own; the caller stamps the
+  // parent thread's project.
+  broadcast({ type: "chat_message", project_id: a, message: { id: "m1", thread_id: threadA } });
+  broadcast({ type: "chat_message", project_id: b, message: { id: "m2", thread_id: newId("thr") } });
+  // Scopeless: the portfolio Chief thread, and fleet-wide frames.
+  broadcast({ type: "chat_message", project_id: null, message: { id: "m3", thread_id: threadChief } });
+  broadcast({ type: "chat_thread", thread: { id: threadA, project_id: a } });
+  broadcast({ type: "offline", on: true });
+  broadcast({ type: "reconciler_error", error: "boom" });
+
+  const frames = await drain(res);
+  const byType = (type: string) => frames.filter((f) => f.type === type);
+
+  // Scoped types: exactly one frame survived per type, it is project a's row,
+  // and it is stamped with project a. [frame type, payload key, expected id].
+  const scoped: [string, string, string][] = [
+    ["task", "task", taskA],
+    ["event", "event", "e1"],
+    ["decision", "decision", "d1"],
+    ["notification", "notification", "n1"],
+    ["evidence", "evidence", "ev1"],
+    ["usage", "usage", "u1"],
+    ["incident", "incident", "inc1"],
+    ["learning", "learning", "l1"],
+  ];
+  for (const [type, key, expectedId] of scoped) {
+    // Labelled with the type so a failure names the frame that regressed.
+    const got = byType(type);
+    expect([type, got.length]).toEqual([type, 1]);
+    expect([type, got[0].project_id]).toEqual([type, a]);
+    expect([type, got[0][key].id]).toEqual([type, expectedId]);
+  }
+
+  // chat_message: project a's passes, project b's is dropped, the Chief's
+  // (scopeless) always passes.
+  expect(byType("chat_message").map((f) => f.message.id)).toEqual(["m1", "m3"]);
+
+  // Scopeless frames are fleet-wide news and are never filtered out.
+  expect(byType("chat_thread").length).toBe(1);
+  expect(byType("chat_thread")[0].project_id).toBeUndefined();
+  expect(byType("offline").length).toBe(1);
+  expect(byType("reconciler_error").length).toBe(1);
+});
+
+test("?classes= admits exactly the listed frame types, across every type", async () => {
+  const { a, taskA } = seed();
+  const res = sseStream(new URLSearchParams({ classes: "incident,chat_message,usage" }));
+  broadcast({ type: "task", task: { id: taskA, project_id: a } });
+  broadcast({ type: "event", event: { id: "e1", task_id: taskA } });
+  broadcast({ type: "decision", decision: { id: "d1", task_id: taskA } });
+  broadcast({ type: "notification", notification: { id: "n1", task_id: taskA } });
+  broadcast({ type: "evidence", evidence: { id: "ev1", task_id: taskA } });
+  broadcast({ type: "usage", usage: { id: "u1", task_id: taskA } });
+  broadcast({ type: "incident", incident: { id: "inc1", project_id: a } });
+  broadcast({ type: "learning", learning: { id: "l1", project_id: a } });
+  broadcast({ type: "chat_message", project_id: a, message: { id: "m1" } });
+  broadcast({ type: "offline", on: true });
+
+  const frames = await drain(res);
+  expect(frames.map((f) => f.type)).toEqual(["hello", "usage", "incident", "chat_message"]);
+});
