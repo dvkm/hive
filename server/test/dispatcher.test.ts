@@ -467,7 +467,7 @@ test("an unanswered repo-mismatch card holds dispatch; answering it releases the
   expect(getTask(db, id).state).toBe("in_progress");
 });
 
-// --- file-overlap aware dispatch (HIVE-504) ---------------------------------
+// --- file-overlap aware dispatch (HIVE-509) ---------------------------------
 
 const eventTypes = (db: DB, taskId: string) =>
   (db.query("SELECT type FROM events WHERE task_id = ?").all(taskId) as { type: string }[]).map((r) => r.type);

@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 const { openDb, newId, now } = await import("../src/db.ts");
 const { writeEvent } = await import("../src/state.ts");
-const { predictScope, scopeOverlap, pathsInText, scoreScopePrediction, inFlightScope } = await import("../src/fileScope.ts");
+const { predictScope, scopeOverlap, pathsInText, scoreScopePrediction, inFlightScope, overlapHold } = await import("../src/fileScope.ts");
 
 function freshDb() {
   const db = openDb(":memory:");
@@ -91,4 +91,21 @@ test("nothing is scored when the brief named no files", () => {
   const t = task(db, projectId, { state: "in_review" });
   scoreScopePrediction(db, t.id, ["server/src/api.ts"]);
   expect((db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'scope_prediction_scored'").all(t.id) as any[]).length).toBe(0);
+});
+
+test("the board hold disappears once the task it waits on is finished", () => {
+  const { db, projectId } = freshDb();
+  const peer = task(db, projectId, { state: "in_progress" });
+  const waiting = task(db, projectId);
+  writeEvent(db, {
+    task_id: waiting.id,
+    source: "dispatcher",
+    type: "dispatch_hold_overlap",
+    payload: { note: "n", held_by: peer.id, held_by_number: 7, files: ["api.ts"] },
+  });
+
+  expect(overlapHold(db, waiting.id)?.files).toEqual(["api.ts"]);
+
+  db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(peer.id);
+  expect(overlapHold(db, waiting.id)).toBe(null);
 });

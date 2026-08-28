@@ -319,7 +319,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
           continue;
         }
 
-        // File-overlap hold (HIVE-504). Two agents editing the same file land
+        // File-overlap hold (HIVE-509). Two agents editing the same file land
         // branches that conflict — or, worse, merge cleanly and contradict each
         // other. The guess is coarse and it never blocks: an overlapping task is
         // just moved behind the non-overlapping ones, and the tail below runs it

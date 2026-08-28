@@ -137,6 +137,7 @@ export interface Task {
   sidecar?: SidecarReport | null; // latest background check on this task's commits
   evidence_count?: number; // list endpoint only; avoids fetching every task detail on startup
   spawn_error?: boolean; // list endpoint only; prior spawn failed and no spawn ever succeeded
+  overlap_hold?: { number: number; files: string[] } | null; // list endpoint only; queued behind a live task that looks like it edits the same files
   requeued_to?: string | null; // successor id when failed + auto-requeued
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
   created_at: string;

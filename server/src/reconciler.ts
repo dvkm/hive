@@ -631,7 +631,7 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
           if (scope) {
             writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: { ...scope, head_sha: data.headRefOid ?? null } });
             // Score the dispatch-time file guess against what the branch really
-            // touched (HIVE-504), so the heuristic can be tuned or dropped on
+            // touched (HIVE-509), so the heuristic can be tuned or dropped on
             // evidence rather than opinion.
             scoreScopePrediction(db, t.id, scope.files);
           }

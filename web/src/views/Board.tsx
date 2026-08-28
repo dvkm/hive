@@ -147,6 +147,14 @@ export function Card({ task }: { task: Task }) {
             ⚠ spawn failed
           </span>
         )}
+        {task.state === "queued" && task.overlap_hold && (
+          <span
+            className="chip chip-blocked"
+            title={`Both this task and #${task.overlap_hold.number} look like they edit ${task.overlap_hold.files.join(", ")}. It starts once that one finishes, or sooner if nothing else can run.`}
+          >
+            waiting on #{task.overlap_hold.number}
+          </span>
+        )}
         <SidecarChip sidecar={task.sidecar} />
         <BlockedBy depends_on={task.depends_on} tasks={tasks} />
         {task.deferred_until && Date.parse(task.deferred_until) > Date.now() && (

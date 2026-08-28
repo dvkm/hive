@@ -1,4 +1,4 @@
-// Predicted file scope at DISPATCH time (HIVE-504).
+// Predicted file scope at DISPATCH time (HIVE-509).
 //
 // The dispatcher used to start up to max_agents tasks with no idea what files
 // they would touch, so two agents could edit the same region and only find out
@@ -196,4 +196,22 @@ export function noteOverlapHold(
     type: "dispatch_hold_overlap",
     payload: { note, held_by: peer.id, held_by_number: peer.number, files },
   });
+}
+
+// The hold to show on a queued card: the most recent overlap hold, but only
+// while the task it is waiting on is still working. A hold whose peer has
+// finished is stale — the next dispatch cycle will start this task.
+export function overlapHold(db: DB, taskId: string): { number: number; files: string[] } | null {
+  const row = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'dispatch_hold_overlap' ORDER BY ts DESC, rowid DESC LIMIT 1")
+    .get(taskId) as { payload: string } | undefined;
+  if (!row) return null;
+  try {
+    const p = JSON.parse(row.payload);
+    const peer = db.query("SELECT number, state FROM tasks WHERE id = ?").get(p.held_by) as { number: number; state: string } | undefined;
+    if (!peer || !["in_progress", "needs_decision"].includes(peer.state)) return null;
+    return { number: peer.number, files: p.files ?? [] };
+  } catch {
+    return null;
+  }
 }
