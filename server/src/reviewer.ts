@@ -23,6 +23,7 @@ import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 import { supervisedSql } from "./supervision.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { parseUnifiedDiff } from "./diff.ts";
+import { startLoop } from "./loop.ts";
 
 const TIMEOUT_MS = Number(process.env.HIVE_REVIEWER_TIMEOUT_MS || 180_000);
 const DIFF_LIMIT = 60_000;
@@ -453,12 +454,9 @@ export async function verifyPendingOnce(db: DB, deps: ReviewerDeps = {}): Promis
 }
 
 export function startAutoReviewer(db: DB, deps: ReviewerDeps & { intervalMs?: number } = {}): () => void {
-  const timer = setInterval(() => {
-    autoReviewOnce(db, deps)
-      .then(() => verifyPendingOnce(db, deps))
-      .catch((e) => console.error("[hive] auto-review crashed:", e));
-  }, deps.intervalMs ?? 60_000);
-  return () => clearInterval(timer);
+  return startLoop("auto-review", deps.intervalMs ?? 60_000, () =>
+    autoReviewOnce(db, deps).then(() => verifyPendingOnce(db, deps))
+  );
 }
 
 // ---------------------------------------------------------------------------

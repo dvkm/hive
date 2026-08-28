@@ -291,8 +291,10 @@ test("startGchatPoll skips a tick while a cycle is already running", async () =>
     return new Response("{}", { status: 200 });
   }) as unknown as FetchLike;
 
+  const origWarn = console.warn;
   const origSetInterval = globalThis.setInterval;
   const origClearInterval = globalThis.clearInterval;
+  console.warn = ((...args: any[]) => logs.push(String(args[0]))) as typeof console.warn;
   globalThis.setInterval = ((callback: () => void) => {
     tick = callback;
     return 1;
@@ -315,13 +317,14 @@ test("startGchatPoll skips a tick while a cycle is already running", async () =>
     await new Promise(setImmediate);
     stop();
   } finally {
+    console.warn = origWarn;
     globalThis.setInterval = origSetInterval;
     globalThis.clearInterval = origClearInterval;
   }
 
   expect(maxActive).toBe(1); // never two cycles in flight at once
   expect(cycles).toBe(1); // the overlapping tick was skipped, not queued
-  expect(logs.some((m) => m.includes("skipped"))).toBe(true);
+  expect(logs.some((m) => m.includes("skipping this tick"))).toBe(true);
 });
 
 test("buildPermalink reconstructs a best-effort room deep-link", () => {

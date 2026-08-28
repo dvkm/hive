@@ -17,6 +17,7 @@ import { broadcastTask } from "./health.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, isSafeRef } from "./exec.ts";
 import { activeProjects } from "./testProjects.ts";
+import { startLoop } from "./loop.ts";
 
 export interface PromoterDeps {
   exec?: Exec;
@@ -135,24 +136,15 @@ export async function promoteOnce(db: DB, deps: PromoterDeps = {}): Promise<void
 // It fires once shortly after boot (SHA dedup makes restarts harmless), then on
 // every interval.
 export function startPromoter(db: DB, deps: PromoterDeps & { intervalMs?: number } = {}): () => void {
-  const intervalMs = deps.intervalMs ?? 30 * 60 * 1000;
-  let running = false;
-  const run = () => {
-    if (running) {
-      console.error("[hive] promoter cycle skipped: previous cycle still running");
-      return;
-    }
-    running = true;
-    promoteOnce(db, deps)
-      .catch((e) => console.error("[hive] promoter cycle crashed:", e))
-      .finally(() => {
-        running = false;
-      });
-  };
-  const boot = setTimeout(run, 30_000);
-  const timer = setInterval(run, intervalMs);
+  const stopLoop = startLoop("promoter", deps.intervalMs ?? 30 * 60 * 1000, () => promoteOnce(db, deps));
+  // ponytail: the boot run sits outside the loop's in-flight guard. Harmless at
+  // the real numbers (30s boot vs a 30min interval, and SHA dedup on top); move
+  // it inside startLoop only if the interval ever drops near a cycle's runtime.
+  const boot = setTimeout(() => {
+    promoteOnce(db, deps).catch((e) => console.error("[hive] promoter cycle crashed:", e));
+  }, 30_000);
   return () => {
     clearTimeout(boot);
-    clearInterval(timer);
+    stopLoop();
   };
 }
