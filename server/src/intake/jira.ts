@@ -83,6 +83,14 @@ const HIVE_COMMENT_PROPERTY = "hive.event_id";
 const HIVE_EVIDENCE_PROPERTY = "hive.evidence_id";
 const CHANGELOG_PAGE = 100;
 const REQUEST_TIMEOUT_MS = 20_000;
+
+// How much wall clock ONE per-project cycle may spend on its issue loop, as a
+// multiple of the poll interval. The single-flight guard means an overrunning
+// cycle does not just run long, it silently drops every subsequent tick — with
+// dozens of issues each failing at REQUEST_TIMEOUT_MS a cycle runs for many
+// minutes and the poll rate degrades to zero. Two intervals leaves a slow but
+// healthy Jira room to finish while capping how far behind the loop can fall.
+const CYCLE_BUDGET_MULTIPLIER = 2;
 // How many CONSECUTIVE observations of one absence kind must accrue before hive
 // stops syncing. Operational failures never count.
 const ABSENT_STREAK_LIMIT = 3;
@@ -588,6 +596,21 @@ export class JiraHttpError extends Error {
   }
 }
 
+// A 2xx whose body is not the JSON object the endpoint promised — a proxy error
+// page, a truncated response, an HTML login redirect. Typed for the same reason
+// the status is: a bare SyntaxError from JSON.parse carries no method, no path
+// and no key, so a systemic Jira fault reads as an opaque failure on every
+// issue instead of a per-issue skip that names what actually broke.
+export class JiraInvalidBodyError extends Error {
+  constructor(
+    readonly method: string,
+    readonly path: string,
+    readonly detail: string
+  ) {
+    super(`jira ${method} ${path} returned an invalid JSON body: ${detail}`);
+  }
+}
+
 export class JiraClient {
   constructor(
     private cfg: JiraConfig,
@@ -607,8 +630,19 @@ export class JiraClient {
     this.cfg = { ...cfg, site, project_key: projectKey, jql };
   }
 
+  // Set by the cycle that owns this client; null for one-off calls (linking,
+  // manual lookups) that are not running under a cycle budget.
+  deadlineAt: number | null = null;
+
   private auth(): string {
     return "Basic " + Buffer.from(`${this.cfg.email}:${this.token}`).toString("base64");
+  }
+
+  private requestTimeoutMs(): number {
+    if (this.deadlineAt === null) return REQUEST_TIMEOUT_MS;
+    // Floor of 1ms: AbortSignal.timeout(0) never fires in Bun, which would turn
+    // an already-blown budget into an unbounded request.
+    return Math.max(1, Math.min(REQUEST_TIMEOUT_MS, this.deadlineAt - Date.now()));
   }
 
   private async call(
@@ -627,8 +661,11 @@ export class JiraClient {
     }
     const res = await this.fetchImpl(`${this.cfg.site}${path}`, {
       // A hung request must not stall the whole cycle (and, with the in-flight
-      // guard, silently degrade the poll rate to zero).
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      // guard, silently degrade the poll rate to zero). When the cycle carries a
+      // wall-clock budget, no single request may outlive it either: without this
+      // the last request started before the deadline still runs a full 20s past
+      // it, so the cycle overshoots by a request every time.
+      signal: AbortSignal.timeout(this.requestTimeoutMs()),
       ...init,
       headers: {
         Authorization: this.auth(),
@@ -647,7 +684,14 @@ export class JiraClient {
     }
     if (res.status === 204) return null;
     const text = await res.text();
-    return text ? JSON.parse(text) : null;
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      // Snippet, not the whole body: a proxy error page can be megabytes, and
+      // this string ends up in stats.failures and the sync log.
+      throw new JiraInvalidBodyError(method, path, `${res.status} ${text.slice(0, 200)}`);
+    }
   }
 
   private async json(
@@ -657,7 +701,7 @@ export class JiraClient {
   ): Promise<any> {
     const body = await this.call(path, init, write);
     if (body === null || typeof body !== "object")
-      throw new Error(`jira ${init.method ?? "GET"} ${path} returned an invalid JSON body`);
+      throw new JiraInvalidBodyError(String(init.method ?? "GET").toUpperCase(), path, "not a JSON object");
     return body;
   }
 
@@ -1490,6 +1534,7 @@ export interface JiraDeps {
   exec?: Exec; // keychain resolution
   log?: (msg: string, err?: unknown) => void;
   intervalMs?: number;
+  budgetMs?: number; // wall-clock cap on one project's issue loop (tests)
   token?: string; // bypass keychain (tests)
 }
 
@@ -1579,6 +1624,7 @@ export interface SyncStats {
   aborted: number; // writes dropped because the boundary re-read disagreed
   blocked: number; // outbound actions refused because a prerequisite could not be confirmed
   skipped: number; // issues whose fresh read failed (missing input)
+  budget_skipped: number; // issues left untouched because the cycle ran out of wall-clock budget
   cancelled: number; // mirrors dispositioned because their issue is proven gone
   errors: number;
   failures: string[];
@@ -1587,7 +1633,7 @@ export interface SyncStats {
 const emptyStats = (): SyncStats => ({
   imported: 0, pushed: 0, pulled: 0, labeled: 0,
   comments_pulled: 0, comments_pushed: 0, receipts: 0, attachments: 0, rendered: 0,
-  shadow: 0, unmapped: 0, aborted: 0, blocked: 0, skipped: 0, cancelled: 0, errors: 0, failures: [],
+  shadow: 0, unmapped: 0, aborted: 0, blocked: 0, skipped: 0, budget_skipped: 0, cancelled: 0, errors: 0, failures: [],
 });
 
 interface Ctx {
@@ -2481,6 +2527,13 @@ function assertJiraTargetOwner(db: DB, projectId: string, cfg: JiraConfig): void
     throw new Error(`jira target ${jiraTargetKey(cfg)} is owned by Hive project ${owner}; refusing project ${projectId}`);
 }
 
+// Where the last budget-truncated cycle stopped, per project. Without this the
+// loop restarts at the same key every tick, so a Jira slow enough to blow the
+// budget on the first N issues would starve every issue after them forever.
+// Keyed on the DB object for the same reason the in-flight guard is: two Hive
+// instances in one process must not share a cursor.
+const cycleResumeKeys = new WeakMap<object, Map<string, string>>();
+
 export async function syncProjectOnce(
   db: DB,
   projectId: string,
@@ -2491,6 +2544,12 @@ export async function syncProjectOnce(
   assertJiraTargetOwner(db, projectId, cfg);
   const log = deps.log ?? ((m: string, e?: unknown) => console.error(`[hive] jira: ${m}`, e ?? ""));
   const ctx: Ctx = { db, cfg, client, stats: emptyStats(), exec: deps.exec ?? defaultExec, diffs: new Map(), log };
+
+  const budgetMs = deps.budgetMs ?? jiraIntervalMs(deps) * CYCLE_BUDGET_MULTIPLIER;
+  const deadline = Date.now() + budgetMs;
+  // Bound every request this cycle makes, discovery included, so the cycle
+  // cannot overshoot the budget by one in-flight request.
+  client.deadlineAt = deadline;
 
   // Discovery must succeed before any verified absence can advance: a failed
   // scope check is not evidence that anything went missing.
@@ -2510,9 +2569,28 @@ export async function syncProjectOnce(
     });
   const linkedByKey = new Map<string, typeof linked>();
   for (const row of linked) linkedByKey.set(row.jira_key, [...(linkedByKey.get(row.jira_key) ?? []), row]);
-  const keys = [...new Set([...discovered, ...linkedByKey.keys()])];
+  const allKeys = [...new Set([...discovered, ...linkedByKey.keys()])];
+  // Resume where the last budget-truncated cycle stopped, then wrap around, so
+  // every issue is reached eventually even while Jira stays slow.
+  const resumeKeys = cycleResumeKeys.get(db as object) ?? new Map<string, string>();
+  const resumeAt = resumeKeys.get(projectId);
+  const start = resumeAt ? allKeys.indexOf(resumeAt) : -1;
+  const keys = start > 0 ? [...allKeys.slice(start), ...allKeys.slice(0, start)] : allKeys;
+  resumeKeys.delete(projectId);
 
-  for (const key of keys) {
+  for (const [index, key] of keys.entries()) {
+    if (Date.now() >= deadline) {
+      // Out of budget: stop here, record what was left, and let the NEXT tick
+      // start on time rather than being dropped by the single-flight guard.
+      ctx.stats.budget_skipped = keys.length - index;
+      resumeKeys.set(projectId, key); // pick this one up first next cycle
+      cycleResumeKeys.set(db as object, resumeKeys);
+      log(
+        `cycle budget of ${budgetMs}ms exhausted for ${cfg.project_key}; ` +
+          `${ctx.stats.budget_skipped} issue(s) deferred, resuming at ${key} next tick`
+      );
+      break;
+    }
     let read: IssueObservation;
     try {
       read = await readIssue(client, cfg, key, true);
@@ -2714,7 +2792,7 @@ export async function runProjectCycle(
     const touched =
       stats.imported || stats.pushed || stats.pulled || stats.labeled || stats.comments_pulled ||
       stats.comments_pushed || stats.receipts || stats.attachments || stats.shadow || stats.unmapped || stats.aborted ||
-      stats.blocked || stats.skipped || stats.errors;
+      stats.blocked || stats.skipped || stats.budget_skipped || stats.errors;
     if (touched)
       console.log(
         `[hive] jira ${cfg.project_key}${cfg.write ? "" : " (shadow)"}: ` +
@@ -2722,7 +2800,7 @@ export async function runProjectCycle(
           `${stats.comments_pulled} comments in, ${stats.comments_pushed} comments out, ${stats.receipts} receipts, ` +
           `${stats.attachments} attachments, ${stats.rendered} rendered, ` +
           `${stats.shadow} shadow, ${stats.unmapped} unmapped, ${stats.aborted} aborted, ${stats.blocked} blocked, ` +
-          `${stats.skipped} skipped, ${stats.errors} errors`
+          `${stats.skipped} skipped, ${stats.budget_skipped} over budget, ${stats.errors} errors`
       );
     return { ok: true, stats, state };
   } catch (e) {

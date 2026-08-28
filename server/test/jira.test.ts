@@ -1733,6 +1733,102 @@ test("manual and scheduled entry points share a per-target single-flight lock", 
   expect((await first).ok).toBe(true);
 });
 
+test("a cycle whose every request hangs aborts within its budget, and the next tick runs", async () => {
+  // The wedge this guards: with no cycle budget, dozens of issues x a 20s
+  // per-request timeout runs one cycle for minutes, and the single-flight guard
+  // then drops EVERY subsequent tick ("previous cycle still running").
+  const issues = Array.from({ length: 12 }, (_, i) => ({ key: `WEB-${i + 1}`, id: String(i + 1), status: "To Do" }));
+  const { db, projectId } = freshDb({ ...CFG });
+
+  // Discovery answers instantly; every per-issue request hangs until aborted, so
+  // only the budget can end the cycle.
+  const hang = (async (url: string, init: RequestInit = {}) => {
+    if (String(url).includes("/search/jql"))
+      return new Response(JSON.stringify({ issues: issues.map((i) => ({ key: i.key })), isLast: true }), { status: 200 });
+    return await new Promise<Response>((_resolve, reject) => {
+      const signal = init.signal;
+      if (signal?.aborted) return reject(new Error("aborted"));
+      signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    });
+  }) as unknown as typeof fetch;
+
+  const budgetMs = 200;
+  const started = Date.now();
+  const first = await J.runProjectCycle(db, projectId, {
+    fetch: hang, token: "tok", budgetMs, log: () => {},
+  });
+  const elapsed = Date.now() - started;
+
+  // It stopped on the budget, not on 12 x REQUEST_TIMEOUT_MS.
+  expect(elapsed).toBeLessThan(budgetMs * 4);
+  // ...and it says how much work it deferred rather than dropping it silently.
+  expect(first.stats!.budget_skipped).toBeGreaterThan(0);
+  expect(first.stats!.budget_skipped + first.stats!.errors).toBe(issues.length);
+
+  // The whole point: the NEXT tick actually starts instead of being skipped by
+  // the in-flight guard, and it picks up where the last one stopped.
+  const jira = fakeJira({ issues });
+  const second = await J.runProjectCycle(db, projectId, { fetch: jira.fetchImpl, token: "tok" });
+  expect(second.ok).toBe(true);
+  expect(second.error).toBeUndefined();
+});
+
+test("a budget-truncated cycle resumes at the deferred issue, so late issues are not starved", async () => {
+  const issues = Array.from({ length: 6 }, (_, i) => ({ key: `WEB-${i + 1}`, id: String(i + 1), status: "To Do" }));
+  const { db, projectId } = freshDb({ ...CFG });
+  const readOrder: string[] = [];
+
+  // Let exactly two issues through per cycle, then blow the budget.
+  const makeFetch = (allow: number) => {
+    let reads = 0;
+    const inner = fakeJira({ issues }).fetchImpl;
+    return (async (url: string, init: RequestInit = {}) => {
+      const m = /\/rest\/api\/3\/issue\/(WEB-\d+)(\?|$)/.exec(String(url));
+      if (m && !String(url).includes("/comment") && !String(url).includes("/changelog")) {
+        readOrder.push(m[1]);
+        if (++reads > allow)
+          return await new Promise<Response>((_r, reject) => {
+            init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+          });
+      }
+      return inner(url as any, init as any);
+    }) as unknown as typeof fetch;
+  };
+
+  await J.runProjectCycle(db, projectId, { fetch: makeFetch(2), token: "tok", budgetMs: 200, log: () => {} });
+  const firstPass = [...readOrder];
+  readOrder.length = 0;
+  await J.runProjectCycle(db, projectId, { fetch: makeFetch(2), token: "tok", budgetMs: 200, log: () => {} });
+
+  // The second cycle must NOT restart at WEB-1; it continues at the first issue
+  // the budget stopped it from reaching.
+  expect(firstPass[0]).toBe("WEB-1");
+  expect(readOrder[0]).not.toBe("WEB-1");
+  expect(firstPass).not.toContain(readOrder[0]); // an issue pass 1 never reached
+  const nextUnreached = issues.map((i) => i.key).find((k) => !firstPass.includes(k));
+  expect(readOrder[0]).toBe(nextUnreached);
+});
+
+test("an invalid JSON body is a named per-issue skip, not an opaque failure", async () => {
+  const jira = fakeJira({
+    issues: [{ key: "WEB-1", id: "1", status: "To Do" }, { key: "WEB-2", id: "2", status: "To Do" }],
+    invalidJsonRead: ["WEB-1"],
+  });
+  const { db, projectId } = freshDb();
+
+  const stats = await run(db, projectId, jira.fetchImpl);
+
+  // Contained to the one issue: WEB-2 still imported.
+  expect(stats.errors).toBe(1);
+  expect(stats.imported).toBe(1);
+  // The failure names the method, the path and the key, so a systemic Jira
+  // fault is diagnosable instead of a bare SyntaxError.
+  expect(stats.failures).toHaveLength(1);
+  expect(stats.failures[0]).toContain("WEB-1");
+  expect(stats.failures[0]).toContain("invalid JSON body");
+  expect(stats.failures[0]).toContain("GET");
+});
+
 test("a second Hive project cannot adopt an owned Jira target", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }] });
   const { db, projectId } = freshDb({ ...CFG });
