@@ -123,6 +123,27 @@ function findHarness(root: string, files: string[]): Harness {
   return { reason: "no Playwright config with a testDir in web/ or cms/" };
 }
 
+// TanStack Router's `src/routes/` tree, where the file name is part of the URL
+// and not a fixed `page.tsx`. `_page/pricing.tsx` is `/pricing`: segments that
+// start with an underscore are pathless layouts, `index` means the parent path,
+// and a dotted file name (`posts.index.tsx`) is the flat spelling of nesting.
+// Returns null when the file is not a TanStack route, or is one hive must skip:
+// a `$param` route it has no id for, or a Storybook story.
+function tanstackRoute(file: string): string | null {
+  const m = file.match(/(?:^|\/)src\/routes\/(.*)$/);
+  if (!m) return null;
+  const parts = m[1].split("/");
+  const name = parts[parts.length - 1] ?? "";
+  if (/\.stories\.[cm]?[jt]sx?$/.test(name)) return null;
+  const segments = [
+    ...parts.slice(0, -1),
+    ...name.replace(/\.[cm]?[jt]sx?$/, "").split("."),
+  ];
+  if (segments.some((s) => s.includes("$"))) return null;
+  const kept = segments.filter((s) => s && s !== "index" && !s.startsWith("_"));
+  return `/${kept.join("/")}`.replace(/\/+$/, "") || "/";
+}
+
 // A route a person can actually open, derived from the changed files. Next-style
 // `app/` and `pages/` trees map a directory to a URL, which is the whole trick.
 // Three kinds of path are dropped, because each would produce a worse picture
@@ -132,6 +153,12 @@ function findHarness(root: string, files: string[]): Harness {
 export function routesFromFiles(files: string[]): string[] {
   const routes: string[] = [];
   for (const file of files) {
+    const tanstack = tanstackRoute(file);
+    if (tanstack) {
+      if (!routes.includes(tanstack)) routes.push(tanstack);
+      if (routes.length === MAX_ROUTES) break;
+      continue;
+    }
     const m = file.match(/(?:^|\/)(?:app|pages)\/(.*)$/);
     if (!m) continue;
     const parts = m[1].split("/");

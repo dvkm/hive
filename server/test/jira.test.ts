@@ -3201,6 +3201,27 @@ test("the route to shoot comes from the changed files, and a guessable one is sk
   expect(routesFromFiles(["web/app/api/users/route.ts", "web/app/insights/page.tsx"])).toEqual(["/insights"]);
 });
 
+// Corebeat web is TanStack Router: the file name is part of the URL, and the
+// `_page` folder is a layout with no path of its own. Before this, every one of
+// these fell through to `/` and the ticket got a front-page picture captioned
+// with the route it never opened.
+test("TanStack src/routes files map to their real URLs", () => {
+  expect(routesFromFiles(["web/src/routes/_page/pricing.tsx"])).toEqual(["/pricing"]);
+  expect(
+    routesFromFiles(["web/src/routes/_page/pricing.tsx", "web/src/routes/_page/search.tsx"])
+  ).toEqual(["/pricing", "/search"]);
+  // index.tsx is the parent path, not a segment.
+  expect(routesFromFiles(["web/src/routes/_page/news/index.tsx"])).toEqual(["/news"]);
+  expect(routesFromFiles(["web/src/routes/_page/index.tsx"])).toEqual(["/"]);
+  // $news_idx is a parameter hive cannot fill, so the file is skipped.
+  expect(routesFromFiles(["web/src/routes/_page/article/$news_idx.tsx"])).toEqual(["/"]);
+  // A Storybook story is not a route.
+  expect(routesFromFiles(["web/src/routes/_page/news/index.stories.tsx"])).toEqual(["/"]);
+  // Dots are TanStack's flat spelling of nesting.
+  expect(routesFromFiles(["web/src/routes/posts.index.tsx"])).toEqual(["/posts"]);
+  expect(routesFromFiles(["web/src/routes/posts.$postId.tsx"])).toEqual(["/"]);
+});
+
 // A worktree that looks like a repo with a Playwright harness. `harness: false`
 // makes it a repo with none, which is the quiet-degrade case. The webServer
 // block is what lets hive serve the PR branch itself, so a real harness has one.

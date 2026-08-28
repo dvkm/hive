@@ -11,6 +11,22 @@ export type Exec = (
 ) => Promise<ExecResult>;
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+const KILL_GRACE_MS = 2_000;
+
+// Signals the whole process group, not just the direct child. `detached: true`
+// (setsid) makes the child its own group leader, so `-pid` reaches every
+// descendant it spawned — e.g. npx's playwright webServer and the chromium it
+// launches — which a plain `proc.kill()` leaves orphaned as an npx grandchild.
+function killGroup(pid: number): void {
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {}
+  setTimeout(() => {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {}
+  }, KILL_GRACE_MS).unref();
+}
 
 // Common CLI install dirs, appended to whatever PATH the process currently has.
 // Task #1096: under `bun --watch` (how the server actually runs, per the
@@ -47,6 +63,7 @@ export const defaultExec: Exec = async (argv, opts = {}) => {
     stdin: opts.input != null ? "pipe" : "ignore",
     stdout: "pipe",
     stderr: "pipe",
+    detached: true,
   });
   let proc: ReturnType<typeof spawn>;
   try {
@@ -88,7 +105,7 @@ export const defaultExec: Exec = async (argv, opts = {}) => {
   let timer: ReturnType<typeof setTimeout>;
   const timeout = new Promise<typeof timedOut>((resolve) => {
     timer = setTimeout(() => {
-      proc.kill();
+      killGroup(proc.pid);
       resolve(timedOut);
     }, timeoutMs);
   });
