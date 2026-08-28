@@ -58,12 +58,12 @@ function freshDb(config: any = {}): { db: DB; projectId: string } {
     .run(projectId, "p", "/repo", JSON.stringify(config), now());
   return { db, projectId };
 }
-function makeTask(db: DB, projectId: string, extra: Partial<{ kind: string; source: string; state: string; agent_target: string; depends_on: string[]; parent_task_id: string }> = {}): string {
+function makeTask(db: DB, projectId: string, extra: Partial<{ kind: string; source: string; state: string; agent_target: string; depends_on: string[]; parent_task_id: string; title: string; brief: string }> = {}): string {
   const id = newId();
   const t = now();
   db.query(
-    "INSERT INTO tasks (id, project_id, title, state, kind, source, agent_target, depends_on, parent_task_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
-  ).run(id, projectId, "t", extra.state ?? "queued", extra.kind ?? "ship", extra.source ?? null, extra.agent_target ?? null, extra.depends_on ? JSON.stringify(extra.depends_on) : null, extra.parent_task_id ?? null, t, t);
+    "INSERT INTO tasks (id, project_id, title, brief, state, kind, source, agent_target, depends_on, parent_task_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+  ).run(id, projectId, extra.title ?? "t", extra.brief ?? null, extra.state ?? "queued", extra.kind ?? "ship", extra.source ?? null, extra.agent_target ?? null, extra.depends_on ? JSON.stringify(extra.depends_on) : null, extra.parent_task_id ?? null, t, t);
   return id;
 }
 
@@ -465,4 +465,99 @@ test("an unanswered repo-mismatch card holds dispatch; answering it releases the
   await dispatchOnce(db, { herdr: released.herdr });
   expect(released.spawns.length).toBe(1);
   expect(getTask(db, id).state).toBe("in_progress");
+});
+
+// --- file-overlap aware dispatch (HIVE-504) ---------------------------------
+
+const eventTypes = (db: DB, taskId: string) =>
+  (db.query("SELECT type FROM events WHERE task_id = ?").all(taskId) as { type: string }[]).map((r) => r.type);
+
+test("two queued tasks naming the same file dispatch one at a time", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 3 });
+  const first = makeTask(db, projectId, { brief: "fix the skip in server/src/sidecar.ts" });
+  const second = makeTask(db, projectId, { brief: "run bun install from server/src/sidecar.ts instead" });
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr });
+
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, first).state).toBe("in_progress");
+  expect(getTask(db, second).state).toBe("queued");
+  expect(eventTypes(db, second)).toContain("dispatch_hold_overlap");
+  const hold: any = JSON.parse(
+    (db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'dispatch_hold_overlap'").get(second) as any).payload
+  );
+  expect(hold.files).toContain("sidecar.ts");
+  expect(hold.held_by).toBe(first);
+});
+
+test("a non-overlapping task is preferred over one that overlaps an in-flight branch", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 2 });
+  const running = makeTask(db, projectId, { state: "in_progress", agent_target: "a1", brief: "rework server/src/sidecar.ts" });
+  writeEvent(db, { task_id: running, source: "dispatcher", type: "dispatch_scope", payload: { files: ["server/src/sidecar.ts"], dirs: [], from: ["brief"] } });
+  const clashing = makeTask(db, projectId, { brief: "another pass over server/src/sidecar.ts" });
+  const clear = makeTask(db, projectId, { brief: "tidy web/src/views/Board.tsx" });
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr });
+
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, clear).state).toBe("in_progress");
+  expect(getTask(db, clashing).state).toBe("queued");
+});
+
+test("a bare filename in one brief still collides with the full path in another", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 3 });
+  const a = makeTask(db, projectId, { brief: "add the route in server/src/api.ts" });
+  const b = makeTask(db, projectId, { brief: "api.ts needs the same guard" });
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, a).state).toBe("in_progress");
+  expect(getTask(db, b).state).toBe("queued");
+});
+
+test("the fleet never idles purely because everything overlaps", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 3 });
+  // A chat manager holds a branch that touches api.ts. It is live, so it is a
+  // real overlap peer, but it does not occupy a worker slot — so the project has
+  // nothing working and the only queued task overlaps it.
+  const manager = makeTask(db, projectId, { source: "chat_supervisor", state: "in_progress", agent_target: "m1" });
+  writeEvent(db, { task_id: manager, source: "reconciler", type: "branch_scope", payload: { base_sha: "abc", files: ["server/src/api.ts"] } });
+  const only = makeTask(db, projectId, { brief: "add the route in server/src/api.ts" });
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr });
+
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, only).state).toBe("in_progress");
+  expect(eventTypes(db, only)).toContain("dispatch_hold_overlap");
+  expect(eventTypes(db, only)).toContain("dispatch_overlap_override");
+});
+
+test("a first task never waits on an empty fleet", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 3 });
+  const a = makeTask(db, projectId, { brief: "touch server/src/api.ts" });
+  const b = makeTask(db, projectId, { brief: "also touch server/src/api.ts" });
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr }); // nothing running: a goes, b is held
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, a).state).toBe("in_progress");
+  expect(getTask(db, b).state).toBe("queued");
+
+  // a finishes; b is no longer overlapping anything live, so it dispatches next
+  // cycle without needing the override.
+  db.query("UPDATE tasks SET state = 'done', agent_target = NULL WHERE id = ?").run(a);
+  await dispatchOnce(db, { herdr });
+  expect(getTask(db, b).state).toBe("in_progress");
+});
+
+test("briefs that name no paths never hold each other", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 3 });
+  makeTask(db, projectId, { brief: "make the board feel faster" });
+  makeTask(db, projectId, { brief: "make the board feel calmer" });
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(2);
 });
