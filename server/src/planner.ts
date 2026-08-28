@@ -24,6 +24,7 @@ import { classifyEscalation, factorsFromPlan, type EscalationVerdict } from "./p
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { teamclaudeEnv, applyTeamclaudeEnv, type TeamclaudeEnv } from "./teamclaude.ts";
 import { claudeProfileEnvForRepo } from "./claudeProfiles.ts";
+import { modelFailure, noteModelCall } from "./modelCall.ts";
 import { homedir } from "node:os";
 import { join, win32 } from "node:path";
 
@@ -289,9 +290,9 @@ export async function runPlanner(db: DB, taskId: string, deps: PlannerDeps = {})
   } catch (e: any) {
     return plannerError(db, taskId, `planner spawn failed: ${e?.message ?? e}`);
   }
-  if (res.timedOut) return plannerError(db, taskId, `planner timed out after ${timeoutMs}ms`);
-  if (res.code !== 0)
-    return plannerError(db, taskId, `planner exited ${res.code}: ${res.stderr.trim() || res.stdout.trim()}`);
+  if (res.timedOut || res.code !== 0)
+    return plannerError(db, taskId, `planner ${modelFailure(db, res, { timeoutMs })}`);
+  noteModelCall(db, null);
 
   const plan = extractPlan(res.stdout);
   if (!plan) return plannerError(db, taskId, "planner output was not valid JSON with proposed_tasks");

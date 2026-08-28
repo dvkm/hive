@@ -87,3 +87,19 @@ test("scout brief has a report-based definition of done", () => {
   db.query("UPDATE tasks SET kind = 'scout' WHERE id = ?").run(taskId);
   expect(composeBrief(db, taskId)).toContain("report");
 });
+
+test("brief tells agents how to read Figma over REST when a token is passed through", () => {
+  const { db, taskId } = setup();
+  const prev = process.env.FIGMA_TOKEN;
+  process.env.FIGMA_TOKEN = "figd_brieftest";
+  try {
+    const brief = composeBrief(db, taskId);
+    expect(brief).toContain("## Figma (headless, no MCP)");
+    expect(brief).toContain("X-Figma-Token: $FIGMA_TOKEN");
+    expect(brief).toContain("api.figma.com/v1/images/");
+    expect(brief).not.toContain("figd_brieftest");
+  } finally {
+    if (prev === undefined) delete process.env.FIGMA_TOKEN;
+    else process.env.FIGMA_TOKEN = prev;
+  }
+});
