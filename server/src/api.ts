@@ -132,6 +132,7 @@ export interface HandlerDeps {
   herdr?: Herdr; // injectable for tests
   supervise?: boolean; // start the herdr wait loop after spawn (true in prod wiring)
   plannerExec?: PlannerExec; // injectable planner subprocess (domain supervisors)
+  triageExec?: PlannerExec; // injectable intake-triage classifier (intake/triage.ts)
   exec?: Exec; // injectable gh/git subprocess (diff + merge); tests pass a stub
   fetch?: Fetcher; // injectable smoke-check fetcher (post-merge); tests pass a stub
   jira?: JiraDeps;
@@ -492,7 +493,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // ---- tasks ----
       if (pathname === "/api/tasks") {
         if (method === "GET") return listTasks(db, url);
-        if (method === "POST") return await createTask(db, req);
+        if (method === "POST") return await createTask(db, req, deps);
       }
       // Land queue (task #1257). Both must precede the /:id route so their
       // path segment isn't parsed as a task id.
@@ -2009,7 +2010,7 @@ export function looksSecuritySensitive(text: string): boolean {
 // Accepts JSON or multipart; attached files are saved under the new task's id
 // and their absolute paths appended to the brief, so the agent that picks the
 // task up can read them.
-async function createTask(db: DB, req: Request): Promise<Response> {
+async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): Promise<Response> {
   const { fields: body, files } = await bodyWithFiles(req);
   if (!body?.project_id) return err("project_id is required");
   if (!body?.title) return err("title is required");
@@ -2132,7 +2133,7 @@ async function createTask(db: DB, req: Request): Promise<Response> {
   // Ambient intake only (source intake_*/watch), and only when the project opted
   // in. Deliberately not awaited: a 60s classifier must not hold the create
   // response, and the dispatcher holds the task meanwhile.
-  triageIntake(db, getTask(db, row.id)).catch((e) => console.error(`[hive] intake triage ${row.id}:`, e));
+  triageIntake(db, getTask(db, row.id), { exec: handlerDeps.triageExec }).catch((e) => console.error(`[hive] intake triage ${row.id}:`, e));
   return json({ ...taskWithHealth(db, getTask(db, row.id)), ...(warning ? { warning } : {}) }, 201);
 }
 

@@ -197,6 +197,9 @@ export interface Decision {
   // chat_supervisor/agent/system for programmatic callers; unknown if unattributed.
   answered_by: "director" | "chat_supervisor" | "agent" | "system" | "unknown" | null;
   answered_actor: string | null;
+  // Set on cards no automation may answer — today only "intake_triage", the
+  // "which reading should we build?" card raised by intake triage.
+  decision_class: string | null;
   bundle?: DecisionBundle | null;
   plan?: DecisionPlan | null;
 }

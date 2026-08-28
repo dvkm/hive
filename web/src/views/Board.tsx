@@ -60,7 +60,7 @@ const COL_EMPTY: Record<string, { title: string; hint: string }> = {
 };
 
 export function Card({ task }: { task: Task }) {
-  const { projects, evidenceCount, spawnError, lastActivity, tasks } = useStore();
+  const { projects, evidenceCount, spawnError, lastActivity, tasks, decisions } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
   const age = useRelTime(lastActivity[task.id] || task.updated_at);
   const ev = evidenceCount[task.id];
@@ -97,6 +97,9 @@ export function Card({ task }: { task: Task }) {
   const trackingOnly = isTrackingOnly(task);
   const jiraMirror = isJiraMirror(task);
   const subtasks = trackingOnly ? trackedSubtasks(task, tasks) : [];
+  // `decisions` is the open-cards list, so an intake_triage card here means this
+  // task is held waiting on the director to pick a reading.
+  const awaitingTriage = decisions.some((d) => d.task_id === task.id && d.decision_class === "intake_triage");
 
   return (
     <Link to={`/tasks/${task.id}`} state={{ backgroundLocation: location }} className="card">
@@ -109,7 +112,14 @@ export function Card({ task }: { task: Task }) {
       <div className="card-meta">
         {project && <span className="chip">{project.name}</span>}
         <span className={`chip chip-kind chip-${task.kind}`}>{task.kind}</span>
-        {task.source === "intake_gchat" && (
+        {awaitingTriage ? (
+          // Intake triage read this request two ways and parked it on one
+          // question. "queued" alone reads as "an agent will pick this up",
+          // which is exactly wrong: nothing moves until the director answers.
+          <span className="chip chip-intake" title="Intake triage found more than one reading. Pick which one to build — nothing is built until you answer.">
+            awaiting one answer
+          </span>
+        ) : task.source === "intake_gchat" && (
           <span className="chip chip-intake" title="Created from a Google Chat message; needs review">
             intake · unreviewed
           </span>
