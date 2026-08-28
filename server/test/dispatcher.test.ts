@@ -10,8 +10,9 @@ process.env.HIVE_HOME = HOME;
 const { openDb, newId, now, getSetting } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
 const { dispatchOnce, isReviewed, inBackoff } = await import("../src/dispatcher.ts");
+const { selfAuditOnce } = await import("../src/selfAudit.ts");
 const { writeEvent, getTask } = await import("../src/state.ts");
-const { createDecision } = await import("../src/api.ts");
+const { createDecision, requeueTask } = await import("../src/api.ts");
 const { queuedSteers } = await import("../src/steer.ts");
 const { createThread } = await import("../src/chat.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
@@ -83,6 +84,32 @@ test("auto_dispatch off: queued tasks are NOT spawned", async () => {
   await dispatchOnce(db, { herdr });
   expect(spawns.length).toBe(0);
   expect(getTask(db, id).state).toBe("queued");
+});
+
+test("weekly self-audit dispatches through normal safeguards when auto_dispatch is off", async () => {
+  const { db, projectId } = freshDb({});
+  db.query("UPDATE projects SET name = 'Hive' WHERE id = ?").run(projectId);
+  const id = selfAuditOnce(db)!;
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr });
+
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, id).state).toBe("in_progress");
+
+  db.query("UPDATE tasks SET state = 'failed' WHERE id = ?").run(id);
+  const retry = requeueTask(db, getTask(db, id));
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(2);
+  expect(getTask(db, retry).state).toBe("in_progress");
+
+  const excluded = freshDb({ dispatch_kinds: ["scout"] });
+  excluded.db.query("UPDATE projects SET name = 'Hive' WHERE id = ?").run(excluded.projectId);
+  const excludedId = selfAuditOnce(excluded.db)!;
+  const excludedHerdr = stubHerdr();
+  await dispatchOnce(excluded.db, { herdr: excludedHerdr.herdr });
+  expect(excludedHerdr.spawns.length).toBe(0);
+  expect(getTask(excluded.db, excludedId).state).toBe("queued");
 });
 
 test("an active chat manager's delegated task dispatches even when project auto_dispatch is off", async () => {

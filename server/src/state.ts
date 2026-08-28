@@ -442,6 +442,18 @@ function trustedRequeueParent(db: DB, task: any): boolean {
   );
 }
 
+export function isSelfAuditLineage(db: DB, task: any | null): boolean {
+  const seen = new Set<string>();
+  let current = task;
+  while (current && !seen.has(current.id)) {
+    if (current.source === "self-audit") return true;
+    if (current.source !== "requeue" || !trustedRequeueParent(db, current)) return false;
+    seen.add(current.id);
+    current = getTask(db, current.parent_task_id);
+  }
+  return false;
+}
+
 // Verify (or quarantine) one requeue task's provenance. Idempotent: a
 // verified row is marked once (requeue_provenance_verified=1) so the indexed
 // sweep below never rechecks it. An unverifiable row is detached from its
@@ -611,6 +623,20 @@ export function queuedInputRecoveryPending(db: DB, taskId: string): boolean {
 // timestamps are millisecond strings: evidence attached in the same tick as the
 // commit's own event is fresh, not stale.
 export function missingVerifications(db: DB, task: any): string[] {
+  return verificationChecklist(db, task)
+    .filter((c) => !c.satisfied)
+    .map((c) => c.name);
+}
+
+// The same contract, item by item, for anything that has to SHOW the gate
+// rather than just enforce it (the review card's checklist, HIVE-403). Each
+// entry carries the id of the freshest evidence that satisfies it, or null when
+// nothing does — so "missing" on the card is the identical judgement the merge
+// gate makes, not a second guess at it.
+export function verificationChecklist(
+  db: DB,
+  task: any
+): { name: string; cmd: string; satisfied: boolean; evidence_id: string | null }[] {
   const cmds = task?.verification_cmds;
   if (!Array.isArray(cmds) || cmds.length === 0) return [];
   let since = "";
@@ -622,13 +648,21 @@ export function missingVerifications(db: DB, task: any): string[] {
   }
   const rows = db
     .query(
-      `SELECT DISTINCT json_extract(payload, '$.verify_name') AS name FROM events
-       WHERE task_id = ? AND type = 'evidence'
-         AND json_extract(payload, '$.verify_name') IS NOT NULL AND ts >= ?`
+      `SELECT json_extract(payload, '$.verify_name') AS name, json_extract(payload, '$.evidence_id') AS evidence_id
+         FROM events
+        WHERE task_id = ? AND type = 'evidence'
+          AND json_extract(payload, '$.verify_name') IS NOT NULL AND ts >= ?
+        ORDER BY ts ASC, rowid ASC`
     )
-    .all(task.id, since) as { name: string }[];
-  const have = new Set(rows.map((r) => r.name));
-  return cmds.map((c: any) => String(c?.name ?? "")).filter((n) => !have.has(n));
+    .all(task.id, since) as { name: string; evidence_id: string | null }[];
+  const have = new Map<string, string | null>();
+  for (const r of rows) have.set(r.name, r.evidence_id); // last write wins: freshest run
+  return cmds.map((c: any) => {
+    const name = String(c?.name ?? "");
+    // `satisfied` is name-presence, exactly as the gate has always read it; the
+    // evidence id is a convenience for linking and may be absent on old rows.
+    return { name, cmd: String(c?.cmd ?? ""), satisfied: have.has(name), evidence_id: have.get(name) ?? null };
+  });
 }
 
 // Same check, plus a `verification_missing` event the agent's next steer can

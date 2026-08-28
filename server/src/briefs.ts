@@ -1,13 +1,14 @@
 // Brief composition. Composed fresh at spawn time (Phase 2) and exposed at
 // GET /api/tasks/:id/brief. Pure function of DB state.
 import type { DB } from "./db.ts";
-import { getTask } from "./state.ts";
+import { getTask, isSelfAuditLineage } from "./state.ts";
 import { prTitlePrefix, prBodyFooter } from "./marker.ts";
 import { managingThreadForTask } from "./chat.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
 import { planGateKinds, planGateBlocks } from "./planCritic.ts";
 import { figmaTokenEnv } from "./secrets.ts";
+import { matchPlaybook, playbookSection } from "./playbook.ts";
 
 // The PR marker contract (documented in docs/API.md). Both halves are REQUIRED
 // on any PR the agent opens so hive can link the PR back to this task.
@@ -284,11 +285,14 @@ output — attach what the command actually printed. If a command fails, fix the
 cause and run it again, or emit \`blocked\` explaining why it cannot pass.`;
 }
 
-function definitionOfDone(kind: string): string {
-  if (kind === "scout") {
+function definitionOfDone(db: DB, task: { id: string; kind: string; source?: string | null }): string {
+  if (isSelfAuditLineage(db, task)) {
+    return "## Definition of done\nIf the audit finds no safe material improvement, attach the findings as report evidence and emit `done` without changing code. Otherwise, merge one evidence-backed optimization through the normal ship path.";
+  }
+  if (task.kind === "scout") {
     return "## Definition of done\nA written report captured as evidence (kind=report) that answers the question. No code changes required.";
   }
-  if (kind === "chore") {
+  if (task.kind === "chore") {
     return "## Definition of done\nThe chore is complete with at least one evidence item showing the result (log, screenshot, or test run).";
   }
   return "## Definition of done\nCode merged (PR open -> reviewed -> verifying -> done), post-merge smoke checks pass, and at least one evidence item is attached. No task reaches Done without evidence.";
@@ -307,7 +311,7 @@ export function composeBrief(db: DB, taskId: string): string {
   parts.push(`# Task ${displayId}: ${task.title}`);
   parts.push(`Task identifier: ${displayId}\nLegacy task number: ${task.number}\nTask id: ${task.id}\nKind: ${task.kind}`);
   parts.push(`## Brief\n${task.brief?.trim() || "(no description provided)"}`);
-  parts.push(definitionOfDone(task.kind));
+  parts.push(definitionOfDone(db, task));
   const contract = verificationContract(task.id, task.verification_cmds);
   if (contract) parts.push(contract);
   parts.push(EMIT_PROTOCOL);
@@ -332,6 +336,12 @@ export function composeBrief(db: DB, taskId: string): string {
   // Standing authority: which scoped rules govern this agent + the guarded-action
   // protocol it MUST use before any externally-risky operation it runs itself.
   parts.push(standingAuthority(db, task.project_id, task.id));
+
+  // A past task like this one may have left a recipe. Inline the single best
+  // match (steps included) instead of trusting the crew to guess the keywords
+  // that would have recalled it.
+  const playbook = matchPlaybook(db, task.project_id, `${task.title} ${task.brief ?? ""}`);
+  if (playbook) parts.push(playbookSection(playbook));
 
   // Project history grows without bound, so briefs carry counts and retrieve
   // task-relevant facts on demand instead of replaying the whole store.

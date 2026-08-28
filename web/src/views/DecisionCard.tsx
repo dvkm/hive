@@ -7,6 +7,69 @@ import { toast } from "../lib/ui";
 import { PrReference, ReferenceText } from "../lib/references";
 import { relTime } from "../lib/time";
 
+// Voice dictation into the note, for answering a decision from a phone. The Web
+// Speech API is the whole implementation — no backend, no library. iOS Safari
+// only exposes the prefixed constructor, and Firefox exposes neither, so the
+// button is hidden wherever the API is absent.
+// ponytail: no interim results and no transcript editing — final phrases are
+// appended to the note, which the director can then edit like any typing.
+type SpeechRec = {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  start: () => void;
+  stop: () => void;
+  onresult: ((event: any) => void) | null;
+  onend: (() => void) | null;
+  onerror: (() => void) | null;
+};
+
+function speechRecognition(): (new () => SpeechRec) | null {
+  const w = typeof window === "undefined" ? undefined : (window as any);
+  return w?.SpeechRecognition || w?.webkitSpeechRecognition || null;
+}
+
+export function MicButton({ onText }: { onText: (text: string) => void }) {
+  const Recognition = speechRecognition();
+  const rec = useRef<SpeechRec | null>(null);
+  const [listening, setListening] = useState(false);
+  if (!Recognition) return null;
+
+  const toggle = () => {
+    if (listening) {
+      rec.current?.stop();
+      return;
+    }
+    const r = new Recognition();
+    r.lang = (typeof navigator !== "undefined" && navigator.language) || "en-US";
+    r.continuous = true;
+    r.interimResults = false;
+    r.onresult = (event: any) => {
+      let text = "";
+      for (let i = event.resultIndex ?? 0; i < event.results.length; i++)
+        if (event.results[i].isFinal) text += event.results[i][0].transcript;
+      if (text.trim()) onText(text.trim());
+    };
+    r.onend = () => setListening(false);
+    r.onerror = () => setListening(false);
+    rec.current = r;
+    setListening(true);
+    r.start();
+  };
+
+  return (
+    <button
+      type="button"
+      className={`btn btn-mini mic-btn ${listening ? "mic-on" : ""}`}
+      aria-pressed={listening}
+      title={listening ? "Stop dictating" : "Dictate the note"}
+      onClick={toggle}
+    >
+      {listening ? "◉ Listening…" : "🎤 Speak"}
+    </button>
+  );
+}
+
 // One decision card: options (recommended first), risk/blast radius, autosaved
 // draft note, Submit. Shared by the Chief exchange, Needs you, and detailed
 // decision views so the card is answerable wherever it appears (product rule 3).
@@ -18,6 +81,8 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
   const [saving, setSaving] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout>>();
+  const noteRef = useRef(note);
+  noteRef.current = note;
 
   // Planner breakdown cards: which proposed tasks are checked (all, by default)
   // and a free-text answer per open question, folded into the note on submit.
@@ -46,6 +111,7 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
   // Debounced draft autosave on every keystroke.
   const onNote = (v: string) => {
     setNote(v);
+    noteRef.current = v;
     clearTimeout(timer.current);
     setSaving(true);
     timer.current = setTimeout(() => {
@@ -155,12 +221,17 @@ export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) 
             })}
           </div>
 
-          <textarea
-            className="dnote"
-            placeholder="Note (optional, autosaved as you type)…"
-            value={note}
-            onChange={(e) => onNote(e.target.value)}
-          />
+          <div className="dnote-wrap">
+            <textarea
+              className="dnote"
+              placeholder="Note (optional, autosaved as you type)…"
+              value={note}
+              onChange={(e) => onNote(e.target.value)}
+            />
+            {/* The recognition callback outlives this render, so read the note
+                from a ref rather than the captured value. */}
+            <MicButton onText={(text) => onNote([noteRef.current, text].filter(Boolean).join(" "))} />
+          </div>
         </>
       )}
 

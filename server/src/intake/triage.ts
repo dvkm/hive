@@ -8,9 +8,19 @@
 // already carry an intent someone chose on purpose.
 //
 // Wired at the three places ambient intake tasks are born: POST /api/tasks
-// (createTask), the Google-Chat connector, and the doc watcher. The braindump
-// endpoint (POST /api/intake) is deliberately NOT wired: the director typed that
-// text themselves, and it already raises a planner-breakdown card.
+// (createTask), the Google-Chat connector, and the doc watcher. That is every
+// funnel (HIVE-411 swept them all); the two that look missing are not:
+//
+// * The braindump endpoint (POST /api/intake) is deliberately NOT wired. The
+//   director typed that text themselves, and it already raises a planner
+//   breakdown card — triaging it too would ask them two questions about one
+//   braindump. Its child tasks are source='planner', which is not a triage
+//   source either: the director already picked those.
+// * Jira import (intake/jira.ts importAndReconcile) only ever creates MIRRORS
+//   — source='external', jira_link_kind='mirror', tracking-only, never
+//   dispatched — so there is nothing to hold. A Jira issue that links to a
+//   hive-native task links to one the director or an agent already created,
+//   and that task came in through POST /api/tasks above.
 //
 // Opt-in per project via config.intake_triage === true, and FAIL OPEN in every
 // failure mode (model down, timeout, junk output, thrown error): a broken

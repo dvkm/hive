@@ -63,6 +63,7 @@ export interface GchatDeps {
   secrets?: GchatSecrets; // bypass keychain resolution (tests)
   intervalMs?: number; // startGchatPoll only
   plannerExec?: PlannerExec; // domain-supervisor planner (auto-trigger when config.plan_intake)
+  triageExec?: PlannerExec; // the intake-triage classifier (injectable in tests)
 }
 
 // ---- module state (mirrors secrets.ts's module-level knownValues) ----
@@ -248,7 +249,8 @@ async function createIntakeTask(
   fetchImpl: FetchLike,
   notify: boolean,
   planIntake: boolean,
-  plannerExec?: PlannerExec
+  plannerExec?: PlannerExec,
+  triageExec?: PlannerExec
 ): Promise<any | null> {
   const name: string = msg.name;
   if (db.query("SELECT 1 FROM tasks WHERE source_ref = ?").get(name)) return null; // dedupe
@@ -316,7 +318,7 @@ async function createIntakeTask(
   // message must not stall the rest of the poll cycle. The task is already held
   // (created unreviewed) and triageIntake takes its own hold synchronously
   // before its first await, so there is no window where it could dispatch.
-  triageIntake(db, task).catch((e) => console.error(`[hive] gchat: intake triage ${id}:`, e));
+  triageIntake(db, task, { exec: triageExec }).catch((e) => console.error(`[hive] gchat: intake triage ${id}:`, e));
   return task;
 }
 
@@ -386,7 +388,7 @@ export async function pollGchatOnce(db: DB, deps: GchatDeps = {}): Promise<{ cre
         const senderType = msg.sender?.type;
         const isSelf = secrets.self && msg.sender?.name === secrets.self;
         if (!isSelf && senderType !== "BOT") {
-          const made = await createIntakeTask(db, job.projectId, job.space, msg, token, fetchImpl, notify, job.planIntake, deps.plannerExec);
+          const made = await createIntakeTask(db, job.projectId, job.space, msg, token, fetchImpl, notify, job.planIntake, deps.plannerExec, deps.triageExec);
           if (made) created++;
         }
         // Advance the cursor even for skipped messages so we never refetch them.
