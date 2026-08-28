@@ -152,3 +152,80 @@ test("a merged-PR catch-up may skip the gate, since holding it would strand the 
   transition(db, id, "in_review", { source: "reconciler", skipVerification: true });
   expect(getTask(db, id).state).toBe("in_review");
 });
+
+// HIVE-403: the same contract at the merge gate. A kind the project ships
+// automatically is refused outright; any other kind is the director's call, but
+// the response names what was never proven.
+//
+// mergeTask is called directly so the git side can be stubbed — the project's
+// repo_path is a fixture, not a real checkout.
+const { mergeTask } = await import("../src/api.ts");
+const { Herdr } = await import("../src/runtime/herdr.ts");
+const okExec = async (argv: string[]) => ({
+  code: 0,
+  stdout: argv.includes("rev-parse") ? (argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n") : argv.includes("symbolic-ref") ? "main\n" : "",
+  stderr: "",
+});
+const herdr = new Herdr(okExec as any, "herdr");
+const merge = (id: string) => mergeTask(db, herdr, id, {}, { exec: okExec as any });
+
+async function inReviewTask(kind: string, projectConfig: unknown): Promise<string> {
+  db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify(projectConfig), projectId);
+  const title = `Merge ${++seq}`;
+  const id = (await post("/api/tasks", { project_id: projectId, title, kind, verification_cmds: CMDS })).json.id;
+  transition(db, id, "in_progress", { source: "director" });
+  transition(db, id, "in_review", { source: "director", skipVerification: true });
+  db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x' WHERE id = ?").run(id);
+  // A kind outside auto_merge.kinds needs a passed understanding check before
+  // merge, which is a separate gate — satisfy it so these tests observe the
+  // verification contract alone.
+  const review = writeEvent(db, {
+    task_id: id,
+    source: "agent",
+    type: "review_summary",
+    payload: {
+      understanding: {
+        check: { question: "Safe?", options: [{ key: "a", label: "Yes" }, { key: "b", label: "No" }], answer_key: "a" },
+      },
+    },
+  });
+  writeEvent(db, {
+    task_id: id,
+    source: "director",
+    type: "understanding_quiz_passed",
+    payload: { review_event_id: review.id, answer_key: "a" },
+  });
+  return id;
+}
+
+test("merging an auto-ship kind is refused while a declared verification has no evidence", async () => {
+  const id = await inReviewTask("chore", { auto_merge: { kinds: ["chore"] } });
+  attach(id, "unit"); // one of two
+
+  const res = await merge(id);
+  expect(res.status).toBe(409);
+  expect((await res.json()).error).toContain("typecheck");
+  expect(getTask(db, id).state).toBe("in_review");
+});
+
+test("a kind outside auto_merge.kinds still merges, and the response warns about the gap", async () => {
+  const id = await inReviewTask("ship", { auto_merge: { kinds: ["chore"] } });
+  attach(id, "unit"); // 'typecheck' never ran
+
+  const res = await merge(id);
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.warning).toContain("typecheck");
+  expect(body.warning).not.toContain("unit,");
+  expect(getTask(db, id).state).not.toBe("in_review"); // it landed
+});
+
+test("no warning once every declared verification has evidence", async () => {
+  const id = await inReviewTask("ship", { auto_merge: { kinds: ["chore"] } });
+  attach(id, "unit");
+  attach(id, "typecheck");
+
+  const res = await merge(id);
+  expect(res.status).toBe(200);
+  expect((await res.json()).warning).toBeUndefined();
+});

@@ -484,6 +484,17 @@ export interface TaskDetail extends Task {
   events: Event[];
   evidence: Evidence[];
   decisions: Decision[];
+  // The task's verification contract resolved against its evidence, server-side
+  // (HIVE-403). Absent when the task declared no commands.
+  verification?: VerificationItem[];
+}
+
+// One declared verification command and whether fresh evidence for it exists.
+export interface VerificationItem {
+  name: string;
+  cmd: string;
+  satisfied: boolean;
+  evidence_id: string | null;
 }
 
 // Structured branch diff for the in-review review panel (server/src/diff.ts).
