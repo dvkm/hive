@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faDiamond } from "@fortawesome/free-solid-svg-icons";
 import { api } from "../lib/api";
+import { RequestChanges } from "./RequestChanges";
 import type { Decision, Evidence, JiraTaskState, TaskDetail, UsageTotals } from "../lib/api";
 import { useStore } from "../lib/store";
 import { splitAttachments } from "../lib/attachments";
@@ -995,6 +996,7 @@ export function TaskBody({ id }: { id: string }) {
                   {promoting ? "Distilling…" : "Promote to playbook"}
                 </button>
               )}
+              {t.state === "done" && !trackingOnly && <RequestChanges taskId={t.id} />}
               <div className="transitions">
                 {(NEXT[t.state] || []).filter((to) => !(trackingOnly && t.state === "failed" && to === "queued")).map((to) => (
                   <button
