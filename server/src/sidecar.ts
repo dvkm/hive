@@ -243,26 +243,6 @@ async function runChecks(
   }
   if (checks.length === 0) return { findings, dirtied: false };
 
-  // A freshly spawned worktree has no node_modules yet (the setup hook that
-  // installs one is best-effort and can be unwired or fail silently), and
-  // without it tsc can't even find its own type defs (TS2688 bun-types),
-  // which then cascades into unrelated TS18046 noise. Same install wt.sh
-  // would run, kept idempotent the same way: skip if already present.
-  // Gated by the shared budget like every other check, and a failed install
-  // is its own finding rather than being left to surface as a confusing TS2688.
-  if (!deps.exists(join(worktree, "node_modules")) && deps.exists(join(worktree, "package.json"))) {
-    if (remaining() <= 0) {
-      for (const check of checks) findings.push({ tool: check.tool, summary: "skipped: the 300s sidecar budget ran out" });
-      return { findings, dirtied: false };
-    }
-    const install = await exec(["bun", "install"], { cwd: worktree, timeoutMs: remaining() });
-    if (install.code !== 0) {
-      const summary = cap(`skipped: dependency install failed: ${summarize(install)}`);
-      for (const check of checks) findings.push({ tool: check.tool, summary });
-      return { findings, dirtied: false };
-    }
-  }
-
   const before = await porcelain(exec, worktree);
   for (const check of checks) {
     // A skipped check is a finding: the report has to say this sha was only

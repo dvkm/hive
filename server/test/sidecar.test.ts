@@ -79,18 +79,6 @@ test("a clean worktree reports ok with no findings", async () => {
   expect(reports(db, taskId)).toEqual([{ sha: SHA, ok: true, findings: [] }]);
 });
 
-test("installs deps first when a fresh worktree has no node_modules yet", async () => {
-  const { db, taskId } = freshDb();
-  const world = fakeWorld();
-  world.exists = (p: string) => p.endsWith("tsconfig.json") || p.endsWith("package.json");
-  await sidecarOnce(db, world);
-
-  expect(reports(db, taskId)).toEqual([{ sha: SHA, ok: true, findings: [] }]);
-  const installIdx = world.calls.findIndex((c) => c[0] === "bun" && c[1] === "install");
-  const tscIdx = world.calls.findIndex((c) => c.includes("tsc"));
-  expect(installIdx).toBeGreaterThanOrEqual(0);
-  expect(installIdx).toBeLessThan(tscIdx);
-});
 
 test("skips the install when node_modules is already there", async () => {
   const { db, taskId } = freshDb();
@@ -102,51 +90,7 @@ test("skips the install when node_modules is already there", async () => {
   expect(world.calls.some((c) => c[0] === "bun" && c[1] === "install")).toBe(false);
 });
 
-test("a failed install is reported as a skipped finding for every check, instead of a confusing tsc error", async () => {
-  const { db, taskId } = freshDb();
-  const world = fakeWorld({}, {});
-  world.exists = (p: string) => p.endsWith("tsconfig.json") || p.endsWith("package.json");
-  const exec: Exec = async (argv, opts) => {
-    if (argv[0] === "bun" && argv[1] === "install") return { code: 1, stdout: "", stderr: "network error\n" };
-    return world.exec(argv, opts);
-  };
-  await sidecarOnce(db, { ...world, exec });
 
-  const [report] = reports(db, taskId);
-  expect(report.ok).toBe(false);
-  expect(report.findings).toEqual([
-    { tool: "tsc", summary: "skipped: dependency install failed: network error" },
-    { tool: "lint", summary: "skipped: dependency install failed: network error" },
-  ]);
-  // tsc/lint never ran on top of a half-installed tree.
-  expect(world.calls.some((c) => c.includes("tsc") || c.includes("lint"))).toBe(false);
-});
-
-test("an install is itself subject to the shared sweep budget", async () => {
-  const { db, taskId } = freshDb();
-  const world = fakeWorld();
-  world.exists = (p: string) => p.endsWith("tsconfig.json") || p.endsWith("package.json");
-  const realNow = Date.now;
-  let clock = 1_000_000;
-  Date.now = () => clock;
-  try {
-    // Burn the budget before the install would run (right after HEAD/git-path/porcelain reads).
-    const exec: Exec = async (argv, opts) => {
-      if (argv.includes("--git-path")) clock += 301_000;
-      return world.exec(argv, opts);
-    };
-    await sidecarOnce(db, { ...world, exec });
-  } finally {
-    Date.now = realNow;
-    __resetSidecarCursor();
-  }
-  const [report] = reports(db, taskId);
-  expect(report.findings).toEqual([
-    { tool: "tsc", summary: "skipped: the 300s sidecar budget ran out" },
-    { tool: "lint", summary: "skipped: the 300s sidecar budget ran out" },
-  ]);
-  expect(world.calls.some((c) => c[0] === "bun" && c[1] === "install")).toBe(false);
-});
 
 test("summaries are capped at 200 characters", async () => {
   const { db, taskId } = freshDb();
