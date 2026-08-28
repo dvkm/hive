@@ -393,6 +393,20 @@ test("a queued corrective steer holds the retry; delivery + a new head resumes i
   expect(resumed.calls).toEqual([a]);
 });
 
+test("a held retry logs land_retry_held once per episode, not once per sweep", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  queueSteerEvent(db, a, "REQUESTS-CHANGES: still mangled", "test steer");
+
+  // Same undelivered steer, three sweeps in a row: only the first sweep should
+  // write the hold event (HIVE-444 follow-up — an agent slow between turns must
+  // not write this event every 30s indefinitely).
+  for (let i = 0; i < 3; i++) await landOnce(db, { exec: filesExec({}), merge: mergeStub(db).merge });
+  const held = db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'land_retry_held'").get(a) as any;
+  expect(held.n).toBe(1);
+});
+
 test("unmarking drops the retry even mid-backoff — zero attempts after (HIVE-444 addendum)", async () => {
   const { db, projectId } = freshDb();
   const a = makeTask(db, projectId, { branch: "a" });
