@@ -620,6 +620,12 @@ test("the guard timeout defaults to 15s and is tunable", () => {
     expect(guardTimeoutMs()).toBe(45_000);
     process.env.HIVE_GUARD_TIMEOUT_MS = "garbage"; // never 0/NaN — that aborts instantly
     expect(guardTimeoutMs()).toBe(15_000);
+    process.env.HIVE_GUARD_TIMEOUT_MS = "-5"; // negative is truthy: must NOT survive
+    expect(guardTimeoutMs()).toBe(15_000);
+    process.env.HIVE_GUARD_TIMEOUT_MS = "0";
+    expect(guardTimeoutMs()).toBe(15_000);
+    process.env.HIVE_GUARD_TIMEOUT_MS = "Infinity";
+    expect(guardTimeoutMs()).toBe(15_000);
   } finally {
     if (prev === undefined) delete process.env.HIVE_GUARD_TIMEOUT_MS;
     else process.env.HIVE_GUARD_TIMEOUT_MS = prev;

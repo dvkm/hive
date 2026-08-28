@@ -668,7 +668,11 @@ export function actionFor(decision: Decision, reason: string): string {
 // authority engine would have allowed. 15s is well past the loaded-server p99 and
 // still bounded; HIVE_GUARD_TIMEOUT_MS raises it further on a heavier fleet.
 export function guardTimeoutMs(): number {
-  return Math.max(1, Number(process.env.HIVE_GUARD_TIMEOUT_MS) || 15_000);
+  // Anything that is not a positive finite number (garbage, 0, negative, Infinity)
+  // counts as absent: a negative is truthy, so `|| 15_000` would keep it and yield
+  // a ~instant abort — fail-closed again, by another door.
+  const raw = Number(process.env.HIVE_GUARD_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 15_000;
 }
 
 // Ask hive's authority engine to decide a not-safe command. Fail-safe: any
