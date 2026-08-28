@@ -2013,3 +2013,38 @@ test("autoMergeReady holds a task until every declared verification has evidence
   await autoMergeReady(db, { exec: git });
   expect(getTask(db, id).state).toBe("done");
 });
+
+// HIVE-486: linkPRs listed one project at a time on the 60s default, so K
+// stalled repos added K full timeouts to the reconciler lap.
+test("linkPRs lists projects concurrently, so K stalled repos cost about one timeout (HIVE-486)", async () => {
+  const { db } = freshDb();
+  const STALL_MS = 150;
+  for (let i = 0; i < 3; i++) {
+    db.query("INSERT INTO projects (id, name, repo_path, config, created_at) VALUES (?,?,?,?,?)").run(
+      newId("proj"), `p${i}`, `/repo/${i}`, "{}", now()
+    );
+  }
+  let inFlight = 0;
+  let peak = 0;
+  const timeouts: (number | undefined)[] = [];
+  const gh: Exec = async (argv, opts) => {
+    if (argv[0] !== "gh" || argv[1] !== "pr" || argv[2] !== "list") return OK();
+    timeouts.push(opts?.timeoutMs);
+    peak = Math.max(peak, ++inFlight);
+    await new Promise((r) => setTimeout(r, STALL_MS));
+    inFlight--;
+    return { code: 124, stdout: "", stderr: "timeout" }; // what defaultExec returns on a timeout
+  };
+
+  const started = Date.now();
+  await reconcileOnce(db, { exec: gh });
+  const elapsed = Date.now() - started;
+
+  expect(timeouts.length).toBe(4);
+  // All 4 lists overlap (GH_LIST_CONCURRENCY is 4), so the step costs about one
+  // stall rather than four. In-flight count is the guarantee; elapsed is the point.
+  expect(peak).toBe(4);
+  expect(elapsed).toBeLessThan(STALL_MS * 3);
+  // A list must not wait the 60s defaultExec default.
+  expect(timeouts.every((ms) => ms != null && ms <= 30_000)).toBe(true);
+});
