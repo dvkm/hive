@@ -271,3 +271,40 @@ test("PR merge fails closed when its base metadata is unavailable", async () => 
   expect(gitCalls).toBe(0);
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_failed'").get(taskId)).toBeTruthy();
 });
+
+
+// The server serves from its own checkout. A land that does not reach that
+// checkout does not run — the 2026-08-25 gap this closes.
+function servingExec(branch: string, seen: string[][]): Exec {
+  return async (argv) => {
+    seen.push(argv);
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(JSON.stringify({ state: "OPEN", baseRefName: "main", baseRefOid: "base-sha", headRefOid: "head-sha", mergeStateStatus: "CLEAN", statusCheckRollup: [] }));
+    // One repo, two worktrees: the serving checkout and /repo share a git dir.
+    if (argv.includes("--git-common-dir")) return OK("/repo/.git");
+    if (argv.includes("--show-current")) return OK(branch);
+    return OK();
+  };
+}
+
+test("a land merges the base into the serving checkout when it is on another branch", async () => {
+  const { db, taskId } = seed();
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/9", taskId);
+  const seen: string[][] = [];
+
+  expect((await mergeTask(db, herdr, taskId, {}, { exec: servingExec("live", seen) })).status).toBe(200);
+
+  expect(seen.some((c) => c.join(" ") === "git merge main --no-edit")).toBe(true);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'deployed'").get(taskId)).toBeTruthy();
+});
+
+test("a land touches nothing when the serving checkout is already on the base branch", async () => {
+  const { db, taskId } = seed();
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/10", taskId);
+  const seen: string[][] = [];
+
+  expect((await mergeTask(db, herdr, taskId, {}, { exec: servingExec("main", seen) })).status).toBe(200);
+
+  expect(seen.some((c) => c[0] === "git" && c[1] === "merge")).toBe(false);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'deployed'").get(taskId)).toBeFalsy();
+});
