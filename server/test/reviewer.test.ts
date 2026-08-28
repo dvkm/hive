@@ -211,7 +211,7 @@ test("extractReview parses whole JSON, envelope, and prose-wrapped output", () =
 
 // --- per-risk adversarial verification (task HIVE-406) ---------------------
 
-const { verifyRisks, extractVerdict, extractAnswer, ambiguityCleared, confirmedRisks } = await import("../src/reviewer.ts");
+const { verifyRisks, extractVerdict, extractAnswer, ambiguityCleared, confirmedRisks, verifyPendingOnce } = await import("../src/reviewer.ts");
 
 // A pre-review that flags `n` risks, so autoReviewOnce triggers verification.
 const cautionWith = (risks: string[]) =>
@@ -395,4 +395,56 @@ test("extractVerdict parses envelope and prose, and rejects anything else", () =
   expect(extractVerdict(`Here: ${body} done`)?.why).toBe("y is unused");
   expect(extractVerdict('{"verdict":"maybe","why":"hm"}')).toBeNull();
   expect(extractVerdict("no json")).toBeNull();
+});
+
+// --- the standalone verification pass -------------------------------------
+
+test("verifyPendingOnce verifies a review autoReviewOnce will never revisit", async () => {
+  const { db, id } = setup();
+  db.query("UPDATE tasks SET state = 'in_review', head_sha = 'review-head' WHERE id = ?").run(id);
+  // A review that raises risks but whose verification never produced verdicts —
+  // autoReviewOnce skips this task (it already has an auto_review at this head),
+  // so before this pass existed nothing could ever cover it.
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "auto_review",
+    payload: { verdict: "caution", summary: "s", risks: ["r1", "r2"], questions: [], reviewed_head_sha: "review-head" },
+  });
+  expect(events(db, id, "risk_verdicts")).toHaveLength(0);
+
+  const claude = async () => ({
+    code: 0,
+    stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"checked"}' }),
+    stderr: "",
+  });
+  await verifyPendingOnce(db, { exec: claude, shellExec: ghDiff });
+
+  const [verdicts] = events(db, id, "risk_verdicts");
+  expect(verdicts.payload.verdicts).toHaveLength(2);
+  expect(ambiguityCleared(db, id, "review-head", { risks: ["r1", "r2"], questions: [] })).toBe(true);
+
+  // Already covered now, so a second pass is a no-op.
+  await verifyPendingOnce(db, { exec: claude, shellExec: ghDiff });
+  expect(events(db, id, "risk_verdicts")).toHaveLength(1);
+});
+
+test("verifyPendingOnce leaves alone a review whose verdicts already cover it", async () => {
+  const { db, id } = setup();
+  db.query("UPDATE tasks SET state = 'in_review', head_sha = 'review-head' WHERE id = ?").run(id);
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "auto_review",
+    payload: { verdict: "caution", summary: "s", risks: ["r1"], questions: [], reviewed_head_sha: "review-head" },
+  });
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "risk_verdicts",
+    payload: { reviewed_head_sha: "review-head", verdicts: [{ risk: "r1", verdict: "refuted" }] },
+  });
+  const claude = async () => { throw new Error("should not run"); };
+  await verifyPendingOnce(db, { exec: claude as any, shellExec: ghDiff });
+  expect(events(db, id, "risk_verdicts")).toHaveLength(1);
 });

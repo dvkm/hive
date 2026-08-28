@@ -85,7 +85,7 @@ import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
-import { confirmedRisks, cautionCleared } from "./reviewer.ts";
+import { confirmedRisks, cautionCleared, latestAutoReviewVerdict } from "./reviewer.ts";
 import { explanationGate } from "./explainDiff.ts";
 import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
@@ -3964,31 +3964,6 @@ function touchesSensitivePath(files: string[], tokens: string[]): boolean {
 
 // The newest verdict from the auto reviewer, or null when it never produced one
 // (never ran, errored, or was skipped by project config).
-function latestAutoReviewVerdict(
-  db: DB,
-  taskId: string
-): { verdict: string; files: string[]; risks: string[]; questions: string[]; reviewed_head_sha?: string } | null {
-  const row = db
-    .query(
-      `SELECT type, payload FROM events WHERE task_id = ? AND type IN ('auto_review', 'auto_review_error')
-        ORDER BY ts DESC, rowid DESC LIMIT 1`
-    )
-    .get(taskId) as { type: string; payload: string } | undefined;
-  if (!row || row.type !== "auto_review") return null;
-  try {
-    const payload = JSON.parse(row.payload);
-    if (payload?.skipped || typeof payload?.verdict !== "string") return null;
-    return {
-      verdict: payload.verdict,
-      files: Array.isArray(payload.files) ? payload.files.map(String) : [],
-      risks: Array.isArray(payload.risks) ? payload.risks.map(String) : [],
-      questions: Array.isArray(payload.questions) ? payload.questions.map(String) : [],
-      reviewed_head_sha: typeof payload.reviewed_head_sha === "string" ? payload.reviewed_head_sha : undefined,
-    };
-  } catch {
-    return null;
-  }
-}
 
 // Judgment-class or not (hive-1559). Hive raises only the few changes that
 // actually need the director's head; everything mechanical merges without a
