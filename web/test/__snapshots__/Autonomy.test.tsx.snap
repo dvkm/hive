@@ -1,0 +1,225 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`autonomy panel shows the four numbers 1`] = `
+{
+  "$$typeof": Symbol(react.test.json),
+  "children": [
+    {
+      "$$typeof": Symbol(react.test.json),
+      "children": [
+        "Autonomy ",
+        {
+          "$$typeof": Symbol(react.test.json),
+          "children": [
+            "last ",
+            "7",
+            "d",
+          ],
+          "props": {
+            "className": "muted autonomy-window",
+          },
+          "type": "span",
+        },
+      ],
+      "props": {
+        "className": "brief-h",
+      },
+      "type": "h2",
+    },
+    {
+      "$$typeof": Symbol(react.test.json),
+      "children": [
+        {
+          "$$typeof": Symbol(react.test.json),
+          "children": [
+            {
+              "$$typeof": Symbol(react.test.json),
+              "children": [
+                "Auto-merges that stuck",
+              ],
+              "props": {
+                "className": "autonomy-label",
+              },
+              "type": "span",
+            },
+            {
+              "$$typeof": Symbol(react.test.json),
+              "children": [
+                "92%",
+              ],
+              "props": {
+                "className": "autonomy-value",
+              },
+              "type": "span",
+            },
+            {
+              "$$typeof": Symbol(react.test.json),
+              "children": [
+                "11 of 12 clean, 1 fixed after merge",
+              ],
+              "props": {
+                "className": "muted",
+              },
+              "type": "span",
+            },
+          ],
+          "props": {
+            "className": "autonomy-cell",
+          },
+          "type": "div",
+        },
+        {
+          "$$typeof": Symbol(react.test.json),
+          "children": [
+            {
+              "$$typeof": Symbol(react.test.json),
+              "children": [
+                "Asks for you",
+              ],
+              "props": {
+                "className": "autonomy-label",
+              },
+              "type": "span",
+            },
+            {
+              "$$typeof": Symbol(react.test.json),
+              "children": [
+                "2.9",
+                {
+                  "$$typeof": Symbol(react.test.json),
+                  "children": [
+                    "/day",
+                  ],
+                  "props": {},
+                  "type": "small",
+                },
+              ],
+              "props": {
+                "className": "autonomy-value",
+              },
+              "type": "span",
+            },
+            {
+              "$$typeof": Symbol(react.test.json),
+              "children": [
+                {
+                  "$$typeof": Symbol(react.test.json),
+                  "children": [
+                    "▁▅█▃▁▂▄",
+                  ],
+                  "props": {
+                    "className": "autonomy-spark",
+                  },
+                  "type": "span",
+                },
+                " ",
+                "20",
+                " in ",
+                "7",
+                "d",
+              ],
+              "props": {
+                "className": "muted",
+              },
+              "type": "span",
+            },
+          ],
+          "props": {
+            "className": "autonomy-cell",
+          },
+          "type": "div",
+        },
+        {
+          "$$typeof": Symbol(react.test.json),
+          "children": [
+            {
+              "$$typeof": Symbol(react.test.json),
+              "children": [
+                "Unstuck itself",
+              ],
+              "props": {
+                "className": "autonomy-label",
+              },
+              "type": "span",
+            },
+            {
+              "$$typeof": Symbol(react.test.json),
+              "children": [
+                "9",
+              ],
+              "props": {
+                "className": "autonomy-value",
+              },
+              "type": "span",
+            },
+            {
+              "$$typeof": Symbol(react.test.json),
+              "children": [
+                "2",
+                " held at cap, ",
+                "4",
+                " scouts",
+              ],
+              "props": {
+                "className": "muted",
+              },
+              "type": "span",
+            },
+          ],
+          "props": {
+            "className": "autonomy-cell",
+          },
+          "type": "div",
+        },
+        {
+          "$$typeof": Symbol(react.test.json),
+          "children": [
+            {
+              "$$typeof": Symbol(react.test.json),
+              "children": [
+                "You agreed with hive",
+              ],
+              "props": {
+                "className": "autonomy-label",
+              },
+              "type": "span",
+            },
+            {
+              "$$typeof": Symbol(react.test.json),
+              "children": [
+                "75%",
+              ],
+              "props": {
+                "className": "autonomy-value",
+              },
+              "type": "span",
+            },
+            {
+              "$$typeof": Symbol(react.test.json),
+              "children": [
+                "4 decisions hive answered itself",
+              ],
+              "props": {
+                "className": "muted",
+              },
+              "type": "span",
+            },
+          ],
+          "props": {
+            "className": "autonomy-cell",
+          },
+          "type": "div",
+        },
+      ],
+      "props": {
+        "className": "autonomy-grid",
+      },
+      "type": "div",
+    },
+  ],
+  "props": {
+    "className": "brief-section",
+  },
+  "type": "section",
+}
+`;

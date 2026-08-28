@@ -1163,6 +1163,15 @@ work. Use `POST /api/tasks/:id/events` with `type=evidence` for that.
 - `GET /api/tasks/:id/usage` → `200 {task_id, usage:[Usage], totals}` | `404`
   All usage rows for a task (oldest first) plus the totals object.
 
+### Autonomy scoreboard
+- `GET /api/stats/autonomy?days=<n>&project_id=<id>&reverts=0` → `200 {window, auto_merge_precision, inbox_load, recovery, agreement}`
+  Read-only. Four questions about whether hive's own automation is earning trust. `days` defaults to 30 (clamped 1..365) and the window snaps to whole UTC days; `project_id` scopes every section; `reverts=0` turns off the git revert scan (file-overlap detection still runs).
+  `auto_merge_precision` is `{merges, measurable, clean, fixed, precision, revert_detection, cases}`. `precision` is `clean / measurable`, and it is `null` when nothing was measurable — a merge with no recorded `merged_files` and no PR number could only ever come back clean, so it is excluded rather than counted as good. `cases` carries one row per auto-merge with its `fix_signal` (`file_overlap` or `revert`, else `null`).
+  `inbox_load` is `{by_day, totals, per_day}`. `by_day` has one row per calendar day in the window with a count per attention class (`decision`, `quiz`, `checkpoint`, `dialog`, `stale`) plus `total`.
+  `recovery` is `{auto_respawns, one_cap_parks, scouts_spawned}`.
+  `agreement` is `{auto_answered, contradictions, auto_contradicted, agreement_rate}`. `agreement_rate` is `null` when hive answered no decisions itself.
+  The signals are heuristics with named ceilings (see `server/src/autonomyStats.ts`); read them as trends. `hive stats` prints the same numbers as an `AUTONOMY` section, and the web Needs-you activity summary shows them as a compact grid. Neither surface applies a threshold or raises an alert.
+
 ### Decisions
 - `GET /api/decisions?status=open[&project_id=<id>][&test=all]` → `200 [Decision, ...]` (newest first; `status` defaults to `open`; `status=all` returns every decision; `project_id` optionally scopes the list). Decisions under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
 - `POST /api/decisions` body `{task_id (required), title (required), context (required), risk?, blast_radius?, options (required, non-empty)}` → `201 Decision` | `400` (missing context or missing/empty `options`)

@@ -83,7 +83,7 @@ Usage:
   hive steer-all "message" [--project <id>] [--actor <session>]   broadcast a steer to every live agent
   hive tunnel                             expose hive to your phone over Tailscale HTTPS (private; enables push)
   hive remote                             print LAN URL + API token for phone access (PWA)
-  hive stats [--days 7]                   autonomy scorecard (steers, decisions, CI gate, cost)
+  hive stats [--days 7]                   autonomy scorecard (steers, decisions, CI gate, cost, autonomy)
   hive watch add --project <id> --name <n> --url <u> [--prompt <s>] [--kind <k>] [--interval <min>]
   hive watch list [--project <id>]        poll a doc/page; changes queue an act-on-change task
   hive watch rm --project <id> --name <n>   (Google Docs edit links auto-use the txt export; doc must be link-readable)
@@ -823,6 +823,13 @@ async function main() {
     console.log(`  CI gate:        ${held} handoffs held, ${bounced} bounced out of review`);
     console.log(`  review->merge:  avg ${review.h ?? "-"}h`);
     for (const c of cost) console.log(`  cost:           ${c.model}  $${c.c}  (${c.t} tasks)`);
+
+    // Read-only autonomy scoreboard (same collector the /api/stats/autonomy
+    // endpoint serves). No thresholds or alerts here on purpose.
+    const { autonomyStats } = await import("../server/src/autonomyStats.ts");
+    const { renderAutonomy } = await import("./autonomySection.ts");
+    for (const line of renderAutonomy(await autonomyStats(db, { days }))) console.log(line);
+
     console.log(`\nfewer steers/nudges per shipped task = more autonomy. Compare week over week.`);
     return;
   }

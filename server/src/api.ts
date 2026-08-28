@@ -16,6 +16,8 @@ import {
   TERMINAL,
   advanceIfFinished,
   verificationGate,
+  verificationChecklist,
+  missingVerifications,
   evidenceCount,
   evidenceAtSha,
   changesRequestUnaddressed,
@@ -2776,7 +2778,11 @@ function getTaskFull(db: DB, id: string): Response {
     .map(parseEvidence)
     .map((e: any) => ({ ...e, preview: evidencePreview(e.path, e.kind) }));
   const decisions = db.query("SELECT * FROM decisions WHERE task_id = ? ORDER BY ts").all(id).map((r) => withBundle(db, parseDecision(r)));
-  return json({ ...taskWithHealth(db, task), events, evidence, decisions });
+  // The verification contract, resolved against the evidence the merge gate
+  // reads, so the review card can show the checklist instead of restating the
+  // rule (HIVE-403). Absent entirely when the task declared no contract.
+  const verification = verificationChecklist(db, task);
+  return json({ ...taskWithHealth(db, task), events, evidence, decisions, ...(verification.length ? { verification } : {}) });
 }
 
 async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
@@ -3112,6 +3118,19 @@ export async function mergeTask(
     }
   }
 
+  // HIVE-403: the verification contract, at the merge gate. For a kind the
+  // project ships automatically, an unproven command blocks the merge outright
+  // — auto-merge must never land work whose declared checks were never run. A
+  // director landing any other kind by hand may proceed, but the response says
+  // which commands have no evidence so the choice is an informed one.
+  const missingVerify = missingVerifications(db, task);
+  if (missingVerify.length && autoShipKind)
+    return err(
+      `merge blocked — no evidence for ${missingVerify.length} declared verification${missingVerify.length === 1 ? "" : "s"}: ` +
+        `${missingVerify.join(", ")}. Run them and attach the output, or merge a kind that is not in auto_merge.kinds by hand.`,
+      409
+    );
+
   // Recompute the dependency claim live rather than trusting evidence prose
   // (task #1000: #977 claimed its dependency had landed on main; it hadn't).
   // Mirrors the dispatcher's own gate (state.ts unmetDeps) at the other end
@@ -3430,7 +3449,10 @@ export async function mergeTask(
     }
   }
 
-  return json(getTask(db, id));
+  return json({
+    ...getTask(db, id),
+    ...(missingVerify.length ? { warning: `merged without evidence for: ${missingVerify.join(", ")}` } : {}),
+  });
 }
 
 // Bounce an in-review task back to in_progress with reviewer feedback, and make

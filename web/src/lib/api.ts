@@ -484,6 +484,17 @@ export interface TaskDetail extends Task {
   events: Event[];
   evidence: Evidence[];
   decisions: Decision[];
+  // The task's verification contract resolved against its evidence, server-side
+  // (HIVE-403). Absent when the task declared no commands.
+  verification?: VerificationItem[];
+}
+
+// One declared verification command and whether fresh evidence for it exists.
+export interface VerificationItem {
+  name: string;
+  cmd: string;
+  satisfied: boolean;
+  evidence_id: string | null;
 }
 
 // Structured branch diff for the in-review review panel (server/src/diff.ts).
@@ -817,6 +828,28 @@ export interface JiraTaskState {
   }[];
 }
 
+// GET /api/stats/autonomy — the read-only autonomy scoreboard. `precision` and
+// `agreement_rate` are null when there was nothing measurable, which the UI
+// shows as "no data" rather than a made-up 100%.
+export interface AutonomyStats {
+  window: { days: number; since: string; until: string };
+  auto_merge_precision: {
+    merges: number;
+    measurable: number;
+    clean: number;
+    fixed: number;
+    precision: number | null;
+    revert_detection: "on" | "off";
+  };
+  inbox_load: {
+    by_day: { day: string; total: number }[];
+    totals: { decision: number; quiz: number; checkpoint: number; dialog: number; stale: number; total: number };
+    per_day: number;
+  };
+  recovery: { auto_respawns: number; one_cap_parks: number; scouts_spawned: number };
+  agreement: { auto_answered: number; contradictions: number; auto_contradicted: number; agreement_rate: number | null };
+}
+
 export const api = {
   token: apiToken,
   jira: (taskId: string) => req<JiraTaskState>(`/api/tasks/${taskId}/jira`),
@@ -1031,6 +1064,12 @@ export const api = {
 
   search: (q: string, limit = 50) =>
     req<{ hits: SearchHit[] }>(`/api/search?q=${encodeURIComponent(q)}&limit=${limit}`),
+
+  autonomyStats: (days = 7, project?: string) => {
+    const q = new URLSearchParams({ days: String(days) });
+    if (project) q.set("project_id", project);
+    return req<AutonomyStats>(`/api/stats/autonomy?${q}`);
+  },
 
   morningBrief: (since?: string, project?: string) => {
     const q = new URLSearchParams();
