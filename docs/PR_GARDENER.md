@@ -19,7 +19,9 @@ It is off by default. Enable it by adding `pr_gardener` to a project's config:
     ],
     "max_actions_per_sweep": 5,
     "max_fix_attempts": 2,
-    "max_gardener_agents": 1
+    "max_gardener_agents": 1,
+    "adopt_untracked": false,
+    "adopt_skip_labels": ["no-hive", "do-not-adopt"]
   }
 }
 ```
@@ -36,4 +38,18 @@ The sweep runs inside Hive's reconciler and never takes a project agent slot. La
 
 The Projects screen shows the current queue and its reasons. The director can hold or release an item. The director can also approve a land or close action. Those actions run on the next sweep and remain subject to Hive's normal merge guardrails.
 
-Each sweep sends one compact digest when it landed, closed, rebased, dispatched a check fix, or escalated at least one pull request.
+## Adopting untracked pull requests
+
+Set `adopt_untracked` to true and each sweep also records the open pull requests that no Hive task tracks yet. These are the ones a human or another tool opened, so Hive never saw them and the gardener could not act on them.
+
+Hive lists every open pull request in the repo for this step, not just the ones on the configured base branch. A hotfix opened straight against `main` therefore gets recorded too, even though the gardener only grades pull requests on the base branch.
+
+A pull request is skipped when it already carries the `hive-task:` footer or a `[hive-<n>]` title, when a Hive task already points at its URL, when it is a draft, or when it carries a label from `adopt_skip_labels`. Those defaults are `no-hive` and `do-not-adopt`. This is how you tell Hive to keep its hands off a pull request you are driving yourself.
+
+Adoption creates one lightweight tracking task. It is a `source=external` task, which is Hive's existing record-only lane. Hive never spawns an agent for it and the merge path refuses it outright. Adoption only makes the pull request visible on the board and to the gardener. Landing it or closing it still needs you to answer a gardener decision card.
+
+Adoption is idempotent. The lookup matches an existing task in any state, including a cancelled one, so a pull request you dismissed is never adopted again. When an adopted pull request stops being open, Hive cancels its tracking task so the board does not fill up.
+
+The poll interval is the shared `cadence`. The repos in scope are the projects that turn `adopt_untracked` on.
+
+Each sweep sends one compact digest when it adopted, landed, closed, rebased, dispatched a check fix, or escalated at least one pull request.

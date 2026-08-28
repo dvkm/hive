@@ -5,6 +5,7 @@ import { projectBaseBranch } from "./exec.ts";
 import { enqueue } from "./notifications.ts";
 import { getTask, transition, writeEvent, TERMINAL, type State } from "./state.ts";
 import { broadcastTask } from "./health.ts";
+import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
 
 export interface PrGardenerConfig {
   enabled?: boolean;
@@ -16,6 +17,8 @@ export interface PrGardenerConfig {
   max_actions_per_sweep?: number;
   max_fix_attempts?: number;
   max_gardener_agents?: number;
+  adopt_untracked?: boolean;
+  adopt_skip_labels?: string[];
 }
 
 export const DEFAULT_SENSITIVE_PATHS = [
@@ -27,6 +30,89 @@ export const DEFAULT_SENSITIVE_PATHS = [
   "**/secrets",
   "**/secrets/**",
 ];
+
+// A PR carrying either of these labels is one a human is driving by hand.
+// Hive records nothing for it and the gardener leaves it alone.
+export const DEFAULT_ADOPT_SKIP_LABELS = ["no-hive", "do-not-adopt"];
+
+export type AdoptPr = {
+  number: number;
+  url: string;
+  title: string;
+  body?: string | null;
+  isDraft?: boolean;
+  labels?: { name?: string }[] | null;
+};
+
+export type AdoptOutcome = "adopted" | "marked" | "tracked" | "draft" | "labelled";
+
+// Adopt one open PR that no Hive task tracks yet.
+//
+// The adopted task is source='external', which is Hive's existing "record it,
+// never do agent work for it" lane (supervision.ts): the dispatcher never
+// spawns for it and mergeTask refuses it outright. So adoption only makes the
+// PR VISIBLE — to the board, to syncPRs, and to the gardener's own classifier,
+// which now finds a linked task instead of dead-ending. Landing or closing it
+// still needs the director to answer a gardener decision card.
+//
+// Idempotent: the pr_url / source_ref lookup matches an already-adopted task in
+// any state, including a cancelled one, so a PR the director dismissed is never
+// resurrected on the next sweep.
+export function adoptUntrackedPr(
+  db: DB,
+  projectId: string,
+  pr: AdoptPr,
+  skipLabels: string[] = DEFAULT_ADOPT_SKIP_LABELS
+): { outcome: AdoptOutcome; task_id?: string } {
+  // A marker means the PR claims a Hive task. linkPRs owns that link; adopting
+  // would double-track it. Skip on the marker alone, even if the id resolves to
+  // no local task (a marker from another Hive DB is still not ours to adopt).
+  if (taskIdFromBody(pr.body) || taskNumberFromTitle(pr.title) != null) return { outcome: "marked" };
+  const sourceRef = `pr-adopt:${pr.number}`;
+  const existing: any = db
+    .query("SELECT id FROM tasks WHERE project_id = ? AND (pr_url = ? OR source_ref = ?) LIMIT 1")
+    .get(projectId, pr.url, sourceRef);
+  if (existing) return { outcome: "tracked", task_id: existing.id };
+  if (pr.isDraft) return { outcome: "draft" };
+  const labels = (pr.labels ?? []).map((l) => String(l?.name ?? "").toLowerCase());
+  if (skipLabels.some((name) => labels.includes(name.toLowerCase()))) return { outcome: "labelled" };
+
+  const id = newId("tsk");
+  const timestamp = now();
+  db.query(
+    "INSERT INTO tasks (id, project_id, title, brief, state, kind, source, source_ref, pr_url, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+  ).run(
+    id,
+    projectId,
+    `PR #${pr.number}: ${pr.title}`,
+    `Hive adopted this pull request so it stops being invisible. It was opened outside Hive, so no Hive agent wrote it and no Hive review covers it.\n\nPR: ${pr.url}\n\nHive tracks it and the PR Gardener watches it. Hive will not merge or close it on its own. Answer the gardener's card to land or close it.`,
+    "queued",
+    "chore",
+    "external",
+    sourceRef,
+    pr.url,
+    timestamp,
+    timestamp
+  );
+  writeEvent(db, { task_id: id, source: "pr-gardener", type: "pr_adopted", payload: { pr_number: pr.number, pr_url: pr.url } });
+  broadcastTask(db, getTask(db, id));
+  return { outcome: "adopted", task_id: id };
+}
+
+// Cancel adopted tracking tasks whose PR is no longer in the open list.
+export function retireAdoptedTasks(db: DB, projectId: string, openNumbers: Set<number>): number[] {
+  const rows = db
+    .query(`SELECT id, source_ref FROM tasks WHERE project_id = ? AND source = 'external' AND source_ref LIKE 'pr-adopt:%' AND state NOT IN ('done','failed','cancelled')`)
+    .all(projectId) as { id: string; source_ref: string }[];
+  const retired: string[] = [];
+  for (const row of rows) {
+    const number = Number(row.source_ref.slice("pr-adopt:".length));
+    if (!Number.isFinite(number) || openNumbers.has(number)) continue;
+    transition(db, row.id, "cancelled", { source: "pr-gardener", reason: "the adopted PR is no longer open" });
+    retired.push(row.id);
+  }
+  return retired;
+}
 
 export type GardenerAction = "land" | "rebase" | "fix" | "close" | "decision" | "hold" | "wait";
 
@@ -46,6 +132,9 @@ export interface ClassifierInput {
   override?: string | null;
   maxFixAttempts?: number;
   autoCloseSuperseded?: boolean;
+  // The linked task is an adoption record (a PR opened outside Hive), not work
+  // a Hive agent did. Only changes the wording the director reads on the card.
+  adopted?: boolean;
 }
 
 export function classifyPr(p: ClassifierInput): { action: GardenerAction; reason: string } {
@@ -77,7 +166,12 @@ export function classifyPr(p: ClassifierInput): { action: GardenerAction; reason
   if (p.ci === "passing" && p.mergeState === "CLEAN") {
     return p.linkedTaskState === "in_review"
       ? { action: "land", reason: "Green, clean, and linked to an in-review Hive task" }
-      : { action: "decision", reason: "Ready to land, but not linked to an in-review Hive task" };
+      : {
+          action: "decision",
+          reason: p.adopted
+            ? "Green and clean, but it was opened outside Hive and no Hive review covers it"
+            : "Ready to land, but not linked to an in-review Hive task",
+        };
   }
   if (p.ci === "pending") return { action: "wait", reason: "Waiting for CI" };
   return { action: "decision", reason: `GitHub reports ${p.mergeState.toLowerCase()} merge state` };
@@ -220,9 +314,43 @@ export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
       if (!openNumbers.has(row.pr_number)) db.query("DELETE FROM pr_gardener_items WHERE project_id = ? AND pr_number = ?").run(project.id, row.pr_number);
     }
 
-    const digest = { landed: [] as number[], closed: [] as number[], rebased: [] as number[], fixing: [] as number[], escalated: [] as number[] };
+    const digest = { adopted: [] as number[], landed: [] as number[], closed: [] as number[], rebased: [] as number[], fixing: [] as number[], escalated: [] as number[] };
     let actions = 0;
     const maxActions = gardener.max_actions_per_sweep ?? 5;
+
+    // Discovery: record open PRs that no Hive task tracks yet, so PRs opened by
+    // hand (or by another tool) stop being invisible to the board and to this
+    // gardener. Listed WITHOUT --base on purpose: a hotfix opened straight
+    // against main gets recorded too, even though the classifier below only
+    // grades PRs on the configured base branch. Adoption writes one row and
+    // touches no repo, so it is capped separately from the mutation budget.
+    if (gardener.adopt_untracked) {
+      const all = await deps.exec(
+        ["gh", "pr", "list", "--state", "open", "--limit", "100", "--json", "number,url,title,body,isDraft,labels"],
+        { cwd: project.repo_path }
+      );
+      let candidates: AdoptPr[] | null = null;
+      try {
+        if (all.code === 0) {
+          const parsed = JSON.parse(all.stdout || "[]");
+          if (Array.isArray(parsed)) candidates = parsed;
+        }
+      } catch {
+        candidates = null; // gh gave us nothing usable; try again next sweep
+      }
+      if (candidates) {
+        const skipLabels = gardener.adopt_skip_labels ?? DEFAULT_ADOPT_SKIP_LABELS;
+        for (const candidate of candidates) {
+          if (digest.adopted.length >= maxActions) break;
+          if (adoptUntrackedPr(db, project.id, candidate, skipLabels).outcome === "adopted") digest.adopted.push(candidate.number);
+        }
+        // An adopted task is pure bookkeeping, so once its PR stops being open
+        // there is nothing left to track. Close it out rather than let adoption
+        // ratchet the board fuller every sweep. Only ever touches tasks this
+        // code created (source_ref 'pr-adopt:<n>'), and only when gh answered.
+        retireAdoptedTasks(db, project.id, new Set(candidates.map((pr) => pr.number)));
+      }
+    }
     const fetched = await deps.exec([
       "git",
       "fetch",
@@ -254,6 +382,7 @@ export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
         superseded,
         sensitive,
         linkedTaskState: linked?.state,
+        adopted: String(linked?.source_ref ?? "").startsWith("pr-adopt:"),
         directorDeciding: !!linked && !!deps.directorDeciding?.(linked.id),
         actionInFlight: activeTask(db, prior?.action_task_id),
         decisionOpen: !!prior?.decision_id,
