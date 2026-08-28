@@ -812,6 +812,17 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         });
       }
     }
+    if (pathname === "/api/tasks" && new URL(req.url).searchParams.get("compact") === "1" &&
+        req.headers.get("accept-encoding")?.includes("gzip") && response.body) {
+      const headers = new Headers(response.headers);
+      headers.set("Content-Encoding", "gzip");
+      headers.set("Vary", "Accept-Encoding");
+      return new Response(response.body.pipeThrough(new CompressionStream("gzip")), {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    }
     return response;
   };
 }
@@ -2304,14 +2315,20 @@ function listTasks(db: DB, url: URL): Response {
     (where.length ? " WHERE " + where.join(" AND ") : "") +
     " ORDER BY t.updated_at DESC";
   const tasks = tasksWithHealth(db, db.query(sql).all(...args).map(parseTask));
-  return json(tasks.map((task) => ({
-    ...task,
-    ...(compact ? { brief: undefined } : {}),
-    evidence_count: evidenceCount(db, task.id),
-    spawn_error: task.state === "queued" &&
-      !!db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawn_error' LIMIT 1").get(task.id) &&
-      !db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawned' LIMIT 1").get(task.id),
-  })));
+  return json(tasks.map((task) => {
+    const listed = {
+      ...task,
+      ...(compact ? { brief: undefined } : {}),
+      evidence_count: evidenceCount(db, task.id),
+      spawn_error: task.state === "queued" &&
+        !!db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawn_error' LIMIT 1").get(task.id) &&
+        !db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawned' LIMIT 1").get(task.id),
+    };
+    return compact
+      ? Object.fromEntries(Object.entries(listed).filter(([, value]) =>
+          value != null && value !== false && value !== 0 && (!Array.isArray(value) || value.length)))
+      : listed;
+  }));
 }
 
 // Activity feed: reverse-chronological events across ALL tasks, each enriched

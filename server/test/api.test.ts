@@ -1279,6 +1279,11 @@ test("task list includes board metadata without task-detail requests", async () 
   expect(listed).toMatchObject({ brief: "load only on detail", evidence_count: 1, spawn_error: true });
   const compact = (await get("/api/tasks?compact=1")).json.find((item: any) => item.id === task.json.id);
   expect(compact).not.toHaveProperty("brief");
+  expect(compact).not.toHaveProperty("agent_target");
+  expect(compact).not.toHaveProperty("depends_on");
+  const compressed = await fetch(BASE + "/api/tasks?compact=1", { headers: { "Accept-Encoding": "gzip" } });
+  expect(compressed.headers.get("content-encoding")).toBe("gzip");
+  expect((await compressed.json()).some((item: any) => item.id === task.json.id)).toBe(true);
 
   db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
     .run("evt_list_spawned", task.json.id, new Date().toISOString(), "herdr", "spawned", "{}");
