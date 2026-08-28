@@ -4593,6 +4593,37 @@ a.dbundle-fact:hover {
   color: inherit;
 }
 
+/* ---- verification contract checklist (HIVE-403) ---- */
+.review-verify {
+  margin: 10px 0 4px;
+  border: 1px solid var(--border, #3333);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.review-verify-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.review-verify-head small { font-weight: 400; opacity: 0.7; }
+.review-verify ul { list-style: none; margin: 0; padding: 0; }
+.review-verify li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+  flex-wrap: wrap;
+}
+.verify-mark { width: 1em; }
+.verify-ok .verify-mark { color: #1a7f37; }
+.verify-missing .verify-mark { color: #cf222e; }
+.verify-missing .verify-link { color: #cf222e; }
+.verify-name { font-weight: 600; }
+.verify-cmd { opacity: 0.7; font-size: 0.85em; }
+.verify-link { margin-left: auto; font-size: 0.85em; }
+
 /* ---- evidence strip on the review card ---- */
 .review-evidence {
   display: flex;

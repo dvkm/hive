@@ -1967,3 +1967,49 @@ test("autoMergeReady stops retrying a merge that is refused at the same head, an
   expect(notes.length).toBe(1);
   expect(notes[0].title).toContain("Auto-merge gave up");
 });
+
+// HIVE-403: a task that declared verification commands must prove it ran them
+// before auto-merge lands it. The gate is the same checker the review handoff
+// uses, so the two can never disagree about what "verified" means.
+test("autoMergeReady holds a task until every declared verification has evidence", async () => {
+  const { autoMergeReady } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
+  const id = makeTask(db, projectId, { kind: "chore" });
+  db.query("UPDATE tasks SET verification_cmds = ? WHERE id = ?").run(
+    JSON.stringify([{ name: "unit", cmd: "bun test" }, { name: "typecheck", cmd: "bun run tsc --noEmit" }]),
+    id
+  );
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review", { skipVerification: true });
+  db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x' WHERE id = ?").run(id);
+  writeEvent(db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
+
+  const attach = (verifyName: string | null) => {
+    const evId = newId("evd");
+    db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+      evId, id, now(), "log", "/tmp/e.log", verifyName ?? "proof"
+    );
+    writeEvent(db, {
+      task_id: id,
+      source: "agent",
+      type: "evidence",
+      payload: { evidence_id: evId, kind: "log", ...(verifyName ? { verify_name: verifyName } : {}) },
+    });
+  };
+  const git: Exec = stub((argv) => {
+    if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
+    return argv.includes("symbolic-ref") ? OK("main\n") : OK();
+  });
+
+  attach("unit"); // one of two: enough evidence to pass the old gate, not this one
+  await autoMergeReady(db, { exec: git });
+  expect(getTask(db, id).state).toBe("in_review");
+  // ...and the gap is on the timeline for the agent's next steer, named.
+  const gap = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'verification_missing'").all(id) as { payload: string }[];
+  expect(gap.length).toBe(1);
+  expect(JSON.parse(gap[0].payload).names).toEqual(["typecheck"]);
+
+  attach("typecheck");
+  await autoMergeReady(db, { exec: git });
+  expect(getTask(db, id).state).toBe("done");
+});
