@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
-import { adoptUntrackedPr, retireAdoptedTasks, runPrGardener, DEFAULT_ADOPT_SKIP_LABELS } from "../src/prGardener.ts";
+import { adoptUntrackedPr, retireAdoptedTasks, runPrGardener, DEFAULT_ADOPT_SKIP_LABELS, ADOPT_LIST_LIMIT } from "../src/prGardener.ts";
 import { getTask } from "../src/state.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -60,11 +60,14 @@ test("skips PRs that carry a hive marker, are draft, or are labelled off-limits"
 test("retires an adopted task once its PR stops being open", () => {
   const { db, projectId } = freshDb();
   const { task_id } = adoptUntrackedPr(db, projectId, PR);
-  expect(retireAdoptedTasks(db, projectId, new Set([999]))).toEqual([]);
-  expect(retireAdoptedTasks(db, projectId, new Set([1]))).toEqual([task_id!]);
+  expect(retireAdoptedTasks(db, projectId, new Set([999]), true)).toEqual([]);
+  // A partial list is never authoritative: nothing is retired from it.
+  expect(retireAdoptedTasks(db, projectId, new Set([1]), false)).toEqual([]);
+  expect(getTask(db, task_id!)!.state).toBe("queued");
+  expect(retireAdoptedTasks(db, projectId, new Set([1]), true)).toEqual([task_id!]);
   expect(getTask(db, task_id!)!.state).toBe("cancelled");
   // Idempotent: a cancelled adoption is never resurrected or re-cancelled.
-  expect(retireAdoptedTasks(db, projectId, new Set([1]))).toEqual([]);
+  expect(retireAdoptedTasks(db, projectId, new Set([1]), true)).toEqual([]);
   expect(adoptUntrackedPr(db, projectId, PR).outcome).toBe("tracked");
 });
 
@@ -97,4 +100,24 @@ test("a sweep adopts the untracked PR and leaves the tracked one alone", async (
   db.query("DELETE FROM settings WHERE key LIKE 'pr_gardener_last:%'").run();
   await runPrGardener(db, deps as any);
   expect((db.query("SELECT COUNT(*) c FROM tasks WHERE source_ref LIKE 'pr-adopt:%'").get() as any).c).toBe(1);
+});
+
+test("a truncated PR list retires nothing", async () => {
+  const { db, projectId } = freshDb({ pr_gardener: { enabled: true, adopt_untracked: true } });
+  const { task_id } = adoptUntrackedPr(db, projectId, PR); // PR 999, still open on GitHub
+
+  // gh answers with a full page that does not contain PR 999: it sits beyond
+  // the page, so it is missing from the list even though it is still open.
+  const page = Array.from({ length: ADOPT_LIST_LIMIT }, (_, i) => ({
+    number: i + 2000, url: `https://github.com/acme/monorepo/pull/${i + 2000}`,
+    title: `PR ${i + 2000}`, body: "", isDraft: false, labels: [{ name: "no-hive" }],
+  }));
+  const exec: Exec = async (argv) => {
+    if (argv[0] === "gh" && argv[1] === "pr" && argv[2] === "list") return OK(JSON.stringify(page));
+    if (argv[0] === "git" && argv[1] === "fetch") return { code: 1, stdout: "", stderr: "no remote" };
+    return OK();
+  };
+  await runPrGardener(db, { exec, land: async () => ({ ok: true }), decide: () => ({ id: newId("dec") }) } as any);
+
+  expect(getTask(db, task_id!)!.state).toBe("queued");
 });
