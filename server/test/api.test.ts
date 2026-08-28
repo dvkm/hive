@@ -529,6 +529,57 @@ test("checkpoints survive task completion; cancelled tasks drop out", async () =
   expect(open.json.checkpoints.some((c: any) => c.id === e2.json.event.id)).toBe(false);
 });
 
+test("checkpoints auto-expire out of the inbox after a quiet window on a progressed task", async () => {
+  const backdate = (eventId: string, hours: number) =>
+    db.query("UPDATE events SET ts = ? WHERE id = ?").run(new Date(Date.now() - hours * 3600_000).toISOString(), eventId);
+
+  // A task that finished normally, carrying a benign note and a flagged one.
+  const t = await post("/api/tasks", { project_id: projectId, title: "cp expiry" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
+  const benign = await post(`/api/tasks/${t.json.id}/events`, { type: "checkpoint", note: "used the existing helper" });
+  const flagged = await post(`/api/tasks/${t.json.id}/events`, { type: "checkpoint", note: "guessed the timezone", flag: true });
+  await post(`/api/tasks/${t.json.id}/events`, { type: "evidence", kind: "log", note: "proof" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+
+  // Still fresh: both stay.
+  let open = await get("/api/checkpoints");
+  expect(open.json.checkpoints.some((c: any) => c.id === benign.json.event.id)).toBe(true);
+  expect(open.json.checkpoints.some((c: any) => c.id === flagged.json.event.id)).toBe(true);
+
+  // Older than the 24h default, and the task moved to in_review after them.
+  backdate(benign.json.event.id, 30);
+  backdate(flagged.json.event.id, 30);
+  open = await get("/api/checkpoints");
+  expect(open.json.checkpoints.some((c: any) => c.id === benign.json.event.id)).toBe(false);
+  expect(open.json.checkpoints.some((c: any) => c.id === flagged.json.event.id)).toBe(true);
+  // Expired only from the inbox — the task timeline still carries it.
+  const evs = await get(`/api/tasks/${t.json.id}/events`);
+  expect(evs.json.some((e: any) => e.id === benign.json.event.id)).toBe(true);
+
+  // A stalled task (no forward state change after the note) keeps asking.
+  const stalled = await post("/api/tasks", { project_id: projectId, title: "cp expiry stalled" });
+  await post(`/api/tasks/${stalled.json.id}/transition`, { to: "in_progress" });
+  const stuck = await post(`/api/tasks/${stalled.json.id}/events`, { type: "checkpoint", note: "waiting on the API" });
+  backdate(stuck.json.event.id, 30);
+  open = await get("/api/checkpoints");
+  expect(open.json.checkpoints.some((c: any) => c.id === stuck.json.event.id)).toBe(true);
+
+  // checkpoint_expiry_hours = 0 turns expiry off for that project.
+  const noExpiry = await post("/api/projects", {
+    name: "cp no expiry",
+    repo_path: "/tmp/cp-no-expiry",
+    config: { checkpoint_expiry_hours: 0 },
+  });
+  const kept = await post("/api/tasks", { project_id: noExpiry.json.id, title: "cp never expires" });
+  await post(`/api/tasks/${kept.json.id}/transition`, { to: "in_progress" });
+  const keptCp = await post(`/api/tasks/${kept.json.id}/events`, { type: "checkpoint", note: "old but still asking" });
+  await post(`/api/tasks/${kept.json.id}/events`, { type: "evidence", kind: "log", note: "proof" });
+  await post(`/api/tasks/${kept.json.id}/transition`, { to: "in_review" });
+  backdate(keptCp.json.event.id, 30);
+  open = await get("/api/checkpoints");
+  expect(open.json.checkpoints.some((c: any) => c.id === keptCp.json.event.id)).toBe(true);
+});
+
 test("event ingestion: status event is recorded", async () => {
   const r = await post(`/api/tasks/${taskId}/events`, { type: "status", note: "working" });
   expect(r.status).toBe(201);
