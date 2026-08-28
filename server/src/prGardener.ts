@@ -33,6 +33,10 @@ export const DEFAULT_SENSITIVE_PATHS = [
 
 // A PR carrying either of these labels is one a human is driving by hand.
 // Hive records nothing for it and the gardener leaves it alone.
+// High enough that a real repo's open PRs fit in one page; a response that
+// actually hits it is treated as truncated (see retireAdoptedTasks).
+export const ADOPT_LIST_LIMIT = 1000;
+
 export const DEFAULT_ADOPT_SKIP_LABELS = ["no-hive", "do-not-adopt"];
 
 export type AdoptPr = {
@@ -100,7 +104,11 @@ export function adoptUntrackedPr(
 }
 
 // Cancel adopted tracking tasks whose PR is no longer in the open list.
-export function retireAdoptedTasks(db: DB, projectId: string, openNumbers: Set<number>): string[] {
+// `complete` must be true only when the caller can prove `openNumbers` holds
+// EVERY open PR. A truncated page would make PRs that are still open look
+// closed, and cancel live tracking tasks, so we refuse to act on one.
+export function retireAdoptedTasks(db: DB, projectId: string, openNumbers: Set<number>, complete: boolean): string[] {
+  if (!complete) return [];
   const rows = db
     .query(`SELECT id, source_ref FROM tasks WHERE project_id = ? AND source = 'external' AND source_ref LIKE 'pr-adopt:%' AND state NOT IN ('done','failed','cancelled')`)
     .all(projectId) as { id: string; source_ref: string }[];
@@ -326,7 +334,7 @@ export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
     // touches no repo, so it is capped separately from the mutation budget.
     if (gardener.adopt_untracked) {
       const all = await deps.exec(
-        ["gh", "pr", "list", "--state", "open", "--limit", "100", "--json", "number,url,title,body,isDraft,labels"],
+        ["gh", "pr", "list", "--state", "open", "--limit", String(ADOPT_LIST_LIMIT), "--json", "number,url,title,body,isDraft,labels"],
         { cwd: project.repo_path }
       );
       let candidates: AdoptPr[] | null = null;
@@ -348,7 +356,9 @@ export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
         // there is nothing left to track. Close it out rather than let adoption
         // ratchet the board fuller every sweep. Only ever touches tasks this
         // code created (source_ref 'pr-adopt:<n>'), and only when gh answered.
-        retireAdoptedTasks(db, project.id, new Set(candidates.map((pr) => pr.number)));
+        // A full page means gh may have had more to give, so we cannot prove we
+        // saw every open PR and must not retire anything this sweep.
+        retireAdoptedTasks(db, project.id, new Set(candidates.map((pr) => pr.number)), candidates.length < ADOPT_LIST_LIMIT);
       }
     }
     const fetched = await deps.exec([
