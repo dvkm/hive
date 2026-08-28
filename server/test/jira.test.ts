@@ -3689,6 +3689,59 @@ test.skipIf(process.platform !== "darwin")("an uninstalled repo is refused, neve
   expect(reason).toContain("host PATH");
 });
 
+// A fresh worktree has no node_modules, but the main checkout it was cut from
+// does. Hive borrows those for the render (it cannot install: the fence denies
+// the network) and unlinks them again as soon as the run is over.
+test.skipIf(process.platform !== "darwin")("a fresh worktree borrows the main checkout's installed deps", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const task = tasks(db)[0];
+  const root = fakeWorktree(task.id, true, undefined, false); // harness, no deps
+  writeFileSyncT(join(root, "web", "package.json"), "{}\n");
+
+  // The main checkout: same layout, deps installed, one real package to link.
+  const main = join(HOME, `main-${newId()}`);
+  mkdirSyncT(join(main, "web", "node_modules", ".bin"), { recursive: true });
+  mkdirSyncT(join(main, "web", "node_modules", "react"), { recursive: true });
+  // A dev-server cache. Linking it would send Vite's startup rewrite to the
+  // main checkout, which the seatbelt denies and Vite dies on.
+  mkdirSyncT(join(main, "web", "node_modules", ".vite", "deps"), { recursive: true });
+  writeFileSyncT(join(main, "web", "package.json"), "{}\n");
+  writeFileSyncT(join(main, "web", "node_modules", ".bin", "playwright"), "#!/bin/sh\n");
+  writeFileSyncT(join(root, ".git"), `gitdir: ${join(main, ".git", "worktrees", "wt")}\n`);
+
+  db.query("UPDATE tasks SET branch = ?, worktree_path = ? WHERE id = ?").run("hive/x", root, task.id);
+  trustRepo(db, projectId);
+
+  const render = execRendering(root, 1);
+  const seen: string[][] = [];
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, {
+    exec: async (argv: string[], opts: any) => {
+      seen.push(argv);
+      if (isHarnessRun(argv)) {
+        // The borrowed packages are in place while the harness runs, reachable
+        // from inside the worktree.
+        expect(readFileSyncT(join(root, "web", "node_modules", ".bin", "playwright"), "utf8")).toBe("#!/bin/sh\n");
+        expect(existsSync(join(root, "web", "node_modules", "react"))).toBe(true);
+        expect(existsSync(join(root, "web", "node_modules", ".vite"))).toBe(false);
+      }
+      return render(argv);
+    },
+  });
+
+  expect(stats.rendered).toBe(1);
+  const harness = seen.find(isHarnessRun)!;
+  expect(harness[harness.findIndex((a) => a.endsWith("/.bin/playwright"))]).toBe(
+    join(root, "web", "node_modules", ".bin", "playwright")
+  );
+  // Gone again afterwards: a branch left wired to another checkout's deps is a
+  // mystery build waiting to happen.
+  expect(existsSync(join(root, "web", "node_modules"))).toBe(false);
+  // And the main checkout is untouched.
+  expect(existsSync(join(main, "web", "node_modules", ".bin", "playwright"))).toBe(true);
+});
+
 test.skipIf(process.platform !== "darwin")(
   "the generated spec still shoots when only third-party and cancelled requests failed",
   async () => {
