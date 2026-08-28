@@ -119,7 +119,11 @@ export function Card({ task }: { task: Task }) {
           <span className="chip chip-intake" title="Intake triage found more than one reading. Pick which one to build — nothing is built until you answer.">
             awaiting one answer
           </span>
-        ) : task.source === "intake_gchat" && (
+        ) : task.source === "intake_gchat" && !task.reviewed && (
+          // `reviewed` is server-computed (health.ts). Intake triage marks a
+          // clear mechanical request reviewed on its own, and a reviewed task
+          // dispatches like any other — so only say "unreviewed" while it is
+          // genuinely held.
           <span className="chip chip-intake" title="Created from a Google Chat message; needs review">
             intake · unreviewed
           </span>
