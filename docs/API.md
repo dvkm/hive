@@ -85,7 +85,12 @@ intake. Classification runs in the background, so a slow one never delays the
 next message or watcher. The card it raises carries `decision_class:
 "intake_triage"`, which every automatic answering path refuses: the standing CI
 ruling, the chat supervisor, and the `decision_auto_answer_hours` timeout. Only
-you can answer it.)
+you can answer it. Answering appends your chosen option to the task's brief under
+a `## Director's answer` heading and marks the task reviewed, so it dispatches on
+the next cycle and the agent builds the reading you picked. Braindumps
+(`POST /api/intake`, source `intake_braindump`) are exempt: you typed that text
+yourself and it already raises a planner breakdown card. Jira import creates only
+tracking-only mirrors, which never dispatch, so nothing there is triaged either.)
 Domain-supervisor keys (see the Domain supervisors section):
 `supervisor_persona` (string, freeform planner identity included in every planner
 prompt), `plan_intake` (bool; when true, each new intake task auto-triggers a

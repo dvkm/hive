@@ -11,7 +11,11 @@ const fakeStore = {
   spawnError: {},
   lastActivity: {},
   tasks: [],
+  decisions: [],
 } as unknown as Store;
+
+// Same store with a set of open decision cards, for the triage-chip tests.
+const storeWith = (decisions: unknown[]) => ({ ...fakeStore, decisions }) as unknown as Store;
 
 const task = (id: string, extra: Partial<Task> = {}): Task => ({
   id,
@@ -38,10 +42,10 @@ const task = (id: string, extra: Partial<Task> = {}): Task => ({
   ...extra,
 });
 
-function tree(t: Task) {
+function tree(t: Task, store: Store = fakeStore) {
   return (
     <MemoryRouter>
-      <Ctx.Provider value={fakeStore}>
+      <Ctx.Provider value={store}>
         <Card task={t} />
       </Ctx.Provider>
     </MemoryRouter>
@@ -213,4 +217,41 @@ test("a sidecar report with findings renders an amber chip counting them, and li
 
 test("no chip at all before the first background check", async () => {
   expect(await checkChips(task("s-none"))).toEqual([]);
+});
+
+// Intake triage parks a task on one question. A plain "queued" card reads as
+// "an agent will get to this", which is the opposite of the truth: nothing
+// happens until the director picks a reading. See server/src/intake/triage.ts.
+const triageCard = (task_id: string) => ({ id: "dec1", task_id, decision_class: "intake_triage" });
+
+test("a task held by an open triage card says it is awaiting one answer", async () => {
+  const t = task("held", { source: "watch" });
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t, storeWith([triageCard("held")])));
+  });
+  expect(chipText(renderer)).toContain("awaiting one answer");
+});
+
+test("the chip replaces the generic intake chip rather than stacking on it", async () => {
+  const t = task("gchat-held", { source: "intake_gchat" });
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t, storeWith([triageCard("gchat-held")])));
+  });
+  const labels = chipText(renderer);
+  expect(labels).toContain("awaiting one answer");
+  expect(labels).not.toContain("intake · unreviewed");
+});
+
+test("no triage card: the card looks exactly as it did before", async () => {
+  const t = task("free", { source: "intake_gchat" });
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    // An open card on a DIFFERENT task, and a non-triage card on this one.
+    renderer = create(tree(t, storeWith([triageCard("someone-else"), { id: "d2", task_id: "free", decision_class: null }])));
+  });
+  const labels = chipText(renderer);
+  expect(labels).not.toContain("awaiting one answer");
+  expect(labels).toContain("intake · unreviewed");
 });
