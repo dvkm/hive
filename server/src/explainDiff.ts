@@ -21,6 +21,7 @@ import { parseEvidence } from "./rows.ts";
 import { writeEvent, getTask } from "./state.ts";
 import { broadcastTask } from "./health.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { modelFailure, noteModelCall } from "./modelCall.ts";
 import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 import { defaultExec, type Exec } from "./exec.ts";
 import { handOffToReview } from "./api.ts";
@@ -212,8 +213,8 @@ async function generateExplanation(db: DB, task: any, head: string | null, deps:
       env: claudeProfileEnvForProject(db, task.project_id),
     }
   );
-  if (res.timedOut) return fail(`explanation run timed out after ${TIMEOUT_MS}ms`);
-  if (res.code !== 0) return fail(`explanation run exited ${res.code}: ${(res.stderr || res.stdout).slice(0, 400)}`);
+  if (res.timedOut || res.code !== 0) return fail(`explanation run ${modelFailure(db, res, { timeoutMs: TIMEOUT_MS })}`);
+  noteModelCall(db, null);
   const html = extractHtml(res.stdout);
   if (!html) return fail("explanation run produced no HTML document");
 

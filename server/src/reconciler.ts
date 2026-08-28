@@ -19,7 +19,7 @@ import { inBackoff, isReviewed, MAX_AGENTS_DEFAULT } from "./dispatcher.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
-import { broadcastTask } from "./health.ts";
+import { broadcastTask, noteToolStart } from "./health.ts";
 import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { notTestProjectSql } from "./testProjects.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
@@ -868,27 +868,6 @@ async function linkPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     for (const pr of list) linkPrIfMarked(db, { title: pr.title, body: pr.body, url: pr.url });
   }
   noteToolStart(db, "gh", startFailure);
-}
-
-// A tool that cannot start is skipped and retried forever by design, so once it
-// stops throwing it also stops counting toward reconciler_error_streak and
-// would go completely silent. That is the #1096 failure mode again: PR linking
-// quietly off, /api/health saying ok. Three consecutive cycles of start
-// failures log once and mark health degraded; the first good cycle clears it.
-const TOOL_DEGRADED_AFTER = 3;
-export function noteToolStart(db: DB, tool: string, failure: string | null): void {
-  const streakKey = `tool_start_failures_${tool}`;
-  const degradedKey = `tool_degraded_${tool}`;
-  if (!failure) {
-    if (getSetting(db, streakKey)) setSetting(db, streakKey, "0");
-    if (getSetting(db, degradedKey)) setSetting(db, degradedKey, "");
-    return;
-  }
-  const streak = Number(getSetting(db, streakKey) ?? "0") + 1;
-  setSetting(db, streakKey, String(streak));
-  if (streak < TOOL_DEGRADED_AFTER) return;
-  if (!getSetting(db, degradedKey)) console.error(`[hive] ${tool} failed to start on ${streak} cycles in a row; marking health degraded: ${failure}`);
-  setSetting(db, degradedKey, failure);
 }
 
 // One rollup entry counts as red. Shared by ciStatusOf and the non-start probe

@@ -47,7 +47,7 @@ import {
 import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
-import { resolveProjectSecrets, serviceName } from "./secrets.ts";
+import { figmaTokenEnv, resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { teamclaudeEnv, usesTeamclaude } from "./teamclaude.ts";
 import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
 import {
@@ -85,7 +85,7 @@ import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
-import { confirmedRisks, cautionCleared, latestAutoReviewVerdict } from "./reviewer.ts";
+import { confirmedRisks, cautionCleared, latestAutoReviewVerdict, reviewCompleteForHead } from "./reviewer.ts";
 import { explanationGate } from "./explainDiff.ts";
 import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
@@ -2025,7 +2025,13 @@ async function createTask(db: DB, req: Request): Promise<Response> {
 export function linkPrIfMarked(
   db: DB,
   pr: { title?: string | null; body?: string | null; url: string },
-  source: "reconciler" | "director" = "reconciler"
+  source: "reconciler" | "director" = "reconciler",
+  // A task whose stored PR no longer exists (the repo's history was rewritten,
+  // the PR was created against a different repo, the branch was replayed) is
+  // otherwise stuck forever: the pr_url guard below refuses every new link, and
+  // nothing else can clear it. Only the explicit director endpoint sets this —
+  // the reconciler must never silently repoint a task at a different PR.
+  allowRelink = false
 ): { task_id: string; number: number; linked: boolean } | null {
   const id = taskIdFromBody(pr.body);
   let task: any = id ? getTask(db, id) : null;
@@ -2039,9 +2045,11 @@ export function linkPrIfMarked(
   }
   if (!task) return null;
   if (isTrackingOnlyTask(task)) return { task_id: task.id, number: task.number, linked: false };
-  if (task.pr_url) return { task_id: task.id, number: task.number, linked: false };
+  if (task.pr_url && !(allowRelink && task.pr_url !== pr.url))
+    return { task_id: task.id, number: task.number, linked: false };
   db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(pr.url, now(), task.id);
-  writeEvent(db, { task_id: task.id, source, type: "pr_linked", payload: { pr_url: pr.url, via } });
+  const previous = task.pr_url as string | null;
+  writeEvent(db, { task_id: task.id, source, type: "pr_linked", payload: { pr_url: pr.url, via, ...(previous ? { relinked_from: previous } : {}) } });
   backfillRequeueResume(db, task.id, source);
   handOffToReview(db, task.id, source);
   broadcastTask(db, getTask(db, task.id));
@@ -2086,7 +2094,7 @@ async function linkPrEndpoint(db: DB, body: any, deps: HandlerDeps): Promise<Res
   } catch {
     return err("could not parse gh pr view output", 502);
   }
-  const res = linkPrIfMarked(db, { title: data.title, body: data.body, url: data.url || prUrl }, "director");
+  const res = linkPrIfMarked(db, { title: data.title, body: data.body, url: data.url || prUrl }, "director", body?.force === true);
   if (!res) return err("PR carries no hive marker (no `hive-task:` footer or `[hive-<n>]` title)", 422);
   return json({ ok: true, ...res });
 }
@@ -3451,6 +3459,10 @@ export async function spawnAgent(
   // cannot silently replace the selected Claude profile.
   const env = {
     ...(usesTeamclaude(config) ? (await teamclaudeEnv())?.set ?? {} : {}),
+    // Figma access for headless agents (the Figma MCP is interactive-only), so
+    // a stripped/sandboxed agent env still reaches the REST API. A project
+    // secret of the same name overrides it below.
+    ...figmaTokenEnv(),
     ...(await resolveProjectSecrets(db, task.project_id)),
     ...agentPlatformEnv(),
     ...claudeProfileEnvForRepo(project.repo_path),
@@ -3996,6 +4008,31 @@ export function understandingChecksRequired(db: DB, task: { id: string; kind: st
   return touchesSensitivePath(review.files, tokens);
 }
 
+// Judgment-class says a quiz is OWED. This says it is ANSWERABLE (HIVE-488).
+// A task still in review has nothing to ask the director until its own review
+// pipeline finished for the CURRENT head: the auto review was written for that
+// head, and every risk and question it raised has a verdict keyed to that head.
+// Short of that the quiz is pipeline state — the review card still shows the
+// task as in review, but it must not count toward the quiz or needs-you totals.
+// Shipped tasks (verifying/done/failed) are the post-ship catch-up class: their
+// head is settled and their quiz is answerable, and it only ever feeds the
+// digest, never a blocking gate.
+function quizAnswerable(db: DB, task: { id: string; state: string; head_sha: string | null; project_id: string }): boolean {
+  // Shipped: the post-ship catch-up class. Its head is settled, so it is
+  // answerable, and it only ever feeds the digest.
+  if (task.state !== "in_review") return true;
+  // The director asked for this one by hand, so it is their question whatever
+  // the pipeline is doing.
+  if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1").get(task.id)) return true;
+  // No head to key verdicts to, or a project that never auto-reviews: the
+  // reviewer skips both, so nothing further is coming and this is as complete
+  // as the review gets.
+  if (!task.head_sha) return true;
+  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+  if (JSON.parse(project?.config ?? "{}").auto_review === false) return true;
+  return reviewCompleteForHead(db, task.id, task.head_sha);
+}
+
 function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; checks: UnderstandingCheck[] } | null {
   const row: any = db
     .query("SELECT id, payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY ts DESC, rowid DESC LIMIT 1")
@@ -4130,6 +4167,8 @@ export function pendingPostShipQuizCount(db: DB, projectId?: string): number {
     let payload: any;
     try { payload = JSON.parse(row.payload); } catch { return false; }
     if (!normalizeUnderstandingChecks(payload?.understanding).length) return false;
+    // Same judgment-class filter the quiz list applies, or the digest promises
+    // more changes to catch up on than the list can show (HIVE-488).
     if (!understandingChecksRequired(db, { id: row.task_id, kind: row.kind, project_id: row.project_id })) return false;
     return understandingQuizStatus(db, row.task_id, row.id) !== "passed";
   }).length;
@@ -4140,7 +4179,7 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
   const statePlaceholders = UNDERSTANDING_QUIZ_ANSWERABLE_STATES.map(() => "?").join(",");
   const rows = db
     .query(
-      `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state, t.kind
+      `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state, t.kind, t.head_sha
          FROM events e JOIN tasks t ON t.id = e.task_id
         WHERE e.type = 'review_summary'
           AND t.state IN (${statePlaceholders})
@@ -4160,6 +4199,8 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
     // A mechanical change gets no backlog entry even when its agent submitted
     // checks anyway (hive-1559).
     if (!understandingChecksRequired(db, { id: row.task_id, kind: row.kind, project_id: row.project_id })) return [];
+    // Not yet answerable = the review pass has not finished for the live head.
+    if (!quizAnswerable(db, { id: row.task_id, state: row.state, head_sha: row.head_sha, project_id: row.project_id })) return [];
     const understanding = payload?.understanding && typeof payload.understanding === "object" && !Array.isArray(payload.understanding)
       ? Object.fromEntries(Object.entries(payload.understanding).filter(([key]) => key !== "check" && key !== "checks"))
       : {};
