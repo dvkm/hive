@@ -395,16 +395,7 @@ export function startRecoveryEpoch(db: DB, taskId: string, source: string, attem
 export function currentAttemptEvidenceCount(db: DB, taskId: string, kind?: string): number {
   const scope = recoveryEvidenceScope(db, taskId);
   if (!scope) return evidenceCount(db, taskId, kind);
-  const { floor, attemptId } = scope;
-  if (attemptId) {
-    const sql = kind
-      ? "SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND json_extract(meta, '$.attempt_id') = ? AND kind = ?"
-      : "SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND json_extract(meta, '$.attempt_id') = ?";
-    const row = kind
-      ? db.query(sql).get(taskId, floor, attemptId, kind)
-      : db.query(sql).get(taskId, floor, attemptId);
-    return (row as { n: number }).n;
-  }
+  const { floor } = scope;
   const sql = kind
     ? "SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND kind = ?"
     : "SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ?";
@@ -421,26 +412,18 @@ export function currentAttemptCommitEvidenceCount(db: DB, taskId: string): numbe
     const row = db.query(`SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND ${commit}`).get(taskId);
     return (row as { n: number }).n;
   }
-  const { floor, attemptId } = scope;
-  const sql = attemptId
-    ? `SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND ${commit} AND json_extract(meta, '$.attempt_id') = ?`
-    : `SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND ${commit}`;
-  const row = attemptId
-    ? db.query(sql).get(taskId, floor, attemptId)
-    : db.query(sql).get(taskId, floor);
+  const { floor } = scope;
+  const sql = `SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND ${commit}`;
+  const row = db.query(sql).get(taskId, floor);
   return (row as { n: number }).n;
 }
 
 export function currentAttemptEvidenceAtSha(db: DB, taskId: string, sha: string): number {
   const scope = recoveryEvidenceScope(db, taskId);
   if (!scope) return evidenceAtSha(db, taskId, sha);
-  const { floor, attemptId } = scope;
-  const sql = attemptId
-    ? "SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND json_extract(meta, '$.commit_sha') = ? AND json_extract(meta, '$.attempt_id') = ?"
-    : "SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND json_extract(meta, '$.commit_sha') = ?";
-  const row = attemptId
-    ? db.query(sql).get(taskId, floor, sha, attemptId)
-    : db.query(sql).get(taskId, floor, sha);
+  const { floor } = scope;
+  const sql = "SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND json_extract(meta, '$.commit_sha') = ?";
+  const row = db.query(sql).get(taskId, floor, sha);
   return (row as { n: number }).n;
 }
 

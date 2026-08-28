@@ -9,7 +9,7 @@ process.env.HIVE_HOME = HOME;
 const { openDb } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
-const { evidenceAtSha } = await import("../src/state.ts");
+const { evidenceAtSha, startRecoveryEpoch } = await import("../src/state.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
 
 const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
@@ -73,6 +73,27 @@ test("evidence is stamped with the worktree HEAD sha, and the ready gate rejects
   expect(evidenceAtSha(s.db, id, head.sha)).toBe(1);
   const r3 = await post(s.base, `/api/tasks/${id}/events`, { type: "ready" });
   expect(r3.json.task.state).toBe("in_review");
+
+  s.server.stop(true);
+});
+
+test("evidence captured through the ordinary emit path counts toward a recovery attempt", async () => {
+  const head = { sha: "cccccccccccccccccccccccccccccccccccccccc" };
+  const s = makeServer(head);
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "task", brief: "b" });
+  const id = t.json.id;
+  await post(s.base, `/api/tasks/${id}/spawn`, {});
+
+  // A recovery epoch opens for the replacement agent's attempt, as reconciler.ts
+  // does on requeue. Production evidence writes never stamp meta.attempt_id, so
+  // the scoped count must not require it — only rowid > floor.
+  startRecoveryEpoch(s.db, id, "reconciler", "attempt-1");
+
+  await post(s.base, `/api/tasks/${id}/events`, { type: "evidence", note: "proof", kind: "log" });
+  const r = await post(s.base, `/api/tasks/${id}/events`, { type: "ready" });
+  expect(r.json.held).toBeUndefined();
+  expect(r.json.task.state).toBe("in_review");
 
   s.server.stop(true);
 });
