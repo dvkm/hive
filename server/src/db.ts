@@ -622,6 +622,15 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v35-task-priority",
     statements: [`ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'`],
   },
+  // Where a terminal task's pr_url goes when it's found to point at a PR that
+  // no longer carries this task's marker (hive-487: a repo migration reset PR
+  // numbering, so old pr_urls silently resolved to unrelated PRs). Keeps the
+  // historical reference instead of discarding it, without it being mistaken
+  // for a live link.
+  {
+    name: "v36-task-legacy-pr-url",
+    statements: [`ALTER TABLE tasks ADD COLUMN legacy_pr_url TEXT`],
+  },
 ];
 
 // -------------------------------------------------------------- settings
