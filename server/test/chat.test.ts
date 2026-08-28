@@ -306,6 +306,23 @@ test("manager inbox review counts exclude tracking-only tasks", async () => {
   await post(`/api/tasks/${tracked.id}/transition`, { to: "cancelled" });
 });
 
+// task #1693 follow-up: the inbox sweep iterated EVERY project including
+// archived/test rows, so a stale scratch project's leftover checkpoints could
+// still page a manager.
+test("manager inbox sweep skips an archived project's actionable items", async () => {
+  const archived = (await post("/api/projects", { name: "archived inbox", repo_path: "/nonexistent/repo", config: { archived: true } })).json;
+  const owned = (await post("/api/tasks", { project_id: archived.id, title: "stale checkpoint task" })).json;
+  await post(`/api/tasks/${owned.id}/transition`, { to: "in_progress" });
+  writeEvent(db, { task_id: owned.id, source: "agent", type: "checkpoint", payload: { note: "left behind" } });
+
+  const before = sends.length;
+  await sweepManagerInboxes(db, herdr, {});
+  const wakeups = sends.slice(before).join("\n");
+  expect(wakeups).not.toContain("archived inbox");
+
+  await post(`/api/tasks/${owned.id}/transition`, { to: "cancelled" });
+});
+
 test("external tracking tasks (source='external') are invisible to manager wakeups and inbox counts", async () => {
   const trackedProject = (await post("/api/projects", { name: "jira-mirrored project", repo_path: WT })).json;
   const tracked = (await post("/api/tasks", { project_id: trackedProject.id, title: "mirrored JIRA issue", source: "external" })).json;

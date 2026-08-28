@@ -9,7 +9,7 @@ const base = process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT |
 
 async function get(path: string): Promise<any> {
   const response = await fetch(base + path);
-  const data = await response.json();
+  const data: any = await response.json();
   if (!response.ok) throw new Error(`${response.status}: ${data.error || response.statusText}`);
   return data;
 }

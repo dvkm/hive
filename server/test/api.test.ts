@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -52,6 +52,12 @@ beforeAll(async () => {
 test("health endpoint", async () => {
   const { json } = await get("/api/health");
   expect(json.ok).toBe(true);
+});
+
+test("shell-version endpoint reports the electron shell's version and this repo's path", async () => {
+  const { json } = await get("/api/shell-version");
+  const electronPkg = JSON.parse(readFileSync(join(json.repo_path, "electron", "package.json"), "utf8"));
+  expect(json.version).toBe(electronPkg.version);
 });
 
 test("health endpoint reports dispatcher/reaper liveness, stale before any cycle has run", async () => {
@@ -527,6 +533,57 @@ test("checkpoints survive task completion; cancelled tasks drop out", async () =
   await post(`/api/tasks/${t2.json.id}/transition`, { to: "cancelled" });
   open = await get("/api/checkpoints");
   expect(open.json.checkpoints.some((c: any) => c.id === e2.json.event.id)).toBe(false);
+});
+
+test("checkpoints auto-expire out of the inbox after a quiet window on a progressed task", async () => {
+  const backdate = (eventId: string, hours: number) =>
+    db.query("UPDATE events SET ts = ? WHERE id = ?").run(new Date(Date.now() - hours * 3600_000).toISOString(), eventId);
+
+  // A task that finished normally, carrying a benign note and a flagged one.
+  const t = await post("/api/tasks", { project_id: projectId, title: "cp expiry" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
+  const benign = await post(`/api/tasks/${t.json.id}/events`, { type: "checkpoint", note: "used the existing helper" });
+  const flagged = await post(`/api/tasks/${t.json.id}/events`, { type: "checkpoint", note: "guessed the timezone", flag: true });
+  await post(`/api/tasks/${t.json.id}/events`, { type: "evidence", kind: "log", note: "proof" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+
+  // Still fresh: both stay.
+  let open = await get("/api/checkpoints");
+  expect(open.json.checkpoints.some((c: any) => c.id === benign.json.event.id)).toBe(true);
+  expect(open.json.checkpoints.some((c: any) => c.id === flagged.json.event.id)).toBe(true);
+
+  // Older than the 24h default, and the task moved to in_review after them.
+  backdate(benign.json.event.id, 30);
+  backdate(flagged.json.event.id, 30);
+  open = await get("/api/checkpoints");
+  expect(open.json.checkpoints.some((c: any) => c.id === benign.json.event.id)).toBe(false);
+  expect(open.json.checkpoints.some((c: any) => c.id === flagged.json.event.id)).toBe(true);
+  // Expired only from the inbox — the task timeline still carries it.
+  const evs = await get(`/api/tasks/${t.json.id}/events`);
+  expect(evs.json.some((e: any) => e.id === benign.json.event.id)).toBe(true);
+
+  // A stalled task (no forward state change after the note) keeps asking.
+  const stalled = await post("/api/tasks", { project_id: projectId, title: "cp expiry stalled" });
+  await post(`/api/tasks/${stalled.json.id}/transition`, { to: "in_progress" });
+  const stuck = await post(`/api/tasks/${stalled.json.id}/events`, { type: "checkpoint", note: "waiting on the API" });
+  backdate(stuck.json.event.id, 30);
+  open = await get("/api/checkpoints");
+  expect(open.json.checkpoints.some((c: any) => c.id === stuck.json.event.id)).toBe(true);
+
+  // checkpoint_expiry_hours = 0 turns expiry off for that project.
+  const noExpiry = await post("/api/projects", {
+    name: "cp no expiry",
+    repo_path: "/tmp/cp-no-expiry",
+    config: { checkpoint_expiry_hours: 0 },
+  });
+  const kept = await post("/api/tasks", { project_id: noExpiry.json.id, title: "cp never expires" });
+  await post(`/api/tasks/${kept.json.id}/transition`, { to: "in_progress" });
+  const keptCp = await post(`/api/tasks/${kept.json.id}/events`, { type: "checkpoint", note: "old but still asking" });
+  await post(`/api/tasks/${kept.json.id}/events`, { type: "evidence", kind: "log", note: "proof" });
+  await post(`/api/tasks/${kept.json.id}/transition`, { to: "in_review" });
+  backdate(keptCp.json.event.id, 30);
+  open = await get("/api/checkpoints");
+  expect(open.json.checkpoints.some((c: any) => c.id === keptCp.json.event.id)).toBe(true);
 });
 
 test("event ingestion: status event is recorded", async () => {
@@ -1226,4 +1283,45 @@ test("a test project never pushes a notification, even for a high-risk decision"
   });
   const after = await get("/api/notifications");
   expect(after.json.notifications.length).toBe(before.json.notifications.length);
+});
+
+// task #1693 follow-up: GET /api/tasks/land-graph with no ?project= iterated
+// EVERY project (including archived/test rows with a dead repo_path), calling
+// `git diff` against a cwd that no longer exists.
+test("land-graph without a project param skips an archived project with a dead repo_path", async () => {
+  const db2 = openDb(":memory:");
+  let gitCalls = 0;
+  const exec = async (argv: string[]) => {
+    if (argv[0] === "git") gitCalls++;
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const srv = Bun.serve({ port: 0, fetch: makeHandler(db2, { exec }) });
+  const base = `http://127.0.0.1:${srv.port}`;
+  const call = async (path: string, body: unknown) => {
+    const response = await fetch(base + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { status: response.status, json: await response.json() };
+  };
+  try {
+    const archived = await call("/api/projects", {
+      name: "archived-dead-repo",
+      repo_path: "/nonexistent/repo",
+      config: { test: true, archived: true },
+    });
+    for (const title of ["a", "b"]) {
+      const t = await call("/api/tasks", { project_id: archived.json.id, title });
+      db2.query("UPDATE tasks SET state = 'in_review', branch = ? WHERE id = ?").run(`hive/${title}`, t.json.id);
+    }
+
+    const graph = await fetch(base + "/api/tasks/land-graph");
+    expect(graph.status).toBe(200);
+    const body = await graph.json();
+    expect(body.nodes).toEqual([]);
+    expect(gitCalls).toBe(0);
+  } finally {
+    srv.stop(true);
+  }
 });

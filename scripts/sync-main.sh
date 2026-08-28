@@ -55,7 +55,15 @@ fi
 # Deploy: ff hive-live to main, rebuild, restart — only when it actually moved.
 cd "$LIVE"
 git fetch "$REPO" main --quiet
-if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
+# "HEAD != FETCH_HEAD" is true in BOTH directions. When the live checkout is
+# AHEAD of main (a hotfix committed straight into it, or a manual merge commit)
+# the ff-merge below is a no-op, HEAD never reaches FETCH_HEAD, and every
+# 5-minute tick rebuilt and `kickstart -k`ed the server forever. On 2026-08-25
+# that restarted the live server 14 times on one unchanged sha (44eb218) and 9
+# more on d50db56, each restart a fresh pid and a multi-minute outage on :4700.
+# Deploy only when main actually carries something live does not have; a real
+# divergence still reaches the ff-merge and still fails loudly.
+if ! git merge-base --is-ancestor FETCH_HEAD HEAD; then
   git merge --ff-only FETCH_HEAD --quiet
   (cd server && bun install --silent >/dev/null)
   (cd web && bun install --silent >/dev/null && bun run build >/dev/null)

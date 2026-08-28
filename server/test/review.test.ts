@@ -1175,6 +1175,91 @@ function addRiskVerdicts(s: ReturnType<typeof makeServer>, taskId: string, head:
   );
 }
 
+// HIVE-488: one task per bucket seen live on the hive project. Only the task
+// whose review actually finished for its CURRENT head is a question the
+// director can answer; the rest are the review pipeline still working, or
+// findings keyed to a head that no longer exists.
+test("only a review that finished for the live head counts as an answerable quiz", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", {
+    name: "p",
+    repo_path: "/repo",
+    config: { default_branch: "main", auto_merge: { kinds: ["chore"] } },
+  });
+  // Bucket task: judgment-class (kind outside auto_merge.kinds) with a quiz.
+  const bucket = async (title: string, head: string | null, review: { head?: string; risks?: string[] } | null) => {
+    const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title, brief: "b", kind: "ship" });
+    await post(s.base, `/api/tasks/${t.json.id}/spawn`, {});
+    await addQuiz(s.base, t.json.id);
+    await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+    if (head) s.db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run(head, t.json.id);
+    if (review)
+      s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+        `ev-auto-${t.json.id}`,
+        t.json.id,
+        new Date().toISOString(),
+        "system",
+        "auto_review",
+        JSON.stringify({
+          verdict: "caution",
+          summary: "s",
+          risks: review.risks ?? [],
+          questions: [],
+          files: ["server/src/rows.ts"],
+          ...(review.head ? { reviewed_head_sha: review.head } : {}),
+        })
+      );
+    return t.json.id;
+  };
+  const verdicts = (taskId: string, head: string, risks: string[]) =>
+    s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+      `ev-rv-${taskId}`,
+      taskId,
+      new Date().toISOString(),
+      "system",
+      "risk_verdicts",
+      JSON.stringify({ reviewed_head_sha: head, verdicts: risks.map((risk) => ({ risk, verdict: "confirmed", why: "checked it" })) })
+    );
+
+  // ANSWERABLE: review written for the live head, every risk verified there.
+  const answerable = await bucket("finished", "head-a", { head: "head-a", risks: ["a leak"] });
+  verdicts(answerable, "head-a", ["a leak"]);
+
+  // The review pass has not produced anything yet.
+  const noReview = await bucket("review not run", "head-b", null);
+  // The review landed, its risks are still waiting on verification.
+  await bucket("risks unverified", "head-c", { head: "head-c", risks: ["a leak"] });
+  // Verdict/review count mismatch: one risk still uncovered (the PR #12 bug).
+  const mismatch = await bucket("verdict count mismatch", "head-d", { head: "head-d", risks: ["a leak", "a race"] });
+  verdicts(mismatch, "head-d", ["a leak"]);
+  // Findings against a head the task has since moved off.
+  const staleHead = await bucket("stale findings", "head-new", { head: "head-old", risks: ["a leak"] });
+  verdicts(staleHead, "head-old", ["a leak"]);
+
+  // Post-ship catch-up: a shipped task, a separate class from the merge gate.
+  const shipped = await bucket("already shipped", "head-f", { head: "head-f", risks: [] });
+  s.db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(shipped);
+
+  const quizzes = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  const mine = quizzes.filter((q) => q.project_id === p.json.id);
+  expect(mine.filter((q) => q.task_state === "in_review").map((q) => q.task_id)).toEqual([answerable]);
+  expect(mine.filter((q) => q.task_state === "done").map((q) => q.task_id)).toEqual([shipped]);
+
+  // The pipeline finishing turns a hidden one into a director ask, no re-review.
+  verdicts(noReview, "head-b", []);
+  s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    `ev-auto-late-${noReview}`,
+    noReview,
+    new Date().toISOString(),
+    "system",
+    "auto_review",
+    JSON.stringify({ verdict: "caution", summary: "s", risks: [], questions: [], files: ["server/src/rows.ts"], reviewed_head_sha: "head-b" })
+  );
+  const after = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  expect(after.some((q) => q.task_id === noReview)).toBe(true);
+  s.server.stop(true);
+});
+
 test("a mechanical looks_good chore mints no quiz anywhere", async () => {
   const s = makeServer();
   const { taskId } = await judgmentTask(s, { verdict: "looks_good" });
@@ -1224,6 +1309,44 @@ test("a caution whose risks were all refuted stops being judgment-class", async 
   expect(check.json.understanding_required).toBe(false);
   const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
   expect(merge.status).toBe(200);
+  s.server.stop(true);
+});
+
+// HIVE-453: a cleared caution only speaks for the head it was cleared on. A
+// force-push after that must re-require the quiz until a review exists for
+// the NEW (live) head, even though the old review's own verdicts still look
+// clean for the head they were computed against.
+test("a force-push after a cleared caution re-requires the quiz until the new head is reviewed", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "caution", risks: ["maybe a leak"], head: "head-a" });
+  addRiskVerdicts(s, taskId, "head-a", "refuted");
+
+  const cleared = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(cleared.json.understanding_required).toBe(false);
+
+  s.db.query("UPDATE tasks SET head_sha = 'head-b' WHERE id = ?").run(taskId);
+  const forcePushed = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(forcePushed.json.understanding_required).toBe(true);
+
+  // Inside auto_merge.kinds, so it merges — but the quiz is deferred again for
+  // the new head, same as any other still-required caution.
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(200);
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  expect(events.json.some((event: any) => event.type === "understanding_quiz_deferred")).toBe(true);
+  s.server.stop(true);
+});
+
+test("a force-push after a looks_good review re-requires the quiz until the new head is reviewed", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "looks_good", head: "head-a" });
+
+  const clean = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(clean.json.understanding_required).toBe(false);
+
+  s.db.query("UPDATE tasks SET head_sha = 'head-b' WHERE id = ?").run(taskId);
+  const forcePushed = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(forcePushed.json.understanding_required).toBe(true);
   s.server.stop(true);
 });
 
@@ -1357,5 +1480,39 @@ test("five deferred quizzes push ONE catch-up digest, not five notifications", a
   expect((await get(s.base, "/api/understanding-quizzes")).json.quizzes).toHaveLength(0);
   notifyQuizDigest(s.db, t0 + QUIZ_DIGEST_MS + 60 * 1000);
   expect(digests()).toHaveLength(2);
+  s.server.stop(true);
+});
+
+test("with quizzes pending in two projects, the total badge count matches the sum of per-project digest cards", async () => {
+  const { pendingPostShipQuizCount } = await import("../src/api.ts");
+  const s = makeServer();
+
+  async function shippedTaskWithQuiz(projectId: string, title: string) {
+    const t = await post(s.base, "/api/tasks", { project_id: projectId, title, brief: "b" });
+    await post(s.base, `/api/tasks/${t.json.id}/spawn`, {});
+    await addQuiz(s.base, t.json.id);
+    await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+    await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "verifying" });
+    return t.json.id as string;
+  }
+
+  const projA = (await post(s.base, "/api/projects", { name: "a", repo_path: "/repo-a", config: { default_branch: "main" } })).json.id;
+  const projB = (await post(s.base, "/api/projects", { name: "b", repo_path: "/repo-b", config: { default_branch: "main" } })).json.id;
+  await shippedTaskWithQuiz(projA, "review me a1");
+  await shippedTaskWithQuiz(projA, "review me a2");
+  await shippedTaskWithQuiz(projB, "review me b1");
+
+  const quizzes = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as { project_id: string }[];
+  const byProject = new Map<string, number>();
+  for (const quiz of quizzes) byProject.set(quiz.project_id, (byProject.get(quiz.project_id) ?? 0) + 1);
+  expect(byProject.get(projA)).toBe(2);
+  expect(byProject.get(projB)).toBe(1);
+
+  // The per-project counts (what the client's digest cards show) must sum to
+  // the same total the server-side badge count reports.
+  const sumOfDigests = [...byProject.values()].reduce((total, n) => total + n, 0);
+  expect(pendingPostShipQuizCount(s.db)).toBe(sumOfDigests);
+  expect(pendingPostShipQuizCount(s.db, projA)).toBe(2);
+  expect(pendingPostShipQuizCount(s.db, projB)).toBe(1);
   s.server.stop(true);
 });

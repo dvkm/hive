@@ -135,6 +135,32 @@ test("linkPrIfMarked matches by the hive-task id footer", () => {
   expect(again).toEqual({ task_id: id, number: 1, linked: false });
 });
 
+test("a director can relink a task whose stored PR is no longer valid", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  const marked = { title: "whatever", body: `hive-task: ${id}` };
+  expect(linkPrIfMarked(db, { ...marked, url: "https://gh/pr/dead" })?.linked).toBe(true);
+
+  // The reconciler must never repoint a task at a different PR on its own.
+  expect(linkPrIfMarked(db, { ...marked, url: "https://gh/pr/new" }, "reconciler")).toEqual({
+    task_id: id,
+    number: 1,
+    linked: false,
+  });
+  expect(getTask(db, id).pr_url).toBe("https://gh/pr/dead");
+
+  // An explicit director relink does, and records where it came from.
+  expect(linkPrIfMarked(db, { ...marked, url: "https://gh/pr/new" }, "director", true)?.linked).toBe(true);
+  expect(getTask(db, id).pr_url).toBe("https://gh/pr/new");
+  const ev: any = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_linked' ORDER BY rowid DESC LIMIT 1")
+    .get(id);
+  expect(JSON.parse(ev.payload).relinked_from).toBe("https://gh/pr/dead");
+
+  // Still idempotent for the same URL, even with the override on.
+  expect(linkPrIfMarked(db, { ...marked, url: "https://gh/pr/new" }, "director", true)?.linked).toBe(false);
+});
+
 test("linkPrIfMarked falls back to the [hive-<number>] title when the footer is absent", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId); // number 1

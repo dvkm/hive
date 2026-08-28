@@ -11,6 +11,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
+import { startLoop } from "./loop.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, repairRequeueProvenance, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
 import { spawnMeta } from "./cleanup.ts";
@@ -18,13 +19,14 @@ import { queuedSteers, markSteersDelivered, queueSteerEvent, resumeReviewForDeli
 import { inBackoff, isReviewed, MAX_AGENTS_DEFAULT } from "./dispatcher.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
+import { syncAway } from "./away.ts";
 import { parseEvidence } from "./rows.ts";
-import { broadcastTask } from "./health.ts";
+import { broadcastTask, noteToolStart } from "./health.ts";
 import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
-import { notTestProjectSql } from "./testProjects.ts";
+import { activeProjects } from "./testProjects.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, editDialogPaths, parseResetClock } from "./diagnose.ts";
-import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount } from "./api.ts";
+import { AUTO_MERGE_PAUSED, requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount } from "./api.ts";
 import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectBaseBranch, preferSafeRef } from "./exec.ts";
@@ -34,7 +36,7 @@ import { sidecarOnce } from "./sidecar.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
 import { runPrGardener } from "./prGardener.ts";
 import { autoAckPlans } from "./planCritic.ts";
-import { ambiguityCleared, cautionCleared } from "./reviewer.ts";
+import { ambiguityCleared, cautionCleared, latestAutoReviewVerdict } from "./reviewer.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
 const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
@@ -136,6 +138,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   };
   await step("surfaceTrackingBindings", () => surfaceTrackingBindings(db));
   await step("syncAgents", () => syncAgents(db, deps));
+  await step("archiveOrphanedDialogCards", () => archiveOrphanedDialogCards(db));
   await step("drainSteers", () => drainSteers(db, deps));
   await step("advanceFinished", () => advanceFinished(db, deps));
   await step("nagOpenDecisions", () => nagOpenDecisions(db, (deps.nowMs ?? (() => Date.now()))()));
@@ -155,6 +158,9 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("captureRecurringRefs", () => captureRecurringRefs(db));
   await step("repairRequeueProvenance", () => repairRequeueProvenance(db));
   await step("surfaceDeadDependencies", () => surfaceDeadDependencies(db));
+  // Away mode flips on/off by its schedule here. On waking it sends ONE
+  // "while you were away" push for everything that was held.
+  await step("syncAway", () => syncAway(db, (deps.nowMs ?? (() => Date.now()))()));
   // Offline mode: everything above is local (herdr + sqlite) and keeps state
   // honest; everything below either needs the network (gh) or would punish
   // agents for being offline (stale flags, nudges, failure escalation). Stop here.
@@ -643,11 +649,11 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       broadcast({ type: "task", task: getTask(db, t.id) });
     }
     // A never-dispatched external task (see supervision.ts) has no agent to
-    // nudge and isn't hive's to auto-transition through review/merge/smoke —
-    // skip the actionable phase below entirely. The bookkeeping above
-    // (ci_status, head_sha, branch_scope, pr_synchronized) already ran: it's
-    // just recording observed PR facts, useful for the tracked view.
-    if (neverDispatched(db, live)) continue;
+    // nudge, so every AGENT-DIRECTED branch below is skipped for it. It used to
+    // skip the whole actionable phase, which also swallowed the MERGED->done
+    // observation and parked merged tasks in in_review forever (HIVE-473). A
+    // terminal PR state is a fact hive observed, not a nudge, so it still runs.
+    const agentless = neverDispatched(db, live);
     // Re-check once more right before the actionable phase: the bookkeeping
     // above (probeRed, ci_status writes) awaited too, and is the last chance
     // for a PR replacement/closure race to have landed.
@@ -659,7 +665,7 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     // green and the director can merge", so failing/pending checks HOLD the
     // task in_progress (this is also what promotes a held `ready`: the moment
     // checks pass, the task moves to review; failing checks steer the agent).
-    if (String(data.state).toUpperCase() === "OPEN" && state === "in_progress") {
+    if (String(data.state).toUpperCase() === "OPEN" && state === "in_progress" && !agentless) {
       if (ci === "failing") {
         await nudgeCiFailure(db, h, t, data.headRefOid ?? null);
       } else if (ci !== "pending") {
@@ -670,11 +676,13 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_merged", payload: { pr_url: t.pr_url } });
       transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged" });
       // Post-merge smoke runs once on entering verifying.
-      try {
-        await smokeThenAdvance(db, t.id, deps.smoke ?? {});
-      } catch (e) {
-        console.error(`[hive] smoke run failed for ${t.id}:`, e);
-      }
+      await advanceAfterMerge(db, t.id, deps);
+    } else if (String(data.state).toUpperCase() === "CLOSED" && state === "in_review" && agentless) {
+      // No agent to bounce it back to and no in_progress worth returning it to,
+      // so just record the fact — once, since nothing here moves the task off
+      // in_review and the probe repeats every cycle.
+      const already = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'pr_closed' LIMIT 1").get(t.id);
+      if (!already) writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_closed", payload: { pr_url: t.pr_url } });
     } else if (String(data.state).toUpperCase() === "CLOSED" && state === "in_review") {
       // Closed-not-merged: nothing reviewable exists. Self-heal instead of
       // waiting for the director to discover it via a failed merge click.
@@ -699,13 +707,12 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
         writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_merged", payload: { pr_url: t.pr_url } });
         // in_progress can't jump straight to verifying — hop through in_review
         // first, same path a non-deferred task takes on its way to merge.
-        transition(db, t.id, "in_review", { source: "reconciler", reason: "PR merged while deferred — catching up review" });
+        // skipVerification: the PR already merged, so the verification contract
+        // has nothing left to hold back — a gate here would park the task in
+        // in_progress with no agent and no way out (HIVE-402).
+        transition(db, t.id, "in_review", { source: "reconciler", reason: "PR merged while deferred — catching up review", skipVerification: true });
         transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged (deferred task undeferred)" });
-        try {
-          await smokeThenAdvance(db, t.id, deps.smoke ?? {});
-        } catch (e) {
-          console.error(`[hive] smoke run failed for ${t.id}:`, e);
-        }
+        await advanceAfterMerge(db, t.id, deps);
       } else {
         writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_closed", payload: { pr_url: t.pr_url } });
       }
@@ -722,19 +729,37 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       const type = String(data.state).toUpperCase() === "MERGED" ? "pr_merged" : "pr_closed";
       const already = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = ? LIMIT 1").get(t.id, type);
       if (!already) writeEvent(db, { task_id: t.id, source: "reconciler", type, payload: { pr_url: t.pr_url } });
-    } else if (ci === "failing" && state === "in_review") {
+    } else if (ci === "failing" && state === "in_review" && !agentless) {
       // Checks went red AFTER the handoff: red is not reviewable. Send it back
       // to the agent to iterate; it returns automatically when green.
       await nudgeCiFailure(db, h, t, data.headRefOid ?? null);
       transition(db, t.id, "in_progress", { source: "reconciler", reason: "CI failing — returned to the agent to iterate" });
       broadcast({ type: "task", task: getTask(db, t.id) });
-    } else if (!deferred && String(data.mergeable).toUpperCase() === "CONFLICTING") {
+    } else if (!deferred && !agentless && String(data.mergeable).toUpperCase() === "CONFLICTING") {
       // A deliberately parked task (deferred_until in the future) shouldn't
       // draw pr_conflict noise or steer an inactive agent (hive-303). No event
       // is written while deferred, so undefer's next cycle sees a fresh
       // head_sha/dedup state and nudges once, immediately.
       await nudgeConflict(db, h, t, data.headRefOid ?? null, exec);
     }
+  }
+}
+
+// Post-merge advance out of `verifying`. A task hive drives runs its smoke
+// checks. A tracking-only task (an external board row) has no hive worktree to
+// smoke and no evidence gate, and both smokeThenAdvance and sweepVerifying bail
+// out on it — so without this it would just swap a stuck `in_review` for a
+// stuck `verifying`. For it, merged IS done (HIVE-473).
+async function advanceAfterMerge(db: DB, taskId: string, deps: ReconcilerDeps): Promise<void> {
+  if (isTrackingOnlyId(db, taskId)) {
+    transition(db, taskId, "done", { source: "reconciler", reason: "PR merged (tracking-only task: no post-merge smoke)" });
+    broadcast({ type: "task", task: getTask(db, taskId) });
+    return;
+  }
+  try {
+    await smokeThenAdvance(db, taskId, deps.smoke ?? {});
+  } catch (e) {
+    console.error(`[hive] smoke run failed for ${taskId}:`, e);
   }
 }
 
@@ -848,9 +873,7 @@ async function linkPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   // scratch dir that gets cleaned up, and running gh against a directory that
   // no longer exists is what wedged this step for ~10h. They have no real PRs
   // to link either.
-  const projects = db
-    .query(`SELECT id, repo_path FROM projects WHERE repo_path IS NOT NULL AND ${notTestProjectSql()}`)
-    .all() as { id: string; repo_path: string }[];
+  const projects = activeProjects(db).filter((p) => p.repo_path) as { id: string; repo_path: string }[];
   let startFailure: string | null = null;
   for (const p of projects) {
     const r = await exec(["gh", "pr", "list", "--state", "open", "--json", "number,title,body,url"], { cwd: p.repo_path });
@@ -868,27 +891,6 @@ async function linkPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     for (const pr of list) linkPrIfMarked(db, { title: pr.title, body: pr.body, url: pr.url });
   }
   noteToolStart(db, "gh", startFailure);
-}
-
-// A tool that cannot start is skipped and retried forever by design, so once it
-// stops throwing it also stops counting toward reconciler_error_streak and
-// would go completely silent. That is the #1096 failure mode again: PR linking
-// quietly off, /api/health saying ok. Three consecutive cycles of start
-// failures log once and mark health degraded; the first good cycle clears it.
-const TOOL_DEGRADED_AFTER = 3;
-export function noteToolStart(db: DB, tool: string, failure: string | null): void {
-  const streakKey = `tool_start_failures_${tool}`;
-  const degradedKey = `tool_degraded_${tool}`;
-  if (!failure) {
-    if (getSetting(db, streakKey)) setSetting(db, streakKey, "0");
-    if (getSetting(db, degradedKey)) setSetting(db, degradedKey, "");
-    return;
-  }
-  const streak = Number(getSetting(db, streakKey) ?? "0") + 1;
-  setSetting(db, streakKey, String(streak));
-  if (streak < TOOL_DEGRADED_AFTER) return;
-  if (!getSetting(db, degradedKey)) console.error(`[hive] ${tool} failed to start on ${streak} cycles in a row; marking health degraded: ${failure}`);
-  setSetting(db, degradedKey, failure);
 }
 
 // One rollup entry counts as red. Shared by ciStatusOf and the non-start probe
@@ -1199,6 +1201,40 @@ export async function probePrReadiness(
   return { ok: false };
 }
 
+// A "blocked on a dialog" card answers by sending a keystroke to a specific
+// pane (recoverBlockedDialog / resolveBlockedForDecision). If that agent died
+// or was respawned since the card opened, the keystroke has nowhere to land —
+// the card is an unanswerable orphan (seen live 2026-08-25: five stuck open).
+// syncAgents already confirms death (lastAgentStatus 'gone' — the same
+// confirmGone path that guards against the false-dead registry-wipe incident),
+// so reuse that signal instead of re-probing herdr here. Never touches
+// non-dialog cards: the title match is the same one recoverBlockedDialog uses
+// to avoid opening duplicates.
+export function archiveOrphanedDialogCards(db: DB): number {
+  const rows = db
+    .query(
+      `SELECT d.id, d.title, d.ts, d.task_id, t.agent_target FROM decisions d JOIN tasks t ON t.id = d.task_id
+        WHERE d.status = 'open' AND d.title LIKE 'Agent blocked on a dialog%'`
+    )
+    .all() as { id: string; title: string; ts: string; task_id: string; agent_target: string | null }[];
+  let archived = 0;
+  for (const r of rows) {
+    const respawned = db
+      .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawned' AND ts > ? LIMIT 1")
+      .get(r.task_id, r.ts);
+    const dead = !r.agent_target || lastAgentStatus(db, r.task_id) === "gone";
+    if (!respawned && !dead) continue;
+    apiDismissDecision(db, r.id, {
+      reason: "dialog_agent_gone",
+      steer:
+        `hive auto-archived your decision card "${r.title}": the agent it was waiting on ` +
+        `${respawned ? "was respawned" : "is gone"} since the card opened, so the dialog it named no longer exists. Carry on.`,
+    });
+    archived++;
+  }
+  return archived;
+}
+
 // Signal freshness. A card that cited red checks is only worth the director's
 // attention while the checks are still red. syncPRs re-probes every cycle, so
 // the moment they turn green the question is moot: close it, tell the agent, and
@@ -1276,6 +1312,61 @@ export function passedByDirector(db: DB, taskId: string): boolean {
   ).get(taskId, taskId);
 }
 
+// One attempt is usually enough to learn a merge is refused; two tolerates a
+// one-off blip. A third identical try is just noise on the card.
+const MAX_AUTO_MERGE_ATTEMPTS = 2;
+
+// How many auto-merge attempts were already refused at this exact head. A new
+// head is a new situation, so its budget starts over.
+function autoMergeFailures(db: DB, taskId: string, head: string | null): number {
+  const row = db
+    .query(
+      `SELECT COUNT(*) n FROM events
+        WHERE task_id = ? AND type = 'auto_merge_failed' AND json_valid(payload)
+          AND json_extract(payload, '$.head_sha') IS ?`
+    )
+    .get(taskId, head) as { n: number };
+  return row.n;
+}
+
+async function errorText(res: Response): Promise<string> {
+  try {
+    const body: any = await res.clone().json();
+    return String(body?.error ?? "");
+  } catch {
+    return "";
+  }
+}
+
+// Failures get their own event type: three `auto_merged` rows with ok:false
+// read like three merges in the event log, which is exactly how HIVE-473 hid
+// in plain sight. `auto_merged` now means merged.
+function recordAutoMergeFailure(
+  db: DB,
+  task: { id: string; number: number; title: string; head_sha: string | null },
+  status: number | null,
+  error: string
+): void {
+  // A pause is not a refusal — the task's readiness changed mid-merge, and the
+  // next cycle re-reads it. Recording it would burn the budget for nothing.
+  if (error === AUTO_MERGE_PAUSED) return;
+  const spent = autoMergeFailures(db, task.id, task.head_sha) + 1;
+  const gaveUp = spent >= MAX_AUTO_MERGE_ATTEMPTS;
+  writeEvent(db, {
+    task_id: task.id,
+    source: "reconciler",
+    type: "auto_merge_failed",
+    payload: { ok: false, status, error, head_sha: task.head_sha, attempts: spent, ...(gaveUp ? { gave_up: true } : {}) },
+  });
+  if (!gaveUp) return;
+  enqueue(db, {
+    kind: "failed",
+    task_id: task.id,
+    title: `Auto-merge gave up on #${task.number}`,
+    body: `Hive tried to merge this ${MAX_AUTO_MERGE_ATTEMPTS} times and was refused each time. Merge it yourself, or push a commit so hive tries again. Last error: ${(error || `HTTP ${status}`).slice(0, 200)}`,
+  });
+}
+
 export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise<void> {
   const h = deps.herdr ?? defaultHerdr;
   const rows = db
@@ -1302,23 +1393,17 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     } catch {
       continue;
     }
-    const review: any = db
-      .query("SELECT payload FROM events WHERE task_id = ? AND type = 'auto_review' ORDER BY ts DESC LIMIT 1")
-      .get(r.id);
-    if (!review) continue; // no pre-review yet — wait for it
-    let verdict: any;
-    try {
-      verdict = JSON.parse(review.payload);
-    } catch {
-      continue;
-    }
-    if (verdict.skipped) continue;
+    // Same helper the merge gate reads (understandingChecksRequired ->
+    // latestAutoReviewVerdict). Two different readings of "the latest review"
+    // is what made this loop forever (HIVE-499).
+    const verdict = latestAutoReviewVerdict(db, r.id);
+    if (!verdict) continue; // no usable pre-review yet — wait for it
     if (verdict.verdict !== "looks_good" && verdict.verdict !== "caution") continue;
     // A PR-backed task's most recent review must have been taken against the
     // PR head that's about to be merged — a delayed review from before a
     // force-push or PR replacement must never auto-merge the new head
     // (task HIVE-307). Not fatal: just wait for autoReviewOnce to catch up.
-    if (r.pr_url && (verdict.reviewed_pr_url !== r.pr_url || verdict.reviewed_head_sha !== r.head_sha)) continue;
+    if (r.pr_url && ((verdict.reviewed_pr_url ?? null) !== r.pr_url || (verdict.reviewed_head_sha ?? null) !== (r.head_sha ?? null))) continue;
     // The pre-review's risks and questions are the ambiguity signal, but they
     // are suspicions until checked: the per-risk verification pass (HIVE-406)
     // re-reads the real code for this exact head. When it refuted every risk
@@ -1344,6 +1429,11 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     if (contested) continue; // a human pushed back once — never auto-merge this task
     const evidence = (db.query("SELECT COUNT(*) n FROM evidence WHERE task_id = ?").get(r.id) as any).n;
     if (!evidence) continue;
+    // Nothing about this task changes between reconciler cycles, so a refusal
+    // at this head will be refused again next cycle, and the cycle after that.
+    // HIVE-473 wrote three identical 409s in two minutes and would have kept
+    // going forever. Spend a small budget per head, then stop and say so once.
+    if (autoMergeFailures(db, r.id, r.head_sha) >= MAX_AUTO_MERGE_ATTEMPTS) continue;
     try {
       const beforeMutation = () => {
         const task = getTask(db, r.id);
@@ -1353,17 +1443,19 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
         return !db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'changes_requested' LIMIT 1").get(r.id);
       };
       const res = await mergeTask(db, h, r.id, {}, { exec: deps.exec }, { beforeMutation });
-      const ok = res.status === 200;
-      writeEvent(db, { task_id: r.id, source: "reconciler", type: "auto_merged", payload: { ok, status: res.status } });
-      if (ok)
+      if (res.status === 200) {
+        writeEvent(db, { task_id: r.id, source: "reconciler", type: "auto_merged", payload: { ok: true, status: res.status } });
         enqueue(db, {
           kind: "auto_merged",
           task_id: r.id,
           title: `Auto-merged #${r.number}: ${r.title.slice(0, 70)}`,
           body: "Green CI, clean pre-review, evidence attached. Now verifying.",
         });
+        continue;
+      }
+      recordAutoMergeFailure(db, r, res.status, await errorText(res));
     } catch (e) {
-      writeEvent(db, { task_id: r.id, source: "reconciler", type: "auto_merged", payload: { ok: false, error: String((e as any)?.message ?? e) } });
+      recordAutoMergeFailure(db, r, null, String((e as any)?.message ?? e));
     }
   }
 }
@@ -2257,9 +2349,5 @@ function nudgesSinceActivity(db: DB, taskId: string): number {
 
 // Background loop. Started only from index.ts (never in tests).
 export function startReconciler(db: DB, deps: ReconcilerDeps & { intervalMs?: number } = {}): () => void {
-  const intervalMs = deps.intervalMs ?? 60_000;
-  const timer = setInterval(() => {
-    reconcileOnce(db, deps).catch((e) => console.error("[hive] reconciler cycle crashed:", e));
-  }, intervalMs);
-  return () => clearInterval(timer);
+  return startLoop("reconciler", deps.intervalMs ?? 60_000, () => reconcileOnce(db, deps));
 }

@@ -15,6 +15,7 @@
 import type { DB } from "./db.ts";
 import { writeEvent } from "./state.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { modelFailure, noteModelCall } from "./modelCall.ts";
 import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 
 const MODEL = "sonnet";
@@ -184,8 +185,8 @@ export async function critiquePlan(
   } catch (e: any) {
     return attach([], `critic spawn failed: ${e?.message ?? e}`);
   }
-  if (res.timedOut) return attach([], `critic timed out after ${TIMEOUT_MS}ms`);
-  if (res.code !== 0) return attach([], `critic exited ${res.code}: ${(res.stderr || res.stdout).slice(0, 400)}`);
+  if (res.timedOut || res.code !== 0) return attach([], `critic ${modelFailure(db, res, { timeoutMs: TIMEOUT_MS })}`);
+  noteModelCall(db, null);
   const concerns = extractConcerns(res.stdout);
   if (!concerns) return attach([], "critic output was not valid JSON with concerns");
 

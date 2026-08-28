@@ -83,6 +83,9 @@ export function eventText(e: EventLike): string {
       return `pre-review ${s(p.verdict) === "caution" ? "⚠ CAUTION" : "✓ looks good"}: ${s(p.summary)}${risks}`;
     }
     case "auto_review_error":
+      // `gave_up` means the retry budget for this PR head is spent — the card
+      // needs a human, so it must not read like one more transient blip.
+      if (p.gave_up) return `pre-review gave up after ${s(p.attempts) || "several"} tries, needs you: ${s(p.error)}`;
       return `pre-review failed: ${s(p.error)}`;
     case "risk_verdicts": {
       const vs = Array.isArray(p.verdicts) ? (p.verdicts as any[]) : [];
@@ -115,7 +118,12 @@ export function eventText(e: EventLike): string {
       return `quick checks found problems: ${findings.map((f) => `${s(f.tool)}: ${s(f.summary)}`).join("; ")}`;
     }
     case "auto_merged":
+      // ok:false is history — failures are their own event type now.
       return p.ok === false ? `automatic merge failed: ${s(p.error) || `HTTP ${s(p.status)}`}` : "automatically merged";
+    case "auto_merge_failed":
+      return p.gave_up
+        ? `automatic merge refused ${s(p.attempts)} times, stopped trying: ${s(p.error) || `HTTP ${s(p.status)}`}`
+        : `automatic merge refused: ${s(p.error) || `HTTP ${s(p.status)}`}`;
     case "cleanup_skipped":
       return `cleanup failed safely: ${s(p.reason) || "worktree preserved"}`;
     case "stack_setup":
@@ -171,6 +179,12 @@ export function eventText(e: EventLike): string {
       return s(p.via) === "emit" ? "handed off for review" : "auto-advanced to review (agent idle)";
     case "stale":
       return "agent went silent";
+    case "deployed":
+      return p.up_to_date
+        ? `serving checkout '${s(p.branch)}' was already current`
+        : `serving checkout '${s(p.branch)}' followed ${s(p.base)} to ${String(p.head_sha ?? "").slice(0, 7)}`;
+    case "serving_follow_conflict":
+      return `serving checkout '${s(p.branch)}' could not merge ${s(p.base)}${Array.isArray(p.files) && p.files.length ? ` (${p.files.join(", ")})` : ""}`;
     case "smoke_passed":
       return "post-deploy smoke passed";
     case "smoke_failed":
@@ -302,6 +316,7 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
   blocked: "incident",
   stale: "incident",
   merge_failed: "incident",
+  auto_merge_failed: "incident",
   merge_blocked_destructive: "incident",
   scope_drift: "decision",
   action_failed: "incident",

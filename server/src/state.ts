@@ -5,6 +5,7 @@
 // Any non-terminal state -> failed | cancelled (with a reason event).
 // Transition to `done` is REJECTED unless >= 1 evidence row exists
 // (scouts additionally require an evidence row of kind = 'report').
+import { execSync } from "node:child_process";
 import type { DB } from "./db.ts";
 import { newId, now } from "./db.ts";
 import { broadcast } from "./bus.ts";
@@ -597,6 +598,59 @@ export function queuedInputRecoveryPending(db: DB, taskId: string): boolean {
   return !movedOn;
 }
 
+// ---- HIVE-402: the verification contract, enforced at the review handoff ----
+
+// The contract command names that still have no matching evidence. Empty when
+// the task carries no contract, so tasks without one are never gated.
+//
+// Freshness: when the task's head commit is known, evidence must have been
+// attached AFTER that commit landed — the same rule that already governs
+// screenshots (#223), applied to test runs. The commit's arrival time is the
+// first moment any event on the task recorded that head_sha; if nothing did,
+// the name merely has to be present. The comparison is >= because event
+// timestamps are millisecond strings: evidence attached in the same tick as the
+// commit's own event is fresh, not stale.
+export function missingVerifications(db: DB, task: any): string[] {
+  const cmds = task?.verification_cmds;
+  if (!Array.isArray(cmds) || cmds.length === 0) return [];
+  let since = "";
+  if (task.head_sha) {
+    const r = db
+      .query("SELECT MIN(ts) AS ts FROM events WHERE task_id = ? AND json_extract(payload, '$.head_sha') = ?")
+      .get(task.id, task.head_sha) as { ts: string | null } | undefined;
+    since = r?.ts ?? "";
+  }
+  const rows = db
+    .query(
+      `SELECT DISTINCT json_extract(payload, '$.verify_name') AS name FROM events
+       WHERE task_id = ? AND type = 'evidence'
+         AND json_extract(payload, '$.verify_name') IS NOT NULL AND ts >= ?`
+    )
+    .all(task.id, since) as { name: string }[];
+  const have = new Set(rows.map((r) => r.name));
+  return cmds.map((c: any) => String(c?.name ?? "")).filter((n) => !have.has(n));
+}
+
+// Same check, plus a `verification_missing` event the agent's next steer can
+// cite. Deduped on the name set so the polling callers (the reconciler asks
+// every cycle) log the gap once instead of forever.
+export function verificationGate(db: DB, task: any, source: string): string[] {
+  const missing = missingVerifications(db, task);
+  if (missing.length === 0) return missing;
+  const last = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'verification_missing' ORDER BY ts DESC LIMIT 1")
+    .get(task.id) as { payload: string } | undefined;
+  let same = false;
+  if (last) {
+    try {
+      same = JSON.stringify(JSON.parse(last.payload).names) === JSON.stringify(missing);
+    } catch {}
+  }
+  if (!same)
+    writeEvent(db, { task_id: task.id, source, type: "verification_missing", payload: { names: missing } });
+  return missing;
+}
+
 // The finished-handoff, shared by every herdr-signal path (the reconciler's
 // poll backstop and the supervise wait loop): an agent observed idle/done/gone on an
 // in_progress task that has a real work product (a pr_url, or a scout report)
@@ -630,6 +684,8 @@ export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, s
   // #1249: no explanation page yet → hold here and let the generation (kicked
   // off by the gate) hand the task off when the page is stored.
   if (explanationGate(db, task) !== "ready") return false;
+  // HIVE-402: a contract with nothing behind it isn't reviewable either.
+  if (verificationGate(db, task, source).length > 0) return false;
   writeEvent(db, {
     task_id: taskId,
     source,
@@ -645,11 +701,102 @@ export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, s
 
 // Perform a state transition. Throws TransitionError on invalid transition or
 // when a `done` transition lacks required evidence. Writes a state_change event.
+// Some handoffs land the PR URL only as free text in the transition reason
+// (e.g. `hive emit ready --note "PR <url>"` without `--pr-url`), so task.pr_url
+// never gets set and auto_review has nothing to diff. Backfill from that text —
+// but ONLY a PR in the project's own repo: the reason is prose an agent wrote,
+// so it can legitimately mention some other PR ("blocked on <url>"), and
+// backfilling that would point hive's review/land machinery at a foreign repo.
+const PR_URL_RE = /https:\/\/github\.com\/([\w.-]+\/[\w.-]+?)\/pull\/\d+/g;
+
+const repoSlugCache = new Map<string, string | null>();
+// ponytail: sync shell-out kept simple with an in-memory cache; fine at
+// per-transition and startup-sweep call rates.
+function repoSlugForPath(repoPath: string): string | null {
+  if (repoSlugCache.has(repoPath)) return repoSlugCache.get(repoPath)!;
+  let slug: string | null = null;
+  try {
+    const url = execSync("git remote get-url origin", { cwd: repoPath, encoding: "utf8" }).trim();
+    slug = url.match(/github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?$/)?.[1] ?? null;
+  } catch {
+    slug = null;
+  }
+  repoSlugCache.set(repoPath, slug);
+  return slug;
+}
+
+// The project's own owner/repo, or null if it can't be determined (no
+// repo_path, or the git remote lookup failed) — callers treat null as "can't
+// verify" and refuse to backfill rather than guessing.
+export function projectRepoSlug(db: DB, projectId: string): string | null {
+  const project = db.query("SELECT repo_path FROM projects WHERE id = ?").get(projectId) as
+    | { repo_path: string | null }
+    | undefined;
+  if (!project?.repo_path) return null;
+  return repoSlugForPath(project.repo_path);
+}
+
+// Extracts a PR URL from free text, scoped to `allowedSlug` (owner/repo). If
+// the text names more than one PR URL, the intended one is ambiguous — take
+// NONE rather than guessing. If `allowedSlug` is omitted, any single match is
+// accepted (used by the standalone unit test); real call sites always pass it.
+export function extractPrUrl(text: string | null | undefined, allowedSlug?: string | null): string | null {
+  if (!text) return null;
+  const matches = [...text.matchAll(PR_URL_RE)];
+  if (matches.length !== 1) return null;
+  const [url, slug] = matches[0];
+  if (allowedSlug !== undefined && slug !== allowedSlug) return null;
+  return url;
+}
+
+// Reconciliation sweep for tasks that got stuck before the transition()-time
+// backfill above existed: a task already sitting in in_review with pr_url
+// still null, whose state_change reason carried the URL as free text.
+// transition() can't fix these itself (it only runs on entry to in_review,
+// and throws on from === to), so this scans the task's own event history
+// instead. Idempotent — skips tasks that already have a pr_url. Startup-only
+// (see index.ts): once history is repaired this can never find anything
+// again, so running it every reconciler lap is a permanent cost for no gain.
+export function backfillStuckPrUrls(db: DB): number {
+  const rows = db
+    .query(
+      `SELECT tasks.id AS id, tasks.project_id AS project_id
+       FROM tasks WHERE tasks.state = 'in_review' AND tasks.pr_url IS NULL`
+    )
+    .all() as { id: string; project_id: string }[];
+  let backfilled = 0;
+  for (const row of rows) {
+    const allowedSlug = projectRepoSlug(db, row.project_id);
+    if (!allowedSlug) continue;
+    const events = db
+      .query(
+        "SELECT payload FROM events WHERE task_id = ? AND type = 'state_change' ORDER BY ts DESC"
+      )
+      .all(row.id) as { payload: string }[];
+    let foundPrUrl: string | null = null;
+    for (const e of events) {
+      const reason = JSON.parse(e.payload)?.reason;
+      foundPrUrl = extractPrUrl(reason, allowedSlug);
+      if (foundPrUrl) break;
+    }
+    if (!foundPrUrl) continue;
+    db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(foundPrUrl, now(), row.id);
+    writeEvent(db, {
+      task_id: row.id,
+      source: "system",
+      type: "pr_linked",
+      payload: { pr_url: foundPrUrl, via: "stuck_reason_backfill" },
+    });
+    backfilled++;
+  }
+  return backfilled;
+}
+
 export function transition(
   db: DB,
   taskId: string,
   to: State,
-  opts: { source?: string; reason?: string; force?: boolean } = {}
+  opts: { source?: string; reason?: string; force?: boolean; skipVerification?: boolean } = {}
 ): any {
   const task = getTask(db, taskId);
   if (!task) throw new TransitionError(`unknown task: ${taskId}`);
@@ -684,6 +831,21 @@ export function transition(
     throw new TransitionError(`invalid transition: '${from}' -> '${to}'${hint}`);
   }
 
+  // HIVE-402: the verification contract is enforced HERE, at the one helper every
+  // route to review funnels through (director move, agent `ready`, PR-link
+  // handoff, the reconciler's CI-green promote). skipVerification is for the one
+  // caller catching up on a PR that already merged — the work has landed, so
+  // holding it in_progress would strand it forever.
+  if (from === "in_progress" && to === "in_review" && !isTrackingOnlyTask(task) && !opts.skipVerification) {
+    const missing = verificationGate(db, task, source);
+    if (missing.length > 0)
+      throw new TransitionError(
+        `cannot hand off to review: the verification contract is unmet — no fresh evidence for: ${missing.join(", ")}. ` +
+          `Run each command from the task's verification contract and attach its output with ` +
+          `\`hive emit ${taskId} evidence --verify-name <name> --file <output>\`, then hand off again.`
+      );
+  }
+
   // Evidence gates apply to hive-driven work. Tracking-only tasks (source
   // 'external', or a Jira mirror) move freely: hive records them, it does not
   // supervise them.
@@ -697,6 +859,14 @@ export function transition(
       throw new TransitionError(
         "cannot transition to 'done': scout task requires a report evidence"
       );
+    }
+  }
+
+  if (to === "in_review" && !task.pr_url) {
+    const foundPrUrl = extractPrUrl(opts.reason, projectRepoSlug(db, task.project_id));
+    if (foundPrUrl) {
+      db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(foundPrUrl, now(), taskId);
+      writeEvent(db, { task_id: taskId, source, type: "pr_linked", payload: { pr_url: foundPrUrl, via: "reason_backfill" } });
     }
   }
 

@@ -224,6 +224,14 @@ async function runChecks(
   base: string
 ): Promise<CheckRun> {
   const findings: SidecarFinding[] = [];
+  // A fresh worktree has no node_modules, so tsc can't resolve a single type
+  // and reports things like "TS2688: Cannot find type definition file for bun"
+  // — a broken environment, not a broken diff. Reporting it steered agents to
+  // chase type errors that a plain `bun install` cleared. The sidecar stays
+  // read-only, so it says so instead of installing (task HIVE-496).
+  if (deps.exists(join(worktree, "package.json")) && !deps.exists(join(worktree, "node_modules"))) {
+    return { findings: [{ tool: "sidecar", summary: "skipped: this worktree has no node_modules, so nothing can be type checked. Run `bun install` in it." }], dirtied: false };
+  }
   const remaining = () => deadline - Date.now();
   const checks: { tool: string; argv: string[] }[] = [];
   if (deps.exists(join(worktree, "tsconfig.json"))) checks.push({ tool: "tsc", argv: ["bun", "x", "tsc", "--noEmit"] });

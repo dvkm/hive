@@ -5,6 +5,7 @@ import { projectBaseBranch } from "./exec.ts";
 import { enqueue } from "./notifications.ts";
 import { getTask, transition, writeEvent, TERMINAL, type State } from "./state.ts";
 import { broadcastTask } from "./health.ts";
+import { activeProjects, type ProjectRow } from "./testProjects.ts";
 
 export interface PrGardenerConfig {
   enabled?: boolean;
@@ -28,6 +29,9 @@ export const DEFAULT_SENSITIVE_PATHS = [
   "**/secrets/**",
 ];
 
+// `gh pr list --json files` pages the files array at this many entries per PR.
+export const GH_FILES_PAGE_CAP = 100;
+
 export type GardenerAction = "land" | "rebase" | "fix" | "close" | "decision" | "hold" | "wait";
 
 export interface ClassifierInput {
@@ -46,6 +50,7 @@ export interface ClassifierInput {
   override?: string | null;
   maxFixAttempts?: number;
   autoCloseSuperseded?: boolean;
+  sensitiveReason?: string;
 }
 
 export function classifyPr(p: ClassifierInput): { action: GardenerAction; reason: string } {
@@ -57,7 +62,7 @@ export function classifyPr(p: ClassifierInput): { action: GardenerAction; reason
   // never approval to ship. Leave the review card alone until they choose.
   if (p.directorDeciding) return { action: "wait", reason: "The director is still deciding whether to ship it" };
   if (p.override === "retry_fix") return { action: "fix", reason: "Another fix attempt was approved by the director" };
-  if (p.sensitive) return { action: "decision", reason: "Touches a sensitive path" };
+  if (p.sensitive) return { action: "decision", reason: p.sensitiveReason ?? "Touches a sensitive path" };
   if (p.decisionOpen) return { action: "wait", reason: "Waiting for the director's decision" };
   if (p.draft) return { action: "wait", reason: "Draft PR" };
   if (p.mergeState === "DIRTY") {
@@ -201,7 +206,7 @@ function openDecision(db: DB, deps: GardenerDeps, projectId: string, pr: GhPr, r
 }
 
 export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
-  const projects = db.query("SELECT * FROM projects WHERE repo_path IS NOT NULL").all() as any[];
+  const projects = activeProjects(db).filter((p): p is ProjectRow & { repo_path: string } => !!p.repo_path);
   for (const project of projects) {
     const config = JSON.parse(project.config || "{}");
     const gardener: PrGardenerConfig = config.pr_gardener ?? {};
@@ -239,7 +244,14 @@ export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
         prior.action_task_id = null;
       }
       const paths = (pr.files ?? []).map((file) => file.path);
-      const sensitive = matchesSensitivePath(paths, [...DEFAULT_SENSITIVE_PATHS, ...(gardener.sensitive_paths ?? [])]);
+      // `gh pr list --json files` caps the files array at 100. A bigger PR can
+      // hide a workflow/secrets change past that cap and past the denylist
+      // below, so treat a capped list as sensitive rather than trust it.
+      const filesTruncated = paths.length >= GH_FILES_PAGE_CAP;
+      const sensitive = filesTruncated || matchesSensitivePath(paths, [...DEFAULT_SENSITIVE_PATHS, ...(gardener.sensitive_paths ?? [])]);
+      const sensitiveReason = filesTruncated
+        ? `PR file list is truncated at ${GH_FILES_PAGE_CAP} files (gh pr list cap); treating as sensitive since a denylisted path could be hidden past it`
+        : undefined;
       const stale = clock - Date.parse(pr.updatedAt) > durationMs(gardener.close_stale_after, 14 * 86_400_000);
       const superseded = fetched.code === 0 && await supersededOnBase(deps.exec, project.repo_path, base, pr.number);
       const linked = linkedTask(db, project.id, pr.url);
@@ -253,6 +265,7 @@ export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
         stale,
         superseded,
         sensitive,
+        sensitiveReason,
         linkedTaskState: linked?.state,
         directorDeciding: !!linked && !!deps.directorDeciding?.(linked.id),
         actionInFlight: activeTask(db, prior?.action_task_id),
