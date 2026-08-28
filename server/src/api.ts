@@ -2025,7 +2025,13 @@ async function createTask(db: DB, req: Request): Promise<Response> {
 export function linkPrIfMarked(
   db: DB,
   pr: { title?: string | null; body?: string | null; url: string },
-  source: "reconciler" | "director" = "reconciler"
+  source: "reconciler" | "director" = "reconciler",
+  // A task whose stored PR no longer exists (the repo's history was rewritten,
+  // the PR was created against a different repo, the branch was replayed) is
+  // otherwise stuck forever: the pr_url guard below refuses every new link, and
+  // nothing else can clear it. Only the explicit director endpoint sets this —
+  // the reconciler must never silently repoint a task at a different PR.
+  allowRelink = false
 ): { task_id: string; number: number; linked: boolean } | null {
   const id = taskIdFromBody(pr.body);
   let task: any = id ? getTask(db, id) : null;
@@ -2039,9 +2045,11 @@ export function linkPrIfMarked(
   }
   if (!task) return null;
   if (isTrackingOnlyTask(task)) return { task_id: task.id, number: task.number, linked: false };
-  if (task.pr_url) return { task_id: task.id, number: task.number, linked: false };
+  if (task.pr_url && !(allowRelink && task.pr_url !== pr.url))
+    return { task_id: task.id, number: task.number, linked: false };
   db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(pr.url, now(), task.id);
-  writeEvent(db, { task_id: task.id, source, type: "pr_linked", payload: { pr_url: pr.url, via } });
+  const previous = task.pr_url as string | null;
+  writeEvent(db, { task_id: task.id, source, type: "pr_linked", payload: { pr_url: pr.url, via, ...(previous ? { relinked_from: previous } : {}) } });
   backfillRequeueResume(db, task.id, source);
   handOffToReview(db, task.id, source);
   broadcastTask(db, getTask(db, task.id));
@@ -2086,7 +2094,7 @@ async function linkPrEndpoint(db: DB, body: any, deps: HandlerDeps): Promise<Res
   } catch {
     return err("could not parse gh pr view output", 502);
   }
-  const res = linkPrIfMarked(db, { title: data.title, body: data.body, url: data.url || prUrl }, "director");
+  const res = linkPrIfMarked(db, { title: data.title, body: data.body, url: data.url || prUrl }, "director", body?.force === true);
   if (!res) return err("PR carries no hive marker (no `hive-task:` footer or `[hive-<n>]` title)", 422);
   return json({ ok: true, ...res });
 }
