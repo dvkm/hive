@@ -3204,7 +3204,7 @@ test("the route to shoot comes from the changed files, and a guessable one is sk
 // A worktree that looks like a repo with a Playwright harness. `harness: false`
 // makes it a repo with none, which is the quiet-degrade case. The webServer
 // block is what lets hive serve the PR branch itself, so a real harness has one.
-function fakeWorktree(name: string, harness: boolean, config?: string): string {
+function fakeWorktree(name: string, harness: boolean, config?: string, installed = true): string {
   const root = join(HOME, `wt-${name}-${newId()}`);
   mkdirSyncT(join(root, "web"), { recursive: true });
   if (harness) {
@@ -3213,11 +3213,19 @@ function fakeWorktree(name: string, harness: boolean, config?: string): string {
       join(root, "web", "playwright.config.ts"),
       config ?? "export default { testDir: './e2e', webServer: { command: 'npm start' } };\n"
     );
+    // A real checkout only runs if its deps are installed. `installed: false`
+    // is the fresh-worktree case, where hive must refuse rather than fall back
+    // to whatever `playwright` happens to sit on the host PATH.
+    if (installed) {
+      mkdirSyncT(join(root, "web", "node_modules", ".bin"), { recursive: true });
+      writeFileSyncT(join(root, "web", "node_modules", ".bin", "playwright"), "#!/bin/sh\n");
+    }
   }
   return root;
 }
 
-const isHarnessRun = (argv: string[]) => argv.includes("playwright");
+// The harness run is now the repo's own binary by absolute path, not `npx`.
+const isHarnessRun = (argv: string[]) => argv.some((a) => a.endsWith("/.bin/playwright"));
 
 function trustRepo(db: DB, projectId: string): void {
   const row = db.query("SELECT config FROM projects WHERE id = ?").get(projectId) as { config: string };
@@ -3368,10 +3376,13 @@ test.skipIf(process.platform !== "darwin")("the harness is forced to boot the ap
   // browser cache while booting the app from this worktree.
   const harness = seen.find((c) => isHarnessRun(c.argv))!;
   expect(harness.argv.slice(3, 5)).toEqual(["/usr/bin/env", "-i"]);
-  const npxAt = harness.argv.indexOf("npx");
-  expect(harness.argv.slice(5, npxAt).map((entry) => entry.split("=", 1)[0])).toEqual(["HOME", "PATH", "TMPDIR", "CI"]);
-  expect(harness.argv.slice(5, npxAt).join("\n")).not.toContain("HIVE_");
-  expect(harness.argv.slice(npxAt, npxAt + 3)).toEqual(["npx", "--no-install", "playwright"]);
+  const binAt = harness.argv.findIndex((a: string) => a.endsWith("/.bin/playwright"));
+  expect(harness.argv.slice(5, binAt).map((entry) => entry.split("=", 1)[0])).toEqual(["HOME", "PATH", "TMPDIR", "CI"]);
+  expect(harness.argv.slice(5, binAt).join("\n")).not.toContain("HIVE_");
+  // The repo's OWN binary, by absolute path inside this worktree. `npx` would
+  // fall back to a host-global playwright when the worktree has no deps.
+  expect(harness.argv[binAt]).toBe(join(root, "web", "node_modules", ".bin", "playwright"));
+  expect(harness.argv[binAt + 1]).toBe("test");
   expect(harness.argv).toContain("--config");
   expect(harness.config).toContain("reuseExistingServer: false");
   expect(harness.cwd).toBe(join(root, "web"));
@@ -3464,11 +3475,11 @@ test.skipIf(process.platform !== "darwin")("the reason names the real failure, n
   expect(reason).not.toContain("\u001b");
 });
 
-test.skipIf(process.platform !== "darwin")("the generated spec refuses a page whose requests failed", async () => {
-  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
-  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
-  // A single-page app renders its own error boundary with HTTP 200, so the spec
-  // itself has to fail the shot; exit code alone would call that picture proof.
+// Capture the spec hive generates for a real sync, then RUN it against a fake
+// page. Matching on the source text only proves the guard was written; running
+// it proves the guard decides correctly, which is the part that posts or
+// withholds a picture on a live ticket.
+async function generatedSpec(root: string, db: DB, projectId: string, jira: ReturnType<typeof fakeJira>) {
   let spec = "";
   const exec = async (argv: string[]) => {
     if (!isHarnessRun(argv)) return { code: 0, stdout: UI_PATCH, stderr: "" };
@@ -3477,12 +3488,178 @@ test.skipIf(process.platform !== "darwin")("the generated spec refuses a page wh
     spec = await Bun.file(join(dir, name)).text();
     return { code: 0, stdout: "1 passed", stderr: "" };
   };
-
   await run(db, projectId, jira.fetchImpl, CFG, { exec });
+  return spec;
+}
 
-  expect(spec).toContain('page.on("requestfailed"');
-  expect(spec).toContain("page could not load its data");
-  expect(spec).toContain("response.ok()");
+// Playwright's own `test` and the import of it are the only things the spec
+// needs from outside, so both are stubbed and the body runs as plain JS.
+function runSpec(spec: string, page: unknown): Promise<void> {
+  const body = spec
+    .replace(/^import .*$/m, "")
+    .replace(/^test\.use\(.*$/m, "");
+  const cases: Array<(args: { page: unknown }) => Promise<void>> = [];
+  const test = (_name: string, fn: (args: { page: unknown }) => Promise<void>) => cases.push(fn);
+  (test as { use?: () => void }).use = () => {};
+  new Function("test", body)(test);
+  return cases[0]({ page });
+}
+
+// A failed request carries the three facts the filter reads.
+const failedRequest = (url: string, resourceType: string, errorText = "net::ERR_FAILED") => ({
+  url: () => url,
+  resourceType: () => resourceType,
+  failure: () => ({ errorText }),
+});
+
+// `overlayText` non-null makes the page look like a dev server showing a
+// compile error over the app: HTTP 200, no failed request, still not proof.
+function fakePage(url: string, failures: Array<ReturnType<typeof failedRequest>>, overlayText: string | null = null) {
+  let onFailed: (r: unknown) => void = () => {};
+  let shot = false;
+  return {
+    page: {
+      locator: (_selector: string) => ({
+        first: () => ({
+          count: async () => (overlayText ? 1 : 0),
+          evaluate: async () => overlayText ?? "",
+        }),
+      }),
+      on: (event: string, fn: (r: unknown) => void) => {
+        if (event === "requestfailed") onFailed = fn;
+      },
+      goto: async () => {
+        for (const f of failures) onFailed(f);
+        return { ok: () => true, status: () => 200 };
+      },
+      waitForLoadState: async () => {},
+      url: () => url,
+      screenshot: async () => {
+        shot = true;
+      },
+    },
+    tookShot: () => shot,
+  };
+}
+
+const PAGE_URL = "http://localhost:3000/insights";
+
+// A fresh hive worktree has no node_modules. `npx --no-install playwright` did
+// not stop there: it walked PATH and ran the host's own playwright, a different
+// package whose CLI has no `test` command. Hive must refuse instead.
+test.skipIf(process.platform !== "darwin")("an uninstalled repo is refused, never run off the host PATH", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const task = tasks(db)[0];
+  const root = fakeWorktree(task.id, true, undefined, false); // harness, but no deps
+  db.query("UPDATE tasks SET branch = ?, worktree_path = ? WHERE id = ?").run("hive/x", root, task.id);
+  trustRepo(db, projectId);
+
+  const seen: string[][] = [];
+  const exec = async (argv: string[]) => {
+    seen.push(argv);
+    return { code: 0, stdout: UI_PATCH, stderr: "" };
+  };
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+
+  expect(stats.rendered).toBe(0);
+  expect(stats.errors).toBe(0);
+  expect(db.query("SELECT id FROM evidence").all()).toHaveLength(0);
+  expect(seen.some(isHarnessRun)).toBe(false); // no browser was started at all
+  const reason = String(syncEvents(db).find((e) => e.action === "render_proof")?.reason);
+  expect(reason).toContain("no installed Playwright");
+  expect(reason).toContain("host PATH");
+});
+
+test.skipIf(process.platform !== "darwin")(
+  "the generated spec still shoots when only third-party and cancelled requests failed",
+  async () => {
+    const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+    const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+    const spec = await generatedSpec(root, db, projectId, jira);
+
+    // Every one of these fails on EVERY run, because the seatbelt allows only
+    // localhost. None of them means the page is broken.
+    const { page, tookShot } = fakePage(PAGE_URL, [
+      failedRequest("https://us.i.posthog.com/e/", "fetch"), // analytics beacon
+      failedRequest("https://www.google-analytics.com/g/collect", "xhr"),
+      failedRequest("https://fonts.gstatic.com/s/inter.woff2", "font"),
+      failedRequest("http://localhost:3000/hero.png", "image"), // same-origin, but not needed to render
+      failedRequest("http://localhost:3000/_next/data/next.json", "fetch", "net::ERR_ABORTED"), // cancelled prefetch
+    ]);
+
+    await runSpec(spec, page);
+
+    expect(tookShot()).toBe(true);
+  }
+);
+
+test.skipIf(process.platform !== "darwin")(
+  "the generated spec refuses a page whose own data failed to load",
+  async () => {
+    const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+    const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+    const spec = await generatedSpec(root, db, projectId, jira);
+
+    // A single-page app renders its own error boundary with HTTP 200, so the
+    // spec itself has to fail the shot; exit code alone would call that proof.
+    const { page, tookShot } = fakePage(PAGE_URL, [
+      failedRequest("https://us.i.posthog.com/e/", "fetch"), // noise, alongside the real one
+      failedRequest("http://localhost:3000/api/insights", "xhr"),
+    ]);
+
+    let thrown = "";
+    await runSpec(spec, page).catch((e) => {
+      thrown = String(e?.message ?? e);
+    });
+
+    expect(thrown).toContain("page could not load its data");
+    expect(thrown).toContain("1 request(s) failed"); // the beacon was not counted
+    expect(thrown).toContain("http://localhost:3000/api/insights");
+    expect(tookShot()).toBe(false);
+  }
+);
+
+// Found by running this code against a real checkout: the dev server answered
+// 200, no request failed, and the screenshot was a full-page Vite overlay
+// reading "Failed to resolve import". Exactly the picture that must not ship.
+test.skipIf(process.platform !== "darwin")("the generated spec refuses a dev-server error overlay", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const spec = await generatedSpec(root, db, projectId, jira);
+
+  const { page, tookShot } = fakePage(
+    PAGE_URL,
+    [],
+    '[plugin:vite:import-analysis] Failed to resolve import "lexical-schema"'
+  );
+
+  let thrown = "";
+  await runSpec(spec, page).catch((e) => {
+    thrown = String(e?.message ?? e);
+  });
+
+  expect(thrown).toContain("dev-server error overlay");
+  expect(thrown).toContain("Failed to resolve import"); // the reason names the real cause
+  expect(tookShot()).toBe(false);
+});
+
+test.skipIf(process.platform !== "darwin")("the generated spec refuses a non-2xx page", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const spec = await generatedSpec(root, db, projectId, jira);
+
+  const { page, tookShot } = fakePage(PAGE_URL, []);
+  page.goto = async () => ({ ok: () => false, status: () => 500 });
+
+  let thrown = "";
+  await runSpec(spec, page).catch((e) => {
+    thrown = String(e?.message ?? e);
+  });
+
+  expect(thrown).toContain("page answered HTTP 500");
+  expect(tookShot()).toBe(false);
 });
 
 test("the scratch directory is gone even when the harness throws", async () => {
