@@ -25,7 +25,7 @@ import { join } from "node:path";
 import type { DB } from "./db.ts";
 import { writeEvent } from "./state.ts";
 import { queueSteerEvent } from "./steer.ts";
-import { defaultExec, type Exec } from "./exec.ts";
+import { defaultExec, projectComparisonBase, type Exec } from "./exec.ts";
 
 export interface SidecarDeps {
   exec?: Exec;
@@ -172,13 +172,56 @@ async function porcelain(exec: Exec, worktree: string): Promise<string | null> {
   return res.code === 0 ? res.stdout.trim() : null;
 }
 
+// tsc reports one error per line, prefixed with a worktree-relative path:
+//   server/src/api.ts(1191,41): error TS18047: 'thread' is possibly 'null'.
+// Some errors carry no file at all (TS2688 for a missing type package, config
+// errors). Those say the CHECK itself is broken rather than the diff, so they
+// are always kept — dropping them would report a check that never really ran
+// as clean.
+const TSC_FILE_ERROR_RE = /^(.+?)\((\d+),(\d+)\): error TS\d+/;
+const TSC_BARE_ERROR_RE = /^error TS\d+/;
+
+// The files this branch actually changed, or null when git could not say. Null
+// means "don't scope" — a scoping failure must never quietly hide real errors.
+async function touchedFiles(exec: Exec, worktree: string, base: string): Promise<Set<string> | null> {
+  const res = await exec(["git", "-C", worktree, "diff", "--name-only", `${base}...HEAD`]);
+  if (res.code !== 0) return null;
+  return new Set(res.stdout.split("\n").map((l) => l.trim()).filter(Boolean));
+}
+
+// Whole-repo `tsc --noEmit` fails a PR for errors in files its diff never
+// touched, so ONE broken file on the base branch marks every open PR at once —
+// which is exactly what happened here: six errors in server/src/api.ts showed
+// up as ok:false on 21 unrelated PRs, and agents started bundling fixes for
+// them into their own branches as scope creep. tsc cannot typecheck a subset of
+// files without dropping tsconfig, so the run stays repo-wide and its OUTPUT is
+// scoped instead. CI still checks the whole repo before anything merges.
+// Returns the errors this diff owns, "" when every error belongs to a file it
+// never touched, or null when the output carries no recognisable tsc error at
+// all. Null means "cannot scope this" — a check that failed in a way we do not
+// understand is reported unchanged rather than silently passed.
+function scopeTscToDiff(text: string, touched: Set<string>): string | null {
+  const errors = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((line) => TSC_FILE_ERROR_RE.test(line) || TSC_BARE_ERROR_RE.test(line));
+  if (!errors.length) return null;
+  return errors
+    .filter((line) => {
+      const m = TSC_FILE_ERROR_RE.exec(line);
+      return m ? touched.has(m[1]!) : true;
+    })
+    .join("\n");
+}
+
 type CheckRun = { findings: SidecarFinding[]; dirtied: boolean };
 
 async function runChecks(
   exec: Exec,
   deps: Required<Pick<SidecarDeps, "exists" | "readFile">>,
   worktree: string,
-  deadline: number
+  deadline: number,
+  base: string
 ): Promise<CheckRun> {
   const findings: SidecarFinding[] = [];
   const remaining = () => deadline - Date.now();
@@ -201,7 +244,17 @@ async function runChecks(
       continue;
     }
     const res = await exec(check.argv, { cwd: worktree, timeoutMs: remaining() });
-    if (res.code !== 0) findings.push({ tool: check.tool, summary: summarize(res) });
+    if (res.code === 0) continue;
+    if (check.tool === "tsc") {
+      const touched = await touchedFiles(exec, worktree, base);
+      const mine = touched ? scopeTscToDiff([res.stdout, res.stderr].join("\n"), touched) : null;
+      if (mine !== null) {
+        if (!mine) continue; // every error is in a file this diff never touched
+        findings.push({ tool: check.tool, summary: cap(mine.split("\n").slice(0, 3).join(" | ")) });
+        continue;
+      }
+    }
+    findings.push({ tool: check.tool, summary: summarize(res) });
   }
   const after = await porcelain(exec, worktree);
   // Detect and alarm only. Reverting could clobber work the agent did while
@@ -222,11 +275,11 @@ async function sweep(db: DB, deps: SidecarDeps): Promise<void> {
   const deadline = Date.now() + SWEEP_BUDGET_MS;
   const rows = db
     .query(
-      `SELECT id, worktree_path FROM tasks
-        WHERE state = 'in_progress' AND agent_target IS NOT NULL AND worktree_path IS NOT NULL
-        ORDER BY id`
+      `SELECT t.id, t.worktree_path, p.config FROM tasks t JOIN projects p ON p.id = t.project_id
+        WHERE t.state = 'in_progress' AND t.agent_target IS NOT NULL AND t.worktree_path IS NOT NULL
+        ORDER BY t.id`
     )
-    .all() as { id: string; worktree_path: string }[];
+    .all() as { id: string; worktree_path: string; config: string | null }[];
   // Resume where the last pass ran out of budget, then wrap around.
   const start = resumeFrom ? rows.findIndex((r) => r.id === resumeFrom) : 0;
   const ordered = start > 0 ? [...rows.slice(start), ...rows.slice(0, start)] : rows;
@@ -250,7 +303,13 @@ async function sweep(db: DB, deps: SidecarDeps): Promise<void> {
       .filter(Boolean)
       .some((p) => fs.exists(p.startsWith("/") ? p : join(wt, p)));
     if (midOperation) continue;
-    const { findings, dirtied } = await runChecks(exec, fs, wt, deadline);
+    let config: any = {};
+    try {
+      config = JSON.parse(row.config ?? "{}");
+    } catch {
+      // Unparseable config just means the default base; not worth skipping the task.
+    }
+    const { findings, dirtied } = await runChecks(exec, fs, wt, deadline, projectComparisonBase(config));
     writeEvent(db, {
       task_id: row.id,
       source: "sidecar",

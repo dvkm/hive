@@ -339,6 +339,46 @@ test("verification is keyed to the reviewed head: same head skips, new head re-r
   expect(events(db, id, "risk_verdicts").map((e: any) => e.payload.reviewed_head_sha).sort()).toEqual(["head-a", "head-b"]);
 });
 
+test("a re-review at the same head re-verifies when the risk list grew", async () => {
+  const { db, id } = setup();
+  let calls = 0;
+  const claude = async () => {
+    calls++;
+    return { code: 0, stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"checked"}' }), stderr: "" };
+  };
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+
+  // First review at this head raised two risks.
+  await verifyRisks(db, task, { risks: ["r1", "r2"], head: "head-a", diff: "diff" }, { exec: claude });
+  expect(calls).toBe(2);
+
+  // Overlapping reconciler laps write a SECOND auto_review for the same head,
+  // and it raises a third risk plus a question. The stored set no longer covers
+  // the review, so it must not be reused — otherwise ambiguityCleared compares
+  // 2 verdicts against 3 risks forever and the task parks with no card.
+  // One exec for both prompt kinds: the question pass wants an `answerable`,
+  // the risk pass wants a `verdict`.
+  const answer = async (argv: string[]) => {
+    calls++;
+    const prompt = argv[4] ?? "";
+    const result = prompt.includes("q1")
+      ? '{"answerable":"machine","answer":"yes"}'
+      : '{"verdict":"refuted","why":"checked"}';
+    return { code: 0, stdout: JSON.stringify({ result }), stderr: "" };
+  };
+  await verifyRisks(db, task, { risks: ["r1", "r2", "r3"], questions: ["q1"], head: "head-a", diff: "diff" }, { exec: answer });
+  expect(calls).toBe(6); // 2 + 4 (three risks and one question re-run)
+
+  const latest: any = events(db, id, "risk_verdicts").at(-1);
+  expect(latest.payload.verdicts).toHaveLength(3);
+  expect(latest.payload.question_verdicts).toHaveLength(1);
+  expect(ambiguityCleared(db, id, "head-a", { risks: ["r1", "r2", "r3"], questions: ["q1"] })).toBe(true);
+
+  // A repeat of that same review is still deduped.
+  await verifyRisks(db, task, { risks: ["r1", "r2", "r3"], questions: ["q1"], head: "head-a", diff: "diff" }, { exec: answer });
+  expect(calls).toBe(6);
+});
+
 test("a failed verification run is counted, never reported as an all-clear", async () => {
   const { db, id } = setup();
   const claude = async () => ({ code: 1, stdout: "", stderr: "boom" });
