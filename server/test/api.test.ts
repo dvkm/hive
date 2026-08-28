@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -52,6 +52,12 @@ beforeAll(async () => {
 test("health endpoint", async () => {
   const { json } = await get("/api/health");
   expect(json.ok).toBe(true);
+});
+
+test("shell-version endpoint reports the electron shell's version and this repo's path", async () => {
+  const { json } = await get("/api/shell-version");
+  const electronPkg = JSON.parse(readFileSync(join(json.repo_path, "electron", "package.json"), "utf8"));
+  expect(json.version).toBe(electronPkg.version);
 });
 
 test("health endpoint reports dispatcher/reaper liveness, stale before any cycle has run", async () => {
