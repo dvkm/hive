@@ -1176,7 +1176,7 @@ export function keepSupervisorWarm(db: DB, herdr: Herdr, deps: HandlerDeps, even
   const task = getTask(db, event.task_id);
   if (!task || task.source !== "chat_supervisor" || TERMINAL.includes(task.state as State)) return;
   const thread = managingThreadForTask(db, task.id);
-  if (thread?.task_id !== task.id) return;
+  if (!thread || thread.task_id !== task.id) return;
   const attempt = (keepWarmAttempts.get(thread.id) ?? 0) + 1;
   if (attempt > KEEP_WARM_MAX_ATTEMPTS) return;
   keepWarmAttempts.set(thread.id, attempt);
