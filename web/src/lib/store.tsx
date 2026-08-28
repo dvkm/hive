@@ -120,14 +120,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     api.tasks().then((ts) => {
       setTasks(ts);
       setLastActivity(Object.fromEntries(ts.map((t) => [t.id, t.updated_at])));
-      // ponytail: N+1 detail fetch to get evidence counts. Localhost, small N.
-      // Add a count column / aggregate endpoint if the board ever gets large.
-      ts.forEach((t) =>
-        api.task(t.id).then((d) => {
-          setEvidenceCount((c) => ({ ...c, [t.id]: d.evidence.length }));
-          setSpawnError((s) => ({ ...s, [t.id]: d.events.some((e) => e.type === "spawn_error") && !d.events.some((e) => e.type === "spawned") }));
-        })
-      );
+      setEvidenceCount(Object.fromEntries(ts.map((t) => [t.id, t.evidence_count ?? 0])));
+      setSpawnError(Object.fromEntries(ts.map((t) => [t.id, t.spawn_error ?? false])));
     });
     api.decisions("open").then(setDecisions);
     reloadCheckpoints();

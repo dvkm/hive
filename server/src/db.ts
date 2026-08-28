@@ -638,6 +638,10 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v37-decision-class",
     statements: [`ALTER TABLE decisions ADD COLUMN decision_class TEXT`],
   },
+  {
+    name: "v38-events-type-task-index",
+    statements: [`CREATE INDEX idx_events_type_task ON events(type, task_id, ts)`],
+  },
 ];
 
 // -------------------------------------------------------------- settings

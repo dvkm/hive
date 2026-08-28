@@ -23,6 +23,20 @@ export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
 // not the agent doing something, and letting it reset the clock would hide a
 // dead task behind hive's own retry loop.
 const RECONCILER_NOISE = new Set(["stale", "recovery_nudge", "recovery", "spawn_error"]);
+const HEALTH_EVENT_TYPES = [
+  "agent_status",
+  "dialog_auto_approved",
+  "dialog_auto_declined",
+  "merge_failed",
+  "merge_blocked_destructive",
+  "merged",
+  "pr_merged",
+  "pr_synchronized",
+  "ready_for_review",
+  "state_change",
+  "recovery_nudge",
+  "stale",
+];
 export interface Health {
   status: HealthStatus;
   reason: string | null;
@@ -120,8 +134,10 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   }
 
   const events = db
-    .query("SELECT type, ts, payload FROM events WHERE task_id = ? ORDER BY ts DESC")
-    .all(task.id) as { type: string; ts: string; payload: string }[];
+    .query(`SELECT type, ts, payload FROM events
+      WHERE task_id = ? AND type IN (${HEALTH_EVENT_TYPES.map(() => "?").join(",")})
+      ORDER BY ts DESC`)
+    .all(task.id, ...HEALTH_EVENT_TYPES) as { type: string; ts: string; payload: string }[];
 
   // Latest recorded liveness from the reconciler's probe.
   let lastStatus: string | null = null;
@@ -192,8 +208,10 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   // wrote a `recovery` row that reset this clock — so a frozen pane read
   // HEALTHY, lap after lap, with a byte-identical tail (#1149/#1156, 2026-08-20).
   // A row hive wrote ABOUT an agent is not evidence the agent did anything.
-  const activity = events.find((e) => !RECONCILER_NOISE.has(e.type));
-  const activityTs = activity ? activity.ts : (task.updated_at as string);
+  const activity = db
+    .query(`SELECT ts FROM events WHERE task_id = ? AND type NOT IN (${[...RECONCILER_NOISE].map(() => "?").join(",")}) ORDER BY ts DESC LIMIT 1`)
+    .get(task.id, ...RECONCILER_NOISE) as { ts: string } | undefined;
+  const activityTs = activity?.ts ?? (task.updated_at as string);
   const age = nowMs - Date.parse(activityTs);
 
   // Recovery is underway if hive nudged AFTER the last real activity. Keyed off
@@ -317,4 +335,3 @@ export function noteToolStart(db: DB, tool: string, failure: string | null): voi
   if (!getSetting(db, degradedKey)) console.error(`[hive] ${tool} failed to start on ${streak} cycles in a row; marking health degraded: ${failure}`);
   setSetting(db, degradedKey, failure);
 }
-

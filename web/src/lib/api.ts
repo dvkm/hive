@@ -133,6 +133,8 @@ export interface Task {
   land_queued_at?: string | null; // marked approved-to-land; the land queue merges it in graph order
   health?: Health | null;
   sidecar?: SidecarReport | null; // latest background check on this task's commits
+  evidence_count?: number; // list endpoint only; avoids fetching every task detail on startup
+  spawn_error?: boolean; // list endpoint only; prior spawn failed and no spawn ever succeeded
   requeued_to?: string | null; // successor id when failed + auto-requeued
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
   created_at: string;

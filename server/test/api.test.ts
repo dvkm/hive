@@ -1269,6 +1269,21 @@ test("test projects, their tasks, decisions and checkpoints are hidden by defaul
   expect(directDecision.status).toBe(200);
 });
 
+test("task list includes board metadata without task-detail requests", async () => {
+  const task = await post("/api/tasks", { project_id: projectId, title: "list metadata" });
+  await post(`/api/tasks/${task.json.id}/events`, { type: "evidence", kind: "log", note: "proof" });
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run("evt_list_spawn_error", task.json.id, new Date().toISOString(), "herdr", "spawn_error", "{}");
+
+  let listed = (await get("/api/tasks")).json.find((item: any) => item.id === task.json.id);
+  expect(listed).toMatchObject({ evidence_count: 1, spawn_error: true });
+
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run("evt_list_spawned", task.json.id, new Date().toISOString(), "herdr", "spawned", "{}");
+  listed = (await get("/api/tasks")).json.find((item: any) => item.id === task.json.id);
+  expect(listed.spawn_error).toBe(false);
+});
+
 test("a test project never pushes a notification, even for a high-risk decision", async () => {
   const tp = await post("/api/projects", { name: "hidden-notif", repo_path: "/x/scratchpad/z" });
   const tt = await post("/api/tasks", { project_id: tp.json.id, title: "scratch task" });

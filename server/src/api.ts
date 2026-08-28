@@ -2302,7 +2302,14 @@ function listTasks(db: DB, url: URL): Response {
     "SELECT t.* FROM tasks t JOIN projects p ON p.id = t.project_id" +
     (where.length ? " WHERE " + where.join(" AND ") : "") +
     " ORDER BY t.updated_at DESC";
-  return json(tasksWithHealth(db, db.query(sql).all(...args).map(parseTask)));
+  const tasks = tasksWithHealth(db, db.query(sql).all(...args).map(parseTask));
+  return json(tasks.map((task) => ({
+    ...task,
+    evidence_count: evidenceCount(db, task.id),
+    spawn_error: task.state === "queued" &&
+      !!db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawn_error' LIMIT 1").get(task.id) &&
+      !db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawned' LIMIT 1").get(task.id),
+  })));
 }
 
 // Activity feed: reverse-chronological events across ALL tasks, each enriched
