@@ -255,3 +255,25 @@ test("no triage card: the card looks exactly as it did before", async () => {
   expect(labels).not.toContain("awaiting one answer");
   expect(labels).toContain("intake · unreviewed");
 });
+
+// Intake triage can classify a mechanical request and mark it reviewed itself
+// (server/src/intake/triage.ts). The server sends that as `reviewed` on the
+// task, and a reviewed task dispatches like any other, so the card must not
+// still claim it is waiting on the director. Task HIVE-513.
+test("a triage-reviewed intake task drops the unreviewed chip", async () => {
+  const t = task("gchat-reviewed", { source: "intake_gchat", reviewed: true });
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t));
+  });
+  expect(chipText(renderer)).not.toContain("intake · unreviewed");
+});
+
+test("an intake task nobody has reviewed still says unreviewed", async () => {
+  const t = task("gchat-unreviewed", { source: "intake_gchat", reviewed: false });
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t));
+  });
+  expect(chipText(renderer)).toContain("intake · unreviewed");
+});

@@ -14,6 +14,7 @@ import { isSupervisedTask, neverDispatched } from "./supervision.ts";
 import { isDeferred, unmetDeps, TERMINAL, type State } from "./state.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
 import { latestSidecar, latestSidecarBatch, type SidecarReport } from "./sidecar.ts";
+import { isReviewed } from "./dispatcher.ts";
 
 export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
 
@@ -289,7 +290,11 @@ export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null
   // board card and the review card can show it without fetching every event.
   // Pass a preloaded `sidecar` when enriching a list (see tasksWithHealth) so
   // this doesn't run one sidecar query per task.
-  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
+  // Intake tasks are held until reviewed (dispatcher.ts's isReviewed), and
+  // intake triage can mark one reviewed on its own — so the board needs the
+  // flag to know whether to say "unreviewed". Only intake tasks pay the query.
+  const reviewed = task.source?.startsWith("intake_") ? isReviewed(db, task.id) : undefined;
+  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), reviewed, sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
 }
 
 // Batched form of taskWithHealth for list endpoints (task HIVE-447): looks up
