@@ -215,3 +215,29 @@ export async function resolveProjectSecrets(
   registerSecretValues(Object.values(env));
   return env;
 }
+
+// ------------------------------------------------------------------- figma
+// The Figma MCP is session-bound (interactive auth), so headless agents can't
+// use it and end up building UI without ever looking at the frames. The
+// headless path is the Figma REST API with a personal access token, so hive
+// passes FIGMA_TOKEN through to every agent it spawns: from its own env, or
+// from ~/.figma-token (the file corebeat's scripts/figma-frame.sh already
+// reads). The value is registered for redaction so it can never land in an
+// event or evidence payload. A project secret named FIGMA_TOKEN still wins —
+// this is applied before resolveProjectSecrets in the spawn env.
+export function figmaTokenEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = process.env.HOME ?? process.env.USERPROFILE ?? ""
+): Record<string, string> {
+  let token = env.FIGMA_TOKEN?.trim();
+  if (!token && home) {
+    try {
+      token = readFileSync(join(home, ".figma-token"), "utf8").trim();
+    } catch {
+      /* no token file; agents just won't have Figma access */
+    }
+  }
+  if (!token) return {};
+  registerSecretValues([token]);
+  return { FIGMA_TOKEN: token };
+}

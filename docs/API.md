@@ -687,7 +687,7 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
 
 ### Tasks
 - `GET /api/tasks?state=&project_id=&test=` → `200 [Task, ...]` (newest `updated_at` first; all filters optional). Tasks under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
-- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?, verification_cmds?, priority?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher and reconciler won't advance the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban. It is never auto-dispatched or staleness-supervised, is exempt from the done-evidence gate, and moves freely via transitions (`hive task move <id> <state>`). The board keeps these tasks in its separate Tracked view with the external state visible. Jira-keyed Hive work is grouped beneath the matching tracked card, with requeue chains collapsed to their latest attempt. `verification_cmds` is the task's verification contract: an array of `{name, cmd}` the agent must run before handing off (`name`: 1-32 chars of `a-z0-9-`, unique within the task; `cmd`: a non-empty string). Anything else → `400`. The agent brief renders it as a "Verification contract" section, and `hive emit <id> evidence --verify-name <name>` tags an artifact with the entry it came from (stored as `verify_name` on the `evidence` event). Nothing is gated on it yet. `priority` is one of `now`, `next`, `normal` (the default), `later`; anything else → `400`. It is ORDERING only, never preemption — see [Priority](#priority). Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
+- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?, verification_cmds?, priority?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher and reconciler won't advance the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban. It is never auto-dispatched or staleness-supervised, is exempt from the done-evidence gate, and moves freely via transitions (`hive task move <id> <state>`). The board keeps these tasks in its separate Tracked view with the external state visible. Jira-keyed Hive work is grouped beneath the matching tracked card, with requeue chains collapsed to their latest attempt. `verification_cmds` is the task's verification contract: an array of `{name, cmd}` the agent must run before handing off (`name`: 1-32 chars of `a-z0-9-`, unique within the task; `cmd`: a non-empty string). Anything else → `400`. The agent brief renders it as a "Verification contract" section, and `hive emit <id> evidence --verify-name <name>` tags an artifact with the entry it came from (stored as `verify_name` on the `evidence` event). Nothing is gated on it yet. `priority` is one of `now`, `next`, `normal`, `later`; anything else → `400`, and a non-director `source` asking for `now` → `403`. Omit it and the task inherits its parent's priority, or starts at `next` when the title/brief reads as security work, else `normal`. It is ORDERING only, never preemption — see [Priority](#priority) for the full inheritance and authority rules. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
 - `POST /api/tasks/:id/jira/link` body `{parent_key (required)}` → `201 {jira_key, browse_url, warnings}` | `400` | `404`
@@ -726,7 +726,7 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   - `failed` — the task is terminal, so no spawn will ever carry it.
 
   Never throws. A herdr failure additionally records a `steer_error` event. The timeline renders the receipt (`✓` / `⏳ queued` / `⚠ undelivered`) so a steer never has to be re-sent blind. Besides the respawn drain, the reconciler re-attempts every queued steer each cycle against any agent with an active turn (receipt flips with `delivered_via:"drain"`); a successful drain writes no event of its own — the receipt flip is the record, and a fresh event would reset the task's silence clock and mask a mute agent from `stale` detection.
-- `PUT /api/tasks/:id` body `{title?, brief?, depends_on?, verification_cmds?, priority?}` (or multipart: same fields + `files`) → `200 Task` | `404` | `400` (unknown/self-referencing `depends_on` id, an invalid `verification_cmds`, or an invalid `priority`)
+- `PUT /api/tasks/:id` body `{title?, brief?, depends_on?, verification_cmds?, priority?, source?}` (or multipart: same fields + `files`) → `200 Task` | `404` | `400` (unknown/self-referencing `depends_on` id, an invalid `verification_cmds`, or an invalid `priority`) | `403` (a non-director `source` setting `priority: "now"` — see [Priority](#priority))
   Attached files are appended to the resulting `brief` under an `## Attachments` heading.
   Updates a task's editable fields. Used by the attention tray's "edit & requeue"
   flow before it re-queues a failed task, and by `hive task update <id> --depends-on <id,id>` —
@@ -1549,6 +1549,49 @@ Every task carries `priority`: one of `now`, `next`, `normal` (the default) or
 never stopped and a merged PR is never rolled back to make room for a
 higher-priority task. Set it at creation (`POST /api/tasks`) or later
 (`PUT /api/tasks/:id`); an unknown value is a `400` and changes nothing.
+
+**Who may set what.** Only the director may set `now`. Attribution is the task
+`source` on the request: the web UI and the CLI send none (or `"director"`),
+a spawned agent sends `"agent"`, the chat supervisor sends `"chat_supervisor"`.
+Any attributed non-director source asking for `now` gets a `403` and nothing
+changes; `next`, `normal` and `later` are open to everyone. This is because
+`now` is the one level that can borrow a slot past `max_agents`, so a
+supervisor or an agent granting itself one would spend the fleet's headroom on
+its own work.
+
+Authority applies to the value the caller asks for, not to an inherited one. An
+agent filing a follow-up under a director's `now` task keeps `now`: it is
+staying with work the director already ranked, not granting itself a level.
+
+**Where priority comes from when the caller does not say.** First match wins:
+
+1. An explicit `priority` in the request.
+2. The parent's, when `parent_task_id` is set. A follow-up matters as much as
+   the work that spawned it.
+3. `next`, when the title or brief reads as security work. The words are the
+   same list the understanding-quiz gate applies to changed paths (`auth`,
+   `token`, `security`, `payment`, `billing`, `migration`, `secret`,
+   `credential`, `password`), matched as whole words so "author" does not count.
+4. `normal`.
+
+Nothing auto-assigns `now`, and nothing auto-assigns `later`.
+
+**Inheritance elsewhere:**
+
+- A **requeue** (recovery, or a director answering a recovery card) copies the
+  failed original's priority to its successor. Without this, a `now` task would
+  fall to the back of the queue on every retry.
+- The **root-cause scout** filed on a lineage's second failure inherits that
+  lineage's priority, so it does not queue behind the work it is meant to
+  unblock.
+- **Monitor auto-tasks** (`config.monitors_auto_task`) are created at `next`:
+  something is already down.
+- **Watcher tasks** and **Jira-imported mirrors** are created at `normal`, the
+  default. They are inbound material, not an emergency.
+- Tasks created **together in a `depends_on` chain do NOT inherit from the head
+  of the chain.** `depends_on` is an ordering edge, not a lineage. Pass
+  `priority` on each task in the chain you want it on (`hive task create
+  --priority <p>`).
 
 It changes two things:
 

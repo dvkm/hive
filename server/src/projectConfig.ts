@@ -294,6 +294,10 @@ const CHECKS: Record<string, Check> = {
   wait_call_warn: nonnegativeInt,
   wait_call_cap: nonnegativeInt,
   decision_auto_answer_hours: num,
+  // Quiet window after which an un-acked, unflagged checkpoint leaves the
+  // attention inbox once its task has moved on (0 disables; default 24).
+  checkpoint_expiry_hours: (v) =>
+    typeof v === "number" && Number.isFinite(v) && v >= 0 ? null : "must be a non-negative number",
   pricing: obj,
   // stored by the director, read by nothing in server/ today
   deploy_notes: str,
