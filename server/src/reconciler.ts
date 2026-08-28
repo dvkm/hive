@@ -27,7 +27,7 @@ import { diagnosePane, dialogAutoApprovable, editDialogPaths, parseResetClock } 
 import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount } from "./api.ts";
 import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, projectBaseBranch, preferSafeRef } from "./exec.ts";
+import { defaultExec, mapLimit, projectBaseBranch, preferSafeRef } from "./exec.ts";
 import { captureBranchScope } from "./rebaseGuard.ts";
 import { landOnce } from "./landQueue.ts";
 import { sidecarOnce } from "./sidecar.ts";
@@ -44,6 +44,12 @@ const MAX_AUTO_REQUEUE = 2;
 const MAX_SILENT_NUDGES = 3;
 const DEFAULT_FAILED_TRIAGE_REQUEUE_HOURS = 4;
 const TURN_COMPLETE_RESPAWN = "agent turn is complete; respawn required";
+// `gh pr view` is a poll: if GitHub is slow this cycle, the next cycle retries in
+// a minute anyway, so waiting the 60s defaultExec default just stalls the lap.
+const GH_PROBE_TIMEOUT_MS = 12_000;
+// ponytail: a flat cap, not per-project. Enough to hide a few stalls without
+// forking a `gh` process per open PR.
+const GH_PROBE_CONCURRENCY = 6;
 
 export interface ReconcilerDeps {
   herdr?: Herdr;
@@ -536,20 +542,32 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     .query(`SELECT id, state, pr_url, ci_status, head_sha, pr_state, agent_target, project_id, branch FROM tasks WHERE pr_url IS NOT NULL AND state IN ${NON_TERMINAL}`)
     .all() as { id: string; state: string; pr_url: string; ci_status: string | null; head_sha: string | null; pr_state: string | null; agent_target: string | null; project_id: string; branch: string | null }[];
 
-  for (const t of tasks) {
+  // Probe every PR first, a few at a time, then act on the results serially.
+  // Serially probing meant K slow `gh` calls cost K timeouts (HIVE-438: 175s
+  // laps against a 24-40s baseline); bounded-concurrent, K slow calls cost
+  // about one. Only the network read is parallel — every DB write below stays
+  // on one thread, in the same order as before.
+  const probes = await mapLimit(tasks, GH_PROBE_CONCURRENCY, async (t) => {
     // A Jira mirror has no hive-owned PR at all, so there is nothing to record;
     // skip it outright. A non-Jira external task DOES get its observed PR facts
     // recorded (ci_status, head_sha, ...) and is skipped further down, at the
     // ACTIONABLE phase only — see the neverDispatched guard below (hive-996).
-    if (isJiraMirrorId(db, t.id)) continue;
-    const r = await exec(["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup,mergeable,headRefOid,baseRefName,baseRefOid"]);
-    if (r.code !== 0) continue; // gh unavailable / auth: skip, try next cycle
-    let data: any;
+    if (isJiraMirrorId(db, t.id)) return null;
+    const r = await exec(
+      ["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup,mergeable,headRefOid,baseRefName,baseRefOid"],
+      { timeoutMs: GH_PROBE_TIMEOUT_MS }
+    );
+    if (r.code !== 0) return null; // gh unavailable / auth: skip, try next cycle
     try {
-      data = JSON.parse(r.stdout);
+      return { t, data: JSON.parse(r.stdout) as any };
     } catch {
-      continue;
+      return null;
     }
+  });
+
+  for (const probe of probes) {
+    if (!probe) continue;
+    const { t, data } = probe;
     // The task's state may have moved on since the SELECT above — a concurrent
     // POST /merge, autoMergeReady, or an overlapping reconcile cycle can land
     // while this `await exec` was in flight and advance the task to a terminal

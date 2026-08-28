@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { defaultExec } from "../src/exec.ts";
+import { defaultExec, mapLimit } from "../src/exec.ts";
 
 const echoArgv = () => process.platform === "win32"
   ? ["cmd.exe", "/d", "/c", "echo", "hi"]
@@ -141,4 +141,17 @@ test("safeBranch and preferSafeRef warn when rejecting a present-but-unsafe valu
   expect(calls.length).toBe(2);
   expect(calls[0].join(" ")).toContain("--output=/tmp/x");
   expect(calls[1].join(" ")).toContain("--output=/tmp/y");
+});
+
+test("mapLimit keeps results in input order and never exceeds the cap", async () => {
+  let inFlight = 0;
+  let peak = 0;
+  const out = await mapLimit([1, 2, 3, 4, 5, 6, 7], 3, async (n) => {
+    peak = Math.max(peak, ++inFlight);
+    await new Promise((r) => setTimeout(r, 5));
+    inFlight--;
+    return n * 2;
+  });
+  expect(out).toEqual([2, 4, 6, 8, 10, 12, 14]);
+  expect(peak).toBe(3);
 });

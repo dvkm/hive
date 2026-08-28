@@ -1775,3 +1775,37 @@ test("a project that did not opt in keeps getting a card per dialog", async () =
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dialog_auto_answered'").get(id)).toBeFalsy();
   expect(db.query("SELECT 1 FROM decisions WHERE task_id = ? AND status = 'open'").get(id)).toBeTruthy();
 });
+
+test("syncPRs probes stalled PRs concurrently, so K slow gh calls cost about one timeout (HIVE-438)", async () => {
+  const { db, projectId } = freshDb();
+  const STALL_MS = 150;
+  const ids = Array.from({ length: 6 }, (_, i) => {
+    const id = makeTask(db, projectId, { pr_url: `https://gh/pr/${i}` });
+    transition(db, id, "in_progress");
+    transition(db, id, "in_review");
+    return id;
+  });
+  let inFlight = 0;
+  let peak = 0;
+  const timeouts: (number | undefined)[] = [];
+  const gh: Exec = async (argv, opts) => {
+    if (argv[0] !== "gh" || argv[1] !== "pr" || argv[2] !== "view") return OK();
+    timeouts.push(opts?.timeoutMs);
+    peak = Math.max(peak, ++inFlight);
+    await new Promise((r) => setTimeout(r, STALL_MS));
+    inFlight--;
+    // A stalled probe looks like defaultExec's timeout: non-zero exit, no data.
+    return { code: 124, stdout: "", stderr: "timeout" };
+  };
+
+  const started = Date.now();
+  await reconcileOnce(db, { exec: gh });
+  const elapsed = Date.now() - started;
+
+  expect(timeouts.length).toBe(ids.length);
+  expect(peak).toBeGreaterThan(1);
+  // Serial would be 6 x STALL_MS; concurrent is ~1 x STALL_MS.
+  expect(elapsed).toBeLessThan(3 * STALL_MS);
+  // A poll must not wait the 60s defaultExec default.
+  expect(timeouts.every((ms) => ms != null && ms <= 15_000)).toBe(true);
+});
