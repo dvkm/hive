@@ -1907,6 +1907,43 @@ function parsePriority(raw: any): string | Response {
   return p;
 }
 
+// Only the director may jump the whole queue with 'now' — it is the one level
+// that can borrow a slot past max_agents (dispatcher.ts), so a supervisor or an
+// agent handing itself one would spend the fleet's headroom on its own work.
+// Everything with an attributed non-director source tops out at 'next'.
+// The task `source` IS the attribution: the web UI and the CLI send none (or
+// "director"), agents send "agent", the chat supervisor sends "chat_supervisor".
+// ponytail: stated-source attribution, the same trust model the rest of this
+// local API runs on. Swap in a real caller identity if hive ever grows one.
+const DIRECTOR_TASK_SOURCES = ["director", "web", "cli"];
+
+function isDirectorSource(source: any): boolean {
+  const s = source == null ? "" : String(source).trim();
+  return s === "" || DIRECTOR_TASK_SOURCES.includes(s);
+}
+
+// Returns a 403 when this source may not set this priority, else null.
+function authorizePriority(source: any, priority: string): Response | null {
+  if (priority !== "now" || isDirectorSource(source)) return null;
+  return err(
+    `only the director may set priority 'now' (source '${String(source)}' may set at most 'next')`,
+    403
+  );
+}
+
+// Security-shaped work starts one notch up the queue. Same vocabulary the
+// understanding-quiz gate applies to changed paths (DEFAULT_SENSITIVE_PATHS),
+// matched here as whole words against the title and brief so "author" and
+// "authority" do not read as "auth".
+// ponytail: the default token list only, not a project's sensitive_paths
+// override — that override is about which FILES earn a quiz, not about what a
+// brief is asking for. Wire it up if a project ever needs its own words.
+// Built per call, not once at module load: DEFAULT_SENSITIVE_PATHS is declared
+// further down this file, so a module-level regex here would read it too early.
+export function looksSecuritySensitive(text: string): boolean {
+  return new RegExp(`\\b(${DEFAULT_SENSITIVE_PATHS.join("|")})s?\\b`, "i").test(text ?? "");
+}
+
 // Accepts JSON or multipart; attached files are saved under the new task's id
 // and their absolute paths appended to the brief, so the agent that picks the
 // task up can read them.
@@ -1936,8 +1973,28 @@ async function createTask(db: DB, req: Request): Promise<Response> {
   if (deps instanceof Response) return deps;
   const verifyCmds = body.verification_cmds !== undefined ? parseVerificationCmds(body.verification_cmds) : null;
   if (verifyCmds instanceof Response) return verifyCmds;
-  const priority = body.priority !== undefined ? parsePriority(body.priority) : "normal";
-  if (priority instanceof Response) return priority;
+  // Priority, most specific wins: an explicit value, then the parent's (a
+  // follow-up matters as much as the work that spawned it), then what the task
+  // itself is — a security-shaped brief starts at 'next'. Nothing here ever
+  // reaches 'now': only the director grants that, and only explicitly.
+  let priority: string;
+  if (body.priority !== undefined) {
+    const parsed = parsePriority(body.priority);
+    if (parsed instanceof Response) return parsed;
+    // Authority applies to the value the caller ASKED for, not to an inherited
+    // one: an agent filing a follow-up under a director's 'now' task is not
+    // granting itself anything, it is staying with work the director already
+    // ranked.
+    const denied = authorizePriority(body.source, parsed);
+    if (denied) return denied;
+    priority = parsed;
+  } else if (parentTask) {
+    priority = parentTask.priority ?? "normal";
+  } else if (looksSecuritySensitive(`${body.title ?? ""}\n${body.brief ?? ""}`)) {
+    priority = "next";
+  } else {
+    priority = "normal";
+  }
   // A follow-up task's brief often describes code that only exists in the
   // parent's still-open PR (HIVE-299). Auto-depend on the parent until its PR
   // has merged so the dispatcher holds this task the same way unmetDeps
@@ -2145,6 +2202,8 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
   if (body?.priority !== undefined) {
     const parsed = parsePriority(body.priority);
     if (parsed instanceof Response) return parsed;
+    const denied = authorizePriority(body.source, parsed);
+    if (denied) return denied;
     priority = parsed;
   }
   db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, updated_at = ? WHERE id = ?")
@@ -4863,11 +4922,14 @@ export function requeueTask(db: DB, source: any): string {
   const priorBrief = stripPriorResumeSection(fresh.brief);
   const brief = resume ? [resume.text, priorBrief].join("\n").trim() : (priorBrief || null);
   db.query(
-    `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, resume_branch, resume_ghost_branch, resume_pr_url, created_at, updated_at)
-     VALUES (?,?,?,?, 'queued', ?, 'requeue', ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, resume_branch, resume_ghost_branch, resume_pr_url, priority, created_at, updated_at)
+     VALUES (?,?,?,?, 'queued', ?, 'requeue', ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id, fresh.project_id, fresh.title, brief || null, fresh.kind, fresh.id,
-    resume?.branch ?? null, resume?.ghostBranch ?? null, resume?.prUrl ?? null, t, t
+    resume?.branch ?? null, resume?.ghostBranch ?? null, resume?.prUrl ?? null,
+    // The successor IS the same work, so it keeps the original's place in the
+    // queue. Losing it would push a 'now' task to the back on every retry.
+    fresh.priority ?? "normal", t, t
   );
   writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title: fresh.title, requeue_of: fresh.id } });
   repointDependents(db, fresh.id, id, "reconciler");
@@ -4962,9 +5024,15 @@ function spawnRecoveryScout(db: DB, task: any, chain: any[]): string | null {
   const t = now();
   const title = `Why does ${task.title} keep failing?`;
   db.query(
-    `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, created_at, updated_at)
-     VALUES (?,?,?,?, 'queued', 'scout', ?, ?, ?, ?)`
-  ).run(id, task.project_id, title, recoveryScoutBrief(db, chain), RECOVERY_SCOUT_SOURCE, task.id, t, t);
+    `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, priority, created_at, updated_at)
+     VALUES (?,?,?,?, 'queued', 'scout', ?, ?, ?, ?, ?)`
+  ).run(
+    id, task.project_id, title, recoveryScoutBrief(db, chain), RECOVERY_SCOUT_SOURCE, task.id,
+    // The scout unblocks the lineage it was filed for, so it inherits that
+    // lineage's urgency instead of queueing behind it.
+    task.priority ?? "normal",
+    t, t
+  );
   writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title, recovery_scout_of: task.id } });
   writeEvent(db, {
     task_id: chain[0].id,
