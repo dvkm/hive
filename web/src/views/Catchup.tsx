@@ -6,6 +6,7 @@ import { useProjectFilter } from "../lib/projectFilter";
 import { Empty } from "../lib/ui";
 import { useLightbox } from "../lib/lightbox";
 import { relTime } from "../lib/time";
+import { RequestChanges } from "./RequestChanges";
 
 // Catch up on shipped work by LOOKING at it (HIVE-511).
 //
@@ -84,6 +85,9 @@ function Card({ card }: { card: GlanceCard }) {
         <span>{card.files} file{card.files === 1 ? "" : "s"}</span>
         <span className="diff-add">+{card.additions}</span>
         <span className="diff-del">−{card.deletions}</span>
+        {/* See it, dislike it, file the rework without leaving the card. The
+            note becomes a follow-up task carrying this change's context. */}
+        <RequestChanges taskId={card.task_id} compact />
         {card.explanation_url ? (
           <a href={card.explanation_url} target="_blank" rel="noreferrer">Explain ↗</a>
         ) : (

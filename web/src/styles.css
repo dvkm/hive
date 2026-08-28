@@ -6102,7 +6102,7 @@ a.chip-jira:hover { background: #2d5488; }
   display: flex;
   flex-direction: column;
   gap: 8px;
-  height: 260px;
+  min-height: 260px;
   padding: 12px 14px;
   background: var(--panel);
   border: 1px solid var(--border-soft);
@@ -6228,6 +6228,15 @@ a.chip-jira:hover { background: #2d5488; }
 }
 .glance-facts a {
   margin-left: auto;
+}
+/* Request changes lives on the card (HIVE-505 pairing): a mini button while
+   closed, its own full-width row once the note is open. */
+.glance-facts {
+  flex-wrap: wrap;
+}
+.glance-facts .request-changes,
+.glance-facts .request-changes-filed {
+  flex-basis: 100%;
 }
 
 /* Request changes on shipped work: a button that opens into its note. */

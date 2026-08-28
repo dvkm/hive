@@ -94,3 +94,11 @@ test("the card links to the long explanation page rather than inlining it", asyn
   expect(link).toHaveLength(1);
   expect(link[0].props.target).toBe("_blank");
 });
+
+test("every card carries Request changes, so disliking a change never leaves the page", async () => {
+  const renderer = await render([card(), card()]);
+  const buttons = renderer.root.findAll(
+    (n) => n.type === "button" && n.children[0] === "Request changes"
+  );
+  expect(buttons).toHaveLength(2);
+});
