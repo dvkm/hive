@@ -7,6 +7,7 @@ import { managingThreadForTask } from "./chat.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
 import { planGateKinds, planGateBlocks } from "./planCritic.ts";
+import { figmaTokenEnv } from "./secrets.ts";
 
 // The PR marker contract (documented in docs/API.md). Both halves are REQUIRED
 // on any PR the agent opens so hive can link the PR back to this task.
@@ -186,6 +187,28 @@ directly, include its \`--headless\` flag. Attach the result:
 
   hive emit <task-id> evidence --file out.png --note "logged-in dashboard"`;
 
+// Figma access for headless agents. The Figma MCP needs interactive auth, so a
+// spawned agent can never use it; without this section agents guess at UI and
+// it drifts from the design. Only shown when hive actually has a token to pass
+// through (see figmaTokenEnv), otherwise the instructions would just fail.
+function figmaSection(): string | null {
+  if (!figmaTokenEnv().FIGMA_TOKEN) return null;
+  return `## Figma (headless, no MCP)
+The Figma MCP needs interactive login, so you cannot use it. Your env has
+\`FIGMA_TOKEN\`. Read frames straight from the Figma REST API instead:
+
+  curl -sS -H "X-Figma-Token: $FIGMA_TOKEN" \\
+    "https://api.figma.com/v1/files/<fileKey>/nodes?ids=<nodeId>"      # spec JSON
+  curl -sS -H "X-Figma-Token: $FIGMA_TOKEN" \\
+    "https://api.figma.com/v1/images/<fileKey>?ids=<nodeId>&format=png" # PNG render URL
+
+The file key and node id are in the frame's Figma URL
+(\`figma.com/design/<fileKey>/...?node-id=<nodeId>\`; turn \`1-23\` into \`1:23\`).
+If the repo ships its own helper, prefer it (corebeat has
+\`scripts/figma-frame.sh\`). Check the frame BEFORE building or changing UI, and
+attach the render as evidence. Never print, commit, or echo the token.`;
+}
+
 // Standing-authority section: the active rules (global + project) that govern
 // this agent, plus the exact guarded-action protocol. The server enforces these
 // before risky actions dispatch, so agents never serially ask for permission.
@@ -295,6 +318,8 @@ export function composeBrief(db: DB, taskId: string): string {
   if (team) parts.push(team);
   parts.push(prMarkerSection(task.number, task.id));
   parts.push(BROWSER_VERIFICATION);
+  const figma = figmaSection();
+  if (figma) parts.push(figma);
 
   // Standing authority: which scoped rules govern this agent + the guarded-action
   // protocol it MUST use before any externally-risky operation it runs itself.
