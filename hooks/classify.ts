@@ -126,16 +126,62 @@ const SAFE: RegExp[] = [
   /^("?\$HIVE_CLI"?|(bun|bunx)\s+\S*hive(\.ts)?|(\.\/)?bin\/hive|hive)\s+(task\s+list|pr-marker|recall|stats|learning\s+list|authority\s+list|policy\s+list|watch\s+list)\b/,
 ];
 
-// Split a command into segments on shell chaining/pipe operators. Naive (does
-// not honour quoting), which only ever makes a safe command look UNsafe — never
-// the reverse — so it stays conservative. `&` is intentionally NOT a delimiter:
-// it collides with redirection syntax (`2>&1`), and a dangerous token after a
-// backgrounding `&` is already caught by the whole-string DANGEROUS scan.
+// Split a command into segments on shell chaining/pipe operators (`||`, `&&`,
+// `;`, `|`, newline), skipping any operator that sits inside single/double
+// quotes or is backslash-escaped — exactly what a real shell does. `&` alone is
+// intentionally NOT a delimiter: it collides with redirection syntax (`2>&1`),
+// and a dangerous token after a backgrounding `&` is already caught by the
+// whole-string DANGEROUS scan.
+//
+// The splitter used to be quote-blind, which shredded any command carrying a
+// literal pipe in an argument — `grep -rn "foo|bar" src` became `grep -rn "foo`
+// plus `bar" src`, the second piece matched nothing on the SAFE allowlist, and a
+// read-only grep escalated as "unknown" (a regex alternation in a search pattern
+// is everyday work, so this fired constantly). An UNTERMINATED quote keeps the
+// rest of the command in one segment, which can only make a command look less
+// safe, never more: "safe" needs EVERY segment to match the allowlist, and the
+// DANGEROUS scan reads the whole string regardless of segmentation.
+//
+// UNBALANCED quotes mean the command can't be parsed at all, so we fall back to
+// the old quote-blind split rather than swallowing the rest of the line: without
+// that, `ls "a; npm publish` would collapse into one `ls …` segment and pass as
+// "safe". Unparseable input keeps the strictly more conservative behaviour.
 function segments(command: string): string[] {
-  return command
-    .split(/\|\||&&|;|\||\n/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const out: string[] = [];
+  let cur = "";
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i];
+    if (quote) {
+      // Inside single quotes a backslash is literal; inside double quotes it escapes.
+      if (c === "\\" && quote === '"' && i + 1 < command.length) {
+        cur += c + command[++i];
+        continue;
+      }
+      cur += c;
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      cur += c;
+      continue;
+    }
+    if (c === "\\" && i + 1 < command.length) {
+      cur += c + command[++i]; // escaped operator (`find … -exec rm {} \;`) is not a delimiter
+      continue;
+    }
+    if (c === ";" || c === "\n" || c === "|" || (c === "&" && command[i + 1] === "&")) {
+      if ((c === "|" || c === "&") && command[i + 1] === c) i++; // `||` / `&&`
+      out.push(cur);
+      cur = "";
+      continue;
+    }
+    cur += c;
+  }
+  if (quote) return command.split(/\|\||&&|;|\||\n/).map((s) => s.trim()).filter(Boolean);
+  out.push(cur);
+  return out.map((s) => s.trim()).filter(Boolean);
 }
 
 // ---- sandbox waiver -------------------------------------------------------
@@ -614,9 +660,22 @@ export function actionFor(decision: Decision, reason: string): string {
   return slug ? `command.dangerous.${slug}` : "command.dangerous";
 }
 
+// How long to wait for hive's guarded-action answer. This used to be a hardcoded
+// 2s, which is shorter than the server's own p99 under swarm load: a busy hive
+// answered a routine `unknown` command in ~3s, the fetch aborted, and the agent
+// was told the command was DENIED. That reads as a policy decision when it was
+// only a slow reply, so agents re-asked, opened cards, or gave up on work the
+// authority engine would have allowed. 15s is well past the loaded-server p99 and
+// still bounded; HIVE_GUARD_TIMEOUT_MS raises it further on a heavier fleet.
+export function guardTimeoutMs(): number {
+  return Math.max(1, Number(process.env.HIVE_GUARD_TIMEOUT_MS) || 15_000);
+}
+
 // Ask hive's authority engine to decide a not-safe command. Fail-safe: any
-// unreachability or error DENIES (never auto-allows an unclassified command).
-async function escalate(
+// unreachability or error DENIES (never auto-allows an unclassified command) —
+// but a TIMEOUT says so in those words, so a busy server is never mistaken for
+// a director's refusal.
+export async function escalate(
   hiveUrl: string,
   taskId: string,
   command: string,
@@ -632,6 +691,7 @@ async function escalate(
   // IN CODE — it requires a decision with no rule present; unknown commands
   // default-allow (logged).
   const action = actionFor(decision, reason);
+  const timeoutMs = guardTimeoutMs();
   try {
     const res = await fetch(`${hiveUrl}/api/tasks/${taskId}/guarded-action`, {
       method: "POST",
@@ -643,7 +703,7 @@ async function escalate(
         // The Bash tool's own description: the card title reads as intent.
         summary: summary || undefined,
       }),
-      signal: AbortSignal.timeout(2000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const body: any = await res.json().catch(() => ({}));
     if (res.status === 200 && body.effect === "allow")
@@ -658,6 +718,15 @@ async function escalate(
       );
     return hookOutput(event, "deny", `unexpected guarded-action response (${res.status})`);
   } catch (e: any) {
+    // Name the timeout explicitly: "denied" and "hive was too slow to answer"
+    // need very different reactions from the agent reading this line.
+    if (e?.name === "TimeoutError" || e?.name === "AbortError")
+      return hookOutput(
+        event,
+        "deny",
+        `hive did not answer within ${timeoutMs}ms — this is a TIMEOUT, not a denial; ` +
+          `the server is busy, so retry the same command (raise HIVE_GUARD_TIMEOUT_MS if it keeps timing out)`
+      );
     return hookOutput(event, "deny", `hive unreachable, denying for safety: ${String(e?.message ?? e)}`);
   }
 }
