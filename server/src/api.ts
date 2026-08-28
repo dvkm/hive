@@ -232,6 +232,8 @@ function deploymentsProject(db: DB, id: string): DeploymentsProject {
 
 const WEB_DIST = join(import.meta.dir, "..", "..", "web", "dist");
 const HOOKS_DIR = join(import.meta.dir, "..", "..", "hooks");
+const REPO_ROOT = join(import.meta.dir, "..", "..");
+const ELECTRON_PKG = join(REPO_ROOT, "electron", "package.json");
 
 // The API token (minted on boot in index.ts) presented as `Authorization:
 // Bearer <t>` or `?token=<t>` — EventSource cannot set headers, so the SSE
@@ -312,6 +314,12 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         const degraded = degradedTools(db);
         const ok = reconciler.consecutive_errors < RECONCILE_ERROR_STREAK_THRESHOLD && degraded.length === 0;
         return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, degraded, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
+      }
+
+      // ---- desktop shell self-update (HIVE-420) ----
+      if (pathname === "/api/shell-version" && method === "GET") {
+        const pkg = JSON.parse(readFileSync(ELECTRON_PKG, "utf8"));
+        return json({ version: pkg.version, repo_path: REPO_ROOT });
       }
 
       // ---- evidence static files ----
