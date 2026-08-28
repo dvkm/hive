@@ -10,7 +10,7 @@ import { AttentionRows, BlockedByLine } from "./attention";
 import { CheckpointsInbox } from "./Checkpoints";
 import { UnderstandingQuiz } from "./UnderstandingQuiz";
 import { fmtUsd, fmtTokens } from "./Analytics";
-import { itemProject } from "../lib/needsYou";
+import { itemProject, orderFocusItems } from "../lib/needsYou";
 import type { NeedsYouItem } from "../lib/needsYou";
 import { useProjectFilter, setProjectFilter, inProjectFilter } from "../lib/projectFilter";
 import { taskLabel } from "../lib/references";
@@ -138,7 +138,7 @@ export default function Brief() {
   // lands on the next one; the arrows let you step past anything you can't act on.
   const focusItems = useMemo(() => {
     const seenCheckpointTasks = new Set<string>();
-    return needsYou.filter((item) => {
+    return orderFocusItems(needsYou.filter((item) => {
       if (item.kind === "decision") return !answered.has(item.id);
       if (item.kind === "quiz_digest") return remainingIn(item).length > 0;
       if (item.kind === "review") return !reviewed.has(item.id);
@@ -149,8 +149,8 @@ export default function Brief() {
         seenCheckpointTasks.add(item.checkpoint.task_id);
       }
       return true;
-    });
-  }, [needsYou, answered, passedQuizzes, reviewed]);
+    }), tasks);
+  }, [needsYou, tasks, answered, passedQuizzes, reviewed]);
   const focusCount = focusItems.length;
   const [focusIdx, setFocusIdx] = useState(0);
   const at = Math.min(focusIdx, Math.max(0, focusCount - 1));

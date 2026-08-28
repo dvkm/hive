@@ -115,6 +115,7 @@ export interface Task {
   brief?: string | null; // omitted from the compact list; present on task detail
   state: State;
   kind: Kind;
+  priority?: "now" | "next" | "normal" | "later";
   agent_target: string | null;
   worktree_path: string | null;
   branch: string | null;

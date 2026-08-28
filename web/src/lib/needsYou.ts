@@ -17,6 +17,36 @@ export type NeedsYouItem =
   | { kind: "attention"; id: string; task: Task }
   | { kind: "waiting"; id: string; task: Task; blockedBy: BlockingTaskRef[] };
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+const PRIORITY_HEAD_START: Record<NonNullable<Task["priority"]>, number> = {
+  now: 3 * DAY_MS,
+  next: 2 * DAY_MS,
+  normal: DAY_MS,
+  later: 0,
+};
+
+function focusItemKey(item: NeedsYouItem, tasks: Map<string, Task>): number {
+  const candidates = item.kind === "quiz_digest"
+    ? item.quizzes.map((quiz) => ({ ts: quiz.ts, task: tasks.get(quiz.task_id) }))
+    : item.kind === "decision"
+      ? [{ ts: item.decision.ts, task: tasks.get(item.decision.task_id) }]
+      : item.kind === "checkpoint"
+        ? [{ ts: item.checkpoint.ts, task: tasks.get(item.checkpoint.task_id) }]
+        : [{ ts: item.task.updated_at, task: item.task }];
+
+  return Math.min(...candidates.map(({ ts, task }) => {
+    const time = Date.parse(ts);
+    return Number.isNaN(time) ? Number.POSITIVE_INFINITY : time - PRIORITY_HEAD_START[task?.priority ?? "normal"];
+  }));
+}
+
+// Priority is a head start, not a permanent lane: one day per level means an
+// old lower-priority item eventually outranks a steady stream of new urgent work.
+export function orderFocusItems(items: NeedsYouItem[], tasks: Task[]): NeedsYouItem[] {
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  return [...items].sort((a, b) => focusItemKey(a, byId) - focusItemKey(b, byId));
+}
+
 // Mirrors server/src/health.ts's needsAttention — keep both excluding the
 // same unsupervised tasks (see server/src/supervision.ts's isSupervisedTask).
 // A never-spawned external task (tracking-only, no agent_target) is excluded;

@@ -1649,12 +1649,13 @@ Nothing auto-assigns `now`, and nothing auto-assigns `later`.
   `priority` on each task in the chain you want it on (`hive task create
   --priority <p>`).
 
-It changes two things:
+It changes three things:
 
 - **Which queued task is picked up first.** The dispatcher orders its queue by
   priority, then by age. A `later` task never beats a `normal` one, however old
   it is. The reattach pass keeps its own ordering (oldest feedback first) —
   that is resumed work, not new work.
+- **Which item Focus shows first.** Each priority level gets a one-day head start, then age decides. Fresh important work rises quickly, while a lower priority item eventually moves ahead instead of waiting forever.
 - **Which approved PR lands first.** The land queue's dependency and conflict
   edges still decide the order; priority only breaks the tie among the PRs that
   are all ready in the same sweep.
