@@ -118,7 +118,12 @@ export function eventText(e: EventLike): string {
       return `quick checks found problems: ${findings.map((f) => `${s(f.tool)}: ${s(f.summary)}`).join("; ")}`;
     }
     case "auto_merged":
+      // ok:false is history — failures are their own event type now.
       return p.ok === false ? `automatic merge failed: ${s(p.error) || `HTTP ${s(p.status)}`}` : "automatically merged";
+    case "auto_merge_failed":
+      return p.gave_up
+        ? `automatic merge refused ${s(p.attempts)} times, stopped trying: ${s(p.error) || `HTTP ${s(p.status)}`}`
+        : `automatic merge refused: ${s(p.error) || `HTTP ${s(p.status)}`}`;
     case "cleanup_skipped":
       return `cleanup failed safely: ${s(p.reason) || "worktree preserved"}`;
     case "stack_setup":
@@ -311,6 +316,7 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
   blocked: "incident",
   stale: "incident",
   merge_failed: "incident",
+  auto_merge_failed: "incident",
   merge_blocked_destructive: "incident",
   scope_drift: "decision",
   action_failed: "incident",

@@ -11,7 +11,7 @@
 // Per-project opt-out: config.auto_review = false. Model: config.model_by_kind
 // .review, else sonnet. Argv override: config.reviewer_argv (verbatim).
 import type { DB } from "./db.ts";
-import { isOffline } from "./db.ts";
+import { isOffline, getSetting, setSetting } from "./db.ts";
 import { writeEvent, getTask } from "./state.ts";
 import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
@@ -262,11 +262,12 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
     recordReviewFailure(db, t, diff.error, reviewIdentity);
     return;
   }
-  const argv: string[] =
+  const base: string[] =
     Array.isArray(config.reviewer_argv) && config.reviewer_argv.length
       ? [...config.reviewer_argv]
       : [claudeBin(), "-p", "--model", config.model_by_kind?.review ?? "sonnet"];
-  argv.push(reviewPrompt(t, diff.text), "--output-format", "json");
+  const buildArgv = (prompt: string) => [...base, prompt, "--output-format", "json"];
+  const argv = buildArgv(reviewPrompt(t, diff.text));
 
   const exec = deps.exec ?? defaultPlannerExec;
   let res;
@@ -289,11 +290,38 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
     return;
   }
   noteModelCall(db, null);
-  const review = extractReview(res.stdout);
+  let review = extractReview(res.stdout);
   if (!review) {
-    recordReviewFailure(db, t, "unparseable reviewer output", reviewIdentity);
+    // Retry once with a stricter format instruction before giving up — most
+    // unparseable output is prose wrapped around the JSON, not a model that
+    // refuses the format outright (task HIVE-446).
+    const retryArgv = buildArgv(`${reviewPrompt(t, diff.text)}\n\nSTRICT: output ONLY the JSON object, nothing else — no prose, no markdown fences.`);
+    let retryRes;
+    try {
+      retryRes = await exec(retryArgv, { timeoutMs: TIMEOUT_MS });
+    } catch {
+      retryRes = null;
+    }
+    if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
+    if (retryRes && !retryRes.timedOut && retryRes.code === 0) review = extractReview(retryRes.stdout);
+  }
+  if (!review) {
+    // Two unparseable attempts in a row is a dead end, not a transient blip:
+    // record a real verdict (not just an error) so autoMergeReady/land surfaces
+    // stop showing "-" forever, and the NOT EXISTS guard in the query above
+    // stops retrying this exact head.
+    const streak = Number(getSetting(db, "reviewer_parse_failure_streak") ?? "0") + 1;
+    setSetting(db, "reviewer_parse_failure_streak", String(streak));
+    writeEvent(db, {
+      task_id: t.id,
+      source: "system",
+      type: "auto_review",
+      payload: { verdict: "unparseable", summary: "auto-reviewer produced unparseable output twice; needs a human look", risks: [], questions: [], ...reviewIdentity },
+    });
+    broadcast({ type: "task", task: getTask(db, t.id) });
     return;
   }
+  setSetting(db, "reviewer_parse_failure_streak", "0");
   // `files` is what the reviewed diff touched. Read back by
   // understandingChecksRequired (hive-1559) to spot sensitive paths without
   // re-shelling out to git for every task on a director surface.
@@ -321,20 +349,35 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
   }
 }
 
-// The latest auto_review payload for a task, or null when the newest review
-// event is an error, a skip, or malformed. Lives with the code that WRITES
-// these events; api.ts imports it rather than keeping a second copy.
+// The latest usable review for a task, or null when there is none (only a skip
+// or a malformed payload). Lives with the code that WRITES these events; api.ts
+// and reconciler.ts import it rather than keeping a second copy.
+//
+// Failed attempts (`auto_review_error`) are NOT read here. A later failure does
+// not un-review an earlier success: the review happened, and its risk verdicts
+// are still keyed to that head. Counting it made autoMergeReady (which reads
+// successes only) and understandingChecksRequired (which read both) disagree
+// about the same task, so the reconciler asked for a merge every cycle and the
+// merge refused every cycle, forever (HIVE-499). Callers that care about
+// freshness compare `reviewed_head_sha` to the head they are about to act on.
 export function latestAutoReviewVerdict(
   db: DB,
   taskId: string
-): { verdict: string; files: string[]; risks: string[]; questions: string[]; reviewed_head_sha?: string } | null {
+): {
+  verdict: string;
+  files: string[];
+  risks: string[];
+  questions: string[];
+  reviewed_pr_url?: string;
+  reviewed_head_sha?: string;
+} | null {
   const row = db
     .query(
-      `SELECT type, payload FROM events WHERE task_id = ? AND type IN ('auto_review', 'auto_review_error')
+      `SELECT payload FROM events WHERE task_id = ? AND type = 'auto_review'
         ORDER BY ts DESC, rowid DESC LIMIT 1`
     )
-    .get(taskId) as { type: string; payload: string } | undefined;
-  if (!row || row.type !== "auto_review") return null;
+    .get(taskId) as { payload: string } | undefined;
+  if (!row) return null;
   try {
     const payload = JSON.parse(row.payload);
     if (payload?.skipped || typeof payload?.verdict !== "string") return null;
@@ -343,6 +386,7 @@ export function latestAutoReviewVerdict(
       files: Array.isArray(payload.files) ? payload.files.map(String) : [],
       risks: Array.isArray(payload.risks) ? payload.risks.map(String) : [],
       questions: Array.isArray(payload.questions) ? payload.questions.map(String) : [],
+      reviewed_pr_url: typeof payload.reviewed_pr_url === "string" ? payload.reviewed_pr_url : undefined,
       reviewed_head_sha: typeof payload.reviewed_head_sha === "string" ? payload.reviewed_head_sha : undefined,
     };
   } catch {

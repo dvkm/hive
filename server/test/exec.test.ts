@@ -76,6 +76,28 @@ test("Windows executable PATH keeps drive-letter entries intact and uses semicol
   expect(path).toContain("C:\\Users\\Ada\\AppData\\Local\\Programs\\Herdr\\bin");
 });
 
+// HIVE-425: `proc.kill()` on timeout only signals the direct child. A render
+// run's direct child is npx; the Playwright webServer and the chromium it
+// launches are grandchildren that npx's death leaves orphaned, holding ports
+// and memory forever. The child now spawns detached (its own process group),
+// so timeout can signal the whole group via `process.kill(-pid, ...)`.
+test("defaultExec kills a timed-out subprocess's whole process group, including grandchildren (HIVE-425)", async () => {
+  const pidFile = `/tmp/hive-exec-test-grandchild-pid-${process.pid}`;
+  try {
+    const result = await defaultExec(["sh", "-c", `sleep 30 & echo $! > ${pidFile}; wait`], { timeoutMs: 300 });
+    expect(result.code).toBe(124);
+
+    const grandchildPid = Number((await Bun.file(pidFile).text()).trim());
+    expect(grandchildPid).toBeGreaterThan(0);
+
+    // SIGTERM fires immediately on timeout; give it a moment to land before asserting.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(() => process.kill(grandchildPid, 0)).toThrow();
+  } finally {
+    await Bun.file(pidFile).delete().catch(() => {});
+  }
+});
+
 // Config-sourced branch names become positional git arguments; git parses a
 // leading `-` as an option, not a ref (task #1024).
 test("isSafeRef rejects option-shaped and malformed refs, accepts real branch names", async () => {

@@ -6,7 +6,7 @@ import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { taskWithHealth, tasksWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
 import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
-import { isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
+import { activeProjects, isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
 import { addClient, removeClient, broadcast, appClientCount } from "./bus.ts";
 import {
   transition,
@@ -15,6 +15,7 @@ import {
   TransitionError,
   TERMINAL,
   advanceIfFinished,
+  verificationGate,
   evidenceCount,
   evidenceAtSha,
   changesRequestUnaddressed,
@@ -61,6 +62,7 @@ import { authorize, resolveGrantForDecision, resolveDenyGuardrailForDecision, ty
 import { isReviewed } from "./dispatcher.ts";
 import { runPlanner, resolvePlanForDecision, decisionPlan, selectedPlanIndices, type PlannerExec } from "./planner.ts";
 import { claudeProfileEnvForRepo } from "./claudeProfiles.ts";
+import { makePlaybook } from "./playbook.ts";
 import { routeIntakeProject } from "./intake/route.ts";
 import {
   REF_PREFIX as JIRA_REF_PREFIX,
@@ -92,12 +94,15 @@ import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
 import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen, probeAgent } from "./reconciler.ts";
+import { getAway, setAway, awayNow, heldPushes, syncAway } from "./away.ts";
+import type { AwayConfig } from "./away.ts";
 import { taskDiff } from "./diff.ts";
-import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
+import { authoredFiles, captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { landGraph, markLand, resolveLandPauseForDecision } from "./landQueue.ts";
 import { followServingBranch, resolveServingFollowForDecision } from "./servingBranch.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
+import { autonomyStats } from "./autonomyStats.ts";
 import { defaultExec, isSafeRef, projectBaseBranch, projectComparisonBase, preferSafeRef } from "./exec.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
 import { projectPrefix, taskIdentifier } from "./taskIdentifier.ts";
@@ -184,6 +189,13 @@ function loopLiveness(db: DB, settingKey: string, staleMs: number): { last_run: 
 // every fresh boot before the first cycle completes) is the sustained-failure
 // signal that flips top-level `ok`.
 const RECONCILE_ERROR_STREAK_THRESHOLD = 3;
+// reviewer.ts's reviewer_parse_failure_streak (task HIVE-446): the model kept
+// producing unparseable output on every attempt, same sustained-failure signal
+// as the reconciler's error streak above.
+const REVIEWER_PARSE_FAILURE_STREAK_THRESHOLD = 3;
+function reviewerHealth(db: DB): { parse_failure_streak: number } {
+  return { parse_failure_streak: Number(getSetting(db, "reviewer_parse_failure_streak") ?? "0") };
+}
 function reconcilerHealth(db: DB): { last_run: string | null; stale: boolean; consecutive_errors: number; last_error: string | null } {
   return {
     ...loopLiveness(db, "last_reconcile_at", RECONCILE_STALE_MS),
@@ -234,6 +246,8 @@ function deploymentsProject(db: DB, id: string): DeploymentsProject {
 
 const WEB_DIST = join(import.meta.dir, "..", "..", "web", "dist");
 const HOOKS_DIR = join(import.meta.dir, "..", "..", "hooks");
+const REPO_ROOT = join(import.meta.dir, "..", "..");
+const ELECTRON_PKG = join(REPO_ROOT, "electron", "package.json");
 
 // The API token (minted on boot in index.ts) presented as `Authorization:
 // Bearer <t>` or `?token=<t>` — EventSource cannot set headers, so the SSE
@@ -311,9 +325,18 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // ---- health ----
       if (pathname === "/api/health" && method === "GET") {
         const reconciler = reconcilerHealth(db);
+        const reviewer = reviewerHealth(db);
         const degraded = degradedTools(db);
-        const ok = reconciler.consecutive_errors < RECONCILE_ERROR_STREAK_THRESHOLD && degraded.length === 0;
-        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, degraded, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
+        const ok = reconciler.consecutive_errors < RECONCILE_ERROR_STREAK_THRESHOLD
+          && reviewer.parse_failure_streak < REVIEWER_PARSE_FAILURE_STREAK_THRESHOLD
+          && degraded.length === 0;
+        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, reviewer, degraded, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
+      }
+
+      // ---- desktop shell self-update (HIVE-420) ----
+      if (pathname === "/api/shell-version" && method === "GET") {
+        const pkg = JSON.parse(readFileSync(ELECTRON_PKG, "utf8"));
+        return json({ version: pkg.version, repo_path: REPO_ROOT });
       }
 
       // ---- evidence static files ----
@@ -484,9 +507,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // edges (declared dependencies + inferred file conflicts) for the board.
       if (pathname === "/api/tasks/land-graph" && method === "GET") {
         const projectId = url.searchParams.get("project");
-        const projects = projectId
-          ? [{ id: projectId }]
-          : (db.query("SELECT id FROM projects").all() as { id: string }[]);
+        const projects = projectId ? [{ id: projectId }] : activeProjects(db).map((p) => ({ id: p.id }));
         const graphs = await Promise.all(projects.map((p) => landGraph(db, p.id, deps.exec ?? defaultExec)));
         return json({ nodes: graphs.flatMap((g) => g.nodes), edges: graphs.flatMap((g) => g.edges) });
       }
@@ -543,6 +564,15 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         return json({ ok: true });
       }
 
+      if (pathname === "/api/stats/autonomy" && method === "GET")
+        return json(
+          await autonomyStats(db, {
+            days: Number(url.searchParams.get("days")) || undefined,
+            projectId: url.searchParams.get("project_id"),
+            exec: url.searchParams.get("reverts") === "0" ? null : deps.exec,
+          })
+        );
+
       if (pathname === "/api/checkpoints" && method === "GET") return listOpenCheckpoints(db, url);
       if (pathname === "/api/understanding-quizzes" && method === "GET") return listUnderstandingQuizzes(db, url);
 
@@ -550,6 +580,10 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         return json({ on: isOffline(db) });
       if (pathname === "/api/offline" && method === "POST")
         return await setOffline(db, herdr, await req.json());
+
+      if (pathname === "/api/away" && method === "GET")
+        return json({ ...getAway(db), active: awayNow(db), held: heldPushes(db).length });
+      if (pathname === "/api/away" && method === "POST") return setAwayMode(db, await req.json());
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/checkpoints\/([^/]+)\/ack$/);
       if (m && method === "POST") return await ackCheckpoint(db, herdr, m[1], m[2], await req.json());
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/understanding-quiz\/answer$/);
@@ -617,6 +651,16 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (!getTask(db, m[1])) return err("task not found", 404);
         const r = await runPlanner(db, m[1], { exec: deps.plannerExec });
         return r.ok ? json({ ok: true, decision: r.decision }) : json({ ok: false, error: r.error }, r.status ?? 502);
+      }
+
+      // Distil a finished task into a reusable playbook (a kind='reference'
+      // learning). Done tasks only — see makePlaybook.
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/playbook$/);
+      if (m && method === "POST") {
+        const r = await makePlaybook(db, m[1], { exec: deps.plannerExec, shellExec: deps.exec });
+        return r.ok
+          ? json({ ok: true, learning_id: r.learning_id, playbook: r.playbook }, 201)
+          : json({ ok: false, error: r.error }, r.status);
       }
 
       // ---- decisions ----
@@ -1195,15 +1239,9 @@ export function keepSupervisorWarm(db: DB, herdr: Herdr, deps: HandlerDeps, even
 }
 
 function coordinatorProjectId(db: DB): string | null {
-  const row = db
-    .query(
-      `SELECT id FROM projects
-       WHERE repo_path IS NOT NULL AND COALESCE(json_extract(config, '$.archived'), 0) = 0
-       ORDER BY CASE WHEN lower(name) = 'hive' THEN 0 ELSE 1 END, created_at
-       LIMIT 1`
-    )
-    .get() as { id: string } | undefined;
-  return row?.id ?? null;
+  const candidates = activeProjects(db).filter((p) => p.repo_path);
+  const hive = candidates.find((p) => p.name.toLowerCase() === "hive");
+  return (hive ?? candidates[0])?.id ?? null;
 }
 
 // Meaningful worker events wake the manager that owns the task. Without managed
@@ -1229,6 +1267,7 @@ const MANAGER_EVENT_TYPES = new Set([
   "pr_merged",
   "merge_failed",
   "auto_merged",
+  "auto_merge_failed",
   "smoke_failed",
   "smoke_passed",
   "verify_wedged",
@@ -1366,7 +1405,7 @@ export async function sweepManagerInboxes(db: DB, herdr: Herdr, deps: HandlerDep
   const byProject = new Map(active.filter((thread) => thread.project_id).map((thread) => [thread.project_id!, thread]));
   const fallback = chief ?? active[0];
   const assignments = new Map<string, { thread: ChatThread; projects: { id: string; name: string; counts: ReturnType<typeof projectInboxCounts> }[] }>();
-  for (const project of db.query("SELECT id, name FROM projects ORDER BY created_at").all() as { id: string; name: string }[]) {
+  for (const project of activeProjects(db)) {
     const counts = projectInboxCounts(db, project.id);
     const total = counts.checkpoints + counts.decisions + counts.reviews + counts.attention;
     if (!total) continue;
@@ -2140,6 +2179,10 @@ export function handOffToReview(db: DB, taskId: string, source: string): boolean
   // missing one holds the task here and kicks off the generation, which calls
   // back into this function when the page lands.
   if (explanationGate(db, t) !== "ready") return false;
+  // #1579: every named verification command needs its own evidence before the
+  // director sees the card. Checked here (not left to transition's throw) so the
+  // reconciler's per-cycle poll holds quietly instead of raising.
+  if (verificationGate(db, t, source).length > 0) return false;
   transition(db, taskId, "in_review", { source, reason: "PR open, awaiting review" });
   return true;
 }
@@ -2813,7 +2856,7 @@ function ghMergeFlag(method: string | undefined): string {
 // records everything for a respawned agent). Other failures (CI blocked, auth,
 // gh missing) keep the task in_review and just report the reason.
 const MERGE_CONFLICT_RE = /conflict|not mergeable|not an ancestor|fast-forward/i;
-const AUTO_MERGE_PAUSED = "auto-merge paused because task readiness changed; review the task again";
+export const AUTO_MERGE_PAUSED = "auto-merge paused because task readiness changed; review the task again";
 async function mergeFailed(db: DB, herdr: Herdr, task: any, base: string, reason: string, actor: string | null = null): Promise<Response> {
   const conflict = MERGE_CONFLICT_RE.test(reason);
   const msg = `hive: merge into '${base}' failed — ${reason}\nRebase your branch '${task.branch}' onto the latest '${base}', resolve the conflicts, rerun the tests, then push.`;
@@ -2931,6 +2974,33 @@ function staleBaseRefusal(prView: any): boolean {
   if (review === "REVIEW_REQUIRED" || review === "CHANGES_REQUESTED") return false;
   const ci = ciStatusOf(prView?.statusCheckRollup);
   return ci !== "failing" && ci !== "pending";
+}
+
+// Files a merge landed. GitHub is the only authority for a PR — after a squash
+// merge the PR head may not exist locally at all, so there is deliberately no
+// local fallback on that path. A PR-less local ff reads the branch's own
+// authored diff instead. Returns null when neither can be read: merged_files is
+// then simply absent, and the autonomy stats treat that merge as unmeasurable
+// for file overlap. Never throws, never blocks the merge.
+async function mergedFileList(
+  exec: Exec,
+  task: any,
+  repoPath: string | null,
+  base: string,
+  head: string | null
+): Promise<string[] | null> {
+  if (task.pr_url) {
+    const r = await exec(["gh", "pr", "view", task.pr_url, "--json", "files"]);
+    if (r.code !== 0) return null;
+    try {
+      const files = JSON.parse(r.stdout || "{}").files;
+      return Array.isArray(files) ? files.map((f: any) => String(f?.path ?? "")).filter(Boolean).sort() : null;
+    } catch {
+      return null;
+    }
+  }
+  if (!repoPath || !head) return null;
+  return await authoredFiles(exec, repoPath, base, head);
 }
 
 // POST /api/tasks/:id/merge — approve & merge an in-review task.
@@ -3065,7 +3135,7 @@ export async function mergeTask(
       }
     })?.ts ?? "";
     const snapEvent: any = db
-      .query("SELECT payload FROM events WHERE task_id = ? AND type = 'branch_scope' AND ts > ? ORDER BY ts ASC LIMIT 1")
+      .query("SELECT payload FROM events WHERE task_id = ? AND type = 'branch_scope' AND ts > ? ORDER BY ts DESC LIMIT 1")
       .get(id, replacementAt);
     if (snapEvent) {
       let snapshot: BranchScope | null = null;
@@ -3083,14 +3153,46 @@ export async function mergeTask(
         try {
           originalHead ||= firstSync ? JSON.parse(firstSync.payload).head_sha ?? null : null;
         } catch {}
+        // A same-branch re-cut (force-push/rebuild) leaves the recorded snapshot
+        // commit outside the new head's history: comparing against it reads
+        // every file the rebuilt branch re-touches as a "revert" of base work,
+        // even when the branch is now strictly ahead (task #1696). Detect that
+        // the snapshot commit is no longer an ancestor of the new head and
+        // re-baseline against the CURRENT head instead of the stale snapshot.
+        let invalidated = false;
         if (originalHead) {
+          const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", originalHead, guardHead]);
+          // exit 0 = ancestor (not invalidated), 1 = confirmed NOT an ancestor
+          // (force-push/rebuild). Any other exit code is a transient git
+          // failure (bad object, repo lock) — treat it like "not invalidated"
+          // rather than re-baselining off a possibly-bogus guardHead.
+          invalidated = anc.code === 1;
+        }
+        let captureFailed = false;
+        if (invalidated) {
+          const fresh = await captureBranchScope(exec, project.repo_path, guardBase, guardHead);
+          if (fresh) {
+            snapshot = fresh;
+            writeEvent(db, { task_id: id, source: "director", type: "branch_scope", payload: { ...fresh, head_sha: guardHead } });
+          } else {
+            captureFailed = true;
+          }
+        } else if (originalHead) {
           const exact = await captureBranchScope(exec, project.repo_path, guardBase, originalHead);
           if (exact) snapshot = { ...snapshot, files: exact.files };
         }
-        const regressed = await detectDestructiveRebase(exec, project.repo_path, guardBase, guardHead, snapshot);
-        if (regressed && regressed.length) {
-          const files = regressed.slice(0, 10).join(", ") + (regressed.length > 10 ? `, …(+${regressed.length - 10})` : "");
-          const reason = `branch '${task.branch}' reverts base work outside this task's scope (${files})`;
+        const regressed = captureFailed
+          ? []
+          : snapshot
+            ? await detectDestructiveRebase(exec, project.repo_path, guardBase, guardHead, snapshot)
+            : null;
+        if (captureFailed || (regressed && regressed.length)) {
+          const files = captureFailed
+            ? ""
+            : regressed!.slice(0, 10).join(", ") + (regressed!.length > 10 ? `, …(+${regressed!.length - 10})` : "");
+          const reason = captureFailed
+            ? `could not re-verify branch scope for '${task.branch}' after a same-branch re-cut (snapshot capture failed)`
+            : `branch '${task.branch}' reverts base work outside this task's scope (${files})`;
           writeEvent(db, {
             task_id: id,
             source: "director",
@@ -3240,7 +3342,11 @@ export async function mergeTask(
       },
     });
   }
-  writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url, actor } });
+  // What this merge actually landed, recorded at merge time so autonomy stats
+  // (server/src/autonomyStats.ts) can later ask "did a fix touch these files?".
+  // Best effort: an unreadable repo or a deleted PR head just leaves it absent.
+  const merged_files = await mergedFileList(exec, task, project?.repo_path ?? null, guardBase, guardHead);
+  writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url, actor, ...(merged_files ? { merged_files } : {}) } });
   // The running server serves from its own checkout, which may sit on a branch
   // that is not `base` — so a landed change does not run until that checkout
   // follows. Done BEFORE the smoke run below, so smoke tests the code that just
@@ -3339,7 +3445,7 @@ async function bounceForChanges(
   if (!delivered) {
     const queued = queueSteerEvent(db, id, msg, "changes requested; agent not live");
     if (queued && !isExternalTask(task.source)) {
-      const r = await spawnAgent(db, herdr, id, { supervise: deps.supervise });
+      const r = await spawnAgent(db, herdr, id, { supervise: deps.supervise, exec: deps.exec });
       respawned = r.ok;
       if (r.ok) delivered = true;
     }
@@ -3380,7 +3486,7 @@ async function spawnTask(
   const blocked = authzBlock(db, { project_id: task.project_id, action: "task.spawn", target: task.title, task_id: id });
   if (blocked) return blocked;
 
-  const r = await spawnAgent(db, herdr, id, { hiveUrl: body?.hive_url, supervise: deps.supervise });
+  const r = await spawnAgent(db, herdr, id, { hiveUrl: body?.hive_url, supervise: deps.supervise, exec: deps.exec });
   if (!r.ok) return err(`spawn failed: ${r.error}`, 502);
   return json({ ok: true, task: getTask(db, id), agent_target: r.agent_target });
 }
@@ -3509,6 +3615,16 @@ export async function spawnAgent(
     const outcome = prOutcome(db, ids, task.resume_pr_url);
     if (outcome !== "open") {
       const error = `refusing to dispatch: predecessor's PR ${task.resume_pr_url} is already ${outcome}. The resume pointer is stale; reattach to the current PR (or clear resume_pr_url) before dispatching`;
+      writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error } });
+      return { ok: false, error };
+    }
+    // hive-487: a recorded "open" outcome only means nothing marked it
+    // closed/merged — it says nothing about whether the URL still names THIS
+    // lineage (a repo migration resets PR numbering, so an old pr_url can
+    // silently resolve to someone else's PR). Confirm the marker live before
+    // telling a fresh agent to adopt it.
+    if (!(await resumePointerMarkerHolds(db, opts.exec ?? defaultExec, ids, task.resume_pr_url))) {
+      const error = `refusing to dispatch: PR ${task.resume_pr_url} no longer carries a hive-task marker naming this task (or its parent) — it may point at a different or migrated repo. Reattach to the current PR (or clear resume_pr_url) before dispatching`;
       writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error } });
       return { ok: false, error };
     }
@@ -3905,6 +4021,23 @@ function writeEvent2Offline(db: DB, on: boolean, steered: number): void {
   }
 }
 
+// ---- away mode ----
+// Hold low-urgency phone pushes and batch them. POST accepts any subset of
+// {on, schedule, always_through}; anything omitted keeps its current value.
+// Turning away mode off (or clearing the schedule) flushes the held list right
+// away, so the summary push does not wait for the next reconciler tick.
+function setAwayMode(db: DB, body: any): Response {
+  const current = getAway(db);
+  const next: AwayConfig = {
+    on: body?.on === undefined ? current.on : !!body.on,
+    schedule: body?.schedule === undefined ? current.schedule : body.schedule || undefined,
+    always_through: Array.isArray(body?.always_through) ? body.always_through : current.always_through,
+  };
+  setAway(db, next);
+  const { active, flushed } = syncAway(db);
+  return json({ ...getAway(db), active, flushed, held: heldPushes(db).length });
+}
+
 // ---- checkpoints (live build-time checklist) ----
 // Agents emit `checkpoint` events WHILE building ("assuming X", "took shortcut
 // Y") instead of saving every judgment call for the final review. The director
@@ -4070,7 +4203,10 @@ function touchesSensitivePath(files: string[], tokens: string[]): boolean {
 //      migrations by default, per-project via config.understanding_checks),
 //   3. its kind is outside the project's auto_merge.kinds allow-list, or
 //   4. the director flagged the task (POST .../understanding-quiz/require).
-export function understandingChecksRequired(db: DB, task: { id: string; kind: string; project_id: string }): boolean {
+export function understandingChecksRequired(
+  db: DB,
+  task: { id: string; kind: string; project_id: string; head_sha?: string | null }
+): boolean {
   const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
   const config = JSON.parse(project?.config ?? "{}");
   if (!(Array.isArray(config.auto_merge?.kinds) && config.auto_merge.kinds.includes(task.kind))) return true;
@@ -4080,6 +4216,11 @@ export function understandingChecksRequired(db: DB, task: { id: string; kind: st
   if (flagged) return true;
   const review = latestAutoReviewVerdict(db, task.id);
   if (!review) return true;
+  // A review's verdict only speaks for the head it looked at. A force-push
+  // after review moves task.head_sha out from under it (HIVE-453) — treat that
+  // review as absent so a stale cleared-caution or stale looks_good can't
+  // un-gate the quiz for a head nobody actually reviewed.
+  if (task.head_sha && review.reviewed_head_sha !== task.head_sha) return true;
   // A caution whose every risk was refuted and every question answered from the
   // code is not judgment-class either (HIVE-407) — the same rule the reconciler
   // uses to auto-merge it. Anything still confirmed or human-only needs the
@@ -4227,19 +4368,25 @@ export function repairDuplicateQuizPasses(db: DB): number {
 // not a number of separate attention items. Quizzes on tasks still in review
 // are excluded — those gate their own review card.
 const POST_SHIP_QUIZ_STATES = ["verifying", "done", "failed"];
-export function pendingPostShipQuizCount(db: DB): number {
+// Same filters as listUnderstandingQuizzes (the list the "Catch up" digest
+// cards are built from) so this count always agrees with what those cards
+// show, including the mechanical-task exclusion (hive-1559). Pass projectId
+// to scope the count to one project, matching how the client groups digests.
+export function pendingPostShipQuizCount(db: DB, projectId?: string): number {
   const placeholders = POST_SHIP_QUIZ_STATES.map(() => "?").join(",");
   const rows = db
     .query(
-      `SELECT e.id, e.task_id, e.payload, t.kind, t.project_id FROM events e JOIN tasks t ON t.id = e.task_id
+      `SELECT e.id, e.task_id, e.payload, t.project_id, t.kind FROM events e JOIN tasks t ON t.id = e.task_id
         WHERE e.type = 'review_summary'
           AND t.state IN (${placeholders})
+          AND (? IS NULL OR t.project_id = ?)
           AND NOT EXISTS (
             SELECT 1 FROM events newer
              WHERE newer.task_id = e.task_id AND newer.type = 'review_summary'
                AND (newer.ts > e.ts OR (newer.ts = e.ts AND newer.rowid > e.rowid)))`
     )
-    .all(...POST_SHIP_QUIZ_STATES) as { id: string; task_id: string; payload: string; kind: string; project_id: string }[];
+    .all(...POST_SHIP_QUIZ_STATES, projectId ?? null, projectId ?? null) as
+    { id: string; task_id: string; payload: string; project_id: string; kind: string }[];
   return rows.filter((row) => {
     let payload: any;
     try { payload = JSON.parse(row.payload); } catch { return false; }
@@ -4275,7 +4422,8 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
     if (!checks.length) return [];
     // A mechanical change gets no backlog entry even when its agent submitted
     // checks anyway (hive-1559).
-    if (!understandingChecksRequired(db, { id: row.task_id, kind: row.kind, project_id: row.project_id })) return [];
+    if (!understandingChecksRequired(db, { id: row.task_id, kind: row.kind, project_id: row.project_id, head_sha: row.head_sha }))
+      return [];
     // Not yet answerable = the review pass has not finished for the live head.
     if (!quizAnswerable(db, { id: row.task_id, state: row.state, head_sha: row.head_sha, project_id: row.project_id })) return [];
     const understanding = payload?.understanding && typeof payload.understanding === "object" && !Array.isArray(payload.understanding)
@@ -4876,8 +5024,22 @@ function buildResumeSection(
   const ghostBranch = ownGhostBranch || inheritedGhost;
   const prUrl = predecessorOpenPrUrl(db, source);
   const prFactsApply = !!prUrl && prUrl === source.pr_url;
-  const decisions = answeredDecisionSummaries(db, source.id);
-  const review = lastReviewHeadline(db, source.id);
+  const chain = [source];
+  const seen = new Set([source.id]);
+  let owner = source;
+  const ownsContext = (task: any) => prUrl ? task.pr_url === prUrl : task.branch === branch;
+  while (!ownsContext(owner) && owner.parent_task_id) {
+    const parent = getTask(db, owner.parent_task_id);
+    if (!parent || seen.has(parent.id)) break;
+    chain.push(parent);
+    seen.add(parent.id);
+    owner = parent;
+  }
+  const ownerPrFactsApply = owner.id !== source.id && !!prUrl && prUrl === owner.pr_url;
+  const headSha = prFactsApply ? source.head_sha : ownerPrFactsApply ? owner.head_sha : null;
+  const ciStatus = prFactsApply ? source.ci_status : ownerPrFactsApply ? owner.ci_status : null;
+  const decisions = chain.flatMap((task) => answeredDecisionSummaries(db, task.id));
+  const review = chain.map((task) => lastReviewHeadline(db, task.id)).find(Boolean) ?? null;
   const lead = prUrl
     ? `**RESUME — adopt PR ${prUrl} / branch \`${branch}\`. Do NOT rebuild this feature from scratch.**`
     : `**RESUME — adopt branch \`${branch}\`. Do NOT rebuild this feature from scratch.**`;
@@ -4894,8 +5056,8 @@ function buildResumeSection(
     lines.push(`- This attempt itself inherited \`${inheritedBranch}\` from an earlier failed attempt but never confirmed merging it before it also died. Fetch it too, check whether it holds work the branch above is missing, and merge whichever has the real content.`);
   if (inheritedGhost)
     lines.push(`- An earlier attempt also had uncommitted WIP separately rescued onto \`${inheritedGhost}\`. Check it too and merge any missing work into your own current branch.`);
-  if (prUrl) lines.push(`- Open PR: ${prUrl}${prFactsApply && source.head_sha ? ` (last known head \`${source.head_sha}\`)` : ""} — push your fixes to this PR. Do not open a second PR for this feature.`);
-  if (prFactsApply && source.ci_status) lines.push(`- Last known CI status: ${source.ci_status}`);
+  if (prUrl) lines.push(`- Open PR: ${prUrl}${headSha ? ` (last known head \`${headSha}\`)` : ""} — push your fixes to this PR. Do not open a second PR for this feature.`);
+  if (ciStatus) lines.push(`- Last known CI status: ${ciStatus}`);
   if (decisions.length) {
     lines.push(`- Decisions the director already answered on the failed attempt (don't re-ask):`);
     for (const d of decisions) lines.push(`  - ${d}`);
@@ -5540,6 +5702,26 @@ async function headSha(exec: Exec, cwd: string | null): Promise<string | null> {
     return sha || null;
   } catch {
     return null;
+  }
+}
+
+// hive-487: does `prUrl` still carry a `hive-task:` marker (or `[hive-<n>]`
+// title prefix) naming one of `ids`? Used to gate resume-pointer adoption at
+// dispatch time — the one place a stale/migrated pr_url would otherwise get
+// silently trusted just because nothing marked it closed.
+async function resumePointerMarkerHolds(db: DB, exec: Exec, ids: string[], prUrl: string): Promise<boolean> {
+  try {
+    const r = await exec(["gh", "pr", "view", prUrl, "--json", "title,body"]);
+    if (r.code !== 0) return false;
+    const data = JSON.parse(r.stdout);
+    const bodyId = taskIdFromBody(data.body);
+    if (bodyId) return ids.includes(bodyId);
+    const titleNumber = taskNumberFromTitle(data.title);
+    if (titleNumber == null) return false;
+    const placeholders = ids.map(() => "?").join(",");
+    return !!db.query(`SELECT 1 FROM tasks WHERE id IN (${placeholders}) AND number = ?`).get(...ids, titleNumber);
+  } catch {
+    return false;
   }
 }
 
@@ -6523,11 +6705,48 @@ function closedDecisionResponse(db: DB, r: any): Response | null {
   });
 }
 
+// Someone answered a card that is already answered, and picked a DIFFERENT
+// option. That is a disagreement with whoever answered first — the signal the
+// agreement metric in autonomyStats.ts counts. The answer itself is still
+// refused (an answered card stays answered); this only records that it happened,
+// once, carrying who answered first so auto-answers can be told from human ones.
+function recordContradiction(db: DB, decision: any, body: any): void {
+  const answerKey = body?.answer_key;
+  if (!answerKey || decision.status !== "answered" || answerKey === decision.answer_key) return;
+  const already = db
+    .query(
+      `SELECT 1 FROM events WHERE task_id = ? AND type = 'decision_contradicted'
+        AND json_extract(payload, '$.decision_id') = ? LIMIT 1`
+    )
+    .get(decision.task_id, decision.id);
+  if (already) return;
+  // Identity is not validated yet on this path (the answer is refused, not
+  // applied), so clamp it rather than writing an arbitrary caller string.
+  const claimed = body?.source ?? "unknown";
+  const source = ANSWER_SOURCES.includes(claimed) ? claimed : "unknown";
+  writeEvent(db, {
+    task_id: decision.task_id,
+    source,
+    type: "decision_contradicted",
+    payload: {
+      decision_id: decision.id,
+      prior_answer_key: decision.answer_key,
+      prior_source: decision.answered_by ?? "unknown",
+      attempted_answer_key: answerKey,
+      source,
+      actor: actorOf(body),
+    },
+  });
+}
+
 export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, supervisorVerified = false): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
   if (!r) return err("decision not found", 404);
   const closed = closedDecisionResponse(db, r);
-  if (closed) return closed;
+  if (closed) {
+    recordContradiction(db, r, body);
+    return closed;
+  }
   const answerKey = body?.answer_key;
   if (!answerKey) return err("answer_key is required");
   const options: any[] = JSON.parse(r.options || "[]");

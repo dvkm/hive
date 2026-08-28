@@ -123,6 +123,21 @@ test("Dispatch now and Send steer show normally for an ordinary (non-external) q
   expect(btn(renderer, "Send steer").length).toBe(1);
 });
 
+// The endpoint 409s on anything but a done task, so the board must not offer
+// the button before then.
+test("Promote to playbook shows only on a done task", async () => {
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(task("still-going", { state: "in_progress" })));
+  });
+  expect(btn(renderer, "Promote to playbook").length).toBe(0);
+
+  await act(async () => {
+    renderer = create(tree(task("finished", { state: "done" })));
+  });
+  expect(btn(renderer, "Promote to playbook").length).toBe(1);
+});
+
 test("the task timeline renders director actors on actions and resolved decisions", async () => {
   const t = task("actors", { state: "in_progress" });
   const d = {

@@ -11,5 +11,8 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": false
   },
+  // scripts/ and server/test are excluded on purpose: they're one-off/test
+  // files with ~1300 untyped-fetch-json errors, not covered by this typecheck
+  // (tests are still verified by `bun test`, not tsc).
   "include": ["server/src", "cli"]
 }

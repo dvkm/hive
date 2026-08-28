@@ -32,6 +32,7 @@ import { triageIntake } from "./triage.ts";
 import { runPlanner, type PlannerExec } from "../planner.ts";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
+import { activeProjects } from "../testProjects.ts";
 
 export type FetchLike = typeof fetch;
 
@@ -327,7 +328,7 @@ export async function pollGchatOnce(db: DB, deps: GchatDeps = {}): Promise<{ cre
   const nowMs = deps.nowMs ?? (() => Date.now());
   const notify = deps.notify ?? true;
 
-  const projects = db.query("SELECT id, config FROM projects").all() as { id: string; config: string }[];
+  const projects = activeProjects(db) as { id: string; config: string }[];
   const jobs: { projectId: string; space: string; planIntake: boolean }[] = [];
   // `gchat_spaces: "*"` means every space the authorized user is in; those
   // projects can only be expanded once we hold a token (spaces.list).

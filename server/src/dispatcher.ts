@@ -30,6 +30,7 @@
 // release frees the slot, this brings the agent back when review talks back.
 import type { DB } from "./db.ts";
 import { parseTask } from "./rows.ts";
+import { startLoop } from "./loop.ts";
 import { isOffline, setSetting, getSetting, now } from "./db.ts";
 import { Herdr, herdr as defaultHerdr, isHerdrUnreachable } from "./runtime/herdr.ts";
 import { authorize } from "./authority.ts";
@@ -386,9 +387,5 @@ export function clearHerdrOutage(db: DB): void {
 
 // Background loop. Started only from index.ts (never in tests).
 export function startDispatcher(db: DB, deps: DispatcherDeps & { intervalMs?: number } = {}): () => void {
-  const intervalMs = deps.intervalMs ?? 30_000;
-  const timer = setInterval(() => {
-    dispatchOnce(db, deps).catch((e) => console.error("[hive] dispatch cycle crashed:", e));
-  }, intervalMs);
-  return () => clearInterval(timer);
+  return startLoop("dispatcher", deps.intervalMs ?? 30_000, () => dispatchOnce(db, deps));
 }

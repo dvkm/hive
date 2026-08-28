@@ -1,4 +1,13 @@
 // hive daemon entrypoint. Bun.serve on 127.0.0.1:4700 (override HIVE_PORT).
+// INCIDENT HOTFIX 2026-08-25 (task 4917e8ecd667): an unhandled async rejection
+// escaping a spawned subprocess (gh ENOENT via exec.ts) exits the Bun process,
+// crash-looping the server under launchd. Log and survive instead; the error
+// streak machinery already surfaces degradation in /api/health. Applied
+// straight to the live checkout during the incident; carried onto main here so
+// the next deploy does not silently drop it.
+process.on("unhandledRejection", (e) => {
+  console.error("[hive] unhandledRejection (survived):", e);
+});
 import { openDb, defaultDbPath } from "./db.ts";
 import { makeHandler, keepSupervisorWarm, notifyManagerOfEvent, repairDuplicateQuizPasses, sweepManagerInboxes, wakeDueManagers } from "./api.ts";
 import { startReconciler, reAdoptAgentsOnBoot } from "./reconciler.ts";
@@ -18,7 +27,7 @@ import { bootstrapAuthority } from "./authority.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { defaultExec } from "./exec.ts";
-import { claimLease, startLease, holdsLease, interloperReason, registerInstance, unregisterInstance, evictContenders, LEASE_MS } from "./lease.ts";
+import { claimLease, startLease, holdsLease, interloperReason, interloperAdvice, registerInstance, unregisterInstance, evictContenders, LEASE_MS } from "./lease.ts";
 import { enqueue } from "./notifications.ts";
 import { setSetting, now } from "./db.ts";
 
@@ -36,7 +45,7 @@ const db = openDb(dbPath);
   const reason = interloperReason(dbPath, port);
   if (reason) {
     console.error(`[hive] REFUSING TO START: ${reason}.`);
-    console.error(`[hive] A second server on the live DB kills working agents. Use a scratch DB: HIVE_DB=/tmp/smoke.db HIVE_PORT=${port} bun run server/src/index.ts`);
+    console.error(`[hive] ${interloperAdvice(port)}`);
     // One card per incident, not per retry: a refused server under a supervisor
     // (launchd, `bun --watch`) relaunches on a loop and would otherwise fill the
     // tray with the same sentence.
@@ -48,7 +57,7 @@ const db = openDb(dbPath);
         kind: "server_refused",
         urgency: "normal",
         title: "Blocked a second hive server on the live database",
-        body: `Something started a hive server on port ${port} against the fleet DB. It was refused and nothing was touched — it needed HIVE_DB set to a scratch path.`,
+        body: `Something started a hive server on port ${port} against the fleet DB. It was refused and nothing was touched. ${interloperAdvice(port)}`,
       });
     process.exit(1);
   }

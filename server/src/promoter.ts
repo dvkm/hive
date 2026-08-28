@@ -16,6 +16,7 @@ import { writeEvent, getTask } from "./state.ts";
 import { broadcastTask } from "./health.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, isSafeRef } from "./exec.ts";
+import { activeProjects } from "./testProjects.ts";
 
 export interface PromoterDeps {
   exec?: Exec;
@@ -43,7 +44,7 @@ Evaluated head: ${sha}`;
 export async function promoteOnce(db: DB, deps: PromoterDeps = {}): Promise<void> {
   if (isOffline(db)) return; // offline mode: no network, no new evaluations
   const exec = deps.exec ?? defaultExec;
-  const projects = db.query("SELECT * FROM projects").all() as any[];
+  const projects = activeProjects(db);
   for (const p of projects) {
     try {
       const cfg = JSON.parse(p.config ?? "{}");

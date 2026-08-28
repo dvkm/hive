@@ -364,6 +364,87 @@ test("five deferred quizzes are one catch-up row, and finishing the flow clears 
   expect(renderer.root.findByProps({ className: "empty-big" }).children).toContain("All quiet.");
 });
 
+test("two projects with pending quizzes get separate digest rows whose counts sum to the total", async () => {
+  values.delete("hive.board.project");
+  api.evidence = (async () => ({ evidence: [] })) as typeof api.evidence;
+  const projectA = "project-a";
+  const projectB = "project-b";
+  const quizzesA = [1, 2].map((n) => ({
+    id: `quiz-a${n}`,
+    task_id: `shipped-a${n}`,
+    ts: task.updated_at,
+    task_number: n,
+    task_title: `A change ${n}`,
+    task_state: "done",
+    task_kind: "ship",
+    project_id: projectA,
+    report: { done: [], iffy: [], decisions: [], testing: [], followups: [] },
+    question: `A question ${n}?`,
+    options: [{ key: "a", label: "A" }, { key: "b", label: "B" }],
+    version: `va${n}`,
+    status: "deferred",
+  })) as unknown as UnderstandingQuizData[];
+  const quizzesB = [1, 2, 3].map((n) => ({
+    id: `quiz-b${n}`,
+    task_id: `shipped-b${n}`,
+    ts: task.updated_at,
+    task_number: n,
+    task_title: `B change ${n}`,
+    task_state: "done",
+    task_kind: "ship",
+    project_id: projectB,
+    report: { done: [], iffy: [], decisions: [], testing: [], followups: [] },
+    question: `B question ${n}?`,
+    options: [{ key: "a", label: "A" }, { key: "b", label: "B" }],
+    version: `vb${n}`,
+    status: "deferred",
+  })) as unknown as UnderstandingQuizData[];
+  const allQuizzes = [...quizzesA, ...quizzesB];
+  const store = {
+    tasks: allQuizzes.map((quiz, i) => ({ ...task, id: quiz.task_id, project_id: quiz.project_id, number: i + 1, title: quiz.task_title, state: "done" })),
+    projects: [{ id: projectA, name: "Project A" }, { id: projectB, name: "Project B" }],
+    needsYou: [
+      { kind: "quiz_digest", id: `quiz-digest:${projectA}`, quizzes: quizzesA },
+      { kind: "quiz_digest", id: `quiz-digest:${projectB}`, quizzes: quizzesB },
+    ],
+    checkpoints: [],
+    quizzes: allQuizzes,
+    rev: {},
+    reloadCheckpoints: () => {},
+    reloadQuizzes: () => {},
+  } as unknown as Store;
+
+  values.set("hive.inbox.mode", "backlogs");
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(
+      <MemoryRouter>
+        <Ctx.Provider value={store}>
+          <LightboxProvider><Brief /></LightboxProvider>
+        </Ctx.Provider>
+      </MemoryRouter>
+    );
+  });
+
+  // Two projects with pending quizzes: two catch-up rows, and the "Catch up"
+  // section badge (a count of digest ITEMS, matching the topbar's own item-based
+  // badge) reflects both — the per-row totals underneath sum to all 5 quizzes.
+  const catchUpButtons = renderer.root.findAll((node) => node.type === "button" && String(node.children[0]).startsWith("Catch up on"));
+  expect(catchUpButtons).toHaveLength(2);
+  const rowTotals = catchUpButtons.map((btn) => Number(btn.children.join("").match(/Catch up on (\d+)/)![1]));
+  expect(rowTotals.sort()).toEqual([2, 3]);
+  expect(rowTotals.reduce((sum, n) => sum + n, 0)).toBe(allQuizzes.length);
+  expect(renderer.root.findByProps({ className: "brief-count" }).children).toEqual(["2"]);
+
+  // Filtering to one project narrows to just that project's row and count.
+  await act(async () => {
+    window.dispatchEvent(new CustomEvent("hive:project-filter", { detail: projectA }));
+  });
+  const filteredButtons = renderer.root.findAll((node) => node.type === "button" && String(node.children[0]).startsWith("Catch up on"));
+  expect(filteredButtons).toHaveLength(1);
+  expect(filteredButtons[0].children.join("")).toBe("Catch up on 2 shipped changes");
+});
+
 // HIVE-413: a blocking plan checkpoint is approved from the card itself, so the
 // card must carry the plan and the critic's concerns without a task-page visit.
 test("Focus shows a blocking plan's fields and the critic's concerns on the card", async () => {
