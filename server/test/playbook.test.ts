@@ -150,3 +150,35 @@ test("extractPlaybook unwraps the --output-format json envelope", () => {
   expect(bare?.gotchas).toEqual([]);
   expect(bare?.success_criteria).toEqual([]);
 });
+
+test("two tasks with the same model-generated title both survive, each keeping its own source task", async () => {
+  const COLLIDE = JSON.stringify({
+    title: "Prune a table safely",
+    when_to_use: "You are deleting rows nothing else reads.",
+    steps: ["Write the sweep", "Test it"],
+  });
+  const s = Bun.serve({ port: 0, fetch: makeHandler(db, { plannerExec: stubExec(COLLIDE).exec }) });
+  try {
+    const a = await mkTask(true);
+    const b = await mkTask(true);
+    const ra = await (await fetch(`http://127.0.0.1:${s.port}/api/tasks/${a.id}/playbook`, { method: "POST", body: "{}" })).json();
+    const rb = await (await fetch(`http://127.0.0.1:${s.port}/api/tasks/${b.id}/playbook`, { method: "POST", body: "{}" })).json();
+
+    expect(rb.learning_id).not.toBe(ra.learning_id);
+    const rowA: any = db.query("SELECT * FROM learnings WHERE id = ?").get(ra.learning_id);
+    const rowB: any = db.query("SELECT * FROM learnings WHERE id = ?").get(rb.learning_id);
+    expect(rowA.source_task_id).toBe(a.id);
+    expect(rowB.source_task_id).toBe(b.id);
+    expect(rowA.title).toBe("Prune a table safely");
+    expect(rowB.title).toBe(`Prune a table safely (task #${b.number})`);
+    expect(rowA.body).toContain(`task #${a.number}`);
+    expect(rowB.body).toContain(`task #${b.number}`);
+
+    // Re-promoting the same task rewrites its own row instead of adding one.
+    const again = await (await fetch(`http://127.0.0.1:${s.port}/api/tasks/${a.id}/playbook`, { method: "POST", body: "{}" })).json();
+    expect(again.learning_id).toBe(ra.learning_id);
+    expect(db.query("SELECT COUNT(*) c FROM learnings WHERE title LIKE 'Prune a table safely%'").get()).toEqual({ c: 2 });
+  } finally {
+    s.stop(true);
+  }
+});

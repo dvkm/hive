@@ -6,6 +6,7 @@
 // from `hive recall`. No schema change: the learnings table already carries
 // references (db.ts v3-learnings + the v-kind column).
 import type { DB } from "./db.ts";
+import { now } from "./db.ts";
 import { getTask } from "./state.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
@@ -175,6 +176,47 @@ export async function makePlaybook(db: DB, taskId: string, deps: PlaybookDeps = 
   const pb = extractPlaybook(res.stdout);
   if (!pb) return { ok: false, status: 502, error: "unparseable playbook output" };
 
-  const learningId = addReference(db, task.project_id, pb.title, playbookBody(pb, task), taskId);
+  const learningId = storePlaybook(db, task, pb);
   return { ok: true, learning_id: learningId, playbook: pb };
+}
+
+// Playbook titles are model-generated, and addReference upserts on (project,
+// kind, title): two different tasks that landed on the same title would
+// silently replace each other, leaving one playbook gone and the survivor
+// pointing at the wrong source task. Key on the source task instead —
+// re-promoting a task rewrites its own row, and a title another row already
+// claims gets the task number appended rather than clobbering it.
+export function storePlaybook(db: DB, task: any, pb: Playbook): string {
+  const body = playbookBody(pb, task);
+  const mine = db
+    .query(
+      `SELECT id FROM learnings WHERE project_id = ? AND kind = 'reference' AND source_task_id = ?
+         AND body LIKE '[playbook]%' LIMIT 1`
+    )
+    .get(task.project_id, task.id) as { id: string } | undefined;
+  const title = freeTitle(db, task.project_id, pb.title, task.number, mine?.id);
+  if (mine) {
+    db.query("UPDATE learnings SET title = ?, body = ?, last_seen = ?, status = 'active' WHERE id = ?").run(
+      title,
+      body,
+      now(),
+      mine.id
+    );
+    return mine.id;
+  }
+  return addReference(db, task.project_id, title, body, task.id);
+}
+
+function freeTitle(db: DB, projectId: string, base: string, taskNumber: number, ownId?: string): string {
+  const taken = (t: string) => {
+    const row = db
+      .query("SELECT id FROM learnings WHERE project_id = ? AND kind = 'reference' AND title = ? LIMIT 1")
+      .get(projectId, t) as { id: string } | undefined;
+    return !!row && row.id !== ownId;
+  };
+  if (!taken(base)) return base;
+  for (let i = 1; ; i++) {
+    const t = i === 1 ? `${base} (task #${taskNumber})` : `${base} (task #${taskNumber}) (${i})`;
+    if (!taken(t)) return t;
+  }
 }
