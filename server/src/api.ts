@@ -85,7 +85,7 @@ import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
-import { confirmedRisks, cautionCleared, latestAutoReviewVerdict } from "./reviewer.ts";
+import { confirmedRisks, cautionCleared, latestAutoReviewVerdict, reviewCompleteForHead } from "./reviewer.ts";
 import { explanationGate } from "./explainDiff.ts";
 import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
@@ -4004,6 +4004,31 @@ export function understandingChecksRequired(db: DB, task: { id: string; kind: st
   return touchesSensitivePath(review.files, tokens);
 }
 
+// Judgment-class says a quiz is OWED. This says it is ANSWERABLE (HIVE-488).
+// A task still in review has nothing to ask the director until its own review
+// pipeline finished for the CURRENT head: the auto review was written for that
+// head, and every risk and question it raised has a verdict keyed to that head.
+// Short of that the quiz is pipeline state — the review card still shows the
+// task as in review, but it must not count toward the quiz or needs-you totals.
+// Shipped tasks (verifying/done/failed) are the post-ship catch-up class: their
+// head is settled and their quiz is answerable, and it only ever feeds the
+// digest, never a blocking gate.
+function quizAnswerable(db: DB, task: { id: string; state: string; head_sha: string | null; project_id: string }): boolean {
+  // Shipped: the post-ship catch-up class. Its head is settled, so it is
+  // answerable, and it only ever feeds the digest.
+  if (task.state !== "in_review") return true;
+  // The director asked for this one by hand, so it is their question whatever
+  // the pipeline is doing.
+  if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1").get(task.id)) return true;
+  // No head to key verdicts to, or a project that never auto-reviews: the
+  // reviewer skips both, so nothing further is coming and this is as complete
+  // as the review gets.
+  if (!task.head_sha) return true;
+  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+  if (JSON.parse(project?.config ?? "{}").auto_review === false) return true;
+  return reviewCompleteForHead(db, task.id, task.head_sha);
+}
+
 function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; checks: UnderstandingCheck[] } | null {
   const row: any = db
     .query("SELECT id, payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY ts DESC, rowid DESC LIMIT 1")
@@ -4119,7 +4144,7 @@ export function pendingPostShipQuizCount(db: DB): number {
   const placeholders = POST_SHIP_QUIZ_STATES.map(() => "?").join(",");
   const rows = db
     .query(
-      `SELECT e.id, e.task_id, e.payload FROM events e JOIN tasks t ON t.id = e.task_id
+      `SELECT e.id, e.task_id, e.payload, t.kind, t.project_id FROM events e JOIN tasks t ON t.id = e.task_id
         WHERE e.type = 'review_summary'
           AND t.state IN (${placeholders})
           AND NOT EXISTS (
@@ -4127,11 +4152,14 @@ export function pendingPostShipQuizCount(db: DB): number {
              WHERE newer.task_id = e.task_id AND newer.type = 'review_summary'
                AND (newer.ts > e.ts OR (newer.ts = e.ts AND newer.rowid > e.rowid)))`
     )
-    .all(...POST_SHIP_QUIZ_STATES) as { id: string; task_id: string; payload: string }[];
+    .all(...POST_SHIP_QUIZ_STATES) as { id: string; task_id: string; payload: string; kind: string; project_id: string }[];
   return rows.filter((row) => {
     let payload: any;
     try { payload = JSON.parse(row.payload); } catch { return false; }
     if (!normalizeUnderstandingChecks(payload?.understanding).length) return false;
+    // Same judgment-class filter the quiz list applies, or the digest promises
+    // more changes to catch up on than the list can show (HIVE-488).
+    if (!understandingChecksRequired(db, { id: row.task_id, kind: row.kind, project_id: row.project_id })) return false;
     return understandingQuizStatus(db, row.task_id, row.id) !== "passed";
   }).length;
 }
@@ -4141,7 +4169,7 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
   const statePlaceholders = UNDERSTANDING_QUIZ_ANSWERABLE_STATES.map(() => "?").join(",");
   const rows = db
     .query(
-      `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state, t.kind
+      `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state, t.kind, t.head_sha
          FROM events e JOIN tasks t ON t.id = e.task_id
         WHERE e.type = 'review_summary'
           AND t.state IN (${statePlaceholders})
@@ -4161,6 +4189,8 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
     // A mechanical change gets no backlog entry even when its agent submitted
     // checks anyway (hive-1559).
     if (!understandingChecksRequired(db, { id: row.task_id, kind: row.kind, project_id: row.project_id })) return [];
+    // Not yet answerable = the review pass has not finished for the live head.
+    if (!quizAnswerable(db, { id: row.task_id, state: row.state, head_sha: row.head_sha, project_id: row.project_id })) return [];
     const understanding = payload?.understanding && typeof payload.understanding === "object" && !Array.isArray(payload.understanding)
       ? Object.fromEntries(Object.entries(payload.understanding).filter(([key]) => key !== "check" && key !== "checks"))
       : {};
