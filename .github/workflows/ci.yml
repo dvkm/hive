@@ -42,6 +42,8 @@ jobs:
       # self-skip via skipIf(platform !== darwin), so this is safe here.
       - run: bun run test
 
+      - run: bunx tsc --noEmit
+
       - run: bunx tsc -b --noEmit
         working-directory: web
 

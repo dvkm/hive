@@ -8,7 +8,7 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-reviewer-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb, newId, now } = await import("../src/db.ts");
-const { autoReviewOnce, extractReview } = await import("../src/reviewer.ts");
+const { autoReviewOnce, extractReview, MAX_REVIEW_ATTEMPTS } = await import("../src/reviewer.ts");
 const { transition, writeEvent } = await import("../src/state.ts");
 import type { DB } from "../src/db.ts";
 import type { Exec } from "../src/exec.ts";
@@ -211,7 +211,7 @@ test("extractReview parses whole JSON, envelope, and prose-wrapped output", () =
 
 // --- per-risk adversarial verification (task HIVE-406) ---------------------
 
-const { verifyRisks, extractVerdict, extractAnswer, ambiguityCleared, confirmedRisks } = await import("../src/reviewer.ts");
+const { verifyRisks, extractVerdict, extractAnswer, ambiguityCleared, confirmedRisks, verifyPendingOnce } = await import("../src/reviewer.ts");
 
 // A pre-review that flags `n` risks, so autoReviewOnce triggers verification.
 const cautionWith = (risks: string[]) =>
@@ -339,6 +339,46 @@ test("verification is keyed to the reviewed head: same head skips, new head re-r
   expect(events(db, id, "risk_verdicts").map((e: any) => e.payload.reviewed_head_sha).sort()).toEqual(["head-a", "head-b"]);
 });
 
+test("a re-review at the same head re-verifies when the risk list grew", async () => {
+  const { db, id } = setup();
+  let calls = 0;
+  const claude = async () => {
+    calls++;
+    return { code: 0, stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"checked"}' }), stderr: "" };
+  };
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+
+  // First review at this head raised two risks.
+  await verifyRisks(db, task, { risks: ["r1", "r2"], head: "head-a", diff: "diff" }, { exec: claude });
+  expect(calls).toBe(2);
+
+  // Overlapping reconciler laps write a SECOND auto_review for the same head,
+  // and it raises a third risk plus a question. The stored set no longer covers
+  // the review, so it must not be reused — otherwise ambiguityCleared compares
+  // 2 verdicts against 3 risks forever and the task parks with no card.
+  // One exec for both prompt kinds: the question pass wants an `answerable`,
+  // the risk pass wants a `verdict`.
+  const answer = async (argv: string[]) => {
+    calls++;
+    const prompt = argv[4] ?? "";
+    const result = prompt.includes("q1")
+      ? '{"answerable":"machine","answer":"yes"}'
+      : '{"verdict":"refuted","why":"checked"}';
+    return { code: 0, stdout: JSON.stringify({ result }), stderr: "" };
+  };
+  await verifyRisks(db, task, { risks: ["r1", "r2", "r3"], questions: ["q1"], head: "head-a", diff: "diff" }, { exec: answer });
+  expect(calls).toBe(6); // 2 + 4 (three risks and one question re-run)
+
+  const latest: any = events(db, id, "risk_verdicts").at(-1);
+  expect(latest.payload.verdicts).toHaveLength(3);
+  expect(latest.payload.question_verdicts).toHaveLength(1);
+  expect(ambiguityCleared(db, id, "head-a", { risks: ["r1", "r2", "r3"], questions: ["q1"] })).toBe(true);
+
+  // A repeat of that same review is still deduped.
+  await verifyRisks(db, task, { risks: ["r1", "r2", "r3"], questions: ["q1"], head: "head-a", diff: "diff" }, { exec: answer });
+  expect(calls).toBe(6);
+});
+
 test("a failed verification run is counted, never reported as an all-clear", async () => {
   const { db, id } = setup();
   const claude = async () => ({ code: 1, stdout: "", stderr: "boom" });
@@ -355,4 +395,119 @@ test("extractVerdict parses envelope and prose, and rejects anything else", () =
   expect(extractVerdict(`Here: ${body} done`)?.why).toBe("y is unused");
   expect(extractVerdict('{"verdict":"maybe","why":"hm"}')).toBeNull();
   expect(extractVerdict("no json")).toBeNull();
+});
+
+// --- the standalone verification pass -------------------------------------
+
+test("verifyPendingOnce verifies a review autoReviewOnce will never revisit", async () => {
+  const { db, id } = setup();
+  db.query("UPDATE tasks SET state = 'in_review', head_sha = 'review-head' WHERE id = ?").run(id);
+  // A review that raises risks but whose verification never produced verdicts —
+  // autoReviewOnce skips this task (it already has an auto_review at this head),
+  // so before this pass existed nothing could ever cover it.
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "auto_review",
+    payload: { verdict: "caution", summary: "s", risks: ["r1", "r2"], questions: [], reviewed_head_sha: "review-head" },
+  });
+  expect(events(db, id, "risk_verdicts")).toHaveLength(0);
+
+  const claude = async () => ({
+    code: 0,
+    stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"checked"}' }),
+    stderr: "",
+  });
+  await verifyPendingOnce(db, { exec: claude, shellExec: ghDiff });
+
+  const [verdicts] = events(db, id, "risk_verdicts");
+  expect(verdicts.payload.verdicts).toHaveLength(2);
+  expect(ambiguityCleared(db, id, "review-head", { risks: ["r1", "r2"], questions: [] })).toBe(true);
+
+  // Already covered now, so a second pass is a no-op.
+  await verifyPendingOnce(db, { exec: claude, shellExec: ghDiff });
+  expect(events(db, id, "risk_verdicts")).toHaveLength(1);
+});
+
+test("verifyPendingOnce leaves alone a review whose verdicts already cover it", async () => {
+  const { db, id } = setup();
+  db.query("UPDATE tasks SET state = 'in_review', head_sha = 'review-head' WHERE id = ?").run(id);
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "auto_review",
+    payload: { verdict: "caution", summary: "s", risks: ["r1"], questions: [], reviewed_head_sha: "review-head" },
+  });
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "risk_verdicts",
+    payload: { reviewed_head_sha: "review-head", verdicts: [{ risk: "r1", verdict: "refuted" }] },
+  });
+  const claude = async () => { throw new Error("should not run"); };
+  await verifyPendingOnce(db, { exec: claude as any, shellExec: ghDiff });
+  expect(events(db, id, "risk_verdicts")).toHaveLength(1);
+});
+
+// HIVE-497: a failed pre-review used to retire the card at that head forever.
+// Any blip (model timeout, rate limit, expired login) took the task out of the
+// review queue permanently, and 31 of 36 cards ended up stuck that way.
+const ageEvents = (db: DB, id: string) =>
+  db.query("UPDATE events SET ts = ? WHERE task_id = ? AND type = 'auto_review_error'").run(
+    new Date(Date.now() - 6 * 3600_000).toISOString(),
+    id
+  );
+
+test("a failed pre-review is retried once the backoff has passed, and can then succeed", async () => {
+  const { db, id } = setup();
+  const failing = async () => ({ code: 1, stdout: "", stderr: "boom" });
+  const ok = async () => ({
+    code: 0,
+    stdout: JSON.stringify({ result: '{"verdict":"looks_good","summary":"fine","risks":[],"questions":[]}' }),
+    stderr: "",
+  });
+  await autoReviewOnce(db, { exec: failing, shellExec: ghDiff });
+  await autoReviewOnce(db, { exec: failing, shellExec: ghDiff }); // inside backoff: no retry
+  expect(events(db, id, "auto_review_error")).toHaveLength(1);
+  ageEvents(db, id);
+  await autoReviewOnce(db, { exec: ok, shellExec: ghDiff });
+  expect(events(db, id, "auto_review")).toHaveLength(1);
+});
+
+test("an auth outage never spends the retry budget, so those cards free themselves", async () => {
+  const { db, id } = setup();
+  const notLoggedIn = async () => ({
+    code: 1,
+    stdout: JSON.stringify({ is_error: true, result: "Not logged in - Please run /login" }),
+    stderr: "",
+  });
+  for (let i = 0; i < MAX_REVIEW_ATTEMPTS + 1; i++) {
+    await autoReviewOnce(db, { exec: notLoggedIn, shellExec: ghDiff });
+    ageEvents(db, id);
+  }
+  const errs = events(db, id, "auto_review_error");
+  expect(errs.length).toBe(MAX_REVIEW_ATTEMPTS + 1);
+  expect(errs.some((e: any) => e.payload.gave_up)).toBe(false);
+  const ok = async () => ({
+    code: 0,
+    stdout: JSON.stringify({ result: '{"verdict":"looks_good","summary":"fine","risks":[],"questions":[]}' }),
+    stderr: "",
+  });
+  await autoReviewOnce(db, { exec: ok, shellExec: ghDiff });
+  expect(events(db, id, "auto_review")).toHaveLength(1);
+});
+
+test("after the retry budget runs out the card is flagged for a human, not silently skipped", async () => {
+  const { db, id } = setup();
+  const failing = async () => ({ code: 1, stdout: "", stderr: "boom" });
+  for (let i = 0; i < MAX_REVIEW_ATTEMPTS + 2; i++) {
+    await autoReviewOnce(db, { exec: failing, shellExec: ghDiff });
+    ageEvents(db, id);
+  }
+  const errs = events(db, id, "auto_review_error");
+  expect(errs).toHaveLength(MAX_REVIEW_ATTEMPTS); // stops trying at the cap
+  expect(errs[MAX_REVIEW_ATTEMPTS - 1].payload.gave_up).toBe(true);
+  const notes: any[] = db.query("SELECT title FROM notifications WHERE task_id = ? AND kind = 'failed'").all(id);
+  expect(notes).toHaveLength(1);
+  expect(notes[0].title).toContain("gave up");
 });
