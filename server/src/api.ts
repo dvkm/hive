@@ -7,7 +7,7 @@ import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db
 import { taskWithHealth, tasksWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
 import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { activeProjects, isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
-import { addClient, removeClient, broadcast, appClientCount } from "./bus.ts";
+import { addClient, removeClient, broadcast, appClientCount, setProjectResolver } from "./bus.ts";
 import {
   transition,
   writeEvent,
@@ -303,6 +303,8 @@ export function requireWriteAuth(db: DB, req: Request, url: URL): boolean {
 
 export function makeHandler(db: DB, deps: HandlerDeps = {}) {
   const herdr = deps.herdr ?? defaultHerdr;
+  // Lets bus.ts stamp project_id onto frames that only name a task.
+  setProjectResolver((taskId) => (db.query("SELECT project_id FROM tasks WHERE id = ?").get(taskId) as any)?.project_id ?? null);
   async function handle(req: Request, server?: { requestIP?: (r: Request) => { address: string } | null }): Promise<Response> {
     const url = new URL(req.url);
     const { pathname } = url;
@@ -319,7 +321,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
     try {
       // ---- SSE stream ----
-      if (pathname === "/api/stream" && method === "GET") return sseStream(url.searchParams.get("client") === "app");
+      if (pathname === "/api/stream" && method === "GET") return sseStream(url.searchParams);
 
       // ---- health ----
       if (pathname === "/api/health" && method === "GET") {
@@ -1075,7 +1077,11 @@ async function chatTurnOnThread(
   thread: ChatThread,
   text: string
 ): Promise<{ thread_id: string; delivery: string }> {
-  broadcast({ type: "chat_message", message: appendMessage(db, thread.id, "director", text) });
+  broadcast({
+    type: "chat_message",
+    project_id: thread.project_id,
+    message: appendMessage(db, thread.id, "director", text),
+  });
   keepWarmAttempts.delete(thread.id); // a director turn restarts keep-warm's patience
 
   // The message the session receives is prefixed so it always knows which thread
@@ -1102,7 +1108,11 @@ function chatDeliveryStatus(threadId: string, status: string, error?: string): v
 // A failed turn must be visible in the conversation, not a silent hang. Message
 // roles are director|assistant, so the notice rides in as an assistant message.
 function postThreadNotice(db: DB, threadId: string, text: string): void {
-  broadcast({ type: "chat_message", message: appendMessage(db, threadId, "assistant", text) });
+  broadcast({
+    type: "chat_message",
+    project_id: getThread(db, threadId)?.project_id ?? null,
+    message: appendMessage(db, threadId, "assistant", text),
+  });
 }
 
 // Tests (and any caller that must observe a settled turn) await the thread's
@@ -1526,7 +1536,7 @@ function chatReply(db: DB, threadId: string, body: any): Response {
     return json({ ok: true, suppressed: true });
 
   const message = appendMessage(db, threadId, "assistant", text, freshActions);
-  broadcast({ type: "chat_message", message });
+  broadcast({ type: "chat_message", project_id: thread.project_id, message });
   return json({ ok: true, message });
 }
 
@@ -7065,15 +7075,23 @@ function updatePolicy(db: DB, id: string, body: any): Response {
 }
 
 // ---------------------------------------------------------------- SSE
-function sseStream(isApp = false): Response {
-  let self: { id: string; send: (d: string) => void; app?: boolean };
+// ?client=app marks the desktop client. ?project=<id> drops frames belonging to
+// other projects (frames with no project scope always pass). ?classes=decision,event
+// drops every other frame type. No params = every frame, which is what the web
+// UI subscribes with.
+export function sseStream(params: URLSearchParams = new URLSearchParams()): Response {
+  const project = params.get("project");
+  const classList = (params.get("classes") ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  let self: { id: string; send: (d: string) => void; app?: boolean; project?: string | null; classes?: Set<string> | null };
   const stream = new ReadableStream({
     start(controller) {
       const enc = new TextEncoder();
       self = {
         id: newId(),
         send: (data: string) => controller.enqueue(enc.encode(`data: ${data}\n\n`)),
-        app: isApp,
+        app: params.get("client") === "app",
+        project,
+        classes: classList.length ? new Set(classList) : null,
       };
       addClient(self);
       // headline so clients know the stream is live

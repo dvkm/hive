@@ -13,7 +13,7 @@ process.env.HIVE_HOME = HOME;
 
 const { openDb, newId, now } = await import("../src/db.ts");
 const { makeHandler, notifyManagerOfEvent, keepSupervisorWarm, flushManagerUpdate, MANAGER_WAKEUP_DEBOUNCE_MS, sweepManagerInboxes, projectInboxCounts, threadIdle } = await import("../src/api.ts");
-const { addClient } = await import("../src/bus.ts");
+const { addClient, removeClient } = await import("../src/bus.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { composeSupervisorBrief, createThread, managingThreadForTask } = await import("../src/chat.ts");
 const { composeBrief } = await import("../src/briefs.ts");
@@ -436,6 +436,26 @@ test("supervisor posts a reply that lands on the thread + streams", async () => 
   const last = thread.messages.at(-1);
   expect(last.role).toBe("assistant");
   expect(last.text).toContain("Queued task #12");
+});
+
+// A chat_messages row has no task_id and no project_id of its own: the scope
+// lives on the parent chat_threads row. Both broadcast paths must therefore
+// stamp the thread's project, or /api/stream?project= silently passes every
+// chat message from every project.
+test("chat_message frames carry the parent thread's project_id on both paths", async () => {
+  const frames: any[] = [];
+  const client = { id: "test-chat-scope", send: (d: string) => frames.push(JSON.parse(d)) };
+  addClient(client);
+  try {
+    await post("/api/chat/turn", { thread_id: threadId, text: "does this frame carry a project?" });
+    await post(`/api/chat/threads/${threadId}/reply`, { text: "it does now." });
+  } finally {
+    removeClient(client);
+  }
+
+  const chat = frames.filter((f) => f.type === "chat_message");
+  expect(chat.map((f) => f.message.role)).toEqual(["director", "assistant"]);
+  for (const f of chat) expect([f.message.role, f.project_id]).toEqual([f.message.role, projectId]);
 });
 
 test("reply to an unknown thread 404s; empty text 400s", async () => {
