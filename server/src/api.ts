@@ -89,7 +89,7 @@ import { evaluateAutoApprove, evaluateAutopilotApprove, NO_AUTO_ANSWER_REASON } 
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { confirmedRisks, cautionCleared, latestAutoReviewVerdict, reviewCompleteForHead } from "./reviewer.ts";
-import { explanationGate } from "./explainDiff.ts";
+import { explanationFor, explanationGate } from "./explainDiff.ts";
 import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
@@ -3507,9 +3507,15 @@ async function bounceForChanges(
 
 // POST /api/tasks/:id/request-changes body {notes} — bounce an in-review task
 // back to in_progress and deliver the captain's notes to the agent.
+//
+// One verb, two shapes. In review the work has not landed, so the notes go
+// straight back to the agent that is still holding it. Once it has SHIPPED
+// there is nothing to bounce: the same request files a follow-up task instead
+// (HIVE-510), and the original stays done.
 async function requestChanges(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
+  if (task.state === "done") return requestChangesOnShipped(db, task, body);
   if (task.state !== "in_review")
     return err(`task is '${task.state}', not 'in_review'`, 409);
   if (isJiraMirror(task))
@@ -4807,6 +4813,67 @@ async function ackCheckpoint(db: DB, herdr: Herdr, taskId: string, eventId: stri
     }
   }
   return json({ ok: true, delivered, followup_task_id });
+}
+
+// ---- request changes on shipped work (HIVE-510) ----
+
+// What the shipped task left behind, for the follow-up brief. Every line is
+// best effort: a report-only task has no PR, an old merge predates merged_files.
+function shippedContext(db: DB, task: any): string[] {
+  const lines = [
+    `- Original task: ${taskIdentifier(db, task)} "${task.title}" (task id ${task.id}, kind ${task.kind})`,
+    `- PR: ${task.pr_url || "none — this task shipped no PR"}`,
+  ];
+  const merged: any = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'merged' ORDER BY ts DESC, rowid DESC LIMIT 1")
+    .get(task.id);
+  const payload = merged ? JSON.parse(merged.payload || "{}") : null;
+  if (task.head_sha) lines.push(`- Commit that shipped: ${task.head_sha}${payload?.base ? ` (merged into ${payload.base})` : ""}`);
+  const files = Array.isArray(payload?.merged_files) ? payload.merged_files.filter((f: unknown) => typeof f === "string") : [];
+  if (files.length) lines.push(`- Files it touched: ${files.join(", ")}`);
+  const explanation = explanationFor(db, task.id, task.head_sha ?? null);
+  if (explanation?.url) lines.push(`- Explanation of the change: ${explanation.url}`);
+  return lines;
+}
+
+// The director read what shipped and wants it changed. The original task is
+// terminal and STAYS terminal — reopening it would rewrite the record of what
+// actually happened — so the correction becomes its own queued task. Same shape
+// as the late checkpoint flag above: parent_task_id back to the original, a
+// countable source, kind inherited, and enough shipped context in the brief that
+// the new agent never has to re-derive what was built.
+function requestChangesOnShipped(db: DB, task: any, body: any) {
+  const taskId = task.id;
+  if (isTrackingOnlyTask(task)) return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
+  const note = String(body?.note ?? body?.notes ?? "").trim();
+  if (!note) return err("a note is required — it is the brief for the follow-up task", 400);
+  const actor = actorOf(body);
+  const label = taskIdentifier(db, task);
+  const fid = newId();
+  const t = now();
+  const brief = [
+    `The director reviewed ${label} after it shipped and wants changes.`,
+    ``,
+    `WHAT THEY ASKED FOR (their words, this is the job):`,
+    note,
+    ``,
+    `WHAT ALREADY SHIPPED — start from this, do not rebuild it:`,
+    ...shippedContext(db, task),
+    ``,
+    `Original brief:`,
+    task.brief || "(none)",
+    ``,
+    `Do NOT reopen ${label}. It shipped and its record stays as it is. Make the change above as its own unit of work, with its own PR.`,
+  ].join("\n");
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, created_at, updated_at)
+     VALUES (?,?,?,?, 'queued', ?, 'director_rework', ?, ?, ?)`
+  ).run(fid, task.project_id, `Changes requested on ${label}: ${note.slice(0, 80)}`, brief, task.kind, taskId, t, t);
+  writeEvent(db, { task_id: fid, source: "director", type: "created", payload: { title: "director requested changes", original_task_id: taskId, actor } });
+  writeEvent(db, { task_id: taskId, source: "director", type: "changes_requested_after_ship", payload: { followup_task_id: fid, note, actor } });
+  const followup = getTask(db, fid);
+  broadcastTask(db, followup);
+  return json({ ok: true, followup_task_id: fid, followup_label: taskIdentifier(db, followup) });
 }
 
 // MCP servers whose tools open an interactive Allow/Deny dialog. A spawned

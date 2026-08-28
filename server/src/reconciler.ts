@@ -734,19 +734,34 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       } else {
         writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_closed", payload: { pr_url: t.pr_url } });
       }
-    } else if (state === "in_progress" && ["MERGED", "CLOSED"].includes(String(data.state).toUpperCase())) {
-      // A PR can be merged/closed by a human while its task is still held in
-      // in_progress (handoff to in_review is held on pending/failing CI — see
-      // the OPEN+in_progress branch above), and the task can die before ever
-      // reaching in_review. Record the terminal PR event either way so
-      // predecessorOpenPrUrl (api.ts) never cites an already-dead PR in a
-      // requeue brief — but skip the in_review side effects (steer, smoke,
-      // verifying transition): the task never reached review, so there's
-      // nothing to bounce back or advance. One-shot per task (no transition
-      // moves it off in_progress to stop this from recurring every cycle).
-      const type = String(data.state).toUpperCase() === "MERGED" ? "pr_merged" : "pr_closed";
-      const already = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = ? LIMIT 1").get(t.id, type);
-      if (!already) writeEvent(db, { task_id: t.id, source: "reconciler", type, payload: { pr_url: t.pr_url } });
+    } else if (state === "in_progress" && String(data.state).toUpperCase() === "MERGED") {
+      // A PR can be merged by a human (director hand-merge, a teammate on
+      // GitHub, auto-merge) while its task is still in_progress — handoff to
+      // in_review is otherwise held on CI (see the OPEN+in_progress branch
+      // above). This used to only record the fact and leave the task sitting
+      // in_progress until the stale sweep flagged it as a hung agent, which is
+      // the opposite of what a merged PR means (HIVE-507). Catch it up through
+      // review to verifying the same way the deferred branch above does, and
+      // tell the agent so it stands down instead of working on landed code.
+      writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_merged", payload: { pr_url: t.pr_url } });
+      transition(db, t.id, "in_review", { source: "reconciler", reason: "PR merged while in progress — catching up review", skipVerification: true });
+      transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged" });
+      await advanceAfterMerge(db, t.id, deps);
+      const msg = `hive: your PR ${t.pr_url} was already MERGED (outside hive). The task has moved on to verifying — stop work on this branch, it's already landed.`;
+      let delivered = false;
+      if (t.agent_target) {
+        try {
+          delivered = sendFailure(await h.send(t.agent_target, msg)) === null;
+        } catch {}
+      }
+      if (!delivered) queueSteerEvent(db, t.id, msg, "PR merged while in_progress; no live agent");
+    } else if (state === "in_progress" && String(data.state).toUpperCase() === "CLOSED") {
+      // Closed-not-merged with the task still in_progress: nothing reviewable
+      // exists, and nothing to bounce back from review either. Record the
+      // fact so predecessorOpenPrUrl (api.ts) never cites an already-dead PR
+      // in a requeue brief. One-shot per task.
+      const already = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'pr_closed' LIMIT 1").get(t.id);
+      if (!already) writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_closed", payload: { pr_url: t.pr_url } });
     } else if (ci === "failing" && state === "in_review" && !agentless) {
       // Checks went red AFTER the handoff: red is not reviewable. Send it back
       // to the agent to iterate; it returns automatically when green.
