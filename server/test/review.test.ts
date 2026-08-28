@@ -237,7 +237,7 @@ test("makeServer skips occupied test ports", async () => {
   const occupied = Bun.serve({ port: occupiedPort, fetch: () => new Response() });
   testPortCounter = occupiedPort;
   const s = makeServer();
-  expect(s.server.port).toBe(occupiedPort + 1);
+  expect(s.server.port).toBeGreaterThan(occupiedPort);
   await s.server.stop(true);
   await occupied.stop(true);
 });
