@@ -75,6 +75,17 @@ that mark a braindump as belonging to THIS project — e.g. `["coredata",
 "figma.com/file/…"]`. At `POST /api/intake` the raw text is scored against every
 project's name, repo basename, and these keywords, and the braindump is re-routed
 to the best match when it strictly out-scores the requested project).
+`intake_triage` (bool, default `false`; when true, each new ambient intake task
+— source `intake_*` or `watch` — is classified by one `claude -p` sonnet call
+before it can dispatch. A request with one clear reading is marked reviewed and
+proceeds. A request that reads two or more ways opens a decision card asking
+which reading to build, and the dispatcher holds the task until you answer. Every
+classifier failure falls through to "mechanical", so triage can never wedge
+intake. Classification runs in the background, so a slow one never delays the
+next message or watcher. The card it raises carries `decision_class:
+"intake_triage"`, which every automatic answering path refuses: the standing CI
+ruling, the chat supervisor, and the `decision_auto_answer_hours` timeout. Only
+you can answer it.)
 Domain-supervisor keys (see the Domain supervisors section):
 `supervisor_persona` (string, freeform planner identity included in every planner
 prompt), `plan_intake` (bool; when true, each new intake task auto-triggers a
@@ -676,7 +687,7 @@ agent's HTTP socket cannot reach. The GitHub credential stays server-side —
 hive shells out to `gh`, and the browser only ever names a commit or a tag.
 
 ### Tasks
-- `GET /api/tasks?state=&project_id=&test=` → `200 [Task, ...]` (newest `updated_at` first; all filters optional). Tasks under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
+- `GET /api/tasks?state=&project_id=&test=&compact=` → `200 [Task + {evidence_count, spawn_error, needs_you_since}, ...]` (newest `updated_at` first; all filters optional). `needs_you_since` is the latest entry into `in_review` or `failed`, and stays fixed when CI or metadata updates the task. `compact=1` omits task briefs and empty/default properties for list/bootstrap clients, and is gzip-compressed when accepted; fetch `GET /api/tasks/:id` when full task data is needed. Tasks under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
 - `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?, verification_cmds?, priority?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher and reconciler won't advance the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban. It is never auto-dispatched or staleness-supervised, is exempt from the done-evidence gate, and moves freely via transitions (`hive task move <id> <state>`). The board keeps these tasks in its separate Tracked view with the external state visible. Jira-keyed Hive work is grouped beneath the matching tracked card, with requeue chains collapsed to their latest attempt. `verification_cmds` is the task's verification contract: an array of `{name, cmd}` the agent must run before handing off (`name`: 1-32 chars of `a-z0-9-`, unique within the task; `cmd`: a non-empty string). Anything else → `400`. The agent brief renders it as a "Verification contract" section, and `hive emit <id> evidence --verify-name <name>` tags an artifact with the entry it came from (stored as `verify_name` on the `evidence` event). The contract is enforced at the review handoff: `in_progress` -> `in_review` is refused with `409` until every named command has a matching evidence event, and the refusal lists exactly the missing names (see the `verification_missing` event). `priority` is one of `now`, `next`, `normal`, `later`; anything else → `400`, and a non-director `source` asking for `now` → `403`. Omit it and the task inherits its parent's priority, or starts at `next` when the title/brief reads as security work, else `normal`. It is ORDERING only, never preemption — see [Priority](#priority) for the full inheritance and authority rules. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
@@ -1451,6 +1462,34 @@ A state change therefore produces both an `event` message (`type:"state_change"`
 and a `task` message. The client should upsert by `id`. There is no replay/backfill
 on connect; load current state via the REST endpoints, then apply stream deltas.
 
+**`project_id` on frames.** Every frame that belongs to a project carries a
+top-level `project_id`, so a client never has to join task → project itself. It
+comes from one of three places:
+
+- the task the frame names, looked up once and cached: `task`, `event`,
+  `decision`, `evidence`, `notification`, `usage`
+- a `project_id` already on the row itself: `incident`, `learning`
+- the parent chat thread: `chat_message`. A chat message row has no task and no
+  project of its own, so the server stamps the scope of its `chat_threads` row.
+  Messages on the portfolio-wide Chief of Staff thread have no project, so they
+  carry `"project_id": null` and are treated as fleet-wide.
+
+Fleet-wide frames have no project scope and carry no `project_id`: `hello`,
+`offline`, `chat_thread`, `chat_delivery`, `notify`, `reconciler_error`, and the
+reaper frames.
+
+**Query parameters (all optional).** With none, the stream behaves exactly as it
+always has: every frame, to every client. Filtering happens per client, so a
+filtered subscriber costs nothing extra for anyone else.
+
+| param | meaning |
+|-------|---------|
+| `client=app` | marks the Electron desktop client, which is the only client that can raise a native notification |
+| `project=<project_id>` | drop frames belonging to other projects. Frames with no project scope always pass |
+| `classes=<comma list>` | keep only these frame types, e.g. `classes=decision,event,task`. The `hello` headline is always sent |
+
+Example: `GET /api/stream?project=proj_e60f3994fbf7&classes=decision,event`
+
 ### Braindump intake — `POST /api/intake`
 Body `{project_id (required), text (required)}` → `202 {"ok":true, "task": Task}`
 | `400` (blank text, unknown `project_id`).
@@ -1610,12 +1649,13 @@ Nothing auto-assigns `now`, and nothing auto-assigns `later`.
   `priority` on each task in the chain you want it on (`hive task create
   --priority <p>`).
 
-It changes two things:
+It changes three things:
 
 - **Which queued task is picked up first.** The dispatcher orders its queue by
   priority, then by age. A `later` task never beats a `normal` one, however old
   it is. The reattach pass keeps its own ordering (oldest feedback first) —
   that is resumed work, not new work.
+- **Which item Focus shows first.** Every day in Focus promotes an item by one priority level, capped at `now`, then FIFO breaks ties. Age starts when a decision or checkpoint is created, a task enters review or failure, or its current stuck/dead health condition begins. CI and metadata updates do not reset it.
 - **Which approved PR lands first.** The land queue's dependency and conflict
   edges still decide the order; priority only breaks the tie among the PRs that
   are all ready in the same sweep.

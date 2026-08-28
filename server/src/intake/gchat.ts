@@ -28,6 +28,7 @@ import { enqueue } from "../notifications.ts";
 import { providerFor } from "../secrets.ts";
 import type { Exec } from "../exec.ts";
 import { defaultExec } from "../exec.ts";
+import { triageIntake } from "./triage.ts";
 import { runPlanner, type PlannerExec } from "../planner.ts";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
@@ -309,6 +310,13 @@ async function createIntakeTask(
       /* runPlanner records its own planner_error event; never fail the intake */
     }
   }
+  // Intake triage (config.intake_triage): mechanical messages clear the
+  // unreviewed hold themselves, ambiguous ones raise the director's card.
+  // Deliberately NOT awaited — the classifier can take up to 60s, and one slow
+  // message must not stall the rest of the poll cycle. The task is already held
+  // (created unreviewed) and triageIntake takes its own hold synchronously
+  // before its first await, so there is no window where it could dispatch.
+  triageIntake(db, task).catch((e) => console.error(`[hive] gchat: intake triage ${id}:`, e));
   return task;
 }
 

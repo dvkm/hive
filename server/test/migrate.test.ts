@@ -23,6 +23,11 @@ function columns(db: DB, table: string): string[] {
   return (db.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((r) => r.name);
 }
 
+// v24 collided this way before the check below existed, and both halves have
+// long since applied on live DBs under their own names. Renaming either one now
+// would re-run it, so this pair stays as the one grandfathered exception.
+const GRANDFATHERED_COLLISIONS = new Set(["v24-task-resume-context"]);
+
 // The skip-if-present machinery only works if every statement is one statement
 // that alreadyApplied can recognize, and if no two migrations create the same
 // object. None of that is enforceable at runtime, so enforce it here: a future
@@ -30,10 +35,20 @@ function columns(db: DB, table: string): string[] {
 // rather than shipping a migration recorded as applied without its effect.
 test("migrations are well-formed", () => {
   const names = new Set<string>();
+  const versions = new Set<string>();
   const created = new Set<string>();
   for (const m of MIGRATIONS) {
     expect(names.has(m.name)).toBe(false);
     names.add(m.name);
+
+    // Two branches each appending "v33-..." merge cleanly and leave two v33s.
+    // The names differ, so the dup check above passes and the collision ships.
+    const version = /^(v\d+)-/.exec(m.name);
+    if (!version) throw new Error(`${m.name}: migration names start with vN-`);
+    if (versions.has(version[1]) && !GRANDFATHERED_COLLISIONS.has(m.name)) {
+      throw new Error(`${m.name}: version ${version[1]} is already taken by another migration`);
+    }
+    versions.add(version[1]);
 
     for (const stmt of m.statements) {
       const create = CREATES.exec(stmt);

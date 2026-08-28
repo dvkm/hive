@@ -24,6 +24,20 @@ export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
 // not the agent doing something, and letting it reset the clock would hide a
 // dead task behind hive's own retry loop.
 const RECONCILER_NOISE = new Set(["stale", "recovery_nudge", "recovery", "spawn_error"]);
+const HEALTH_EVENT_TYPES = [
+  "agent_status",
+  "dialog_auto_approved",
+  "dialog_auto_declined",
+  "merge_failed",
+  "merge_blocked_destructive",
+  "merged",
+  "pr_merged",
+  "pr_synchronized",
+  "ready_for_review",
+  "state_change",
+  "recovery_nudge",
+  "stale",
+];
 export interface Health {
   status: HealthStatus;
   reason: string | null;
@@ -121,8 +135,10 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   }
 
   const events = db
-    .query("SELECT type, ts, payload FROM events WHERE task_id = ? ORDER BY ts DESC")
-    .all(task.id) as { type: string; ts: string; payload: string }[];
+    .query(`SELECT type, ts, payload FROM events
+      WHERE task_id = ? AND type IN (${HEALTH_EVENT_TYPES.map(() => "?").join(",")})
+      ORDER BY ts DESC`)
+    .all(task.id, ...HEALTH_EVENT_TYPES) as { type: string; ts: string; payload: string }[];
 
   // Latest recorded liveness from the reconciler's probe.
   let lastStatus: string | null = null;
@@ -193,8 +209,10 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   // wrote a `recovery` row that reset this clock — so a frozen pane read
   // HEALTHY, lap after lap, with a byte-identical tail (#1149/#1156, 2026-08-20).
   // A row hive wrote ABOUT an agent is not evidence the agent did anything.
-  const activity = events.find((e) => !RECONCILER_NOISE.has(e.type));
-  const activityTs = activity ? activity.ts : (task.updated_at as string);
+  const activity = db
+    .query(`SELECT ts FROM events WHERE task_id = ? AND type NOT IN (${[...RECONCILER_NOISE].map(() => "?").join(",")}) ORDER BY ts DESC LIMIT 1`)
+    .get(task.id, ...RECONCILER_NOISE) as { ts: string } | undefined;
+  const activityTs = activity?.ts ?? (task.updated_at as string);
   const age = nowMs - Date.parse(activityTs);
 
   // Recovery is underway if hive nudged AFTER the last real activity. Keyed off
@@ -261,6 +279,11 @@ export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null
     task.state === "failed"
       ? ((db.query("SELECT id FROM tasks WHERE parent_task_id = ? AND source = 'requeue' LIMIT 1").get(task.id) as any)?.id ?? null)
       : null;
+  const needs_you_since = ["in_review", "failed"].includes(task.state)
+    ? task.needs_you_since ?? (db.query(
+        "SELECT MAX(ts) AS ts FROM events WHERE task_id = ? AND type = 'state_change' AND json_extract(payload, '$.to') = ?"
+      ).get(task.id, task.state) as { ts: string | null }).ts ?? task.updated_at
+    : null;
   // Server-computed so the web app never has to re-derive "was this ever
   // spawned" from raw event history — see supervision.ts's neverDispatched.
   // `sidecar` is the latest background check on this task's own commits, so the
@@ -270,7 +293,7 @@ export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null
   // `review_actionable` (HIVE-500) is server-computed for the same reason health
   // is: it reads events the browser never sees. Only in-review tasks carry it;
   // everywhere else it is false and means nothing.
-  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, never_dispatched: neverDispatched(db, task), review_actionable: reviewActionable(db, task), sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
+  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), review_actionable: reviewActionable(db, task), sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
 }
 
 // Batched form of taskWithHealth for list endpoints (task HIVE-447): looks up
@@ -321,4 +344,3 @@ export function noteToolStart(db: DB, tool: string, failure: string | null): voi
   if (!getSetting(db, degradedKey)) console.error(`[hive] ${tool} failed to start on ${streak} cycles in a row; marking health degraded: ${failure}`);
   setSetting(db, degradedKey, failure);
 }
-

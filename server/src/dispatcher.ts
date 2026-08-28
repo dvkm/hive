@@ -40,6 +40,7 @@ import { isTrackingOnlyTask } from "./supervision.ts";
 import { queuedSteers } from "./steer.ts";
 import { managingThreadForTask } from "./chat.ts";
 import { repoMismatchUnresolved } from "./repoTarget.ts";
+import { triageHold } from "./intake/triage.ts";
 import type { Exec } from "./exec.ts";
 
 // Chores included since 2026-07-12: the queue sat at 10 tasks / 1 live agent
@@ -266,6 +267,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         if (!kinds.includes(task.kind) && task.source !== "requeue" && !gardenerTask) continue; // chore / human-titled tasks excluded
 
         if (task.source?.startsWith("intake_") && !isReviewed(db, task.id)) continue; // unreviewed intake
+        if (triageHold(db, task)) continue; // intake triage asked the director which reading to build
         if (isTrackingOnlyTask(task)) continue; // tracking-only: never spawned
 
         if (!hasCapacity(task, cfg)) continue;

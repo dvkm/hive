@@ -3,6 +3,7 @@ import { openDb, newId, now, type DB } from "../src/db.ts";
 import { landGraph, landOnce, markLand } from "../src/landQueue.ts";
 import { transition, writeEvent } from "../src/state.ts";
 import { apiAnswerDecision } from "../src/api.ts";
+import { queueSteerEvent, queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers } from "../src/steer.ts";
 import type { Herdr } from "../src/runtime/herdr.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -356,4 +357,68 @@ test("a stale pause card closes itself once the PR leaves the queue", async () =
   markLand(db, [a], false); // director unmarks it
   await landOnce(db, { exec: filesExec({}), merge: mergeStub(db).merge });
   expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(0);
+});
+
+test("a queued corrective steer holds the retry; delivery + a new head resumes it (HIVE-444)", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  writeEvent(db, { task_id: a, source: "reconciler", type: "pr_synchronized", payload: { head_sha: "broken-sha" } });
+  queueSteerEvent(db, a, "REQUESTS-CHANGES: migration table is mangled", "test steer");
+
+  // The steer sits undelivered (agent between turns): no attempt against the
+  // known-broken branch, and the hold is logged.
+  const held = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: held.merge });
+  expect(held.calls).toEqual([]);
+  const heldEvent = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'land_retry_held'").get(a) as any;
+  expect(JSON.parse(heldEvent.payload).reason).toBe("pending steer");
+
+  // Steer delivers, the agent pushes a fix, and the task comes back to review —
+  // but still on the same head that was known broken: still held.
+  const steers = queuedSteers(db, a);
+  markSteersDelivered(db, steers.map((s) => s.id), "drain");
+  resumeReviewForDeliveredSteers(db, a, steers, "drain");
+  transition(db, a, "in_review", { source: "agent", reason: "fixed the migration" });
+  const stillHeld = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: stillHeld.merge });
+  expect(stillHeld.calls).toEqual([]);
+
+  // A new head_sha lands: the retry resumes. Bumped a tick later since the
+  // changes_requested/pr_synchronized pair can otherwise land in the same ms.
+  const sync = writeEvent(db, { task_id: a, source: "reconciler", type: "pr_synchronized", payload: { head_sha: "fixed-sha" } });
+  db.query("UPDATE events SET ts = ? WHERE id = ?").run(new Date(Date.parse(sync.ts) + 1000).toISOString(), sync.id);
+  const resumed = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: resumed.merge });
+  expect(resumed.calls).toEqual([a]);
+});
+
+test("a held retry logs land_retry_held once per episode, not once per sweep", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  queueSteerEvent(db, a, "REQUESTS-CHANGES: still mangled", "test steer");
+
+  // Same undelivered steer, three sweeps in a row: only the first sweep should
+  // write the hold event (HIVE-444 follow-up — an agent slow between turns must
+  // not write this event every 30s indefinitely).
+  for (let i = 0; i < 3; i++) await landOnce(db, { exec: filesExec({}), merge: mergeStub(db).merge });
+  const held = db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'land_retry_held'").get(a) as any;
+  expect(held.n).toBe(1);
+});
+
+test("unmarking drops the retry even mid-backoff — zero attempts after (HIVE-444 addendum)", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+
+  const first = mergeStub(db, { [a]: "Base branch was modified. Review and try the merge again." });
+  await landOnce(db, { exec: filesExec({}), merge: first.merge });
+  expect(first.calls).toEqual([a]);
+
+  markLand(db, [a], false); // director unqueues it while it's still backing off
+  ageLandAttempts(db, a, 3_600_000); // well past any backoff window
+  const after = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: after.merge });
+  expect(after.calls).toEqual([]);
 });

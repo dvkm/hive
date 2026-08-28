@@ -199,6 +199,8 @@ const prGardener: Check = (v) => {
     max_actions_per_sweep: positiveInt,
     max_fix_attempts: positiveInt,
     max_gardener_agents: positiveInt,
+    adopt_untracked: bool,
+    adopt_skip_labels: strArray,
   };
   for (const [key, value] of Object.entries(v as Record<string, unknown>)) {
     if (!Object.hasOwn(checks, key)) return `.${key} is not a known PR gardener key`;
@@ -239,6 +241,7 @@ const CHECKS: Record<string, Check> = {
   test: bool, // test/ephemeral project, hidden from director surfaces (testProjects.ts)
   plan_intake: bool,
   plan_gate,
+  intake_triage: bool, // classify ambient intake before dispatch (intake/triage.ts)
   intake_keywords: strArray,
   // subprocess argv overrides (see above)
   agent_argv: argv,

@@ -112,9 +112,10 @@ export interface Task {
   display_id?: string; // project-scoped human handle, e.g. HIVE-247
   project_id: string;
   title: string;
-  brief: string;
+  brief?: string | null; // omitted from the compact list; present on task detail
   state: State;
   kind: Kind;
+  priority?: "now" | "next" | "normal" | "later";
   agent_target: string | null;
   worktree_path: string | null;
   branch: string | null;
@@ -131,8 +132,11 @@ export interface Task {
   depends_on: string[]; // task ids governed by the server dependency gate (docs/API.md)
   deferred_until?: string | null; // parked pending an offline human action; nudges suppressed while future-dated
   land_queued_at?: string | null; // marked approved-to-land; the land queue merges it in graph order
+  needs_you_since?: string | null; // when review/failed entered Focus; unlike updated_at, CI and metadata cannot reset it
   health?: Health | null;
   sidecar?: SidecarReport | null; // latest background check on this task's commits
+  evidence_count?: number; // list endpoint only; avoids fetching every task detail on startup
+  spawn_error?: boolean; // list endpoint only; prior spawn failed and no spawn ever succeeded
   requeued_to?: string | null; // successor id when failed + auto-requeued
   review_actionable?: boolean; // in_review AND the director can act on it now (server-computed, HIVE-500)
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
@@ -643,6 +647,27 @@ async function req<T>(path: string, init?: RequestInit, retried = false): Promis
   return res.json() as Promise<T>;
 }
 
+const TASKS_PATH = "/api/tasks?compact=1";
+const TASKS_CACHE = "hive-task-list-v1";
+const taskCacheKey = () => new URL(BASE + TASKS_PATH, globalThis.location?.href || "http://localhost/").href;
+async function cachedTasks(): Promise<Task[] | null> {
+  if (!("caches" in globalThis)) return null;
+  try {
+    const response = await (await caches.open(TASKS_CACHE)).match(taskCacheKey());
+    return response ? response.json() : null;
+  } catch {
+    return null;
+  }
+}
+async function cacheTasks(tasks: Task[]): Promise<void> {
+  if (!("caches" in globalThis)) return;
+  try {
+    await (await caches.open(TASKS_CACHE)).put(taskCacheKey(), new Response(JSON.stringify(tasks), { headers: { "Content-Type": "application/json" } }));
+  } catch {
+    /* cache is an optional fast path */
+  }
+}
+
 // JSON when there's nothing to upload, multipart when there is. The server
 // accepts either on /send, POST /api/tasks and PUT /api/tasks/:id.
 function bodyFor(fields: Record<string, unknown>, files?: File[]): string | FormData {
@@ -813,9 +838,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ source: "director", actor: directorActor() }),
     }),
-  tasks: (q: { state?: State; project_id?: string } = {}) => {
+  cachedTasks,
+  tasks: async (q: { state?: State; project_id?: string } = {}) => {
     const p = new URLSearchParams(q as Record<string, string>).toString();
-    return req<Task[]>(`/api/tasks${p ? "?" + p : ""}`);
+    const tasks = await req<Task[]>(p ? `/api/tasks?${p}&compact=1` : TASKS_PATH);
+    if (!p) void cacheTasks(tasks);
+    return tasks;
   },
   task: (id: string) => req<TaskDetail>(`/api/tasks/${id}`),
   pane: (id: string, lines = 200) =>

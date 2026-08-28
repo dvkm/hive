@@ -631,6 +631,17 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v36-task-legacy-pr-url",
     statements: [`ALTER TABLE tasks ADD COLUMN legacy_pr_url TEXT`],
   },
+  // A decision that names its own class. Set on cards no automation may ever
+  // answer for the director (today: intake triage), and checked by every
+  // auto-answer path.
+  {
+    name: "v37-decision-class",
+    statements: [`ALTER TABLE decisions ADD COLUMN decision_class TEXT`],
+  },
+  {
+    name: "v38-events-type-task-index",
+    statements: [`CREATE INDEX idx_events_type_task ON events(type, task_id, ts)`],
+  },
 ];
 
 // -------------------------------------------------------------- settings

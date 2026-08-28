@@ -18,6 +18,47 @@ export type NeedsYouItem =
   | { kind: "attention"; id: string; task: Task }
   | { kind: "waiting"; id: string; task: Task; blockedBy: BlockingTaskRef[] };
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+const PRIORITY_HEAD_START: Record<NonNullable<Task["priority"]>, number> = {
+  now: 3 * DAY_MS,
+  next: 2 * DAY_MS,
+  normal: DAY_MS,
+  later: 0,
+};
+
+function focusItemKey(item: NeedsYouItem, tasks: Map<string, Task>): [number, number] {
+  const candidates = item.kind === "quiz_digest"
+    ? item.quizzes.map((quiz) => ({ ts: quiz.ts, task: tasks.get(quiz.task_id) }))
+    : item.kind === "decision"
+      ? [{ ts: item.decision.ts, task: tasks.get(item.decision.task_id) }]
+      : item.kind === "checkpoint"
+        ? [{ ts: item.checkpoint.ts, task: tasks.get(item.checkpoint.task_id) }]
+        : [{
+            ts: item.kind === "attention"
+              ? item.task.health?.since ?? item.task.needs_you_since ?? item.task.updated_at
+              : item.task.needs_you_since ?? item.task.updated_at,
+            task: item.task,
+          }];
+
+  return candidates.reduce<[number, number]>((best, { ts, task }) => {
+    const time = Date.parse(ts);
+    const key: [number, number] = Number.isNaN(time)
+      ? [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY]
+      : [time - PRIORITY_HEAD_START[task?.priority ?? "normal"], time];
+    return key[0] < best[0] || (key[0] === best[0] && key[1] < best[1]) ? key : best;
+  }, [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY]);
+}
+
+// Priority is a head start, not a permanent lane: one day per level means an
+// old lower-priority item eventually outranks a steady stream of new urgent work.
+export function orderFocusItems(items: NeedsYouItem[], tasks: Task[]): NeedsYouItem[] {
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  return items
+    .map((item, index) => ({ item, index, key: focusItemKey(item, byId) }))
+    .sort((a, b) => a.key[0] - b.key[0] || a.key[1] - b.key[1] || a.index - b.index)
+    .map(({ item }) => item);
+}
+
 // Mirrors server/src/health.ts's needsAttention — keep both excluding the
 // same unsupervised tasks (see server/src/supervision.ts's isSupervisedTask).
 // A never-spawned external task (tracking-only, no agent_target) is excluded;

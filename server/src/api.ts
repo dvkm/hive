@@ -7,7 +7,7 @@ import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db
 import { taskWithHealth, tasksWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
 import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { activeProjects, isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
-import { addClient, removeClient, broadcast, appClientCount } from "./bus.ts";
+import { addClient, removeClient, broadcast, appClientCount, setProjectResolver } from "./bus.ts";
 import {
   transition,
   writeEvent,
@@ -80,11 +80,12 @@ import {
   type JiraDeps,
 } from "./intake/jira.ts";
 import { detectDuplicate, mergeInto, openDuplicateDecision, resolveDuplicateForDecision, duplicateClusters } from "./dedup.ts";
+import { triageIntake, resolveIntakeTriageForDecision } from "./intake/triage.ts";
 import { noteRepoMismatch, resolveRepoMismatchForDecision } from "./repoTarget.ts";
 import { costUsd } from "./pricing.ts";
 import { checkUsageGuardrails, resolveUsageCapForDecision, taskSpend } from "./costs.ts";
 import { resolveScopeDriftForDecision } from "./drift.ts";
-import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
+import { evaluateAutoApprove, evaluateAutopilotApprove, NO_AUTO_ANSWER_REASON } from "./autoapprove.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { confirmedRisks, cautionCleared, latestAutoReviewVerdict, reviewPipelineSettled } from "./reviewer.ts";
@@ -303,6 +304,8 @@ export function requireWriteAuth(db: DB, req: Request, url: URL): boolean {
 
 export function makeHandler(db: DB, deps: HandlerDeps = {}) {
   const herdr = deps.herdr ?? defaultHerdr;
+  // Lets bus.ts stamp project_id onto frames that only name a task.
+  setProjectResolver((taskId) => (db.query("SELECT project_id FROM tasks WHERE id = ?").get(taskId) as any)?.project_id ?? null);
   async function handle(req: Request, server?: { requestIP?: (r: Request) => { address: string } | null }): Promise<Response> {
     const url = new URL(req.url);
     const { pathname } = url;
@@ -319,7 +322,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
     try {
       // ---- SSE stream ----
-      if (pathname === "/api/stream" && method === "GET") return sseStream(url.searchParams.get("client") === "app");
+      if (pathname === "/api/stream" && method === "GET") return sseStream(url.searchParams);
 
       // ---- health ----
       if (pathname === "/api/health" && method === "GET") {
@@ -809,6 +812,17 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         });
       }
     }
+    if (pathname === "/api/tasks" && new URL(req.url).searchParams.get("compact") === "1" &&
+        req.headers.get("accept-encoding")?.includes("gzip") && response.body) {
+      const headers = new Headers(response.headers);
+      headers.set("Content-Encoding", "gzip");
+      headers.set("Vary", "Accept-Encoding");
+      return new Response(response.body.pipeThrough(new CompressionStream("gzip")), {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    }
     return response;
   };
 }
@@ -1075,7 +1089,11 @@ async function chatTurnOnThread(
   thread: ChatThread,
   text: string
 ): Promise<{ thread_id: string; delivery: string }> {
-  broadcast({ type: "chat_message", message: appendMessage(db, thread.id, "director", text) });
+  broadcast({
+    type: "chat_message",
+    project_id: thread.project_id,
+    message: appendMessage(db, thread.id, "director", text),
+  });
   keepWarmAttempts.delete(thread.id); // a director turn restarts keep-warm's patience
 
   // The message the session receives is prefixed so it always knows which thread
@@ -1102,7 +1120,11 @@ function chatDeliveryStatus(threadId: string, status: string, error?: string): v
 // A failed turn must be visible in the conversation, not a silent hang. Message
 // roles are director|assistant, so the notice rides in as an assistant message.
 function postThreadNotice(db: DB, threadId: string, text: string): void {
-  broadcast({ type: "chat_message", message: appendMessage(db, threadId, "assistant", text) });
+  broadcast({
+    type: "chat_message",
+    project_id: getThread(db, threadId)?.project_id ?? null,
+    message: appendMessage(db, threadId, "assistant", text),
+  });
 }
 
 // Tests (and any caller that must observe a settled turn) await the thread's
@@ -1526,7 +1548,7 @@ function chatReply(db: DB, threadId: string, body: any): Response {
     return json({ ok: true, suppressed: true });
 
   const message = appendMessage(db, threadId, "assistant", text, freshActions);
-  broadcast({ type: "chat_message", message });
+  broadcast({ type: "chat_message", project_id: thread.project_id, message });
   return json({ ok: true, message });
 }
 
@@ -2107,6 +2129,10 @@ async function createTask(db: DB, req: Request): Promise<Response> {
   // never gets a card it can't act on. A strong mismatch rides back on the
   // response as `warning` (the CLI prints it) and holds dispatch via its card.
   const warning = noteRepoMismatch(db, getTask(db, row.id));
+  // Ambient intake only (source intake_*/watch), and only when the project opted
+  // in. Deliberately not awaited: a 60s classifier must not hold the create
+  // response, and the dispatcher holds the task meanwhile.
+  triageIntake(db, getTask(db, row.id)).catch((e) => console.error(`[hive] intake triage ${row.id}:`, e));
   return json({ ...taskWithHealth(db, getTask(db, row.id)), ...(warning ? { warning } : {}) }, 201);
 }
 
@@ -2275,6 +2301,7 @@ function mergeIntoEndpoint(db: DB, id: string, body: any): Response {
 function listTasks(db: DB, url: URL): Response {
   const state = url.searchParams.get("state");
   const projectId = url.searchParams.get("project_id");
+  const compact = url.searchParams.get("compact") === "1";
   const includeTest = url.searchParams.get("test") === "all";
   const where: string[] = [];
   const args: any[] = [];
@@ -2284,10 +2311,29 @@ function listTasks(db: DB, url: URL): Response {
   // from director surfaces by default, same as the project itself.
   if (!includeTest) where.push(notTestProjectSql("p.config"));
   const sql =
-    "SELECT t.* FROM tasks t JOIN projects p ON p.id = t.project_id" +
+    `SELECT t.*,
+      CASE WHEN t.state IN ('in_review', 'failed') THEN COALESCE(
+        (SELECT MAX(e.ts) FROM events e WHERE e.task_id = t.id AND e.type = 'state_change'
+          AND json_extract(e.payload, '$.to') = t.state), t.updated_at)
+      END AS needs_you_since
+     FROM tasks t JOIN projects p ON p.id = t.project_id` +
     (where.length ? " WHERE " + where.join(" AND ") : "") +
     " ORDER BY t.updated_at DESC";
-  return json(tasksWithHealth(db, db.query(sql).all(...args).map(parseTask)));
+  const tasks = tasksWithHealth(db, db.query(sql).all(...args).map(parseTask));
+  return json(tasks.map((task) => {
+    const listed = {
+      ...task,
+      ...(compact ? { brief: undefined } : {}),
+      evidence_count: evidenceCount(db, task.id),
+      spawn_error: task.state === "queued" &&
+        !!db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawn_error' LIMIT 1").get(task.id) &&
+        !db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawned' LIMIT 1").get(task.id),
+    };
+    return compact
+      ? Object.fromEntries(Object.entries(listed).filter(([, value]) =>
+          value != null && value !== false && value !== 0 && (!Array.isArray(value) || value.length)))
+      : listed;
+  }));
 }
 
 // Activity feed: reverse-chronological events across ALL tasks, each enriched
@@ -6535,7 +6581,17 @@ function standingCiRuling(db: DB, projectId: string, signal: string, options: an
 
 export function createDecision(
   db: DB,
-  d: { task_id: string; title: string; context?: string | null; risk?: string | null; blast_radius?: string | null; options?: any[] }
+  d: {
+    task_id: string;
+    title: string;
+    context?: string | null;
+    risk?: string | null;
+    blast_radius?: string | null;
+    options?: any[];
+    // Set this on a card only the director may ever answer. Every auto-answer
+    // path refuses a classed card (see NO_AUTO_ANSWER_REASON in autoapprove.ts).
+    decision_class?: string | null;
+  }
 ): any {
   if (!getTask(db, d.task_id)) throw new Error("unknown task_id");
   const options = Array.isArray(d.options) && d.options.length ? d.options : DEFAULT_OPTIONS;
@@ -6556,15 +6612,16 @@ export function createDecision(
     answered_at: null,
     ci_status_at_card: cited.status,
     ci_signal: cited.signal,
+    decision_class: d.decision_class ?? null,
   };
   db.query(
     `INSERT INTO decisions (id, task_id, ts, title, context, risk, blast_radius,
-      options, status, answer_key, answer_note, draft_note, answered_at, ci_status_at_card, ci_signal)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      options, status, answer_key, answer_note, draft_note, answered_at, ci_status_at_card, ci_signal, decision_class)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.task_id, row.ts, row.title, row.context, row.risk,
     row.blast_radius, row.options, row.status, row.answer_key, row.answer_note,
-    row.draft_note, row.answered_at, row.ci_status_at_card, row.ci_signal
+    row.draft_note, row.answered_at, row.ci_status_at_card, row.ci_signal, row.decision_class
   );
   writeEvent(db, { task_id: d.task_id, source: "agent", type: "needs-decision", payload: { decision_id: row.id, title: row.title } });
   // Move task into needs_decision only from in_progress — an agent mid-work
@@ -6580,7 +6637,10 @@ export function createDecision(
   // Same outage, same ruling: answer it now with what the director already
   // decided, and do NOT notify — a second identical question is the interruption
   // this exists to remove.
-  const ruling = row.ci_signal ? standingCiRuling(db, task.project_id, row.ci_signal, options) : null;
+  // A classed card is never answered by automation, this standing ruling
+  // included — the director has to see it.
+  const ruling =
+    row.ci_signal && !row.decision_class ? standingCiRuling(db, task.project_id, row.ci_signal, options) : null;
   if (ruling) {
     const res = apiAnswerDecision(db, defaultHerdr, row.id, {
       answer_key: ruling.key,
@@ -6758,6 +6818,11 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
   if (!ANSWER_SOURCES.includes(answeredBy))
     return err(`source '${answeredBy}' is not one of ${ANSWER_SOURCES.join("|")}`, 400);
   const answeredActor = actorOf(body);
+  // Backstop for the classed cards. The sweeps that could reach here are gated
+  // at their own source too, so this only ever fires on a new automated caller
+  // — which is exactly when we want it to.
+  if (r.decision_class && (answeredBy === "system" || answeredBy === "chat_supervisor"))
+    return json({ effect: "escalate", category: String(r.decision_class), reason: NO_AUTO_ANSWER_REASON }, 403);
   if (answeredBy === "chat_supervisor" && !supervisorVerified) {
     if (!answeredActor || !getThread(db, String(answeredActor)))
       return err("chat_supervisor decision answers require a valid thread actor", 403);
@@ -6811,6 +6876,7 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     resolveRefCaptureForDecision(db, id, answerKey, answerNote),
     resolveDependentsWedgedForDecision(db, id, answerKey, successorId, answeredBy),
     resolveLandPauseForDecision(db, id, answerKey),
+    resolveIntakeTriageForDecision(db, id, answerKey, answerNote),
     resolveServingFollowForDecision(db, id, answerKey),
   ].some(Boolean);
   if (!claimed) {
@@ -7068,15 +7134,23 @@ function updatePolicy(db: DB, id: string, body: any): Response {
 }
 
 // ---------------------------------------------------------------- SSE
-function sseStream(isApp = false): Response {
-  let self: { id: string; send: (d: string) => void; app?: boolean };
+// ?client=app marks the desktop client. ?project=<id> drops frames belonging to
+// other projects (frames with no project scope always pass). ?classes=decision,event
+// drops every other frame type. No params = every frame, which is what the web
+// UI subscribes with.
+export function sseStream(params: URLSearchParams = new URLSearchParams()): Response {
+  const project = params.get("project");
+  const classList = (params.get("classes") ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  let self: { id: string; send: (d: string) => void; app?: boolean; project?: string | null; classes?: Set<string> | null };
   const stream = new ReadableStream({
     start(controller) {
       const enc = new TextEncoder();
       self = {
         id: newId(),
         send: (data: string) => controller.enqueue(enc.encode(`data: ${data}\n\n`)),
-        app: isApp,
+        app: params.get("client") === "app",
+        project,
+        classes: classList.length ? new Set(classList) : null,
       };
       addClient(self);
       // headline so clients know the stream is live

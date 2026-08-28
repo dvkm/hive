@@ -28,6 +28,12 @@ describe("PR Gardener classifier", () => {
     expect(classifyPr({ ...ready, directorDeciding: true, override: "force_close" }).action).toBe("close");
   });
 
+  test("an adopted PR needs a decision, and says why in the director's words", () => {
+    const adopted = classifyPr({ ...ready, linkedTaskState: "queued", adopted: true });
+    expect(adopted.action).toBe("decision");
+    expect(adopted.reason).toContain("opened outside Hive");
+  });
+
   test("sensitive paths always need a decision", () => {
     expect(classifyPr({ ...ready, sensitive: true }).action).toBe("decision");
   });
@@ -131,5 +137,7 @@ test("PR Gardener config validates its guarded settings", () => {
   expect(validateProjectConfig({ pr_gardener: { enabled: true, cadence: "30m", sensitive_paths: ["src/auth/**"], max_gardener_agents: 1 } })).toBeNull();
   expect(validateProjectConfig({ pr_gardener: { max_gardener_agents: 0 } })).toContain("positive integer");
   expect(validateProjectConfig({ pr_gardener: { max_actions_per_sweep: 0 } })).toContain("positive integer");
+  expect(validateProjectConfig({ pr_gardener: { adopt_untracked: true, adopt_skip_labels: ["no-hive"] } })).toBeNull();
+  expect(validateProjectConfig({ pr_gardener: { adopt_untracked: "yes" } })).toContain("adopt_untracked");
   expect(validateProjectConfig({ pr_gardener: { surprise: true } })).toContain("not a known PR gardener key");
 });

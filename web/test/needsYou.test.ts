@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { Checkpoint, Decision, Task, UnderstandingQuiz } from "../src/lib/api";
-import { getNeedsYouItems, itemProject, trackedSubtasks } from "../src/lib/needsYou";
+import { getNeedsYouItems, itemProject, orderFocusItems, trackedSubtasks } from "../src/lib/needsYou";
 import { inProjectFilter } from "../src/lib/projectFilter";
 import { JiraPanel, jiraMoveHint, jiraMoveSummary, jiraNextAutomaticText, jiraPanelNotice, trackingBindingNotice } from "../src/views/Task";
 
@@ -157,6 +157,28 @@ test("reviews the director cannot act on split into review_pending", () => {
     ["no-report", "review_pending"],
     ["ready-1", "review"],
     ["ready-2", "review"],
+  ]);
+});
+
+test("Focus gives priority a head start without starving old low-priority work", () => {
+  const tasks = [
+    task("old-later", "in_review", { priority: "later", needs_you_since: "2026-08-20T00:00:00Z", updated_at: "2026-08-24T00:00:00Z" }),
+    task("new-now", "in_review", { priority: "now", updated_at: "2026-08-23T00:00:00Z" }),
+    task("new-normal", "in_review", { priority: "normal", updated_at: "2026-08-24T00:00:00Z" }),
+    task("new-later", "in_review", { priority: "later", updated_at: "2026-08-24T00:00:00Z" }),
+  ];
+  const items = [
+    { kind: "review" as const, id: tasks[0].id, task: tasks[0] },
+    { kind: "decision" as const, id: "decision-now", decision: { id: "decision-now", task_id: tasks[1].id, ts: tasks[1].updated_at } as Decision },
+    { kind: "checkpoint" as const, id: "checkpoint-normal", checkpoint: { id: "checkpoint-normal", task_id: tasks[2].id, ts: tasks[2].updated_at } as Checkpoint },
+    { kind: "review" as const, id: tasks[3].id, task: tasks[3] },
+  ];
+
+  expect(orderFocusItems(items, tasks).map((item) => item.id)).toEqual([
+    "old-later",
+    "decision-now",
+    "checkpoint-normal",
+    "new-later",
   ]);
 });
 
