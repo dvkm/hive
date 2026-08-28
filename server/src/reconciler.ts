@@ -137,6 +137,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   };
   await step("surfaceTrackingBindings", () => surfaceTrackingBindings(db));
   await step("syncAgents", () => syncAgents(db, deps));
+  await step("archiveOrphanedDialogCards", () => archiveOrphanedDialogCards(db));
   await step("drainSteers", () => drainSteers(db, deps));
   await step("advanceFinished", () => advanceFinished(db, deps));
   await step("nagOpenDecisions", () => nagOpenDecisions(db, (deps.nowMs ?? (() => Date.now()))()));
@@ -1193,6 +1194,40 @@ export async function probePrReadiness(
       return { ok: true, data: current, ci };
   }
   return { ok: false };
+}
+
+// A "blocked on a dialog" card answers by sending a keystroke to a specific
+// pane (recoverBlockedDialog / resolveBlockedForDecision). If that agent died
+// or was respawned since the card opened, the keystroke has nowhere to land —
+// the card is an unanswerable orphan (seen live 2026-08-25: five stuck open).
+// syncAgents already confirms death (lastAgentStatus 'gone' — the same
+// confirmGone path that guards against the false-dead registry-wipe incident),
+// so reuse that signal instead of re-probing herdr here. Never touches
+// non-dialog cards: the title match is the same one recoverBlockedDialog uses
+// to avoid opening duplicates.
+export function archiveOrphanedDialogCards(db: DB): number {
+  const rows = db
+    .query(
+      `SELECT d.id, d.title, d.ts, d.task_id, t.agent_target FROM decisions d JOIN tasks t ON t.id = d.task_id
+        WHERE d.status = 'open' AND d.title LIKE 'Agent blocked on a dialog%'`
+    )
+    .all() as { id: string; title: string; ts: string; task_id: string; agent_target: string | null }[];
+  let archived = 0;
+  for (const r of rows) {
+    const respawned = db
+      .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawned' AND ts > ? LIMIT 1")
+      .get(r.task_id, r.ts);
+    const dead = !r.agent_target || lastAgentStatus(db, r.task_id) === "gone";
+    if (!respawned && !dead) continue;
+    apiDismissDecision(db, r.id, {
+      reason: "dialog_agent_gone",
+      steer:
+        `hive auto-archived your decision card "${r.title}": the agent it was waiting on ` +
+        `${respawned ? "was respawned" : "is gone"} since the card opened, so the dialog it named no longer exists. Carry on.`,
+    });
+    archived++;
+  }
+  return archived;
 }
 
 // Signal freshness. A card that cited red checks is only worth the director's
