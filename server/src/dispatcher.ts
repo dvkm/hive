@@ -36,7 +36,7 @@ import { isOffline, setSetting, getSetting, now } from "./db.ts";
 import { Herdr, herdr as defaultHerdr, isHerdrUnreachable } from "./runtime/herdr.ts";
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
-import { unmetDeps, noteDependencyBlock } from "./state.ts";
+import { isSelfAuditLineage, unmetDeps, noteDependencyBlock } from "./state.ts";
 import { isTrackingOnlyTask } from "./supervision.ts";
 import { queuedSteers } from "./steer.ts";
 import { managingThreadForTask } from "./chat.ts";
@@ -257,7 +257,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         const manager = managed?.task_id ? db.query("SELECT state FROM tasks WHERE id = ?").get(managed.task_id) as { state: string } | undefined : null;
         const managerDelegated = !!manager && !["done", "failed", "cancelled"].includes(manager.state);
         const gardenerTask = task.source === "pr-gardener";
-        const scheduledSelfAudit = task.source === "self-audit";
+        const scheduledSelfAudit = isSelfAuditLineage(db, task);
         if (gardenerTask && cfg.pr_gardener?.enabled !== true) continue;
         if (cfg.auto_dispatch !== true && !managerDelegated && !gardenerTask && !scheduledSelfAudit) continue;
 

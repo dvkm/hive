@@ -8,7 +8,9 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-test-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb, setSetting } = await import("../src/db.ts");
-const { makeHandler } = await import("../src/api.ts");
+const { makeHandler, requeueTask } = await import("../src/api.ts");
+const { composeBrief } = await import("../src/briefs.ts");
+const { getTask } = await import("../src/state.ts");
 const { createThread } = await import("../src/chat.ts");
 import type { Fetcher } from "../src/monitors.ts";
 
@@ -195,15 +197,19 @@ test("only a scheduled self-audit ship can finish report-only", async () => {
       title: "normal ship",
       kind: "ship",
     });
-    for (const id of [normal.json.id, audit]) {
-      expect((await localPost(`/api/tasks/${id}/transition`, { to: "in_progress" })).status).toBe(200);
-      expect((await localPost(`/api/tasks/${id}/events`, { type: "evidence", kind: "report", note: "audit findings" })).status).toBe(201);
-    }
+    expect((await localPost(`/api/tasks/${normal.json.id}/transition`, { to: "in_progress" })).status).toBe(200);
+    expect((await localPost(`/api/tasks/${normal.json.id}/events`, { type: "evidence", kind: "report", note: "audit findings" })).status).toBe(201);
+    expect((await localPost(`/api/tasks/${audit}/transition`, { to: "in_progress" })).status).toBe(200);
+    expect((await localPost(`/api/tasks/${audit}/transition`, { to: "failed" })).status).toBe(200);
+    const retry = requeueTask(localDb, getTask(localDb, audit));
+    expect(composeBrief(localDb, retry)).toContain("emit `done` without changing code");
+    expect((await localPost(`/api/tasks/${retry}/transition`, { to: "in_progress" })).status).toBe(200);
+    expect((await localPost(`/api/tasks/${retry}/events`, { type: "evidence", kind: "report", note: "audit findings" })).status).toBe(201);
 
     expect((await localPost(`/api/tasks/${normal.json.id}/events`, { type: "done" })).status).toBe(409);
-    const done = await localPost(`/api/tasks/${audit}/events`, { type: "done" });
+    const done = await localPost(`/api/tasks/${retry}/events`, { type: "done" });
     expect(done.status).toBe(200);
-    expect(done.json.task).toMatchObject({ state: "done", kind: "ship", source: "self-audit", pr_url: null });
+    expect(done.json.task).toMatchObject({ state: "done", kind: "ship", source: "requeue", pr_url: null });
   } finally {
     localServer.stop(true);
   }

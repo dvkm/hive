@@ -242,7 +242,11 @@ startPromoter(db, { intervalMs: promoteMs });
 
 // Hive audits its own recent trajectories and usage weekly, then sends one
 // evidence-backed improvement through the same guarded ship path as other work.
-selfAuditOnce(db);
+try {
+  selfAuditOnce(db);
+} catch (e) {
+  console.error("[hive] self-audit boot attempt failed; hourly loop will retry:", e);
+}
 const selfAuditPollMs = Number(process.env.HIVE_SELF_AUDIT_POLL_MS || 60 * 60 * 1000);
 startSelfAudit(db, selfAuditPollMs);
 

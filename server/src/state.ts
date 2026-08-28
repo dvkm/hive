@@ -442,6 +442,18 @@ function trustedRequeueParent(db: DB, task: any): boolean {
   );
 }
 
+export function isSelfAuditLineage(db: DB, task: any | null): boolean {
+  const seen = new Set<string>();
+  let current = task;
+  while (current && !seen.has(current.id)) {
+    if (current.source === "self-audit") return true;
+    if (current.source !== "requeue" || !trustedRequeueParent(db, current)) return false;
+    seen.add(current.id);
+    current = getTask(db, current.parent_task_id);
+  }
+  return false;
+}
+
 // Verify (or quarantine) one requeue task's provenance. Idempotent: a
 // verified row is marked once (requeue_provenance_verified=1) so the indexed
 // sweep below never rechecks it. An unverifiable row is detached from its

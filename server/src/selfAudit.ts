@@ -20,8 +20,21 @@ export function selfAuditOnce(db: DB, nowMs = Date.now()): string | null {
 
   const id = db.transaction(() => {
     const latest = db
-      .query("SELECT state, created_at FROM tasks WHERE project_id = ? AND source = 'self-audit' ORDER BY created_at DESC LIMIT 1")
-      .get(project.id) as { state: string; created_at: string } | undefined;
+      .query(`WITH RECURSIVE audit_lineage(id) AS (
+          SELECT id FROM tasks WHERE project_id = ? AND source = 'self-audit'
+          UNION
+          SELECT child.id FROM tasks child
+          JOIN audit_lineage parent ON child.parent_task_id = parent.id
+          JOIN events created ON created.task_id = child.id
+            AND created.type = 'created' AND created.source = 'reconciler'
+            AND json_valid(created.payload)
+            AND json_extract(created.payload, '$.requeue_of') = parent.id
+          WHERE child.project_id = ? AND child.source = 'requeue'
+        )
+        SELECT state, created_at FROM tasks
+        WHERE id IN (SELECT id FROM audit_lineage)
+        ORDER BY created_at DESC LIMIT 1`)
+      .get(project.id, project.id) as { state: string; created_at: string } | undefined;
     if (latest) {
       if (!["done", "cancelled", "failed"].includes(latest.state)) return null;
       if (nowMs - Date.parse(latest.created_at) < SELF_AUDIT_CADENCE_MS) return null;

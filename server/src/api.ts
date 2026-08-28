@@ -34,6 +34,7 @@ import {
   dependentsWedgedForDecision,
   resolveDependentsWedgedForDecision,
   queuedInputRecoveryPending,
+  isSelfAuditLineage,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
@@ -5980,7 +5981,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     if (blocked) return blocked;
     if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });
     if (note) db.query("UPDATE tasks SET summary = ? WHERE id = ?").run(note, taskId);
-    const reportOnlySelfAudit = t.source === "self-audit" && t.kind === "ship" && t.state === "in_progress" && !t.pr_url && evidenceCount(db, taskId, "report") > 0;
+    const reportOnlySelfAudit = isSelfAuditLineage(db, t) && t.kind === "ship" && t.state === "in_progress" && !t.pr_url && evidenceCount(db, taskId, "report") > 0;
     const task = transition(db, taskId, "done", { source, reason: note ?? undefined, force: reportOnlySelfAudit });
     return json({ task });
   }

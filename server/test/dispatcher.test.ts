@@ -12,7 +12,7 @@ import type { DB } from "../src/db.ts";
 const { dispatchOnce, isReviewed, inBackoff } = await import("../src/dispatcher.ts");
 const { selfAuditOnce } = await import("../src/selfAudit.ts");
 const { writeEvent, getTask } = await import("../src/state.ts");
-const { createDecision } = await import("../src/api.ts");
+const { createDecision, requeueTask } = await import("../src/api.ts");
 const { queuedSteers } = await import("../src/steer.ts");
 const { createThread } = await import("../src/chat.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
@@ -96,6 +96,12 @@ test("weekly self-audit dispatches through normal safeguards when auto_dispatch 
 
   expect(spawns.length).toBe(1);
   expect(getTask(db, id).state).toBe("in_progress");
+
+  db.query("UPDATE tasks SET state = 'failed' WHERE id = ?").run(id);
+  const retry = requeueTask(db, getTask(db, id));
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(2);
+  expect(getTask(db, retry).state).toBe("in_progress");
 
   const excluded = freshDb({ dispatch_kinds: ["scout"] });
   excluded.db.query("UPDATE projects SET name = 'Hive' WHERE id = ?").run(excluded.projectId);
