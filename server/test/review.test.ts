@@ -107,12 +107,8 @@ test("taskDiff uses git diff base...branch for a branch task, gh for a PR task",
 
 // ---- full server: merge / request-changes / reject / brief ----
 
-// port: 0 (ask the OS for any free port) lets the OS hand back a port it JUST
-// freed from a previous test's stopped server while fetch's keep-alive pool
-// still has a stale connection cached for that port — occasionally delivering
-// a stray/garbled response to a totally unrelated request (hive-1694). Every
-// server in this file gets its own never-reused port instead.
-let testPortCounter = 10_000 + ((process.pid + Math.floor(Math.random() * 10_000)) % 20_000);
+// Reusing an ephemeral port can misroute fetch keep-alive connections after a server stops, so every server in this file gets a unique port (HIVE-443).
+let testPortCounter = 34_567;
 function nextTestPort(): number {
   return testPortCounter++;
 }
