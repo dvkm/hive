@@ -287,7 +287,8 @@ export default function App() {
   const { needsYou, tasks, offline, setOffline } = useStore();
   const projectFilter = useProjectFilter();
   const inboxCount = needsYou.filter(
-    (item) => item.kind !== "waiting" && inProjectFilter(itemProject(item, tasks), projectFilter),
+    // "waiting" and "review_pending" are visible but not yours to act on yet.
+    (item) => item.kind !== "waiting" && item.kind !== "review_pending" && inProjectFilter(itemProject(item, tasks), projectFilter),
   ).length;
   const location = useLocation();
   // Board card clicks push /tasks/:id with state.backgroundLocation set to the

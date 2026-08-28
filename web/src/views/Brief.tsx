@@ -22,6 +22,7 @@ const ITEM_LABELS: Record<NeedsYouItem["kind"], string> = {
   checkpoint: "Checkpoint",
   quiz_digest: "Catch up",
   review: "Review",
+  review_pending: "In review",
   attention: "Issue",
   waiting: "Waiting",
 };
@@ -38,6 +39,14 @@ function Section({ title, count, children }: { title: string; count: number; chi
       {children}
     </section>
   );
+}
+
+// Why this review is not yours yet, in the words the director would use.
+function pendingReason(task: { pr_url: string | null; ci_status: string | null }): string {
+  if (!task.pr_url) return "No pull request yet";
+  if (task.ci_status === "failing") return "Tests failing";
+  if (task.ci_status === "pending") return "Tests running";
+  return "Review still running";
 }
 
 // <input type="datetime-local"> wants a local "YYYY-MM-DDTHH:mm" string, not ISO.
@@ -114,6 +123,8 @@ export default function Brief() {
     return remaining.length ? [{ id: item.id, total: item.kind === "quiz_digest" ? item.quizzes.length : 0, remaining }] : [];
   });
   const toReview = needsYou.flatMap((item) => item.kind === "review" && !reviewed.has(item.id) ? [item.task] : []);
+  // Still with the agents or the pipeline: shown so nothing disappears, never counted.
+  const inReviewPending = needsYou.flatMap((item) => item.kind === "review_pending" ? [item.task] : []);
   const attention = needsYou.flatMap((item) => item.kind === "attention" ? [item.task] : []);
   const waiting = needsYou.flatMap((item) => item.kind === "waiting" ? [{ task: item.task, blockedBy: item.blockedBy }] : []);
 
@@ -142,6 +153,7 @@ export default function Brief() {
       if (item.kind === "decision") return !answered.has(item.id);
       if (item.kind === "quiz_digest") return remainingIn(item).length > 0;
       if (item.kind === "review") return !reviewed.has(item.id);
+      if (item.kind === "review_pending") return false;
       if (item.kind === "waiting") return false;
       // One card per task: CheckpointsInbox already shows the task's checkpoints together.
       if (item.kind === "checkpoint") {
@@ -299,6 +311,13 @@ export default function Brief() {
           <Section title="Reviews" count={toReview.length}>
             <ul className="brief-backlog-list">
               {toReview.map((task) => <li key={task.id}><Link to={`/tasks/${task.id}`} state={{ backgroundLocation: location }}>{taskLabel(task)} {task.title}</Link><span>{task.ci_status === "passing" ? "Ready" : task.ci_status || "Review"}</span><TaskEvidence taskId={task.id} title={task.title} compact /></li>)}
+            </ul>
+          </Section>
+          {/* Visible, deliberately uncounted: these are still the agent's or the
+              pipeline's, so they are not part of the Backlogs number. */}
+          <Section title="In review" count={inReviewPending.length}>
+            <ul className="brief-backlog-list">
+              {inReviewPending.map((task) => <li key={task.id}><Link to={`/tasks/${task.id}`} state={{ backgroundLocation: location }}>{taskLabel(task)} {task.title}</Link><span>{pendingReason(task)}</span></li>)}
             </ul>
           </Section>
           <Section title="Issues" count={attention.length}>

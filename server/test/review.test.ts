@@ -9,6 +9,7 @@ process.env.HIVE_HOME = HOME;
 const { openDb } = await import("../src/db.ts");
 const { makeHandler, repairDuplicateQuizPasses } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
+const { writeEvent } = await import("../src/state.ts");
 const { parseUnifiedDiff, taskDiff, MAX_DIFF_LINES } = await import("../src/diff.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -1092,6 +1093,44 @@ test("brief.to_review derivation lists in_review tasks", async () => {
   const b3 = await get(s.base, `/api/brief`);
   expect(b3.json.to_review.some((t: any) => t.id === external.json.id)).toBe(false);
   expect(b3.json.to_review.some((t: any) => t.id === linked.json.id)).toBe(false);
+  s.server.stop(true);
+});
+
+// HIVE-500: the review column counted everything in_review, so the Backlogs
+// number was mostly pipeline state. One task per bucket; only the last two are
+// the director's.
+test("brief.to_review counts only reviews the director can act on", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", { name: "actionable", repo_path: "/repo" });
+  const make = async (title: string, cols: Record<string, any>) => {
+    const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title });
+    const id = t.json.id;
+    for (const [k, v] of Object.entries(cols)) s.db.query(`UPDATE tasks SET ${k} = ? WHERE id = ?`).run(v, id);
+    s.db.query("UPDATE tasks SET state = 'in_review' WHERE id = ?").run(id);
+    return id;
+  };
+  const review = (id: string, head: string, risks: string[] = []) =>
+    writeEvent(s.db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks, questions: [], reviewed_head_sha: head } });
+  const PR = { pr_url: "https://x/pr/1", ci_status: "passing", head_sha: "head1" };
+
+  const noReview = await make("no review yet", PR);
+  const staleReview = await make("review at a stale head", PR);
+  review(staleReview, "old-head");
+  const unverified = await make("risks unverified", PR);
+  review(unverified, "head1", ["a risk nobody checked"]);
+  const noPrNoReport = await make("no PR and no report", {});
+  const noPrReport = await make("no PR but a report", {});
+  writeEvent(s.db, { task_id: noPrReport, source: "agent", type: "review_summary", payload: { done: ["read the docs"] } });
+  const redCi = await make("PR with red CI", { ...PR, ci_status: "failing" });
+  review(redCi, "head1");
+  const ready = await make("PR with green CI and a finished review", PR);
+  review(ready, "head1");
+
+  const b = await get(s.base, "/api/brief");
+  const ids = (rows: any[]) => rows.map((t: any) => t.id).sort();
+  expect(ids(b.json.to_review)).toEqual([noPrReport, ready].sort());
+  // Everything else stays visible, just uncounted.
+  expect(ids(b.json.in_review_pending)).toEqual([noReview, staleReview, unverified, noPrNoReport, redCi].sort());
   s.server.stop(true);
 });
 

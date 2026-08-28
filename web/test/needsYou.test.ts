@@ -55,7 +55,7 @@ test("needs-you queue includes every actionable item", () => {
   const items = getNeedsYouItems(
     [decision],
     [
-      task("review-1", "in_review", { health: { status: "dead", reason: null, since: "now" } }),
+      task("review-1", "in_review", { review_actionable: true, health: { status: "dead", reason: null, since: "now" } }),
       task("failed-1", "failed"),
       task("requeued-1", "failed", { requeued_to: "successor" }),
       task("stuck-1", "in_progress", { health: { status: "stuck", reason: null, since: "now" } }),
@@ -133,22 +133,31 @@ test("a failed task always needs routing, even with an unmet dependency", () => 
   expect(items.map((item) => item.kind)).toEqual(["attention"]);
 });
 
-test("reviews with pending CI do not hide actionable reviews", () => {
+// HIVE-500: a review the director cannot act on yet is still listed, but as its
+// own kind, so no count and no focus card ever stops on it.
+test("reviews the director cannot act on split into review_pending", () => {
   const items = getNeedsYouItems(
     [],
     [
       task("pending", "in_review", { kind: "ship", pr_url: "https://example.com/pending", ci_status: "pending" }),
-      ...[1, 2, 3, 4].map((number) => task(`ready-${number}`, "in_review", {
+      task("no-report", "in_review", { kind: "ship" }),
+      ...[1, 2].map((number) => task(`ready-${number}`, "in_review", {
         kind: "ship",
         pr_url: `https://example.com/ready-${number}`,
         ci_status: "passing",
+        review_actionable: true,
       })),
     ],
     [],
     []
   );
 
-  expect(items.map((item) => item.id)).toEqual(["ready-1", "ready-2", "ready-3", "ready-4", "pending"]);
+  expect(items.map((item) => [item.id, item.kind])).toEqual([
+    ["pending", "review_pending"],
+    ["no-report", "review_pending"],
+    ["ready-1", "review"],
+    ["ready-2", "review"],
+  ]);
 });
 
 test("tracking-only tasks never enter code-review queues", () => {
@@ -297,7 +306,7 @@ test("legacy tracking bindings remain visibly actionable", () => {
 });
 
 test("itemProject resolves the project for every needs-you item kind", () => {
-  const reviewTask = task("t-review", "in_review", { project_id: "p1", pr_url: "https://x/1", ci_status: "passing" });
+  const reviewTask = task("t-review", "in_review", { project_id: "p1", pr_url: "https://x/1", ci_status: "passing", review_actionable: true });
   const decisionTask = task("t-decision", "needs_decision", { project_id: "p2" });
   const tasks = [reviewTask, decisionTask];
   const decision = { id: "d1", task_id: "t-decision", status: "open" } as Decision;

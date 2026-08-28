@@ -134,6 +134,7 @@ export interface Task {
   health?: Health | null;
   sidecar?: SidecarReport | null; // latest background check on this task's commits
   requeued_to?: string | null; // successor id when failed + auto-requeued
+  review_actionable?: boolean; // in_review AND the director can act on it now (server-computed, HIVE-500)
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
   created_at: string;
   updated_at: string;
@@ -611,7 +612,8 @@ export interface Brief {
   fleet: Task[];
   incidents: BriefIncident[];
   intake: BriefIntake[];
-  to_review: Task[]; // Hive-owned reviews; tracking-only tasks are excluded.
+  to_review: Task[]; // Hive-owned reviews the director can act on now; tracking-only tasks are excluded.
+  in_review_pending: Task[]; // still in review but not yet the director's: red/running CI, review pipeline unfinished, or no report to read.
   spend: { totals: UsageTotals; by_model: (UsageTotals & { model: string })[] };
   learnings_new: BriefLearning[];
 }

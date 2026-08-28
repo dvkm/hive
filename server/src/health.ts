@@ -14,6 +14,7 @@ import { isSupervisedTask, neverDispatched } from "./supervision.ts";
 import { isDeferred, unmetDeps, TERMINAL, type State } from "./state.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
 import { latestSidecar, latestSidecarBatch, type SidecarReport } from "./sidecar.ts";
+import { reviewActionable } from "./reviewer.ts";
 
 export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
 
@@ -266,7 +267,10 @@ export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null
   // board card and the review card can show it without fetching every event.
   // Pass a preloaded `sidecar` when enriching a list (see tasksWithHealth) so
   // this doesn't run one sidecar query per task.
-  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, never_dispatched: neverDispatched(db, task), sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
+  // `review_actionable` (HIVE-500) is server-computed for the same reason health
+  // is: it reads events the browser never sees. Only in-review tasks carry it;
+  // everywhere else it is false and means nothing.
+  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, never_dispatched: neverDispatched(db, task), review_actionable: reviewActionable(db, task), sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
 }
 
 // Batched form of taskWithHealth for list endpoints (task HIVE-447): looks up

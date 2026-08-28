@@ -728,6 +728,54 @@ export function reviewCompleteForHead(db: DB, taskId: string, head: string | nul
   return expected === 0 || hasRiskVerdicts(db, taskId, head, expected);
 }
 
+// Is there any further review work COMING for this head, or is what we have as
+// complete as the review will ever get? Nothing coming means either no head to
+// key verdicts to or a project that never auto-reviews (the reviewer skips
+// both); otherwise the pipeline must have finished for this exact head.
+export function reviewPipelineSettled(
+  db: DB,
+  task: { id: string; head_sha?: string | null; project_id: string }
+): boolean {
+  if (!task.head_sha) return true;
+  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+  if (JSON.parse(project?.config ?? "{}").auto_review === false) return true;
+  return reviewCompleteForHead(db, task.id, task.head_sha);
+}
+
+// Can the DIRECTOR act on this review right now (HIVE-500)? The review column
+// counts everything in_review, but most of it is still the agent's or the
+// pipeline's work, not a decision waiting on a human. Two rules:
+//   - WITH a pull request: CI must not be red or still running (a red build is
+//     the agent's to fix), and the review pipeline must have settled on the
+//     live head, or the director would read a report about a stale commit.
+//   - WITHOUT a pull request: there must be something to READ — a self-review
+//     summary or a report attached as evidence. A task with neither has no
+//     work product and nothing to merge; it is unfinished agent work, and
+//     health surfaces it as stuck instead.
+// Anything false here stays VISIBLE as in-review; it just must not be counted
+// as something needing the director.
+export function reviewActionable(
+  db: DB,
+  task: { id: string; state: string; pr_url?: string | null; ci_status?: string | null; head_sha?: string | null; project_id: string }
+): boolean {
+  if (task.state !== "in_review") return false;
+  if (task.pr_url) {
+    // Matches advanceIfFinished / landQueue: only failing and pending hold.
+    // A null or 'unavailable' rollup means a repo (or check run) that never
+    // reports, and holding the review there would hide mergeable work forever.
+    if (task.ci_status === "failing" || task.ci_status === "pending") return false;
+    return reviewPipelineSettled(db, task);
+  }
+  return hasDirectorReport(db, task.id);
+}
+
+// Something the director can actually read: the agent's own review summary, or
+// a report attached as evidence (how scouts hand work over).
+export function hasDirectorReport(db: DB, taskId: string): boolean {
+  if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'review_summary' LIMIT 1").get(taskId)) return true;
+  return !!db.query("SELECT 1 FROM evidence WHERE task_id = ? AND kind = 'report' LIMIT 1").get(taskId);
+}
+
 export function confirmedRisks(db: DB, taskId: string, head: string | null | undefined): RiskVerdict[] {
   return (riskVerdictsFor(db, taskId, head)?.verdicts ?? []).filter((v) => v?.verdict === "confirmed");
 }

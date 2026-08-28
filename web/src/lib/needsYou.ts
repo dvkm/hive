@@ -14,6 +14,7 @@ export type NeedsYouItem =
   | { kind: "checkpoint"; id: string; checkpoint: Checkpoint }
   | { kind: "quiz_digest"; id: string; quizzes: UnderstandingQuiz[] }
   | { kind: "review"; id: string; task: Task }
+  | { kind: "review_pending"; id: string; task: Task }
   | { kind: "attention"; id: string; task: Task }
   | { kind: "waiting"; id: string; task: Task; blockedBy: BlockingTaskRef[] };
 
@@ -77,8 +78,13 @@ export function trackedSubtasks(task: Task, tasks: Task[]): Task[] {
   }).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
 }
 
+// Can the director act on this review NOW? The server decides (reviewer.ts's
+// reviewActionable) because the answer reads events the browser never sees:
+// whether the auto-review finished for the live head, and whether a task with
+// no pull request left a report behind. Everything else stays visible as
+// "in review" but must not be counted as needing the director (HIVE-500).
 function reviewIsActionable(task: Task): boolean {
-  return task.kind === "scout" || (!!(task.pr_url || task.branch) && task.ci_status !== "pending" && task.ci_status !== "failing");
+  return task.review_actionable === true;
 }
 
 // Browser-safe mirror of server/src/state.ts's dependency gate. Exported so
@@ -132,8 +138,10 @@ export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoin
     ...quizDigests(tasks, quizzes),
     ...tasks
       .filter((task) => task.state === "in_review" && !isTrackingOnly(task))
-      .sort((a, b) => Number(reviewIsActionable(b)) - Number(reviewIsActionable(a)))
-      .map((task) => ({ kind: "review" as const, id: task.id, task })),
+      .map((task): NeedsYouItem =>
+        reviewIsActionable(task)
+          ? { kind: "review", id: task.id, task }
+          : { kind: "review_pending", id: task.id, task }),
     ...tasks.filter(taskNeedsAttention).map((task): NeedsYouItem => {
       const blockedBy = task.state === "failed" ? [] : unmetDeps(task, tasks);
       return blockedBy.length && !blockedBy.every((dep) => DEAD_DEP_STATES.has(dep.state))

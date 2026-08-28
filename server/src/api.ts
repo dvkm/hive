@@ -87,7 +87,7 @@ import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
-import { confirmedRisks, cautionCleared, latestAutoReviewVerdict, reviewCompleteForHead } from "./reviewer.ts";
+import { confirmedRisks, cautionCleared, latestAutoReviewVerdict, reviewPipelineSettled } from "./reviewer.ts";
 import { explanationGate } from "./explainDiff.ts";
 import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
@@ -2500,9 +2500,12 @@ function brief(db: DB, url: URL): Response {
     .filter((t: any) => !isReviewed(db, t.id))
     .map((t: any) => ({ ...parseTask(t), project_name: t.project_name }));
 
-  // ⑦ to review — Hive-owned in-review tasks awaiting the captain's review
-  // and merge. Full task objects (with health) so the web renders review cards inline.
-  const to_review = tasksWithHealth(
+  // ⑦ to review — Hive-owned in-review tasks. Split in two (HIVE-500): only the
+  // ones the director can actually act on now count as work; the rest are still
+  // waiting on CI, on the review pipeline, or on the agent finishing at all.
+  // Both lists are full task objects (with health) so the web renders review
+  // cards inline.
+  const inReview = tasksWithHealth(
     db,
     db
       .query("SELECT * FROM tasks WHERE state = 'in_review' ORDER BY updated_at DESC")
@@ -2510,6 +2513,8 @@ function brief(db: DB, url: URL): Response {
       .map(parseTask)
       .filter((task: any) => !isTrackingOnlyTask(task))
   );
+  const to_review = inReview.filter((task: any) => task.review_actionable);
+  const in_review_pending = inReview.filter((task: any) => !task.review_actionable);
 
   // ⑧ spend since — reuse the analytics rollup (totals + by-model for top model).
   // `?project` scopes it, so a reader who filtered the brief to one project does
@@ -2554,6 +2559,7 @@ function brief(db: DB, url: URL): Response {
     incidents,
     intake,
     to_review,
+    in_review_pending,
     spend,
     learnings_new,
   });
@@ -4246,10 +4252,7 @@ function quizAnswerable(db: DB, task: { id: string; state: string; head_sha: str
   // No head to key verdicts to, or a project that never auto-reviews: the
   // reviewer skips both, so nothing further is coming and this is as complete
   // as the review gets.
-  if (!task.head_sha) return true;
-  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
-  if (JSON.parse(project?.config ?? "{}").auto_review === false) return true;
-  return reviewCompleteForHead(db, task.id, task.head_sha);
+  return reviewPipelineSettled(db, task);
 }
 
 function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; checks: UnderstandingCheck[] } | null {
