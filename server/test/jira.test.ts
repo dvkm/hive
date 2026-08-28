@@ -3441,6 +3441,50 @@ test.skipIf(process.platform !== "darwin")("a failed harness run never becomes a
   expect(readdirSyncT(root).some((name) => name.startsWith(".hive-proof-"))).toBe(false);
 });
 
+test.skipIf(process.platform !== "darwin")("the reason names the real failure, not node's deprecation noise", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  // Playwright reports the failure on stdout; node writes deprecation warnings
+  // to stderr. Reading stderr first buried the only line worth showing.
+  const exec = async (argv: string[]) => {
+    if (!isHarnessRun(argv)) return { code: 0, stdout: UI_PATCH, stderr: "" };
+    return {
+      code: 1,
+      stdout: "\u001b[1A\u001b[2K1 failed\n  Error: page could not load its data, 47 request(s) failed: https://api.example.test/v1/news",
+      stderr: "(node:123) [DEP0205] DeprecationWarning: `module.register()` is deprecated.\n(Use `node --trace-deprecation ...` to show where the warning was created)",
+    };
+  };
+
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+
+  expect(stats.rendered).toBe(0);
+  const reason = String(syncEvents(db).find((e) => e.action === "render_proof")?.reason);
+  expect(reason).toContain("page could not load its data");
+  expect(reason).not.toContain("DeprecationWarning");
+  expect(reason).not.toContain("\u001b");
+});
+
+test.skipIf(process.platform !== "darwin")("the generated spec refuses a page whose requests failed", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  // A single-page app renders its own error boundary with HTTP 200, so the spec
+  // itself has to fail the shot; exit code alone would call that picture proof.
+  let spec = "";
+  const exec = async (argv: string[]) => {
+    if (!isHarnessRun(argv)) return { code: 0, stdout: UI_PATCH, stderr: "" };
+    const dir = join(root, "web", "e2e");
+    const name = readdirSyncT(dir).find((f) => f.startsWith("hive-proof-"))!;
+    spec = await Bun.file(join(dir, name)).text();
+    return { code: 0, stdout: "1 passed", stderr: "" };
+  };
+
+  await run(db, projectId, jira.fetchImpl, CFG, { exec });
+
+  expect(spec).toContain('page.on("requestfailed"');
+  expect(spec).toContain("page could not load its data");
+  expect(spec).toContain("response.ok()");
+});
+
 test("the scratch directory is gone even when the harness throws", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
   const { db, projectId, root } = await uiTaskWithNoShots(jira, true);

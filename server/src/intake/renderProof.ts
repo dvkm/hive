@@ -152,12 +152,23 @@ function specSource(routes: string[], outDir: string): string {
     .map(
       (route, i) => `
 test(${JSON.stringify(`hive proof ${i + 1}: ${route}`)}, async ({ page }) => {
-  await page.goto(${JSON.stringify(route)});
+  const dead = [];
+  page.on("requestfailed", (r) => dead.push(r.url()));
+  const response = await page.goto(${JSON.stringify(route)});
   await page.waitForLoadState("networkidle").catch(() => {});
+  if (response && !response.ok()) throw new Error("page answered HTTP " + response.status());
+  if (dead.length) throw new Error("page could not load its data, " + dead.length + " request(s) failed: " + dead.slice(0, 3).join(" "));
   await page.screenshot({ path: ${JSON.stringify(join(outDir, `proof-${i + 1}.png`))} });
 });`
     )
     .join("\n");
+  // A page that renders its own error boundary still answers HTTP 200 and still
+  // screenshots cleanly, so exit code alone is not enough: a single-page app
+  // whose API is unreachable from the sandbox produces a picture of "something
+  // went wrong" and hive would post it to a live ticket as proof. Any failed
+  // request or non-2xx document fails the shot instead, so the ticket falls back
+  // to text with a reason a person can act on.
+  //
   // Chromium's own helper sandbox cannot nest inside the seatbelt: its GPU
   // process dies on launch and takes the run with it. The outer seatbelt is the
   // fence that matters here, so the inner one is turned off.
@@ -234,7 +245,20 @@ export async function renderProofs(
     // A red run is not proof. It may have landed on an error page, a crash, or
     // a server that never came up, and that picture would go straight onto a
     // live Jira issue. Only a clean run is allowed to produce evidence.
-    const detail = () => (result!.stderr || result!.stdout || "").trim().split("\n").slice(-3).join(" ").slice(0, 300);
+    // The reason is the only thing a person gets when nothing rendered, so it
+    // has to name the real failure. Playwright puts that on stdout while node
+    // puts its deprecation warnings on stderr, and reading stderr first buried
+    // "page could not load its data" under "module.register() is deprecated".
+    // Read both, drop the noise, and prefer the line that carries the error.
+    const detail = () => {
+      const lines = `${result!.stdout ?? ""}\n${result!.stderr ?? ""}`
+        .replace(/\u001b\[[0-9;]*[A-Za-z]/g, "")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line && !/DeprecationWarning|trace-deprecation|^\(node:\d+\)/.test(line));
+      const errors = lines.filter((line) => /Error:/.test(line));
+      return (errors.length ? errors : lines.slice(-3)).join(" ").slice(0, 300);
+    };
     if (result.code !== 0)
       return { created: 0, reason: `harness run failed (exit ${result.code}): ${detail()}` };
 
