@@ -22,7 +22,7 @@ import { startAutoReviewer } from "./reviewer.ts";
 import { startDriftWatch } from "./drift.ts";
 import { startPromoter } from "./promoter.ts";
 import { followServingBranchOnBoot } from "./servingBranch.ts";
-import { setEventHook, setTerminalHook, expireOrphanedDecisions, repairRequeueProvenance } from "./state.ts";
+import { setEventHook, setTerminalHook, expireOrphanedDecisions, repairRequeueProvenance, backfillStuckPrUrls } from "./state.ts";
 import { bootstrapAuthority } from "./authority.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { herdr as defaultHerdr } from "./runtime/herdr.ts";
@@ -82,6 +82,11 @@ if (orphaned) console.log(`[hive] expired ${orphaned} orphaned open decision(s) 
 // only ever rescans unverified rows).
 const quarantinedRequeues = repairRequeueProvenance(db);
 if (quarantinedRequeues) console.log(`[hive] quarantined ${quarantinedRequeues} requeue task(s) with unverifiable provenance`);
+
+// Backfill: link pr_url for tasks already stuck in in_review whose PR URL only
+// ever landed as free text in a state_change reason (hive-1717). Idempotent.
+const backfilledPrUrls = backfillStuckPrUrls(db);
+if (backfilledPrUrls) console.log(`[hive] backfilled pr_url for ${backfilledPrUrls} stuck in_review task(s)`);
 
 // Mint the remote API token once (phones/tablets present it; loopback never
 // needs it). Shown by `hive remote`.
