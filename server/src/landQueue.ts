@@ -17,11 +17,11 @@
 // each other. `from` lands BEFORE `to` on every edge.
 import type { DB } from "./db.ts";
 import { now } from "./db.ts";
-import { getTask, writeEvent } from "./state.ts";
+import { getTask, writeEvent, changesRequestUnaddressed } from "./state.ts";
 import { authoredFiles } from "./rebaseGuard.ts";
 import { defaultExec, projectComparisonBase, type Exec } from "./exec.ts";
 import { enqueue } from "./notifications.ts";
-import { queueSteerEvent } from "./steer.ts";
+import { queueSteerEvent, queuedSteers } from "./steer.ts";
 
 export interface LandNode {
   id: string;
@@ -329,6 +329,23 @@ async function revalidateLandPauseCards(db: DB): Promise<void> {
   }
 }
 
+// Has this task's most recent land-queue event already logged the pending-steer
+// hold? Sweeps run every 30s and a slow agent can sit between turns for a long
+// time, so without this check `land_retry_held` would write once per sweep for
+// the whole hold instead of once per episode (HIVE-444 follow-up). Any other
+// event type (a delivered steer resuming retries, a fresh attempt, a re-mark)
+// means the episode ended, so the next hold logs again.
+function alreadyHeldForSteer(db: DB, taskId: string): boolean {
+  const row = db
+    .query(
+      `SELECT type FROM events
+        WHERE task_id = ? AND type IN ('land_retry_held', 'land_attempted', 'land_queued', 'land_unqueued')
+        ORDER BY rowid DESC LIMIT 1`
+    )
+    .get(taskId) as { type: string } | undefined;
+  return row?.type === "land_retry_held";
+}
+
 // One sweep of the land queue for every project that has one. Lands everything
 // whose edges are satisfied and skips the rest for the next sweep.
 //
@@ -376,6 +393,15 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
       // construction still keys on the number alone, so a conflicting pair
       // resolves the same way every sweep.
       for (const n of nodes.filter((x) => pending.has(x.id)).sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority) || a.number - b.number)) {
+        // Re-read the mark fresh right before attempting: `pending` was built
+        // from one snapshot at the top of this sweep, and an unmark landing in
+        // between must drop the task on the spot, not ride out on stale state
+        // (HIVE-444 addendum — unqueue wasn't stopping the periodic retries).
+        const stillMarked = (db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(n.id) as { land_queued_at: string | null } | undefined)?.land_queued_at;
+        if (!stillMarked) {
+          pending.delete(n.id);
+          continue;
+        }
         // Red or still-running CI holds only this node. Independent nodes can
         // still enter the same concurrent batch.
         if (n.ci_status === "failing" || n.ci_status === "pending") continue;
@@ -385,6 +411,19 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         if (backingOff(retryState(db, n.id), nowMs)) continue;
         // Quiz passed after the mark: wait for the director's "Land now" tap.
         if (landHeldForQuiz(db, n.id)) continue;
+        // A corrective steer is queued for the agent (it's between turns) but
+        // not delivered yet: the branch is known to need a fix, so retrying the
+        // merge against it now just burns attempts (HIVE-444). Hold quietly
+        // until the steer is delivered AND a new head_sha shows up.
+        if (queuedSteers(db, n.id).length) {
+          if (!alreadyHeldForSteer(db, n.id)) {
+            writeEvent(db, { task_id: n.id, source: "reconciler", type: "land_retry_held", payload: { reason: "pending steer" } });
+          }
+          continue;
+        }
+        // A changes_requested this task hasn't addressed yet (no new commit
+        // since) — same hold, covers the steer having just been delivered.
+        if (changesRequestUnaddressed(db, n.id)) continue;
         const waiting = edges.some((e) => {
           // depends is directional and hard: `to` waits until `from` has merged.
           if (e.kind === "depends")
