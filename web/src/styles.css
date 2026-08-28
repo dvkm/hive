@@ -6088,3 +6088,143 @@ a.chip-jira:hover { background: #2d5488; }
   border-bottom: 1px solid var(--border-soft);
   font-size: 13px;
 }
+
+/* Catch up (HIVE-511): one glanceable card per shipped change. The whole point
+   is that a card fits without scrolling, so the height is fixed and the visual
+   takes whatever the text does not. */
+.glance-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 14px;
+}
+.glance-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 260px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+}
+.glance-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.glance-head a {
+  font-weight: 600;
+}
+.glance-when {
+  margin-left: auto;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+/* One line, always. A payload that grew back into prose gets clipped here
+   rather than pushing the visual off the card. */
+.glance-line {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.35;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.glance-shots {
+  flex: 1;
+  display: flex;
+  gap: 6px;
+  min-height: 0;
+}
+.glance-shot {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg);
+  cursor: zoom-in;
+}
+.glance-shot img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: top center;
+  display: block;
+}
+.glance-shot-tag {
+  position: absolute;
+  left: 4px;
+  bottom: 4px;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(11, 12, 10, 0.82);
+  color: var(--text-dim);
+}
+.glance-areas {
+  flex: 1;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  min-height: 0;
+}
+.glance-areas li {
+  display: grid;
+  grid-template-columns: minmax(0, 96px) 1fr auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.glance-area-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.glance-area-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--bg-elev2);
+  overflow: hidden;
+}
+.glance-area-bar i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+.glance-area-churn {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.glance-noshape {
+  flex: 1;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+  font-size: 12px;
+  border: 1px dashed var(--border-soft);
+  border-radius: 8px;
+}
+.glance-facts {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.glance-facts a {
+  margin-left: auto;
+}

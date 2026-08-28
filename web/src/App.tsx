@@ -9,6 +9,7 @@ import {
   faComments,
   faSatelliteDish,
   faImage,
+  faEye,
   faBookOpen,
   faChartColumn,
   faFolder,
@@ -30,6 +31,7 @@ import TaskPage from "./views/Task";
 import TaskModal from "./views/TaskModal";
 import Decisions from "./views/Decisions";
 import Review from "./views/Review";
+import Catchup from "./views/Catchup";
 import Policies from "./views/Policies";
 import Monitors from "./views/Monitors";
 import Learnings from "./views/Learnings";
@@ -66,6 +68,7 @@ const SECONDARY_NAV: { label: string; items: [string, string, IconDefinition][] 
   {
     label: "Observe",
     items: [
+      ["/catchup", "Catch up", faEye],
       ["/feed", "Activity", faSatelliteDish],
       ["/evidence", "Evidence", faImage],
       ["/supervisors", "Agent sessions", faComments],
@@ -343,6 +346,7 @@ export default function App() {
           <Route path="/tasks/:id" element={<TaskPage />} />
           <Route path="/decisions" element={<Decisions />} />
           <Route path="/review" element={<Review />} />
+          <Route path="/catchup" element={<Catchup />} />
           <Route path="/supervisors" element={<Supervisors />} />
           <Route path="/terminals" element={<Terminals />} />
           <Route path="/learnings" element={<Learnings />} />

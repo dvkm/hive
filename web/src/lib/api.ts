@@ -733,6 +733,27 @@ export interface ReviewSummary {
   understanding?: UnderstandingPacket;
 }
 
+// One shipped change, sized for a glance (HIVE-511). `headline` is already
+// capped server-side; the card renders it on one line regardless.
+export interface GlanceCard {
+  task_id: string;
+  number: number;
+  display_id: string;
+  title: string;
+  project_id: string;
+  kind: string;
+  state: string;
+  shipped_at: string;
+  headline: string;
+  merged_by: "auto" | "director" | null;
+  files: number;
+  additions: number;
+  deletions: number;
+  areas: { area: string; churn: number }[];
+  images: { url: string; caption: string | null; phase: "before" | "after" | null }[];
+  explanation_url: string | null;
+}
+
 export interface UnderstandingQuiz {
   id: string;
   task_id: string;
@@ -821,6 +842,8 @@ export const api = {
       body: JSON.stringify({ verdict, note, source: "director", actor: directorActor() }),
     }),
   understandingQuizzes: () => req<{ quizzes: UnderstandingQuiz[] }>(`/api/understanding-quizzes`),
+  catchup: (limit = 10, projectId?: string) =>
+    req<{ cards: GlanceCard[] }>(`/api/catchup?limit=${limit}${projectId ? `&project_id=${encodeURIComponent(projectId)}` : ""}`),
   answerUnderstandingQuiz: (taskId: string, answerKey: string, version: string, surface?: "focus") =>
     req<{ ok: boolean; correct: boolean; passed: boolean; explanation: string | null; completed?: number; total?: number; quiz?: Pick<UnderstandingQuiz, "question" | "options" | "version" | "completed" | "total"> }>(`/api/tasks/${taskId}/understanding-quiz/answer`, {
       method: "POST",
