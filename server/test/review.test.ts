@@ -209,7 +209,16 @@ function makeServer(
     return OK();
   };
   const herdr = new Herdr(exec, "herdr");
-  const server = Bun.serve({ port: nextTestPort(), fetch: makeHandler(db, { herdr, exec }) });
+  const handler = makeHandler(db, { herdr, exec });
+  let server: ReturnType<typeof Bun.serve>;
+  while (true) {
+    try {
+      server = Bun.serve({ port: nextTestPort(), fetch: handler });
+      break;
+    } catch (error) {
+      if ((error as { code?: string }).code !== "EADDRINUSE") throw error;
+    }
+  }
   const base = `http://127.0.0.1:${server.port}`;
   return { db, server, base, sends, removed, ghMergeCalls, updateRefCalls, prView };
 }
@@ -222,6 +231,16 @@ async function get(base: string, path: string) {
   const res = await fetch(base + path);
   return { status: res.status, json: await res.json() };
 }
+
+test("makeServer skips occupied test ports", async () => {
+  const occupiedPort = nextTestPort();
+  const occupied = Bun.serve({ port: occupiedPort, fetch: () => new Response() });
+  testPortCounter = occupiedPort;
+  const s = makeServer();
+  expect(s.server.port).toBe(occupiedPort + 1);
+  await s.server.stop(true);
+  await occupied.stop(true);
+});
 
 // Drive a task to in_review with a branch set (via a stubbed spawn).
 const QUIZ = {
