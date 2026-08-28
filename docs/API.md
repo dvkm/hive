@@ -75,6 +75,17 @@ that mark a braindump as belonging to THIS project — e.g. `["coredata",
 "figma.com/file/…"]`. At `POST /api/intake` the raw text is scored against every
 project's name, repo basename, and these keywords, and the braindump is re-routed
 to the best match when it strictly out-scores the requested project).
+`intake_triage` (bool, default `false`; when true, each new ambient intake task
+— source `intake_*` or `watch` — is classified by one `claude -p` sonnet call
+before it can dispatch. A request with one clear reading is marked reviewed and
+proceeds. A request that reads two or more ways opens a decision card asking
+which reading to build, and the dispatcher holds the task until you answer. Every
+classifier failure falls through to "mechanical", so triage can never wedge
+intake. Classification runs in the background, so a slow one never delays the
+next message or watcher. The card it raises carries `decision_class:
+"intake_triage"`, which every automatic answering path refuses: the standing CI
+ruling, the chat supervisor, and the `decision_auto_answer_hours` timeout. Only
+you can answer it.)
 Domain-supervisor keys (see the Domain supervisors section):
 `supervisor_persona` (string, freeform planner identity included in every planner
 prompt), `plan_intake` (bool; when true, each new intake task auto-triggers a

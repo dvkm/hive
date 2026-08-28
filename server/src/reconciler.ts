@@ -1489,7 +1489,8 @@ export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()
     .query(
       `SELECT d.id, d.task_id, d.ts, d.title, d.options, p.config FROM decisions d
          JOIN tasks t ON t.id = d.task_id JOIN projects p ON p.id = t.project_id
-        WHERE d.status = 'open' AND COALESCE(d.risk, 'normal') != 'high' AND ${supervisedSql("t.source", "t.agent_target")}`
+        WHERE d.status = 'open' AND COALESCE(d.risk, 'normal') != 'high' AND d.decision_class IS NULL
+          AND ${supervisedSql("t.source", "t.agent_target")}`
     )
     .all() as { id: string; task_id: string; ts: string; title: string; options: string; config: string }[];
   for (const r of rows) {

@@ -22,6 +22,8 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, hiveHome, isOffline } from "./db.ts";
 import { writeEvent, getTask } from "./state.ts";
+import { triageIntake } from "./intake/triage.ts";
+import type { PlannerExec } from "./planner.ts";
 import { broadcast } from "./bus.ts";
 import { getCursor, setCursor } from "./intake/gchat.ts";
 import type { Exec } from "./exec.ts";
@@ -40,6 +42,7 @@ export interface WatchDeps {
   fetchImpl?: typeof fetch;
   exec?: Exec; // for git diff --no-index
   nowMs?: () => number;
+  triageExec?: PlannerExec; // the intake-triage classifier (injectable in tests)
 }
 
 const DEFAULT_INTERVAL_MIN = 5;
@@ -137,6 +140,14 @@ export async function checkWatcher(db: DB, projectId: string, w: Watcher, deps: 
   );
   writeEvent(db, { task_id: id, source: "system", type: "created", payload: { watcher: w.name, url: w.url } });
   broadcast({ type: "task", task: getTask(db, id) });
+  // Intake triage (config.intake_triage): a doc change that reads two ways asks
+  // the director which reading to build before this dispatches. No-op when the
+  // project has not opted in.
+  // Deliberately NOT awaited — the classifier can take up to 60s, and one slow
+  // watcher must not delay the next one's tick. triageIntake takes its dispatch
+  // hold synchronously before its first await, so the task cannot slip out while
+  // the classification runs.
+  triageIntake(db, getTask(db, id), { exec: deps.triageExec }).catch((e) => console.error(`[hive] watch: intake triage ${id}:`, e));
 
   writeFileSync(snap, body);
   setCursor(db, "watch", cursorKey, hash);

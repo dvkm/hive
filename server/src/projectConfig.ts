@@ -241,6 +241,7 @@ const CHECKS: Record<string, Check> = {
   test: bool, // test/ephemeral project, hidden from director surfaces (testProjects.ts)
   plan_intake: bool,
   plan_gate,
+  intake_triage: bool, // classify ambient intake before dispatch (intake/triage.ts)
   intake_keywords: strArray,
   // subprocess argv overrides (see above)
   agent_argv: argv,
