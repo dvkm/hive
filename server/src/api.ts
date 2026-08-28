@@ -3343,7 +3343,7 @@ async function bounceForChanges(
   if (!delivered) {
     const queued = queueSteerEvent(db, id, msg, "changes requested; agent not live");
     if (queued && !isExternalTask(task.source)) {
-      const r = await spawnAgent(db, herdr, id, { supervise: deps.supervise });
+      const r = await spawnAgent(db, herdr, id, { supervise: deps.supervise, exec: deps.exec });
       respawned = r.ok;
       if (r.ok) delivered = true;
     }
@@ -3384,7 +3384,7 @@ async function spawnTask(
   const blocked = authzBlock(db, { project_id: task.project_id, action: "task.spawn", target: task.title, task_id: id });
   if (blocked) return blocked;
 
-  const r = await spawnAgent(db, herdr, id, { hiveUrl: body?.hive_url, supervise: deps.supervise });
+  const r = await spawnAgent(db, herdr, id, { hiveUrl: body?.hive_url, supervise: deps.supervise, exec: deps.exec });
   if (!r.ok) return err(`spawn failed: ${r.error}`, 502);
   return json({ ok: true, task: getTask(db, id), agent_target: r.agent_target });
 }
@@ -3513,6 +3513,16 @@ export async function spawnAgent(
     const outcome = prOutcome(db, ids, task.resume_pr_url);
     if (outcome !== "open") {
       const error = `refusing to dispatch: predecessor's PR ${task.resume_pr_url} is already ${outcome}. The resume pointer is stale; reattach to the current PR (or clear resume_pr_url) before dispatching`;
+      writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error } });
+      return { ok: false, error };
+    }
+    // hive-487: a recorded "open" outcome only means nothing marked it
+    // closed/merged — it says nothing about whether the URL still names THIS
+    // lineage (a repo migration resets PR numbering, so an old pr_url can
+    // silently resolve to someone else's PR). Confirm the marker live before
+    // telling a fresh agent to adopt it.
+    if (!(await resumePointerMarkerHolds(db, opts.exec ?? defaultExec, ids, task.resume_pr_url))) {
+      const error = `refusing to dispatch: PR ${task.resume_pr_url} no longer carries a hive-task marker naming this task (or its parent) — it may point at a different or migrated repo. Reattach to the current PR (or clear resume_pr_url) before dispatching`;
       writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error } });
       return { ok: false, error };
     }
@@ -5573,6 +5583,26 @@ async function headSha(exec: Exec, cwd: string | null): Promise<string | null> {
     return sha || null;
   } catch {
     return null;
+  }
+}
+
+// hive-487: does `prUrl` still carry a `hive-task:` marker (or `[hive-<n>]`
+// title prefix) naming one of `ids`? Used to gate resume-pointer adoption at
+// dispatch time — the one place a stale/migrated pr_url would otherwise get
+// silently trusted just because nothing marked it closed.
+async function resumePointerMarkerHolds(db: DB, exec: Exec, ids: string[], prUrl: string): Promise<boolean> {
+  try {
+    const r = await exec(["gh", "pr", "view", prUrl, "--json", "title,body"]);
+    if (r.code !== 0) return false;
+    const data = JSON.parse(r.stdout);
+    const bodyId = taskIdFromBody(data.body);
+    if (bodyId) return ids.includes(bodyId);
+    const titleNumber = taskNumberFromTitle(data.title);
+    if (titleNumber == null) return false;
+    const placeholders = ids.map(() => "?").join(",");
+    return !!db.query(`SELECT 1 FROM tasks WHERE id IN (${placeholders}) AND number = ?`).get(...ids, titleNumber);
+  } catch {
+    return false;
   }
 }
 

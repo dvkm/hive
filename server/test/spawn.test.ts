@@ -32,9 +32,17 @@ function stubHerdr(sendResult: ExecResult = OK()) {
       sends.push({ target: argv[argv.indexOf("send") + 1], message: argv[argv.indexOf("send") + 2] });
       return sendResult;
     }
+    // hive-487's dispatch-time marker check: these tests are about the
+    // resume_pr_url/brief guards, not the marker guard, so the stubbed PR
+    // always carries the marker for whichever task currently owns that URL.
+    if (has(argv, "pr", "view")) {
+      const url = argv[argv.indexOf("view") + 1];
+      const owner = db.query("SELECT id FROM tasks WHERE resume_pr_url = ? OR pr_url = ? ORDER BY rowid DESC LIMIT 1").get(url, url) as { id: string } | undefined;
+      return OK(JSON.stringify({ title: "stub", body: owner ? `hive-task: ${owner.id}` : "" }));
+    }
     return OK();
   };
-  return { herdr: new Herdr(exec, "herdr"), sends, calls };
+  return { herdr: new Herdr(exec, "herdr"), sends, calls, exec };
 }
 
 const TOKEN = "test-token";
@@ -44,10 +52,10 @@ let server: any;
 let BASE = "";
 let projectId = "";
 let taskId = "";
-const { herdr, sends, calls } = stubHerdr();
+const { herdr, sends, calls, exec: herdrExec } = stubHerdr();
 
 beforeAll(async () => {
-  server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr }) });
+  server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr, exec: herdrExec }) });
   BASE = `http://127.0.0.1:${server.port}`;
   const p = await (await fetch(BASE + "/api/projects", {
     method: "POST", headers: { "Content-Type": "application/json" },
