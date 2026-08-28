@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { parseTeamclaudeEnv, proxyUrl, applyTeamclaudeEnv, usesTeamclaude } from "../src/teamclaude.ts";
 import { agentForConfig, modelForTask } from "../src/api.ts";
+import { plannerSpawnEnv } from "../src/planner.ts";
 
 const MITM_OUTPUT = `export HTTPS_PROXY=http://127.0.0.1:3456
 export HTTP_PROXY=http://127.0.0.1:3456
@@ -63,5 +64,33 @@ describe("applyTeamclaudeEnv", () => {
   test("null teamclaude env is a no-op", () => {
     const base = { PATH: "/bin" };
     expect(applyTeamclaudeEnv(base, null)).toBe(base);
+  });
+});
+
+// HIVE-491: with no ~/.hive/claude-profiles.json, claudeProfileEnvForRepo returns
+// {}. That empty object used to be read as "route to the personal account", which
+// took every server-side model call off the TeamClaude proxy and killed the whole
+// review pipeline once the personal account hit its weekly limit.
+describe("plannerSpawnEnv", () => {
+  const TC = { set: { HTTPS_PROXY: "http://127.0.0.1:3456" }, unset: ["ANTHROPIC_BASE_URL"] };
+
+  test("an empty project env still routes through TeamClaude", () => {
+    const env = plannerSpawnEnv({ PATH: "/bin" }, {}, TC);
+    expect(env.HTTPS_PROXY).toBe("http://127.0.0.1:3456");
+  });
+
+  test("no project env still routes through TeamClaude", () => {
+    expect(plannerSpawnEnv({ PATH: "/bin" }, undefined, TC).HTTPS_PROXY).toBe("http://127.0.0.1:3456");
+  });
+
+  test("a real route wins over TeamClaude and unsets nothing of its own", () => {
+    const env = plannerSpawnEnv({ PATH: "/bin" }, { CLAUDE_CONFIG_DIR: "/home/ada/.claude-work" }, TC);
+    expect(env.CLAUDE_CONFIG_DIR).toBe("/home/ada/.claude-work");
+    expect(env.HTTPS_PROXY).toBeUndefined();
+  });
+
+  test("an inherited CLAUDE_CONFIG_DIR is dropped when no route names one", () => {
+    const env = plannerSpawnEnv({ CLAUDE_CONFIG_DIR: "/leaked" }, {}, null);
+    expect(env.CLAUDE_CONFIG_DIR).toBeUndefined();
   });
 });

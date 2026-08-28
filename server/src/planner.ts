@@ -22,7 +22,7 @@ import { parseDecision } from "./rows.ts";
 import { listReferences } from "./learn.ts";
 import { classifyEscalation, factorsFromPlan, type EscalationVerdict } from "./policy.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
-import { teamclaudeEnv, applyTeamclaudeEnv } from "./teamclaude.ts";
+import { teamclaudeEnv, applyTeamclaudeEnv, type TeamclaudeEnv } from "./teamclaude.ts";
 import { claudeProfileEnvForRepo } from "./claudeProfiles.ts";
 import { homedir } from "node:os";
 import { join, win32 } from "node:path";
@@ -62,19 +62,34 @@ export type PlannerExec = (
   opts: { timeoutMs: number; cwd?: string; env?: Record<string, string> }
 ) => Promise<{ code: number; stdout: string; stderr: string; timedOut?: boolean }>;
 
-export const defaultPlannerExec: PlannerExec = async (argv, opts) => {
-  // A project-scoped env, including an empty one for the personal default,
-  // deliberately wins over TeamClaude's multi-account proxy. This guarantees
-  // that path routing selects the requested account. Callers with no project
-  // env retain TeamClaude's existing fail-open behavior.
-  const env = opts.env === undefined
-    ? applyTeamclaudeEnv({ ...process.env }, await teamclaudeEnv())
-    : { ...process.env };
+// Pick the env a `claude -p` subprocess runs with.
+//
+// A project env that actually NAMES a route (CLAUDE_CONFIG_DIR) deliberately
+// wins over TeamClaude's multi-account proxy, so path routing selects the
+// requested account. An EMPTY object is not such a route: it is what
+// claudeProfileEnvForRepo returns when no claude-profiles.json exists at all,
+// which is every install that never configured routing. Treating that as a
+// deliberate "personal account" choice silently pinned every server-side model
+// call (review, risk verification, planner, drift, explain) to the personal
+// account, and the whole review pipeline died the week that account hit its
+// usage limit (HIVE-491, 2026-08-27). No route means no preference, so
+// TeamClaude's fail-open balancing still applies.
+export function plannerSpawnEnv(
+  processEnv: Record<string, string | undefined>,
+  optsEnv: Record<string, string> | undefined,
+  tc: TeamclaudeEnv | null
+): Record<string, string | undefined> {
+  const routed = optsEnv !== undefined && Object.keys(optsEnv).length > 0;
+  const env = routed ? { ...processEnv } : applyTeamclaudeEnv({ ...processEnv }, tc);
   // No route means Claude's normal personal profile, which is represented by
   // an UNSET variable rather than CLAUDE_CONFIG_DIR=~/.claude (that directory
   // uses a different on-disk layout).
   delete env.CLAUDE_CONFIG_DIR;
-  Object.assign(env, opts.env);
+  return Object.assign(env, optsEnv);
+}
+
+export const defaultPlannerExec: PlannerExec = async (argv, opts) => {
+  const env = plannerSpawnEnv(process.env, opts.env, await teamclaudeEnv()) as Record<string, string>;
   const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe", stdin: "ignore", env, ...(opts.cwd ? { cwd: opts.cwd } : {}) });
   let timedOut = false;
   const timer = setTimeout(() => {
