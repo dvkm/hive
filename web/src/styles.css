@@ -3839,6 +3839,41 @@ a.dbundle-fact:hover {
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
+.autonomy-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.autonomy-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+}
+.autonomy-label {
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.autonomy-value {
+  font-size: 20px;
+  font-weight: 600;
+}
+.autonomy-value small {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-dim);
+}
+.autonomy-window {
+  font-size: 11px;
+  font-weight: 400;
+}
+.autonomy-spark {
+  letter-spacing: 1px;
+}
+
 .brief-spend-model {
   margin-left: auto;
   color: var(--text-dim);
