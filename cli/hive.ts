@@ -822,6 +822,18 @@ async function main() {
     console.log(`  sidecar:        ${sidecar.n} checks, ${sidecar.caught ?? 0} caught problems (${(sidecar.n / days).toFixed(1)}/day)`);
     console.log(`  CI gate:        ${held} handoffs held, ${bounced} bounced out of review`);
     console.log(`  review->merge:  avg ${review.h ?? "-"}h`);
+    // Repeat decisions hive already answered the same way: each is a rule the
+    // director could mint once instead of answering again. Minting stays a click.
+    const candidates = db.query(
+      `SELECT json_extract(payload,'$.title') title, MAX(json_extract(payload,'$.occurrences')) n,
+              json_extract(payload,'$.decision_ids') ids
+         FROM events WHERE type='rule_candidate' AND ts > ? GROUP BY title ORDER BY n DESC`
+    ).all(since) as any[];
+    if (candidates.length) {
+      console.log(`  rules:          ${candidates.length} repeat decisions could become rules`);
+      for (const c of candidates)
+        console.log(`                  "${c.title}" (${c.n}x) ${(JSON.parse(c.ids ?? "[]") as string[]).join(", ")}`);
+    }
     for (const c of cost) console.log(`  cost:           ${c.model}  $${c.c}  (${c.t} tasks)`);
     console.log(`\nfewer steers/nudges per shipped task = more autonomy. Compare week over week.`);
     return;

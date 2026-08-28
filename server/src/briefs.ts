@@ -8,6 +8,7 @@ import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
 import { planGateKinds, planGateBlocks } from "./planCritic.ts";
 import { figmaTokenEnv } from "./secrets.ts";
+import { matchPlaybook, playbookSection } from "./playbook.ts";
 
 // The PR marker contract (documented in docs/API.md). Both halves are REQUIRED
 // on any PR the agent opens so hive can link the PR back to this task.
@@ -332,6 +333,12 @@ export function composeBrief(db: DB, taskId: string): string {
   // Standing authority: which scoped rules govern this agent + the guarded-action
   // protocol it MUST use before any externally-risky operation it runs itself.
   parts.push(standingAuthority(db, task.project_id, task.id));
+
+  // A past task like this one may have left a recipe. Inline the single best
+  // match (steps included) instead of trusting the crew to guess the keywords
+  // that would have recalled it.
+  const playbook = matchPlaybook(db, task.project_id, `${task.title} ${task.brief ?? ""}`);
+  if (playbook) parts.push(playbookSection(playbook));
 
   // Project history grows without bound, so briefs carry counts and retrieve
   // task-relevant facts on demand instead of replaying the whole store.
