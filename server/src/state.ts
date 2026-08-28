@@ -343,6 +343,115 @@ export function evidenceAtSha(db: DB, taskId: string, sha: string): number {
   return (row as { n: number }).n;
 }
 
+// A recovery epoch marks the point a task's generation changed (a predecessor's
+// rescued work was forwarded onto it, or its PR was invalidated) so a stale
+// pane or late rescue event from the OLD generation can't be mistaken for the
+// current one. `recoveryEpochRowid` is the epoch's own event rowid — 0 means
+// no recovery is in flight.
+export function recoveryEpochRowid(db: DB, taskId: string): number {
+  const row = db
+    .query("SELECT MAX(rowid) AS rowid FROM events WHERE task_id = ? AND type = 'recovery_epoch'")
+    .get(taskId) as { rowid: number | null };
+  return row.rowid ?? 0;
+}
+
+function recoveryEvidenceScope(db: DB, taskId: string): { floor: number; attemptId: string | null } | null {
+  const epoch = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery_epoch' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId) as { payload: string } | undefined;
+  if (!epoch) return null;
+  let floor = 0;
+  let attemptId: string | null = null;
+  try {
+    const payload = JSON.parse(epoch.payload);
+    floor = Number(payload?.evidence_rowid) || 0;
+    attemptId = typeof payload?.attempt_id === "string" ? payload.attempt_id : null;
+  } catch {}
+  return { floor, attemptId };
+}
+
+// The herdr attempt id the current recovery epoch was opened for, or
+// `undefined` when no epoch is open (distinct from `null`, an epoch opened
+// without a known attempt id — e.g. before the replacement agent's own
+// `spawned` event landed).
+export function recoveryAttemptId(db: DB, taskId: string): string | null | undefined {
+  return recoveryEvidenceScope(db, taskId)?.attemptId;
+}
+
+export function startRecoveryEpoch(db: DB, taskId: string, source: string, attemptId?: string): void {
+  const evidence = db.query("SELECT MAX(rowid) AS rowid FROM evidence WHERE task_id = ?").get(taskId) as { rowid: number | null };
+  writeEvent(db, {
+    task_id: taskId,
+    source,
+    type: "recovery_epoch",
+    payload: { evidence_rowid: evidence.rowid ?? 0, ...(attemptId ? { attempt_id: attemptId } : {}) },
+  });
+}
+
+// Evidence count scoped to the current recovery epoch: only evidence captured
+// after the epoch opened (and, once the replacement agent's attempt id is
+// known, tagged with it) counts. Falls back to the ordinary all-time count
+// when no epoch is open.
+export function currentAttemptEvidenceCount(db: DB, taskId: string, kind?: string): number {
+  const scope = recoveryEvidenceScope(db, taskId);
+  if (!scope) return evidenceCount(db, taskId, kind);
+  const { floor, attemptId } = scope;
+  if (attemptId) {
+    const sql = kind
+      ? "SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND json_extract(meta, '$.attempt_id') = ? AND kind = ?"
+      : "SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND json_extract(meta, '$.attempt_id') = ?";
+    const row = kind
+      ? db.query(sql).get(taskId, floor, attemptId, kind)
+      : db.query(sql).get(taskId, floor, attemptId);
+    return (row as { n: number }).n;
+  }
+  const sql = kind
+    ? "SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND kind = ?"
+    : "SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ?";
+  const row = kind
+    ? db.query(sql).get(taskId, floor, kind)
+    : db.query(sql).get(taskId, floor);
+  return (row as { n: number }).n;
+}
+
+export function currentAttemptCommitEvidenceCount(db: DB, taskId: string): number {
+  const scope = recoveryEvidenceScope(db, taskId);
+  const commit = "json_type(meta, '$.commit_sha') = 'text' AND json_extract(meta, '$.commit_sha') != ''";
+  if (!scope) {
+    const row = db.query(`SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND ${commit}`).get(taskId);
+    return (row as { n: number }).n;
+  }
+  const { floor, attemptId } = scope;
+  const sql = attemptId
+    ? `SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND ${commit} AND json_extract(meta, '$.attempt_id') = ?`
+    : `SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND ${commit}`;
+  const row = attemptId
+    ? db.query(sql).get(taskId, floor, attemptId)
+    : db.query(sql).get(taskId, floor);
+  return (row as { n: number }).n;
+}
+
+export function currentAttemptEvidenceAtSha(db: DB, taskId: string, sha: string): number {
+  const scope = recoveryEvidenceScope(db, taskId);
+  if (!scope) return evidenceAtSha(db, taskId, sha);
+  const { floor, attemptId } = scope;
+  const sql = attemptId
+    ? "SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND json_extract(meta, '$.commit_sha') = ? AND json_extract(meta, '$.attempt_id') = ?"
+    : "SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND rowid > ? AND json_extract(meta, '$.commit_sha') = ?";
+  const row = attemptId
+    ? db.query(sql).get(taskId, floor, sha, attemptId)
+    : db.query(sql).get(taskId, floor, sha);
+  return (row as { n: number }).n;
+}
+
+// Does the given PR head (or the task's own head_sha) carry evidence captured
+// during the CURRENT recovery attempt? Scout tasks and PR-less tasks have
+// nothing to check; with no recovery epoch open at all, anything counts.
+export function recoveryPrHeadHasEvidence(db: DB, task: any, headSha: string | null = task.head_sha ?? null): boolean {
+  if (!recoveryEpochRowid(db, task.id) || !task.pr_url || task.kind === "scout") return true;
+  return Boolean(headSha && currentAttemptEvidenceAtSha(db, task.id, headSha) >= 1);
+}
+
 function insertEvent(
   db: DB,
   args: { task_id: string; source: string; type: string; payload?: unknown }
@@ -697,6 +806,23 @@ export function transition(
       throw new TransitionError(
         "cannot transition to 'done': scout task requires a report evidence"
       );
+    }
+  }
+
+  // A recovery epoch is open: a stale-generation review handoff (evidence
+  // captured by a predecessor, or none at all since the epoch opened) must not
+  // reach the director. Merge-time checks (recoveryPrHeadHasEvidence in api.ts
+  // /reconciler.ts) are the second line of defense; this is the first.
+  if (from === "in_progress" && to === "in_review" && !isTrackingOnlyTask(task)) {
+    const recoveryEpoch = recoveryEpochRowid(db, taskId);
+    if (recoveryEpoch) {
+      const evidenceKind = task.kind === "scout" ? "report" : undefined;
+      if (currentAttemptEvidenceCount(db, taskId, evidenceKind) < 1) {
+        throw new TransitionError("cannot transition to 'in_review': the current recovery attempt has no evidence");
+      }
+      if (!recoveryPrHeadHasEvidence(db, task)) {
+        throw new TransitionError("cannot transition to 'in_review': the pull request head lacks current recovery evidence");
+      }
     }
   }
 

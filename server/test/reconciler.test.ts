@@ -1,10 +1,11 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, getSetting, type DB } from "../src/db.ts";
-import { transition, getTask, writeEvent } from "../src/state.ts";
+import { transition, getTask, writeEvent, startRecoveryEpoch } from "../src/state.ts";
 import { reconcileOnce, ciStatusOf, ciStatusProbed } from "../src/reconciler.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
 import { addClient, removeClient } from "../src/bus.ts";
 import { taskWithHealth, needsAttention } from "../src/health.ts";
+import { queuedSteers } from "../src/steer.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
 function freshDb(config: any = {}): { db: DB; projectId: string } {
@@ -457,6 +458,83 @@ test("syncPRs updates ci_status and transitions in_review->verifying on merge", 
   expect(task.state).toBe("verifying");
   const merged = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_merged'").get(id) as any;
   expect(JSON.parse(merged.payload)).toEqual({ pr_url: "https://gh/pr/1" });
+});
+
+test("syncPRs advances an evidenced recovery merged while still in progress", async () => {
+  const { db, projectId } = freshDb();
+  const prUrl = "https://gh/pr/recovery-complete";
+  const head = "recovered-merged-head";
+  const id = makeTask(db, projectId, { pr_url: prUrl, agent_target: "recovery-agent" });
+  transition(db, id, "in_progress");
+  db.query("UPDATE tasks SET branch = ?, head_sha = ?, resume_branch = ?, resume_pr_url = ? WHERE id = ?")
+    .run("hive/recovery-complete", head, "hive/recovery-complete", prUrl, id);
+  startRecoveryEpoch(db, id, "system");
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, meta) VALUES (?,?,?,?,?)").run(
+    newId("evd"), id, now(), "log", JSON.stringify({ commit_sha: head })
+  );
+  const gh: Exec = stub((argv) => argv[0] === "gh"
+    ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: head }))
+    : OK());
+
+  await reconcileOnce(db, { exec: gh, herdr: statusHerdr("working") });
+
+  expect(getTask(db, id).state).toBe("done");
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'pr_merged'").get(id)).toEqual({ n: 1 });
+});
+
+test("syncPRs requires a new landing when an external merge omits recovery work", async () => {
+  const { db, projectId } = freshDb();
+  const prUrl = "https://gh/pr/recovery-merged";
+  const id = makeTask(db, projectId, { pr_url: prUrl, agent_target: "recovery-agent" });
+  transition(db, id, "in_progress");
+  db.query("UPDATE tasks SET branch = ?, head_sha = ?, resume_branch = ?, resume_pr_url = ? WHERE id = ?")
+    .run("hive/recovery-merged", "evidenced-head", "hive/recovery-merged", prUrl, id);
+  startRecoveryEpoch(db, id, "system");
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, meta) VALUES (?,?,?,?,?)").run(
+    newId("evd"), id, now(), "log", JSON.stringify({ commit_sha: "evidenced-head" })
+  );
+  transition(db, id, "in_review");
+
+  const gh: Exec = stub((argv) => argv[0] === "gh"
+    ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "force-pushed-head" }))
+    : OK());
+  await reconcileOnce(db, { exec: gh, herdr: statusHerdr("working") });
+
+  expect(getTask(db, id)).toMatchObject({
+    state: "in_progress",
+    pr_url: null,
+    head_sha: null,
+    ci_status: null,
+    resume_pr_url: null,
+  });
+  const mismatch = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery_pr_mismatch' ORDER BY rowid DESC LIMIT 1")
+    .get(id) as { payload: string };
+  expect(JSON.parse(mismatch.payload)).toMatchObject({ pr_url: prUrl, head_sha: "force-pushed-head", merged: true });
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'pr_merged'").get(id)).toEqual({ n: 1 });
+  expect(db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_context_reset' ORDER BY rowid DESC LIMIT 1").get(id))
+    .toBeTruthy();
+  expect(queuedSteers(db, id).map((steer) => steer.message).join("\n")).toContain("new pull request");
+});
+
+test("syncPRs does not claim an inherited merge omitted work before recovery commits", async () => {
+  const { db, projectId } = freshDb();
+  const prUrl = "https://gh/pr/inherited-merged";
+  const id = makeTask(db, projectId, { pr_url: prUrl });
+  db.query("UPDATE tasks SET resume_branch = ?, resume_pr_url = ? WHERE id = ?")
+    .run("hive/inherited-merged", prUrl, id);
+  startRecoveryEpoch(db, id, "reconciler");
+  const gh: Exec = stub((argv) => argv[0] === "gh"
+    ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "inherited-head" }))
+    : OK());
+
+  await reconcileOnce(db, { exec: gh });
+
+  expect(getTask(db, id)).toMatchObject({ state: "queued", pr_url: null, resume_pr_url: null });
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery_pr_mismatch'").get(id)).toBeNull();
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'pr_merged'").get(id)).toBeTruthy();
+  const message = queuedSteers(db, id).map((steer) => steer.message).join("\n");
+  expect(message).toContain("merged before this recovery attempt evidenced a commit");
+  expect(message).toContain("open a replacement PR only if additional work remains");
 });
 
 test("syncPRs skips a task that raced ahead to done instead of throwing (task #621)", async () => {

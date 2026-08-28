@@ -9,10 +9,10 @@
 // is never torn down twice (see cleanedUpSinceLastSpawn).
 import type { DB } from "./db.ts";
 import { now } from "./db.ts";
-import { getTask, writeEvent, TERMINAL, queuedInputRecoveryPending, type State } from "./state.ts";
+import { getTask, writeEvent, transition, startRecoveryEpoch, recoveryAttemptId, TERMINAL, queuedInputRecoveryPending, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { isTrackingOnlyTask } from "./supervision.ts";
-import { queuedSteers } from "./steer.ts";
+import { queuedSteers, queueSteerEvent } from "./steer.ts";
 import { broadcastTask } from "./health.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectBaseBranch } from "./exec.ts";
@@ -90,18 +90,32 @@ export interface CleanupOutcome {
 // The `spawned` event carries the herdr tab id and the worktree's own workspace
 // id (the task row stores neither). fleet_workspace_id is deliberately NOT
 // returned: it's the shared hive-fleet workspace and must never be closed.
-export function spawnMeta(db: DB, taskId: string): { tab_id: string | null; workspace_id: string | null; terminal_id: string | null } {
-  const empty = { tab_id: null, workspace_id: null, terminal_id: null };
+type SpawnRecord = {
+  event_id: string | null;
+  rowid: number;
+  tab_id: string | null;
+  workspace_id: string | null;
+  terminal_id: string | null;
+  attempt_id: string | null;
+};
+
+export function latestSpawnRecord(db: DB, taskId: string): SpawnRecord {
+  const empty = { event_id: null, rowid: 0, tab_id: null, workspace_id: null, terminal_id: null, attempt_id: null };
   const r = db
-    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'spawned' ORDER BY ts DESC LIMIT 1")
-    .get(taskId) as { payload: string } | undefined;
+    .query("SELECT rowid, id, payload FROM events WHERE task_id = ? AND type = 'spawned' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId) as { rowid: number; id: string; payload: string } | undefined;
   if (!r) return empty;
   try {
     const p = JSON.parse(r.payload);
-    return { tab_id: p.tab_id ?? null, workspace_id: p.workspace_id ?? null, terminal_id: p.terminal_id ?? null };
+    return { event_id: r.id, rowid: r.rowid, tab_id: p.tab_id ?? null, workspace_id: p.workspace_id ?? null, terminal_id: p.terminal_id ?? null, attempt_id: p.attempt_id ?? null };
   } catch {
     return empty;
   }
+}
+
+export function spawnMeta(db: DB, taskId: string): { tab_id: string | null; workspace_id: string | null; terminal_id: string | null; attempt_id: string | null } {
+  const { tab_id, workspace_id, terminal_id, attempt_id } = latestSpawnRecord(db, taskId);
+  return { tab_id, workspace_id, terminal_id, attempt_id };
 }
 
 // `cleaned_up` is the record that this spawn's teardown already ran to
@@ -122,14 +136,145 @@ export function spawnMeta(db: DB, taskId: string): { tab_id: string | null; work
 // (unmerged) worktree writes `cleanup_skipped`, not `cleaned_up`, and keeps
 // retrying on purpose until its branch is mergeable.
 function cleanedUpSinceLastSpawn(db: DB, taskId: string): boolean {
-  const r = db
+  const cleaned = db
+    .query("SELECT rowid, payload FROM events WHERE task_id = ? AND type = 'cleaned_up' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId) as { rowid: number; payload: string } | undefined;
+  if (!cleaned) return false;
+  const spawned = latestSpawnRecord(db, taskId);
+  try {
+    const spawnRowid = JSON.parse(cleaned.payload)?.spawn_rowid;
+    if (typeof spawnRowid === "number") return spawnRowid === spawned.rowid;
+  } catch {}
+  return !spawned.rowid || spawned.rowid <= cleaned.rowid;
+}
+
+// Forward a predecessor's cleanup rescue (a ghost branch, or just "the kept
+// worktree is gone now") onto one live successor — a requeued row or the same
+// row's next in-place retry. Opens a fresh recovery epoch on the successor so
+// evidence captured before this point can't satisfy a review/merge gate for
+// work the successor never actually saw (late rescue events must not revive
+// an older generation), bounces it out of review if it had already gotten
+// there, and steers the agent. Idempotent per (cleanup event, successor).
+function forwardRescuedWork(
+  db: DB,
+  cleanupEventId: string,
+  predecessorTaskId: string,
+  ghostBranch: string | null,
+  successorId: string
+): boolean {
+  const successor = getTask(db, successorId);
+  if (!successor || !["queued", "in_progress", "needs_decision", "in_review", "verifying"].includes(successor.state)) return false;
+  const forwarded = db
     .query(
-      `SELECT MAX(CASE WHEN type = 'cleaned_up' THEN ts END) AS cleaned,
-              MAX(CASE WHEN type = 'spawned'    THEN ts END) AS spawned
-         FROM events WHERE task_id = ? AND type IN ('cleaned_up', 'spawned')`
+      `SELECT 1 FROM events
+       WHERE task_id = ? AND type = 'recovery_work_forwarded'
+         AND json_extract(payload, '$.cleanup_event_id') = ? LIMIT 1`
     )
-    .get(taskId) as { cleaned: string | null; spawned: string | null };
-  return !!r.cleaned && (!r.spawned || r.spawned <= r.cleaned);
+    .get(successor.id, cleanupEventId);
+  if (forwarded) return false;
+  db.query("UPDATE tasks SET resume_ghost_branch = COALESCE(?, resume_ghost_branch), updated_at = ? WHERE id = ?")
+    .run(ghostBranch, now(), successor.id);
+  const recoveryAttempt = recoveryAttemptId(db, successor.id);
+  const attemptId = recoveryAttempt === undefined ? spawnMeta(db, successor.id).attempt_id ?? undefined : recoveryAttempt ?? undefined;
+  startRecoveryEpoch(db, successor.id, "reaper", attemptId);
+  if (successor.state === "in_review" || successor.state === "verifying")
+    transition(db, successor.id, "in_progress", { source: "reaper", reason: "predecessor cleanup invalidated recovery worktree" });
+  const message = ghostBranch
+    ? `Recovery update: cleanup rescued additional predecessor work onto \`${ghostBranch}\`. Fetch and merge it before continuing.`
+    : "Recovery update: cleanup removed the previously advertised kept worktree. That path is no longer available; continue from the inherited branch and do not rely on the old worktree.";
+  queueSteerEvent(
+    db,
+    successor.id,
+    message,
+    ghostBranch ? "predecessor cleanup rescued work" : "predecessor cleanup removed kept worktree"
+  );
+  writeEvent(db, {
+    task_id: successor.id,
+    source: "reaper",
+    type: "recovery_work_forwarded",
+    payload: { cleanup_event_id: cleanupEventId, predecessor_task_id: predecessorTaskId, ghost_branch: ghostBranch },
+  });
+  return true;
+}
+
+// Replay any cleanup (or late worktree reclamation) rescues that haven't yet
+// been forwarded onto their live successor(s) — a requeued row's whole
+// lineage, plus a same-row replacement generation. Scoped to a single
+// predecessor when `taskId` is given (the normal cleanupTask/reclaim call);
+// unscoped for a startup/reaper sweep. Cross-project requeue rows are never
+// followed — the lineage walk requires the parent and child to share a
+// project.
+export function replayCleanedUpRecovery(db: DB, taskId?: string): number {
+  const rows = db
+    .query(
+      `WITH RECURSIVE active_recoveries(id, task_number) AS (
+         SELECT candidate.id, candidate.number
+         FROM tasks candidate
+         WHERE candidate.state IN ('queued','in_progress','needs_decision','in_review','verifying')
+       ), lineage(successor_id, successor_number, task_id) AS (
+         SELECT id, task_number, id FROM active_recoveries
+         UNION ALL
+         SELECT lineage.successor_id, lineage.successor_number, parent.id
+         FROM lineage
+         JOIN tasks child ON child.id = lineage.task_id
+         JOIN tasks parent ON parent.id = child.parent_task_id
+         WHERE child.source = 'requeue'
+           AND child.project_id = parent.project_id
+           AND EXISTS (
+             SELECT 1 FROM events AS provenance
+             WHERE provenance.task_id = child.id
+               AND provenance.type = 'created'
+               AND provenance.source = 'reconciler'
+               AND json_extract(provenance.payload, '$.requeue_of') = parent.id
+           )
+       )
+       SELECT cleanup.id AS cleanup_event_id,
+              cleanup.task_id AS predecessor_task_id,
+              json_extract(cleanup.payload, '$.ghost_branch') AS ghost_branch,
+              lineage.successor_id
+       FROM lineage
+       JOIN events AS cleanup
+         ON cleanup.task_id = lineage.task_id AND cleanup.type IN ('cleaned_up','worktree_reclaimed')
+       WHERE (
+           cleanup.type = 'worktree_reclaimed'
+           OR json_extract(cleanup.payload, '$.worktree_removed') = 1
+           OR json_extract(cleanup.payload, '$.ghost_branch') IS NOT NULL
+         )
+         ${taskId ? "AND cleanup.task_id = ?" : ""}
+         AND (
+           cleanup.task_id != lineage.successor_id
+           OR EXISTS (
+             SELECT 1 FROM events AS changed
+             WHERE changed.task_id = lineage.successor_id
+               AND changed.type = 'state_change'
+               -- No fallback to 0: a cleanup event without a real spawn_rowid (e.g. an
+               -- older worktree_reclaimed event, before reconciler started stamping one)
+               -- must never match — json_extract(...) IS NULL makes the comparison NULL,
+               -- so EXISTS finds nothing, rather than "any failed->queued ever" matching.
+               AND changed.rowid > json_extract(cleanup.payload, '$.spawn_rowid')
+               AND json_extract(changed.payload, '$.from') = 'failed'
+               AND json_extract(changed.payload, '$.to') = 'queued'
+           )
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM events AS forwarded
+           WHERE forwarded.task_id = lineage.successor_id
+             AND forwarded.type = 'recovery_work_forwarded'
+             AND json_extract(forwarded.payload, '$.cleanup_event_id') = cleanup.id
+         )
+       ORDER BY cleanup.rowid, lineage.successor_number DESC`
+    )
+    .all(...(taskId ? [taskId] : [])) as {
+      cleanup_event_id: string;
+      predecessor_task_id: string;
+      ghost_branch: string | null;
+      successor_id: string;
+    }[];
+  let forwarded = 0;
+  for (const row of rows)
+    if (forwardRescuedWork(db, row.cleanup_event_id, row.predecessor_task_id, row.ghost_branch, row.successor_id))
+      forwarded++;
+  return forwarded;
 }
 
 // Tear down a finished task. `force` skips the terminal-state guard (used by the
@@ -144,7 +289,22 @@ export async function cleanupTask(
   const task = getTask(db, taskId);
   if (!task) return noop;
   if (!opts.force && !TERMINAL.includes(task.state as State)) return noop;
-  if (cleanedUpSinceLastSpawn(db, taskId)) return noop; // already torn down; see above
+  const initialSpawn = latestSpawnRecord(db, taskId);
+  // A replacement generation (a requeue, or the same row's next in-place
+  // attempt) can start mid-cleanup — herdr calls below are `await`-ed, so a
+  // fresh spawn/state-change race is real, not hypothetical (see the
+  // same-row test). Once the generation has moved on, this cleanup no longer
+  // owns the row: bail rather than clear/rebind state out from under the
+  // replacement.
+  const ownsCleanupGeneration = (): boolean => {
+    const current = getTask(db, taskId);
+    return Boolean(current && current.state === task.state && latestSpawnRecord(db, taskId).rowid === initialSpawn.rowid);
+  };
+  if (cleanedUpSinceLastSpawn(db, taskId)) {
+    replayCleanedUpRecovery(db, taskId);
+    db.query("UPDATE tasks SET agent_target = NULL, worktree_path = NULL, updated_at = ? WHERE id = ?").run(now(), taskId);
+    return noop;
+  }
 
   const project = db.query("SELECT repo_path, config FROM projects WHERE id = ?").get(task.project_id) as
     | { repo_path: string | null; config: string | null }
@@ -157,6 +317,7 @@ export async function cleanupTask(
     config = {};
   }
   const defaultBranch = projectBaseBranch(config);
+  if (!ownsCleanupGeneration()) return noop;
 
   // 0) per-project stack teardown (docker etc.) — BEFORE the worktree goes
   // away, since the command usually lives inside it.
@@ -170,6 +331,7 @@ export async function cleanupTask(
       type: "stack_teardown",
       source: "reaper",
     });
+    if (!ownsCleanupGeneration()) return noop;
   }
 
   // 1) worktree — guarded removal (branch pushed/merged; uncommitted work preserved).
@@ -210,10 +372,11 @@ export async function cleanupTask(
   // (kern.tty.ptmx_max=511) and took down all spawning (2026-07-17).
   // Preserved tasks keep agent_target until the close succeeds, then drop it so
   // later sweeps skip the herdr call instead of re-closing a dead tab.
-  const meta = spawnMeta(db, taskId);
+  const generationChanged = !ownsCleanupGeneration();
+  const meta = initialSpawn;
   const preserved = preservedWorktree;
   let session = { closed: false, via: null as string | null };
-  const attemptedClose = preserved ? !!task.agent_target : !!(task.agent_target || meta.tab_id);
+  const attemptedClose = !generationChanged && (preserved ? !!task.agent_target : !!(task.agent_target || meta.tab_id));
   if (attemptedClose) {
     session = await herdr.closeSession({
       agentTarget: task.agent_target,
@@ -246,7 +409,7 @@ export async function cleanupTask(
     // 6 terminal tasks, ~5 closes each, every 5 minutes). Dropping the binding
     // makes the next sweep a no-op; the pane sweep (reaper.ts) is the backstop
     // for a tab that really is still open.
-    if (attemptedClose)
+    if (attemptedClose && ownsCleanupGeneration())
       db.query("UPDATE tasks SET agent_target = NULL, updated_at = ? WHERE id = ?").run(now(), taskId);
     // One event per distinct skip reason, not one per reaper sweep: the same
     // dozen preserved worktrees emitted 2,668 duplicate events in 3 days.
@@ -289,10 +452,14 @@ export async function cleanupTask(
       session_closed: session.closed,
       session_via: session.via,
       tab_id: meta.tab_id,
+      spawn_event_id: meta.event_id,
+      spawn_rowid: meta.rowid,
     },
   });
+  replayCleanedUpRecovery(db, taskId);
   // Clear the now-gone runtime binding so a re-run/reaper pass is a no-op.
-  db.query("UPDATE tasks SET agent_target = NULL, worktree_path = NULL, updated_at = ? WHERE id = ?").run(now(), taskId);
+  if (ownsCleanupGeneration())
+    db.query("UPDATE tasks SET agent_target = NULL, worktree_path = NULL, updated_at = ? WHERE id = ?").run(now(), taskId);
   return { cleaned: true, worktree, session };
 }
 

@@ -31,6 +31,8 @@ import {
   dependentsWedgedForDecision,
   resolveDependentsWedgedForDecision,
   queuedInputRecoveryPending,
+  recoveryEpochRowid,
+  recoveryPrHeadHasEvidence,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
@@ -2897,6 +2899,37 @@ export async function mergeTask(
   if (task.kind === "scout")
     return err(`scout tasks are report-only; accept the report by moving task '${id}' to 'verifying' instead of merging its branch`, 409);
 
+  // A recovery epoch open at request time marks this a recovery attempt: the
+  // merge target must still carry the commit THIS attempt evidenced, checked
+  // again immediately before the actual `gh pr merge` (a force-push or a
+  // rescue racing in between the two `await`s is real — see the recovery-race
+  // tests). `mergeStillCurrent` also catches the plainer race where rescued
+  // work invalidates this whole recovery attempt (a new epoch opens, or the
+  // task leaves in_review) while a `gh pr view` is in flight.
+  const mergeEpoch = recoveryEpochRowid(db, id);
+  const mergeStillCurrent = (): boolean => {
+    const current = getTask(db, id);
+    return Boolean(
+      current &&
+        current.state === "in_review" &&
+        recoveryEpochRowid(db, id) === mergeEpoch &&
+        current.pr_url === task.pr_url &&
+        current.branch === task.branch
+    );
+  };
+  const recoverySuperseded = () => err("merge superseded by a recovery update; review the rescued work before merging", 409);
+  const recoveryHeadMismatch = (headSha: string | null) => {
+    writeEvent(db, { task_id: id, source: "director", type: "recovery_pr_mismatch", payload: { pr_url: task.pr_url, head_sha: headSha } });
+    queueSteerEvent(
+      db,
+      id,
+      "The pull request no longer contains the commit evidenced by this recovery attempt. Push the recovered work to the PR and attach fresh evidence from its live head before requesting review again.",
+      "recovery commit missing from PR"
+    );
+    transition(db, id, "in_progress", { source: "director", reason: "recovery commit missing from pull request" });
+    return err("merge blocked: the live pull request head lacks current recovery evidence", 409);
+  };
+
   const blocked = authzBlock(db, { project_id: task.project_id, action: "task.merge", target: task.title, task_id: id });
   if (blocked) return blocked;
 
@@ -2964,6 +2997,10 @@ export async function mergeTask(
       prView = JSON.parse(probe.stdout || "{}");
     } catch {
       return mergeFailed(db, herdr, task, projectBaseBranch(config), "Could not parse PR metadata; merge was not attempted.", actor);
+    }
+    if (mergeEpoch && !recoveryPrHeadHasEvidence(db, task, prView.headRefOid ?? null)) {
+      if (!mergeStillCurrent()) return recoverySuperseded();
+      return recoveryHeadMismatch(prView.headRefOid ?? null);
     }
     if (!prView.baseRefName || !prView.baseRefOid)
       return mergeFailed(db, herdr, task, projectBaseBranch(config), "PR base metadata is missing; merge was not attempted.", actor);
@@ -3082,6 +3119,7 @@ export async function mergeTask(
 
   if (!method) {
     if (task.pr_url && !forceLocalFf) {
+      if (!mergeStillCurrent()) return recoverySuperseded();
       const flag = ghMergeFlag(config.merge_method);
       method = `pr ${flag.slice(2)}`;
       if (opts.beforeMutation && !opts.beforeMutation()) return err(AUTO_MERGE_PAUSED, 409);
@@ -3095,11 +3133,20 @@ export async function mergeTask(
       // a probe failure unrelated to the merge itself.
       let matchedHead: string | null = null;
       const readiness = await probePrReadiness(exec, task.pr_url);
+      if (!mergeStillCurrent()) return recoverySuperseded();
       if (opts.beforeMutation && !opts.beforeMutation()) return err(AUTO_MERGE_PAUSED, 409);
       if (readiness.ok) {
         const liveHead =
           typeof readiness.data.headRefOid === "string" && readiness.data.headRefOid ? readiness.data.headRefOid : null;
         if (liveHead && String(readiness.data.state ?? "").toUpperCase() === "OPEN") matchedHead = liveHead;
+      }
+      if (mergeEpoch) {
+        if (!readiness.ok) return err("merge blocked: could not verify live pull request readiness", 409);
+        if (!matchedHead) return err("merge blocked: could not verify the live pull request head", 409);
+        db.query("UPDATE tasks SET head_sha = ?, ci_status = ?, updated_at = ? WHERE id = ? AND pr_url = ?")
+          .run(matchedHead, readiness.ci, now(), id, task.pr_url);
+        if (readiness.ci === "failing" || readiness.ci === "pending") return err(`merge blocked: live pull request CI is ${readiness.ci}`, 409);
+        if (!recoveryPrHeadHasEvidence(db, task, matchedHead)) return recoveryHeadMismatch(matchedHead);
       }
       const mergeArgv = ["gh", "pr", "merge", task.pr_url, flag];
       if (matchedHead) mergeArgv.push("--match-head-commit", matchedHead);
@@ -3154,6 +3201,7 @@ export async function mergeTask(
     }
   }
 
+  if (!mergeStillCurrent()) return recoverySuperseded();
   if (deferQuizReviewEventId) {
     writeEvent(db, {
       task_id: id,

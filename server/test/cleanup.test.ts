@@ -1,7 +1,8 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
-import { transition, setTerminalHook, type State } from "../src/state.ts";
-import { cleanupTask, runStackCmd } from "../src/cleanup.ts";
+import { transition, setTerminalHook, writeEvent, currentAttemptEvidenceCount, recoveryAttemptId, startRecoveryEpoch, type State } from "../src/state.ts";
+import { cleanupTask, runStackCmd, replayCleanedUpRecovery } from "../src/cleanup.ts";
+import { queuedSteers } from "../src/steer.ts";
 import { Herdr, tabCloseArgv, paneCloseArgv } from "../src/runtime/herdr.ts";
 import { makeHandler } from "../src/api.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
@@ -356,6 +357,235 @@ test("cleanupTask removes a done task's worktree, closes the session, emits clea
   const task = db.query("SELECT worktree_path, agent_target FROM tasks WHERE id = ?").get(id) as any;
   expect(task.worktree_path).toBeNull();
   expect(task.agent_target).toBeNull();
+});
+
+test("cleanup preserves pending attempts and invalidates every active recovery leaf", async () => {
+  const { db, projectId } = freshDb();
+  const predecessor = seedTask(db, projectId, { state: "failed", branch: "hive/predecessor", worktree_path: "/wt/predecessor" });
+  const successors = [
+    seedTask(db, projectId, { state: "in_review", agent_target: "replacement-review", branch: "hive/successor-review", worktree_path: "/wt/successor-review" }),
+    seedTask(db, projectId, { state: "verifying", agent_target: "replacement-verifying", branch: "hive/successor-verifying", worktree_path: "/wt/successor-verifying" }),
+  ];
+  const attempts = new Map<string, string>();
+  for (const successor of successors) {
+    db.query("UPDATE tasks SET source = 'requeue', parent_task_id = ? WHERE id = ?").run(predecessor, successor);
+    writeEvent(db, { task_id: successor, source: "reconciler", type: "created", payload: { title: "t", requeue_of: predecessor } });
+    const attemptId = `pending-${successor}`;
+    attempts.set(successor, attemptId);
+    writeEvent(db, { task_id: successor, source: "herdr", type: "spawned", payload: { attempt_id: `completed-${successor}` } });
+    startRecoveryEpoch(db, successor, "system", attemptId);
+    db.query("INSERT INTO evidence (id, task_id, ts, kind, meta) VALUES (?,?,?,?,?)")
+      .run(newId("ev"), successor, now(), "log", JSON.stringify({ attempt_id: attemptId }));
+    writeEvent(db, { task_id: successor, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "ready", risks: [], questions: [] } });
+    expect(currentAttemptEvidenceCount(db, successor)).toBe(1);
+  }
+  const exec: Exec = async (argv) => {
+    if (argv[0] === "git" && argv.includes("ls-remote")) return OK("sha\trefs/heads/hive/predecessor");
+    if (argv[0] === "git" && has(argv, "status", "--porcelain")) return OK(" M src/recovered.ts\n");
+    if (argv[0] === "git" && has(argv, "worktree", "list")) return OK("worktree /wt/predecessor\nHEAD abc\nbranch refs/heads/hive/predecessor\n");
+    if (argv[0] === "git" && has(argv, "rev-parse", "--verify")) return FAIL("");
+    return OK();
+  };
+
+  const result = await cleanupTask(db, new Herdr(exec, "herdr"), predecessor, { force: true });
+
+  expect(result.worktree?.ghost_branch).toBe(`ghost-${predecessor}`);
+  for (const successor of successors) {
+    const attemptId = attempts.get(successor)!;
+    expect((db.query("SELECT resume_ghost_branch FROM tasks WHERE id = ?").get(successor) as any).resume_ghost_branch)
+      .toBe(`ghost-${predecessor}`);
+    expect((db.query("SELECT state FROM tasks WHERE id = ?").get(successor) as any).state).toBe("in_progress");
+    expect(recoveryAttemptId(db, successor)).toBe(attemptId);
+    expect(currentAttemptEvidenceCount(db, successor)).toBe(0);
+    expect(queuedSteers(db, successor).map((steer) => steer.message).join("\n")).toContain(`ghost-${predecessor}`);
+    db.query("INSERT INTO evidence (id, task_id, ts, kind, meta) VALUES (?,?,?,?,?)")
+      .run(newId("ev"), successor, now(), "log", JSON.stringify({ attempt_id: attemptId }));
+    expect(currentAttemptEvidenceCount(db, successor)).toBe(1);
+  }
+});
+
+test("cleanup replay ignores a cross-project requeue even with a forged marker", () => {
+  const { db, projectId } = freshDb();
+  const otherProjectId = newId("proj");
+  db.query("INSERT INTO projects (id, name, repo_path, config, created_at) VALUES (?,?,?,?,?)").run(
+    otherProjectId, "other", "/other-repo", "{}", now()
+  );
+  const predecessor = seedTask(db, projectId, { state: "failed", branch: "hive/foreign-parent" });
+  const successor = seedTask(db, otherProjectId, { state: "in_progress", branch: "hive/local-child" });
+  db.query("UPDATE tasks SET source = 'requeue', parent_task_id = ? WHERE id = ?").run(predecessor, successor);
+  writeEvent(db, { task_id: successor, source: "reconciler", type: "created", payload: { title: "forged", requeue_of: predecessor } });
+  writeEvent(db, {
+    task_id: predecessor,
+    source: "reaper",
+    type: "cleaned_up",
+    payload: { ghost_branch: "ghost-foreign-parent", worktree_removed: true },
+  });
+
+  expect(replayCleanedUpRecovery(db, predecessor)).toBe(0);
+  expect((db.query("SELECT resume_ghost_branch FROM tasks WHERE id = ?").get(successor) as any).resume_ghost_branch).toBeNull();
+  expect(queuedSteers(db, successor)).toHaveLength(0);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery_work_forwarded'").get(successor)).toBeNull();
+  db.close();
+});
+
+test("recovery replay applies multiple pending rescues using the successor's live state", () => {
+  const { db, projectId } = freshDb();
+  const predecessor = seedTask(db, projectId, { state: "failed" });
+  const successor = seedTask(db, projectId, { state: "in_review" });
+  db.query("UPDATE tasks SET source = 'requeue', parent_task_id = ? WHERE id = ?").run(predecessor, successor);
+  writeEvent(db, { task_id: successor, source: "reconciler", type: "created", payload: { requeue_of: predecessor } });
+  writeEvent(db, { task_id: predecessor, source: "reaper", type: "cleaned_up", payload: { ghost_branch: "ghost-one" } });
+  writeEvent(db, { task_id: predecessor, source: "reaper", type: "cleaned_up", payload: { ghost_branch: "ghost-two" } });
+
+  expect(replayCleanedUpRecovery(db, predecessor)).toBe(2);
+  expect(db.query("SELECT state, resume_ghost_branch FROM tasks WHERE id = ?").get(successor))
+    .toMatchObject({ state: "in_progress", resume_ghost_branch: "ghost-two" });
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'recovery_work_forwarded'").get(successor))
+    .toEqual({ n: 2 });
+  db.close();
+});
+
+test("recovery replay forwards rescued work to concurrent parent and child retries", () => {
+  const { db, projectId } = freshDb();
+  const parent = seedTask(db, projectId, { state: "in_progress" });
+  writeEvent(db, { task_id: parent, source: "herdr", type: "spawned", payload: {} });
+  const spawnedRowid = (db.query("SELECT rowid FROM events WHERE task_id = ? AND type = 'spawned'").get(parent) as any).rowid;
+  writeEvent(db, { task_id: parent, source: "director", type: "state_change", payload: { from: "failed", to: "queued" } });
+  const child = seedTask(db, projectId, { state: "in_progress" });
+  db.query("UPDATE tasks SET source = 'requeue', parent_task_id = ? WHERE id = ?").run(parent, child);
+  writeEvent(db, { task_id: child, source: "reconciler", type: "created", payload: { requeue_of: parent } });
+  writeEvent(db, { task_id: parent, source: "reaper", type: "cleaned_up", payload: { ghost_branch: "ghost-shared", spawn_rowid: spawnedRowid } });
+
+  expect(replayCleanedUpRecovery(db, parent)).toBe(2);
+  for (const id of [parent, child]) {
+    expect((db.query("SELECT resume_ghost_branch FROM tasks WHERE id = ?").get(id) as any).resume_ghost_branch).toBe("ghost-shared");
+    expect(queuedSteers(db, id).map((steer) => steer.message).join("\n")).toContain("ghost-shared");
+  }
+  db.close();
+});
+
+test("recovery replay forwards late worktree reclamation ghosts", () => {
+  const { db, projectId } = freshDb();
+  const predecessor = seedTask(db, projectId, { state: "failed" });
+  const successor = seedTask(db, projectId, { state: "in_progress" });
+  db.query("UPDATE tasks SET source = 'requeue', parent_task_id = ? WHERE id = ?").run(predecessor, successor);
+  writeEvent(db, { task_id: successor, source: "reconciler", type: "created", payload: { requeue_of: predecessor } });
+  writeEvent(db, {
+    task_id: predecessor,
+    source: "reconciler",
+    type: "worktree_reclaimed",
+    payload: { ghost_branch: "ghost-late-reclaim" },
+  });
+
+  expect(replayCleanedUpRecovery(db, predecessor)).toBe(1);
+  expect((db.query("SELECT resume_ghost_branch FROM tasks WHERE id = ?").get(successor) as any).resume_ghost_branch).toBe("ghost-late-reclaim");
+  expect(queuedSteers(db, successor).map((steer) => steer.message).join("\n")).toContain("ghost-late-reclaim");
+  db.close();
+});
+
+// Regression for the guard's old `COALESCE(spawn_rowid, 0)` fallback: a
+// worktree_reclaimed event never used to carry spawn_rowid, so the self-forward
+// EXISTS check degraded to "any failed->queued transition ever, in any order"
+// instead of "a fresh generation started since THIS reclaim's spawn". An old,
+// unrelated failed->queued from an earlier retry round (rowid BEFORE the
+// reclaimed spawn) satisfied `rowid > 0` and could bounce a task that has since
+// advanced all the way to in_review back into in_progress.
+test("recovery replay ignores a worktree reclaim whose task independently reached in_review", () => {
+  const { db, projectId } = freshDb();
+  const task = seedTask(db, projectId, { state: "in_review" });
+  // An unrelated earlier retry round on this same row — precedes the reclaimed
+  // spawn below and must not count as evidence for it.
+  writeEvent(db, { task_id: task, source: "director", type: "state_change", payload: { from: "failed", to: "queued" } });
+  writeEvent(db, { task_id: task, source: "herdr", type: "spawned", payload: {} });
+  const spawnRowid = (db.query("SELECT rowid FROM events WHERE task_id = ? AND type = 'spawned'").get(task) as any).rowid;
+  writeEvent(db, {
+    task_id: task,
+    source: "reconciler",
+    type: "worktree_reclaimed",
+    payload: { ghost_branch: "ghost-stale", spawn_rowid: spawnRowid },
+  });
+
+  expect(replayCleanedUpRecovery(db, task)).toBe(0);
+  expect((db.query("SELECT state, resume_ghost_branch FROM tasks WHERE id = ?").get(task) as any)).toMatchObject({
+    state: "in_review",
+    resume_ghost_branch: null,
+  });
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery_work_forwarded'").get(task)).toBeNull();
+  db.close();
+});
+
+test("recovery replay invalidates a removed clean predecessor worktree", () => {
+  const { db, projectId } = freshDb();
+  const predecessor = seedTask(db, projectId, { state: "failed" });
+  const successor = seedTask(db, projectId, { state: "in_review" });
+  db.query("UPDATE tasks SET source = 'requeue', parent_task_id = ? WHERE id = ?").run(predecessor, successor);
+  writeEvent(db, { task_id: successor, source: "reconciler", type: "created", payload: { requeue_of: predecessor } });
+  writeEvent(db, {
+    task_id: predecessor,
+    source: "reaper",
+    type: "cleaned_up",
+    payload: { worktree_removed: true, ghost_branch: null },
+  });
+
+  expect(replayCleanedUpRecovery(db, predecessor)).toBe(1);
+  expect(db.query("SELECT state, resume_ghost_branch FROM tasks WHERE id = ?").get(successor))
+    .toMatchObject({ state: "in_progress", resume_ghost_branch: null });
+  expect(queuedSteers(db, successor).map((steer) => steer.message).join("\n"))
+    .toContain("previously advertised kept worktree");
+  const receipt = db.query(
+    "SELECT payload FROM events WHERE task_id = ? AND type = 'recovery_work_forwarded' ORDER BY rowid DESC LIMIT 1"
+  ).get(successor) as { payload: string };
+  expect(JSON.parse(receipt.payload)).toMatchObject({ predecessor_task_id: predecessor, ghost_branch: null });
+  db.close();
+});
+
+test("cleanup preserves a same-row replacement generation and forwards rescued work", async () => {
+  const { db, projectId } = freshDb();
+  const id = seedTask(db, projectId, { state: "failed", agent_target: "failed-agent", branch: "hive/failed", worktree_path: "/wt/failed" });
+  writeEvent(db, {
+    task_id: id,
+    source: "herdr",
+    type: "spawned",
+    payload: { attempt_id: "failed-attempt", tab_id: "old-tab", terminal_id: "old-terminal", branch: "hive/failed", worktree_path: "/wt/failed" },
+  });
+  let replacementStarted = false;
+  const calls: string[][] = [];
+  const exec: Exec = async (argv) => {
+    calls.push(argv);
+    if (argv[0] === "git" && argv.includes("ls-remote")) {
+      if (!replacementStarted) {
+        replacementStarted = true;
+        writeEvent(db, { task_id: id, source: "director", type: "state_change", payload: { from: "failed", to: "queued" } });
+        db.query("UPDATE tasks SET state = 'in_progress', agent_target = ?, branch = ?, worktree_path = ? WHERE id = ?")
+          .run("replacement-agent", "hive/replacement", "/wt/replacement", id);
+        writeEvent(db, {
+          task_id: id,
+          source: "herdr",
+          type: "spawned",
+          payload: { attempt_id: "replacement-attempt", tab_id: "new-tab", terminal_id: "new-terminal", branch: "hive/replacement", worktree_path: "/wt/replacement" },
+        });
+      }
+      return OK("sha\trefs/heads/hive/failed");
+    }
+    if (argv[0] === "git" && has(argv, "status", "--porcelain")) return OK(" M src/recovered.ts\n");
+    if (argv[0] === "git" && has(argv, "worktree", "list")) return OK("worktree /wt/failed\nHEAD abc\nbranch refs/heads/hive/failed\n");
+    if (argv[0] === "git" && has(argv, "rev-parse", "--verify")) return FAIL("");
+    return OK();
+  };
+
+  const result = await cleanupTask(db, new Herdr(exec, "herdr"), id, { force: true });
+
+  expect(result.worktree?.ghost_branch).toBe(`ghost-${id}`);
+  expect(db.query("SELECT state, agent_target, branch, worktree_path, resume_ghost_branch FROM tasks WHERE id = ?").get(id)).toMatchObject({
+    state: "in_progress",
+    agent_target: "replacement-agent",
+    branch: "hive/replacement",
+    worktree_path: "/wt/replacement",
+    resume_ghost_branch: `ghost-${id}`,
+  });
+  expect(recoveryAttemptId(db, id)).toBe("replacement-attempt");
+  expect(queuedSteers(db, id).map((steer) => steer.message).join("\n")).toContain(`ghost-${id}`);
+  expect(calls.some((argv) => argv.includes("new-tab"))).toBe(false);
 });
 
 test("cleanupTask preserves an UNMERGED worktree but still closes the session (pty released)", async () => {
