@@ -1,6 +1,19 @@
 import { test, expect } from "bun:test";
+import { execSync } from "node:child_process";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { openDb, newId, now, type DB } from "../src/db.ts";
 import { transition, canTransition, TransitionError, getTask, expireOpenDecisions, expireOrphanedDecisions, isDeferred, deferTask, undeferTask, advanceIfFinished, writeEvent, extractPrUrl, backfillStuckPrUrls } from "../src/state.ts";
+
+// Gives a project a real git repo with an `origin` remote, so projectRepoSlug()
+// (which shells out to `git remote get-url origin`) resolves "owner/repo".
+function setProjectRepo(db: DB, projectId: string, slug: string): void {
+  const repoPath = mkdtempSync(join(tmpdir(), "hive-state-test-"));
+  execSync("git init -q", { cwd: repoPath });
+  execSync(`git remote add origin https://github.com/${slug}.git`, { cwd: repoPath });
+  db.query("UPDATE projects SET repo_path = ? WHERE id = ?").run(repoPath, projectId);
+}
 
 function freshDb(): { db: DB; projectId: string } {
   const db = openDb(":memory:");
@@ -70,6 +83,7 @@ test("extractPrUrl pulls a github PR URL out of free text", () => {
 
 test("transitioning to in_review backfills pr_url from the reason text when only free text carries it", () => {
   const { db, projectId } = freshDb();
+  setProjectRepo(db, projectId, "corebeatcokr/monorepo");
   const id = makeTask(db, projectId);
   transition(db, id, "in_progress");
   transition(db, id, "in_review", { reason: "PR https://github.com/corebeatcokr/monorepo/pull/1032" });
@@ -81,6 +95,7 @@ test("transitioning to in_review backfills pr_url from the reason text when only
 
 test("in_review backfill does not clobber an already-linked pr_url", () => {
   const { db, projectId } = freshDb();
+  setProjectRepo(db, projectId, "corebeatcokr/monorepo");
   const id = makeTask(db, projectId);
   db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://github.com/corebeatcokr/monorepo/pull/1", id);
   transition(db, id, "in_progress");
@@ -88,8 +103,20 @@ test("in_review backfill does not clobber an already-linked pr_url", () => {
   expect(getTask(db, id).pr_url).toBe("https://github.com/corebeatcokr/monorepo/pull/1");
 });
 
+test("in_review backfill skips a PR named in the reason that belongs to a different repo", () => {
+  const { db, projectId } = freshDb();
+  setProjectRepo(db, projectId, "corebeatcokr/monorepo");
+  const id = makeTask(db, projectId);
+  transition(db, id, "in_progress");
+  // Prose an agent wrote can legitimately reference someone else's PR ("same
+  // fix as <url>") — that must never get adopted as this task's pr_url.
+  transition(db, id, "in_review", { reason: "same fix as https://github.com/dvkm/hive-private/pull/42" });
+  expect(getTask(db, id).pr_url).toBeNull();
+});
+
 test("backfillStuckPrUrls links pr_url for a task already sitting in in_review from before the fix existed", () => {
   const { db, projectId } = freshDb();
+  setProjectRepo(db, projectId, "corebeatcokr/monorepo");
   const id = makeTask(db, projectId);
   // Simulate a legacy stuck task: state_change reason carried the PR URL as
   // free text, but pr_url was never set because this predates the in-transition
@@ -112,6 +139,7 @@ test("backfillStuckPrUrls links pr_url for a task already sitting in in_review f
 
 test("backfillStuckPrUrls is a no-op when pr_url is already set or the reason has no URL", () => {
   const { db, projectId } = freshDb();
+  setProjectRepo(db, projectId, "corebeatcokr/monorepo");
   const linked = makeTask(db, projectId);
   db.query("UPDATE tasks SET state = 'in_review', pr_url = ? WHERE id = ?").run(
     "https://github.com/corebeatcokr/monorepo/pull/1",
@@ -130,6 +158,38 @@ test("backfillStuckPrUrls is a no-op when pr_url is already set or the reason ha
   expect(backfillStuckPrUrls(db)).toBe(0);
   expect(getTask(db, linked).pr_url).toBe("https://github.com/corebeatcokr/monorepo/pull/1");
   expect(getTask(db, noUrl).pr_url).toBeNull();
+});
+
+test("backfillStuckPrUrls skips a PR belonging to a different repo, and leaves pr_url null when the reason names more than one PR", () => {
+  const { db, projectId } = freshDb();
+  setProjectRepo(db, projectId, "corebeatcokr/monorepo");
+
+  const foreign = makeTask(db, projectId);
+  db.query("UPDATE tasks SET state = 'in_review' WHERE id = ?").run(foreign);
+  writeEvent(db, {
+    task_id: foreign,
+    source: "director",
+    type: "state_change",
+    payload: { from: "in_progress", to: "in_review", reason: "blocked on https://github.com/dvkm/hive-private/pull/42" },
+  });
+
+  const ambiguous = makeTask(db, projectId);
+  db.query("UPDATE tasks SET state = 'in_review' WHERE id = ?").run(ambiguous);
+  writeEvent(db, {
+    task_id: ambiguous,
+    source: "director",
+    type: "state_change",
+    payload: {
+      from: "in_progress",
+      to: "in_review",
+      reason:
+        "PR https://github.com/corebeatcokr/monorepo/pull/1024, same fix as https://github.com/corebeatcokr/monorepo/pull/999",
+    },
+  });
+
+  expect(backfillStuckPrUrls(db)).toBe(0);
+  expect(getTask(db, foreign).pr_url).toBeNull();
+  expect(getTask(db, ambiguous).pr_url).toBeNull();
 });
 
 test("an invalid in_progress -> queued transition hints at /requeue", () => {
