@@ -10,10 +10,11 @@ import {
   registerSecretValues,
   clearSecretValues,
   resolveProjectSecrets,
+  figmaTokenEnv,
 } from "../src/secrets.ts";
 import { openDb, newId, now } from "../src/db.ts";
 import { writeEvent } from "../src/state.ts";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -131,4 +132,23 @@ test("resolveProjectSecrets resolves via the provider and registers values", asy
   expect(env).toEqual({ API_KEY: "resolvedvalue99" });
   // value is now registered for redaction
   expect(redact({ v: "resolvedvalue99" }).v).toBe("***");
+});
+
+test("figmaTokenEnv passes the host token through and redacts it", () => {
+  clearSecretValues();
+  expect(figmaTokenEnv({}, "/nonexistent-home")).toEqual({});
+  expect(figmaTokenEnv({ FIGMA_TOKEN: "figd_abc123 " }, "/nonexistent-home")).toEqual({
+    FIGMA_TOKEN: "figd_abc123",
+  });
+  expect(redact({ note: "token figd_abc123 leaked" })).toEqual({ note: "token *** leaked" });
+  clearSecretValues();
+});
+
+test("figmaTokenEnv falls back to ~/.figma-token", () => {
+  clearSecretValues();
+  const home = mkdtempSync(join(tmpdir(), "figma-"));
+  writeFileSync(join(home, ".figma-token"), "figd_fromfile\n");
+  expect(figmaTokenEnv({}, home)).toEqual({ FIGMA_TOKEN: "figd_fromfile" });
+  rmSync(home, { recursive: true, force: true });
+  clearSecretValues();
 });

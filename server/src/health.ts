@@ -8,7 +8,7 @@
 // the request path. The reconciler is what turns live herdr probes into
 // `agent_status` events (including `gone`), so health reads that recorded truth.
 import type { DB } from "./db.ts";
-import { getSetting } from "./db.ts";
+import { getSetting, setSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { isSupervisedTask, neverDispatched } from "./supervision.ts";
 import { isDeferred, unmetDeps, TERMINAL, type State } from "./state.ts";
@@ -296,3 +296,25 @@ export function needsAttention(task: { state: string; source?: string | null; ag
 export function broadcastTask(db: DB, task: any): void {
   broadcast({ type: "task", task: taskWithHealth(db, task) });
 }
+
+// A tool that cannot start is skipped and retried forever by design, so once it
+// stops throwing it also stops counting toward reconciler_error_streak and
+// would go completely silent. That is the #1096 failure mode again: PR linking
+// quietly off, /api/health saying ok. Three consecutive cycles of start
+// failures log once and mark health degraded; the first good cycle clears it.
+const TOOL_DEGRADED_AFTER = 3;
+export function noteToolStart(db: DB, tool: string, failure: string | null): void {
+  const streakKey = `tool_start_failures_${tool}`;
+  const degradedKey = `tool_degraded_${tool}`;
+  if (!failure) {
+    if (getSetting(db, streakKey)) setSetting(db, streakKey, "0");
+    if (getSetting(db, degradedKey)) setSetting(db, degradedKey, "");
+    return;
+  }
+  const streak = Number(getSetting(db, streakKey) ?? "0") + 1;
+  setSetting(db, streakKey, String(streak));
+  if (streak < TOOL_DEGRADED_AFTER) return;
+  if (!getSetting(db, degradedKey)) console.error(`[hive] ${tool} failed to start on ${streak} cycles in a row; marking health degraded: ${failure}`);
+  setSetting(db, degradedKey, failure);
+}
+
