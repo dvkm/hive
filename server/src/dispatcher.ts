@@ -305,6 +305,18 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         // worktree it cannot do the work in.
         if (repoMismatchUnresolved(db, task.id)) continue;
 
+        // Dependency gate FIRST. A blocked task is skipped every lap for as long
+        // as its blockers run, and authorize() writes an unconditional
+        // authority_logged row on every allow — so gating after it minted one
+        // event per task per lap forever (485k rows in 7 days, 99% of all events
+        // written; HIVE-515). noteDependencyBlock already dedupes; this gate is a
+        // pure local read, so checking it first costs nothing and logs nothing.
+        const blocking = unmetDeps(db, task);
+        if (blocking.length) {
+          noteDependencyBlock(db, task.id, blocking, "dispatcher");
+          continue;
+        }
+
         const authz = authorize(db, {
           project_id: task.project_id,
           action: "task.dispatch",
@@ -312,14 +324,6 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
           task_id: task.id,
         });
         if (authz.effect !== "allow") continue; // deny or require_decision blocks the auto-spawn
-
-        // Dependency gate: don't spawn until every depends_on task is merged/done.
-        // Same shape as the authz gate above — skip and surface a visible reason.
-        const blocking = unmetDeps(db, task);
-        if (blocking.length) {
-          noteDependencyBlock(db, task.id, blocking, "dispatcher");
-          continue;
-        }
 
         // File-overlap hold (HIVE-509). Two agents editing the same file land
         // branches that conflict — or, worse, merge cleanly and contradict each

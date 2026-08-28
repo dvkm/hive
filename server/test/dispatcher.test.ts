@@ -375,6 +375,30 @@ test("unmet depends_on blocks spawn (visible 'blocked by'), met deps let it thro
   expect(getTask(db, child).state).toBe("in_progress");
 });
 
+test("a dependency-blocked task logs no authority event, however many laps run", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const dep = makeTask(db, projectId, { state: "in_progress" }); // never merges
+  const child = makeTask(db, projectId, { depends_on: [dep] });
+  const { herdr, spawns } = stubHerdr();
+
+  for (let i = 0; i < 5; i++) await dispatchOnce(db, { herdr });
+
+  expect(spawns.length).toBe(0);
+  const authz = db
+    .query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'authority_logged'")
+    .get(child) as { n: number };
+  expect(authz.n).toBe(0);
+
+  // the gate still runs (and still logs) once the blocker clears
+  db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(dep);
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(1);
+  const after = db
+    .query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'authority_logged'")
+    .get(child) as { n: number };
+  expect(after.n).toBe(1);
+});
+
 test("spawn failure records one spawn_error and backs off (no retry storm)", async () => {
   const { db, projectId } = freshDb({ auto_dispatch: true });
   const id = makeTask(db, projectId);
