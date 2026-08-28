@@ -11,7 +11,7 @@
 // Per-project opt-out: config.auto_review = false. Model: config.model_by_kind
 // .review, else sonnet. Argv override: config.reviewer_argv (verbatim).
 import type { DB } from "./db.ts";
-import { isOffline } from "./db.ts";
+import { isOffline, getSetting, setSetting } from "./db.ts";
 import { writeEvent, getTask } from "./state.ts";
 import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
@@ -262,11 +262,12 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
     recordReviewFailure(db, t, diff.error, reviewIdentity);
     return;
   }
-  const argv: string[] =
+  const base: string[] =
     Array.isArray(config.reviewer_argv) && config.reviewer_argv.length
       ? [...config.reviewer_argv]
       : [claudeBin(), "-p", "--model", config.model_by_kind?.review ?? "sonnet"];
-  argv.push(reviewPrompt(t, diff.text), "--output-format", "json");
+  const buildArgv = (prompt: string) => [...base, prompt, "--output-format", "json"];
+  const argv = buildArgv(reviewPrompt(t, diff.text));
 
   const exec = deps.exec ?? defaultPlannerExec;
   let res;
@@ -289,11 +290,38 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
     return;
   }
   noteModelCall(db, null);
-  const review = extractReview(res.stdout);
+  let review = extractReview(res.stdout);
   if (!review) {
-    recordReviewFailure(db, t, "unparseable reviewer output", reviewIdentity);
+    // Retry once with a stricter format instruction before giving up — most
+    // unparseable output is prose wrapped around the JSON, not a model that
+    // refuses the format outright (task HIVE-446).
+    const retryArgv = buildArgv(`${reviewPrompt(t, diff.text)}\n\nSTRICT: output ONLY the JSON object, nothing else — no prose, no markdown fences.`);
+    let retryRes;
+    try {
+      retryRes = await exec(retryArgv, { timeoutMs: TIMEOUT_MS });
+    } catch {
+      retryRes = null;
+    }
+    if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
+    if (retryRes && !retryRes.timedOut && retryRes.code === 0) review = extractReview(retryRes.stdout);
+  }
+  if (!review) {
+    // Two unparseable attempts in a row is a dead end, not a transient blip:
+    // record a real verdict (not just an error) so autoMergeReady/land surfaces
+    // stop showing "-" forever, and the NOT EXISTS guard in the query above
+    // stops retrying this exact head.
+    const streak = Number(getSetting(db, "reviewer_parse_failure_streak") ?? "0") + 1;
+    setSetting(db, "reviewer_parse_failure_streak", String(streak));
+    writeEvent(db, {
+      task_id: t.id,
+      source: "system",
+      type: "auto_review",
+      payload: { verdict: "unparseable", summary: "auto-reviewer produced unparseable output twice; needs a human look", risks: [], questions: [], ...reviewIdentity },
+    });
+    broadcast({ type: "task", task: getTask(db, t.id) });
     return;
   }
+  setSetting(db, "reviewer_parse_failure_streak", "0");
   // `files` is what the reviewed diff touched. Read back by
   // understandingChecksRequired (hive-1559) to spot sensitive paths without
   // re-shelling out to git for every task on a director surface.

@@ -174,6 +174,42 @@ test("reviewer failure records auto_review_error once and never blocks review", 
   expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_review");
 });
 
+test("unparseable model output retries once, then a second unparseable attempt records a verdict, not just an error", async () => {
+  const { db, id } = setup();
+  let calls = 0;
+  const claude = async () => {
+    calls++;
+    return { code: 0, stdout: "sorry, I can't help with that", stderr: "" };
+  };
+  await autoReviewOnce(db, { exec: claude, shellExec: ghDiff });
+  expect(calls).toBe(2); // one attempt, one retry
+  expect(events(db, id, "auto_review_error")).toHaveLength(0);
+  const revs = events(db, id, "auto_review");
+  expect(revs).toHaveLength(1);
+  expect(revs[0].payload.verdict).toBe("unparseable");
+  expect(revs[0].payload).toMatchObject({ reviewed_pr_url: "https://gh/pr/5", reviewed_head_sha: "review-head" });
+
+  await autoReviewOnce(db, { exec: claude, shellExec: ghDiff }); // no third attempt, same head
+  expect(calls).toBe(2);
+  expect(events(db, id, "auto_review")).toHaveLength(1);
+});
+
+test("a retry that succeeds posts a normal review, not an unparseable verdict", async () => {
+  const { db, id } = setup();
+  let calls = 0;
+  const claude = async () => {
+    calls++;
+    return calls === 1
+      ? { code: 0, stdout: "not json", stderr: "" }
+      : { code: 0, stdout: JSON.stringify({ verdict: "looks_good", summary: "fine", risks: [], questions: [] }), stderr: "" };
+  };
+  await autoReviewOnce(db, { exec: claude, shellExec: ghDiff });
+  expect(calls).toBe(2);
+  const revs = events(db, id, "auto_review");
+  expect(revs).toHaveLength(1);
+  expect(revs[0].payload.verdict).toBe("looks_good");
+});
+
 test("project opt-out records a skip", async () => {
   const { db, id } = setup({ auto_review: false });
   const claude = async () => { throw new Error("should not run"); };
