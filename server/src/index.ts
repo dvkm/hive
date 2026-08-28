@@ -21,6 +21,7 @@ import { startWatchers } from "./watch.ts";
 import { startAutoReviewer } from "./reviewer.ts";
 import { startDriftWatch } from "./drift.ts";
 import { startPromoter } from "./promoter.ts";
+import { selfAuditOnce, startSelfAudit } from "./selfAudit.ts";
 import { followServingBranchOnBoot } from "./servingBranch.ts";
 import { setEventHook, setTerminalHook, expireOrphanedDecisions, repairRequeueProvenance, backfillStuckPrUrls } from "./state.ts";
 import { bootstrapAuthority } from "./authority.ts";
@@ -238,5 +239,11 @@ startDriftWatch(db);
 // an evaluation task queued whenever `from` moves ahead of `to`. No-op otherwise.
 const promoteMs = Number(process.env.HIVE_PROMOTE_MS || 30 * 60 * 1000);
 startPromoter(db, { intervalMs: promoteMs });
+
+// Hive audits its own recent trajectories and usage weekly, then sends one
+// evidence-backed improvement through the same guarded ship path as other work.
+selfAuditOnce(db);
+const selfAuditPollMs = Number(process.env.HIVE_SELF_AUDIT_POLL_MS || 60 * 60 * 1000);
+startSelfAudit(db, selfAuditPollMs);
 
 console.log(`[hive] server on http://${server.hostname}:${server.port}  db=${dbPath}`);

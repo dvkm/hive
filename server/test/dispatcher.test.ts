@@ -85,6 +85,24 @@ test("auto_dispatch off: queued tasks are NOT spawned", async () => {
   expect(getTask(db, id).state).toBe("queued");
 });
 
+test("weekly self-audit dispatches through normal safeguards when auto_dispatch is off", async () => {
+  const { db, projectId } = freshDb({});
+  const id = makeTask(db, projectId, { source: "self-audit" });
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr });
+
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, id).state).toBe("in_progress");
+
+  const excluded = freshDb({ dispatch_kinds: ["scout"] });
+  const excludedId = makeTask(excluded.db, excluded.projectId, { source: "self-audit" });
+  const excludedHerdr = stubHerdr();
+  await dispatchOnce(excluded.db, { herdr: excludedHerdr.herdr });
+  expect(excludedHerdr.spawns.length).toBe(0);
+  expect(getTask(excluded.db, excludedId).state).toBe("queued");
+});
+
 test("an active chat manager's delegated task dispatches even when project auto_dispatch is off", async () => {
   const { db, projectId } = freshDb({ max_agents: 1 });
   const managerId = makeTask(db, projectId, { source: "chat_supervisor", state: "in_progress", agent_target: "manager" });

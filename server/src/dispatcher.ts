@@ -4,7 +4,8 @@
 //
 //   - per-project config `auto_dispatch: true` is required for ordinary queued
 //     work (default off, so intake drafts/setup tasks never auto-spawn). Tasks
-//     explicitly delegated by an active chat manager bypass this one toggle.
+//     explicitly delegated by an active chat manager and Hive's own scheduled
+//     self-audit bypass this one toggle.
 //   - `dispatch_kinds` (default ["ship","scout"]) — chore tasks (usually titled
 //     for a human) are excluded by default.
 //   - source='intake_*' tasks (gchat messages, director braindumps) are skipped
@@ -256,8 +257,9 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         const manager = managed?.task_id ? db.query("SELECT state FROM tasks WHERE id = ?").get(managed.task_id) as { state: string } | undefined : null;
         const managerDelegated = !!manager && !["done", "failed", "cancelled"].includes(manager.state);
         const gardenerTask = task.source === "pr-gardener";
+        const scheduledSelfAudit = task.source === "self-audit";
         if (gardenerTask && cfg.pr_gardener?.enabled !== true) continue;
-        if (cfg.auto_dispatch !== true && !managerDelegated && !gardenerTask) continue;
+        if (cfg.auto_dispatch !== true && !managerDelegated && !gardenerTask && !scheduledSelfAudit) continue;
 
         const kinds = Array.isArray(cfg.dispatch_kinds) ? cfg.dispatch_kinds : DISPATCH_KINDS_DEFAULT;
         // A requeue is recovery for work already dispatched once (auto-requeue on
