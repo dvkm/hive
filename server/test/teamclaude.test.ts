@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseTeamclaudeEnv, proxyUrl, applyTeamclaudeEnv, usesTeamclaude } from "../src/teamclaude.ts";
+import { parseTeamclaudeEnv, proxyUrl, applyTeamclaudeEnv, teamclaudeOverlay, usesTeamclaude } from "../src/teamclaude.ts";
 import { agentForConfig, modelForTask } from "../src/api.ts";
 import { plannerSpawnEnv } from "../src/planner.ts";
 
@@ -92,5 +92,19 @@ describe("plannerSpawnEnv", () => {
   test("an inherited CLAUDE_CONFIG_DIR is dropped when no route names one", () => {
     const env = plannerSpawnEnv({ CLAUDE_CONFIG_DIR: "/leaked" }, {}, null);
     expect(env.CLAUDE_CONFIG_DIR).toBeUndefined();
+  });
+});
+
+// herdr agents get `--env K=V` overlays with no way to unset a name, so an
+// unset ships as an empty value instead of being silently dropped.
+describe("teamclaudeOverlay", () => {
+  test("carries exports and blanks the unset names", () => {
+    const overlay = teamclaudeOverlay(parseTeamclaudeEnv(MITM_OUTPUT));
+    expect(overlay.HTTPS_PROXY).toBe("http://127.0.0.1:3456");
+    expect(overlay.ANTHROPIC_BASE_URL).toBe("");
+  });
+
+  test("no proxy means no overlay", () => {
+    expect(teamclaudeOverlay(null)).toEqual({});
   });
 });
