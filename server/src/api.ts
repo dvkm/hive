@@ -2019,13 +2019,14 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(body.project_id))
     return err("unknown project_id", 400);
   const kind = body.kind ?? "ship";
+  const source = body.source ? String(body.source) : null;
   if (!["ship", "scout", "chore"].includes(kind)) return err("invalid kind");
-  if (body.source === "self-audit") return err("source 'self-audit' is reserved for the scheduler", 400);
+  if (source === "self-audit") return err("source 'self-audit' is reserved for the scheduler", 400);
   // A tracking-only task starts life with no agent — that's the whole point
   // (see supervision.ts). Accepting a caller-supplied agent_target here would
   // let a fresh external task skip straight past the neverDispatched gate
   // spawnAgent enforces below.
-  if (body.source === "external" && body.agent_target)
+  if (source === "external" && body.agent_target)
     return err("external tasks cannot be created with an agent_target — they start tracking-only and are dispatched (if ever) via spawn", 400);
   // Agents may create follow-up tasks (source="agent", parent_task_id → the
   // spawning task); the dispatcher treats them like director-created tasks.
@@ -2033,7 +2034,7 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   const parentTask = parent ? getTask(db, parent) : null;
   if (parent && !parentTask) return err("unknown parent_task_id", 400);
   if (parentTask && isTrackingOnlyTask(parentTask)) return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
-  if (isTrackingOnlyTask({ source: body.source }) && body.agent_target)
+  if (isTrackingOnlyTask({ source }) && body.agent_target)
     return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
   const deps = parseDeps(db, body.depends_on);
   if (deps instanceof Response) return deps;
@@ -2051,7 +2052,7 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
     // one: an agent filing a follow-up under a director's 'now' task is not
     // granting itself anything, it is staying with work the director already
     // ranked.
-    const denied = authorizePriority(body.source, parsed);
+    const denied = authorizePriority(source, parsed);
     if (denied) return denied;
     priority = parsed;
   } else if (parentTask) {
@@ -2087,7 +2088,7 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
     pr_url: null,
     ci_status: null,
     summary: null,
-    source: body.source ? String(body.source) : null,
+    source,
     parent_task_id: parent,
     depends_on: deps.length ? JSON.stringify(deps) : null,
     verification_cmds: verifyCmds ? JSON.stringify(verifyCmds) : null,
@@ -2095,16 +2096,27 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
     created_at: t,
     updated_at: t,
   };
-  db.query(
-    `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
-      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, priority, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).run(
-    row.id, row.project_id, row.title, row.brief, row.state, row.kind,
-    row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
-    row.summary, row.source, row.parent_task_id, row.depends_on, row.verification_cmds,
-    row.priority, row.created_at, row.updated_at
-  );
+  const insert = () =>
+    db.query(
+      `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
+        worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, priority, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).run(
+      row.id, row.project_id, row.title, row.brief, row.state, row.kind,
+      row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
+      row.summary, row.source, row.parent_task_id, row.depends_on, row.verification_cmds,
+      row.priority, row.created_at, row.updated_at
+    );
+  if (kind === "ship" && parentTask?.source === "self-audit") {
+    const inserted = db.transaction(() => {
+      if (db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND kind = 'ship' LIMIT 1").get(parent)) return false;
+      insert();
+      return true;
+    }).immediate();
+    if (!inserted) return err("self-audit already has a ship follow-up", 409);
+  } else {
+    insert();
+  }
   writeEvent(db, {
     task_id: row.id,
     source: row.source === "agent" ? "agent" : "director",

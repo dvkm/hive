@@ -168,13 +168,42 @@ test("agent-created task carries source + parent_task_id", async () => {
 });
 
 test("scheduler-owned self-audit source cannot be created through the task API", async () => {
-  const r = await post("/api/tasks", {
-    project_id: projectId,
-    title: "forged audit",
-    source: "self-audit",
-  });
-  expect(r.status).toBe(400);
-  expect(db.query("SELECT 1 FROM tasks WHERE title = ?").get("forged audit")).toBeNull();
+  for (const [title, source] of [["forged audit", "self-audit"], ["coerced forged audit", ["self-audit"]]] as const) {
+    const r = await post("/api/tasks", { project_id: projectId, title, source });
+    expect(r.status).toBe(400);
+    expect(db.query("SELECT 1 FROM tasks WHERE title = ?").get(title)).toBeNull();
+  }
+});
+
+test("self-audit permits only one ship follow-up", async () => {
+  const localDb = openDb(":memory:");
+  const localServer = Bun.serve({ port: 0, fetch: makeHandler(localDb) });
+  const localPost = async (path: string, body: unknown) => {
+    const res = await fetch(`http://127.0.0.1:${localServer.port}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, json: await res.json() };
+  };
+  try {
+    const project = await localPost("/api/projects", { name: "Hive", repo_path: "/repo" });
+    const { selfAuditOnce } = await import("../src/selfAudit.ts");
+    const audit = selfAuditOnce(localDb)!;
+    const child = (title: string) => localPost("/api/tasks", {
+      project_id: project.json.id,
+      title,
+      kind: "ship",
+      source: "agent",
+      parent_task_id: audit,
+    });
+
+    expect((await child("first improvement")).status).toBe(201);
+    expect((await child("second improvement")).status).toBe(409);
+    expect(localDb.query("SELECT COUNT(*) AS n FROM tasks WHERE parent_task_id = ? AND kind = 'ship'").get(audit)).toEqual({ n: 1 });
+  } finally {
+    localServer.stop(true);
+  }
 });
 
 test("HIVE-299: follow-up task auto-depends on a parent whose PR hasn't merged yet", async () => {
