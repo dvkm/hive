@@ -60,6 +60,11 @@ Usage:
         them in graph order (declared dependencies first, one conflicting branch per sweep)
   hive land-graph [--project <id>]        show the review column's ordering edges
   hive recall <keywords>                  search project knowledge (references, learnings, policies)
+  hive garden [--project <id>] [--apply] [--remote] [--json]
+        prune task branches + worktrees using task state, not git reachability.
+        Deletes a branch only when its task is done; keeps cancelled/failed
+        branches; never touches a branch with no task or one checked out
+        somewhere. Dry run unless --apply.
   hive jira link <task-id> --parent <KEY> create and link a Jira sub-task
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
@@ -1023,6 +1028,29 @@ async function main() {
       `no confirmation after 10s (${id}). The notification did not render. Check that hive.app is running (hive app) ` +
         "and that hive is allowed to notify in System Settings > Notifications."
     );
+  }
+
+  // Garden the checkout: prune task branches and worktrees using TASK STATE
+  // (see server/src/branchGardener.ts). Read-only against the DB; dry run
+  // unless --apply, and origin is only touched with --remote on top of it.
+  if (cmd === "garden") {
+    const { flags } = parseFlags(argv.slice(1));
+    const { Database } = await import("bun:sqlite");
+    const { defaultDbPath } = await import("../server/src/db.ts");
+    const { gardenRepos, formatGardenReport } = await import("../server/src/branchGardener.ts");
+    const db = new Database(defaultDbPath(), { readonly: true }) as any;
+    const reports = await gardenRepos(db, {
+      apply: !!flags.apply,
+      remote: !!flags.remote,
+      projectId: flags.project as string | undefined,
+    });
+    if (flags.json) {
+      console.log(JSON.stringify(reports, null, 2));
+      return;
+    }
+    for (const r of reports) console.log(formatGardenReport(r) + "\n");
+    if (!flags.apply) console.log("dry run — nothing was deleted. Re-run with --apply (add --remote to also delete on origin).");
+    return;
   }
 
   if (cmd === "open") {
