@@ -1457,6 +1457,7 @@ textarea { font-family: inherit; }
   margin-top: 8px;
 }
 .steer textarea,
+.request-changes textarea,
 .dnote,
 .add-policy textarea,
 .add-policy input,
@@ -6087,4 +6088,33 @@ a.chip-jira:hover { background: #2d5488; }
   padding: 6px 0;
   border-bottom: 1px solid var(--border-soft);
   font-size: 13px;
+}
+
+/* Request changes on shipped work: a button that opens into its note. */
+/* The Done row is a single no-wrap flex line, so let the open note claim its
+   own line instead of squeezing the title and summary. */
+.brief-done-row {
+  flex-wrap: wrap;
+}
+.brief-done-row .request-changes,
+.brief-done-row .request-changes-filed {
+  flex-basis: 100%;
+}
+.request-changes {
+  margin-top: 8px;
+  width: 100%;
+}
+.request-changes textarea {
+  min-height: 56px;
+  margin-bottom: 6px;
+}
+.request-changes-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.request-changes-filed {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
 }

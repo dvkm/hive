@@ -9,6 +9,7 @@ import { EvidenceStrip, ReviewAudit, ReviewCard, ReviewUnderstanding } from "./R
 import { AttentionRows, BlockedByLine } from "./attention";
 import { CheckpointsInbox } from "./Checkpoints";
 import { UnderstandingQuiz } from "./UnderstandingQuiz";
+import { RequestChanges } from "./RequestChanges";
 import { fmtUsd, fmtTokens } from "./Analytics";
 import { itemProject, orderFocusItems } from "../lib/needsYou";
 import type { NeedsYouItem } from "../lib/needsYou";
@@ -264,6 +265,9 @@ export default function Brief() {
                     reloadQuizzes();
                   }}
                 />
+                {/* Caught up and don't like it? The note becomes a new task
+                    that carries this one's context. This one stays done. */}
+                <RequestChanges taskId={quiz.task_id} compact />
               </div>
             );
           })()}
@@ -364,6 +368,7 @@ export default function Brief() {
                     <span className="chip">{t.project_name}</span>
                     {t.summary && <span className="brief-done-summary muted">{t.summary}</span>}
                     <Link className="brief-evc" to={`/tasks/${t.id}`} state={{ backgroundLocation: location }} title="Evidence">◱ {t.evidence_count}</Link>
+                    <RequestChanges taskId={t.id} compact />
                   </li>
                 ))}
               </ul>

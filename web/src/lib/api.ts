@@ -930,11 +930,13 @@ export const api = {
         actor: directorActor(),
       }),
     }),
+  // In review this bounces the task back to its agent. On a task that already
+  // shipped the same call files a follow-up instead (followup_task_id).
   requestChanges: (id: string, notes: string) =>
-    req<{ ok: boolean; delivered: boolean; task: Task }>(`/api/tasks/${id}/request-changes`, {
-      method: "POST",
-      body: JSON.stringify({ notes }),
-    }),
+    req<{ ok: boolean; delivered?: boolean; task?: Task; followup_task_id?: string; followup_label?: string }>(
+      `/api/tasks/${id}/request-changes`,
+      { method: "POST", body: JSON.stringify({ notes, actor: directorActor() }) }
+    ),
 
   decisions: (status: "open" | "answered" | "all" = "open") =>
     req<Decision[]>(`/api/decisions?status=${status}`),
