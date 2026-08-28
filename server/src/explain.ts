@@ -8,6 +8,7 @@ import { broadcast } from "./bus.ts";
 import { parseDecision } from "./rows.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
 import { claudeProfileEnvForRepo } from "./claudeProfiles.ts";
+import { modelErrorText, noteModelCall } from "./modelCall.ts";
 
 const TIMEOUT_MS = 60_000;
 
@@ -47,7 +48,11 @@ export async function explainCommandDecision(
   } catch {
     return; // enrichment is best-effort, the card stands on its static context
   }
-  if (res.timedOut || res.code !== 0) return;
+  if (res.timedOut || res.code !== 0) {
+    noteModelCall(db, modelErrorText(res, { timeoutMs: TIMEOUT_MS }));
+    return;
+  }
+  noteModelCall(db, null);
   let text = res.stdout.trim();
   try {
     const env = JSON.parse(text);
