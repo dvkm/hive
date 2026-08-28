@@ -1191,15 +1191,9 @@ export function keepSupervisorWarm(db: DB, herdr: Herdr, deps: HandlerDeps, even
 }
 
 function coordinatorProjectId(db: DB): string | null {
-  const row = db
-    .query(
-      `SELECT id FROM projects
-       WHERE repo_path IS NOT NULL AND COALESCE(json_extract(config, '$.archived'), 0) = 0
-       ORDER BY CASE WHEN lower(name) = 'hive' THEN 0 ELSE 1 END, created_at
-       LIMIT 1`
-    )
-    .get() as { id: string } | undefined;
-  return row?.id ?? null;
+  const candidates = activeProjects(db).filter((p) => p.repo_path);
+  const hive = candidates.find((p) => p.name.toLowerCase() === "hive");
+  return (hive ?? candidates[0])?.id ?? null;
 }
 
 // Meaningful worker events wake the manager that owns the task. Without managed
