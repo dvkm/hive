@@ -100,7 +100,7 @@ export function adoptUntrackedPr(
 }
 
 // Cancel adopted tracking tasks whose PR is no longer in the open list.
-export function retireAdoptedTasks(db: DB, projectId: string, openNumbers: Set<number>): number[] {
+export function retireAdoptedTasks(db: DB, projectId: string, openNumbers: Set<number>): string[] {
   const rows = db
     .query(`SELECT id, source_ref FROM tasks WHERE project_id = ? AND source = 'external' AND source_ref LIKE 'pr-adopt:%' AND state NOT IN ('done','failed','cancelled')`)
     .all(projectId) as { id: string; source_ref: string }[];
