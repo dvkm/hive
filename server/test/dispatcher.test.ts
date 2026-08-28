@@ -10,6 +10,7 @@ process.env.HIVE_HOME = HOME;
 const { openDb, newId, now, getSetting } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
 const { dispatchOnce, isReviewed, inBackoff } = await import("../src/dispatcher.ts");
+const { selfAuditOnce } = await import("../src/selfAudit.ts");
 const { writeEvent, getTask } = await import("../src/state.ts");
 const { createDecision } = await import("../src/api.ts");
 const { queuedSteers } = await import("../src/steer.ts");
@@ -87,7 +88,8 @@ test("auto_dispatch off: queued tasks are NOT spawned", async () => {
 
 test("weekly self-audit dispatches through normal safeguards when auto_dispatch is off", async () => {
   const { db, projectId } = freshDb({});
-  const id = makeTask(db, projectId, { source: "self-audit" });
+  db.query("UPDATE projects SET name = 'Hive' WHERE id = ?").run(projectId);
+  const id = selfAuditOnce(db)!;
   const { herdr, spawns } = stubHerdr();
 
   await dispatchOnce(db, { herdr });
@@ -95,8 +97,14 @@ test("weekly self-audit dispatches through normal safeguards when auto_dispatch 
   expect(spawns.length).toBe(1);
   expect(getTask(db, id).state).toBe("in_progress");
 
-  const excluded = freshDb({ dispatch_kinds: ["scout"] });
-  const excludedId = makeTask(excluded.db, excluded.projectId, { source: "self-audit" });
+  const followup = makeTask(db, projectId, { source: "agent", parent_task_id: id });
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, followup).state).toBe("queued");
+
+  const excluded = freshDb({ dispatch_kinds: ["ship"] });
+  excluded.db.query("UPDATE projects SET name = 'Hive' WHERE id = ?").run(excluded.projectId);
+  const excludedId = selfAuditOnce(excluded.db)!;
   const excludedHerdr = stubHerdr();
   await dispatchOnce(excluded.db, { herdr: excludedHerdr.herdr });
   expect(excludedHerdr.spawns.length).toBe(0);

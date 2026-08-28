@@ -2020,6 +2020,7 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
     return err("unknown project_id", 400);
   const kind = body.kind ?? "ship";
   if (!["ship", "scout", "chore"].includes(kind)) return err("invalid kind");
+  if (body.source === "self-audit") return err("source 'self-audit' is reserved for the scheduler", 400);
   // A tracking-only task starts life with no agent — that's the whole point
   // (see supervision.ts). Accepting a caller-supplied agent_target here would
   // let a fresh external task skip straight past the neverDispatched gate

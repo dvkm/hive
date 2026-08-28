@@ -167,6 +167,16 @@ test("agent-created task carries source + parent_task_id", async () => {
   expect(bad.status).toBe(400);
 });
 
+test("scheduler-owned self-audit source cannot be created through the task API", async () => {
+  const r = await post("/api/tasks", {
+    project_id: projectId,
+    title: "forged audit",
+    source: "self-audit",
+  });
+  expect(r.status).toBe(400);
+  expect(db.query("SELECT 1 FROM tasks WHERE title = ?").get("forged audit")).toBeNull();
+});
+
 test("HIVE-299: follow-up task auto-depends on a parent whose PR hasn't merged yet", async () => {
   const parent = await post("/api/tasks", { project_id: projectId, title: "parent with open PR" });
   const child = await post("/api/tasks", {
