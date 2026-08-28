@@ -1798,14 +1798,13 @@ test("syncPRs probes stalled PRs concurrently, so K slow gh calls cost about one
     return { code: 124, stdout: "", stderr: "timeout" };
   };
 
-  const started = Date.now();
   await reconcileOnce(db, { exec: gh });
-  const elapsed = Date.now() - started;
 
   expect(timeouts.length).toBe(ids.length);
-  expect(peak).toBeGreaterThan(1);
-  // Serial would be 6 x STALL_MS; concurrent is ~1 x STALL_MS.
-  expect(elapsed).toBeLessThan(3 * STALL_MS);
+  // Serial probing peaks at 1 in flight and costs 6 x STALL_MS. All 6 stalled
+  // probes overlap here (GH_PROBE_CONCURRENCY is 6), so the lap costs one
+  // timeout. Counting in-flight calls is the guarantee; wall-clock only proxies it.
+  expect(peak).toBe(ids.length);
   // A poll must not wait the 60s defaultExec default.
   expect(timeouts.every((ms) => ms != null && ms <= 15_000)).toBe(true);
 });
