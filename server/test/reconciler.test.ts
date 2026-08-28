@@ -756,6 +756,21 @@ test("syncPRs' actionable phase skips a never-dispatched external task — no nu
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'steer'").get(id)).toBeFalsy();
 });
 
+test("syncPRs closes a never-dispatched external task once its PR MERGES (HIVE-473)", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/9", source: "external" });
+  transition(db, id, "in_progress"); // never spawned
+  transition(db, id, "in_review");
+  const gh: Exec = stub((argv) =>
+    argv[0] === "gh" ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-m" })) : OK()
+  );
+  await reconcileOnce(db, { exec: gh });
+  // merged is terminal for a task hive only tracks: no smoke to run, no evidence gate
+  expect(getTask(db, id).state).toBe("done");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'pr_merged'").get(id)).toBeTruthy();
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'steer'").get(id)).toBeFalsy();
+});
+
 test("syncPRs' actionable phase still acts on an external task that WAS spawned before (agent_target-aware, not blanket source-only)", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { pr_url: "https://gh/pr/8", agent_target: "t-agent-live", source: "external" });
