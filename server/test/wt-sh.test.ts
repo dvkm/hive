@@ -1,4 +1,4 @@
-// Self-check for infra/worktree/wt.sh — the hive per-worktree bootstrap hook.
+// Self-check for the cross-platform hive per-worktree bootstrap hook.
 // Exercises the dispatch/branch logic without a real (networked) `bun install`:
 // the idempotent "deps present" path, down's no-op, arg defaulting, and usage.
 import { test, expect } from "bun:test";
@@ -6,10 +6,10 @@ import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const SCRIPT = join(import.meta.dir, "..", "..", "infra", "worktree", "wt.sh");
+const SCRIPT = join(import.meta.dir, "..", "..", "infra", "worktree", "wt.ts");
 
 function run(args: string[]): { code: number; out: string } {
-  const p = Bun.spawnSync(["bash", SCRIPT, ...args]);
+  const p = Bun.spawnSync([process.execPath, SCRIPT, ...args]);
   return { code: p.exitCode, out: p.stdout.toString() + p.stderr.toString() };
 }
 

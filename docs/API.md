@@ -41,7 +41,7 @@ must be built against this file. Server: `http://127.0.0.1:4700` (override
 {
   "id": "proj_ab12...",
   "name": "acme-web",
-  "repo_path": "/Users/david/code/acme-web",
+  "repo_path": "/Users/you/code/acme-web",
   "config": { "default_branch": "main", "deploy_notes": "...", "monitors": [ ... ] },
   "created_at": "2026-07-08T12:00:00.000Z"
 }
@@ -57,12 +57,15 @@ downstream (see `agent_argv` below). Keys used elsewhere:
 `monitors` (`[{name, url, expect_status, expect_substring?, interval_s}]`),
 `monitors_auto_task` (bool; a monitor failure auto-creates a `chore` task),
 `smoke` (`[{name, url, expect_status, expect_substring?}]`, run once on
-`verifying`), `agent` (`"claude" | "codex"`, default `"claude"`; `"codex"` runs the interactive Codex CLI using the machine's ChatGPT login), `codex_model` / `codex_model_by_kind` (optional Codex model overrides; omitted means the current Codex default), `codex_reasoning_effort` / `codex_reasoning_effort_by_kind` (optional Codex reasoning overrides; defaults are `medium` for ship and `low` for scout/chore), `codex_auto_compact_token_limit` (default `64000`), `codex_tool_output_token_limit` (default `6000`), `processed_token_warn` / `processed_token_cap` (defaults `75000000` / `200000000`), `wait_call_warn` / `wait_call_cap` (defaults `25` / `100`; `0` disables a threshold), `agent_argv` (string[], advanced per-project override of the complete command herdr runs; verbatim and responsible for its own briefing),
+`verifying`),
+`deployments` (object; opts the project into the production release model and
+the Deployments tab — see [Deployments](#deployments-production-releases)),
+`agent` (`"claude" | "codex"`, default `"claude"`; `"codex"` runs the interactive Codex CLI using the machine's ChatGPT login), `codex_model` / `codex_model_by_kind` (optional Codex model overrides; omitted means the current Codex default), `codex_reasoning_effort` / `codex_reasoning_effort_by_kind` (optional Codex reasoning overrides; defaults are `medium` for ship and `low` for scout/chore), `codex_auto_compact_token_limit` (default `64000`), `codex_tool_output_token_limit` (default `6000`), `processed_token_warn` / `processed_token_cap` (defaults `75000000` / `200000000`), `wait_call_warn` / `wait_call_cap` (defaults `25` / `100`; `0` disables a threshold), `agent_argv` (string[], advanced per-project override of the complete command herdr runs; verbatim and responsible for its own briefing),
 `setup_argv` / `cleanup_argv` (string[], a symmetric per-project stack hook pair —
 `setup_argv` runs at spawn time once the worktree exists but before the agent
 starts, `cleanup_argv` runs before the worktree is removed; relative `argv[0]`
 resolves against the project repo path and `{worktree}` substitutes the task's
-worktree path, e.g. `["infra/worktree/wt.sh","up","{worktree}"]` /
+worktree path, e.g. `["bun","infra/worktree/wt.ts","up","{worktree}"]` /
 `[…,"down","{worktree}"]`; both best-effort with a 120s timeout, emitting a
 `stack_setup` / `stack_teardown` event — see the Auto-cleanup section),
 and `gchat_spaces` (`[{space, label?}]`, the Google Chat intake allowlist —
@@ -78,11 +81,15 @@ prompt), `plan_intake` (bool; when true, each new intake task auto-triggers a
 planner breakdown), `planner_argv` (string[], the planner command, default
 `["claude","-p"]`), and `playbook` (string, freeform project context injected
 into planner prompts).
-Plan-gate key: `plan_gate` (`{kinds?: string[], block?: boolean}`, default
-`{}`). Tasks whose kind is listed in `kinds` are told in their brief to post a
-plan checkpoint before their first edit, which hive then critiques (see the
-`checkpoint` event). `block` is reserved for a later phase and is read by
-nothing today.
+Plan-gate key: `plan_gate` (`{kinds?: string[], block?: boolean,
+auto_ack_hours?: number}`, default `{}`). Tasks whose kind is listed in `kinds`
+are told in their brief to post a plan checkpoint before their first edit, which
+hive then critiques (see the `checkpoint` event). With `block: true` that
+checkpoint also parks the agent: the brief tells it to post the plan and end its
+turn, and the director's ack sends the steer that releases it.
+`auto_ack_hours` (positive number, default off) acks a waiting plan on the
+director's behalf once it has waited that long, so away-mode never strands an
+agent.
 Dispatcher keys (see the Dispatcher section):
 `auto_dispatch` (bool, default `false`; when true the dispatcher auto-spawns
 agents for this project's queued tasks), `dispatch_kinds` (string[], default
@@ -92,7 +99,7 @@ concurrently-running agents).
 Supervisor key: `autonomy_profile` (`"conservative" | "balanced" | "autopilot"`, default `"balanced"`). Conservative leaves every checkpoint and decision to the director. Balanced may acknowledge reversible checkpoints and use only the server's closed safe-decision allow-list. Autopilot may also answer a raiser-recommended low/normal-risk technical choice after the server excludes authority grants and production/shared blast radius. No profile bypasses standing-authority gates.
 Worktree stack hooks (symmetric per-project lifecycle commands, both `string[]`,
 `{worktree}` substitutes the task's worktree path, relative `argv[0]` resolves
-against `repo_path`): `setup_argv` (e.g. `["infra/worktree/wt.sh","up","{worktree}"]`,
+against `repo_path`): `setup_argv` (e.g. `["bun","infra/worktree/wt.ts","up","{worktree}"]`,
 run at spawn after the worktree exists but before the agent starts, so agents
 don't install deps / bring up their stack themselves; emits a `stack_setup`
 event) and `cleanup_argv` (e.g. `[...,"down","{worktree}"]`, run before the
@@ -118,7 +125,7 @@ notification. The reaper auto-sets `archived: true` on a `test` project once
 every task it owns is terminal.
 Worktree stack hooks (symmetric per-project lifecycle commands): `setup_argv`
 (string[], run AFTER the worktree exists but BEFORE the agent starts — e.g.
-`["infra/worktree/wt.sh", "up", "{worktree}"]` — so agents don't bring up their
+`["bun", "infra/worktree/wt.ts", "up", "{worktree}"]` — so agents don't bring up their
 stack themselves; emits a `stack_setup` event) and `cleanup_argv` (string[], run
 BEFORE the worktree is removed — e.g. `[..., "down", "{worktree}"]`; emits a
 `stack_teardown` event). Both: relative `argv[0]` resolves against `repo_path`,
@@ -149,8 +156,11 @@ timeout — a failed hook never blocks spawn nor teardown.
   "resume_ghost_branch": null,
   "resume_pr_url": null,
   "depends_on": [],
+  "verification_cmds": null,
+  "priority": "normal",
   "duplicate_of": null,
   "health": { "status": "healthy", "reason": null, "since": "..." },
+  "sidecar": { "sha": "a1b2c3d...", "ok": false, "findings": [{ "tool": "tsc", "summary": "src/a.ts(3,1): error TS2345" }] },
   "created_at": "...",
   "updated_at": "..."
 }
@@ -169,6 +179,12 @@ reconciler opens ONE `chore` task for the signal itself (deduped fleet-wide on a
 `ci-signal: <key>` line in its brief) and every PR hitting that signal shares it.
 Code-red (anything a commit could plausibly have caused) still steers the PR's
 own agent to fix forward, once per pushed head SHA.
+`sidecar` is the latest background check on the task's OWN commits
+(`server/src/sidecar.ts`): hive runs `tsc --noEmit` and the project's `lint`
+script in a working agent's worktree whenever its HEAD moves. `null` until the
+first check. It is advisory — the board and review cards show it as a chip, and
+a broken build (a `tsc` finding) queues ONE non-blocking FYI steer per commit to
+that task's agent. CI on the PR is still the merge gate.
 `ci_checked_at` is when hive last LOOKED at the checks — `ci_status` only moves
 when the answer moves, so this is the timestamp a decision card cites.
 `head_sha` is the PR's current head commit, refreshed by the reconciler's PR
@@ -234,7 +250,7 @@ never deleted, so the cancelled row + this pointer preserve the full history.
 - `created` — task created. `payload: {title}`
 - `state_change` — every state transition. `payload: {from, to, reason}`
 - `status` — an agent status note. `payload: {note}`
-- `evidence` — an evidence item was attached. `payload: {evidence_id, kind, caption}`
+- `evidence` — an evidence item was attached. `payload: {evidence_id, kind, caption, verify_name?}` (`verify_name`: the task `verification_cmds` entry this artifact came from, from `hive emit ... --verify-name <name>`)
 - `needs-decision` — a decision card was opened. `payload: {decision_id, title}`
 - `decision_answered` — `payload: {decision_id, answer_key, answer_note, answered_by, actor}`; the event `source` is the answerer identity
 - `auto_approved` — the chat supervisor cleared a card itself via the auto-approve bar. `payload: {decision_id, answer_key, category, reason, note}`. `source: chat_supervisor`
@@ -251,9 +267,11 @@ the task timeline with the agent's actual work; see `hooks/install.md`):
 - `agent_turn_end` — a quiet Stop/SubagentStop liveness heartbeat. `payload: {}` (kept for health/reconciler; the timeline hides it)
 
 Types written by the runtime layer (Phase 2b):
-- `checkpoint` — a live build-time judgment call from a working agent (`payload: {note}`; `hive emit <id> checkpoint --note "..."`). Non-blocking. Acknowledgment uses `POST /api/tasks/:id/checkpoints/:eventId/ack` body `{verdict: "ok"|"flag", note?, source?: "director"|"chat_supervisor", actor?}` → `200 {ok, delivered, followup_task_id}` | `409 {stale:true, resolution:{source, actor, at, verdict, note}}` when another actor already acknowledged it | `400` | `404`. `checkpoint_ack` events (`payload: {checkpoint_id, verdict, note, actor}`) record the outcome and their event source records who acted. A `flag` steers a live agent immediately; a flag on a finished/agentless task queues a corrective follow-up task instead (`source="checkpoint_flag"`, parent → the flagged task). `GET /api/checkpoints[?project_id=<id>][?test=all]` → `200 {checkpoints: [{id, task_id, ts, task_number, task_title, task_state, project_id, note}]}` lists un-acked checkpoints, optionally scoped to one project. They survive task completion (only `cancelled` drops them) so judgment calls stay reviewable after fast agents finish. Checkpoints under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
+- `checkpoint` — a live build-time judgment call from a working agent (`payload: {note}`; `hive emit <id> checkpoint --note "..."`). Non-blocking. Acknowledgment uses `POST /api/tasks/:id/checkpoints/:eventId/ack` body `{verdict: "ok"|"flag", note?, source?: "director"|"chat_supervisor", actor?}` → `200 {ok, delivered, followup_task_id}` | `409 {stale:true, resolution:{source, actor, at, verdict, note}}` when another actor already acknowledged it | `400` | `404`. `checkpoint_ack` events (`payload: {checkpoint_id, verdict, note, actor}`) record the outcome and their event source records who acted. A `flag` steers a live agent immediately; a flag on a finished/agentless task queues a corrective follow-up task instead (`source="checkpoint_flag"`, parent → the flagged task). `GET /api/checkpoints[?project_id=<id>][?test=all]` → `200 {checkpoints: [{id, task_id, ts, task_number, task_title, task_state, project_id, note, blocking?, plan?, concerns?}]}` lists un-acked checkpoints, optionally scoped to one project. They survive task completion (only `cancelled` drops them) so judgment calls stay reviewable after fast agents finish. Checkpoints under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
   A PLAN checkpoint is the same event with structured fields instead of a bare note: `payload: {kind: "plan", goal, approach, files_expected: string[], verification_planned, note}` (`hive emit <id> checkpoint --json plan.json`; `note` defaults to `goal` so it still lists like any other checkpoint). Agents are asked for one before their first edit when the project sets `config.plan_gate.kinds` and the task's kind is in that list. Hive critiques it in the background with one sonnet one-shot (60s cap) and attaches a `plan_critique` event (`payload: {checkpoint_id, concerns: [{severity: "note"|"veto", text}], error?}`). A critic that fails, times out, or returns unparseable output attaches `concerns: []` with `error` and logs — it never blocks the agent. Each `veto` concern also steers the agent, quoting the concern. Ordinary note-only checkpoints are not critiqued.
-- `review_summary`: the agent's structured self-review, submitted before `ready`. `payload: {done?: string[], iffy?: (string|{what,why})[], decisions?: string[], testing?: string[], followups?: string[], understanding?: {background?: string, essence?: string, walkthrough?: string[], participate?: string, check?: {question: string, options: {key: string, label: string}[], answer_key: string, explanation?: string}}}`. Mergeable changes require a 2-4 option understanding check. The review card presents the mental model before the technical audit, then uses the check as the approval gate. Questions must teach the director about the specific change or report and may not test agent procedures, debugging, merging, tools, or policy.
+  A plan checkpoint listed by `GET /api/checkpoints` also carries `plan: {goal, approach, files_expected, verification_planned}` and `concerns` (the critic's verdict, `[]` until the critique lands), so the Needs You card can be approved without opening the task.
+  BLOCKING plans (`config.plan_gate.block === true`): the checkpoint payload also carries `blocking: true`, and the brief tells the agent to post the plan and end its turn instead of editing. The `ack` endpoint is what restarts it — `verdict: "ok"` steers "Your plan is APPROVED …", `verdict: "flag"` steers "Your plan was FLAGGED …" and asks for a corrected plan. A flag on a blocking plan always steers (queued if no agent is live) rather than queueing a corrective follow-up task, because nothing has shipped yet. With `config.plan_gate.auto_ack_hours` set, a reconciler step (`autoAckPlans`) acks any blocking plan that has waited that long, writing `checkpoint_ack` with `source: "hive"`, `actor: "auto_ack"`, `auto: true` and sending the same release steer.
+- `review_summary`: the agent's structured self-review, submitted before `ready`. `payload: {done?: string[], iffy?: (string|{what,why})[], decisions?: string[], testing?: string[], followups?: string[], understanding?: {background?: string, essence?: string, walkthrough?: string[], participate?: string, check?: {question: string, options: {key: string, label: string}[], answer_key: string, explanation?: string}}}`. Judgment-class changes require a 2-4 option understanding check (see the understanding gate below); mechanical ones may omit `understanding.checks` entirely. The review card presents the mental model before the technical audit, then uses the check as the approval gate. Questions must teach the director about the specific change or report and may not test agent procedures, debugging, merging, tools, or policy.
 - `understanding_quiz_attempt`, `understanding_quiz_passed`, `understanding_quiz_deferred`: director-only quiz outcomes tied to the latest `review_summary` by `payload.review_event_id`. Their payload includes the optional director `actor`. A new review summary creates a new check. Passing removes it from the backlog. Deferring unlocks an urgent merge but deliberately leaves the quiz open after the task finishes. `understanding_quiz_deferred` is also written with `source: "system"` when a merge auto-defers a required check for a task kind listed in the project's `config.auto_merge.kinds`.
 
 Understanding quiz API:
@@ -261,6 +279,7 @@ Understanding quiz API:
 - `GET /api/understanding-quizzes[?project_id=<id>]` returns `{quizzes}` for required and deferred checks on each task's latest review. Each quiz includes an opaque, review-specific `version` for stale-read detection. Correct answers and explanations are omitted.
 - `POST /api/tasks/:id/understanding-quiz/answer` body `{answer_key, version?, source: "director", actor?}` returns `{ok, correct, explanation}`. Incorrect answers remain blocked and do not reveal the correct option. When `version` is stale, it returns `409 {stale:true, resolution:{source, actor, at, answer_key, answer_label, correct}}` instead of applying the old answer to the next question. Omitting `version` preserves the legacy behavior.
 - `POST /api/tasks/:id/understanding-quiz/defer` body `{confirm: "quiz_later", source: "director"}` is the explicit urgent escape hatch. It is accepted only while the task is in review.
+- `POST /api/tasks/:id/understanding-quiz/require` body `{source: "director", actor?}` flags a task as judgment-class, so its checks are required even when everything else about it looks mechanical. It writes one `understanding_required` event and is idempotent.
 - `spawned` — a herdr agent was started. `payload: {agent_target, branch, worktree_path, tab_id, label, fleet_workspace_id}`
 - `spawn_error` — spawn failed. `payload: {error, infra?}`. `infra: "herdr_unreachable"` marks a herdr-daemon-down failure (`ConnectionRefused` / `Os { code: 61 }`) rather than a task-specific fault; the dispatcher excludes these from a task's per-task backoff and handles them with a global circuit breaker instead (see `docs/runtime.md`)
 - `stack_setup` — the per-project spawn hook (`config.setup_argv`) ran while preparing the worktree, before the agent started (`source: herdr`). `payload: {argv, ok, error?}` (`error` = first 300 chars of stderr/stdout on failure; best-effort, a failure never blocks the spawn).
@@ -322,7 +341,7 @@ Standing-authority events (written by the policy engine, `source: system` unless
   "task_id": "9da7c5527580",
   "ts": "...",
   "kind": "screenshot",
-  "path": "/Users/david/.hive/evidence/9da7c5527580/1720440000_shot.png",
+  "path": "/Users/you/.hive/evidence/9da7c5527580/1720440000_shot.png",
   "url": "/evidence/9da7c5527580/1720440000_shot.png",
   "caption": "Dark mode enabled",
   "meta": {}
@@ -358,7 +377,7 @@ rev-parse HEAD` in the CLI's cwd. The review card compares it to the task's
   "answered_actor": null,
   "bundle": {
     "task_number": 262,
-    "pr_url": "https://github.com/dvkm/hive/pull/42",
+    "pr_url": "https://github.com/example-org/example-repo/pull/42",
     "branch": "hive/rich-cards",
     "spend_usd": 3.2,
     "ci": {
@@ -510,7 +529,7 @@ learnings table doubles as the project knowledge store:
 (`intake` is a new Google-Chat draft task; `planned` is an approved planner
 breakdown — both always `normal`, batched into the digest. `review` is a task
 handed to the director for approval, always `urgent`.)
-`task_id` / `decision_id` may be null. `delivered_at` is set once David has been
+`task_id` / `decision_id` may be null. `delivered_at` is set once the director has been
 made aware — for an urgent notification that means the desktop app reported that
 macOS actually rendered it (`POST /api/notifications/:id/shown`), NOT that the
 server tried to send it; normal ones are batched into a single digest every
@@ -611,9 +630,53 @@ once; caps park an in-progress task behind a wrap-up-or-continue decision. A
   project, edit keys like `auto_dispatch`, write the object back). Used by the
   Policies-page auto-dispatch toggle.
 
+### Deployments (production releases)
+
+The one-branch deploy model: merging into the project's integration branch
+deploys staging, and production is a GitHub workflow the director runs by hand.
+That workflow stamps an immutable tag `prod-YYYY-MM-DD-<short sha>`, so the
+NEWEST such tag is what is live. There is no branch that means "production".
+
+Opt-in per project through `config.deployments`. Without that key these routes
+404 and the project does not appear on the Deployments tab. Every field is
+optional:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `deploy_workflow` | `prod-deploy.yml` | Workflow dispatched to deploy |
+| `rollback_workflow` | `prod-rollback.yml` | Workflow dispatched to roll back |
+| `tag_prefix` | `prod-` | Release tags are read and validated against this |
+| `workflow_ref` | the project's integration branch | Ref the workflow file is read from |
+| `health_url` | none | Probed on each read (same checker as `config.monitors`) |
+| `health_substring` | none | Required in the health response body |
+| `flags` | `[]` | Feature-flag keys to show, in order |
+| `posthog_project` | none | With a `POSTHOG_API_KEY` secret, resolves live flag states |
+| `posthog_host` | `https://us.posthog.com` | PostHog API base |
+| `history` | `15` | Releases listed |
+
+- `GET /api/projects/:id/deployments` → `200 DeploymentsStatus` | `404` when the project or its `deployments` config is missing
+  `{branch, head:{sha,short,subject}|null, current:Release|null, releases:[Release], ahead:number|null, health:{ok,detail,url}|null, flags:{available,reason,items:[{key,name,active,rollout}]}, runs:[WorkflowRun], errors:[string]}`.
+  `Release` is `{tag, sha, short, subject, created_at, current}`, where `sha` is
+  the release tag's DEREFERENCED commit (the workflow writes annotated tags).
+  `ahead` counts commits on `branch` that production does not have. A section
+  that could not be read degrades to null/`[]` and appends to `errors` rather
+  than failing the whole response.
+- `POST /api/projects/:id/deployments/deploy` body `{commit?}` → `200 {ok, workflow, ref}` | `400` | `401` without the API token | `502` when `gh` refuses
+  Blank `commit` means the workflow's own default (the current head of the
+  branch). Anything that is not a commit SHA → `400`.
+- `POST /api/projects/:id/deployments/rollback` body `{tag?}` → `200 {ok, workflow, ref}` | `400` | `401` without the API token | `502` when `gh` refuses
+  Blank `tag` means the workflow's own default (the release before the current
+  one). A tag outside `tag_prefix` → `400`, so production can never be pointed
+  at a commit that was never live.
+
+Both writes are token-gated (see Auth). Hive has no user accounts, so the API
+token IS the super-admin check: it is read out of hive's own DB, which an
+agent's HTTP socket cannot reach. The GitHub credential stays server-side —
+hive shells out to `gh`, and the browser only ever names a commit or a tag.
+
 ### Tasks
 - `GET /api/tasks?state=&project_id=&test=` → `200 [Task, ...]` (newest `updated_at` first; all filters optional). Tasks under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
-- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher and reconciler won't advance the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban. It is never auto-dispatched or staleness-supervised, is exempt from the done-evidence gate, and moves freely via transitions (`hive task move <id> <state>`). The board keeps these tasks in its separate Tracked view with the external state visible. Jira-keyed Hive work is grouped beneath the matching tracked card, with requeue chains collapsed to their latest attempt. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
+- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?, verification_cmds?, priority?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher and reconciler won't advance the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban. It is never auto-dispatched or staleness-supervised, is exempt from the done-evidence gate, and moves freely via transitions (`hive task move <id> <state>`). The board keeps these tasks in its separate Tracked view with the external state visible. Jira-keyed Hive work is grouped beneath the matching tracked card, with requeue chains collapsed to their latest attempt. `verification_cmds` is the task's verification contract: an array of `{name, cmd}` the agent must run before handing off (`name`: 1-32 chars of `a-z0-9-`, unique within the task; `cmd`: a non-empty string). Anything else → `400`. The agent brief renders it as a "Verification contract" section, and `hive emit <id> evidence --verify-name <name>` tags an artifact with the entry it came from (stored as `verify_name` on the `evidence` event). Nothing is gated on it yet. `priority` is one of `now`, `next`, `normal` (the default), `later`; anything else → `400`. It is ORDERING only, never preemption — see [Priority](#priority). Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
 - `POST /api/tasks/:id/jira/link` body `{parent_key (required)}` → `201 {jira_key, browse_url, warnings}` | `400` | `404`
@@ -652,7 +715,7 @@ once; caps park an in-progress task behind a wrap-up-or-continue decision. A
   - `failed` — the task is terminal, so no spawn will ever carry it.
 
   Never throws. A herdr failure additionally records a `steer_error` event. The timeline renders the receipt (`✓` / `⏳ queued` / `⚠ undelivered`) so a steer never has to be re-sent blind. Besides the respawn drain, the reconciler re-attempts every queued steer each cycle against any agent with an active turn (receipt flips with `delivered_via:"drain"`); a successful drain writes no event of its own — the receipt flip is the record, and a fresh event would reset the task's silence clock and mask a mute agent from `stale` detection.
-- `PUT /api/tasks/:id` body `{title?, brief?, depends_on?}` (or multipart: same fields + `files`) → `200 Task` | `404` | `400` (unknown/self-referencing `depends_on` id)
+- `PUT /api/tasks/:id` body `{title?, brief?, depends_on?, verification_cmds?, priority?}` (or multipart: same fields + `files`) → `200 Task` | `404` | `400` (unknown/self-referencing `depends_on` id, an invalid `verification_cmds`, or an invalid `priority`)
   Attached files are appended to the resulting `brief` under an `## Attachments` heading.
   Updates a task's editable fields. Used by the attention tray's "edit & requeue"
   flow before it re-queues a failed task, and by `hive task update <id> --depends-on <id,id>` —
@@ -661,9 +724,13 @@ once; caps park an in-progress task behind a wrap-up-or-continue decision. A
   `depends_on` to leave it alone; when sent, it's a full replace (same
   validation as creation: each id must exist, and a task may not depend on
   itself), so pass every id the task should still wait on, not just the new one.
+  `verification_cmds` is full-replace the same way: omit it to leave it alone,
+  send `[]` or `null` to clear it. `priority` is a plain scalar: omit it to leave
+  it alone, send one of `now`/`next`/`normal`/`later` to change it. A rejected
+  value changes nothing.
 - `POST /api/tasks/:id/focus-agent` body `{}` → `200 {"ok":true, "focused":true, "target":"..."}` | `404`
   The board's "view agent" affordance: focuses the task's herdr tab via
-  `herdr agent focus` so David can watch/attach. Records a `focus_agent` event.
+  `herdr agent focus` so the director can watch/attach. Records a `focus_agent` event.
   Degrades gracefully (never throws): `200 {"ok":false, "focused":false, "error":"..."}`
   when the task has no agent or herdr fails.
 - `POST /api/tasks/:id/requeue` body `{}` → `200 {"ok":true, "new_task_id":"..."}` | `404`
@@ -843,8 +910,9 @@ hand-ordering PRs. `from` lands before `to` on every edge.
   `authoredFiles`). Nothing is stored; a git read failure means that branch just
   gets no conflict edges, never a blocked merge.
 
-Each sweep lands every marked task whose edges are satisfied, in task-number
-order. A `depends` edge holds a task until its predecessor has actually merged.
+Each sweep lands every marked task whose edges are satisfied. Among the tasks
+that are ready in a sweep, the higher `priority` goes first and the task number
+breaks the remaining ties. A `depends` edge holds a task until its predecessor has actually merged.
 A `conflict` edge only holds it when the peer lands in the SAME sweep — merging
 one moves the base out from under the other, so the second waits for its agent
 to rebase, and a peer that is not landing (red CI, unmarked) holds nothing.
@@ -864,6 +932,8 @@ cycle.
   a squash merge).
 
   **Understanding gate.** The latest review must include a valid multiple-choice understanding check. The director must pass it before merge. The explicit `quiz_later` defer endpoint temporarily unlocks the merge while keeping the quiz in Needs You until it is eventually passed. Supervisors cannot answer or defer it.
+
+  **Judgment-class only.** A task needs an understanding check at all only when it is judgment-class: the latest `auto_review` verdict is not `looks_good` (missing, errored or skipped counts), the reviewed diff touches a sensitive path (`auth`, `security`, `payment`, `billing`, `migration`, `secret`, `credential`, `password` by default, overridable with `config.understanding_checks.sensitive_paths`), the task kind is outside `config.auto_merge.kinds`, or the director flagged the task. Everything else merges with no check, mints no quiz, and never appears in `GET /api/understanding-quizzes`.
 
   For task kinds a project opted into with `config.auto_merge.kinds`, the check never gates the merge: a missing check is ignored, and a required-but-unpassed one is deferred automatically (an `understanding_quiz_deferred` event with `source: "system"`, written only after the merge succeeds) so it stays in Needs You. Kinds outside the allow-list keep the `409`.
 
@@ -1004,6 +1074,7 @@ recognized fields (JSON keys == form field names):
 | `title`,`context`,`risk`,`blast_radius`,`options` | decision fields (needs-decision type; `options` is a JSON string in multipart) |
 | `until`,`days` | (deferred type) auto-resume horizon: an ISO timestamp (`until`) or an integer number of days from now (`days`); neither = indefinite |
 | `model`,`input_tokens`,`output_tokens`,`cache_read_tokens`,`cache_write_tokens`,`cost_usd` | usage fields (usage type; numbers, or numeric strings in multipart; `cost_usd` optional) |
+| `verify_name` | (evidence type) the task `verification_cmds` entry this artifact came from; recorded on the `evidence` event payload (CLI: `--verify-name <name>`) |
 | `file` | (multipart only) the uploaded evidence file |
 
 Behavior by `type`:
@@ -1302,7 +1373,7 @@ same destinations are reachable from anywhere: `hive://task/<number-or-id>`,
 `hive://decision/<id>`, `hive://quiz/<task-id>`, `hive://open?path=/<route>`.
 Task routes accept a task NUMBER as well as an id (`hive://task/1247`).
 
-[Apple documents Mobile Web Push](https://developer.apple.com/documentation/usernotifications/sending-web-push-notifications-in-web-apps-and-browsers) on iOS and iPadOS 16.4 or later after Hive is added to the Home Screen and notification permission is requested from a user action. This standards-based path uses Apple's push service but does not require Apple Developer Program membership or native app plumbing. An open decision uses the decision title as the notification question. Browsers that expose Web Notification action buttons can answer a fixed option without opening Hive. Tapping the notification body, a free-text answer, or a failed inline answer opens `/decisions#dcard-<decision_id>` instead. The answer request carries a token that can answer only the named decision. Apple documents Home Screen Web Push support, but not notification action buttons. Verify whether actions appear on David's installed PWA. If iOS shows only View, the decision deep link is the supported fallback.
+[Apple documents Mobile Web Push](https://developer.apple.com/documentation/usernotifications/sending-web-push-notifications-in-web-apps-and-browsers) on iOS and iPadOS 16.4 or later after Hive is added to the Home Screen and notification permission is requested from a user action. This standards-based path uses Apple's push service but does not require Apple Developer Program membership or native app plumbing. An open decision uses the decision title as the notification question. Browsers that expose Web Notification action buttons can answer a fixed option without opening Hive. Tapping the notification body, a free-text answer, or a failed inline answer opens `/decisions#dcard-<decision_id>` instead. The answer request carries a token that can answer only the named decision. Apple documents Home Screen Web Push support, but not notification action buttons. Verify whether actions appear on the director's installed PWA. If iOS shows only View, the decision deep link is the supported fallback.
 
 `POST /api/push/subscribe` requires the API token from every caller, including loopback. The PWA sends its saved token and prompts for one after a `401` response. `POST /api/push/unsubscribe` remains available to remove an existing endpoint.
 
@@ -1397,7 +1468,7 @@ bot messages are skipped; each message is deduped by its resource name (unique
 
 ### Domain supervisors (on-demand planners)
 A per-project planner that triages a task and proposes a breakdown. hive's core
-design REJECTS long-running LLM supervisor sessions (firstmate's failure mode):
+design REJECTS long-running LLM supervisor sessions (a prior orchestration tool's failure mode):
 the supervisor is "persistent" only in that its ROLE and CONTEXT live in the DB
 (the `supervisor_persona`, `playbook`, `plan_intake`, `planner_argv` config
 keys). The LLM itself runs as a short-lived, on-demand subprocess:
@@ -1434,7 +1505,21 @@ When herdr reports an agent `blocked`, the reconciler reads the pane immediately
 (`get_*`/`list_*`/`search_*`/`read_*`/`whoami`) are auto-approved with
 "don't ask again" and logged as a `dialog_auto_approved` event; projects extend
 the allowlist with `config.dialog_auto_approve` (array of regex strings matched
-against the dialog text). Anything else opens an URGENT decision card whose
+against the dialog text).
+
+Projects that set `config.auto_answer_dialogs: true` also let the server answer
+codex file-write confirmations ("Would you like to make the following edits?")
+by itself. It sends `1` (yes, proceed — this edit only, never "don't ask again")
+and logs a `dialog_auto_answered` event with the files touched, source
+`supervisor`. Every file must be the task's own: inside its `worktree_path`, or a
+`/tmp`, `/private/tmp` or `/var/folders` path whose name carries the task id or
+`-<number>-`. A `..` escape, a relative path, a file outside those, or any other
+dialog shape (a shell-command approval such as `rm -rf` is a different prompt and
+never matches) parks for the director as before. `GET /api/brief` returns
+`auto_answered_dialogs`, the count over the `since` window (default 24h), so the
+director sees one number instead of a card per write.
+
+Anything else opens an URGENT decision card whose
 Approve/Deny answer sends the keystroke to the pane remotely
 (`blocked_card`/`dialog_answered` events); the task parks in `needs_decision`.
 Silent-path diagnosis (auth lost, context exhausted, transient API errors) is
@@ -1447,9 +1532,34 @@ Every automatic transition that could act on a task mid-recovery — idle/done/g
 ### Promoter (continuous promote-to-main evaluation)
 No HTTP endpoints — a server-internal loop (`server/src/promoter.ts`, scheduled by `HIVE_PROMOTE_MS`, default 30m, plus one run ~30s after boot). Each started loop runs at most one cycle at a time; ticks during a slow cycle are logged and skipped, not queued. Projects opt in with `config.promote = {from: "staging", to: "main"}`. Whenever `origin/<from>` has commits `origin/<to>` lacks, it queues ONE evaluation task (`source="promoter"`, `source_ref` = the evaluated head SHA, kind `ship`) that the dispatcher spawns like any other. The agent judges readiness — CI green, test comprehensiveness for the promoted range (uncovered bug fixes or gaps in auth/billing/data-integrity paths BLOCK promotion; the agent spawns a gap task per missing test), half-shipped features, pending migrations — and either opens the Promote PR with a per-PR "Test coverage" verdict section (base `<to>`, head `<from>`; the DIRECTOR merges) or attaches a not-ready report and finishes. Dedup: one in-flight evaluation per project, a given head SHA is evaluated at most once, and an already-open promote PR suppresses new evaluations until it's merged/closed.
 
+### Priority
+Every task carries `priority`: one of `now`, `next`, `normal` (the default) or
+`later`. It is ORDERING only. Nothing is ever preempted — a running agent is
+never stopped and a merged PR is never rolled back to make room for a
+higher-priority task. Set it at creation (`POST /api/tasks`) or later
+(`PUT /api/tasks/:id`); an unknown value is a `400` and changes nothing.
+
+It changes two things:
+
+- **Which queued task is picked up first.** The dispatcher orders its queue by
+  priority, then by age. A `later` task never beats a `normal` one, however old
+  it is. The reattach pass keeps its own ordering (oldest feedback first) —
+  that is resumed work, not new work.
+- **Which approved PR lands first.** The land queue's dependency and conflict
+  edges still decide the order; priority only breaks the tie among the PRs that
+  are all ready in the same sweep.
+
+One extra rule, the **borrowed slot**: when a project is exactly at its
+`max_agents` cap, a single `now` task may start anyway, at `cap + 1`. At most
+ONE borrowed slot per project at a time — a second `now` task waits until the
+borrower is no longer in flight. The `max_agents × 2` overhang on total live
+agents still applies. This is the only way the cap is ever exceeded, and it adds
+an agent rather than taking one away.
+
 ### Dispatcher (self-driving spawn loop)
 No HTTP endpoints — the dispatcher is a server-internal loop (`server/src/dispatcher.ts`,
-default every 30s, `HIVE_DISPATCH_MS`). It picks up `queued` tasks and spawns a
+default every 30s, `HIVE_DISPATCH_MS`). It picks up `queued` tasks in
+[priority](#priority) then age order and spawns a
 herdr agent for each (the same path as `POST /api/tasks/:id/spawn`), gated by:
 project `config.auto_dispatch: true` (default off), `config.dispatch_kinds`
 (default `["ship","scout"]`), `config.max_agents` (default 3, per-project cap on

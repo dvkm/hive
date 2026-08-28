@@ -2,8 +2,7 @@
 
 This documents the self-driving dispatcher and the herdr adapter's verified
 behavior against a live herdr server (client + server 0.7.1, protocol 14). The
-adapter was exercised end to end against a throwaway git repo; the captured
-transcript is `docs/evidence/herdr-live-verification.txt`.
+adapter was exercised end to end against a throwaway git repo.
 
 ## Dispatcher (`server/src/dispatcher.ts`)
 
@@ -80,7 +79,7 @@ The herdr adapter also serializes create, reclaim, cleanup, and teardown for the
 
 An `in_review` task is parked on the DIRECTOR — PR open, CI green, quiz waiting
 on a human. Its agent has nothing to do, but while it lives it holds a pty and a
-dispatch slot. On 2026-08-19 ten such agents held corebeat at 3 running against
+dispatch slot. On 2026-08-19 ten such agents held a project at 3 running against
 19 queued, because live agents (`max_agents × 2`) were all review-parked.
 
 **Release** (`cleanup.releaseReviewAgent`, run every reaper sweep). For each
@@ -118,7 +117,7 @@ lifecycle effect when queued feedback reaches an `in_review` task.
 
 ## Visible interactive fleet (spawn design)
 
-hive uses herdr the way firstmate's `docs/herdr-backend.md` proved it should be used: agents are VISIBLE and INTERACTIVE, never invisible one-shot processes. A project selects Claude Code (default) or ChatGPT through the Codex CLI with `config.agent`; both stay attached to a labelled Herdr tab. `spawn()` (`server/src/runtime/herdr.ts`) does, in order:
+hive uses herdr the way a prior orchestration tool proved it should be used: agents are VISIBLE and INTERACTIVE, never invisible one-shot processes. A project selects Claude Code (default) or ChatGPT through the Codex CLI with `config.agent`; both stay attached to a labelled Herdr tab. `spawn()` (`server/src/runtime/herdr.ts`) does, in order:
 
 1. Resolve the base as `config.default_branch`, otherwise `config.promote.from`,
    otherwise `main`. Fetch that branch from `origin` into its remote-tracking ref,
@@ -129,7 +128,7 @@ hive uses herdr the way firstmate's `docs/herdr-backend.md` proved it should be 
 Read-only branch comparisons (review diffs, scope-drift footprints, and stacked-branch checks) likewise use `origin/<base>`. Local branch state is reserved for operations that intentionally act on the checkout, such as merging and cleanup.
 2. **Prepare the worktree** (callback) wires Hive's Stop/SubagentStop/PostToolUse hooks before the agent starts (`.claude/settings.local.json` for Claude; per-invocation Codex hook config for ChatGPT), so lifecycle reporting is structural, not brief-dependent (`hooks/`), then runs
    the per-project spawn hook `config.setup_argv` (e.g.
-   `["infra/worktree/wt.sh", "up", "{worktree}"]`) so agents don't have to
+   `["bun", "infra/worktree/wt.ts", "up", "{worktree}"]`) so agents don't have to
    install deps / bring up their stack themselves. It is the symmetric partner of
    `config.cleanup_argv` (teardown); both share `runStackCmd` in `cleanup.ts`,
    substitute `{worktree}`, resolve a relative `argv[0]` against `repo_path`, and
@@ -140,7 +139,7 @@ Read-only branch comparisons (review diffs, scope-drift footprints, and stacked-
    spawn never steals the space the captain is watching. NOT `"hive"`: herdr
    auto-labels a worktree's own workspace by repo name, and this repo is named
    `hive`, so `"hive"` would adopt the hive checkout's workspace — the
-   label-collision class firstmate's 2026-07-02 self-kill documents.
+   label-collision class a prior orchestration tool's 2026-07-02 self-kill documents.
 4. `herdr tab create --workspace <fleet> --cwd <worktree> --label "<id> <title>"`
    — one labelled tab per task (this IS the visible "id + title" affordance).
 5. `herdr agent start <id> --workspace <fleet> --tab <tab> --cwd <worktree> --env HIVE_TASK_ID=<id> --env HIVE_URL=... [secrets] --no-focus -- <agent command>` starts either interactive `claude "<brief>" --permission-mode auto` or interactive `codex --sandbox workspace-write --ask-for-approval on-request ... "<brief>"`. The composed brief is the first prompt, and the agent stays live for steering or direct attachment.
@@ -249,7 +248,9 @@ Quirks found and handled:
   since there is no work to lose. The refuse path triggers only once the agent
   has made an unpushed commit.
 
-`HERDR_BIN` overrides the binary path (default `/opt/homebrew/bin/herdr`).
+`HERDR_BIN` overrides binary discovery. Without it, Hive checks `PATH`, the
+standard Windows per-user Herdr install, `/opt/homebrew/bin`, `/usr/local/bin`,
+and the user's `.local/bin`.
 
 ## Re-running the live verification
 
@@ -264,12 +265,11 @@ and prints a PASS/FAIL line per checked behavior.
 The visible-fleet + stale-recovery rework has its own end-to-end harness:
 
 ```bash
-bun run scripts/herdr-rework-verify.ts 2>&1 | tee docs/evidence/herdr-rework-verification.txt
+bun run scripts/herdr-rework-verify.ts
 ```
 
 It boots a scratch hive server in-process against the real herdr and drives a
 task through the whole new pipeline (interactive claude in the `hive-fleet`
 workspace with a labelled tab, hook wiring + a live hook event) then the full
 recovery loop (agent exits → reconciler fails + auto-requeues twice → the cap
-opens a decision card). The committed transcript is
-`docs/evidence/herdr-rework-verification.txt`.
+opens a decision card).

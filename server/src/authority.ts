@@ -1,4 +1,4 @@
-// Standing-authority policy engine (v3). David grants scoped authority once and
+// Standing-authority policy engine (v3). The director grants scoped authority once and
 // the SERVER enforces it before risky actions dispatch — agents never serially
 // ask for permission, and high-blast-radius actions structurally cannot proceed
 // without an answered decision card that names the EXACT target.

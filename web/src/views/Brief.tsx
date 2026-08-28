@@ -20,7 +20,7 @@ const MODE_KEY = "hive.inbox.mode";
 const ITEM_LABELS: Record<NeedsYouItem["kind"], string> = {
   decision: "Decision",
   checkpoint: "Checkpoint",
-  quiz: "Understanding",
+  quiz_digest: "Catch up",
   review: "Review",
   attention: "Issue",
   waiting: "Waiting",
@@ -105,7 +105,14 @@ export default function Brief() {
   }, [needsYou]);
   const openDecisions = needsYou.flatMap((item) => item.kind === "decision" && !answered.has(item.id) ? [item.decision] : []);
   const checkpoints = needsYou.flatMap((item) => item.kind === "checkpoint" ? [item.checkpoint] : []);
-  const quizzes = needsYou.flatMap((item) => item.kind === "quiz" && !passedQuizzes.has(item.id) ? [item.quiz] : []);
+  // One digest per project, holding only the changes still to catch up on.
+  // Answering one drops it out here, so the digest empties as you work through it.
+  const remainingIn = (item: NeedsYouItem) =>
+    item.kind === "quiz_digest" ? item.quizzes.filter((quiz) => !passedQuizzes.has(quiz.id)) : [];
+  const digests = needsYou.flatMap((item) => {
+    const remaining = remainingIn(item);
+    return remaining.length ? [{ id: item.id, total: item.kind === "quiz_digest" ? item.quizzes.length : 0, remaining }] : [];
+  });
   const toReview = needsYou.flatMap((item) => item.kind === "review" && !reviewed.has(item.id) ? [item.task] : []);
   const attention = needsYou.flatMap((item) => item.kind === "attention" ? [item.task] : []);
   const waiting = needsYou.flatMap((item) => item.kind === "waiting" ? [{ task: item.task, blockedBy: item.blockedBy }] : []);
@@ -119,17 +126,21 @@ export default function Brief() {
   const incidents = scope(data?.incidents ?? []);
   const intake = scope(data?.intake ?? []);
   const learnings = scope(data?.learnings_new ?? []);
+  // Fleet-wide on purpose: the count is a reassurance line, not a work item,
+  // and events carry no project column to filter on here.
+  const autoAnsweredDialogs = data?.auto_answered_dialogs ?? 0;
   const spend = data?.spend;
   const spendCount = spend ? spend.totals.calls : 0;
 
-  const actionCount = openDecisions.length + checkpoints.length + quizzes.length + toReview.length + attention.length;
+  // A digest counts as ONE item however many changes it holds.
+  const actionCount = openDecisions.length + checkpoints.length + digests.length + toReview.length + attention.length;
   // The focus queue, in order. Handled items drop out, so the index naturally
   // lands on the next one; the arrows let you step past anything you can't act on.
   const focusItems = useMemo(() => {
     const seenCheckpointTasks = new Set<string>();
     return needsYou.filter((item) => {
       if (item.kind === "decision") return !answered.has(item.id);
-      if (item.kind === "quiz") return !passedQuizzes.has(item.id);
+      if (item.kind === "quiz_digest") return remainingIn(item).length > 0;
       if (item.kind === "review") return !reviewed.has(item.id);
       if (item.kind === "waiting") return false;
       // One card per task: CheckpointsInbox already shows the task's checkpoints together.
@@ -206,39 +217,52 @@ export default function Brief() {
             <DecisionCard d={focusItem.decision} onDone={(id) => setAnswered((items) => new Set(items).add(id))} />
           )}
           {focusItem.kind === "checkpoint" && <CheckpointsInbox taskId={focusItem.checkpoint.task_id} heading={false} />}
-          {focusItem.kind === "quiz" && (
-            <div className="brief-quiz">
-              <Link to={`/tasks/${focusItem.quiz.task_id}`}>{taskIdLabel(focusItem.quiz.task_id, focusItem.quiz.task_number)} {focusItem.quiz.task_title}</Link>
-              <details className="review-details" open>
-                <summary>
-                  <span>{focusItem.quiz.task_kind === "scout" ? "Explain report" : "Understand this change"}</span>
-                  <small>Read before answering</small>
-                </summary>
-                <div className="review-details-body">
-                  {focusItem.quiz.report.understanding && (
-                    <ReviewUnderstanding packet={focusItem.quiz.report.understanding} report={focusItem.quiz.task_kind === "scout"} caveats={focusItem.quiz.report.iffy} />
-                  )}
-                  <ReviewAudit r={focusItem.quiz.report} />
+          {focusItem.kind === "quiz_digest" && (() => {
+            // One change at a time, in order. Passing the current one drops it
+            // from `remaining`, so the next change slides in without a click.
+            const remaining = remainingIn(focusItem);
+            const quiz = remaining[0];
+            const at = focusItem.quizzes.length - remaining.length + 1;
+            return (
+              <div className="brief-quiz">
+                <div className="brief-digest-head">
+                  <strong>Catch up on {focusItem.quizzes.length} shipped {focusItem.quizzes.length === 1 ? "change" : "changes"}</strong>
+                  <span className="muted">Change {at} of {focusItem.quizzes.length}</span>
                 </div>
-              </details>
-              <UnderstandingQuiz
-                quiz={focusItem.quiz}
-                surface="focus"
-                onPassed={() => {
-                  setPassedQuizzes((items) => new Set(items).add(focusItem.id));
-                  reloadQuizzes();
-                }}
-              />
-            </div>
-          )}
+                <Link to={`/tasks/${quiz.task_id}`}>{taskIdLabel(quiz.task_id, quiz.task_number)} {quiz.task_title}</Link>
+                <details className="review-details" open>
+                  <summary>
+                    <span>{quiz.task_kind === "scout" ? "Explain report" : "Understand this change"}</span>
+                    <small>Read before answering</small>
+                  </summary>
+                  <div className="review-details-body">
+                    {quiz.report.understanding && (
+                      <ReviewUnderstanding packet={quiz.report.understanding} report={quiz.task_kind === "scout"} caveats={quiz.report.iffy} />
+                    )}
+                    <ReviewAudit r={quiz.report} />
+                  </div>
+                </details>
+                <UnderstandingQuiz
+                  quiz={quiz}
+                  // These already shipped, so the default "Before you approve" would lie.
+                  label="Catch up on this change"
+                  surface="focus"
+                  onPassed={() => {
+                    setPassedQuizzes((items) => new Set(items).add(quiz.id));
+                    reloadQuizzes();
+                  }}
+                />
+              </div>
+            );
+          })()}
           {focusItem.kind === "review" && (
             <ReviewCard task={focusItem.task} surface="focus" onDone={() => setReviewed((items) => new Set(items).add(focusItem.id))} />
           )}
           {focusItem.kind === "attention" && <div className="brief-attn"><AttentionRows tasks={[focusItem.task]} /></div>}
           {focusItem.kind !== "review" && (
             <TaskEvidence
-              taskId={focusItem.kind === "decision" ? focusItem.decision.task_id : focusItem.kind === "checkpoint" ? focusItem.checkpoint.task_id : focusItem.kind === "quiz" ? focusItem.quiz.task_id : focusItem.task.id}
-              title={focusItem.kind === "decision" ? focusItem.decision.title : focusItem.kind === "checkpoint" ? focusItem.checkpoint.task_title : focusItem.kind === "quiz" ? focusItem.quiz.task_title : focusItem.task.title}
+              taskId={focusItem.kind === "decision" ? focusItem.decision.task_id : focusItem.kind === "checkpoint" ? focusItem.checkpoint.task_id : focusItem.kind === "quiz_digest" ? remainingIn(focusItem)[0].task_id : focusItem.task.id}
+              title={focusItem.kind === "decision" ? focusItem.decision.title : focusItem.kind === "checkpoint" ? focusItem.checkpoint.task_title : focusItem.kind === "quiz_digest" ? remainingIn(focusItem)[0].task_title : focusItem.task.title}
             />
           )}
           {focusCount > 1 && <div className="brief-queue-note">{focusCount - 1} more waiting.</div>}
@@ -257,9 +281,19 @@ export default function Brief() {
               {checkpoints.map((checkpoint) => <li key={checkpoint.id}><Link to={`/tasks/${checkpoint.task_id}`} state={{ backgroundLocation: location }}>{taskIdLabel(checkpoint.task_id, checkpoint.task_number)} {checkpoint.task_title}</Link><span>{checkpoint.note}</span><TaskEvidence taskId={checkpoint.task_id} title={checkpoint.task_title} compact /></li>)}
             </ul>
           </Section>
-          <Section title="Understanding" count={quizzes.length}>
+          {/* One row for the whole catch-up, not one per shipped change. It opens
+              the single sequential flow in Focus. */}
+          <Section title="Catch up" count={digests.length}>
             <ul className="brief-backlog-list">
-              {quizzes.map((quiz) => <li key={quiz.id}><Link to={`/tasks/${quiz.task_id}`} state={{ backgroundLocation: location }}>{taskIdLabel(quiz.task_id, quiz.task_number)} {quiz.task_title}</Link><span>{quiz.task_kind === "scout" ? "Report" : "Change"}</span><TaskEvidence taskId={quiz.task_id} title={quiz.task_title} compact /></li>)}
+              {digests.map((digest) => (
+                <li key={digest.id}>
+                  <button className="link-btn" onClick={() => { setFocusIdx(focusItems.findIndex((item) => item.id === digest.id)); chooseMode("focus"); }}>
+                    Catch up on {digest.total} shipped {digest.total === 1 ? "change" : "changes"}
+                  </button>
+                  <span>{digest.remaining.length} left</span>
+                  <TaskEvidence taskId={digest.remaining[0].task_id} title={digest.remaining[0].task_title} compact />
+                </li>
+              ))}
             </ul>
           </Section>
           <Section title="Reviews" count={toReview.length}>
@@ -315,6 +349,16 @@ export default function Brief() {
                 ))}
               </ul>
             </Section>
+
+            {autoAnsweredDialogs > 0 && (
+              <section className="brief-section">
+                <h2 className="brief-h">Dialogs</h2>
+                <div className="muted">
+                  Hive answered {autoAnsweredDialogs} agent {autoAnsweredDialogs === 1 ? "dialog" : "dialogs"} for you. Each one was a
+                  file write inside the agent's own worktree or scratchpad.
+                </div>
+              </section>
+            )}
 
             <Section title="Fleet now" count={fleet.length}>
               <ul className="brief-list">

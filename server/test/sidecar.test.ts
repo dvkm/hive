@@ -167,3 +167,77 @@ test("one pass is capped at 300s total and the next pass resumes where it stoppe
     __resetSidecarCursor();
   }
 });
+
+// ---- steering on a broken build (task HIVE-405) --------------------------
+// A broken build is the one finding worth telling the agent about mid-task, and
+// it is worth telling it exactly once per commit.
+function steers(db: DB, taskId: string): any[] {
+  return (db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'steer' ORDER BY rowid").all(taskId) as any[])
+    .map((r) => JSON.parse(r.payload));
+}
+
+// A second HEAD, so a pass can look at a fresh commit on the same task.
+function fakeWorldAtSha(sha: string, results: Record<string, ExecResult> = {}) {
+  const world = fakeWorld(results);
+  const exec: Exec = async (argv, opts) => (argv[4] === "HEAD" ? OK(`${sha}\n`) : world.exec(argv, opts));
+  return { ...world, exec };
+}
+
+test("a broken build queues ONE non-blocking FYI steer, and never a second one for the same sha", async () => {
+  const { db, taskId } = freshDb();
+  const tsc = { code: 2, stdout: "src/a.ts(3,1): error TS2345: nope\n", stderr: "" };
+  await sidecarOnce(db, fakeWorld({ tsc }));
+
+  const queued = steers(db, taskId);
+  expect(queued.length).toBe(1);
+  expect(queued[0].delivery).toBe("queued");
+  expect(queued[0].message).toContain(`sidecar: build broken since ${SHA.slice(0, 7)}:`);
+  expect(queued[0].message).toContain("src/a.ts(3,1): error TS2345: nope");
+  expect(queued[0].message).toContain("not a blocker");
+
+  // Same commit checked again (the report row is gone, so HEAD reads as fresh):
+  // the sha marker in the queued steer is what stops the repeat.
+  db.query("DELETE FROM events WHERE type = 'sidecar_report'").run();
+  await sidecarOnce(db, fakeWorld({ tsc }));
+  expect(steers(db, taskId).length).toBe(1);
+});
+
+test("a new commit that is still broken gets its own steer", async () => {
+  const { db, taskId } = freshDb();
+  const tsc = { code: 2, stdout: "src/a.ts(3,1): error TS2345: nope\n", stderr: "" };
+  await sidecarOnce(db, fakeWorld({ tsc }));
+  await sidecarOnce(db, fakeWorldAtSha("b".repeat(40), { tsc }));
+
+  const messages = steers(db, taskId).map((s) => s.message);
+  expect(messages.length).toBe(2);
+  expect(messages[1]).toContain(`sidecar: build broken since ${"b".repeat(7)}:`);
+});
+
+test("lint-only findings never steer the agent", async () => {
+  const { db, taskId } = freshDb();
+  await sidecarOnce(db, fakeWorld({ lint: { code: 1, stdout: "src/a.ts:3 no-unused-vars\n", stderr: "" } }));
+
+  expect(reports(db, taskId)[0].ok).toBe(false);
+  expect(steers(db, taskId)).toEqual([]);
+});
+
+test("a tsc check that was skipped for budget is not a broken build", async () => {
+  const { db, taskId } = freshDb();
+  const world = fakeWorld();
+  const realNow = Date.now;
+  let clock = 1_000_000;
+  Date.now = () => clock;
+  try {
+    // Burn the budget inside the pass, before the checks themselves run.
+    const slow: Exec = async (argv, opts) => {
+      if (argv.includes("--porcelain")) clock += 301_000;
+      return world.exec(argv, opts);
+    };
+    await sidecarOnce(db, { ...world, exec: slow });
+  } finally {
+    Date.now = realNow;
+    __resetSidecarCursor();
+  }
+  expect(reports(db, taskId)[0].findings.every((f: any) => f.summary.startsWith("skipped:"))).toBe(true);
+  expect(steers(db, taskId)).toEqual([]);
+});

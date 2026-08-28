@@ -16,10 +16,11 @@ import { queuedSteers } from "./steer.ts";
 import { broadcastTask } from "./health.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectBaseBranch } from "./exec.ts";
+import { resolveConfiguredCommand } from "./platform.ts";
 
 // Per-project stack lifecycle command. Two symmetric hooks share this runner:
-//   config.setup_argv    = ["infra/worktree/wt.sh", "up",   "{worktree}"]  (spawn time, before agent starts)
-//   config.cleanup_argv  = ["infra/worktree/wt.sh", "down", "{worktree}"]  (before worktree removal)
+//   config.setup_argv    = ["bun", "infra/worktree/wt.ts", "up",   "{worktree}"]  (spawn time)
+//   config.cleanup_argv  = ["bun", "infra/worktree/wt.ts", "down", "{worktree}"]  (before removal)
 // Setup gets its own budget via config.stack_setup_timeout_ms (default 600_000);
 // teardown keeps the short 120s default.
 // Setup runs AFTER the worktree exists but BEFORE the agent starts (see the
@@ -43,7 +44,7 @@ export async function runStackCmd(
 ): Promise<{ ok: boolean; error?: string }> {
   if (!Array.isArray(argvTemplate) || !argvTemplate.length) return { ok: true };
   const argv = argvTemplate.map((a) => String(a).replaceAll("{worktree}", worktreePath));
-  if (!argv[0].startsWith("/")) argv[0] = `${repoPath}/${argv[0]}`;
+  argv[0] = resolveConfiguredCommand(repoPath, argv[0]);
   // Teardown ('wt.sh down') is quick; setup ('wt.sh up') on a cold worktree
   // installs deps + brings up docker and routinely runs past 2 min, so it gets
   // its own (configurable) budget. Timing out setup would start the agent
@@ -287,7 +288,7 @@ export async function cleanupTask(
 // A task in review is parked on the DIRECTOR: the PR is open, CI is green, and
 // nothing in hive asks its agent to act again until a human (or a red check)
 // does. Left alive that agent still holds a pty AND a dispatch slot — 10 idle
-// review agents starved corebeat to 3 running against 19 queued (2026-08-19).
+// review agents starved a consuming project to 3 running against 19 queued (2026-08-19).
 //
 // Release = close the session, KEEP the worktree and branch (the PR still needs
 // them), drop agent_target so the dispatcher stops counting it. Feedback brings

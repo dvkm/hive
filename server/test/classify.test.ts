@@ -147,7 +147,7 @@ test("restarting the live hive server is dangerous (agents die in batches)", () 
     "launchctl bootout gui/501/dev.hive.server",
     "./scripts/sync-main.sh",
     "bash scripts/sync-main.sh",
-    "/Users/david/projects/hive-live/bin/hive serve",
+    "/Users/ada/projects/hive-live/bin/hive serve",
     "hive serve",
     "bun run server/src/index.ts",
     "bun --watch server/src/index.ts",
@@ -171,7 +171,7 @@ test("safe commands classify as safe", () => {
 });
 
 test("Codex PermissionRequest receives the Codex allow shape", async () => {
-  const proc = Bun.spawn(["bun", join(import.meta.dir, "../../hooks/classify.ts")], {
+  const proc = Bun.spawn([process.execPath, join(import.meta.dir, "../../hooks/classify.ts")], {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -187,7 +187,7 @@ test("Codex PermissionRequest receives the Codex allow shape", async () => {
 });
 
 test("Codex PreToolUse continues safe commands without an unsupported allow decision", async () => {
-  const proc = Bun.spawn(["bun", join(import.meta.dir, "../../hooks/classify.ts")], {
+  const proc = Bun.spawn([process.execPath, join(import.meta.dir, "../../hooks/classify.ts")], {
     env: { ...process.env, HIVE_AGENT: "codex" },
     stdin: "pipe",
     stdout: "pipe",
@@ -197,6 +197,18 @@ test("Codex PreToolUse continues safe commands without an unsupported allow deci
   await proc.stdin.end();
   expect((await new Response(proc.stdout).text()).trim()).toBe("");
   expect(await proc.exited).toBe(0);
+});
+
+test("native Windows destructive commands are classified", () => {
+  expect(classify("Remove-Item C:\\work -Recurse -Force").decision).toBe("dangerous");
+  expect(classify("Stop-Process -Id 42").decision).toBe("dangerous");
+  expect(classify("Get-ChildItem C:\\work").decision).toBe("safe");
+});
+
+test("Windows and Git Bash worktree paths share the sandbox waiver", () => {
+  const env = { USERPROFILE: "C:\\Users\\Ada", TEMP: "C:\\Users\\Ada\\AppData\\Local\\Temp" };
+  expect(classify("git reset --hard", env, "C:\\Users\\Ada\\.herdr\\worktrees\\repo\\hive-x").decision).toBe("unknown");
+  expect(classify("git reset --hard", env, "/c/Users/Ada/.herdr/worktrees/repo/hive-x").decision).toBe("unknown");
 });
 
 test("unrecognized commands classify as unknown (never safe)", () => {
@@ -224,10 +236,10 @@ test("dev/null and dev/urandom redirects are not treated as device writes", () =
 // scratchpad/tmp/worktree downgrade to "unknown" (allow+log), never "safe" —
 // and anything not provably confined stays "dangerous".
 test("sandbox-scoped rm downgrades to unknown, not dangerous", () => {
-  const env = { HOME: "/Users/david", TMPDIR: "/var/folders/ab/T/" };
+  const env = { HOME: "/Users/ada", TMPDIR: "/var/folders/ab/T/" };
   expect(classify("rm -rf /tmp/build-cache", env).decision).toBe("unknown");
   expect(classify("rm -f /private/tmp/claude-501/x/scratchpad/copy.db*", env).decision).toBe("unknown");
-  expect(classify("rm -rf /Users/david/.herdr/worktrees/repo/hive-abc", env).decision).toBe("unknown");
+  expect(classify("rm -rf /Users/ada/.herdr/worktrees/repo/hive-abc", env).decision).toBe("unknown");
   // same-command variable assignment resolves (the real dec_7ba648202a09 shape)
   const real = `S=/private/tmp/claude-501/sess/scratchpad\nrm -f "$S/hive-copy.db"*\nsqlite3 /tmp/copy.db ".backup"`;
   expect(classify(real, env).decision).toBe("unknown");
@@ -236,7 +248,7 @@ test("sandbox-scoped rm downgrades to unknown, not dangerous", () => {
 });
 
 test("non-sandbox / unprovable rm stays dangerous", () => {
-  const env = { HOME: "/Users/david" };
+  const env = { HOME: "/Users/ada" };
   expect(classify("rm -rf /", env).decision).toBe("dangerous");
   expect(classify("rm -rf ~/projects", env).decision).toBe("dangerous"); // ~ unexpanded → relative
   expect(classify("rm -rf $HOME/projects", env).decision).toBe("dangerous");
@@ -248,7 +260,7 @@ test("non-sandbox / unprovable rm stays dangerous", () => {
 });
 
 test("agent-tooling kill downgrades to unknown; general kill stays dangerous", () => {
-  const env = { HOME: "/Users/david" };
+  const env = { HOME: "/Users/ada" };
   expect(classify('pkill -f "remote-debugging-port=9333"', env).decision).toBe("unknown");
   expect(classify("pkill -f '/private/tmp/claude-501/sess/prof'", env).decision).toBe("unknown");
   expect(classify("kill %1 2>/dev/null", env).decision).toBe("unknown"); // own shell job
@@ -261,8 +273,8 @@ test("agent-tooling kill downgrades to unknown; general kill stays dangerous", (
 });
 
 test("git reset --hard / clean inside the agent's own worktree downgrades; the main checkout stays dangerous", () => {
-  const env = { HOME: "/Users/david" };
-  const wt = "/Users/david/.herdr/worktrees/monorepo/hive-4a2ac7fff8cf";
+  const env = { HOME: "/Users/ada" };
+  const wt = "/Users/ada/.herdr/worktrees/monorepo/hive-4a2ac7fff8cf";
   // the exact shape from the card: cd into the worktree, then reset --hard
   const real = `cd ${wt}\ngit reset --hard origin/fm/node-consolidate 2>&1\ngh pr checks https://github.com/x/y/pull/20 2>&1`;
   expect(classify(real, env, wt).decision).toBe("unknown");
@@ -271,8 +283,8 @@ test("git reset --hard / clean inside the agent's own worktree downgrades; the m
   // git -C into the worktree resolves regardless of cwd
   expect(classify(`git -C ${wt} clean -fd`, env, "/tmp").decision).toBe("unknown");
   // the MAIN checkout is not a sandbox root → stays gated
-  expect(classify("git reset --hard origin/main", env, "/Users/david/projects/monorepo").decision).toBe("dangerous");
-  expect(classify(`cd /Users/david/projects/monorepo\ngit reset --hard`, env, wt).decision).toBe("dangerous");
+  expect(classify("git reset --hard origin/main", env, "/Users/ada/projects/monorepo").decision).toBe("dangerous");
+  expect(classify(`cd /Users/ada/projects/monorepo\ngit reset --hard`, env, wt).decision).toBe("dangerous");
   // no cwd, no absolute cd: unprovable → gated
   expect(classify("git reset --hard origin/main", env).decision).toBe("dangerous");
   // relative cd: unresolvable → gated
@@ -280,13 +292,13 @@ test("git reset --hard / clean inside the agent's own worktree downgrades; the m
 });
 
 test("destructive SQL against the agent's OWN worktree docker DB downgrades; anything else stays dangerous", () => {
-  const env = { HOME: "/Users/david" };
-  const cwd = "/Users/david/.herdr/worktrees/monorepo/hive-abc123def456";
-  const own = 'docker exec -i hive-abc123def456-mariadb mysql -uroot -proot corebeat -e "DROP TABLE scratch_probe"';
+  const env = { HOME: "/Users/ada" };
+  const cwd = "/Users/ada/.herdr/worktrees/monorepo/hive-abc123def456";
+  const own = 'docker exec -i hive-abc123def456-mariadb mysql -uroot -proot acme -e "DROP TABLE scratch_probe"';
   expect(classify(own, env, cwd).decision).toBe("unknown"); // waived -> allow-and-log
   // value-taking flags before the container name still resolve it
   expect(
-    classify('docker exec -u root -e TZ=UTC hive-abc123def456-mariadb mysql corebeat -e "TRUNCATE TABLE t"', env, cwd).decision
+    classify('docker exec -u root -e TZ=UTC hive-abc123def456-mariadb mysql acme -e "TRUNCATE TABLE t"', env, cwd).decision
   ).toBe("unknown");
   // someone ELSE's stack, the human's dev DB, or no docker at all: gated
   expect(classify('docker exec hive-ffffffffffff-mariadb mysql -e "DROP TABLE x"', env, cwd).decision).toBe("dangerous");
@@ -299,11 +311,11 @@ test("destructive SQL against the agent's OWN worktree docker DB downgrades; any
 });
 
 test("SQL on a sandboxed sqlite copy downgrades; live/server DBs stay dangerous", () => {
-  const env = { HOME: "/Users/david" };
+  const env = { HOME: "/Users/ada" };
   expect(classify('sqlite3 /tmp/claude-501/s/copy.db "update usage set cost=0"', env).decision).toBe("unknown");
   const heredoc = `S=/private/tmp/claude-501/s/scratchpad\nsqlite3 "$S/copy.db" <<SQL\nupdate usage set cost_usd = 0\nSQL`;
   expect(classify(heredoc, env).decision).toBe("unknown");
-  expect(classify('sqlite3 /Users/david/.hive/hive.db "update usage set cost=0"', env).decision).toBe("dangerous");
+  expect(classify('sqlite3 /Users/ada/.hive/hive.db "update usage set cost=0"', env).decision).toBe("dangerous");
   expect(classify("psql -c 'UPDATE users SET admin = 1'", env).decision).toBe("dangerous");
   expect(classify('sqlite3 /tmp/claude-501/x.db "drop table usage"; psql -c "x"', env).decision).toBe("dangerous");
 });
@@ -315,7 +327,7 @@ test("SQL on a sandboxed sqlite copy downgrades; live/server DBs stay dangerous"
 // stripping for the whole command, so the quoted "UPDATE tasks SET" text got
 // scanned as if it were live shell text.
 test("SQL-looking text in a pure read-only search pipeline is not dangerous", () => {
-  const env = { HOME: "/Users/david" };
+  const env = { HOME: "/Users/ada" };
   expect(classify('grep -rn "UPDATE tasks SET" server/src | grep -i source', env).decision).toBe("safe");
   expect(classify('rg "DELETE FROM users" src', env).decision).toBe("safe");
   expect(classify('grep -n "DROP TABLE accounts" migrations/*.sql', env).decision).toBe("safe");
@@ -332,7 +344,7 @@ test("SQL-looking text in a pure read-only search pipeline is not dangerous", ()
 // Live incident: an echo whose quoted payload contained "SWEEP-KILL
 // EVIDENCE" tripped command.dangerous.process-kill though nothing was killed.
 test("quoted trigger words in a read-only pipeline are not dangerous, across every category", () => {
-  const env = { HOME: "/Users/david" };
+  const env = { HOME: "/Users/ada" };
   const triggers: [string, string][] = [
     ["recursive/forced rm", "rm -rf /tmp/x"],
     ["privilege escalation", "sudo rm -rf /"],
@@ -378,7 +390,7 @@ test("hive emit with destructive text in the note is data, not danger", () => {
 });
 
 test("data text (quotes, heredocs) is not scanned as shell — executors still are", () => {
-  const env = { HOME: "/Users/david" };
+  const env = { HOME: "/Users/ada" };
   // commit messages / PR comments / grep patterns mentioning rm (live 2026-07-10)
   expect(classify(`git commit -q -F- <<'MSG'\nmerge: deny-safe rm -rf handling\nMSG`, env).decision).toBe("unknown");
   expect(classify('gh pr comment 11 --body "covers the sandboxed rm -rf case"', env).decision).toBe("unknown");
@@ -404,7 +416,7 @@ test("data text (quotes, heredocs) is not scanned as shell — executors still a
 // whole class so a future refactor of stripDataText/EXECUTOR can't silently
 // regress the non-find families the earlier tests never exercised.
 test("danger keywords quoted in prose are data across every dangerous family", () => {
-  const env = { HOME: "/Users/david" };
+  const env = { HOME: "/Users/ada" };
   // SQL family
   expect(classify(`git commit -m "add DROP TABLE migration and TRUNCATE cleanup"`, env).decision).not.toBe("dangerous");
   // process-kill family
@@ -424,32 +436,32 @@ test("danger keywords quoted in prose are data across every dangerous family", (
 });
 
 test("container/vcs rm and sandboxed-cwd relative rm are waived", () => {
-  const env = { HOME: "/Users/david" };
-  const wt = "/Users/david/.herdr/worktrees/monorepo/hive-abc";
+  const env = { HOME: "/Users/ada" };
+  const wt = "/Users/ada/.herdr/worktrees/monorepo/hive-abc";
   expect(classify("docker rm -f hive62-db", env).decision).toBe("unknown");
   expect(classify("git rm -rf old/dir", env).decision).toBe("unknown");
   expect(classify("rm -f lib/contents/mod.rs.tmptest", env, wt).decision).toBe("unknown");
-  expect(classify("rm -f lib/x.tmp", env, "/Users/david/projects/monorepo").decision).toBe("dangerous"); // cwd not sandboxed
+  expect(classify("rm -f lib/x.tmp", env, "/Users/ada/projects/monorepo").decision).toBe("dangerous"); // cwd not sandboxed
   expect(classify("rm -rf ../other", env, wt).decision).toBe("dangerous"); // escape
   expect(classify("cd /; rm -rf tmp", env, wt).decision).toBe("dangerous"); // in-command cd voids cwd proof
   expect(classify("ls | xargs rm -rf", env, wt).decision).toBe("dangerous"); // executor + unseen targets
 });
 
 test("find -delete/-exec inside the agent's own sandbox downgrades; elsewhere stays dangerous", () => {
-  const env = { HOME: "/Users/david" };
-  const wt = "/Users/david/.herdr/worktrees/monorepo/hive-abc";
+  const env = { HOME: "/Users/ada" };
+  const wt = "/Users/ada/.herdr/worktrees/monorepo/hive-abc";
   expect(classify(`find ${wt} -name '*.log' -delete`, env).decision).toBe("unknown");
   expect(classify(`find ${wt} -type f -exec rm {} \\;`, env).decision).toBe("unknown");
   expect(classify("find . -name '*.log' -delete", env, wt).decision).toBe("unknown"); // relative + sandboxed cwd
-  expect(classify("find /Users/david/projects/monorepo -name '*.log' -delete", env).decision).toBe("dangerous");
-  expect(classify("find . -name '*.log' -delete", env, "/Users/david/projects/monorepo").decision).toBe("dangerous");
+  expect(classify("find /Users/ada/projects/monorepo -name '*.log' -delete", env).decision).toBe("dangerous");
+  expect(classify("find . -name '*.log' -delete", env, "/Users/ada/projects/monorepo").decision).toBe("dangerous");
   expect(classify("find . -name '*.log' -delete", env).decision).toBe("dangerous"); // no cwd: unprovable
   expect(classify(`find ${wt}/../other -name '*.log' -delete`, env).decision).toBe("dangerous"); // escape
   // Multiple search paths: every leading path must be sandboxed, not just the first.
-  expect(classify(`find ${wt} /Users/david/projects/monorepo -name '*.log' -delete`, env).decision).toBe("dangerous");
+  expect(classify(`find ${wt} /Users/ada/projects/monorepo -name '*.log' -delete`, env).decision).toBe("dangerous");
   expect(classify(`find ${wt} ${wt}/sub -name '*.log' -delete`, env).decision).toBe("unknown");
   // Leading global-option flags must not hide the real search path.
-  expect(classify("find -L /Users/david/projects/monorepo -name '*.ts' -delete", env, wt).decision).toBe("dangerous");
+  expect(classify("find -L /Users/ada/projects/monorepo -name '*.ts' -delete", env, wt).decision).toBe("dangerous");
   expect(classify(`find -L ${wt} -name '*.ts' -delete`, env).decision).toBe("unknown");
   expect(classify("find -L -delete", env, wt).decision).toBe("unknown"); // globals-only + sandboxed cwd → implicit '.'
 });
@@ -484,7 +496,7 @@ test("actionFor namespaces dangerous commands by classifier category", () => {
 // shell text. stripDataText must scope the raw-vs-stripped decision to the
 // region that actually contains the trigger.
 test("a subshell elsewhere in the command does not unstrip unrelated quoted prose", () => {
-  const env = { HOME: "/Users/david" };
+  const env = { HOME: "/Users/ada" };
   // $(...)-wrapped quoted-delimiter heredoc (a `gh pr create --body "$(cat <<'EOF' ... )"` shape);
   // the heredoc body merely mentions a force-delete-branch example in backticks.
   const cmd1 = [

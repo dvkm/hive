@@ -3,8 +3,8 @@ name: CI
 on:
   workflow_dispatch:
   pull_request:
-  # push:
-  #   branches: [main]
+  push:
+    branches: [main]
 
 # Agents push to many branches at once; drop superseded runs so the
 # "wait for checks" handoff gate isn't stuck behind a stale queue.
@@ -13,12 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    # Self-hosted runner on David's Mac (mac-hive-runner). GitHub-hosted minutes
-    # are billing-blocked on the dvkm account and hive is a solo, locally-deployed
-    # project (sync-main.sh builds + restarts on this same Mac), so a local runner
-    # is free CI with no GitHub-hosted dependency. bun comes from setup-bun below.
-    runs-on: [self-hosted, macOS, ARM64]
+  linux:
+    runs-on: ubuntu-latest
     # This job only reads the tree. Narrow the default GITHUB_TOKEN so a
     # compromised dependency in a PR run can't write to the repo.
     permissions:
@@ -32,15 +28,40 @@ jobs:
           # unrelated branch. Bump this alongside the bun agents run locally.
           bun-version: 1.3.14
 
-      # Two separate manifests: the root install does NOT cover web/.
+      # Three separate manifests: the root install does not cover web/ or the
+      # native desktop bundle.
       - run: bun install
       - run: bun install
         working-directory: web
+      - run: bun install
+        working-directory: electron
 
       # 'bun run test', not bare 'bun test'. The run form also executes
       # docs:jira:check, which fails when README's generated Jira
-      # write-scope section drifts from the registry.
+      # write-scope section drifts from the registry. macOS-only tests
+      # self-skip via skipIf(platform !== darwin), so this is safe here.
       - run: bun run test
 
       - run: bunx tsc -b --noEmit
         working-directory: web
+
+  macos:
+    # macOS compatibility gate: packaging the electron bundle proves that
+    # cross-platform build routing has preserved the native Mac artifact.
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - run: bun install
+      - run: bun install
+        working-directory: web
+      - run: bun install
+        working-directory: electron
+
+      - run: bun run build
+        working-directory: electron

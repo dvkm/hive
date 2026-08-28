@@ -16,8 +16,10 @@ import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectComparisonBase } from "./exec.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 import { supervisedSql } from "./supervision.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
+import { parseUnifiedDiff } from "./diff.ts";
 
 const TIMEOUT_MS = Number(process.env.HIVE_REVIEWER_TIMEOUT_MS || 180_000);
 const DIFF_LIMIT = 60_000;
@@ -153,7 +155,7 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
       && current.branch === t.branch
       && (!t.pr_url || current.head_sha === t.head_sha);
   };
-  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(t.project_id);
+  const project: any = db.query("SELECT repo_path, config FROM projects WHERE id = ?").get(t.project_id);
   const config = JSON.parse(project?.config ?? "{}");
   if (config.auto_review === false) {
     writeEvent(db, { task_id: t.id, source: "system", type: "auto_review", payload: { skipped: "disabled by project config" } });
@@ -187,7 +189,11 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
   const exec = deps.exec ?? defaultPlannerExec;
   let res;
   try {
-    res = await exec(argv, { timeoutMs: TIMEOUT_MS });
+    res = await exec(argv, {
+      timeoutMs: TIMEOUT_MS,
+      ...(project?.repo_path ? { cwd: project.repo_path } : {}),
+      env: claudeProfileEnvForProject(db, t.project_id),
+    });
   } catch (e: any) {
     if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
     writeEvent(db, { task_id: t.id, source: "system", type: "auto_review_error", payload: { error: String(e?.message ?? e), ...reviewIdentity } });
@@ -218,8 +224,31 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
     });
     return;
   }
-  writeEvent(db, { task_id: t.id, source: "system", type: "auto_review", payload: { ...review, ...reviewIdentity } as any });
+  // `files` is what the reviewed diff touched. Read back by
+  // understandingChecksRequired (hive-1559) to spot sensitive paths without
+  // re-shelling out to git for every task on a director surface.
+  const files = parseUnifiedDiff(diff.text).files.map((f) => f.path);
+  writeEvent(db, { task_id: t.id, source: "system", type: "auto_review", payload: { ...review, files, ...reviewIdentity } as any });
   broadcast({ type: "task", task: getTask(db, t.id) });
+  // Any risk or question the pre-reviewer wrote is a suspicion — check each one
+  // against the real code before it blocks the merge. Not caution-only: a
+  // looks_good review with soft notes would otherwise veto its own auto-merge
+  // forever. PR-backed tasks only: without a PR head there is nothing to key
+  // the verdicts to.
+  if (reviewedHead && (review.risks.length || review.questions.length)) {
+    await verifyRisks(
+      db,
+      t,
+      {
+        risks: review.risks,
+        questions: review.questions,
+        head: reviewedHead,
+        diff: diff.text,
+        stillCurrent: async () => stillCurrent() && (await livePrHead(shell, t.pr_url)) === reviewedHead,
+      },
+      deps
+    );
+  }
 }
 
 export function startAutoReviewer(db: DB, deps: ReviewerDeps & { intervalMs?: number } = {}): () => void {
@@ -227,4 +256,270 @@ export function startAutoReviewer(db: DB, deps: ReviewerDeps & { intervalMs?: nu
     autoReviewOnce(db, deps).catch((e) => console.error("[hive] auto-review crashed:", e));
   }, deps.intervalMs ?? 60_000);
   return () => clearInterval(timer);
+}
+
+// ---------------------------------------------------------------------------
+// Per-risk adversarial verification (tasks HIVE-406, HIVE-407).
+//
+// A pre-review lists risks the sonnet reviewer *suspects* and questions it
+// wants answered. Some are real, some are the model pattern-matching on a diff
+// it can only see a window of. So each one gets its own opus one-shot that can
+// read the actual worktree: risks are confirmed or refuted, questions are
+// answered from the code or handed to the human. The verdicts land as ONE
+// `risk_verdicts` event on the card, so the director reads "3 of 5 were
+// refuted" instead of five maybes — and a fully refuted/answered set lets the
+// reconciler auto-merge (see ambiguityCleared).
+//
+// Keyed to the reviewed PR head: it re-runs only when the pre-review itself
+// re-runs for a new head, and never twice for the same one.
+const MAX_VERIFIED_RISKS = 5;
+const MAX_VERIFIED_QUESTIONS = 5;
+const VERIFY_MODEL = "opus";
+
+export interface RiskVerdict {
+  risk: string;
+  verdict: "confirmed" | "refuted";
+  why: string;
+  evidence_path?: string;
+}
+
+// A question is only cleared when the code itself answers it. "Did you check
+// this on the installed app?" needs the human — it stays a merge veto.
+export interface QuestionVerdict {
+  question: string;
+  answerable: "machine" | "human";
+  answer: string;
+}
+
+// Same loose parsing as extractReview: whole JSON, the `--output-format json`
+// {result:"..."} envelope, or a braces slice of prose. `norm` decides what
+// shape counts, so a parse that yields the wrong shape keeps falling through.
+function looseParse<T>(raw: string, norm: (o: any) => T | null): T | null {
+  const tryParse = (s: string) => {
+    try {
+      return norm(JSON.parse(s));
+    } catch {
+      return null;
+    }
+  };
+  const braces = (s: string) => {
+    const a = s.indexOf("{");
+    const b = s.lastIndexOf("}");
+    return a >= 0 && b > a ? tryParse(s.slice(a, b + 1)) : null;
+  };
+  const whole = tryParse(raw);
+  if (whole) return whole;
+  try {
+    const env = JSON.parse(raw);
+    if (env && typeof env.result === "string") return tryParse(env.result) ?? braces(env.result);
+  } catch {}
+  return braces(raw);
+}
+
+export function extractVerdict(raw: string): { verdict: "confirmed" | "refuted"; why: string; evidence_path?: string } | null {
+  return looseParse(raw, (o: any) => {
+    if (!o || (o.verdict !== "confirmed" && o.verdict !== "refuted")) return null;
+    const out: any = { verdict: o.verdict, why: String(o.why ?? "").trim().slice(0, 300) };
+    if (typeof o.evidence_path === "string" && o.evidence_path.trim()) out.evidence_path = o.evidence_path.trim();
+    return out;
+  });
+}
+
+export function extractAnswer(raw: string): { answerable: "machine" | "human"; answer: string } | null {
+  return looseParse(raw, (o: any) => {
+    if (!o || (o.answerable !== "machine" && o.answerable !== "human")) return null;
+    return { answerable: o.answerable, answer: String(o.answer ?? "").trim().slice(0, 300) };
+  });
+}
+
+function verifyPrompt(task: any, risk: string, diff: string): string {
+  return [
+    `A code reviewer flagged ONE risk on a pull request. Decide whether it is real.`,
+    `Be adversarial: try to refute it. Say 'confirmed' only if you can point at the code that makes it true.`,
+    ``,
+    `Risk: ${risk}`,
+    ``,
+    `Task #${task.number}: ${task.title}`,
+    task.worktree_path ? `The full checkout is at ${task.worktree_path} — read files there to check. Do not edit anything.` : ``,
+    ``,
+    `Diff (may be truncated):`,
+    diff.slice(0, DIFF_LIMIT),
+    ``,
+    PLAIN_ENGLISH,
+    ``,
+    `Answer as ONLY a JSON object, no prose around it:`,
+    `{"verdict": "confirmed" | "refuted",`,
+    ` "why": "one or two sentences, 300 characters or fewer",`,
+    ` "evidence_path": "file:line you checked, if any"}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function answerPrompt(task: any, question: string, diff: string): string {
+  return [
+    `A code reviewer asked ONE question about a pull request before merging it.`,
+    `Decide who can answer it. Answer it yourself ("machine") only if reading this repository settles it.`,
+    `Say "human" when the answer needs something outside the code: a manual check on a running or installed app,`,
+    `product intent, a business decision, credentials, or anything only the director knows.`,
+    `If you are unsure, say "human".`,
+    ``,
+    `Question: ${question}`,
+    ``,
+    `Task #${task.number}: ${task.title}`,
+    task.worktree_path ? `The full checkout is at ${task.worktree_path} — read files there to check. Do not edit anything.` : ``,
+    ``,
+    `Diff (may be truncated):`,
+    diff.slice(0, DIFF_LIMIT),
+    ``,
+    PLAIN_ENGLISH,
+    ``,
+    `Answer as ONLY a JSON object, no prose around it:`,
+    `{"answerable": "machine" | "human",`,
+    ` "answer": "the answer if you can give it, otherwise what the human must check — 300 characters or fewer"}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+// Already verified for this exact PR head? Then don't spend the model again.
+function hasRiskVerdicts(db: DB, taskId: string, head: string): boolean {
+  const rows = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts'").all(taskId) as { payload: string }[];
+  return rows.some((r) => {
+    try {
+      return JSON.parse(r.payload)?.reviewed_head_sha === head;
+    } catch {
+      return false;
+    }
+  });
+}
+
+// One opus run per risk and per question, in sequence, each capped. A run that
+// fails or returns junk is left out and counted in `unverified`, so a broken
+// run never reads as an all-clear. `stillCurrent` is re-checked between runs:
+// these verdicts now decide whether a PR auto-merges, so a set produced for a
+// head that has since been force-pushed must never be written at all.
+export async function verifyRisks(
+  db: DB,
+  task: any,
+  input: { risks?: string[]; questions?: string[]; head: string; diff: string; stillCurrent?: () => boolean | Promise<boolean> },
+  deps: ReviewerDeps = {}
+): Promise<void> {
+  const risks = (input.risks ?? []).slice(0, MAX_VERIFIED_RISKS);
+  const questions = (input.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS);
+  if (!risks.length && !questions.length) return;
+  if (hasRiskVerdicts(db, task.id, input.head)) return;
+  const exec = deps.exec ?? defaultPlannerExec;
+  const current = async () => (input.stillCurrent ? await input.stillCurrent() : true);
+  const run = async (prompt: string) => {
+    try {
+      return await exec([claudeBin(), "-p", "--model", VERIFY_MODEL, prompt, "--output-format", "json"], {
+        timeoutMs: TIMEOUT_MS,
+        cwd: task.worktree_path ?? undefined,
+        env: claudeProfileEnvForProject(db, task.project_id),
+      });
+    } catch {
+      return null;
+    }
+  };
+  const verdicts: RiskVerdict[] = [];
+  const question_verdicts: QuestionVerdict[] = [];
+  let unverified = 0;
+  for (const risk of risks) {
+    if (!(await current())) return;
+    const res = await run(verifyPrompt(task, risk, input.diff));
+    const v = !res || res.timedOut || res.code !== 0 ? null : extractVerdict(res.stdout);
+    if (v) verdicts.push({ risk, ...v });
+    else unverified++;
+  }
+  for (const question of questions) {
+    if (!(await current())) return;
+    const res = await run(answerPrompt(task, question, input.diff));
+    const a = !res || res.timedOut || res.code !== 0 ? null : extractAnswer(res.stdout);
+    if (a) question_verdicts.push({ question, ...a });
+    else unverified++;
+  }
+  if (!(await current())) return;
+  writeEvent(db, {
+    task_id: task.id,
+    source: "system",
+    type: "risk_verdicts",
+    payload: {
+      reviewed_head_sha: input.head,
+      verdicts,
+      ...(question_verdicts.length ? { question_verdicts } : {}),
+      ...(unverified ? { unverified } : {}),
+    } as any,
+  });
+  broadcast({ type: "task", task: getTask(db, task.id) });
+}
+
+// What the risk check decided for one PR head, or null when it never ran for
+// that head. Read by the reconciler (auto-merge) and by mergeTask (the 409
+// that names the confirmed risks) — both must ignore a verdict set produced
+// for an older head.
+export function riskVerdictsFor(
+  db: DB,
+  taskId: string,
+  head: string | null | undefined
+): { verdicts: RiskVerdict[]; question_verdicts: QuestionVerdict[]; unverified: number } | null {
+  if (!head) return null;
+  const rows = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts' ORDER BY ts DESC, rowid DESC")
+    .all(taskId) as { payload: string }[];
+  for (const r of rows) {
+    let p: any;
+    try {
+      p = JSON.parse(r.payload);
+    } catch {
+      continue;
+    }
+    if (p?.reviewed_head_sha !== head) continue;
+    return {
+      verdicts: Array.isArray(p.verdicts) ? p.verdicts : [],
+      question_verdicts: Array.isArray(p.question_verdicts) ? p.question_verdicts : [],
+      unverified: Number(p.unverified) || 0,
+    };
+  }
+  return null;
+}
+
+export function confirmedRisks(db: DB, taskId: string, head: string | null | undefined): RiskVerdict[] {
+  return (riskVerdictsFor(db, taskId, head)?.verdicts ?? []).filter((v) => v?.verdict === "confirmed");
+}
+
+// The pre-reviewer nearly always writes at least one soft risk or question, so
+// treating "wrote something" as ambiguity meant nothing ever auto-merged
+// (HIVE-407). The flag clears only when the verification pass covered EVERY
+// risk and question for this exact head, refuted every risk, and could answer
+// every question from the code. Anything unverified, uncovered, confirmed, or
+// human-only leaves it ambiguous, and the director decides.
+// A caution verdict is only as good as the check that cleared it. A caution
+// with nothing listed was never verified at all, so it stays the director's
+// call — `ambiguityCleared` alone would wave it through as "nothing to clear".
+export function cautionCleared(
+  db: DB,
+  taskId: string,
+  head: string | null | undefined,
+  review: { risks?: string[]; questions?: string[] }
+): boolean {
+  const noted = (review.risks?.length ?? 0) + (review.questions?.length ?? 0) > 0;
+  return noted && ambiguityCleared(db, taskId, head, review);
+}
+
+export function ambiguityCleared(
+  db: DB,
+  taskId: string,
+  head: string | null | undefined,
+  review: { risks?: string[]; questions?: string[] }
+): boolean {
+  const risks = review.risks ?? [];
+  const questions = review.questions ?? [];
+  if (!risks.length && !questions.length) return true;
+  const found = riskVerdictsFor(db, taskId, head);
+  if (!found || found.unverified) return false;
+  if (found.verdicts.length !== risks.length || found.question_verdicts.length !== questions.length) return false;
+  return (
+    found.verdicts.every((v) => v?.verdict === "refuted") && found.question_verdicts.every((q) => q?.answerable === "machine")
+  );
 }

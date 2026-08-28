@@ -7,6 +7,7 @@ import type { DB } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { parseDecision } from "./rows.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { claudeProfileEnvForRepo } from "./claudeProfiles.ts";
 
 const TIMEOUT_MS = 60_000;
 
@@ -17,6 +18,13 @@ export async function explainCommandDecision(
   deps: { exec?: PlannerExec } = {}
 ): Promise<void> {
   const exec = deps.exec ?? defaultPlannerExec;
+  const project = db.query(
+    `SELECT p.repo_path
+       FROM decisions d
+       JOIN tasks t ON t.id = d.task_id
+       JOIN projects p ON p.id = t.project_id
+      WHERE d.id = ?`
+  ).get(decisionId) as { repo_path: string | null } | undefined;
   const prompt = [
     "You are annotating an approval card for someone reviewing an automation request.",
     "First line, exactly: `VERDICT: zero-risk` if this command is read-only and touches no",
@@ -33,6 +41,8 @@ export async function explainCommandDecision(
   try {
     res = await exec([claudeBin(), "-p", "--model", "haiku", prompt, "--output-format", "json"], {
       timeoutMs: TIMEOUT_MS,
+      ...(project?.repo_path ? { cwd: project.repo_path } : {}),
+      env: claudeProfileEnvForRepo(project?.repo_path),
     });
   } catch {
     return; // enrichment is best-effort, the card stands on its static context

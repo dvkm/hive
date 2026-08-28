@@ -1,14 +1,16 @@
 // hive desktop app: a native window onto the local hive server, plus what a
-// browser tab can't do — native macOS notifications from the server's
-// notification stream and a dock badge counting open decisions + checkpoints.
-// The server itself stays the LaunchAgent (dev.hive.server); this app is a
-// client only and reconnects politely when the daemon is down.
+// browser tab can't do — native OS notifications from the server's stream and
+// an app badge counting open decisions + checkpoints where the OS supports it.
+// macOS keeps the server in a LaunchAgent (dev.hive.server). On Windows the
+// installer records the local Bun + checkout paths so this client can recover
+// a missing daemon on demand; remote/custom server URLs are never spawned.
 const { app, BrowserWindow, Notification, shell, screen, ipcMain } = require("electron");
 const http = require("node:http");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { routeFor } = require("./deeplink.js");
 const { shouldUpdate } = require("./versionCheck.js");
+const { isDefaultLocalBase, launchWindowsServer } = require("./windows-server.js");
 
 const BASE = process.env.HIVE_URL || "http://127.0.0.1:4700";
 const SMOKE = !!process.env.HIVE_SMOKE; // load, print ok, quit — used by CI/verification
@@ -21,7 +23,7 @@ const pendingUrls = [];
 // the stream and (on a cold start) through the hive:// URL; show it once.
 const shown = new Set();
 
-function createWindow() {
+function createWindow(initialPath = "/") {
   // Clamp the initial size to the display's work area. At a fixed 1440x920 the
   // window is taller/wider than a small laptop screen (e.g. 1440x900), so its
   // resize edges fall off-screen and can't be grabbed — it reads as "can't
@@ -33,7 +35,7 @@ function createWindow() {
     minWidth: 640,
     minHeight: 480,
     resizable: true,
-    titleBarStyle: "hiddenInset",
+    ...(process.platform === "darwin" ? { titleBarStyle: "hiddenInset" } : {}),
     backgroundColor: "#1c1c1e",
     webPreferences: { contextIsolation: true, preload: path.join(__dirname, "preload.js") },
   });
@@ -45,7 +47,7 @@ function createWindow() {
     }
     return { action: "allow" };
   });
-  loadWithRetry();
+  loadWithRetry(initialPath);
   win.on("focus", () => checkForShellUpdate());
   win.on("closed", () => (win = null));
 }
@@ -53,10 +55,48 @@ function createWindow() {
 // The daemon may be restarting (deploys kickstart it); retry instead of
 // showing Chromium's error page.
 let retryTimer = null;
-function loadWithRetry() {
-  if (!win) return;
-  win.loadURL(BASE).catch(() => {
-    win?.loadURL(
+let lastServerLaunchAt = 0;
+function startLocalWindowsServer() {
+  if (process.platform !== "win32" || !isDefaultLocalBase(BASE) || Date.now() - lastServerLaunchAt < 30_000) return;
+  lastServerLaunchAt = Date.now();
+  let settled = false;
+  const finish = (reachable) => {
+    if (settled) return;
+    settled = true;
+    if (reachable) return;
+    const launched = launchWindowsServer({ base: BASE });
+    if (launched.started) console.log(`[hive] started local server (pid=${launched.pid ?? "unknown"})`);
+    else if (launched.reason === "spawn-failed") console.error("[hive] local server failed to start:", launched.error);
+  };
+  const probe = http.get(BASE + "/api/health", (res) => {
+    res.resume();
+    finish(true);
+  });
+  probe.setTimeout(1000, () => probe.destroy(new Error("Hive health probe timed out")));
+  probe.on("error", () => finish(false));
+}
+function safeLoad(target, url) {
+  if (!target || target.isDestroyed()) return Promise.resolve(false);
+  try {
+    return target.loadURL(url).then(() => true, () => false);
+  } catch {
+    // BrowserWindow can be destroyed between isDestroyed() and loadURL().
+    return Promise.resolve(false);
+  }
+}
+function loadWithRetry(route = "/") {
+  const initial = win;
+  if (!initial) return;
+  safeLoad(initial, BASE + route).then((loaded) => {
+    if (loaded) return;
+    const current = win;
+    // A close or a replacement window cancels navigation too; that is not a
+    // server outage and must not start a duplicate daemon.
+    if (!current || current !== initial || current.isDestroyed()) return;
+    // macOS has a LaunchAgent. The Windows installer records the Bun + checkout
+    // paths beside hive.exe so a cold app can recover its local daemon itself.
+    startLocalWindowsServer();
+    safeLoad(current,
       "data:text/html;charset=utf-8," +
         encodeURIComponent(
           `<body style="background:#1c1c1e;color:#ddd;font-family:system-ui;display:grid;place-items:center;height:100vh;margin:0">
@@ -65,17 +105,18 @@ function loadWithRetry() {
         )
     );
     clearTimeout(retryTimer);
-    retryTimer = setTimeout(loadWithRetry, 3000);
+    retryTimer = setTimeout(() => loadWithRetry(route), 3000);
   });
 }
 
 function goto(path) {
-  if (!win) createWindow();
+  const created = !win;
+  if (created) createWindow(path);
   if (win.isMinimized()) win.restore();
   win.show();
   app.focus({ steal: true });
   win.focus();
-  win.loadURL(BASE + path).catch(() => {});
+  if (!created) safeLoad(win, BASE + path);
 }
 
 // ---- hive:// deeplinks ----
@@ -104,7 +145,7 @@ function handleUrl(rawUrl) {
   if (route) goto(route);
 }
 
-// One native macOS notification. Electron routes it through the app bundle, so
+// One native desktop notification. Electron routes it through the app bundle, so
 // it carries the hive icon and obeys Do Not Disturb / Focus like any other app.
 function showNotification(n) {
   if (n.id) {
@@ -121,13 +162,13 @@ function showNotification(n) {
   };
   const note = new Notification({ title: n.title || "hive", body: n.body || "" });
   note.on("click", () => goto(n.path && n.path.startsWith("/") ? n.path : "/"));
-  // macOS refusing is the failure the director actually hit. Report it instead
+  // OS refusal is the failure the director actually hit. Report it instead
   // of swallowing it: `hive notify --test` prints the reason.
   note.on("failed", (_event, error) => {
     console.error("[hive] notification failed:", error);
     report({ error: String(error) });
   });
-  // `show` is the only honest delivery signal: it fires when macOS accepted it.
+  // `show` is the only honest delivery signal: it fires when the OS accepted it.
   note.on("show", () => report({ shown: true }));
   note.show();
 }
@@ -146,8 +187,16 @@ if (!app.requestSingleInstanceLock()) app.quit();
 app.on("second-instance", (_event, argv) => {
   const url = argv.find((a) => a.startsWith("hive://"));
   if (url) handleUrl(url);
-  else if (win) goto("/");
+  else goto("/");
 });
+
+// macOS delivers protocol URLs through `open-url`; Windows/Linux put them in
+// argv on the first launch. Queue those until Electron is ready.
+for (const arg of process.argv) {
+  if (!arg.startsWith("hive://")) continue;
+  launchedByDeeplink = true;
+  pendingUrls.push(arg);
+}
 
 // ---- live state from the server's SSE stream ----
 function subscribe() {
@@ -199,7 +248,8 @@ function refreshBadge() {
         fetch(BASE + "/api/checkpoints").then((r) => r.json()),
       ]);
       const n = (Array.isArray(d) ? d.length : 0) + (c?.checkpoints?.length ?? 0);
-      app.dock?.setBadge(n > 0 ? String(n) : "");
+      if (app.dock) app.dock.setBadge(n > 0 ? String(n) : "");
+      else app.setBadgeCount?.(n);
     } catch {
       /* server down — leave the badge alone */
     }
@@ -276,9 +326,12 @@ ipcMain.on("shell-update-relaunch", (event) => {
 });
 
 app.whenReady().then(() => {
+  if (process.platform === "win32") app.setAppUserModelId("dev.hive.app");
   // Dev runs (`electron .`) are not launched from the bundle, so claim the
   // scheme explicitly; from the built app this is already true.
-  app.setAsDefaultProtocolClient("hive");
+  if (process.defaultApp && process.argv[1])
+    app.setAsDefaultProtocolClient("hive", process.execPath, [path.resolve(process.argv[1])]);
+  else app.setAsDefaultProtocolClient("hive");
   if (!launchedByDeeplink || SMOKE) createWindow();
   pendingUrls.splice(0).forEach(handleUrl);
   subscribe();

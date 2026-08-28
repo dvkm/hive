@@ -58,6 +58,19 @@ test("diagnoses context exhaustion", () => {
   expect(diagnosePane("some output\nnew task? /clear to save 383.2k tokens\n❯")?.kind).toBe("context_full");
 });
 
+test("diagnoses the newer session-limit park wording, not the dialog it echoes (HIVE-451)", () => {
+  const tail = `You have hit your session limit - resets 8:30pm (America/Los_Angeles)
+Continuing automatically at 8:30pm - esc to cancel`;
+  const d = diagnosePane(tail);
+  expect(d?.kind).toBe("usage_limit");
+});
+
+test("diagnoses the usage-limit status-line wording", () => {
+  const tail = `some earlier output
+Usage limit reached - continuing automatically`;
+  expect(diagnosePane(tail)?.kind).toBe("usage_limit");
+});
+
 test("diagnoses transient API errors", () => {
   expect(diagnosePane("API Error: 529 overloaded_error, retrying...")?.kind).toBe("api_error");
   expect(diagnosePane("fetch failed: ETIMEDOUT")?.kind).toBe("api_error");

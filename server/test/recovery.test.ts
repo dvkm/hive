@@ -23,7 +23,7 @@ const gh: Exec = async () => ({ code: 1, stdout: "", stderr: "no gh" }); // PR s
 // own pane really is gone from herdr. `panes(cwd)` puts a pane back at that cwd,
 // which is what a live-but-unregistered agent looks like (herdr's agent registry
 // is wiped by a desktop-app restart while the panes keep running).
-const NO_TASK_PANE = OK('{"result":{"panes":[{"pane_id":"w6:p1","tab_id":"w6:t1","workspace_id":"w6","cwd":"/Users/david"}]}}');
+const NO_TASK_PANE = OK('{"result":{"panes":[{"pane_id":"w6:p1","tab_id":"w6:t1","workspace_id":"w6","cwd":"/Users/ada"}]}}');
 const panes = (cwd: string) =>
   OK(`{"result":{"panes":[{"pane_id":"w6:p9","tab_id":"w6:t9","workspace_id":"w6","cwd":"${cwd}"}]}}`);
 const isPaneList = (argv: string[]) => argv.includes("pane") && argv.includes("list");
@@ -632,7 +632,7 @@ test("failed triage requeue defaults to four hours and zero disables it", () => 
   expect(disabled.db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(parked)).toBeFalsy();
 });
 
-test("director failures, change requests, and failed requeues stay parked", () => {
+test("director failures and change requests stay parked", () => {
   const { db, projectId } = freshDb({ failed_triage_requeue_hours: 1 });
   const directorFailed = makeTask(db, projectId);
   failAt(db, directorFailed, 2 * 60 * 60 * 1000, "director");
@@ -641,14 +641,33 @@ test("director failures, change requests, and failed requeues stay parked", () =
   failAt(db, rejected, 2 * 60 * 60 * 1000);
   putEvent(db, rejected, "changes_requested", { notes: "do not retry" });
 
+  requeueStaleFailed(db);
+
+  for (const id of [directorFailed, rejected])
+    expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(id)).toBeFalsy();
+});
+
+test("a depth-1 requeue lineage still auto-requeues past the triage window", () => {
+  const { db, projectId } = freshDb({ failed_triage_requeue_hours: 1 });
   const original = makeTask(db, projectId);
   const failedRequeue = makeTask(db, projectId, { source: "requeue", parent: original });
   failAt(db, failedRequeue, 2 * 60 * 60 * 1000);
 
   requeueStaleFailed(db);
 
-  for (const id of [directorFailed, rejected, failedRequeue])
-    expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(id)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(failedRequeue)).toBeTruthy();
+});
+
+test("a depth-2 requeue lineage (requeue of a requeue) stays parked", () => {
+  const { db, projectId } = freshDb({ failed_triage_requeue_hours: 1 });
+  const original = makeTask(db, projectId);
+  const firstRequeue = makeTask(db, projectId, { source: "requeue", parent: original });
+  const secondRequeue = makeTask(db, projectId, { source: "requeue", parent: firstRequeue });
+  failAt(db, secondRequeue, 2 * 60 * 60 * 1000);
+
+  requeueStaleFailed(db);
+
+  expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(secondRequeue)).toBeFalsy();
 });
 
 test("a failed task with an existing successor is never auto-requeued again", () => {

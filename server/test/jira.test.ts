@@ -12,7 +12,7 @@
 //     have a human move an issue mid-cycle).
 import { test, expect } from "bun:test";
 import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 const HOME = mkdtempSync(join(tmpdir(), "hive-jira-"));
@@ -24,8 +24,8 @@ const { addClient, removeClient } = await import("../src/bus.ts");
 const J = await import("../src/intake/jira.ts");
 import type { DB } from "../src/db.ts";
 
-const SITE = "https://corebeat.atlassian.net";
-const EMAIL = "corebeat@vid.kim";
+const SITE = "https://example.atlassian.net";
+const EMAIL = "jira@example.com";
 const SELF = "acct-hive-sync";
 const HUMAN = "acct-a-real-person";
 
@@ -324,48 +324,47 @@ const syncEvents = (db: DB) =>
 // ============================================================================
 // CREDENTIAL GATE  (the security-critical path)
 // ============================================================================
-test("credential gate: only the exact compiled-in https host + email is allowed", () => {
-  expect(J.credentialTargetAllowed(SITE, EMAIL)).toBe(true);
+test("credential gate: only a well-formed https site + email passes", () => {
+  expect(J.credentialTargetValid(SITE, EMAIL)).toBe(true);
+  // any Jira Cloud/Data Center host is legitimate now — the target is per-project
+  expect(J.credentialTargetValid("https://other.atlassian.net", EMAIL)).toBe(true);
+  expect(J.credentialTargetValid("https://jira.example.co.uk", EMAIL)).toBe(true);
 
   // http is rejected outright — Basic auth over http is base64, not encryption.
-  expect(J.credentialTargetAllowed("http://corebeat.atlassian.net", EMAIL)).toBe(false);
-
-  // A SUFFIX check would pass these. Atlassian Cloud sites are self-serve, so an
-  // attacker registers `evil.atlassian.net` for free; that is exactly why the
-  // check is an exact host match and not `*.atlassian.net`.
-  expect(J.credentialTargetAllowed("https://evil.atlassian.net", EMAIL)).toBe(false);
-  expect(J.credentialTargetAllowed("https://corebeat.atlassian.net.evil.com", EMAIL)).toBe(false);
-  expect(J.credentialTargetAllowed("https://notcorebeat.atlassian.net", EMAIL)).toBe(false);
+  expect(J.credentialTargetValid("http://example.atlassian.net", EMAIL)).toBe(false);
 
   // userinfo trick: parses to host evil.tld, reads as the real site to a human.
-  expect(J.credentialTargetAllowed("https://corebeat.atlassian.net@evil.tld/", EMAIL)).toBe(false);
+  expect(J.credentialTargetValid("https://example.atlassian.net@evil.tld/", EMAIL)).toBe(false);
   // new URL() reports username="" for a bare delimiter, so a falsy-userinfo
-  // check alone lets these through. Not an exfil path (the host still resolves
-  // correctly) but the parse must not be laxer than it reads.
-  expect(J.credentialTargetAllowed("https://@corebeat.atlassian.net", EMAIL)).toBe(false);
-  expect(J.credentialTargetAllowed("https://:@corebeat.atlassian.net", EMAIL)).toBe(false);
-  // a different port is a different endpoint
-  expect(J.credentialTargetAllowed("https://corebeat.atlassian.net:8443", EMAIL)).toBe(false);
+  // check alone lets these through; the parse must not be laxer than it reads.
+  expect(J.credentialTargetValid("https://@example.atlassian.net", EMAIL)).toBe(false);
+  expect(J.credentialTargetValid("https://:@example.atlassian.net", EMAIL)).toBe(false);
+  // not a hostname
+  expect(J.credentialTargetValid("https://localhost", EMAIL)).toBe(false);
   // garbage / empty
-  expect(J.credentialTargetAllowed("not a url", EMAIL)).toBe(false);
-  expect(J.credentialTargetAllowed("", EMAIL)).toBe(false);
-  expect(J.credentialTargetAllowed(null, EMAIL)).toBe(false);
+  expect(J.credentialTargetValid("not a url", EMAIL)).toBe(false);
+  expect(J.credentialTargetValid("", EMAIL)).toBe(false);
+  expect(J.credentialTargetValid(null, EMAIL)).toBe(false);
 
   // the gate covers the WHOLE credential pair, not just the host
-  expect(J.credentialTargetAllowed(SITE, "attacker@evil.tld")).toBe(false);
-  expect(J.credentialTargetAllowed(SITE, "")).toBe(false);
-  expect(J.credentialTargetAllowed(SITE, null)).toBe(false);
+  expect(J.credentialTargetValid(SITE, "not-an-email")).toBe(false);
+  expect(J.credentialTargetValid(SITE, "")).toBe(false);
+  expect(J.credentialTargetValid(SITE, null)).toBe(false);
+
+  // canonicalSite rebuilds the string that reaches fetch(), dropping path/query
+  expect(J.canonicalSite(SITE + "/wiki?x=1")).toBe(SITE);
 });
 
-test("credential gate: a mutated config is a hard no-op, and jiraConfig canonicalizes", () => {
+test("credential gate: a malformed config is a hard no-op, and jiraConfig canonicalizes", () => {
   // jiraConfig returns null (not a throw a catch could swallow into 'carry on')
-  expect(J.jiraConfig({ jira: { ...CFG, site: "https://evil.atlassian.net" } })).toBeNull();
-  expect(J.jiraConfig({ jira: { ...CFG, site: "http://corebeat.atlassian.net" } })).toBeNull();
-  expect(J.jiraConfig({ jira: { ...CFG, email: "attacker@evil.tld" } })).toBeNull();
-  expect(J.jiraConfig({ jira: { ...CFG, project_key: "OTHER" } })).toBeNull();
+  expect(J.jiraConfig({ jira: { ...CFG, site: "http://example.atlassian.net" } })).toBeNull();
+  expect(J.jiraConfig({ jira: { ...CFG, site: "https://example.atlassian.net@evil.tld" } })).toBeNull();
+  expect(J.jiraConfig({ jira: { ...CFG, email: "not-an-email" } })).toBeNull();
+  expect(J.jiraConfig({ jira: { ...CFG, project_key: "web" } })).toBeNull();
+  expect(J.jiraConfig({ jira: { ...CFG, project_key: "" } })).toBeNull();
   expect(J.jiraConfig({ jira: { ...CFG, jql: "labels = sync) OR project = OPS OR (project = WEB" } })).toBeNull();
 
-  // and a passing config carries hive's OWN constants forward, not the caller's
+  // a passing config carries the CANONICALIZED site forward, not the caller's
   // string, so no unvalidated remnant can reach fetch().
   const ok = J.jiraConfig({ jira: { ...CFG, site: SITE + "/" } });
   expect(ok!.site).toBe(SITE);
@@ -373,9 +372,9 @@ test("credential gate: a mutated config is a hard no-op, and jiraConfig canonica
   expect(ok!.project_key).toBe("WEB");
 
   // the client refuses a hand-built config that bypassed jiraConfig()
-  expect(() => new J.JiraClient({ ...CFG, site: "https://evil.tld" } as any, "tok")).toThrow(/allowlisted/);
-  expect(() => new J.JiraClient({ ...CFG, project_key: "OTHER" } as any, "tok")).toThrow(/allowlisted/);
-  expect(() => new J.JiraClient({ ...CFG, jql: "labels = sync) OR project = OPS OR (project = WEB" } as any, "tok")).toThrow(/allowlisted/);
+  expect(() => new J.JiraClient({ ...CFG, site: "http://evil.tld" } as any, "tok")).toThrow(/malformed/);
+  expect(() => new J.JiraClient({ ...CFG, project_key: "lower" } as any, "tok")).toThrow(/malformed/);
+  expect(() => new J.JiraClient({ ...CFG, jql: "labels = sync) OR project = OPS OR (project = WEB" } as any, "tok")).toThrow(/malformed/);
 });
 
 test("SECURITY: escaping JQL disables sync before an outside project can be observed", async () => {
@@ -420,7 +419,7 @@ test("SECURITY: a mutated target NEVER produces a request, even on the read path
   // This is the actual guarantee, so this asserts the OUTPUT (no network call at
   // all) rather than merely that the validator exists. write:false is included
   // deliberately because shadow mode still exercises the read path.
-  for (const target of [{ site: "https://evil.atlassian.net" }, { project_key: "OTHER" }]) {
+  for (const target of [{ site: "http://example.atlassian.net" }, { project_key: "lower" }]) {
     for (const write of [true, false]) {
       const { db } = freshDb({ ...CFG, write, ...target });
       let called = 0;
@@ -1919,7 +1918,7 @@ test("link creation sends Jira's sub-task payload and stores the link", async ()
   const ts = now();
   db.query(
     `INSERT INTO tasks (id, project_id, title, pr_url, state, kind, created_at, updated_at)
-     VALUES (?, ?, 'Ship outbound links', 'https://github.com/corebeat/hive/pull/1', 'queued', 'ship', ?, ?)`
+     VALUES (?, ?, 'Ship outbound links', 'https://github.com/acme/hive/pull/1', 'queued', 'ship', ?, ?)`
   ).run(taskId, projectId, ts, ts);
 
   const linked = await J.linkTaskToJira(db, taskId, "web-7", { fetch: jira.fetchImpl, token: "tok" });
@@ -3057,18 +3056,18 @@ test("a failing cycle records a PERSISTENT error a director can see, and counts 
   expect(r3.state.consecutive_failures).toBe(0);
 });
 
-test("a disabled or non-allowlisted project reports WHY rather than failing silently", async () => {
+test("a disabled or malformed project reports WHY rather than failing silently", async () => {
   const off = freshDb({ ...CFG, enabled: false });
   const r1 = await J.runProjectCycle(off.db, off.projectId, { token: "tok" });
   expect(r1.ok).toBe(false);
   expect(r1.state.last_error).toContain("disabled");
 
-  const bad = freshDb({ ...CFG, site: "https://evil.atlassian.net" });
+  const bad = freshDb({ ...CFG, site: "http://example.atlassian.net" });
   let called = 0;
   const spy = (async () => { called++; return new Response("{}"); }) as unknown as typeof fetch;
   const r2 = await J.runProjectCycle(bad.db, bad.projectId, { fetch: spy, token: "tok" });
   expect(r2.ok).toBe(false);
-  expect(r2.state.last_error).toMatch(/allow-listed|config missing/);
+  expect(r2.state.last_error).toMatch(/malformed|config missing/);
   expect(called).toBe(0); // still no request to the mutated host
 });
 
@@ -3177,4 +3176,297 @@ test("a director's cancellation is never undone by the sync", async () => {
   await run(db, projectId, fakeJira({ issues }).fetchImpl);
   expect(taskFor(db, "WEB-14").state).toBe("cancelled"); // stays cancelled
   expect(syncEvents(db).some((e) => e.action === "source_restored")).toBe(false);
+});
+
+// ============================================================================
+// A UI task that attached NO screenshot used to leave its ticket picture-less.
+// Hive now renders one at review time with the target repo's own Playwright
+// harness, saves it as ordinary evidence, and the upload path above carries it.
+const { routesFromFiles } = await import("../src/intake/renderProof.ts");
+const { existsSync, mkdirSync: mkdirSyncT, readFileSync: readFileSyncT, readdirSync: readdirSyncT, writeFileSync: writeFileSyncT, rmSync: rmSyncT, symlinkSync: symlinkSyncT } = await import("node:fs");
+
+test("the route to shoot comes from the changed files, and a guessable one is skipped", () => {
+  expect(routesFromFiles(["web/src/app/(main)/insights/page.tsx"])).toEqual(["/insights"]);
+  // A [id] segment has no value hive can supply; a guessed one renders a 404.
+  expect(routesFromFiles(["web/src/app/posts/[id]/page.tsx"])).toEqual(["/"]);
+  // Two at most, never a contact sheet.
+  expect(
+    routesFromFiles(["web/app/a/page.tsx", "web/app/b/page.tsx", "web/app/c/page.tsx"])
+  ).toEqual(["/a", "/b"]);
+  // Nothing route-shaped in the diff still gets the home page.
+  expect(routesFromFiles(["web/src/components/Button.tsx"])).toEqual(["/"]);
+  // An API path answers with JSON or an error, never a page. Both spellings.
+  expect(routesFromFiles(["web/pages/api/users.ts"])).toEqual(["/"]);
+  expect(routesFromFiles(["web/src/app/users/route.ts"])).toEqual(["/"]);
+  expect(routesFromFiles(["web/app/api/users/route.ts", "web/app/insights/page.tsx"])).toEqual(["/insights"]);
+});
+
+// A worktree that looks like a repo with a Playwright harness. `harness: false`
+// makes it a repo with none, which is the quiet-degrade case. The webServer
+// block is what lets hive serve the PR branch itself, so a real harness has one.
+function fakeWorktree(name: string, harness: boolean, config?: string): string {
+  const root = join(HOME, `wt-${name}-${newId()}`);
+  mkdirSyncT(join(root, "web"), { recursive: true });
+  if (harness) {
+    mkdirSyncT(join(root, "web", "e2e"), { recursive: true });
+    writeFileSyncT(
+      join(root, "web", "playwright.config.ts"),
+      config ?? "export default { testDir: './e2e', webServer: { command: 'npm start' } };\n"
+    );
+  }
+  return root;
+}
+
+const isHarnessRun = (argv: string[]) => argv.includes("playwright");
+
+function trustRepo(db: DB, projectId: string): void {
+  const row = db.query("SELECT config FROM projects WHERE id = ?").get(projectId) as { config: string };
+  const config = { ...JSON.parse(row.config), render_proof: true };
+  db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify(config), projectId);
+}
+
+// Stands in for the repo's Playwright: writes the PNG the real one would, and
+// answers every other command (the diff read) with the UI patch. `code` fakes a
+// red run, which must never become evidence.
+const execRendering = (root: string, shots: number, code = 0) => async (argv: string[]) => {
+  if (isHarnessRun(argv)) {
+    const out = join(root, readdirSyncT(root).find((name) => name.startsWith(".hive-proof-"))!);
+    for (let i = 1; i <= shots; i++) await Bun.write(join(out, `proof-${i}.png`), PNG_1PX);
+    return { code, stdout: code ? "1 failed\nError: connect ECONNREFUSED" : "1 passed", stderr: "" };
+  }
+  return { code: 0, stdout: UI_PATCH, stderr: "" };
+};
+
+async function uiTaskWithNoShots(
+  jira: any, harness: boolean, config?: string
+): Promise<{ db: DB; projectId: string; root: string }> {
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const task = tasks(db)[0];
+  const root = fakeWorktree(task.id, harness, config);
+  db.query("UPDATE tasks SET branch = ?, worktree_path = ? WHERE id = ?").run("hive/x", root, task.id);
+  // Rendering executes the repo's own harness, so it only runs for a repo the
+  // director marked trusted. Every test below is on a trusted repo except the
+  // one that checks the gate itself.
+  trustRepo(db, projectId);
+  return { db, projectId, root };
+}
+
+test.skipIf(process.platform !== "darwin")("a UI task with no screenshot gets one rendered, and a second sync renders nothing", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const deps = { exec: execRendering(root, 1) };
+
+  const first = await run(db, projectId, jira.fetchImpl, CFG, deps);
+  expect(first.rendered).toBe(1);
+  expect(first.attachments).toBe(1);
+  const uploaded = jira.byKey.get("WEB-1")!.attachments;
+  expect(uploaded).toHaveLength(1);
+  const evidence = db.query("SELECT caption FROM evidence").all() as any[];
+  expect(evidence).toHaveLength(1);
+  expect(evidence[0].caption).toBe("Rendered at review: /");
+
+  const second = await run(db, projectId, jira.fetchImpl, CFG, deps);
+  expect(second.rendered).toBe(0);
+  expect(second.attachments).toBe(0);
+  expect(jira.byKey.get("WEB-1")!.attachments).toHaveLength(1);
+  expect((db.query("SELECT id FROM evidence").all() as any[])).toHaveLength(1);
+});
+
+test("a repo with no Playwright harness attaches nothing and says why", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, false);
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec: execRendering(root, 1) });
+
+  expect(stats.rendered).toBe(0);
+  expect(stats.attachments).toBe(0);
+  expect(stats.errors).toBe(0);
+  expect(db.query("SELECT id FROM evidence").all()).toHaveLength(0);
+  const logged = syncEvents(db).find((e) => e.action === "render_proof");
+  expect(String(logged?.reason)).toContain("no Playwright config");
+});
+
+// The seatbelt profile IS the boundary, so it is checked by running it, not by
+// reading it. macOS only: on any other host renderProofs refuses outright.
+test.skipIf(process.platform !== "darwin")("the sandbox really refuses a write outside the worktree", async () => {
+  const { seatbelt } = await import("../src/intake/renderProof.ts");
+  const root = join(HOME, `sbx-${newId()}`);
+  mkdirSyncT(root, { recursive: true });
+  const fence = seatbelt(root) as { argv: string[] };
+  const run = (path: string) =>
+    Bun.spawn([...fence.argv, "/bin/sh", "-c", `echo hi > ${path}`], { stdout: "pipe", stderr: "pipe" }).exited;
+
+  expect(await run(join(root, "inside.txt"))).toBe(0);
+  // Outside the worktree: a fresh name directly under the real home dir, which
+  // the profile never lists. NOT derived from cwd, so the test still means
+  // something when the checkout itself sits in a whitelisted dir like /tmp.
+  // Cleaned up either way, so a broken fence leaves nothing behind.
+  const outside = join(homedir(), `sandbox-probe-${newId()}`);
+  expect(await run(outside)).not.toBe(0);
+  rmSyncT(outside, { force: true });
+});
+
+test.skipIf(process.platform !== "darwin")("an untrusted repo never starts a browser, and the gate does not burn the one attempt", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify({ jira: CFG }), projectId);
+  let browserRuns = 0;
+  const render = execRendering(root, 1);
+  const exec = async (argv: string[]) => {
+    if (isHarnessRun(argv)) browserRuns++;
+    return render(argv);
+  };
+
+  const blocked = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+  expect(blocked.rendered).toBe(0);
+  expect(browserRuns).toBe(0);
+  expect(syncEvents(db).some((e) => e.action === "render_proof")).toBe(false);
+  expect(String(syncEvents(db).find((e) => e.action === "render_proof_scope")?.reason)).toContain("render_proof: true");
+
+  // Turning the flag on later still renders: the gate logged, it did not
+  // consume the single render attempt.
+  trustRepo(db, projectId);
+  const allowed = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+  expect(allowed.rendered).toBe(1);
+  expect(browserRuns).toBe(1);
+});
+
+test("a task that already has a screenshot never starts a browser", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId } = await uiTaskInReview(jira);
+  let browserRuns = 0;
+  const exec = async (argv: string[]) => {
+    if (isHarnessRun(argv)) browserRuns++;
+    return { code: 0, stdout: UI_PATCH, stderr: "" };
+  };
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+  expect(stats.attachments).toBe(1);
+  expect(stats.rendered).toBe(0);
+  expect(browserRuns).toBe(0);
+});
+
+test.skipIf(process.platform !== "darwin")("the harness is forced to boot the app itself, so the picture is the PR branch", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const seen: { argv: string[]; config?: string; cwd?: string }[] = [];
+  const render = execRendering(root, 1);
+  const exec = async (argv: string[], opts: any = {}) => {
+    const configAt = argv.indexOf("--config");
+    seen.push({
+      argv,
+      cwd: opts.cwd,
+      ...(configAt >= 0 ? { config: readFileSyncT(join(opts.cwd, argv[configAt + 1]), "utf8") } : {}),
+    });
+    return render(argv);
+  };
+
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+  expect(stats.rendered).toBe(1);
+
+  // The empty environment prevents the PR branch from inheriting Hive secrets.
+  // Four non-secret values are restored so Playwright can find its tools and
+  // browser cache while booting the app from this worktree.
+  const harness = seen.find((c) => isHarnessRun(c.argv))!;
+  expect(harness.argv.slice(3, 5)).toEqual(["/usr/bin/env", "-i"]);
+  const npxAt = harness.argv.indexOf("npx");
+  expect(harness.argv.slice(5, npxAt).map((entry) => entry.split("=", 1)[0])).toEqual(["HOME", "PATH", "TMPDIR", "CI"]);
+  expect(harness.argv.slice(5, npxAt).join("\n")).not.toContain("HIVE_");
+  expect(harness.argv.slice(npxAt, npxAt + 3)).toEqual(["npx", "--no-install", "playwright"]);
+  expect(harness.argv).toContain("--config");
+  expect(harness.config).toContain("reuseExistingServer: false");
+  expect(harness.cwd).toBe(join(root, "web"));
+
+  // And it runs fenced: seatbelt may write to the worktree, not to the rest of
+  // the Mac. Anything else would let a PR branch's config touch the machine.
+  expect(harness.argv[0]).toBe("/usr/bin/sandbox-exec");
+  const profile = harness.argv[2];
+  expect(profile).toContain("(deny network*)");
+  expect(profile).toContain('(allow network-inbound (local ip "localhost:*"))');
+  expect(profile).toContain('(allow network-outbound (remote ip "localhost:*"))');
+  expect(profile).toContain("(deny file-write*)");
+  expect(profile).toContain(`(subpath "${root}")`);
+  expect(profile).not.toContain(`(subpath "/")`);
+});
+
+test("a harness that cannot serve the PR branch renders nothing and says why", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(
+    jira, true, "export default { testDir: './e2e' };\n" // no webServer block
+  );
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec: execRendering(root, 1) });
+
+  expect(stats.rendered).toBe(0);
+  expect(stats.attachments).toBe(0);
+  expect(stats.errors).toBe(0);
+  expect(db.query("SELECT id FROM evidence").all()).toHaveLength(0);
+  const logged = syncEvents(db).find((e) => e.action === "render_proof");
+  expect(String(logged?.reason)).toContain("no webServer");
+});
+
+test("a Playwright testDir outside the worktree is refused", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(
+    jira, true, "export default { testDir: '../../../', webServer: { command: 'npm start' } };\n"
+  );
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec: execRendering(root, 1) });
+
+  expect(stats.rendered).toBe(0);
+  expect(String(syncEvents(db).find((e) => e.action === "render_proof")?.reason)).toContain("outside the task worktree");
+});
+
+test("a Playwright testDir symlink outside the worktree is refused", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  rmSyncT(join(root, "web", "e2e"), { recursive: true });
+  symlinkSyncT(HOME, join(root, "web", "e2e"), "dir");
+
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec: execRendering(root, 1) });
+
+  expect(stats.rendered).toBe(0);
+  expect(String(syncEvents(db).find((e) => e.action === "render_proof")?.reason)).toContain("outside the task worktree");
+});
+
+test.skipIf(process.platform !== "darwin")("a failed harness run never becomes a picture on the issue", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  // The run wrote a PNG and THEN went red: an error page is still a PNG.
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec: execRendering(root, 1, 1) });
+
+  expect(stats.rendered).toBe(0);
+  expect(stats.attachments).toBe(0);
+  expect(jira.byKey.get("WEB-1")!.attachments).toHaveLength(0);
+  expect(db.query("SELECT id FROM evidence").all()).toHaveLength(0);
+  const logged = syncEvents(db).find((e) => e.action === "render_proof");
+  expect(String(logged?.reason)).toContain("exit 1");
+  expect(readdirSyncT(root).some((name) => name.startsWith(".hive-proof-"))).toBe(false);
+});
+
+test("the scratch directory is gone even when the harness throws", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const exec = async (argv: string[]) => {
+    if (isHarnessRun(argv)) throw new Error("spawn npx ENOENT");
+    return { code: 0, stdout: UI_PATCH, stderr: "" };
+  };
+
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+  expect(stats.rendered).toBe(0);
+  expect(stats.errors).toBe(0);
+  expect(readdirSyncT(root).some((name) => name.startsWith(".hive-proof-"))).toBe(false);
+  expect(readdirSyncT(join(root, "web", "e2e")).some((name) => name.startsWith("hive-proof-"))).toBe(false);
+});
+
+test.skipIf(process.platform !== "darwin")("the task's diff is read once per cycle, not once per check", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  let diffReads = 0;
+  const render = execRendering(root, 1);
+  const exec = async (argv: string[]) => {
+    if (!isHarnessRun(argv)) diffReads++;
+    return render(argv);
+  };
+
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+  expect(stats.rendered).toBe(1);
+  expect(diffReads).toBe(1); // the UI-scope check and the renderer share one read
 });

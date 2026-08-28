@@ -13,6 +13,7 @@ import { broadcast } from "./bus.ts";
 import { isSupervisedTask, neverDispatched } from "./supervision.ts";
 import { isDeferred, unmetDeps, TERMINAL, type State } from "./state.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
+import { latestSidecar, latestSidecarBatch, type SidecarReport } from "./sidecar.ts";
 
 export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
 
@@ -254,14 +255,25 @@ export function sessionUtilization(
 // A task row enriched with its computed health, for API responses + SSE.
 // Failed tasks also carry `requeued_to` (their auto-requeue successor's id, if
 // any) so the attention rule can tell "awaiting triage" from "already retried".
-export function taskWithHealth(db: DB, task: any): any {
+export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null): any {
   const requeued_to =
     task.state === "failed"
       ? ((db.query("SELECT id FROM tasks WHERE parent_task_id = ? AND source = 'requeue' LIMIT 1").get(task.id) as any)?.id ?? null)
       : null;
   // Server-computed so the web app never has to re-derive "was this ever
   // spawned" from raw event history — see supervision.ts's neverDispatched.
-  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, never_dispatched: neverDispatched(db, task) };
+  // `sidecar` is the latest background check on this task's own commits, so the
+  // board card and the review card can show it without fetching every event.
+  // Pass a preloaded `sidecar` when enriching a list (see tasksWithHealth) so
+  // this doesn't run one sidecar query per task.
+  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, never_dispatched: neverDispatched(db, task), sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
+}
+
+// Batched form of taskWithHealth for list endpoints (task HIVE-447): looks up
+// every task's sidecar report in one grouped query instead of one per task.
+export function tasksWithHealth(db: DB, tasks: any[]): any[] {
+  const sidecars = latestSidecarBatch(db, tasks.map((t) => t.id));
+  return tasks.map((task) => taskWithHealth(db, task, sidecars.get(task.id) ?? null));
 }
 
 // "Needs attention" tray eligibility (the single rule; the web mirrors it):

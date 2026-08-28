@@ -1,7 +1,7 @@
 // Domain supervisors (v3): on-demand planner agents per project.
 //
-// hive's core design REJECTS long-running LLM supervisor sessions (firstmate's
-// failure mode). "Persistent" here means the supervisor's ROLE and CONTEXT live
+// hive's core design REJECTS long-running LLM supervisor sessions (a prior
+// persistent-supervisor design's failure mode). "Persistent" here means the supervisor's ROLE and CONTEXT live
 // in the DB (project config: supervisor_persona, playbook, plan_intake); the LLM
 // itself runs only as a short-lived, on-demand subprocess:
 //
@@ -22,6 +22,10 @@ import { parseDecision } from "./rows.ts";
 import { listReferences } from "./learn.ts";
 import { classifyEscalation, factorsFromPlan, type EscalationVerdict } from "./policy.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
+import { teamclaudeEnv, applyTeamclaudeEnv } from "./teamclaude.ts";
+import { claudeProfileEnvForRepo } from "./claudeProfiles.ts";
+import { homedir } from "node:os";
+import { join, win32 } from "node:path";
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.HIVE_PLANNER_TIMEOUT_MS || 120_000);
 // Pinned to sonnet: a breakdown proposal is triage, not deep work, and an
@@ -30,12 +34,14 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.HIVE_PLANNER_TIMEOUT_MS || 120_000
 // minimal PATH and a bare "claude" fails with "Executable not found" — every
 // braindump auto-triage died this way (task #131 et al., 2026-07-11).
 export function claudeBin(): string {
-  const home = process.env.HOME ?? "";
+  const home = process.env.USERPROFILE || process.env.HOME || homedir();
+  const local = process.env.LOCALAPPDATA || win32.join(home, "AppData", "Local");
   for (const p of [
     process.env.HIVE_CLAUDE_BIN,
     Bun.which("claude"),
-    `${home}/.local/bin/claude`,
-    `${home}/.claude/local/claude`,
+    process.platform === "win32" ? win32.join(home, ".local", "bin", "claude.exe") : join(home, ".local", "bin", "claude"),
+    process.platform === "win32" ? win32.join(home, ".claude", "local", "claude.exe") : join(home, ".claude", "local", "claude"),
+    process.platform === "win32" ? win32.join(local, "Programs", "Claude", "claude.exe") : null,
     "/opt/homebrew/bin/claude",
     "/usr/local/bin/claude",
   ]) {
@@ -53,11 +59,23 @@ const DEFAULT_ARGV = [claudeBin(), "-p", "--model", "sonnet"];
 // default implementation kills the process on timeout (hard cap, no runaway).
 export type PlannerExec = (
   argv: string[],
-  opts: { timeoutMs: number; cwd?: string }
+  opts: { timeoutMs: number; cwd?: string; env?: Record<string, string> }
 ) => Promise<{ code: number; stdout: string; stderr: string; timedOut?: boolean }>;
 
 export const defaultPlannerExec: PlannerExec = async (argv, opts) => {
-  const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe", stdin: "ignore", ...(opts.cwd ? { cwd: opts.cwd } : {}) });
+  // A project-scoped env, including an empty one for the personal default,
+  // deliberately wins over TeamClaude's multi-account proxy. This guarantees
+  // that path routing selects the requested account. Callers with no project
+  // env retain TeamClaude's existing fail-open behavior.
+  const env = opts.env === undefined
+    ? applyTeamclaudeEnv({ ...process.env }, await teamclaudeEnv())
+    : { ...process.env };
+  // No route means Claude's normal personal profile, which is represented by
+  // an UNSET variable rather than CLAUDE_CONFIG_DIR=~/.claude (that directory
+  // uses a different on-disk layout).
+  delete env.CLAUDE_CONFIG_DIR;
+  Object.assign(env, opts.env);
+  const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe", stdin: "ignore", env, ...(opts.cwd ? { cwd: opts.cwd } : {}) });
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
@@ -248,7 +266,11 @@ export async function runPlanner(db: DB, taskId: string, deps: PlannerDeps = {})
 
   let res: Awaited<ReturnType<PlannerExec>>;
   try {
-    res = await exec(argv, { timeoutMs });
+    res = await exec(argv, {
+      timeoutMs,
+      ...(project?.repo_path ? { cwd: project.repo_path } : {}),
+      env: claudeProfileEnvForRepo(project?.repo_path),
+    });
   } catch (e: any) {
     return plannerError(db, taskId, `planner spawn failed: ${e?.message ?? e}`);
   }

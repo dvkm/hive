@@ -1004,6 +1004,16 @@ textarea { font-family: inherit; }
   color: var(--text);
   border-color: var(--text-faint);
 }
+/* Background check chip (sidecar): green when the agent's last commit passed,
+   amber with a count when it did not. Advisory, never a merge gate. */
+.chip-check-ok {
+  color: var(--green);
+  border-color: var(--border);
+}
+.chip-check-warn {
+  color: var(--amber);
+  border-color: rgba(226, 165, 66, 0.5);
+}
 .chip-blocked {
   color: var(--amber);
   border-color: rgba(226, 165, 66, 0.5);
@@ -3580,7 +3590,8 @@ a.dbundle-fact:hover {
   border-top: 1px solid var(--border-soft);
 }
 .brief-backlog-list li:first-child { border-top: 0; }
-.brief-backlog-list a {
+.brief-backlog-list a,
+.brief-backlog-list .link-btn {
   min-width: 0;
   overflow: hidden;
   color: var(--text);
@@ -3589,7 +3600,14 @@ a.dbundle-fact:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.brief-backlog-list a:hover { text-decoration: underline; }
+.brief-backlog-list a:hover,
+.brief-backlog-list .link-btn:hover { text-decoration: underline; }
+/* The catch-up row's title is a button (it opens the flow), so match the links. */
+.brief-backlog-list .link-btn {
+  padding: 0;
+  font-size: inherit;
+  text-align: left;
+}
 .brief-backlog-list li > span {
   overflow: hidden;
   color: var(--text-faint);
@@ -4123,6 +4141,66 @@ a.dbundle-fact:hover {
   flex: none;
   color: var(--text-faint);
 }
+.risk-verdicts {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-soft);
+  font-size: var(--t-sm);
+}
+.risk-verdicts-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text-faint);
+  font-size: var(--t-eyebrow);
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.risk-verdicts ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.risk-verdicts li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.rv-chip {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: var(--t-eyebrow);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.rv-confirmed .rv-chip {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 16%, transparent);
+}
+.rv-refuted .rv-chip {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 16%, transparent);
+}
+.rv-human .rv-chip {
+  color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 16%, transparent);
+}
+.rv-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+.rv-confirmed .rv-text {
+  color: var(--text);
+}
 .review-details {
   border: 1px solid var(--border-soft);
   border-radius: 8px;
@@ -4338,6 +4416,14 @@ a.dbundle-fact:hover {
 .understanding-quiz-panel .understanding-quiz {
   margin-top: var(--s3);
 }
+.brief-digest-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s2);
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: var(--s2);
+}
 .brief-quiz > a {
   display: inline-block;
   margin-bottom: var(--s2);
@@ -4471,6 +4557,15 @@ a.dbundle-fact:hover {
 .cp-row.cp-acked { opacity: 0.55; }
 .cp-row.cp-ok .cp-note { text-decoration: line-through; text-decoration-color: #2da44e88; }
 .cp-flag-note { color: #cf222e; margin-left: 6px; }
+/* Blocking plan checkpoint (HIVE-413): the plan and the critic's concerns sit
+   on the card so approval is a glance, not a task-page visit. */
+.cp-waiting { margin-left: 6px; background: #bf871155; color: inherit; }
+.cp-plan { margin-top: 6px; padding-left: 10px; border-left: 2px solid currentColor; opacity: 0.85; font-size: 0.92em; }
+.cp-plan-line { margin: 2px 0; }
+.cp-plan-line b { margin-right: 6px; opacity: 0.7; font-weight: 600; }
+.cp-concerns { margin: 6px 0 0; padding-left: 18px; }
+.cp-concerns li { margin: 2px 0; }
+.cp-concern-veto { color: #cf222e; font-weight: 600; }
 .cp-flag {
   flex: none;
   border: 1px solid #cf222e55;
@@ -5910,4 +6005,87 @@ a.chip-jira:hover { background: #2d5488; }
 .brief-projects {
   padding: 0;
   margin: -16px 0 20px;
+}
+
+/* ---- Deployments (production releases + the deploy/rollback buttons) ---- */
+.deployments {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 22px 20px;
+}
+.dep-project + .dep-project {
+  margin-top: 18px;
+}
+.dep-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.dep-head h2 {
+  margin: 0;
+}
+/* Two cards side by side: what is live, and what is waiting on the branch. */
+.dep-now {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 14px 0;
+}
+@media (max-width: 640px) {
+  .dep-now {
+    grid-template-columns: 1fr;
+  }
+}
+.dep-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: var(--bg);
+}
+.dep-card-label {
+  color: var(--text-faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-bottom: 6px;
+}
+.dep-tag {
+  font-size: 14px;
+}
+.dep-subject {
+  margin: 2px 0 4px;
+}
+.dep-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.dep-flags,
+.dep-releases,
+.dep-runs {
+  margin-top: 18px;
+}
+.dep-flags h3,
+.dep-releases h3,
+.dep-runs h3 {
+  font-size: 12px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin: 0;
+}
+.dep-current td {
+  background: var(--panel);
+}
+.dep-current .chip {
+  margin-left: 8px;
+}
+.dep-run {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 13px;
 }

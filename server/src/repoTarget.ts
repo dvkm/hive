@@ -1,9 +1,9 @@
 // Target-repo sanity check for task creation (#989).
 //
 // The failure this exists for: a parent task spawned a child whose brief edits
-// `server/src/intake/jira.ts` (a HIVE file) but passed --project for corebeat,
-// because the SUBJECT (a Jira integration) belongs to corebeat while the CODE
-// belongs to hive. Hive dispatched a corebeat worktree and the child agent was
+// `server/src/intake/jira.ts` (a HIVE file) but passed --project for another project,
+// because the SUBJECT (a Jira integration) belongs to that other project while the CODE
+// belongs to hive. Hive dispatched that other project's worktree and the child agent was
 // asked to edit a repo it could not reach. The worktree boundary held, but only
 // after a full spawn and a human cancelling it.
 //

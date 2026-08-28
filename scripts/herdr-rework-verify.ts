@@ -4,7 +4,7 @@
 // new pipeline and the stale-recovery loop, printing each step so the run can be
 // captured as committed evidence. Not part of the test suite (needs live herdr).
 //
-//   bun run scripts/herdr-rework-verify.ts 2>&1 | tee docs/evidence/herdr-rework-verification.txt
+//   bun run scripts/herdr-rework-verify.ts
 import { mkdtempSync } from "node:fs";
 import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -12,11 +12,11 @@ import { join } from "node:path";
 import { openDb } from "../server/src/db.ts";
 import { makeHandler } from "../server/src/api.ts";
 import { reconcileOnce } from "../server/src/reconciler.ts";
-import { Herdr, FLEET_LABEL } from "../server/src/runtime/herdr.ts";
+import { Herdr, FLEET_LABEL, HERDR_BIN } from "../server/src/runtime/herdr.ts";
 import { defaultExec } from "../server/src/exec.ts";
 
-const BIN = process.env.HERDR_BIN || "/opt/homebrew/bin/herdr";
-const repo = "/tmp/hive-rework-verify";
+const BIN = HERDR_BIN;
+const repo = join(tmpdir(), "hive-rework-verify");
 const HOME = mkdtempSync(join(tmpdir(), "hive-rework-home-"));
 process.env.HIVE_HOME = HOME;
 const herdr = new Herdr(defaultExec);

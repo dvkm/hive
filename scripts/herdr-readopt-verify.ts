@@ -3,11 +3,11 @@
 // proves herdr actually behaves the way re-adoption depends on. Creates its own
 // throwaway workspace and closes it again — it never touches the hive fleet.
 //
-//   bun run scripts/herdr-readopt-verify.ts 2>&1 | tee docs/evidence/herdr-readopt-verification.txt
+//   bun run scripts/herdr-readopt-verify.ts
 import { defaultExec } from "../server/src/exec.ts";
-import { parsePaneList, paneRunsAgentCommand, parseAgentProbe, parsePaneId } from "../server/src/runtime/herdr.ts";
+import { HERDR_BIN, parsePaneList, paneRunsAgentCommand, parseAgentProbe, parsePaneId } from "../server/src/runtime/herdr.ts";
 
-const BIN = process.env.HERDR_BIN || "/opt/homebrew/bin/herdr";
+const BIN = HERDR_BIN;
 const NAME = `readopt-verify-${Math.random().toString(16).slice(2, 8)}`;
 
 const log = (...a: unknown[]) => console.log(...a);

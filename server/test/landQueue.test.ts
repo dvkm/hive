@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
 import { landGraph, landOnce, markLand } from "../src/landQueue.ts";
-import { transition } from "../src/state.ts";
+import { transition, writeEvent } from "../src/state.ts";
 import { apiAnswerDecision } from "../src/api.ts";
 import type { Herdr } from "../src/runtime/herdr.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
@@ -264,6 +264,46 @@ test("a pending understanding check holds the queue instead of opening a card", 
   const { calls, merge } = mergeStub(db);
   await landOnce(db, { exec: filesExec({}), merge });
   expect(calls).toEqual([a]);
+});
+
+test("a quiz passed after the land mark holds the merge until the director taps Land now (HIVE-421)", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  // The director marks it approved to land, and only THEN takes the check.
+  const review = writeEvent(db, { task_id: a, source: "agent", type: "review_summary", payload: { done: ["x"] } });
+  writeEvent(db, {
+    task_id: a,
+    source: "director",
+    type: "understanding_quiz_passed",
+    payload: { review_event_id: review.id, answer_key: "safe" },
+  });
+
+  const held = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: held.merge });
+  expect(held.calls).toEqual([]); // no merge, no card, mark still standing
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+  expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(a) as any).land_queued_at).toBeTruthy();
+
+  // "Land now" is the same mark call, so the approval now postdates the quiz.
+  markLand(db, [a], true);
+  const tapped = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: tapped.merge });
+  expect(tapped.calls).toEqual([a]);
+});
+
+test("unmarking a quiz-held task takes it out of the queue for good", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  const review = writeEvent(db, { task_id: a, source: "agent", type: "review_summary", payload: { done: ["x"] } });
+  writeEvent(db, { task_id: a, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id } });
+  markLand(db, [a], false);
+
+  const { calls, merge } = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge });
+  expect(calls).toEqual([]);
+  expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(a) as any).land_queued_at).toBeNull();
 });
 
 test("answering the pause card administratively never bounces the agent", async () => {

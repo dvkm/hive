@@ -96,6 +96,15 @@ export interface Health {
   since: string;
 }
 
+// Latest background check on a task's own commits (server/src/sidecar.ts):
+// hive runs tsc and the project's lint script on an agent's fresh commits while
+// it works. Advisory only; CI is still the merge gate.
+export interface SidecarReport {
+  sha: string;
+  ok: boolean;
+  findings: { tool: string; summary: string }[];
+}
+
 export interface Task {
   id: string;
   number: number; // legacy global handle retained for PR markers and API compatibility
@@ -123,6 +132,7 @@ export interface Task {
   deferred_until?: string | null; // parked pending an offline human action; nudges suppressed while future-dated
   land_queued_at?: string | null; // marked approved-to-land; the land queue merges it in graph order
   health?: Health | null;
+  sidecar?: SidecarReport | null; // latest background check on this task's commits
   requeued_to?: string | null; // successor id when failed + auto-requeued
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
   created_at: string;
@@ -133,7 +143,7 @@ export interface Event {
   id: string;
   task_id: string;
   ts: string;
-  source: "agent" | "hook" | "herdr" | "reconciler" | "monitor" | "director" | "system" | "chat_supervisor" | "jira" | "jira-sync" | "unknown";
+  source: "agent" | "hook" | "herdr" | "reconciler" | "monitor" | "director" | "system" | "supervisor" | "chat_supervisor" | "jira" | "jira-sync" | "unknown";
   type: string;
   payload: Record<string, unknown>;
 }
@@ -179,7 +189,7 @@ export interface Decision {
   answer_note: string | null;
   draft_note: string | null;
   answered_at: string | null;
-  // Who answered (audit trail). director when David clicked in the inbox;
+  // Who answered (audit trail). director when the director clicked in the inbox;
   // chat_supervisor/agent/system for programmatic callers; unknown if unattributed.
   answered_by: "director" | "chat_supervisor" | "agent" | "system" | "unknown" | null;
   answered_actor: string | null;
@@ -252,7 +262,7 @@ export interface Project {
     max_agents?: number;
     supervisor_persona?: string;
     playbook?: string;
-    agent?: "claude" | "codex";
+    agent?: "claude" | "codex" | "teamclaude";
     codex_model?: string;
     codex_model_by_kind?: Partial<Record<Kind, string>>;
     codex_reasoning_effort?: "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -264,6 +274,19 @@ export interface Project {
     wait_call_warn?: number;
     wait_call_cap?: number;
     autonomy_profile?: "conservative" | "balanced" | "autopilot";
+    // Opt-in: presence of this key is what puts the project on /deployments.
+    deployments?: {
+      deploy_workflow?: string;
+      rollback_workflow?: string;
+      tag_prefix?: string;
+      workflow_ref?: string;
+      health_url?: string;
+      health_substring?: string;
+      posthog_project?: string;
+      posthog_host?: string;
+      flags?: string[];
+      history?: number;
+    };
     archived?: boolean;
     test?: boolean;
     pr_gardener?: {
@@ -296,6 +319,44 @@ export interface PrGardenerItem {
   decision_id: string | null;
   linked_task_id: string | null;
   linked_task_state: State | null;
+}
+
+// Production releases for a project (server/src/deployments.ts). The newest
+// `prod-*` tag is what is live; there is no branch that means "production".
+export interface Release {
+  tag: string;
+  sha: string;
+  short: string;
+  subject: string;
+  created_at: string;
+  current: boolean;
+}
+export interface FlagState {
+  key: string;
+  name: string | null;
+  active: boolean | null; // null = PostHog has no such flag, or hive could not ask
+  rollout: number | null;
+}
+export interface WorkflowRun {
+  id: number;
+  name: string;
+  event: string;
+  status: string;
+  conclusion: string | null;
+  url: string;
+  created_at: string;
+  head_sha: string;
+}
+export interface DeploymentsStatus {
+  branch: string;
+  head: { sha: string; short: string; subject: string } | null;
+  current: Release | null;
+  releases: Release[];
+  ahead: number | null;
+  health: { ok: boolean; detail: string; url: string } | null;
+  flags: { available: boolean; reason: string | null; items: FlagState[] };
+  runs: WorkflowRun[];
+  errors: string[];
 }
 
 export interface Incident {
@@ -451,6 +512,7 @@ export const MAX_DIFF_LINES = 20000;
 export interface BranchCheck {
   unmet_deps: { id: string; number: number; title: string; state: State }[];
   embedded_tasks: { id: string; number: number; title: string }[];
+  understanding_required?: boolean; // judgment-class change; the quiz gates approval (hive-1559)
 }
 
 // The land queue's ordering graph (server/src/landQueue.ts). `from` lands
@@ -541,6 +603,7 @@ export interface BriefLearning extends Learning {
 // windowed by `since`.
 export interface Brief {
   since: string | null;
+  auto_answered_dialogs: number; // benign agent dialogs the server answered itself
   done: BriefDone[];
   director_required_task_ids: string[];
   failed_or_attention: Task[];
@@ -589,6 +652,13 @@ function bodyFor(fields: Record<string, unknown>, files?: File[]): string | Form
 }
 
 // An open (un-acked) build-time checkpoint, as returned by GET /api/checkpoints.
+export interface CheckpointPlan {
+  goal: string;
+  approach: string;
+  files_expected: string[];
+  verification_planned: string;
+}
+
 export interface Checkpoint {
   id: string;
   task_id: string;
@@ -598,6 +668,11 @@ export interface Checkpoint {
   task_state: string;
   project_id: string;
   note: string;
+  // Plan checkpoints only (HIVE-412/413). `blocking` means the agent is parked
+  // until this is acked; `concerns` is the critic's verdict, [] until it lands.
+  blocking?: boolean;
+  plan?: CheckpointPlan;
+  concerns?: { severity: "note" | "veto"; text: string }[];
 }
 
 export type ReviewItem = string | { what: string; why?: string };
@@ -731,6 +806,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ confirm: "quiz_later", source: "director", actor: directorActor() }),
     }),
+  requireUnderstandingQuiz: (taskId: string) =>
+    req<{ ok: boolean; understanding_required: boolean }>(`/api/tasks/${taskId}/understanding-quiz/require`, {
+      method: "POST",
+      body: JSON.stringify({ source: "director", actor: directorActor() }),
+    }),
   tasks: (q: { state?: State; project_id?: string } = {}) => {
     const p = new URLSearchParams(q as Record<string, string>).toString();
     return req<Task[]>(`/api/tasks${p ? "?" + p : ""}`);
@@ -806,10 +886,14 @@ export const api = {
       body: JSON.stringify({ task_ids, queued }),
     }),
   branchCheck: (id: string) => req<BranchCheck>(`/api/tasks/${id}/branch-check`),
-  merge: (id: string, strategy?: "local_ff") =>
+  merge: (id: string, strategy?: "local_ff", overrideConfirmedRisks?: boolean) =>
     req<Task>(`/api/tasks/${id}/merge`, {
       method: "POST",
-      body: JSON.stringify({ ...(strategy ? { merge_strategy: strategy } : {}), actor: directorActor() }),
+      body: JSON.stringify({
+        ...(strategy ? { merge_strategy: strategy } : {}),
+        ...(overrideConfirmedRisks ? { override_confirmed_risks: true } : {}),
+        actor: directorActor(),
+      }),
     }),
   requestChanges: (id: string, notes: string) =>
     req<{ ok: boolean; delivered: boolean; task: Task }>(`/api/tasks/${id}/request-changes`, {
@@ -827,7 +911,7 @@ export const api = {
   answerDecision: (id: string, answer_key: string, answer_note?: string, selected_indices?: number[]) =>
     req<Decision>(`/api/decisions/${id}/answer`, {
       method: "POST",
-      // The inbox is David's surface — answers from here are the director's.
+      // The inbox is the director's surface — answers from here are the director's.
       body: JSON.stringify({ answer_key, answer_note, selected_indices, source: "director", actor: directorActor() }),
     }),
   dismissDecision: (id: string) =>
@@ -853,6 +937,19 @@ export const api = {
   updateProject: (id: string, b: { config?: Project["config"]; name?: string; repo_path?: string | null }) =>
     req<Project>(`/api/projects/${id}`, { method: "PUT", body: JSON.stringify(b) }),
   prGardener: (id: string) => req<PrGardenerItem[]>(`/api/projects/${id}/pr-gardener`),
+  // The GitHub credential stays on the server: these two POSTs ask hive to run
+  // the workflow, and the browser never holds a token that could.
+  deployments: (id: string) => req<DeploymentsStatus>(`/api/projects/${id}/deployments`),
+  deploy: (id: string, commit?: string) =>
+    req<{ ok: true; workflow: string; ref: string }>(`/api/projects/${id}/deployments/deploy`, {
+      method: "POST",
+      body: JSON.stringify({ commit: commit ?? "" }),
+    }),
+  rollback: (id: string, tag?: string) =>
+    req<{ ok: true; workflow: string; ref: string }>(`/api/projects/${id}/deployments/rollback`, {
+      method: "POST",
+      body: JSON.stringify({ tag: tag ?? "" }),
+    }),
   setPrGardenerOverride: (id: string, prNumber: number, override: PrGardenerItem["override"]) =>
     req<PrGardenerItem>(`/api/projects/${id}/pr-gardener/${prNumber}`, { method: "POST", body: JSON.stringify({ override }) }),
   // Incidents API is built in parallel; treat absence (404/network) as "not running yet".

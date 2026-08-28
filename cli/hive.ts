@@ -1,6 +1,7 @@
 // hive CLI — thin HTTP wrappers around the daemon. The server is the only DB writer.
 // Installed as bin/hive (bun shebang). Base URL: HIVE_URL or http://127.0.0.1:<HIVE_PORT|4700>.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { appBrowserCandidates, installedHiveAppCandidates, openUrlArgv, tailscaleCandidates } from "./platform.ts";
 
 const BASE =
   process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
@@ -20,12 +21,14 @@ Usage:
   hive task update <task-id> --depends-on <id,id>   declare a dependency discovered mid-task
         (e.g. "my PR needs #993's to merge first"); full replace, so pass every
         id this task should still wait on, not just the new one
-  hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>] [--landing-commit <sha>]
+  hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>] [--landing-commit <sha>] [--verify-name <name>]
         types: status | evidence | needs-decision | ready | done | unmergeable | blocked | deferred | undefer | review_summary | <custom>
         unmergeable: this task's PR has nothing left to merge (GitHub refused to
         reopen it) but the work landed via a different PR/commit. Pass
         --landing-commit <sha>; hive verifies it's on the base branch, then closes
         the task without a merge step.
+        --verify-name <name>: on evidence, tags the artifact with the named
+        verification command it came from (see the brief's Verification contract)
         review_summary: --json review.json with {done[], iffy[], decisions[], testing[], followups[], understanding{check{question,options[],answer_key}}}
         deferred: park a task waiting on an OFFLINE human action (no more "gone quiet" nudges);
                   [--until <iso>] or [--days <n>] to auto-resume, else indefinite. undefer to resume early.
@@ -84,11 +87,11 @@ Usage:
   hive secret list --project <id>
   hive secret rm --project <id> --name <n>
   hive offline [on|off]                   drain the fleet before losing internet / resume after
-  hive notify --test                      fire one real macOS notification and report whether
+  hive notify --test                      fire one real desktop notification and report whether
         the desktop app rendered it (proves the whole chain without a real event)
   hive open                               open the board in a browser
   hive app                                open the hive desktop app (native notifications
-        + dock badge; install once: cd electron && bun install && bun run install-app)
+        + badge; install once: cd electron && bun install && bun run install-app)
 
 Env: HIVE_URL, HIVE_PORT, HIVE_DB, BW_SESSION`;
 
@@ -289,11 +292,12 @@ async function main() {
       if (flags.note) form.set("note", String(flags.note));
       if (flags.caption) form.set("caption", String(flags.caption));
       if (flags.source) form.set("source", String(flags.source));
+      if (flags["verify-name"]) form.set("verify_name", String(flags["verify-name"]));
       if (sha) form.set("meta", JSON.stringify({ commit_sha: sha }));
       const file = Bun.file(String(flags.file));
       form.set("file", file);
       const res = await fetch(BASE + path, { method: "POST", body: form });
-      const data = await res.json();
+      const data: any = await res.json();
       if (!res.ok) die(`error ${res.status}: ${data.error}`);
       result = data;
     } else {
@@ -311,6 +315,7 @@ async function main() {
         days: flags.days,
         pr_url: flags["pr-url"] ?? flags.url,
         landing_commit: flags["landing-commit"],
+        verify_name: flags["verify-name"],
         ...(sha && !extra.meta ? { meta: JSON.stringify({ commit_sha: sha }) } : {}),
         ...extra,
       });
@@ -753,6 +758,11 @@ async function main() {
       `SELECT COUNT(*) n, SUM(status='expired') expired,
               ROUND(AVG(CASE WHEN answered_at IS NOT NULL THEN (julianday(answered_at)-julianday(ts))*24*60 END),0) med_min
          FROM decisions WHERE ts > ?`, since);
+    // Sidecar: background type/lint checks on an agent's fresh commits, and how
+    // often they caught something. Per-day, so it compares across --days values.
+    const sidecar = one(
+      `SELECT COUNT(*) n, SUM(json_extract(payload,'$.ok') = 0) caught
+         FROM events WHERE type='sidecar_report' AND ts > ?`, since);
     const held = one("SELECT COUNT(*) n FROM events WHERE type='ready_held' AND ts > ?", since).n;
     const bounced = one("SELECT COUNT(*) n FROM events WHERE type IN ('ci_failure','pr_closed') AND ts > ?", since).n;
     const cost = db.query(
@@ -768,6 +778,7 @@ async function main() {
     console.log(`  spawns:         ${spawns} ok, ${spawnErr} errors${spawns ? ` (${Math.round((100 * spawnErr) / (spawns + spawnErr))}% failure)` : ""}`);
     console.log(`  intervention:   ${steers} steers, ${nudges} gone-quiet nudges`);
     console.log(`  decisions:      ${dec.n} opened, ${dec.expired ?? 0} expired, avg answer ${dec.med_min ?? "-"}m`);
+    console.log(`  sidecar:        ${sidecar.n} checks, ${sidecar.caught ?? 0} caught problems (${(sidecar.n / days).toFixed(1)}/day)`);
     console.log(`  CI gate:        ${held} handoffs held, ${bounced} bounced out of review`);
     console.log(`  review->merge:  avg ${review.h ?? "-"}h`);
     for (const c of cost) console.log(`  cost:           ${c.model}  $${c.c}  (${c.t} tasks)`);
@@ -780,7 +791,7 @@ async function main() {
   if (cmd === "tunnel") {
     const port = process.env.HIVE_PORT || 4700;
     const run = (args: string[]) => {
-      for (const bin of ["tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale"]) {
+      for (const bin of tailscaleCandidates()) {
         try {
           const r = Bun.spawnSync([bin, ...args]);
           if (r.exitCode !== 127) return { ...r, bin };
@@ -792,7 +803,7 @@ async function main() {
     };
     const setup =
       "Tailscale isn't set up yet. One-time steps (yours — it's your account):\n" +
-      "  1. Install Tailscale on this Mac (App Store 'Tailscale', or `brew install --cask tailscale`) and log in.\n" +
+      `  1. Install Tailscale on this ${process.platform === "win32" ? "Windows PC" : process.platform === "darwin" ? "Mac" : "Linux machine"} and log in.\n` +
       "  2. Install Tailscale on your iPhone and log into the SAME account.\n" +
       "  3. Re-run `hive tunnel`.";
     const status = run(["status"]);
@@ -963,8 +974,8 @@ async function main() {
       }
       if (last_delivery_error?.id === id)
         die(
-          `macOS REFUSED the notification: ${last_delivery_error.error}\n` +
-            "Turn hive's notifications on in System Settings > Notifications > hive, then run this again."
+          `The OS refused the notification: ${last_delivery_error.error}\n` +
+            "Turn hive's notifications on in system notification settings, then run this again."
         );
     }
     die(
@@ -975,8 +986,7 @@ async function main() {
 
   if (cmd === "open") {
     const url = BASE + "/";
-    const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-    Bun.spawn([opener, url]);
+    Bun.spawn(openUrlArgv(url), { stdout: "ignore", stderr: "ignore" });
     console.log(`opening ${url}`);
     return;
   }
@@ -988,21 +998,27 @@ async function main() {
   // Falls back to a chromeless Chrome window, then the default browser.
   if (cmd === "app") {
     const url = BASE + "/";
-    const { existsSync } = await import("node:fs");
-    const appPath = "/Applications/hive.app";
-    if (existsSync(appPath)) {
-      Bun.spawn(["open", appPath], { stdout: "ignore", stderr: "ignore" });
-      console.log(`opening hive.app (${appPath})`);
+    const appPath = installedHiveAppCandidates().find(existsSync);
+    if (appPath) {
+      const argv = process.platform === "darwin" ? ["open", appPath] : [appPath];
+      Bun.spawn(argv, { stdout: "ignore", stderr: "ignore" });
+      console.log(`opening hive desktop app (${appPath})`);
       return;
     }
-    const chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-    try {
-      Bun.spawn([chrome, `--app=${url}`], { stdout: "ignore", stderr: "ignore" });
-      console.log(`hive.app not installed (cd electron && bun install && bun run install-app) — Chrome app window on ${url}`);
-    } catch {
-      Bun.spawn(["open", url]);
-      console.log(`opened ${url} in the default browser`);
+    const browser = appBrowserCandidates().find(
+      (candidate) => (!candidate.includes("/") && !candidate.includes("\\")) || existsSync(candidate)
+    );
+    if (browser) {
+      try {
+        Bun.spawn([browser, `--app=${url}`], { stdout: "ignore", stderr: "ignore" });
+        console.log(`hive desktop app not installed (cd electron && bun install && bun run install-app) — app window on ${url}`);
+        return;
+      } catch {
+        // Fall through to the default browser.
+      }
     }
+    Bun.spawn(openUrlArgv(url), { stdout: "ignore", stderr: "ignore" });
+    console.log(`opened ${url} in the default browser`);
     return;
   }
 

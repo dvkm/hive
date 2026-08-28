@@ -4,12 +4,16 @@
 // both halves: malformed values are REJECTED at the API, and a valid config with
 // those same keys set still drives a real spawn.
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const HOME = mkdtempSync(join(tmpdir(), "hive-projcfg-"));
 process.env.HIVE_HOME = HOME;
+writeFileSync(
+  join(HOME, "claude-profiles.json"),
+  JSON.stringify({ routes: [{ root: "/repo", config_dir: "/profiles/company" }] })
+);
 
 const { openDb, setSetting } = await import("../src/db.ts");
 const { makeHandler, spawnAgent } = await import("../src/api.ts");
@@ -68,7 +72,8 @@ const GOOD_CONFIG = {
   setup_argv: ["infra/worktree/wt.sh", "up", "{worktree}"],
   cleanup_argv: ["infra/worktree/wt.sh", "down", "{worktree}"],
   promote: { from: "staging", to: "main" },
-  jira: { site: "https://corebeat.atlassian.net", email: "corebeat@vid.kim", project_key: "WEB", enabled: true, write: true },
+  render_proof: true,
+  jira: { site: "https://example.atlassian.net", email: "jira@example.com", project_key: "WEB", enabled: true, write: true },
   watchers: [{ name: "doc", url: "https://docs.google.com/document/d/abc/edit" }],
   monitors: [{ name: "root", url: "http://127.0.0.1:1/", expect_status: 200 }],
   smoke: [{ name: "root", url: "http://127.0.0.1:1/", expect_status: 200 }],
@@ -107,6 +112,7 @@ test("a valid agent_argv/setup_argv config still spawns: the override IS the sub
   // agent_argv reached herdr verbatim as the command after `--`.
   const start = herdrCalls.find((argv) => has(argv, "agent", "start"));
   expect(start).toBeDefined();
+  expect(start).toContain("CLAUDE_CONFIG_DIR=/profiles/company");
   expect(start!.slice(start!.indexOf("--") + 1)).toEqual(GOOD_CONFIG.agent_argv);
 
   const task = await get(`/api/tasks/${t.json.id}`);
@@ -124,13 +130,14 @@ const BAD: [string, unknown, string][] = [
   ["promote.to as a git option", { promote: { from: "staging", to: "--output=/tmp/x" } }, "promote.to"],
   ["promote.from as a number", { promote: { from: 3, to: "main" } }, "promote.from"],
   ["jira as a string", { jira: "https://evil.example.com" }, "jira"],
-  ["jira missing project_key", { jira: { site: "https://corebeat.atlassian.net", email: "a@b.c" } }, "project_key"],
+  ["jira missing project_key", { jira: { site: "https://example.atlassian.net", email: "a@b.c" } }, "project_key"],
   ["jira with a non-boolean write", { jira: { site: "https://s", email: "a@b.c", project_key: "WEB", write: "yes" } }, "write"],
   ["a watcher url with a file:// scheme", { watchers: [{ name: "w", url: "file:///etc/passwd" }] }, "watchers"],
   ["a monitor url that is not a URL", { monitors: [{ name: "m", url: "not a url" }] }, "monitors"],
   ["a smoke url with a javascript: scheme", { smoke: [{ name: "s", url: "javascript:alert(1)" }] }, "smoke"],
   ["a negative processed-token threshold", { processed_token_warn: -1 }, "processed_token_warn"],
   ["a fractional wait-call threshold", { wait_call_cap: 2.5 }, "wait_call_cap"],
+  ["render_proof as a string", { render_proof: "yes" }, "render_proof"],
   ["watchers as an object", { watchers: { url: "https://x.example" } }, "watchers"],
   ["an unknown top-level key", { totally_new_key: true }, "totally_new_key"],
   ["an unknown key alongside valid ones", { auto_dispatch: true, sneaky: ["sh", "-c", "id"] }, "sneaky"],
@@ -165,14 +172,14 @@ for (const [label, config, mentions] of BAD) {
 // must survive that round-trip.
 test("stored-but-unread keys still round-trip", async () => {
   const p = await post("/api/projects", {
-    name: "mills-like",
+    name: "alt-config-like",
     repo_path: "/repo",
-    config: { auto_dispatch: true, env: { CLAUDE_CONFIG_DIR: "/Users/x/.claude-mills" }, default_branch: "staging", open_prs: false },
+    config: { auto_dispatch: true, env: { CLAUDE_CONFIG_DIR: "/Users/x/.claude-alt" }, default_branch: "staging", open_prs: false },
   });
   expect(p.status).toBe(201);
   const r = await put(`/api/projects/${p.json.id}`, { config: { ...p.json.config, auto_dispatch: false } });
   expect(r.status).toBe(200);
-  expect(r.json.config.env).toEqual({ CLAUDE_CONFIG_DIR: "/Users/x/.claude-mills" });
+  expect(r.json.config.env).toEqual({ CLAUDE_CONFIG_DIR: "/Users/x/.claude-alt" });
   expect(r.json.config.open_prs).toBe(false);
 });
 
@@ -230,4 +237,39 @@ test("the token gate answers before the schema does", async () => {
   });
   expect(res.status).toBe(401);
   expect((await get(`/api/projects/${projectId}`)).json.config).toEqual(before);
+});
+
+// The Deployments tab is opt-in through this key, and three of its fields become
+// git/gh arguments or a fetch destination — so the schema is the first gate.
+test("deployments config accepts a real block and rejects argument-shaped values", async () => {
+  const ok = await put(`/api/projects/${projectId}`, {
+    config: {
+      deployments: {
+        health_url: "https://example.com/",
+        tag_prefix: "prod-",
+        workflow_ref: "main",
+        flags: ["insights-page-redesign"],
+        history: 15,
+      },
+    },
+  });
+  expect(ok.status).toBe(200);
+  expect(ok.json.config.deployments.tag_prefix).toBe("prod-");
+
+  const badWorkflow = await put(`/api/projects/${projectId}`, {
+    config: { deployments: { deploy_workflow: "--version" } },
+  });
+  expect(badWorkflow.status).toBe(400);
+  expect(badWorkflow.json.error).toContain("deploy_workflow");
+
+  const badRef = await put(`/api/projects/${projectId}`, {
+    config: { deployments: { workflow_ref: "--upload-pack=evil" } },
+  });
+  expect(badRef.status).toBe(400);
+
+  const badUrl = await put(`/api/projects/${projectId}`, {
+    config: { deployments: { health_url: "file:///etc/passwd" } },
+  });
+  expect(badUrl.status).toBe(400);
+  expect(badUrl.json.error).toContain("http(s)");
 });

@@ -59,6 +59,13 @@ test("invalid transition is rejected with a clear error", () => {
   expect(() => transition(db, id, "verifying")).toThrow(/invalid transition/);
 });
 
+test("an invalid in_progress -> queued transition hints at /requeue", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  transition(db, id, "in_progress");
+  expect(() => transition(db, id, "queued")).toThrow(new RegExp(`/api/tasks/${id}/requeue`));
+});
+
 test("done is rejected without evidence", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId);
@@ -316,7 +323,7 @@ test("defer/undefer parks a task in_progress and toggles isDeferred", () => {
   transition(db, id, "in_progress");
 
   // indefinite defer (no until) sets a far-future sentinel -> isDeferred true, still in_progress
-  deferTask(db, id, "9999-12-31T00:00:00.000Z", { source: "agent", note: "waiting on David's sudo" });
+  deferTask(db, id, "9999-12-31T00:00:00.000Z", { source: "agent", note: "waiting on the director's sudo" });
   expect(getTask(db, id).state).toBe("in_progress");
   expect(isDeferred(getTask(db, id))).toBe(true);
   expect(db.query("SELECT COUNT(*) n FROM events WHERE task_id = ? AND type = 'deferred'").get(id) as any).toEqual({ n: 1 });

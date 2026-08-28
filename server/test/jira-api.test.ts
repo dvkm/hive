@@ -64,7 +64,7 @@ function seed(jira?: Record<string, unknown>): { projectId: string; jiraTask: st
   return { projectId, jiraTask: mk(`jira:${key}`), plainTask: mk(null), key };
 }
 
-const CFG = { site: "https://corebeat.atlassian.net", email: "corebeat@vid.kim", project_key: "WEB", enabled: true, write: true };
+const CFG = { site: "https://example.atlassian.net", email: "jira@example.com", project_key: "WEB", enabled: true, write: true };
 
 function retryJiraFetch(key: string, comments: (method: string) => Response): typeof fetch {
   return (async (input: string | URL | Request, init: RequestInit = {}) => {
@@ -111,16 +111,16 @@ test("a linked ticket exposes the browse URL and effective write scope", async (
   const r = await get(`/api/tasks/${jiraTask}/jira`);
   expect(r.json.linked).toBe(true);
   expect(r.json.issue_key).toBe(key);
-  expect(r.json.browse_url).toBe(`https://corebeat.atlassian.net/browse/${key}`);
+  expect(r.json.browse_url).toBe(`https://example.atlassian.net/browse/${key}`);
   expect(r.json.enabled).toBe(true);
   expect(r.json.assignee).toBe("Sohee Kim");
   expect(r.json.write_scope).toEqual({ ...J.JIRA_WRITE_SCOPE, create_subtask: true });
 });
 
-test("a config pointing somewhere not allow-listed reports unconfigured, and never echoes that host", async () => {
+test("a malformed config reports unconfigured, and never echoes that host", async () => {
   // The credential gate refused it, so the board must not imply the site it
   // names is in use — that would make an attacker-supplied host look adopted.
-  const { jiraTask } = seed({ ...CFG, site: "https://evil.atlassian.net" });
+  const { jiraTask } = seed({ ...CFG, site: "https://example.atlassian.net@evil.atlassian.net" });
   const r = await get(`/api/tasks/${jiraTask}/jira`);
   expect(r.json.configured).toBe(false);
   expect(r.json.browse_url).toBeNull();
@@ -131,17 +131,17 @@ test("the project payload carries the canonicalized Jira site, never the configu
   // The board card builds its browse chip from the project payload, so this
   // field has to survive the same credential gate the per-task browse_url does.
   const allowed = seed(CFG);
-  const evil = seed({ ...CFG, site: "https://evil.atlassian.net" });
+  const evil = seed({ ...CFG, site: "https://example.atlassian.net@evil.atlassian.net" });
 
   const one = await get(`/api/projects/${allowed.projectId}`);
-  expect(one.json.jira_site).toBe("https://corebeat.atlassian.net");
+  expect(one.json.jira_site).toBe("https://example.atlassian.net");
 
   const bad = await get(`/api/projects/${evil.projectId}`);
   expect(bad.json.jira_site).toBeNull();
   expect(JSON.stringify(bad.json)).not.toContain("evil.atlassian.net/browse");
 
   const list = await get("/api/projects");
-  expect(list.json.find((p: any) => p.id === allowed.projectId).jira_site).toBe("https://corebeat.atlassian.net");
+  expect(list.json.find((p: any) => p.id === allowed.projectId).jira_site).toBe("https://example.atlassian.net");
   expect(list.json.find((p: any) => p.id === evil.projectId).jira_site).toBeNull();
 });
 

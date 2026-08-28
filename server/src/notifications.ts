@@ -6,7 +6,7 @@
 //   - `normal` -> batched: startDigest() delivers ONE digest notification every
 //     HIVE_DIGEST_MS summarizing counts ("3 done, 1 needs decision"). Never
 //     per-event spam.
-// `delivered_at` doubles as "David has been made aware" (push, digest, or by
+// `delivered_at` doubles as "the director has been made aware" (push, digest, or by
 // opening the header bell via POST /api/notifications/ack); the bell's unread
 // count is the rows where delivered_at IS NULL.
 import type { DB } from "./db.ts";
@@ -28,7 +28,7 @@ export interface NotifInput {
   decision_id?: string | null;
 }
 
-// Module-level macOS app sink. Off by default (null) so tests and the CLI never
+// Module-level desktop app sink. Off by default (null) so tests and the CLI never
 // pop real notifications; the server turns it on with the real Exec (index.ts).
 let notifier: Exec | null = null;
 export function setNotifier(exec: Exec | null): void {
@@ -37,15 +37,26 @@ export function setNotifier(exec: Exec | null): void {
 
 // Where clicking a notification should land in the app. These are the same
 // paths the web UI already uses, so a deeplink is just a normal route.
-export function deeplinkPath(n: { task_id?: string | null; decision_id?: string | null }): string {
+export function deeplinkPath(n: { kind?: string; task_id?: string | null; decision_id?: string | null }): string {
+  // The catch-up digest is one pass over many tasks, so it opens the queue, not a task.
+  if (n.kind === "quiz_digest") return "/inbox";
   if (n.decision_id) return `/decisions#dcard-${n.decision_id}`;
   if (n.task_id) return `/tasks/${n.task_id}`;
   return "/";
 }
 
+export function notificationLaunchArgv(
+  url: string,
+  platform: NodeJS.Platform = process.platform
+): string[] {
+  if (platform === "darwin") return ["open", "-g", "-b", "dev.hive.app", url];
+  if (platform === "win32") return ["explorer.exe", url];
+  return ["xdg-open", url];
+}
+
 // Cold-start path only: the desktop app is not attached to the stream, so hand
-// macOS the whole notification in a hive:// URL and let LaunchServices start
-// the app to render it.
+// the whole notification to the OS through a hive:// URL and let the registered
+// desktop app render it.
 async function launchAndNotify(exec: Exec, n: { id: string; title: string; body: string; path: string }): Promise<void> {
   try {
     const url = new URL("hive://notify");
@@ -53,9 +64,9 @@ async function launchAndNotify(exec: Exec, n: { id: string; title: string; body:
     url.searchParams.set("title", n.title);
     url.searchParams.set("body", n.body);
     url.searchParams.set("path", n.path);
-    await exec(["open", "-g", "-b", "dev.hive.app", url.toString()]);
+    await exec(notificationLaunchArgv(url.toString()));
   } catch {
-    /* non-fatal: hive.app missing / not macOS */
+    /* non-fatal: desktop app missing or protocol not registered */
   }
 }
 

@@ -6,6 +6,7 @@ import { LightboxProvider } from "../src/lib/lightbox";
 import { api } from "../src/lib/api";
 import type { Task, TaskDetail } from "../src/lib/api";
 import { ReviewCard } from "../src/views/ReviewCard";
+import { UnderstandingQuiz } from "../src/views/UnderstandingQuiz";
 
 const fakeStore = { projects: [], quizzes: [] } as unknown as Store;
 
@@ -150,6 +151,117 @@ function passingDetail(id: string): TaskDetail {
   };
 }
 
+// HIVE-421: approved to land FIRST, understanding check passed AFTER. The
+// approval predates the insight, so the queue must ask before it merges.
+function landMarkedThenPassedDetail(id: string): TaskDetail {
+  const base = passingDetail(id);
+  return {
+    ...base,
+    land_queued_at: "2026-01-01T00:00:00.500Z",
+    events: [
+      base.events[0],
+      { id: "land-1", task_id: id, ts: "2026-01-01T00:00:00.500Z", source: "director", type: "land_queued", payload: {} } as any,
+      base.events[1],
+    ],
+  };
+}
+
+test("a quiz passed after the land mark asks for a Land now tap instead of merging (HIVE-421)", async () => {
+  const originalTask = api.task;
+  const originalLandQueue = api.landQueue;
+  const calls: { ids: string[]; queued: boolean }[] = [];
+  api.task = (async (id: string) => landMarkedThenPassedDetail(id)) as typeof api.task;
+  api.landQueue = (async (ids: string[], queued = true) => {
+    calls.push({ ids, queued });
+    return { changed: ids, queued };
+  }) as typeof api.landQueue;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree({ ...task("land-held"), land_queued_at: "2026-01-01T00:00:00.500Z" }));
+    });
+    const landNow = renderer.root.findAll((n) => n.type === "button" && n.children.includes("Land now"));
+    const unmark = renderer.root.findAll((n) => n.type === "button" && n.children.includes("Unmark"));
+    expect(landNow).toHaveLength(1);
+    expect(unmark).toHaveLength(1);
+
+    // toast() reaches for a DOM this renderer has none of; the tap itself is
+    // what matters here.
+    const doc = (globalThis as any).document;
+    (globalThis as any).document = { createElement: () => ({ style: {}, className: "", classList: { add() {}, remove() {} }, remove() {} }), body: { appendChild() {} } };
+    try {
+      await act(async () => {
+        await landNow[0].props.onClick();
+      });
+    } finally {
+      (globalThis as any).document = doc;
+    }
+    expect(calls).toEqual([{ ids: ["land-held"], queued: true }]);
+  } finally {
+    api.task = originalTask;
+    api.landQueue = originalLandQueue;
+  }
+});
+
+// HIVE-421 steer: the pass happens in THIS session (no quiz_passed event yet),
+// so the hold comes from the in-session pass. Tapping "Land now" must clear it
+// right away — the director just confirmed, the card must not still read held.
+test("passing the quiz then tapping Land now clears the hold in the same session", async () => {
+  const originalTask = api.task;
+  const originalLandQueue = api.landQueue;
+  const calls: { ids: string[]; queued: boolean }[] = [];
+  // Only the review_summary — the quiz is passed below, in-session.
+  api.task = (async (id: string) => ({ ...passingDetail(id), events: [passingDetail(id).events[0]] })) as typeof api.task;
+  api.landQueue = (async (ids: string[], queued = true) => {
+    calls.push({ ids, queued });
+    return { changed: ids, queued };
+  }) as typeof api.landQueue;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree({ ...task("land-same-session"), land_queued_at: "2026-01-01T00:00:00.500Z" }));
+    });
+    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Land now"))).toHaveLength(0);
+
+    await act(async () => {
+      renderer.root.findByType(UnderstandingQuiz).props.onPassed();
+    });
+    const landNow = renderer.root.findAll((n) => n.type === "button" && n.children.includes("Land now"));
+    expect(landNow).toHaveLength(1);
+
+    const doc = (globalThis as any).document;
+    (globalThis as any).document = { createElement: () => ({ style: {}, className: "", classList: { add() {}, remove() {} }, remove() {} }), body: { appendChild() {} } };
+    try {
+      await act(async () => {
+        await landNow[0].props.onClick();
+      });
+    } finally {
+      (globalThis as any).document = doc;
+    }
+    expect(calls).toEqual([{ ids: ["land-same-session"], queued: true }]);
+    // The card now reads as queued to land, not as held awaiting a tap.
+    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Land now"))).toHaveLength(0);
+    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Unmark"))).toHaveLength(0);
+  } finally {
+    api.task = originalTask;
+    api.landQueue = originalLandQueue;
+  }
+});
+
+test("a task that is not queued to land shows no land prompt", async () => {
+  const originalTask = api.task;
+  api.task = (async (id: string) => passingDetail(id)) as typeof api.task;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree(task("not-queued")));
+    });
+    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Land now"))).toHaveLength(0);
+  } finally {
+    api.task = originalTask;
+  }
+});
+
 // task #1000: the merge decision must reflect the LIVE branch-check, not just
 // whatever the agent's own review_summary claims. An unmet dependency
 // disables the merge button; a shared-history branch shows an explicit flag
@@ -179,7 +291,7 @@ test("an unmet dependency from branch-check disables Approve & merge", async () 
 });
 
 // task #1134: the flag used to spell out every task's title inline — 80+ of
-// them on one corebeat card, with the actual risk buried at the very end. It
+// them on one consuming-project card, with the actual risk buried at the very end. It
 // must stay one glanceable sentence no matter how many tasks are involved.
 test("many stacked branches collapse to one sentence, not a title dump", async () => {
   const originalTask = api.task;
@@ -319,7 +431,19 @@ test("the explanation page for the current head is embedded as a sandboxed ifram
   api.task = (async (id: string) => explainDetail(id, "abc123", "abc123")) as typeof api.task;
   try {
     const renderer = await renderReview({ ...task("explain-current"), head_sha: "abc123" });
-    const frame = renderer.root.findAllByType("iframe").find((f) => String(f.props.className).includes("explain-embed-frame"));
+    // Other test files may install a phone-sized global window while Bun runs
+    // files concurrently. Open the responsive disclosure when needed; this
+    // test is about the iframe boundary, while the phone test below owns the
+    // initial collapsed-state assertion.
+    let frame = renderer.root.findAllByType("iframe").find((f) => String(f.props.className).includes("explain-embed-frame"));
+    if (!frame) {
+      const open = renderer.root.findAll(
+        (n) => n.type === "button" && n.children.includes("Open visual explanation")
+      )[0];
+      expect(open).toBeTruthy();
+      await act(async () => open.props.onClick());
+      frame = renderer.root.findAllByType("iframe").find((f) => String(f.props.className).includes("explain-embed-frame"));
+    }
     expect(frame).toBeTruthy();
     expect(frame!.props.sandbox).toBe("allow-scripts");
     expect(frame!.props.src).toBe("/evidence/explain-current/1_explanation.html");
@@ -366,5 +490,65 @@ test("on a phone the embed collapses to an Open visual explanation button", asyn
   } finally {
     api.task = originalTask;
     delete (globalThis as any).window;
+  }
+});
+
+// HIVE-407: the card shows what the risk check decided, one chip per item, so
+// the director reads "confirmed" or "refuted" instead of the raw caution blob.
+function verdictDetail(id: string, verdictHead: string): TaskDetail {
+  const base = passingDetail(id);
+  return {
+    ...base,
+    head_sha: "head-1",
+    events: [
+      ...base.events,
+      {
+        id: "rev-auto",
+        task_id: id,
+        ts: "2026-01-01T00:00:04.000Z",
+        source: "system",
+        type: "auto_review",
+        payload: { verdict: "caution", summary: "s", risks: ["drops the lock early"], questions: ["is the flag on?"], reviewed_head_sha: "head-1" },
+      } as any,
+      {
+        id: "rev-verdicts",
+        task_id: id,
+        ts: "2026-01-01T00:00:05.000Z",
+        source: "system",
+        type: "risk_verdicts",
+        payload: {
+          reviewed_head_sha: verdictHead,
+          verdicts: [{ risk: "drops the lock early", verdict: "confirmed", why: "line 12 releases it" }],
+          question_verdicts: [{ question: "is the flag on?", answerable: "human", answer: "check the console" }],
+        },
+      } as any,
+    ],
+  };
+}
+
+test("risk verdicts render as per-item chips on the review card", async () => {
+  const originalTask = api.task;
+  api.task = (async (id: string) => verdictDetail(id, "head-1")) as typeof api.task;
+  try {
+    const renderer = await renderReview({ ...task("verdicts"), head_sha: "head-1" });
+    const json = JSON.stringify(renderer.toJSON());
+    expect(json).toContain("drops the lock early");
+    expect(json).toContain("confirmed");
+    expect(json).toContain("you answer");
+    expect(json).toContain("rv-confirmed");
+    expect(json).toContain("rv-human");
+  } finally {
+    api.task = originalTask;
+  }
+});
+
+test("verdicts recorded for an older head are not shown against this one", async () => {
+  const originalTask = api.task;
+  api.task = (async (id: string) => verdictDetail(id, "older-head")) as typeof api.task;
+  try {
+    const renderer = await renderReview({ ...task("verdicts-stale"), head_sha: "head-1" });
+    expect(JSON.stringify(renderer.toJSON())).not.toContain("rv-confirmed");
+  } finally {
+    api.task = originalTask;
   }
 });

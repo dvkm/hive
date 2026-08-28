@@ -1,12 +1,12 @@
 # Hive v1 — Specification
 
-Hive is a local-first orchestration control plane. David (the director) sets direction through one persistent, cross-project Chief of Staff and opens the focused Needs you queue or secondary operational views only when he needs detail or must act. Hive owns durable state, event-driven supervision, evidence, policies, and verification. It is a NEW system: it borrows ideas from firstmate (worktree isolation, evidence-gated done, option-menu decisions) and lavish (annotate/respond loop, SSE, action-only surfaces) but shares no code with them.
+Hive is a local-first orchestration control plane. The director sets direction through one persistent, cross-project Chief of Staff and opens the focused Needs you queue or secondary operational views only when they need detail or must act. Hive owns durable state, event-driven supervision, evidence, policies, and verification. It is a NEW system: it borrows ideas from a prior orchestration tool (worktree isolation, evidence-gated done, option-menu decisions) and a consuming project (annotate/respond loop, SSE, action-only surfaces) but shares no code with them.
 
 Decisions locked 2026-07-08: new system using herdr as agent runtime (D1), SQLite state store (D2), v1 includes smoke checks + health monitors (D3-B), build approved (D4-A).
 
 ## Non-negotiable product rules (from pain-point analysis)
 
-1. Status is push, never pull. The board is always current (SSE). David never types "status?".
+1. Status is push, never pull. The board is always current (SSE). The director never types "status?".
 2. No task reaches Done without evidence. The state machine enforces it.
 3. Every decision card carries: two-sentence what/why, options with recommendation + rationale first, risk + blast radius (prod? reversible? exact target named), inline evidence, and an explicit SUBMIT button. Drafts are saved server-side on every keystroke and never lost.
 4. Standing preferences are policies stored in the DB and injected into every agent brief automatically. Nothing is repeated because a context window compacted.
@@ -14,7 +14,7 @@ Decisions locked 2026-07-08: new system using herdr as agent runtime (D1), SQLit
 6. High-risk actions (prod deploys, feature flags, destructive ops) require a decision card that names the exact target before execution.
 7. Action-only surfaces: resolved decisions auto-archive; Needs you contains only open decisions, checkpoints, reviews, and untriaged failed or unhealthy work.
 8. Future-proofness over shortcuts. Root-cause fixes, clean seams, boring durable tech. Never skip or shrink work because it "would take too long" — effort cost is not a valid argument in this project, and time estimates are never given. Push through.
-9. Versions ship continuously without waiting for a go-ahead. Each version ends with evidence (green tests, screenshots, a working demo recorded as evidence rows in hive itself), then work proceeds directly to the next version. David is interrupted only by genuine decision cards.
+9. Versions ship continuously without waiting for a go-ahead. Each version ends with evidence (green tests, screenshots, a working demo recorded as evidence rows in hive itself), then work proceeds directly to the next version. The director is interrupted only by genuine decision cards.
 10. Top-level asks are loops, not queues. The director talks to one Chief of Staff whose durable conversation and run ledger persist across project switches. It restores context on re-entry, coordinates delegated work through independently verified completion, handles low-risk actions under each target project's autonomy profile, and escalates only consequential decisions. Workers coordinate directly through durable, attributed messages; consequential disagreements use a bounded propose/critique/synthesize meeting rather than serial director mediation.
 
 ## Architecture
@@ -62,9 +62,9 @@ State machine (server-enforced):
 
 ## herdr runtime adapter (`server/src/runtime/herdr.ts`)
 
-Non-negotiable presentation rules (2026-07-09, David): hive uses herdr the way firstmate proved it should be used — agents are VISIBLE and INTERACTIVE, never invisible one-shot processes. Reference: /Users/david/projects/firstmate/docs/herdr-backend.md and AGENTS.md herdr sections.
+Non-negotiable presentation rules (2026-07-09, the director): hive uses herdr the way a prior orchestration tool proved it should be used — agents are VISIBLE and INTERACTIVE, never invisible one-shot processes. Reference: AGENTS.md herdr sections.
 - Workers spawn as long-running INTERACTIVE agent sessions (never bare `claude -p` one-shots) in a dedicated, named herdr session/workspace for hive, one labeled tab per task (label = task id + short title), cwd = the task worktree.
-- David can open herdr at any time and see the whole fleet at a glance, attach to any agent, and type into it; hive must tolerate and absorb manual captain interventions (they surface as events).
+- The director can open herdr at any time and see the whole fleet at a glance, attach to any agent, and type into it; hive must tolerate and absorb manual captain interventions (they surface as events).
 - The board links each in-progress task to its agent (a "view agent" affordance that focuses the herdr tab via `herdr agent focus`); agent liveness/status shown on the card comes from herdr integration-reported status.
 - Agent exit is an observable event: the wait/reconcile loop must detect a vanished agent within one cycle and run stale-recovery (below), never leaving a task pointing at a ghost.
 
@@ -102,7 +102,7 @@ Orthogonal to the timer above and much stronger: when an agent's turn ENDS (the 
 
 Views (React + Vite + TS; no UI framework dependency heavier than needed; SSE via EventSource to `/api/stream`):
 1. **Chief of Staff home**: the default route restores one durable conversation across every project, with a short re-entry briefing above the current director/Chief exchange. Earlier messages collapse behind a history control, detailed agent activity stays under an "Activity and agent details" disclosure, and each consequential question appears as one answerable decision card instead of a prose checklist.
-2. **Board**: the Work view has 5 columns (Queued, Working, Needs You, Ready to Merge, Done; Done shows the last 10). `verifying` is a transient post-merge-checks strip, not a work lane. Tracking-only tasks live in a separate Tracked view with their external status and logical Hive subtasks; Jira-keyed retry chains collapse to the latest attempt. Cards show the title, project chip, agent status dot, last-event age, PR + CI badge, evidence count, and one-line summary. Click → task page. Live reorder via SSE. A prominent **"+ New task"** control (header and/or top of Queued column) has two modes: **Braindump** (default: project select + one textarea; the planner drafts a breakdown that David approves on a decision card before anything is queued) and **Manual** (project select, title, brief, kind; queues directly). David queues work directly from the board; it must never require the CLI.
+2. **Board**: the Work view has 5 columns (Queued, Working, Needs You, Ready to Merge, Done; Done shows the last 10). `verifying` is a transient post-merge-checks strip, not a work lane. Tracking-only tasks live in a separate Tracked view with their external status and logical Hive subtasks; Jira-keyed retry chains collapse to the latest attempt. Cards show the title, project chip, agent status dot, last-event age, PR + CI badge, evidence count, and one-line summary. Click → task page. Live reorder via SSE. A prominent **"+ New task"** control (header and/or top of Queued column) has two modes: **Braindump** (default: project select + one textarea; the planner drafts a breakdown that the director approves on a decision card before anything is queued) and **Manual** (project select, title, brief, kind; queues directly). The director queues work directly from the board; it must never require the CLI.
 3. **Task page** — brief, live event timeline, evidence gallery (inline images, test-run summaries, links), decisions (open + history), PR/CI panel, final summary. Actions: send steer message, cancel, approve merge.
 4. **Needs you**: one shared action queue for open decisions, unacknowledged checkpoints, tasks awaiting review, failed tasks awaiting triage, and dead or stuck work. A project chip row scopes the queue, the backlogs lists, and the activity summary to one project; the top bar and mobile navigation count honours the same filter. A task parked in review or decision state is not counted or rendered again as an agent-health issue. Decisions, checkpoints, reviews, and attention issues are each presented one at a time, with review evidence and diffs behind a disclosure. The same page keeps completions, fleet status, incidents, intake, spend, and learnings under an activity-summary disclosure. Decision notes autosave via debounced PUT; submitting dispatches an event to the owning task's agent via `herdr agent send` and archives the card.
 5. **Policies** — list/add/edit/deactivate policies, global and per-project.
@@ -126,7 +126,7 @@ Design: dark, calm, conversational, and focused. Localhost tool, no auth except 
 
 Hive never invents crypto. A pluggable secrets provider interface with two backends:
 - `keychain` (default): macOS Keychain via the `security` CLI, service-namespaced `hive/<project>/<name>`.
-- `bitwarden`: via `bw` CLI (David's existing vault) for secrets that should live in Bitwarden.
+- `bitwarden`: via `bw` CLI (the director's existing vault) for secrets that should live in Bitwarden.
 
 Behavior:
 - `secrets(id, project_id, name, provider, ref, created_at)` — the DB stores ONLY references/names, never values.
@@ -139,7 +139,7 @@ Behavior:
 - **v1**: everything above: server core, state machine, board, task pages, Needs you queue (with decision Submit), policies, herdr runtime, reconciler, hooks, monitors + post-deploy smoke, secrets management, CLI.
 - **v2** — regression/learning ledger (recurring failures become tracked learnings + auto root-cause tasks; "unblock now, root-cause later" as a first-class flow); intake connectors (Google Chat first: stakeholder messages become draft tasks for triage); notification digests (batched, urgent-decision override, macOS push).
 - **v3** — scoped standing-authority policy engine (staging autonomous / prod requires exact-target decision card, enforced server-side before risky actions dispatch); domain supervisors (persistent planner agents per project that triage intake and propose task breakdowns); cost/token analytics per task and per model.
-- **v4** — migrate a real project off firstmate end to end (dogfood exit criteria); remote access (tailscale-friendly bind + minimal auth); UI polish pass driven by David's annotations on the live board.
+- **v4** — migrate a real project off a prior orchestration tool end to end (dogfood exit criteria); remote access (tailscale-friendly bind + minimal auth); UI polish pass driven by the director's annotations on the live board.
 
 Each version's definition of done: tests green, evidence rows (screenshots + test runs) attached to that version's tracking task in hive itself, then the next version starts immediately.
 

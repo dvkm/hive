@@ -24,6 +24,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DB } from "./db.ts";
 import { writeEvent } from "./state.ts";
+import { queueSteerEvent } from "./steer.ts";
 import { defaultExec, type Exec } from "./exec.ts";
 
 export interface SidecarDeps {
@@ -54,6 +55,84 @@ let inFlight: Promise<void> | null = null;
 // Task id to start the next pass at, when this pass ran out of budget before
 // reaching the end of the fleet. Plain round-robin fairness.
 let resumeFrom: string | null = null;
+
+// The latest report, for the board card and review card chips (task HIVE-405).
+export interface SidecarReport {
+  sha: string;
+  ok: boolean;
+  findings: SidecarFinding[];
+}
+
+export function latestSidecar(db: DB, taskId: string): SidecarReport | null {
+  const row = db
+    .query(
+      `SELECT payload FROM events
+        WHERE task_id = ? AND type = 'sidecar_report' ORDER BY ts DESC, rowid DESC LIMIT 1`
+    )
+    .get(taskId) as { payload: string } | undefined;
+  if (!row) return null;
+  return parseSidecarPayload(row.payload);
+}
+
+function parseSidecarPayload(payload: string): SidecarReport | null {
+  try {
+    const p = JSON.parse(payload);
+    if (typeof p?.sha !== "string") return null;
+    return { sha: p.sha, ok: !!p.ok, findings: Array.isArray(p.findings) ? p.findings : [] };
+  } catch {
+    return null;
+  }
+}
+
+// Batched form of latestSidecar (task HIVE-447): one grouped query for a whole
+// task list instead of one query per task, so list endpoints (board,
+// needs-attention, brief) stay O(1) queries regardless of list size.
+export function latestSidecarBatch(db: DB, taskIds: string[]): Map<string, SidecarReport | null> {
+  const result = new Map<string, SidecarReport | null>();
+  const ids = [...new Set(taskIds)];
+  if (ids.length === 0) return result;
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = db
+    .query(
+      `SELECT e.task_id AS task_id, e.payload AS payload FROM events e
+        JOIN (SELECT task_id, MAX(rowid) AS rid FROM events
+               WHERE type = 'sidecar_report' AND task_id IN (${placeholders})
+               GROUP BY task_id) latest
+          ON e.rowid = latest.rid`
+    )
+    .all(...ids) as { task_id: string; payload: string }[];
+  for (const row of rows) result.set(row.task_id, parseSidecarPayload(row.payload));
+  return result;
+}
+
+// A broken build is the one finding worth interrupting an agent for: everything
+// it writes on top of it is built on a tree that does not compile. Lint is not
+// — style noise mid-task is exactly the nagging this whole feature avoids.
+// A check we skipped proves nothing, so it is not a break either.
+function buildBreak(findings: SidecarFinding[]): SidecarFinding | undefined {
+  return findings.find((f) => f.tool === "tsc" && !f.summary.startsWith("skipped:"));
+}
+
+// One FYI steer per commit. The sha sits in the message itself, so the events
+// table is the dedupe key too — no side table, same as steer.ts.
+function steerOnBuildBreak(db: DB, taskId: string, sha: string, findings: SidecarFinding[]): void {
+  const broken = buildBreak(findings);
+  if (!broken) return;
+  const marker = `sidecar: build broken since ${sha.slice(0, 7)}:`;
+  const seen = db
+    .query(
+      `SELECT 1 FROM events
+        WHERE task_id = ? AND type = 'steer' AND json_extract(payload, '$.message') LIKE ? LIMIT 1`
+    )
+    .get(taskId, `${marker}%`);
+  if (seen) return;
+  queueSteerEvent(
+    db,
+    taskId,
+    `${marker} ${broken.summary}\nFYI from hive's background type check, not a blocker: keep going and fix it whenever it suits you.`,
+    "sidecar found a broken build"
+  );
+}
 
 function lastReportedSha(db: DB, taskId: string): string | null {
   const row = db
@@ -178,6 +257,7 @@ async function sweep(db: DB, deps: SidecarDeps): Promise<void> {
       type: "sidecar_report",
       payload: { sha, ok: findings.length === 0, findings },
     });
+    steerOnBuildBreak(db, row.id, sha, findings);
     if (dirtied) {
       // Hard fail: something under us can write. Stop the pass rather than
       // point the same checks at the next live worktree.

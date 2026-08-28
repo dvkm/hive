@@ -4,7 +4,7 @@ import { dirname, join, normalize } from "node:path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
-import { taskWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
+import { taskWithHealth, tasksWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
 import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
 import { addClient, removeClient, broadcast, appClientCount } from "./bus.ts";
@@ -48,11 +48,19 @@ import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from ".
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { resolveProjectSecrets, serviceName } from "./secrets.ts";
+import { teamclaudeEnv, usesTeamclaude } from "./teamclaude.ts";
 import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
+import {
+  deploymentsStatus,
+  startDeploy,
+  startRollback,
+  type DeploymentsConfig,
+} from "./deployments.ts";
 import { enqueue, ackNotifications, markShown, recordDeliveryError, lastDeliveryError } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, resolveDenyGuardrailForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
 import { runPlanner, resolvePlanForDecision, decisionPlan, selectedPlanIndices, type PlannerExec } from "./planner.ts";
+import { claudeProfileEnvForRepo } from "./claudeProfiles.ts";
 import { routeIntakeProject } from "./intake/route.ts";
 import {
   REF_PREFIX as JIRA_REF_PREFIX,
@@ -77,10 +85,12 @@ import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
+import { confirmedRisks, cautionCleared } from "./reviewer.ts";
 import { explanationGate } from "./explainDiff.ts";
-import { critiquePlan, parsePlan } from "./planCritic.ts";
+import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
+import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
-import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen } from "./reconciler.ts";
+import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen, probeAgent } from "./reconciler.ts";
 import { taskDiff } from "./diff.ts";
 import { captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { landGraph, markLand, resolveLandPauseForDecision } from "./landQueue.ts";
@@ -203,6 +213,23 @@ function authzBlock(db: DB, input: AuthzInput): Response | null {
   );
 }
 
+// Resolve a project for the deployments routes. The tab is opt-in: a project
+// without a config.deployments block has no production release model, so it 404s
+// rather than guessing one.
+type DeploymentsProject =
+  | { ok: true; repoPath: string; branch: string; config: DeploymentsConfig }
+  | { ok: false; res: Response };
+
+function deploymentsProject(db: DB, id: string): DeploymentsProject {
+  const row = db.query("SELECT * FROM projects WHERE id = ?").get(id);
+  if (!row) return { ok: false, res: err("project not found", 404) };
+  const project = parseProject(row);
+  const config = (project.config as any)?.deployments as DeploymentsConfig | undefined;
+  if (!config) return { ok: false, res: err("deployments are not configured for this project", 404) };
+  if (!project.repo_path) return { ok: false, res: err("project has no repo_path", 400) };
+  return { ok: true, repoPath: project.repo_path, branch: projectBaseBranch(project.config), config };
+}
+
 const WEB_DIST = join(import.meta.dir, "..", "..", "web", "dist");
 const HOOKS_DIR = join(import.meta.dir, "..", "..", "hooks");
 const REPO_ROOT = join(import.meta.dir, "..", "..");
@@ -246,6 +273,11 @@ const WRITE_AUTH_ROUTES: { method: string; path: RegExp }[] = [
   { method: "DELETE", path: /^\/api\/projects\/[^/]+\/secrets\/[^/]+$/ },
   { method: "POST", path: /^\/api\/projects\/[^/]+\/pr-gardener\/\d+$/ },
   { method: "POST", path: /^\/api\/push\/subscribe$/ },
+  // Deploying and rolling back production. Hive has no user accounts, so the
+  // API token IS the super-admin check: holding it means filesystem access to
+  // hive's own DB, which an agent's HTTP socket or a stray browser tab does not
+  // have. Reading the release list stays open; only pressing the button is gated.
+  { method: "POST", path: /^\/api\/projects\/[^/]+\/deployments\/(deploy|rollback)$/ },
 ];
 
 // True when the request may proceed: either it is not a gated write, or it
@@ -332,6 +364,34 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
             return err("override must be force_land, force_close, hold, or null", 400);
           }
           return json(gardenerQueue(db, match[1]).find((row) => row.pr_number === prNumber));
+        }
+      }
+      // ---- deployments (production releases: what is live + the two buttons) ----
+      {
+        const match = pathname.match(/^\/api\/projects\/([^/]+)\/deployments(\/deploy|\/rollback)?$/);
+        if (match) {
+          const project = deploymentsProject(db, match[1]);
+          if (!project.ok) return project.res;
+          const { repoPath, branch, config } = project;
+          const exec = deps.exec ?? defaultExec;
+          if (!match[2] && method === "GET") {
+            // The PostHog key is only resolved when the project actually asked
+            // for flag states, so the keychain is left alone otherwise.
+            const posthogKey = config.flags?.length
+              ? (await resolveProjectSecrets(db, match[1], exec)).POSTHOG_API_KEY
+              : undefined;
+            return json(
+              await deploymentsStatus(repoPath, branch, config, { exec, fetcher: deps.fetch, posthogKey })
+            );
+          }
+          if (match[2] && method === "POST") {
+            const body = (await safeJson(req)) as any;
+            const r =
+              match[2] === "/deploy"
+                ? await startDeploy(exec, repoPath, branch, config, body?.commit)
+                : await startRollback(exec, repoPath, branch, config, body?.tag);
+            return r.ok ? json(r) : err(r.error, r.status);
+          }
         }
       }
       let m = pathname.match(/^\/api\/projects\/([^/]+)$/);
@@ -502,6 +562,8 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (m && method === "POST") return answerUnderstandingQuiz(db, m[1], await req.json());
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/understanding-quiz\/defer$/);
       if (m && method === "POST") return deferUnderstandingQuiz(db, m[1], await req.json());
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/understanding-quiz\/require$/);
+      if (m && method === "POST") return requireUnderstandingQuiz(db, m[1], await req.json());
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/focus-agent$/);
       if (m && method === "POST") return await focusAgent(db, herdr, m[1]);
@@ -652,7 +714,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // {shown:true} it rendered, or {error} it refused.
       m = pathname.match(/^\/api\/notifications\/([^/]+)\/delivery$/);
       if (m && method === "POST") {
-        const b = await req.json().catch(() => ({} as any));
+        const b: any = await req.json().catch(() => ({}));
         if (b?.error) {
           recordDeliveryError(m[1], String(b.error));
           return json({ ok: false });
@@ -814,7 +876,7 @@ function jiraTaskState(db: DB, taskId: string): Response {
     browse_url: key && site ? `${site}/browse/${encodeURIComponent(key)}` : null,
     enabled: cfg?.enabled ?? false,
     write: cfg?.write ?? false,
-    // A configured-but-not-allowlisted target reads as "not configured" here on
+    // A configured-but-malformed target reads as "not configured" here on
     // purpose: the credential gate refused it, and the UI should not imply the
     // site it names is in use.
     configured: !!cfg,
@@ -872,7 +934,7 @@ function intake(db: DB, body: any, deps: HandlerDeps): Response {
   // The caller's project_id is a DEFAULT, not gospel — the web picker defaults to
   // whatever project is in view. Classify the text against every project's
   // identifying signals and re-route when a different one clearly matches, so a
-  // corebeat braindump lands in the corebeat repo and not wherever the UI sat.
+  // braindump lands in the repo it is about and not wherever the UI sat.
   const route = routeIntakeProject(db, text, body.project_id);
   const projectId = route.project_id;
 
@@ -1029,9 +1091,13 @@ async function deliverToSupervisor(
     task = getTask(db, taskId);
   }
 
-  // Is the session already live? If so, just send into it (fast path).
+  // Is the session already live? If so, just send into it (fast path). Uses
+  // probeAgent (not a raw herdr.probe) so a herdr registry eviction — the
+  // supervisor pane is still alive, only its registration was wiped — is
+  // re-adopted here instead of read as dead and sent through spawnAgent, where
+  // the spawn guard would correctly refuse (name still held) and drop the turn.
   if (task.agent_target) {
-    const { alive } = await herdr.probe(task.agent_target).catch(() => ({ alive: false }));
+    const { alive } = await probeAgent(herdr, db, taskId!, task.agent_target).catch(() => ({ alive: false }));
     if (alive) {
       const error = await sendOnce(herdr, task.agent_target, wireMessage);
       if (!error) {
@@ -1201,7 +1267,7 @@ export function projectInboxCounts(db: DB, projectId: string): { checkpoints: nu
   const reviews = Number(
     (db.query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND state = 'in_review' AND ${supervisedSql()} AND COALESCE(source_ref, '') NOT LIKE 'jira:%'`).get(projectId) as { n: number }).n
   );
-  const tasks = db.query("SELECT * FROM tasks WHERE project_id = ?").all(projectId).map((task) => taskWithHealth(db, parseTask(task)));
+  const tasks = tasksWithHealth(db, db.query("SELECT * FROM tasks WHERE project_id = ?").all(projectId).map(parseTask));
   const attention = tasks.filter(needsAttention).length;
   return { checkpoints, decisions, reviews, attention };
 }
@@ -1720,6 +1786,52 @@ function parseDeps(db: DB, raw: any, selfId?: string): string[] | Response {
   return deps;
 }
 
+// The verification contract: named commands an agent must run before it hands
+// off, so its evidence can be tagged with the name it came from
+// (`hive emit ... --verify-name <name>`). Stored as a JSON array on the task.
+// Names are short slugs so they read well in a brief and in evidence payloads.
+// Nothing is gated on this yet — it is data the brief renders.
+function parseVerificationCmds(raw: any): { name: string; cmd: string }[] | null | Response {
+  if (raw === null || raw === "") return null;
+  let list = raw;
+  if (typeof raw === "string") {
+    try {
+      list = JSON.parse(raw);
+    } catch {
+      return err("verification_cmds must be a JSON array of {name, cmd}", 400);
+    }
+  }
+  if (!Array.isArray(list)) return err("verification_cmds must be an array of {name, cmd}", 400);
+  const seen = new Set<string>();
+  const out: { name: string; cmd: string }[] = [];
+  for (const entry of list) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry))
+      return err("each verification_cmds entry must be an object with 'name' and 'cmd'", 400);
+    const name = String((entry as any).name ?? "");
+    const cmd = String((entry as any).cmd ?? "");
+    if (!/^[a-z0-9-]{1,32}$/.test(name))
+      return err(`invalid verification_cmds name: ${JSON.stringify(name)} (use 1-32 chars of a-z, 0-9, -)`, 400);
+    if (seen.has(name)) return err(`duplicate verification_cmds name: ${name}`, 400);
+    if (!cmd.trim()) return err(`verification_cmds entry '${name}' needs a non-empty cmd`, 400);
+    seen.add(name);
+    out.push({ name, cmd });
+  }
+  return out.length ? out : null;
+}
+
+// Priority is ordering only, never preemption: it decides which queued task is
+// picked up first (dispatcher.ts) and which approved PR lands first
+// (landQueue.ts). Highest to lowest: now, next, normal, later.
+export const TASK_PRIORITIES = ["now", "next", "normal", "later"] as const;
+
+// Returns the validated value, or a 400 for anything outside the vocabulary.
+function parsePriority(raw: any): string | Response {
+  const p = String(raw);
+  if (!(TASK_PRIORITIES as readonly string[]).includes(p))
+    return err(`invalid priority: ${JSON.stringify(p)} (use ${TASK_PRIORITIES.join(", ")})`, 400);
+  return p;
+}
+
 // Accepts JSON or multipart; attached files are saved under the new task's id
 // and their absolute paths appended to the brief, so the agent that picks the
 // task up can read them.
@@ -1747,6 +1859,10 @@ async function createTask(db: DB, req: Request): Promise<Response> {
     return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
   const deps = parseDeps(db, body.depends_on);
   if (deps instanceof Response) return deps;
+  const verifyCmds = body.verification_cmds !== undefined ? parseVerificationCmds(body.verification_cmds) : null;
+  if (verifyCmds instanceof Response) return verifyCmds;
+  const priority = body.priority !== undefined ? parsePriority(body.priority) : "normal";
+  if (priority instanceof Response) return priority;
   // A follow-up task's brief often describes code that only exists in the
   // parent's still-open PR (HIVE-299). Auto-depend on the parent until its PR
   // has merged so the dispatcher holds this task the same way unmetDeps
@@ -1776,17 +1892,20 @@ async function createTask(db: DB, req: Request): Promise<Response> {
     source: body.source ? String(body.source) : null,
     parent_task_id: parent,
     depends_on: deps.length ? JSON.stringify(deps) : null,
+    verification_cmds: verifyCmds ? JSON.stringify(verifyCmds) : null,
+    priority,
     created_at: t,
     updated_at: t,
   };
   db.query(
     `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
-      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, priority, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.project_id, row.title, row.brief, row.state, row.kind,
     row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
-    row.summary, row.source, row.parent_task_id, row.depends_on, row.created_at, row.updated_at
+    row.summary, row.source, row.parent_task_id, row.depends_on, row.verification_cmds,
+    row.priority, row.created_at, row.updated_at
   );
   writeEvent(db, {
     task_id: row.id,
@@ -1930,8 +2049,23 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
     if (parsed instanceof Response) return parsed;
     deps = parsed;
   }
-  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, updated_at = ? WHERE id = ?")
-    .run(title, brief, deps.length ? JSON.stringify(deps) : null, now(), id);
+  // verification_cmds is full-replace too: omit to leave it alone, send [] or
+  // null to clear it.
+  let verify: string | null = task.verification_cmds ? JSON.stringify(task.verification_cmds) : null;
+  if (body?.verification_cmds !== undefined) {
+    const parsed = parseVerificationCmds(body.verification_cmds);
+    if (parsed instanceof Response) return parsed;
+    verify = parsed ? JSON.stringify(parsed) : null;
+  }
+  // priority is a plain scalar: omit it to leave it alone.
+  let priority: string = task.priority ?? "normal";
+  if (body?.priority !== undefined) {
+    const parsed = parsePriority(body.priority);
+    if (parsed instanceof Response) return parsed;
+    priority = parsed;
+  }
+  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, updated_at = ? WHERE id = ?")
+    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, now(), id);
   const updated = getTask(db, id);
   broadcastTask(db, updated);
   return json(taskWithHealth(db, updated));
@@ -1967,7 +2101,7 @@ function listTasks(db: DB, url: URL): Response {
     "SELECT t.* FROM tasks t JOIN projects p ON p.id = t.project_id" +
     (where.length ? " WHERE " + where.join(" AND ") : "") +
     " ORDER BY t.updated_at DESC";
-  return json(db.query(sql).all(...args).map(parseTask).map((t) => taskWithHealth(db, t)));
+  return json(tasksWithHealth(db, db.query(sql).all(...args).map(parseTask)));
 }
 
 // Activity feed: reverse-chronological events across ALL tasks, each enriched
@@ -2115,13 +2249,15 @@ function brief(db: DB, url: URL): Response {
   // ② needs attention uses the shared eligibility rule over full task objects
   // (with health), so the web can reuse the tray rows.
   // Not windowed: these persist until you act on them.
-  const attnCandidates = db
-    .query(
-      "SELECT * FROM tasks WHERE state = 'failed' OR (agent_target IS NOT NULL AND state IN ('in_progress','needs_decision','in_review','verifying'))"
-    )
-    .all()
-    .map(parseTask)
-    .map((t: any) => taskWithHealth(db, t));
+  const attnCandidates = tasksWithHealth(
+    db,
+    db
+      .query(
+        "SELECT * FROM tasks WHERE state = 'failed' OR (agent_target IS NOT NULL AND state IN ('in_progress','needs_decision','in_review','verifying'))"
+      )
+      .all()
+      .map(parseTask)
+  );
   const failed_or_attention = attnCandidates.filter((t: any) => needsAttention(t));
 
   // ③ decisions — open cards ARE the action items (full objects, rendered inline).
@@ -2150,13 +2286,15 @@ function brief(db: DB, url: URL): Response {
   }
 
   // ④ fleet now — currently live agents (task + health).
-  const fleet = db
-    .query(
-      "SELECT * FROM tasks WHERE agent_target IS NOT NULL AND state IN ('in_progress','needs_decision','in_review','verifying') ORDER BY updated_at DESC"
-    )
-    .all()
-    .map(parseTask)
-    .map((t: any) => taskWithHealth(db, t));
+  const fleet = tasksWithHealth(
+    db,
+    db
+      .query(
+        "SELECT * FROM tasks WHERE agent_target IS NOT NULL AND state IN ('in_progress','needs_decision','in_review','verifying') ORDER BY updated_at DESC"
+      )
+      .all()
+      .map(parseTask)
+  );
 
   // ⑤ incidents opened/resolved since.
   const incidents = db
@@ -2178,12 +2316,14 @@ function brief(db: DB, url: URL): Response {
 
   // ⑦ to review — Hive-owned in-review tasks awaiting the captain's review
   // and merge. Full task objects (with health) so the web renders review cards inline.
-  const to_review = db
-    .query("SELECT * FROM tasks WHERE state = 'in_review' ORDER BY updated_at DESC")
-    .all()
-    .map(parseTask)
-    .filter((task: any) => !isTrackingOnlyTask(task))
-    .map((t: any) => taskWithHealth(db, t));
+  const to_review = tasksWithHealth(
+    db,
+    db
+      .query("SELECT * FROM tasks WHERE state = 'in_review' ORDER BY updated_at DESC")
+      .all()
+      .map(parseTask)
+      .filter((task: any) => !isTrackingOnlyTask(task))
+  );
 
   // ⑧ spend since — reuse the analytics rollup (totals + by-model for top model).
   // `?project` scopes it, so a reader who filtered the brief to one project does
@@ -2209,8 +2349,17 @@ function brief(db: DB, url: URL): Response {
     )
     .all(...(since ? [since] : []));
 
+  // ⑩ dialogs the server answered for the agent — a count, not a card each
+  // (task #1562). Windowed like the other "what happened" sections; a day is
+  // the default because that is how often the director reads this.
+  const dialogsSince = since ?? new Date(Date.now() - 24 * 3600_000).toISOString();
+  const auto_answered_dialogs = (db
+    .query("SELECT COUNT(*) AS n FROM events WHERE type = 'dialog_auto_answered' AND ts >= ?")
+    .get(dialogsSince) as { n: number }).n;
+
   return json({
     since: since ?? null,
+    auto_answered_dialogs,
     done,
     director_required_task_ids: [...directorRequiredTaskIds],
     failed_or_attention,
@@ -2423,7 +2572,7 @@ async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {
     const t = getTask(db, id);
     if (t) {
       const hiveOwnedReview = !isTrackingOnlyTask(t);
-      if (hiveOwnedReview && to === "verifying" && t.state === "in_review" && t.kind === "scout") {
+      if (hiveOwnedReview && to === "verifying" && t.state === "in_review" && t.kind === "scout" && understandingChecksRequired(db, t)) {
         const quiz = latestUnderstandingQuiz(db, id);
         if (!quiz)
           return err("Understanding check required. Ask the agent to add one before accepting this report.", 409);
@@ -2488,7 +2637,7 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
     const config = JSON.parse(project.config ?? "{}");
     const base = projectComparisonBase(config);
     // TERMINAL, not just done/cancelled: a `failed` task's branch is as dead as
-    // a cancelled one, and corebeat's 109 failed tasks were 87 of the 103 rows
+    // a cancelled one, and one real project's 109 failed tasks were 87 of the 103 rows
     // this flag used to dump on one card (task #1134).
     const others = db
       .query(
@@ -2499,7 +2648,8 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
     const found = await findEmbeddedTasks(deps.exec ?? defaultExec, project.repo_path, base, task.branch, others);
     if (found) embedded_tasks = found;
   }
-  return json({ unmet_deps, embedded_tasks });
+  // The review card only blocks on the understanding check when this says so.
+  return json({ unmet_deps, embedded_tasks, understanding_required: understandingChecksRequired(db, task) });
 }
 
 // Map our merge_method config onto gh's flag. Squash is the default.
@@ -2679,14 +2829,17 @@ export async function mergeTask(
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   const config = JSON.parse(project?.config ?? "{}");
   const autoShipKind = Array.isArray(config.auto_merge?.kinds) && config.auto_merge.kinds.includes(task.kind);
-  const quiz = latestUnderstandingQuiz(db, id);
-  if (!quiz && !autoShipKind)
-    return err("Understanding check required. Ask the agent to submit one in its latest review before merging.", 409);
+  // Mechanical changes (hive-1559) never mint a quiz, so nothing here to gate on.
   let deferQuizReviewEventId: string | null = null;
-  if (quiz && understandingQuizStatus(db, id, quiz.reviewEventId) === "required") {
-    if (!autoShipKind)
-      return err("Pass the understanding check before merging, or choose 'Continue now, quiz me later'.", 409);
-    deferQuizReviewEventId = quiz.reviewEventId;
+  if (understandingChecksRequired(db, task)) {
+    const quiz = latestUnderstandingQuiz(db, id);
+    if (!quiz)
+      return err("Understanding check required. Ask the agent to submit one in its latest review before merging.", 409);
+    if (understandingQuizStatus(db, id, quiz.reviewEventId) === "required") {
+      if (!autoShipKind)
+        return err("Pass the understanding check before merging, or choose 'Continue now, quiz me later'.", 409);
+      deferQuizReviewEventId = quiz.reviewEventId;
+    }
   }
 
   // Recompute the dependency claim live rather than trusting evidence prose
@@ -2699,6 +2852,19 @@ export async function mergeTask(
     const names = blockingDeps.map((b) => `#${b.number} ${b.title} (${b.state})`).join(", ");
     return err(`blocked by unmet dependenc${blockingDeps.length === 1 ? "y" : "ies"}: ${names} — not yet merged/done`, 409);
   }
+
+  // The risk check (HIVE-406) re-read the real code for this exact head. Risks
+  // it CONFIRMED are the ones that survived an adversarial second look, so the
+  // director sees that short list verbatim instead of the whole caution blob.
+  // Refuted risks say nothing here. Overridable, like the rebase guard below.
+  const confirmed = body?.override_confirmed_risks ? [] : confirmedRisks(db, id, task.head_sha);
+  if (confirmed.length)
+    return err(
+      `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
+        confirmed.map((c) => `“${c.risk}” — ${c.why}${c.evidence_path ? ` (${c.evidence_path})` : ""}`).join("; ") +
+        `. Fix them, or merge with override_confirmed_risks=true.`,
+      409
+    );
 
   const exec = deps.exec ?? defaultExec;
   let prView: any = null;
@@ -3084,6 +3250,14 @@ function codexHookOverride(event: string, command: string, matcher?: string): st
   return `hooks.${event}=[{${group}}]`;
 }
 
+export function hookScriptCommand(
+  script: "hive-hook.ts" | "classify.ts",
+  args: string[] = [],
+  platform: NodeJS.Platform = process.platform
+): string {
+  return commandForCurrentShell(["bun", join(HOOKS_DIR, script), ...args], platform);
+}
+
 export function codexAgentArgv(
   brief: string,
   model?: string,
@@ -3094,8 +3268,8 @@ export function codexAgentArgv(
     toolOutputTokenLimit: 6_000,
   }
 ): string[] {
-  const hook = join(HOOKS_DIR, "hive-hook.sh");
-  const approve = join(HOOKS_DIR, "hive-approve.sh");
+  const hook = (event: string) => hookScriptCommand("hive-hook.ts", [event]);
+  const approve = hookScriptCommand("classify.ts", [commandApproval]);
   const argv = [
     "codex",
     "--sandbox", "workspace-write",
@@ -3103,11 +3277,11 @@ export function codexAgentArgv(
     "--ask-for-approval", "on-request",
     "--dangerously-bypass-hook-trust",
     "-c", "features.hooks=true",
-    "-c", codexHookOverride("PreToolUse", `${approve} ${commandApproval}`, "^Bash$"),
-    "-c", codexHookOverride("PermissionRequest", `${approve} ${commandApproval}`, "^Bash$"),
-    "-c", codexHookOverride("PostToolUse", `${hook} PostToolUse`),
-    "-c", codexHookOverride("Stop", `${hook} Stop`),
-    "-c", codexHookOverride("SubagentStop", `${hook} SubagentStop`),
+    "-c", codexHookOverride("PreToolUse", approve, "^Bash$"),
+    "-c", codexHookOverride("PermissionRequest", approve, "^Bash$"),
+    "-c", codexHookOverride("PostToolUse", hook("PostToolUse")),
+    "-c", codexHookOverride("Stop", hook("Stop")),
+    "-c", codexHookOverride("SubagentStop", hook("SubagentStop")),
     "-c", `model_reasoning_effort=${JSON.stringify(settings.reasoningEffort)}`,
     "-c", `model_auto_compact_token_limit=${settings.autoCompactTokenLimit}`,
     "-c", `tool_output_token_limit=${settings.toolOutputTokenLimit}`,
@@ -3197,7 +3371,17 @@ export async function spawnAgent(
   const pending = queuedSteers(db, id);
   const brief = steerPreamble(pending) + (opts.briefOverride ?? composeBrief(db, id));
   const hiveUrl = opts.hiveUrl || process.env.HIVE_URL || `http://127.0.0.1:${process.env.HIVE_PORT || 4700}`;
-  const env = { ...(await resolveProjectSecrets(db, task.project_id)), HIVE_AGENT: agent };
+  // TeamClaude proxy env first when the project opted in (agent="teamclaude";
+  // null when the proxy is down → agent runs direct), then secrets/platform.
+  // Machine account routing is applied last so a same-named project secret
+  // cannot silently replace the selected Claude profile.
+  const env = {
+    ...(usesTeamclaude(config) ? (await teamclaudeEnv())?.set ?? {} : {}),
+    ...(await resolveProjectSecrets(db, task.project_id)),
+    ...agentPlatformEnv(),
+    ...claudeProfileEnvForRepo(project.repo_path),
+    HIVE_AGENT: agent,
+  };
 
   let result;
   try {
@@ -3343,7 +3527,7 @@ async function sendOnce(herdr: Herdr, target: string, message: string): Promise<
 // Programmatic steer for hive's own subsystems (offline prep, checkpoint
 // flags): same delivery-receipt semantics as the HTTP path, no Request object,
 // no authz gate (the server is steering, not an agent).
-async function internalSteer(db: DB, herdr: Herdr, id: string, message: string, actor: string | null = null): Promise<boolean> {
+export async function internalSteer(db: DB, herdr: Herdr, id: string, message: string, actor: string | null = null): Promise<boolean> {
   const task = getTask(db, id);
   if (!task || isTrackingOnlyTask(task)) return false;
   const target = task.agent_target;
@@ -3574,6 +3758,32 @@ function checkpointNote(payload: string): string {
   }
 }
 
+// Is this checkpoint a plan the agent is parked on (HIVE-413)?
+function planCheckpointBlocks(payload: string): boolean {
+  try {
+    return JSON.parse(payload)?.blocking === true;
+  } catch {
+    return false;
+  }
+}
+
+// The plan fields on a plan checkpoint, for the Needs You card. Null for an
+// ordinary note-only checkpoint.
+function checkpointPlan(payload: string): Record<string, unknown> | null {
+  try {
+    const p = JSON.parse(payload);
+    if (p?.kind !== "plan") return null;
+    return {
+      goal: String(p.goal ?? ""),
+      approach: String(p.approach ?? ""),
+      files_expected: Array.isArray(p.files_expected) ? p.files_expected.map(String) : [],
+      verification_planned: String(p.verification_planned ?? ""),
+    };
+  } catch {
+    return null;
+  }
+}
+
 interface UnderstandingCheck {
   question: string;
   options: { key: string; label: string }[];
@@ -3659,6 +3869,83 @@ function normalizeUnderstandingChecks(understanding: unknown): UnderstandingChec
 // states have an actionable quiz, or the list can advertise an item the answer
 // endpoint then rejects (hive-1006).
 const UNDERSTANDING_QUIZ_ANSWERABLE_STATES = ["in_review", "verifying", "done", "failed"];
+
+// Paths whose changes always deserve a director quiz, whatever the reviewer
+// said. Per-project override: config.understanding_checks.sensitive_paths.
+const DEFAULT_SENSITIVE_PATHS = ["auth", "token", "security", "payment", "billing", "migration", "secret", "credential", "password"];
+
+// Match a token anywhere inside a path segment, case-insensitively, so "auth"
+// hits `server/src/auth.ts`, `web/authGuard.ts` AND `src/authTokens.ts`.
+// Deliberately biased to false positives: quizzing a mechanical change costs
+// the director one question, missing a sensitive one costs a blind merge.
+// ponytail: substring matching, not globs. Swap in a glob matcher only if a
+// project needs a path shape this cannot express.
+function touchesSensitivePath(files: string[], tokens: string[]): boolean {
+  const needles = tokens.map((token) => token.toLowerCase()).filter(Boolean);
+  return files.some((file) => {
+    const segments = file.toLowerCase().split("/");
+    return needles.some((needle) => segments.some((segment) => segment.includes(needle)));
+  });
+}
+
+// The newest verdict from the auto reviewer, or null when it never produced one
+// (never ran, errored, or was skipped by project config).
+function latestAutoReviewVerdict(
+  db: DB,
+  taskId: string
+): { verdict: string; files: string[]; risks: string[]; questions: string[]; reviewed_head_sha?: string } | null {
+  const row = db
+    .query(
+      `SELECT type, payload FROM events WHERE task_id = ? AND type IN ('auto_review', 'auto_review_error')
+        ORDER BY ts DESC, rowid DESC LIMIT 1`
+    )
+    .get(taskId) as { type: string; payload: string } | undefined;
+  if (!row || row.type !== "auto_review") return null;
+  try {
+    const payload = JSON.parse(row.payload);
+    if (payload?.skipped || typeof payload?.verdict !== "string") return null;
+    return {
+      verdict: payload.verdict,
+      files: Array.isArray(payload.files) ? payload.files.map(String) : [],
+      risks: Array.isArray(payload.risks) ? payload.risks.map(String) : [],
+      questions: Array.isArray(payload.questions) ? payload.questions.map(String) : [],
+      reviewed_head_sha: typeof payload.reviewed_head_sha === "string" ? payload.reviewed_head_sha : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Judgment-class or not (hive-1559). Hive raises only the few changes that
+// actually need the director's head; everything mechanical merges without a
+// quiz and never lands in the post-ship backlog. A task is judgment-class when
+// ANY of these holds:
+//   1. the latest auto_review verdict is not `looks_good` (missing, errored,
+//      skipped and `caution` all count — no clean verdict means no free pass),
+//   2. its reviewed diff touches a sensitive path (auth/security/payments/
+//      migrations by default, per-project via config.understanding_checks),
+//   3. its kind is outside the project's auto_merge.kinds allow-list, or
+//   4. the director flagged the task (POST .../understanding-quiz/require).
+export function understandingChecksRequired(db: DB, task: { id: string; kind: string; project_id: string }): boolean {
+  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+  const config = JSON.parse(project?.config ?? "{}");
+  if (!(Array.isArray(config.auto_merge?.kinds) && config.auto_merge.kinds.includes(task.kind))) return true;
+  const flagged = db
+    .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1")
+    .get(task.id);
+  if (flagged) return true;
+  const review = latestAutoReviewVerdict(db, task.id);
+  if (!review) return true;
+  // A caution whose every risk was refuted and every question answered from the
+  // code is not judgment-class either (HIVE-407) — the same rule the reconciler
+  // uses to auto-merge it. Anything still confirmed or human-only needs the
+  // director, so it keeps its quiz.
+  if (review.verdict !== "looks_good" && !cautionCleared(db, task.id, review.reviewed_head_sha, review)) return true;
+  const tokens = Array.isArray(config.understanding_checks?.sensitive_paths)
+    ? config.understanding_checks.sensitive_paths.map(String)
+    : DEFAULT_SENSITIVE_PATHS;
+  return touchesSensitivePath(review.files, tokens);
+}
 
 function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; checks: UnderstandingCheck[] } | null {
   const row: any = db
@@ -3766,6 +4053,32 @@ export function repairDuplicateQuizPasses(db: DB): number {
   return repaired;
 }
 
+// Quizzes on tasks that already shipped: the post-ship catch-up backlog. The
+// web UI shows these as ONE digest, so the count here is what that digest says,
+// not a number of separate attention items. Quizzes on tasks still in review
+// are excluded — those gate their own review card.
+const POST_SHIP_QUIZ_STATES = ["verifying", "done", "failed"];
+export function pendingPostShipQuizCount(db: DB): number {
+  const placeholders = POST_SHIP_QUIZ_STATES.map(() => "?").join(",");
+  const rows = db
+    .query(
+      `SELECT e.id, e.task_id, e.payload FROM events e JOIN tasks t ON t.id = e.task_id
+        WHERE e.type = 'review_summary'
+          AND t.state IN (${placeholders})
+          AND NOT EXISTS (
+            SELECT 1 FROM events newer
+             WHERE newer.task_id = e.task_id AND newer.type = 'review_summary'
+               AND (newer.ts > e.ts OR (newer.ts = e.ts AND newer.rowid > e.rowid)))`
+    )
+    .all(...POST_SHIP_QUIZ_STATES) as { id: string; task_id: string; payload: string }[];
+  return rows.filter((row) => {
+    let payload: any;
+    try { payload = JSON.parse(row.payload); } catch { return false; }
+    if (!normalizeUnderstandingChecks(payload?.understanding).length) return false;
+    return understandingQuizStatus(db, row.task_id, row.id) !== "passed";
+  }).length;
+}
+
 function listUnderstandingQuizzes(db: DB, url: URL): Response {
   const projectId = url.searchParams.get("project_id");
   const statePlaceholders = UNDERSTANDING_QUIZ_ANSWERABLE_STATES.map(() => "?").join(",");
@@ -3788,6 +4101,9 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
     try { payload = JSON.parse(row.payload); } catch { return []; }
     const checks = normalizeUnderstandingChecks(payload?.understanding);
     if (!checks.length) return [];
+    // A mechanical change gets no backlog entry even when its agent submitted
+    // checks anyway (hive-1559).
+    if (!understandingChecksRequired(db, { id: row.task_id, kind: row.kind, project_id: row.project_id })) return [];
     const understanding = payload?.understanding && typeof payload.understanding === "object" && !Array.isArray(payload.understanding)
       ? Object.fromEntries(Object.entries(payload.understanding).filter(([key]) => key !== "check" && key !== "checks"))
       : {};
@@ -3903,6 +4219,18 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   return json({ ok: true, correct: true, passed: true, explanation: check.explanation ?? null, completed: next.completed, total: quiz.checks.length });
 }
 
+// The director's own "quiz me on this one" flag (hive-1559): it makes an
+// otherwise mechanical task judgment-class, so its checks are required again.
+function requireUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
+  const task = getTask(db, taskId);
+  if (!task) return err("task not found", 404);
+  if (body?.source !== "director") return err("only the director can require understanding checks", 403);
+  const already = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1").get(taskId);
+  if (!already)
+    writeEvent(db, { task_id: taskId, source: "director", type: "understanding_required", payload: { actor: actorOf(body) } });
+  return json({ ok: true, understanding_required: true });
+}
+
 function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   const task = getTask(db, taskId);
   if (!task) return err("task not found", 404);
@@ -3951,17 +4279,41 @@ function openCheckpointRows(db: DB, projectId: string | null, includeTest = fals
 function listOpenCheckpoints(db: DB, url: URL): Response {
   const rows = openCheckpointRows(db, url.searchParams.get("project_id"), url.searchParams.get("test") === "all");
   return json({
-    checkpoints: rows.map((r) => ({
-      id: r.id,
-      task_id: r.task_id,
-      ts: r.ts,
-      task_number: r.number,
-      task_title: r.title,
-      task_state: r.state,
-      project_id: r.project_id,
-      note: checkpointNote(r.payload),
-    })),
+    checkpoints: rows.map((r) => {
+      const plan = checkpointPlan(r.payload);
+      return {
+        id: r.id,
+        task_id: r.task_id,
+        ts: r.ts,
+        task_number: r.number,
+        task_title: r.title,
+        task_state: r.state,
+        project_id: r.project_id,
+        note: checkpointNote(r.payload),
+        // A blocking plan is the whole card: the director approves from the
+        // plan plus the critic's concerns, without opening the task.
+        ...(planCheckpointBlocks(r.payload) ? { blocking: true } : {}),
+        ...(plan ? { plan, concerns: planConcerns(db, r.task_id, r.id) } : {}),
+      };
+    }),
   });
+}
+
+// The critic's concerns for a plan checkpoint, or [] when the critique has not
+// landed yet (it runs in the background).
+function planConcerns(db: DB, taskId: string, checkpointId: string): { severity: string; text: string }[] {
+  const row: any = db
+    .query(
+      `SELECT payload FROM events WHERE task_id = ? AND type = 'plan_critique'
+        AND json_extract(payload, '$.checkpoint_id') = ? ORDER BY rowid DESC LIMIT 1`
+    )
+    .get(taskId, checkpointId);
+  try {
+    const concerns = JSON.parse(row?.payload ?? "{}")?.concerns;
+    return Array.isArray(concerns) ? concerns : [];
+  } catch {
+    return [];
+  }
 }
 
 async function ackCheckpoint(db: DB, herdr: Herdr, taskId: string, eventId: string, body: any): Promise<Response> {
@@ -4009,15 +4361,32 @@ async function ackCheckpoint(db: DB, herdr: Herdr, taskId: string, eventId: stri
   });
   let delivered = false;
   let followup_task_id: string | null = null;
+  // A blocking plan checkpoint (HIVE-413) parked the agent: the ack is what
+  // restarts it, on both verdicts. An approval says nothing else, so it steers
+  // here; a flag falls through to the flag steer below, which already carries
+  // the correction.
+  if (planCheckpointBlocks(ev.payload) && verdict === "ok") {
+    delivered = await internalSteer(db, herdr, taskId, planReleaseSteer("ok", note));
+    return json({ ok: true, delivered, followup_task_id });
+  }
   if (verdict === "flag") {
     const cpText = checkpointNote(ev.payload);
-    const live = task && !["done", "cancelled", "failed"].includes(task.state) && task.agent_target;
+    // A blocking plan (HIVE-413) parked its agent before any edit: a flag must
+    // reach it even with no agent_target right now (internalSteer queues the
+    // steer onto the next spawn). Nothing shipped, so a corrective follow-up
+    // task would be the wrong answer.
+    const live =
+      task &&
+      !["done", "cancelled", "failed"].includes(task.state) &&
+      (task.agent_target || planCheckpointBlocks(ev.payload));
     if (live) {
       delivered = await internalSteer(
         db,
         herdr,
         taskId,
-        `${source === "chat_supervisor" ? "The project supervisor" : "Director"} FLAGGED your checkpoint: "${cpText}"${note ? ` — ${note}` : ""}. Address this now, before continuing.`
+        planCheckpointBlocks(ev.payload)
+          ? planReleaseSteer("flag", note)
+          : `${source === "chat_supervisor" ? "The project supervisor" : "Director"} FLAGGED your checkpoint: "${cpText}"${note ? ` — ${note}` : ""}. Address this now, before continuing.`
       );
     }
     // Late flag (task finished / agent gone): the work already shipped, so the
@@ -4136,20 +4505,18 @@ function writeHookSettings(
   hiveUrl: string,
   commandApproval: "escalate" | "allow" | "prompt" = "escalate"
 ): void {
-  const hook = join(HOOKS_DIR, "hive-hook.sh");
-  const approve = join(HOOKS_DIR, "hive-approve.sh");
   const settings = {
     permissions: { allow: SAFE_TOOL_ALLOWLIST, deny: DENIED_MCP_SERVERS },
     hooks: {
       // Gate Bash before it runs: safe commands auto-approve, risky ones escalate
       // to the authority engine so an autonomous worker never hangs on a dialog.
       PreToolUse: [
-        { matcher: "Bash", hooks: [{ type: "command", command: `${approve} ${commandApproval}` }] },
+        { matcher: "Bash", hooks: [{ type: "command", command: hookScriptCommand("classify.ts", [commandApproval]) }] },
       ],
-      Stop: [{ hooks: [{ type: "command", command: `${hook} Stop` }] }],
-      SubagentStop: [{ hooks: [{ type: "command", command: `${hook} SubagentStop` }] }],
+      Stop: [{ hooks: [{ type: "command", command: hookScriptCommand("hive-hook.ts", ["Stop"]) }] }],
+      SubagentStop: [{ hooks: [{ type: "command", command: hookScriptCommand("hive-hook.ts", ["SubagentStop"]) }] }],
       PostToolUse: [
-        { matcher: "Bash|Write|Edit", hooks: [{ type: "command", command: `${hook} PostToolUse` }] },
+        { matcher: "Bash|Write|Edit", hooks: [{ type: "command", command: hookScriptCommand("hive-hook.ts", ["PostToolUse"]) }] },
       ],
     },
   };
@@ -4158,7 +4525,7 @@ function writeHookSettings(
   writeFileSync(join(dir, "settings.local.json"), JSON.stringify(settings, null, 2));
 }
 
-// "View agent" affordance: focus the task's herdr tab so David can watch/attach.
+// "View agent" affordance: focus the task's herdr tab so the director can watch/attach.
 async function focusAgent(db: DB, herdr: Herdr, id: string): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
@@ -4688,7 +5055,7 @@ function listLearnings(db: DB, url: URL): Response {
 
 // A learning that silently defaulted to kind='failure' when the caller forgot
 // --kind used to pollute the "Known failure patterns" brief section forever
-// (task #904/corebeat #901: a routine watcher-summary auto-spawned a bogus
+// (task #904: a routine watcher-summary auto-spawned a bogus
 // root-cause chore). kind is now required, not inferred.
 const CREATABLE_KINDS = new Set(["failure", "reference"]);
 
@@ -5062,7 +5429,15 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     ).run(ev.id, ev.task_id, ev.ts, ev.kind, ev.path, ev.url, ev.caption, ev.meta);
     const evidence = parseEvidence(ev);
     broadcast({ type: "evidence", evidence });
-    const event = writeEvent(db, { task_id: taskId, source, type: "evidence", payload: { evidence_id: ev.id, kind, caption: ev.caption } });
+    // `--verify-name <name>` ties this artifact back to one entry of the task's
+    // verification contract. Recorded on the event; nothing is gated on it yet.
+    const verifyName = String(fields.verify_name ?? "").trim() || null;
+    const event = writeEvent(db, {
+      task_id: taskId,
+      source,
+      type: "evidence",
+      payload: { evidence_id: ev.id, kind, caption: ev.caption, ...(verifyName ? { verify_name: verifyName } : {}) },
+    });
     return json({ evidence, event }, 201);
   }
 
@@ -5466,11 +5841,15 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
   if (type === "checkpoint") {
     const plan = parsePlan(fields);
     if (plan) {
+      // Blocking mode (HIVE-413): the marker rides on the payload, so an ack
+      // knows to release the agent even if the project config changes later.
+      const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+      const blocking = planGateBlocks(JSON.parse(project?.config ?? "{}"), task.kind);
       const event = writeEvent(db, {
         task_id: taskId,
         source,
         type,
-        payload: { note: note ?? plan.goal, ...plan },
+        payload: { note: note ?? plan.goal, ...plan, ...(blocking ? { blocking: true } : {}) },
       });
       const herdr = deps.herdr ?? defaultHerdr;
       critiquePlan(db, task, event.id, plan, {

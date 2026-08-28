@@ -42,7 +42,7 @@ const COMMITMENT: RegExp[] = [
 //
 // (a) the next step belongs to someone else,
 const NOT_OURS: RegExp[] = [
-  /\b(?:you|the director|david|the reviewer|the user|ci)\s+(?:will|should|can|may|needs? to|must)\b/i,
+  /\b(?:you|the director|the reviewer|the user|ci)\s+(?:will|should|can|may|needs? to|must)\b/i,
   /\bfor (?:you|the director|review)\b/i,
   /\b(?:over|up|back) to you\b/i,
   /\bif you\b/i, // "I'll be here if you need anything" — addressed at the human
@@ -52,7 +52,7 @@ const WAITING: RegExp[] = [
   /\b(?:waiting|wait)\s+(?:on|for)\b/i,
   /\bawaiting\b/i,
   /\bblocked\s+(?:on|by)\b/i,
-  /\bonce (?:you|the director|david|approved|it(?:'|’)?s approved|the decision)\b/i,
+  /\bonce (?:you|the director|approved|it(?:'|’)?s approved|the decision)\b/i,
   /\bneeds? (?:your|a|the director(?:'|’)?s) (?:decision|approval|answer|input|review)\b/i,
   /\b(?:let me know|should i\b|shall i\b|want me to\b|do you want)\b/i,
 ];

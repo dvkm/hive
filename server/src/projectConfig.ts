@@ -22,7 +22,9 @@ import { isSafeRef } from "./exec.ts";
 
 // Lives here, not in api.ts: this schema needs it, and api.ts already imports
 // this file, so importing back would be a cycle. api.ts re-exports the name.
-export const AGENTS = ["claude", "codex"] as const;
+// "teamclaude" is Claude Code routed through the local TeamClaude proxy
+// (multi-account API balancing); it runs the same claude binary + hooks.
+export const AGENTS = ["claude", "codex", "teamclaude"] as const;
 export type Agent = (typeof AGENTS)[number];
 export const AUTONOMY_PROFILES = ["conservative", "balanced", "autopilot"] as const;
 
@@ -88,9 +90,9 @@ const urlList: Check = (v) => {
 };
 
 // Mirrors what intake/jira.ts's jiraConfigStatus() needs to build a usable
-// config. The credential target itself is pinned there against compiled-in
-// constants (credentialTargetAllowed); this only keeps a malformed value from
-// reaching it at all.
+// config. The credential target's own shape (https site, real email, uppercase
+// project key) is enforced there (credentialTargetValid / canonicalSite); this
+// only keeps a wrong-typed value from reaching it at all.
 const jira: Check = (v) => {
   const bad = obj(v);
   if (bad) return bad;
@@ -124,11 +126,60 @@ const gchatSpaces: Check = (v) => {
   return null;
 };
 
+// Production releases (server/src/deployments.ts). Presence of this key is what
+// opts a project into the Deployments tab, so every field is optional. The two
+// name-shaped fields become git/gh arguments and posthog_host becomes a fetch
+// destination, so those are pinned here; deployments.ts still falls back to a
+// default rather than trusting a name that reaches it another way.
+const deployments: Check = (v) => {
+  const bad = obj(v);
+  if (bad) return bad;
+  const d = v as Record<string, unknown>;
+  for (const key of ["deploy_workflow", "rollback_workflow", "tag_prefix"])
+    // Leading character pinned to alphanumeric: "--version" is otherwise a
+    // valid "name" that `gh workflow run` would read as a flag.
+    if (d[key] !== undefined && !(typeof d[key] === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(d[key] as string)))
+      return `.${key} must be a plain name starting with a letter or digit`;
+  if (d.workflow_ref !== undefined && !isSafeRef(d.workflow_ref)) return ".workflow_ref must be a git branch name";
+  for (const key of ["health_url", "posthog_host"]) {
+    if (d[key] === undefined) continue;
+    const invalid = httpUrl(d[key]);
+    if (invalid) return `.${key} ${invalid}`;
+  }
+  for (const key of ["health_substring", "posthog_project"])
+    if (d[key] !== undefined && typeof d[key] !== "string") return `.${key} must be a string`;
+  if (d.flags !== undefined) {
+    const invalid = strArray(d.flags);
+    if (invalid) return `.flags ${invalid}`;
+  }
+  if (d.history !== undefined) {
+    const invalid = positiveInt(d.history);
+    if (invalid) return `.history ${invalid}`;
+  }
+  return null;
+};
+
 const promote: Check = (v) => {
   const bad = obj(v);
   if (bad) return bad;
   const p = v as Record<string, unknown>;
   for (const key of ["from", "to"]) if (!isSafeRef(p[key])) return `.${key} must be a git branch name`;
+  return null;
+};
+
+// {sensitive_paths: ["auth", "payments", ...]} — path tokens whose changes stay
+// judgment-class no matter how clean the auto-review was. Each token matches as
+// a case-insensitive substring of any path segment, so "auth" also catches
+// `authTokens.ts`.
+const understandingChecks: Check = (v) => {
+  const bad = obj(v);
+  if (bad) return bad;
+  const u = v as Record<string, unknown>;
+  for (const key of Object.keys(u)) if (key !== "sensitive_paths") return `.${key} is not supported`;
+  if (u.sensitive_paths !== undefined) {
+    const invalid = strArray(u.sensitive_paths);
+    if (invalid) return `.sensitive_paths ${invalid}`;
+  }
   return null;
 };
 
@@ -157,18 +208,22 @@ const prGardener: Check = (v) => {
   return null;
 };
 
-// Which task kinds must post a plan checkpoint before their first edit, and
-// (later) whether a vetoed plan blocks. See server/src/planCritic.ts.
+// Which task kinds must post a plan checkpoint before their first edit, whether
+// that checkpoint blocks the agent until it is acked, and how long a blocked
+// plan may wait before hive acks it. See server/src/planCritic.ts.
 const plan_gate: Check = (v) => {
   const bad = obj(v);
   if (bad) return bad;
   const g = v as Record<string, unknown>;
-  for (const key of Object.keys(g)) if (key !== "kinds" && key !== "block") return `.${key} is not supported`;
+  for (const key of Object.keys(g))
+    if (key !== "kinds" && key !== "block" && key !== "auto_ack_hours") return `.${key} is not supported`;
   if (g.kinds !== undefined) {
     const invalid = strArray(g.kinds);
     if (invalid) return `.kinds ${invalid}`;
   }
   if (g.block !== undefined && typeof g.block !== "boolean") return ".block must be a boolean";
+  if (g.auto_ack_hours !== undefined && !(typeof g.auto_ack_hours === "number" && Number.isFinite(g.auto_ack_hours) && g.auto_ack_hours > 0))
+    return ".auto_ack_hours must be a positive number of hours";
   return null;
 };
 
@@ -206,6 +261,7 @@ const CHECKS: Record<string, Check> = {
   playbook: str,
   command_approval: oneOf("escalate", "allow", "prompt"),
   dialog_auto_approve: strArray,
+  auto_answer_dialogs: bool,
   // git / merge
   default_branch: str,
   merge_method: str,
@@ -213,6 +269,9 @@ const CHECKS: Record<string, Check> = {
   auto_merge: obj,
   pr_gardener: prGardener,
   auto_review: bool,
+  render_proof: bool,
+  // Which changes still need a director understanding check (hive-1559).
+  understanding_checks: understandingChecks,
   release_review_agents: bool,
   scope_drift: bool,
   scope_drift_commits: num,
@@ -221,6 +280,7 @@ const CHECKS: Record<string, Check> = {
   monitors: urlList,
   monitors_auto_task: bool,
   smoke: urlList,
+  deployments,
   jira,
   gchat_spaces: gchatSpaces,
   // budgets / bookkeeping

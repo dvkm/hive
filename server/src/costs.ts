@@ -13,7 +13,7 @@ import { getTask, writeEvent } from "./state.ts";
 import { queueSteerEvent } from "./steer.ts";
 import { createDecision } from "./api.ts";
 
-// OFF by default (David, 2026-07-12): historical usage rows are inflated by the
+// OFF by default (director's call, 2026-07-12): historical usage rows are inflated by the
 // per-Stop cumulative double-count (fixed at ingestion the same day), so
 // spend-sums can't be trusted until the old rows are rebuilt. Enable per
 // project via config.cost_warn_usd / config.cost_cap_usd once numbers verify.

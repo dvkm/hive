@@ -13,7 +13,7 @@ test("decision text turns its PR and task references into hover actions", () => 
           bundle={{
             task_number: 1095,
             task_display_id: "HIVE-247",
-            pr_url: "https://github.com/dvkm/hive/pull/125",
+            pr_url: "https://github.com/example-org/example-repo/pull/125",
             branch: "hive/task-1095",
             spend_usd: 0,
             prior_decisions: [],

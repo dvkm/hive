@@ -192,7 +192,7 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       )`,
     ],
   },
-  // standing-authority policy engine. David grants scoped authority once; the
+  // standing-authority policy engine. The director grants scoped authority once; the
   // server enforces it before risky actions dispatch. authority_rules match an
   // action to an effect (allow | require_decision | deny); most-specific active
   // rule wins (project over global, longer pattern over shorter).
@@ -391,7 +391,7 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
   },
   // Who answered a decision. Before this, every answer was logged as the
   // director — a chat-supervisor or any API caller was indistinguishable from
-  // David in the audit trail. answered_by is the caller identity
+  // the director in the audit trail. answered_by is the caller identity
   // (director|chat_supervisor|agent|system|unknown), answered_actor an optional
   // free label (e.g. the supervisor session id). Audit only, no auto-approve.
   {
@@ -605,6 +605,23 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       `CREATE INDEX idx_pr_gardener_action_task ON pr_gardener_items(action_task_id)`,
     ],
   },
+  // Per-task verification contract: a JSON array of {name, cmd} the agent must
+  // run before handing off, each piece of evidence tagged with the name it
+  // came from (`hive emit ... --verify-name <name>`). Data only for now —
+  // nothing is gated on it yet.
+  {
+    name: "v34-task-verification-cmds",
+    statements: [`ALTER TABLE tasks ADD COLUMN verification_cmds TEXT`],
+  },
+  // Four-level ordinal priority: now > next > normal > later. ORDERING ONLY —
+  // it decides which queued task is picked up first and which approved PR lands
+  // first. It never preempts: a running agent is never killed to make room.
+  // Validated in the app (api.ts), not by a CHECK constraint, so the vocabulary
+  // can grow without a table rebuild.
+  {
+    name: "v35-task-priority",
+    statements: [`ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'`],
+  },
 ];
 
 // -------------------------------------------------------------- settings
@@ -634,10 +651,18 @@ export function openDb(path: string = defaultDbPath()): DB {
     mkdirSync(dirname(path), { recursive: true });
   }
   const db = new Database(path, { create: true });
-  db.exec("PRAGMA journal_mode = WAL;");
-  db.exec("PRAGMA foreign_keys = ON;");
-  migrate(db);
-  return db;
+  try {
+    db.exec("PRAGMA journal_mode = WAL;");
+    db.exec("PRAGMA foreign_keys = ON;");
+    migrate(db);
+    return db;
+  } catch (error) {
+    // Windows refuses to reopen/delete a SQLite file while a failed migration's
+    // handle is still live. Close before rethrowing so recovery and tests can
+    // inspect the unchanged database immediately.
+    db.close();
+    throw error;
+  }
 }
 
 export const CREATES = /^\s*CREATE\s+(?:UNIQUE\s+)?(TABLE|INDEX|TRIGGER|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)/i;

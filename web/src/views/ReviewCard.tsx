@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import type { BranchCheck, DiffFile, DiffResult, Evidence, ReviewItem, ReviewSummary, Task, UnderstandingPacket } from "../lib/api";
 import { useStore } from "../lib/store";
-import { CiBadge, toast } from "../lib/ui";
+import { CiBadge, SidecarChip, toast } from "../lib/ui";
 import { MAX_DIFF_LINES } from "../lib/api";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
@@ -104,6 +104,60 @@ import type { Decision, Event } from "../lib/api";
 // The request-changes exchange: the director's notes and the agent's replies,
 // in order. Without this, "Request changes" fired into the void — the agent's
 // response only existed in the buried timeline.
+// The pre-review's risks and questions, after the per-risk check re-read the
+// real code for this head (HIVE-406/407). Confirmed risks are red, refuted ones
+// green, and a question only the human can answer stays amber — so the director
+// reads a short verdict list instead of a wall of maybes. Verdicts recorded for
+// an older head are ignored: they say nothing about what is about to merge.
+export function RiskVerdicts({ events, headSha }: { events: Event[]; headSha: string | null }) {
+  const review = [...events].reverse().find((e) => e.type === "auto_review" && !e.payload.skipped);
+  const verdictEvent = headSha
+    ? [...events].reverse().find((e) => e.type === "risk_verdicts" && e.payload.reviewed_head_sha === headSha)
+    : undefined;
+  if (!review || !verdictEvent) return null;
+  const risks = (verdictEvent.payload.verdicts ?? []) as { risk: string; verdict: string; why?: string; evidence_path?: string }[];
+  const questions = (verdictEvent.payload.question_verdicts ?? []) as { question: string; answerable: string; answer?: string }[];
+  const unverified = Number(verdictEvent.payload.unverified) || 0;
+  if (!risks.length && !questions.length && !unverified) return null;
+  // "Still open" is what the director must act on: a risk the check confirmed,
+  // a question only they can answer, or an item the check could not reach.
+  const noted = risks.length + questions.length;
+  const open =
+    risks.filter((r) => r.verdict === "confirmed").length + questions.filter((q) => q.answerable === "human").length + unverified;
+  return (
+    <div className="risk-verdicts">
+      <span className="risk-verdicts-label">
+        Pre-review {review.payload.verdict === "caution" ? "flagged" : "noted"} {noted} thing{noted === 1 ? "" : "s"} — {open || "none"}{" "}
+        still open
+      </span>
+      <ul>
+        {risks.map((r, i) => (
+          <li key={`r${i}`} className={r.verdict === "confirmed" ? "rv-confirmed" : "rv-refuted"}>
+            <span className="rv-chip">{r.verdict === "confirmed" ? "confirmed" : "refuted"}</span>
+            <span className="rv-text" title={[r.why, r.evidence_path].filter(Boolean).join(" · ")}>
+              {r.risk}
+            </span>
+          </li>
+        ))}
+        {questions.map((q, i) => (
+          <li key={`q${i}`} className={q.answerable === "human" ? "rv-human" : "rv-refuted"}>
+            <span className="rv-chip">{q.answerable === "human" ? "you answer" : "answered"}</span>
+            <span className="rv-text" title={q.answer ?? ""}>
+              {q.question}
+            </span>
+          </li>
+        ))}
+        {unverified > 0 && (
+          <li className="rv-human">
+            <span className="rv-chip">unchecked</span>
+            <span className="rv-text">{unverified} could not be checked</span>
+          </li>
+        )}
+      </ul>
+    </div>
+  );
+}
+
 function ChangesThread({ events }: { events: Event[] }) {
   const firstReq = events.findIndex((e) => e.type === "changes_requested");
   if (firstReq === -1) return null;
@@ -367,6 +421,32 @@ function DiffFileView({ f, wrap }: { f: DiffFile; wrap: boolean }) {
 
 type ActionMode = null | "changes" | "reject";
 
+// Approved-to-land, then understood. The mark was made BEFORE the director knew
+// what the change does, so the queue stops and asks rather than merging on the
+// next sweep (HIVE-421). "Land now" re-marks it, which puts the approval after
+// the quiz again; "Unmark" takes it out of the queue. Either tap sets landActed,
+// so the hold clears on the tap itself, because the task prop and the events
+// still carry the pre-tap state until the refetch lands.
+export function isLandHeld(o: {
+  landActed: boolean;
+  landQueuedAt?: string | null;
+  quizStatus: string;
+  passedThisSession: boolean;
+  events: Event[];
+  reviewEventId: string | null;
+}): boolean {
+  if (o.landActed || !o.landQueuedAt || o.quizStatus !== "passed") return false;
+  if (o.passedThisSession) return true;
+  const lastIndexOf = (match: (e: Event) => boolean) => {
+    for (let i = o.events.length - 1; i >= 0; i--) if (match(o.events[i])) return i;
+    return -1;
+  };
+  return (
+    lastIndexOf((e) => e.type === "understanding_quiz_passed" && e.payload.review_event_id === o.reviewEventId) >
+    lastIndexOf((e) => e.type === "land_queued")
+  );
+}
+
 // The one review surface, shared by the task page, the /review queue, and the
 // Needs you view. Renders: title/project/summary, PR+CI status, a compact diff
 // stat with an expandable inline diff, and the three primary actions
@@ -388,6 +468,9 @@ export function ReviewCard({
   const [expanded, setExpanded] = useState(false);
   const [wrap, setWrap] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Tapping Land now / Unmark settles the question; the task prop still carries
+  // the old land_queued_at until the parent refetches, so hide the prompt here.
+  const [landActed, setLandActed] = useState(false);
   const [mode, setMode] = useState<ActionMode>(null);
   const [notes, setNotes] = useState("");
   const [review, setReview] = useState<ReviewSummary | null>(null);
@@ -484,8 +567,13 @@ export function ReviewCard({
       ? "deferred"
       : "required";
   const quizStatus = quizOverride ?? recordedQuizStatus;
+  // Mechanical changes are not judgment-class (hive-1559): no quiz is minted,
+  // and its absence blocks nothing. Undefined (older server) keeps the old gate.
+  const quizRequired = branchCheck?.understanding_required !== false;
   const missingQuiz = reviewLoaded && (!quiz || !reviewEventId);
-  const quizBlocked = !reviewLoaded
+  const quizBlocked = !quizRequired
+    ? ""
+    : !reviewLoaded
     ? "Loading the understanding check"
     : missingQuiz
       ? task.never_dispatched
@@ -533,6 +621,14 @@ export function ReviewCard({
           ? "No PR and no branch — nothing to merge"
           : "";
   const mergeBlocked = quizBlocked || depBlocked || deliveryBlocked;
+  const landHeld = isLandHeld({
+    landActed,
+    landQueuedAt: task.land_queued_at,
+    quizStatus,
+    passedThisSession: quizOverride === "passed",
+    events,
+    reviewEventId,
+  });
   const embeddedTasks = branchCheck?.embedded_tasks ?? [];
   const failures = [...events]
     .reverse()
@@ -547,7 +643,7 @@ export function ReviewCard({
         : "Approve and merge";
   const recommendationReason = openDecisions.length
     ? `${openDecisions.length} decision${openDecisions.length === 1 ? "" : "s"} still need your judgment.`
-    : missingQuiz
+    : quizRequired && missingQuiz
       ? "This older review has no understanding check."
       : mergeBlocked ||
       (reportOnly
@@ -566,7 +662,18 @@ export function ReviewCard({
   const finish = () => {
     if (surface !== "focus") onDone?.();
   };
-  const merge = async (strategy?: "local_ff") => {
+  // Flagging the card makes it judgment-class, so its checks are required again.
+  const requireQuiz = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await api.requireUnderstandingQuiz(task.id);
+      setBranchCheck((prev) => (prev ? { ...prev, understanding_required: true } : prev));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const merge = async (strategy?: "local_ff", overrideConfirmedRisks?: boolean) => {
     if (busy) return;
     start();
     try {
@@ -574,7 +681,7 @@ export function ReviewCard({
         await api.transition(task.id, "verifying");
         toast("Report accepted");
       } else {
-        await api.merge(task.id, strategy);
+        await api.merge(task.id, strategy, overrideConfirmedRisks);
         toast(strategy ? "Merged locally → Verifying" : "Merged → Verifying");
       }
       finish();
@@ -622,6 +729,21 @@ export function ReviewCard({
       setBusy(false);
     }
   };
+  const setLandMark = async (queued: boolean) => {
+    if (busy) return;
+    setBusy(true);
+    setLandActed(true);
+    try {
+      await api.landQueue([task.id], queued);
+      toast(queued ? "Landing — the queue will merge it" : "Taken out of the land queue");
+      const t = await api.task(task.id).catch(() => null);
+      if (t) setEvents(t.events ?? []);
+    } catch (e) {
+      toast((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
   const reject = async () => {
     if (!notes.trim() || busy) return;
     start();
@@ -657,6 +779,7 @@ export function ReviewCard({
           ) : (
             <span className="muted mono-sm">branch {task.branch || "?"}</span>
           )}
+          <SidecarChip sidecar={task.sidecar} />
           <CiBadge status={task.ci_status} />
         </div>
       </div>
@@ -706,6 +829,7 @@ export function ReviewCard({
             {caveats.length > 1 && <small>+{caveats.length - 1} more</small>}
           </div>
         )}
+        <RiskVerdicts events={events} headSha={task.head_sha} />
       </div>
 
       <EvidenceStrip evidence={evidence.filter((e) => e.kind !== "explanation")} task={task} />
@@ -775,7 +899,7 @@ export function ReviewCard({
         </div>
       </details>
 
-      {quiz && reviewEventId && quizStatus === "required" && (
+      {quizRequired && quiz && reviewEventId && quizStatus === "required" && (
         <UnderstandingQuiz
           quiz={{
             task_id: task.id,
@@ -789,8 +913,21 @@ export function ReviewCard({
           onDeferred={() => setQuizOverride("deferred")}
         />
       )}
-      {quizStatus === "passed" && <div className="understanding-quiz-status passed">Understanding confirmed. Approval unlocked.</div>}
+      {quizRequired && quizStatus === "passed" && <div className="understanding-quiz-status passed">Understanding confirmed. Approval unlocked.</div>}
+      {landHeld && (
+        <div className="review-blocked review-blocked-action">
+          You marked this approved to land before you took the check. It will not merge until you say so.
+          <button className="btn btn-mini" disabled={busy} onClick={() => setLandMark(true)}>Land now</button>
+          <button className="btn btn-mini" disabled={busy} onClick={() => setLandMark(false)}>Unmark</button>
+        </div>
+      )}
       {quizStatus === "deferred" && <div className="understanding-quiz-status deferred">Quiz saved in Needs You. You can continue now.</div>}
+      {!quizRequired && (
+        <div className="understanding-quiz-status deferred">
+          Mechanical change: no understanding check needed.{" "}
+          <button className="btn btn-mini" onClick={requireQuiz} disabled={busy}>Quiz me on this one</button>
+        </div>
+      )}
 
       <div className="review-actions">
         <button className="btn btn-primary" onClick={() => merge()} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
@@ -817,6 +954,17 @@ export function ReviewCard({
       {mergeErr && (
         <div className="review-merge-error">
           Merge failed: {mergeErr}
+          {mergeErr.includes("override_confirmed_risks") && (
+            <button
+              className="btn"
+              style={{ marginLeft: "var(--s2)" }}
+              disabled={busy || !!mergeBlocked}
+              title="Merge anyway. The risks above stay on the card as the record of what you accepted."
+              onClick={() => merge(undefined, true)}
+            >
+              Merge anyway
+            </button>
+          )}
           {task.pr_url && !mergeErr.includes("CLOSED (not merged)") && (
             <button
               className="btn"

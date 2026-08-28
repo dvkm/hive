@@ -10,32 +10,32 @@ const task = (id: string, state: Task["state"], extra: Partial<Task> = {}) => ({
 
 test("tracked Jira cards show logical subtasks with retry chains collapsed", () => {
   const tracked = task("jira", "in_review", {
-    project_id: "corebeat",
+    project_id: "acme",
     title: "[WEB-7] Newsletter",
     source: "external",
     source_ref: "jira:WEB-7",
   });
   const shipped = task("shipped", "done", {
-    project_id: "corebeat",
+    project_id: "acme",
     title: "[WEB-7] Analytics",
     parent_task_id: "manager",
     updated_at: "2026-08-20T00:00:00Z",
   });
   const failed = task("failed", "failed", {
-    project_id: "corebeat",
+    project_id: "acme",
     title: "[WEB-7] Autosave",
     parent_task_id: "manager",
     updated_at: "2026-08-19T00:00:00Z",
   });
   const retry = task("retry", "in_progress", {
-    project_id: "corebeat",
+    project_id: "acme",
     title: failed.title,
     source: "requeue",
     parent_task_id: failed.id,
     updated_at: "2026-08-21T00:00:00Z",
   });
   const otherIssue = task("other", "done", {
-    project_id: "corebeat",
+    project_id: "acme",
     title: "[WEB-6] Intro",
     updated_at: "2026-08-21T00:00:00Z",
   });
@@ -49,7 +49,7 @@ test("tracked Jira cards show logical subtasks with retry chains collapsed", () 
 test("needs-you queue includes every actionable item", () => {
   const decision = { id: "decision-1" } as Decision;
   const checkpoint = { id: "checkpoint-1" } as Checkpoint;
-  const quiz = { id: "quiz-1", task_id: "quiz-task", task_state: "in_review" } as UnderstandingQuiz;
+  const quiz = { id: "quiz-1", task_id: "quiz-task", project_id: "p1", task_state: "in_review" } as UnderstandingQuiz;
   const activeQuiz = { id: "quiz-active", task_id: "review-1", task_state: "done" } as UnderstandingQuiz;
   const cancelledQuiz = { id: "quiz-cancelled", task_id: "cancelled-1", task_state: "in_review" } as UnderstandingQuiz;
   const items = getNeedsYouItems(
@@ -68,8 +68,8 @@ test("needs-you queue includes every actionable item", () => {
     [quiz, activeQuiz, cancelledQuiz]
   );
 
-  expect(items.map((item) => item.kind)).toEqual(["decision", "checkpoint", "quiz", "review", "attention", "attention"]);
-  expect(items.map((item) => item.id)).toEqual(["decision-1", "checkpoint-1", "quiz-1", "review-1", "failed-1", "stuck-1"]);
+  expect(items.map((item) => item.kind)).toEqual(["decision", "checkpoint", "quiz_digest", "review", "attention", "attention"]);
+  expect(items.map((item) => item.id)).toEqual(["decision-1", "checkpoint-1", "quiz-digest:p1", "review-1", "failed-1", "stuck-1"]);
 });
 
 test("a stuck/dead task blocked on an unmerged dependency is 'waiting', not 'attention', and contributes no attention item", () => {
@@ -247,13 +247,13 @@ test("the Jira panel keeps the safe browse action when sync is unconfigured", ()
     jira: {
       linked: true,
       issue_key: "WEB-1",
-      browse_url: "https://corebeat.atlassian.net/browse/WEB-1",
+      browse_url: "https://example.atlassian.net/browse/WEB-1",
       configured: false,
     },
     onSynced: () => {},
   }));
 
-  expect(html).toContain('href="https://corebeat.atlassian.net/browse/WEB-1"');
+  expect(html).toContain('href="https://example.atlassian.net/browse/WEB-1"');
   expect(html).toContain("unconfigured");
 });
 
@@ -306,7 +306,7 @@ test("itemProject resolves the project for every needs-you item kind", () => {
 
   const items = getNeedsYouItems([decision], tasks, [checkpoint], [quiz]);
   const projects = Object.fromEntries(items.map((item) => [item.kind, itemProject(item, tasks)]));
-  expect(projects).toEqual({ decision: "p2", checkpoint: "p3", quiz: "p4", review: "p1" });
+  expect(projects).toEqual({ decision: "p2", checkpoint: "p3", quiz_digest: "p4", review: "p1" });
 
   // "All" (empty filter) keeps everything; a project filter keeps only its own.
   expect(items.filter((item) => inProjectFilter(itemProject(item, tasks), "")).length).toBe(4);

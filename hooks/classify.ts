@@ -27,6 +27,8 @@ export interface Classification {
 // so chaining (`ok; rm -rf /`) or piping into a shell can't hide them.
 const DANGEROUS: [RegExp, string][] = [
   [/(^|[\s;&|("'])rm\s+(-[a-z]*\s+)*-[a-z]*[rf]/i, "recursive/forced rm"],
+  [/\bRemove-Item\b[^\n]*(?:-Recurse\b|-Force\b)/i, "PowerShell recursive/forced delete"],
+  [/(^|[\s;&|])(del|erase|rd|rmdir)\b[^\n]*(?:\/s\b|\/q\b)/i, "Windows recursive/forced delete"],
   [/(^|[\s;&|(])(sudo|doas)\b/i, "privilege escalation"],
   [/(curl|wget|fetch)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh|python|perl|ruby|node)\b/i, "pipe-to-shell from network"],
   [/git\s+push\b[^\n]*(--force\b|--force-with-lease\b|(^|\s)-f(\s|$))/i, "force push"],
@@ -38,9 +40,11 @@ const DANGEROUS: [RegExp, string][] = [
   [/>\s*\/dev\/(?!null\b|stdout\b|stderr\b|tty\b|zero\b|urandom\b|random\b)/i, "write to device node"],
   [/>\s*\/(etc|usr|bin|sbin|boot|sys|lib|var|opt)\//i, "write to system path"],
   [/\b(shutdown|reboot|halt|poweroff|init\s+0|init\s+6)\b/i, "power/session control"],
+  [/\b(Restart-Computer|Stop-Computer|Format-Volume|Clear-Disk|Initialize-Disk)\b/i, "Windows power/disk control"],
   [/\bchmod\s+(-[a-z]*R[a-z]*\s+)?[0-7]*777\b/i, "world-writable chmod"],
   [/\bchown\s+-[a-z]*R\b/i, "recursive chown"],
   [/\b(kill(all)?|pkill)\b/i, "process kill"],
+  [/\b(Stop-Process|taskkill)\b/i, "Windows process kill"],
   // Restarting the LIVE hive server (launchd dev.hive.server / sync-main.sh's
   // kickstart / a second `hive serve` taking the DB lease) makes every running
   // agent look vanished: the new server re-adopts nobody, the reconciler's
@@ -86,6 +90,7 @@ const DANGEROUS_RAW: [RegExp, string][] = [
 // (split on shell operators) matches one of these anchored at the segment start.
 const SAFE: RegExp[] = [
   /^(ls|pwd|cat|head|tail|wc|stat|file|tree|echo|printf|date|whoami|hostname|uname|id|groups|df|du|ps|uptime|cd|dirname|basename|realpath|readlink|env)\b/,
+  /^(Get-ChildItem|Get-Content|Get-Location|Get-Item|Test-Path|Resolve-Path|Select-String|Get-Command|Get-Process|Get-Date|Write-Output)\b/i,
   /^(which|type|command\s+-v)\b/,
   /^(grep|egrep|fgrep|rg|ag|sort|uniq|cut|nl|diff|comm|jq|column|tr|xxd|md5|md5sum|sha1sum|sha256sum)\b/,
   // `find` alone is read-only; -delete/-exec is caught by DANGEROUS above and
@@ -137,14 +142,36 @@ function segments(command: string): string[] {
 // Destructive ops provably confined to the agent's OWN sandbox (its scratchpad
 // under /tmp, macOS temp dirs, herdr worktrees) are routine cleanup, not
 // incidents — every one used to open a decision card and stall the agent until
-// David answered (4 cards on 2026-07-10 alone, all scratchpad rm / headless-
+// the director answered (4 cards on 2026-07-10 alone, all scratchpad rm / headless-
 // chrome pkill). A waived match downgrades to "unknown", which the authority
 // engine allows-and-logs — never silently, never "safe".
 
+function comparablePath(value: string): string {
+  let path = value.replaceAll("\\", "/").replace(/\/{2,}/g, "/");
+  if (/^[A-Za-z]:\//.test(path)) path = `/${path[0].toLowerCase()}${path.slice(2)}`;
+  // Git Bash reports the same Windows path as /c/Users/...; compare that form
+  // case-insensitively just like the underlying Windows filesystem.
+  if (/^\/[A-Za-z]\//.test(path)) path = path.toLowerCase();
+  return path;
+}
+
+function absoluteCommandPath(value: string): boolean {
+  return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\/]+[\\/]/.test(value);
+}
+
+function withinRoots(value: string, roots: string[]): boolean {
+  const path = comparablePath(value).replace(/\/$/, "") + "/";
+  return roots.some((root) => path.startsWith(root));
+}
+
 function sandboxRoots(env: Record<string, string | undefined>): string[] {
   const roots = ["/tmp/", "/private/tmp/", "/var/folders/"];
-  if (env.HOME) roots.push(`${env.HOME}/.herdr/worktrees/`);
-  return roots;
+  for (const temp of [env.TMPDIR, env.TEMP, env.TMP]) {
+    if (temp) roots.push(`${comparablePath(temp).replace(/\/$/, "")}/`);
+  }
+  const home = env.USERPROFILE || env.HOME;
+  if (home) roots.push(`${comparablePath(home).replace(/\/$/, "")}/.herdr/worktrees/`);
+  return [...new Set(roots)];
 }
 
 // Substitute $VAR / ${VAR} from a map; unknown vars stay verbatim (and later
@@ -181,7 +208,7 @@ function rmTargetsSandboxed(
 ): boolean {
   const map = varMap(cmd, env);
   const roots = sandboxRoots(env);
-  const cwdSandboxed = !!cwd && roots.some((r) => (cwd + "/").startsWith(r));
+  const cwdSandboxed = !!cwd && withinRoots(cwd, roots);
   const rmSegs = segments(cmd).filter((s) => /^rm\b/.test(s));
   if (!rmSegs.length) return false;
   // The whole-string DANGEROUS scan can also fire on an rm hidden in a non-rm
@@ -201,11 +228,11 @@ function rmTargetsSandboxed(
       if (/[$`]/.test(tok)) return false; // unresolved substitution
       if (tok.includes("..")) return false; // path escape
       if (tok.startsWith("~")) return false; // unexpanded home
-      if (!tok.startsWith("/")) {
+      if (!absoluteCommandPath(tok)) {
         if (!cwdSandboxed) return false; // relative: only provable via sandboxed cwd
         continue;
       }
-      if (!roots.some((r) => tok.startsWith(r))) return false;
+      if (!withinRoots(tok, roots)) return false;
     }
   }
   return true;
@@ -223,7 +250,7 @@ function findDeleteTargetsSandboxed(
 ): boolean {
   const map = varMap(cmd, env);
   const roots = sandboxRoots(env);
-  const cwdSandboxed = !!cwd && roots.some((r) => (cwd + "/").startsWith(r));
+  const cwdSandboxed = !!cwd && withinRoots(cwd, roots);
   const findSegs = segments(cmd).filter((s) => /^find\b/.test(s));
   if (!findSegs.length) return false;
   const findish = segments(cmd).filter((s) => /find\b[^\n]*-(delete|exec(dir)?)\b/i.test(s));
@@ -258,11 +285,11 @@ function findDeleteTargetsSandboxed(
       if (/[$`]/.test(tok)) return false; // unresolved substitution
       if (tok.includes("..")) return false; // path escape
       if (tok.startsWith("~")) return false; // unexpanded home
-      if (!tok.startsWith("/")) {
+      if (!absoluteCommandPath(tok)) {
         if (!cwdSandboxed) return false; // relative: only provable via sandboxed cwd
         continue;
       }
-      if (!roots.some((r) => tok.startsWith(r))) return false;
+      if (!withinRoots(tok, roots)) return false;
     }
   }
   return true;
@@ -282,7 +309,7 @@ function killTargetsSandboxed(cmd: string, env: Record<string, string | undefine
   return killSegs.every((seg) => {
     const s = subst(seg.replace(/["']/g, ""), map);
     if (/remote-debugging-port|--headless/.test(s)) return true;
-    if (roots.some((r) => s.includes(r))) return true; // pidfile or pattern in sandbox
+    if (roots.some((r) => comparablePath(s).includes(r))) return true; // pidfile or pattern in sandbox
     // `kill %1 [%2 …]` — the shell's own background jobs, nothing else.
     const body = s.split(/\s+[\d&]*[<>]/)[0];
     const targets = body.split(/\s+/).slice(1).filter((t) => !t.startsWith("-"));
@@ -311,8 +338,8 @@ export function gitResetInSandbox(
   const isDangerGit = (s: string) =>
     /^git\s+(-C\s+\S+\s+)?(reset\s+--hard|clean\s+(-[a-z]*\s+)*-[a-z]*[fd])/.test(s);
   const inSandbox = (dir: string | null | undefined) =>
-    !!dir && dir.startsWith("/") && !dir.includes("..") && !/[$`]/.test(dir) &&
-    roots.some((r) => (dir + "/").startsWith(r));
+    !!dir && absoluteCommandPath(dir) && !dir.includes("..") && !/[$`]/.test(dir) &&
+    withinRoots(dir, roots);
   const gitSegs = segments(cmd).filter(isDangerGit);
   if (!gitSegs.length) return false;
   let eff = cwd ? subst(cwd, map) : null; // effective cwd, tracked across cd
@@ -320,7 +347,7 @@ export function gitResetInSandbox(
     const cd = seg.match(/^cd\s+(\S+)/);
     if (cd) {
       const d = subst(cd[1].replace(/["']/g, ""), map);
-      if (!d.startsWith("/")) return false; // relative cd: unresolvable
+      if (!absoluteCommandPath(d)) return false; // relative cd: unresolvable
       eff = d;
       continue;
     }
@@ -344,7 +371,7 @@ export function dockerDbTargetsSandboxed(
   env: Record<string, string | undefined>,
   cwd?: string
 ): boolean {
-  const m = cwd ? /\/worktrees\/[^/]+\/([A-Za-z0-9._-]+)/.exec(cwd) : null;
+  const m = cwd ? /\/worktrees\/[^/]+\/([A-Za-z0-9._-]+)/.exec(comparablePath(cwd)) : null;
   if (!m) return false;
   const slug = m[1].toLowerCase();
   const map = varMap(cmd, env);
@@ -383,8 +410,8 @@ function sqlTargetsSandboxed(cmd: string, env: Record<string, string | undefined
       .slice(1)
       .map((t) => subst(t.replace(/["']/g, ""), map))
       .find((t) => t && !t.startsWith("-"));
-    return !!file && file.startsWith("/") && !file.includes("..") && !/[$`]/.test(file) &&
-      roots.some((r) => file.startsWith(r));
+    return !!file && absoluteCommandPath(file) && !file.includes("..") && !/[$`]/.test(file) &&
+      withinRoots(file, roots);
   });
 }
 

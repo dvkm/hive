@@ -6,7 +6,27 @@ This repo contains **Phase 1** (server core + CLI) and **Phase 2b** (the runtime
 
 ## Requirements
 
-- [Bun](https://bun.sh) (tested on 1.3.x). No other dependencies.
+- [Bun](https://bun.sh) (tested on 1.3.x and 1.4.x).
+- [Git](https://git-scm.com/) and [Herdr](https://herdr.dev/) — **Herdr is a
+  hard prerequisite for running agents.** Without it installed and running,
+  hive's server and web UI still work and you can browse the board, but no
+  agents will spawn. GitHub CLI (`gh`) is optional but required for
+  pull-request review and merge automation.
+- The [Claude Code](https://claude.com/product/claude-code) or
+  [Codex](https://developer.openai.com/codex/cli/) CLI — these are the agent
+  binaries workers run through Herdr, selected per project by
+  `config.agent`.
+- On Windows, install Git for Windows. Hive automatically supplies its
+  `bash.exe` location to native Claude Code through
+  `CLAUDE_CODE_GIT_BASH_PATH`.
+
+## Install
+
+```bash
+bun install                    # root: server + CLI deps
+(cd web && bun install)        # web app deps
+(cd electron && bun install)   # desktop app deps
+```
 
 ## Run
 
@@ -16,11 +36,55 @@ bun run server/src/index.ts     # start the daemon on 127.0.0.1:4700
 bin/hive serve
 ```
 
+Native Windows PowerShell/cmd:
+
+```powershell
+bun run server/src/index.ts
+bin\hive.cmd serve
+```
+
+### Web app
+
+The server serves `web/dist` statically once built. For development:
+
+```bash
+cd web
+bun run dev      # Vite dev server with hot reload
+bun run build    # production build to web/dist
+```
+
+For deployments, `scripts\sync-main.ps1` is the native Windows counterpart to
+`scripts/sync-main.sh`; invoking the shell script from Git Bash dispatches to it
+automatically. It syncs `main`, rebuilds and installs the desktop app, restarts
+the Hive server, and verifies `/api/health`.
+
+Repository paths may use the host's normal absolute syntax: `/Users/me/repo`,
+`C:\Users\me\repo`, `D:/src/repo`, or a UNC path such as
+`\\server\share\repo`. Relative paths and drive-relative forms such as
+`C:repo` are rejected.
+
 Environment:
 - `HIVE_DB` — SQLite file path (default `~/.hive/hive.db`; parent dir auto-created).
 - `HIVE_PORT` — server port (default `4700`).
 - `HIVE_HOME` — base dir for evidence files (default `~/.hive`).
 - `HIVE_URL` — base URL the CLI talks to (default `http://127.0.0.1:$HIVE_PORT`).
+
+Claude Code accounts can be routed by original project path with the
+machine-local `$HIVE_HOME/claude-profiles.json` file. Hive applies the selected
+`CLAUDE_CONFIG_DIR` to planners, reviewers, critics, and Herdr workers; matching
+uses the original repository path even though workers run in separate
+worktrees. The longest containing root wins. Projects outside every route use
+`default_config_dir` when provided; omitting it preserves Claude's normal
+personal default with no `CLAUDE_CONFIG_DIR` override:
+
+```json
+{
+  "default_config_dir": "/Users/me/.claude",
+  "routes": [
+    { "root": "/Users/me/work/company", "config_dir": "/Users/me/.claude-company" }
+  ]
+}
+```
 
 ## Seed a demo board
 
@@ -75,8 +139,8 @@ bin/hive open
 ```
 server/src/  db.ts state.ts briefs.ts api.ts bus.ts rows.ts exec.ts
              secrets.ts monitors.ts reconciler.ts runtime/herdr.ts index.ts
-cli/hive.ts  bin/hive        CLI
-hooks/       hive-hook.sh install.md   Claude Code lifecycle hooks
+cli/hive.ts  bin/hive bin/hive.cmd     CLI
+hooks/       hive-hook.ts hive-hook.sh install.md   Claude Code/Codex lifecycle hooks
 scripts/     demo-seed.ts
 docs/API.md  the HTTP contract (the web app builds against this)
 server/test/ bun test suite
@@ -132,8 +196,10 @@ server/test/ bun test suite
   the herdr daemon is unreachable so a dead socket isn't pounded once per queued
   task). Shares the spawn core with the
   manual `POST /api/tasks/:id/spawn`. The herdr adapter is verified against a
-  live herdr server — see `docs/runtime.md` and
-  `docs/evidence/herdr-live-verification.txt`.
+  live herdr server — see `docs/runtime.md`.
+  On Windows, Hive discovers the standard per-user Herdr install under
+  `%LOCALAPPDATA%\Programs\Herdr\bin`, augments child `PATH` without corrupting
+  drive letters, and treats PowerShell/cmd panes as shells rather than agents.
 - **Reconciler** (`server/src/reconciler.ts`, 60s; `HIVE_RECONCILE_MS`) syncs
   herdr agent status, `gh pr view` CI/merge state, and flags tasks silent past
   `HIVE_STALE_MS` (default 15m) as `stale`. Every cycle is failure-isolated and
@@ -146,7 +212,7 @@ server/test/ bun test suite
   fail → back to `in_progress`.
 - **Native notifications + deeplinks** (`server/src/notifications.ts`,
   `electron/main.js`). Urgent events (a decision opened, a task handed to
-  review, an agent unreachable, a monitor incident) raise a real macOS
+  review, an agent unreachable, a monitor incident) raise a real desktop
   notification through the desktop app, so it carries the hive icon and obeys
   Do Not Disturb. The app already holds an SSE connection
   (`/api/stream?client=app`), so the server delivers over that; only when no app
@@ -155,28 +221,39 @@ server/test/ bun test suite
   not when the server tried. Clicking one opens the exact task or decision.
   `cd electron && bun install && bun run build` builds the app into the checkout;
   `bun run install-app` in `electron/` builds and then installs that bundle to
-  `/Applications/hive.app`, the canonical copy macOS resolves `dev.hive.app` and
-  `hive://` to. Everything that launches the app (`hive app`, the post-deploy
+  `/Applications/hive.app` on macOS or `%LOCALAPPDATA%\Programs\hive` on
+  Windows. Windows build staging lives in `%LOCALAPPDATA%\Hive\electron-builds`
+  so editors and antivirus cannot lock a checkout-local bundle during updates.
+  The Windows installer records the Bun executable and checkout paths beside
+  the app; when the default loopback server is unavailable, the app starts it
+  hidden on demand and keeps retrying. Remote/custom `HIVE_URL` values never
+  start a local process. Closing and reopening the window restores the board
+  through the same installed app.
+  The installer registers `hive://` per-user on both platforms.
+  Everything that launches the app (`hive app`, the post-deploy
   restart) opens that installed copy, so a checkout build never re-registers
   itself as `dev.hive.app`.
   `hive://` deeplinks work from anywhere (Terminal, another app, a script):
 
   ```
-  open "hive://task/1247"           # task by number or id
-  open "hive://decision/dec_ab12"   # the decision card, scrolled to + highlighted
-  open "hive://quiz/1b75826af9fb"   # the understanding check on that task
-  open "hive://open?path=/inbox"    # any app route
+  # macOS: open "hive://task/1247"
+  # Windows: Start-Process "hive://task/1247"
+  # Other routes: hive://decision/dec_ab12, hive://quiz/1b75826af9fb,
+  #               hive://open?path=/inbox
   ```
 
   Check the whole chain without waiting for a real event: `hive notify --test`
   fires one urgent notification and waits up to 10s for the app to confirm
-  macOS rendered it. It fails loudly if nothing did.
+  rendered it. It fails loudly if nothing did.
 - **Secrets** store names/refs only (migration v2). Values live in macOS
-  Keychain (`security`) or Bitwarden (`bw`), resolved at spawn and injected as
+  Keychain (`security`), Windows per-user DPAPI-encrypted storage, or Bitwarden
+  (`bw`), resolved at spawn and injected as
   env; the server redacts known secret values from stored payloads. Manage with
   `hive secret set|list|rm` (`set` reads the value from stdin).
 - **Hooks** (`hooks/`) POST liveness events to `$HIVE_URL` when `$HIVE_TASK_ID`
-  is set; fail silent + fast (2s curl cap). See `hooks/install.md`.
+  is set. New spawns run the Bun/TypeScript hook directly, so native Windows
+  does not depend on WSL; the shell wrapper remains for older Unix settings.
+  Hooks fail silent and fast. See `hooks/install.md`.
 
 ## v2 notes (intake connector)
 
@@ -192,19 +269,20 @@ server/test/ bun test suite
   readable before hive edits a real ticket.
 
   ```jsonc
-  "jira": { "site": "https://corebeat.atlassian.net", "email": "corebeat@vid.kim",
+  "jira": { "site": "https://example.atlassian.net", "email": "jira@example.com",
             "project_key": "WEB", "enabled": false, "write": false,
             "write_scope": { "create_subtask": false },
             "status_notes_to_comments": false,
             "jql": "labels = sync" }   // optional, ANDed with project = <key>
   ```
 
-  `site`, `email` and `project_key` must match a compiled-in allowlist
-  (`credentialTargetAllowed` in `server/src/intake/jira.ts`) or the connector
-  is a silent no-op; config alone can't repoint it elsewhere, since
-  `projects.config` is writable over hive's unauthenticated loopback API and a
-  config-supplied site would otherwise be able to send `JIRA_API_TOKEN`
-  anywhere. Changing the allowed target is a code change, not a config edit.
+  `site`, `email` and `project_key` are per-project and must be well-formed
+  (`credentialTargetValid` in `server/src/intake/jira.ts`): an `https` site with
+  no userinfo and a real hostname, a syntactically valid email, an uppercase
+  project key. Anything else is a silent no-op. The site that reaches `fetch()`
+  is rebuilt from the parsed URL, so no path, query or trailing slash from the
+  config survives into a request. The API token is never in the config — it is
+  the keychain secret `JIRA_API_TOKEN`, resolved by name at spawn.
 
   Auth is HTTP Basic (`email:api_token`) — a personal API token sent as `Bearer`
   is rejected as an unparseable Connect JWT. The token is the project secret
@@ -231,7 +309,7 @@ server/test/ bun test suite
 
 - **On-demand planners** (`server/src/planner.ts`, migration v7). A per-project
   planner triages a task and proposes a breakdown. hive rejects long-running LLM
-  supervisor sessions (firstmate's failure mode): "persistent" means the ROLE +
+  supervisor sessions (a prior orchestration tool's failure mode): "persistent" means the ROLE +
   CONTEXT live in the DB (project config `supervisor_persona`, `playbook`,
   `plan_intake`, `planner_argv`), while the LLM runs as a short-lived subprocess
   `claude -p <prompt> --output-format json` (timeout-capped by
@@ -297,8 +375,15 @@ server/test/ bun test suite
   `status_notes_to_comments: true`, `hive emit <id> status` notes become Jira
   comments through the existing at-most-once delivery ledger. The default is false.
 <!-- BEGIN GENERATED JIRA WRITE SCOPE -->
-- **Field ownership.** Jira owns `summary`, `description`, `issue type`, `priority`, and all labels except `hive:needs-decision`. Hive's generated write scope is `status`, `comments` and evidence receipts, `attachments` (up to 3 screenshots hive already holds as evidence, on UI work only), and `hive:needs-decision` label; everything else flows Jira → hive only. Creating a Jira sub-task is a separate, default-off project opt-in through `write_scope.create_subtask`. **hive never writes the assignee at all.** It reads the field to display it and stops there because Jira Cloud has no compare-and-swap across the separate check and write requests, so "a human's assignment is never touched" only holds absolutely if hive never touches it (dec_234877ea4617). `GET /api/tasks/:id/jira` exposes the same registry as `write_scope`. `needs_decision` has no Jira status, `verifying` maps to In Review, and `failed` never moves Jira. A linked native task maps `cancelled` to Done and posts a cancellation comment.
+- **Field ownership.** Jira owns `summary`, `description`, `issue type`, `priority`, and all labels except `hive:needs-decision`. Hive's generated write scope is `status`, `comments` and evidence receipts, `attachments` (up to 3 screenshots on UI work only: evidence hive already holds, or one it renders at review when the task has none), and `hive:needs-decision` label; everything else flows Jira → hive only. Creating a Jira sub-task is a separate, default-off project opt-in through `write_scope.create_subtask`. **hive never writes the assignee at all.** It reads the field to display it and stops there because Jira Cloud has no compare-and-swap across the separate check and write requests, so "a human's assignment is never touched" only holds absolutely if hive never touches it (dec_234877ea4617). `GET /api/tasks/:id/jira` exposes the same registry as `write_scope`. `needs_decision` has no Jira status, `verifying` maps to In Review, and `failed` never moves Jira. A linked native task maps `cancelled` to Done and posts a cancellation comment.
 <!-- END GENERATED JIRA WRITE SCOPE -->
+- **Rendered screenshots are opt-in and sandboxed.** A UI task that attached no
+  screenshot can have one rendered at review time with the target repo's own
+  Playwright harness. That runs the PR branch's own config, so it is off unless
+  the project config sets `render_proof: true`, and the run happens inside a
+  macOS seatbelt that may write only to the task's worktree and the temp dirs.
+  On any host without seatbelt, or any repo whose harness cannot boot the app
+  itself, nothing is rendered and the reason is logged.
 - **Idempotent comments and receipts with contained unknowns.** Jira comments
   become timeline entries; hive-side comments are an outbox drained on the next
   cycle; and hive's reports and evidence reach the ticket with links back into
@@ -324,12 +409,13 @@ server/test/ bun test suite
   structural rather than a marker every code path must remember to check. The
   agreement test compares JIRA-STATUS space, not hive-state space, because the
   mapping is 2:1 (`in_review` and `verifying` both show as "In Review").
-- **Credential gate.** `config` is writable through the loopback API, so the site
-  and email are pinned to compiled-in constants (`credentialTargetAllowed`),
-  matched EXACTLY — https only, no userinfo, no suffix match, since Atlassian
-  Cloud sites are self-serve and `*.atlassian.net` would be free for an attacker
-  to register. The gate runs before secret resolution and before any auth header
-  exists; a mismatch yields `null` (hard no-op). Adding a site is a PR.
+- **Credential gate.** `config` is writable through the loopback API, so the
+  target's SHAPE is validated before anything else (`credentialTargetValid`):
+  https only, no userinfo, a real hostname, a valid email, an uppercase project
+  key, and the site rebuilt from parsed components so no remnant of the config
+  string reaches `fetch()` or the auth header. The gate runs before secret
+  resolution and before any auth header exists; a malformed target yields `null`
+  (hard no-op).
 - **Eventual consistency.** Jira's enhanced search is treated as DISCOVERY-ONLY:
   it returns candidate keys, and every per-issue action derives from one fresh,
   strongly-consistent read (status and its timestamp taken from the same

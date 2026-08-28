@@ -23,8 +23,8 @@ import { broadcastTask } from "./health.ts";
 import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { notTestProjectSql } from "./testProjects.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
-import { diagnosePane, dialogAutoApprovable, parseResetClock } from "./diagnose.ts";
-import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent } from "./api.ts";
+import { diagnosePane, dialogAutoApprovable, editDialogPaths, parseResetClock } from "./diagnose.ts";
+import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount } from "./api.ts";
 import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectBaseBranch, preferSafeRef } from "./exec.ts";
@@ -33,6 +33,8 @@ import { landOnce } from "./landQueue.ts";
 import { sidecarOnce } from "./sidecar.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
 import { runPrGardener } from "./prGardener.ts";
+import { autoAckPlans } from "./planCritic.ts";
+import { ambiguityCleared, cautionCleared } from "./reviewer.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
 const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
@@ -138,7 +140,18 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("advanceFinished", () => advanceFinished(db, deps));
   await step("nagOpenDecisions", () => nagOpenDecisions(db, (deps.nowMs ?? (() => Date.now()))()));
   await step("unparkAnswered", () => unparkAnswered(db, (deps.nowMs ?? (() => Date.now()))()));
+  // Away-mode release valve: a plan the director never acked frees its agent
+  // after the project's plan_gate.auto_ack_hours. Local (herdr + sqlite), so it
+  // sits above the offline cutoff — an offline director is exactly the case it
+  // exists for.
+  await step("autoAckPlans", () =>
+    autoAckPlans(db, {
+      steer: (id, message) => internalSteer(db, deps.herdr ?? defaultHerdr, id, message),
+      nowMs: (deps.nowMs ?? (() => Date.now()))(),
+    })
+  );
   await step("remindUnreviewedIntake", () => remindUnreviewedIntake(db, (deps.nowMs ?? (() => Date.now()))()));
+  await step("notifyQuizDigest", () => notifyQuizDigest(db, (deps.nowMs ?? (() => Date.now()))()));
   await step("captureRecurringRefs", () => captureRecurringRefs(db));
   await step("repairRequeueProvenance", () => repairRequeueProvenance(db));
   await step("surfaceDeadDependencies", () => surfaceDeadDependencies(db));
@@ -162,7 +175,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
       const body = await response.json().catch(() => ({})) as any;
       return { ok: false, error: body.error ?? `HTTP ${response.status}` };
     },
-    directorDeciding: (taskId) => passedInFocus(db, taskId),
+    directorDeciding: (taskId) => passedByDirector(db, taskId),
     decide: (input) => createDecision(db, input),
   }));
   await step("resumeUsageLimited", () => resumeUsageLimited(db, (deps.nowMs ?? (() => Date.now()))()));
@@ -344,7 +357,7 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
 // death. Herdr.confirmGone cross-checks the pane list; an unconfirmed death
 // degrades to alive+unknown, which every caller already treats as "leave it
 // alone" (2026-08-19 incident: 12+ live agents failed and their tabs closed).
-async function probeAgent(
+export async function probeAgent(
   h: Herdr,
   db: DB,
   taskId: string,
@@ -958,7 +971,7 @@ async function isNonStart(exec: Exec, check: any): Promise<boolean> {
   }
 }
 
-// The other two infra shapes, both seen on corebeat PR #811: the job "ran" but
+// The other two infra shapes, both seen on a consuming project's PR #811: the job "ran" but
 // executed ZERO steps in a couple of seconds (no runner picked it up), and the
 // exact same check is already red on the base branch, where this PR's diff does
 // not exist. Neither can be fixed by a commit on the PR.
@@ -1247,11 +1260,15 @@ export function nagOpenDecisions(db: DB, nowMs: number = Date.now()): void {
 // those without waiting. Anything contested (caution verdict, risks, red CI,
 // a changes_requested in history) still parks for the human. A notification
 // reports every auto-merge; the existing verifying/smoke gates still run.
-export function passedInFocus(db: DB, taskId: string): boolean {
+// Passing the understanding check proves the director READ the change. It is
+// never approval to ship: having understood it, they may well decide it is not
+// what they wanted. So any pass on the latest review — Focus, the review card,
+// the task page, it makes no difference — parks the task for an explicit Ship or
+// Request changes click (director ruling, HIVE-421).
+export function passedByDirector(db: DB, taskId: string): boolean {
   return !!db.query(
     `SELECT 1 FROM events passed
       WHERE passed.task_id = ? AND passed.type = 'understanding_quiz_passed'
-        AND json_extract(passed.payload, '$.surface') = 'focus'
         AND json_extract(passed.payload, '$.review_event_id') = (
           SELECT id FROM events
            WHERE task_id = ? AND type = 'review_summary'
@@ -1269,9 +1286,9 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     .all() as { id: string; number: number; title: string; kind: string; pr_url: string | null; head_sha: string | null; config: string }[];
   for (const r of rows) {
     if (isTrackingOnlyId(db, r.id)) continue;
-    // Passing Focus proves understanding, not approval to ship. Leave the task
+    // A quiz pass proves understanding, not approval to ship. Leave the task
     // parked so the director can still choose Ship or Request changes.
-    if (passedInFocus(db, r.id)) continue;
+    if (passedByDirector(db, r.id)) continue;
     // A queued steer is requested work the agent has not received yet. Never
     // merge the branch before a fresh turn can address it.
     if (queuedSteers(db, r.id).length) continue;
@@ -1295,21 +1312,29 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     } catch {
       continue;
     }
-    if (verdict.skipped || verdict.verdict !== "looks_good") continue;
+    if (verdict.skipped) continue;
+    if (verdict.verdict !== "looks_good" && verdict.verdict !== "caution") continue;
     // A PR-backed task's most recent review must have been taken against the
     // PR head that's about to be merged — a delayed review from before a
     // force-push or PR replacement must never auto-merge the new head
     // (task HIVE-307). Not fatal: just wait for autoReviewOnce to catch up.
     if (r.pr_url && (verdict.reviewed_pr_url !== r.pr_url || verdict.reviewed_head_sha !== r.head_sha)) continue;
+    // The pre-review's risks and questions are the ambiguity signal, but they
+    // are suspicions until checked: the per-risk verification pass (HIVE-406)
+    // re-reads the real code for this exact head. When it refuted every risk
+    // and answered every question from the code, the ambiguity is gone and a
+    // caution verdict lands like a clean one; one confirmed risk, one
+    // human-only question, or any gap keeps the card parked for the director.
+    const cleared = ambiguityCleared(db, r.id, verdict.reviewed_head_sha, verdict);
+    if (verdict.verdict === "caution" && !cautionCleared(db, r.id, verdict.reviewed_head_sha, verdict)) continue;
     // Same policy the planner uses for its breakdown cards: a PR merge is
     // always revertible (reversible=true) and touches the shared main branch
-    // (blastRadius="shared"); the pre-review's own risks/questions are the
-    // ambiguity signal, and the project's auto_merge.kinds allow-list IS the
-    // stored preference — unset/not-listed means "preference unknown".
+    // (blastRadius="shared"), and the project's auto_merge.kinds allow-list IS
+    // the stored preference — unset/not-listed means "preference unknown".
     const escalation = classifyEscalation({
       reversible: true,
       blastRadius: "shared",
-      ambiguous: Boolean(verdict.risks?.length || verdict.questions?.length),
+      ambiguous: !cleared,
       preferenceKnown: kinds.includes(r.kind),
     });
     if (escalation.effect !== "auto_handle") continue;
@@ -1323,7 +1348,7 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
       const beforeMutation = () => {
         const task = getTask(db, r.id);
         if (!task || task.state !== "in_review" || task.ci_status !== "passing") return false;
-        if (passedInFocus(db, r.id)) return false;
+        if (passedByDirector(db, r.id)) return false;
         if (queuedSteers(db, r.id).length || queuedInputRecoveryPending(db, r.id)) return false;
         return !db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'changes_requested' LIMIT 1").get(r.id);
       };
@@ -1455,6 +1480,31 @@ export async function sweepVerifying(db: DB, deps: ReconcilerDeps = {}): Promise
 // Intake tasks wait for the director's review before dispatch — correct, but a
 // forgotten one rots in `queued` invisibly. One reminder after a day.
 const INTAKE_REMINDER_MS = 24 * 60 * 60 * 1000;
+
+// ONE push for the whole post-ship catch-up, never one per shipped change.
+// It fires at most once a day, and early only when the pile first reaches
+// three. The last notified count lives in settings so the "reached three" nudge
+// cannot repeat on every cycle.
+export const QUIZ_DIGEST_MS = 24 * 60 * 60 * 1000;
+export function notifyQuizDigest(db: DB, nowMs: number = Date.now()): void {
+  const count = pendingPostShipQuizCount(db);
+  if (count === 0) {
+    setSetting(db, "quiz_digest_last_count", "0");
+    return;
+  }
+  const lastCount = Number(getSetting(db, "quiz_digest_last_count") ?? "0");
+  const last = db.query("SELECT ts FROM notifications WHERE kind = 'quiz_digest' ORDER BY ts DESC LIMIT 1").get() as { ts: string } | undefined;
+  const dueDaily = !last || nowMs - Date.parse(last.ts) >= QUIZ_DIGEST_MS;
+  const reachedThree = count >= 3 && lastCount < 3;
+  if (!dueDaily && !reachedThree) return;
+  setSetting(db, "quiz_digest_last_count", String(count));
+  enqueue(db, {
+    kind: "quiz_digest",
+    urgency: "urgent",
+    title: `Catch up on ${count} shipped ${count === 1 ? "change" : "changes"}`,
+    body: "One pass, one question at a time. Open Needs you when you have a minute.",
+  });
+}
 
 export function remindUnreviewedIntake(db: DB, nowMs: number = Date.now()): void {
   const rows = db
@@ -1849,14 +1899,21 @@ export function requeueStaleFailed(db: DB, nowMs: number = Date.now()): void {
     const configured = JSON.parse(task.project_config ?? "{}").failed_triage_requeue_hours;
     const hours = configured === undefined ? DEFAULT_FAILED_TRIAGE_REQUEUE_HOURS : Number(configured);
     if (!Number.isFinite(hours) || hours <= 0 || nowMs - Date.parse(task.failed_at) < hours * 60 * 60 * 1000) continue;
-    if (task.source === "requeue") continue;
+    // A blanket skip on source='requeue' parked a lineage forever the moment
+    // it was requeued once — including by a fleet-wide death wave, which kills
+    // requeued tasks same as any other. Cap by depth instead, same escalation
+    // line the dead-agent recovery path (recoverDead) uses: first/second
+    // generation still auto-requeues past the triage window, deeper than that
+    // parks for a human.
+    const depth = requeueDepth(db, task);
+    if (depth >= MAX_AUTO_REQUEUE) continue;
     if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type IN ('changes_requested','requeued') LIMIT 1").get(task.id)) continue;
     const failure = db.query("SELECT source FROM events WHERE task_id = ? AND type = 'state_change' AND json_extract(payload, '$.to') = 'failed' ORDER BY ts DESC LIMIT 1").get(task.id) as { source: string } | undefined;
     if (failure?.source === "director") continue;
 
     const newId = requeueTask(db, task);
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "requeued", payload: { new_task_id: newId, attempt: 1, reason: "failed task exceeded triage window" } });
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "failed-triage-auto-requeue", new_task_id: newId, attempt: 1 } });
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "requeued", payload: { new_task_id: newId, attempt: depth + 1, reason: "failed task exceeded triage window" } });
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "failed-triage-auto-requeue", new_task_id: newId, attempt: depth + 1 } });
     enqueue(db, { kind: "failed", task_id: task.id, title: `Auto-requeued after ${hours}h awaiting triage: ${task.title}` });
   }
 }
@@ -1896,15 +1953,25 @@ export async function handleBlockedAgent(db: DB, h: Herdr, taskId: string, targe
     await recoverQueuedInput(db, h, task, target, diag.excerpt);
     return true;
   }
+  if (diag?.kind === "usage_limit") {
+    // Catch the park the moment status flips (~60s), same as every other
+    // dialog kind here — waiting for the 15-minute stale timer is exactly the
+    // churn window that burned quota on 2026-08-26 (HIVE-451).
+    recoverUsageLimit(db, task, diag.excerpt);
+    return true;
+  }
   if (diag?.kind !== "blocked_dialog") return false; // blocked but no visible dialog: leave to the silent path
 
   const project = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id) as { config: string } | undefined;
-  let extra: string[] = [];
+  let config: any = {};
   try {
-    extra = JSON.parse(project?.config ?? "{}").dialog_auto_approve ?? [];
+    config = JSON.parse(project?.config ?? "{}");
   } catch {
     /* bad config never breaks recovery */
   }
+  const extra: string[] = config.dialog_auto_approve ?? [];
+
+  if (config.auto_answer_dialogs === true && (await autoAnswerBenignWrite(db, h, task, target, tail))) return true;
 
   if (dialogAutoApprovable(diag.excerpt, extra)) {
     const r = await h.answerDialog(target, "2");
@@ -1990,6 +2057,41 @@ async function recoverQueuedInput(db: DB, h: Herdr, task: any, target: string, e
 }
 
 // ---- graceful failure-class handlers (pane-diagnosed) ----
+
+// The dialog is a codex file-write confirmation and every file it touches is
+// the agent's own: answer it here instead of waking the director. Three of
+// these were hand-approved on 2026-08-25, all of them review.json writes the
+// agent had just been told to make. Opt-in per project (config.auto_answer_dialogs).
+//
+// "The agent's own" means its worktree, or a temp file named for this task —
+// the two places a worker is told to write. Anything else (a path outside
+// both, a `..` escape, a relative path we cannot resolve, a command approval
+// rather than an edit) fails the check and still parks for the director.
+const TEMP_ROOTS = ["/tmp/", "/private/tmp/", "/var/folders/"];
+
+function ownedByTask(path: string, task: { id: string; number?: number | null; worktree_path?: string | null }): boolean {
+  if (!path.startsWith("/") || path.includes("..")) return false;
+  const wt = task.worktree_path;
+  if (wt && path.startsWith(wt.replace(/\/$/, "") + "/")) return true;
+  if (!TEMP_ROOTS.some((r) => path.startsWith(r))) return false;
+  // A shared temp root is only "its own" when the name carries this task.
+  return path.includes(task.id) || (task.number != null && path.includes(`-${task.number}-`));
+}
+
+async function autoAnswerBenignWrite(db: DB, h: Herdr, task: any, target: string, tail: string): Promise<boolean> {
+  const paths = editDialogPaths(tail);
+  if (!paths || !paths.every((p) => ownedByTask(p, task))) return false;
+  // "1" = yes, proceed for THIS edit only. Never "2" (don't ask again for
+  // these files): each write should re-clear the same bar.
+  const r = await h.answerDialog(target, "1");
+  writeEvent(db, {
+    task_id: task.id,
+    source: "supervisor",
+    type: "dialog_auto_answered",
+    payload: { delivered: r.code === 0, key: "1", paths, reason: "codex write inside the task's own worktree or scratchpad" },
+  });
+  return true;
+}
 
 // A dialog froze the agent: open ONE answerable card (approve/deny resolve by
 // sending the keystroke to the pane — resolveBlockedForDecision in api.ts).

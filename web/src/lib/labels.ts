@@ -23,7 +23,7 @@ export const HEALTH_LABEL: Record<Health["status"], string> = {
 
 // Who answered a decision, for the audit trail in the timeline. "director" is
 // the implicit default and stays unlabelled ("You answered"); everyone else is
-// named so a non-director answer is never mistaken for David's.
+// named so a non-director answer is never mistaken for the director's.
 export const ANSWERED_BY_LABEL: Record<string, string> = {
   chat_supervisor: "Chat supervisor",
   agent: "Agent",

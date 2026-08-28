@@ -11,7 +11,12 @@ const start = current.indexOf(START);
 const end = current.indexOf(END);
 if (start < 0 || end < start) throw new Error("README Jira write-scope markers are missing");
 
-const generated = `${START}\n${jiraOwnershipMarkdown()}\n${END}`;
+// Preserve the checkout's newline convention. On Windows, core.autocrlf makes
+// README.md CRLF; emitting an LF-only generated block made --check report
+// drift even when the normalized Git content was identical.
+const newline = current.includes("\r\n") ? "\r\n" : "\n";
+const generatedBody = jiraOwnershipMarkdown().replaceAll("\n", newline);
+const generated = `${START}${newline}${generatedBody}${newline}${END}`;
 const next = current.slice(0, start) + generated + current.slice(end + END.length);
 if (process.argv.includes("--check")) {
   if (next !== current) throw new Error("README Jira write scope is stale; run bun run docs:jira");
