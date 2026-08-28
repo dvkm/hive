@@ -4066,7 +4066,10 @@ function touchesSensitivePath(files: string[], tokens: string[]): boolean {
 //      migrations by default, per-project via config.understanding_checks),
 //   3. its kind is outside the project's auto_merge.kinds allow-list, or
 //   4. the director flagged the task (POST .../understanding-quiz/require).
-export function understandingChecksRequired(db: DB, task: { id: string; kind: string; project_id: string }): boolean {
+export function understandingChecksRequired(
+  db: DB,
+  task: { id: string; kind: string; project_id: string; head_sha?: string | null }
+): boolean {
   const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
   const config = JSON.parse(project?.config ?? "{}");
   if (!(Array.isArray(config.auto_merge?.kinds) && config.auto_merge.kinds.includes(task.kind))) return true;
@@ -4076,6 +4079,11 @@ export function understandingChecksRequired(db: DB, task: { id: string; kind: st
   if (flagged) return true;
   const review = latestAutoReviewVerdict(db, task.id);
   if (!review) return true;
+  // A review's verdict only speaks for the head it looked at. A force-push
+  // after review moves task.head_sha out from under it (HIVE-453) — treat that
+  // review as absent so a stale cleared-caution or stale looks_good can't
+  // un-gate the quiz for a head nobody actually reviewed.
+  if (task.head_sha && review.reviewed_head_sha !== task.head_sha) return true;
   // A caution whose every risk was refuted and every question answered from the
   // code is not judgment-class either (HIVE-407) — the same rule the reconciler
   // uses to auto-merge it. Anything still confirmed or human-only needs the
@@ -4271,7 +4279,8 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
     if (!checks.length) return [];
     // A mechanical change gets no backlog entry even when its agent submitted
     // checks anyway (hive-1559).
-    if (!understandingChecksRequired(db, { id: row.task_id, kind: row.kind, project_id: row.project_id })) return [];
+    if (!understandingChecksRequired(db, { id: row.task_id, kind: row.kind, project_id: row.project_id, head_sha: row.head_sha }))
+      return [];
     // Not yet answerable = the review pass has not finished for the live head.
     if (!quizAnswerable(db, { id: row.task_id, state: row.state, head_sha: row.head_sha, project_id: row.project_id })) return [];
     const understanding = payload?.understanding && typeof payload.understanding === "object" && !Array.isArray(payload.understanding)

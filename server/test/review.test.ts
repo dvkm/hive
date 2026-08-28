@@ -1312,6 +1312,44 @@ test("a caution whose risks were all refuted stops being judgment-class", async 
   s.server.stop(true);
 });
 
+// HIVE-453: a cleared caution only speaks for the head it was cleared on. A
+// force-push after that must re-require the quiz until a review exists for
+// the NEW (live) head, even though the old review's own verdicts still look
+// clean for the head they were computed against.
+test("a force-push after a cleared caution re-requires the quiz until the new head is reviewed", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "caution", risks: ["maybe a leak"], head: "head-a" });
+  addRiskVerdicts(s, taskId, "head-a", "refuted");
+
+  const cleared = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(cleared.json.understanding_required).toBe(false);
+
+  s.db.query("UPDATE tasks SET head_sha = 'head-b' WHERE id = ?").run(taskId);
+  const forcePushed = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(forcePushed.json.understanding_required).toBe(true);
+
+  // Inside auto_merge.kinds, so it merges — but the quiz is deferred again for
+  // the new head, same as any other still-required caution.
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(200);
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  expect(events.json.some((event: any) => event.type === "understanding_quiz_deferred")).toBe(true);
+  s.server.stop(true);
+});
+
+test("a force-push after a looks_good review re-requires the quiz until the new head is reviewed", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "looks_good", head: "head-a" });
+
+  const clean = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(clean.json.understanding_required).toBe(false);
+
+  s.db.query("UPDATE tasks SET head_sha = 'head-b' WHERE id = ?").run(taskId);
+  const forcePushed = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(forcePushed.json.understanding_required).toBe(true);
+  s.server.stop(true);
+});
+
 test("a confirmed risk blocks the merge and the 409 names it", async () => {
   const s = makeServer();
   const { taskId } = await judgmentTask(s, { verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
