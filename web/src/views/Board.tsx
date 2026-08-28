@@ -238,7 +238,9 @@ export function LandChips({ task, graph, tasks }: { task: Task; graph: LandGraph
       {clash.length > 0 && (
         <span
           className="chip chip-blocked"
-          title={clash.map((e) => `${name(e.peer)}: ${(e.files ?? []).join(", ")}`).join("\n")}
+          title={clash
+            .map((e) => `Both PRs change ${(e.files ?? []).join(", ") || "the same files"} — read them together before landing (${name(e.peer)})`)
+            .join("\n")}
         >
           conflicts with {clash.map((e) => name(e.peer)).join(", ")}
         </span>
