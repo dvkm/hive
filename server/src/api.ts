@@ -4239,19 +4239,25 @@ export function repairDuplicateQuizPasses(db: DB): number {
 // not a number of separate attention items. Quizzes on tasks still in review
 // are excluded — those gate their own review card.
 const POST_SHIP_QUIZ_STATES = ["verifying", "done", "failed"];
-export function pendingPostShipQuizCount(db: DB): number {
+// Same filters as listUnderstandingQuizzes (the list the "Catch up" digest
+// cards are built from) so this count always agrees with what those cards
+// show, including the mechanical-task exclusion (hive-1559). Pass projectId
+// to scope the count to one project, matching how the client groups digests.
+export function pendingPostShipQuizCount(db: DB, projectId?: string): number {
   const placeholders = POST_SHIP_QUIZ_STATES.map(() => "?").join(",");
   const rows = db
     .query(
-      `SELECT e.id, e.task_id, e.payload, t.kind, t.project_id FROM events e JOIN tasks t ON t.id = e.task_id
+      `SELECT e.id, e.task_id, e.payload, t.project_id, t.kind FROM events e JOIN tasks t ON t.id = e.task_id
         WHERE e.type = 'review_summary'
           AND t.state IN (${placeholders})
+          AND (? IS NULL OR t.project_id = ?)
           AND NOT EXISTS (
             SELECT 1 FROM events newer
              WHERE newer.task_id = e.task_id AND newer.type = 'review_summary'
                AND (newer.ts > e.ts OR (newer.ts = e.ts AND newer.rowid > e.rowid)))`
     )
-    .all(...POST_SHIP_QUIZ_STATES) as { id: string; task_id: string; payload: string; kind: string; project_id: string }[];
+    .all(...POST_SHIP_QUIZ_STATES, projectId ?? null, projectId ?? null) as
+    { id: string; task_id: string; payload: string; project_id: string; kind: string }[];
   return rows.filter((row) => {
     let payload: any;
     try { payload = JSON.parse(row.payload); } catch { return false; }
