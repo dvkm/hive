@@ -1284,3 +1284,44 @@ test("a test project never pushes a notification, even for a high-risk decision"
   const after = await get("/api/notifications");
   expect(after.json.notifications.length).toBe(before.json.notifications.length);
 });
+
+// task #1693 follow-up: GET /api/tasks/land-graph with no ?project= iterated
+// EVERY project (including archived/test rows with a dead repo_path), calling
+// `git diff` against a cwd that no longer exists.
+test("land-graph without a project param skips an archived project with a dead repo_path", async () => {
+  const db2 = openDb(":memory:");
+  let gitCalls = 0;
+  const exec = async (argv: string[]) => {
+    if (argv[0] === "git") gitCalls++;
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const srv = Bun.serve({ port: 0, fetch: makeHandler(db2, { exec }) });
+  const base = `http://127.0.0.1:${srv.port}`;
+  const call = async (path: string, body: unknown) => {
+    const response = await fetch(base + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { status: response.status, json: await response.json() };
+  };
+  try {
+    const archived = await call("/api/projects", {
+      name: "archived-dead-repo",
+      repo_path: "/nonexistent/repo",
+      config: { test: true, archived: true },
+    });
+    for (const title of ["a", "b"]) {
+      const t = await call("/api/tasks", { project_id: archived.json.id, title });
+      db2.query("UPDATE tasks SET state = 'in_review', branch = ? WHERE id = ?").run(`hive/${title}`, t.json.id);
+    }
+
+    const graph = await fetch(base + "/api/tasks/land-graph");
+    expect(graph.status).toBe(200);
+    const body = await graph.json();
+    expect(body.nodes).toEqual([]);
+    expect(gitCalls).toBe(0);
+  } finally {
+    srv.stop(true);
+  }
+});

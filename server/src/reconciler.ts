@@ -22,7 +22,7 @@ import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask, noteToolStart } from "./health.ts";
 import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
-import { notTestProjectSql } from "./testProjects.ts";
+import { activeProjects } from "./testProjects.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, editDialogPaths, parseResetClock } from "./diagnose.ts";
 import { AUTO_MERGE_PAUSED, requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount } from "./api.ts";
@@ -866,9 +866,7 @@ async function linkPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   // scratch dir that gets cleaned up, and running gh against a directory that
   // no longer exists is what wedged this step for ~10h. They have no real PRs
   // to link either.
-  const projects = db
-    .query(`SELECT id, repo_path FROM projects WHERE repo_path IS NOT NULL AND ${notTestProjectSql()}`)
-    .all() as { id: string; repo_path: string }[];
+  const projects = activeProjects(db).filter((p) => p.repo_path) as { id: string; repo_path: string }[];
   let startFailure: string | null = null;
   for (const p of projects) {
     const r = await exec(["gh", "pr", "list", "--state", "open", "--json", "number,title,body,url"], { cwd: p.repo_path });

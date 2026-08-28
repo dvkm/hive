@@ -8,6 +8,7 @@ import type { DB } from "./db.ts";
 import { now, newId } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { createDecision } from "./api.ts";
+import { activeProjects } from "./testProjects.ts";
 
 // Normalize a message into a stable signature: ids, hashes, paths, and numbers
 // vary per occurrence; the pattern doesn't.
@@ -75,7 +76,7 @@ function normalizeUrl(u: string): string {
 // the same URL suppresses re-proposing. This is what "don't make me paste the
 // Figma link a fourth time" looks like.
 export function captureRecurringRefs(db: DB): void {
-  const projects = db.query("SELECT id FROM projects").all() as { id: string }[];
+  const projects = activeProjects(db) as { id: string }[];
   for (const p of projects) {
     const texts = db
       .query(

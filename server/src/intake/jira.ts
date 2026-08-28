@@ -66,6 +66,7 @@ import {
 } from "./jira-write-scope.ts";
 
 export { NEEDS_DECISION_LABEL, JIRA_WRITE_SCOPE } from "./jira-write-scope.ts";
+import { activeProjects } from "../testProjects.ts";
 
 export type FetchLike = typeof fetch;
 
@@ -2511,7 +2512,7 @@ function jiraTargetOwner(db: DB, projectId: string, cfg: JiraConfig): string {
     throw new Error(`jira target ${jiraTargetKey(cfg)} already has linked tasks in multiple Hive projects`);
   if (linkedOwners.length === 1) return linkedOwners[0].project_id;
 
-  const projects = db.query("SELECT id, config FROM projects ORDER BY created_at, id").all() as { id: string; config: string }[];
+  const projects = activeProjects(db) as { id: string; config: string }[];
   for (const project of projects) {
     try {
       const candidate = jiraConfig(JSON.parse(project.config || "{}"));
@@ -2816,7 +2817,7 @@ export async function runProjectCycle(
 export async function syncJiraOnce(db: DB, deps: JiraDeps = {}): Promise<SyncStats[]> {
   const out: SyncStats[] = [];
   if (isOffline(db)) return out;
-  const projects = db.query("SELECT id FROM projects").all() as { id: string }[];
+  const projects = activeProjects(db) as { id: string }[];
   for (const p of projects) {
     const status = jiraConfigStatusFor(db, p.id);
     // A config the gate rejected cannot produce a working cycle, so running one
@@ -2842,7 +2843,7 @@ export function startJiraSync(db: DB, deps: JiraDeps = {}): () => void {
   const intervalMs = jiraIntervalMs(deps);
   let nextFireAt = Date.now() + intervalMs;
   const publishNextDue = (value: string | null) => {
-    const projects = db.query("SELECT id, config FROM projects").all() as { id: string; config: string }[];
+    const projects = activeProjects(db) as { id: string; config: string }[];
     for (const project of projects) {
       try {
         if (jiraConfig(JSON.parse(project.config || "{}"))?.enabled)

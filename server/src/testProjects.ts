@@ -1,3 +1,5 @@
+import type { DB } from "./db.ts";
+
 // Test/ephemeral projects: a project an agent's own E2E/smoke run registered
 // against the LIVE server instead of a throwaway instance (task #1020, seen
 // 2026-08-19 — task #989's repo-validation E2E run left 4 scratch projects,
@@ -22,4 +24,28 @@ export function isEphemeralRepoPath(repoPath: string | null | undefined): boolea
 // `... JOIN projects p ON p.id = t.project_id WHERE ${notTestProjectSql("p.config")}`
 export function notTestProjectSql(configColumn = "config"): string {
   return `COALESCE(json_extract(${configColumn}, '$.test'), 0) = 0`;
+}
+
+// SQL fragment excluding both test and archived projects.
+export function activeProjectSql(configColumn = "config"): string {
+  return `${notTestProjectSql(configColumn)} AND COALESCE(json_extract(${configColumn}, '$.archived'), 0) = 0`;
+}
+
+export interface ProjectRow {
+  id: string;
+  name: string;
+  repo_path: string | null;
+  config: string;
+  created_at: string;
+}
+
+// Every background sweep (reconciler/reaper/dispatcher/monitors/watch/jira/...)
+// that iterates ALL projects must use this instead of `SELECT ... FROM
+// projects` directly (task #1693) — a test or archived row's repo_path can
+// point at a cleaned-up worktree/scratchpad, and spawning tools like `gh` or
+// `git` against a nonexistent cwd wedges the sweep and pushes /api/health to
+// ok:false (task #1667, #1096). A single project fetched by id (resolving a
+// specific task's project) does NOT need this filter.
+export function activeProjects(db: DB): ProjectRow[] {
+  return db.query(`SELECT * FROM projects WHERE ${activeProjectSql()} ORDER BY created_at`).all() as ProjectRow[];
 }
