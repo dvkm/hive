@@ -645,6 +645,50 @@ export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, s
 
 // Perform a state transition. Throws TransitionError on invalid transition or
 // when a `done` transition lacks required evidence. Writes a state_change event.
+// Some handoffs land the PR URL only as free text in the transition reason
+// (e.g. `hive emit ready --note "PR <url>"` without `--pr-url`), so task.pr_url
+// never gets set and auto_review has nothing to diff. Backfill from that text.
+const PR_URL_RE = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/;
+export function extractPrUrl(text: string | null | undefined): string | null {
+  return text?.match(PR_URL_RE)?.[0] ?? null;
+}
+
+// Reconciliation sweep for tasks that got stuck before the transition()-time
+// backfill above existed: a task already sitting in in_review with pr_url
+// still null, whose state_change reason carried the URL as free text.
+// transition() can't fix these itself (it only runs on entry to in_review,
+// and throws on from === to), so this scans the task's own event history
+// instead. Idempotent — skips tasks that already have a pr_url.
+export function backfillStuckPrUrls(db: DB): number {
+  const rows = db
+    .query("SELECT id FROM tasks WHERE state = 'in_review' AND pr_url IS NULL")
+    .all() as { id: string }[];
+  let backfilled = 0;
+  for (const row of rows) {
+    const events = db
+      .query(
+        "SELECT payload FROM events WHERE task_id = ? AND type = 'state_change' ORDER BY ts DESC"
+      )
+      .all(row.id) as { payload: string }[];
+    let foundPrUrl: string | null = null;
+    for (const e of events) {
+      const reason = JSON.parse(e.payload)?.reason;
+      foundPrUrl = extractPrUrl(reason);
+      if (foundPrUrl) break;
+    }
+    if (!foundPrUrl) continue;
+    db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(foundPrUrl, now(), row.id);
+    writeEvent(db, {
+      task_id: row.id,
+      source: "system",
+      type: "pr_linked",
+      payload: { pr_url: foundPrUrl, via: "stuck_reason_backfill" },
+    });
+    backfilled++;
+  }
+  return backfilled;
+}
+
 export function transition(
   db: DB,
   taskId: string,
@@ -697,6 +741,14 @@ export function transition(
       throw new TransitionError(
         "cannot transition to 'done': scout task requires a report evidence"
       );
+    }
+  }
+
+  if (to === "in_review" && !task.pr_url) {
+    const foundPrUrl = extractPrUrl(opts.reason);
+    if (foundPrUrl) {
+      db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(foundPrUrl, now(), taskId);
+      writeEvent(db, { task_id: taskId, source, type: "pr_linked", payload: { pr_url: foundPrUrl, via: "reason_backfill" } });
     }
   }
 
