@@ -3500,7 +3500,7 @@ async function bounceForChanges(
 // One verb, two shapes. In review the work has not landed, so the notes go
 // straight back to the agent that is still holding it. Once it has SHIPPED
 // there is nothing to bounce: the same request files a follow-up task instead
-// (HIVE-505), and the original stays done.
+// (HIVE-510), and the original stays done.
 async function requestChanges(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
@@ -4804,7 +4804,7 @@ async function ackCheckpoint(db: DB, herdr: Herdr, taskId: string, eventId: stri
   return json({ ok: true, delivered, followup_task_id });
 }
 
-// ---- request changes on shipped work (HIVE-505) ----
+// ---- request changes on shipped work (HIVE-510) ----
 
 // What the shipped task left behind, for the follow-up brief. Every line is
 // best effort: a report-only task has no PR, an old merge predates merged_files.

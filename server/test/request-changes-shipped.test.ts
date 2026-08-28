@@ -1,4 +1,4 @@
-// Request changes on shipped work (HIVE-505). The director read what landed and
+// Request changes on shipped work (HIVE-510). The director read what landed and
 // wants it different. The original task is done and STAYS done; the ask becomes
 // its own queued task carrying what the original built.
 import { test, expect } from "bun:test";

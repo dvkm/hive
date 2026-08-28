@@ -6091,6 +6091,15 @@ a.chip-jira:hover { background: #2d5488; }
 }
 
 /* Request changes on shipped work: a button that opens into its note. */
+/* The Done row is a single no-wrap flex line, so let the open note claim its
+   own line instead of squeezing the title and summary. */
+.brief-done-row {
+  flex-wrap: wrap;
+}
+.brief-done-row .request-changes,
+.brief-done-row .request-changes-filed {
+  flex-basis: 100%;
+}
 .request-changes {
   margin-top: 8px;
   width: 100%;
