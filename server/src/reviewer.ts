@@ -383,11 +383,29 @@ function answerPrompt(task: any, question: string, diff: string): string {
 }
 
 // Already verified for this exact PR head? Then don't spend the model again.
-function hasRiskVerdicts(db: DB, taskId: string, head: string): boolean {
+//
+// The head alone is not enough to answer that. autoReviewOnce can write a
+// SECOND auto_review for the same head (overlapping reconciler laps), and the
+// new review's risk and question lists are regenerated, so they routinely
+// differ from the ones the stored verdicts were produced for. Keying only on
+// the head made that set look reusable forever, while ambiguityCleared compares
+// it against the LATEST review and rejects it on the count mismatch — the task
+// parks with no card and no signal, and nothing ever re-runs the pass to fix it
+// (observed on HIVE-445/HIVE-455: 3 risks vs 2 verdicts, 1 question vs 0).
+//
+// So a stored set counts as covering this review only when it accounts for
+// every risk and question the review actually raised. Anything else re-verifies.
+function hasRiskVerdicts(db: DB, taskId: string, head: string, expected: number): boolean {
   const rows = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts'").all(taskId) as { payload: string }[];
   return rows.some((r) => {
     try {
-      return JSON.parse(r.payload)?.reviewed_head_sha === head;
+      const p = JSON.parse(r.payload);
+      if (p?.reviewed_head_sha !== head) return false;
+      const covered =
+        (Array.isArray(p.verdicts) ? p.verdicts.length : 0) +
+        (Array.isArray(p.question_verdicts) ? p.question_verdicts.length : 0) +
+        (typeof p.unverified === "number" ? p.unverified : 0);
+      return covered === expected;
     } catch {
       return false;
     }
@@ -408,7 +426,7 @@ export async function verifyRisks(
   const risks = (input.risks ?? []).slice(0, MAX_VERIFIED_RISKS);
   const questions = (input.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS);
   if (!risks.length && !questions.length) return;
-  if (hasRiskVerdicts(db, task.id, input.head)) return;
+  if (hasRiskVerdicts(db, task.id, input.head, risks.length + questions.length)) return;
   const exec = deps.exec ?? defaultPlannerExec;
   const current = async () => (input.stillCurrent ? await input.stillCurrent() : true);
   const run = async (prompt: string) => {
