@@ -25,7 +25,7 @@ import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { notTestProjectSql } from "./testProjects.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, editDialogPaths, parseResetClock } from "./diagnose.ts";
-import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount } from "./api.ts";
+import { AUTO_MERGE_PAUSED, requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount } from "./api.ts";
 import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectBaseBranch, preferSafeRef } from "./exec.ts";
@@ -35,7 +35,7 @@ import { sidecarOnce } from "./sidecar.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
 import { runPrGardener } from "./prGardener.ts";
 import { autoAckPlans } from "./planCritic.ts";
-import { ambiguityCleared, cautionCleared } from "./reviewer.ts";
+import { ambiguityCleared, cautionCleared, latestAutoReviewVerdict } from "./reviewer.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
 const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
@@ -1272,6 +1272,61 @@ export function passedByDirector(db: DB, taskId: string): boolean {
   ).get(taskId, taskId);
 }
 
+// One attempt is usually enough to learn a merge is refused; two tolerates a
+// one-off blip. A third identical try is just noise on the card.
+const MAX_AUTO_MERGE_ATTEMPTS = 2;
+
+// How many auto-merge attempts were already refused at this exact head. A new
+// head is a new situation, so its budget starts over.
+function autoMergeFailures(db: DB, taskId: string, head: string | null): number {
+  const row = db
+    .query(
+      `SELECT COUNT(*) n FROM events
+        WHERE task_id = ? AND type = 'auto_merge_failed' AND json_valid(payload)
+          AND json_extract(payload, '$.head_sha') IS ?`
+    )
+    .get(taskId, head) as { n: number };
+  return row.n;
+}
+
+async function errorText(res: Response): Promise<string> {
+  try {
+    const body: any = await res.clone().json();
+    return String(body?.error ?? "");
+  } catch {
+    return "";
+  }
+}
+
+// Failures get their own event type: three `auto_merged` rows with ok:false
+// read like three merges in the event log, which is exactly how HIVE-473 hid
+// in plain sight. `auto_merged` now means merged.
+function recordAutoMergeFailure(
+  db: DB,
+  task: { id: string; number: number; title: string; head_sha: string | null },
+  status: number | null,
+  error: string
+): void {
+  // A pause is not a refusal — the task's readiness changed mid-merge, and the
+  // next cycle re-reads it. Recording it would burn the budget for nothing.
+  if (error === AUTO_MERGE_PAUSED) return;
+  const spent = autoMergeFailures(db, task.id, task.head_sha) + 1;
+  const gaveUp = spent >= MAX_AUTO_MERGE_ATTEMPTS;
+  writeEvent(db, {
+    task_id: task.id,
+    source: "reconciler",
+    type: "auto_merge_failed",
+    payload: { ok: false, status, error, head_sha: task.head_sha, attempts: spent, ...(gaveUp ? { gave_up: true } : {}) },
+  });
+  if (!gaveUp) return;
+  enqueue(db, {
+    kind: "failed",
+    task_id: task.id,
+    title: `Auto-merge gave up on #${task.number}`,
+    body: `Hive tried to merge this ${MAX_AUTO_MERGE_ATTEMPTS} times and was refused each time. Merge it yourself, or push a commit so hive tries again. Last error: ${(error || `HTTP ${status}`).slice(0, 200)}`,
+  });
+}
+
 export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise<void> {
   const h = deps.herdr ?? defaultHerdr;
   const rows = db
@@ -1298,23 +1353,17 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     } catch {
       continue;
     }
-    const review: any = db
-      .query("SELECT payload FROM events WHERE task_id = ? AND type = 'auto_review' ORDER BY ts DESC LIMIT 1")
-      .get(r.id);
-    if (!review) continue; // no pre-review yet — wait for it
-    let verdict: any;
-    try {
-      verdict = JSON.parse(review.payload);
-    } catch {
-      continue;
-    }
-    if (verdict.skipped) continue;
+    // Same helper the merge gate reads (understandingChecksRequired ->
+    // latestAutoReviewVerdict). Two different readings of "the latest review"
+    // is what made this loop forever (HIVE-499).
+    const verdict = latestAutoReviewVerdict(db, r.id);
+    if (!verdict) continue; // no usable pre-review yet — wait for it
     if (verdict.verdict !== "looks_good" && verdict.verdict !== "caution") continue;
     // A PR-backed task's most recent review must have been taken against the
     // PR head that's about to be merged — a delayed review from before a
     // force-push or PR replacement must never auto-merge the new head
     // (task HIVE-307). Not fatal: just wait for autoReviewOnce to catch up.
-    if (r.pr_url && (verdict.reviewed_pr_url !== r.pr_url || verdict.reviewed_head_sha !== r.head_sha)) continue;
+    if (r.pr_url && ((verdict.reviewed_pr_url ?? null) !== r.pr_url || (verdict.reviewed_head_sha ?? null) !== (r.head_sha ?? null))) continue;
     // The pre-review's risks and questions are the ambiguity signal, but they
     // are suspicions until checked: the per-risk verification pass (HIVE-406)
     // re-reads the real code for this exact head. When it refuted every risk
@@ -1340,6 +1389,11 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     if (contested) continue; // a human pushed back once — never auto-merge this task
     const evidence = (db.query("SELECT COUNT(*) n FROM evidence WHERE task_id = ?").get(r.id) as any).n;
     if (!evidence) continue;
+    // Nothing about this task changes between reconciler cycles, so a refusal
+    // at this head will be refused again next cycle, and the cycle after that.
+    // HIVE-473 wrote three identical 409s in two minutes and would have kept
+    // going forever. Spend a small budget per head, then stop and say so once.
+    if (autoMergeFailures(db, r.id, r.head_sha) >= MAX_AUTO_MERGE_ATTEMPTS) continue;
     try {
       const beforeMutation = () => {
         const task = getTask(db, r.id);
@@ -1349,17 +1403,19 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
         return !db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'changes_requested' LIMIT 1").get(r.id);
       };
       const res = await mergeTask(db, h, r.id, {}, { exec: deps.exec }, { beforeMutation });
-      const ok = res.status === 200;
-      writeEvent(db, { task_id: r.id, source: "reconciler", type: "auto_merged", payload: { ok, status: res.status } });
-      if (ok)
+      if (res.status === 200) {
+        writeEvent(db, { task_id: r.id, source: "reconciler", type: "auto_merged", payload: { ok: true, status: res.status } });
         enqueue(db, {
           kind: "auto_merged",
           task_id: r.id,
           title: `Auto-merged #${r.number}: ${r.title.slice(0, 70)}`,
           body: "Green CI, clean pre-review, evidence attached. Now verifying.",
         });
+        continue;
+      }
+      recordAutoMergeFailure(db, r, res.status, await errorText(res));
     } catch (e) {
-      writeEvent(db, { task_id: r.id, source: "reconciler", type: "auto_merged", payload: { ok: false, error: String((e as any)?.message ?? e) } });
+      recordAutoMergeFailure(db, r, null, String((e as any)?.message ?? e));
     }
   }
 }
