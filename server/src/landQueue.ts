@@ -329,6 +329,23 @@ async function revalidateLandPauseCards(db: DB): Promise<void> {
   }
 }
 
+// Has this task's most recent land-queue event already logged the pending-steer
+// hold? Sweeps run every 30s and a slow agent can sit between turns for a long
+// time, so without this check `land_retry_held` would write once per sweep for
+// the whole hold instead of once per episode (HIVE-444 follow-up). Any other
+// event type (a delivered steer resuming retries, a fresh attempt, a re-mark)
+// means the episode ended, so the next hold logs again.
+function alreadyHeldForSteer(db: DB, taskId: string): boolean {
+  const row = db
+    .query(
+      `SELECT type FROM events
+        WHERE task_id = ? AND type IN ('land_retry_held', 'land_attempted', 'land_queued', 'land_unqueued')
+        ORDER BY rowid DESC LIMIT 1`
+    )
+    .get(taskId) as { type: string } | undefined;
+  return row?.type === "land_retry_held";
+}
+
 // One sweep of the land queue for every project that has one. Lands everything
 // whose edges are satisfied and skips the rest for the next sweep.
 //
@@ -399,7 +416,9 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         // merge against it now just burns attempts (HIVE-444). Hold quietly
         // until the steer is delivered AND a new head_sha shows up.
         if (queuedSteers(db, n.id).length) {
-          writeEvent(db, { task_id: n.id, source: "reconciler", type: "land_retry_held", payload: { reason: "pending steer" } });
+          if (!alreadyHeldForSteer(db, n.id)) {
+            writeEvent(db, { task_id: n.id, source: "reconciler", type: "land_retry_held", payload: { reason: "pending steer" } });
+          }
           continue;
         }
         // A changes_requested this task hasn't addressed yet (no new commit
