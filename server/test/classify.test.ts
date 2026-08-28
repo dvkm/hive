@@ -4,7 +4,7 @@
 // "safe"), and anything unrecognized must fall to "unknown" (never "safe").
 import { test, expect } from "bun:test";
 import { join } from "node:path";
-import { classify, actionFor } from "../../hooks/classify.ts";
+import { classify, actionFor, escalate, guardTimeoutMs } from "../../hooks/classify.ts";
 
 const dangerous = [
   "rm -rf /",
@@ -523,4 +523,111 @@ test("force-push to the agent's own task branch is waived; anything else escalat
   expect(classify("git push --force origin hive/abc123", { HOME: "/Users/x" }).decision).toBe("dangerous");
   // a second push segment to a different ref must not ride the waiver
   expect(classify("git push --force origin hive/abc123; git push -f origin main", env).decision).toBe("dangerous");
+});
+
+// A literal `|` inside a quoted argument (a regex alternation in a grep pattern,
+// a printf format, a path with a pipe) is DATA, not a shell pipe. The segment
+// splitter used to cut on it anyway, so `grep -rn "foo|bar" src` was shredded
+// into `grep -rn "foo` + `bar" src`; the second piece matched nothing on the SAFE
+// allowlist and a read-only search escalated as "unknown".
+test("a quoted pipe is data, not a segment boundary", () => {
+  const env = { HOME: "/Users/ada" };
+  for (const cmd of [
+    'grep -rn "foo|bar" server/src',
+    "grep -n 'a|b' file.ts",
+    'rg "DELETE|DROP|TRUNCATE" src',
+    'grep -E "^(ls|cat|echo)\\b" hooks/classify.ts',
+    'echo "a|b"',
+    'grep -rn "state == \'ready\' || state == \'done\'" server/src',
+    'find . -name "*.ts" -newer "a|b.txt"',
+  ]) {
+    expect(classify(cmd, env).decision, cmd).toBe("safe");
+  }
+  // A REAL (unquoted) pipe still splits, so an unsafe stage still escalates.
+  expect(classify('grep -rn "foo|bar" src | xargs sed -i s/a/b/', env).decision).toBe("unknown");
+  // …and a real chain after a quoted-pipe argument is still scanned segment by segment.
+  expect(classify('grep -n "a|b" f; rm -rf /srv', env).decision).toBe("dangerous");
+  expect(classify('ls "a|b" && sudo reboot', env).decision).toBe("dangerous");
+  // Quoting a pipe must not launder a destructive command into the safe lane:
+  // the DANGEROUS scan reads the whole string regardless of segmentation.
+  expect(classify('echo "x|y" > /dev/sda', env).decision).toBe("dangerous");
+  expect(classify('bash -c "grep \'a|b\' f; rm -rf /srv"', env).decision).toBe("dangerous");
+  // An escaped `;` is part of the command, not a separator (`find … -exec … \;`).
+  expect(classify("find . -type f -exec rm {} \\;", env).decision).toBe("dangerous");
+  // An unterminated quote is unparseable, so it falls back to the quote-blind
+  // split — never MORE permissive than before the fix.
+  expect(classify('ls "a; npm publish', env).decision).toBe("unknown");
+  expect(classify("echo 'x; bun install", env).decision).toBe("unknown");
+});
+
+// The guarded-action fetch used to abort after a hardcoded 2s. Under swarm load
+// hive answers slower than that, so ordinary `unknown` commands came back DENIED
+// — a slow server wearing a director's refusal. The timeout is now 15s (tunable
+// via HIVE_GUARD_TIMEOUT_MS), and a real timeout says "TIMEOUT, not a denial".
+test("a slow hive under concurrent load still returns the gate's real answer", async () => {
+  let inFlight = 0;
+  let peak = 0;
+  const server = Bun.serve({
+    port: 0,
+    async fetch() {
+      peak = Math.max(peak, ++inFlight);
+      await Bun.sleep(2_500); // slower than the old hardcoded 2s abort
+      inFlight--;
+      return Response.json({ effect: "allow" });
+    },
+  });
+  try {
+    const outs = await Promise.all(
+      Array.from({ length: 12 }, (_, i) =>
+        escalate(`http://127.0.0.1:${server.port}`, "task1", `bun install ${i}`, "unknown",
+          "not on the safe allowlist", "PreToolUse", false)
+      )
+    );
+    expect(peak).toBeGreaterThan(1); // the calls really did overlap
+    for (const out of outs) {
+      expect(JSON.parse(out).hookSpecificOutput.permissionDecision).toBe("allow");
+    }
+  } finally {
+    server.stop(true);
+  }
+}, 30_000);
+
+test("a gate timeout denies, but says it is a timeout and not a denial", async () => {
+  const server = Bun.serve({ port: 0, async fetch() { await Bun.sleep(5_000); return Response.json({ effect: "allow" }); } });
+  const prev = process.env.HIVE_GUARD_TIMEOUT_MS;
+  process.env.HIVE_GUARD_TIMEOUT_MS = "250";
+  try {
+    expect(guardTimeoutMs()).toBe(250);
+    const out = await escalate(`http://127.0.0.1:${server.port}`, "task1", "bun install", "unknown",
+      "not on the safe allowlist", "PreToolUse", false);
+    const hook = JSON.parse(out).hookSpecificOutput;
+    expect(hook.permissionDecision).toBe("deny"); // still fail-safe
+    expect(hook.permissionDecisionReason).toContain("TIMEOUT, not a denial");
+    expect(hook.permissionDecisionReason).toContain("250ms");
+  } finally {
+    if (prev === undefined) delete process.env.HIVE_GUARD_TIMEOUT_MS;
+    else process.env.HIVE_GUARD_TIMEOUT_MS = prev;
+    server.stop(true);
+  }
+}, 20_000);
+
+test("the guard timeout defaults to 15s and is tunable", () => {
+  const prev = process.env.HIVE_GUARD_TIMEOUT_MS;
+  try {
+    delete process.env.HIVE_GUARD_TIMEOUT_MS;
+    expect(guardTimeoutMs()).toBe(15_000);
+    process.env.HIVE_GUARD_TIMEOUT_MS = "45000";
+    expect(guardTimeoutMs()).toBe(45_000);
+    process.env.HIVE_GUARD_TIMEOUT_MS = "garbage"; // never 0/NaN — that aborts instantly
+    expect(guardTimeoutMs()).toBe(15_000);
+    process.env.HIVE_GUARD_TIMEOUT_MS = "-5"; // negative is truthy: must NOT survive
+    expect(guardTimeoutMs()).toBe(15_000);
+    process.env.HIVE_GUARD_TIMEOUT_MS = "0";
+    expect(guardTimeoutMs()).toBe(15_000);
+    process.env.HIVE_GUARD_TIMEOUT_MS = "Infinity";
+    expect(guardTimeoutMs()).toBe(15_000);
+  } finally {
+    if (prev === undefined) delete process.env.HIVE_GUARD_TIMEOUT_MS;
+    else process.env.HIVE_GUARD_TIMEOUT_MS = prev;
+  }
 });

@@ -79,6 +79,19 @@ test("a clean worktree reports ok with no findings", async () => {
   expect(reports(db, taskId)).toEqual([{ sha: SHA, ok: true, findings: [] }]);
 });
 
+
+test("skips the install when node_modules is already there", async () => {
+  const { db, taskId } = freshDb();
+  const world = fakeWorld();
+  world.exists = (p: string) => p.endsWith("tsconfig.json") || p.endsWith("package.json") || p.endsWith("node_modules");
+  await sidecarOnce(db, world);
+
+  expect(reports(db, taskId)).toEqual([{ sha: SHA, ok: true, findings: [] }]);
+  expect(world.calls.some((c) => c[0] === "bun" && c[1] === "install")).toBe(false);
+});
+
+
+
 test("summaries are capped at 200 characters", async () => {
   const { db, taskId } = freshDb();
   await sidecarOnce(db, fakeWorld({ tsc: { code: 2, stdout: "x".repeat(500), stderr: "" } }));
@@ -294,4 +307,23 @@ test("unparseable tsc output is reported unchanged rather than scoped away", asy
   const world = fakeWorld({ tsc: { code: 2, stdout: "segfault\n", stderr: "" } }, { touched: ["src/mine.ts"] });
   await sidecarOnce(db, world);
   expect(reports(db, taskId)[0]).toEqual({ sha: SHA, ok: false, findings: [{ tool: "tsc", summary: "segfault" }] });
+});
+
+test("a worktree with no node_modules is skipped, and never reported as a broken build", async () => {
+  const { db, taskId } = freshDb();
+  const world = fakeWorld({ tsc: { code: 2, stdout: "error TS2688: Cannot find type definition file for 'bun'.\n", stderr: "" } });
+  // Same repo, but dependencies were never installed.
+  const uninstalled = { ...world, exists: (p: string) => p.endsWith("tsconfig.json") || p.endsWith("package.json") };
+  await sidecarOnce(db, uninstalled);
+
+  expect(reports(db, taskId)).toEqual([
+    {
+      sha: SHA,
+      ok: false,
+      findings: [{ tool: "sidecar", summary: "skipped: this worktree has no node_modules, so nothing can be type checked. Run `bun install` in it." }],
+    },
+  ]);
+  expect(world.calls.some((c) => c.includes("tsc"))).toBe(false);
+  // A skipped check is not a build break, so the agent is never steered.
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'steer'").all(taskId)).toEqual([]);
 });

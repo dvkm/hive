@@ -21,6 +21,7 @@
 // covers the known case; add the ask path if mis-routes show up.
 import type { DB } from "../db.ts";
 import { basename } from "node:path";
+import { activeProjects } from "../testProjects.ts";
 
 export interface RouteResult {
   project_id: string; // where the braindump should be filed
@@ -53,9 +54,7 @@ function hits(text: string, signals: { value: string; word: boolean }[]): string
 // out-scores it.
 export function routeIntakeProject(db: DB, text: string, requestedId: string): RouteResult {
   const lower = text.toLowerCase();
-  const projects = db
-    .query("SELECT id, name, repo_path, config FROM projects")
-    .all() as { id: string; name: string; repo_path: string | null; config: string }[];
+  const projects = activeProjects(db);
 
   let best: { id: string; matched: string[] } | null = null;
   let tied = false; // two projects share the top positive score → ambiguous

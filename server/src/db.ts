@@ -622,6 +622,15 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v35-task-priority",
     statements: [`ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'`],
   },
+  // Where a terminal task's pr_url goes when it's found to point at a PR that
+  // no longer carries this task's marker (hive-487: a repo migration reset PR
+  // numbering, so old pr_urls silently resolved to unrelated PRs). Keeps the
+  // historical reference instead of discarding it, without it being mistaken
+  // for a live link.
+  {
+    name: "v36-task-legacy-pr-url",
+    statements: [`ALTER TABLE tasks ADD COLUMN legacy_pr_url TEXT`],
+  },
 ];
 
 // -------------------------------------------------------------- settings
@@ -646,7 +655,17 @@ export function isOffline(db: DB): boolean {
 
 export type DB = Database;
 
+// A test that forgets to pass a scratch path falls through to defaultDbPath()
+// and writes fixtures straight into the live fleet database (hive-1436: a
+// leaked "scratch (hive-1560 seed)" project with repo_path '/repo' wasted a
+// reconciler spawn every cycle for ~10 hours). `bun test` sets NODE_ENV=test
+// on its own, so this needs no per-test opt-in.
 export function openDb(path: string = defaultDbPath()): DB {
+  if (process.env.NODE_ENV === "test" && path === homeDbPath()) {
+    throw new Error(
+      `openDb: refusing to open the live database (${homeDbPath()}) under NODE_ENV=test. Pass an explicit scratch path, e.g. openDb(":memory:").`
+    );
+  }
   if (path !== ":memory:") {
     mkdirSync(dirname(path), { recursive: true });
   }

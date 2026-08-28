@@ -19,10 +19,11 @@ import { queuedSteers, markSteersDelivered, queueSteerEvent, resumeReviewForDeli
 import { inBackoff, isReviewed, MAX_AGENTS_DEFAULT } from "./dispatcher.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
+import { syncAway } from "./away.ts";
 import { parseEvidence } from "./rows.ts";
 import { broadcastTask, noteToolStart } from "./health.ts";
 import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
-import { notTestProjectSql } from "./testProjects.ts";
+import { activeProjects } from "./testProjects.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, editDialogPaths, parseResetClock } from "./diagnose.ts";
 import { AUTO_MERGE_PAUSED, requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount } from "./api.ts";
@@ -137,6 +138,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   };
   await step("surfaceTrackingBindings", () => surfaceTrackingBindings(db));
   await step("syncAgents", () => syncAgents(db, deps));
+  await step("archiveOrphanedDialogCards", () => archiveOrphanedDialogCards(db));
   await step("drainSteers", () => drainSteers(db, deps));
   await step("advanceFinished", () => advanceFinished(db, deps));
   await step("nagOpenDecisions", () => nagOpenDecisions(db, (deps.nowMs ?? (() => Date.now()))()));
@@ -156,6 +158,9 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("captureRecurringRefs", () => captureRecurringRefs(db));
   await step("repairRequeueProvenance", () => repairRequeueProvenance(db));
   await step("surfaceDeadDependencies", () => surfaceDeadDependencies(db));
+  // Away mode flips on/off by its schedule here. On waking it sends ONE
+  // "while you were away" push for everything that was held.
+  await step("syncAway", () => syncAway(db, (deps.nowMs ?? (() => Date.now()))()));
   // Offline mode: everything above is local (herdr + sqlite) and keeps state
   // honest; everything below either needs the network (gh) or would punish
   // agents for being offline (stale flags, nudges, failure escalation). Stop here.
@@ -702,7 +707,10 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
         writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_merged", payload: { pr_url: t.pr_url } });
         // in_progress can't jump straight to verifying — hop through in_review
         // first, same path a non-deferred task takes on its way to merge.
-        transition(db, t.id, "in_review", { source: "reconciler", reason: "PR merged while deferred — catching up review" });
+        // skipVerification: the PR already merged, so the verification contract
+        // has nothing left to hold back — a gate here would park the task in
+        // in_progress with no agent and no way out (HIVE-402).
+        transition(db, t.id, "in_review", { source: "reconciler", reason: "PR merged while deferred — catching up review", skipVerification: true });
         transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged (deferred task undeferred)" });
         await advanceAfterMerge(db, t.id, deps);
       } else {
@@ -865,9 +873,7 @@ async function linkPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   // scratch dir that gets cleaned up, and running gh against a directory that
   // no longer exists is what wedged this step for ~10h. They have no real PRs
   // to link either.
-  const projects = db
-    .query(`SELECT id, repo_path FROM projects WHERE repo_path IS NOT NULL AND ${notTestProjectSql()}`)
-    .all() as { id: string; repo_path: string }[];
+  const projects = activeProjects(db).filter((p) => p.repo_path) as { id: string; repo_path: string }[];
   let startFailure: string | null = null;
   for (const p of projects) {
     const r = await exec(["gh", "pr", "list", "--state", "open", "--json", "number,title,body,url"], { cwd: p.repo_path });
@@ -1193,6 +1199,40 @@ export async function probePrReadiness(
       return { ok: true, data: current, ci };
   }
   return { ok: false };
+}
+
+// A "blocked on a dialog" card answers by sending a keystroke to a specific
+// pane (recoverBlockedDialog / resolveBlockedForDecision). If that agent died
+// or was respawned since the card opened, the keystroke has nowhere to land —
+// the card is an unanswerable orphan (seen live 2026-08-25: five stuck open).
+// syncAgents already confirms death (lastAgentStatus 'gone' — the same
+// confirmGone path that guards against the false-dead registry-wipe incident),
+// so reuse that signal instead of re-probing herdr here. Never touches
+// non-dialog cards: the title match is the same one recoverBlockedDialog uses
+// to avoid opening duplicates.
+export function archiveOrphanedDialogCards(db: DB): number {
+  const rows = db
+    .query(
+      `SELECT d.id, d.title, d.ts, d.task_id, t.agent_target FROM decisions d JOIN tasks t ON t.id = d.task_id
+        WHERE d.status = 'open' AND d.title LIKE 'Agent blocked on a dialog%'`
+    )
+    .all() as { id: string; title: string; ts: string; task_id: string; agent_target: string | null }[];
+  let archived = 0;
+  for (const r of rows) {
+    const respawned = db
+      .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawned' AND ts > ? LIMIT 1")
+      .get(r.task_id, r.ts);
+    const dead = !r.agent_target || lastAgentStatus(db, r.task_id) === "gone";
+    if (!respawned && !dead) continue;
+    apiDismissDecision(db, r.id, {
+      reason: "dialog_agent_gone",
+      steer:
+        `hive auto-archived your decision card "${r.title}": the agent it was waiting on ` +
+        `${respawned ? "was respawned" : "is gone"} since the card opened, so the dialog it named no longer exists. Carry on.`,
+    });
+    archived++;
+  }
+  return archived;
 }
 
 // Signal freshness. A card that cited red checks is only worth the director's

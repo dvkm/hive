@@ -256,6 +256,7 @@ never deleted, so the cancelled row + this pointer preserve the full history.
 - `auto_approved` — the chat supervisor cleared a card itself via the auto-approve bar. `payload: {decision_id, answer_key, category, reason, note}`. `source: chat_supervisor`
 - `auto_approve_declined` — the auto-approve bar rejected a card; it stays `open` for the director. `payload: {decision_id, answer_key, category, reason}`. `source: chat_supervisor`
 - `decision_expired` — a decision was cleared without an answer: dismissed, or auto-expired because its task went terminal. `payload: {decision_id, reason}` (`reason` ∈ `dismissed` | `task cancelled` | `task done` | `task failed` | `task terminal (backfill)`)
+- `verification_missing` — the review handoff was refused because the task's `verification_cmds` had no matching evidence. `payload: {names}` (the missing contract entries). Written once per distinct set of missing names, so a polling caller records the gap once.
 - `note` — a free note (e.g. a `done` summary). `payload: {note}`
 - `steer` — a steer message was dispatched to the agent. Director calls, including broadcasts, may include an optional session label: `payload: {message, target, actor}`.
 - `blocked` — agent reported blocked. `payload: {note}`
@@ -676,7 +677,7 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
 
 ### Tasks
 - `GET /api/tasks?state=&project_id=&test=` → `200 [Task, ...]` (newest `updated_at` first; all filters optional). Tasks under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
-- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?, verification_cmds?, priority?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher and reconciler won't advance the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban. It is never auto-dispatched or staleness-supervised, is exempt from the done-evidence gate, and moves freely via transitions (`hive task move <id> <state>`). The board keeps these tasks in its separate Tracked view with the external state visible. Jira-keyed Hive work is grouped beneath the matching tracked card, with requeue chains collapsed to their latest attempt. `verification_cmds` is the task's verification contract: an array of `{name, cmd}` the agent must run before handing off (`name`: 1-32 chars of `a-z0-9-`, unique within the task; `cmd`: a non-empty string). Anything else → `400`. The agent brief renders it as a "Verification contract" section, and `hive emit <id> evidence --verify-name <name>` tags an artifact with the entry it came from (stored as `verify_name` on the `evidence` event). Nothing is gated on it yet. `priority` is one of `now`, `next`, `normal`, `later`; anything else → `400`, and a non-director `source` asking for `now` → `403`. Omit it and the task inherits its parent's priority, or starts at `next` when the title/brief reads as security work, else `normal`. It is ORDERING only, never preemption — see [Priority](#priority) for the full inheritance and authority rules. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
+- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?, verification_cmds?, priority?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher and reconciler won't advance the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban. It is never auto-dispatched or staleness-supervised, is exempt from the done-evidence gate, and moves freely via transitions (`hive task move <id> <state>`). The board keeps these tasks in its separate Tracked view with the external state visible. Jira-keyed Hive work is grouped beneath the matching tracked card, with requeue chains collapsed to their latest attempt. `verification_cmds` is the task's verification contract: an array of `{name, cmd}` the agent must run before handing off (`name`: 1-32 chars of `a-z0-9-`, unique within the task; `cmd`: a non-empty string). Anything else → `400`. The agent brief renders it as a "Verification contract" section, and `hive emit <id> evidence --verify-name <name>` tags an artifact with the entry it came from (stored as `verify_name` on the `evidence` event). The contract is enforced at the review handoff: `in_progress` -> `in_review` is refused with `409` until every named command has a matching evidence event, and the refusal lists exactly the missing names (see the `verification_missing` event). `priority` is one of `now`, `next`, `normal`, `later`; anything else → `400`, and a non-director `source` asking for `now` → `403`. Omit it and the task inherits its parent's priority, or starts at `next` when the title/brief reads as security work, else `normal`. It is ORDERING only, never preemption — see [Priority](#priority) for the full inheritance and authority rules. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
 - `POST /api/tasks/:id/jira/link` body `{parent_key (required)}` → `201 {jira_key, browse_url, warnings}` | `400` | `404`
@@ -1384,6 +1385,33 @@ Task routes accept a task NUMBER as well as an id (`hive://task/1247`).
   Fires one urgent test notification down the live delivery path. `app_clients` is how many desktop apps are attached to the stream; zero means delivery falls back to launching the app. Behind `hive notify --test`, which then polls for `delivered_at`.
 - `POST /api/notifications/ack` → `200 {"ok":true, "acked": <n>}`
   Marks all currently-undelivered notifications as seen (`delivered_at` set to now). Called when the header bell dropdown is opened, so those events are not re-pushed by the next digest.
+
+### Away mode
+Holds low-urgency phone pushes overnight and batches them into one summary.
+
+Every urgent notification pushes to the phone the moment it happens. Away mode
+classifies each outgoing push and holds the ones that can wait. The class comes
+from the notification `kind` (`decision`, `decision_nag`, `review` → `decision`;
+`quiz_digest` → `quiz-digest`; `circuit_breaker`, `agent_unreachable`,
+`auth_lost`, `incident` → `fleet_down`; everything else → `info`), and an `enqueue` can override it with an explicit
+`class`. A class listed in `always_through` is pushed immediately even while
+away; everything else is appended to a held list.
+
+Config lives in the `away_mode` settings key, the held list in `away_held`, and
+the latched schedule state in `away_active`. The reconciler step `syncAway`
+flips the latch by the schedule. On waking it sends ONE push,
+`While you were away: N items`, deep-linking `/inbox`, then clears the list.
+The manual `on` switch takes effect on the very next push, not at the next tick.
+
+- `GET /api/away` → `200 {"on": <bool>, "schedule": {"start","end","tz"}|null, "always_through": [...], "active": <bool>, "held": <n>}`
+  `active` is away RIGHT NOW (manual switch, or the schedule latch). `held` is how many pushes are waiting.
+- `POST /api/away` body `{on?, schedule?, always_through?}` → `200 {..., "active": <bool>, "flushed": <n>, "held": <n>}`
+  Any omitted field keeps its current value; `"schedule": null` clears the schedule. Turning away mode off flushes the held list immediately, so the summary push does not wait for the next reconciler tick. `flushed` is how many held pushes that summary covered.
+
+`schedule.start` is inclusive and `schedule.end` exclusive, both wall clock in
+`schedule.tz` (an IANA zone). A window that wraps midnight (`23:00` → `08:00`)
+is the normal case. An unparsable time or timezone never holds anything.
+`always_through` defaults to `["security","spend","fleet_down","second_failure"]`.
 
 ### Secrets (metadata only)
 `POST` and `DELETE` here require the API token from every caller, loopback

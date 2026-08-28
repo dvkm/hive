@@ -22,12 +22,12 @@ import { startAutoReviewer } from "./reviewer.ts";
 import { startDriftWatch } from "./drift.ts";
 import { startPromoter } from "./promoter.ts";
 import { followServingBranchOnBoot } from "./servingBranch.ts";
-import { setEventHook, setTerminalHook, expireOrphanedDecisions, repairRequeueProvenance } from "./state.ts";
+import { setEventHook, setTerminalHook, expireOrphanedDecisions, repairRequeueProvenance, backfillStuckPrUrls } from "./state.ts";
 import { bootstrapAuthority } from "./authority.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { defaultExec } from "./exec.ts";
-import { claimLease, startLease, holdsLease, interloperReason, registerInstance, unregisterInstance, evictContenders, LEASE_MS } from "./lease.ts";
+import { claimLease, startLease, holdsLease, interloperReason, interloperAdvice, registerInstance, unregisterInstance, evictContenders, LEASE_MS } from "./lease.ts";
 import { enqueue } from "./notifications.ts";
 import { setSetting, now } from "./db.ts";
 
@@ -45,7 +45,7 @@ const db = openDb(dbPath);
   const reason = interloperReason(dbPath, port);
   if (reason) {
     console.error(`[hive] REFUSING TO START: ${reason}.`);
-    console.error(`[hive] A second server on the live DB kills working agents. Use a scratch DB: HIVE_DB=/tmp/smoke.db HIVE_PORT=${port} bun run server/src/index.ts`);
+    console.error(`[hive] ${interloperAdvice(port)}`);
     // One card per incident, not per retry: a refused server under a supervisor
     // (launchd, `bun --watch`) relaunches on a loop and would otherwise fill the
     // tray with the same sentence.
@@ -57,7 +57,7 @@ const db = openDb(dbPath);
         kind: "server_refused",
         urgency: "normal",
         title: "Blocked a second hive server on the live database",
-        body: `Something started a hive server on port ${port} against the fleet DB. It was refused and nothing was touched — it needed HIVE_DB set to a scratch path.`,
+        body: `Something started a hive server on port ${port} against the fleet DB. It was refused and nothing was touched. ${interloperAdvice(port)}`,
       });
     process.exit(1);
   }
@@ -82,6 +82,11 @@ if (orphaned) console.log(`[hive] expired ${orphaned} orphaned open decision(s) 
 // only ever rescans unverified rows).
 const quarantinedRequeues = repairRequeueProvenance(db);
 if (quarantinedRequeues) console.log(`[hive] quarantined ${quarantinedRequeues} requeue task(s) with unverifiable provenance`);
+
+// Backfill: link pr_url for tasks already stuck in in_review whose PR URL only
+// ever landed as free text in a state_change reason (hive-1717). Idempotent.
+const backfilledPrUrls = backfillStuckPrUrls(db);
+if (backfilledPrUrls) console.log(`[hive] backfilled pr_url for ${backfilledPrUrls} stuck in_review task(s)`);
 
 // Mint the remote API token once (phones/tablets present it; loopback never
 // needs it). Shown by `hive remote`.

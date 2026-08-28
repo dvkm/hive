@@ -528,6 +528,7 @@ export function TaskBody({ id }: { id: string }) {
   const [steer, setSteer] = useState("");
   const [steerFiles, setSteerFiles] = useState<File[]>([]);
   const [planning, setPlanning] = useState(false);
+  const [promoting, setPromoting] = useState(false);
 
   const refresh = () => api.task(id).then(setT).catch(() => {});
 
@@ -624,6 +625,19 @@ export function TaskBody({ id }: { id: string }) {
       toast((e as Error).message);
     } finally {
       setPlanning(false);
+    }
+  };
+  // Done tasks only: the endpoint 409s otherwise, and the button is hidden.
+  const promoteToPlaybook = async () => {
+    if (promoting) return;
+    setPromoting(true);
+    try {
+      const r = await api.playbook(t.id);
+      toast(`Playbook saved: ${r.playbook.title}`);
+    } catch (e) {
+      toast((e as Error).message);
+    } finally {
+      setPromoting(false);
     }
   };
   const dispatch = async () => {
@@ -969,6 +983,16 @@ export function TaskBody({ id }: { id: string }) {
               {!trackingOnly && (
                 <button className="btn" onClick={planBreakdown} disabled={planning}>
                   {planning ? "Planning…" : "Plan breakdown"}
+                </button>
+              )}
+              {t.state === "done" && (
+                <button
+                  className="btn"
+                  onClick={promoteToPlaybook}
+                  disabled={promoting}
+                  title="Distil this finished task into a reusable playbook, saved under References"
+                >
+                  {promoting ? "Distilling…" : "Promote to playbook"}
                 </button>
               )}
               <div className="transitions">
