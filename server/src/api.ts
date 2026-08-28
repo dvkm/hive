@@ -2082,6 +2082,32 @@ export function handOffToReview(db: DB, taskId: string, source: string): boolean
 
 // POST /api/tasks/link-pr {pr_url} — resolve a PR's marker and link it to its
 // task. Reads the PR title/body via `gh pr view` and matches by marker.
+// Delete a task branch once its merge is CONFIRMED. Best-effort and always
+// after the fact: a branch that will not delete (protected, already gone, still
+// checked out in a live worktree) must never make a successful merge look like
+// a failure, which is exactly what `gh pr merge --delete-branch` would do by
+// folding both outcomes into one exit code.
+//
+// The local delete uses -D because a squash merge leaves the branch "not fully
+// merged" by git's reckoning even though GitHub has already taken the content.
+// git still refuses to delete a branch checked out in any worktree, which is
+// the guard that actually matters here.
+async function deleteMergedBranch(exec: Exec, task: any, project: any): Promise<void> {
+  const branch = task.branch;
+  if (!branch) return;
+  if (task.pr_url) {
+    const m = /github\.com\/([^/]+)\/([^/]+)\/pull\//.exec(task.pr_url);
+    if (m) {
+      const r = await exec(["gh", "api", "-X", "DELETE", `repos/${m[1]}/${m[2]}/git/refs/heads/${branch}`]);
+      if (r.code !== 0) console.error(`[hive] could not delete remote branch ${branch}: ${r.stderr.trim().slice(0, 200)}`);
+    }
+  }
+  if (project?.repo_path) {
+    const r = await exec(["git", "-C", project.repo_path, "branch", "-D", branch]);
+    if (r.code !== 0) console.error(`[hive] could not delete local branch ${branch}: ${r.stderr.trim().slice(0, 200)}`);
+  }
+}
+
 async function linkPrEndpoint(db: DB, body: any, deps: HandlerDeps): Promise<Response> {
   const prUrl = String(body?.pr_url ?? "").trim();
   if (!prUrl) return err("pr_url is required");
@@ -3175,6 +3201,9 @@ export async function mergeTask(
     });
   }
   writeEvent(db, { task_id: id, source: "director", type: "merged", payload: { method, base, branch: task.branch, pr_url: task.pr_url, actor } });
+  // The merge is committed at this point, so branch cleanup can only be
+  // cosmetic from here on. Never let it throw into the merge path.
+  await deleteMergedBranch(exec, task, project).catch((e) => console.error("[hive] branch cleanup:", e));
   // in_review → verifying (runs post-deploy smoke once).
   transition(db, id, "verifying", { source: "director", reason: `merged (${method})` });
   await smokeThenAdvance(db, id, { fetch: deps.fetch }).catch((e) => console.error("[hive] smoke run failed:", e));

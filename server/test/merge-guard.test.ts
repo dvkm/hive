@@ -271,3 +271,24 @@ test("PR merge fails closed when its base metadata is unavailable", async () => 
   expect(gitCalls).toBe(0);
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_failed'").get(taskId)).toBeTruthy();
 });
+
+test("a merged task's branch is deleted, and a failed delete does not fail the merge", async () => {
+  const { db, taskId } = seed();
+  const calls: string[][] = [];
+  // Same router as the override path, plus a branch delete that always refuses.
+  const exec: Exec = stub((argv) => {
+    calls.push(argv);
+    if (argv.includes("branch") && argv.includes("-D")) return { code: 1, stdout: "", stderr: "branch is checked out" };
+    if (argv.includes("diff") && argv.includes("--name-only")) return OK("src/task.ts\n");
+    if (argv[3] === "log") return OK("");
+    if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
+    if (argv.includes("symbolic-ref")) return OK("main\n");
+    return OK();
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec });
+  expect(res.status).toBe(200);
+  // The merge still landed even though the branch could not be removed.
+  expect(getTask(db, taskId).state).toBe("verifying");
+  expect(calls.some((c) => c.includes("branch") && c.includes("-D") && c.includes("feat"))).toBe(true);
+});
