@@ -192,6 +192,15 @@ async function runChecks(
   }
   if (checks.length === 0) return { findings, dirtied: false };
 
+  // A freshly spawned worktree has no node_modules yet (the setup hook that
+  // installs one is best-effort and can be unwired or fail silently), and
+  // without it tsc can't even find its own type defs (TS2688 bun-types),
+  // which then cascades into unrelated TS18046 noise. Same install wt.sh
+  // would run, kept idempotent the same way: skip if already present.
+  if (!deps.exists(join(worktree, "node_modules")) && deps.exists(join(worktree, "package.json"))) {
+    await exec(["bun", "install"], { cwd: worktree, timeoutMs: remaining() });
+  }
+
   const before = await porcelain(exec, worktree);
   for (const check of checks) {
     // A skipped check is a finding: the report has to say this sha was only
