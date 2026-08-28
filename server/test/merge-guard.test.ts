@@ -315,6 +315,55 @@ test("a real revert still blocks after the snapshot was re-baselined (#1696)", a
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_blocked_destructive'").get(taskId)).toBeTruthy();
 });
 
+test("a transient merge-base failure (exit 128) does not re-baseline the snapshot (#1696 follow-up)", async () => {
+  const { db, taskId } = seed();
+  const prUrl = "https://gh/pr/glitch";
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run(prUrl, taskId);
+  writeEvent(db, { task_id: taskId, source: "reconciler", type: "branch_scope", payload: { base_sha: "old-base-sha", files: ["src/task.ts"], head_sha: "old-head" } });
+  const branchScopeCountBefore = (db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'branch_scope'").get(taskId) as any).n;
+  const exec: Exec = stub((argv) => {
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(JSON.stringify({ state: "OPEN", baseRefName: "main", baseRefOid: "base-sha-now", headRefOid: "some-head", mergeStateStatus: "CLEAN", statusCheckRollup: [] }));
+    if (argv[0] === "gh" && argv.includes("merge")) return OK();
+    // git object corruption / repo lock — NOT a confirmed "not an ancestor" (exit 1)
+    if (argv.includes("merge-base") && argv.includes("--is-ancestor")) return { code: 128, stdout: "", stderr: "fatal: bad object" };
+    if (argv.includes("diff") && argv.includes("--name-only")) return OK("src/task.ts\n");
+    if (argv.includes("rev-parse")) return OK(`${argv.at(-1)}\n`);
+    return OK();
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec });
+
+  expect(res.status).toBe(200);
+  // no new branch_scope re-baseline event was written for the transient failure
+  const branchScopeCountAfter = (db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'branch_scope'").get(taskId) as any).n;
+  expect(branchScopeCountAfter).toBe(branchScopeCountBefore);
+});
+
+test("merge is refused, not silently allowed, when re-baseline capture fails (#1696 follow-up)", async () => {
+  const { db, taskId } = seed();
+  const prUrl = "https://gh/pr/capturefail";
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run(prUrl, taskId);
+  writeEvent(db, { task_id: taskId, source: "reconciler", type: "branch_scope", payload: { base_sha: "old-base-sha", files: ["src/task.ts"], head_sha: "old-head" } });
+  const exec: Exec = stub((argv) => {
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(JSON.stringify({ state: "OPEN", baseRefName: "main", baseRefOid: "base-sha-now", headRefOid: "rebuilt-head", mergeStateStatus: "CLEAN", statusCheckRollup: [] }));
+    if (argv[0] === "gh" && argv.includes("merge")) return OK();
+    if (argv.includes("merge-base") && argv.includes("--is-ancestor")) return { code: 1, stdout: "", stderr: "not an ancestor" };
+    // the re-baseline capture's own diff read fails — captureBranchScope returns null
+    if (argv.includes("diff") && argv.includes("--name-only")) return { code: 128, stdout: "", stderr: "fatal: bad revision" };
+    if (argv.includes("rev-parse")) return OK(`${argv.at(-1)}\n`);
+    return OK();
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec });
+
+  expect(res.status).toBe(409);
+  const body: any = await res.json();
+  expect(body.error).toContain("could not re-verify branch scope");
+  expect(getTask(db, taskId).state).toBe("in_progress");
+});
+
 test("PR merge fails closed when its base metadata is unavailable", async () => {
   const { db, taskId } = seed();
   db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/1", taskId);

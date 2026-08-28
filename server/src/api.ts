@@ -3018,20 +3018,37 @@ export async function mergeTask(
         let invalidated = false;
         if (originalHead) {
           const anc = await exec(["git", "-C", project.repo_path, "merge-base", "--is-ancestor", originalHead, guardHead]);
-          invalidated = anc.code !== 0;
+          // exit 0 = ancestor (not invalidated), 1 = confirmed NOT an ancestor
+          // (force-push/rebuild). Any other exit code is a transient git
+          // failure (bad object, repo lock) — treat it like "not invalidated"
+          // rather than re-baselining off a possibly-bogus guardHead.
+          invalidated = anc.code === 1;
         }
+        let captureFailed = false;
         if (invalidated) {
           const fresh = await captureBranchScope(exec, project.repo_path, guardBase, guardHead);
-          snapshot = fresh;
-          if (fresh) writeEvent(db, { task_id: id, source: "director", type: "branch_scope", payload: { ...fresh, head_sha: guardHead } });
+          if (fresh) {
+            snapshot = fresh;
+            writeEvent(db, { task_id: id, source: "director", type: "branch_scope", payload: { ...fresh, head_sha: guardHead } });
+          } else {
+            captureFailed = true;
+          }
         } else if (originalHead) {
           const exact = await captureBranchScope(exec, project.repo_path, guardBase, originalHead);
           if (exact) snapshot = { ...snapshot, files: exact.files };
         }
-        const regressed = snapshot ? await detectDestructiveRebase(exec, project.repo_path, guardBase, guardHead, snapshot) : null;
-        if (regressed && regressed.length) {
-          const files = regressed.slice(0, 10).join(", ") + (regressed.length > 10 ? `, …(+${regressed.length - 10})` : "");
-          const reason = `branch '${task.branch}' reverts base work outside this task's scope (${files})`;
+        const regressed = captureFailed
+          ? []
+          : snapshot
+            ? await detectDestructiveRebase(exec, project.repo_path, guardBase, guardHead, snapshot)
+            : null;
+        if (captureFailed || (regressed && regressed.length)) {
+          const files = captureFailed
+            ? ""
+            : regressed!.slice(0, 10).join(", ") + (regressed!.length > 10 ? `, …(+${regressed!.length - 10})` : "");
+          const reason = captureFailed
+            ? `could not re-verify branch scope for '${task.branch}' after a same-branch re-cut (snapshot capture failed)`
+            : `branch '${task.branch}' reverts base work outside this task's scope (${files})`;
           writeEvent(db, {
             task_id: id,
             source: "director",
