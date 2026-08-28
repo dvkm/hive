@@ -79,6 +79,19 @@ test("a clean worktree reports ok with no findings", async () => {
   expect(reports(db, taskId)).toEqual([{ sha: SHA, ok: true, findings: [] }]);
 });
 
+
+test("skips the install when node_modules is already there", async () => {
+  const { db, taskId } = freshDb();
+  const world = fakeWorld();
+  world.exists = (p: string) => p.endsWith("tsconfig.json") || p.endsWith("package.json") || p.endsWith("node_modules");
+  await sidecarOnce(db, world);
+
+  expect(reports(db, taskId)).toEqual([{ sha: SHA, ok: true, findings: [] }]);
+  expect(world.calls.some((c) => c[0] === "bun" && c[1] === "install")).toBe(false);
+});
+
+
+
 test("summaries are capped at 200 characters", async () => {
   const { db, taskId } = freshDb();
   await sidecarOnce(db, fakeWorld({ tsc: { code: 2, stdout: "x".repeat(500), stderr: "" } }));

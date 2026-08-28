@@ -54,6 +54,8 @@ Usage:
         [--body <s>] [--task <src-task-id>] [--root-cause]  (root-cause: failure only, auto-spawns a chore task)
   hive learning list [--project <id>] [--status active|resolved]
   hive learning recur <learning-id>
+  hive playbook create <task-id>          distil a done task into a reusable playbook (a reference)
+  hive playbook list [--project <id>]
   hive land <task-id...> [--off]          mark in-review tasks approved-to-land; hive merges
         them in graph order (declared dependencies first, one conflicting branch per sweep)
   hive land-graph [--project <id>]        show the review column's ordering edges
@@ -497,6 +499,33 @@ async function main() {
       return;
     }
     die(`unknown 'learning' subcommand: ${sub}\n\n${USAGE}`);
+  }
+
+  // Playbooks are kind='reference' learnings whose body starts with
+  // `[playbook]`, so they need no store of their own — just a create call and a
+  // filtered list.
+  if (cmd === "playbook") {
+    const sub = argv[1];
+    const { _, flags } = parseFlags(argv.slice(2));
+    if (sub === "create") {
+      const taskId = _[0];
+      if (!taskId) die("usage: hive playbook create <task-id>");
+      const r = await api("POST", `/api/tasks/${taskId}/playbook`, {});
+      console.log(`playbook ${r.learning_id}: ${r.playbook.title}`);
+      console.log(`  when to use: ${r.playbook.when_to_use}`);
+      for (const s of r.playbook.steps) console.log(`  - ${s}`);
+      return;
+    }
+    if (sub === "list") {
+      const qs = new URLSearchParams({ status: "active" });
+      if (flags.project) qs.set("project_id", String(flags.project));
+      const rows = await api("GET", "/api/learnings?" + qs.toString());
+      const books = rows.filter((l: any) => l.kind === "reference" && String(l.body ?? "").startsWith("[playbook]"));
+      if (!books.length) return console.log("(no playbooks)");
+      for (const l of books) console.log(`${l.id}  ${l.title}\n    ${String(l.body).split("\n")[0].slice(11)}`);
+      return;
+    }
+    die(`unknown 'playbook' subcommand: ${sub}\n\n${USAGE}`);
   }
 
   if (cmd === "spawn") {

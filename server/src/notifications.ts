@@ -16,6 +16,8 @@ import { pushToAll } from "./push.ts";
 import type { PushPayload } from "./push.ts";
 import type { Exec } from "./exec.ts";
 import { notTestProjectSql } from "./testProjects.ts";
+import { classOfKind, holdIfAway } from "./away.ts";
+import type { PushClass } from "./away.ts";
 
 export type Urgency = "normal" | "urgent";
 
@@ -26,6 +28,10 @@ export interface NotifInput {
   urgency?: Urgency;
   task_id?: string | null;
   decision_id?: string | null;
+  // How this push is classified for away mode. Defaults from `kind` (see
+  // away.ts). Set it explicitly when the kind alone does not say enough — a
+  // security or spend alert must not be held overnight.
+  class?: PushClass;
 }
 
 // Module-level desktop app sink. Off by default (null) so tests and the CLI never
@@ -146,7 +152,11 @@ export function enqueue(db: DB, n: NotifInput, deps: { exec?: Exec; push?: typeo
         }
       }
     }
-    void (deps.push ?? pushToAll)(db, payload).catch(() => {});
+    // Away mode holds low-urgency pushes and batches them into one summary
+    // when it lifts. Classes in `always_through` still go out immediately.
+    if (!holdIfAway(db, n.class ?? classOfKind(n.kind), payload)) {
+      void (deps.push ?? pushToAll)(db, payload).catch(() => {});
+    }
   }
   return row;
 }
