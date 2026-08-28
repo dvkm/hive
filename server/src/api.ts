@@ -96,7 +96,7 @@ import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
 import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infraTaskOpen, probeAgent } from "./reconciler.ts";
-import { getAway, setAway, awayNow, heldPushes, syncAway } from "./away.ts";
+import { getAway, setAway, awayNow, heldPushes, lastFlush, syncAway } from "./away.ts";
 import type { AwayConfig } from "./away.ts";
 import { taskDiff } from "./diff.ts";
 import { authoredFiles, captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
@@ -586,7 +586,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         return await setOffline(db, herdr, await req.json());
 
       if (pathname === "/api/away" && method === "GET")
-        return json({ ...getAway(db), active: awayNow(db), held: heldPushes(db).length });
+        return json({ ...getAway(db), active: awayNow(db), held: heldPushes(db).length, items: heldPushes(db), last_flush: lastFlush(db) });
       if (pathname === "/api/away" && method === "POST") return setAwayMode(db, await req.json());
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/checkpoints\/([^/]+)\/ack$/);
       if (m && method === "POST") return await ackCheckpoint(db, herdr, m[1], m[2], await req.json());
@@ -4104,7 +4104,7 @@ function setAwayMode(db: DB, body: any): Response {
   };
   setAway(db, next);
   const { active, flushed } = syncAway(db);
-  return json({ ...getAway(db), active, flushed, held: heldPushes(db).length });
+  return json({ ...getAway(db), active, flushed, held: heldPushes(db).length, items: heldPushes(db), last_flush: lastFlush(db) });
 }
 
 // ---- checkpoints (live build-time checklist) ----

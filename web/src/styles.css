@@ -6184,3 +6184,56 @@ a.chip-jira:hover { background: #2d5488; }
   font-size: 13px;
   color: var(--muted);
 }
+
+/* ---- away mode: topbar toggle, banner, held summary ---- */
+.away-toggle.away-on {
+  background: #5b6cff;
+  border-color: #5b6cff;
+  color: #f5f5f7;
+  font-weight: 700;
+}
+.away-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 24px;
+  background: rgba(91, 108, 255, 0.12);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 13px;
+  color: var(--text);
+}
+.away-banner-text {
+  font-weight: 500;
+}
+.away-held-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.away-held-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 13px;
+}
+.away-held-list li span:last-child {
+  margin-left: auto;
+  white-space: nowrap;
+}
+.dnote-wrap {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.dnote-wrap .dnote {
+  flex: 1;
+}
+.mic-btn.mic-on {
+  background: #d4a72c;
+  border-color: #d4a72c;
+  color: #1a1a1a;
+}
