@@ -1,4 +1,13 @@
 // hive daemon entrypoint. Bun.serve on 127.0.0.1:4700 (override HIVE_PORT).
+// INCIDENT HOTFIX 2026-08-25 (task 4917e8ecd667): an unhandled async rejection
+// escaping a spawned subprocess (gh ENOENT via exec.ts) exits the Bun process,
+// crash-looping the server under launchd. Log and survive instead; the error
+// streak machinery already surfaces degradation in /api/health. Applied
+// straight to the live checkout during the incident; carried onto main here so
+// the next deploy does not silently drop it.
+process.on("unhandledRejection", (e) => {
+  console.error("[hive] unhandledRejection (survived):", e);
+});
 import { openDb, defaultDbPath } from "./db.ts";
 import { makeHandler, keepSupervisorWarm, notifyManagerOfEvent, repairDuplicateQuizPasses, sweepManagerInboxes, wakeDueManagers } from "./api.ts";
 import { startReconciler, reAdoptAgentsOnBoot } from "./reconciler.ts";
@@ -12,6 +21,7 @@ import { startWatchers } from "./watch.ts";
 import { startAutoReviewer } from "./reviewer.ts";
 import { startDriftWatch } from "./drift.ts";
 import { startPromoter } from "./promoter.ts";
+import { followServingBranchOnBoot } from "./servingBranch.ts";
 import { setEventHook, setTerminalHook, expireOrphanedDecisions, repairRequeueProvenance } from "./state.ts";
 import { bootstrapAuthority } from "./authority.ts";
 import { cleanupTask } from "./cleanup.ts";
@@ -138,6 +148,11 @@ const { instance, displaced } = claimLease(db);
 // reaped in the first minutes after a restart/self-deploy, when herdr's agent
 // registry may still be cold and every live agent probes as gone.
 setSetting(db, "server_started_at", now());
+
+// Whatever landed while this server was down has not reached its checkout yet.
+// Bring the serving checkout up to the base branch before the loops start, so
+// boot runs the code that actually landed. (`bun --watch` reloads on the merge.)
+followServingBranchOnBoot(db).catch((e) => console.error("[hive] serving-branch follow on boot:", e));
 
 // Background supervision: coarse reconciler (herdr status + gh PR sync + stale
 // flagging) and per-project URL monitors. Both are failure-isolated internally.
