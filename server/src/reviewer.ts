@@ -591,6 +591,21 @@ export function riskVerdictsFor(
   return null;
 }
 
+// Has the review pipeline actually FINISHED for this head (HIVE-488)? Read
+// from the other side, this is the same test verifyPendingOnce uses to decide a
+// task needs no further verification: the newest review was written for this
+// exact head, and every risk and question it raised already has a verdict keyed
+// to that head. Until then the missing quiz answer is a pass that has not run,
+// not a question for the director — so the director surfaces must not count it.
+export function reviewCompleteForHead(db: DB, taskId: string, head: string | null | undefined): boolean {
+  if (!head) return false;
+  const review = latestAutoReviewVerdict(db, taskId);
+  if (!review || review.reviewed_head_sha !== head) return false;
+  const expected =
+    (review.risks ?? []).slice(0, MAX_VERIFIED_RISKS).length + (review.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS).length;
+  return expected === 0 || hasRiskVerdicts(db, taskId, head, expected);
+}
+
 export function confirmedRisks(db: DB, taskId: string, head: string | null | undefined): RiskVerdict[] {
   return (riskVerdictsFor(db, taskId, head)?.verdicts ?? []).filter((v) => v?.verdict === "confirmed");
 }

@@ -1175,6 +1175,91 @@ function addRiskVerdicts(s: ReturnType<typeof makeServer>, taskId: string, head:
   );
 }
 
+// HIVE-488: one task per bucket seen live on the hive project. Only the task
+// whose review actually finished for its CURRENT head is a question the
+// director can answer; the rest are the review pipeline still working, or
+// findings keyed to a head that no longer exists.
+test("only a review that finished for the live head counts as an answerable quiz", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", {
+    name: "p",
+    repo_path: "/repo",
+    config: { default_branch: "main", auto_merge: { kinds: ["chore"] } },
+  });
+  // Bucket task: judgment-class (kind outside auto_merge.kinds) with a quiz.
+  const bucket = async (title: string, head: string | null, review: { head?: string; risks?: string[] } | null) => {
+    const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title, brief: "b", kind: "ship" });
+    await post(s.base, `/api/tasks/${t.json.id}/spawn`, {});
+    await addQuiz(s.base, t.json.id);
+    await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+    if (head) s.db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run(head, t.json.id);
+    if (review)
+      s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+        `ev-auto-${t.json.id}`,
+        t.json.id,
+        new Date().toISOString(),
+        "system",
+        "auto_review",
+        JSON.stringify({
+          verdict: "caution",
+          summary: "s",
+          risks: review.risks ?? [],
+          questions: [],
+          files: ["server/src/rows.ts"],
+          ...(review.head ? { reviewed_head_sha: review.head } : {}),
+        })
+      );
+    return t.json.id;
+  };
+  const verdicts = (taskId: string, head: string, risks: string[]) =>
+    s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+      `ev-rv-${taskId}`,
+      taskId,
+      new Date().toISOString(),
+      "system",
+      "risk_verdicts",
+      JSON.stringify({ reviewed_head_sha: head, verdicts: risks.map((risk) => ({ risk, verdict: "confirmed", why: "checked it" })) })
+    );
+
+  // ANSWERABLE: review written for the live head, every risk verified there.
+  const answerable = await bucket("finished", "head-a", { head: "head-a", risks: ["a leak"] });
+  verdicts(answerable, "head-a", ["a leak"]);
+
+  // The review pass has not produced anything yet.
+  const noReview = await bucket("review not run", "head-b", null);
+  // The review landed, its risks are still waiting on verification.
+  await bucket("risks unverified", "head-c", { head: "head-c", risks: ["a leak"] });
+  // Verdict/review count mismatch: one risk still uncovered (the PR #12 bug).
+  const mismatch = await bucket("verdict count mismatch", "head-d", { head: "head-d", risks: ["a leak", "a race"] });
+  verdicts(mismatch, "head-d", ["a leak"]);
+  // Findings against a head the task has since moved off.
+  const staleHead = await bucket("stale findings", "head-new", { head: "head-old", risks: ["a leak"] });
+  verdicts(staleHead, "head-old", ["a leak"]);
+
+  // Post-ship catch-up: a shipped task, a separate class from the merge gate.
+  const shipped = await bucket("already shipped", "head-f", { head: "head-f", risks: [] });
+  s.db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(shipped);
+
+  const quizzes = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  const mine = quizzes.filter((q) => q.project_id === p.json.id);
+  expect(mine.filter((q) => q.task_state === "in_review").map((q) => q.task_id)).toEqual([answerable]);
+  expect(mine.filter((q) => q.task_state === "done").map((q) => q.task_id)).toEqual([shipped]);
+
+  // The pipeline finishing turns a hidden one into a director ask, no re-review.
+  verdicts(noReview, "head-b", []);
+  s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    `ev-auto-late-${noReview}`,
+    noReview,
+    new Date().toISOString(),
+    "system",
+    "auto_review",
+    JSON.stringify({ verdict: "caution", summary: "s", risks: [], questions: [], files: ["server/src/rows.ts"], reviewed_head_sha: "head-b" })
+  );
+  const after = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  expect(after.some((q) => q.task_id === noReview)).toBe(true);
+  s.server.stop(true);
+});
+
 test("a mechanical looks_good chore mints no quiz anywhere", async () => {
   const s = makeServer();
   const { taskId } = await judgmentTask(s, { verdict: "looks_good" });
