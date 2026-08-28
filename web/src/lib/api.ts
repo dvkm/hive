@@ -859,6 +859,11 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
+  playbook: (id: string) =>
+    req<{ ok: boolean; learning_id: string; playbook: { title: string } }>(`/api/tasks/${id}/playbook`, {
+      method: "POST",
+      body: "{}",
+    }),
   spawn: (id: string) =>
     req<{ ok: boolean; task: Task; agent_target: string }>(`/api/tasks/${id}/spawn`, {
       method: "POST",

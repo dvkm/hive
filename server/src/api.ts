@@ -61,6 +61,7 @@ import { authorize, resolveGrantForDecision, resolveDenyGuardrailForDecision, ty
 import { isReviewed } from "./dispatcher.ts";
 import { runPlanner, resolvePlanForDecision, decisionPlan, selectedPlanIndices, type PlannerExec } from "./planner.ts";
 import { claudeProfileEnvForRepo } from "./claudeProfiles.ts";
+import { makePlaybook } from "./playbook.ts";
 import { routeIntakeProject } from "./intake/route.ts";
 import {
   REF_PREFIX as JIRA_REF_PREFIX,
@@ -615,6 +616,16 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (!getTask(db, m[1])) return err("task not found", 404);
         const r = await runPlanner(db, m[1], { exec: deps.plannerExec });
         return r.ok ? json({ ok: true, decision: r.decision }) : json({ ok: false, error: r.error }, r.status ?? 502);
+      }
+
+      // Distil a finished task into a reusable playbook (a kind='reference'
+      // learning). Done tasks only — see makePlaybook.
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/playbook$/);
+      if (m && method === "POST") {
+        const r = await makePlaybook(db, m[1], { exec: deps.plannerExec, shellExec: deps.exec });
+        return r.ok
+          ? json({ ok: true, learning_id: r.learning_id, playbook: r.playbook }, 201)
+          : json({ ok: false, error: r.error }, r.status);
       }
 
       // ---- decisions ----
