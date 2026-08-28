@@ -197,8 +197,19 @@ async function runChecks(
   // without it tsc can't even find its own type defs (TS2688 bun-types),
   // which then cascades into unrelated TS18046 noise. Same install wt.sh
   // would run, kept idempotent the same way: skip if already present.
+  // Gated by the shared budget like every other check, and a failed install
+  // is its own finding rather than being left to surface as a confusing TS2688.
   if (!deps.exists(join(worktree, "node_modules")) && deps.exists(join(worktree, "package.json"))) {
-    await exec(["bun", "install"], { cwd: worktree, timeoutMs: remaining() });
+    if (remaining() <= 0) {
+      for (const check of checks) findings.push({ tool: check.tool, summary: "skipped: the 300s sidecar budget ran out" });
+      return { findings, dirtied: false };
+    }
+    const install = await exec(["bun", "install"], { cwd: worktree, timeoutMs: remaining() });
+    if (install.code !== 0) {
+      const summary = cap(`skipped: dependency install failed: ${summarize(install)}`);
+      for (const check of checks) findings.push({ tool: check.tool, summary });
+      return { findings, dirtied: false };
+    }
   }
 
   const before = await porcelain(exec, worktree);
