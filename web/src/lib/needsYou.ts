@@ -25,26 +25,37 @@ const PRIORITY_HEAD_START: Record<NonNullable<Task["priority"]>, number> = {
   later: 0,
 };
 
-function focusItemKey(item: NeedsYouItem, tasks: Map<string, Task>): number {
+function focusItemKey(item: NeedsYouItem, tasks: Map<string, Task>): [number, number] {
   const candidates = item.kind === "quiz_digest"
     ? item.quizzes.map((quiz) => ({ ts: quiz.ts, task: tasks.get(quiz.task_id) }))
     : item.kind === "decision"
       ? [{ ts: item.decision.ts, task: tasks.get(item.decision.task_id) }]
       : item.kind === "checkpoint"
         ? [{ ts: item.checkpoint.ts, task: tasks.get(item.checkpoint.task_id) }]
-        : [{ ts: item.task.updated_at, task: item.task }];
+        : [{
+            ts: item.kind === "attention"
+              ? item.task.health?.since ?? item.task.needs_you_since ?? item.task.updated_at
+              : item.task.needs_you_since ?? item.task.updated_at,
+            task: item.task,
+          }];
 
-  return Math.min(...candidates.map(({ ts, task }) => {
+  return candidates.reduce<[number, number]>((best, { ts, task }) => {
     const time = Date.parse(ts);
-    return Number.isNaN(time) ? Number.POSITIVE_INFINITY : time - PRIORITY_HEAD_START[task?.priority ?? "normal"];
-  }));
+    const key: [number, number] = Number.isNaN(time)
+      ? [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY]
+      : [time - PRIORITY_HEAD_START[task?.priority ?? "normal"], time];
+    return key[0] < best[0] || (key[0] === best[0] && key[1] < best[1]) ? key : best;
+  }, [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY]);
 }
 
 // Priority is a head start, not a permanent lane: one day per level means an
 // old lower-priority item eventually outranks a steady stream of new urgent work.
 export function orderFocusItems(items: NeedsYouItem[], tasks: Task[]): NeedsYouItem[] {
   const byId = new Map(tasks.map((task) => [task.id, task]));
-  return [...items].sort((a, b) => focusItemKey(a, byId) - focusItemKey(b, byId));
+  return items
+    .map((item, index) => ({ item, index, key: focusItemKey(item, byId) }))
+    .sort((a, b) => a.key[0] - b.key[0] || a.key[1] - b.key[1] || a.index - b.index)
+    .map(({ item }) => item);
 }
 
 // Mirrors server/src/health.ts's needsAttention — keep both excluding the

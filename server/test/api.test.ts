@@ -1271,16 +1271,23 @@ test("test projects, their tasks, decisions and checkpoints are hidden by defaul
 
 test("task list includes board metadata without task-detail requests", async () => {
   const task = await post("/api/tasks", { project_id: projectId, title: "list metadata", brief: "load only on detail" });
+  const review = await post("/api/tasks", { project_id: projectId, title: "stable review age" });
+  db.query("UPDATE tasks SET state = 'in_review', updated_at = ? WHERE id = ?").run("2026-08-24T00:00:00Z", review.json.id);
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run("evt_list_review_since", review.json.id, "2026-08-20T00:00:00Z", "agent", "state_change", JSON.stringify({ from: "in_progress", to: "in_review" }));
   await post(`/api/tasks/${task.json.id}/events`, { type: "evidence", kind: "log", note: "proof" });
   db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
     .run("evt_list_spawn_error", task.json.id, new Date().toISOString(), "herdr", "spawn_error", "{}");
 
   let listed = (await get("/api/tasks")).json.find((item: any) => item.id === task.json.id);
   expect(listed).toMatchObject({ brief: "load only on detail", evidence_count: 1, spawn_error: true });
-  const compact = (await get("/api/tasks?compact=1")).json.find((item: any) => item.id === task.json.id);
+  const compactList = (await get("/api/tasks?compact=1")).json;
+  const compact = compactList.find((item: any) => item.id === task.json.id);
   expect(compact).not.toHaveProperty("brief");
   expect(compact).not.toHaveProperty("agent_target");
   expect(compact).not.toHaveProperty("depends_on");
+  expect(compactList.find((item: any) => item.id === review.json.id).needs_you_since).toBe("2026-08-20T00:00:00Z");
+  expect((await get(`/api/tasks/${review.json.id}`)).json.needs_you_since).toBe("2026-08-20T00:00:00Z");
   const compressed = await fetch(BASE + "/api/tasks?compact=1", { headers: { "Accept-Encoding": "gzip" } });
   expect(compressed.headers.get("content-encoding")).toBe("gzip");
   expect((await compressed.json()).some((item: any) => item.id === task.json.id)).toBe(true);

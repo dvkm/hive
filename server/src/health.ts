@@ -278,13 +278,18 @@ export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null
     task.state === "failed"
       ? ((db.query("SELECT id FROM tasks WHERE parent_task_id = ? AND source = 'requeue' LIMIT 1").get(task.id) as any)?.id ?? null)
       : null;
+  const needs_you_since = ["in_review", "failed"].includes(task.state)
+    ? task.needs_you_since ?? (db.query(
+        "SELECT MAX(ts) AS ts FROM events WHERE task_id = ? AND type = 'state_change' AND json_extract(payload, '$.to') = ?"
+      ).get(task.id, task.state) as { ts: string | null }).ts ?? task.updated_at
+    : null;
   // Server-computed so the web app never has to re-derive "was this ever
   // spawned" from raw event history — see supervision.ts's neverDispatched.
   // `sidecar` is the latest background check on this task's own commits, so the
   // board card and the review card can show it without fetching every event.
   // Pass a preloaded `sidecar` when enriching a list (see tasksWithHealth) so
   // this doesn't run one sidecar query per task.
-  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, never_dispatched: neverDispatched(db, task), sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
+  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
 }
 
 // Batched form of taskWithHealth for list endpoints (task HIVE-447): looks up

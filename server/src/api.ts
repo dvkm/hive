@@ -2311,7 +2311,12 @@ function listTasks(db: DB, url: URL): Response {
   // from director surfaces by default, same as the project itself.
   if (!includeTest) where.push(notTestProjectSql("p.config"));
   const sql =
-    "SELECT t.* FROM tasks t JOIN projects p ON p.id = t.project_id" +
+    `SELECT t.*,
+      CASE WHEN t.state IN ('in_review', 'failed') THEN COALESCE(
+        (SELECT MAX(e.ts) FROM events e WHERE e.task_id = t.id AND e.type = 'state_change'
+          AND json_extract(e.payload, '$.to') = t.state), t.updated_at)
+      END AS needs_you_since
+     FROM tasks t JOIN projects p ON p.id = t.project_id` +
     (where.length ? " WHERE " + where.join(" AND ") : "") +
     " ORDER BY t.updated_at DESC";
   const tasks = tasksWithHealth(db, db.query(sql).all(...args).map(parseTask));

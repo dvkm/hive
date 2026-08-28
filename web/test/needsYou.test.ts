@@ -153,8 +153,8 @@ test("reviews with pending CI do not hide actionable reviews", () => {
 
 test("Focus gives priority a head start without starving old low-priority work", () => {
   const tasks = [
-    task("old-later", "in_review", { priority: "later", updated_at: "2026-08-20T00:00:00Z" }),
-    task("new-now", "in_review", { priority: "now", updated_at: "2026-08-24T00:00:00Z" }),
+    task("old-later", "in_review", { priority: "later", needs_you_since: "2026-08-20T00:00:00Z", updated_at: "2026-08-24T00:00:00Z" }),
+    task("new-now", "in_review", { priority: "now", updated_at: "2026-08-23T00:00:00Z" }),
     task("new-normal", "in_review", { priority: "normal", updated_at: "2026-08-24T00:00:00Z" }),
     task("new-later", "in_review", { priority: "later", updated_at: "2026-08-24T00:00:00Z" }),
   ];
