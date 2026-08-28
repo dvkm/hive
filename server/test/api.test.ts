@@ -175,7 +175,7 @@ test("scheduler-owned self-audit source cannot be created through the task API",
   }
 });
 
-test("self-audit permits only one ship follow-up", async () => {
+test("only a scheduled self-audit ship can finish report-only", async () => {
   const localDb = openDb(":memory:");
   const localServer = Bun.serve({ port: 0, fetch: makeHandler(localDb) });
   const localPost = async (path: string, body: unknown) => {
@@ -190,17 +190,20 @@ test("self-audit permits only one ship follow-up", async () => {
     const project = await localPost("/api/projects", { name: "Hive", repo_path: "/repo" });
     const { selfAuditOnce } = await import("../src/selfAudit.ts");
     const audit = selfAuditOnce(localDb)!;
-    const child = (title: string) => localPost("/api/tasks", {
+    const normal = await localPost("/api/tasks", {
       project_id: project.json.id,
-      title,
+      title: "normal ship",
       kind: "ship",
-      source: "agent",
-      parent_task_id: audit,
     });
+    for (const id of [normal.json.id, audit]) {
+      expect((await localPost(`/api/tasks/${id}/transition`, { to: "in_progress" })).status).toBe(200);
+      expect((await localPost(`/api/tasks/${id}/events`, { type: "evidence", kind: "report", note: "audit findings" })).status).toBe(201);
+    }
 
-    expect((await child("first improvement")).status).toBe(201);
-    expect((await child("second improvement")).status).toBe(409);
-    expect(localDb.query("SELECT COUNT(*) AS n FROM tasks WHERE parent_task_id = ? AND kind = 'ship'").get(audit)).toEqual({ n: 1 });
+    expect((await localPost(`/api/tasks/${normal.json.id}/events`, { type: "done" })).status).toBe(409);
+    const done = await localPost(`/api/tasks/${audit}/events`, { type: "done" });
+    expect(done.status).toBe(200);
+    expect(done.json.task).toMatchObject({ state: "done", kind: "ship", source: "self-audit", pr_url: null });
   } finally {
     localServer.stop(true);
   }

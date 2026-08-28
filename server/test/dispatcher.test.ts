@@ -97,12 +97,7 @@ test("weekly self-audit dispatches through normal safeguards when auto_dispatch 
   expect(spawns.length).toBe(1);
   expect(getTask(db, id).state).toBe("in_progress");
 
-  const followup = makeTask(db, projectId, { source: "agent", parent_task_id: id });
-  await dispatchOnce(db, { herdr });
-  expect(spawns.length).toBe(1);
-  expect(getTask(db, followup).state).toBe("queued");
-
-  const excluded = freshDb({ dispatch_kinds: ["ship"] });
+  const excluded = freshDb({ dispatch_kinds: ["scout"] });
   excluded.db.query("UPDATE projects SET name = 'Hive' WHERE id = ?").run(excluded.projectId);
   const excludedId = selfAuditOnce(excluded.db)!;
   const excludedHerdr = stubHerdr();

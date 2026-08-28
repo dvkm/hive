@@ -2096,27 +2096,16 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
     created_at: t,
     updated_at: t,
   };
-  const insert = () =>
-    db.query(
-      `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
-        worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, priority, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-    ).run(
-      row.id, row.project_id, row.title, row.brief, row.state, row.kind,
-      row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
-      row.summary, row.source, row.parent_task_id, row.depends_on, row.verification_cmds,
-      row.priority, row.created_at, row.updated_at
-    );
-  if (kind === "ship" && parentTask?.source === "self-audit") {
-    const inserted = db.transaction(() => {
-      if (db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND kind = 'ship' LIMIT 1").get(parent)) return false;
-      insert();
-      return true;
-    }).immediate();
-    if (!inserted) return err("self-audit already has a ship follow-up", 409);
-  } else {
-    insert();
-  }
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
+      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, priority, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(
+    row.id, row.project_id, row.title, row.brief, row.state, row.kind,
+    row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
+    row.summary, row.source, row.parent_task_id, row.depends_on, row.verification_cmds,
+    row.priority, row.created_at, row.updated_at
+  );
   writeEvent(db, {
     task_id: row.id,
     source: row.source === "agent" ? "agent" : "director",
@@ -5991,7 +5980,8 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     if (blocked) return blocked;
     if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });
     if (note) db.query("UPDATE tasks SET summary = ? WHERE id = ?").run(note, taskId);
-    const task = transition(db, taskId, "done", { source, reason: note ?? undefined });
+    const reportOnlySelfAudit = t.source === "self-audit" && t.kind === "ship" && t.state === "in_progress" && !t.pr_url && evidenceCount(db, taskId, "report") > 0;
+    const task = transition(db, taskId, "done", { source, reason: note ?? undefined, force: reportOnlySelfAudit });
     return json({ task });
   }
 

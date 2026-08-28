@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { openDb, newId } from "../src/db.ts";
 import { SELF_AUDIT_CADENCE_MS, selfAuditOnce } from "../src/selfAudit.ts";
-import { transition } from "../src/state.ts";
 
 function project(db: ReturnType<typeof openDb>, name: string, archived = false): string {
   const id = newId("proj");
@@ -18,7 +17,7 @@ function project(db: ReturnType<typeof openDb>, name: string, archived = false):
   return id;
 }
 
-test("weekly self-audit creates one bounded report task for Hive", () => {
+test("weekly self-audit creates one bounded ship task for Hive", () => {
   const db = openDb(":memory:");
   project(db, "other");
   const hive = project(db, "Hive");
@@ -28,25 +27,10 @@ test("weekly self-audit creates one bounded report task for Hive", () => {
   const task = db.query("SELECT * FROM tasks WHERE id = ?").get(id) as any;
   expect(task.project_id).toBe(hive);
   expect(task.state).toBe("queued");
-  expect(task.kind).toBe("scout");
+  expect(task.kind).toBe("ship");
   expect(task.source).toBe("self-audit");
   expect(task.priority).toBe("next");
   expect(selfAuditOnce(db, now + SELF_AUDIT_CADENCE_MS * 2)).toBeNull();
-});
-
-test("weekly self-audit can finish with report evidence and no code change", () => {
-  const db = openDb(":memory:");
-  project(db, "hive");
-  const id = selfAuditOnce(db)!;
-  transition(db, id, "in_progress");
-  db.query("INSERT INTO evidence (id, task_id, ts, kind, caption, meta) VALUES (?,?,?,?,?,?)")
-    .run(newId("ev"), id, new Date().toISOString(), "report", "No safe material improvement", "{}");
-  transition(db, id, "in_review");
-  transition(db, id, "verifying");
-  transition(db, id, "done");
-
-  const task = db.query("SELECT state, pr_url FROM tasks WHERE id = ?").get(id);
-  expect(task).toEqual({ state: "done", pr_url: null });
 });
 
 test("weekly self-audit waits seven days after the latest finished audit", () => {
@@ -69,7 +53,7 @@ test("overlapping schedulers atomically create one weekly self-audit", async () 
   db.exec("BEGIN IMMEDIATE");
   db.query(
     `INSERT INTO tasks (id, project_id, title, state, kind, source, created_at, updated_at)
-     VALUES (?,?,?, 'queued', 'scout', 'self-audit', ?, ?)`
+     VALUES (?,?,?, 'queued', 'ship', 'self-audit', ?, ?)`
   ).run(newId("tsk"), hive, "first audit", timestamp, timestamp);
 
   const child = Bun.spawn([process.execPath, "-e", `
