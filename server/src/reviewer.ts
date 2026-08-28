@@ -251,9 +251,98 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
   }
 }
 
+// The latest auto_review payload for a task, or null when the newest review
+// event is an error, a skip, or malformed. Lives with the code that WRITES
+// these events; api.ts imports it rather than keeping a second copy.
+export function latestAutoReviewVerdict(
+  db: DB,
+  taskId: string
+): { verdict: string; files: string[]; risks: string[]; questions: string[]; reviewed_head_sha?: string } | null {
+  const row = db
+    .query(
+      `SELECT type, payload FROM events WHERE task_id = ? AND type IN ('auto_review', 'auto_review_error')
+        ORDER BY ts DESC, rowid DESC LIMIT 1`
+    )
+    .get(taskId) as { type: string; payload: string } | undefined;
+  if (!row || row.type !== "auto_review") return null;
+  try {
+    const payload = JSON.parse(row.payload);
+    if (payload?.skipped || typeof payload?.verdict !== "string") return null;
+    return {
+      verdict: payload.verdict,
+      files: Array.isArray(payload.files) ? payload.files.map(String) : [],
+      risks: Array.isArray(payload.risks) ? payload.risks.map(String) : [],
+      questions: Array.isArray(payload.questions) ? payload.questions.map(String) : [],
+      reviewed_head_sha: typeof payload.reviewed_head_sha === "string" ? payload.reviewed_head_sha : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Risks are normally verified at the tail of autoReviewOnce, but that pass
+// never revisits a task it has already reviewed at this head. So a review whose
+// verification did not finish keeps NO covering verdict set and nothing ever
+// produces one: ambiguityCleared rejects it on every lap and the task parks in
+// review with no card, no signal and no way out. Two ways in, both seen live:
+//   - verifyRisks returned early (stillCurrent went false mid-pass, or a run
+//     timed out) before it could write its event, and
+//   - a SECOND auto_review landed for the same head with a different risk list,
+//     leaving the first pass's verdicts no longer covering the latest review.
+// This pass is the missing half — it verifies any in_review task whose latest
+// review is still uncovered, whether or not that review is new.
+export async function verifyPendingOnce(db: DB, deps: ReviewerDeps = {}): Promise<void> {
+  if (isOffline(db)) return;
+  const shell = deps.shellExec ?? defaultExec;
+  const rows: any[] = db
+    .query(
+      `SELECT t.* FROM tasks t
+        WHERE t.state = 'in_review' AND ${supervisedSql("t.source", "t.agent_target")}
+        ORDER BY t.updated_at ASC`
+    )
+    .all();
+  for (const t of rows) {
+    if (!t.head_sha) continue; // nothing to key verdicts to
+    const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(t.project_id);
+    if (JSON.parse(project?.config ?? "{}").auto_review === false) continue;
+    const review = latestAutoReviewVerdict(db, t.id);
+    if (!review || review.reviewed_head_sha !== t.head_sha) continue;
+    const risks = (review.risks ?? []).slice(0, MAX_VERIFIED_RISKS);
+    const questions = (review.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS);
+    if (!risks.length && !questions.length) continue;
+    if (hasRiskVerdicts(db, t.id, t.head_sha, risks.length + questions.length)) continue;
+    const diff = await rawDiff(db, t, shell);
+    if (!diff.ok) continue;
+    console.error(`[hive] verifying uncovered review for task ${t.id} at ${String(t.head_sha).slice(0, 7)}`);
+    await verifyRisks(
+      db,
+      t,
+      {
+        risks,
+        questions,
+        head: t.head_sha,
+        diff: diff.text,
+        stillCurrent: async () => {
+          const current: any = getTask(db, t.id);
+          return (
+            !!current &&
+            current.state === "in_review" &&
+            current.head_sha === t.head_sha &&
+            (!t.pr_url || (await livePrHead(shell, t.pr_url)) === t.head_sha)
+          );
+        },
+      },
+      deps
+    );
+    return; // one per pass, same no-stampede rule autoReviewOnce follows
+  }
+}
+
 export function startAutoReviewer(db: DB, deps: ReviewerDeps & { intervalMs?: number } = {}): () => void {
   const timer = setInterval(() => {
-    autoReviewOnce(db, deps).catch((e) => console.error("[hive] auto-review crashed:", e));
+    autoReviewOnce(db, deps)
+      .then(() => verifyPendingOnce(db, deps))
+      .catch((e) => console.error("[hive] auto-review crashed:", e));
   }, deps.intervalMs ?? 60_000);
   return () => clearInterval(timer);
 }
