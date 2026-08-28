@@ -969,6 +969,49 @@ textarea { font-family: inherit; }
   color: var(--purple);
   border-color: rgba(155, 125, 214, 0.4);
 }
+/* Priority chip (HIVE-430). It IS the quick-set control: a bare <select>
+   painted as a chip. 'normal' is the default on nearly every task, so it stays
+   invisible until the card is hovered — set a priority and the chip shows. */
+.chip-prio {
+  appearance: none;
+  -webkit-appearance: none;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  text-transform: capitalize;
+}
+.prio-now {
+  color: var(--red);
+  border-color: rgba(239, 93, 107, 0.5);
+}
+.prio-next {
+  color: var(--amber);
+  border-color: rgba(226, 165, 66, 0.4);
+}
+.prio-later {
+  color: var(--text-dim);
+}
+.card .prio-normal {
+  opacity: 0;
+}
+.card:hover .prio-normal,
+.card .prio-normal:focus {
+  opacity: 1;
+}
+/* No hover to reveal it on touch, so keep it there, quietly. */
+@media (hover: none) {
+  .card .prio-normal {
+    opacity: 0.45;
+  }
+}
+/* The task page's priority row: always visible, with its label. */
+.task-prio {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
 .chip-deferred {
   color: var(--text-dim);
   border-color: var(--border);

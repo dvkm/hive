@@ -897,11 +897,11 @@ export const api = {
     const qs = p.toString();
     return req<{ evidence: EvidenceRow[] }>(`/api/evidence${qs ? "?" + qs : ""}`);
   },
-  createTask: (b: { project_id: string; title: string; brief?: string; kind?: Kind }, files?: File[]) =>
+  createTask: (b: { project_id: string; title: string; brief?: string; kind?: Kind; priority?: string }, files?: File[]) =>
     req<Task>(`/api/tasks`, { method: "POST", body: bodyFor(b, files) }),
   intake: (b: { project_id: string; text: string }) =>
     req<{ ok: boolean; task: Task }>(`/api/intake`, { method: "POST", body: JSON.stringify(b) }),
-  updateTask: (id: string, b: { title?: string; brief?: string }, files?: File[]) =>
+  updateTask: (id: string, b: { title?: string; brief?: string; priority?: string }, files?: File[]) =>
     req<Task>(`/api/tasks/${id}`, { method: "PUT", body: bodyFor(b, files) }),
   brief: (id: string) => req<{ task_id: string; brief: string }>(`/api/tasks/${id}/brief`),
   transition: (id: string, to: State, reason?: string) =>

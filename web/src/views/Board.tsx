@@ -3,7 +3,7 @@ import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
 import type { Health, Kind, LandGraph, State, Task } from "../lib/api";
-import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, SidecarChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, PRIORITIES, PriorityChip, priorityRank, SidecarChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
 import { AttentionTray, needsAttention, isWaiting } from "./attention";
@@ -109,6 +109,7 @@ export function Card({ task }: { task: Task }) {
       <div className="card-meta">
         {project && <span className="chip">{project.name}</span>}
         <span className={`chip chip-kind chip-${task.kind}`}>{task.kind}</span>
+        <PriorityChip task={task} />
         {task.source === "intake_gchat" && (
           <span className="chip chip-intake" title="Created from a Google Chat message; needs review">
             intake · unreviewed
@@ -247,6 +248,13 @@ export function LandChips({ task, graph, tasks }: { task: Task; graph: LandGraph
   );
 }
 
+// Queued cards read in the order the dispatcher will actually pick them up:
+// priority first, then the longest wait (server: PRIORITY_RANK_SQL, created_at).
+export const queueOrder = (list: Task[]): Task[] =>
+  [...list].sort(
+    (a, b) => priorityRank(a.priority) - priorityRank(b.priority) || a.created_at.localeCompare(b.created_at)
+  );
+
 const BANNER_DISMISS_KEY = "hive.brief.bannerDismissed";
 
 // Slim, dismissible banner nudging the director to Needs you when there are
@@ -303,6 +311,7 @@ export default function Board() {
   const byState = (s: State) => {
     let list = visible.filter((t) => !isTrackingOnly(t) && t.state === s);
     // list is already newest-updated first from the API / SSE upserts.
+    if (s === "queued") list = queueOrder(list);
     if (s === "done") list = list.slice(0, 10);
     return list;
   };
@@ -460,6 +469,7 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
   const [brief, setBrief] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [kind, setKind] = useState<Kind>("ship");
+  const [priority, setPriority] = useState("normal");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -476,7 +486,10 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
         await api.intake({ project_id: project, text: dump.trim() });
         toast("Braindump sent — Claude is drafting a breakdown for you to approve");
       } else {
-        await api.createTask({ project_id: project, title: title.trim(), brief: brief.trim() || undefined, kind }, files);
+        await api.createTask(
+          { project_id: project, title: title.trim(), brief: brief.trim() || undefined, kind, priority },
+          files
+        );
         toast(files.length ? `Task queued with ${files.length} attachment(s)` : "Task queued");
       }
       onClose();
@@ -546,6 +559,16 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
                     <option value="ship">ship</option>
                     <option value="scout">scout</option>
                     <option value="chore">chore</option>
+                  </select>
+                </label>
+                <label className="fld">
+                  <span>Priority</span>
+                  <select value={priority} onChange={(e) => setPriority(e.target.value)}>
+                    {PRIORITIES.map((p) => (
+                      <option key={p} value={p}>
+                        {p}
+                      </option>
+                    ))}
                   </select>
                 </label>
               </>
