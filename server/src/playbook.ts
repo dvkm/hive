@@ -220,3 +220,62 @@ function freeTitle(db: DB, projectId: string, base: string, taskNumber: number, 
     if (!taken(t)) return t;
   }
 }
+
+// ---- matching a stored playbook to a new task ------------------------------
+// A playbook only helps if the crew that needs it sees it. `hive recall` needs
+// keywords the agent thinks to type; a brief already carries them. Recall's own
+// rule (every term must appear) can't be inverted onto a whole brief — nothing
+// would ever match — so score instead: how many of the task's keywords does this
+// playbook mention? Best one wins, ties go to the more recently seen row.
+// ponytail: word overlap, no embeddings. Swap in real similarity if the wrong
+// playbook keeps landing in briefs.
+const KEYWORD_STOPWORDS = new Set(
+  ("the and for with that this from into over under when what which will shall must have has had are was were you your our their they them then than out add new use used using make made need needs task hive done work file files code change changes should could would about after before each only also more most some such very every both same other").split(" ")
+);
+export const MIN_KEYWORD_HITS = 2;
+
+export function briefKeywords(text: string): string[] {
+  const seen = new Set<string>();
+  for (const w of String(text ?? "").toLowerCase().match(/[a-z][a-z0-9_-]{3,}/g) ?? []) {
+    if (!KEYWORD_STOPWORDS.has(w)) seen.add(w);
+  }
+  return [...seen];
+}
+
+// The best-matching `[playbook]` reference for this task, or null when nothing
+// clears MIN_KEYWORD_HITS. Scored on the playbook's title + when_to_use line
+// (its "when should I reach for this" summary), not the whole recipe — steps
+// name so many files that any task would match any playbook.
+export function matchPlaybook(db: DB, projectId: string, text: string): Playbook | null {
+  const keywords = briefKeywords(text);
+  if (keywords.length < MIN_KEYWORD_HITS) return null;
+  const rows = db
+    .query(
+      `SELECT title, body FROM learnings
+        WHERE project_id = ? AND kind = 'reference' AND status = 'active' AND body LIKE '[playbook]%'
+        ORDER BY last_seen DESC`
+    )
+    .all(projectId) as { title: string; body: string }[];
+  let best: { hits: number; pb: Playbook } | null = null;
+  for (const row of rows) {
+    const pb = extractPlaybook(row.body);
+    if (!pb) continue;
+    const haystack = `${row.title} ${pb.title} ${pb.when_to_use}`.toLowerCase();
+    const hits = keywords.filter((k) => haystack.includes(k)).length;
+    if (hits >= MIN_KEYWORD_HITS && (!best || hits > best.hits)) best = { hits, pb };
+  }
+  return best?.pb ?? null;
+}
+
+// The brief section: when to use it plus the steps, inline. Gotchas and success
+// criteria stay behind `hive recall` — the steps are what a crew acts on.
+export function playbookSection(pb: Playbook): string {
+  return [
+    `## Playbook: ${pb.title}`,
+    `A past task like this one left a recipe. Use it when: ${pb.when_to_use}`,
+    ``,
+    ...pb.steps.map((s, i) => `${i + 1}. ${s}`),
+    ``,
+    `This is the best-matching playbook, not a rule. Say so in a checkpoint if it does not fit.`,
+  ].join("\n");
+}
