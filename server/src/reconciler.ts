@@ -19,7 +19,7 @@ import { inBackoff, isReviewed, MAX_AGENTS_DEFAULT } from "./dispatcher.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { parseEvidence } from "./rows.ts";
-import { broadcastTask } from "./health.ts";
+import { broadcastTask, noteToolStart } from "./health.ts";
 import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { notTestProjectSql } from "./testProjects.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
@@ -643,11 +643,11 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       broadcast({ type: "task", task: getTask(db, t.id) });
     }
     // A never-dispatched external task (see supervision.ts) has no agent to
-    // nudge and isn't hive's to auto-transition through review/merge/smoke —
-    // skip the actionable phase below entirely. The bookkeeping above
-    // (ci_status, head_sha, branch_scope, pr_synchronized) already ran: it's
-    // just recording observed PR facts, useful for the tracked view.
-    if (neverDispatched(db, live)) continue;
+    // nudge, so every AGENT-DIRECTED branch below is skipped for it. It used to
+    // skip the whole actionable phase, which also swallowed the MERGED->done
+    // observation and parked merged tasks in in_review forever (HIVE-473). A
+    // terminal PR state is a fact hive observed, not a nudge, so it still runs.
+    const agentless = neverDispatched(db, live);
     // Re-check once more right before the actionable phase: the bookkeeping
     // above (probeRed, ci_status writes) awaited too, and is the last chance
     // for a PR replacement/closure race to have landed.
@@ -659,7 +659,7 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     // green and the director can merge", so failing/pending checks HOLD the
     // task in_progress (this is also what promotes a held `ready`: the moment
     // checks pass, the task moves to review; failing checks steer the agent).
-    if (String(data.state).toUpperCase() === "OPEN" && state === "in_progress") {
+    if (String(data.state).toUpperCase() === "OPEN" && state === "in_progress" && !agentless) {
       if (ci === "failing") {
         await nudgeCiFailure(db, h, t, data.headRefOid ?? null);
       } else if (ci !== "pending") {
@@ -670,11 +670,13 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_merged", payload: { pr_url: t.pr_url } });
       transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged" });
       // Post-merge smoke runs once on entering verifying.
-      try {
-        await smokeThenAdvance(db, t.id, deps.smoke ?? {});
-      } catch (e) {
-        console.error(`[hive] smoke run failed for ${t.id}:`, e);
-      }
+      await advanceAfterMerge(db, t.id, deps);
+    } else if (String(data.state).toUpperCase() === "CLOSED" && state === "in_review" && agentless) {
+      // No agent to bounce it back to and no in_progress worth returning it to,
+      // so just record the fact — once, since nothing here moves the task off
+      // in_review and the probe repeats every cycle.
+      const already = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'pr_closed' LIMIT 1").get(t.id);
+      if (!already) writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_closed", payload: { pr_url: t.pr_url } });
     } else if (String(data.state).toUpperCase() === "CLOSED" && state === "in_review") {
       // Closed-not-merged: nothing reviewable exists. Self-heal instead of
       // waiting for the director to discover it via a failed merge click.
@@ -701,11 +703,7 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
         // first, same path a non-deferred task takes on its way to merge.
         transition(db, t.id, "in_review", { source: "reconciler", reason: "PR merged while deferred — catching up review" });
         transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged (deferred task undeferred)" });
-        try {
-          await smokeThenAdvance(db, t.id, deps.smoke ?? {});
-        } catch (e) {
-          console.error(`[hive] smoke run failed for ${t.id}:`, e);
-        }
+        await advanceAfterMerge(db, t.id, deps);
       } else {
         writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_closed", payload: { pr_url: t.pr_url } });
       }
@@ -722,19 +720,37 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       const type = String(data.state).toUpperCase() === "MERGED" ? "pr_merged" : "pr_closed";
       const already = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = ? LIMIT 1").get(t.id, type);
       if (!already) writeEvent(db, { task_id: t.id, source: "reconciler", type, payload: { pr_url: t.pr_url } });
-    } else if (ci === "failing" && state === "in_review") {
+    } else if (ci === "failing" && state === "in_review" && !agentless) {
       // Checks went red AFTER the handoff: red is not reviewable. Send it back
       // to the agent to iterate; it returns automatically when green.
       await nudgeCiFailure(db, h, t, data.headRefOid ?? null);
       transition(db, t.id, "in_progress", { source: "reconciler", reason: "CI failing — returned to the agent to iterate" });
       broadcast({ type: "task", task: getTask(db, t.id) });
-    } else if (!deferred && String(data.mergeable).toUpperCase() === "CONFLICTING") {
+    } else if (!deferred && !agentless && String(data.mergeable).toUpperCase() === "CONFLICTING") {
       // A deliberately parked task (deferred_until in the future) shouldn't
       // draw pr_conflict noise or steer an inactive agent (hive-303). No event
       // is written while deferred, so undefer's next cycle sees a fresh
       // head_sha/dedup state and nudges once, immediately.
       await nudgeConflict(db, h, t, data.headRefOid ?? null, exec);
     }
+  }
+}
+
+// Post-merge advance out of `verifying`. A task hive drives runs its smoke
+// checks. A tracking-only task (an external board row) has no hive worktree to
+// smoke and no evidence gate, and both smokeThenAdvance and sweepVerifying bail
+// out on it — so without this it would just swap a stuck `in_review` for a
+// stuck `verifying`. For it, merged IS done (HIVE-473).
+async function advanceAfterMerge(db: DB, taskId: string, deps: ReconcilerDeps): Promise<void> {
+  if (isTrackingOnlyId(db, taskId)) {
+    transition(db, taskId, "done", { source: "reconciler", reason: "PR merged (tracking-only task: no post-merge smoke)" });
+    broadcast({ type: "task", task: getTask(db, taskId) });
+    return;
+  }
+  try {
+    await smokeThenAdvance(db, taskId, deps.smoke ?? {});
+  } catch (e) {
+    console.error(`[hive] smoke run failed for ${taskId}:`, e);
   }
 }
 
@@ -868,27 +884,6 @@ async function linkPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     for (const pr of list) linkPrIfMarked(db, { title: pr.title, body: pr.body, url: pr.url });
   }
   noteToolStart(db, "gh", startFailure);
-}
-
-// A tool that cannot start is skipped and retried forever by design, so once it
-// stops throwing it also stops counting toward reconciler_error_streak and
-// would go completely silent. That is the #1096 failure mode again: PR linking
-// quietly off, /api/health saying ok. Three consecutive cycles of start
-// failures log once and mark health degraded; the first good cycle clears it.
-const TOOL_DEGRADED_AFTER = 3;
-export function noteToolStart(db: DB, tool: string, failure: string | null): void {
-  const streakKey = `tool_start_failures_${tool}`;
-  const degradedKey = `tool_degraded_${tool}`;
-  if (!failure) {
-    if (getSetting(db, streakKey)) setSetting(db, streakKey, "0");
-    if (getSetting(db, degradedKey)) setSetting(db, degradedKey, "");
-    return;
-  }
-  const streak = Number(getSetting(db, streakKey) ?? "0") + 1;
-  setSetting(db, streakKey, String(streak));
-  if (streak < TOOL_DEGRADED_AFTER) return;
-  if (!getSetting(db, degradedKey)) console.error(`[hive] ${tool} failed to start on ${streak} cycles in a row; marking health degraded: ${failure}`);
-  setSetting(db, degradedKey, failure);
 }
 
 // One rollup entry counts as red. Shared by ciStatusOf and the non-start probe

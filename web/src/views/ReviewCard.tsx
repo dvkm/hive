@@ -719,7 +719,7 @@ export function ReviewCard({
     try {
       await api.requestChanges(
         task.id,
-        "Refresh the existing review_summary without changing the implementation. Preserve the review findings, regenerate the explanation in the current format, and add 1-5 multiple-choice understanding.checks. Each question must help the director understand this specific change or report: its behavior, user impact, risk, tradeoff, or evidence, with the answer taught in the explanation. Do not quiz agent procedures, debugging, merging, tools, or policy. Then submit the task for review again."
+        "Refresh the existing review_summary without changing the implementation. Preserve the review findings, regenerate the explanation in the current format, and add 1-5 multiple-choice understanding.checks. Each question must help the director understand this specific change or report: its behavior, user impact, risk, tradeoff, or evidence, with the answer taught in the explanation. Do not quiz agent procedures, debugging, merging, tools, or policy. Write every question and option in plain everyday words: one idea per sentence, no nested clauses. Use jargon only if the diff itself introduces the term, and then define it. Make each option plainly distinct from the others. Length follows the content, not a cap: a simple change earns a short question, a genuinely complex change can take the words it needs. Write background, essence, walkthrough, and participate the way you would explain the change to a colleague on the phone: clarity first, brevity second. Then submit the task for review again."
       );
       toast("Agent asked to add the understanding check");
       finish();

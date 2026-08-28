@@ -35,6 +35,7 @@ import { createDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectComparisonBase } from "./exec.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { modelFailure, noteModelCall } from "./modelCall.ts";
 import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { supervisedSql } from "./supervision.ts";
@@ -238,9 +239,10 @@ async function judge(db: DB, task: any, fp: Footprint, config: any, deps: DriftD
     return;
   }
   if (res.timedOut || res.code !== 0) {
-    record({ error: res.timedOut ? `timed out after ${TIMEOUT_MS}ms` : `exited ${res.code}: ${res.stderr.trim().slice(0, 300)}` });
+    record({ error: modelFailure(db, res, { timeoutMs: TIMEOUT_MS }) });
     return;
   }
+  noteModelCall(db, null);
   const verdict = extractDrift(res.stdout);
   if (!verdict) {
     record({ error: "unparseable drift-check output" });

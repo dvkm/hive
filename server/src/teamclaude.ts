@@ -92,3 +92,12 @@ export function applyTeamclaudeEnv(
   for (const k of tc.unset) delete merged[k];
   return merged;
 }
+
+// The same routing as an OVERLAY, for herdr pane agents. herdr takes `--env K=V`
+// pairs layered onto the inherited env and has no way to unset a name, so an
+// `unset` ships as an empty value — enough that a stray inherited
+// ANTHROPIC_BASE_URL cannot silently bypass the MITM proxy.
+export function teamclaudeOverlay(tc: TeamclaudeEnv | null): Record<string, string> {
+  if (!tc) return {};
+  return { ...tc.set, ...Object.fromEntries(tc.unset.map((k) => [k, ""])) };
+}
