@@ -48,7 +48,7 @@ import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from ".
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { figmaTokenEnv, resolveProjectSecrets, serviceName } from "./secrets.ts";
-import { teamclaudeEnv, usesTeamclaude } from "./teamclaude.ts";
+import { teamclaudeEnv, teamclaudeOverlay, usesTeamclaude } from "./teamclaude.ts";
 import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
 import {
   deploymentsStatus,
@@ -3466,7 +3466,7 @@ export async function spawnAgent(
   // Machine account routing is applied last so a same-named project secret
   // cannot silently replace the selected Claude profile.
   const env = {
-    ...(usesTeamclaude(config) ? (await teamclaudeEnv())?.set ?? {} : {}),
+    ...teamclaudeOverlay(usesTeamclaude(config) ? await teamclaudeEnv() : null),
     // Figma access for headless agents (the Figma MCP is interactive-only), so
     // a stripped/sandboxed agent env still reaches the REST API. A project
     // secret of the same name overrides it below.
