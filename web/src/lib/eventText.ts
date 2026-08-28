@@ -83,6 +83,9 @@ export function eventText(e: EventLike): string {
       return `pre-review ${s(p.verdict) === "caution" ? "⚠ CAUTION" : "✓ looks good"}: ${s(p.summary)}${risks}`;
     }
     case "auto_review_error":
+      // `gave_up` means the retry budget for this PR head is spent — the card
+      // needs a human, so it must not read like one more transient blip.
+      if (p.gave_up) return `pre-review gave up after ${s(p.attempts) || "several"} tries, needs you: ${s(p.error)}`;
       return `pre-review failed: ${s(p.error)}`;
     case "risk_verdicts": {
       const vs = Array.isArray(p.verdicts) ? (p.verdicts as any[]) : [];
