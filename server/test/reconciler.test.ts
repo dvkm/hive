@@ -1455,6 +1455,36 @@ test("syncPRs advances a merged deferred PR through verifying instead of leaving
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'undeferred'").all(id).length).toBe(1);
 });
 
+test("syncPRs advances an in_progress task whose PR merges outside hive, and stands the agent down (HIVE-507)", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/45", agent_target: "t-agent" });
+  transition(db, id, "in_progress");
+
+  const sends: string[] = [];
+  const gh: Exec = stub((argv) =>
+    argv[0] === "gh" ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] })) : OK()
+  );
+  const herdr = new Herdr(
+    stub((argv) => {
+      if (argv.includes("send")) {
+        sends.push(argv[argv.indexOf("send") + 2]);
+        return OK();
+      }
+      if (argv.includes("get")) return OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}');
+      return OK();
+    }),
+    "herdr"
+  );
+
+  await reconcileOnce(db, { exec: gh, herdr });
+
+  const task = getTask(db, id);
+  expect(task.state).toBe("verifying");
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_merged'").all(id).length).toBe(1);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'stale'").get(id)).toBeFalsy();
+  expect(sends.some((s) => s.includes("MERGED"))).toBe(true);
+});
+
 test("advanceFinished: in_progress + pr_url + idle agent -> in_review (+ event)", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { agent_target: "a1", pr_url: "https://gh/pr/1" });
