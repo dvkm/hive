@@ -194,6 +194,7 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("requeueStaleFailed", () => requeueStaleFailed(db, (deps.nowMs ?? (() => Date.now()))()));
   await step("flagStale", () => flagStale(db, deps));
   await step("recoverStale", () => recoverStale(db, deps));
+  await step("recoverConflictedDeadEnd", () => recoverConflictedDeadEnd(db, deps));
   await step("sweepVerifying", () => sweepVerifying(db, deps));
   await step("autoMergeReady", () => autoMergeReady(db, deps));
   await step("landOnce", () => landOnce(db, { exec: deps.exec }));
@@ -2048,6 +2049,62 @@ export function requeueStaleFailed(db: DB, nowMs: number = Date.now()): void {
     writeEvent(db, { task_id: task.id, source: "reconciler", type: "requeued", payload: { new_task_id: newId, attempt: depth + 1, reason: "failed task exceeded triage window" } });
     writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "failed-triage-auto-requeue", new_task_id: newId, attempt: depth + 1 } });
     enqueue(db, { kind: "failed", task_id: task.id, title: `Auto-requeued after ${hours}h awaiting triage: ${task.title}` });
+  }
+}
+
+// Give the normal reattach-respawn path (a queued conflict steer the dispatcher
+// re-delivers) this long to produce a fresh head before we give up on it and
+// requeue from scratch.
+const CONFLICT_DEAD_END_GRACE_MS = 15 * 60_000;
+
+// A PR-backed in_review task can dead-end with nothing left to move it and no
+// live agent to fix it: the auto-reviewer produced an `unparseable` verdict (so
+// hive-446 has stopped retrying this exact head), AND the PR is conflicted with
+// base while no agent was live to take the resolve-conflicts nudge
+// (nudgeConflict recorded a pr_conflict with delivered=false at this head). The
+// head can be neither reviewed nor merged, so it parks on the director behind a
+// greyed 'Approve & merge' indefinitely — the manual 'have agent add it' just
+// re-runs the same review that already dead-ended. The only real fix is a fresh
+// agent that resolves the conflict and pushes a NEW head, which resets the
+// review budget. Requeue it, bounded by MAX_AUTO_REQUEUE exactly like
+// recoverDead; past the cap it parks with the same recovery card a human answers.
+export async function recoverConflictedDeadEnd(db: DB, deps: ReconcilerDeps): Promise<void> {
+  const h = deps.herdr ?? defaultHerdr;
+  const nowMs = (deps.nowMs ?? (() => Date.now()))();
+  const rows = db
+    .query("SELECT * FROM tasks WHERE state = 'in_review' AND pr_url IS NOT NULL AND agent_target IS NULL")
+    .all() as any[];
+  for (const task of rows) {
+    if (isTrackingOnlyId(db, task.id)) continue;
+    const verdict = latestAutoReviewVerdict(db, task.id);
+    if (verdict?.verdict !== "unparseable") continue;
+    const conflict = db
+      .query("SELECT ts, payload FROM events WHERE task_id = ? AND type = 'pr_conflict' ORDER BY ts DESC LIMIT 1")
+      .get(task.id) as { ts: string; payload: string } | undefined;
+    if (!conflict) continue;
+    let cp: any;
+    try {
+      cp = JSON.parse(conflict.payload);
+    } catch {
+      continue;
+    }
+    // Must be conflicted at the head we actually have, with no live agent having
+    // taken the nudge; and past the grace window so the normal respawn had its shot.
+    if ((cp.head_sha ?? null) !== (task.head_sha ?? null) || cp.delivered) continue;
+    if (nowMs - Date.parse(conflict.ts) < CONFLICT_DEAD_END_GRACE_MS) continue;
+
+    const attempts = requeueDepth(db, task);
+    await reclaimDeadWorktree(db, h, task);
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "conflicted-review-dead-end", attempts } });
+    transition(db, task.id, "failed", { source: "reconciler", reason: "PR conflicted and auto-review dead-ended; no live agent to resolve" });
+    if (attempts >= MAX_AUTO_REQUEUE) {
+      openRecoveryDecision(db, task, attempts);
+      enqueue(db, { kind: "failed", task_id: task.id, title: `Recovery cap reached: ${task.title}` });
+    } else {
+      const newId = requeueTask(db, task);
+      writeEvent(db, { task_id: task.id, source: "reconciler", type: "requeued", payload: { new_task_id: newId, attempt: attempts + 1, reason: "conflicted review dead-end" } });
+      enqueue(db, { kind: "failed", task_id: task.id, title: `Auto-requeued to resolve conflicts (attempt ${attempts + 1}): ${task.title}` });
+    }
   }
 }
 

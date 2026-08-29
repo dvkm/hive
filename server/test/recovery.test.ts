@@ -9,7 +9,7 @@ process.env.HIVE_HOME = HOME;
 
 const { openDb, newId, now } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
-const { reconcileOnce, requeueStaleFailed } = await import("../src/reconciler.ts");
+const { reconcileOnce, requeueStaleFailed, recoverConflictedDeadEnd } = await import("../src/reconciler.ts");
 const { requeueTask } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { getTask } = await import("../src/state.ts");
@@ -1037,4 +1037,73 @@ test("a reclaim failure never derails recovery", async () => {
   expect(reclaimEvent(db, id, "worktree_reclaim_failed")).toBeTruthy();
   expect(getTask(db, id).state).toBe("failed"); // recovery completed anyway
   expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").all(id).length).toBe(1);
+});
+
+// ---- conflicted review dead-end → auto-requeue (no director click needed) ----
+const DEAD_END_PR = "https://github.com/acme/web/pull/9";
+const DEAD_END_HEAD = "deadbeef01";
+function conflictedDeadEnd(
+  db: DB,
+  projectId: string,
+  opts: { verdict?: string; delivered?: boolean; conflictHead?: string; conflictAgeMs?: number; steer?: boolean } = {}
+): string {
+  const id = makeTask(db, projectId, { agent: "a1" });
+  db.query("UPDATE tasks SET state='in_review', agent_target=NULL, pr_url=?, head_sha=?, branch=?, worktree_path=? WHERE id=?")
+    .run(DEAD_END_PR, DEAD_END_HEAD, `hive/${id}`, `/wt/${id}`, id);
+  putEvent(db, id, "auto_review", { verdict: opts.verdict ?? "unparseable", reviewed_pr_url: DEAD_END_PR, reviewed_head_sha: DEAD_END_HEAD });
+  const ts = new Date(Date.now() - (opts.conflictAgeMs ?? 20 * 60_000)).toISOString();
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run(newId("evt"), id, ts, "reconciler", "pr_conflict", JSON.stringify({ head_sha: opts.conflictHead ?? DEAD_END_HEAD, delivered: opts.delivered ?? false }));
+  if (opts.steer) putEvent(db, id, "steer", { message: "resolve the conflicts", delivery: "queued" });
+  return id;
+}
+const requeueChild = (db: DB, id: string) =>
+  db.query("SELECT * FROM tasks WHERE source = 'requeue' AND parent_task_id = ?").get(id) as any;
+
+test("conflicted PR + unparseable review + no live agent → auto-requeued", async () => {
+  const { db, projectId } = freshDb();
+  const id = conflictedDeadEnd(db, projectId);
+  const { herdr } = herdrProbe("dead");
+
+  await recoverConflictedDeadEnd(db, { ...inert, herdr });
+
+  expect(getTask(db, id).state).toBe("failed");
+  const child = requeueChild(db, id);
+  expect(child).toBeTruthy();
+  expect(child.state).toBe("queued");
+  const requeued: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'requeued'").get(id);
+  expect(JSON.parse(requeued.payload).attempt).toBe(1);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery' AND json_extract(payload,'$.decision') = 'conflicted-review-dead-end'").get(id)).toBeTruthy();
+});
+
+test("does NOT requeue while still inside the reattach grace window", async () => {
+  const { db, projectId } = freshDb();
+  const id = conflictedDeadEnd(db, projectId, { conflictAgeMs: 60_000 }); // 1 min < 15 min grace
+  await recoverConflictedDeadEnd(db, { ...inert, herdr: herdrProbe("dead").herdr });
+  expect(getTask(db, id).state).toBe("in_review");
+  expect(requeueChild(db, id)).toBeFalsy();
+});
+
+test("does NOT requeue when the conflict nudge reached a live agent", async () => {
+  const { db, projectId } = freshDb();
+  const id = conflictedDeadEnd(db, projectId, { delivered: true });
+  await recoverConflictedDeadEnd(db, { ...inert, herdr: herdrProbe("dead").herdr });
+  expect(getTask(db, id).state).toBe("in_review");
+  expect(requeueChild(db, id)).toBeFalsy();
+});
+
+test("does NOT requeue a healthy (looks_good) review", async () => {
+  const { db, projectId } = freshDb();
+  const id = conflictedDeadEnd(db, projectId, { verdict: "looks_good" });
+  await recoverConflictedDeadEnd(db, { ...inert, herdr: herdrProbe("dead").herdr });
+  expect(getTask(db, id).state).toBe("in_review");
+  expect(requeueChild(db, id)).toBeFalsy();
+});
+
+test("a stuck queued conflict steer does NOT block recovery (nudgeConflict always leaves one)", async () => {
+  const { db, projectId } = freshDb();
+  const id = conflictedDeadEnd(db, projectId, { steer: true });
+  await recoverConflictedDeadEnd(db, { ...inert, herdr: herdrProbe("dead").herdr });
+  expect(getTask(db, id).state).toBe("failed");
+  expect(requeueChild(db, id)).toBeTruthy();
 });

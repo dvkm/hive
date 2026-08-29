@@ -991,6 +991,7 @@ export function ReviewCard({
       </div>
       {missingQuiz && !task.never_dispatched ? (
         <div className="review-blocked review-blocked-action">
+          <span>{mergeBlocked}</span>
           <button className="btn btn-mini" disabled={busy} onClick={refreshUnderstandingCheck}>
             {busy ? "Asking…" : "Have agent add it"}
           </button>
