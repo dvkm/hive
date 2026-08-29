@@ -11,10 +11,10 @@ const USAGE = `hive — local orchestration control plane
 Usage:
   hive serve                              start the daemon
   hive task create --project <id> --title <t> [--brief <file> | --brief-text <s>]
-        [--kind ship|scout|chore] [--parent <task-id>] [--depends-on <id,id>] [--track]
+        [--kind ship|scout|chore] [--parent <task-id>] [--depends-on <id,id>]
         [--priority now|next|normal|later]
         (under a hive agent, HIVE_TASK_ID makes source=agent + parent automatic;
-         --track = tracking-only: never auto-dispatched, moves freely, no evidence gate)
+         to park a task instead, create it then run: hive emit <id> deferred)
         (priority is queue ORDER, never preemption. Omit it and the task inherits
          its parent's, or starts at 'next' when the brief is security-shaped,
          else 'normal'. Tasks created together in a depends-on chain do NOT
@@ -197,15 +197,16 @@ async function main() {
     if (sub === "create") {
       if (!flags.project) die("--project is required");
       if (!flags.title) die("--title is required");
+      // --track (source='external') is retired: it made tasks hive could never
+      // dispatch and never told anyone. Park work with `deferred` instead.
+      if (flags.track) die("--track is retired. Create the task, then park it: hive emit <id> deferred");
       const brief = flags.brief
         ? readFileSync(String(flags.brief), "utf8")
         : flags["brief-text"]
           ? String(flags["brief-text"])
           : undefined;
       // Running under a spawned agent (HIVE_TASK_ID set): attribute the task to
-      // the agent and default the parent to the spawning task. --track marks a
-      // tracking-only task (source='external'): never auto-dispatched, moves
-      // freely through states — hive as a kanban for OTHER agents' own work.
+      // the agent and default the parent to the spawning task.
       const agentTask = process.env.HIVE_TASK_ID;
       const t = await api("POST", "/api/tasks", {
         project_id: flags.project,
@@ -214,7 +215,7 @@ async function main() {
         kind: flags.kind,
         parent_task_id: flags.parent ?? agentTask ?? undefined,
         depends_on: flags["depends-on"] ? String(flags["depends-on"]) : undefined,
-        source: flags.track ? "external" : agentTask ? "agent" : undefined,
+        source: agentTask ? "agent" : undefined,
         priority: flags.priority ? String(flags.priority) : undefined,
       });
       console.log(`created task ${t.id}  [${t.state}]  ${t.title}`);
