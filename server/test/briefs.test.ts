@@ -1,6 +1,7 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
 import { composeBrief } from "../src/briefs.ts";
+import { playbookBody } from "../src/playbook.ts";
 
 function setup(): { db: DB; projectId: string; taskId: string } {
   const db = openDb(":memory:");
@@ -102,4 +103,44 @@ test("brief tells agents how to read Figma over REST when a token is passed thro
     if (prev === undefined) delete process.env.FIGMA_TOKEN;
     else process.env.FIGMA_TOKEN = prev;
   }
+});
+
+// A stored playbook only helps if the crew that needs it sees it, so a brief
+// whose task matches one carries its steps inline.
+function addPlaybook(db: DB, projectId: string, pb: any) {
+  const body = playbookBody(pb, { number: 7, title: "the source task" });
+  db.query(
+    `INSERT INTO learnings (id, project_id, title, body, source_task_id, occurrences, first_seen, last_seen, status, root_cause_task_id, kind)
+     VALUES (?,?,?,?,NULL,1,?,?, 'active', NULL, 'reference')`
+  ).run(newId("lrn"), projectId, pb.title, body, now(), now());
+}
+
+test("a matching playbook is inlined into the brief; a mismatched one is not", () => {
+  const db = openDb(":memory:");
+  const projectId = newId("proj");
+  db.query("INSERT INTO projects (id, name, created_at) VALUES (?,?,?)").run(projectId, "p", now());
+  const mkTask = (title: string, brief: string) => {
+    const id = newId();
+    db.query(
+      "INSERT INTO tasks (id, project_id, title, brief, state, kind, created_at, updated_at) VALUES (?,?,?,?, 'queued','ship',?,?)"
+    ).run(id, projectId, title, brief, now(), now());
+    return id;
+  };
+
+  addPlaybook(db, projectId, {
+    title: "Add a Stripe webhook endpoint",
+    when_to_use: "when a task adds or changes a Stripe webhook handler",
+    steps: ["Register the route in server/src/api.ts", "Verify the Stripe signature before parsing"],
+    gotchas: ["Stripe retries with the same event id"],
+    success_criteria: ["bun test passes"],
+  });
+
+  const hit = composeBrief(db, mkTask("Add the Stripe refund webhook", "Handle refund events from Stripe."));
+  expect(hit).toContain("## Playbook: Add a Stripe webhook endpoint");
+  expect(hit).toContain("when a task adds or changes a Stripe webhook handler");
+  expect(hit).toContain("Verify the Stripe signature before parsing");
+  expect(hit).not.toContain("Stripe retries with the same event id"); // gotchas stay behind recall
+
+  const miss = composeBrief(db, mkTask("Rename the sidebar", "Change the label on the navigation sidebar."));
+  expect(miss).not.toContain("## Playbook:");
 });

@@ -4,7 +4,8 @@
 //
 //   - per-project config `auto_dispatch: true` is required for ordinary queued
 //     work (default off, so intake drafts/setup tasks never auto-spawn). Tasks
-//     explicitly delegated by an active chat manager bypass this one toggle.
+//     explicitly delegated by an active chat manager and Hive's own scheduled
+//     self-audit bypass this one toggle.
 //   - `dispatch_kinds` (default ["ship","scout"]) — chore tasks (usually titled
 //     for a human) are excluded by default.
 //   - source='intake_*' tasks (gchat messages, director braindumps) are skipped
@@ -35,7 +36,7 @@ import { isOffline, setSetting, getSetting, now } from "./db.ts";
 import { Herdr, herdr as defaultHerdr, isHerdrUnreachable } from "./runtime/herdr.ts";
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
-import { unmetDeps, noteDependencyBlock } from "./state.ts";
+import { isSelfAuditLineage, unmetDeps, noteDependencyBlock } from "./state.ts";
 import { isTrackingOnlyTask } from "./supervision.ts";
 import { queuedSteers } from "./steer.ts";
 import { managingThreadForTask } from "./chat.ts";
@@ -117,9 +118,16 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
 
   // Priority first, then age. Ordering only — nothing running is ever killed to
   // make room for a higher-priority task (see the borrowed slot in hasCapacity).
+  // A deferred task is deliberately parked: skip it until deferred_until passes
+  // (or `emit undefer` clears it). Same clause the reconciler's staleness sweep
+  // uses — without it `defer` only silenced nudges and a queued task still
+  // dispatched (hive-1864, the answer that replaced --track).
   const queued = db
-    .query(`SELECT * FROM tasks WHERE state = 'queued' ORDER BY ${PRIORITY_RANK_SQL}, created_at ASC`)
-    .all()
+    .query(
+      `SELECT * FROM tasks WHERE state = 'queued' AND (deferred_until IS NULL OR deferred_until <= ?)
+        ORDER BY ${PRIORITY_RANK_SQL}, created_at ASC`
+    )
+    .all(new Date(nowMs).toISOString())
     .map(parseTask);
 
   // Reattach candidates: a live task with NO agent but feedback waiting for one.
@@ -256,8 +264,9 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         const manager = managed?.task_id ? db.query("SELECT state FROM tasks WHERE id = ?").get(managed.task_id) as { state: string } | undefined : null;
         const managerDelegated = !!manager && !["done", "failed", "cancelled"].includes(manager.state);
         const gardenerTask = task.source === "pr-gardener";
+        const scheduledSelfAudit = isSelfAuditLineage(db, task);
         if (gardenerTask && cfg.pr_gardener?.enabled !== true) continue;
-        if (cfg.auto_dispatch !== true && !managerDelegated && !gardenerTask) continue;
+        if (cfg.auto_dispatch !== true && !managerDelegated && !gardenerTask && !scheduledSelfAudit) continue;
 
         const kinds = Array.isArray(cfg.dispatch_kinds) ? cfg.dispatch_kinds : DISPATCH_KINDS_DEFAULT;
         // A requeue is recovery for work already dispatched once (auto-requeue on
@@ -279,6 +288,18 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         // worktree it cannot do the work in.
         if (repoMismatchUnresolved(db, task.id)) continue;
 
+        // Dependency gate FIRST. A blocked task is skipped every lap for as long
+        // as its blockers run, and authorize() writes an unconditional
+        // authority_logged row on every allow — so gating after it minted one
+        // event per task per lap forever (485k rows in 7 days, 99% of all events
+        // written; HIVE-515). noteDependencyBlock already dedupes; this gate is a
+        // pure local read, so checking it first costs nothing and logs nothing.
+        const blocking = unmetDeps(db, task);
+        if (blocking.length) {
+          noteDependencyBlock(db, task.id, blocking, "dispatcher");
+          continue;
+        }
+
         const authz = authorize(db, {
           project_id: task.project_id,
           action: "task.dispatch",
@@ -286,14 +307,6 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
           task_id: task.id,
         });
         if (authz.effect !== "allow") continue; // deny or require_decision blocks the auto-spawn
-
-        // Dependency gate: don't spawn until every depends_on task is merged/done.
-        // Same shape as the authz gate above — skip and surface a visible reason.
-        const blocking = unmetDeps(db, task);
-        if (blocking.length) {
-          noteDependencyBlock(db, task.id, blocking, "dispatcher");
-          continue;
-        }
 
         if (!(await spawnFor(task))) return;
       } catch (e) {
