@@ -293,3 +293,35 @@ test("a partially-numbered DB fails the migration instead of committing duplicat
     cleanup(path);
   }
 });
+
+// hive-1864: --track is retired. The migration parks the tracking-only rows it
+// leaves behind and hands them back to the normal machinery, without touching
+// Jira mirrors (which also carry source='external' and must stay undispatchable).
+test("v39 retires source='external' on non-mirror tasks and parks the live ones", () => {
+  const path = tmpDb("v39");
+  try {
+    const db = openDb(path);
+    const mk = (id: string, state: string, sourceRef: string | null) =>
+      db
+        .query(
+          "INSERT INTO tasks (id, project_id, title, state, kind, source, source_ref, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"
+        )
+        .run(id, "p1", id, state, "ship", "external", sourceRef, "2026-01-01", "2026-01-01");
+    db.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run("p1", "p", "{}", "2026-01-01");
+    mk("parked", "queued", null);
+    mk("gone", "cancelled", null);
+    mk("mirror", "queued", "jira:WEB-1");
+
+    const m = MIGRATIONS.find((x) => x.name === "v39-retire-tracking-only-source")!;
+    for (const pass of [1, 2]) for (const stmt of m.statements) db.query(stmt).run(); // re-runnable
+
+    const row = (id: string) =>
+      db.query("SELECT source, deferred_until FROM tasks WHERE id = ?").get(id) as { source: string | null; deferred_until: string | null };
+    expect(row("parked")).toEqual({ source: null, deferred_until: "9999-12-31T00:00:00.000Z" });
+    expect(row("gone")).toEqual({ source: null, deferred_until: null }); // terminal: nothing to park
+    expect(row("mirror")).toEqual({ source: "external", deferred_until: null }); // mirrors untouched
+    db.close();
+  } finally {
+    cleanup(path);
+  }
+});
