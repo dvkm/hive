@@ -642,6 +642,24 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v38-events-type-task-index",
     statements: [`CREATE INDEX idx_events_type_task ON events(type, task_id, ts)`],
   },
+  // --track is retired (hive-1864): source='external' made a task hive could
+  // never dispatch and never spawn, silently, so 26 of them went nowhere. The
+  // parked ones become ordinary tasks deferred indefinitely — visible in the
+  // queue, skipped by the dispatcher, resumed with `hive emit <id> undefer`.
+  // Jira mirrors keep source='external' (source_ref 'jira:KEY' gates them on its
+  // own, and they are the healthy population). Both statements re-run safely:
+  // the park runs before the source clear, and once source is cleared the WHERE
+  // matches nothing.
+  {
+    name: "v39-retire-tracking-only-source",
+    statements: [
+      `UPDATE tasks SET deferred_until = '9999-12-31T00:00:00.000Z'
+         WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'
+           AND state NOT IN ('done', 'failed', 'cancelled') AND deferred_until IS NULL`,
+      `UPDATE tasks SET source = NULL
+         WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings

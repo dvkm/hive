@@ -340,6 +340,26 @@ test("tracking-only (source=external) tasks are never auto-dispatched", async ()
   expect(getTask(db, id).state).toBe("queued");
 });
 
+// hive-1864: `defer` is now the answer for "parked, do not act on this" — the
+// role --track used to play badly. Before this the dispatcher ignored
+// deferred_until entirely and a deferred queued task spawned anyway.
+test("a deferred queued task is not dispatched until it is un-deferred", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  db.query("UPDATE tasks SET deferred_until = ? WHERE id = ?").run("9999-12-31T00:00:00.000Z", id);
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(0);
+  expect(getTask(db, id).state).toBe("queued");
+
+  // A past deadline is the same as no deadline: the park has expired.
+  db.query("UPDATE tasks SET deferred_until = ? WHERE id = ?").run("2020-01-01T00:00:00.000Z", id);
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, id).state).toBe("in_progress");
+});
+
 test("authority deny blocks auto-dispatch", async () => {
   const { db, projectId } = freshDb({ auto_dispatch: true });
   const id = makeTask(db, projectId);

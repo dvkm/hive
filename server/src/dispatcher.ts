@@ -119,9 +119,16 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
 
   // Priority first, then age. Ordering only — nothing running is ever killed to
   // make room for a higher-priority task (see the borrowed slot in hasCapacity).
+  // A deferred task is deliberately parked: skip it until deferred_until passes
+  // (or `emit undefer` clears it). Same clause the reconciler's staleness sweep
+  // uses — without it `defer` only silenced nudges and a queued task still
+  // dispatched (hive-1864, the answer that replaced --track).
   const queued = db
-    .query(`SELECT * FROM tasks WHERE state = 'queued' ORDER BY ${PRIORITY_RANK_SQL}, created_at ASC`)
-    .all()
+    .query(
+      `SELECT * FROM tasks WHERE state = 'queued' AND (deferred_until IS NULL OR deferred_until <= ?)
+        ORDER BY ${PRIORITY_RANK_SQL}, created_at ASC`
+    )
+    .all(new Date(nowMs).toISOString())
     .map(parseTask);
 
   // Reattach candidates: a live task with NO agent but feedback waiting for one.
