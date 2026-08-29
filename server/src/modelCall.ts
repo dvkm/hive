@@ -15,6 +15,7 @@ import type { DB } from "./db.ts";
 import { getSetting, setSetting } from "./db.ts";
 import { enqueue } from "./notifications.ts";
 import { noteToolStart } from "./health.ts";
+import { cachedProxyUrl } from "./teamclaude.ts";
 
 export type ModelResult = { code: number; stdout: string; stderr: string; timedOut?: boolean };
 
@@ -55,6 +56,17 @@ export function isAuthFailure(text: string): boolean {
 
 const AUTH_ALERT_KEY = "model_auth_alert";
 
+// The fix depends on how the failing call was routed. Hive's own `claude -p`
+// subprocesses prefer the TeamClaude proxy whenever it is up, and when they do,
+// `claude /login` on the host changes nothing: the accounts that need re-auth
+// are the ones in the proxy's pool.
+export function authAlertBody(failure: string, proxy: string | null): string {
+  const fix = proxy
+    ? `Hive's model calls go through the TeamClaude proxy at ${proxy}, so \`claude /login\` on the host will not fix this. Run \`teamclaude status\` and re-auth the accounts it shows as logged out.`
+    : "Run `claude /login` on the hive host, then hive recovers on its own.";
+  return `Every review, plan and verification is failing. ${fix} Reported: ${failure.slice(0, 200)}`;
+}
+
 // Record the outcome of one model call. `failure` is null on success.
 // Returns the failure text so call sites can write it straight into their event.
 export function noteModelCall(db: DB, failure: string | null): string | null {
@@ -71,7 +83,7 @@ export function noteModelCall(db: DB, failure: string | null): string | null {
       kind: "incident",
       urgency: "urgent",
       title: "Hive cannot reach the model: not logged in",
-      body: `Every review, plan and verification is failing. Run \`claude /login\` on the hive host, then hive recovers on its own. Reported: ${failure.slice(0, 200)}`,
+      body: authAlertBody(failure, cachedProxyUrl()),
     });
   }
   return failure;
