@@ -2644,7 +2644,14 @@ export async function syncProjectOnce(
       const marker = hiveTaskMarker(read.issue);
       if (marker) {
         const marked = db.query("SELECT * FROM tasks WHERE id = ? AND project_id = ?").get(marker, projectId) as any;
-        if (marked && !marked.jira_key) {
+        // The marker names the task the sub-task was created FOR, which is not
+        // always the task that still owns the link: a requeue MOVES the key to
+        // the successor (see requeueTask) and the marker keeps naming the dead
+        // predecessor. Re-linking it would both strand the issue again and hit
+        // the unique index on (jira_key, jira_link_kind). So the marker only
+        // adopts a key that nobody holds.
+        const alreadyOwned = linkedTasks.some((task) => task.jira_link_kind === "subtask");
+        if (marked && !marked.jira_key && !alreadyOwned) {
           const linked = db.query("UPDATE tasks SET jira_key = ?, jira_link_kind = 'subtask', updated_at = ? WHERE id = ? AND jira_key IS NULL")
             .run(key, now(), marked.id);
           if (linked.changes !== 1) continue;
