@@ -26,12 +26,20 @@ import { parseUnifiedDiff } from "./diff.ts";
 import { startLoop } from "./loop.ts";
 
 const TIMEOUT_MS = Number(process.env.HIVE_REVIEWER_TIMEOUT_MS || 180_000);
-// How many tasks one pass reviews, and how many risk/question checks one task
-// runs, at the same time. One-at-a-time made the review column the auto-merge
-// ceiling: ~0.6 reviews/min against a fleet of 4 agents filling it. Deliberately
-// a constant, not a config knob — the ceiling here is the model API, not
-// anything a project would want to tune.
+// How many tasks one pass reviews at the same time. One-at-a-time made the
+// review column the auto-merge ceiling: ~0.6 reviews/min against a fleet of 4
+// agents filling it. Deliberately a constant, not a config knob — the ceiling
+// here is the model API, not anything a project would want to tune.
 const REVIEW_CONCURRENCY = 4;
+// The per-risk fan-out is nested inside the per-task one, so the two caps
+// multiply: 4 tasks x 4 risks would be 16 `claude -p` subprocesses at once,
+// which is a peak nobody chose and the kind of load that has exhausted ptys
+// here before. 2 keeps the real ceiling at roughly 8.
+// ponytail: two nested caps whose product is the true bound. If the reviewer
+// ever needs a genuine total budget, replace both with one shared semaphore
+// around the model calls -- but don't hold an outer slot across the inner
+// fan-out or it deadlocks.
+const RISK_CONCURRENCY = 2;
 const DIFF_LIMIT = 60_000;
 
 export interface ReviewerDeps {
@@ -637,7 +645,7 @@ function hasRiskVerdicts(db: DB, taskId: string, head: string, expected: number)
   });
 }
 
-// One opus run per risk and per question, up to REVIEW_CONCURRENCY at a time,
+// One opus run per risk and per question, up to RISK_CONCURRENCY at a time,
 // each capped. They are independent one-shots with no ordering between them. A
 // run that fails or returns junk is left out and counted in `unverified`, so a
 // broken run never reads as an all-clear. `stillCurrent` is checked before each
@@ -679,7 +687,7 @@ export async function verifyRisks(
     ...risks.map((risk) => ({ kind: "risk" as const, text: risk, prompt: verifyPrompt(task, risk, input.diff) })),
     ...questions.map((q) => ({ kind: "question" as const, text: q, prompt: answerPrompt(task, q, input.diff) })),
   ];
-  const results = await mapLimit(jobs, REVIEW_CONCURRENCY, async (job) => {
+  const results = await mapLimit(jobs, RISK_CONCURRENCY, async (job) => {
     if (aborted) return null;
     if (!(await current())) {
       aborted = true;

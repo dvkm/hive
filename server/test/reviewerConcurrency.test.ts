@@ -1,5 +1,5 @@
 // Throughput: one pass reviews several tasks at once, and one task's risk and
-// question checks run at once (HIVE-502). Before this the whole pipeline was
+// question checks run at once (HIVE-523). Before this the whole pipeline was
 // single-threaded end to end and drained slower than the fleet filled it.
 import { test, expect } from "bun:test";
 import { mkdtempSync } from "node:fs";
@@ -76,13 +76,15 @@ test("a task with fewer tasks than the cap still reviews them all", async () => 
   expect(state.calls).toBe(2);
 });
 
-test("a task's three risk checks run concurrently", async () => {
+test("a task's risk checks run concurrently, capped at RISK_CONCURRENCY", async () => {
   const { db, ids } = seed(1);
   const { exec, state } = tracker(JSON.stringify({ result: '{"verdict":"refuted","reason":"not real","evidence":"x.ts:1"}' }));
   const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(ids[0]);
   await verifyRisks(db, task, { risks: ["r1", "r2", "r3"], head: "head-1", diff: "d" }, { exec });
   expect(state.calls).toBe(3);
-  expect(state.peak).toBe(3);
+  // Concurrent, but bounded: the inner cap is 2, so 3 risks never put 3
+  // subprocesses in flight at once.
+  expect(state.peak).toBe(2);
   const payload = JSON.parse((db.query("SELECT payload FROM events WHERE type = 'risk_verdicts'").get() as any).payload);
   // Order follows the risk list, not whichever run finished first.
   expect(payload.verdicts.map((v: any) => v.risk)).toEqual(["r1", "r2", "r3"]);
