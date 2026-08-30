@@ -209,29 +209,43 @@ function orphanedExternalKey(db: DB): AuditFinding[] {
 
 // 5. Provenance breaks: a failed task with no successor that was nonetheless
 //    superseded by work that landed. The board reads it as dead; it shipped.
-//    Five tasks looked abandoned this way. Matched on branch or exact title,
-//    the two things a replacement carries over.
+//    Five tasks looked abandoned this way.
+//
+//    Matching is the whole risk here. A shared branch is proof: hive names a
+//    branch after the task, so two tasks on one branch are one piece of work.
+//    A shared title is only a hint — "update dependencies" gets typed twice a
+//    year by unrelated people, and a false "this already shipped" on a real
+//    failure is the one error this check must not make. So the title path is
+//    fenced: same kind, and landed inside the window a replacement actually
+//    lands in. Outside that, a repeated title is treated as a coincidence.
+const REPLACEMENT_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+
 function provenanceBreaks(db: DB): AuditFinding[] {
   const dead = db
     .query(
-      `SELECT t.id, t.number, t.title, t.branch, t.project_id, t.created_at FROM tasks t ${active()}
+      `SELECT t.id, t.number, t.title, t.kind, t.branch, t.project_id, t.created_at FROM tasks t ${active()}
         WHERE t.state = 'failed' AND NOT EXISTS (SELECT 1 FROM tasks s WHERE s.parent_task_id = t.id)`
     )
     .all() as any[];
   const successor = db.query(
-    `SELECT id, number, title FROM tasks
+    `SELECT id, number, title, branch FROM tasks
       WHERE project_id = ?1 AND state = 'done' AND id <> ?2 AND created_at > ?3
-        AND (title = ?4 OR (?5 IS NOT NULL AND branch = ?5))
+        AND ((?5 IS NOT NULL AND branch = ?5)
+             OR (title = ?4 AND kind = ?6 AND created_at <= ?7))
       ORDER BY created_at LIMIT 1`
   );
   const out: AuditFinding[] = [];
   for (const t of dead) {
-    const hit = successor.get(t.project_id, t.id, t.created_at, t.title, t.branch) as any;
+    const deadline = new Date(Date.parse(t.created_at) + REPLACEMENT_WINDOW_MS).toISOString();
+    const hit = successor.get(t.project_id, t.id, t.created_at, t.title, t.branch, t.kind, deadline) as any;
     if (!hit) continue;
     out.push({
       kind: "provenance_break",
       task_id: t.id,
-      note: `Shows as failed with nothing following it, but ${label(hit)} shipped the same work later. The board is calling shipped work dead.`,
+      note:
+        hit.branch && hit.branch === t.branch
+          ? `Shows as failed with nothing following it, but ${label(hit)} shipped on the same branch (${t.branch}) later. The board is calling shipped work dead.`
+          : `Shows as failed with nothing following it, but ${label(hit)} shipped under the same title soon after. Check they are the same work: the titles match, the branches do not.`,
     });
   }
   return out;

@@ -148,6 +148,24 @@ test("provenance break: failed with no successor, but the same work shipped late
   expect(kinds(db)).toEqual(["provenance_break"]);
 });
 
+test("provenance break: a repeated title on unrelated work is not a break", () => {
+  const { db, pid } = setup();
+  // Same words, different work: a year apart, and a different kind of task.
+  task(db, pid, { state: "failed", title: "update dependencies", kind: "ship" }, "2025-08-01T00:00:00.000Z");
+  task(db, pid, { state: "done", title: "update dependencies", kind: "chore" }, "2026-08-02T00:00:00.000Z");
+  expect(auditBoard(db)).toEqual([]);
+
+  // Same title and kind, but far outside the window a replacement lands in.
+  task(db, pid, { state: "failed", title: "tidy the log lines" }, "2026-01-01T00:00:00.000Z");
+  task(db, pid, { state: "done", title: "tidy the log lines" }, "2026-06-01T00:00:00.000Z");
+  expect(auditBoard(db)).toEqual([]);
+
+  // A shared branch is proof on its own, whatever the titles say.
+  task(db, pid, { state: "failed", title: "first attempt", branch: "hive/abc123" }, "2026-01-01T00:00:00.000Z");
+  task(db, pid, { state: "done", title: "totally different words", branch: "hive/abc123" }, "2026-06-01T00:00:00.000Z");
+  expect(kinds(db)).toEqual(["provenance_break"]);
+});
+
 test("provenance break: a failed task with a real successor is not a break", () => {
   const { db, pid } = setup();
   const failed = task(db, pid, { state: "failed", title: "port the seat writer" }, "2026-08-01T00:00:00.000Z");

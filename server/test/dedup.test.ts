@@ -187,3 +187,44 @@ test("GET /api/tasks/duplicates surfaces clusters among non-terminal tasks", asy
   expect(cluster.tasks.length).toBeGreaterThanOrEqual(2);
   expect(cluster.tasks.some((t: any) => t.id === near.id)).toBe(true);
 });
+
+// ---- #1879: the caller is told what dedup did, and how to undo it ----
+test("auto-merged create returns a warning naming the survivor, its state, and the recovery", async () => {
+  const survivor = await mkTask("Expire the untagged ECR orphans");
+  const dup = await mkTask("expire the untagged ECR orphans");
+
+  expect(dup.state).toBe("cancelled");
+  expect(dup.warning).toContain(`folded into ${survivor.id} (queued)`);
+  expect(dup.warning).toContain(`hive task move ${survivor.id} cancelled`);
+});
+
+test("a create that does not dedup carries no warning", async () => {
+  const solo = await mkTask("Rotate the staging signing key");
+  expect(solo.state).toBe("queued");
+  expect(solo.warning ?? null).toBeNull();
+});
+
+test("near-dup create warns that it is parked behind the card", async () => {
+  const survivor = await mkTask("Retry the flaky editorial flip test");
+  const near = await mkTask("Retry the flaky editorial flip test again");
+  const dec = (await openDecisionsFor(near.id))[0];
+
+  expect(near.warning).toContain(`possible duplicate of ${survivor.id} (queued)`);
+  expect(near.warning).toContain("cancels this task");
+  expect(near.warning).toContain(dec.id);
+  expect(near.warning).toContain(`hive task move ${survivor.id} cancelled`);
+});
+
+test("following the printed recovery: cancel the survivor, recreate, task survives", async () => {
+  const broken = await mkTask("Fix NON_PROD failing open on unset RUST_PROFILE");
+  const refiled = await mkTask("Fix NON_PROD failing open on unset RUST_PROFILE");
+  expect(refiled.state).toBe("cancelled");
+
+  // The recovery the warning prints.
+  await post(`/api/tasks/${broken.id}/transition`, { to: "cancelled", reason: "superseded" });
+  const retry = await mkTask("Fix NON_PROD failing open on unset RUST_PROFILE");
+  expect(retry.state).toBe("queued");
+  expect(retry.duplicate_of ?? null).toBeNull();
+  expect(retry.warning ?? null).toBeNull();
+  expect((await openDecisionsFor(retry.id)).length).toBe(0);
+});
