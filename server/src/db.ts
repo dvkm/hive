@@ -642,6 +642,36 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v38-events-type-task-index",
     statements: [`CREATE INDEX idx_events_type_task ON events(type, task_id, ts)`],
   },
+  // --track is retired (hive-1864): source='external' made a task hive could
+  // never dispatch and never spawn, silently, so 26 of them went nowhere. The
+  // parked ones become ordinary tasks deferred indefinitely — visible in the
+  // queue, skipped by the dispatcher, resumed with `hive emit <id> undefer`.
+  // Jira mirrors keep source='external' (source_ref 'jira:KEY' gates them on its
+  // own, and they are the healthy population). Both statements re-run safely:
+  // the park runs before the source clear, and once source is cleared the WHERE
+  // matches nothing.
+  {
+    name: "v39-retire-tracking-only-source",
+    statements: [
+      `UPDATE tasks SET deferred_until = '9999-12-31T00:00:00.000Z'
+         WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'
+           AND state NOT IN ('done', 'failed', 'cancelled') AND deferred_until IS NULL`,
+      `UPDATE tasks SET source = NULL
+         WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'`,
+    ],
+  },
+  // Why the dispatcher last skipped a queued task (HIVE-525). Seven of the nine
+  // `continue` paths in the queued loop used to be silent, so a task that could
+  // never run looked exactly like one about to start. Written only when the
+  // reason CHANGES (state.ts's noteSkip), so a steady-state queue costs one row
+  // update per transition, not one event per cycle.
+  {
+    name: "v40-task-skip-reason",
+    statements: [
+      `ALTER TABLE tasks ADD COLUMN skip_reason TEXT`,
+      `ALTER TABLE tasks ADD COLUMN skip_reason_at TEXT`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings

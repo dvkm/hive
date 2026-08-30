@@ -159,6 +159,22 @@ export function heldPushes(db: DB): HeldPush[] {
   return readHeld(db);
 }
 
+export interface LastFlush {
+  at: string;
+  items: HeldPush[];
+}
+
+// What the last wake-up summary covered. The summary push links to /inbox, so
+// the web view needs the list AFTER the held queue was cleared.
+export function lastFlush(db: DB): LastFlush | null {
+  try {
+    const raw = JSON.parse(getSetting(db, "away_last_flush") || "null");
+    return raw && Array.isArray(raw.items) ? (raw as LastFlush) : null;
+  } catch {
+    return null;
+  }
+}
+
 // Decide what to do with one outgoing push. Returns true when it was held (the
 // caller must NOT push), false when it should go out now.
 export function holdIfAway(db: DB, cls: PushClass, payload: PushPayload): boolean {
@@ -181,6 +197,7 @@ export function flushHeld(db: DB, deps: FlushDeps = {}): { count: number; summar
   setSetting(db, "away_held", "[]");
   if (!held.length) return { count: 0, summary: "" };
   const summary = `While you were away: ${held.length} item${held.length === 1 ? "" : "s"}`;
+  setSetting(db, "away_last_flush", JSON.stringify({ at: now(), items: held }));
   void (deps.push ?? pushToAll)(db, { title: summary, body: held[held.length - 1].title, url: "/inbox" }).catch(() => {});
   return { count: held.length, summary };
 }

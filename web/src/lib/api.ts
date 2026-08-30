@@ -138,7 +138,9 @@ export interface Task {
   evidence_count?: number; // list endpoint only; avoids fetching every task detail on startup
   spawn_error?: boolean; // list endpoint only; prior spawn failed and no spawn ever succeeded
   requeued_to?: string | null; // successor id when failed + auto-requeued
+  skip?: { reason: string; label: string; permanent: boolean; since: string | null } | null; // queued only: why the dispatcher last skipped it
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
+  reviewed?: boolean; // intake tasks only: the director (or intake triage) signalled it is free to dispatch
   created_at: string;
   updated_at: string;
 }
@@ -197,6 +199,9 @@ export interface Decision {
   // chat_supervisor/agent/system for programmatic callers; unknown if unattributed.
   answered_by: "director" | "chat_supervisor" | "agent" | "system" | "unknown" | null;
   answered_actor: string | null;
+  // Set on cards no automation may answer — today only "intake_triage", the
+  // "which reading should we build?" card raised by intake triage.
+  decision_class: string | null;
   bundle?: DecisionBundle | null;
   plan?: DecisionPlan | null;
 }
@@ -538,6 +543,20 @@ export interface LandGraph {
   edges: { from: string; to: string; kind: "depends" | "conflict"; files?: string[] }[];
 }
 
+// The divergence radar (server/src/divergence.ts): for every branch still being
+// worked on, how far it trails the branch it will land on and which files it
+// shares with a sibling branch. `behind: null` means git could not tell.
+export interface DivergenceRow {
+  id: string;
+  number: number;
+  title: string;
+  state: State;
+  branch: string;
+  behind: number | null;
+  files: number;
+  overlaps: { task_id: string; number: number; files: string[] }[];
+}
+
 // One global-search hit. task_state/project_id are present only for task hits.
 export interface SearchHit {
   type: "task" | "decision" | "learning" | "policy" | "project";
@@ -685,6 +704,25 @@ function bodyFor(fields: Record<string, unknown>, files?: File[]): string | Form
   for (const [k, v] of Object.entries(fields)) if (v != null) fd.append(k, String(v));
   for (const f of files) fd.append("files", f);
   return fd;
+}
+
+// Away mode, as returned by GET/POST /api/away. `active` is the live state
+// (manual switch OR the schedule window); `on` is only the manual switch.
+export interface HeldPush {
+  at: string;
+  class: string;
+  title: string;
+  body: string | null;
+  url: string;
+}
+
+export interface Away {
+  on: boolean;
+  active: boolean;
+  schedule?: { start: string; end: string; tz: string };
+  held: number;
+  items?: HeldPush[];
+  last_flush?: { at: string; items: HeldPush[] } | null;
 }
 
 // An open (un-acked) build-time checkpoint, as returned by GET /api/checkpoints.
@@ -868,6 +906,8 @@ export const api = {
   offline: () => req<{ on: boolean }>(`/api/offline`),
   setOffline: (on: boolean) =>
     req<{ on: boolean; steered: number }>(`/api/offline`, { method: "POST", body: JSON.stringify({ on }) }),
+  away: () => req<Away>(`/api/away`),
+  setAway: (on: boolean) => req<Away>(`/api/away`, { method: "POST", body: JSON.stringify({ on }) }),
   checkpoints: () => req<{ checkpoints: Checkpoint[] }>(`/api/checkpoints`),
   ackCheckpoint: (taskId: string, eventId: string, verdict: "ok" | "flag", note?: string) =>
     req<{ ok: boolean; delivered: boolean; followup_task_id: string | null }>(`/api/tasks/${taskId}/checkpoints/${eventId}/ack`, {
@@ -969,6 +1009,8 @@ export const api = {
     req<{ clusters: { project_id: string; tasks: Pick<Task, "id" | "title" | "project_id" | "state">[] }[] }>(`/api/tasks/duplicates`),
   diff: (id: string) => req<DiffResult>(`/api/tasks/${id}/diff`),
   landGraph: (project?: string) => req<LandGraph>(`/api/tasks/land-graph${project ? `?project=${project}` : ""}`),
+  divergence: (project?: string) =>
+    req<{ rows: DivergenceRow[] }>(`/api/tasks/divergence${project ? `?project=${project}` : ""}`),
   landQueue: (task_ids: string[], queued = true) =>
     req<{ changed: string[]; queued: boolean }>(`/api/tasks/land-queue`, {
       method: "POST",

@@ -42,6 +42,7 @@ import Palette from "./views/Palette";
 import Chat from "./views/Chat";
 import Supervisors from "./views/Supervisors";
 import Deployments from "./views/Deployments";
+import { AwayBanner, AwayToggle } from "./views/Away";
 
 // Enable web-push on this device (phone PWA). Hidden once granted or where
 // unsupported (desktop keeps the osascript notifier). iOS only offers this on
@@ -287,7 +288,7 @@ export function Bell() {
 }
 
 export default function App() {
-  const { needsYou, tasks, offline, setOffline } = useStore();
+  const { needsYou, tasks, offline, setOffline, away, setAway } = useStore();
   const projectFilter = useProjectFilter();
   const inboxCount = needsYou.filter(
     (item) => item.kind !== "waiting" && inProjectFilter(itemProject(item, tasks), projectFilter),
@@ -330,9 +331,11 @@ export default function App() {
           </NavLink>
           <SecondaryNav offline={offline} setOffline={setOffline} />
         </nav>
+        <AwayToggle />
         <Bell />
         <ConnDot />
       </header>
+      <AwayBanner away={away} onResume={() => setAway(false)} />
       <MobileNav inboxCount={inboxCount} offline={offline} setOffline={setOffline} />
       <main className="content" id="main-content">
         <Routes location={background || location}>

@@ -306,3 +306,21 @@ test("tasksWithHealth: sidecar lookup stays a single query regardless of task co
   expect(sidecarQueries).toBe(1);
   for (const t of tasks) expect(t.sidecar?.sha).toBe("abc123");
 });
+
+// The board's "intake · unreviewed" chip reads this flag, so it must follow
+// dispatcher.ts's isReviewed: intake triage marking a task reviewed has to
+// clear the chip. Non-intake tasks never carry the field. Task HIVE-513.
+test("reviewed: only intake tasks carry it, and a reviewed event flips it", () => {
+  const { db, projectId } = freshDb();
+  const plain = makeTask(db, projectId);
+  const held = makeTask(db, projectId, "queued");
+  const ok = makeTask(db, projectId, "queued");
+  for (const id of [held, ok]) db.query("UPDATE tasks SET source = 'intake_gchat' WHERE id = ?").run(id);
+  putEvent(db, ok, "reviewed", { note: "triage: mechanical" });
+  const by = Object.fromEntries(
+    tasksWithHealth(db, [plain, held, ok].map((id) => getTask(db, id))).map((t: any) => [t.id, t.reviewed])
+  );
+  expect(by[plain]).toBeUndefined();
+  expect(by[held]).toBe(false);
+  expect(by[ok]).toBe(true);
+});

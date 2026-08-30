@@ -290,6 +290,84 @@ function playwrightBin(dir: string, root: string): string | { reason: string } {
   };
 }
 
+// ---- borrowed dependencies -----------------------------------------------
+// A fresh hive worktree has no node_modules, so playwrightBin above refuses and
+// the render never happens. Installing them here is not an option: the run is
+// fenced by a seatbelt that denies the network, and an install outside the fence
+// would execute the PR branch's own postinstall scripts unfenced, which is the
+// one thing the trust story is built to avoid.
+//
+// So borrow instead. Every task worktree is cut from a main checkout that
+// already has the deps installed, and linking costs no network and runs no repo
+// code.
+//
+// node_modules is created as a REAL directory holding one symlink per entry,
+// never as a single symlink to the main checkout's. Vite writes its dependency
+// cache into node_modules/.vite, and the seatbelt denies every write outside
+// the worktree, so a wholly symlinked node_modules would kill the dev server on
+// startup.
+//
+// The links are removed after the run. Leaving a branch wired to another
+// checkout's dependencies is how an agent later gets a mystery build: the
+// branch may add or bump a package, and `wt.sh up`-style setup hooks skip the
+// install when node_modules already exists.
+//
+// ponytail: no version check against the branch's lockfile. A dependency the
+// branch just added is missing, so its dev server fails and the task falls back
+// to text with the reason — the same quiet degrade as today, and cheaper than
+// resolving a lockfile hive does not own.
+
+// The checkout this linked worktree was cut from. A linked worktree's `.git` is
+// a FILE reading `gitdir: <repo>/.git/worktrees/<name>`; anything else (a real
+// repo, a bare directory) has no main checkout to borrow from.
+function mainCheckout(root: string): string | null {
+  let text = "";
+  try {
+    text = readFileSync(join(root, ".git"), "utf8");
+  } catch {
+    return null;
+  }
+  const gitdir = /^gitdir:\s*(.+?)\s*$/m.exec(text)?.[1];
+  const main = gitdir ? /^(.*)\/\.git\/worktrees\/[^/]+$/.exec(gitdir)?.[1] : null;
+  return main && existsSync(main) ? main : null;
+}
+
+// Build caches that live inside node_modules. These are NOT linked: a dev
+// server rewrites them on startup, and a link would send that write to the main
+// checkout, which the seatbelt denies. Vite dies on exactly this
+// ("EPERM: operation not permitted, unlink node_modules/.vite/deps/..."), so the
+// worktree gets its own empty cache and Vite fills it.
+const DEV_CACHES = [".vite", ".vite-temp", ".cache"];
+
+// Link the main checkout's installed packages into every package directory from
+// the harness up to the worktree root that has none. Returns an undo that
+// deletes exactly what it created, and nothing else.
+export function borrowDeps(dir: string, root: string): () => void {
+  const made: string[] = [];
+  const undo = () => made.forEach((path) => rmSync(path, { recursive: true, force: true }));
+  const main = mainCheckout(root);
+  if (!main) return undo;
+  for (let at = resolve(dir); ; at = resolve(at, "..")) {
+    const into = join(at, "node_modules");
+    const from = join(main, relative(root, at), "node_modules");
+    if (existsSync(join(at, "package.json")) && !existsSync(into) && existsSync(from)) {
+      try {
+        mkdirSync(into, { recursive: true });
+        made.push(into);
+        for (const entry of readdirSync(from)) {
+          if (DEV_CACHES.includes(entry)) continue;
+          symlinkSync(join(from, entry), join(into, entry));
+        }
+      } catch {
+        undo(); // a half-linked node_modules is worse than none
+        return () => {};
+      }
+    }
+    if (at === resolve(root) || at === resolve(at, "..")) break;
+  }
+  return undo;
+}
+
 function saveEvidence(db: DB, taskId: string, file: string, caption: string, phase: "before" | "after"): void {
   const destDir = join(evidenceDir(), taskId);
   mkdirSync(destDir, { recursive: true });
@@ -457,8 +535,12 @@ export async function renderProofs(
   if ("reason" in harness) return { created: 0, reason: harness.reason };
   const fence = seatbelt(root);
   if ("reason" in fence) return { created: 0, reason: fence.reason };
+  const unborrow = borrowDeps(harness.dir, root);
   const playwright = playwrightBin(harness.dir, root);
-  if (typeof playwright !== "string") return { created: 0, reason: playwright.reason };
+  if (typeof playwright !== "string") {
+    unborrow();
+    return { created: 0, reason: playwright.reason };
+  }
 
   const routes = routesFromFiles(files);
   const runId = newId();
@@ -481,6 +563,7 @@ export async function renderProofs(
   } finally {
     if (outDir) rmSync(outDir, { recursive: true, force: true });
     rmSync(join(root, `.hive-proof-${runId}`), { recursive: true, force: true });
+    unborrow();
   }
 }
 

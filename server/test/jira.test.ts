@@ -3689,6 +3689,59 @@ test.skipIf(process.platform !== "darwin")("an uninstalled repo is refused, neve
   expect(reason).toContain("host PATH");
 });
 
+// A fresh worktree has no node_modules, but the main checkout it was cut from
+// does. Hive borrows those for the render (it cannot install: the fence denies
+// the network) and unlinks them again as soon as the run is over.
+test.skipIf(process.platform !== "darwin")("a fresh worktree borrows the main checkout's installed deps", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const task = tasks(db)[0];
+  const root = fakeWorktree(task.id, true, undefined, false); // harness, no deps
+  writeFileSyncT(join(root, "web", "package.json"), "{}\n");
+
+  // The main checkout: same layout, deps installed, one real package to link.
+  const main = join(HOME, `main-${newId()}`);
+  mkdirSyncT(join(main, "web", "node_modules", ".bin"), { recursive: true });
+  mkdirSyncT(join(main, "web", "node_modules", "react"), { recursive: true });
+  // A dev-server cache. Linking it would send Vite's startup rewrite to the
+  // main checkout, which the seatbelt denies and Vite dies on.
+  mkdirSyncT(join(main, "web", "node_modules", ".vite", "deps"), { recursive: true });
+  writeFileSyncT(join(main, "web", "package.json"), "{}\n");
+  writeFileSyncT(join(main, "web", "node_modules", ".bin", "playwright"), "#!/bin/sh\n");
+  writeFileSyncT(join(root, ".git"), `gitdir: ${join(main, ".git", "worktrees", "wt")}\n`);
+
+  db.query("UPDATE tasks SET branch = ?, worktree_path = ? WHERE id = ?").run("hive/x", root, task.id);
+  trustRepo(db, projectId);
+
+  const render = execRendering(root, 1);
+  const seen: string[][] = [];
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, {
+    exec: async (argv: string[], opts: any) => {
+      seen.push(argv);
+      if (isHarnessRun(argv)) {
+        // The borrowed packages are in place while the harness runs, reachable
+        // from inside the worktree.
+        expect(readFileSyncT(join(root, "web", "node_modules", ".bin", "playwright"), "utf8")).toBe("#!/bin/sh\n");
+        expect(existsSync(join(root, "web", "node_modules", "react"))).toBe(true);
+        expect(existsSync(join(root, "web", "node_modules", ".vite"))).toBe(false);
+      }
+      return render(argv);
+    },
+  });
+
+  expect(stats.rendered).toBe(1);
+  const harness = seen.find(isHarnessRun)!;
+  expect(harness[harness.findIndex((a) => a.endsWith("/.bin/playwright"))]).toBe(
+    join(root, "web", "node_modules", ".bin", "playwright")
+  );
+  // Gone again afterwards: a branch left wired to another checkout's deps is a
+  // mystery build waiting to happen.
+  expect(existsSync(join(root, "web", "node_modules"))).toBe(false);
+  // And the main checkout is untouched.
+  expect(existsSync(join(main, "web", "node_modules", ".bin", "playwright"))).toBe(true);
+});
+
 test.skipIf(process.platform !== "darwin")(
   "the generated spec still shoots when only third-party and cancelled requests failed",
   async () => {
@@ -3832,4 +3885,149 @@ test.skipIf(process.platform !== "darwin")("the task's diff is read once per cyc
   const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
   expect(stats.rendered).toBe(1);
   expect(diffReads).toBe(1); // the UI-scope check and the renderer share one read
+});
+
+// ============================================================================
+// REQUEUE CARRIES THE JIRA LINK  (hive-1872)
+// ============================================================================
+// Ten WEB sub-tasks sat at In Progress while their work was merged on main. The
+// tasks had died to infrastructure and been requeued; the successor that
+// finished the work carried no jira_key, and the failed row that did could
+// never push (failed maps to no Jira status). So nothing ever closed the issue.
+const { requeueTask } = await import("../src/api.ts");
+
+// A task linked to WEB-23 as a sub-task, plus the tracking-only mirror row the
+// importer creates for the same issue.
+function linkedSubtask(db: DB, projectId: string, key = "WEB-23"): string {
+  const taskId = newId();
+  const ts = now();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, jira_key, jira_link_kind, created_at, updated_at)
+     VALUES (?, ?, 'Linked work', 'in_progress', 'ship', ?, 'subtask', ?, ?)`
+  ).run(taskId, projectId, key, ts, ts);
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, source, source_ref, jira_key, jira_link_kind, created_at, updated_at)
+     VALUES (?, ?, 'Mirror', 'in_progress', 'ship', 'external', ?, ?, 'mirror', ?, ?)`
+  ).run(newId(), projectId, `jira:${key}`, key, ts, ts);
+  return taskId;
+}
+
+const finish = (db: DB, taskId: string) => {
+  db.query("UPDATE tasks SET state = 'done', updated_at = ? WHERE id = ?").run(now(), taskId);
+  writeEvent(db, { task_id: taskId, source: "director", type: "state_change", payload: { from: "in_progress", to: "done" } });
+};
+
+const linkOf = (db: DB, taskId: string) =>
+  db.query("SELECT jira_key, jira_link_kind FROM tasks WHERE id = ?").get(taskId) as any;
+
+const subtaskOwners = (db: DB, key = "WEB-23") =>
+  (db.query("SELECT id FROM tasks WHERE jira_key = ? AND jira_link_kind = 'subtask'").all(key) as any[]).map((r) => r.id);
+
+test("a requeue MOVES the Jira link to the successor, and the successor closes the issue", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-23", id: "23", status: "In Progress", parentKey: "WEB-7" }] });
+  const { db, projectId } = freshDb();
+  const original = linkedSubtask(db, projectId);
+
+  transition(db, original, "failed", { source: "reconciler", reason: "agent died" });
+  const successor = requeueTask(db, db.query("SELECT * FROM tasks WHERE id = ?").get(original));
+
+  // the link moved: the dead row no longer claims it, exactly one task holds it
+  expect(linkOf(db, original)).toEqual({ jira_key: null, jira_link_kind: null });
+  expect(linkOf(db, successor)).toEqual({ jira_key: "WEB-23", jira_link_kind: "subtask" });
+  expect(subtaskOwners(db)).toEqual([successor]);
+
+  finish(db, successor);
+  await run(db, projectId, jira.fetchImpl);
+
+  // assert on the ISSUE, not on hive's own state
+  expect(jira.byKey.get("WEB-23")!.status).toBe("Done");
+});
+
+test("the link survives a multi-hop recovery chain and lands on the task that finishes", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-43", id: "43", status: "In Progress" }] });
+  const { db, projectId } = freshDb();
+  const first = linkedSubtask(db, projectId, "WEB-43");
+
+  transition(db, first, "failed", { source: "reconciler", reason: "died" });
+  const second = requeueTask(db, db.query("SELECT * FROM tasks WHERE id = ?").get(first));
+  expect(subtaskOwners(db, "WEB-43")).toEqual([second]);
+
+  transition(db, second, "in_progress", { source: "reconciler" });
+  transition(db, second, "failed", { source: "reconciler", reason: "died again" });
+  const third = requeueTask(db, db.query("SELECT * FROM tasks WHERE id = ?").get(second));
+
+  expect(linkOf(db, first)).toEqual({ jira_key: null, jira_link_kind: null });
+  expect(linkOf(db, second)).toEqual({ jira_key: null, jira_link_kind: null });
+  expect(subtaskOwners(db, "WEB-43")).toEqual([third]);
+
+  finish(db, third);
+  await run(db, projectId, jira.fetchImpl);
+  expect(jira.byKey.get("WEB-43")!.status).toBe("Done");
+});
+
+test("a task that fails and is never requeued leaves its Jira issue alone", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-23", id: "23", status: "In Progress" }] });
+  const { db, projectId } = freshDb();
+  const taskId = linkedSubtask(db, projectId);
+
+  transition(db, taskId, "failed", { source: "reconciler", reason: "gave up" });
+  await run(db, projectId, jira.fetchImpl);
+
+  expect(jira.byKey.get("WEB-23")!.status).toBe("In Progress");
+  expect(jira.writes().filter((c) => c.path.endsWith("/transitions"))).toEqual([]);
+});
+
+test("the issue's hive-task marker does not re-link the dead predecessor after a requeue", async () => {
+  const { db, projectId } = freshDb();
+  const original = linkedSubtask(db, projectId);
+  // the sub-task hive created names the ORIGINAL task forever
+  const jira = fakeJira({ issues: [{
+    key: "WEB-23", id: "23", status: "In Progress",
+    description: J.textToAdf(`hive-task: ${original}`),
+  }] });
+
+  transition(db, original, "failed", { source: "reconciler", reason: "agent died" });
+  const successor = requeueTask(db, db.query("SELECT * FROM tasks WHERE id = ?").get(original));
+
+  const stats = await run(db, projectId, jira.fetchImpl);
+  expect(stats.errors).toBe(0);
+  expect(stats.failures).toEqual([]);
+  expect(subtaskOwners(db)).toEqual([successor]);
+
+  finish(db, successor);
+  await run(db, projectId, jira.fetchImpl);
+  expect(jira.byKey.get("WEB-23")!.status).toBe("Done");
+});
+
+// The pull direction needs no change, and this test pins why: for a sub-task
+// link hive is authoritative and reconcileLinkedTask only ever PUSHES. Pulls
+// happen on the mirror row, and a mirror can never be requeued, so moving the
+// sub-task key cannot point a pull at the wrong row.
+test("only the mirror pulls, and a mirror is never requeued, so the pull side is unaffected", async () => {
+  const jira = fakeJira({ issues: [{
+    key: "WEB-23", id: "23", status: "In Review",
+    history: [{ at: "2099-01-01T00:00:00.000Z", to: "In Review" }],
+  }] });
+  const { db, projectId } = freshDb();
+  const original = linkedSubtask(db, projectId);
+  const mirror = db.query("SELECT * FROM tasks WHERE jira_link_kind = 'mirror'").get() as any;
+
+  transition(db, original, "failed", { source: "reconciler", reason: "agent died" });
+  const successor = requeueTask(db, db.query("SELECT * FROM tasks WHERE id = ?").get(original));
+
+  expect(() => requeueTask(db, mirror)).toThrow();
+  expect(db.query("SELECT id FROM tasks WHERE jira_key = 'WEB-23' AND jira_link_kind = 'mirror'").all())
+    .toEqual([{ id: mirror.id }]);
+
+  await run(db, projectId, jira.fetchImpl);
+
+  // Jira moved most recently, so the mirror pulls; the sub-task side pushes,
+  // and it is the successor that does it.
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(mirror.id) as any).state).toBe("in_review");
+  expect(syncEvents(db).filter((e: any) => e.linked)).toContainEqual(
+    expect.objectContaining({ action: "push", issue: "WEB-23", to: "To Do", linked: true, outcome: "ok" })
+  );
+  expect(db.query(
+    "SELECT COUNT(*) AS count FROM events WHERE task_id = ? AND type = 'jira_sync'"
+  ).get(successor)).toEqual({ count: 2 });
 });

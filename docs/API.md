@@ -85,7 +85,12 @@ intake. Classification runs in the background, so a slow one never delays the
 next message or watcher. The card it raises carries `decision_class:
 "intake_triage"`, which every automatic answering path refuses: the standing CI
 ruling, the chat supervisor, and the `decision_auto_answer_hours` timeout. Only
-you can answer it.)
+you can answer it. Answering appends your chosen option to the task's brief under
+a `## Director's answer` heading and marks the task reviewed, so it dispatches on
+the next cycle and the agent builds the reading you picked. Braindumps
+(`POST /api/intake`, source `intake_braindump`) are exempt: you typed that text
+yourself and it already raises a planner breakdown card. Jira import creates only
+tracking-only mirrors, which never dispatch, so nothing there is triaged either.)
 Domain-supervisor keys (see the Domain supervisors section):
 `supervisor_persona` (string, freeform planner identity included in every planner
 prompt), `plan_intake` (bool; when true, each new intake task auto-triggers a
@@ -688,7 +693,7 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
 
 ### Tasks
 - `GET /api/tasks?state=&project_id=&test=&compact=` → `200 [Task + {evidence_count, spawn_error, needs_you_since}, ...]` (newest `updated_at` first; all filters optional). `needs_you_since` is the latest entry into `in_review` or `failed`, and stays fixed when CI or metadata updates the task. `compact=1` omits task briefs and empty/default properties for list/bootstrap clients, and is gzip-compressed when accepted; fetch `GET /api/tasks/:id` when full task data is needed. Tasks under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
-- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?, verification_cmds?, priority?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher and reconciler won't advance the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban. It is never auto-dispatched or staleness-supervised, is exempt from the done-evidence gate, and moves freely via transitions (`hive task move <id> <state>`). The board keeps these tasks in its separate Tracked view with the external state visible. Jira-keyed Hive work is grouped beneath the matching tracked card, with requeue chains collapsed to their latest attempt. `verification_cmds` is the task's verification contract: an array of `{name, cmd}` the agent must run before handing off (`name`: 1-32 chars of `a-z0-9-`, unique within the task; `cmd`: a non-empty string). Anything else → `400`. The agent brief renders it as a "Verification contract" section, and `hive emit <id> evidence --verify-name <name>` tags an artifact with the entry it came from (stored as `verify_name` on the `evidence` event). The contract is enforced at the review handoff: `in_progress` -> `in_review` is refused with `409` until every named command has a matching evidence event, and the refusal lists exactly the missing names (see the `verification_missing` event). `priority` is one of `now`, `next`, `normal`, `later`; anything else → `400`, and a non-director `source` asking for `now` → `403`. Omit it and the task inherits its parent's priority, or starts at `next` when the title/brief reads as security work, else `normal`. It is ORDERING only, never preemption — see [Priority](#priority) for the full inheritance and authority rules. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
+- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?, verification_cmds?, priority?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher and reconciler won't advance the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` marks a TRACKING-ONLY task: another agent using hive as its kanban. It is never auto-dispatched or staleness-supervised, is exempt from the done-evidence gate, and moves freely via transitions (`hive task move <id> <state>`). The `--track` CLI flag that used to set it is retired (it only ever produced tasks nobody could dispatch); the Jira mirror path still sets it. To park a normal task, defer it: `hive emit <id> deferred` keeps it out of the dispatcher until `hive emit <id> undefer`. The board keeps these tasks in its separate Tracked view with the external state visible. Jira-keyed Hive work is grouped beneath the matching tracked card, with requeue chains collapsed to their latest attempt. `verification_cmds` is the task's verification contract: an array of `{name, cmd}` the agent must run before handing off (`name`: 1-32 chars of `a-z0-9-`, unique within the task; `cmd`: a non-empty string). Anything else → `400`. The agent brief renders it as a "Verification contract" section, and `hive emit <id> evidence --verify-name <name>` tags an artifact with the entry it came from (stored as `verify_name` on the `evidence` event). The contract is enforced at the review handoff: `in_progress` -> `in_review` is refused with `409` until every named command has a matching evidence event, and the refusal lists exactly the missing names (see the `verification_missing` event). `priority` is one of `now`, `next`, `normal`, `later`; anything else → `400`, and a non-director `source` asking for `now` → `403`. Omit it and the task inherits its parent's priority, or starts at `next` when the title/brief reads as security work, else `normal`. It is ORDERING only, never preemption — see [Priority](#priority) for the full inheritance and authority rules. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
 - `POST /api/tasks/:id/jira/link` body `{parent_key (required)}` → `201 {jira_key, browse_url, warnings}` | `400` | `404`
@@ -932,6 +937,39 @@ Failing or pending CI holds a task in the queue; `unavailable` (no CI at all)
 does not. A merge that actually fails drops out of the queue and the whole sweep
 raises ONE notification naming what stopped, so a broken PR is not retried every
 cycle.
+
+**Merges are single-flight per target branch (HIVE-348).** The edges decide who
+MAY land; the queue then lands them one at a time. Every caller goes through
+`mergeTask`, which takes a lock keyed on the repo plus the branch being merged
+into, so the land sweep, the reconciler's auto-merge, the PR gardener and the
+director's own click can never run two merges against one base at once — the
+race that once dropped a commit through a reset and re-merge. Independent repos
+and independent target branches still land in parallel. Everything that
+validates a merge (the PR metadata probe, the destructive-rebase guard, the
+live-head match, `beforeMutation`) runs inside the lock, so a queued merge
+validates against the base its predecessor just moved. The queue also re-reads
+the approved-to-land mark immediately before each merge, so unmarking a PR
+mid-sweep stops the merges still waiting behind the one in flight.
+
+### Divergence radar (HIVE-348)
+
+Conflicts used to surface at merge time, after a review was already done. This
+shows them while the work is still in flight.
+
+- `GET /api/tasks/divergence[?project=<id>]` → `200 {projects: [{project_id, base, rows}], rows}`.
+  Rows cover every task in `in_progress`, `in_review` or `needs_decision` that
+  has a branch. Each row is `{id, number, title, state, branch, behind, files,
+  overlaps}`: `behind` is `git rev-list --count <branch>..<base>` (commits the
+  target branch has that this one does not, `null` when git could not tell,
+  never 0), `files` is how many files the branch authors, and `overlaps` lists
+  the sibling branches touching the same files as `{task_id, number, files}`
+  (capped at 5 files, symmetric so each side sees the other). Overlap reuses the
+  land graph's own detector (`authoredFiles`), not a second one. Nothing is
+  stored, and a project with no `repo_path` returns no rows without shelling out.
+
+  The board shows this as two chips on in-flight cards: "N behind" (only from 5
+  commits behind, since every branch in an active repo trails by one or two) and
+  "same files as DEMO-2", whose tooltip names the shared files.
 
 - `POST /api/tasks/:id/merge` body `{merge_strategy?: "local_ff", override_destructive_check?: boolean, actor?}` → `200 Task` (now `verifying`) | `409` (not `in_review`, missing/unpassed understanding check on a kind outside `config.auto_merge.kinds`, or the merge failed: conflict / not a fast-forward / gh refused / **destructive auto-rebase**) | `403` (denied by a `task.merge` authority rule) | `404` | `400` (local merge but no `repo_path`/`branch`). The optional director `actor` is recorded on `merged`, `merge_failed`, and `merge_blocked_destructive` events.
   Approve & merge. When `pr_url` is set: `gh pr merge <url> <method>` where

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
-import type { Health, Kind, LandGraph, State, Task } from "../lib/api";
+import type { DivergenceRow, Health, Kind, LandGraph, State, Task } from "../lib/api";
 import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, SidecarChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
@@ -60,7 +60,7 @@ const COL_EMPTY: Record<string, { title: string; hint: string }> = {
 };
 
 export function Card({ task }: { task: Task }) {
-  const { projects, evidenceCount, spawnError, lastActivity, tasks } = useStore();
+  const { projects, evidenceCount, spawnError, lastActivity, tasks, decisions } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
   const age = useRelTime(lastActivity[task.id] || task.updated_at);
   const ev = evidenceCount[task.id];
@@ -97,6 +97,9 @@ export function Card({ task }: { task: Task }) {
   const trackingOnly = isTrackingOnly(task);
   const jiraMirror = isJiraMirror(task);
   const subtasks = trackingOnly ? trackedSubtasks(task, tasks) : [];
+  // `decisions` is the open-cards list, so an intake_triage card here means this
+  // task is held waiting on the director to pick a reading.
+  const awaitingTriage = decisions.some((d) => d.task_id === task.id && d.decision_class === "intake_triage");
 
   return (
     <Link to={`/tasks/${task.id}`} state={{ backgroundLocation: location }} className="card">
@@ -109,7 +112,18 @@ export function Card({ task }: { task: Task }) {
       <div className="card-meta">
         {project && <span className="chip">{project.name}</span>}
         <span className={`chip chip-kind chip-${task.kind}`}>{task.kind}</span>
-        {task.source === "intake_gchat" && (
+        {awaitingTriage ? (
+          // Intake triage read this request two ways and parked it on one
+          // question. "queued" alone reads as "an agent will pick this up",
+          // which is exactly wrong: nothing moves until the director answers.
+          <span className="chip chip-intake" title="Intake triage found more than one reading. Pick which one to build — nothing is built until you answer.">
+            awaiting one answer
+          </span>
+        ) : task.source === "intake_gchat" && !task.reviewed && (
+          // `reviewed` is server-computed (health.ts). Intake triage marks a
+          // clear mechanical request reviewed on its own, and a reviewed task
+          // dispatches like any other — so only say "unreviewed" while it is
+          // genuinely held.
           <span className="chip chip-intake" title="Created from a Google Chat message; needs review">
             intake · unreviewed
           </span>
@@ -145,6 +159,17 @@ export function Card({ task }: { task: Task }) {
         {task.state === "queued" && spawnError[task.id] && (
           <span className="chip chip-error" title="A previous spawn failed; see the task timeline">
             ⚠ spawn failed
+          </span>
+        )}
+        {/* Why this queued task is not running (HIVE-525). A permanent reason is
+            the loud one: nothing changes until a human changes a setting. */}
+        {task.state === "queued" && task.skip && task.skip.reason !== "dependency_blocked" && (
+          <span
+            className={task.skip.permanent ? "chip chip-error" : "chip"}
+            title={`Dispatcher skipped this task: ${task.skip.label}`}
+          >
+            {task.skip.permanent ? "won't run · " : "waiting · "}
+            {task.skip.label}
           </span>
         )}
         <SidecarChip sidecar={task.sidecar} />
@@ -247,6 +272,51 @@ export function LandChips({ task, graph, tasks }: { task: Task; graph: LandGraph
   );
 }
 
+// ---- divergence radar (HIVE-348) ----------------------------------------
+// Conflicts used to appear at merge time, after a review was already done. This
+// shows them while the work is still in flight: how far a branch trails the
+// branch it will land on, and which files it shares with a sibling branch. Same
+// file-overlap detector the land queue uses, read one step earlier.
+function useDivergence(signature: string, project: string): DivergenceRow[] {
+  const [rows, setRows] = useState<DivergenceRow[]>([]);
+  useEffect(() => {
+    api.divergence(project || undefined).then((r) => setRows(r.rows)).catch(() => {});
+  }, [signature, project]);
+  return rows;
+}
+
+// A branch is always a commit or two behind an active base; saying so on every
+// card would be noise, not signal. Only a real drift earns a chip.
+const BEHIND_CHIP_MIN = 5;
+
+export function DivergenceChips({ task, rows, tasks }: { task: Task; rows: DivergenceRow[]; tasks: Task[] }) {
+  const row = rows.find((r) => r.id === task.id);
+  if (!row) return null;
+  const behind = row.behind ?? 0;
+  const name = (id: string, number: number) => {
+    const t = tasks.find((x) => x.id === id);
+    return t ? taskLabel(t) : `#${number}`;
+  };
+  if (behind < BEHIND_CHIP_MIN && !row.overlaps.length) return null;
+  return (
+    <div className="card-meta card-land">
+      {behind >= BEHIND_CHIP_MIN && (
+        <span className="chip chip-blocked" title={`'${row.branch}' is missing ${behind} commits that are already on the branch it lands on. Rebase before review.`}>
+          {behind} behind
+        </span>
+      )}
+      {row.overlaps.length > 0 && (
+        <span
+          className="chip chip-blocked"
+          title={row.overlaps.map((o) => `${name(o.task_id, o.number)}: ${o.files.join(", ")}`).join("\n")}
+        >
+          same files as {row.overlaps.map((o) => name(o.task_id, o.number)).join(", ")}
+        </span>
+      )}
+    </div>
+  );
+}
+
 const BANNER_DISMISS_KEY = "hive.brief.bannerDismissed";
 
 // Slim, dismissible banner nudging the director to Needs you when there are
@@ -311,6 +381,14 @@ export default function Board() {
   // only meaningful between two PRs that are both still open.
   const reviewIds = visible.filter((t) => t.state === "in_review").map((t) => t.id).sort().join(",");
   const landGraph = useLandGraph(reviewIds, projectFilter);
+  // The radar covers every branch still moving, so it refetches when the set of
+  // in-flight cards changes, not just the review column.
+  const inFlightIds = visible
+    .filter((t) => t.state === "in_progress" || t.state === "in_review" || t.state === "needs_decision")
+    .map((t) => t.id)
+    .sort()
+    .join(",");
+  const divergence = useDivergence(inFlightIds, projectFilter);
   const toggleLand = (id: string) => setLandSel((sel) => (sel.includes(id) ? sel.filter((x) => x !== id) : [...sel, id]));
   const queueLand = async () => {
     try {
@@ -408,10 +486,14 @@ export default function Board() {
                         <div className="land-card">
                           <Card task={t} />
                           <LandChips task={t} graph={landGraph} tasks={visible} />
+                          <DivergenceChips task={t} rows={divergence} tasks={visible} />
                         </div>
                       </div>
                     ) : (
-                      <Card key={t.id} task={t} />
+                      <div key={t.id}>
+                        <Card task={t} />
+                        <DivergenceChips task={t} rows={divergence} tasks={visible} />
+                      </div>
                     )
                   )}
                   {list.length === 0 && <Empty compact {...COL_EMPTY[state]} />}
