@@ -660,6 +660,18 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
          WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'`,
     ],
   },
+  // Why the dispatcher last skipped a queued task (HIVE-525). Seven of the nine
+  // `continue` paths in the queued loop used to be silent, so a task that could
+  // never run looked exactly like one about to start. Written only when the
+  // reason CHANGES (state.ts's noteSkip), so a steady-state queue costs one row
+  // update per transition, not one event per cycle.
+  {
+    name: "v40-task-skip-reason",
+    statements: [
+      `ALTER TABLE tasks ADD COLUMN skip_reason TEXT`,
+      `ALTER TABLE tasks ADD COLUMN skip_reason_at TEXT`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings
