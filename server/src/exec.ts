@@ -186,8 +186,9 @@ export function preferSafeRef(candidate: unknown, fallback: string): string {
 // Run `fn` over `items` with at most `limit` in flight, preserving input order
 // in the results. Used for the reconciler's per-task `gh` probes: serial calls
 // meant K stalled ones cost K timeouts, which is what turned 24-40s reconciler
-// laps into 175s+ ones (HIVE-438). Bounded, so a fleet of 40 PRs still can't
-// fork 40 `gh` processes at once.
+// laps into 175s+ ones (HIVE-438), and by the reviewer's per-pass and per-risk
+// fan-out (HIVE-523). Bounded, so a fleet of 40 PRs still can't fork 40 `gh`
+// processes at once, and a review backlog can't stampede the model API.
 // `gh pr list` is heavier than a single-PR probe: it returns every open PR,
 // with check rollups and file lists. It is still a poll, so bound it well under
 // the reconciler cadence instead of waiting the 60s defaultExec default.

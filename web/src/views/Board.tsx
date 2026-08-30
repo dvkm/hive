@@ -2,8 +2,8 @@ import { useEffect, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
-import type { Health, Kind, LandGraph, State, Task } from "../lib/api";
-import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, SidecarChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import type { DivergenceRow, Health, Kind, LandGraph, State, Task } from "../lib/api";
+import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, PRIORITIES, PriorityChip, priorityRank, SidecarChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
 import { AttentionTray, needsAttention, isWaiting } from "./attention";
@@ -112,6 +112,7 @@ export function Card({ task }: { task: Task }) {
       <div className="card-meta">
         {project && <span className="chip">{project.name}</span>}
         <span className={`chip chip-kind chip-${task.kind}`}>{task.kind}</span>
+        <PriorityChip task={task} />
         {awaitingTriage ? (
           // Intake triage read this request two ways and parked it on one
           // question. "queued" alone reads as "an agent will pick this up",
@@ -119,7 +120,11 @@ export function Card({ task }: { task: Task }) {
           <span className="chip chip-intake" title="Intake triage found more than one reading. Pick which one to build — nothing is built until you answer.">
             awaiting one answer
           </span>
-        ) : task.source === "intake_gchat" && (
+        ) : task.source === "intake_gchat" && !task.reviewed && (
+          // `reviewed` is server-computed (health.ts). Intake triage marks a
+          // clear mechanical request reviewed on its own, and a reviewed task
+          // dispatches like any other — so only say "unreviewed" while it is
+          // genuinely held.
           <span className="chip chip-intake" title="Created from a Google Chat message; needs review">
             intake · unreviewed
           </span>
@@ -157,9 +162,26 @@ export function Card({ task }: { task: Task }) {
             ⚠ spawn failed
           </span>
         )}
+        {/* Why this queued task is not running (HIVE-525). A permanent reason is
+            the loud one: nothing changes until a human changes a setting. */}
+        {task.state === "queued" && task.skip && task.skip.reason !== "dependency_blocked" && (
+          <span
+            className={task.skip.permanent ? "chip chip-error" : "chip"}
+            title={`Dispatcher skipped this task: ${task.skip.label}`}
+          >
+            {task.skip.permanent ? "won't run · " : "waiting · "}
+            {task.skip.label}
+          </span>
+        )}
         <SidecarChip sidecar={task.sidecar} />
         <BlockedBy depends_on={task.depends_on} tasks={tasks} />
-        {task.deferred_until && Date.parse(task.deferred_until) > Date.now() && (
+        {/* A taken-over task is deferred too (that is how it is parked), so this
+            comes first: "you are holding this one" beats "parked". */}
+        {task.parked_for_director ? (
+          <span className="chip chip-deferred" title="You took this worktree over; no agent runs on it until you hand it back">
+            yours
+          </span>
+        ) : task.deferred_until && Date.parse(task.deferred_until) > Date.now() && (
           <span className="chip chip-deferred" title="Deferred pending an offline human action; nudges suppressed">
             deferred
           </span>
@@ -257,6 +279,58 @@ export function LandChips({ task, graph, tasks }: { task: Task; graph: LandGraph
   );
 }
 
+// Queued cards read in the order the dispatcher will actually pick them up:
+// priority first, then the longest wait (server: PRIORITY_RANK_SQL, created_at).
+export const queueOrder = (list: Task[]): Task[] =>
+  [...list].sort(
+    (a, b) => priorityRank(a.priority) - priorityRank(b.priority) || a.created_at.localeCompare(b.created_at)
+  );
+
+// ---- divergence radar (HIVE-348) ----------------------------------------
+// Conflicts used to appear at merge time, after a review was already done. This
+// shows them while the work is still in flight: how far a branch trails the
+// branch it will land on, and which files it shares with a sibling branch. Same
+// file-overlap detector the land queue uses, read one step earlier.
+function useDivergence(signature: string, project: string): DivergenceRow[] {
+  const [rows, setRows] = useState<DivergenceRow[]>([]);
+  useEffect(() => {
+    api.divergence(project || undefined).then((r) => setRows(r.rows)).catch(() => {});
+  }, [signature, project]);
+  return rows;
+}
+
+// A branch is always a commit or two behind an active base; saying so on every
+// card would be noise, not signal. Only a real drift earns a chip.
+const BEHIND_CHIP_MIN = 5;
+
+export function DivergenceChips({ task, rows, tasks }: { task: Task; rows: DivergenceRow[]; tasks: Task[] }) {
+  const row = rows.find((r) => r.id === task.id);
+  if (!row) return null;
+  const behind = row.behind ?? 0;
+  const name = (id: string, number: number) => {
+    const t = tasks.find((x) => x.id === id);
+    return t ? taskLabel(t) : `#${number}`;
+  };
+  if (behind < BEHIND_CHIP_MIN && !row.overlaps.length) return null;
+  return (
+    <div className="card-meta card-land">
+      {behind >= BEHIND_CHIP_MIN && (
+        <span className="chip chip-blocked" title={`'${row.branch}' is missing ${behind} commits that are already on the branch it lands on. Rebase before review.`}>
+          {behind} behind
+        </span>
+      )}
+      {row.overlaps.length > 0 && (
+        <span
+          className="chip chip-blocked"
+          title={row.overlaps.map((o) => `${name(o.task_id, o.number)}: ${o.files.join(", ")}`).join("\n")}
+        >
+          same files as {row.overlaps.map((o) => name(o.task_id, o.number)).join(", ")}
+        </span>
+      )}
+    </div>
+  );
+}
+
 const BANNER_DISMISS_KEY = "hive.brief.bannerDismissed";
 
 // Slim, dismissible banner nudging the director to Needs you when there are
@@ -313,6 +387,7 @@ export default function Board() {
   const byState = (s: State) => {
     let list = visible.filter((t) => !isTrackingOnly(t) && t.state === s);
     // list is already newest-updated first from the API / SSE upserts.
+    if (s === "queued") list = queueOrder(list);
     if (s === "done") list = list.slice(0, 10);
     return list;
   };
@@ -321,6 +396,14 @@ export default function Board() {
   // only meaningful between two PRs that are both still open.
   const reviewIds = visible.filter((t) => t.state === "in_review").map((t) => t.id).sort().join(",");
   const landGraph = useLandGraph(reviewIds, projectFilter);
+  // The radar covers every branch still moving, so it refetches when the set of
+  // in-flight cards changes, not just the review column.
+  const inFlightIds = visible
+    .filter((t) => t.state === "in_progress" || t.state === "in_review" || t.state === "needs_decision")
+    .map((t) => t.id)
+    .sort()
+    .join(",");
+  const divergence = useDivergence(inFlightIds, projectFilter);
   const toggleLand = (id: string) => setLandSel((sel) => (sel.includes(id) ? sel.filter((x) => x !== id) : [...sel, id]));
   const queueLand = async () => {
     try {
@@ -418,10 +501,14 @@ export default function Board() {
                         <div className="land-card">
                           <Card task={t} />
                           <LandChips task={t} graph={landGraph} tasks={visible} />
+                          <DivergenceChips task={t} rows={divergence} tasks={visible} />
                         </div>
                       </div>
                     ) : (
-                      <Card key={t.id} task={t} />
+                      <div key={t.id}>
+                        <Card task={t} />
+                        <DivergenceChips task={t} rows={divergence} tasks={visible} />
+                      </div>
                     )
                   )}
                   {list.length === 0 && <Empty compact {...COL_EMPTY[state]} />}
@@ -470,6 +557,7 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
   const [brief, setBrief] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [kind, setKind] = useState<Kind>("ship");
+  const [priority, setPriority] = useState("normal");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -486,7 +574,10 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
         await api.intake({ project_id: project, text: dump.trim() });
         toast("Braindump sent — Claude is drafting a breakdown for you to approve");
       } else {
-        await api.createTask({ project_id: project, title: title.trim(), brief: brief.trim() || undefined, kind }, files);
+        await api.createTask(
+          { project_id: project, title: title.trim(), brief: brief.trim() || undefined, kind, priority },
+          files
+        );
         toast(files.length ? `Task queued with ${files.length} attachment(s)` : "Task queued");
       }
       onClose();
@@ -556,6 +647,16 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
                     <option value="ship">ship</option>
                     <option value="scout">scout</option>
                     <option value="chore">chore</option>
+                  </select>
+                </label>
+                <label className="fld">
+                  <span>Priority</span>
+                  <select value={priority} onChange={(e) => setPriority(e.target.value)}>
+                    {PRIORITIES.map((p) => (
+                      <option key={p} value={p}>
+                        {p}
+                      </option>
+                    ))}
                   </select>
                 </label>
               </>

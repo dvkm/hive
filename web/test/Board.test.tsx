@@ -3,7 +3,7 @@ import { act, create } from "react-test-renderer";
 import { MemoryRouter } from "react-router-dom";
 import { Ctx, type Store } from "../src/lib/store";
 import type { LandGraph, Task } from "../src/lib/api";
-import { Card, LandChips } from "../src/views/Board";
+import { Card, LandChips, queueOrder } from "../src/views/Board";
 
 const fakeStore = {
   projects: [],
@@ -254,4 +254,83 @@ test("no triage card: the card looks exactly as it did before", async () => {
   const labels = chipText(renderer);
   expect(labels).not.toContain("awaiting one answer");
   expect(labels).toContain("intake · unreviewed");
+});
+
+// Intake triage can classify a mechanical request and mark it reviewed itself
+// (server/src/intake/triage.ts). The server sends that as `reviewed` on the
+// task, and a reviewed task dispatches like any other, so the card must not
+// still claim it is waiting on the director. Task HIVE-513.
+test("a triage-reviewed intake task drops the unreviewed chip", async () => {
+  const t = task("gchat-reviewed", { source: "intake_gchat", reviewed: true });
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t));
+  });
+  expect(chipText(renderer)).not.toContain("intake · unreviewed");
+});
+
+test("an intake task nobody has reviewed still says unreviewed", async () => {
+  const t = task("gchat-unreviewed", { source: "intake_gchat", reviewed: false });
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t));
+  });
+  expect(chipText(renderer)).toContain("intake · unreviewed");
+});
+
+// ---- priority (HIVE-430) ------------------------------------------------
+// The chip IS the quick-set control (a <select> painted as a chip), so the
+// class name is what says whether the card carries a visible priority: only
+// `prio-normal` is styled away, and only until the card is hovered.
+const prioChip = async (t: Task) => {
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t));
+  });
+  const [sel, ...rest] = renderer.root.findAll(
+    (n) => n.type === "select" && String(n.props.className ?? "").includes("chip-prio")
+  );
+  expect(rest).toEqual([]);
+  return sel;
+};
+
+test("a card shows its priority as a chip for now, next and later", async () => {
+  for (const p of ["now", "next", "later"] as const) {
+    const sel = await prioChip(task(`p-${p}`, { priority: p }));
+    expect(sel.props.value).toBe(p);
+    expect(sel.props.className).toContain(`prio-${p}`);
+  }
+});
+
+test("normal is the quiet default: the chip renders in the no-noise class", async () => {
+  const sel = await prioChip(task("p-normal", { priority: "normal" }));
+  expect(sel.props.className).toContain("prio-normal");
+  // A task the API answered before priority existed reads as normal too.
+  expect((await prioChip(task("p-missing"))).props.className).toContain("prio-normal");
+});
+
+test("the queued column sorts by priority first, then by the longest wait", async () => {
+  const at = (iso: string) => ({ created_at: iso });
+  const queued = [
+    task("normal-new", { priority: "normal", ...at("2026-01-04T00:00:00.000Z") }),
+    task("later-old", { priority: "later", ...at("2026-01-01T00:00:00.000Z") }),
+    task("now-new", { priority: "now", ...at("2026-01-05T00:00:00.000Z") }),
+    task("normal-old", { priority: "normal", ...at("2026-01-02T00:00:00.000Z") }),
+    task("next-newest", { priority: "next", ...at("2026-01-06T00:00:00.000Z") }),
+  ];
+  // Ages run backwards from the priority order, so passing on created_at alone
+  // is impossible: the highest priority here is also the newest task.
+  expect(queueOrder(queued).map((t) => t.id)).toEqual([
+    "now-new",
+    "next-newest",
+    "normal-old",
+    "normal-new",
+    "later-old",
+  ]);
+  // An unrecognised value (only a hand-edited row) sorts last, with 'later'.
+  const odd = [
+    task("weird", { priority: "urgent" as never, ...at("2026-01-09T00:00:00.000Z") }),
+    task("later", { priority: "later", ...at("2026-01-08T00:00:00.000Z") }),
+  ];
+  expect(queueOrder(odd).map((t) => t.id)).toEqual(["later", "weird"]);
 });

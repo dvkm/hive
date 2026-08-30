@@ -280,6 +280,40 @@ export function noteDependencyBlock(
   broadcastTask(db, getTask(db, taskId));
 }
 
+// Why the dispatcher skipped a queued task, and whether that answer can change
+// on its own. "not yet" = the task is waiting for something that normally
+// arrives (capacity, a blocker finishing, your review). "not ever" = nothing
+// will change until a human changes a setting or the task itself — those are
+// the ones that used to sit in `queued` looking healthy for days (HIVE-525).
+export const SKIP_REASONS: Record<string, { label: string; permanent: boolean }> = {
+  no_repo_path: { label: "project has no repo path", permanent: true },
+  gardener_decision: { label: "PR gardener decision card, not agent work", permanent: true },
+  gardener_disabled: { label: "PR gardener is off for this project", permanent: true },
+  auto_dispatch_off: { label: "auto-dispatch is off for this project", permanent: true },
+  kind_excluded: { label: "kind is not in the project's dispatch_kinds", permanent: true },
+  tracking_only: { label: "tracking-only task — never dispatched", permanent: true },
+  authority_denied: { label: "an authority rule denies task.dispatch", permanent: true },
+  intake_unreviewed: { label: "unreviewed intake — waiting on your review", permanent: false },
+  triage_hold: { label: "waiting on your intake triage answer", permanent: false },
+  repo_mismatch: { label: "brief targets another project's repo", permanent: false },
+  dependency_blocked: { label: "blocked by unfinished dependencies", permanent: false },
+  authority_decision: { label: "waiting on a dispatch decision card", permanent: false },
+  no_capacity: { label: "at the project's max_agents cap", permanent: false },
+  spawn_backoff: { label: "cooling down after a spawn failure", permanent: false },
+};
+
+// Record (or clear) why a queued task was skipped. Writes ONLY when the reason
+// changed, so the 30s dispatch loop costs one UPDATE per transition and can
+// never flood — the same discipline noteDependencyBlock uses for its event.
+// Deliberately a task FIELD and not an event: a steady-state queue would
+// otherwise mint one row per task per cycle (HIVE-515 burned 485k rows that way).
+export function noteSkip(db: DB, taskId: string, reason: string | null): void {
+  const cur = db.query("SELECT skip_reason FROM tasks WHERE id = ?").get(taskId) as { skip_reason: string | null } | undefined;
+  if (!cur || (cur.skip_reason ?? null) === reason) return;
+  db.query("UPDATE tasks SET skip_reason = ?, skip_reason_at = ? WHERE id = ?").run(reason, reason ? now() : null, taskId);
+  broadcastTask(db, getTask(db, taskId));
+}
+
 // A task deferred pending an OFFLINE human action (e.g. sudo). It stays
 // in_progress, but the stale/nudge machinery skips it while deferred_until is in
 // the future — that is what stops the endless "gone quiet" nudges (task #329
@@ -400,9 +434,10 @@ export function mutateWithEvent<T>(
 export function expireOpenDecisions(db: DB, taskId: string, reason: string): number {
   const rows = db.query("SELECT * FROM decisions WHERE task_id = ? AND status = 'open'").all(taskId) as any[];
   for (const r of rows) {
-    db.query("UPDATE decisions SET status = 'expired' WHERE id = ?").run(r.id);
+    const expiredAt = now();
+    db.query("UPDATE decisions SET status = 'expired', answered_at = ?, answered_by = 'system' WHERE id = ?").run(expiredAt, r.id);
     writeEvent(db, { task_id: taskId, source: "system", type: "decision_expired", payload: { decision_id: r.id, reason } });
-    broadcast({ type: "decision", decision: parseDecision({ ...r, status: "expired" }) });
+    broadcast({ type: "decision", decision: parseDecision({ ...r, status: "expired", answered_at: expiredAt, answered_by: "system" }) });
   }
   return rows.length;
 }
@@ -440,6 +475,18 @@ function trustedRequeueParent(db: DB, task: any): boolean {
       )
       .get(task.id, task.parent_task_id)
   );
+}
+
+export function isSelfAuditLineage(db: DB, task: any | null): boolean {
+  const seen = new Set<string>();
+  let current = task;
+  while (current && !seen.has(current.id)) {
+    if (current.source === "self-audit") return true;
+    if (current.source !== "requeue" || !trustedRequeueParent(db, current)) return false;
+    seen.add(current.id);
+    current = getTask(db, current.parent_task_id);
+  }
+  return false;
 }
 
 // Verify (or quarantine) one requeue task's provenance. Idempotent: a
@@ -895,12 +942,15 @@ export function transition(
   const updated = mutateWithEvent(db, () => {
     // Re-queuing a failed task (attention tray) resets its runtime binding so the
     // next spawn is clean — a queued task must not point at a dead agent/worktree.
+    // Any state change answers the dispatcher's "why not" (noteSkip): the task
+    // either started, or is no longer queued at all. Clear it in the same write
+    // so a stale reason can never outlive the state it described.
     if (to === "queued") {
       db.query(
-        "UPDATE tasks SET state = ?, updated_at = ?, agent_target = NULL, worktree_path = NULL, branch = NULL WHERE id = ?"
+        "UPDATE tasks SET state = ?, updated_at = ?, agent_target = NULL, worktree_path = NULL, branch = NULL, skip_reason = NULL, skip_reason_at = NULL WHERE id = ?"
       ).run(to, now(), taskId);
     } else {
-      db.query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?").run(to, now(), taskId);
+      db.query("UPDATE tasks SET state = ?, updated_at = ?, skip_reason = NULL, skip_reason_at = NULL WHERE id = ?").run(to, now(), taskId);
     }
     return getTask(db, taskId);
   }, {

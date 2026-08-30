@@ -34,6 +34,7 @@ import { captureBranchScope } from "./rebaseGuard.ts";
 import { landOnce } from "./landQueue.ts";
 import { sidecarOnce } from "./sidecar.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
+import { riskLevel } from "./autoapprove.ts";
 import { runPrGardener } from "./prGardener.ts";
 import { autoAckPlans } from "./planCritic.ts";
 import { ambiguityCleared, cautionCleared, latestAutoReviewVerdict } from "./reviewer.ts";
@@ -139,7 +140,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
       setSetting(db, "reconciler_error_streak", String(streak));
       if (lastError) setSetting(db, "reconciler_last_error", lastError);
     } else {
+      // HIVE-533: clear the message with the streak. Leaving it behind pinned one
+      // transient failure in `settings` forever, and /api/health published that
+      // fossil next to consecutive_errors: 0 as if it were current.
       setSetting(db, "reconciler_error_streak", "0");
+      setSetting(db, "reconciler_last_error", "");
     }
   };
   await step("surfaceTrackingBindings", () => surfaceTrackingBindings(db));
@@ -1509,18 +1514,25 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
 // Auto-answer: a decision card that sits past the project's timeout
 // (config.decision_auto_answer_hours, off unless set) and carries a
 // RECOMMENDED option gets answered with that recommendation — except
-// risk='high' cards (authority/prod), which always wait for the human.
+// high-risk cards (authority/prod), which always wait for the human.
 // The notification names what was chosen, so silence is informed consent,
 // not surprise.
+//
+// High risk is deliberately asymmetric. The card stays OPEN past the window
+// (an open card parks its task; a released one may have already shipped the
+// thing nobody approved) and the sweep escalates it once with an urgent push
+// instead. Risk is read through riskLevel(), not compared to the literal
+// string 'high' — three cards whose risk field was a whole sentence beginning
+// "high — ..." slipped past the old exact match.
 export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()): void {
   const rows = db
     .query(
-      `SELECT d.id, d.task_id, d.ts, d.title, d.options, p.config FROM decisions d
+      `SELECT d.id, d.task_id, d.ts, d.title, d.options, d.risk, p.config FROM decisions d
          JOIN tasks t ON t.id = d.task_id JOIN projects p ON p.id = t.project_id
-        WHERE d.status = 'open' AND COALESCE(d.risk, 'normal') != 'high' AND d.decision_class IS NULL
+        WHERE d.status = 'open' AND d.decision_class IS NULL
           AND ${supervisedSql("t.source", "t.agent_target")}`
     )
-    .all() as { id: string; task_id: string; ts: string; title: string; options: string; config: string }[];
+    .all() as { id: string; task_id: string; ts: string; title: string; options: string; risk: string | null; config: string }[];
   for (const r of rows) {
     if (isTrackingOnlyId(db, r.task_id)) continue;
     let hours = 0;
@@ -1531,6 +1543,29 @@ export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()
     }
     if (hours <= 0) continue;
     if (nowMs - Date.parse(r.ts) < hours * 3600_000) continue;
+    // Past the window and high risk: escalate, never answer. Once per card —
+    // the event is the dedup key, so a 30s sweep does not re-push every loop.
+    if (riskLevel(r.risk) === "high") {
+      const already = db
+        .query("SELECT 1 FROM events WHERE type = 'decision_escalated' AND json_extract(payload, '$.decision_id') = ? LIMIT 1")
+        .get(r.id);
+      if (already) continue;
+      writeEvent(db, {
+        task_id: r.task_id,
+        source: "reconciler",
+        type: "decision_escalated",
+        payload: { decision_id: r.id, reason: `high risk, open ${hours}h past the auto-answer window`, risk: r.risk ?? null },
+      });
+      enqueue(db, {
+        kind: "decision",
+        urgency: "urgent",
+        task_id: r.task_id,
+        decision_id: r.id,
+        title: `Still needs you: "${r.title.slice(0, 70)}"`,
+        body: `High risk, open ${hours}h with no reply. It stays open and its task stays blocked — high-risk cards are never auto-answered.`,
+      });
+      continue;
+    }
     let rec: any;
     try {
       rec = JSON.parse(r.options || "[]").find((o: any) => o.recommended);
