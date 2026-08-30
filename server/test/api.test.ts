@@ -113,6 +113,21 @@ test("health endpoint surfaces reconciler heartbeat and flips ok false once fail
   expect((await get("/api/health")).json.ok).toBe(true);
 });
 
+// HIVE-533: one transient failure pinned reconciler_last_error in settings, and
+// health published it beside consecutive_errors: 0 with no timestamp to tell a
+// live fault from a fossil. It cost real diagnosis time twice in one day.
+test("health never reports a current reconciler last_error beside a zero error streak (HIVE-533)", async () => {
+  setSetting(db, "last_reconcile_at", new Date().toISOString());
+  setSetting(db, "reconciler_error_streak", "0");
+  // A stale message left in settings by an older build must not surface.
+  setSetting(db, "reconciler_last_error", "linkPRs: ENOENT: no such file or directory, posix_spawn 'gh'");
+
+  const h = (await get("/api/health")).json;
+  expect(h.reconciler.consecutive_errors).toBe(0);
+  expect(h.reconciler.last_error).toBeNull();
+  expect(h.ok).toBe(true);
+});
+
 test("health endpoint exposes pty/session utilization once the reaper has counted", async () => {
   // Absent until the first pane sweep records a count.
   expect((await get("/api/health")).json.sessions).toBeNull();

@@ -140,7 +140,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
       setSetting(db, "reconciler_error_streak", String(streak));
       if (lastError) setSetting(db, "reconciler_last_error", lastError);
     } else {
+      // HIVE-533: clear the message with the streak. Leaving it behind pinned one
+      // transient failure in `settings` forever, and /api/health published that
+      // fossil next to consecutive_errors: 0 as if it were current.
       setSetting(db, "reconciler_error_streak", "0");
+      setSetting(db, "reconciler_last_error", "");
     }
   };
   await step("surfaceTrackingBindings", () => surfaceTrackingBindings(db));
