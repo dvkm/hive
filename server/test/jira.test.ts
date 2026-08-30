@@ -3631,7 +3631,15 @@ const failedRequest = (url: string, resourceType: string, errorText = "net::ERR_
 
 // `overlayText` non-null makes the page look like a dev server showing a
 // compile error over the app: HTTP 200, no failed request, still not proof.
-function fakePage(url: string, failures: Array<ReturnType<typeof failedRequest>>, overlayText: string | null = null) {
+// `content` is what the browser reports back about what the page painted: how
+// many characters of text the body shows, and how many visible images it has.
+// The default is an ordinary page with plenty of both.
+function fakePage(
+  url: string,
+  failures: Array<ReturnType<typeof failedRequest>>,
+  overlayText: string | null = null,
+  content: { text: number; media: number } = { text: 500, media: 3 }
+) {
   let onFailed: (r: unknown) => void = () => {};
   let shot = false;
   return {
@@ -3650,6 +3658,7 @@ function fakePage(url: string, failures: Array<ReturnType<typeof failedRequest>>
         return { ok: () => true, status: () => 200 };
       },
       waitForLoadState: async () => {},
+      evaluate: async () => content,
       url: () => url,
       screenshot: async () => {
         shot = true;
@@ -3830,6 +3839,69 @@ test.skipIf(process.platform !== "darwin")("the generated spec refuses a non-2xx
 
   expect(thrown).toContain("page answered HTTP 500");
   expect(tookShot()).toBe(false);
+});
+
+// The corebeat run that prompted this: the app's API is unreachable inside the
+// seatbelt, so the page answered 200, failed no request hive counts, showed no
+// overlay, and painted a blank white 1280x800. A blank picture is worse than no
+// picture, so the spec fails the shot.
+test.skipIf(process.platform !== "darwin")("the generated spec refuses a blank page", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const spec = await generatedSpec(root, db, projectId, jira);
+
+  const { page, tookShot } = fakePage(PAGE_URL, [], null, { text: 0, media: 0 });
+
+  let thrown = "";
+  await runSpec(spec, page).catch((e) => {
+    thrown = String(e?.message ?? e);
+  });
+
+  expect(thrown).toContain("page rendered nothing");
+  expect(tookShot()).toBe(false);
+});
+
+// A page can be nearly wordless and still be a real picture, so text alone does
+// not condemn it: one visible image is enough to shoot.
+test.skipIf(process.platform !== "darwin")("the generated spec still shoots a wordless page that shows an image", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const spec = await generatedSpec(root, db, projectId, jira);
+
+  const { page, tookShot } = fakePage(PAGE_URL, [], null, { text: 3, media: 1 });
+
+  await runSpec(spec, page);
+
+  expect(tookShot()).toBe(true);
+});
+
+// End to end: the spec hive generated, run against a blank page, makes the
+// harness go red, and the ticket falls back to text with a reason that names
+// the empty page.
+test.skipIf(process.platform !== "darwin")("a blank page renders nothing and the reason names it", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const exec = async (argv: string[]) => {
+    if (!isHarnessRun(argv)) return { code: 0, stdout: UI_PATCH, stderr: "" };
+    const dir = join(root, "web", "e2e");
+    const name = readdirSyncT(dir).find((f) => f.startsWith("hive-proof-"))!;
+    const spec = await Bun.file(join(dir, name)).text();
+    const { page } = fakePage(PAGE_URL, [], null, { text: 0, media: 0 });
+    let thrown = "";
+    await runSpec(spec, page).catch((e) => {
+      thrown = String(e?.message ?? e);
+    });
+    return { code: 1, stdout: `1 failed\n  Error: ${thrown}`, stderr: "" };
+  };
+
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+
+  expect(stats.rendered).toBe(0);
+  expect(db.query("SELECT id FROM evidence").all()).toHaveLength(0);
+  expect(jira.byKey.get("WEB-1")!.attachments).toHaveLength(0);
+  const reason = String(syncEvents(db).find((e) => e.action === "render_proof")?.reason);
+  expect(reason).toContain("page rendered nothing");
+  expect(reason).toContain("blank");
 });
 
 test("the scratch directory is gone even when the harness throws", async () => {

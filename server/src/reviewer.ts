@@ -15,7 +15,7 @@ import { isOffline, getSetting, setSetting } from "./db.ts";
 import { writeEvent, getTask } from "./state.ts";
 import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, projectComparisonBase } from "./exec.ts";
+import { defaultExec, projectComparisonBase, mapLimit } from "./exec.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
 import { modelFailure, modelErrorText, noteModelCall, isAuthFailure } from "./modelCall.ts";
 import { enqueue } from "./notifications.ts";
@@ -23,8 +23,23 @@ import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 import { supervisedSql } from "./supervision.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { parseUnifiedDiff } from "./diff.ts";
+import { startLoop } from "./loop.ts";
 
 const TIMEOUT_MS = Number(process.env.HIVE_REVIEWER_TIMEOUT_MS || 180_000);
+// How many tasks one pass reviews at the same time. One-at-a-time made the
+// review column the auto-merge ceiling: ~0.6 reviews/min against a fleet of 4
+// agents filling it. Deliberately a constant, not a config knob — the ceiling
+// here is the model API, not anything a project would want to tune.
+const REVIEW_CONCURRENCY = 4;
+// The per-risk fan-out is nested inside the per-task one, so the two caps
+// multiply: 4 tasks x 4 risks would be 16 `claude -p` subprocesses at once,
+// which is a peak nobody chose and the kind of load that has exhausted ptys
+// here before. 2 keeps the real ceiling at roughly 8.
+// ponytail: two nested caps whose product is the true bound. If the reviewer
+// ever needs a genuine total budget, replace both with one shared semaphore
+// around the model calls -- but don't hold an outer slot across the inner
+// fan-out or it deadlocks.
+const RISK_CONCURRENCY = 2;
 const DIFF_LIMIT = 60_000;
 
 export interface ReviewerDeps {
@@ -197,7 +212,7 @@ function recordReviewFailure(db: DB, task: any, error: string, reviewIdentity: R
   });
 }
 
-// One review per pass (no stampede when a backlog of reviews appears at once).
+// Up to REVIEW_CONCURRENCY reviews per pass, each an independent one-shot.
 export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<void> {
   if (isOffline(db)) return;
   // A success — a real review or a project-level skip — is what retires a card
@@ -223,8 +238,16 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
         ORDER BY t.updated_at ASC`
     )
     .all();
-  const t: any = candidates.find((c) => retryDue(failedReviewAttempts(db, c)));
-  if (!t) return;
+  const due = candidates.filter((c) => retryDue(failedReviewAttempts(db, c))).slice(0, REVIEW_CONCURRENCY);
+  if (!due.length) return;
+  await mapLimit(due, REVIEW_CONCURRENCY, (t) => reviewOne(db, t, deps).catch((e) => {
+    console.error(`[hive] auto-review of task ${t.id} crashed:`, e);
+  }));
+}
+
+// One task's review, start to finish. Every guard below is per-task, so several
+// of these run side by side without seeing each other.
+async function reviewOne(db: DB, t: any, deps: ReviewerDeps): Promise<void> {
   // Guards against a delayed/stale review landing after the task moved on
   // (state left in_review, or the linked PR/branch/head changed underneath
   // it) — the review this pass produces is only good for the exact task and
@@ -415,6 +438,9 @@ export async function verifyPendingOnce(db: DB, deps: ReviewerDeps = {}): Promis
         ORDER BY t.updated_at ASC`
     )
     .all();
+  // Cheap DB-only filtering first, so the bounded fan-out below spends its slots
+  // on tasks that actually need a verification run.
+  const pending: any[] = [];
   for (const t of rows) {
     if (!t.head_sha) continue; // nothing to key verdicts to
     const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(t.project_id);
@@ -425,8 +451,12 @@ export async function verifyPendingOnce(db: DB, deps: ReviewerDeps = {}): Promis
     const questions = (review.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS);
     if (!risks.length && !questions.length) continue;
     if (hasRiskVerdicts(db, t.id, t.head_sha, risks.length + questions.length)) continue;
+    pending.push({ t, risks, questions });
+    if (pending.length >= REVIEW_CONCURRENCY) break;
+  }
+  await mapLimit(pending, REVIEW_CONCURRENCY, async ({ t, risks, questions }) => {
     const diff = await rawDiff(db, t, shell);
-    if (!diff.ok) continue;
+    if (!diff.ok) return;
     console.error(`[hive] verifying uncovered review for task ${t.id} at ${String(t.head_sha).slice(0, 7)}`);
     await verifyRisks(
       db,
@@ -447,18 +477,18 @@ export async function verifyPendingOnce(db: DB, deps: ReviewerDeps = {}): Promis
         },
       },
       deps
-    );
-    return; // one per pass, same no-stampede rule autoReviewOnce follows
-  }
+    ).catch((e) => console.error(`[hive] verification of task ${t.id} crashed:`, e));
+  });
 }
 
 export function startAutoReviewer(db: DB, deps: ReviewerDeps & { intervalMs?: number } = {}): () => void {
-  const timer = setInterval(() => {
-    autoReviewOnce(db, deps)
-      .then(() => verifyPendingOnce(db, deps))
-      .catch((e) => console.error("[hive] auto-review crashed:", e));
-  }, deps.intervalMs ?? 60_000);
-  return () => clearInterval(timer);
+  // startLoop, not setInterval: a pass now runs several reviews at once and can
+  // easily outlast the 60s tick. A tick landing on a running pass is dropped —
+  // the next one re-reads the board anyway.
+  return startLoop("auto-review", deps.intervalMs ?? 60_000, async () => {
+    await autoReviewOnce(db, deps);
+    await verifyPendingOnce(db, deps);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -615,11 +645,13 @@ function hasRiskVerdicts(db: DB, taskId: string, head: string, expected: number)
   });
 }
 
-// One opus run per risk and per question, in sequence, each capped. A run that
-// fails or returns junk is left out and counted in `unverified`, so a broken
-// run never reads as an all-clear. `stillCurrent` is re-checked between runs:
-// these verdicts now decide whether a PR auto-merges, so a set produced for a
-// head that has since been force-pushed must never be written at all.
+// One opus run per risk and per question, up to RISK_CONCURRENCY at a time,
+// each capped. They are independent one-shots with no ordering between them. A
+// run that fails or returns junk is left out and counted in `unverified`, so a
+// broken run never reads as an all-clear. `stillCurrent` is checked before each
+// run starts and again before anything is written: these verdicts now decide
+// whether a PR auto-merges, so a set produced for a head that has since been
+// force-pushed must never be written at all.
 export async function verifyRisks(
   db: DB,
   task: any,
@@ -646,26 +678,39 @@ export async function verifyRisks(
   const verdicts: RiskVerdict[] = [];
   const question_verdicts: QuestionVerdict[] = [];
   let unverified = 0;
-  // The reason the last run failed. `unverified` alone reads as "the model was
-  // unsure"; an auth outage is a completely different story (hive-1800).
+  // Why a run failed. `unverified` alone reads as "the model was unsure"; an
+  // auth outage is a completely different story (hive-1800). With runs in
+  // flight together this is one of the reasons, not strictly the last.
   let unverified_reason: string | null = null;
-  for (const risk of risks) {
-    if (!(await current())) return;
-    const res = await run(verifyPrompt(task, risk, input.diff));
+  let aborted = false;
+  const jobs = [
+    ...risks.map((risk) => ({ kind: "risk" as const, text: risk, prompt: verifyPrompt(task, risk, input.diff) })),
+    ...questions.map((q) => ({ kind: "question" as const, text: q, prompt: answerPrompt(task, q, input.diff) })),
+  ];
+  const results = await mapLimit(jobs, RISK_CONCURRENCY, async (job) => {
+    if (aborted) return null;
+    if (!(await current())) {
+      aborted = true;
+      return null;
+    }
+    const res = await run(job.prompt);
     const failed = !res || noteModelCall(db, res.code === 0 && !res.timedOut ? null : modelErrorText(res, { timeoutMs: TIMEOUT_MS }));
     if (typeof failed === "string") unverified_reason = failed;
-    const v = failed ? null : extractVerdict(res!.stdout);
-    if (v) verdicts.push({ risk, ...v });
-    else unverified++;
-  }
-  for (const question of questions) {
-    if (!(await current())) return;
-    const res = await run(answerPrompt(task, question, input.diff));
-    const failed = !res || noteModelCall(db, res.code === 0 && !res.timedOut ? null : modelErrorText(res, { timeoutMs: TIMEOUT_MS }));
-    if (typeof failed === "string") unverified_reason = failed;
-    const a = failed ? null : extractAnswer(res!.stdout);
-    if (a) question_verdicts.push({ question, ...a });
-    else unverified++;
+    if (failed) return { job, value: null };
+    return { job, value: job.kind === "risk" ? extractVerdict(res!.stdout) : extractAnswer(res!.stdout) };
+  });
+  if (aborted) return;
+  // Re-assembled in the original risks-then-questions order, so a verdict set
+  // reads the same whichever run finished first.
+  for (const r of results) {
+    if (!r) return; // a slot bailed on stillCurrent: write nothing
+    if (!r.value) {
+      unverified++;
+    } else if (r.job.kind === "risk") {
+      verdicts.push({ risk: r.job.text, ...(r.value as any) });
+    } else {
+      question_verdicts.push({ question: r.job.text, ...(r.value as any) });
+    }
   }
   if (!(await current())) return;
   writeEvent(db, {

@@ -29,6 +29,8 @@ export const ANSWERED_BY_LABEL: Record<string, string> = {
   agent: "Agent",
   system: "System (auto-answered)",
   unknown: "Unknown caller",
+  reconciler: "System (expired)",
+  unattributed: "Unattributed (pre-2026-07-22)",
 };
 
 // Which transitions the director can trigger from the current state.
