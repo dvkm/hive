@@ -10,7 +10,7 @@ process.env.HIVE_HOME = HOME;
 const { openDb, newId, now } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
 const { reconcileOnce, requeueStaleFailed } = await import("../src/reconciler.ts");
-const { requeueTask } = await import("../src/api.ts");
+const { requeueTask, resolveRecoveryForDecision } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { getTask } = await import("../src/state.ts");
 const { DEAD_BURST_N } = await import("../src/teardownGuard.ts");
@@ -1037,4 +1037,34 @@ test("a reclaim failure never derails recovery", async () => {
   expect(reclaimEvent(db, id, "worktree_reclaim_failed")).toBeTruthy();
   expect(getTask(db, id).state).toBe("failed"); // recovery completed anyway
   expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").all(id).length).toBe(1);
+});
+
+test("answering a recovery card with 'requeue' writes the requeued event that chains the lineage", () => {
+  // Every other requeue path writes this event, and the board walks it forward
+  // to find the live successor. Without it a recovered task reads as dead
+  // forever, which is how ten WEB sub-tasks looked abandoned (hive-1872).
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  failAt(db, id, 1000);
+  putEvent(db, id, "recovery_card", { decision_id: "dec_recover", source_task_id: id });
+
+  expect(resolveRecoveryForDecision(db, "dec_recover", "requeue")).toBe(true);
+
+  const successor = db.query("SELECT id FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(id) as any;
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'requeued'").get(id) as any;
+  expect(JSON.parse(ev.payload).new_task_id).toBe(successor.id);
+});
+
+test("a recovery-card requeue moves the task's Jira link to the successor", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  db.query("UPDATE tasks SET jira_key = 'WEB-30', jira_link_kind = 'subtask' WHERE id = ?").run(id);
+  failAt(db, id, 1000);
+  putEvent(db, id, "recovery_card", { decision_id: "dec_jira", source_task_id: id });
+
+  resolveRecoveryForDecision(db, "dec_jira", "requeue");
+
+  const owners = db.query("SELECT id FROM tasks WHERE jira_key = 'WEB-30'").all() as any[];
+  const successor = db.query("SELECT id FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(id) as any;
+  expect(owners.map((r) => r.id)).toEqual([successor.id]);
 });
