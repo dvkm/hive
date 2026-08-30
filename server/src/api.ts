@@ -2134,23 +2134,53 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   // task that's already started — asks the director via a decision card. Safety:
   // only a queued task with no agent is ever auto-cancelled here.
   const match = detectDuplicate(db, parseTask(row));
+  let dupWarning: string | undefined;
   if (match) {
     const safeAuto = row.state === "queued" && !row.agent_target;
     if (match.tier === "exact" && safeAuto) {
       mergeInto(db, row.id, match.survivor.id);
-      return json(taskWithHealth(db, getTask(db, row.id)), 201);
+      // #1879: say what happened and how to get what the caller wanted. Refiling
+      // a broken task is the obvious recovery, and dedup silently undoes it
+      // because the broken original is still non-terminal.
+      return json(
+        {
+          ...taskWithHealth(db, getTask(db, row.id)),
+          warning: dupMergedWarning(match.survivor),
+        },
+        201
+      );
     }
-    openDuplicateDecision(db, getTask(db, row.id), match);
+    const decision = openDuplicateDecision(db, getTask(db, row.id), match);
+    dupWarning = dupSuspectedWarning(match.survivor, decision.id);
   }
   // Target-repo sanity check (#989). Runs after dedup so an auto-merged task
   // never gets a card it can't act on. A strong mismatch rides back on the
   // response as `warning` (the CLI prints it) and holds dispatch via its card.
-  const warning = noteRepoMismatch(db, getTask(db, row.id));
+  const repoWarning = noteRepoMismatch(db, getTask(db, row.id));
+  const warning = [dupWarning, repoWarning].filter(Boolean).join("\n  ") || undefined;
   // Ambient intake only (source intake_*/watch), and only when the project opted
   // in. Deliberately not awaited: a 60s classifier must not hold the create
   // response, and the dispatcher holds the task meanwhile.
   triageIntake(db, getTask(db, row.id), { exec: handlerDeps.triageExec }).catch((e) => console.error(`[hive] intake triage ${row.id}:`, e));
   return json({ ...taskWithHealth(db, getTask(db, row.id)), ...(warning ? { warning } : {}) }, 201);
+}
+
+// #1879: dedup outcomes the caller must be told about. A create that folds into
+// an existing task looks identical to a create that vanished, so the warning
+// names the survivor, its state, and the command that gets the caller what they
+// actually wanted (replace the original, not add to it).
+function dupMergedWarning(survivor: any): string {
+  return (
+    `folded into ${survivor.id} (${survivor.state}) as a duplicate. To replace it instead, cancel it first:\n` +
+    `    hive task move ${survivor.id} cancelled --note "superseded"`
+  );
+}
+
+function dupSuspectedWarning(survivor: any, decisionId: string): string {
+  return (
+    `possible duplicate of ${survivor.id} (${survivor.state}); decision ${decisionId} is open, and answering it "merge" cancels this task.\n` +
+    `    To replace ${survivor.id} instead, cancel it first: hive task move ${survivor.id} cancelled --note "superseded"`
+  );
 }
 
 // Link a marked PR back to its task. Matches by the `hive-task: <id>` body
