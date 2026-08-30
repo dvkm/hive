@@ -196,7 +196,10 @@ export interface Decision {
   answered_at: string | null;
   // Who answered (audit trail). director when the director clicked in the inbox;
   // chat_supervisor/agent/system for programmatic callers; unknown if unattributed.
-  answered_by: "director" | "chat_supervisor" | "agent" | "system" | "unknown" | null;
+  // "reconciler" on a card the system expired, "unattributed" on a card
+  // resolved before hive recorded answerers at all (everything before
+  // 2026-07-22). null only ever appears on an open card.
+  answered_by: "director" | "chat_supervisor" | "agent" | "system" | "unknown" | "reconciler" | "unattributed" | null;
   answered_actor: string | null;
   // Set on cards no automation may answer — today only "intake_triage", the
   // "which reading should we build?" card raised by intake triage.

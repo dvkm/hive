@@ -415,9 +415,24 @@ rev-parse HEAD` in the CLI's cwd. The review card compares it to the task's
 array; render the `recommended: true` option first per product rule 3.
 `draft_note` is the server-side autosaved draft. A decision is `expired` once it
 was dismissed, or its task went terminal (`done`/`failed`/`cancelled`) — expired
-cards leave the inbox and can no longer be answered. `answered_by` is the caller
-identity recorded on answer (`director|chat_supervisor|agent|system|unknown`) and
-`answered_actor` an optional free label; both are `null` until the card is answered.
+cards leave the inbox and can no longer be answered. `answered_by` names who
+resolved the card and is never null once it leaves `open`: the caller identity on
+answer (`director|chat_supervisor|agent|system|unknown`), `director` or
+`reconciler` on a dismissal, `system` on a task-terminal expiry, and
+`unattributed` on the 414 legacy rows resolved before hive recorded answerers at
+all (everything before 2026-07-22). `answered_actor` is an optional free label.
+
+**A high-risk card is only ever answered by the director.** `POST
+/api/decisions/:id/answer` returns `403 {"effect":"escalate","category":"risk_high"}`
+for any other `source`, including a bare call with no `source` (which is
+`unknown`, not the director). The one exception is a `deny` on a pending
+standing-authority grant: refusing an unexecuted command is fail-closed and stops
+the work rather than releasing it. The timeout sweep
+(`decision_auto_answer_hours`) never answers a high-risk card either; past the
+window it writes one `decision_escalated` event and raises one urgent
+notification, and the card stays open. Risk is matched on the leading level word,
+so a `risk` field that reads `"high — leaked prod key"` counts as high, and free
+prose with no level word at all is treated as high rather than auto-answerable.
 
 `bundle` is server-**derived** (never stored) context attached to each card as
 it's returned, so the director can decide in one pass without opening the task:

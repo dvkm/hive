@@ -400,9 +400,10 @@ export function mutateWithEvent<T>(
 export function expireOpenDecisions(db: DB, taskId: string, reason: string): number {
   const rows = db.query("SELECT * FROM decisions WHERE task_id = ? AND status = 'open'").all(taskId) as any[];
   for (const r of rows) {
-    db.query("UPDATE decisions SET status = 'expired' WHERE id = ?").run(r.id);
+    const expiredAt = now();
+    db.query("UPDATE decisions SET status = 'expired', answered_at = ?, answered_by = 'system' WHERE id = ?").run(expiredAt, r.id);
     writeEvent(db, { task_id: taskId, source: "system", type: "decision_expired", payload: { decision_id: r.id, reason } });
-    broadcast({ type: "decision", decision: parseDecision({ ...r, status: "expired" }) });
+    broadcast({ type: "decision", decision: parseDecision({ ...r, status: "expired", answered_at: expiredAt, answered_by: "system" }) });
   }
   return rows.length;
 }

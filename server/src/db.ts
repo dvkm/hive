@@ -660,6 +660,21 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
          WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'`,
     ],
   },
+  // Every resolved card must name who resolved it. 414 answered rows predate
+  // v19-decision-caller (which added answered_by), so their answerer is not
+  // merely unknown, it was never recorded — and a NULL is indistinguishable
+  // from a bug in a path that forgot to stamp the column. Name the gap
+  // explicitly instead: 'unattributed' means "resolved before hive tracked
+  // answerers", which is a fact, where NULL was a question. Expired rows get
+  // the same treatment. Both statements re-run safely (the WHERE stops
+  // matching once applied).
+  {
+    name: "v40-attribute-legacy-decisions",
+    statements: [
+      `UPDATE decisions SET answered_by = 'unattributed'
+         WHERE status IN ('answered', 'expired') AND answered_by IS NULL`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings
