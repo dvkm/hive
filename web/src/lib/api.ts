@@ -139,6 +139,7 @@ export interface Task {
   evidence_count?: number; // list endpoint only; avoids fetching every task detail on startup
   spawn_error?: boolean; // list endpoint only; prior spawn failed and no spawn ever succeeded
   requeued_to?: string | null; // successor id when failed + auto-requeued
+  review_actionable?: boolean; // in_review AND the director can act on it now (server-computed, HIVE-500)
   skip?: { reason: string; label: string; permanent: boolean; since: string | null } | null; // queued only: why the dispatcher last skipped it
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
   reviewed?: boolean; // intake tasks only: the director (or intake triage) signalled it is free to dispatch
@@ -649,7 +650,8 @@ export interface Brief {
   fleet: Task[];
   incidents: BriefIncident[];
   intake: BriefIntake[];
-  to_review: Task[]; // Hive-owned reviews; tracking-only tasks are excluded.
+  to_review: Task[]; // Hive-owned reviews the director can act on now; tracking-only tasks are excluded.
+  in_review_pending: Task[]; // still in review but not yet the director's: red/running CI, review pipeline unfinished, or no report to read.
   spend: { totals: UsageTotals; by_model: (UsageTotals & { model: string })[] };
   learnings_new: BriefLearning[];
 }
