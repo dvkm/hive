@@ -4,7 +4,7 @@
 //    with answered_by NULL — all of them before the v19 migration that added
 //    the column, so the answerer was never recorded rather than lost. NULL is
 //    now impossible on a resolved row: the answer path stamps it, the expiry
-//    paths stamp it, and the v40 migration renames the legacy gap
+//    paths stamp it, and the v41 migration renames the legacy gap
 //    'unattributed'.
 // 2. A high-risk card is only ever answered by the director. Not on timeout,
 //    not by the supervisor, not by an agent answering its own question.
@@ -124,7 +124,7 @@ test("dismissing a high-risk card tells the agent it is unapproved, not to use i
   expect(text).not.toContain("Proceed with your best judgment");
 });
 
-test("v40 backfill names the legacy gap 'unattributed' instead of leaving it NULL", () => {
+test("v41 backfill names the legacy gap 'unattributed' instead of leaving it NULL", () => {
   const { db, projectId } = freshDb();
   const taskId = makeTask(db, projectId);
   // A pre-v19 row: answered, no answerer ever recorded.
@@ -132,7 +132,7 @@ test("v40 backfill names the legacy gap 'unattributed' instead of leaving it NUL
     `INSERT INTO decisions (id, task_id, ts, title, options, status, answer_key, answered_at)
      VALUES (?,?,?,?,'[]','answered','go',?)`
   ).run("dec_legacy", taskId, now(), "old", now());
-  db.query("DELETE FROM schema_migrations WHERE name = 'v40-attribute-legacy-decisions'").run();
+  db.query("DELETE FROM schema_migrations WHERE name = 'v41-attribute-legacy-decisions'").run();
   db.query("UPDATE decisions SET answered_by = NULL WHERE id = 'dec_legacy'").run();
 
   // Re-open the same file-backed DB is overkill; run the statement the

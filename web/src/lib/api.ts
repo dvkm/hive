@@ -138,6 +138,7 @@ export interface Task {
   evidence_count?: number; // list endpoint only; avoids fetching every task detail on startup
   spawn_error?: boolean; // list endpoint only; prior spawn failed and no spawn ever succeeded
   requeued_to?: string | null; // successor id when failed + auto-requeued
+  skip?: { reason: string; label: string; permanent: boolean; since: string | null } | null; // queued only: why the dispatcher last skipped it
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
   reviewed?: boolean; // intake tasks only: the director (or intake triage) signalled it is free to dispatch
   created_at: string;
@@ -543,6 +544,20 @@ export interface BranchCheck {
 export interface LandGraph {
   nodes: { id: string; number: number; project_number: number | null; title: string; land_queued_at: string | null }[];
   edges: { from: string; to: string; kind: "depends" | "conflict"; files?: string[] }[];
+}
+
+// The divergence radar (server/src/divergence.ts): for every branch still being
+// worked on, how far it trails the branch it will land on and which files it
+// shares with a sibling branch. `behind: null` means git could not tell.
+export interface DivergenceRow {
+  id: string;
+  number: number;
+  title: string;
+  state: State;
+  branch: string;
+  behind: number | null;
+  files: number;
+  overlaps: { task_id: string; number: number; files: string[] }[];
 }
 
 // One global-search hit. task_state/project_id are present only for task hits.
@@ -974,6 +989,8 @@ export const api = {
     req<{ clusters: { project_id: string; tasks: Pick<Task, "id" | "title" | "project_id" | "state">[] }[] }>(`/api/tasks/duplicates`),
   diff: (id: string) => req<DiffResult>(`/api/tasks/${id}/diff`),
   landGraph: (project?: string) => req<LandGraph>(`/api/tasks/land-graph${project ? `?project=${project}` : ""}`),
+  divergence: (project?: string) =>
+    req<{ rows: DivergenceRow[] }>(`/api/tasks/divergence${project ? `?project=${project}` : ""}`),
   landQueue: (task_ids: string[], queued = true) =>
     req<{ changed: string[]; queued: boolean }>(`/api/tasks/land-queue`, {
       method: "POST",

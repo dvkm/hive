@@ -660,6 +660,18 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
          WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'`,
     ],
   },
+  // Why the dispatcher last skipped a queued task (HIVE-525). Seven of the nine
+  // `continue` paths in the queued loop used to be silent, so a task that could
+  // never run looked exactly like one about to start. Written only when the
+  // reason CHANGES (state.ts's noteSkip), so a steady-state queue costs one row
+  // update per transition, not one event per cycle.
+  {
+    name: "v40-task-skip-reason",
+    statements: [
+      `ALTER TABLE tasks ADD COLUMN skip_reason TEXT`,
+      `ALTER TABLE tasks ADD COLUMN skip_reason_at TEXT`,
+    ],
+  },
   // Every resolved card must name who resolved it. 414 answered rows predate
   // v19-decision-caller (which added answered_by), so their answerer is not
   // merely unknown, it was never recorded — and a NULL is indistinguishable
@@ -669,7 +681,7 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
   // the same treatment. Both statements re-run safely (the WHERE stops
   // matching once applied).
   {
-    name: "v40-attribute-legacy-decisions",
+    name: "v41-attribute-legacy-decisions",
     statements: [
       `UPDATE decisions SET answered_by = 'unattributed'
          WHERE status IN ('answered', 'expired') AND answered_by IS NULL`,
