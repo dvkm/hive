@@ -4,7 +4,7 @@ import type { Location } from "react-router-dom";
 import { api } from "../lib/api";
 import type { SearchHit } from "../lib/api";
 import { useStore } from "../lib/store";
-import { toast } from "../lib/ui";
+import { PRIORITIES, toast } from "../lib/ui";
 import { setProjectFilter } from "../lib/projectFilter";
 import { isJiraMirror } from "../lib/needsYou";
 import { taskLabel } from "../lib/references";
@@ -195,7 +195,27 @@ export default function Palette() {
         },
       })),
     ];
+    // Priority for the task you are looking at: the palette opens over the task
+    // modal / page, so /tasks/<id> in the URL is the "focused" task.
+    const openId = /^\/tasks\/([^/]+)/.exec(location.pathname)?.[1];
+    const openTaskRow = openId ? tasks.find((t) => t.id === openId) : undefined;
     const extra: Item[] = [
+      ...(openTaskRow
+        ? PRIORITIES.map((p) => ({
+            key: `cmd:priority:${p}`,
+            group: "Commands",
+            icon: "⇅",
+            label: `Set priority ${p} · ${openTaskRow.title}`,
+            hint: "priority",
+            run: () => {
+              close();
+              api.updateTask(openTaskRow.id, { priority: p }).then(
+                () => toast(`Priority: ${p}`),
+                (e) => toast((e as Error).message)
+              );
+            },
+          }))
+        : []),
       {
         key: "cmd:filter:all",
         group: "Commands",
