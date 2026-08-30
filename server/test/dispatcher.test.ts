@@ -11,7 +11,8 @@ const { openDb, newId, now, getSetting } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
 const { dispatchOnce, isReviewed, inBackoff } = await import("../src/dispatcher.ts");
 const { selfAuditOnce } = await import("../src/selfAudit.ts");
-const { writeEvent, getTask } = await import("../src/state.ts");
+const { writeEvent, getTask, SKIP_REASONS } = await import("../src/state.ts");
+const { taskWithHealth, needsAttention } = await import("../src/health.ts");
 const { createDecision, requeueTask } = await import("../src/api.ts");
 const { queuedSteers } = await import("../src/steer.ts");
 const { createThread } = await import("../src/chat.ts");
@@ -631,4 +632,75 @@ test("briefs that name no paths never hold each other", async () => {
   const { herdr, spawns } = stubHerdr();
   await dispatchOnce(db, { herdr });
   expect(spawns.length).toBe(2);
+});
+
+// HIVE-525: every dispatcher skip leaves a trace on the task.
+test("each skip path records a distinct, human-readable reason", async () => {
+  const off = freshDb({}); // auto_dispatch off
+  const offId = makeTask(off.db, off.projectId);
+  await dispatchOnce(off.db, { herdr: stubHerdr().herdr });
+  expect(getTask(off.db, offId).skip_reason).toBe("auto_dispatch_off");
+
+  const { db, projectId } = freshDb({ auto_dispatch: true, dispatch_kinds: ["scout"] });
+  const wrongKind = makeTask(db, projectId, { kind: "ship" });
+  const tracked = makeTask(db, projectId, { kind: "scout", source: "external" });
+  await dispatchOnce(db, { herdr: stubHerdr().herdr });
+  expect(getTask(db, wrongKind).skip_reason).toBe("kind_excluded");
+  expect(getTask(db, tracked).skip_reason).toBe("tracking_only");
+
+  // Every reason resolves to a label the board can print.
+  const seen = ["auto_dispatch_off", "kind_excluded", "tracking_only"];
+  for (const r of seen) expect(SKIP_REASONS[r].label.length).toBeGreaterThan(0);
+  // "not ever" vs "not yet" is the distinction the board needs.
+  expect(SKIP_REASONS.kind_excluded.permanent).toBe(true);
+  expect(SKIP_REASONS.no_capacity.permanent).toBe(false);
+});
+
+test("a steady skip costs one row write and zero events, however many cycles run", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, dispatch_kinds: ["scout"] });
+  const id = makeTask(db, projectId, { kind: "ship" });
+  const { herdr } = stubHerdr();
+  for (let i = 0; i < 100; i++) await dispatchOnce(db, { herdr });
+
+  const t = getTask(db, id);
+  expect(t.skip_reason).toBe("kind_excluded");
+  const firstAt = t.skip_reason_at;
+  await dispatchOnce(db, { herdr });
+  expect(getTask(db, id).skip_reason_at).toBe(firstAt); // unchanged reason -> no rewrite
+  const events = db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ?").get(id) as { n: number };
+  expect(events.n).toBe(0);
+});
+
+test("a task that becomes dispatchable clears its skip reason", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 0 });
+  const id = makeTask(db, projectId);
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr });
+  expect(getTask(db, id).skip_reason).toBe("no_capacity");
+
+  db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify({ auto_dispatch: true, max_agents: 3 }), projectId);
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(1);
+  const t = getTask(db, id);
+  expect(t.state).toBe("in_progress");
+  expect(t.skip_reason).toBeNull();
+  expect(t.skip_reason_at).toBeNull();
+});
+
+test("a permanent per-task skip shows up as a stuck queued task, a project switch does not", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, dispatch_kinds: ["scout"] });
+  const wrongKind = makeTask(db, projectId, { kind: "ship" });
+  await dispatchOnce(db, { herdr: stubHerdr().herdr });
+  const enriched = taskWithHealth(db, getTask(db, wrongKind));
+  expect(enriched.skip.label).toBe(SKIP_REASONS.kind_excluded.label);
+  expect(enriched.skip.permanent).toBe(true);
+  expect(enriched.health?.status).toBe("stuck");
+  expect(needsAttention(enriched)).toBe(true);
+
+  const off = freshDb({});
+  const offId = makeTask(off.db, off.projectId);
+  await dispatchOnce(off.db, { herdr: stubHerdr().herdr });
+  const offTask = taskWithHealth(off.db, getTask(off.db, offId));
+  expect(offTask.skip.reason).toBe("auto_dispatch_off");
+  expect(offTask.health).toBeNull(); // a project-wide switch is a label, not an attention item
 });

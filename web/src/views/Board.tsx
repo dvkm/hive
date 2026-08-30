@@ -169,6 +169,18 @@ export function Card({ task }: { task: Task }) {
             waiting on #{task.overlap_hold.number}
           </span>
         )}
+        {/* Why this queued task is not running (HIVE-525). A permanent reason is
+            the loud one: nothing changes until a human changes a setting. The
+            two reasons with their own richer chip above are left out. */}
+        {task.state === "queued" && task.skip && !["dependency_blocked", "file_overlap"].includes(task.skip.reason) && (
+          <span
+            className={task.skip.permanent ? "chip chip-error" : "chip"}
+            title={`Dispatcher skipped this task: ${task.skip.label}`}
+          >
+            {task.skip.permanent ? "won't run · " : "waiting · "}
+            {task.skip.label}
+          </span>
+        )}
         <SidecarChip sidecar={task.sidecar} />
         <BlockedBy depends_on={task.depends_on} tasks={tasks} />
         {task.deferred_until && Date.parse(task.deferred_until) > Date.now() && (
