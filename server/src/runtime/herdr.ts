@@ -231,6 +231,27 @@ export function isWorktreeExistsError(r: ExecResult): boolean {
   return /already exists|already used by worktree/.test(`${r.stdout}\n${r.stderr}`);
 }
 
+// `git worktree remove` refused because the checkout directory still holds
+// files git does not know about — untracked build cache (web/.vite,
+// node_modules, dist) an agent created. Git prints
+// `error: failed to delete '<path>': Directory not empty`, drops the worktree
+// registration anyway, and leaves the directory behind. That leftover is a
+// landmine: every later `worktree add` on the path fails with `already exists`
+// (22 recorded removals hit this between 2026-07-30 and 2026-08-28).
+export function isWorktreeNotEmptyError(r: ExecResult): boolean {
+  return /Directory not empty|failed to delete/.test(`${r.stdout}\n${r.stderr}`);
+}
+
+// Guard for the two places that clear a directory outright. A path is only ever
+// clearable when it is absolute, at least two levels deep, and not the repo
+// itself — so a mangled or empty path can never turn into `rm -rf /`.
+export function isClearableWorktreePath(repoPath: string, path: string): boolean {
+  const trim = (s: string) => s.replace(/\/+$/, "");
+  if (!path.startsWith("/")) return false;
+  if (trim(path) === trim(repoPath)) return false;
+  return trim(path).split("/").filter(Boolean).length >= 2;
+}
+
 // herdr serializes worktree operations globally; two near-simultaneous spawns
 // (dispatcher + manual /spawn, or spawn racing the reaper) surface as
 // `worktree_operation_in_progress` (seen 3× live). Transient by construction —
@@ -1003,9 +1024,15 @@ export class Herdr {
     const wt = args.hintPath
       ? entries.find((e) => e.path === args.hintPath)
       : entries.find((e) => e.branch === args.branch);
-    // ponytail: an unregistered directory in the way is left alone — refusing
-    // beats `rm -rf` on a path we cannot prove is ours. Surfaces as spawn_error.
-    if (!wt) return miss("no registered worktree to reclaim", args.hintPath ?? null);
+    // An unregistered directory in the way is only cleared when it is PROVABLY
+    // debris from a failed removal (see clearOrphanPath). Anything else is left
+    // alone and surfaces as spawn_error — refusing beats `rm -rf` on a path we
+    // cannot prove is ours.
+    if (!wt) {
+      if (args.hintPath && (await this.clearOrphanPath(args.repoPath, args.hintPath, entries)))
+        return { reclaimed: true, ghost_branch: null, path: args.hintPath, reason: "orphaned directory cleared" };
+      return miss("no registered worktree to reclaim", args.hintPath ?? null);
+    }
 
     const status = await this.exec(["git", "-C", wt.path, "status", "--porcelain"]);
     if (status.code !== 0) return miss("git status failed in worktree", wt.path);
@@ -1029,7 +1056,7 @@ export class Herdr {
 
     await this.unregisterBuiltApp(wt.path);
 
-    const rm = await this.exec(["git", "-C", args.repoPath, "worktree", "remove", "--force", wt.path]);
+    const rm = await this.removeWorktreePath(args.repoPath, wt.path);
     if (rm.code !== 0) throw new HerdrError(`worktree remove failed: ${rm.stderr.trim() || rm.stdout.trim()}`);
     return {
       reclaimed: true,
@@ -1157,6 +1184,44 @@ export class Herdr {
     return withWorktreeLock(args.repoPath, args.branch, () => this.cleanupWorktreeCore(args));
   }
 
+  // `git worktree remove --force`, with the one recovery that keeps a failure
+  // from leaving a landmine behind. Force-removal already discards untracked
+  // files, so when git refuses only because the directory still holds build
+  // cache it does not track, clearing the rest destroys nothing git was not
+  // about to destroy — and NOT clearing it strands the path forever, because
+  // git drops the registration regardless (HIVE-526). Every guard that decides
+  // removal is allowed at all (branchIsSafe, the ghost-branch WIP rescue) has
+  // already run in the callers; this only finishes the removal they asked for.
+  private async removeWorktreePath(repoPath: string, path: string): Promise<ExecResult> {
+    const rm = await this.exec(["git", "-C", repoPath, "worktree", "remove", "--force", path]);
+    if (rm.code === 0 || !isWorktreeNotEmptyError(rm) || !isClearableWorktreePath(repoPath, path)) return rm;
+    const wiped = await this.exec(["rm", "-rf", path]);
+    if (wiped.code !== 0) return rm; // couldn't clear it — report the original refusal
+    const pruned = await this.exec(["git", "-C", repoPath, "worktree", "prune"]);
+    if (pruned.code !== 0) return rm;
+    return { code: 0, stdout: `cleared untracked leftovers and pruned ${path}`, stderr: "" };
+  }
+
+  // Self-heal for debris left by an older failed removal: a directory sitting on
+  // a worktree path that git no longer knows anything about. ALL THREE must
+  // hold, or the path is left untouched:
+  //   1. git has no worktree registered at it (`git worktree list`),
+  //   2. it is not a git repository or worktree checkout of its own,
+  //   3. it exists as a directory.
+  // A live worktree fails (1) and (2), so it can never be cleared here.
+  private async clearOrphanPath(repoPath: string, path: string, entries: { path: string }[]): Promise<boolean> {
+    if (!isClearableWorktreePath(repoPath, path)) return false;
+    if (entries.some((e) => e.path === path)) return false;
+    const dir = await this.exec(["test", "-d", path]);
+    if (dir.code !== 0) return false;
+    const repo = await this.exec(["git", "-C", path, "rev-parse", "--git-dir"]);
+    if (repo.code === 0) return false; // a real checkout — never ours to delete
+    const wiped = await this.exec(["rm", "-rf", path]);
+    if (wiped.code !== 0) return false;
+    await this.exec(["git", "-C", repoPath, "worktree", "prune"]);
+    return true;
+  }
+
   // Best-effort: drop a worktree's built hive.app from LaunchServices before the
   // worktree disappears, so 'open -b dev.hive.app' / hive:// deeplinks stop being
   // able to resolve to a now-gone path (task #1288 / hive-313). Never throws: a
@@ -1205,7 +1270,7 @@ export class Herdr {
       };
     }
 
-    const rm = await this.exec(["git", "-C", args.repoPath, "worktree", "remove", "--force", args.worktreePath]);
+    const rm = await this.removeWorktreePath(args.repoPath, args.worktreePath);
     if (rm.code !== 0) {
       // Task #341: the worktree was already gone from disk (e.g. removed
       // outside hive) — there's nothing left to preserve, so this must NOT

@@ -163,6 +163,8 @@ export function eventText(e: EventLike): string {
       return "agent spawned";
     case "spawn_error":
       return `spawn failed: ${s(p.error)}`;
+    case "spawn_gave_up":
+      return `gave up spawning after ${s(p.attempts) || "repeated"} identical failures: ${s(p.error)}`;
     case "agent_status":
       return `agent ${s(p.status) || "status changed"}`;
     case "dialog_auto_approved":
@@ -321,6 +323,7 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
   scope_drift: "decision",
   action_failed: "incident",
   spawn_error: "incident",
+  spawn_gave_up: "incident",
   smoke_failed: "incident",
   steer_error: "incident",
   planner_error: "incident",
@@ -348,6 +351,7 @@ const FAILURE_TYPES = new Set([
   "recovery",
   "smoke_failed",
   "spawn_error",
+  "spawn_gave_up",
   "steer_error",
   "supervise_error",
   "usage_limit",

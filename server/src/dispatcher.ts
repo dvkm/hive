@@ -18,7 +18,9 @@
 //     a `deny` or `require_decision` rule blocks the auto-spawn.
 //   - spawn failures back off exponentially per task (30s * 2^(n-1), capped at
 //     30m) so a broken repo never retry-storms; the task stays queued with the
-//     spawn_error event visible.
+//     spawn_error event visible. After SPAWN_ATTEMPT_CEILING consecutive
+//     failures with the same error signature the task is failed instead of
+//     retried forever (giveUpOnSpawn).
 //
 // The actual spawn (worktree + agent start + events + queued->in_progress) is
 // the shared spawnAgent() core, so the auto path and the manual /spawn endpoint
@@ -36,7 +38,8 @@ import { isOffline, setSetting, getSetting, now } from "./db.ts";
 import { Herdr, herdr as defaultHerdr, isHerdrUnreachable } from "./runtime/herdr.ts";
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
-import { isSelfAuditLineage, unmetDeps, noteDependencyBlock } from "./state.ts";
+import { isSelfAuditLineage, unmetDeps, noteDependencyBlock, transition, writeEvent } from "./state.ts";
+import { signature } from "./learn.ts";
 import { isTrackingOnlyTask } from "./supervision.ts";
 import { queuedSteers } from "./steer.ts";
 import { managingThreadForTask } from "./chat.ts";
@@ -61,6 +64,13 @@ const BACKOFF_BASE_MS = 30_000;
 const HERDR_OUTAGE_BASE_MS = 30_000;
 const HERDR_OUTAGE_CAP_MS = 5 * 60 * 1000;
 const BACKOFF_CAP_MS = 30 * 60 * 1000;
+// Attempt ceiling. The exponential backoff above settles at one retry every 30
+// minutes and never stops, so a permanently unsatisfiable precondition (a
+// blocked worktree path, a stale resume pointer) retried 48 times a day forever
+// while the task still read as ordinary queued work. After this many CONSECUTIVE
+// spawn failures that all say the same thing, the task is not going to spawn:
+// fail it so a human sees it, with the last error attached (HIVE-526).
+export const SPAWN_ATTEMPT_CEILING = 5;
 // States that count as "working" for the max_agents cap. in_review/verifying
 // agents are parked waiting on the DIRECTOR — counting them froze the whole
 // pipeline whenever the review queue filled (seen live 2026-07-10: 3 PRs in
@@ -242,6 +252,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         if (!proj?.repo_path) continue;
         const cfg = proj.config ?? {};
         if (!hasCapacity(task, cfg)) continue;
+        if (giveUpOnSpawn(db, task)) continue;
         if (inBackoff(db, task.id, nowMs)) continue;
         if (!(await spawnFor(task))) return;
       } catch (e) {
@@ -281,6 +292,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
 
         if (!hasCapacity(task, cfg)) continue;
 
+        if (giveUpOnSpawn(db, task)) continue; // ceiling reached — failed, not retried
         if (inBackoff(db, task.id, nowMs)) continue; // still cooling down after a spawn failure
 
         // #989: the brief edits files that live in ANOTHER project's repo. The
@@ -353,6 +365,65 @@ export function isReviewed(db: DB, taskId: string): boolean {
     }
   }
   return false;
+}
+
+// The task's own (non-infra) spawn failures since the last time hive gave up on
+// it. Infra-tagged failures — the herdr daemon being down — are somebody else's
+// fault: the global circuit breaker owns those, so they neither count towards
+// the ceiling nor break a streak, exactly as in inBackoff. Newest first.
+function ownSpawnErrors(db: DB, taskId: string): string[] {
+  const gaveUpAt = (
+    db
+      .query("SELECT MAX(ts) AS ts FROM events WHERE task_id = ? AND type = 'spawn_gave_up'")
+      .get(taskId) as { ts: string | null }
+  ).ts;
+  const rows = db
+    .query(
+      `SELECT payload FROM events WHERE task_id = ? AND type = 'spawn_error' AND ts > ?
+        ORDER BY ts DESC LIMIT ?`
+    )
+    .all(taskId, gaveUpAt ?? "", SPAWN_ATTEMPT_CEILING) as { payload: string }[];
+  const out: string[] = [];
+  for (const r of rows) {
+    try {
+      const p = JSON.parse(r.payload);
+      if (!p.infra) out.push(String(p.error ?? ""));
+    } catch {
+      out.push(""); // unparseable payload counts as a real failure, like inBackoff
+    }
+  }
+  return out;
+}
+
+// Has this task run out of attempts? True once the last SPAWN_ATTEMPT_CEILING
+// failures all carry the SAME error signature — a precondition nobody is fixing
+// by retrying. The task is failed here (hive's "a human must look at this"
+// state) so it leaves the dispatch queues instead of looping forever; the last
+// error rides along on both the event and the state_change reason. A retry after
+// the director fixes the cause starts a fresh count, because ownSpawnErrors only
+// looks at failures newer than the give-up marker.
+export function giveUpOnSpawn(db: DB, task: { id: string }): boolean {
+  const errors = ownSpawnErrors(db, task.id);
+  if (errors.length < SPAWN_ATTEMPT_CEILING) return false;
+  const sig = signature(errors[0]);
+  if (!errors.every((e) => signature(e) === sig)) return false;
+  // Marker first: it is what resets the count, so it must exist even if the
+  // transition below throws (a task raced into a terminal state, say).
+  writeEvent(db, {
+    task_id: task.id,
+    source: "dispatcher",
+    type: "spawn_gave_up",
+    payload: { error: errors[0], attempts: errors.length },
+  });
+  try {
+    transition(db, task.id, "failed", {
+      source: "dispatcher",
+      reason: `spawn failed ${errors.length}× with the same error — needs a human: ${errors[0]}`,
+    });
+  } catch (e) {
+    console.error(`[hive] dispatcher give-up transition ${task.id}:`, e);
+  }
+  return true;
 }
 
 // Exponential backoff keyed on the count of spawn_error events for the task:
