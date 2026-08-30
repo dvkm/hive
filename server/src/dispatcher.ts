@@ -399,10 +399,13 @@ function ownSpawnErrors(db: DB, taskId: string): string[] {
   const rows = db
     .query(
       `SELECT payload FROM events WHERE task_id = ? AND type = 'spawn_error' AND ts > ?
-        ORDER BY ts DESC LIMIT ?`
+        ORDER BY ts DESC`
     )
-    .all(taskId, gaveUpAt ?? "", SPAWN_ATTEMPT_CEILING) as { payload: string }[];
+    .all(taskId, gaveUpAt ?? "") as { payload: string }[];
   const out: string[] = [];
+  // Filter FIRST, cap after — never `LIMIT` in SQL. An infra row consuming one of
+  // the newest N slots would otherwise hide a real failure from the count, so a
+  // task whose infra and real failures interleave could dodge the ceiling forever.
   for (const r of rows) {
     try {
       const p = JSON.parse(r.payload);
@@ -410,6 +413,7 @@ function ownSpawnErrors(db: DB, taskId: string): string[] {
     } catch {
       out.push(""); // unparseable payload counts as a real failure, like inBackoff
     }
+    if (out.length === SPAWN_ATTEMPT_CEILING) break;
   }
   return out;
 }
@@ -426,14 +430,12 @@ export function giveUpOnSpawn(db: DB, task: { id: string }): boolean {
   if (errors.length < SPAWN_ATTEMPT_CEILING) return false;
   const sig = signature(errors[0]);
   if (!errors.every((e) => signature(e) === sig)) return false;
-  // Marker first: it is what resets the count, so it must exist even if the
-  // transition below throws (a task raced into a terminal state, say).
-  writeEvent(db, {
-    task_id: task.id,
-    source: "dispatcher",
-    type: "spawn_gave_up",
-    payload: { error: errors[0], attempts: errors.length },
-  });
+  // Transition FIRST. The marker is what resets the count, so writing it before a
+  // transition that throws would silently hand the task a clean slate and let the
+  // retry storm resume — the exact failure this function exists to stop. On a
+  // throw we give up on giving up: stay in backoff and retry the whole thing next
+  // cycle. A director's retry still resets the count without a marker, because
+  // ownSpawnErrors also restarts its window at the last successful spawn.
   try {
     transition(db, task.id, "failed", {
       source: "dispatcher",
@@ -441,7 +443,14 @@ export function giveUpOnSpawn(db: DB, task: { id: string }): boolean {
     });
   } catch (e) {
     console.error(`[hive] dispatcher give-up transition ${task.id}:`, e);
+    return false;
   }
+  writeEvent(db, {
+    task_id: task.id,
+    source: "dispatcher",
+    type: "spawn_gave_up",
+    payload: { error: errors[0], attempts: errors.length },
+  });
   return true;
 }
 

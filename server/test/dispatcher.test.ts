@@ -488,6 +488,26 @@ test("infra-tagged spawn failures never reach the ceiling", async () => {
   expect(spawns.length).toBe(1);
 });
 
+// The regression that let the storm survive the ceiling: infra failures are
+// filtered out of the count, but if the newest N rows are read from SQL BEFORE
+// that filter, an interleaved infra row hides a real failure and the task dodges
+// the ceiling for as long as the daemon keeps flapping.
+test("real failures interleaved with infra ones still reach the ceiling", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  // Alternating, so any window of the newest 5 rows holds only ~3 real errors.
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING * 2; i++) {
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "worktree create failed: already exists" } });
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "ConnectionRefused", infra: "herdr_unreachable" } });
+  }
+
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr, nowMs: () => Date.now() + 60 * 60 * 1000 });
+
+  expect(getTask(db, id).state).toBe("failed");
+  expect(spawns.length).toBe(0);
+});
+
 // Different failures mean something is still moving; only a stuck precondition
 // repeats itself verbatim.
 test("failures with different causes keep retrying (only one repeated error gives up)", async () => {

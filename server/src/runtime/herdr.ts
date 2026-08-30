@@ -238,18 +238,27 @@ export function isWorktreeExistsError(r: ExecResult): boolean {
 // registration anyway, and leaves the directory behind. That leftover is a
 // landmine: every later `worktree add` on the path fails with `already exists`
 // (22 recorded removals hit this between 2026-07-30 and 2026-08-28).
+// Matches ONLY the leftover-cache condition, never `failed to delete` on its own:
+// git prints that prefix for any deletion failure (permission denied, file busy,
+// I/O error), and those are real problems to surface, not directories to wipe.
 export function isWorktreeNotEmptyError(r: ExecResult): boolean {
-  return /Directory not empty|failed to delete/.test(`${r.stdout}\n${r.stderr}`);
+  return /Directory not empty/.test(`${r.stdout}\n${r.stderr}`);
 }
 
-// Guard for the two places that clear a directory outright. A path is only ever
-// clearable when it is absolute, at least two levels deep, and not the repo
-// itself — so a mangled or empty path can never turn into `rm -rf /`.
+// Guard for the two places that clear a directory outright. Clearable only when
+// the path is absolute, at least three levels deep, not the repo itself, and not
+// an ancestor of the repo. That rules out `/`, `/Users`, `/Users/david` and any
+// parent of the checkout; it does NOT prove the path is a worktree, so callers
+// stay responsible for that (clearOrphanPath's three conditions, or a
+// `worktree remove --force` that already authorised the deletion).
 export function isClearableWorktreePath(repoPath: string, path: string): boolean {
   const trim = (s: string) => s.replace(/\/+$/, "");
   if (!path.startsWith("/")) return false;
-  if (trim(path) === trim(repoPath)) return false;
-  return trim(path).split("/").filter(Boolean).length >= 2;
+  const p = trim(path);
+  const repo = trim(repoPath);
+  if (p === repo) return false;
+  if (repo.startsWith(`${p}/`)) return false; // an ancestor of the repo — never ours
+  return p.split("/").filter(Boolean).length >= 3;
 }
 
 // herdr serializes worktree operations globally; two near-simultaneous spawns
