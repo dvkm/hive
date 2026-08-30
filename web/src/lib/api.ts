@@ -543,6 +543,20 @@ export interface LandGraph {
   edges: { from: string; to: string; kind: "depends" | "conflict"; files?: string[] }[];
 }
 
+// The divergence radar (server/src/divergence.ts): for every branch still being
+// worked on, how far it trails the branch it will land on and which files it
+// shares with a sibling branch. `behind: null` means git could not tell.
+export interface DivergenceRow {
+  id: string;
+  number: number;
+  title: string;
+  state: State;
+  branch: string;
+  behind: number | null;
+  files: number;
+  overlaps: { task_id: string; number: number; files: string[] }[];
+}
+
 // One global-search hit. task_state/project_id are present only for task hits.
 export interface SearchHit {
   type: "task" | "decision" | "learning" | "policy" | "project";
@@ -972,6 +986,8 @@ export const api = {
     req<{ clusters: { project_id: string; tasks: Pick<Task, "id" | "title" | "project_id" | "state">[] }[] }>(`/api/tasks/duplicates`),
   diff: (id: string) => req<DiffResult>(`/api/tasks/${id}/diff`),
   landGraph: (project?: string) => req<LandGraph>(`/api/tasks/land-graph${project ? `?project=${project}` : ""}`),
+  divergence: (project?: string) =>
+    req<{ rows: DivergenceRow[] }>(`/api/tasks/divergence${project ? `?project=${project}` : ""}`),
   landQueue: (task_ids: string[], queued = true) =>
     req<{ changed: string[]; queued: boolean }>(`/api/tasks/land-queue`, {
       method: "POST",
