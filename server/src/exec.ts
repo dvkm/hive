@@ -189,6 +189,14 @@ export function preferSafeRef(candidate: unknown, fallback: string): string {
 // laps into 175s+ ones (HIVE-438), and by the reviewer's per-pass and per-risk
 // fan-out (HIVE-523). Bounded, so a fleet of 40 PRs still can't fork 40 `gh`
 // processes at once, and a review backlog can't stampede the model API.
+// `gh pr list` is heavier than a single-PR probe: it returns every open PR,
+// with check rollups and file lists. It is still a poll, so bound it well under
+// the reconciler cadence instead of waiting the 60s defaultExec default.
+export const GH_LIST_TIMEOUT_MS = 30_000;
+// ponytail: a flat cap across projects. Hive runs a handful of repos, so this
+// is really "do not fork one gh per repo at once".
+export const GH_LIST_CONCURRENCY = 4;
+
 export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const results = new Array<R>(items.length);
   let next = 0;

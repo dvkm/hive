@@ -29,7 +29,7 @@ import { diagnosePane, dialogAutoApprovable, editDialogPaths, parseResetClock } 
 import { AUTO_MERGE_PAUSED, requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount } from "./api.ts";
 import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, mapLimit, projectBaseBranch, preferSafeRef } from "./exec.ts";
+import { defaultExec, mapLimit, projectBaseBranch, preferSafeRef, GH_LIST_TIMEOUT_MS, GH_LIST_CONCURRENCY } from "./exec.ts";
 import { captureBranchScope } from "./rebaseGuard.ts";
 import { landOnce } from "./landQueue.ts";
 import { sidecarOnce } from "./sidecar.ts";
@@ -913,8 +913,14 @@ async function linkPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   // to link either.
   const projects = activeProjects(db).filter((p) => p.repo_path) as { id: string; repo_path: string }[];
   let startFailure: string | null = null;
-  for (const p of projects) {
-    const r = await exec(["gh", "pr", "list", "--state", "open", "--json", "number,title,body,url"], { cwd: p.repo_path });
+  // List every project a few at a time (HIVE-486): listing serially meant one
+  // stalled repo cost a full timeout before the next repo was even tried, so K
+  // stalled repos added K timeouts to the lap. Only the `gh` calls overlap; the
+  // linking below still runs serially, in project order.
+  const lists = await mapLimit(projects, GH_LIST_CONCURRENCY, (p) =>
+    exec(["gh", "pr", "list", "--state", "open", "--json", "number,title,body,url"], { cwd: p.repo_path, timeoutMs: GH_LIST_TIMEOUT_MS })
+  );
+  for (const r of lists) {
     // 127 is defaultExec's "the child never started" (missing binary, or a
     // repo_path that no longer exists), as opposed to gh running and failing.
     if (r.code === 127 && startFailure === null) startFailure = r.stderr.trim();
