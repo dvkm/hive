@@ -131,6 +131,7 @@ export interface Task {
   duplicate_of: string | null; // survivor id when cancelled as a duplicate
   depends_on: string[]; // task ids governed by the server dependency gate (docs/API.md)
   deferred_until?: string | null; // parked pending an offline human action; nudges suppressed while future-dated
+  parked_for_director?: string | null; // director took the worktree over; no agent runs on it until hand-back
   land_queued_at?: string | null; // marked approved-to-land; the land queue merges it in graph order
   needs_you_since?: string | null; // when review/failed entered Focus; unlike updated_at, CI and metadata cannot reset it
   health?: Health | null;
@@ -978,6 +979,16 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
+  takeover: (id: string) =>
+    req<{ ok: boolean; worktree_path: string; branch: string | null; agent_stopped: boolean }>(
+      `/api/tasks/${id}/takeover`,
+      { method: "POST" }
+    ),
+  handback: (id: string, note?: string) =>
+    req<{ ok: boolean; steer_queued: boolean; summary: string | null; branch: string | null }>(
+      `/api/tasks/${id}/handback`,
+      { method: "POST", body: JSON.stringify({ note }) }
+    ),
   requeue: (id: string) =>
     req<{ ok: boolean; new_task_id: string }>(`/api/tasks/${id}/requeue`, {
       method: "POST",

@@ -674,6 +674,30 @@ export function TaskBody({ id }: { id: string }) {
       toast((e as Error).message);
     }
   };
+  // Take over (HIVE-352): park the agent and edit this worktree by hand. The
+  // path is what the director actually needs, so the toast carries it.
+  const takeOver = async () => {
+    try {
+      const r = await api.takeover(t.id);
+      toast(`Yours now — ${r.worktree_path}`);
+      refresh();
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  };
+  const handBack = async () => {
+    try {
+      const r = await api.handback(t.id);
+      toast(
+        r.summary
+          ? "Handed back — the agent is steered with your changes"
+          : "Handed back — nothing changed while you had it"
+      );
+      refresh();
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  };
   const failRequeue = async () => {
     try {
       await api.requeue(t.id);
@@ -979,10 +1003,29 @@ export function TaskBody({ id }: { id: string }) {
                   View agent
                 </button>
               )}
-              {dispatchIsPrimary && (
+              {dispatchIsPrimary && !t.parked_for_director && (
                 <button className="btn btn-primary" onClick={dispatch}>
                   Dispatch now
                 </button>
+              )}
+              {!trackingOnly && !jiraMirror && t.worktree_path && !["done", "failed", "cancelled"].includes(t.state) && (
+                t.parked_for_director ? (
+                  <button
+                    className="btn btn-primary"
+                    onClick={handBack}
+                    title="Put an agent back on this branch, steered with what you changed"
+                  >
+                    Hand back to the agent
+                  </button>
+                ) : (
+                  <button
+                    className="btn"
+                    onClick={takeOver}
+                    title="Stop the agent and edit this worktree yourself; frees its agent slot"
+                  >
+                    Take over
+                  </button>
+                )
               )}
               {!trackingOnly && (
                 <button className="btn" onClick={planBreakdown} disabled={planning}>

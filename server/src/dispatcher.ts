@@ -147,7 +147,15 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     .query(`SELECT * FROM tasks WHERE agent_target IS NULL AND state IN ('in_progress','in_review','verifying') ORDER BY updated_at ASC`)
     .all()
     .map(parseTask)
-    .filter((t: any) => !isTrackingOnlyTask(t) && !["chat_supervisor", "pr-gardener-decision"].includes(t.source) && queuedSteers(db, t.id).length > 0);
+    .filter(
+      (t: any) =>
+        !isTrackingOnlyTask(t) &&
+        !["chat_supervisor", "pr-gardener-decision"].includes(t.source) &&
+        // Taken over by the director: the worktree is theirs until they hand it
+        // back, so a queued steer must not pull an agent back into it.
+        !t.parked_for_director &&
+        queuedSteers(db, t.id).length > 0
+    );
 
   let errors = 0;
   const projectCache = new Map<string, { repo_path: string | null; config: any } | null>();

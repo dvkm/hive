@@ -687,6 +687,18 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
          WHERE status IN ('answered', 'expired') AND answered_by IS NULL`,
     ],
   },
+  // Director take-over (HIVE-352). `parked_for_director` is the timestamp the
+  // director took the worktree over; `takeover_base` is the git commit that
+  // captured the tree at that moment, so hand-back can diff exactly what the
+  // director changed. The park itself reuses deferred_until (far-future), which
+  // is what already keeps the dispatcher and the stale-nudge sweep off a task.
+  {
+    name: "v42-task-director-takeover",
+    statements: [
+      `ALTER TABLE tasks ADD COLUMN parked_for_director TEXT`,
+      `ALTER TABLE tasks ADD COLUMN takeover_base TEXT`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings

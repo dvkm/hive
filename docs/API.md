@@ -319,6 +319,8 @@ Understanding quiz API:
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
 - `deferred` — task parked pending an offline human action; `deferred_until` set (nudges suppressed while future-dated). `payload: {until, note}`
 - `undeferred` — a deferred task was resumed; `deferred_until` cleared. `payload: {note}`
+- `taken_over` — the director took the worktree over by hand; the agent was stopped and its slot freed. `payload: {worktree_path, branch, base, agent_stopped}`
+- `handed_back` — the worktree was handed back; a steer summarising the director's changes is queued for the next agent. `payload: {branch, base, summary, note}`
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
 - `smoke_passed` / `smoke_failed` — post-deploy smoke result. `payload: {results:[{name,ok,detail}], evidence_id?}`
 - `cleaned_up` — a finished task's runtime was torn down: worktree removed (when its branch was pushed/merged) and herdr session (tab/pane) closed. `payload: {worktree_path, branch, worktree_removed, ghost_branch, session_closed, session_via, tab_id}` (`ghost_branch` non-null when tracked uncommitted work was preserved before removal). Fired on the `done`/`cancelled` transition and by the reaper.
@@ -765,6 +767,32 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   `herdr agent focus` so the director can watch/attach. Records a `focus_agent` event.
   Degrades gracefully (never throws): `200 {"ok":false, "focused":false, "error":"..."}`
   when the task has no agent or herdr fails.
+- `POST /api/tasks/:id/takeover` body `{}` → `200 {"ok":true, "worktree_path":"...", "branch":"...", "base":"<sha>", "agent_stopped":true}` | `404` | `409`
+  The director takes the worktree over by hand. Stops the agent (the same
+  close-the-session sequence cleanup uses), clears `agent_target` — which is what
+  frees the project's agent slot, since every dispatcher capacity count keys on
+  it — and parks the task by setting `deferred_until` far into the future, so the
+  dispatcher and the "gone quiet" nudges leave it alone. No state hop: an
+  `in_progress` task stays `in_progress`. `parked_for_director` is the timestamp,
+  and `takeover_base` is a `git stash create` commit capturing the tree at that
+  moment (a dangling object; it never touches the shared stash stack), which is
+  what lets hand-back report the director's edits alone rather than whatever the
+  agent had left uncommitted. Writes a `taken_over` event. `409` when the task is
+  terminal, has no worktree, is not a hive worker task, or is already taken over.
+  While parked, `spawnAgent` refuses — two writers on one checkout is the thing
+  this endpoint exists to prevent.
+- `POST /api/tasks/:id/handback` body `{note?}` → `200 {"ok":true, "steer_queued":true, "summary":"...", "branch":"..."}` | `404` | `409`
+  Hands the worktree back. Queues ONE steer describing what changed while the
+  task was parked (new commits, `git diff --stat` against `takeover_base`, and
+  untracked files that were not already there at take-over, each capped at 40
+  lines), plus the optional `note`, then clears
+  `parked_for_director` and lifts the park. The park is lifted only when
+  `deferred_until` still holds the take-over sentinel, so a deferral the director
+  set separately survives. Nothing respawns here: the dispatcher's existing
+  reattach pass sees a live task with no agent and queued steers and puts a fresh
+  agent on the SAME branch with those steers at the top of its brief. `summary` is
+  `null` when git could not be read (the steer then tells the agent to check git
+  itself) and `""` when nothing changed. Writes a `handed_back` event.
 - `POST /api/tasks/:id/requeue` body `{}` → `200 {"ok":true, "new_task_id":"..."}` | `404`
   The recovery banner's manual "fail + requeue": reclaims a still-live task's worktree, fails it, then creates a FRESH queued copy (`source="requeue"`, `parent_task_id` → the original) with the [Task resume context](#task) whenever the original left a branch. Reclaim matches dead-agent and context-full auto-requeue: uncommitted state is preserved to a `ghost-<task-id>` branch and recorded as a `worktree_reclaimed` event. Distinct from the attention tray's in-place requeue of an already-failed task (`POST /transition {to:"queued"}`, which reactivates the SAME task and clears its runtime binding).
   A `source="requeue"` row is only ever trusted lineage once its `created`
