@@ -981,8 +981,14 @@ test("decision: create, draft autosave, answer flow", async () => {
   const afterDraft = await get(`/api/decisions/${decisionId}`);
   expect(afterDraft.json.draft_note).toBe("leaning yes");
 
+  // A high-risk card refuses a caller that does not name itself as the
+  // director — an unattributed answer is not a human answer (HIVE-527).
+  const anon = await post(`/api/decisions/${decisionId}/answer`, { answer_key: "yes", answer_note: "go" });
+  expect(anon.status).toBe(403);
+  expect(anon.json.category).toBe("risk_high");
+
   // answer / submit
-  const ans = await post(`/api/decisions/${decisionId}/answer`, { answer_key: "yes", answer_note: "go" });
+  const ans = await post(`/api/decisions/${decisionId}/answer`, { answer_key: "yes", answer_note: "go", source: "director" });
   expect(ans.status).toBe(200);
   expect(ans.json.status).toBe("answered");
   expect(ans.json.answer_key).toBe("yes");

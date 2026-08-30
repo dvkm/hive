@@ -1186,10 +1186,32 @@ test("autoAnswerStale answers timed-out normal-risk cards with the recommendatio
   };
   const normal = mkDecision("normal");
   const high = mkDecision("high");
+  // The live gap (HIVE-527): risk is free text, so an exact != 'high' test let
+  // a card whose risk was a whole sentence through the sweep.
+  const prose = mkDecision("high — if these keys are real, anyone with repo read access can use them");
   const herdr = new Herdr(stub(() => OK()), "herdr");
   autoAnswerStale(db, herdr, Date.now());
   expect((db.query("SELECT status, answer_key FROM decisions WHERE id = ?").get(normal) as any).answer_key).toBe("go");
   expect((db.query("SELECT status FROM decisions WHERE id = ?").get(high) as any).status).toBe("open");
+  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(prose) as any).status).toBe("open");
+});
+
+test("autoAnswerStale escalates a timed-out high-risk card once instead of answering it", async () => {
+  const { autoAnswerStale } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ decision_auto_answer_hours: 4 });
+  const id = makeTask(db, projectId, {});
+  const did = newId("dec");
+  db.query(
+    "INSERT INTO decisions (id, task_id, ts, title, risk, options, status) VALUES (?,?,?,?,'high',?, 'open')"
+  ).run(did, id, new Date(Date.now() - 5 * 3600_000).toISOString(), "rotate prod keys?",
+    JSON.stringify([{ key: "go", label: "Go", recommended: true }, { key: "no", label: "No" }]));
+  const herdr = new Herdr(stub(() => OK()), "herdr");
+  autoAnswerStale(db, herdr, Date.now());
+  autoAnswerStale(db, herdr, Date.now());
+  // Still open, and escalated exactly once — a 30s sweep must not re-push.
+  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(did) as any).status).toBe("open");
+  expect(db.query("SELECT COUNT(*) n FROM events WHERE task_id = ? AND type = 'decision_escalated'").get(id) as any).toEqual({ n: 1 });
+  expect(db.query("SELECT COUNT(*) n FROM notifications WHERE decision_id = ? AND urgency = 'urgent'").get(did) as any).toEqual({ n: 1 });
 });
 
 test("autoAnswerStale skips options that need director-supplied input (flag or keyword), notifies once", async () => {
