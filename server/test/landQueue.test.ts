@@ -92,9 +92,11 @@ test("declared and brief-written dependencies both become 'depends' edges", asyn
 });
 
 // The brief's regression test: A is independent, B and C both touch a file A
-// does not. A lands alongside the first of B/C; the second waits a sweep. A red
-// CI on B must not hold C back.
-test("independent PRs land together, conflicting ones serialize", async () => {
+// does not. A and the first of B/C land in this sweep; the second waits a sweep.
+// HIVE-348 tightened the "land together" half: they land in the same sweep, but
+// one merge at a time, because two merges racing on one base is what once ate a
+// commit.
+test("independent PRs land in one sweep, one at a time; conflicting ones wait", async () => {
   const { db, projectId } = freshDb();
   const a = makeTask(db, projectId, { branch: "a" });
   const b = makeTask(db, projectId, { branch: "b" });
@@ -103,21 +105,22 @@ test("independent PRs land together, conflicting ones serialize", async () => {
   markLand(db, [a, b, c], true);
 
   const calls: string[] = [];
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => (release = resolve));
-  const firstSweep = landOnce(db, {
+  let inFlight = 0;
+  let peak = 0;
+  await landOnce(db, {
     exec,
     merge: async (id) => {
       calls.push(id);
-      await gate;
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await Bun.sleep(1);
+      inFlight--;
       transition(db, id, "verifying", { source: "director", reason: "test merge" });
       return { ok: true };
     },
   });
-  await Bun.sleep(0);
-  expect(calls).toEqual([a, b]); // both started before either merge finished
-  release();
-  await firstSweep;
+  expect(calls).toEqual([a, b]); // C conflicts with B, so it sits out this sweep
+  expect(peak).toBe(1); // never two merges in flight at once
 
   // Next sweep: B has merged, so C is unblocked and lands on its own.
   const second = mergeStub(db);
