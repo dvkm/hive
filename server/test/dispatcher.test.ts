@@ -503,6 +503,26 @@ test("failures with different causes keep retrying (only one repeated error give
   expect(spawns.length).toBe(1);
 });
 
+// A task reattaches many times over its life (every review handoff), so old
+// failures from a previous spawn must not add up with new ones. A successful
+// spawn wipes the slate.
+test("a successful spawn resets the attempt count", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  // Ceiling-1 identical failures, then a clean spawn, then more of the same error.
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING - 1; i++)
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "worktree create boom" } });
+  writeEvent(db, { task_id: id, source: "herdr", type: "spawned", payload: { agent_id: "a1" } });
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING - 1; i++)
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "worktree create boom" } });
+
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr, nowMs: () => Date.now() + 60 * 60 * 1000 });
+
+  expect(getTask(db, id).state).toBe("in_progress"); // not given up on
+  expect(spawns.length).toBe(1);
+});
+
 test("herdr unreachable: one probe per cycle (not per task) + global cooldown pauses dispatch", async () => {
   const { db, projectId } = freshDb({ auto_dispatch: true });
   makeTask(db, projectId);

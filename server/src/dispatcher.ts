@@ -379,14 +379,21 @@ export function isReviewed(db: DB, taskId: string): boolean {
   return false;
 }
 
-// The task's own (non-infra) spawn failures since the last time hive gave up on
-// it. Infra-tagged failures — the herdr daemon being down — are somebody else's
-// fault: the global circuit breaker owns those, so they neither count towards
-// the ceiling nor break a streak, exactly as in inBackoff. Newest first.
+// The task's own (non-infra) spawn failures since the task last got a clean
+// start. "Clean start" means either the last give-up marker or the last
+// SUCCESSFUL spawn: a task reattaches many times over its life (every review
+// handoff), so failures either side of a working spawn are unrelated and must
+// not add up towards the ceiling. Infra-tagged failures — the herdr daemon being
+// down — are somebody else's fault: the global circuit breaker owns those, so
+// they neither count towards the ceiling nor break a streak, exactly as in
+// inBackoff. Newest first.
 function ownSpawnErrors(db: DB, taskId: string): string[] {
   const gaveUpAt = (
     db
-      .query("SELECT MAX(ts) AS ts FROM events WHERE task_id = ? AND type = 'spawn_gave_up'")
+      .query(
+        `SELECT MAX(ts) AS ts FROM events
+          WHERE task_id = ? AND type IN ('spawn_gave_up', 'spawned')`
+      )
       .get(taskId) as { ts: string | null }
   ).ts;
   const rows = db
@@ -413,7 +420,7 @@ function ownSpawnErrors(db: DB, taskId: string): string[] {
 // state) so it leaves the dispatch queues instead of looping forever; the last
 // error rides along on both the event and the state_change reason. A retry after
 // the director fixes the cause starts a fresh count, because ownSpawnErrors only
-// looks at failures newer than the give-up marker.
+// looks at failures newer than the give-up marker or the last successful spawn.
 export function giveUpOnSpawn(db: DB, task: { id: string }): boolean {
   const errors = ownSpawnErrors(db, task.id);
   if (errors.length < SPAWN_ATTEMPT_CEILING) return false;
