@@ -174,7 +174,13 @@ export function Card({ task }: { task: Task }) {
         )}
         <SidecarChip sidecar={task.sidecar} />
         <BlockedBy depends_on={task.depends_on} tasks={tasks} />
-        {task.deferred_until && Date.parse(task.deferred_until) > Date.now() && (
+        {/* A taken-over task is deferred too (that is how it is parked), so this
+            comes first: "you are holding this one" beats "parked". */}
+        {task.parked_for_director ? (
+          <span className="chip chip-deferred" title="You took this worktree over; no agent runs on it until you hand it back">
+            yours
+          </span>
+        ) : task.deferred_until && Date.parse(task.deferred_until) > Date.now() && (
           <span className="chip chip-deferred" title="Deferred pending an offline human action; nudges suppressed">
             deferred
           </span>

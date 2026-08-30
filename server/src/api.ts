@@ -51,6 +51,7 @@ import {
 import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
+import { takeOver, handBack, TakeoverError } from "./takeover.ts";
 import { figmaTokenEnv, resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { teamclaudeEnv, teamclaudeOverlay, usesTeamclaude } from "./teamclaude.ts";
 import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
@@ -601,6 +602,10 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/focus-agent$/);
       if (m && method === "POST") return await focusAgent(db, herdr, m[1]);
+
+      // Director take-over / hand-back of a task's worktree (HIVE-352).
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/(takeover|handback)$/);
+      if (m && method === "POST") return await takeoverEndpoint(db, herdr, m[1], m[2], await safeJson(req), deps);
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/requeue$/);
       if (m && method === "POST") return await requeueEndpoint(db, herdr, m[1]);
@@ -3672,6 +3677,10 @@ export async function spawnAgent(
     return { ok: false, error: "this task mirrors a Jira issue — hive tracks it but never runs agents on it" };
   if (neverDispatched(db, task))
     return { ok: false, error: "task is untracked (source=external) and has never been spawned — hive does not dispatch agents for tracking-only tasks" };
+  // The director is editing this worktree by hand (HIVE-352). Starting an agent
+  // in it now means two writers on one checkout; hand it back first.
+  if (task.parked_for_director)
+    return { ok: false, error: "the director has taken this worktree over — hand it back to put an agent on it again" };
   // Adoption guard (hive-1090): a requeue whose predecessor left an open PR
   // must carry that pointer in its brief before it dispatches — this is the
   // structural backstop for buildResumeSection (requeueTask always writes the
@@ -5001,6 +5010,26 @@ function writeHookSettings(
 }
 
 // "View agent" affordance: focus the task's herdr tab so the director can watch/attach.
+// POST /api/tasks/:id/takeover  — park the agent, hand the worktree to the director.
+// POST /api/tasks/:id/handback {note?} — put an agent back on the branch with a
+// steer summarising what the director changed while it was parked.
+async function takeoverEndpoint(
+  db: DB,
+  herdr: Herdr,
+  id: string,
+  verb: string,
+  body: any,
+  deps: HandlerDeps
+): Promise<Response> {
+  try {
+    if (verb === "takeover") return json({ ok: true, ...(await takeOver(db, id, { herdr, exec: deps.exec })) });
+    return json({ ok: true, ...(await handBack(db, id, { note: body?.note, exec: deps.exec })) });
+  } catch (e) {
+    if (e instanceof TakeoverError) return err(e.message, e.message === "task not found" ? 404 : 409);
+    throw e;
+  }
+}
+
 async function focusAgent(db: DB, herdr: Herdr, id: string): Promise<Response> {
   const task = getTask(db, id);
   if (!task) return err("task not found", 404);
