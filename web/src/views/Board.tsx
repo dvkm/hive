@@ -162,9 +162,18 @@ export function Card({ task }: { task: Task }) {
             ⚠ spawn failed
           </span>
         )}
+        {task.state === "queued" && task.overlap_hold && (
+          <span
+            className="chip chip-blocked"
+            title={`Both this task and #${task.overlap_hold.number} look like they edit ${task.overlap_hold.files.join(", ")}. It starts once that one finishes, or sooner if nothing else can run.`}
+          >
+            waiting on #{task.overlap_hold.number}
+          </span>
+        )}
         {/* Why this queued task is not running (HIVE-525). A permanent reason is
-            the loud one: nothing changes until a human changes a setting. */}
-        {task.state === "queued" && task.skip && task.skip.reason !== "dependency_blocked" && (
+            the loud one: nothing changes until a human changes a setting. The
+            two reasons with their own richer chip above are left out. */}
+        {task.state === "queued" && task.skip && !["dependency_blocked", "file_overlap"].includes(task.skip.reason) && (
           <span
             className={task.skip.permanent ? "chip chip-error" : "chip"}
             title={`Dispatcher skipped this task: ${task.skip.label}`}
@@ -270,7 +279,9 @@ export function LandChips({ task, graph, tasks }: { task: Task; graph: LandGraph
       {clash.length > 0 && (
         <span
           className="chip chip-blocked"
-          title={clash.map((e) => `${name(e.peer)}: ${(e.files ?? []).join(", ")}`).join("\n")}
+          title={clash
+            .map((e) => `Both PRs change ${(e.files ?? []).join(", ") || "the same files"} — read them together before landing (${name(e.peer)})`)
+            .join("\n")}
         >
           conflicts with {clash.map((e) => name(e.peer)).join(", ")}
         </span>

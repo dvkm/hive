@@ -51,6 +51,7 @@ import { managingThreadForTask } from "./chat.ts";
 import { repoMismatchUnresolved } from "./repoTarget.ts";
 import { triageHold } from "./intake/triage.ts";
 import type { Exec } from "./exec.ts";
+import { predictScope, inFlightScope, scopeOverlap, noteOverlapHold, type FileScope } from "./fileScope.ts";
 
 // Chores included since 2026-07-12: the queue sat at 10 tasks / 1 live agent
 // because 9 were agent-filed follow-up FIXES tagged chore — "chores are titled
@@ -173,6 +174,19 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   const activeCount = new Map<string, number>(); // per-project live agents incl. review-parked
   const gardenerWorkingCount = new Map<string, number>();
   const gardenerActiveCount = new Map<string, number>();
+  // Predicted (or, once a branch exists, real) file scope of everything already
+  // working in a project, loaded once and extended as this cycle spawns more.
+  const inFlight = new Map<string, { id: string; number: number; scope: FileScope }[]>();
+  const inFlightFor = (pid: string) => {
+    let list = inFlight.get(pid);
+    if (!list) {
+      const rows = db
+        .query(`SELECT id, number FROM tasks WHERE project_id = ? AND agent_target IS NOT NULL AND state IN ${WORKING_STATES}`)
+        .all(pid) as { id: string; number: number }[];
+      inFlight.set(pid, (list = rows.map((r) => ({ id: r.id, number: r.number, scope: inFlightScope(db, r.id) }))));
+    }
+    return list;
+  };
 
   const getProject = (pid: string) => {
     if (!projectCache.has(pid)) {
@@ -229,9 +243,16 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   let herdrDown = false;
   // Shared spawn tail: cap bookkeeping + the herdr-outage circuit breaker.
   // Returns false when the daemon is down and the whole cycle must bail.
-  const spawnFor = async (task: any): Promise<boolean> => {
+  const spawnFor = async (task: any, scope?: FileScope): Promise<boolean> => {
     const r = await spawnAgent(db, h, task.id, { hiveUrl: deps.hiveUrl, supervise: deps.supervise, exec: deps.exec });
     if (r.ok) {
+      // The guess this task started under: it is what later candidates are
+      // checked against, and what scoreScopePrediction marks against the real
+      // branch once one exists.
+      if (scope && (scope.files.length || scope.dirs.length)) {
+        writeEvent(db, { task_id: task.id, source: "dispatcher", type: "dispatch_scope", payload: { ...scope } });
+        inFlightFor(task.project_id).push({ id: task.id, number: task.number, scope });
+      }
       if (task.source === "pr-gardener") {
         gardenerWorkingCount.set(task.project_id, gardenerWorkingFor(task.project_id) + 1);
         gardenerActiveCount.set(task.project_id, gardenerActiveFor(task.project_id) + 1);
@@ -250,7 +271,10 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     return true;
   };
 
-  const dispatchProject = async (group: { reattach: typeof queued; queued: typeof queued }) => {
+  const dispatchProject = async (pid: string, group: { reattach: typeof queued; queued: typeof queued }) => {
+    // Candidates skipped only because they look like they touch the same files as
+    // something already running. Ordering, not a block — see the tail of this fn.
+    const deferred: { task: any; scope: FileScope }[] = [];
     // Feedback on work already in flight comes back BEFORE new work starts —
     // otherwise a bounce queues behind fresh dispatch for the same slot.
     // Deliberately NOT gated on auto_dispatch, dispatch_kinds, intake review or
@@ -337,13 +361,49 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
           continue;
         }
 
+        // File-overlap hold (HIVE-509). Two agents editing the same file land
+        // branches that conflict — or, worse, merge cleanly and contradict each
+        // other. The guess is coarse and it never blocks: an overlapping task is
+        // just moved behind the non-overlapping ones, and the tail below runs it
+        // anyway rather than let the project sit idle.
+        const scope = predictScope(db, task);
+        const clash = inFlightFor(task.project_id)
+          .map((peer) => ({ peer, files: scopeOverlap(scope, peer.scope) }))
+          .find((x) => x.files.length);
+        if (clash) {
+          noteOverlapHold(db, task.id, clash.peer, clash.files);
+          noteSkip(db, task.id, "file_overlap");
+          deferred.push({ task, scope });
+          continue;
+        }
+
         // Dispatchable: the reason (if any) is answered, so clear it before the
         // spawn — a task that starts must not keep a stale "why not" on the board.
         noteSkip(db, task.id, null);
-        if (!(await spawnFor(task))) return;
+        if (!(await spawnFor(task, scope))) return;
       } catch (e) {
         errors++;
         console.error(`[hive] dispatcher task ${task.id}:`, e);
+      }
+    }
+
+    // Nothing running and nothing dispatched, but work was held for overlap:
+    // run the first held task anyway. An idle fleet is strictly worse than a
+    // predicted conflict, and the prediction is a guess.
+    if (deferred.length && !herdrDown && workingFor(pid) === 0) {
+      const { task, scope } = deferred[0];
+      try {
+        writeEvent(db, {
+          task_id: task.id,
+          source: "dispatcher",
+          type: "dispatch_overlap_override",
+          payload: { note: "started despite a predicted file overlap — nothing else was dispatchable" },
+        });
+        noteSkip(db, task.id, null);
+        await spawnFor(task, scope);
+      } catch (e) {
+        errors++;
+        console.error(`[hive] dispatcher overlap override ${task.id}:`, e);
       }
     }
   };
@@ -360,7 +420,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   };
   for (const task of reattach) groupFor(task.project_id).reattach.push(task);
   for (const task of queued) groupFor(task.project_id).queued.push(task);
-  await Promise.all([...byProject.values()].map(dispatchProject));
+  await Promise.all([...byProject.entries()].map(([pid, g]) => dispatchProject(pid, g)));
   setSetting(db, "last_dispatch_at", now()); // cycle completed — refresh heartbeat
   console.log(
     `[hive] dispatcher run: duration_ms=${Date.now() - startedAt} steps=${queued.length} reattach=${reattach.length} errors=${errors} outcome=${errors > 0 ? "error" : "ok"}`
