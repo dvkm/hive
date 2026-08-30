@@ -158,8 +158,8 @@ async function gardenRepo(
     else report.active.push(item);
     // A worktree on a TERMINAL task's branch is pure disk: the commits stay on
     // the branch (which we keep unless the task is done), so removing the
-    // checkout can only lose uncommitted files — and a tracked-dirty tree is
-    // skipped below rather than removed.
+    // checkout can only lose uncommitted files — and a dirty tree (untracked
+    // files included) is skipped below rather than removed.
     const wtPath = item.worktree;
     if (wtPath && task && TERMINAL.includes(task.state as State)) {
       report.worktrees.push({
@@ -176,14 +176,17 @@ async function gardenRepo(
 
   // 1) worktrees first: a branch checked out anywhere cannot be deleted.
   for (const wt of report.worktrees) {
+    // Any porcelain line counts, `??` included: an untracked file can be work
+    // nobody has committed yet. Ignored build junk (node_modules) is not listed
+    // by --porcelain, so it never blocks. No --force either, so git's own
+    // dirty/locked checks stay as the backstop if the status read went wrong.
     const status = await exec(["git", "-C", wt.path, "status", "--porcelain"]);
-    const trackedDirty =
-      status.code === 0 && status.stdout.split("\n").some((l) => l.length > 0 && !l.startsWith("??"));
-    if (trackedDirty) {
-      report.skipped.push({ what: wt.path, reason: "uncommitted tracked changes" });
+    const dirty = status.code !== 0 || status.stdout.split("\n").some((l) => l.trim().length > 0);
+    if (dirty) {
+      report.skipped.push({ what: wt.path, reason: "uncommitted changes" });
       continue;
     }
-    const rm = await exec(["git", "-C", repo, "worktree", "remove", "--force", wt.path]);
+    const rm = await exec(["git", "-C", repo, "worktree", "remove", wt.path]);
     if (rm.code !== 0) {
       report.skipped.push({ what: wt.path, reason: `worktree remove failed: ${(rm.stderr || rm.stdout).trim().slice(0, 200)}` });
       continue;

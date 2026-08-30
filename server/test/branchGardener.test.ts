@@ -90,16 +90,27 @@ test("apply deletes done branches, removes terminal worktrees, keeps unlanded on
   expect(f.calls.some((c) => c.includes("push"))).toBe(false);
 });
 
-test("a tracked-dirty worktree is skipped, and its done branch with it", async () => {
+test.each([
+  [" M server/src/x.ts", "modified"],
+  ["?? server/src/new-file.ts", "untracked"],
+])("a dirty worktree (%s) is skipped, and its done branch with it", async (statusLine) => {
   const f = fixture();
   const exec: Exec = async (argv) => {
-    if (argv.includes("status")) return OK(" M server/src/x.ts");
+    if (argv.includes("status")) return OK(statusLine);
     return f.exec(argv);
   };
   const [r] = await gardenRepos(f.db, { exec, apply: true });
   expect(r.removed_worktrees).toEqual([]);
   expect(r.deleted_local).toEqual([`hive/${f.done}`]); // the one with no worktree
-  expect(r.skipped.map((s) => s.reason)).toContain("uncommitted tracked changes");
+  expect(r.skipped.map((s) => s.reason)).toContain("uncommitted changes");
+});
+
+test("worktree removal never forces", async () => {
+  const f = fixture();
+  await gardenRepos(f.db, { exec: f.exec, apply: true });
+  const removes = f.calls.filter((c) => c.includes("worktree") && c.includes("remove"));
+  expect(removes.length).toBe(2);
+  expect(removes.every((c) => !c.includes("--force"))).toBe(true);
 });
 
 test("--remote deletes only origin refs that exist, in one batched push", async () => {
