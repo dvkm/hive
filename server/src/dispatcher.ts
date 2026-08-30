@@ -20,6 +20,11 @@
 //     30m) so a broken repo never retry-storms; the task stays queued with the
 //     spawn_error event visible.
 //
+// Every one of those skips records WHY on the task itself (state.ts's noteSkip,
+// tasks.skip_reason) — written only when the reason changes, so a queue at rest
+// costs nothing. Before that, seven of the nine skip paths were silent and an
+// undispatchable task was indistinguishable from one about to start (HIVE-525).
+//
 // The actual spawn (worktree + agent start + events + queued->in_progress) is
 // the shared spawnAgent() core, so the auto path and the manual /spawn endpoint
 // behave identically.
@@ -36,7 +41,7 @@ import { isOffline, setSetting, getSetting, now } from "./db.ts";
 import { Herdr, herdr as defaultHerdr, isHerdrUnreachable } from "./runtime/herdr.ts";
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
-import { isSelfAuditLineage, unmetDeps, noteDependencyBlock } from "./state.ts";
+import { isSelfAuditLineage, unmetDeps, noteDependencyBlock, noteSkip } from "./state.ts";
 import { isTrackingOnlyTask } from "./supervision.ts";
 import { queuedSteers } from "./steer.ts";
 import { managingThreadForTask } from "./chat.ts";
@@ -142,7 +147,15 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     .query(`SELECT * FROM tasks WHERE agent_target IS NULL AND state IN ('in_progress','in_review','verifying') ORDER BY updated_at ASC`)
     .all()
     .map(parseTask)
-    .filter((t: any) => !isTrackingOnlyTask(t) && !["chat_supervisor", "pr-gardener-decision"].includes(t.source) && queuedSteers(db, t.id).length > 0);
+    .filter(
+      (t: any) =>
+        !isTrackingOnlyTask(t) &&
+        !["chat_supervisor", "pr-gardener-decision"].includes(t.source) &&
+        // Taken over by the director: the worktree is theirs until they hand it
+        // back, so a queued steer must not pull an agent back into it.
+        !t.parked_for_director &&
+        queuedSteers(db, t.id).length > 0
+    );
 
   let errors = 0;
   const projectCache = new Map<string, { repo_path: string | null; config: any } | null>();
@@ -253,9 +266,9 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     for (const task of group.queued) {
       if (herdrDown) return; // daemon down this cycle — stop, cooldown already set
       try {
-        if (task.source === "pr-gardener-decision") continue;
+        if (task.source === "pr-gardener-decision") { noteSkip(db, task.id, "gardener_decision"); continue; }
         const proj = getProject(task.project_id);
-        if (!proj?.repo_path) continue; // no repo -> can't spawn
+        if (!proj?.repo_path) { noteSkip(db, task.id, "no_repo_path"); continue; } // no repo -> can't spawn
         const cfg = proj.config ?? {};
         // A manager-created task is an explicit delegation from the director's
         // live supervisor, not unreviewed ambient intake. It dispatches even
@@ -265,28 +278,28 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         const managerDelegated = !!manager && !["done", "failed", "cancelled"].includes(manager.state);
         const gardenerTask = task.source === "pr-gardener";
         const scheduledSelfAudit = isSelfAuditLineage(db, task);
-        if (gardenerTask && cfg.pr_gardener?.enabled !== true) continue;
-        if (cfg.auto_dispatch !== true && !managerDelegated && !gardenerTask && !scheduledSelfAudit) continue;
+        if (gardenerTask && cfg.pr_gardener?.enabled !== true) { noteSkip(db, task.id, "gardener_disabled"); continue; }
+        if (cfg.auto_dispatch !== true && !managerDelegated && !gardenerTask && !scheduledSelfAudit) { noteSkip(db, task.id, "auto_dispatch_off"); continue; }
 
         const kinds = Array.isArray(cfg.dispatch_kinds) ? cfg.dispatch_kinds : DISPATCH_KINDS_DEFAULT;
         // A requeue is recovery for work already dispatched once (auto-requeue on
         // context-full/death, or the director's recovery card) — excluding chores
         // here stranded every requeued braindump in 'queued' forever ("failed —
         // awaiting triage" with a successor nobody spawns, task #135).
-        if (!kinds.includes(task.kind) && task.source !== "requeue" && !gardenerTask) continue; // chore / human-titled tasks excluded
+        if (!kinds.includes(task.kind) && task.source !== "requeue" && !gardenerTask) { noteSkip(db, task.id, "kind_excluded"); continue; } // chore / human-titled tasks excluded
 
-        if (task.source?.startsWith("intake_") && !isReviewed(db, task.id)) continue; // unreviewed intake
-        if (triageHold(db, task)) continue; // intake triage asked the director which reading to build
-        if (isTrackingOnlyTask(task)) continue; // tracking-only: never spawned
+        if (task.source?.startsWith("intake_") && !isReviewed(db, task.id)) { noteSkip(db, task.id, "intake_unreviewed"); continue; } // unreviewed intake
+        if (triageHold(db, task)) { noteSkip(db, task.id, "triage_hold"); continue; } // intake triage asked the director which reading to build
+        if (isTrackingOnlyTask(task)) { noteSkip(db, task.id, "tracking_only"); continue; } // tracking-only: never spawned
 
-        if (!hasCapacity(task, cfg)) continue;
+        if (!hasCapacity(task, cfg)) { noteSkip(db, task.id, "no_capacity"); continue; }
 
-        if (inBackoff(db, task.id, nowMs)) continue; // still cooling down after a spawn failure
+        if (inBackoff(db, task.id, nowMs)) { noteSkip(db, task.id, "spawn_backoff"); continue; } // still cooling down after a spawn failure
 
         // #989: the brief edits files that live in ANOTHER project's repo. The
         // open card is the visible reason; spawning here hands the agent a
         // worktree it cannot do the work in.
-        if (repoMismatchUnresolved(db, task.id)) continue;
+        if (repoMismatchUnresolved(db, task.id)) { noteSkip(db, task.id, "repo_mismatch"); continue; }
 
         // Dependency gate FIRST. A blocked task is skipped every lap for as long
         // as its blockers run, and authorize() writes an unconditional
@@ -297,6 +310,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         const blocking = unmetDeps(db, task);
         if (blocking.length) {
           noteDependencyBlock(db, task.id, blocking, "dispatcher");
+          noteSkip(db, task.id, "dependency_blocked");
           continue;
         }
 
@@ -306,8 +320,14 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
           target: task.title,
           task_id: task.id,
         });
-        if (authz.effect !== "allow") continue; // deny or require_decision blocks the auto-spawn
+        if (authz.effect !== "allow") { // deny or require_decision blocks the auto-spawn
+          noteSkip(db, task.id, authz.effect === "deny" ? "authority_denied" : "authority_decision");
+          continue;
+        }
 
+        // Dispatchable: the reason (if any) is answered, so clear it before the
+        // spawn — a task that starts must not keep a stale "why not" on the board.
+        noteSkip(db, task.id, null);
         if (!(await spawnFor(task))) return;
       } catch (e) {
         errors++;

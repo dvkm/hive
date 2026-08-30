@@ -277,6 +277,12 @@ export function eventText(e: EventLike): string {
       if (s(p.direction) === "inbound") return `Jira comment${at} from ${s(p.author) || "someone"}`;
       return `comment queued for Jira${at}`;
     }
+    case "taken_over":
+      return `you took the worktree over — the agent is parked and its slot is free`;
+    case "handed_back":
+      return s(p.summary)
+        ? `handed back to an agent, steered with what you changed`
+        : `handed back to an agent — nothing changed while you had it`;
     default: {
       const words = e.type.replace(/[_-]+/g, " ");
       const note = s(p.note);
