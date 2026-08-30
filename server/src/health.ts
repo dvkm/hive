@@ -11,11 +11,16 @@ import type { DB } from "./db.ts";
 import { getSetting, setSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { isSupervisedTask, neverDispatched } from "./supervision.ts";
-import { isDeferred, unmetDeps, TERMINAL, type State } from "./state.ts";
+import { isDeferred, unmetDeps, SKIP_REASONS, TERMINAL, type State } from "./state.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
 import { latestSidecar, latestSidecarBatch, type SidecarReport } from "./sidecar.ts";
+import { isReviewed } from "./dispatcher.ts";
 
 export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
+
+// Permanent skip reasons that are this TASK's problem, not a project setting —
+// the ones worth an attention item rather than just a label.
+const ATTENTION_SKIPS = new Set(["no_repo_path", "kind_excluded", "authority_denied"]);
 
 // Rows the reconciler writes about an agent, never by the agent. None of them
 // prove the agent is alive, so none of them may reset its silence clock.
@@ -116,6 +121,13 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
       ? db.query("SELECT ts FROM events WHERE task_id = ? AND type = 'dead_dependencies' ORDER BY ts DESC LIMIT 1").get(task.id) as { ts: string } | undefined
       : undefined;
     if (marker) return { status: "stuck", reason: "all blocking dependencies ended without completing", since: marker.ts };
+    // A dispatcher skip the task itself can never grow out of (HIVE-525): no
+    // repo, an excluded kind, an authority deny. Project-wide switches
+    // (auto_dispatch off, gardener off, tracking-only) are deliberate and shared
+    // by every queued task there, so they stay a visible label on the card and
+    // do NOT each raise an attention item.
+    if (task.skip_reason && ATTENTION_SKIPS.has(task.skip_reason))
+      return { status: "stuck", reason: SKIP_REASONS[task.skip_reason].label, since: task.skip_reason_at ?? task.updated_at };
   }
   if (!HEALTH_STATES.has(task.state)) return null;
   // Health is agent-derived, so it needs a bound agent — with one exception: a
@@ -289,7 +301,18 @@ export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null
   // board card and the review card can show it without fetching every event.
   // Pass a preloaded `sidecar` when enriching a list (see tasksWithHealth) so
   // this doesn't run one sidecar query per task.
-  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
+  // Intake tasks are held until reviewed (dispatcher.ts's isReviewed), and
+  // intake triage can mark one reviewed on its own — so the board needs the
+  // flag to know whether to say "unreviewed". Only intake tasks pay the query.
+  const reviewed = task.source?.startsWith("intake_") ? isReviewed(db, task.id) : undefined;
+  // Why the dispatcher last skipped this task, resolved to something a human can
+  // read (HIVE-525). `permanent` is the distinction that matters on the board:
+  // "not yet" (capacity, backoff, a blocker) versus "not ever until someone
+  // changes something". Only queued tasks can carry one.
+  const skip = task.skip_reason && SKIP_REASONS[task.skip_reason]
+    ? { reason: task.skip_reason, ...SKIP_REASONS[task.skip_reason], since: task.skip_reason_at ?? null }
+    : null;
+  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), reviewed, skip, sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
 }
 
 // Batched form of taskWithHealth for list endpoints (task HIVE-447): looks up

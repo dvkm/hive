@@ -8,7 +8,9 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-test-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb, setSetting } = await import("../src/db.ts");
-const { makeHandler } = await import("../src/api.ts");
+const { makeHandler, requeueTask } = await import("../src/api.ts");
+const { composeBrief } = await import("../src/briefs.ts");
+const { getTask } = await import("../src/state.ts");
 const { createThread } = await import("../src/chat.ts");
 import type { Fetcher } from "../src/monitors.ts";
 
@@ -111,6 +113,21 @@ test("health endpoint surfaces reconciler heartbeat and flips ok false once fail
   expect((await get("/api/health")).json.ok).toBe(true);
 });
 
+// HIVE-533: one transient failure pinned reconciler_last_error in settings, and
+// health published it beside consecutive_errors: 0 with no timestamp to tell a
+// live fault from a fossil. It cost real diagnosis time twice in one day.
+test("health never reports a current reconciler last_error beside a zero error streak (HIVE-533)", async () => {
+  setSetting(db, "last_reconcile_at", new Date().toISOString());
+  setSetting(db, "reconciler_error_streak", "0");
+  // A stale message left in settings by an older build must not surface.
+  setSetting(db, "reconciler_last_error", "linkPRs: ENOENT: no such file or directory, posix_spawn 'gh'");
+
+  const h = (await get("/api/health")).json;
+  expect(h.reconciler.consecutive_errors).toBe(0);
+  expect(h.reconciler.last_error).toBeNull();
+  expect(h.ok).toBe(true);
+});
+
 test("health endpoint exposes pty/session utilization once the reaper has counted", async () => {
   // Absent until the first pane sweep records a count.
   expect((await get("/api/health")).json.sessions).toBeNull();
@@ -165,6 +182,52 @@ test("agent-created task carries source + parent_task_id", async () => {
     parent_task_id: "nope",
   });
   expect(bad.status).toBe(400);
+});
+
+test("scheduler-owned self-audit source cannot be created through the task API", async () => {
+  for (const [title, source] of [["forged audit", "self-audit"], ["coerced forged audit", ["self-audit"]]] as const) {
+    const r = await post("/api/tasks", { project_id: projectId, title, source });
+    expect(r.status).toBe(400);
+    expect(db.query("SELECT 1 FROM tasks WHERE title = ?").get(title)).toBeNull();
+  }
+});
+
+test("only a scheduled self-audit ship can finish report-only", async () => {
+  const localDb = openDb(":memory:");
+  const localServer = Bun.serve({ port: 0, fetch: makeHandler(localDb) });
+  const localPost = async (path: string, body: unknown) => {
+    const res = await fetch(`http://127.0.0.1:${localServer.port}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, json: await res.json() };
+  };
+  try {
+    const project = await localPost("/api/projects", { name: "Hive", repo_path: "/repo" });
+    const { selfAuditOnce } = await import("../src/selfAudit.ts");
+    const audit = selfAuditOnce(localDb)!;
+    const normal = await localPost("/api/tasks", {
+      project_id: project.json.id,
+      title: "normal ship",
+      kind: "ship",
+    });
+    expect((await localPost(`/api/tasks/${normal.json.id}/transition`, { to: "in_progress" })).status).toBe(200);
+    expect((await localPost(`/api/tasks/${normal.json.id}/events`, { type: "evidence", kind: "report", note: "audit findings" })).status).toBe(201);
+    expect((await localPost(`/api/tasks/${audit}/transition`, { to: "in_progress" })).status).toBe(200);
+    expect((await localPost(`/api/tasks/${audit}/transition`, { to: "failed" })).status).toBe(200);
+    const retry = requeueTask(localDb, getTask(localDb, audit));
+    expect(composeBrief(localDb, retry)).toContain("emit `done` without changing code");
+    expect((await localPost(`/api/tasks/${retry}/transition`, { to: "in_progress" })).status).toBe(200);
+    expect((await localPost(`/api/tasks/${retry}/events`, { type: "evidence", kind: "report", note: "audit findings" })).status).toBe(201);
+
+    expect((await localPost(`/api/tasks/${normal.json.id}/events`, { type: "done" })).status).toBe(409);
+    const done = await localPost(`/api/tasks/${retry}/events`, { type: "done" });
+    expect(done.status).toBe(200);
+    expect(done.json.task).toMatchObject({ state: "done", kind: "ship", source: "requeue", pr_url: null });
+  } finally {
+    localServer.stop(true);
+  }
 });
 
 test("HIVE-299: follow-up task auto-depends on a parent whose PR hasn't merged yet", async () => {
@@ -933,8 +996,14 @@ test("decision: create, draft autosave, answer flow", async () => {
   const afterDraft = await get(`/api/decisions/${decisionId}`);
   expect(afterDraft.json.draft_note).toBe("leaning yes");
 
+  // A high-risk card refuses a caller that does not name itself as the
+  // director — an unattributed answer is not a human answer (HIVE-527).
+  const anon = await post(`/api/decisions/${decisionId}/answer`, { answer_key: "yes", answer_note: "go" });
+  expect(anon.status).toBe(403);
+  expect(anon.json.category).toBe("risk_high");
+
   // answer / submit
-  const ans = await post(`/api/decisions/${decisionId}/answer`, { answer_key: "yes", answer_note: "go" });
+  const ans = await post(`/api/decisions/${decisionId}/answer`, { answer_key: "yes", answer_note: "go", source: "director" });
   expect(ans.status).toBe(200);
   expect(ans.json.status).toBe("answered");
   expect(ans.json.answer_key).toBe("yes");

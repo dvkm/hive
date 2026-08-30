@@ -969,6 +969,49 @@ textarea { font-family: inherit; }
   color: var(--purple);
   border-color: rgba(155, 125, 214, 0.4);
 }
+/* Priority chip (HIVE-430). It IS the quick-set control: a bare <select>
+   painted as a chip. 'normal' is the default on nearly every task, so it stays
+   invisible until the card is hovered — set a priority and the chip shows. */
+.chip-prio {
+  appearance: none;
+  -webkit-appearance: none;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  text-transform: capitalize;
+}
+.prio-now {
+  color: var(--red);
+  border-color: rgba(239, 93, 107, 0.5);
+}
+.prio-next {
+  color: var(--amber);
+  border-color: rgba(226, 165, 66, 0.4);
+}
+.prio-later {
+  color: var(--text-dim);
+}
+.card .prio-normal {
+  opacity: 0;
+}
+.card:hover .prio-normal,
+.card .prio-normal:focus {
+  opacity: 1;
+}
+/* No hover to reveal it on touch, so keep it there, quietly. */
+@media (hover: none) {
+  .card .prio-normal {
+    opacity: 0.45;
+  }
+}
+/* The task page's priority row: always visible, with its label. */
+.task-prio {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
 .chip-deferred {
   color: var(--text-dim);
   border-color: var(--border);
@@ -6183,4 +6226,57 @@ a.chip-jira:hover { background: #2d5488; }
   margin: 0;
   font-size: 13px;
   color: var(--muted);
+}
+
+/* ---- away mode: topbar toggle, banner, held summary ---- */
+.away-toggle.away-on {
+  background: #5b6cff;
+  border-color: #5b6cff;
+  color: #f5f5f7;
+  font-weight: 700;
+}
+.away-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 24px;
+  background: rgba(91, 108, 255, 0.12);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 13px;
+  color: var(--text);
+}
+.away-banner-text {
+  font-weight: 500;
+}
+.away-held-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.away-held-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 13px;
+}
+.away-held-list li span:last-child {
+  margin-left: auto;
+  white-space: nowrap;
+}
+.dnote-wrap {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.dnote-wrap .dnote {
+  flex: 1;
+}
+.mic-btn.mic-on {
+  background: #d4a72c;
+  border-color: #d4a72c;
+  color: #1a1a1a;
 }

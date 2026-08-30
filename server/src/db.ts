@@ -642,6 +642,63 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
     name: "v38-events-type-task-index",
     statements: [`CREATE INDEX idx_events_type_task ON events(type, task_id, ts)`],
   },
+  // --track is retired (hive-1864): source='external' made a task hive could
+  // never dispatch and never spawn, silently, so 26 of them went nowhere. The
+  // parked ones become ordinary tasks deferred indefinitely — visible in the
+  // queue, skipped by the dispatcher, resumed with `hive emit <id> undefer`.
+  // Jira mirrors keep source='external' (source_ref 'jira:KEY' gates them on its
+  // own, and they are the healthy population). Both statements re-run safely:
+  // the park runs before the source clear, and once source is cleared the WHERE
+  // matches nothing.
+  {
+    name: "v39-retire-tracking-only-source",
+    statements: [
+      `UPDATE tasks SET deferred_until = '9999-12-31T00:00:00.000Z'
+         WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'
+           AND state NOT IN ('done', 'failed', 'cancelled') AND deferred_until IS NULL`,
+      `UPDATE tasks SET source = NULL
+         WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'`,
+    ],
+  },
+  // Why the dispatcher last skipped a queued task (HIVE-525). Seven of the nine
+  // `continue` paths in the queued loop used to be silent, so a task that could
+  // never run looked exactly like one about to start. Written only when the
+  // reason CHANGES (state.ts's noteSkip), so a steady-state queue costs one row
+  // update per transition, not one event per cycle.
+  {
+    name: "v40-task-skip-reason",
+    statements: [
+      `ALTER TABLE tasks ADD COLUMN skip_reason TEXT`,
+      `ALTER TABLE tasks ADD COLUMN skip_reason_at TEXT`,
+    ],
+  },
+  // Every resolved card must name who resolved it. 414 answered rows predate
+  // v19-decision-caller (which added answered_by), so their answerer is not
+  // merely unknown, it was never recorded — and a NULL is indistinguishable
+  // from a bug in a path that forgot to stamp the column. Name the gap
+  // explicitly instead: 'unattributed' means "resolved before hive tracked
+  // answerers", which is a fact, where NULL was a question. Expired rows get
+  // the same treatment. Both statements re-run safely (the WHERE stops
+  // matching once applied).
+  {
+    name: "v41-attribute-legacy-decisions",
+    statements: [
+      `UPDATE decisions SET answered_by = 'unattributed'
+         WHERE status IN ('answered', 'expired') AND answered_by IS NULL`,
+    ],
+  },
+  // Director take-over (HIVE-352). `parked_for_director` is the timestamp the
+  // director took the worktree over; `takeover_base` is the git commit that
+  // captured the tree at that moment, so hand-back can diff exactly what the
+  // director changed. The park itself reuses deferred_until (far-future), which
+  // is what already keeps the dispatcher and the stale-nudge sweep off a task.
+  {
+    name: "v42-task-director-takeover",
+    statements: [
+      `ALTER TABLE tasks ADD COLUMN parked_for_director TEXT`,
+      `ALTER TABLE tasks ADD COLUMN takeover_base TEXT`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings

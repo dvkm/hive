@@ -186,8 +186,9 @@ export function preferSafeRef(candidate: unknown, fallback: string): string {
 // Run `fn` over `items` with at most `limit` in flight, preserving input order
 // in the results. Used for the reconciler's per-task `gh` probes: serial calls
 // meant K stalled ones cost K timeouts, which is what turned 24-40s reconciler
-// laps into 175s+ ones (HIVE-438). Bounded, so a fleet of 40 PRs still can't
-// fork 40 `gh` processes at once.
+// laps into 175s+ ones (HIVE-438), and by the reviewer's per-pass and per-risk
+// fan-out (HIVE-523). Bounded, so a fleet of 40 PRs still can't fork 40 `gh`
+// processes at once, and a review backlog can't stampede the model API.
 export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const results = new Array<R>(items.length);
   let next = 0;

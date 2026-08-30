@@ -10,6 +10,7 @@ import { AttentionRows, BlockedByLine } from "./attention";
 import { CheckpointsInbox } from "./Checkpoints";
 import { UnderstandingQuiz } from "./UnderstandingQuiz";
 import { RequestChanges } from "./RequestChanges";
+import { HeldSummary } from "./Away";
 import { fmtUsd, fmtTokens } from "./Analytics";
 import { itemProject, orderFocusItems } from "../lib/needsYou";
 import type { NeedsYouItem } from "../lib/needsYou";
@@ -254,6 +255,8 @@ export default function Brief() {
           </button>
         ))}
       </div>
+
+      <HeldSummary />
 
       {data && actionCount === 0 && (
         <div className="brief-quiet">

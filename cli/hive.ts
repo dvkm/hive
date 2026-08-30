@@ -11,10 +11,10 @@ const USAGE = `hive — local orchestration control plane
 Usage:
   hive serve                              start the daemon
   hive task create --project <id> --title <t> [--brief <file> | --brief-text <s>]
-        [--kind ship|scout|chore] [--parent <task-id>] [--depends-on <id,id>] [--track]
+        [--kind ship|scout|chore] [--parent <task-id>] [--depends-on <id,id>]
         [--priority now|next|normal|later]
         (under a hive agent, HIVE_TASK_ID makes source=agent + parent automatic;
-         --track = tracking-only: never auto-dispatched, moves freely, no evidence gate)
+         to park a task instead, create it then run: hive emit <id> deferred)
         (priority is queue ORDER, never preemption. Omit it and the task inherits
          its parent's, or starts at 'next' when the brief is security-shaped,
          else 'normal'. Tasks created together in a depends-on chain do NOT
@@ -24,6 +24,10 @@ Usage:
   hive task move <task-id> <state> [--note <s>]   states: queued in_progress needs_decision
         in_review verifying done failed cancelled
   hive task list [--state <s>] [--project <id>]
+  hive task takeover <task-id> [--open]    park the agent and edit the worktree yourself
+        (frees the agent's slot; --open starts $VISUAL/$EDITOR on the checkout)
+  hive task handback <task-id> [--note <s>]   put an agent back on the same branch,
+        steered with a summary of what you changed while you had it
   hive task update <task-id> [--depends-on <id,id>] [--priority now|next|normal|later]
         --depends-on declares a dependency discovered mid-task
         (e.g. "my PR needs #993's to merge first"); full replace, so pass every
@@ -197,15 +201,16 @@ async function main() {
     if (sub === "create") {
       if (!flags.project) die("--project is required");
       if (!flags.title) die("--title is required");
+      // --track (source='external') is retired: it made tasks hive could never
+      // dispatch and never told anyone. Park work with `deferred` instead.
+      if (flags.track) die("--track is retired. Create the task, then park it: hive emit <id> deferred");
       const brief = flags.brief
         ? readFileSync(String(flags.brief), "utf8")
         : flags["brief-text"]
           ? String(flags["brief-text"])
           : undefined;
       // Running under a spawned agent (HIVE_TASK_ID set): attribute the task to
-      // the agent and default the parent to the spawning task. --track marks a
-      // tracking-only task (source='external'): never auto-dispatched, moves
-      // freely through states — hive as a kanban for OTHER agents' own work.
+      // the agent and default the parent to the spawning task.
       const agentTask = process.env.HIVE_TASK_ID;
       const t = await api("POST", "/api/tasks", {
         project_id: flags.project,
@@ -214,7 +219,7 @@ async function main() {
         kind: flags.kind,
         parent_task_id: flags.parent ?? agentTask ?? undefined,
         depends_on: flags["depends-on"] ? String(flags["depends-on"]) : undefined,
-        source: flags.track ? "external" : agentTask ? "agent" : undefined,
+        source: agentTask ? "agent" : undefined,
         priority: flags.priority ? String(flags.priority) : undefined,
       });
       console.log(`created task ${t.id}  [${t.state}]  ${t.title}`);
@@ -265,6 +270,37 @@ async function main() {
         priority: flags.priority ? String(flags.priority) : undefined,
       });
       console.log(`task ${t.id} depends_on: ${t.depends_on.length ? t.depends_on.join(", ") : "(none)"}  priority: ${t.priority}`);
+      return;
+    }
+    // Take the worktree over by hand, and hand it back when done (HIVE-352).
+    // `--open` starts $VISUAL/$EDITOR on the checkout; without it, the printed
+    // path is the whole point.
+    if (sub === "takeover") {
+      const taskId = _[0];
+      if (!taskId) die("usage: hive task takeover <task-id> [--open]");
+      const r = await api("POST", `/api/tasks/${taskId}/takeover`, {});
+      console.log(`${taskId} is yours — the agent is parked and its slot is free`);
+      console.log(`  worktree: ${r.worktree_path}`);
+      if (r.branch) console.log(`  branch:   ${r.branch}`);
+      console.log(`  hand it back with: hive task handback ${taskId}`);
+      const editor = flags.open ? process.env.VISUAL || process.env.EDITOR : null;
+      if (flags.open && !editor) console.log("  (no $VISUAL or $EDITOR set — open it yourself)");
+      else if (editor) Bun.spawn([editor, r.worktree_path], { stdout: "inherit", stderr: "inherit" });
+      return;
+    }
+    if (sub === "handback") {
+      const taskId = _[0];
+      if (!taskId) die('usage: hive task handback <task-id> [--note "<s>"]');
+      const r = await api("POST", `/api/tasks/${taskId}/handback`, { note: flags.note });
+      console.log(`${taskId} handed back${r.branch ? ` on ${r.branch}` : ""}`);
+      console.log(
+        r.summary === null
+          ? "  hive could not read the diff — the agent is told to check git itself"
+          : r.summary === ""
+            ? "  nothing changed while you had it"
+            : `  the agent's steer summarises:\n${r.summary.split("\n").map((l: string) => "    " + l).join("\n")}`
+      );
+      if (!r.steer_queued) console.log("  ⚠ the steer could not be queued — no agent will ever read it");
       return;
     }
     die(`unknown 'task' subcommand: ${sub}\n\n${USAGE}`);
