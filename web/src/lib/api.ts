@@ -139,6 +139,7 @@ export interface Task {
   spawn_error?: boolean; // list endpoint only; prior spawn failed and no spawn ever succeeded
   requeued_to?: string | null; // successor id when failed + auto-requeued
   review_actionable?: boolean; // in_review AND the director can act on it now (server-computed, HIVE-500)
+  skip?: { reason: string; label: string; permanent: boolean; since: string | null } | null; // queued only: why the dispatcher last skipped it
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
   reviewed?: boolean; // intake tasks only: the director (or intake triage) signalled it is free to dispatch
   created_at: string;

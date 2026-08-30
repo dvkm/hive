@@ -129,3 +129,22 @@ test("verifyRisks records why a check could not run", async () => {
   expect(payload.unverified).toBe(1);
   expect(payload.unverified_reason).toBe("exited 1: Not logged in - Please run /login");
 });
+
+// hive-1844: both live projects route hive's own `claude -p` calls through the
+// TeamClaude proxy, where `claude /login` on the host fixes nothing.
+test("the auth alert names the fix for the active route", async () => {
+  const { authAlertBody } = await import("../src/modelCall.ts");
+  const failure = "exited 1: Not logged in - Please run /login";
+
+  const proxied = authAlertBody(failure, "http://127.0.0.1:3456");
+  expect(proxied).toContain("teamclaude status");
+  expect(proxied).toContain("http://127.0.0.1:3456");
+  expect(proxied).not.toContain("Run `claude /login` on the hive host");
+
+  const direct = authAlertBody(failure, null);
+  expect(direct).toContain("Run `claude /login` on the hive host");
+  expect(direct).not.toContain("teamclaude");
+
+  // Both keep the truncated failure snippet.
+  for (const body of [proxied, direct]) expect(body).toContain(failure);
+});

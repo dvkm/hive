@@ -34,6 +34,7 @@ import {
   dependentsWedgedForDecision,
   resolveDependentsWedgedForDecision,
   queuedInputRecoveryPending,
+  isSelfAuditLineage,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
@@ -2019,12 +2020,14 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(body.project_id))
     return err("unknown project_id", 400);
   const kind = body.kind ?? "ship";
+  const source = body.source ? String(body.source) : null;
   if (!["ship", "scout", "chore"].includes(kind)) return err("invalid kind");
+  if (source === "self-audit") return err("source 'self-audit' is reserved for the scheduler", 400);
   // A tracking-only task starts life with no agent — that's the whole point
   // (see supervision.ts). Accepting a caller-supplied agent_target here would
   // let a fresh external task skip straight past the neverDispatched gate
   // spawnAgent enforces below.
-  if (body.source === "external" && body.agent_target)
+  if (source === "external" && body.agent_target)
     return err("external tasks cannot be created with an agent_target — they start tracking-only and are dispatched (if ever) via spawn", 400);
   // Agents may create follow-up tasks (source="agent", parent_task_id → the
   // spawning task); the dispatcher treats them like director-created tasks.
@@ -2032,7 +2035,7 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   const parentTask = parent ? getTask(db, parent) : null;
   if (parent && !parentTask) return err("unknown parent_task_id", 400);
   if (parentTask && isTrackingOnlyTask(parentTask)) return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
-  if (isTrackingOnlyTask({ source: body.source }) && body.agent_target)
+  if (isTrackingOnlyTask({ source }) && body.agent_target)
     return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
   const deps = parseDeps(db, body.depends_on);
   if (deps instanceof Response) return deps;
@@ -2050,7 +2053,7 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
     // one: an agent filing a follow-up under a director's 'now' task is not
     // granting itself anything, it is staying with work the director already
     // ranked.
-    const denied = authorizePriority(body.source, parsed);
+    const denied = authorizePriority(source, parsed);
     if (denied) return denied;
     priority = parsed;
   } else if (parentTask) {
@@ -2086,7 +2089,7 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
     pr_url: null,
     ci_status: null,
     summary: null,
-    source: body.source ? String(body.source) : null,
+    source,
     parent_task_id: parent,
     depends_on: deps.length ? JSON.stringify(deps) : null,
     verification_cmds: verifyCmds ? JSON.stringify(verifyCmds) : null,
@@ -5240,17 +5243,35 @@ export function requeueTask(db: DB, source: any): string {
   const resume = buildResumeSection(db, fresh);
   const priorBrief = stripPriorResumeSection(fresh.brief);
   const brief = resume ? [resume.text, priorBrief].join("\n").trim() : (priorBrief || null);
-  db.query(
-    `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, resume_branch, resume_ghost_branch, resume_pr_url, priority, created_at, updated_at)
-     VALUES (?,?,?,?, 'queued', ?, 'requeue', ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id, fresh.project_id, fresh.title, brief || null, fresh.kind, fresh.id,
-    resume?.branch ?? null, resume?.ghostBranch ?? null, resume?.prUrl ?? null,
-    // The successor IS the same work, so it keeps the original's place in the
-    // queue. Losing it would push a 'now' task to the back on every retry.
-    fresh.priority ?? "normal", t, t
-  );
+  // The Jira link MOVES to the successor, it is not copied (hive-1872). A failed
+  // row can never push a status (failed has no Jira meaning), so a link left
+  // behind strands the issue forever while the successor that actually finishes
+  // the work has nothing to close. Exactly one live task may own a key — the
+  // unique index on (jira_key, jira_link_kind) enforces it — so the predecessor
+  // is cleared first, in the same transaction as the insert.
+  const jiraKey = fresh.jira_link_kind === "subtask" ? fresh.jira_key ?? null : null;
+  db.transaction(() => {
+    if (jiraKey)
+      db.query("UPDATE tasks SET jira_key = NULL, jira_link_kind = NULL, updated_at = ? WHERE id = ?").run(t, fresh.id);
+    db.query(
+      `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, resume_branch, resume_ghost_branch, resume_pr_url, priority, jira_key, jira_link_kind, created_at, updated_at)
+       VALUES (?,?,?,?, 'queued', ?, 'requeue', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id, fresh.project_id, fresh.title, brief || null, fresh.kind, fresh.id,
+      resume?.branch ?? null, resume?.ghostBranch ?? null, resume?.prUrl ?? null,
+      // The successor IS the same work, so it keeps the original's place in the
+      // queue. Losing it would push a 'now' task to the back on every retry.
+      fresh.priority ?? "normal", jiraKey, jiraKey ? "subtask" : null, t, t
+    );
+  })();
   writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title: fresh.title, requeue_of: fresh.id } });
+  if (jiraKey)
+    writeEvent(db, {
+      task_id: id,
+      source: "reconciler",
+      type: "jira_link_moved",
+      payload: { issue: jiraKey, from_task_id: fresh.id },
+    });
   repointDependents(db, fresh.id, id, "reconciler");
   broadcastTask(db, getTask(db, id));
   // Re-broadcast the failed original: its earlier `failed` SSE frame predates
@@ -5473,7 +5494,13 @@ export function resolveRecoveryForDecision(db: DB, decisionId: string, answerKey
   if (!card) return false;
   if (answerKey !== "requeue") return true;
   const source = getTask(db, card.source_task_id);
-  if (source) requeueTask(db, source);
+  if (source) {
+    const newId = requeueTask(db, source);
+    // Every other requeue path writes this, and the board walks it forward to
+    // find the live successor. Without it a recovered task looks dead forever
+    // (hive-1872) even though its successor finished the work.
+    writeEvent(db, { task_id: source.id, source: "director", type: "requeued", payload: { new_task_id: newId, reason: "recovery decision" } });
+  }
   return true;
 }
 
@@ -5981,7 +6008,8 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     if (blocked) return blocked;
     if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });
     if (note) db.query("UPDATE tasks SET summary = ? WHERE id = ?").run(note, taskId);
-    const task = transition(db, taskId, "done", { source, reason: note ?? undefined });
+    const reportOnlySelfAudit = isSelfAuditLineage(db, t) && t.kind === "ship" && t.state === "in_progress" && !t.pr_url && evidenceCount(db, taskId, "report") > 0;
+    const task = transition(db, taskId, "done", { source, reason: note ?? undefined, force: reportOnlySelfAudit });
     return json({ task });
   }
 
