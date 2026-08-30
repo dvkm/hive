@@ -203,10 +203,14 @@ function reviewerHealth(db: DB): { parse_failure_streak: number } {
   return { parse_failure_streak: Number(getSetting(db, "reviewer_parse_failure_streak") ?? "0") };
 }
 function reconcilerHealth(db: DB): { last_run: string | null; stale: boolean; consecutive_errors: number; last_error: string | null } {
+  const errors = Number(getSetting(db, "reconciler_error_streak") ?? "0");
   return {
     ...loopLiveness(db, "last_reconcile_at", RECONCILE_STALE_MS),
-    consecutive_errors: Number(getSetting(db, "reconciler_error_streak") ?? "0"),
-    last_error: getSetting(db, "reconciler_last_error"),
+    consecutive_errors: errors,
+    // HIVE-533: last_error describes the CURRENT failure, so it only exists
+    // while the streak does. A message beside consecutive_errors: 0 reads as a
+    // live fault and sent two people chasing a bug that was already fixed.
+    last_error: errors > 0 ? getSetting(db, "reconciler_last_error") || null : null,
   };
 }
 

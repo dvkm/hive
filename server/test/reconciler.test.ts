@@ -1619,9 +1619,12 @@ test("reconcileOnce heartbeats last_reconcile_at and tracks a failing step's err
   await reconcileOnce(db, { exec: ghEnoent });
   expect(getSetting(db, "reconciler_error_streak")).toBe("2");
 
-  // A clean cycle (gh resolves again) resets the streak.
+  // A clean cycle (gh resolves again) resets the streak AND the message
+  // (HIVE-533: the message used to survive forever, so /api/health kept
+  // reporting a resolved fault as a current one).
   await reconcileOnce(db, { exec: stub(() => OK("[]")) });
   expect(getSetting(db, "reconciler_error_streak")).toBe("0");
+  expect(getSetting(db, "reconciler_last_error") ?? "").toBe("");
 });
 
 // task #1667: the same ENOENT no longer errors the cycle, so it would stop
