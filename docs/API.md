@@ -938,6 +938,39 @@ does not. A merge that actually fails drops out of the queue and the whole sweep
 raises ONE notification naming what stopped, so a broken PR is not retried every
 cycle.
 
+**Merges are single-flight per target branch (HIVE-348).** The edges decide who
+MAY land; the queue then lands them one at a time. Every caller goes through
+`mergeTask`, which takes a lock keyed on the repo plus the branch being merged
+into, so the land sweep, the reconciler's auto-merge, the PR gardener and the
+director's own click can never run two merges against one base at once — the
+race that once dropped a commit through a reset and re-merge. Independent repos
+and independent target branches still land in parallel. Everything that
+validates a merge (the PR metadata probe, the destructive-rebase guard, the
+live-head match, `beforeMutation`) runs inside the lock, so a queued merge
+validates against the base its predecessor just moved. The queue also re-reads
+the approved-to-land mark immediately before each merge, so unmarking a PR
+mid-sweep stops the merges still waiting behind the one in flight.
+
+### Divergence radar (HIVE-348)
+
+Conflicts used to surface at merge time, after a review was already done. This
+shows them while the work is still in flight.
+
+- `GET /api/tasks/divergence[?project=<id>]` → `200 {projects: [{project_id, base, rows}], rows}`.
+  Rows cover every task in `in_progress`, `in_review` or `needs_decision` that
+  has a branch. Each row is `{id, number, title, state, branch, behind, files,
+  overlaps}`: `behind` is `git rev-list --count <branch>..<base>` (commits the
+  target branch has that this one does not, `null` when git could not tell,
+  never 0), `files` is how many files the branch authors, and `overlaps` lists
+  the sibling branches touching the same files as `{task_id, number, files}`
+  (capped at 5 files, symmetric so each side sees the other). Overlap reuses the
+  land graph's own detector (`authoredFiles`), not a second one. Nothing is
+  stored, and a project with no `repo_path` returns no rows without shelling out.
+
+  The board shows this as two chips on in-flight cards: "N behind" (only from 5
+  commits behind, since every branch in an active repo trails by one or two) and
+  "same files as DEMO-2", whose tooltip names the shared files.
+
 - `POST /api/tasks/:id/merge` body `{merge_strategy?: "local_ff", override_destructive_check?: boolean, actor?}` → `200 Task` (now `verifying`) | `409` (not `in_review`, missing/unpassed understanding check on a kind outside `config.auto_merge.kinds`, or the merge failed: conflict / not a fast-forward / gh refused / **destructive auto-rebase**) | `403` (denied by a `task.merge` authority rule) | `404` | `400` (local merge but no `repo_path`/`branch`). The optional director `actor` is recorded on `merged`, `merge_failed`, and `merge_blocked_destructive` events.
   Approve & merge. When `pr_url` is set: `gh pr merge <url> <method>` where
   `method` is the project's `config.merge_method` (`squash` default, or `merge` /
