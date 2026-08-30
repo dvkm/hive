@@ -10,6 +10,7 @@ const { openDb } = await import("../src/db.ts");
 const { makeHandler, repairDuplicateQuizPasses } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { writeEvent } = await import("../src/state.ts");
+const { reviewActionable, reviewActionableBatch } = await import("../src/reviewer.ts");
 const { parseUnifiedDiff, taskDiff, MAX_DIFF_LINES } = await import("../src/diff.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -1157,6 +1158,13 @@ test("brief.to_review counts only reviews the director can act on", async () => 
   expect(ids(b.json.to_review)).toEqual([noPrReport, ready].sort());
   // Everything else stays visible, just uncounted.
   expect(ids(b.json.in_review_pending)).toEqual([noReview, staleReview, unverified, noPrNoReport, redCi].sort());
+
+  // The batched rule the list endpoints use must agree with the single-task one
+  // on every bucket, or a board card and its brief row would disagree.
+  const rows = s.db.query("SELECT * FROM tasks").all() as any[];
+  const batch = reviewActionableBatch(s.db, rows);
+  for (const t of rows) expect(batch.has(t.id)).toBe(reviewActionable(s.db, t));
+
   s.server.stop(true);
 });
 
