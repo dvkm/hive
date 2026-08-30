@@ -262,7 +262,9 @@ const devOverlay = async (page) => {
       text: (document.body?.innerText || "").trim().length,
       media: [...document.querySelectorAll("img, svg, canvas, video")].filter((el) => {
         const box = el.getBoundingClientRect();
-        return box.width > 8 && box.height > 8;
+        if (box.width <= 8 || box.height <= 8) return false;
+        const style = getComputedStyle(el);
+        return style.visibility === "visible" && Number(style.opacity) > 0;
       }).length,
     }))
     .catch(() => null);`;
