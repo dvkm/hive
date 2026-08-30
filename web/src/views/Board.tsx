@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
-import type { Health, Kind, LandGraph, State, Task } from "../lib/api";
+import type { DivergenceRow, Health, Kind, LandGraph, State, Task } from "../lib/api";
 import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, PRIORITIES, PriorityChip, priorityRank, SidecarChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
@@ -162,6 +162,17 @@ export function Card({ task }: { task: Task }) {
             ⚠ spawn failed
           </span>
         )}
+        {/* Why this queued task is not running (HIVE-525). A permanent reason is
+            the loud one: nothing changes until a human changes a setting. */}
+        {task.state === "queued" && task.skip && task.skip.reason !== "dependency_blocked" && (
+          <span
+            className={task.skip.permanent ? "chip chip-error" : "chip"}
+            title={`Dispatcher skipped this task: ${task.skip.label}`}
+          >
+            {task.skip.permanent ? "won't run · " : "waiting · "}
+            {task.skip.label}
+          </span>
+        )}
         <SidecarChip sidecar={task.sidecar} />
         <BlockedBy depends_on={task.depends_on} tasks={tasks} />
         {task.deferred_until && Date.parse(task.deferred_until) > Date.now() && (
@@ -269,6 +280,51 @@ export const queueOrder = (list: Task[]): Task[] =>
     (a, b) => priorityRank(a.priority) - priorityRank(b.priority) || a.created_at.localeCompare(b.created_at)
   );
 
+// ---- divergence radar (HIVE-348) ----------------------------------------
+// Conflicts used to appear at merge time, after a review was already done. This
+// shows them while the work is still in flight: how far a branch trails the
+// branch it will land on, and which files it shares with a sibling branch. Same
+// file-overlap detector the land queue uses, read one step earlier.
+function useDivergence(signature: string, project: string): DivergenceRow[] {
+  const [rows, setRows] = useState<DivergenceRow[]>([]);
+  useEffect(() => {
+    api.divergence(project || undefined).then((r) => setRows(r.rows)).catch(() => {});
+  }, [signature, project]);
+  return rows;
+}
+
+// A branch is always a commit or two behind an active base; saying so on every
+// card would be noise, not signal. Only a real drift earns a chip.
+const BEHIND_CHIP_MIN = 5;
+
+export function DivergenceChips({ task, rows, tasks }: { task: Task; rows: DivergenceRow[]; tasks: Task[] }) {
+  const row = rows.find((r) => r.id === task.id);
+  if (!row) return null;
+  const behind = row.behind ?? 0;
+  const name = (id: string, number: number) => {
+    const t = tasks.find((x) => x.id === id);
+    return t ? taskLabel(t) : `#${number}`;
+  };
+  if (behind < BEHIND_CHIP_MIN && !row.overlaps.length) return null;
+  return (
+    <div className="card-meta card-land">
+      {behind >= BEHIND_CHIP_MIN && (
+        <span className="chip chip-blocked" title={`'${row.branch}' is missing ${behind} commits that are already on the branch it lands on. Rebase before review.`}>
+          {behind} behind
+        </span>
+      )}
+      {row.overlaps.length > 0 && (
+        <span
+          className="chip chip-blocked"
+          title={row.overlaps.map((o) => `${name(o.task_id, o.number)}: ${o.files.join(", ")}`).join("\n")}
+        >
+          same files as {row.overlaps.map((o) => name(o.task_id, o.number)).join(", ")}
+        </span>
+      )}
+    </div>
+  );
+}
+
 const BANNER_DISMISS_KEY = "hive.brief.bannerDismissed";
 
 // Slim, dismissible banner nudging the director to Needs you when there are
@@ -334,6 +390,14 @@ export default function Board() {
   // only meaningful between two PRs that are both still open.
   const reviewIds = visible.filter((t) => t.state === "in_review").map((t) => t.id).sort().join(",");
   const landGraph = useLandGraph(reviewIds, projectFilter);
+  // The radar covers every branch still moving, so it refetches when the set of
+  // in-flight cards changes, not just the review column.
+  const inFlightIds = visible
+    .filter((t) => t.state === "in_progress" || t.state === "in_review" || t.state === "needs_decision")
+    .map((t) => t.id)
+    .sort()
+    .join(",");
+  const divergence = useDivergence(inFlightIds, projectFilter);
   const toggleLand = (id: string) => setLandSel((sel) => (sel.includes(id) ? sel.filter((x) => x !== id) : [...sel, id]));
   const queueLand = async () => {
     try {
@@ -431,10 +495,14 @@ export default function Board() {
                         <div className="land-card">
                           <Card task={t} />
                           <LandChips task={t} graph={landGraph} tasks={visible} />
+                          <DivergenceChips task={t} rows={divergence} tasks={visible} />
                         </div>
                       </div>
                     ) : (
-                      <Card key={t.id} task={t} />
+                      <div key={t.id}>
+                        <Card task={t} />
+                        <DivergenceChips task={t} rows={divergence} tasks={visible} />
+                      </div>
                     )
                   )}
                   {list.length === 0 && <Empty compact {...COL_EMPTY[state]} />}

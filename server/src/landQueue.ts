@@ -13,8 +13,10 @@
 //              only ONE of a conflicting pair lands per sweep; the other waits
 //              for its agent to rebase.
 //
-// Everything else lands in the same sweep — independent PRs never queue behind
-// each other. `from` lands BEFORE `to` on every edge.
+// Everything else lands in the same sweep — independent PRs never wait a whole
+// sweep for each other. `from` lands BEFORE `to` on every edge. Within a sweep
+// the merges themselves are SERIAL (HIVE-348): edges decide who may land, and
+// the queue then lands them one at a time so no two merges race on one base.
 import type { DB } from "./db.ts";
 import { now } from "./db.ts";
 import { getTask, writeEvent, changesRequestUnaddressed } from "./state.ts";
@@ -403,7 +405,7 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
           continue;
         }
         // Red or still-running CI holds only this node. Independent nodes can
-        // still enter the same concurrent batch.
+        // still enter the same batch (they land one after another, not at once).
         if (n.ci_status === "failing" || n.ci_status === "pending") continue;
         // A pause card already waiting on the director holds the task too —
         // otherwise every sweep would re-attempt and re-ask the same question.
@@ -443,8 +445,22 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
       }
       if (!batch.length) break;
 
-      const results = await Promise.all(batch.map(async (node) => ({ node, result: await merge(node.id) })));
-      for (const { node, result } of results) {
+      // Land ONE AT A TIME (HIVE-348). These branches don't touch the same
+      // files, so merging them together looked safe — but each merge moves the
+      // base under the next one, and two `gh pr merge` calls racing on one base
+      // is how a commit once vanished. mergeTask re-reads the PR's live base and
+      // head on every call, so landing serially means each merge is validated
+      // against the base the previous one just created. It also re-reads the
+      // mark first: a director unmarking mid-sweep must stop the merges still
+      // queued behind the one in flight.
+      for (const node of batch) {
+        const stillMarked = (db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(node.id) as { land_queued_at: string | null } | undefined)
+          ?.land_queued_at;
+        if (!stillMarked) {
+          pending.delete(node.id);
+          continue;
+        }
+        const result = await merge(node.id);
         pending.delete(node.id);
         const reason = result.reason ?? "merge failed";
         // Waiting on the director's quiz answer: hold quietly, log nothing. A

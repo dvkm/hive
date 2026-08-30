@@ -102,6 +102,8 @@ import type { AwayConfig } from "./away.ts";
 import { taskDiff } from "./diff.ts";
 import { authoredFiles, captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { landGraph, markLand, resolveLandPauseForDecision } from "./landQueue.ts";
+import { withMergeLock } from "./mergeLock.ts";
+import { divergence } from "./divergence.ts";
 import { followServingBranch, resolveServingFollowForDecision } from "./servingBranch.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
@@ -516,6 +518,15 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         const projects = projectId ? [{ id: projectId }] : activeProjects(db).map((p) => ({ id: p.id }));
         const graphs = await Promise.all(projects.map((p) => landGraph(db, p.id, deps.exec ?? defaultExec)));
         return json({ nodes: graphs.flatMap((g) => g.nodes), edges: graphs.flatMap((g) => g.edges) });
+      }
+      // GET /api/tasks/divergence?project=<id> — the board's divergence radar:
+      // for every branch still being worked on, how far behind the target
+      // branch it is and which files it shares with a sibling branch.
+      if (pathname === "/api/tasks/divergence" && method === "GET") {
+        const projectId = url.searchParams.get("project");
+        const projects = projectId ? [{ id: projectId }] : activeProjects(db).map((p) => ({ id: p.id }));
+        const results = await Promise.all(projects.map((p) => divergence(db, p.id, deps.exec ?? defaultExec)));
+        return json({ projects: results, rows: results.flatMap((r) => r.rows) });
       }
       // Duplicate CLUSTERS among current non-terminal tasks (backfill/UI). Must
       // precede the /:id route so "duplicates" isn't parsed as a task id.
@@ -3075,7 +3086,44 @@ async function mergedFileList(
 // the local ff before bouncing the task back to the agent (rebasing onto a
 // stale origin/<base> would only make things worse).
 // Guarded by the `task.merge` standing-authority action.
+//
+// Merges are SINGLE-FLIGHT per target branch (HIVE-348). The land queue, the
+// reconciler's auto-merge, the PR gardener and the director's click all land
+// through here, and two of them running at once against one base is the race
+// that once dropped a commit. The lock key is the repo plus the branch being
+// merged into, so independent repos and independent target branches still land
+// in parallel. Everything that validates the merge — the PR probe, the
+// destructive-rebase guard, the live head match, `beforeMutation` — runs inside
+// the lock, so a queued merge re-validates against the base its predecessor
+// just moved instead of the base it saw when it started waiting.
 export async function mergeTask(
+  db: DB,
+  herdr: Herdr,
+  id: string,
+  body: any,
+  deps: HandlerDeps,
+  opts: { beforeMutation?: () => boolean } = {}
+): Promise<Response> {
+  return withMergeLock(mergeLockKey(db, id), () => mergeTaskLocked(db, herdr, id, body, deps, opts));
+}
+
+// The branch this task's merge lands on, qualified by the repo that owns it.
+// Read before the lock so waiters queue on the right key; mergeTaskLocked
+// re-reads the PR's live base inside the lock and may land on a different
+// branch than the project default, which is why this is a lock key and not a
+// merge decision.
+function mergeLockKey(db: DB, id: string): string {
+  const task = getTask(db, id);
+  if (!task) return `task:${id}`;
+  const project: any = db.query("SELECT repo_path, config FROM projects WHERE id = ?").get(task.project_id);
+  let base = "";
+  try {
+    base = projectBaseBranch(JSON.parse(project?.config ?? "{}"));
+  } catch {}
+  return `${project?.repo_path || task.project_id}#${base}`;
+}
+
+async function mergeTaskLocked(
   db: DB,
   herdr: Herdr,
   id: string,
@@ -5240,17 +5288,35 @@ export function requeueTask(db: DB, source: any): string {
   const resume = buildResumeSection(db, fresh);
   const priorBrief = stripPriorResumeSection(fresh.brief);
   const brief = resume ? [resume.text, priorBrief].join("\n").trim() : (priorBrief || null);
-  db.query(
-    `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, resume_branch, resume_ghost_branch, resume_pr_url, priority, created_at, updated_at)
-     VALUES (?,?,?,?, 'queued', ?, 'requeue', ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id, fresh.project_id, fresh.title, brief || null, fresh.kind, fresh.id,
-    resume?.branch ?? null, resume?.ghostBranch ?? null, resume?.prUrl ?? null,
-    // The successor IS the same work, so it keeps the original's place in the
-    // queue. Losing it would push a 'now' task to the back on every retry.
-    fresh.priority ?? "normal", t, t
-  );
+  // The Jira link MOVES to the successor, it is not copied (hive-1872). A failed
+  // row can never push a status (failed has no Jira meaning), so a link left
+  // behind strands the issue forever while the successor that actually finishes
+  // the work has nothing to close. Exactly one live task may own a key — the
+  // unique index on (jira_key, jira_link_kind) enforces it — so the predecessor
+  // is cleared first, in the same transaction as the insert.
+  const jiraKey = fresh.jira_link_kind === "subtask" ? fresh.jira_key ?? null : null;
+  db.transaction(() => {
+    if (jiraKey)
+      db.query("UPDATE tasks SET jira_key = NULL, jira_link_kind = NULL, updated_at = ? WHERE id = ?").run(t, fresh.id);
+    db.query(
+      `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, resume_branch, resume_ghost_branch, resume_pr_url, priority, jira_key, jira_link_kind, created_at, updated_at)
+       VALUES (?,?,?,?, 'queued', ?, 'requeue', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id, fresh.project_id, fresh.title, brief || null, fresh.kind, fresh.id,
+      resume?.branch ?? null, resume?.ghostBranch ?? null, resume?.prUrl ?? null,
+      // The successor IS the same work, so it keeps the original's place in the
+      // queue. Losing it would push a 'now' task to the back on every retry.
+      fresh.priority ?? "normal", jiraKey, jiraKey ? "subtask" : null, t, t
+    );
+  })();
   writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title: fresh.title, requeue_of: fresh.id } });
+  if (jiraKey)
+    writeEvent(db, {
+      task_id: id,
+      source: "reconciler",
+      type: "jira_link_moved",
+      payload: { issue: jiraKey, from_task_id: fresh.id },
+    });
   repointDependents(db, fresh.id, id, "reconciler");
   broadcastTask(db, getTask(db, id));
   // Re-broadcast the failed original: its earlier `failed` SSE frame predates
@@ -5473,7 +5539,13 @@ export function resolveRecoveryForDecision(db: DB, decisionId: string, answerKey
   if (!card) return false;
   if (answerKey !== "requeue") return true;
   const source = getTask(db, card.source_task_id);
-  if (source) requeueTask(db, source);
+  if (source) {
+    const newId = requeueTask(db, source);
+    // Every other requeue path writes this, and the board walks it forward to
+    // find the live successor. Without it a recovered task looks dead forever
+    // (hive-1872) even though its successor finished the work.
+    writeEvent(db, { task_id: source.id, source: "director", type: "requeued", payload: { new_task_id: newId, reason: "recovery decision" } });
+  }
   return true;
 }
 
