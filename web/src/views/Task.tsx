@@ -7,7 +7,7 @@ import { RequestChanges } from "./RequestChanges";
 import type { Decision, Evidence, JiraTaskState, TaskDetail, UsageTotals } from "../lib/api";
 import { useStore } from "../lib/store";
 import { splitAttachments } from "../lib/attachments";
-import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, NEXT, PriorityChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { ReviewAudit, ReviewCard, ReviewUnderstanding } from "./ReviewCard";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
@@ -734,6 +734,9 @@ export function TaskBody({ id }: { id: string }) {
               {project && <span className="chip">{project.name}</span>}
               <span className={`chip chip-kind chip-${t.kind}`}>{t.kind}</span>
               <span className="chip">{STATE_LABEL[t.state]}</span>
+              <span className="task-prio">
+                Priority <PriorityChip task={t} />
+              </span>
               {/* At a glance: this row IS a Jira ticket, and one click opens it.
                   The link used to be plain text buried in the brief. */}
               {(isJira || t.jira_key) && (

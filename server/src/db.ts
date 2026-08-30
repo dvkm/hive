@@ -672,13 +672,28 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       `ALTER TABLE tasks ADD COLUMN skip_reason_at TEXT`,
     ],
   },
+  // Every resolved card must name who resolved it. 414 answered rows predate
+  // v19-decision-caller (which added answered_by), so their answerer is not
+  // merely unknown, it was never recorded — and a NULL is indistinguishable
+  // from a bug in a path that forgot to stamp the column. Name the gap
+  // explicitly instead: 'unattributed' means "resolved before hive tracked
+  // answerers", which is a fact, where NULL was a question. Expired rows get
+  // the same treatment. Both statements re-run safely (the WHERE stops
+  // matching once applied).
+  {
+    name: "v41-attribute-legacy-decisions",
+    statements: [
+      `UPDATE decisions SET answered_by = 'unattributed'
+         WHERE status IN ('answered', 'expired') AND answered_by IS NULL`,
+    ],
+  },
   // Director take-over (HIVE-352). `parked_for_director` is the timestamp the
   // director took the worktree over; `takeover_base` is the git commit that
   // captured the tree at that moment, so hand-back can diff exactly what the
   // director changed. The park itself reuses deferred_until (far-future), which
   // is what already keeps the dispatcher and the stale-nudge sweep off a task.
   {
-    name: "v41-task-director-takeover",
+    name: "v42-task-director-takeover",
     statements: [
       `ALTER TABLE tasks ADD COLUMN parked_for_director TEXT`,
       `ALTER TABLE tasks ADD COLUMN takeover_base TEXT`,

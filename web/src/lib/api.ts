@@ -198,7 +198,10 @@ export interface Decision {
   answered_at: string | null;
   // Who answered (audit trail). director when the director clicked in the inbox;
   // chat_supervisor/agent/system for programmatic callers; unknown if unattributed.
-  answered_by: "director" | "chat_supervisor" | "agent" | "system" | "unknown" | null;
+  // "reconciler" on a card the system expired, "unattributed" on a card
+  // resolved before hive recorded answerers at all (everything before
+  // 2026-07-22). null only ever appears on an open card.
+  answered_by: "director" | "chat_supervisor" | "agent" | "system" | "unknown" | "reconciler" | "unattributed" | null;
   answered_actor: string | null;
   // Set on cards no automation may answer — today only "intake_triage", the
   // "which reading should we build?" card raised by intake triage.
@@ -542,6 +545,20 @@ export interface BranchCheck {
 export interface LandGraph {
   nodes: { id: string; number: number; project_number: number | null; title: string; land_queued_at: string | null }[];
   edges: { from: string; to: string; kind: "depends" | "conflict"; files?: string[] }[];
+}
+
+// The divergence radar (server/src/divergence.ts): for every branch still being
+// worked on, how far it trails the branch it will land on and which files it
+// shares with a sibling branch. `behind: null` means git could not tell.
+export interface DivergenceRow {
+  id: string;
+  number: number;
+  title: string;
+  state: State;
+  branch: string;
+  behind: number | null;
+  files: number;
+  overlaps: { task_id: string; number: number; files: string[] }[];
 }
 
 // One global-search hit. task_state/project_id are present only for task hits.
@@ -924,11 +941,11 @@ export const api = {
     const qs = p.toString();
     return req<{ evidence: EvidenceRow[] }>(`/api/evidence${qs ? "?" + qs : ""}`);
   },
-  createTask: (b: { project_id: string; title: string; brief?: string; kind?: Kind }, files?: File[]) =>
+  createTask: (b: { project_id: string; title: string; brief?: string; kind?: Kind; priority?: string }, files?: File[]) =>
     req<Task>(`/api/tasks`, { method: "POST", body: bodyFor(b, files) }),
   intake: (b: { project_id: string; text: string }) =>
     req<{ ok: boolean; task: Task }>(`/api/intake`, { method: "POST", body: JSON.stringify(b) }),
-  updateTask: (id: string, b: { title?: string; brief?: string }, files?: File[]) =>
+  updateTask: (id: string, b: { title?: string; brief?: string; priority?: string }, files?: File[]) =>
     req<Task>(`/api/tasks/${id}`, { method: "PUT", body: bodyFor(b, files) }),
   brief: (id: string) => req<{ task_id: string; brief: string }>(`/api/tasks/${id}/brief`),
   transition: (id: string, to: State, reason?: string) =>
@@ -983,6 +1000,8 @@ export const api = {
     req<{ clusters: { project_id: string; tasks: Pick<Task, "id" | "title" | "project_id" | "state">[] }[] }>(`/api/tasks/duplicates`),
   diff: (id: string) => req<DiffResult>(`/api/tasks/${id}/diff`),
   landGraph: (project?: string) => req<LandGraph>(`/api/tasks/land-graph${project ? `?project=${project}` : ""}`),
+  divergence: (project?: string) =>
+    req<{ rows: DivergenceRow[] }>(`/api/tasks/divergence${project ? `?project=${project}` : ""}`),
   landQueue: (task_ids: string[], queued = true) =>
     req<{ changed: string[]; queued: boolean }>(`/api/tasks/land-queue`, {
       method: "POST",

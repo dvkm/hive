@@ -417,9 +417,24 @@ rev-parse HEAD` in the CLI's cwd. The review card compares it to the task's
 array; render the `recommended: true` option first per product rule 3.
 `draft_note` is the server-side autosaved draft. A decision is `expired` once it
 was dismissed, or its task went terminal (`done`/`failed`/`cancelled`) — expired
-cards leave the inbox and can no longer be answered. `answered_by` is the caller
-identity recorded on answer (`director|chat_supervisor|agent|system|unknown`) and
-`answered_actor` an optional free label; both are `null` until the card is answered.
+cards leave the inbox and can no longer be answered. `answered_by` names who
+resolved the card and is never null once it leaves `open`: the caller identity on
+answer (`director|chat_supervisor|agent|system|unknown`), `director` or
+`reconciler` on a dismissal, `system` on a task-terminal expiry, and
+`unattributed` on the 414 legacy rows resolved before hive recorded answerers at
+all (everything before 2026-07-22). `answered_actor` is an optional free label.
+
+**A high-risk card is only ever answered by the director.** `POST
+/api/decisions/:id/answer` returns `403 {"effect":"escalate","category":"risk_high"}`
+for any other `source`, including a bare call with no `source` (which is
+`unknown`, not the director). The one exception is a `deny` on a pending
+standing-authority grant: refusing an unexecuted command is fail-closed and stops
+the work rather than releasing it. The timeout sweep
+(`decision_auto_answer_hours`) never answers a high-risk card either; past the
+window it writes one `decision_escalated` event and raises one urgent
+notification, and the card stays open. Risk is matched on the leading level word,
+so a `risk` field that reads `"high — leaked prod key"` counts as high, and free
+prose with no level word at all is treated as high rather than auto-answerable.
 
 `bundle` is server-**derived** (never stored) context attached to each card as
 it's returned, so the director can decide in one pass without opening the task:
@@ -965,6 +980,39 @@ Failing or pending CI holds a task in the queue; `unavailable` (no CI at all)
 does not. A merge that actually fails drops out of the queue and the whole sweep
 raises ONE notification naming what stopped, so a broken PR is not retried every
 cycle.
+
+**Merges are single-flight per target branch (HIVE-348).** The edges decide who
+MAY land; the queue then lands them one at a time. Every caller goes through
+`mergeTask`, which takes a lock keyed on the repo plus the branch being merged
+into, so the land sweep, the reconciler's auto-merge, the PR gardener and the
+director's own click can never run two merges against one base at once — the
+race that once dropped a commit through a reset and re-merge. Independent repos
+and independent target branches still land in parallel. Everything that
+validates a merge (the PR metadata probe, the destructive-rebase guard, the
+live-head match, `beforeMutation`) runs inside the lock, so a queued merge
+validates against the base its predecessor just moved. The queue also re-reads
+the approved-to-land mark immediately before each merge, so unmarking a PR
+mid-sweep stops the merges still waiting behind the one in flight.
+
+### Divergence radar (HIVE-348)
+
+Conflicts used to surface at merge time, after a review was already done. This
+shows them while the work is still in flight.
+
+- `GET /api/tasks/divergence[?project=<id>]` → `200 {projects: [{project_id, base, rows}], rows}`.
+  Rows cover every task in `in_progress`, `in_review` or `needs_decision` that
+  has a branch. Each row is `{id, number, title, state, branch, behind, files,
+  overlaps}`: `behind` is `git rev-list --count <branch>..<base>` (commits the
+  target branch has that this one does not, `null` when git could not tell,
+  never 0), `files` is how many files the branch authors, and `overlaps` lists
+  the sibling branches touching the same files as `{task_id, number, files}`
+  (capped at 5 files, symmetric so each side sees the other). Overlap reuses the
+  land graph's own detector (`authoredFiles`), not a second one. Nothing is
+  stored, and a project with no `repo_path` returns no rows without shelling out.
+
+  The board shows this as two chips on in-flight cards: "N behind" (only from 5
+  commits behind, since every branch in an active repo trails by one or two) and
+  "same files as DEMO-2", whose tooltip names the shared files.
 
 - `POST /api/tasks/:id/merge` body `{merge_strategy?: "local_ff", override_destructive_check?: boolean, actor?}` → `200 Task` (now `verifying`) | `409` (not `in_review`, missing/unpassed understanding check on a kind outside `config.auto_merge.kinds`, or the merge failed: conflict / not a fast-forward / gh refused / **destructive auto-rebase**) | `403` (denied by a `task.merge` authority rule) | `404` | `400` (local merge but no `repo_path`/`branch`). The optional director `actor` is recorded on `merged`, `merge_failed`, and `merge_blocked_destructive` events.
   Approve & merge. When `pr_url` is set: `gh pr merge <url> <method>` where

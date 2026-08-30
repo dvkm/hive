@@ -89,7 +89,7 @@ import { noteRepoMismatch, resolveRepoMismatchForDecision } from "./repoTarget.t
 import { costUsd } from "./pricing.ts";
 import { checkUsageGuardrails, resolveUsageCapForDecision, taskSpend } from "./costs.ts";
 import { resolveScopeDriftForDecision } from "./drift.ts";
-import { evaluateAutoApprove, evaluateAutopilotApprove, NO_AUTO_ANSWER_REASON } from "./autoapprove.ts";
+import { evaluateAutoApprove, evaluateAutopilotApprove, riskLevel, NO_AUTO_ANSWER_REASON } from "./autoapprove.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { confirmedRisks, cautionCleared, latestAutoReviewVerdict, reviewCompleteForHead } from "./reviewer.ts";
@@ -103,6 +103,8 @@ import type { AwayConfig } from "./away.ts";
 import { taskDiff } from "./diff.ts";
 import { authoredFiles, captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { landGraph, markLand, resolveLandPauseForDecision } from "./landQueue.ts";
+import { withMergeLock } from "./mergeLock.ts";
+import { divergence } from "./divergence.ts";
 import { followServingBranch, resolveServingFollowForDecision } from "./servingBranch.ts";
 import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
@@ -517,6 +519,15 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         const projects = projectId ? [{ id: projectId }] : activeProjects(db).map((p) => ({ id: p.id }));
         const graphs = await Promise.all(projects.map((p) => landGraph(db, p.id, deps.exec ?? defaultExec)));
         return json({ nodes: graphs.flatMap((g) => g.nodes), edges: graphs.flatMap((g) => g.edges) });
+      }
+      // GET /api/tasks/divergence?project=<id> — the board's divergence radar:
+      // for every branch still being worked on, how far behind the target
+      // branch it is and which files it shares with a sibling branch.
+      if (pathname === "/api/tasks/divergence" && method === "GET") {
+        const projectId = url.searchParams.get("project");
+        const projects = projectId ? [{ id: projectId }] : activeProjects(db).map((p) => ({ id: p.id }));
+        const results = await Promise.all(projects.map((p) => divergence(db, p.id, deps.exec ?? defaultExec)));
+        return json({ projects: results, rows: results.flatMap((r) => r.rows) });
       }
       // Duplicate CLUSTERS among current non-terminal tasks (backfill/UI). Must
       // precede the /:id route so "duplicates" isn't parsed as a task id.
@@ -2128,23 +2139,53 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   // task that's already started — asks the director via a decision card. Safety:
   // only a queued task with no agent is ever auto-cancelled here.
   const match = detectDuplicate(db, parseTask(row));
+  let dupWarning: string | undefined;
   if (match) {
     const safeAuto = row.state === "queued" && !row.agent_target;
     if (match.tier === "exact" && safeAuto) {
       mergeInto(db, row.id, match.survivor.id);
-      return json(taskWithHealth(db, getTask(db, row.id)), 201);
+      // #1879: say what happened and how to get what the caller wanted. Refiling
+      // a broken task is the obvious recovery, and dedup silently undoes it
+      // because the broken original is still non-terminal.
+      return json(
+        {
+          ...taskWithHealth(db, getTask(db, row.id)),
+          warning: dupMergedWarning(match.survivor),
+        },
+        201
+      );
     }
-    openDuplicateDecision(db, getTask(db, row.id), match);
+    const decision = openDuplicateDecision(db, getTask(db, row.id), match);
+    dupWarning = dupSuspectedWarning(match.survivor, decision.id);
   }
   // Target-repo sanity check (#989). Runs after dedup so an auto-merged task
   // never gets a card it can't act on. A strong mismatch rides back on the
   // response as `warning` (the CLI prints it) and holds dispatch via its card.
-  const warning = noteRepoMismatch(db, getTask(db, row.id));
+  const repoWarning = noteRepoMismatch(db, getTask(db, row.id));
+  const warning = [dupWarning, repoWarning].filter(Boolean).join("\n  ") || undefined;
   // Ambient intake only (source intake_*/watch), and only when the project opted
   // in. Deliberately not awaited: a 60s classifier must not hold the create
   // response, and the dispatcher holds the task meanwhile.
   triageIntake(db, getTask(db, row.id), { exec: handlerDeps.triageExec }).catch((e) => console.error(`[hive] intake triage ${row.id}:`, e));
   return json({ ...taskWithHealth(db, getTask(db, row.id)), ...(warning ? { warning } : {}) }, 201);
+}
+
+// #1879: dedup outcomes the caller must be told about. A create that folds into
+// an existing task looks identical to a create that vanished, so the warning
+// names the survivor, its state, and the command that gets the caller what they
+// actually wanted (replace the original, not add to it).
+function dupMergedWarning(survivor: any): string {
+  return (
+    `folded into ${survivor.id} (${survivor.state}) as a duplicate. To replace it instead, cancel it first:\n` +
+    `    hive task move ${survivor.id} cancelled --note "superseded"`
+  );
+}
+
+function dupSuspectedWarning(survivor: any, decisionId: string): string {
+  return (
+    `possible duplicate of ${survivor.id} (${survivor.state}); decision ${decisionId} is open, and answering it "merge" cancels this task.\n` +
+    `    To replace ${survivor.id} instead, cancel it first: hive task move ${survivor.id} cancelled --note "superseded"`
+  );
 }
 
 // Link a marked PR back to its task. Matches by the `hive-task: <id>` body
@@ -3080,7 +3121,44 @@ async function mergedFileList(
 // the local ff before bouncing the task back to the agent (rebasing onto a
 // stale origin/<base> would only make things worse).
 // Guarded by the `task.merge` standing-authority action.
+//
+// Merges are SINGLE-FLIGHT per target branch (HIVE-348). The land queue, the
+// reconciler's auto-merge, the PR gardener and the director's click all land
+// through here, and two of them running at once against one base is the race
+// that once dropped a commit. The lock key is the repo plus the branch being
+// merged into, so independent repos and independent target branches still land
+// in parallel. Everything that validates the merge — the PR probe, the
+// destructive-rebase guard, the live head match, `beforeMutation` — runs inside
+// the lock, so a queued merge re-validates against the base its predecessor
+// just moved instead of the base it saw when it started waiting.
 export async function mergeTask(
+  db: DB,
+  herdr: Herdr,
+  id: string,
+  body: any,
+  deps: HandlerDeps,
+  opts: { beforeMutation?: () => boolean } = {}
+): Promise<Response> {
+  return withMergeLock(mergeLockKey(db, id), () => mergeTaskLocked(db, herdr, id, body, deps, opts));
+}
+
+// The branch this task's merge lands on, qualified by the repo that owns it.
+// Read before the lock so waiters queue on the right key; mergeTaskLocked
+// re-reads the PR's live base inside the lock and may land on a different
+// branch than the project default, which is why this is a lock key and not a
+// merge decision.
+function mergeLockKey(db: DB, id: string): string {
+  const task = getTask(db, id);
+  if (!task) return `task:${id}`;
+  const project: any = db.query("SELECT repo_path, config FROM projects WHERE id = ?").get(task.project_id);
+  let base = "";
+  try {
+    base = projectBaseBranch(JSON.parse(project?.config ?? "{}"));
+  } catch {}
+  return `${project?.repo_path || task.project_id}#${base}`;
+}
+
+async function mergeTaskLocked(
   db: DB,
   herdr: Herdr,
   id: string,
@@ -6862,6 +6940,21 @@ function saveDraft(db: DB, id: string, body: any): Response {
 // This is identity only — it grants nothing and gates nothing.
 const ANSWER_SOURCES = ["director", "chat_supervisor", "agent", "system", "unknown"] as const;
 
+// The one non-director answer a high-risk card still accepts: refusing a
+// standing-authority command that has not run. It is the fail-closed direction
+// — it stops the work rather than releasing it — and leaving the grant
+// 'pending' instead strands the agent retrying a card nobody will answer.
+// Approving is still, always, the director's.
+function isFailClosedDeny(db: DB, decisionId: string, answerKey: string): boolean {
+  return (
+    answerKey === "deny" &&
+    db.query("SELECT 1 FROM authority_grants WHERE decision_id = ? AND status = 'pending'").get(decisionId) != null
+  );
+}
+
+export const HIGH_RISK_HUMAN_ONLY_REASON =
+  "high-risk cards are only ever answered by the director (source:\"director\")";
+
 function decisionAnswerBodyError(body: any): string | null {
   if (body?.answer_note !== undefined && typeof body.answer_note !== "string")
     return "answer_note must be a string";
@@ -6967,6 +7060,13 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
   // — which is exactly when we want it to.
   if (r.decision_class && (answeredBy === "system" || answeredBy === "chat_supervisor"))
     return json({ effect: "escalate", category: String(r.decision_class), reason: NO_AUTO_ANSWER_REASON }, 403);
+  // A high-risk card is a human's to answer, full stop. Every automated caller
+  // — the timeout sweep, the chat supervisor, autopilot, the standing CI
+  // ruling, an agent answering its own card — is refused here, so a new
+  // automated path cannot reintroduce the hole by simply not knowing about it.
+  // "unknown" is refused too: a caller we cannot vouch for is not a human.
+  if (riskLevel(r.risk) === "high" && answeredBy !== "director" && !isFailClosedDeny(db, r.id, answerKey))
+    return json({ effect: "escalate", category: "risk_high", reason: HIGH_RISK_HUMAN_ONLY_REASON }, 403);
   if (answeredBy === "chat_supervisor" && !supervisorVerified) {
     if (!answeredActor || !getThread(db, String(answeredActor)))
       return err("chat_supervisor decision answers require a valid thread actor", 403);
@@ -7106,7 +7206,9 @@ export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; 
   if (!r) return err("decision not found", 404);
   if (r.status !== "open") return err(`decision already ${r.status}`, 409);
   const source = moot ? "reconciler" : "director";
-  db.query("UPDATE decisions SET status = 'expired' WHERE id = ?").run(id);
+  const expiredAt = now();
+  db.query("UPDATE decisions SET status = 'expired', answered_at = ?, answered_by = ?, answered_actor = ? WHERE id = ?")
+    .run(expiredAt, source, moot ? "reconciler-moot" : null, id);
   writeEvent(db, { task_id: r.task_id, source, type: "decision_expired", payload: { decision_id: id, reason: moot?.reason ?? "dismissed" } });
   // An authority card's pending grant must die with it: left 'pending', every
   // retry of the gated command resolves to this expired decision id and the
@@ -7122,7 +7224,13 @@ export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; 
         moot ? moot.steer :
         `The director dismissed your decision card "${r.title}" without answering — it is gone, do not wait ` +
           `on it or retry the same request. ${wasAuthority ? "The gated command stays unapproved; find another way (or narrow the command so the gate passes). " : ""}` +
-          `Proceed with your best judgment and note the call as a checkpoint.`,
+          // A dismissed HIGH-risk card is not permission. Releasing the agent
+          // with "use your best judgment" would hand it exactly the approval
+          // nobody gave; the rest of the task may continue, that action may not.
+          (riskLevel(r.risk) === "high"
+            ? `This was a HIGH-risk card, so treat it as unapproved: do NOT carry out the risky action it asked about. ` +
+              `Continue any other work and note the block as a checkpoint.`
+            : `Proceed with your best judgment and note the call as a checkpoint.`),
         "queued by decision dismiss"
       );
   }
@@ -7135,7 +7243,7 @@ export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; 
   const task = getTask(db, r.task_id);
   if (!remaining && task && task.state === "needs_decision")
     transition(db, r.task_id, "in_progress", { source, reason: moot?.reason ?? "last open decision dismissed" });
-  const decision = parseDecision({ ...r, status: "expired" });
+  const decision = parseDecision({ ...r, status: "expired", answered_at: expiredAt, answered_by: source });
   broadcast({ type: "decision", decision });
   return json(decision);
 }
