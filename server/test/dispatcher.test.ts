@@ -9,7 +9,7 @@ process.env.HIVE_HOME = HOME;
 
 const { openDb, newId, now, getSetting } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
-const { dispatchOnce, isReviewed, inBackoff } = await import("../src/dispatcher.ts");
+const { dispatchOnce, isReviewed, inBackoff, SPAWN_ATTEMPT_CEILING } = await import("../src/dispatcher.ts");
 const { selfAuditOnce } = await import("../src/selfAudit.ts");
 const { writeEvent, getTask, SKIP_REASONS } = await import("../src/state.ts");
 const { taskWithHealth, needsAttention } = await import("../src/health.ts");
@@ -446,6 +446,101 @@ test("spawn failure records one spawn_error and backs off (no retry storm)", asy
   await dispatchOnce(db, { herdr, nowMs: clock });
   errs = db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'spawn_error'").get(id) as { n: number };
   expect(errs.n).toBe(2);
+});
+
+// HIVE-526: the exponential backoff settles at one retry every 30 minutes and
+// never stops, so an unsatisfiable precondition retried 48 times a day forever
+// while the task still read as ordinary queued work.
+test("a spawn that keeps failing the same way stops retrying and fails the task", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  const { herdr, spawns } = stubHerdr(true); // worktree create fails, always the same way
+  let t = Date.now();
+
+  // Every lap starts outside the previous backoff window, so each one retries.
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING + 2; i++) {
+    await dispatchOnce(db, { herdr, nowMs: () => t });
+    t += 31 * 60 * 1000;
+  }
+
+  const errs = db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'spawn_error'").get(id) as { n: number };
+  expect(errs.n).toBe(SPAWN_ATTEMPT_CEILING); // the ceiling, not one per lap forever
+  expect(spawns.length).toBe(0);
+  expect(getTask(db, id).state).toBe("failed");
+
+  const gave = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'spawn_gave_up'").all(id) as { payload: string }[];
+  expect(gave.length).toBe(1);
+  expect(JSON.parse(gave[0].payload).error).toContain("worktree create boom"); // the last error rides along
+});
+
+// The daemon being down is not the task's fault: the global circuit breaker owns
+// it, so it must not spend the task's attempts either.
+test("infra-tagged spawn failures never reach the ceiling", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING * 2; i++)
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "ConnectionRefused", infra: "herdr_unreachable" } });
+
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr });
+
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(spawns.length).toBe(1);
+});
+
+// The regression that let the storm survive the ceiling: infra failures are
+// filtered out of the count, but if the newest N rows are read from SQL BEFORE
+// that filter, an interleaved infra row hides a real failure and the task dodges
+// the ceiling for as long as the daemon keeps flapping.
+test("real failures interleaved with infra ones still reach the ceiling", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  // Alternating, so any window of the newest 5 rows holds only ~3 real errors.
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING * 2; i++) {
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "worktree create failed: already exists" } });
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "ConnectionRefused", infra: "herdr_unreachable" } });
+  }
+
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr, nowMs: () => Date.now() + 60 * 60 * 1000 });
+
+  expect(getTask(db, id).state).toBe("failed");
+  expect(spawns.length).toBe(0);
+});
+
+// Different failures mean something is still moving; only a stuck precondition
+// repeats itself verbatim.
+test("failures with different causes keep retrying (only one repeated error gives up)", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING * 2; i++)
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: i % 2 ? "worktree create failed" : "stack setup failed" } });
+
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr, nowMs: () => Date.now() + 60 * 60 * 1000 });
+
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(spawns.length).toBe(1);
+});
+
+// A task reattaches many times over its life (every review handoff), so old
+// failures from a previous spawn must not add up with new ones. A successful
+// spawn wipes the slate.
+test("a successful spawn resets the attempt count", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  // Ceiling-1 identical failures, then a clean spawn, then more of the same error.
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING - 1; i++)
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "worktree create boom" } });
+  writeEvent(db, { task_id: id, source: "herdr", type: "spawned", payload: { agent_id: "a1" } });
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING - 1; i++)
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "worktree create boom" } });
+
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr, nowMs: () => Date.now() + 60 * 60 * 1000 });
+
+  expect(getTask(db, id).state).toBe("in_progress"); // not given up on
+  expect(spawns.length).toBe(1);
 });
 
 test("herdr unreachable: one probe per cycle (not per task) + global cooldown pauses dispatch", async () => {
