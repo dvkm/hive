@@ -37,6 +37,7 @@ import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
 import { runPrGardener } from "./prGardener.ts";
 import { autoAckPlans } from "./planCritic.ts";
 import { ambiguityCleared, cautionCleared, latestAutoReviewVerdict } from "./reviewer.ts";
+import { reportBoardAudit } from "./boardAudit.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
 const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
@@ -140,6 +141,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
       if (lastError) setSetting(db, "reconciler_last_error", lastError);
     } else {
       setSetting(db, "reconciler_error_streak", "0");
+      // Clear the message too. Left behind, /api/health reports
+      // consecutive_errors: 0 alongside a scary `last_error` string from a
+      // cycle that recovered long ago — a health endpoint disagreeing with
+      // itself, which is the same class of bug this task's audit exists for.
+      if (getSetting(db, "reconciler_last_error")) setSetting(db, "reconciler_last_error", "");
     }
   };
   await step("surfaceTrackingBindings", () => surfaceTrackingBindings(db));
@@ -178,6 +184,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("syncPRs", () => syncPRs(db, deps));
   await step("revalidateCiDecisions", () => revalidateCiDecisions(db));
   await step("linkPRs", () => linkPRs(db, deps));
+  // Read-only board-vs-reality audit (HIVE-528). Below the offline cutoff and
+  // after linkPRs because one of its checks asks GitHub whether a PR really
+  // landed. step() isolates it, so a failure here can never stall a sync path.
+  // It reports; it never repairs.
+  await step("boardAudit", () => reportBoardAudit(db, { exec: deps.exec }));
   await step("prGardener", () => runPrGardener(db, {
     exec: deps.exec ?? defaultExec,
     nowMs: deps.nowMs,
