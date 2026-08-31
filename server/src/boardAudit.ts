@@ -22,7 +22,7 @@ import type { DB } from "./db.ts";
 import { writeEvent } from "./state.ts";
 import { enqueue } from "./notifications.ts";
 import { activeProjectSql } from "./testProjects.ts";
-import { isTrackingOnlyTask } from "./supervision.ts";
+import { isTrackingOnlyTask, everSpawned } from "./supervision.ts";
 import { defaultExec, mapLimit, type Exec } from "./exec.ts";
 
 export type AuditKind =
@@ -31,7 +31,8 @@ export type AuditKind =
   | "queued_unrunnable"
   | "orphaned_external_key"
   | "provenance_break"
-  | "stuck_spawns";
+  | "stuck_spawns"
+  | "stalled_tracking_only";
 
 export interface AuditFinding {
   kind: AuditKind;
@@ -269,6 +270,39 @@ function stuckSpawns(db: DB): AuditFinding[] {
   }));
 }
 
+// 7. A tracking-only row parked in a state only an agent can leave (HIVE-541).
+//    hive never runs an agent on these, so the in_progress -> in_review ->
+//    verifying -> done path is walked by nobody: the row just sits in a work
+//    column forever. Three were found this way on corebeat, the oldest idle
+//    83 hours, and only because someone happened to sort the review column by
+//    age.
+//
+//    Only the two states with no exit but the review path. `queued` is already
+//    `queued_unrunnable`, and a mirror in in_progress is just an issue someone
+//    is working on — `merged_not_closed` is the check that catches that one
+//    going stale, and reporting both would be two cards for one row.
+//
+//    Never reported for a task that was actually spawned: a director can spawn
+//    a source='external' row by hand, and then it is real hive-driven work with
+//    a real agent, not a parked mirror.
+const STALLED_STATES = "('in_review','verifying')";
+
+function stalledTrackingOnly(db: DB): AuditFinding[] {
+  const rows = db
+    .query(
+      `SELECT t.id, t.number, t.title, t.state, t.source, t.source_ref, t.agent_target FROM tasks t ${active()}
+        WHERE t.state IN ${STALLED_STATES}`
+    )
+    .all() as any[];
+  return rows
+    .filter((t) => isTrackingOnlyTask(t) && !t.agent_target && !everSpawned(db, t.id))
+    .map((t) => ({
+      kind: "stalled_tracking_only" as const,
+      task_id: t.id,
+      note: `Sitting in ${t.state}, but it is a tracking-only row (a mirrored ticket or another agent's board entry) that hive never runs an agent on, so nothing will move it on. Close it with \`hive task move ${t.id} done\` if the work shipped, or \`cancelled\` if it did not.`,
+    }));
+}
+
 // The checks that need nothing but the database. Pure read, so every caller can
 // run this as often as it likes. `closed_not_merged` is deliberately not here:
 // it needs GitHub to answer, and lives in reportBoardAudit.
@@ -279,6 +313,7 @@ export function auditBoard(db: DB): AuditFinding[] {
     ...orphanedExternalKey(db),
     ...provenanceBreaks(db),
     ...stuckSpawns(db),
+    ...stalledTrackingOnly(db),
   ];
 }
 
@@ -289,6 +324,7 @@ const HEADLINE: Record<AuditKind, string> = {
   orphaned_external_key: "Jira key left on a finished task",
   provenance_break: "failed on the board but the work shipped",
   stuck_spawns: "stuck failing to start",
+  stalled_tracking_only: "parked in a work column with nothing to move it",
 };
 
 // Run the audit and report only what has never been reported before. Returns

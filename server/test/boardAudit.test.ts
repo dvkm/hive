@@ -124,6 +124,26 @@ test("queued but unrunnable: a project with no repo checked out", () => {
   expect(kinds(db)).toEqual(["queued_unrunnable"]);
 });
 
+test("stalled tracking-only: a mirror parked in the review column (HIVE-541)", () => {
+  const { db, pid } = setup();
+  task(db, pid, { state: "in_review", source: "external", source_ref: "jira:WEB-94" });
+
+  expect(kinds(db)).toEqual(["stalled_tracking_only"]);
+});
+
+test("stalled tracking-only: a row a director actually spawned is real work", () => {
+  const { db, pid } = setup();
+  const id = task(db, pid, { state: "in_review", source: "external", source_ref: "jira:WEB-94" });
+  db.query("UPDATE tasks SET agent_target = 'claude' WHERE id = ?").run(id);
+
+  expect(kinds(db)).toEqual([]);
+
+  // Still real work after cleanup nulls agent_target: the spawn is on record.
+  db.query("UPDATE tasks SET agent_target = NULL WHERE id = ?").run(id);
+  event(db, id, "spawned", {});
+  expect(kinds(db)).toEqual([]);
+});
+
 test("orphaned external identity: the key stays on the finished predecessor", () => {
   const { db, pid } = setup();
   const prev = task(db, pid, { state: "failed", jira_key: "CORE-1", jira_link_kind: "subtask" });
@@ -210,6 +230,7 @@ test("every check reports exactly once, then goes quiet", async () => {
   task(db, pid, { state: "done", title: "abandoned" }, "2026-08-02T00:00:00.000Z");
   const stuck = task(db, pid, { state: "queued", title: "broken repo" });
   for (let i = 0; i < 7; i++) event(db, stuck, "spawn_error", { error: "boom" });
+  task(db, pid, { state: "in_review", source: "external", source_ref: "jira:WEB-95" });
 
   const first = await reportBoardAudit(db, { exec: gh("OPEN") });
   expect([...new Set(first.map((f) => f.kind))].sort()).toEqual([
@@ -218,16 +239,17 @@ test("every check reports exactly once, then goes quiet", async () => {
     "orphaned_external_key",
     "provenance_break",
     "queued_unrunnable",
+    "stalled_tracking_only",
     "stuck_spawns",
   ]);
   // Exactly one finding per check, and exactly one digest notification.
-  expect(first.length).toBe(6);
+  expect(first.length).toBe(7);
   expect(db.query("SELECT COUNT(*) AS n FROM notifications").get()).toEqual({ n: 1 } as any);
 
   // Nothing changed on the board, so a second pass says nothing at all.
   expect(await reportBoardAudit(db, { exec: gh("OPEN") })).toEqual([]);
   expect(db.query("SELECT COUNT(*) AS n FROM notifications").get()).toEqual({ n: 1 } as any);
-  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE type = 'board_audit'").get()).toEqual({ n: 6 } as any);
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE type = 'board_audit'").get()).toEqual({ n: 7 } as any);
 });
 
 test("the audit never writes to tasks or decisions", async () => {
