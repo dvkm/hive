@@ -1752,6 +1752,77 @@ export function unparkAnswered(db: DB, nowMs: number = Date.now()): void {
   }
 }
 
+// Rows hive writes ABOUT a task never prove the agent did anything, so none of
+// them may reset its progress clock. `authority_logged` is here too: a spawn
+// hive attempted logs one, and the agent's own commands always land a `tool_use`
+// alongside it, so dropping it costs no signal.
+const NO_PROGRESS_NOISE = ["stale", "hung", "recovery", "recovery_nudge", "spawn_error", "agent_status", "ci_status", "authority_logged"];
+// A hung agent is not a dead one: it still holds its name, so reattach skips it,
+// the reaper leaves it alone, and the stale flag fires exactly once. Silence at
+// 4x the stale threshold means the WORK stopped, which needs a human eye rather
+// than a respawn — hive must not kill it, because a slow `pnpm install` and a
+// wedged one look identical from here (hive-1951).
+const HUNG_MULTIPLIER = 4;
+
+// The last thing the agent itself said, for the hung notification: the wedge
+// point is usually named right there ("Installing (cms pins pnpm 9.1.0)").
+function lastAgentWord(db: DB, taskId: string): string | null {
+  const r = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type IN ('assistant_text','status','note','checkpoint','blocked') ORDER BY ts DESC LIMIT 1")
+    .get(taskId) as { payload: string } | undefined;
+  if (!r) return null;
+  try {
+    const p = JSON.parse(r.payload);
+    const text = String(p.text ?? p.note ?? "").trim().replace(/\s+/g, " ");
+    return text ? text.slice(0, 240) : null;
+  } catch {
+    return null;
+  }
+}
+
+function humanMs(ms: number): string {
+  const mins = Math.round(ms / 60000);
+  return mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`;
+}
+
+// Silent past HUNG_MULTIPLIER x the stale threshold, with the agent still
+// holding its name: report it once per silence window as its own class. The
+// caller's filters (deferred, dependency-blocked, mirrors, chat supervisors)
+// already exclude everything that is quiet on purpose.
+function flagHung(db: DB, taskId: string, staleMs: number, nowMs: number): void {
+  const act = db
+    .query(
+      `SELECT ts FROM events WHERE task_id = ? AND type NOT IN (${NO_PROGRESS_NOISE.map(() => "?").join(",")}) ORDER BY ts DESC LIMIT 1`
+    )
+    .get(taskId, ...NO_PROGRESS_NOISE) as { ts: string } | undefined;
+  if (!act) return;
+  const quiet = nowMs - Date.parse(act.ts);
+  if (quiet <= staleMs * HUNG_MULTIPLIER) return;
+  // Once per silence window, keyed on the activity it starts from — not on "is
+  // there a newer hung row", which would be true forever after the first one and
+  // silence a task that woke up, spoke, and wedged again.
+  if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'hung' AND json_extract(payload, '$.since') = ? LIMIT 1").get(taskId, act.ts))
+    return;
+  const said = lastAgentWord(db, taskId);
+  const task = getTask(db, taskId);
+  writeEvent(db, {
+    task_id: taskId,
+    source: "reconciler",
+    type: "hung",
+    payload: { since: act.ts, silent_ms: quiet, threshold_ms: staleMs * HUNG_MULTIPLIER, last_said: said },
+  });
+  enqueue(db, {
+    kind: "hung_agent",
+    urgency: "urgent",
+    task_id: taskId,
+    title: `No progress for ${humanMs(quiet)}: ${task?.title ?? taskId}`,
+    body:
+      `The agent is still holding this task, but nothing has happened since ${act.ts}. ` +
+      (said ? `It last said: "${said}". ` : "It said nothing before going quiet. ") +
+      `It may be wedged, or just running something long. Look at the pane before killing anything.`,
+  });
+}
+
 function flagStale(db: DB, deps: ReconcilerDeps): void {
   const staleMs = deps.staleMs ?? DEFAULT_STALE_MS;
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
@@ -1782,6 +1853,7 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
       .query("SELECT ts, type FROM events WHERE task_id = ? ORDER BY ts DESC LIMIT 1")
       .get(t.id) as { ts: string; type: string } | undefined;
     if (!last) continue;
+    flagHung(db, t.id, staleMs, nowMs);
     if (last.type === "stale") continue; // already flagged; don't spam
     const age = nowMs - Date.parse(last.ts);
     if (age > staleMs) {

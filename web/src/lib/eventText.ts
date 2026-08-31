@@ -186,6 +186,8 @@ export function eventText(e: EventLike): string {
       return s(p.via) === "emit" ? "handed off for review" : "auto-advanced to review (agent idle)";
     case "stale":
       return "agent went silent";
+    case "hung":
+      return `no progress for ${Math.round(Number(p.silent_ms ?? 0) / 60000)} min, agent still alive${s(p.last_said) ? ` — last said: "${s(p.last_said)}"` : ""}`;
     case "deployed":
       return p.up_to_date
         ? `serving checkout '${s(p.branch)}' was already current`
@@ -328,6 +330,7 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
   incident: "incident",
   blocked: "incident",
   stale: "incident",
+  hung: "incident",
   merge_failed: "incident",
   auto_merge_failed: "incident",
   merge_blocked_destructive: "incident",

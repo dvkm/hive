@@ -28,7 +28,7 @@ const ATTENTION_SKIPS = new Set(["no_repo_path", "kind_excluded", "authority_den
 // `spawn_error` is here for the same reason: a respawn hive TRIED and failed is
 // not the agent doing something, and letting it reset the clock would hide a
 // dead task behind hive's own retry loop.
-const RECONCILER_NOISE = new Set(["stale", "recovery_nudge", "recovery", "spawn_error"]);
+const RECONCILER_NOISE = new Set(["stale", "hung", "recovery_nudge", "recovery", "spawn_error"]);
 const HEALTH_EVENT_TYPES = [
   "agent_status",
   "dialog_auto_approved",
@@ -42,6 +42,7 @@ const HEALTH_EVENT_TYPES = [
   "state_change",
   "recovery_nudge",
   "stale",
+  "hung",
 ];
 export interface Health {
   status: HealthStatus;
@@ -242,6 +243,13 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
     return { status: "stuck", reason: `finished or stuck: agent ${lastStatus}, no PR`, since: activityTs };
   }
   if (age > staleMs()) {
+    // Flagged hung: the agent still holds the task but the WORK stopped. Say so
+    // in the reason, because it needs a human look, not another respawn.
+    const hung = events.find((e) => e.type === "hung" && e.ts > activityTs);
+    if (hung) {
+      const mins = Math.round(age / 60000);
+      return { status: "stuck", reason: `no progress for ${mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`} (agent still alive)`, since: activityTs };
+    }
     const escalating = events.some((e) => e.type === "stale" && e.ts > activityTs);
     return {
       status: escalating ? "stuck" : "silent",
