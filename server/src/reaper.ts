@@ -18,6 +18,7 @@ import { teardownBlocked } from "./teardownGuard.ts";
 import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
+import { startLoop } from "./loop.ts";
 
 export interface ReaperDeps {
   herdr?: Herdr;
@@ -345,9 +346,5 @@ async function reapOrphan(db: DB, herdr: Herdr, repoPath: string, branch: string
 
 // Background loop. Started only from index.ts (never in tests).
 export function startReaper(db: DB, deps: ReaperDeps & { intervalMs?: number } = {}): () => void {
-  const intervalMs = deps.intervalMs ?? 300_000;
-  const timer = setInterval(() => {
-    reapOnce(db, deps).catch((e) => console.error("[hive] reaper cycle crashed:", e));
-  }, intervalMs);
-  return () => clearInterval(timer);
+  return startLoop("reaper", deps.intervalMs ?? 300_000, () => reapOnce(db, deps));
 }

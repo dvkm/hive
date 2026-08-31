@@ -40,6 +40,7 @@ import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { supervisedSql } from "./supervision.ts";
 import { authoredFiles } from "./rebaseGuard.ts";
+import { startLoop } from "./loop.ts";
 
 const TIMEOUT_MS = Number(process.env.HIVE_DRIFT_TIMEOUT_MS || 300_000);
 const DEFAULT_COMMIT_STEP = 3;
@@ -322,20 +323,11 @@ export function resolveScopeDriftForDecision(db: DB, decisionId: string, answerK
 }
 
 export function startDriftWatch(db: DB, deps: DriftDeps & { intervalMs?: number } = {}): () => void {
-  // A judge call outlasts the interval (~30-130s observed), so without this the
-  // loop would start a second check on the SAME task before the first records
-  // its `scope_drift_check` event — double spend, and two cards for one drift.
-  // Per-loop (closure) scope, not a module singleton, per the poll-guard
-  // precedent: a second watch on a second DB must not be blocked by the first.
-  let running = false;
-  const timer = setInterval(() => {
-    if (running) return;
-    running = true;
-    driftCheckOnce(db, deps)
-      .catch((e) => console.error("[hive] scope-drift check crashed:", e))
-      .finally(() => {
-        running = false;
-      });
-  }, deps.intervalMs ?? 60_000);
-  return () => clearInterval(timer);
+  // A judge call outlasts the interval (~30-130s observed), so without the
+  // startLoop guard the loop would start a second check on the SAME task before
+  // the first records its `scope_drift_check` event — double spend, and two
+  // cards for one drift. The guard is per-loop (closure) scope, not a module
+  // singleton, per the poll-guard precedent: a second watch on a second DB must
+  // not be blocked by the first.
+  return startLoop("scope-drift", deps.intervalMs ?? 60_000, () => driftCheckOnce(db, deps));
 }

@@ -29,6 +29,7 @@ import { getCursor, setCursor } from "./intake/gchat.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 import { activeProjects } from "./testProjects.ts";
+import { startLoop } from "./loop.ts";
 
 export interface Watcher {
   name: string;
@@ -188,18 +189,5 @@ export async function watchOnce(db: DB, deps: WatchDeps = {}): Promise<void> {
 // Each start call owns its timer and in-flight guard; a slow cycle skips ticks
 // instead of queueing them.
 export function startWatchers(db: DB, deps: WatchDeps & { intervalMs?: number } = {}): () => void {
-  let running = false;
-  const timer = setInterval(() => {
-    if (running) {
-      console.error("[hive] watch cycle skipped: previous cycle still running");
-      return;
-    }
-    running = true;
-    watchOnce(db, deps)
-      .catch((e) => console.error("[hive] watch cycle crashed:", e))
-      .finally(() => {
-        running = false;
-      });
-  }, deps.intervalMs ?? 60_000);
-  return () => clearInterval(timer);
+  return startLoop("watch", deps.intervalMs ?? 60_000, () => watchOnce(db, deps));
 }
