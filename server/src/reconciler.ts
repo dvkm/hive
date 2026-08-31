@@ -15,6 +15,7 @@ import { startLoop } from "./loop.ts";
 import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, verificationGate, repairRequeueProvenance, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
 import { spawnMeta } from "./cleanup.ts";
+import { raceSweep } from "./race.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent, resumeReviewForDeliveredSteers } from "./steer.ts";
 import { inBackoff, isReviewed, MAX_AGENTS_DEFAULT } from "./dispatcher.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
@@ -171,6 +172,8 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("captureRecurringRefs", () => captureRecurringRefs(db));
   await step("repairRequeueProvenance", () => repairRequeueProvenance(db));
   await step("surfaceDeadDependencies", () => surfaceDeadDependencies(db));
+  // Best-of-N: open the compare card once a race's attempts have all settled.
+  await step("raceSweep", () => raceSweep(db, { exec: deps.exec ?? defaultExec, nowMs: deps.nowMs?.() }));
   // Away mode flips on/off by its schedule here. On waking it sends ONE
   // "while you were away" push for everything that was held.
   await step("syncAway", () => syncAway(db, (deps.nowMs ?? (() => Date.now()))()));

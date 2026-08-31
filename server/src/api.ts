@@ -88,6 +88,7 @@ import { triageIntake, resolveIntakeTriageForDecision } from "./intake/triage.ts
 import { noteRepoMismatch, resolveRepoMismatchForDecision } from "./repoTarget.ts";
 import { costUsd } from "./pricing.ts";
 import { checkUsageGuardrails, resolveUsageCapForDecision, taskSpend } from "./costs.ts";
+import { startRace, raceView, pickWinner, resolveRaceForDecision } from "./race.ts";
 import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove, riskLevel, NO_AUTO_ANSWER_REASON } from "./autoapprove.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
@@ -632,6 +633,24 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/usage$/);
       if (m && method === "GET") return taskUsage(db, m[1]);
 
+      // Best-of-N racing (HIVE-351). Director-flagged only: nothing in hive
+      // starts a race on its own.
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/race$/);
+      if (m && method === "POST") {
+        const body = await safeJson(req);
+        const task = getTask(db, m[1]);
+        if (!task) return err("task not found", 404);
+        const blocked = authzBlock(db, { project_id: task.project_id, action: "task.spawn", target: task.title, task_id: m[1] });
+        if (blocked) return blocked;
+        const r = startRace(db, m[1], {
+          attempts: body?.attempts !== undefined ? Number(body.attempts) : undefined,
+          agents: Array.isArray(body?.agents) ? body.agents.map(String) : undefined,
+          deadline_min: body?.deadline_min !== undefined ? Number(body.deadline_min) : undefined,
+        });
+        if (!r.ok) return err(r.error, r.status);
+        return json({ ok: true, race_id: r.race_id, task_ids: r.task_ids }, 201);
+      }
+
       // Live read-only view of the agent's terminal pane (the web UI's
       // embedded terminal polls this). Input goes through steer as always.
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/pane$/);
@@ -688,6 +707,21 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         return r.ok
           ? json({ ok: true, learning_id: r.learning_id, playbook: r.playbook }, 201)
           : json({ ok: false, error: r.error }, r.status);
+      }
+
+      // ---- races (best-of-N) ----
+      m = pathname.match(/^\/api\/races\/([^/]+)$/);
+      if (m && method === "GET") {
+        const view = await raceView(db, m[1], deps.exec ?? defaultExec);
+        return view ? json(view) : err("race not found", 404);
+      }
+      m = pathname.match(/^\/api\/races\/([^/]+)\/pick$/);
+      if (m && method === "POST") {
+        const body = await safeJson(req);
+        if (!body?.task_id) return err("task_id is required");
+        const r = pickWinner(db, m[1], String(body.task_id));
+        if (!r.ok) return err(r.error, r.status);
+        return json({ ok: true, winner: r.winner, losers: r.losers });
       }
 
       // ---- decisions ----
@@ -3800,7 +3834,10 @@ export async function spawnAgent(
   }
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   if (!project?.repo_path) return { ok: false, error: "project has no repo_path" };
-  const config = JSON.parse(project.config ?? "{}");
+  // A race attempt pins its own backend (HIVE-351) so one attempt can run on
+  // codex while its sibling runs on claude. Overlaying it on the project config
+  // is enough: model, argv and hooks all key off the same `agent` field.
+  const config = { ...JSON.parse(project.config ?? "{}"), ...(task.agent_override ? { agent: task.agent_override } : {}) };
   const agent = agentForConfig(config);
 
   // Compose the brief fresh; it is delivered as the interactive agent's first
@@ -7124,6 +7161,7 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     resolveDuplicateForDecision(db, id, answerKey),
     resolveRepoMismatchForDecision(db, id, answerKey),
     resolveUsageCapForDecision(db, id, answerKey),
+    resolveRaceForDecision(db, id, answerKey),
     resolveScopeDriftForDecision(db, id, answerKey),
     resolveGardenerDecision(db, id, answerKey),
     resolveRefCaptureForDecision(db, id, answerKey, answerNote),

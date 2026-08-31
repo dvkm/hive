@@ -4,6 +4,7 @@ import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faDiamond } from "@fortawesome/free-solid-svg-icons";
 import { api } from "../lib/api";
 import { RequestChanges } from "./RequestChanges";
+import { RaceCompare } from "./Race";
 import type { Decision, Evidence, JiraTaskState, TaskDetail, UsageTotals } from "../lib/api";
 import { useStore } from "../lib/store";
 import { splitAttachments } from "../lib/attachments";
@@ -650,6 +651,21 @@ export function TaskBody({ id }: { id: string }) {
       toast((e as Error).message);
     }
   };
+  // Best-of-N: two agents, two worktrees, one brief. Deliberately a deliberate
+  // click — it doubles both the token bill and the review burden, so it is only
+  // ever worth it on a task whose right answer is genuinely unclear.
+  const startRace = async () => {
+    if (!t) return;
+    if (!confirm("Race this task? Two agents (claude and codex) build the same brief in their own worktrees, and you keep one."))
+      return;
+    try {
+      await api.startRace(t.id, { attempts: 2 });
+      toast("Race started — both attempts are queued");
+      refresh();
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  };
   const viewAgent = async () => {
     try {
       const r = await api.focusAgent(t.id);
@@ -798,6 +814,8 @@ export function TaskBody({ id }: { id: string }) {
         )}
 
         {codeReview && <ReviewCard task={t} onDone={refresh} />}
+
+        {t.race_id && <RaceCompare raceId={t.race_id} taskId={t.id} onPicked={refresh} />}
 
         {postShipQuiz && (
           <section className="panel understanding-quiz-panel">
@@ -1006,6 +1024,11 @@ export function TaskBody({ id }: { id: string }) {
               {dispatchIsPrimary && !t.parked_for_director && (
                 <button className="btn btn-primary" onClick={dispatch}>
                   Dispatch now
+                </button>
+              )}
+              {dispatchIsPrimary && !t.race_id && !trackingOnly && !t.parked_for_director && (
+                <button className="btn" onClick={startRace} title="Run this brief twice, on two different agents, and keep the better result">
+                  Race it
                 </button>
               )}
               {!trackingOnly && !jiraMirror && t.worktree_path && !["done", "failed", "cancelled"].includes(t.state) && (

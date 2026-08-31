@@ -6280,3 +6280,58 @@ a.chip-jira:hover { background: #2d5488; }
   border-color: #d4a72c;
   color: #1a1a1a;
 }
+
+/* Best-of-N race comparison: one column per attempt, side by side. */
+.race-note {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+.race-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--s3);
+  margin-top: var(--s3);
+}
+.race-attempt {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: var(--s3);
+}
+.race-attempt.race-self {
+  border-color: var(--border);
+}
+.race-attempt.race-loser {
+  opacity: 0.6;
+}
+.race-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: var(--s2);
+}
+.race-num {
+  font-weight: 650;
+}
+.race-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  margin: 0 0 var(--s2);
+  font-size: 13px;
+}
+.race-facts dt {
+  color: var(--text-dim);
+}
+.race-facts dd {
+  margin: 0;
+}
+.race-check-miss {
+  color: var(--danger, #c0392b);
+}
+.race-foot {
+  color: var(--text-dim);
+  font-size: 13px;
+  margin: var(--s3) 0 0;
+}

@@ -699,6 +699,19 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       `ALTER TABLE tasks ADD COLUMN takeover_base TEXT`,
     ],
   },
+  // Best-of-N racing (HIVE-351). A race is N sibling tasks that share a
+  // race_id and run the SAME brief in their own worktrees; the director keeps
+  // one and the losers are cancelled through the normal cleanup path.
+  // agent_override lets one attempt run on codex while another runs on claude,
+  // without touching the project's own `agent` setting.
+  {
+    name: "v43-task-race",
+    statements: [
+      `ALTER TABLE tasks ADD COLUMN race_id TEXT`,
+      `ALTER TABLE tasks ADD COLUMN agent_override TEXT`,
+      `CREATE INDEX idx_tasks_race ON tasks(race_id) WHERE race_id IS NOT NULL`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings

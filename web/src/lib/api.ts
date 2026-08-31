@@ -128,6 +128,7 @@ export interface Task {
   jira_key: string | null;
   jira_link_kind: "mirror" | "subtask" | null;
   parent_task_id: string | null;
+  race_id?: string | null; // best-of-N: the group of attempts this task is one of
   duplicate_of: string | null; // survivor id when cancelled as a duplicate
   depends_on: string[]; // task ids governed by the server dependency gate (docs/API.md)
   deferred_until?: string | null; // parked pending an offline human action; nudges suppressed while future-dated
@@ -872,7 +873,41 @@ export interface AutonomyStats {
   agreement: { auto_answered: number; contradictions: number; auto_contradicted: number; agreement_rate: number | null };
 }
 
+export interface RaceAttempt {
+  task_id: string;
+  number: number;
+  title: string;
+  agent: string;
+  state: State;
+  branch: string | null;
+  pr_url: string | null;
+  settled: boolean;
+  diff: { files: number; additions: number; deletions: number } | null;
+  verification: { name: string; satisfied: boolean }[];
+  cost_usd: number;
+  processed_tokens: number;
+  outcome: "winner" | "loser" | null;
+}
+
+export interface RaceView {
+  race_id: string;
+  deadline: string | null;
+  settled: boolean;
+  attempts: RaceAttempt[];
+}
+
 export const api = {
+  race: (raceId: string) => req<RaceView>(`/api/races/${raceId}`),
+  startRace: (taskId: string, b: { attempts?: number; agents?: string[]; deadline_min?: number } = {}) =>
+    req<{ ok: boolean; race_id: string; task_ids: string[] }>(`/api/tasks/${taskId}/race`, {
+      method: "POST",
+      body: JSON.stringify(b),
+    }),
+  pickRaceWinner: (raceId: string, taskId: string) =>
+    req<{ ok: boolean; winner: string; losers: string[] }>(`/api/races/${raceId}/pick`, {
+      method: "POST",
+      body: JSON.stringify({ task_id: taskId }),
+    }),
   token: apiToken,
   jira: (taskId: string) => req<JiraTaskState>(`/api/tasks/${taskId}/jira`),
   jiraSync: (taskId: string) =>
