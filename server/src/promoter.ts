@@ -136,15 +136,7 @@ export async function promoteOnce(db: DB, deps: PromoterDeps = {}): Promise<void
 // It fires once shortly after boot (SHA dedup makes restarts harmless), then on
 // every interval.
 export function startPromoter(db: DB, deps: PromoterDeps & { intervalMs?: number } = {}): () => void {
-  const stopLoop = startLoop("promoter", deps.intervalMs ?? 30 * 60 * 1000, () => promoteOnce(db, deps));
-  // ponytail: the boot run sits outside the loop's in-flight guard. Harmless at
-  // the real numbers (30s boot vs a 30min interval, and SHA dedup on top); move
-  // it inside startLoop only if the interval ever drops near a cycle's runtime.
-  const boot = setTimeout(() => {
-    promoteOnce(db, deps).catch((e) => console.error("[hive] promoter cycle crashed:", e));
-  }, 30_000);
-  return () => {
-    clearTimeout(boot);
-    stopLoop();
-  };
+  return startLoop("promoter", deps.intervalMs ?? 30 * 60 * 1000, () => promoteOnce(db, deps), {
+    firstRunAfterMs: 30_000,
+  });
 }

@@ -407,7 +407,7 @@ export async function pollGchatOnce(db: DB, deps: GchatDeps = {}): Promise<{ cre
 // timer and in-flight guard; a slow cycle skips ticks instead of queueing them.
 export function startGchatPoll(db: DB, deps: GchatDeps = {}): () => void {
   const intervalMs = deps.intervalMs ?? Number(process.env.HIVE_GCHAT_POLL_MS || 60_000);
-  return startLoop("gchat poll", intervalMs, () => pollGchatOnce(db, deps));
+  return startLoop("gchat", intervalMs, () => pollGchatOnce(db, deps));
 }
 
 // ------------------------------------------------------------------ oauth (CLI)
