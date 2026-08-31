@@ -1440,6 +1440,33 @@ test("a confirmed risk blocks the merge and the 409 names it", async () => {
   await s.server.stop(true);
 });
 
+// HIVE-539: a risk check that never produced a verdict must not be quoted as a
+// confirmed risk. The 409 says the check did not finish, and the director can
+// still merge over it.
+test("a timed-out risk check blocks with an honest reason, not a confirmed risk", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
+  s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    `ev-rv-timeout-${taskId}`,
+    taskId,
+    new Date().toISOString(),
+    "system",
+    "risk_verdicts",
+    JSON.stringify({ reviewed_head_sha: "head-1", verdicts: [], unverified: 1, unverified_reason: "timed out after 180000ms" })
+  );
+
+  const blocked = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(blocked.status).toBe(409);
+  expect(blocked.json.error).toContain("did not finish");
+  expect(blocked.json.error).toContain("timed out after 180000ms");
+  expect(blocked.json.error).not.toContain("confirmed 1 risk");
+  expect(blocked.json.error).not.toContain("maybe a leak");
+
+  const merged = await post(s.base, `/api/tasks/${taskId}/merge`, { override_confirmed_risks: true });
+  expect(merged.status).toBe(200);
+  await s.server.stop(true);
+});
+
 test("the director can merge over a confirmed risk on purpose", async () => {
   const s = makeServer();
   const { taskId } = await judgmentTask(s, { verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
