@@ -22,6 +22,7 @@ const { openDb, newId, now, setSetting } = await import("../src/db.ts");
 const { writeEvent, transition } = await import("../src/state.ts");
 const { addClient, removeClient } = await import("../src/bus.ts");
 const J = await import("../src/intake/jira.ts");
+const { TASK_PRIORITIES } = await import("../src/api.ts");
 import type { DB } from "../src/db.ts";
 
 const SITE = "https://example.atlassian.net";
@@ -48,6 +49,7 @@ interface FakeIssue {
   parentKey?: string | null;
   created?: string | null;
   updated?: string;
+  priority?: string | null; // Jira priority NAME; null = no priority set
   history?: { at: string; to: string }[]; // status transitions, oldest first
   rawHistory?: any[] | null;
   attachments?: { id: string; filename: string }[];
@@ -95,7 +97,7 @@ interface FakeOpts {
 }
 
 function fakeJira(opts: FakeOpts) {
-  const byKey = new Map(opts.issues.map((i) => [i.key, { labels: [], assignee: null, projectKey: "WEB", summary: "s", description: null, properties: {}, parentKey: null, created: "2026-01-01T00:00:00.000Z", updated: "2026-01-01T00:00:00.000Z", history: [], rawHistory: null, comments: [], attachments: [], ...i } as Required<FakeIssue>]));
+  const byKey = new Map(opts.issues.map((i) => [i.key, { labels: [], assignee: null, projectKey: "WEB", summary: "s", description: null, properties: {}, parentKey: null, created: "2026-01-01T00:00:00.000Z", updated: "2026-01-01T00:00:00.000Z", priority: "Medium", history: [], rawHistory: null, comments: [], attachments: [], ...i } as Required<FakeIssue>]));
   const calls: { method: string; path: string; body?: any }[] = [];
   const reads = new Map<string, number>();
   const changelogReads = new Map<string, number>();
@@ -191,7 +193,7 @@ function fakeJira(opts: FakeOpts) {
             summary: iss.summary, description: iss.description, created: iss.created, updated: iss.updated,
             status: { name: iss.status }, labels: [...iss.labels],
             assignee: iss.assignee ? { accountId: iss.assignee } : null,
-            priority: { name: "Medium" }, issuetype: { name: "Story" },
+            priority: iss.priority == null ? null : { name: iss.priority }, issuetype: { name: "Story" },
             project: iss.projectKey == null ? undefined : { key: iss.projectKey },
             parent: iss.parentKey ? { key: iss.parentKey } : null,
             attachment: iss.attachments.map((a) => ({ id: a.id, filename: a.filename })),
@@ -496,6 +498,68 @@ test("import mirrors an issue as a tracking-only task with the mapped state", as
   expect(t.state).toBe("in_review");
   expect(t.title).toBe("[WEB-1] 뉴스레터 기획");
   expect(t.brief).toContain(`${SITE}/browse/WEB-1`);
+});
+
+test("Jira priority reaches tasks.priority, so the dispatcher can actually order the queue", async () => {
+  const jira = fakeJira({
+    issues: [
+      { key: "WEB-1", id: "1", status: "To Do", priority: "Highest" },
+      { key: "WEB-2", id: "2", status: "To Do", priority: "High" },
+      { key: "WEB-3", id: "3", status: "To Do", priority: "Medium" },
+      { key: "WEB-4", id: "4", status: "To Do", priority: "Low" },
+      { key: "WEB-5", id: "5", status: "To Do", priority: "Lowest" },
+      { key: "WEB-6", id: "6", status: "To Do", priority: null }, // no priority set in Jira
+    ],
+  });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+
+  expect(Object.fromEntries(tasks(db).map((t) => [t.jira_key, t.priority]))).toEqual({
+    "WEB-1": "now", "WEB-2": "next", "WEB-3": "normal", "WEB-4": "later", "WEB-5": "later", "WEB-6": "normal",
+  });
+  // The brief keeps carrying the Jira name — it is still context for an agent.
+  expect(tasks(db)[0].brief).toContain("Priority: Highest");
+  // Nothing in the priority copy may look like a status decision.
+  expect(syncEvents(db).some((e) => e.action === "pull" || e.action === "push")).toBe(false);
+});
+
+test("a priority change in Jira moves the hive priority and moves nothing else", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Progress", priority: "Medium" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const before = tasks(db)[0];
+  expect(before.priority).toBe("normal");
+
+  jira.byKey.get("WEB-1")!.priority = "Highest";
+  await run(db, projectId, jira.fetchImpl);
+
+  const after = tasks(db)[0];
+  expect(after.priority).toBe("now");
+  expect(after.state).toBe(before.state);
+  expect(jira.calls.some((c) => c.method === "POST" && c.path.includes("/transitions"))).toBe(false);
+});
+
+test("an unrecognised Jira priority lands on normal and is logged ONCE, not every cycle", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do", priority: "Blocker" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  await run(db, projectId, jira.fetchImpl);
+
+  expect(tasks(db)[0].priority).toBe("normal");
+  const unmapped = syncEvents(db).filter((e) => e.action === "unmapped_priority");
+  expect(unmapped).toEqual([{ action: "unmapped_priority", issue: "WEB-1", jira_priority: "Blocker" }]);
+});
+
+test("the priority map covers Jira's default scheme and refuses to guess anything else", () => {
+  expect(J.jiraPriorityToPriority("Highest")).toBe("now");
+  expect(J.jiraPriorityToPriority("  high ")).toBe("next"); // case + whitespace tolerant
+  expect(J.jiraPriorityToPriority("Medium")).toBe("normal");
+  expect(J.jiraPriorityToPriority("Low")).toBe("later");
+  expect(J.jiraPriorityToPriority("Lowest")).toBe("later");
+  expect(J.jiraPriorityToPriority("P0")).toBe(null);
+  expect(J.jiraPriorityToPriority(null)).toBe(null);
+  // Every value it CAN produce has to be a rank the dispatcher understands.
+  for (const p of Object.values(J.JIRA_TO_PRIORITY)) expect(TASK_PRIORITIES).toContain(p);
 });
 
 test("import broadcasts via broadcastTask, so the live-pushed card already carries never_dispatched", async () => {

@@ -299,6 +299,34 @@ export function stateToJiraStatus(state: string): string | null {
   return Object.hasOwn(STATE_TO_JIRA, state) ? STATE_TO_JIRA[state as State] ?? null : null;
 }
 
+// ---------------------------------------------------------------- priority
+// Jira's default five-level scheme onto hive's four-level one. Confirmed
+// against the live board before hardcoding: the 111 mirrored issues carry
+// Highest/High/Medium/Low/Lowest and nothing else.
+//
+// ONE-WAY, Jira -> hive. hive never writes a priority back: the director
+// triages in Jira, and a mirror is tracking-only.
+//
+// Highest maps to 'now' on purpose. authorizePriority (api.ts) reserves 'now'
+// for a director source because it can borrow a dispatch slot past max_agents —
+// but this priority WAS set by the director, in Jira, and a mirror is never
+// dispatched, so it can never spend that headroom. The importer is therefore
+// trusted with it rather than bypassing the check silently.
+export const JIRA_TO_PRIORITY: Record<string, string> = {
+  highest: "now",
+  high: "next",
+  medium: "normal",
+  low: "later",
+  lowest: "later",
+};
+
+// null means "not a name hive knows" — a renamed or added Jira priority. The
+// caller records that and falls back to 'normal' rather than guessing a rank.
+export function jiraPriorityToPriority(name: string | undefined | null): string | null {
+  const key = String(name ?? "").trim().toLowerCase();
+  return Object.hasOwn(JIRA_TO_PRIORITY, key) ? JIRA_TO_PRIORITY[key] : null;
+}
+
 const sameStatus = (a: string | null, b: string | null): boolean =>
   a != null && b != null && a.trim().toLowerCase() === b.trim().toLowerCase();
 
@@ -1801,8 +1829,21 @@ async function reconcileIssue(ctx: Ctx, read: IssueRead, task: any): Promise<voi
   // ---- JIRA-owned fields always flow JIRA -> hive (hive never rewrites them)
   const title = titleFor(read.issue);
   const brief = briefFor(read.issue, cfg.site);
-  if (task.title !== title || task.brief !== brief) {
-    db.query("UPDATE tasks SET title = ?, brief = ?, updated_at = ? WHERE id = ?").run(title, brief, now(), task.id);
+  // Priority is one of those Jira-owned fields, and this is the ONLY place hive
+  // writes it for a mirror — a fresh import reaches here on the same cycle
+  // (importAndReconcile), so there is one rule and no second copy to drift.
+  // It rides with title/brief deliberately: it is a plain field copy, entirely
+  // separate from the status conflict rule below, so it can never move a
+  // mirror's state.
+  const jiraPriorityName: string | null = read.issue.fields?.priority?.name ?? null;
+  const mappedPriority = jiraPriorityToPriority(jiraPriorityName);
+  if (jiraPriorityName != null && mappedPriority == null)
+    logSyncOnce(db, task.id, { action: "unmapped_priority", issue: key, jira_priority: jiraPriorityName });
+  // An issue with NO priority set is not an unmapped name; both land on normal.
+  const priority = mappedPriority ?? "normal";
+  if (task.title !== title || task.brief !== brief || task.priority !== priority) {
+    db.query("UPDATE tasks SET title = ?, brief = ?, priority = ?, updated_at = ? WHERE id = ?")
+      .run(title, brief, priority, now(), task.id);
     broadcastTask(db, getTask(db, task.id));
   }
 
