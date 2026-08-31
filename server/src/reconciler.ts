@@ -12,9 +12,10 @@ import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { startLoop } from "./loop.ts";
-import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, verificationGate, repairRequeueProvenance, TERMINAL, type State } from "./state.ts";
+import { writeEvent, lastAgentActivity, AGENT_EVENT_SOURCES, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, verificationGate, repairRequeueProvenance, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
 import { spawnMeta } from "./cleanup.ts";
+import { raceSweep } from "./race.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent, resumeReviewForDeliveredSteers } from "./steer.ts";
 import { inBackoff, isReviewed, MAX_AGENTS_DEFAULT } from "./dispatcher.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
@@ -29,14 +30,17 @@ import { diagnosePane, dialogAutoApprovable, editDialogPaths, parseResetClock } 
 import { AUTO_MERGE_PAUSED, requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount } from "./api.ts";
 import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, mapLimit, projectBaseBranch, preferSafeRef } from "./exec.ts";
+import { defaultExec, mapLimit, projectBaseBranch, preferSafeRef, GH_LIST_TIMEOUT_MS, GH_LIST_CONCURRENCY } from "./exec.ts";
 import { captureBranchScope } from "./rebaseGuard.ts";
+import { scoreScopePrediction } from "./fileScope.ts";
 import { landOnce } from "./landQueue.ts";
 import { sidecarOnce } from "./sidecar.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
+import { riskLevel } from "./autoapprove.ts";
 import { runPrGardener } from "./prGardener.ts";
 import { autoAckPlans } from "./planCritic.ts";
 import { ambiguityCleared, cautionCleared, latestAutoReviewVerdict } from "./reviewer.ts";
+import { reportBoardAudit } from "./boardAudit.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
 const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
@@ -139,7 +143,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
       setSetting(db, "reconciler_error_streak", String(streak));
       if (lastError) setSetting(db, "reconciler_last_error", lastError);
     } else {
+      // HIVE-533: clear the message with the streak. Leaving it behind pinned one
+      // transient failure in `settings` forever, and /api/health published that
+      // fossil next to consecutive_errors: 0 as if it were current.
       setSetting(db, "reconciler_error_streak", "0");
+      setSetting(db, "reconciler_last_error", "");
     }
   };
   await step("surfaceTrackingBindings", () => surfaceTrackingBindings(db));
@@ -164,6 +172,8 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("captureRecurringRefs", () => captureRecurringRefs(db));
   await step("repairRequeueProvenance", () => repairRequeueProvenance(db));
   await step("surfaceDeadDependencies", () => surfaceDeadDependencies(db));
+  // Best-of-N: open the compare card once a race's attempts have all settled.
+  await step("raceSweep", () => raceSweep(db, { exec: deps.exec ?? defaultExec, nowMs: deps.nowMs?.() }));
   // Away mode flips on/off by its schedule here. On waking it sends ONE
   // "while you were away" push for everything that was held.
   await step("syncAway", () => syncAway(db, (deps.nowMs ?? (() => Date.now()))()));
@@ -178,6 +188,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("syncPRs", () => syncPRs(db, deps));
   await step("revalidateCiDecisions", () => revalidateCiDecisions(db));
   await step("linkPRs", () => linkPRs(db, deps));
+  // Read-only board-vs-reality audit (HIVE-528). Below the offline cutoff and
+  // after linkPRs because one of its checks asks GitHub whether a PR really
+  // landed. step() isolates it, so a failure here can never stall a sync path.
+  // It reports; it never repairs.
+  await step("boardAudit", () => reportBoardAudit(db, { exec: deps.exec }));
   await step("prGardener", () => runPrGardener(db, {
     exec: deps.exec ?? defaultExec,
     nowMs: deps.nowMs,
@@ -627,7 +642,13 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
           const scope = await captureBranchScope(exec, project.repo_path, data.baseRefOid || base, scopeHead);
           const afterScope = getTask(db, t.id);
           if (!afterScope || TERMINAL.includes(afterScope.state as State) || afterScope.pr_url !== t.pr_url) continue;
-          if (scope) writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: { ...scope, head_sha: data.headRefOid ?? null } });
+          if (scope) {
+            writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: { ...scope, head_sha: data.headRefOid ?? null } });
+            // Score the dispatch-time file guess against what the branch really
+            // touched (HIVE-509), so the heuristic can be tuned or dropped on
+            // evidence rather than opinion.
+            scoreScopePrediction(db, t.id, scope.files);
+          }
         }
       }
     }
@@ -908,8 +929,14 @@ async function linkPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   // to link either.
   const projects = activeProjects(db).filter((p) => p.repo_path) as { id: string; repo_path: string }[];
   let startFailure: string | null = null;
-  for (const p of projects) {
-    const r = await exec(["gh", "pr", "list", "--state", "open", "--json", "number,title,body,url"], { cwd: p.repo_path });
+  // List every project a few at a time (HIVE-486): listing serially meant one
+  // stalled repo cost a full timeout before the next repo was even tried, so K
+  // stalled repos added K timeouts to the lap. Only the `gh` calls overlap; the
+  // linking below still runs serially, in project order.
+  const lists = await mapLimit(projects, GH_LIST_CONCURRENCY, (p) =>
+    exec(["gh", "pr", "list", "--state", "open", "--json", "number,title,body,url"], { cwd: p.repo_path, timeoutMs: GH_LIST_TIMEOUT_MS })
+  );
+  for (const r of lists) {
     // 127 is defaultExec's "the child never started" (missing binary, or a
     // repo_path that no longer exists), as opposed to gh running and failing.
     if (r.code === 127 && startFailure === null) startFailure = r.stderr.trim();
@@ -1503,18 +1530,25 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
 // Auto-answer: a decision card that sits past the project's timeout
 // (config.decision_auto_answer_hours, off unless set) and carries a
 // RECOMMENDED option gets answered with that recommendation — except
-// risk='high' cards (authority/prod), which always wait for the human.
+// high-risk cards (authority/prod), which always wait for the human.
 // The notification names what was chosen, so silence is informed consent,
 // not surprise.
+//
+// High risk is deliberately asymmetric. The card stays OPEN past the window
+// (an open card parks its task; a released one may have already shipped the
+// thing nobody approved) and the sweep escalates it once with an urgent push
+// instead. Risk is read through riskLevel(), not compared to the literal
+// string 'high' — three cards whose risk field was a whole sentence beginning
+// "high — ..." slipped past the old exact match.
 export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()): void {
   const rows = db
     .query(
-      `SELECT d.id, d.task_id, d.ts, d.title, d.options, p.config FROM decisions d
+      `SELECT d.id, d.task_id, d.ts, d.title, d.options, d.risk, p.config FROM decisions d
          JOIN tasks t ON t.id = d.task_id JOIN projects p ON p.id = t.project_id
-        WHERE d.status = 'open' AND COALESCE(d.risk, 'normal') != 'high' AND d.decision_class IS NULL
+        WHERE d.status = 'open' AND d.decision_class IS NULL
           AND ${supervisedSql("t.source", "t.agent_target")}`
     )
-    .all() as { id: string; task_id: string; ts: string; title: string; options: string; config: string }[];
+    .all() as { id: string; task_id: string; ts: string; title: string; options: string; risk: string | null; config: string }[];
   for (const r of rows) {
     if (isTrackingOnlyId(db, r.task_id)) continue;
     let hours = 0;
@@ -1525,6 +1559,29 @@ export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()
     }
     if (hours <= 0) continue;
     if (nowMs - Date.parse(r.ts) < hours * 3600_000) continue;
+    // Past the window and high risk: escalate, never answer. Once per card —
+    // the event is the dedup key, so a 30s sweep does not re-push every loop.
+    if (riskLevel(r.risk) === "high") {
+      const already = db
+        .query("SELECT 1 FROM events WHERE type = 'decision_escalated' AND json_extract(payload, '$.decision_id') = ? LIMIT 1")
+        .get(r.id);
+      if (already) continue;
+      writeEvent(db, {
+        task_id: r.task_id,
+        source: "reconciler",
+        type: "decision_escalated",
+        payload: { decision_id: r.id, reason: `high risk, open ${hours}h past the auto-answer window`, risk: r.risk ?? null },
+      });
+      enqueue(db, {
+        kind: "decision",
+        urgency: "urgent",
+        task_id: r.task_id,
+        decision_id: r.id,
+        title: `Still needs you: "${r.title.slice(0, 70)}"`,
+        body: `High risk, open ${hours}h with no reply. It stays open and its task stays blocked — high-risk cards are never auto-answered.`,
+      });
+      continue;
+    }
     let rec: any;
     try {
       rec = JSON.parse(r.options || "[]").find((o: any) => o.recommended);
@@ -1695,6 +1752,72 @@ export function unparkAnswered(db: DB, nowMs: number = Date.now()): void {
   }
 }
 
+// A hung agent is not a dead one: it still holds its name, so reattach skips it,
+// the reaper leaves it alone, and the stale flag fires exactly once. Silence at
+// 4x the stale threshold means the WORK stopped, which needs a human eye rather
+// than a respawn — hive must not kill it, because a slow `pnpm install` and a
+// wedged one look identical from here (hive-1951). The clock counts only
+// agent-generated events (see lastAgentActivity): hive's own rows, and a human
+// poking the task, must not make a frozen task look busy.
+const HUNG_MULTIPLIER = 4;
+
+// The last thing the agent itself said, for the hung notification: the wedge
+// point is usually named right there ("Installing (cms pins pnpm 9.1.0)").
+function lastAgentWord(db: DB, taskId: string): string | null {
+  const r = db
+    .query(
+      `SELECT payload FROM events WHERE task_id = ? AND source IN (${AGENT_EVENT_SOURCES.map(() => "?").join(",")}) AND type IN ('assistant_text','status','note','checkpoint','blocked') ORDER BY ts DESC LIMIT 1`
+    )
+    .get(taskId, ...AGENT_EVENT_SOURCES) as { payload: string } | undefined;
+  if (!r) return null;
+  try {
+    const p = JSON.parse(r.payload);
+    const text = String(p.text ?? p.note ?? "").trim().replace(/\s+/g, " ");
+    return text ? text.slice(0, 240) : null;
+  } catch {
+    return null;
+  }
+}
+
+function humanMs(ms: number): string {
+  const mins = Math.round(ms / 60000);
+  return mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`;
+}
+
+// Silent past HUNG_MULTIPLIER x the stale threshold, with the agent still
+// holding its name: report it once per silence window as its own class. The
+// caller's filters (deferred, dependency-blocked, mirrors, chat supervisors)
+// already exclude everything that is quiet on purpose.
+function flagHung(db: DB, taskId: string, staleMs: number, nowMs: number): void {
+  const since = lastAgentActivity(db, taskId);
+  if (!since) return;
+  const quiet = nowMs - Date.parse(since);
+  if (quiet <= staleMs * HUNG_MULTIPLIER) return;
+  // Once per silence window, keyed on the activity it starts from — not on "is
+  // there a newer hung row", which would be true forever after the first one and
+  // silence a task that woke up, spoke, and wedged again.
+  if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'hung' AND json_extract(payload, '$.since') = ? LIMIT 1").get(taskId, since))
+    return;
+  const said = lastAgentWord(db, taskId);
+  const task = getTask(db, taskId);
+  writeEvent(db, {
+    task_id: taskId,
+    source: "reconciler",
+    type: "hung",
+    payload: { since, silent_ms: quiet, threshold_ms: staleMs * HUNG_MULTIPLIER, last_said: said },
+  });
+  enqueue(db, {
+    kind: "hung_agent",
+    urgency: "urgent",
+    task_id: taskId,
+    title: `No progress for ${humanMs(quiet)}: ${task?.title ?? taskId}`,
+    body:
+      `The agent is still holding this task, but nothing has happened since ${since}. ` +
+      (said ? `It last said: "${said}". ` : "It said nothing before going quiet. ") +
+      `It may be wedged, or just running something long. Look at the pane before killing anything.`,
+  });
+}
+
 function flagStale(db: DB, deps: ReconcilerDeps): void {
   const staleMs = deps.staleMs ?? DEFAULT_STALE_MS;
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
@@ -1725,6 +1848,7 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
       .query("SELECT ts, type FROM events WHERE task_id = ? ORDER BY ts DESC LIMIT 1")
       .get(t.id) as { ts: string; type: string } | undefined;
     if (!last) continue;
+    flagHung(db, t.id, staleMs, nowMs);
     if (last.type === "stale") continue; // already flagged; don't spam
     const age = nowMs - Date.parse(last.ts);
     if (age > staleMs) {
@@ -2136,8 +2260,9 @@ function queuedInputEpisode(
   db: DB,
   taskId: string
 ): { attempts: number; startedAt: string | null; latestDelivered: boolean | null | undefined } {
-  const rows = db.query("SELECT type, ts, payload FROM events WHERE task_id = ? ORDER BY ts DESC, rowid DESC").all(taskId) as {
+  const rows = db.query("SELECT type, source, ts, payload FROM events WHERE task_id = ? ORDER BY ts DESC, rowid DESC").all(taskId) as {
     type: string;
+    source: string;
     ts: string;
     payload: string;
   }[];
@@ -2149,7 +2274,7 @@ function queuedInputEpisode(
       if (n === 0) latestDelivered = JSON.parse(r.payload).delivered;
       n++;
       startedAt = r.ts;
-    } else if (r.type === "agent_status" || r.type === "stale") continue; // reconciler noise
+    } else if (!AGENT_EVENT_SOURCES.includes(r.source)) continue; // hive's own rows about the task, not the agent working
     else break; // real activity resets the count
   }
   return { attempts: n, startedAt, latestDelivered };

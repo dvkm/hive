@@ -33,6 +33,7 @@ import { runPlanner, type PlannerExec } from "../planner.ts";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 import { activeProjects } from "../testProjects.ts";
+import { startLoop } from "../loop.ts";
 
 export type FetchLike = typeof fetch;
 
@@ -405,22 +406,8 @@ export async function pollGchatOnce(db: DB, deps: GchatDeps = {}): Promise<{ cre
 // Production starts one background loop from index.ts. Each start call owns its
 // timer and in-flight guard; a slow cycle skips ticks instead of queueing them.
 export function startGchatPoll(db: DB, deps: GchatDeps = {}): () => void {
-  const log = deps.log ?? ((m: string, e?: unknown) => console.error(`[hive] gchat: ${m}`, e ?? ""));
   const intervalMs = deps.intervalMs ?? Number(process.env.HIVE_GCHAT_POLL_MS || 60_000);
-  let running = false;
-  const timer = setInterval(() => {
-    if (running) {
-      log("poll tick skipped: previous cycle still running");
-      return;
-    }
-    running = true;
-    pollGchatOnce(db, deps)
-      .catch((e) => console.error("[hive] gchat poll crashed:", e))
-      .finally(() => {
-        running = false;
-      });
-  }, intervalMs);
-  return () => clearInterval(timer);
+  return startLoop("gchat", intervalMs, () => pollGchatOnce(db, deps));
 }
 
 // ------------------------------------------------------------------ oauth (CLI)

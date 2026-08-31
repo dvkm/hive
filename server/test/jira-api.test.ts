@@ -226,7 +226,9 @@ test("a whitespace-only Jira comment is rejected before it enters the outbox", a
   const response = await postJson(`/api/tasks/${jiraTask}/send`, { message: " \n\t " });
 
   expect(response.status).toBe(400);
-  expect(response.json.error).toBe("message is required");
+  // HIVE-530: the refusal now names the command that fixes it.
+  expect(response.json.error).toContain("message is required");
+  expect(response.json.error).toContain("hive task send");
   expect(db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'jira_comment'").get(jiraTask)).toEqual({ n: 0 });
 });
 

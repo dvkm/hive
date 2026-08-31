@@ -98,11 +98,11 @@ test("startWatchers skips a tick while a cycle is already running", async () => 
     return new Response(`v${cycles}`, { status: 200 });
   }) as unknown as typeof fetch;
 
-  const origError = console.error;
+  const origWarn = console.warn;
   const origSetInterval = globalThis.setInterval;
   const origClearInterval = globalThis.clearInterval;
   const logs: string[] = [];
-  console.error = ((...args: any[]) => logs.push(String(args[0]))) as typeof console.error;
+  console.warn = ((...args: any[]) => logs.push(String(args[0]))) as typeof console.warn;
   globalThis.setInterval = ((callback: () => void) => {
     tick = callback;
     return 1;
@@ -119,14 +119,14 @@ test("startWatchers skips a tick while a cycle is already running", async () => 
     await new Promise(setImmediate);
     stop();
   } finally {
-    console.error = origError;
+    console.warn = origWarn;
     globalThis.setInterval = origSetInterval;
     globalThis.clearInterval = origClearInterval;
   }
 
   expect(maxActive).toBe(1);
   expect(cycles).toBe(1);
-  expect(logs.some((m) => m.includes("skipped"))).toBe(true);
+  expect(logs.some((m) => m.includes("skipping this tick"))).toBe(true);
 });
 
 test("google docs/sheets edit links rewrite to export endpoints", () => {

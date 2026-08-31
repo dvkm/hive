@@ -4,6 +4,8 @@ Local-first orchestration control plane built around one persistent Chief of Sta
 
 This repo contains **Phase 1** (server core + CLI) and **Phase 2b** (the runtime layer: herdr adapter, reconciler, monitors + post-deploy smoke, secrets, and Claude Code/Codex hooks). The web app is built separately against `docs/API.md`.
 
+New here? Start with **[docs/GETTING-STARTED.md](./docs/GETTING-STARTED.md)**: the eight concepts, the five commands you actually need, and what to check when a task will not run.
+
 ## Requirements
 
 - [Bun](https://bun.sh) (tested on 1.3.x and 1.4.x).

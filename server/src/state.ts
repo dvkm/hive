@@ -297,6 +297,7 @@ export const SKIP_REASONS: Record<string, { label: string; permanent: boolean }>
   triage_hold: { label: "waiting on your intake triage answer", permanent: false },
   repo_mismatch: { label: "brief targets another project's repo", permanent: false },
   dependency_blocked: { label: "blocked by unfinished dependencies", permanent: false },
+  file_overlap: { label: "another running task looks like it edits the same files", permanent: false },
   authority_decision: { label: "waiting on a dispatch decision card", permanent: false },
   no_capacity: { label: "at the project's max_agents cap", permanent: false },
   spawn_backoff: { label: "cooling down after a spawn failure", permanent: false },
@@ -434,9 +435,10 @@ export function mutateWithEvent<T>(
 export function expireOpenDecisions(db: DB, taskId: string, reason: string): number {
   const rows = db.query("SELECT * FROM decisions WHERE task_id = ? AND status = 'open'").all(taskId) as any[];
   for (const r of rows) {
-    db.query("UPDATE decisions SET status = 'expired' WHERE id = ?").run(r.id);
+    const expiredAt = now();
+    db.query("UPDATE decisions SET status = 'expired', answered_at = ?, answered_by = 'system' WHERE id = ?").run(expiredAt, r.id);
     writeEvent(db, { task_id: taskId, source: "system", type: "decision_expired", payload: { decision_id: r.id, reason } });
-    broadcast({ type: "decision", decision: parseDecision({ ...r, status: "expired" }) });
+    broadcast({ type: "decision", decision: parseDecision({ ...r, status: "expired", answered_at: expiredAt, answered_by: "system" }) });
   }
   return rows.length;
 }
@@ -991,4 +993,27 @@ export function transition(
     }
   }
   return updated;
+}
+
+// The last time the AGENT itself did something, for every "is this task still
+// moving?" question (health, the hung detector, any UI that shows last
+// activity). Only two sources are the agent talking: `agent` (its own `hive
+// emit` calls) and `hook` (its Claude Code / Codex transcript rows). Everything
+// else — the reconciler, the reaper, herdr, jira sync, and a human steering or
+// poking the task — is hive writing ABOUT the task, and must never reset the
+// clock. Measured the hard way (hive-1951, 2026-08-31): a refused respawn wrote
+// spawn_error + authority_logged, and a task frozen since 09:51 dropped off the
+// stall list at 12:14 while being exactly as frozen. Checking on a stuck task
+// must not hide it.
+// A `spawned` row is the one exception: an agent that has not spoken yet has
+// been silent since it started, so the spawn is where its clock begins. A
+// REFUSED spawn writes spawn_error, not spawned, so it grants nothing.
+export const AGENT_EVENT_SOURCES = ["agent", "hook"];
+export function lastAgentActivity(db: DB, taskId: string): string | null {
+  const r = db
+    .query(
+      `SELECT ts FROM events WHERE task_id = ? AND (source IN (${AGENT_EVENT_SOURCES.map(() => "?").join(",")}) OR type = 'spawned') ORDER BY ts DESC LIMIT 1`
+    )
+    .get(taskId, ...AGENT_EVENT_SOURCES) as { ts: string } | undefined;
+  return r?.ts ?? null;
 }

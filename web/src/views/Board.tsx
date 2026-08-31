@@ -3,7 +3,7 @@ import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
 import type { DivergenceRow, Health, Kind, LandGraph, State, Task } from "../lib/api";
-import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, SidecarChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, PRIORITIES, PriorityChip, priorityRank, SidecarChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
 import { AttentionTray, needsAttention, isWaiting } from "./attention";
@@ -62,7 +62,9 @@ const COL_EMPTY: Record<string, { title: string; hint: string }> = {
 export function Card({ task }: { task: Task }) {
   const { projects, evidenceCount, spawnError, lastActivity, tasks, decisions } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
-  const age = useRelTime(lastActivity[task.id] || task.updated_at);
+  // health.since is the server's agent-only activity clock (health.ts); it is
+  // the honest "quiet for" number, where updated_at counts hive's own writes.
+  const age = useRelTime(task.health?.since || lastActivity[task.id] || task.updated_at);
   const ev = evidenceCount[task.id];
   const location = useLocation();
   const [dispatching, setDispatching] = useState(false);
@@ -112,6 +114,7 @@ export function Card({ task }: { task: Task }) {
       <div className="card-meta">
         {project && <span className="chip">{project.name}</span>}
         <span className={`chip chip-kind chip-${task.kind}`}>{task.kind}</span>
+        <PriorityChip task={task} />
         {awaitingTriage ? (
           // Intake triage read this request two ways and parked it on one
           // question. "queued" alone reads as "an agent will pick this up",
@@ -161,9 +164,18 @@ export function Card({ task }: { task: Task }) {
             ⚠ spawn failed
           </span>
         )}
+        {task.state === "queued" && task.overlap_hold && (
+          <span
+            className="chip chip-blocked"
+            title={`Both this task and #${task.overlap_hold.number} look like they edit ${task.overlap_hold.files.join(", ")}. It starts once that one finishes, or sooner if nothing else can run.`}
+          >
+            waiting on #{task.overlap_hold.number}
+          </span>
+        )}
         {/* Why this queued task is not running (HIVE-525). A permanent reason is
-            the loud one: nothing changes until a human changes a setting. */}
-        {task.state === "queued" && task.skip && task.skip.reason !== "dependency_blocked" && (
+            the loud one: nothing changes until a human changes a setting. The
+            two reasons with their own richer chip above are left out. */}
+        {task.state === "queued" && task.skip && !["dependency_blocked", "file_overlap"].includes(task.skip.reason) && (
           <span
             className={task.skip.permanent ? "chip chip-error" : "chip"}
             title={`Dispatcher skipped this task: ${task.skip.label}`}
@@ -174,7 +186,13 @@ export function Card({ task }: { task: Task }) {
         )}
         <SidecarChip sidecar={task.sidecar} />
         <BlockedBy depends_on={task.depends_on} tasks={tasks} />
-        {task.deferred_until && Date.parse(task.deferred_until) > Date.now() && (
+        {/* A taken-over task is deferred too (that is how it is parked), so this
+            comes first: "you are holding this one" beats "parked". */}
+        {task.parked_for_director ? (
+          <span className="chip chip-deferred" title="You took this worktree over; no agent runs on it until you hand it back">
+            yours
+          </span>
+        ) : task.deferred_until && Date.parse(task.deferred_until) > Date.now() && (
           <span className="chip chip-deferred" title="Deferred pending an offline human action; nudges suppressed">
             deferred
           </span>
@@ -263,7 +281,9 @@ export function LandChips({ task, graph, tasks }: { task: Task; graph: LandGraph
       {clash.length > 0 && (
         <span
           className="chip chip-blocked"
-          title={clash.map((e) => `${name(e.peer)}: ${(e.files ?? []).join(", ")}`).join("\n")}
+          title={clash
+            .map((e) => `Both PRs change ${(e.files ?? []).join(", ") || "the same files"} — read them together before landing (${name(e.peer)})`)
+            .join("\n")}
         >
           conflicts with {clash.map((e) => name(e.peer)).join(", ")}
         </span>
@@ -271,6 +291,13 @@ export function LandChips({ task, graph, tasks }: { task: Task; graph: LandGraph
     </div>
   );
 }
+
+// Queued cards read in the order the dispatcher will actually pick them up:
+// priority first, then the longest wait (server: PRIORITY_RANK_SQL, created_at).
+export const queueOrder = (list: Task[]): Task[] =>
+  [...list].sort(
+    (a, b) => priorityRank(a.priority) - priorityRank(b.priority) || a.created_at.localeCompare(b.created_at)
+  );
 
 // ---- divergence radar (HIVE-348) ----------------------------------------
 // Conflicts used to appear at merge time, after a review was already done. This
@@ -373,6 +400,7 @@ export default function Board() {
   const byState = (s: State) => {
     let list = visible.filter((t) => !isTrackingOnly(t) && t.state === s);
     // list is already newest-updated first from the API / SSE upserts.
+    if (s === "queued") list = queueOrder(list);
     if (s === "done") list = list.slice(0, 10);
     return list;
   };
@@ -542,6 +570,7 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
   const [brief, setBrief] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [kind, setKind] = useState<Kind>("ship");
+  const [priority, setPriority] = useState("normal");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -558,7 +587,10 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
         await api.intake({ project_id: project, text: dump.trim() });
         toast("Braindump sent — Claude is drafting a breakdown for you to approve");
       } else {
-        await api.createTask({ project_id: project, title: title.trim(), brief: brief.trim() || undefined, kind }, files);
+        await api.createTask(
+          { project_id: project, title: title.trim(), brief: brief.trim() || undefined, kind, priority },
+          files
+        );
         toast(files.length ? `Task queued with ${files.length} attachment(s)` : "Task queued");
       }
       onClose();
@@ -628,6 +660,16 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
                     <option value="ship">ship</option>
                     <option value="scout">scout</option>
                     <option value="chore">chore</option>
+                  </select>
+                </label>
+                <label className="fld">
+                  <span>Priority</span>
+                  <select value={priority} onChange={(e) => setPriority(e.target.value)}>
+                    {PRIORITIES.map((p) => (
+                      <option key={p} value={p}>
+                        {p}
+                      </option>
+                    ))}
                   </select>
                 </label>
               </>

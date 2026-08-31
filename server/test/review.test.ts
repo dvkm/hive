@@ -9,6 +9,8 @@ process.env.HIVE_HOME = HOME;
 const { openDb } = await import("../src/db.ts");
 const { makeHandler, repairDuplicateQuizPasses } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
+const { writeEvent } = await import("../src/state.ts");
+const { reviewActionable, reviewActionableBatch } = await import("../src/reviewer.ts");
 const { parseUnifiedDiff, taskDiff, MAX_DIFF_LINES } = await import("../src/diff.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -1121,6 +1123,51 @@ test("brief.to_review derivation lists in_review tasks", async () => {
   await s.server.stop(true);
 });
 
+// HIVE-500: the review column counted everything in_review, so the Backlogs
+// number was mostly pipeline state. One task per bucket; only the last two are
+// the director's.
+test("brief.to_review counts only reviews the director can act on", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", { name: "actionable", repo_path: "/repo" });
+  const make = async (title: string, cols: Record<string, any>) => {
+    const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title });
+    const id = t.json.id;
+    for (const [k, v] of Object.entries(cols)) s.db.query(`UPDATE tasks SET ${k} = ? WHERE id = ?`).run(v, id);
+    s.db.query("UPDATE tasks SET state = 'in_review' WHERE id = ?").run(id);
+    return id;
+  };
+  const review = (id: string, head: string, risks: string[] = []) =>
+    writeEvent(s.db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks, questions: [], reviewed_head_sha: head } });
+  const PR = { pr_url: "https://x/pr/1", ci_status: "passing", head_sha: "head1" };
+
+  const noReview = await make("no review yet", PR);
+  const staleReview = await make("review at a stale head", PR);
+  review(staleReview, "old-head");
+  const unverified = await make("risks unverified", PR);
+  review(unverified, "head1", ["a risk nobody checked"]);
+  const noPrNoReport = await make("no PR and no report", {});
+  const noPrReport = await make("no PR but a report", {});
+  writeEvent(s.db, { task_id: noPrReport, source: "agent", type: "review_summary", payload: { done: ["read the docs"] } });
+  const redCi = await make("PR with red CI", { ...PR, ci_status: "failing" });
+  review(redCi, "head1");
+  const ready = await make("PR with green CI and a finished review", PR);
+  review(ready, "head1");
+
+  const b = await get(s.base, "/api/brief");
+  const ids = (rows: any[]) => rows.map((t: any) => t.id).sort();
+  expect(ids(b.json.to_review)).toEqual([noPrReport, ready].sort());
+  // Everything else stays visible, just uncounted.
+  expect(ids(b.json.in_review_pending)).toEqual([noReview, staleReview, unverified, noPrNoReport, redCi].sort());
+
+  // The batched rule the list endpoints use must agree with the single-task one
+  // on every bucket, or a board card and its brief row would disagree.
+  const rows = s.db.query("SELECT * FROM tasks").all() as any[];
+  const batch = reviewActionableBatch(s.db, rows);
+  for (const t of rows) expect(batch.has(t.id)).toBe(reviewActionable(s.db, t));
+
+  s.server.stop(true);
+});
+
 test("diff endpoint returns the structured shape for a branch task", async () => {
   const s = makeServer();
   const { taskId } = await inReviewTask(s.base);
@@ -1266,7 +1313,7 @@ test("only a review that finished for the live head counts as an answerable quiz
   const shipped = await bucket("already shipped", "head-f", { head: "head-f", risks: [] });
   s.db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(shipped);
 
-  const quizzes = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  const quizzes = (await get(s.base, "/api/understanding-quizzes?scope=all")).json.quizzes as any[];
   const mine = quizzes.filter((q) => q.project_id === p.json.id);
   expect(mine.filter((q) => q.task_state === "in_review").map((q) => q.task_id)).toEqual([answerable]);
   expect(mine.filter((q) => q.task_state === "done").map((q) => q.task_id)).toEqual([shipped]);
@@ -1283,6 +1330,20 @@ test("only a review that finished for the live head counts as an answerable quiz
   );
   const after = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
   expect(after.some((q) => q.task_id === noReview)).toBe(true);
+  await s.server.stop(true);
+});
+
+test("the quiz list defaults to live tasks; shipped ones need scope=all (HIVE-542)", async () => {
+  const s = makeServer();
+  const live = await judgmentTask(s, { verdict: "caution" });
+  const shipped = await judgmentTask(s, { verdict: "caution" });
+  s.db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(shipped.taskId);
+
+  const live_only = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  expect(live_only.map((q) => q.task_id)).toEqual([live.taskId]);
+
+  const all = (await get(s.base, "/api/understanding-quizzes?scope=all")).json.quizzes as any[];
+  expect(all.map((q) => q.task_id).sort()).toEqual([live.taskId, shipped.taskId].sort());
   await s.server.stop(true);
 });
 
@@ -1390,6 +1451,33 @@ test("a confirmed risk blocks the merge and the 409 names it", async () => {
   s.db.query("UPDATE tasks SET head_sha = 'head-2' WHERE id = ?").run(taskId);
   const stale = await post(s.base, `/api/tasks/${taskId}/merge`, {});
   expect(stale.status).not.toBe(409);
+  await s.server.stop(true);
+});
+
+// HIVE-539: a risk check that never produced a verdict must not be quoted as a
+// confirmed risk. The 409 says the check did not finish, and the director can
+// still merge over it.
+test("a timed-out risk check blocks with an honest reason, not a confirmed risk", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
+  s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    `ev-rv-timeout-${taskId}`,
+    taskId,
+    new Date().toISOString(),
+    "system",
+    "risk_verdicts",
+    JSON.stringify({ reviewed_head_sha: "head-1", verdicts: [], unverified: 1, unverified_reason: "timed out after 180000ms" })
+  );
+
+  const blocked = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(blocked.status).toBe(409);
+  expect(blocked.json.error).toContain("did not finish");
+  expect(blocked.json.error).toContain("timed out after 180000ms");
+  expect(blocked.json.error).not.toContain("confirmed 1 risk");
+  expect(blocked.json.error).not.toContain("maybe a leak");
+
+  const merged = await post(s.base, `/api/tasks/${taskId}/merge`, { override_confirmed_risks: true });
+  expect(merged.status).toBe(200);
   await s.server.stop(true);
 });
 

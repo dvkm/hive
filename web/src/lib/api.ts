@@ -128,16 +128,20 @@ export interface Task {
   jira_key: string | null;
   jira_link_kind: "mirror" | "subtask" | null;
   parent_task_id: string | null;
+  race_id?: string | null; // best-of-N: the group of attempts this task is one of
   duplicate_of: string | null; // survivor id when cancelled as a duplicate
   depends_on: string[]; // task ids governed by the server dependency gate (docs/API.md)
   deferred_until?: string | null; // parked pending an offline human action; nudges suppressed while future-dated
+  parked_for_director?: string | null; // director took the worktree over; no agent runs on it until hand-back
   land_queued_at?: string | null; // marked approved-to-land; the land queue merges it in graph order
   needs_you_since?: string | null; // when review/failed entered Focus; unlike updated_at, CI and metadata cannot reset it
   health?: Health | null;
   sidecar?: SidecarReport | null; // latest background check on this task's commits
   evidence_count?: number; // list endpoint only; avoids fetching every task detail on startup
   spawn_error?: boolean; // list endpoint only; prior spawn failed and no spawn ever succeeded
+  overlap_hold?: { number: number; files: string[] } | null; // list endpoint only; queued behind a live task that looks like it edits the same files
   requeued_to?: string | null; // successor id when failed + auto-requeued
+  review_actionable?: boolean; // in_review AND the director can act on it now (server-computed, HIVE-500)
   skip?: { reason: string; label: string; permanent: boolean; since: string | null } | null; // queued only: why the dispatcher last skipped it
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
   reviewed?: boolean; // intake tasks only: the director (or intake triage) signalled it is free to dispatch
@@ -197,7 +201,10 @@ export interface Decision {
   answered_at: string | null;
   // Who answered (audit trail). director when the director clicked in the inbox;
   // chat_supervisor/agent/system for programmatic callers; unknown if unattributed.
-  answered_by: "director" | "chat_supervisor" | "agent" | "system" | "unknown" | null;
+  // "reconciler" on a card the system expired, "unattributed" on a card
+  // resolved before hive recorded answerers at all (everything before
+  // 2026-07-22). null only ever appears on an open card.
+  answered_by: "director" | "chat_supervisor" | "agent" | "system" | "unknown" | "reconciler" | "unattributed" | null;
   answered_actor: string | null;
   // Set on cards no automation may answer — today only "intake_triage", the
   // "which reading should we build?" card raised by intake triage.
@@ -645,7 +652,8 @@ export interface Brief {
   fleet: Task[];
   incidents: BriefIncident[];
   intake: BriefIntake[];
-  to_review: Task[]; // Hive-owned reviews; tracking-only tasks are excluded.
+  to_review: Task[]; // Hive-owned reviews the director can act on now; tracking-only tasks are excluded.
+  in_review_pending: Task[]; // still in review but not yet the director's: red/running CI, review pipeline unfinished, or no report to read.
   spend: { totals: UsageTotals; by_model: (UsageTotals & { model: string })[] };
   learnings_new: BriefLearning[];
 }
@@ -888,7 +896,41 @@ export interface AutonomyStats {
   agreement: { auto_answered: number; contradictions: number; auto_contradicted: number; agreement_rate: number | null };
 }
 
+export interface RaceAttempt {
+  task_id: string;
+  number: number;
+  title: string;
+  agent: string;
+  state: State;
+  branch: string | null;
+  pr_url: string | null;
+  settled: boolean;
+  diff: { files: number; additions: number; deletions: number } | null;
+  verification: { name: string; satisfied: boolean }[];
+  cost_usd: number;
+  processed_tokens: number;
+  outcome: "winner" | "loser" | null;
+}
+
+export interface RaceView {
+  race_id: string;
+  deadline: string | null;
+  settled: boolean;
+  attempts: RaceAttempt[];
+}
+
 export const api = {
+  race: (raceId: string) => req<RaceView>(`/api/races/${raceId}`),
+  startRace: (taskId: string, b: { attempts?: number; agents?: string[]; deadline_min?: number } = {}) =>
+    req<{ ok: boolean; race_id: string; task_ids: string[] }>(`/api/tasks/${taskId}/race`, {
+      method: "POST",
+      body: JSON.stringify(b),
+    }),
+  pickRaceWinner: (raceId: string, taskId: string) =>
+    req<{ ok: boolean; winner: string; losers: string[] }>(`/api/races/${raceId}/pick`, {
+      method: "POST",
+      body: JSON.stringify({ task_id: taskId }),
+    }),
   token: apiToken,
   jira: (taskId: string) => req<JiraTaskState>(`/api/tasks/${taskId}/jira`),
   jiraSync: (taskId: string) =>
@@ -914,7 +956,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ verdict, note, source: "director", actor: directorActor() }),
     }),
-  understandingQuizzes: () => req<{ quizzes: UnderstandingQuiz[] }>(`/api/understanding-quizzes`),
+  understandingQuizzes: () => req<{ quizzes: UnderstandingQuiz[] }>(`/api/understanding-quizzes?scope=all`),
   catchup: (limit = 10, projectId?: string) =>
     req<{ cards: GlanceCard[] }>(`/api/catchup?limit=${limit}${projectId ? `&project_id=${encodeURIComponent(projectId)}` : ""}`),
   answerUnderstandingQuiz: (taskId: string, answerKey: string, version: string, surface?: "focus") =>
@@ -960,11 +1002,11 @@ export const api = {
     const qs = p.toString();
     return req<{ evidence: EvidenceRow[] }>(`/api/evidence${qs ? "?" + qs : ""}`);
   },
-  createTask: (b: { project_id: string; title: string; brief?: string; kind?: Kind }, files?: File[]) =>
+  createTask: (b: { project_id: string; title: string; brief?: string; kind?: Kind; priority?: string }, files?: File[]) =>
     req<Task>(`/api/tasks`, { method: "POST", body: bodyFor(b, files) }),
   intake: (b: { project_id: string; text: string }) =>
     req<{ ok: boolean; task: Task }>(`/api/intake`, { method: "POST", body: JSON.stringify(b) }),
-  updateTask: (id: string, b: { title?: string; brief?: string }, files?: File[]) =>
+  updateTask: (id: string, b: { title?: string; brief?: string; priority?: string }, files?: File[]) =>
     req<Task>(`/api/tasks/${id}`, { method: "PUT", body: bodyFor(b, files) }),
   brief: (id: string) => req<{ task_id: string; brief: string }>(`/api/tasks/${id}/brief`),
   transition: (id: string, to: State, reason?: string) =>
@@ -998,6 +1040,16 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
+  takeover: (id: string) =>
+    req<{ ok: boolean; worktree_path: string; branch: string | null; agent_stopped: boolean }>(
+      `/api/tasks/${id}/takeover`,
+      { method: "POST" }
+    ),
+  handback: (id: string, note?: string) =>
+    req<{ ok: boolean; steer_queued: boolean; summary: string | null; branch: string | null }>(
+      `/api/tasks/${id}/handback`,
+      { method: "POST", body: JSON.stringify({ note }) }
+    ),
   requeue: (id: string) =>
     req<{ ok: boolean; new_task_id: string }>(`/api/tasks/${id}/requeue`, {
       method: "POST",

@@ -39,6 +39,10 @@ const MAX_ROUTES = 2;
 // bounded: this runs inside the Jira sync cycle.
 const RENDER_TIMEOUT_MS = 180_000;
 const UI_DIRS = ["web", "cms"];
+// Below this many visible characters, and with no visible image, a page has
+// painted nothing worth posting. Low on purpose: a real page that is genuinely
+// this bare (a logo-only splash) still passes on its image.
+const EMPTY_TEXT_CHARS = 20;
 
 export interface RenderOutcome {
   created: number;
@@ -192,6 +196,9 @@ test(${JSON.stringify(`hive proof ${i + 1}: ${route}`)}, async ({ page }) => {
   if (broken.length) throw new Error("page could not load its data, " + broken.length + " request(s) failed: " + broken.slice(0, 3).join(" "));
   const overlay = await devOverlay(page);
   if (overlay) throw new Error("page is showing a dev-server error overlay: " + overlay);
+  const painted = await pageContent(page);
+  if (painted && painted.text < ${EMPTY_TEXT_CHARS} && !painted.media)
+    throw new Error("page rendered nothing: it is blank, " + painted.text + " character(s) of text and no visible image");
   await page.screenshot({ path: ${JSON.stringify(join(outDir, `proof-${i + 1}.png`))} });
 });`
     )
@@ -242,7 +249,27 @@ const devOverlay = async (page) => {
   }
   return null;
 };`;
+  // The last way a broken page looks healthy: nothing at all. A single-page app
+  // whose API is unreachable inside the fence can answer 200, fail no request
+  // hive counts, show no overlay, and still paint a blank white page — which is
+  // what the first real run against corebeat posted. So ask the browser for two
+  // facts and decide here: how much text the body actually shows, and whether
+  // any image, drawing or video is big enough to see. A page with neither is
+  // not proof of anything.
+  const content = `const pageContent = (page) =>
+  page
+    .evaluate(() => ({
+      text: (document.body?.innerText || "").trim().length,
+      media: [...document.querySelectorAll("img, svg, canvas, video")].filter((el) => {
+        const box = el.getBoundingClientRect();
+        if (box.width <= 8 || box.height <= 8) return false;
+        const style = getComputedStyle(el);
+        return style.visibility === "visible" && Number(style.opacity) > 0;
+      }).length,
+    }))
+    .catch(() => null);`;
   const helpers = `${overlay}
+${content}
 const CRITICAL = new Set(["document", "script", "xhr", "fetch"]);
 const sameOrigin = (pageUrl) => {
   let origin = null;

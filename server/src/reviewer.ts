@@ -15,7 +15,7 @@ import { isOffline, getSetting, setSetting } from "./db.ts";
 import { writeEvent, getTask } from "./state.ts";
 import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, projectComparisonBase } from "./exec.ts";
+import { defaultExec, projectComparisonBase, mapLimit } from "./exec.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
 import { modelFailure, modelErrorText, noteModelCall, isAuthFailure } from "./modelCall.ts";
 import { enqueue } from "./notifications.ts";
@@ -23,8 +23,23 @@ import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 import { supervisedSql } from "./supervision.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { parseUnifiedDiff } from "./diff.ts";
+import { startLoop } from "./loop.ts";
 
 const TIMEOUT_MS = Number(process.env.HIVE_REVIEWER_TIMEOUT_MS || 180_000);
+// How many tasks one pass reviews at the same time. One-at-a-time made the
+// review column the auto-merge ceiling: ~0.6 reviews/min against a fleet of 4
+// agents filling it. Deliberately a constant, not a config knob — the ceiling
+// here is the model API, not anything a project would want to tune.
+const REVIEW_CONCURRENCY = 4;
+// The per-risk fan-out is nested inside the per-task one, so the two caps
+// multiply: 4 tasks x 4 risks would be 16 `claude -p` subprocesses at once,
+// which is a peak nobody chose and the kind of load that has exhausted ptys
+// here before. 2 keeps the real ceiling at roughly 8.
+// ponytail: two nested caps whose product is the true bound. If the reviewer
+// ever needs a genuine total budget, replace both with one shared semaphore
+// around the model calls -- but don't hold an outer slot across the inner
+// fan-out or it deadlocks.
+const RISK_CONCURRENCY = 2;
 const DIFF_LIMIT = 60_000;
 
 export interface ReviewerDeps {
@@ -197,7 +212,7 @@ function recordReviewFailure(db: DB, task: any, error: string, reviewIdentity: R
   });
 }
 
-// One review per pass (no stampede when a backlog of reviews appears at once).
+// Up to REVIEW_CONCURRENCY reviews per pass, each an independent one-shot.
 export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<void> {
   if (isOffline(db)) return;
   // A success — a real review or a project-level skip — is what retires a card
@@ -223,8 +238,16 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
         ORDER BY t.updated_at ASC`
     )
     .all();
-  const t: any = candidates.find((c) => retryDue(failedReviewAttempts(db, c)));
-  if (!t) return;
+  const due = candidates.filter((c) => retryDue(failedReviewAttempts(db, c))).slice(0, REVIEW_CONCURRENCY);
+  if (!due.length) return;
+  await mapLimit(due, REVIEW_CONCURRENCY, (t) => reviewOne(db, t, deps).catch((e) => {
+    console.error(`[hive] auto-review of task ${t.id} crashed:`, e);
+  }));
+}
+
+// One task's review, start to finish. Every guard below is per-task, so several
+// of these run side by side without seeing each other.
+async function reviewOne(db: DB, t: any, deps: ReviewerDeps): Promise<void> {
   // Guards against a delayed/stale review landing after the task moved on
   // (state left in_review, or the linked PR/branch/head changed underneath
   // it) — the review this pass produces is only good for the exact task and
@@ -360,26 +383,30 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
 // about the same task, so the reconciler asked for a merge every cycle and the
 // merge refused every cycle, forever (HIVE-499). Callers that care about
 // freshness compare `reviewed_head_sha` to the head they are about to act on.
-export function latestAutoReviewVerdict(
-  db: DB,
-  taskId: string
-): {
+export interface AutoReviewVerdict {
   verdict: string;
   files: string[];
   risks: string[];
   questions: string[];
   reviewed_pr_url?: string;
   reviewed_head_sha?: string;
-} | null {
+}
+
+export function latestAutoReviewVerdict(db: DB, taskId: string): AutoReviewVerdict | null {
   const row = db
     .query(
       `SELECT payload FROM events WHERE task_id = ? AND type = 'auto_review'
         ORDER BY ts DESC, rowid DESC LIMIT 1`
     )
     .get(taskId) as { payload: string } | undefined;
-  if (!row) return null;
+  return row ? parseAutoReview(row.payload) : null;
+}
+
+// The row-to-verdict half of latestAutoReviewVerdict, so the batched form
+// (reviewActionableBatch) reads an auto_review row exactly the same way.
+function parseAutoReview(raw: string): AutoReviewVerdict | null {
   try {
-    const payload = JSON.parse(row.payload);
+    const payload = JSON.parse(raw);
     if (payload?.skipped || typeof payload?.verdict !== "string") return null;
     return {
       verdict: payload.verdict,
@@ -415,6 +442,9 @@ export async function verifyPendingOnce(db: DB, deps: ReviewerDeps = {}): Promis
         ORDER BY t.updated_at ASC`
     )
     .all();
+  // Cheap DB-only filtering first, so the bounded fan-out below spends its slots
+  // on tasks that actually need a verification run.
+  const pending: any[] = [];
   for (const t of rows) {
     if (!t.head_sha) continue; // nothing to key verdicts to
     const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(t.project_id);
@@ -425,8 +455,12 @@ export async function verifyPendingOnce(db: DB, deps: ReviewerDeps = {}): Promis
     const questions = (review.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS);
     if (!risks.length && !questions.length) continue;
     if (hasRiskVerdicts(db, t.id, t.head_sha, risks.length + questions.length)) continue;
+    pending.push({ t, risks, questions });
+    if (pending.length >= REVIEW_CONCURRENCY) break;
+  }
+  await mapLimit(pending, REVIEW_CONCURRENCY, async ({ t, risks, questions }) => {
     const diff = await rawDiff(db, t, shell);
-    if (!diff.ok) continue;
+    if (!diff.ok) return;
     console.error(`[hive] verifying uncovered review for task ${t.id} at ${String(t.head_sha).slice(0, 7)}`);
     await verifyRisks(
       db,
@@ -447,18 +481,18 @@ export async function verifyPendingOnce(db: DB, deps: ReviewerDeps = {}): Promis
         },
       },
       deps
-    );
-    return; // one per pass, same no-stampede rule autoReviewOnce follows
-  }
+    ).catch((e) => console.error(`[hive] verification of task ${t.id} crashed:`, e));
+  });
 }
 
 export function startAutoReviewer(db: DB, deps: ReviewerDeps & { intervalMs?: number } = {}): () => void {
-  const timer = setInterval(() => {
-    autoReviewOnce(db, deps)
-      .then(() => verifyPendingOnce(db, deps))
-      .catch((e) => console.error("[hive] auto-review crashed:", e));
-  }, deps.intervalMs ?? 60_000);
-  return () => clearInterval(timer);
+  // startLoop, not setInterval: a pass now runs several reviews at once and can
+  // easily outlast the 60s tick. A tick landing on a running pass is dropped —
+  // the next one re-reads the board anyway.
+  return startLoop("auto-review", deps.intervalMs ?? 60_000, async () => {
+    await autoReviewOnce(db, deps);
+    await verifyPendingOnce(db, deps);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -478,6 +512,20 @@ export function startAutoReviewer(db: DB, deps: ReviewerDeps & { intervalMs?: nu
 const MAX_VERIFIED_RISKS = 5;
 const MAX_VERIFIED_QUESTIONS = 5;
 const VERIFY_MODEL = "opus";
+
+// A run that TIMED OUT is not a judgement: the findings it never reached are
+// unknown, not confirmed (HIVE-539). So an `unverified` set does not close the
+// head — the next pass retries only the findings still missing a verdict and
+// carries the ones already produced forward, so a slow finding never voids the
+// verdicts beside it. Bounded, or a finding too big for the budget would re-run
+// every minute for ever.
+const MAX_VERIFY_ATTEMPTS = 3;
+
+// The 60s reviewer tick is shorter than one verification pass (up to
+// TIMEOUT_MS per finding), so without this every tick stacked ANOTHER full pass
+// on the same head: six overlapping runs all timing out, each overwriting the
+// last with an emptier result (observed on corebeat ed28a0ca27c6).
+const verifyInFlight = new Set<string>();
 
 export interface RiskVerdict {
   risk: string;
@@ -600,26 +648,16 @@ function answerPrompt(task: any, question: string, diff: string): string {
 // every risk and question the review actually raised. Anything else re-verifies.
 function hasRiskVerdicts(db: DB, taskId: string, head: string, expected: number): boolean {
   const rows = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts'").all(taskId) as { payload: string }[];
-  return rows.some((r) => {
-    try {
-      const p = JSON.parse(r.payload);
-      if (p?.reviewed_head_sha !== head) return false;
-      const covered =
-        (Array.isArray(p.verdicts) ? p.verdicts.length : 0) +
-        (Array.isArray(p.question_verdicts) ? p.question_verdicts.length : 0) +
-        (typeof p.unverified === "number" ? p.unverified : 0);
-      return covered === expected;
-    } catch {
-      return false;
-    }
-  });
+  return rows.some((r) => coversReview(r.payload, head, expected));
 }
 
-// One opus run per risk and per question, in sequence, each capped. A run that
-// fails or returns junk is left out and counted in `unverified`, so a broken
-// run never reads as an all-clear. `stillCurrent` is re-checked between runs:
-// these verdicts now decide whether a PR auto-merges, so a set produced for a
-// head that has since been force-pushed must never be written at all.
+// One opus run per risk and per question, up to RISK_CONCURRENCY at a time,
+// each capped. They are independent one-shots with no ordering between them. A
+// run that fails or returns junk is left out and counted in `unverified`, so a
+// broken run never reads as an all-clear. `stillCurrent` is checked before each
+// run starts and again before anything is written: these verdicts now decide
+// whether a PR auto-merges, so a set produced for a head that has since been
+// force-pushed must never be written at all.
 export async function verifyRisks(
   db: DB,
   task: any,
@@ -629,7 +667,81 @@ export async function verifyRisks(
   const risks = (input.risks ?? []).slice(0, MAX_VERIFIED_RISKS);
   const questions = (input.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS);
   if (!risks.length && !questions.length) return;
-  if (hasRiskVerdicts(db, task.id, input.head, risks.length + questions.length)) return;
+  // What this head already has a verdict for. Anything here is never re-run and
+  // never dropped: this pass only fills the gaps and rewrites the whole set.
+  // Read across EVERY pass for this head, not just the newest one — a later run
+  // that timed out wrote an emptier set over a good one, and those verdicts are
+  // still true (they were produced for this exact head). Matched by the finding's
+  // own text, so a verdict for a risk the current review no longer raises is
+  // simply never used.
+  const { knownRisk, knownQuestion } = priorVerdicts(db, task.id, input.head);
+  const todoRisks = risks.filter((r) => !knownRisk.has(r));
+  const todoQuestions = questions.filter((q) => !knownQuestion.has(q));
+  if (!todoRisks.length && !todoQuestions.length) return; // fully verified for this head
+  if (verifyAttempts(db, task.id, input.head) >= MAX_VERIFY_ATTEMPTS) return; // retries spent; the gap stands
+  const flightKey = `${task.id}:${input.head}`;
+  if (verifyInFlight.has(flightKey)) return;
+  verifyInFlight.add(flightKey);
+  try {
+    await runVerification(db, task, input, deps, { risks, questions, knownRisk, knownQuestion, todoRisks, todoQuestions });
+  } finally {
+    verifyInFlight.delete(flightKey);
+  }
+}
+
+// Every verdict any pass produced for this head, newest pass winning on a tie.
+function priorVerdicts(
+  db: DB,
+  taskId: string,
+  head: string
+): { knownRisk: Map<string, RiskVerdict>; knownQuestion: Map<string, QuestionVerdict> } {
+  const knownRisk = new Map<string, RiskVerdict>();
+  const knownQuestion = new Map<string, QuestionVerdict>();
+  const rows = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts' ORDER BY ts DESC, rowid DESC")
+    .all(taskId) as { payload: string }[];
+  for (const r of rows) {
+    let p: any;
+    try {
+      p = JSON.parse(r.payload);
+    } catch {
+      continue;
+    }
+    if (p?.reviewed_head_sha !== head) continue;
+    for (const v of Array.isArray(p.verdicts) ? p.verdicts : []) if (v?.risk && !knownRisk.has(v.risk)) knownRisk.set(v.risk, v);
+    for (const q of Array.isArray(p.question_verdicts) ? p.question_verdicts : [])
+      if (q?.question && !knownQuestion.has(q.question)) knownQuestion.set(q.question, q);
+  }
+  return { knownRisk, knownQuestion };
+}
+
+// How many verification passes this head has already written. One event per
+// finished pass, so this is the retry counter MAX_VERIFY_ATTEMPTS caps.
+function verifyAttempts(db: DB, taskId: string, head: string): number {
+  return (
+    db
+      .query(
+        "SELECT COUNT(*) n FROM events WHERE task_id = ? AND type = 'risk_verdicts' AND json_extract(payload, '$.reviewed_head_sha') = ?"
+      )
+      .get(taskId, head) as { n: number }
+  ).n;
+}
+
+async function runVerification(
+  db: DB,
+  task: any,
+  input: { head: string; diff: string; stillCurrent?: () => boolean | Promise<boolean> },
+  deps: ReviewerDeps,
+  plan: {
+    risks: string[];
+    questions: string[];
+    knownRisk: Map<string, RiskVerdict>;
+    knownQuestion: Map<string, QuestionVerdict>;
+    todoRisks: string[];
+    todoQuestions: string[];
+  }
+): Promise<void> {
+  const { risks, questions, knownRisk, knownQuestion, todoRisks, todoQuestions } = plan;
   const exec = deps.exec ?? defaultPlannerExec;
   const current = async () => (input.stillCurrent ? await input.stillCurrent() : true);
   const run = async (prompt: string) => {
@@ -643,28 +755,49 @@ export async function verifyRisks(
       return null;
     }
   };
-  const verdicts: RiskVerdict[] = [];
-  const question_verdicts: QuestionVerdict[] = [];
   let unverified = 0;
-  // The reason the last run failed. `unverified` alone reads as "the model was
-  // unsure"; an auth outage is a completely different story (hive-1800).
+  // Why a run failed. `unverified` alone reads as "the model was unsure"; an
+  // auth outage is a completely different story (hive-1800). With runs in
+  // flight together this is one of the reasons, not strictly the last.
   let unverified_reason: string | null = null;
-  for (const risk of risks) {
-    if (!(await current())) return;
-    const res = await run(verifyPrompt(task, risk, input.diff));
+  let aborted = false;
+  const jobs = [
+    ...todoRisks.map((risk) => ({ kind: "risk" as const, text: risk, prompt: verifyPrompt(task, risk, input.diff) })),
+    ...todoQuestions.map((q) => ({ kind: "question" as const, text: q, prompt: answerPrompt(task, q, input.diff) })),
+  ];
+  const results = await mapLimit(jobs, RISK_CONCURRENCY, async (job) => {
+    if (aborted) return null;
+    if (!(await current())) {
+      aborted = true;
+      return null;
+    }
+    const res = await run(job.prompt);
     const failed = !res || noteModelCall(db, res.code === 0 && !res.timedOut ? null : modelErrorText(res, { timeoutMs: TIMEOUT_MS }));
     if (typeof failed === "string") unverified_reason = failed;
-    const v = failed ? null : extractVerdict(res!.stdout);
-    if (v) verdicts.push({ risk, ...v });
+    if (failed) return { job, value: null };
+    return { job, value: job.kind === "risk" ? extractVerdict(res!.stdout) : extractAnswer(res!.stdout) };
+  });
+  if (aborted) return;
+  const freshRisk = new Map<string, any>();
+  const freshQuestion = new Map<string, any>();
+  for (const r of results) {
+    if (!r) return; // a slot bailed on stillCurrent: write nothing
+    if (!r.value) continue;
+    (r.job.kind === "risk" ? freshRisk : freshQuestion).set(r.job.text, r.value);
+  }
+  // Re-assembled in the original risks-then-questions order, so a verdict set
+  // reads the same whichever run finished first — and an earlier pass's verdict
+  // counts exactly like one produced just now.
+  const verdicts: RiskVerdict[] = [];
+  const question_verdicts: QuestionVerdict[] = [];
+  for (const risk of risks) {
+    const v = knownRisk.get(risk) ?? freshRisk.get(risk);
+    if (v) verdicts.push({ ...(v as any), risk });
     else unverified++;
   }
   for (const question of questions) {
-    if (!(await current())) return;
-    const res = await run(answerPrompt(task, question, input.diff));
-    const failed = !res || noteModelCall(db, res.code === 0 && !res.timedOut ? null : modelErrorText(res, { timeoutMs: TIMEOUT_MS }));
-    if (typeof failed === "string") unverified_reason = failed;
-    const a = failed ? null : extractAnswer(res!.stdout);
-    if (a) question_verdicts.push({ question, ...a });
+    const a = knownQuestion.get(question) ?? freshQuestion.get(question);
+    if (a) question_verdicts.push({ ...(a as any), question });
     else unverified++;
   }
   if (!(await current())) return;
@@ -683,6 +816,30 @@ export async function verifyRisks(
   broadcast({ type: "task", task: getTask(db, task.id) });
 }
 
+// Does one stored risk_verdicts row account for this exact head's whole review?
+// Split out of hasRiskVerdicts so the batched path applies the identical test.
+function coversReview(raw: string, head: string, expected: number): boolean {
+  try {
+    const p = JSON.parse(raw);
+    if (p?.reviewed_head_sha !== head) return false;
+    const covered =
+      (Array.isArray(p.verdicts) ? p.verdicts.length : 0) +
+      (Array.isArray(p.question_verdicts) ? p.question_verdicts.length : 0) +
+      (typeof p.unverified === "number" ? p.unverified : 0);
+    return covered === expected;
+  } catch {
+    return false;
+  }
+}
+
+// How many verdicts a review must have before it counts as fully verified.
+function expectedVerdicts(review: AutoReviewVerdict): number {
+  return (
+    (review.risks ?? []).slice(0, MAX_VERIFIED_RISKS).length +
+    (review.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS).length
+  );
+}
+
 // What the risk check decided for one PR head, or null when it never ran for
 // that head. Read by the reconciler (auto-merge) and by mergeTask (the 409
 // that names the confirmed risks) — both must ignore a verdict set produced
@@ -691,7 +848,7 @@ export function riskVerdictsFor(
   db: DB,
   taskId: string,
   head: string | null | undefined
-): { verdicts: RiskVerdict[]; question_verdicts: QuestionVerdict[]; unverified: number } | null {
+): { verdicts: RiskVerdict[]; question_verdicts: QuestionVerdict[]; unverified: number; unverified_reason: string | null } | null {
   if (!head) return null;
   const rows = db
     .query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts' ORDER BY ts DESC, rowid DESC")
@@ -708,6 +865,7 @@ export function riskVerdictsFor(
       verdicts: Array.isArray(p.verdicts) ? p.verdicts : [],
       question_verdicts: Array.isArray(p.question_verdicts) ? p.question_verdicts : [],
       unverified: Number(p.unverified) || 0,
+      unverified_reason: typeof p.unverified_reason === "string" ? p.unverified_reason : null,
     };
   }
   return null;
@@ -723,9 +881,171 @@ export function reviewCompleteForHead(db: DB, taskId: string, head: string | nul
   if (!head) return false;
   const review = latestAutoReviewVerdict(db, taskId);
   if (!review || review.reviewed_head_sha !== head) return false;
-  const expected =
-    (review.risks ?? []).slice(0, MAX_VERIFIED_RISKS).length + (review.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS).length;
+  const expected = expectedVerdicts(review);
   return expected === 0 || hasRiskVerdicts(db, taskId, head, expected);
+}
+
+// Is there any further review work COMING for this head, or is what we have as
+// complete as the review will ever get? Nothing coming means either no head to
+// key verdicts to or a project that never auto-reviews (the reviewer skips
+// both); otherwise the pipeline must have finished for this exact head.
+export function reviewPipelineSettled(
+  db: DB,
+  task: { id: string; head_sha?: string | null; project_id: string }
+): boolean {
+  if (!task.head_sha) return true;
+  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+  if (JSON.parse(project?.config ?? "{}").auto_review === false) return true;
+  return reviewCompleteForHead(db, task.id, task.head_sha);
+}
+
+// Can the DIRECTOR act on this review right now (HIVE-500)? The review column
+// counts everything in_review, but most of it is still the agent's or the
+// pipeline's work, not a decision waiting on a human. Two rules:
+//   - WITH a pull request: CI must not be red or still running (a red build is
+//     the agent's to fix), and the review pipeline must have settled on the
+//     live head, or the director would read a report about a stale commit.
+//   - WITHOUT a pull request: there must be something to READ — a self-review
+//     summary or a report attached as evidence. A task with neither has no
+//     work product and nothing to merge; it is unfinished agent work, and
+//     health surfaces it as stuck instead.
+// Anything false here stays VISIBLE as in-review; it just must not be counted
+// as something needing the director.
+export function reviewActionable(
+  db: DB,
+  task: { id: string; state: string; pr_url?: string | null; ci_status?: string | null; head_sha?: string | null; project_id: string }
+): boolean {
+  if (task.state !== "in_review") return false;
+  if (task.pr_url) {
+    // Matches advanceIfFinished / landQueue: only failing and pending hold.
+    // A null or 'unavailable' rollup means a repo (or check run) that never
+    // reports, and holding the review there would hide mergeable work forever.
+    if (task.ci_status === "failing" || task.ci_status === "pending") return false;
+    return reviewPipelineSettled(db, task);
+  }
+  return hasDirectorReport(db, task.id);
+}
+
+export interface ReviewActionableTask {
+  id: string;
+  state: string;
+  pr_url?: string | null;
+  ci_status?: string | null;
+  head_sha?: string | null;
+  project_id: string;
+}
+
+// Batched form of reviewActionable for list endpoints, the same reason
+// latestSidecarBatch exists: the single-task rule runs up to five queries, and
+// a board with thirty in-review cards paid all of them once per card. This
+// applies the identical rule with a fixed number of queries instead.
+// Returns the ids that ARE actionable; anything absent is not.
+export function reviewActionableBatch(db: DB, tasks: ReviewActionableTask[]): Set<string> {
+  const actionable = new Set<string>();
+  const candidates = tasks.filter((t) => t.state === "in_review");
+  if (candidates.length === 0) return actionable;
+
+  // No pull request: actionable only when there is something to READ.
+  const noPr = candidates.filter((t) => !t.pr_url);
+  if (noPr.length > 0) {
+    const ids = noPr.map((t) => t.id);
+    const ph = ids.map(() => "?").join(",");
+    for (const row of db
+      .query(`SELECT DISTINCT task_id FROM events WHERE type = 'review_summary' AND task_id IN (${ph})`)
+      .all(...ids) as { task_id: string }[])
+      actionable.add(row.task_id);
+    for (const row of db
+      .query(`SELECT DISTINCT task_id FROM evidence WHERE kind = 'report' AND task_id IN (${ph})`)
+      .all(...ids) as { task_id: string }[])
+      actionable.add(row.task_id);
+  }
+
+  // With a pull request: red or running CI is still the agent's problem.
+  const live = candidates.filter(
+    (t) => t.pr_url && t.ci_status !== "failing" && t.ci_status !== "pending"
+  );
+  if (live.length === 0) return actionable;
+
+  const projectIds = [...new Set(live.map((t) => t.project_id))];
+  const noAutoReview = new Set(
+    (db
+      .query(`SELECT id, config FROM projects WHERE id IN (${projectIds.map(() => "?").join(",")})`)
+      .all(...projectIds) as { id: string; config: string | null }[])
+      .filter((p) => {
+        try {
+          return JSON.parse(p.config ?? "{}").auto_review === false;
+        } catch {
+          return false;
+        }
+      })
+      .map((p) => p.id)
+  );
+
+  // Nothing further is coming for these, so what we have is as complete as it gets.
+  const needSettle: ReviewActionableTask[] = [];
+  for (const t of live) {
+    if (!t.head_sha || noAutoReview.has(t.project_id)) actionable.add(t.id);
+    else needSettle.push(t);
+  }
+  if (needSettle.length === 0) return actionable;
+
+  const ids = needSettle.map((t) => t.id);
+  const ph = ids.map(() => "?").join(",");
+  // Newest auto_review per task, read in the same order latestAutoReviewVerdict uses.
+  const latest = new Map<string, AutoReviewVerdict | null>();
+  for (const row of db
+    .query(
+      `SELECT task_id, payload FROM events WHERE type = 'auto_review' AND task_id IN (${ph})
+        ORDER BY ts DESC, rowid DESC`
+    )
+    .all(...ids) as { task_id: string; payload: string }[])
+    if (!latest.has(row.task_id)) latest.set(row.task_id, parseAutoReview(row.payload));
+
+  const verdictRows = new Map<string, string[]>();
+  for (const row of db
+    .query(`SELECT task_id, payload FROM events WHERE type = 'risk_verdicts' AND task_id IN (${ph})`)
+    .all(...ids) as { task_id: string; payload: string }[]) {
+    const list = verdictRows.get(row.task_id);
+    if (list) list.push(row.payload);
+    else verdictRows.set(row.task_id, [row.payload]);
+  }
+
+  for (const t of needSettle) {
+    const review = latest.get(t.id);
+    if (!review || review.reviewed_head_sha !== t.head_sha) continue;
+    const expected = expectedVerdicts(review);
+    if (expected === 0) {
+      actionable.add(t.id);
+      continue;
+    }
+    const rows = verdictRows.get(t.id) ?? [];
+    if (rows.some((raw) => coversReview(raw, t.head_sha!, expected))) actionable.add(t.id);
+  }
+  return actionable;
+}
+
+// Something the director can actually read: the agent's own review summary, or
+// a report attached as evidence (how scouts hand work over).
+export function hasDirectorReport(db: DB, taskId: string): boolean {
+  if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'review_summary' LIMIT 1").get(taskId)) return true;
+  return !!db.query("SELECT 1 FROM evidence WHERE task_id = ? AND kind = 'report' LIMIT 1").get(taskId);
+}
+
+// Findings the risk check never reached on this head — a timeout or a model
+// outage, not a judgement. Kept separate from confirmedRisks so the merge gate
+// can say "I could not check" instead of quoting a risk as confirmed (HIVE-539).
+export function unfinishedRiskCheck(
+  db: DB,
+  taskId: string,
+  head: string | null | undefined
+): { unverified: number; checked: number; reason: string | null } | null {
+  const found = riskVerdictsFor(db, taskId, head);
+  if (!found || !found.unverified) return null;
+  return {
+    unverified: found.unverified,
+    checked: found.verdicts.length + found.question_verdicts.length,
+    reason: found.unverified_reason,
+  };
 }
 
 export function confirmedRisks(db: DB, taskId: string, head: string | null | undefined): RiskVerdict[] {

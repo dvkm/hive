@@ -11,9 +11,10 @@ import type { DB } from "./db.ts";
 import { getSetting, setSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { isSupervisedTask, neverDispatched } from "./supervision.ts";
-import { isDeferred, unmetDeps, SKIP_REASONS, TERMINAL, type State } from "./state.ts";
+import { isDeferred, unmetDeps, lastAgentActivity, SKIP_REASONS, TERMINAL, type State } from "./state.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
 import { latestSidecar, latestSidecarBatch, type SidecarReport } from "./sidecar.ts";
+import { reviewActionable, reviewActionableBatch } from "./reviewer.ts";
 import { isReviewed } from "./dispatcher.ts";
 
 export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
@@ -22,12 +23,6 @@ export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
 // the ones worth an attention item rather than just a label.
 const ATTENTION_SKIPS = new Set(["no_repo_path", "kind_excluded", "authority_denied"]);
 
-// Rows the reconciler writes about an agent, never by the agent. None of them
-// prove the agent is alive, so none of them may reset its silence clock.
-// `spawn_error` is here for the same reason: a respawn hive TRIED and failed is
-// not the agent doing something, and letting it reset the clock would hide a
-// dead task behind hive's own retry loop.
-const RECONCILER_NOISE = new Set(["stale", "recovery_nudge", "recovery", "spawn_error"]);
 const HEALTH_EVENT_TYPES = [
   "agent_status",
   "dialog_auto_approved",
@@ -41,6 +36,7 @@ const HEALTH_EVENT_TYPES = [
   "state_change",
   "recovery_nudge",
   "stale",
+  "hung",
 ];
 export interface Health {
   status: HealthStatus;
@@ -214,16 +210,15 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   if (task.state === "needs_decision" || task.state === "in_review")
     return { status: "healthy", reason: null, since: task.updated_at as string };
 
-  // "Activity" excludes reconciler noise so a genuinely quiet agent keeps aging
-  // toward silent instead of resetting. `recovery` belongs in that set and was
-  // missing: hive re-diagnosed an auth-lost pane every lap, and each diagnosis
-  // wrote a `recovery` row that reset this clock — so a frozen pane read
-  // HEALTHY, lap after lap, with a byte-identical tail (#1149/#1156, 2026-08-20).
-  // A row hive wrote ABOUT an agent is not evidence the agent did anything.
-  const activity = db
-    .query(`SELECT ts FROM events WHERE task_id = ? AND type NOT IN (${[...RECONCILER_NOISE].map(() => "?").join(",")}) ORDER BY ts DESC LIMIT 1`)
-    .get(task.id, ...RECONCILER_NOISE) as { ts: string } | undefined;
-  const activityTs = activity?.ts ?? (task.updated_at as string);
+  // "Activity" means the AGENT did something. Only its own rows count (see
+  // lastAgentActivity): every row hive writes ABOUT a task, and every human
+  // poke, would otherwise reset this clock and make a frozen task read healthy.
+  // Two ways that already bit us: hive re-diagnosed an auth-lost pane every lap
+  // and each `recovery` row reset the clock, so a frozen pane read HEALTHY lap
+  // after lap with a byte-identical tail (#1149/#1156, 2026-08-20); and a
+  // refused respawn wrote spawn_error + authority_logged, dropping a task
+  // frozen for 2.5h off the stall list (hive-1951, 2026-08-31).
+  const activityTs = lastAgentActivity(db, task.id) ?? (task.updated_at as string);
   const age = nowMs - Date.parse(activityTs);
 
   // Recovery is underway if hive nudged AFTER the last real activity. Keyed off
@@ -241,6 +236,13 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
     return { status: "stuck", reason: `finished or stuck: agent ${lastStatus}, no PR`, since: activityTs };
   }
   if (age > staleMs()) {
+    // Flagged hung: the agent still holds the task but the WORK stopped. Say so
+    // in the reason, because it needs a human look, not another respawn.
+    const hung = events.find((e) => e.type === "hung" && e.ts > activityTs);
+    if (hung) {
+      const mins = Math.round(age / 60000);
+      return { status: "stuck", reason: `no progress for ${mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`} (agent still alive)`, since: activityTs };
+    }
     const escalating = events.some((e) => e.type === "stale" && e.ts > activityTs);
     return {
       status: escalating ? "stuck" : "silent",
@@ -285,7 +287,7 @@ export function sessionUtilization(
 // A task row enriched with its computed health, for API responses + SSE.
 // Failed tasks also carry `requeued_to` (their auto-requeue successor's id, if
 // any) so the attention rule can tell "awaiting triage" from "already retried".
-export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null): any {
+export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null, actionable?: Set<string>): any {
   const requeued_to =
     task.state === "failed"
       ? ((db.query("SELECT id FROM tasks WHERE parent_task_id = ? AND source = 'requeue' LIMIT 1").get(task.id) as any)?.id ?? null)
@@ -301,6 +303,10 @@ export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null
   // board card and the review card can show it without fetching every event.
   // Pass a preloaded `sidecar` when enriching a list (see tasksWithHealth) so
   // this doesn't run one sidecar query per task.
+  // `review_actionable` (HIVE-500) is server-computed for the same reason health
+  // is: it reads events the browser never sees. Only in-review tasks carry it;
+  // everywhere else it is false and means nothing.
+  //
   // Intake tasks are held until reviewed (dispatcher.ts's isReviewed), and
   // intake triage can mark one reviewed on its own — so the board needs the
   // flag to know whether to say "unreviewed". Only intake tasks pay the query.
@@ -312,14 +318,17 @@ export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null
   const skip = task.skip_reason && SKIP_REASONS[task.skip_reason]
     ? { reason: task.skip_reason, ...SKIP_REASONS[task.skip_reason], since: task.skip_reason_at ?? null }
     : null;
-  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), reviewed, skip, sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
+  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), review_actionable: actionable ? actionable.has(task.id) : reviewActionable(db, task), reviewed, skip, sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
 }
 
 // Batched form of taskWithHealth for list endpoints (task HIVE-447): looks up
-// every task's sidecar report in one grouped query instead of one per task.
+// every task's sidecar report in one grouped query instead of one per task, and
+// the same for `review_actionable` (HIVE-500), whose per-task rule reads up to
+// five tables.
 export function tasksWithHealth(db: DB, tasks: any[]): any[] {
   const sidecars = latestSidecarBatch(db, tasks.map((t) => t.id));
-  return tasks.map((task) => taskWithHealth(db, task, sidecars.get(task.id) ?? null));
+  const actionable = reviewActionableBatch(db, tasks);
+  return tasks.map((task) => taskWithHealth(db, task, sidecars.get(task.id) ?? null, actionable));
 }
 
 // "Needs attention" tray eligibility (the single rule; the web mirrors it):

@@ -90,12 +90,17 @@ export function eventText(e: EventLike): string {
     case "risk_verdicts": {
       const vs = Array.isArray(p.verdicts) ? (p.verdicts as any[]) : [];
       const qs = Array.isArray(p.question_verdicts) ? (p.question_verdicts as any[]) : [];
-      if (!vs.length && !qs.length) return `risk check produced no verdicts`;
+      const unchecked = Number(p.unverified) || 0;
+      const why = s(p.unverified_reason);
+      // A timeout is not a verdict: say so, or an empty set reads as a clean bill.
+      if (!vs.length && !qs.length)
+        return `risk check did not finish — ${unchecked || "no"} finding${unchecked === 1 ? "" : "s"} got no verdict${why ? ` (${why})` : ""}`;
       const confirmed = vs.filter((v) => v?.verdict === "confirmed");
       const forYou = qs.filter((q) => q?.answerable === "human");
       const parts = [];
       if (vs.length) parts.push(`${confirmed.length} of ${vs.length} risks confirmed`);
       if (qs.length) parts.push(`${forYou.length} of ${qs.length} questions need you`);
+      if (unchecked) parts.push(`${unchecked} not checked${why ? ` (${why})` : ""}`);
       const head = `risk check: ${parts.join(", ")}`;
       const named = [...confirmed.map((v) => s(v.risk)), ...forYou.map((q) => s(q.question))];
       return named.length ? `${head} — ${named.join("; ")}` : head;
@@ -163,6 +168,8 @@ export function eventText(e: EventLike): string {
       return "agent spawned";
     case "spawn_error":
       return `spawn failed: ${s(p.error)}`;
+    case "spawn_gave_up":
+      return `gave up spawning after ${s(p.attempts) || "repeated"} identical failures: ${s(p.error)}`;
     case "agent_status":
       return `agent ${s(p.status) || "status changed"}`;
     case "dialog_auto_approved":
@@ -179,6 +186,8 @@ export function eventText(e: EventLike): string {
       return s(p.via) === "emit" ? "handed off for review" : "auto-advanced to review (agent idle)";
     case "stale":
       return "agent went silent";
+    case "hung":
+      return `no progress for ${Math.round(Number(p.silent_ms ?? 0) / 60000)} min, agent still alive${s(p.last_said) ? ` — last said: "${s(p.last_said)}"` : ""}`;
     case "deployed":
       return p.up_to_date
         ? `serving checkout '${s(p.branch)}' was already current`
@@ -277,6 +286,12 @@ export function eventText(e: EventLike): string {
       if (s(p.direction) === "inbound") return `Jira comment${at} from ${s(p.author) || "someone"}`;
       return `comment queued for Jira${at}`;
     }
+    case "taken_over":
+      return `you took the worktree over — the agent is parked and its slot is free`;
+    case "handed_back":
+      return s(p.summary)
+        ? `handed back to an agent, steered with what you changed`
+        : `handed back to an agent — nothing changed while you had it`;
     default: {
       const words = e.type.replace(/[_-]+/g, " ");
       const note = s(p.note);
@@ -315,12 +330,14 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
   incident: "incident",
   blocked: "incident",
   stale: "incident",
+  hung: "incident",
   merge_failed: "incident",
   auto_merge_failed: "incident",
   merge_blocked_destructive: "incident",
   scope_drift: "decision",
   action_failed: "incident",
   spawn_error: "incident",
+  spawn_gave_up: "incident",
   smoke_failed: "incident",
   steer_error: "incident",
   planner_error: "incident",
@@ -348,6 +365,7 @@ const FAILURE_TYPES = new Set([
   "recovery",
   "smoke_failed",
   "spawn_error",
+  "spawn_gave_up",
   "steer_error",
   "supervise_error",
   "usage_limit",

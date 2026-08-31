@@ -425,3 +425,48 @@ test("unmarking drops the retry even mid-backoff — zero attempts after (HIVE-4
   await landOnce(db, { exec: filesExec({}), merge: after.merge });
   expect(after.calls).toEqual([]);
 });
+
+// HIVE-539: a failure that BOUNCES the task out of review opens no pause card,
+// and the mark is sticky, so the same doomed merge was re-attempted every sweep
+// for ever (b5f437266360 tried it 52 times). Attempts are capped now.
+test("repeated failures that never open a card take the task out of the queue", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  const reason = "merge blocked — branch 'hive/a' reverts base work outside this task's scope";
+  const calls: string[] = [];
+  const bounceThenReturn = async (id: string) => {
+    calls.push(id);
+    // What the destructive-rebase guard does: send it back to the agent, who
+    // pushes and lands back in review before the next sweep.
+    transition(db, id, "in_progress", { source: "director", reason: "merge blocked" });
+    return { ok: false, reason };
+  };
+  for (let i = 0; i < 15; i++) {
+    await landOnce(db, { exec: filesExec({}), merge: bounceThenReturn });
+    // The agent pushes again and hands off, so the sticky mark puts it straight
+    // back in the queue — that is the loop.
+    if ((db.query("SELECT state FROM tasks WHERE id = ?").get(a) as any).state !== "in_review")
+      transition(db, a, "in_review", { source: "agent", reason: "pushed again" });
+    ageLandAttempts(db, a, 3_600_000);
+  }
+  expect(calls).toHaveLength(10); // MAX_LAND_ATTEMPTS
+  expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(a) as any).land_queued_at).toBeNull();
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'land_retry_exhausted'").get(a) as any).n).toBe(1);
+  expect((db.query("SELECT COUNT(*) AS n FROM notifications WHERE task_id = ? AND kind = 'stale'").get(a) as any).n).toBe(1);
+});
+
+// The queue must read "the risk check timed out" as something to retry, not as
+// a director question — nothing was confirmed.
+test("an unfinished risk check retries on the backoff instead of opening a card", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  const reason = "merge blocked — the risk check did not finish on this head: 2 of 4 findings got no verdict (timed out after 180000ms). Nothing was confirmed.";
+  const { merge, calls } = mergeStub(db, { [a]: reason });
+  await landOnce(db, { exec: filesExec({}), merge });
+  expect(calls).toEqual([a]);
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+  const attempt: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'land_attempted'").get(a);
+  expect(JSON.parse(attempt.payload).transient).toBe(true);
+});

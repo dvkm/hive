@@ -421,14 +421,27 @@ export function dockerDbTargetsSandboxed(
   if (!m) return false;
   const slug = m[1].toLowerCase();
   const map = varMap(cmd, env);
-  const sqlSegs = segments(cmd).filter((s) => /\b(mysql|mariadb|psql)\b/i.test(s));
+  // Agents build the client once and reuse it: `DBC="docker exec -i
+  // <slug>-mariadb mysql …"` then `$DBC -e "delete from …"`. So find the sql
+  // segments in the SUBSTITUTED text (the line that runs the delete says only
+  // `$DBC` and names no sql client until the variable is resolved), and skip
+  // the assignment line itself, which runs nothing. Matching the raw text
+  // instead made every clean-baseline reset escalate (live 2026-08-31,
+  // dec_e01966a50764). The assignment test uses the RAW segment, before quote
+  // stripping blends `DBC=` into its value.
+  const ASSIGNMENT = /^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=("[^"]*"|'[^']*'|\S*)$/;
+  const sqlSegs = segments(cmd)
+    .filter((seg) => !ASSIGNMENT.test(seg))
+    .map((seg) => subst(seg.replace(/["']/g, ""), map))
+    .filter((s) => /\b(mysql|mariadb|psql)\b/i.test(s));
   if (!sqlSegs.length) return false;
   // Flags that consume the next token, so the container name is found reliably.
   const VALUE_FLAGS = new Set(["-u", "--user", "-e", "--env", "-w", "--workdir", "--env-file", "--detach-keys"]);
-  return sqlSegs.every((seg) => {
-    const s = subst(seg.replace(/["']/g, ""), map);
+  return sqlSegs.every((s) => {
     if (/[$`]/.test(s)) return false; // unresolved substitution
     const toks = s.trim().split(/\s+/);
+    // `FOO=bar docker exec …`: leading env assignments prefix the real command.
+    while (toks.length > 1 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[0])) toks.shift();
     if (toks[0] !== "docker" || toks[1] !== "exec") return false;
     let i = 2;
     while (i < toks.length && toks[i].startsWith("-")) {
@@ -591,7 +604,12 @@ export function classify(
   // above), scoped to that region — no need to force the WHOLE command raw
   // just because a trigger appears somewhere in it.
   const stripped = stripDataText(cmd);
-  const scanTarget = EXECUTOR.test(stripped) ? cmd : stripped;
+  // A client assembled in a variable hides its executor inside the quotes of the
+  // assignment (`DBC="docker exec -i … mysql …"` then `$DBC -e "delete from …"`),
+  // so stripping erased both the executor and the SQL and the whole command
+  // slipped the scan. Resolve in-command assignments before deciding.
+  const resolved = stripDataText(subst(cmd, varMap(cmd, env)));
+  const scanTarget = EXECUTOR.test(stripped) || EXECUTOR.test(resolved) ? cmd : stripped;
   for (const [rx, reason] of DANGEROUS) {
     if (!rx.test(scanTarget)) continue;
     if (emitDataOnly) continue; // arguments are data, not executed

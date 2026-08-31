@@ -4,10 +4,11 @@ import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faDiamond } from "@fortawesome/free-solid-svg-icons";
 import { api } from "../lib/api";
 import { RequestChanges } from "./RequestChanges";
+import { RaceCompare } from "./Race";
 import type { Decision, Evidence, JiraTaskState, TaskDetail, UsageTotals } from "../lib/api";
 import { useStore } from "../lib/store";
 import { splitAttachments } from "../lib/attachments";
-import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, NEXT, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, NEXT, PriorityChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { ReviewAudit, ReviewCard, ReviewUnderstanding } from "./ReviewCard";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
@@ -650,6 +651,21 @@ export function TaskBody({ id }: { id: string }) {
       toast((e as Error).message);
     }
   };
+  // Best-of-N: two agents, two worktrees, one brief. Deliberately a deliberate
+  // click — it doubles both the token bill and the review burden, so it is only
+  // ever worth it on a task whose right answer is genuinely unclear.
+  const startRace = async () => {
+    if (!t) return;
+    if (!confirm("Race this task? Two agents (claude and codex) build the same brief in their own worktrees, and you keep one."))
+      return;
+    try {
+      await api.startRace(t.id, { attempts: 2 });
+      toast("Race started — both attempts are queued");
+      refresh();
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  };
   const viewAgent = async () => {
     try {
       const r = await api.focusAgent(t.id);
@@ -670,6 +686,30 @@ export function TaskBody({ id }: { id: string }) {
           ? `Nudge undelivered: ${r.error || "task is finished"}`
           : "No live agent — nudge queued for the next spawn"
       );
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  };
+  // Take over (HIVE-352): park the agent and edit this worktree by hand. The
+  // path is what the director actually needs, so the toast carries it.
+  const takeOver = async () => {
+    try {
+      const r = await api.takeover(t.id);
+      toast(`Yours now — ${r.worktree_path}`);
+      refresh();
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  };
+  const handBack = async () => {
+    try {
+      const r = await api.handback(t.id);
+      toast(
+        r.summary
+          ? "Handed back — the agent is steered with your changes"
+          : "Handed back — nothing changed while you had it"
+      );
+      refresh();
     } catch (e) {
       toast((e as Error).message);
     }
@@ -710,6 +750,9 @@ export function TaskBody({ id }: { id: string }) {
               {project && <span className="chip">{project.name}</span>}
               <span className={`chip chip-kind chip-${t.kind}`}>{t.kind}</span>
               <span className="chip">{STATE_LABEL[t.state]}</span>
+              <span className="task-prio">
+                Priority <PriorityChip task={t} />
+              </span>
               {/* At a glance: this row IS a Jira ticket, and one click opens it.
                   The link used to be plain text buried in the brief. */}
               {(isJira || t.jira_key) && (
@@ -771,6 +814,8 @@ export function TaskBody({ id }: { id: string }) {
         )}
 
         {codeReview && <ReviewCard task={t} onDone={refresh} />}
+
+        {t.race_id && <RaceCompare raceId={t.race_id} taskId={t.id} onPicked={refresh} />}
 
         {postShipQuiz && (
           <section className="panel understanding-quiz-panel">
@@ -976,10 +1021,34 @@ export function TaskBody({ id }: { id: string }) {
                   View agent
                 </button>
               )}
-              {dispatchIsPrimary && (
+              {dispatchIsPrimary && !t.parked_for_director && (
                 <button className="btn btn-primary" onClick={dispatch}>
                   Dispatch now
                 </button>
+              )}
+              {dispatchIsPrimary && !t.race_id && !trackingOnly && !t.parked_for_director && (
+                <button className="btn" onClick={startRace} title="Run this brief twice, on two different agents, and keep the better result">
+                  Race it
+                </button>
+              )}
+              {!trackingOnly && !jiraMirror && t.worktree_path && !["done", "failed", "cancelled"].includes(t.state) && (
+                t.parked_for_director ? (
+                  <button
+                    className="btn btn-primary"
+                    onClick={handBack}
+                    title="Put an agent back on this branch, steered with what you changed"
+                  >
+                    Hand back to the agent
+                  </button>
+                ) : (
+                  <button
+                    className="btn"
+                    onClick={takeOver}
+                    title="Stop the agent and edit this worktree yourself; frees its agent slot"
+                  >
+                    Take over
+                  </button>
+                )
               )}
               {!trackingOnly && (
                 <button className="btn" onClick={planBreakdown} disabled={planning}>

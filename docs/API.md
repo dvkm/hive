@@ -288,7 +288,7 @@ Types written by the runtime layer (Phase 2b):
   A PLAN checkpoint is the same event with structured fields instead of a bare note: `payload: {kind: "plan", goal, approach, files_expected: string[], verification_planned, note}` (`hive emit <id> checkpoint --json plan.json`; `note` defaults to `goal` so it still lists like any other checkpoint). Agents are asked for one before their first edit when the project sets `config.plan_gate.kinds` and the task's kind is in that list. Hive critiques it in the background with one sonnet one-shot (60s cap) and attaches a `plan_critique` event (`payload: {checkpoint_id, concerns: [{severity: "note"|"veto", text}], error?}`). A critic that fails, times out, or returns unparseable output attaches `concerns: []` with `error` and logs — it never blocks the agent. Each `veto` concern also steers the agent, quoting the concern. Ordinary note-only checkpoints are not critiqued.
   A plan checkpoint listed by `GET /api/checkpoints` also carries `plan: {goal, approach, files_expected, verification_planned}` and `concerns` (the critic's verdict, `[]` until the critique lands), so the Needs You card can be approved without opening the task.
   BLOCKING plans (`config.plan_gate.block === true`): the checkpoint payload also carries `blocking: true`, and the brief tells the agent to post the plan and end its turn instead of editing. The `ack` endpoint is what restarts it — `verdict: "ok"` steers "Your plan is APPROVED …", `verdict: "flag"` steers "Your plan was FLAGGED …" and asks for a corrected plan. A flag on a blocking plan always steers (queued if no agent is live) rather than queueing a corrective follow-up task, because nothing has shipped yet. With `config.plan_gate.auto_ack_hours` set, a reconciler step (`autoAckPlans`) acks any blocking plan that has waited that long, writing `checkpoint_ack` with `source: "hive"`, `actor: "auto_ack"`, `auto: true` and sending the same release steer.
-- `review_summary`: the agent's structured self-review, submitted before `ready`. `payload: {done?: string[], iffy?: (string|{what,why})[], decisions?: string[], testing?: string[], followups?: string[], understanding?: {background?: string, essence?: string, walkthrough?: string[], participate?: string, check?: {question: string, options: {key: string, label: string}[], answer_key: string, explanation?: string}}}`. Judgment-class changes require a 2-4 option understanding check (see the understanding gate below); mechanical ones may omit `understanding.checks` entirely. The review card presents the mental model before the technical audit, then uses the check as the approval gate. Questions must teach the director about the specific change or report and may not test agent procedures, debugging, merging, tools, or policy.
+- `review_summary`: the agent's structured self-review, submitted before `ready`. `payload: {done?: string[], iffy?: (string|{what,why})[], decisions?: string[], testing?: string[], followups?: string[], understanding?: {background?: string, scope?: string, essence?: string, walkthrough?: string[], affected_areas?: string[], risk_assessment?: string, participate?: string, checks?: {question: string, options: {key: string, label: string}[], answer_key: string, explanation?: string}[]}}`. `checks` is an array, each `options` entry is a `{key,label}` object, and `answer_key` must equal one of those option keys; a singular `check` (object or array) is accepted as an alias and stored as `checks`. Submitting checks that normalise to nothing is a `400` naming the expected shape rather than a silent accept (hive-1947). Judgment-class changes require a 2-4 option understanding check (see the understanding gate below); mechanical ones may omit `understanding.checks` entirely. The review card presents the mental model before the technical audit, then uses the check as the approval gate. Questions must teach the director about the specific change or report and may not test agent procedures, debugging, merging, tools, or policy.
 - `understanding_quiz_attempt`, `understanding_quiz_passed`, `understanding_quiz_deferred`: director-only quiz outcomes tied to the latest `review_summary` by `payload.review_event_id`. Their payload includes the optional director `actor`. A new review summary creates a new check. Passing removes it from the backlog. Deferring unlocks an urgent merge but deliberately leaves the quiz open after the task finishes. `understanding_quiz_deferred` is also written with `source: "system"` when a merge auto-defers a required check for a task kind listed in the project's `config.auto_merge.kinds`.
 
 Understanding quiz API:
@@ -319,6 +319,8 @@ Understanding quiz API:
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
 - `deferred` — task parked pending an offline human action; `deferred_until` set (nudges suppressed while future-dated). `payload: {until, note}`
 - `undeferred` — a deferred task was resumed; `deferred_until` cleared. `payload: {note}`
+- `taken_over` — the director took the worktree over by hand; the agent was stopped and its slot freed. `payload: {worktree_path, branch, base, agent_stopped}`
+- `handed_back` — the worktree was handed back; a steer summarising the director's changes is queued for the next agent. `payload: {branch, base, summary, note}`
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
 - `smoke_passed` / `smoke_failed` — post-deploy smoke result. `payload: {results:[{name,ok,detail}], evidence_id?}`
 - `cleaned_up` — a finished task's runtime was torn down: worktree removed (when its branch was pushed/merged) and herdr session (tab/pane) closed. `payload: {worktree_path, branch, worktree_removed, ghost_branch, session_closed, session_via, tab_id}` (`ghost_branch` non-null when tracked uncommitted work was preserved before removal). Fired on the `done`/`cancelled` transition and by the reaper.
@@ -347,6 +349,10 @@ Duplicate-detection events (written by the dedup path, `source: system`):
 Standing-authority events (written by the policy engine, `source: system` unless noted):
 - `authority_logged` — an action was allowed (matched an `allow` rule, defaulted to allow when unmatched, or passed by consuming a grant). `payload: {action, target, effect:"allow", rule_id?, via_grant?}`
 - `authority_denied` — an action was blocked by a `deny` rule. `payload: {action, target, rule_id}`
+- `dispatch_hold_overlap` — the dispatcher held a queued task because its predicted file scope overlaps a task already running, and started a non-overlapping task instead. `payload: {note, held_by, held_by_number, files}`. Deduped on the note: the dispatcher runs every 30s and must not write one per cycle. This is ORDERING only, never a block.
+- `dispatch_overlap_override` — a held task was started anyway because nothing else in the project was dispatchable. `payload: {note}`. An idle fleet is worse than a predicted conflict.
+- `dispatch_scope` — the file scope guessed for a task when it was dispatched, from paths named in its brief and (for a requeue) the files its predecessor's branch touched. `payload: {files, dirs, from}` (`from`: `["brief", "predecessor"]`). Written by the dispatcher only when the guess is non-empty.
+- `scope_prediction_scored` — once the branch exists, the dispatch-time guess is compared with what it really touched, so the heuristic can be tuned or dropped on evidence. Written once per task by the reconciler. `payload: {note, predicted, hits, actual_count, precision, recall, from}`
 - `dependency_blocked` — a task's `depends_on` isn't all merged/done, so the dispatcher held its spawn (or the reconciler held its stage). `payload: {note, blocked_by}` (`blocked_by`: `["#<n> <title>", ...]`). Deduped: re-written only when the blocking set changes.
 - `authority_required` — a `require_decision` rule opened a card gating the action. `payload: {action, target, decision_id, rule_id}`
 - `authority_granted` — the director approved the card; a single-use 24h grant was minted (`source: director`). `payload: {action, target, decision_id, expires_at}`
@@ -415,9 +421,24 @@ rev-parse HEAD` in the CLI's cwd. The review card compares it to the task's
 array; render the `recommended: true` option first per product rule 3.
 `draft_note` is the server-side autosaved draft. A decision is `expired` once it
 was dismissed, or its task went terminal (`done`/`failed`/`cancelled`) — expired
-cards leave the inbox and can no longer be answered. `answered_by` is the caller
-identity recorded on answer (`director|chat_supervisor|agent|system|unknown`) and
-`answered_actor` an optional free label; both are `null` until the card is answered.
+cards leave the inbox and can no longer be answered. `answered_by` names who
+resolved the card and is never null once it leaves `open`: the caller identity on
+answer (`director|chat_supervisor|agent|system|unknown`), `director` or
+`reconciler` on a dismissal, `system` on a task-terminal expiry, and
+`unattributed` on the 414 legacy rows resolved before hive recorded answerers at
+all (everything before 2026-07-22). `answered_actor` is an optional free label.
+
+**A high-risk card is only ever answered by the director.** `POST
+/api/decisions/:id/answer` returns `403 {"effect":"escalate","category":"risk_high"}`
+for any other `source`, including a bare call with no `source` (which is
+`unknown`, not the director). The one exception is a `deny` on a pending
+standing-authority grant: refusing an unexecuted command is fail-closed and stops
+the work rather than releasing it. The timeout sweep
+(`decision_auto_answer_hours`) never answers a high-risk card either; past the
+window it writes one `decision_escalated` event and raises one urgent
+notification, and the card stays open. Risk is matched on the leading level word,
+so a `risk` field that reads `"high — leaked prod key"` counts as high, and free
+prose with no level word at all is treated as high rather than auto-answerable.
 
 `bundle` is server-**derived** (never stored) context attached to each card as
 it's returned, so the director can decide in one pass without opening the task:
@@ -692,7 +713,7 @@ agent's HTTP socket cannot reach. The GitHub credential stays server-side —
 hive shells out to `gh`, and the browser only ever names a commit or a tag.
 
 ### Tasks
-- `GET /api/tasks?state=&project_id=&test=&compact=` → `200 [Task + {evidence_count, spawn_error, needs_you_since}, ...]` (newest `updated_at` first; all filters optional). `needs_you_since` is the latest entry into `in_review` or `failed`, and stays fixed when CI or metadata updates the task. `compact=1` omits task briefs and empty/default properties for list/bootstrap clients, and is gzip-compressed when accepted; fetch `GET /api/tasks/:id` when full task data is needed. Tasks under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
+- `GET /api/tasks?state=&project_id=&test=&compact=` → `200 [Task + {evidence_count, spawn_error, overlap_hold, needs_you_since}, ...]` (newest `updated_at` first; all filters optional). `needs_you_since` is the latest entry into `in_review` or `failed`, and stays fixed when CI or metadata updates the task. `overlap_hold` is `{number, files}` when a queued task is waiting because the dispatcher thinks it edits the same files as a task that is still running, and `null` otherwise (including once that task finishes). `compact=1` omits task briefs and empty/default properties for list/bootstrap clients, and is gzip-compressed when accepted; fetch `GET /api/tasks/:id` when full task data is needed. Tasks under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
 - `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?, verification_cmds?, priority?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher and reconciler won't advance the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` marks a TRACKING-ONLY task: another agent using hive as its kanban. It is never auto-dispatched or staleness-supervised, is exempt from the done-evidence gate, and moves freely via transitions (`hive task move <id> <state>`). The `--track` CLI flag that used to set it is retired (it only ever produced tasks nobody could dispatch); the Jira mirror path still sets it. To park a normal task, defer it: `hive emit <id> deferred` keeps it out of the dispatcher until `hive emit <id> undefer`. The board keeps these tasks in its separate Tracked view with the external state visible. Jira-keyed Hive work is grouped beneath the matching tracked card, with requeue chains collapsed to their latest attempt. `verification_cmds` is the task's verification contract: an array of `{name, cmd}` the agent must run before handing off (`name`: 1-32 chars of `a-z0-9-`, unique within the task; `cmd`: a non-empty string). Anything else → `400`. The agent brief renders it as a "Verification contract" section, and `hive emit <id> evidence --verify-name <name>` tags an artifact with the entry it came from (stored as `verify_name` on the `evidence` event). The contract is enforced at the review handoff: `in_progress` -> `in_review` is refused with `409` until every named command has a matching evidence event, and the refusal lists exactly the missing names (see the `verification_missing` event). `priority` is one of `now`, `next`, `normal`, `later`; anything else → `400`, and a non-director `source` asking for `now` → `403`. Omit it and the task inherits its parent's priority, or starts at `next` when the title/brief reads as security work, else `normal`. It is ORDERING only, never preemption — see [Priority](#priority) for the full inheritance and authority rules. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
@@ -750,6 +771,32 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   `herdr agent focus` so the director can watch/attach. Records a `focus_agent` event.
   Degrades gracefully (never throws): `200 {"ok":false, "focused":false, "error":"..."}`
   when the task has no agent or herdr fails.
+- `POST /api/tasks/:id/takeover` body `{}` → `200 {"ok":true, "worktree_path":"...", "branch":"...", "base":"<sha>", "agent_stopped":true}` | `404` | `409`
+  The director takes the worktree over by hand. Stops the agent (the same
+  close-the-session sequence cleanup uses), clears `agent_target` — which is what
+  frees the project's agent slot, since every dispatcher capacity count keys on
+  it — and parks the task by setting `deferred_until` far into the future, so the
+  dispatcher and the "gone quiet" nudges leave it alone. No state hop: an
+  `in_progress` task stays `in_progress`. `parked_for_director` is the timestamp,
+  and `takeover_base` is a `git stash create` commit capturing the tree at that
+  moment (a dangling object; it never touches the shared stash stack), which is
+  what lets hand-back report the director's edits alone rather than whatever the
+  agent had left uncommitted. Writes a `taken_over` event. `409` when the task is
+  terminal, has no worktree, is not a hive worker task, or is already taken over.
+  While parked, `spawnAgent` refuses — two writers on one checkout is the thing
+  this endpoint exists to prevent.
+- `POST /api/tasks/:id/handback` body `{note?}` → `200 {"ok":true, "steer_queued":true, "summary":"...", "branch":"..."}` | `404` | `409`
+  Hands the worktree back. Queues ONE steer describing what changed while the
+  task was parked (new commits, `git diff --stat` against `takeover_base`, and
+  untracked files that were not already there at take-over, each capped at 40
+  lines), plus the optional `note`, then clears
+  `parked_for_director` and lifts the park. The park is lifted only when
+  `deferred_until` still holds the take-over sentinel, so a deferral the director
+  set separately survives. Nothing respawns here: the dispatcher's existing
+  reattach pass sees a live task with no agent and queued steers and puts a fresh
+  agent on the SAME branch with those steers at the top of its brief. `summary` is
+  `null` when git could not be read (the steer then tells the agent to check git
+  itself) and `""` when nothing changed. Writes a `handed_back` event.
 - `POST /api/tasks/:id/requeue` body `{}` → `200 {"ok":true, "new_task_id":"..."}` | `404`
   The recovery banner's manual "fail + requeue": reclaims a still-live task's worktree, fails it, then creates a FRESH queued copy (`source="requeue"`, `parent_task_id` → the original) with the [Task resume context](#task) whenever the original left a branch. Reclaim matches dead-agent and context-full auto-requeue: uncommitted state is preserved to a `ghost-<task-id>` branch and recorded as a `worktree_reclaimed` event. Distinct from the attention tray's in-place requeue of an already-failed task (`POST /transition {to:"queued"}`, which reactivates the SAME task and clears its runtime binding).
   A `source="requeue"` row is only ever trusted lineage once its `created`
@@ -760,6 +807,14 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   `source="requeue_quarantined"` and loses its `parent_task_id` — so nothing
   downstream ever follows an untrusted parent chain. A verified row is never
   rechecked, so the sweep never scans every historical `requeue` task.
+- `POST /api/tasks/:id/race` body `{attempts?: 2|3, agents?: ["claude"|"codex"|"teamclaude", ...], deadline_min?: number}` → `201 {"ok":true, "race_id":"race_...", "task_ids":[...]}` | `400` | `404` | `409`
+  Best-of-N racing (HIVE-351). Runs the SAME brief N times side by side, each attempt in its own worktree and branch, ideally split across agent backends. The flagged task IS attempt 1; the rest are clones of it (same brief, kind, verification contract, priority, dependencies) with `source="race"`, a shared `race_id`, and their own `agent_override`. Clones bypass duplicate detection on purpose — N identical briefs would otherwise collapse the race back to one task. `attempts` defaults to 2; `agents` defaults to the project's own backend alternating with the other one. `deadline_min` (optional) is the release valve for an attempt that never finishes.
+  **Never automatic.** Racing multiplies token spend and review burden, so only this endpoint starts one — no dispatcher path does. `409` when the task already ran (it must be `queued` with no agent), is already in a race, or is tracking-only.
+  Once every attempt has settled (`in_review`/`verifying`/`done`/`failed`/`cancelled`) or the deadline passes, the reconciler's `raceSweep` opens ONE comparison decision card (`race_compare` event, `decision_class: "race"`, so no auto-answer path may settle it) with an option per attempt. It recommends the attempt that met its whole verification contract with the smallest diff. Answering the card picks that winner.
+- `GET /api/races/:race_id` → `200 {race_id, deadline, settled, attempts:[{task_id, number, title, agent, state, branch, pr_url, settled, diff:{files,additions,deletions}|null, verification:[{name,satisfied}], cost_usd, processed_tokens, outcome:"winner"|"loser"|null}]}` | `404`
+  The comparison itself, rendered by the task page's race panel: diff size per attempt (`git diff --numstat` against the project comparison base), the task's own verification checklist, and what each attempt has cost.
+- `POST /api/races/:race_id/pick` body `{task_id (required)}` → `200 {"ok":true, "winner":"...", "losers":[...]}` | `400` | `404` | `409` (already decided, or the pick was already cancelled)
+  Keep one attempt, cancel the rest. The winner carries on through the normal review path. Each loser gets a `race_lost` event recording its cost, branch and PR before it is cancelled, and cancellation runs the normal terminal-state teardown (agent session closed, guarded worktree removal). Because a loser's branch holds unmerged commits, that guard preserves the checkout on disk on purpose, and any PR a loser opened stays open until someone closes it. The winner gets a `race_won` event carrying the cost of the whole race.
 - `POST /api/tasks/:id/cleanup` body `{}` → `200 {"ok":true, "cleaned":bool, "worktree":{removed,reason,ghost_branch}|null, "session":{closed,via}}` | `404` | `409` (task not terminal)
   Manual force-teardown for a **terminal** task (`done`/`cancelled`/`failed`): removes its git worktree and closes its herdr session. Refuses (`409`) on a live task so an in-flight worktree is never pulled out from under a working agent. Keeps every safety guard: the worktree is removed only when its branch is pushed/merged (else `cleanup_skipped`), and any tracked uncommitted work is preserved to a `ghost-<task-id>` branch first. Backstop for the auto-teardown that fires on the `done`/`cancelled` transition and the periodic reaper sweep.
 - `POST /api/tasks/:id/merge-into` body `{target_id (required)}` → `200 Task` (now `cancelled`) | `400` (missing/self `target_id`) | `404` (task or target missing) | `409` (source is already terminal)
@@ -1378,11 +1433,19 @@ same authority engine (`writeHookSettings` in `api.ts`; `hooks/classify.ts` +
      `POST guarded-action {action:"command.dangerous.<category>", target:<cmd>, summary:<Bash description>}`. The hook forwards the Bash tool's one-line description as the stated intent; see the `guarded-action` contract above for missing-summary behavior.
      Never auto-allowed, even under `command_approval:"allow"`.
      **Sandbox waiver**: a destructive command PROVEN to act only inside the
-     agent's own sandbox (its herdr worktree or a tmp scratchpad) is first
-     downgraded out of `dangerous` to **unknown** (allow-and-log) — this covers
-     `rm -rf`, `kill`/`pkill`, `git reset --hard`/`git clean`, `git push --force`,
-     `find … -delete/-exec`, and sandboxed SQL. Anything unresolvable (a shell
-     var, a `..` escape, an un-sandboxed or unknown path) stays dangerous.
+     agent's own sandbox (its herdr worktree, a tmp scratchpad, or a docker
+     container belonging to that worktree) is first downgraded out of
+     `dangerous` to **unknown** (allow-and-log) — this covers `rm -rf`,
+     `kill`/`pkill`, `git reset --hard`/`git clean`, `git push --force`,
+     `find … -delete/-exec`, and sandboxed SQL. Sandboxed SQL means sqlite3 on a
+     file under a sandbox root, or `docker exec` into a container whose name
+     starts with the requesting worktree's own slug (`<slug>-mariadb`, brought up
+     by `infra/worktree/wt.sh` and thrown away with the worktree). The slug match
+     is exact and anchored, so a neighbouring task's container never waives, and
+     a client assembled in a shell variable (`DBC="docker exec … mysql …"`) is
+     resolved before the check. Anything unresolvable (a shell var set in an
+     earlier call, a `..` escape, an un-sandboxed or unknown path, a bare
+     `mysql -h <host>`) stays dangerous.
    - **unknown** (not provably safe) → escalates via `{action:"command", …}`, or is
      allowed / deferred per the `command_approval` policy below.
 

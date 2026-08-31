@@ -1,6 +1,7 @@
 // hive CLI — thin HTTP wrappers around the daemon. The server is the only DB writer.
 // Installed as bin/hive (bun shebang). Base URL: HIVE_URL or http://127.0.0.1:<HIVE_PORT|4700>.
 import { existsSync, readFileSync } from "node:fs";
+import { REVIEW_SUMMARY_HELP } from "../server/src/reviewShape.ts";
 import { appBrowserCandidates, installedHiveAppCandidates, openUrlArgv, tailscaleCandidates } from "./platform.ts";
 
 const BASE =
@@ -24,6 +25,10 @@ Usage:
   hive task move <task-id> <state> [--note <s>]   states: queued in_progress needs_decision
         in_review verifying done failed cancelled
   hive task list [--state <s>] [--project <id>]
+  hive task takeover <task-id> [--open]    park the agent and edit the worktree yourself
+        (frees the agent's slot; --open starts $VISUAL/$EDITOR on the checkout)
+  hive task handback <task-id> [--note <s>]   put an agent back on the same branch,
+        steered with a summary of what you changed while you had it
   hive task update <task-id> [--depends-on <id,id>] [--priority now|next|normal|later]
         --depends-on declares a dependency discovered mid-task
         (e.g. "my PR needs #993's to merge first"); full replace, so pass every
@@ -36,7 +41,7 @@ Usage:
         the task without a merge step.
         --verify-name <name>: on evidence, tags the artifact with the named
         verification command it came from (see the brief's Verification contract)
-        review_summary: --json review.json with {done[], iffy[], decisions[], testing[], followups[], understanding{check{question,options[],answer_key}}}
+        ${REVIEW_SUMMARY_HELP}
         deferred: park a task waiting on an OFFLINE human action (no more "gone quiet" nudges);
                   [--until <iso>] or [--days <n>] to auto-resume, else indefinite. undefer to resume early.
         ready: PR open (or scout report written) → hand off to review (in_progress -> in_review)
@@ -60,6 +65,12 @@ Usage:
         them in graph order (declared dependencies first, one conflicting branch per sweep)
   hive land-graph [--project <id>]        show the review column's ordering edges
   hive recall <keywords>                  search project knowledge (references, learnings, policies)
+  hive garden [--project <id>] [--apply] [--remote] [--json]
+        prune task branches + worktrees using task state, not git reachability.
+        Deletes a branch only when its task is done; keeps cancelled/failed
+        branches; never touches a branch with no task, a ghost-* WIP rescue, a
+        branch hive does not own, or one checked out somewhere. Dry run unless
+        --apply.
   hive jira link <task-id> --parent <KEY> create and link a Jira sub-task
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
@@ -266,6 +277,37 @@ async function main() {
         priority: flags.priority ? String(flags.priority) : undefined,
       });
       console.log(`task ${t.id} depends_on: ${t.depends_on.length ? t.depends_on.join(", ") : "(none)"}  priority: ${t.priority}`);
+      return;
+    }
+    // Take the worktree over by hand, and hand it back when done (HIVE-352).
+    // `--open` starts $VISUAL/$EDITOR on the checkout; without it, the printed
+    // path is the whole point.
+    if (sub === "takeover") {
+      const taskId = _[0];
+      if (!taskId) die("usage: hive task takeover <task-id> [--open]");
+      const r = await api("POST", `/api/tasks/${taskId}/takeover`, {});
+      console.log(`${taskId} is yours — the agent is parked and its slot is free`);
+      console.log(`  worktree: ${r.worktree_path}`);
+      if (r.branch) console.log(`  branch:   ${r.branch}`);
+      console.log(`  hand it back with: hive task handback ${taskId}`);
+      const editor = flags.open ? process.env.VISUAL || process.env.EDITOR : null;
+      if (flags.open && !editor) console.log("  (no $VISUAL or $EDITOR set — open it yourself)");
+      else if (editor) Bun.spawn([editor, r.worktree_path], { stdout: "inherit", stderr: "inherit" });
+      return;
+    }
+    if (sub === "handback") {
+      const taskId = _[0];
+      if (!taskId) die('usage: hive task handback <task-id> [--note "<s>"]');
+      const r = await api("POST", `/api/tasks/${taskId}/handback`, { note: flags.note });
+      console.log(`${taskId} handed back${r.branch ? ` on ${r.branch}` : ""}`);
+      console.log(
+        r.summary === null
+          ? "  hive could not read the diff — the agent is told to check git itself"
+          : r.summary === ""
+            ? "  nothing changed while you had it"
+            : `  the agent's steer summarises:\n${r.summary.split("\n").map((l: string) => "    " + l).join("\n")}`
+      );
+      if (!r.steer_queued) console.log("  ⚠ the steer could not be queued — no agent will ever read it");
       return;
     }
     die(`unknown 'task' subcommand: ${sub}\n\n${USAGE}`);
@@ -1043,6 +1085,29 @@ async function main() {
       `no confirmation after 10s (${id}). The notification did not render. Check that hive.app is running (hive app) ` +
         "and that hive is allowed to notify in System Settings > Notifications."
     );
+  }
+
+  // Garden the checkout: prune task branches and worktrees using TASK STATE
+  // (see server/src/branchGardener.ts). Read-only against the DB; dry run
+  // unless --apply, and origin is only touched with --remote on top of it.
+  if (cmd === "garden") {
+    const { flags } = parseFlags(argv.slice(1));
+    const { Database } = await import("bun:sqlite");
+    const { defaultDbPath } = await import("../server/src/db.ts");
+    const { gardenRepos, formatGardenReport } = await import("../server/src/branchGardener.ts");
+    const db = new Database(defaultDbPath(), { readonly: true }) as any;
+    const reports = await gardenRepos(db, {
+      apply: !!flags.apply,
+      remote: !!flags.remote,
+      projectId: flags.project as string | undefined,
+    });
+    if (flags.json) {
+      console.log(JSON.stringify(reports, null, 2));
+      return;
+    }
+    for (const r of reports) console.log(formatGardenReport(r) + "\n");
+    if (!flags.apply) console.log("dry run — nothing was deleted. Re-run with --apply (add --remote to also delete on origin).");
+    return;
   }
 
   if (cmd === "open") {

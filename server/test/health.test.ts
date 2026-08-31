@@ -17,10 +17,13 @@ function makeTask(db: DB, projectId: string, state = "in_progress", agent: strin
   return id;
 }
 let seq = 0;
-function putEvent(db: DB, taskId: string, type: string, payload: any = {}, agoMs = 0): void {
+// Source matters: only the agent's own rows (`agent` for its `hive emit` calls,
+// `hook` for transcript rows) count as activity, so the default here mirrors
+// what the agent really writes. Pass a source explicitly for hive's own rows.
+function putEvent(db: DB, taskId: string, type: string, payload: any = {}, agoMs = 0, source = type === "status" ? "agent" : "herdr"): void {
   const ts = new Date(Date.now() - agoMs + seq++).toISOString();
   db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
-    .run(newId("evt"), taskId, ts, "herdr", type, JSON.stringify(payload));
+    .run(newId("evt"), taskId, ts, source, type, JSON.stringify(payload));
 }
 const STALE = 15 * 60 * 1000;
 

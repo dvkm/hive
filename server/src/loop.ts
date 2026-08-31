@@ -8,9 +8,18 @@
 // A tick that lands while the previous cycle is still running is DROPPED, not
 // queued: the next one is at most `intervalMs` away and every cycle re-reads
 // the world from the DB, so there is nothing for a catch-up run to add.
-export function startLoop(name: string, intervalMs: number, run: () => Promise<unknown>): () => void {
+//
+// `firstRunAfterMs` schedules an extra early run (some loops want one shortly
+// after boot rather than waiting a full interval). It shares the same guard as
+// the interval ticks, so a boot run and a tick can never overlap.
+export function startLoop(
+  name: string,
+  intervalMs: number,
+  run: () => Promise<unknown>,
+  opts: { firstRunAfterMs?: number } = {},
+): () => void {
   let running = false;
-  const timer = setInterval(() => {
+  const tick = () => {
     if (running) {
       console.warn(`[hive] ${name}: previous cycle still running; skipping this tick`);
       return;
@@ -21,6 +30,11 @@ export function startLoop(name: string, intervalMs: number, run: () => Promise<u
       .finally(() => {
         running = false;
       });
-  }, intervalMs);
-  return () => clearInterval(timer);
+  };
+  const timer = setInterval(tick, intervalMs);
+  const first = opts.firstRunAfterMs === undefined ? undefined : setTimeout(tick, opts.firstRunAfterMs);
+  return () => {
+    if (first !== undefined) clearTimeout(first);
+    clearInterval(timer);
+  };
 }

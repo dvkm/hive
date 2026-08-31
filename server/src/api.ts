@@ -51,6 +51,7 @@ import {
 import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
+import { takeOver, handBack, TakeoverError } from "./takeover.ts";
 import { figmaTokenEnv, resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { teamclaudeEnv, teamclaudeOverlay, usesTeamclaude } from "./teamclaude.ts";
 import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
@@ -87,11 +88,12 @@ import { triageIntake, resolveIntakeTriageForDecision } from "./intake/triage.ts
 import { noteRepoMismatch, resolveRepoMismatchForDecision } from "./repoTarget.ts";
 import { costUsd } from "./pricing.ts";
 import { checkUsageGuardrails, resolveUsageCapForDecision, taskSpend } from "./costs.ts";
+import { startRace, raceView, pickWinner, resolveRaceForDecision } from "./race.ts";
 import { resolveScopeDriftForDecision } from "./drift.ts";
-import { evaluateAutoApprove, evaluateAutopilotApprove, NO_AUTO_ANSWER_REASON } from "./autoapprove.ts";
+import { evaluateAutoApprove, evaluateAutopilotApprove, riskLevel, NO_AUTO_ANSWER_REASON } from "./autoapprove.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
-import { confirmedRisks, cautionCleared, latestAutoReviewVerdict, reviewCompleteForHead } from "./reviewer.ts";
+import { confirmedRisks, unfinishedRiskCheck, cautionCleared, latestAutoReviewVerdict, reviewPipelineSettled } from "./reviewer.ts";
 import { explanationFor, explanationGate } from "./explainDiff.ts";
 import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
@@ -102,6 +104,7 @@ import type { AwayConfig } from "./away.ts";
 import { taskDiff } from "./diff.ts";
 import { catchupCards } from "./glance.ts";
 import { authoredFiles, captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
+import { overlapHold } from "./fileScope.ts";
 import { landGraph, markLand, resolveLandPauseForDecision } from "./landQueue.ts";
 import { withMergeLock } from "./mergeLock.ts";
 import { divergence } from "./divergence.ts";
@@ -161,6 +164,20 @@ function err(message: string, status = 400): Response {
   return json({ error: message }, status);
 }
 
+// HIVE-530: a refusal states the cause AND the next action. When a command
+// resolves it, the refusal names that command. These two cover the 30-odd
+// "not found" sites where the caller's very next question is "so how do I list
+// the valid ones?". Only the id the caller already sent is echoed back.
+const noTask = (id: string) =>
+  err(`task ${id} not found. List them: hive task list --project <project-id>`, 404);
+const noProject = (id: string, status = 404) =>
+  err(`project ${id} not found. List them: curl -s $HIVE_URL/api/projects`, status);
+const noThread = (id: string) =>
+  err(`chat thread ${id} not found. Start one: hive chat send --project <project-id> "<text>"`, 404);
+// A thread exists but has no live supervisor session behind it yet.
+const NO_SUPERVISOR_SESSION =
+  "the supervisor session has not started yet — send the thread a message first: hive chat send --thread <thread-id> \"<text>\"";
+
 function actorOf(body: any): string | null {
   const actor = body?.actor == null ? "" : String(body.actor).trim();
   return actor || null;
@@ -204,10 +221,14 @@ function reviewerHealth(db: DB): { parse_failure_streak: number } {
   return { parse_failure_streak: Number(getSetting(db, "reviewer_parse_failure_streak") ?? "0") };
 }
 function reconcilerHealth(db: DB): { last_run: string | null; stale: boolean; consecutive_errors: number; last_error: string | null } {
+  const errors = Number(getSetting(db, "reconciler_error_streak") ?? "0");
   return {
     ...loopLiveness(db, "last_reconcile_at", RECONCILE_STALE_MS),
-    consecutive_errors: Number(getSetting(db, "reconciler_error_streak") ?? "0"),
-    last_error: getSetting(db, "reconciler_last_error"),
+    consecutive_errors: errors,
+    // HIVE-533: last_error describes the CURRENT failure, so it only exists
+    // while the streak does. A message beside consecutive_errors: 0 reads as a
+    // live fault and sent two people chasing a bug that was already fixed.
+    last_error: errors > 0 ? getSetting(db, "reconciler_last_error") || null : null,
   };
 }
 
@@ -243,11 +264,11 @@ type DeploymentsProject =
 
 function deploymentsProject(db: DB, id: string): DeploymentsProject {
   const row = db.query("SELECT * FROM projects WHERE id = ?").get(id);
-  if (!row) return { ok: false, res: err("project not found", 404) };
+  if (!row) return { ok: false, res: noProject(id) };
   const project = parseProject(row);
   const config = (project.config as any)?.deployments as DeploymentsConfig | undefined;
   if (!config) return { ok: false, res: err("deployments are not configured for this project", 404) };
-  if (!project.repo_path) return { ok: false, res: err("project has no repo_path", 400) };
+  if (!project.repo_path) return { ok: false, res: err("project has no repo_path, so deployments have no working copy to run in. Set one on the project first.", 400) };
   return { ok: true, repoPath: project.repo_path, branch: projectBaseBranch(project.config), config };
 }
 
@@ -372,7 +393,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       {
         const match = pathname.match(/^\/api\/projects\/([^/]+)\/pr-gardener$/);
         if (match && method === "GET") {
-          if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(match[1])) return err("project not found", 404);
+          if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(match[1])) return noProject(match[1]);
           return json(gardenerQueue(db, match[1]));
         }
       }
@@ -423,7 +444,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       let m = pathname.match(/^\/api\/projects\/([^/]+)$/);
       if (m && method === "GET") {
         const r = db.query("SELECT * FROM projects WHERE id = ?").get(m[1]);
-        return r ? json(projectPayload(r)) : err("project not found", 404);
+        return r ? json(projectPayload(r)) : noProject(m[1]);
       }
       if (m && method === "PUT") return updateProject(db, m[1], await req.json());
 
@@ -487,7 +508,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         const m = pathname.match(/^\/api\/chat\/threads\/([^/]+)$/);
         if (m && method === "GET") {
           const thread = getThread(db, m[1]);
-          if (!thread) return err("thread not found", 404);
+          if (!thread) return noThread(m[1]);
           return json({ ...thread, ...supervisorArtifacts(db, m[1]), commitments: listCommitments(db, m[1]), messages: listMessages(db, m[1]) });
         }
       }
@@ -508,7 +529,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (pathname === "/api/tasks/land-queue" && method === "POST") {
         const body = await safeJson(req);
         const ids = Array.isArray(body?.task_ids) ? body.task_ids.map(String) : [];
-        if (!ids.length) return err("task_ids must be a non-empty array", 400);
+        if (!ids.length) return err("task_ids must be a non-empty array: hive land <task-id> [<task-id>...]", 400);
         const queued = body?.queued !== false;
         return json({ changed: markLand(db, ids, queued), queued });
       }
@@ -624,6 +645,10 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/focus-agent$/);
       if (m && method === "POST") return await focusAgent(db, herdr, m[1]);
 
+      // Director take-over / hand-back of a task's worktree (HIVE-352).
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/(takeover|handback)$/);
+      if (m && method === "POST") return await takeoverEndpoint(db, herdr, m[1], m[2], await safeJson(req), deps);
+
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/requeue$/);
       if (m && method === "POST") return await requeueEndpoint(db, herdr, m[1]);
 
@@ -633,6 +658,24 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/usage$/);
       if (m && method === "GET") return taskUsage(db, m[1]);
 
+      // Best-of-N racing (HIVE-351). Director-flagged only: nothing in hive
+      // starts a race on its own.
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/race$/);
+      if (m && method === "POST") {
+        const body = await safeJson(req);
+        const task = getTask(db, m[1]);
+        if (!task) return err("task not found", 404);
+        const blocked = authzBlock(db, { project_id: task.project_id, action: "task.spawn", target: task.title, task_id: m[1] });
+        if (blocked) return blocked;
+        const r = startRace(db, m[1], {
+          attempts: body?.attempts !== undefined ? Number(body.attempts) : undefined,
+          agents: Array.isArray(body?.agents) ? body.agents.map(String) : undefined,
+          deadline_min: body?.deadline_min !== undefined ? Number(body.deadline_min) : undefined,
+        });
+        if (!r.ok) return err(r.error, r.status);
+        return json({ ok: true, race_id: r.race_id, task_ids: r.task_ids }, 201);
+      }
+
       // Live read-only view of the agent's terminal pane (the web UI's
       // embedded terminal polls this). Input goes through steer as always.
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/pane$/);
@@ -640,7 +683,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/brief$/);
       if (m && method === "GET") {
-        if (!getTask(db, m[1])) return err("task not found", 404);
+        if (!getTask(db, m[1])) return noTask(m[1]);
         return json({ task_id: m[1], brief: composeBrief(db, m[1]) });
       }
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/diff$/);
@@ -664,7 +707,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/jira\/link$/);
       if (m && method === "POST") {
         const body = await safeJson(req);
-        if (!body?.parent_key) return err("parent_key is required");
+        if (!body?.parent_key) return err("parent_key is required: hive jira link <task-id> --parent <JIRA-KEY>");
         return json(await linkTaskToJira(db, m[1], String(body.parent_key), deps.jira), 201);
       }
 
@@ -676,7 +719,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/plan$/);
       if (m && method === "POST") {
-        if (!getTask(db, m[1])) return err("task not found", 404);
+        if (!getTask(db, m[1])) return noTask(m[1]);
         const r = await runPlanner(db, m[1], { exec: deps.plannerExec });
         return r.ok ? json({ ok: true, decision: r.decision }) : json({ ok: false, error: r.error }, r.status ?? 502);
       }
@@ -691,6 +734,21 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
           : json({ ok: false, error: r.error }, r.status);
       }
 
+      // ---- races (best-of-N) ----
+      m = pathname.match(/^\/api\/races\/([^/]+)$/);
+      if (m && method === "GET") {
+        const view = await raceView(db, m[1], deps.exec ?? defaultExec);
+        return view ? json(view) : err("race not found", 404);
+      }
+      m = pathname.match(/^\/api\/races\/([^/]+)\/pick$/);
+      if (m && method === "POST") {
+        const body = await safeJson(req);
+        if (!body?.task_id) return err("task_id is required");
+        const r = pickWinner(db, m[1], String(body.task_id));
+        if (!r.ok) return err(r.error, r.status);
+        return json({ ok: true, winner: r.winner, losers: r.losers });
+      }
+
       // ---- decisions ----
       if (pathname === "/api/decisions") {
         if (method === "GET") return listDecisions(db, url);
@@ -699,7 +757,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       m = pathname.match(/^\/api\/decisions\/([^/]+)$/);
       if (m && method === "GET") {
         const r = db.query("SELECT * FROM decisions WHERE id = ?").get(m[1]);
-        return r ? json(withBundle(db, parseDecision(r))) : err("decision not found", 404);
+        return r ? json(withBundle(db, parseDecision(r))) : err("decision not found. List the open ones: curl -s \"$HIVE_URL/api/decisions?status=open\"", 404);
       }
       m = pathname.match(/^\/api\/decisions\/([^/]+)\/draft$/);
       if (m && method === "PUT") return saveDraft(db, m[1], await req.json());
@@ -720,7 +778,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (m) {
         if (method === "GET") {
           const r = db.query("SELECT * FROM policies WHERE id = ?").get(m[1]);
-          return r ? json(parsePolicy(r)) : err("policy not found", 404);
+          return r ? json(parsePolicy(r)) : err("policy not found. List them: hive policy list", 404);
         }
         if (method === "PUT") return updatePolicy(db, m[1], await req.json());
         if (method === "DELETE") {
@@ -761,7 +819,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (m) {
         if (method === "GET") {
           const r = db.query("SELECT * FROM learnings WHERE id = ?").get(m[1]);
-          return r ? json(r) : err("learning not found", 404);
+          return r ? json(r) : err("learning not found. List them: hive learning list --project <project-id>", 404);
         }
         if (method === "PUT") return updateLearning(db, m[1], await req.json());
         if (method === "DELETE") {
@@ -805,7 +863,10 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (method === "GET" && !pathname.startsWith("/api/"))
         return await serveWeb(pathname);
 
-      return err("not found", 404);
+      // HIVE-530: the bare "not found" left the caller guessing which thing was
+      // missing. Name the route they actually asked for (sliced: a long path
+      // should not become a long error body).
+      return err(`no API route for ${method} ${pathname.slice(0, 120)}. Routes are listed in docs/API.md`, 404);
     } catch (e: any) {
       if (e instanceof TransitionError) return err(e.message, 409);
       if (e instanceof SyntaxError) return err("invalid JSON body", 400);
@@ -855,7 +916,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
 // ---------------------------------------------------------------- projects
 function createProject(db: DB, body: any): Response {
-  if (!body?.name) return err("name is required");
+  if (!body?.name) return err('name is required: POST /api/projects with {"name":"<project name>","repo_path":"/abs/path/to/repo"}');
   const invalid = validateProjectConfig(body.config ?? {});
   if (invalid) return err(invalid);
   // A repo_path living inside a task's own worktree/scratchpad can only be a
@@ -880,7 +941,7 @@ function createProject(db: DB, body: any): Response {
 // reads the project, edits keys like auto_dispatch, and writes the object back).
 function updateProject(db: DB, id: string, body: any): Response {
   const existing: any = db.query("SELECT * FROM projects WHERE id = ?").get(id);
-  if (!existing) return err("project not found", 404);
+  if (!existing) return noProject(id);
   const name = body?.name != null ? String(body.name) : existing.name;
   const repo_path = body?.repo_path !== undefined ? body.repo_path : existing.repo_path;
   if (body?.config !== undefined) {
@@ -914,7 +975,7 @@ function jiraIssueKey(task: { jira_key?: string | null; source_ref?: string | nu
 
 function jiraTaskState(db: DB, taskId: string): Response {
   const task = getTask(db, taskId);
-  if (!task) return err("task not found", 404);
+  if (!task) return noTask(taskId);
   const key = jiraIssueKey(task);
   if (!key) return json({ linked: false });
   const configStatus = jiraConfigStatusFor(db, task.project_id);
@@ -972,12 +1033,12 @@ function jiraTaskState(db: DB, taskId: string): Response {
 
 function jiraResolveDelivery(db: DB, taskId: string, body: any): Response {
   const task = getTask(db, taskId);
-  if (!task) return err("task not found", 404);
-  if (!jiraIssueKey(task)) return err("task is not linked to a Jira issue", 400);
+  if (!task) return noTask(taskId);
+  if (!jiraIssueKey(task)) return err("task is not linked to a Jira issue. Link one: hive jira link <task-id> --parent <JIRA-KEY>", 400);
   const action = String(body?.action ?? "");
   const sourceId = String(body?.source_id ?? "");
   if ((action !== "comment_push" && action !== "receipt") || !sourceId)
-    return err("action and source_id identify the unknown Jira delivery", 400);
+    return err("no Jira delivery matches this 'action' and 'source_id'. Both are required, and they must name a delivery that is still awaiting confirmation.", 400);
   if (!resolveUnknownOutbound(db, taskId, action, sourceId))
     return err("delivery is not awaiting confirmation", 409);
   return jiraTaskState(db, taskId);
@@ -988,8 +1049,8 @@ function jiraResolveDelivery(db: DB, taskId: string, body: any): Response {
 // implementation that could succeed while the real one keeps failing.
 async function jiraManualSync(db: DB, taskId: string, deps?: JiraDeps): Promise<Response> {
   const task = getTask(db, taskId);
-  if (!task) return err("task not found", 404);
-  if (!jiraIssueKey(task)) return err("task is not linked to a Jira issue", 400);
+  if (!task) return noTask(taskId);
+  if (!jiraIssueKey(task)) return err("task is not linked to a Jira issue. Link one: hive jira link <task-id> --parent <JIRA-KEY>", 400);
   const r = await runJiraProjectCycle(db, task.project_id, deps);
   return json({ ok: r.ok, error: r.error ?? null, stats: r.stats ?? null, sync: r.state }, r.ok ? 200 : 502);
 }
@@ -1006,7 +1067,7 @@ function intake(db: DB, body: any, deps: HandlerDeps): Response {
   if (!body?.project_id) return err("project_id is required");
   if (!text) return err("text is required");
   if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(body.project_id))
-    return err("unknown project_id", 400);
+    return noProject(String(body.project_id), 400);
 
   // The caller's project_id is a DEFAULT, not gospel — the web picker defaults to
   // whatever project is in view. Classify the text against every project's
@@ -1059,14 +1120,14 @@ async function chatTurn(db: DB, herdr: Herdr, deps: HandlerDeps, body: any): Pro
 
   if (body?.thread_id) {
     const thread = getThread(db, String(body.thread_id));
-    if (!thread) return err("thread not found", 404);
+    if (!thread) return noThread(String(body.thread_id));
     return json(await chatTurnOnThread(db, herdr, deps, thread, text), 202);
   }
 
   const chief = body?.scope === "chief";
   const projectId = chief ? null : body?.project_id ? String(body.project_id) : null;
-  if (!chief && !projectId) return err("project_id is required to start a chat (the supervisor session runs in the project's repo)");
-  if (projectId && !db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return err("unknown project_id", 400);
+  if (!chief && !projectId) return err('a new chat needs a project, since the supervisor session runs in that project\'s repo. Name one: hive chat send --project <project-id> "<text>"');
+  if (projectId && !db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return noProject(projectId, 400);
   if (chief && !coordinatorProjectId(db)) return err("at least one project with a repository is required", 400);
 
   // A brand-new chat has no thread_id yet, so two concurrent first-messages
@@ -1319,6 +1380,7 @@ const MANAGER_EVENT_TYPES = new Set([
   "smoke_passed",
   "verify_wedged",
   "spawn_error",
+  "spawn_gave_up",
   "planner_error",
   "stale",
   "recovery",
@@ -1523,7 +1585,7 @@ export async function wakeDueManagers(db: DB, herdr: Herdr, deps: HandlerDeps): 
 // localhost); appends the assistant message and streams it over SSE.
 function chatReply(db: DB, threadId: string, body: any): Response {
   const thread = getThread(db, threadId);
-  if (!thread) return err("thread not found", 404);
+  if (!thread) return noThread(threadId);
   const text = String(body?.text ?? "").trim();
   if (!text) return err("text is required");
   const requestedDecisionIds = stringList(
@@ -1589,7 +1651,7 @@ function chatReply(db: DB, threadId: string, body: any): Response {
 // deliverToSupervisor).
 function chatClose(db: DB, threadId: string): Response {
   const thread = getThread(db, threadId);
-  if (!thread) return err("thread not found", 404);
+  if (!thread) return noThread(threadId);
   const task = thread.task_id ? getTask(db, thread.task_id) : null;
   if (task && !TERMINAL.includes(task.state as State)) {
     transition(db, task.id, "cancelled", { source: "director", reason: "chat thread closed" });
@@ -1638,13 +1700,13 @@ function commitmentDepsReach(db: DB, threadId: string, startIds: string[], targe
 
 function recordCommitment(db: DB, threadId: string, body: any): Response {
   const thread = getThread(db, threadId);
-  if (!thread) return err("thread not found", 404);
-  if (!thread.task_id) return err("supervisor session has not started", 409);
+  if (!thread) return noThread(threadId);
+  if (!thread.task_id) return err(NO_SUPERVISOR_SESSION, 409);
   const title = String(body?.title ?? "").trim();
   if (!title) return err("title is required");
   const projectId = thread.project_id ?? String(body?.project_id ?? "").trim();
   if (!projectId) return err("project_id is required for a portfolio commitment");
-  if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return err("project not found", 404);
+  if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return noProject(projectId);
   if (thread.project_id && body?.project_id && String(body.project_id) !== thread.project_id)
     return err("commitment project is outside this thread", 409);
 
@@ -1686,7 +1748,7 @@ function recordCommitment(db: DB, threadId: string, body: any): Response {
 
 function reviseCommitment(db: DB, threadId: string, commitmentId: string, body: any): Response {
   const thread = getThread(db, threadId);
-  if (!thread?.task_id) return err(thread ? "supervisor session has not started" : "thread not found", thread ? 409 : 404);
+  if (!thread?.task_id) return thread ? err(NO_SUPERVISOR_SESSION, 409) : noThread(threadId);
   const current = listCommitments(db, threadId).find((item) => item.id === commitmentId);
   if (!current) return err("commitment not found", 404);
   const patch: any = {};
@@ -1725,7 +1787,7 @@ function reviseCommitment(db: DB, threadId: string, commitmentId: string, body: 
 
 function updateSupervisorRun(db: DB, threadId: string, body: any): Response {
   const thread = getThread(db, threadId);
-  if (!thread) return err("thread not found", 404);
+  if (!thread) return noThread(threadId);
   if (body?.phase !== undefined && !SUPERVISOR_PHASES.includes(body.phase))
     return err(`phase must be one of ${SUPERVISOR_PHASES.join("|")}`);
   if (body?.acceptance_criteria != null && !Array.isArray(body.acceptance_criteria))
@@ -1765,8 +1827,8 @@ function updateSupervisorRun(db: DB, threadId: string, body: any): Response {
 
 async function recordManagerMeeting(db: DB, herdr: Herdr, threadId: string, body: any): Promise<Response> {
   const thread = getThread(db, threadId);
-  if (!thread) return err("thread not found", 404);
-  if (!thread.task_id) return err("supervisor session has not started", 409);
+  if (!thread) return noThread(threadId);
+  if (!thread.task_id) return err(NO_SUPERVISOR_SESSION, 409);
   const stage = String(body?.stage ?? "");
   if (!["proposal", "critique", "decided"].includes(stage)) return err("stage must be proposal|critique|decided");
 
@@ -1818,8 +1880,8 @@ async function recordManagerMeeting(db: DB, herdr: Herdr, threadId: string, body
 
 function recordManagerVerification(db: DB, threadId: string, body: any): Response {
   const thread = getThread(db, threadId);
-  if (!thread) return err("thread not found", 404);
-  if (!thread.task_id) return err("supervisor session has not started", 409);
+  if (!thread) return noThread(threadId);
+  if (!thread.task_id) return err(NO_SUPERVISOR_SESSION, 409);
   const status = String(body?.status ?? "");
   if (!["started", "passed", "failed"].includes(status)) return err("status must be started|passed|failed");
   const method = String(body?.method ?? "").trim();
@@ -1871,7 +1933,7 @@ function recordManagerVerification(db: DB, threadId: string, body: any): Respons
 
 async function replayManagerVerification(db: DB, herdr: Herdr, deps: HandlerDeps, threadId: string, eventId: string): Promise<Response> {
   const thread = getThread(db, threadId);
-  if (!thread?.task_id) return err(thread ? "supervisor session has not started" : "thread not found", thread ? 409 : 404);
+  if (!thread?.task_id) return thread ? err(NO_SUPERVISOR_SESSION, 409) : noThread(threadId);
   const row = db
     .query("SELECT payload FROM events WHERE id = ? AND type = 'manager_verification' AND json_extract(payload, '$.thread_id') = ?")
     .get(eventId, threadId) as { payload: string } | undefined;
@@ -1910,8 +1972,8 @@ async function replayManagerVerification(db: DB, herdr: Herdr, deps: HandlerDeps
 
 function recordManagerRetrospective(db: DB, threadId: string, body: any): Response {
   const thread = getThread(db, threadId);
-  if (!thread) return err("thread not found", 404);
-  if (!thread.task_id) return err("supervisor session has not started", 409);
+  if (!thread) return noThread(threadId);
+  if (!thread.task_id) return err(NO_SUPERVISOR_SESSION, 409);
   const summary = String(body?.summary ?? "").trim();
   if (!summary) return err("summary is required");
   const event = writeEvent(db, {
@@ -2037,13 +2099,13 @@ export function looksSecuritySensitive(text: string): boolean {
 // task up can read them.
 async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): Promise<Response> {
   const { fields: body, files } = await bodyWithFiles(req);
-  if (!body?.project_id) return err("project_id is required");
-  if (!body?.title) return err("title is required");
+  if (!body?.project_id) return err("project_id is required. List projects: curl -s $HIVE_URL/api/projects");
+  if (!body?.title) return err(`title is required: hive task create --project ${String(body?.project_id)} --title "<short imperative title>"`);
   if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(body.project_id))
-    return err("unknown project_id", 400);
+    return noProject(String(body.project_id), 400);
   const kind = body.kind ?? "ship";
   const source = body.source ? String(body.source) : null;
-  if (!["ship", "scout", "chore"].includes(kind)) return err("invalid kind");
+  if (!["ship", "scout", "chore"].includes(kind)) return err("invalid kind. Use one of: --kind ship|scout|chore");
   if (source === "self-audit") return err("source 'self-audit' is reserved for the scheduler", 400);
   // A tracking-only task starts life with no agent — that's the whole point
   // (see supervision.ts). Accepting a caller-supplied agent_target here would
@@ -2055,7 +2117,7 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   // spawning task); the dispatcher treats them like director-created tasks.
   const parent = body.parent_task_id ? String(body.parent_task_id) : null;
   const parentTask = parent ? getTask(db, parent) : null;
-  if (parent && !parentTask) return err("unknown parent_task_id", 400);
+  if (parent && !parentTask) return err(`parent_task_id ${parent} not found. List them: hive task list --project ${String(body.project_id)}`, 400);
   if (parentTask && isTrackingOnlyTask(parentTask)) return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
   if (isTrackingOnlyTask({ source }) && body.agent_target)
     return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
@@ -2145,23 +2207,53 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   // task that's already started — asks the director via a decision card. Safety:
   // only a queued task with no agent is ever auto-cancelled here.
   const match = detectDuplicate(db, parseTask(row));
+  let dupWarning: string | undefined;
   if (match) {
     const safeAuto = row.state === "queued" && !row.agent_target;
     if (match.tier === "exact" && safeAuto) {
       mergeInto(db, row.id, match.survivor.id);
-      return json(taskWithHealth(db, getTask(db, row.id)), 201);
+      // #1879: say what happened and how to get what the caller wanted. Refiling
+      // a broken task is the obvious recovery, and dedup silently undoes it
+      // because the broken original is still non-terminal.
+      return json(
+        {
+          ...taskWithHealth(db, getTask(db, row.id)),
+          warning: dupMergedWarning(match.survivor),
+        },
+        201
+      );
     }
-    openDuplicateDecision(db, getTask(db, row.id), match);
+    const decision = openDuplicateDecision(db, getTask(db, row.id), match);
+    dupWarning = dupSuspectedWarning(match.survivor, decision.id);
   }
   // Target-repo sanity check (#989). Runs after dedup so an auto-merged task
   // never gets a card it can't act on. A strong mismatch rides back on the
   // response as `warning` (the CLI prints it) and holds dispatch via its card.
-  const warning = noteRepoMismatch(db, getTask(db, row.id));
+  const repoWarning = noteRepoMismatch(db, getTask(db, row.id));
+  const warning = [dupWarning, repoWarning].filter(Boolean).join("\n  ") || undefined;
   // Ambient intake only (source intake_*/watch), and only when the project opted
   // in. Deliberately not awaited: a 60s classifier must not hold the create
   // response, and the dispatcher holds the task meanwhile.
   triageIntake(db, getTask(db, row.id), { exec: handlerDeps.triageExec }).catch((e) => console.error(`[hive] intake triage ${row.id}:`, e));
   return json({ ...taskWithHealth(db, getTask(db, row.id)), ...(warning ? { warning } : {}) }, 201);
+}
+
+// #1879: dedup outcomes the caller must be told about. A create that folds into
+// an existing task looks identical to a create that vanished, so the warning
+// names the survivor, its state, and the command that gets the caller what they
+// actually wanted (replace the original, not add to it).
+function dupMergedWarning(survivor: any): string {
+  return (
+    `folded into ${survivor.id} (${survivor.state}) as a duplicate. To replace it instead, cancel it first:\n` +
+    `    hive task move ${survivor.id} cancelled --note "superseded"`
+  );
+}
+
+function dupSuspectedWarning(survivor: any, decisionId: string): string {
+  return (
+    `possible duplicate of ${survivor.id} (${survivor.state}); decision ${decisionId} is open, and answering it "merge" cancels this task.\n` +
+    `    To replace ${survivor.id} instead, cancel it first: hive task move ${survivor.id} cancelled --note "superseded"`
+  );
 }
 
 // Link a marked PR back to its task. Matches by the `hive-task: <id>` body
@@ -2263,7 +2355,7 @@ async function linkPrEndpoint(db: DB, body: any, deps: HandlerDeps): Promise<Res
 // way task creation does.
 async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
   const task = getTask(db, id);
-  if (!task) return err("task not found", 404);
+  if (!task) return noTask(id);
   // Only a JIRA MIRROR has an external system that actually owns title/brief
   // (the sync overwrites them from the issue every cycle, so a director edit
   // here would just be clobbered next pull). A plain source='external' task
@@ -2317,11 +2409,11 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
 // folding an already-terminal task (409 via the transition error).
 function mergeIntoEndpoint(db: DB, id: string, body: any): Response {
   const task = getTask(db, id);
-  if (!task) return err("task not found", 404);
+  if (!task) return noTask(id);
   const targetId = body?.target_id;
   if (!targetId) return err("target_id is required");
   if (targetId === id) return err("cannot merge a task into itself");
-  if (!getTask(db, targetId)) return err("target task not found", 404);
+  if (!getTask(db, targetId)) return err(`target task ${targetId} not found. List them: hive task list --project <project-id>`, 404);
   const cancelled = mergeInto(db, id, targetId);
   return json(taskWithHealth(db, cancelled));
 }
@@ -2356,6 +2448,9 @@ function listTasks(db: DB, url: URL): Response {
       spawn_error: task.state === "queued" &&
         !!db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawn_error' LIMIT 1").get(task.id) &&
         !db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawned' LIMIT 1").get(task.id),
+      // Why a queued card is waiting: the dispatcher thinks it edits the same
+      // files as something still running (HIVE-509).
+      overlap_hold: task.state === "queued" ? overlapHold(db, task.id) : null,
     };
     return compact
       ? Object.fromEntries(Object.entries(listed).filter(([, value]) =>
@@ -2376,7 +2471,7 @@ const FEED_CATEGORIES: Record<string, string[]> = {
   state: ["state_change", "ready_for_review"],
   decision: ["needs-decision", "decision_answered", "planned", "authority_required", "authority_granted", "auto_approved", "auto_approve_declined"],
   evidence: ["evidence", "smoke_passed"],
-  incident: ["blocked", "stale", "spawn_error", "smoke_failed", "steer_error", "planner_error", "supervise_error", "authority_denied", "merge_failed"],
+  incident: ["blocked", "stale", "spawn_error", "spawn_gave_up", "smoke_failed", "steer_error", "planner_error", "supervise_error", "authority_denied", "merge_failed"],
   lifecycle: ["created", "spawned", "agent_status", "status", "steer", "note", "ci_status", "pr_merged", "planning", "assistant_text", "tool_use", "agent_turn_end", "auto_resume"],
 };
 
@@ -2574,9 +2669,12 @@ function brief(db: DB, url: URL): Response {
     .filter((t: any) => !isReviewed(db, t.id))
     .map((t: any) => ({ ...parseTask(t), project_name: t.project_name }));
 
-  // ⑦ to review — Hive-owned in-review tasks awaiting the captain's review
-  // and merge. Full task objects (with health) so the web renders review cards inline.
-  const to_review = tasksWithHealth(
+  // ⑦ to review — Hive-owned in-review tasks. Split in two (HIVE-500): only the
+  // ones the director can actually act on now count as work; the rest are still
+  // waiting on CI, on the review pipeline, or on the agent finishing at all.
+  // Both lists are full task objects (with health) so the web renders review
+  // cards inline.
+  const inReview = tasksWithHealth(
     db,
     db
       .query("SELECT * FROM tasks WHERE state = 'in_review' ORDER BY updated_at DESC")
@@ -2584,6 +2682,8 @@ function brief(db: DB, url: URL): Response {
       .map(parseTask)
       .filter((task: any) => !isTrackingOnlyTask(task))
   );
+  const to_review = inReview.filter((task: any) => task.review_actionable);
+  const in_review_pending = inReview.filter((task: any) => !task.review_actionable);
 
   // ⑧ spend since — reuse the analytics rollup (totals + by-model for top model).
   // `?project` scopes it, so a reader who filtered the brief to one project does
@@ -2628,6 +2728,7 @@ function brief(db: DB, url: URL): Response {
     incidents,
     intake,
     to_review,
+    in_review_pending,
     spend,
     learnings_new,
   });
@@ -2785,7 +2886,7 @@ function evidencePreview(path: string | null, kind: string): string | null {
 
 function getTaskFull(db: DB, id: string): Response {
   const task = getTask(db, id);
-  if (!task) return err("task not found", 404);
+  if (!task) return noTask(id);
   const events = db.query("SELECT * FROM events WHERE task_id = ? ORDER BY ts").all(id).map(parseEvent);
   const evidence = db
     .query("SELECT * FROM evidence WHERE task_id = ? ORDER BY ts")
@@ -2801,7 +2902,7 @@ function getTaskFull(db: DB, id: string): Response {
 }
 
 async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
-  if (!body?.to) return err("'to' state is required");
+  if (!body?.to) return err("'to' state is required: hive task move <task-id> <queued|in_progress|needs_decision|in_review|verifying|done|failed|cancelled>");
   const to = body.to as State;
   // A reviewer bounce (`hive task move <id> in_progress --note`) IS a
   // request-changes: it must deliver the note and keep an agent on the task. A
@@ -2876,8 +2977,8 @@ async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {
 // GET /api/tasks/:id/diff → the structured branch diff for the review UI.
 async function taskDiffEndpoint(db: DB, id: string, deps: HandlerDeps): Promise<Response> {
   const task = getTask(db, id);
-  if (!task) return err("task not found", 404);
-  if (isTrackingOnlyTask(task)) return err("tracking-only tasks have no Hive-owned diff to review", 409);
+  if (!task) return noTask(id);
+  if (isTrackingOnlyTask(task)) return err("this task is tracking-only — hive tracks it but never runs an agent on it, so there is no hive-owned diff to review", 409);
   const r = await taskDiff(db, id, deps.exec ?? defaultExec);
   return r.ok ? json(r.diff) : err(r.error, r.status);
 }
@@ -2892,7 +2993,7 @@ async function taskDiffEndpoint(db: DB, id: string, deps: HandlerDeps): Promise<
 // commits — see findEmbeddedTasks).
 export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerDeps): Promise<Response> {
   const task = getTask(db, id);
-  if (!task) return err("task not found", 404);
+  if (!task) return noTask(id);
   const unmet_deps = unmetDeps(db, task).map((b) => ({ id: b.id, number: b.number, title: b.title, state: b.state }));
 
   let embedded_tasks: { id: string; number: number; title: string }[] = [];
@@ -3144,8 +3245,8 @@ async function mergeTaskLocked(
 ): Promise<Response> {
   const task = getTask(db, id);
   const actor = actorOf(body);
-  if (!task) return err("task not found", 404);
-  if (isTrackingOnlyTask(task)) return err("tracking-only tasks have no Hive-owned work to merge", 409);
+  if (!task) return noTask(id);
+  if (isTrackingOnlyTask(task)) return err("this task is tracking-only — hive tracks it but never runs an agent on it, so there is no branch to merge", 409);
   if (task.state !== "in_review")
     return err(`task is '${task.state}', not 'in_review'; only in-review tasks can be merged`, 409);
   if (task.kind === "scout")
@@ -3204,6 +3305,21 @@ async function mergeTaskLocked(
       `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
         confirmed.map((c) => `“${c.risk}” — ${c.why}${c.evidence_path ? ` (${c.evidence_path})` : ""}`).join("; ") +
         `. Fix them, or merge with override_confirmed_risks=true.`,
+      409
+    );
+
+  // "I could not check" is not "I checked and it is bad" (HIVE-539). A run that
+  // timed out leaves findings with NO verdict; quoting one of them as confirmed
+  // is how a task that already fixed the finding could never land. Say what
+  // actually happened instead, and let the queue retry — the verification pass
+  // re-runs the findings it missed and keeps the ones it already got.
+  const unfinished = body?.override_confirmed_risks ? null : unfinishedRiskCheck(db, id, task.head_sha);
+  if (unfinished)
+    return err(
+      `merge blocked — the risk check did not finish on this head: ${unfinished.unverified} of ` +
+        `${unfinished.unverified + unfinished.checked} finding${unfinished.unverified + unfinished.checked === 1 ? "" : "s"} ` +
+        `got no verdict${unfinished.reason ? ` (${unfinished.reason})` : ""}. Nothing was confirmed. ` +
+        `Wait for it to retry, or merge with override_confirmed_risks=true.`,
       409
     );
 
@@ -3433,8 +3549,8 @@ async function mergeTaskLocked(
         }
       }
     } else {
-      if (!project?.repo_path) return err("project has no repo_path; cannot merge", 400);
-      if (!task.branch) return err("task has no branch; nothing to merge", 400);
+      if (!project?.repo_path) return err("this task's project has no repo_path, so there is no working copy to merge in. Set one on the project first.", 400);
+      if (!task.branch) return err("task has no branch, so there is nothing to merge. The agent never pushed one; requeue the task or close it as unmergeable.", 400);
       // Documented safe local merge: fast-forward the default branch to the task
       // branch tip. Requires the default branch to be an ancestor of the task
       // branch; a non-fast-forward (diverged / conflicting) merge is refused, no
@@ -3588,7 +3704,7 @@ async function bounceForChanges(
 // (HIVE-510), and the original stays done.
 async function requestChanges(db: DB, herdr: Herdr, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
   const task = getTask(db, id);
-  if (!task) return err("task not found", 404);
+  if (!task) return noTask(id);
   if (task.state === "done") return requestChangesOnShipped(db, task, body);
   if (task.state !== "in_review")
     return err(`task is '${task.state}', not 'in_review'`, 409);
@@ -3612,9 +3728,9 @@ async function spawnTask(
   deps: HandlerDeps
 ): Promise<Response> {
   const task = getTask(db, id);
-  if (!task) return err("task not found", 404);
+  if (!task) return noTask(id);
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
-  if (!project?.repo_path) return err("project has no repo_path; cannot spawn", 400);
+  if (!project?.repo_path) return err("this task's project has no repo_path, so there is no working copy to spawn an agent in. Set one on the project first.", 400);
   const blocked = authzBlock(db, { project_id: task.project_id, action: "task.spawn", target: task.title, task_id: id });
   if (blocked) return blocked;
 
@@ -3731,6 +3847,10 @@ export async function spawnAgent(
     return { ok: false, error: "this task mirrors a Jira issue — hive tracks it but never runs agents on it" };
   if (neverDispatched(db, task))
     return { ok: false, error: "task is untracked (source=external) and has never been spawned — hive does not dispatch agents for tracking-only tasks" };
+  // The director is editing this worktree by hand (HIVE-352). Starting an agent
+  // in it now means two writers on one checkout; hand it back first.
+  if (task.parked_for_director)
+    return { ok: false, error: "the director has taken this worktree over — hand it back to put an agent on it again" };
   // Adoption guard (hive-1090): a requeue whose predecessor left an open PR
   // must carry that pointer in its brief before it dispatches — this is the
   // structural backstop for buildResumeSection (requeueTask always writes the
@@ -3763,7 +3883,10 @@ export async function spawnAgent(
   }
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   if (!project?.repo_path) return { ok: false, error: "project has no repo_path" };
-  const config = JSON.parse(project.config ?? "{}");
+  // A race attempt pins its own backend (HIVE-351) so one attempt can run on
+  // codex while its sibling runs on claude. Overlaying it on the project config
+  // is enough: model, argv and hooks all key off the same `agent` field.
+  const config = { ...JSON.parse(project.config ?? "{}"), ...(task.agent_override ? { agent: task.agent_override } : {}) };
   const agent = agentForConfig(config);
 
   // Compose the brief fresh; it is delivered as the interactive agent's first
@@ -3958,10 +4081,10 @@ export async function internalSteer(db: DB, herdr: Herdr, id: string, message: s
 
 async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promise<Response> {
   const task = getTask(db, id);
-  if (!task) return err("task not found", 404);
+  if (!task) return noTask(id);
   const { fields, files } = await bodyWithFiles(req);
   const text = String(fields?.message ?? "").trim();
-  if (!text) return err("message is required");
+  if (!text) return err('message is required: hive task send <task-id> "<message>"');
   const fromTaskId = fields?.from_task_id ? String(fields.from_task_id) : null;
   const sender = fromTaskId ? getTask(db, fromTaskId) : null;
   const actor = sender ? null : actorOf(fields);
@@ -4045,9 +4168,9 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
 // an agent work; interaction stays on the steer channel.
 async function taskPane(db: DB, herdr: Herdr, id: string, url: URL): Promise<Response> {
   const task = getTask(db, id);
-  if (!task) return err("task not found", 404);
-  if (isTrackingOnlyTask(task)) return err("tracking-only tasks have no agent pane", 409);
-  if (!task.agent_target) return err("task has no agent (not spawned, or already cleaned up)", 404);
+  if (!task) return noTask(id);
+  if (isTrackingOnlyTask(task)) return err("this task is tracking-only — hive tracks it but never runs an agent on it, so there is no pane to show", 409);
+  if (!task.agent_target) return err(`task has no agent — it was never spawned, or its agent was cleaned up. Spawn one: hive spawn ${id}`, 404);
   const lines = Math.min(Math.max(Number(url.searchParams.get("lines")) || 200, 10), 2000);
   const raw = await herdr.read(task.agent_target, lines);
   // CSI/OSC escape sequences and stray control chars (keep \n and \t).
@@ -4084,7 +4207,7 @@ async function steerLiveAgents(
 
 async function broadcastSteer(db: DB, herdr: Herdr, body: any): Promise<Response> {
   const message = String(body?.message ?? "").trim();
-  if (!message) return err("message is required");
+  if (!message) return err('message is required: hive steer-all "<message>" [--project <id>]');
   const r = await steerLiveAgents(db, herdr, message, body?.project_id ? String(body.project_id) : undefined, actorOf(body));
   return json({ ok: true, ...r });
 }
@@ -4383,10 +4506,7 @@ function quizAnswerable(db: DB, task: { id: string; state: string; head_sha: str
   // No head to key verdicts to, or a project that never auto-reviews: the
   // reviewer skips both, so nothing further is coming and this is as complete
   // as the review gets.
-  if (!task.head_sha) return true;
-  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
-  if (JSON.parse(project?.config ?? "{}").auto_review === false) return true;
-  return reviewCompleteForHead(db, task.id, task.head_sha);
+  return reviewPipelineSettled(db, task);
 }
 
 function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; checks: UnderstandingCheck[] } | null {
@@ -4530,9 +4650,25 @@ export function pendingPostShipQuizCount(db: DB, projectId?: string): number {
   }).length;
 }
 
+// Quizzes split into two very different classes, and only one of them is
+// something anyone is waiting on:
+//   - live (in_review, verifying): the task has not finished, so the quiz can
+//     still change what happens to it.
+//   - shipped (done, failed): the post-ship catch-up backlog. Real, but nothing
+//     is blocked on it and it only ever grows.
+// The default is LIVE, because every counter that reads this endpoint without
+// thinking about it was reporting the shipped pile as a pending queue
+// (HIVE-542: 104 "pending" quizzes, 1 of them on a live task). The web UI wants
+// both classes — it builds the "Catch up on N shipped changes" digest from the
+// shipped ones — so it asks for `?scope=all` explicitly.
+const UNDERSTANDING_QUIZ_LIVE_STATES = ["in_review", "verifying"];
+
 function listUnderstandingQuizzes(db: DB, url: URL): Response {
   const projectId = url.searchParams.get("project_id");
-  const statePlaceholders = UNDERSTANDING_QUIZ_ANSWERABLE_STATES.map(() => "?").join(",");
+  const states = url.searchParams.get("scope") === "all"
+    ? UNDERSTANDING_QUIZ_ANSWERABLE_STATES
+    : UNDERSTANDING_QUIZ_LIVE_STATES;
+  const statePlaceholders = states.map(() => "?").join(",");
   const rows = db
     .query(
       `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state, t.kind, t.head_sha
@@ -4546,7 +4682,7 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
                AND (newer.ts > e.ts OR (newer.ts = e.ts AND newer.rowid > e.rowid)))
         ORDER BY t.number DESC`
     )
-    .all(...UNDERSTANDING_QUIZ_ANSWERABLE_STATES, projectId, projectId) as any[];
+    .all(...states, projectId, projectId) as any[];
   const quizzes = rows.flatMap((row) => {
     let payload: any;
     try { payload = JSON.parse(row.payload); } catch { return []; }
@@ -4587,7 +4723,7 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
 
 function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   const task = getTask(db, taskId);
-  if (!task) return err("task not found", 404);
+  if (!task) return noTask(taskId);
   if (task.state === "cancelled") return err("cancelled task has no active understanding check", 409);
   if (!UNDERSTANDING_QUIZ_ANSWERABLE_STATES.includes(task.state))
     return err("understanding checks can be answered during review or from the post-ship backlog", 409);
@@ -4677,7 +4813,7 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
 // otherwise mechanical task judgment-class, so its checks are required again.
 function requireUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   const task = getTask(db, taskId);
-  if (!task) return err("task not found", 404);
+  if (!task) return noTask(taskId);
   if (body?.source !== "director") return err("only the director can require understanding checks", 403);
   const already = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1").get(taskId);
   if (!already)
@@ -4687,7 +4823,7 @@ function requireUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
 
 function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   const task = getTask(db, taskId);
-  if (!task) return err("task not found", 404);
+  if (!task) return noTask(taskId);
   if (task.state !== "in_review") return err("understanding checks can only be deferred while a task is in review", 409);
   if (body?.source !== "director") return err("only the director can defer understanding checks", 403);
   if (body?.confirm !== "quiz_later") return err("confirm must be 'quiz_later'");
@@ -5060,10 +5196,30 @@ function writeHookSettings(
 }
 
 // "View agent" affordance: focus the task's herdr tab so the director can watch/attach.
+// POST /api/tasks/:id/takeover  — park the agent, hand the worktree to the director.
+// POST /api/tasks/:id/handback {note?} — put an agent back on the branch with a
+// steer summarising what the director changed while it was parked.
+async function takeoverEndpoint(
+  db: DB,
+  herdr: Herdr,
+  id: string,
+  verb: string,
+  body: any,
+  deps: HandlerDeps
+): Promise<Response> {
+  try {
+    if (verb === "takeover") return json({ ok: true, ...(await takeOver(db, id, { herdr, exec: deps.exec })) });
+    return json({ ok: true, ...(await handBack(db, id, { note: body?.note, exec: deps.exec })) });
+  } catch (e) {
+    if (e instanceof TakeoverError) return err(e.message, e.message === "task not found" ? 404 : 409);
+    throw e;
+  }
+}
+
 async function focusAgent(db: DB, herdr: Herdr, id: string): Promise<Response> {
   const task = getTask(db, id);
-  if (!task) return err("task not found", 404);
-  if (isTrackingOnlyTask(task)) return err("tracking-only tasks have no agent to focus", 409);
+  if (!task) return noTask(id);
+  if (isTrackingOnlyTask(task)) return err("this task is tracking-only — hive tracks it but never runs an agent on it, so there is no agent to focus", 409);
   if (!task.agent_target) return json({ ok: false, focused: false, error: "task has no agent" });
   try {
     const r = await herdr.focus(task.agent_target);
@@ -5082,7 +5238,7 @@ async function focusAgent(db: DB, herdr: Herdr, id: string): Promise<Response> {
 // live, then spin up a fresh queued copy. Idempotent on an already-failed task.
 async function requeueEndpoint(db: DB, herdr: Herdr, id: string): Promise<Response> {
   const task = getTask(db, id);
-  if (!task) return err("task not found", 404);
+  if (!task) return noTask(id);
   if (isJiraMirror(task)) return err(TRACKING_ONLY_REQUEUE_ERROR, 409);
   if (!TERMINAL.includes(task.state as State)) {
     await reclaimDeadWorktree(db, herdr, task);
@@ -5099,9 +5255,9 @@ async function requeueEndpoint(db: DB, herdr: Herdr, id: string): Promise<Respon
 // fires on the done/cancelled transition and the periodic reaper sweep.
 async function cleanupEndpoint(db: DB, herdr: Herdr, id: string): Promise<Response> {
   const task = getTask(db, id);
-  if (!task) return err("task not found", 404);
+  if (!task) return noTask(id);
   if (!TERMINAL.includes(task.state as State))
-    return err("task is not terminal; refusing to clean up a live task", 409);
+    return err(`task is '${task.state}', not done/failed/cancelled — cleaning up a live task would pull the worktree out from under its agent. Move it first: hive task move ${id} cancelled`, 409);
   const r = await cleanupTask(db, herdr, id, { force: true });
   return json({ ok: true, ...r });
 }
@@ -5589,7 +5745,7 @@ function knowledgeSearch(db: DB, url: URL): Response {
     const t: any = db.query("SELECT project_id FROM tasks WHERE id = ?").get(taskId);
     projectId = t?.project_id ?? null;
   }
-  if (!projectId) return err("project_id or task_id is required");
+  if (!projectId) return err("project_id or task_id is required. Run 'hive recall <keywords>' with HIVE_TASK_ID set, or pass ?project_id=<project-id>");
   const terms = (url.searchParams.get("q") ?? "").trim().split(/\s+/).filter(Boolean);
   const like = (cols: string) =>
     terms.length ? " AND " + terms.map(() => `(${cols}) LIKE ?`).join(" AND ") : "";
@@ -5645,11 +5801,11 @@ const CREATABLE_KINDS = new Set(["failure", "reference"]);
 // root-cause later" flow. Only kind='failure' may spawn one: a reference/typo
 // kind describes no regression to root-cause.
 function createLearning(db: DB, body: any): Response {
-  if (!body?.project_id) return err("project_id is required");
-  if (!body?.title) return err("title is required");
-  if (!CREATABLE_KINDS.has(body.kind)) return err("kind is required: 'failure' or 'reference'", 400);
+  if (!body?.project_id) return err("project_id is required: hive learning add --project <project-id> --title ... --kind failure|reference");
+  if (!body?.title) return err('title is required: hive learning add --project <id> --title "<one-line pattern>" --kind failure|reference');
+  if (!CREATABLE_KINDS.has(body.kind)) return err("kind is required: pass --kind failure or --kind reference", 400);
   if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(body.project_id))
-    return err("unknown project_id", 400);
+    return noProject(String(body.project_id), 400);
   // Reference facts route to the reference store (pinned into briefs, browsable
   // under References), not the occurrence-aged failure ledger.
   if (body.kind === "reference") {
@@ -5743,7 +5899,7 @@ function cancelQueuedRootCauseTask(
 // it from the decisions brief and re-ask the same question as a fresh row).
 function updateLearning(db: DB, id: string, body: any): Response {
   const r: any = db.query("SELECT * FROM learnings WHERE id = ?").get(id);
-  if (!r) return err("learning not found", 404);
+  if (!r) return err("learning not found. List them: hive learning list --project <project-id>", 404);
   if (body.status && !["active", "resolved"].includes(body.status))
     return err("status must be 'active' or 'resolved'");
   // Only an actual change is a recategorization: a read-modify-write client
@@ -5776,7 +5932,7 @@ function updateLearning(db: DB, id: string, body: any): Response {
 // Bump occurrences + last_seen: the same failure pattern happened again.
 function recurLearning(db: DB, id: string): Response {
   const r: any = db.query("SELECT * FROM learnings WHERE id = ?").get(id);
-  if (!r) return err("learning not found", 404);
+  if (!r) return err("learning not found. List them: hive learning list --project <project-id>", 404);
   const last_seen = now();
   db.query(
     "UPDATE learnings SET occurrences = occurrences + 1, last_seen = ?, status = 'active' WHERE id = ?"
@@ -5812,7 +5968,7 @@ function testNotification(db: DB): Response {
 
 // ---------------------------------------------------------------- secrets (metadata only)
 function listSecrets(db: DB, projectId: string): Response {
-  if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return err("project not found", 404);
+  if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return noProject(projectId);
   const rows = db
     .query("SELECT id, project_id, name, provider, created_at FROM secrets WHERE project_id = ? ORDER BY name")
     .all(projectId);
@@ -5820,8 +5976,8 @@ function listSecrets(db: DB, projectId: string): Response {
 }
 
 function createSecret(db: DB, projectId: string, body: any): Response {
-  if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return err("project not found", 404);
-  if (!body?.name) return err("name is required");
+  if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return noProject(projectId);
+  if (!body?.name) return err("name is required: hive secret set --project <project-id> --name <name>");
   const provider = body.provider ?? "keychain";
   const name = String(body.name);
   const row = {
@@ -5956,7 +6112,7 @@ async function prHeadBranch(exec: Exec, prUrl: string): Promise<string | null> {
 // ---------------------------------------------------------------- event ingestion (`hive emit`)
 async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDeps = {}): Promise<Response> {
   const task = getTask(db, taskId);
-  if (!task) return err("task not found", 404);
+  if (!task) return noTask(taskId);
   const exec = deps.exec ?? defaultExec;
   const ct = req.headers.get("content-type") || "";
   let fields: Record<string, string> = {};
@@ -5977,9 +6133,9 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
   }
 
   const type = fields.type;
-  if (!type) return err("event 'type' is required");
+  if (!type) return err('event \'type\' is required: hive emit <task-id> <status|evidence|ready|blocked|done|deferred> --note "..."');
   if (isTrackingOnlyTask(task) && ["needs-decision", "done", "ready", "unmergeable"].includes(type))
-    return err("tracking-only tasks do not accept agent lifecycle events", 409);
+    return err("this task is tracking-only — hive tracks it but never runs an agent on it, so there are no agent lifecycle events to record", 409);
   const source = fields.source || "agent";
   const note = fields.note ?? null;
 
@@ -6045,7 +6201,8 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
   // --- needs-decision (minimal card; full cards go via POST /api/decisions) ---
   if (type === "needs-decision") {
     const context = fields.context ?? note;
-    if (!String(context ?? "").trim()) return err("needs-decision needs context", 400);
+    if (!String(context ?? "").trim())
+      return err('needs-decision needs context: hive decision ask <task-id> --title "..." --context "..." --option key:Label:detail', 400);
     const decision = createDecision(db, {
       task_id: taskId,
       title: fields.title || note || "Decision needed",
@@ -6358,7 +6515,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         answer_key: string;
         explanation?: string;
       }>(
-        rawChecks.flatMap((value: unknown) => {
+        submittedChecks.flatMap((value: unknown) => {
           const check = normalizeUnderstandingCheck(value);
           return check ? [{
             question: check.question,
@@ -6370,19 +6527,24 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         (check) => recurrenceKey(check.question)
       ).slice(0, 5);
       if (checks.length) understanding.checks = checks;
-      if (!checks.length && rawCheck && typeof rawCheck === "object" && !Array.isArray(rawCheck)) {
-        const check = normalizeUnderstandingCheck(rawCheck);
-        if (check) understanding.check = {
-          question: check.question,
-          options: check.options,
-          answer_key: check.answerKey,
-          ...(check.explanation ? { explanation: check.explanation } : {}),
-        };
-      }
+      // Submitted a quiz that normalises to nothing? Say so. Accepting it
+      // silently is what cost two tasks a round trip each: the agent believed
+      // it had supplied a check, and land only said one was "required"
+      // (hive-1947).
+      if (submittedChecks.length && !checks.length)
+        return err(
+          "understanding checks were submitted but none are usable. Expected " +
+            'understanding.checks: [{"question":"...","options":[{"key":"a","label":"..."},' +
+            '{"key":"b","label":"..."}],"answer_key":"a","explanation":"..."}]. ' +
+            "options entries must be {key,label} objects (bare strings are dropped), " +
+            "each check needs 2+ options, and answer_key must equal one option key. " +
+            "Singular `check` is accepted and stored as checks[].",
+          400,
+        );
       if (Object.keys(understanding).length) payload.understanding = understanding;
     }
     if (!Object.keys(payload).length)
-      return err("review_summary needs a structured review section");
+      return err("review_summary needs a structured review section: hive emit <task-id> review_summary --json review.json");
     const latest = db
       .query("SELECT * FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
       .get(taskId) as any;
@@ -6393,8 +6555,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     )
       return json({ event: parseEvent(latest), duplicate: true }, 201);
     const event = writeEvent(db, { task_id: taskId, source, type, payload });
-    const understandingChecks = (payload.understanding as any)?.checks
-      ?? ((payload.understanding as any)?.check ? [(payload.understanding as any).check] : []);
+    const understandingChecks = ((payload.understanding as any)?.checks ?? []) as any[];
     if (understandingChecks.some(isEgregiousCheckWording))
       queueSteerEvent(
         db,
@@ -6412,7 +6573,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
   // a two-paragraph AES explanation surfaced only in the transcript log).
   // Urgent: the director asked; the reply should land as a push, not a digest.
   if (type === "answer") {
-    if (!note) return err("answer needs --note (the reply text)");
+    if (!note) return err('answer needs the reply text: hive emit <task-id> answer --note "..."');
     const t = getTask(db, taskId);
     const event = writeEvent(db, { task_id: taskId, source, type: "answer", payload: { note } });
     enqueue(db, {
@@ -6608,7 +6769,7 @@ function analyticsSummary(db: DB, url: URL): Response {
 }
 
 function taskUsage(db: DB, taskId: string): Response {
-  if (!getTask(db, taskId)) return err("task not found", 404);
+  if (!getTask(db, taskId)) return noTask(taskId);
   const usage = db.query("SELECT * FROM usage WHERE task_id = ? ORDER BY ts").all(taskId);
   const totals = db.query(`SELECT ${usageTotals()} FROM usage WHERE task_id = ?`).get(taskId);
   return json({ task_id: taskId, usage, totals });
@@ -6844,11 +7005,12 @@ export function createDecision(
 }
 
 function apiCreateDecision(db: DB, body: any): Response {
-  if (!body?.task_id) return err("task_id is required");
-  if (!body?.title) return err("title is required");
-  if (!String(body?.context ?? "").trim()) return err("context is required", 400);
+  if (!body?.task_id) return err("task_id is required: hive decision ask <task-id> --title ... --context ... --option key:Label:detail");
+  if (!body?.title) return err('title is required: hive decision ask <task-id> --title "<one specific question>" ...');
+  if (!String(body?.context ?? "").trim())
+    return err('context is required — it must stand alone without opening the task: hive decision ask <task-id> --context "..."', 400);
   if (!Array.isArray(body?.options) || body.options.length === 0)
-    return err("options must be a non-empty array", 400);
+    return err("options must be a non-empty array: pass 2-4 of --option key:Label:\"what choosing this means\"", 400);
   const decision = createDecision(db, {
     task_id: body.task_id,
     title: body.title,
@@ -6882,7 +7044,7 @@ function listDecisions(db: DB, url: URL): Response {
 // Autosave: overwrite draft_note only. Cheap, called on every keystroke (debounced).
 function saveDraft(db: DB, id: string, body: any): Response {
   const r = db.query("SELECT 1 FROM decisions WHERE id = ?").get(id);
-  if (!r) return err("decision not found", 404);
+  if (!r) return err("decision not found. List the open ones: curl -s \"$HIVE_URL/api/decisions?status=open\"", 404);
   db.query("UPDATE decisions SET draft_note = ? WHERE id = ?").run(body?.draft_note ?? "", id);
   return json({ ok: true, id });
 }
@@ -6891,6 +7053,21 @@ function saveDraft(db: DB, id: string, body: any): Response {
 // chat-supervisor (or any API caller) answering is not logged as the director.
 // This is identity only — it grants nothing and gates nothing.
 const ANSWER_SOURCES = ["director", "chat_supervisor", "agent", "system", "unknown"] as const;
+
+// The one non-director answer a high-risk card still accepts: refusing a
+// standing-authority command that has not run. It is the fail-closed direction
+// — it stops the work rather than releasing it — and leaving the grant
+// 'pending' instead strands the agent retrying a card nobody will answer.
+// Approving is still, always, the director's.
+function isFailClosedDeny(db: DB, decisionId: string, answerKey: string): boolean {
+  return (
+    answerKey === "deny" &&
+    db.query("SELECT 1 FROM authority_grants WHERE decision_id = ? AND status = 'pending'").get(decisionId) != null
+  );
+}
+
+export const HIGH_RISK_HUMAN_ONLY_REASON =
+  "high-risk cards are only ever answered by the director (source:\"director\")";
 
 function decisionAnswerBodyError(body: any): string | null {
   if (body?.answer_note !== undefined && typeof body.answer_note !== "string")
@@ -6959,7 +7136,7 @@ function recordContradiction(db: DB, decision: any, body: any): void {
 
 export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, supervisorVerified = false): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
-  if (!r) return err("decision not found", 404);
+  if (!r) return err("decision not found. List the open ones: curl -s \"$HIVE_URL/api/decisions?status=open\"", 404);
   const closed = closedDecisionResponse(db, r);
   if (closed) {
     recordContradiction(db, r, body);
@@ -6997,6 +7174,13 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
   // — which is exactly when we want it to.
   if (r.decision_class && (answeredBy === "system" || answeredBy === "chat_supervisor"))
     return json({ effect: "escalate", category: String(r.decision_class), reason: NO_AUTO_ANSWER_REASON }, 403);
+  // A high-risk card is a human's to answer, full stop. Every automated caller
+  // — the timeout sweep, the chat supervisor, autopilot, the standing CI
+  // ruling, an agent answering its own card — is refused here, so a new
+  // automated path cannot reintroduce the hole by simply not knowing about it.
+  // "unknown" is refused too: a caller we cannot vouch for is not a human.
+  if (riskLevel(r.risk) === "high" && answeredBy !== "director" && !isFailClosedDeny(db, r.id, answerKey))
+    return json({ effect: "escalate", category: "risk_high", reason: HIGH_RISK_HUMAN_ONLY_REASON }, 403);
   if (answeredBy === "chat_supervisor" && !supervisorVerified) {
     if (!answeredActor || !getThread(db, String(answeredActor)))
       return err("chat_supervisor decision answers require a valid thread actor", 403);
@@ -7045,6 +7229,7 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     resolveDuplicateForDecision(db, id, answerKey),
     resolveRepoMismatchForDecision(db, id, answerKey),
     resolveUsageCapForDecision(db, id, answerKey),
+    resolveRaceForDecision(db, id, answerKey),
     resolveScopeDriftForDecision(db, id, answerKey),
     resolveGardenerDecision(db, id, answerKey),
     resolveRefCaptureForDecision(db, id, answerKey, answerNote),
@@ -7085,7 +7270,7 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
 // escalate. The verdict — not the caller's identity — is the gate.
 export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
-  if (!r) return err("decision not found", 404);
+  if (!r) return err("decision not found. List the open ones: curl -s \"$HIVE_URL/api/decisions?status=open\"", 404);
   const closed = closedDecisionResponse(db, r);
   if (closed) return closed;
   const answerKey = body?.answer_key;
@@ -7133,10 +7318,12 @@ export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: an
 // explicitly "take no action".
 export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; steer: string }): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
-  if (!r) return err("decision not found", 404);
+  if (!r) return err("decision not found. List the open ones: curl -s \"$HIVE_URL/api/decisions?status=open\"", 404);
   if (r.status !== "open") return err(`decision already ${r.status}`, 409);
   const source = moot ? "reconciler" : "director";
-  db.query("UPDATE decisions SET status = 'expired' WHERE id = ?").run(id);
+  const expiredAt = now();
+  db.query("UPDATE decisions SET status = 'expired', answered_at = ?, answered_by = ?, answered_actor = ? WHERE id = ?")
+    .run(expiredAt, source, moot ? "reconciler-moot" : null, id);
   writeEvent(db, { task_id: r.task_id, source, type: "decision_expired", payload: { decision_id: id, reason: moot?.reason ?? "dismissed" } });
   // An authority card's pending grant must die with it: left 'pending', every
   // retry of the gated command resolves to this expired decision id and the
@@ -7152,7 +7339,13 @@ export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; 
         moot ? moot.steer :
         `The director dismissed your decision card "${r.title}" without answering — it is gone, do not wait ` +
           `on it or retry the same request. ${wasAuthority ? "The gated command stays unapproved; find another way (or narrow the command so the gate passes). " : ""}` +
-          `Proceed with your best judgment and note the call as a checkpoint.`,
+          // A dismissed HIGH-risk card is not permission. Releasing the agent
+          // with "use your best judgment" would hand it exactly the approval
+          // nobody gave; the rest of the task may continue, that action may not.
+          (riskLevel(r.risk) === "high"
+            ? `This was a HIGH-risk card, so treat it as unapproved: do NOT carry out the risky action it asked about. ` +
+              `Continue any other work and note the block as a checkpoint.`
+            : `Proceed with your best judgment and note the call as a checkpoint.`),
         "queued by decision dismiss"
       );
   }
@@ -7165,7 +7358,7 @@ export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; 
   const task = getTask(db, r.task_id);
   if (!remaining && task && task.state === "needs_decision")
     transition(db, r.task_id, "in_progress", { source, reason: moot?.reason ?? "last open decision dismissed" });
-  const decision = parseDecision({ ...r, status: "expired" });
+  const decision = parseDecision({ ...r, status: "expired", answered_at: expiredAt, answered_by: source });
   broadcast({ type: "decision", decision });
   return json(decision);
 }
@@ -7176,7 +7369,7 @@ export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; 
 // → 409 {decision_id} (open a card; the agent waits, then retries the same call).
 function guardedAction(db: DB, taskId: string, body: any): Response {
   const task = getTask(db, taskId);
-  if (!task) return err("task not found", 404);
+  if (!task) return noTask(taskId);
   if (!body?.action) return err("action is required");
   if (!body?.target) return err("target is required");
   const r = authorize(db, {
@@ -7209,13 +7402,13 @@ function listAuthorityRules(db: DB, url: URL): Response {
 }
 
 function createAuthorityRule(db: DB, body: any): Response {
-  if (!body?.action_pattern) return err("action_pattern is required");
+  if (!body?.action_pattern) return err("action_pattern is required: hive authority add --action <pattern> --effect allow|require_decision|deny");
   const effect = body.effect ?? "allow";
   if (!["allow", "require_decision", "deny"].includes(effect))
     return err("effect must be allow | require_decision | deny");
   const projectId = body.project_id ?? null;
   if (projectId && !db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId))
-    return err("unknown project_id", 400);
+    return noProject(String(projectId), 400);
   const row = {
     id: newId("aur"),
     project_id: projectId,
@@ -7234,7 +7427,7 @@ function createAuthorityRule(db: DB, body: any): Response {
 
 function updateAuthorityRule(db: DB, id: string, body: any): Response {
   const r: any = db.query("SELECT * FROM authority_rules WHERE id = ?").get(id);
-  if (!r) return err("authority rule not found", 404);
+  if (!r) return err("authority rule not found. List them: hive authority list", 404);
   if (body.effect && !["allow", "require_decision", "deny"].includes(body.effect))
     return err("effect must be allow | require_decision | deny");
   const next = {
@@ -7251,11 +7444,11 @@ function updateAuthorityRule(db: DB, id: string, body: any): Response {
 
 // ---------------------------------------------------------------- policies
 function createPolicy(db: DB, herdr: Herdr, body: any): Response {
-  if (!body?.title) return err("title is required");
-  if (!body?.body) return err("body is required");
+  if (!body?.title) return err('title is required: hive policy add --title "<t>" --body "<s>"');
+  if (!body?.body) return err("body is required: pass --body <s> or --body-file <f>");
   const scope = body.scope ?? "global";
   if (scope !== "global" && !/^project:.+/.test(scope))
-    return err("scope must be 'global' or 'project:<id>'");
+    return err("scope must be 'global' or 'project:<id>': hive policy add --scope global|project:<project-id>");
   const t = now();
   const row = {
     id: newId("pol"),
@@ -7294,7 +7487,7 @@ function listPolicies(db: DB, url: URL): Response {
 
 function updatePolicy(db: DB, id: string, body: any): Response {
   const r: any = db.query("SELECT * FROM policies WHERE id = ?").get(id);
-  if (!r) return err("policy not found", 404);
+  if (!r) return err("policy not found. List them: hive policy list", 404);
   const next = {
     scope: body.scope ?? r.scope,
     title: body.title ?? r.title,

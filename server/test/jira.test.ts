@@ -22,6 +22,7 @@ const { openDb, newId, now, setSetting } = await import("../src/db.ts");
 const { writeEvent, transition } = await import("../src/state.ts");
 const { addClient, removeClient } = await import("../src/bus.ts");
 const J = await import("../src/intake/jira.ts");
+const { TASK_PRIORITIES } = await import("../src/api.ts");
 import type { DB } from "../src/db.ts";
 
 const SITE = "https://example.atlassian.net";
@@ -48,6 +49,7 @@ interface FakeIssue {
   parentKey?: string | null;
   created?: string | null;
   updated?: string;
+  priority?: string | null; // Jira priority NAME; null = no priority set
   history?: { at: string; to: string }[]; // status transitions, oldest first
   rawHistory?: any[] | null;
   attachments?: { id: string; filename: string }[];
@@ -95,7 +97,7 @@ interface FakeOpts {
 }
 
 function fakeJira(opts: FakeOpts) {
-  const byKey = new Map(opts.issues.map((i) => [i.key, { labels: [], assignee: null, projectKey: "WEB", summary: "s", description: null, properties: {}, parentKey: null, created: "2026-01-01T00:00:00.000Z", updated: "2026-01-01T00:00:00.000Z", history: [], rawHistory: null, comments: [], attachments: [], ...i } as Required<FakeIssue>]));
+  const byKey = new Map(opts.issues.map((i) => [i.key, { labels: [], assignee: null, projectKey: "WEB", summary: "s", description: null, properties: {}, parentKey: null, created: "2026-01-01T00:00:00.000Z", updated: "2026-01-01T00:00:00.000Z", priority: "Medium", history: [], rawHistory: null, comments: [], attachments: [], ...i } as Required<FakeIssue>]));
   const calls: { method: string; path: string; body?: any }[] = [];
   const reads = new Map<string, number>();
   const changelogReads = new Map<string, number>();
@@ -191,7 +193,7 @@ function fakeJira(opts: FakeOpts) {
             summary: iss.summary, description: iss.description, created: iss.created, updated: iss.updated,
             status: { name: iss.status }, labels: [...iss.labels],
             assignee: iss.assignee ? { accountId: iss.assignee } : null,
-            priority: { name: "Medium" }, issuetype: { name: "Story" },
+            priority: iss.priority == null ? null : { name: iss.priority }, issuetype: { name: "Story" },
             project: iss.projectKey == null ? undefined : { key: iss.projectKey },
             parent: iss.parentKey ? { key: iss.parentKey } : null,
             attachment: iss.attachments.map((a) => ({ id: a.id, filename: a.filename })),
@@ -496,6 +498,68 @@ test("import mirrors an issue as a tracking-only task with the mapped state", as
   expect(t.state).toBe("in_review");
   expect(t.title).toBe("[WEB-1] 뉴스레터 기획");
   expect(t.brief).toContain(`${SITE}/browse/WEB-1`);
+});
+
+test("Jira priority reaches tasks.priority, so the dispatcher can actually order the queue", async () => {
+  const jira = fakeJira({
+    issues: [
+      { key: "WEB-1", id: "1", status: "To Do", priority: "Highest" },
+      { key: "WEB-2", id: "2", status: "To Do", priority: "High" },
+      { key: "WEB-3", id: "3", status: "To Do", priority: "Medium" },
+      { key: "WEB-4", id: "4", status: "To Do", priority: "Low" },
+      { key: "WEB-5", id: "5", status: "To Do", priority: "Lowest" },
+      { key: "WEB-6", id: "6", status: "To Do", priority: null }, // no priority set in Jira
+    ],
+  });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+
+  expect(Object.fromEntries(tasks(db).map((t) => [t.jira_key, t.priority]))).toEqual({
+    "WEB-1": "now", "WEB-2": "next", "WEB-3": "normal", "WEB-4": "later", "WEB-5": "later", "WEB-6": "normal",
+  });
+  // The brief keeps carrying the Jira name — it is still context for an agent.
+  expect(tasks(db)[0].brief).toContain("Priority: Highest");
+  // Nothing in the priority copy may look like a status decision.
+  expect(syncEvents(db).some((e) => e.action === "pull" || e.action === "push")).toBe(false);
+});
+
+test("a priority change in Jira moves the hive priority and moves nothing else", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Progress", priority: "Medium" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const before = tasks(db)[0];
+  expect(before.priority).toBe("normal");
+
+  jira.byKey.get("WEB-1")!.priority = "Highest";
+  await run(db, projectId, jira.fetchImpl);
+
+  const after = tasks(db)[0];
+  expect(after.priority).toBe("now");
+  expect(after.state).toBe(before.state);
+  expect(jira.calls.some((c) => c.method === "POST" && c.path.includes("/transitions"))).toBe(false);
+});
+
+test("an unrecognised Jira priority lands on normal and is logged ONCE, not every cycle", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do", priority: "Blocker" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  await run(db, projectId, jira.fetchImpl);
+
+  expect(tasks(db)[0].priority).toBe("normal");
+  const unmapped = syncEvents(db).filter((e) => e.action === "unmapped_priority");
+  expect(unmapped).toEqual([{ action: "unmapped_priority", issue: "WEB-1", jira_priority: "Blocker" }]);
+});
+
+test("the priority map covers Jira's default scheme and refuses to guess anything else", () => {
+  expect(J.jiraPriorityToPriority("Highest")).toBe("now");
+  expect(J.jiraPriorityToPriority("  high ")).toBe("next"); // case + whitespace tolerant
+  expect(J.jiraPriorityToPriority("Medium")).toBe("normal");
+  expect(J.jiraPriorityToPriority("Low")).toBe("later");
+  expect(J.jiraPriorityToPriority("Lowest")).toBe("later");
+  expect(J.jiraPriorityToPriority("P0")).toBe(null);
+  expect(J.jiraPriorityToPriority(null)).toBe(null);
+  // Every value it CAN produce has to be a rank the dispatcher understands.
+  for (const p of Object.values(J.JIRA_TO_PRIORITY)) expect(TASK_PRIORITIES).toContain(p);
 });
 
 test("import broadcasts via broadcastTask, so the live-pushed card already carries never_dispatched", async () => {
@@ -3631,7 +3695,15 @@ const failedRequest = (url: string, resourceType: string, errorText = "net::ERR_
 
 // `overlayText` non-null makes the page look like a dev server showing a
 // compile error over the app: HTTP 200, no failed request, still not proof.
-function fakePage(url: string, failures: Array<ReturnType<typeof failedRequest>>, overlayText: string | null = null) {
+// `content` is what the browser reports back about what the page painted: how
+// many characters of text the body shows, and how many visible images it has.
+// The default is an ordinary page with plenty of both.
+function fakePage(
+  url: string,
+  failures: Array<ReturnType<typeof failedRequest>>,
+  overlayText: string | null = null,
+  content: { text: number; media: number } = { text: 500, media: 3 }
+) {
   let onFailed: (r: unknown) => void = () => {};
   let shot = false;
   return {
@@ -3650,6 +3722,7 @@ function fakePage(url: string, failures: Array<ReturnType<typeof failedRequest>>
         return { ok: () => true, status: () => 200 };
       },
       waitForLoadState: async () => {},
+      evaluate: async () => content,
       url: () => url,
       screenshot: async () => {
         shot = true;
@@ -3830,6 +3903,69 @@ test.skipIf(process.platform !== "darwin")("the generated spec refuses a non-2xx
 
   expect(thrown).toContain("page answered HTTP 500");
   expect(tookShot()).toBe(false);
+});
+
+// The corebeat run that prompted this: the app's API is unreachable inside the
+// seatbelt, so the page answered 200, failed no request hive counts, showed no
+// overlay, and painted a blank white 1280x800. A blank picture is worse than no
+// picture, so the spec fails the shot.
+test.skipIf(process.platform !== "darwin")("the generated spec refuses a blank page", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const spec = await generatedSpec(root, db, projectId, jira);
+
+  const { page, tookShot } = fakePage(PAGE_URL, [], null, { text: 0, media: 0 });
+
+  let thrown = "";
+  await runSpec(spec, page).catch((e) => {
+    thrown = String(e?.message ?? e);
+  });
+
+  expect(thrown).toContain("page rendered nothing");
+  expect(tookShot()).toBe(false);
+});
+
+// A page can be nearly wordless and still be a real picture, so text alone does
+// not condemn it: one visible image is enough to shoot.
+test.skipIf(process.platform !== "darwin")("the generated spec still shoots a wordless page that shows an image", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const spec = await generatedSpec(root, db, projectId, jira);
+
+  const { page, tookShot } = fakePage(PAGE_URL, [], null, { text: 3, media: 1 });
+
+  await runSpec(spec, page);
+
+  expect(tookShot()).toBe(true);
+});
+
+// End to end: the spec hive generated, run against a blank page, makes the
+// harness go red, and the ticket falls back to text with a reason that names
+// the empty page.
+test.skipIf(process.platform !== "darwin")("a blank page renders nothing and the reason names it", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const exec = async (argv: string[]) => {
+    if (!isHarnessRun(argv)) return { code: 0, stdout: UI_PATCH, stderr: "" };
+    const dir = join(root, "web", "e2e");
+    const name = readdirSyncT(dir).find((f) => f.startsWith("hive-proof-"))!;
+    const spec = await Bun.file(join(dir, name)).text();
+    const { page } = fakePage(PAGE_URL, [], null, { text: 0, media: 0 });
+    let thrown = "";
+    await runSpec(spec, page).catch((e) => {
+      thrown = String(e?.message ?? e);
+    });
+    return { code: 1, stdout: `1 failed\n  Error: ${thrown}`, stderr: "" };
+  };
+
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+
+  expect(stats.rendered).toBe(0);
+  expect(db.query("SELECT id FROM evidence").all()).toHaveLength(0);
+  expect(jira.byKey.get("WEB-1")!.attachments).toHaveLength(0);
+  const reason = String(syncEvents(db).find((e) => e.action === "render_proof")?.reason);
+  expect(reason).toContain("page rendered nothing");
+  expect(reason).toContain("blank");
 });
 
 test("the scratch directory is gone even when the harness throws", async () => {

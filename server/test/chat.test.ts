@@ -609,7 +609,8 @@ test("Chief bundles real decisions into actionable message data and does not res
 test("starting a chat with no project is rejected (session needs a repo)", async () => {
   const { status, json } = await turn({ text: "hello" });
   expect(status).toBe(400);
-  expect(json.error).toContain("project_id is required");
+  expect(json.error).toContain("a new chat needs a project");
+  expect(json.error).toContain("hive chat send --project");
 });
 
 test("composeSupervisorBrief bakes in the thread id, reply verb, and hard limits", () => {
