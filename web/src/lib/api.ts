@@ -935,7 +935,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ verdict, note, source: "director", actor: directorActor() }),
     }),
-  understandingQuizzes: () => req<{ quizzes: UnderstandingQuiz[] }>(`/api/understanding-quizzes`),
+  understandingQuizzes: () => req<{ quizzes: UnderstandingQuiz[] }>(`/api/understanding-quizzes?scope=all`),
   answerUnderstandingQuiz: (taskId: string, answerKey: string, version: string, surface?: "focus") =>
     req<{ ok: boolean; correct: boolean; passed: boolean; explanation: string | null; completed?: number; total?: number; quiz?: Pick<UnderstandingQuiz, "question" | "options" | "version" | "completed" | "total"> }>(`/api/tasks/${taskId}/understanding-quiz/answer`, {
       method: "POST",

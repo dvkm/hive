@@ -4639,9 +4639,25 @@ export function pendingPostShipQuizCount(db: DB, projectId?: string): number {
   }).length;
 }
 
+// Quizzes split into two very different classes, and only one of them is
+// something anyone is waiting on:
+//   - live (in_review, verifying): the task has not finished, so the quiz can
+//     still change what happens to it.
+//   - shipped (done, failed): the post-ship catch-up backlog. Real, but nothing
+//     is blocked on it and it only ever grows.
+// The default is LIVE, because every counter that reads this endpoint without
+// thinking about it was reporting the shipped pile as a pending queue
+// (HIVE-542: 104 "pending" quizzes, 1 of them on a live task). The web UI wants
+// both classes — it builds the "Catch up on N shipped changes" digest from the
+// shipped ones — so it asks for `?scope=all` explicitly.
+const UNDERSTANDING_QUIZ_LIVE_STATES = ["in_review", "verifying"];
+
 function listUnderstandingQuizzes(db: DB, url: URL): Response {
   const projectId = url.searchParams.get("project_id");
-  const statePlaceholders = UNDERSTANDING_QUIZ_ANSWERABLE_STATES.map(() => "?").join(",");
+  const states = url.searchParams.get("scope") === "all"
+    ? UNDERSTANDING_QUIZ_ANSWERABLE_STATES
+    : UNDERSTANDING_QUIZ_LIVE_STATES;
+  const statePlaceholders = states.map(() => "?").join(",");
   const rows = db
     .query(
       `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state, t.kind, t.head_sha
@@ -4655,7 +4671,7 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
                AND (newer.ts > e.ts OR (newer.ts = e.ts AND newer.rowid > e.rowid)))
         ORDER BY t.number DESC`
     )
-    .all(...UNDERSTANDING_QUIZ_ANSWERABLE_STATES, projectId, projectId) as any[];
+    .all(...states, projectId, projectId) as any[];
   const quizzes = rows.flatMap((row) => {
     let payload: any;
     try { payload = JSON.parse(row.payload); } catch { return []; }
