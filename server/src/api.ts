@@ -6108,7 +6108,14 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
   const type = fields.type;
   if (!type) return err('event \'type\' is required: hive emit <task-id> <status|evidence|ready|blocked|done|deferred> --note "..."');
   if (isTrackingOnlyTask(task) && ["needs-decision", "done", "ready", "unmergeable"].includes(type))
-    return err("this task is tracking-only — hive tracks it but never runs an agent on it, so there are no agent lifecycle events to record", 409);
+    return err(
+      // hive-1952: say what IS allowed. This message used to stop at "no agent
+      // lifecycle events", and the state machine's own error then sent the
+      // caller back to `ready` — the two guards pointed at each other and an
+      // in_review mirror had no exit but `cancelled`.
+      `this task is tracking-only — hive tracks it but never runs an agent on it, so there are no agent lifecycle events to record. To close it, move it directly: \`hive task move ${taskId} done\` (or \`cancelled\`).`,
+      409
+    );
   const source = fields.source || "agent";
   const note = fields.note ?? null;
 
