@@ -1433,11 +1433,19 @@ same authority engine (`writeHookSettings` in `api.ts`; `hooks/classify.ts` +
      `POST guarded-action {action:"command.dangerous.<category>", target:<cmd>, summary:<Bash description>}`. The hook forwards the Bash tool's one-line description as the stated intent; see the `guarded-action` contract above for missing-summary behavior.
      Never auto-allowed, even under `command_approval:"allow"`.
      **Sandbox waiver**: a destructive command PROVEN to act only inside the
-     agent's own sandbox (its herdr worktree or a tmp scratchpad) is first
-     downgraded out of `dangerous` to **unknown** (allow-and-log) — this covers
-     `rm -rf`, `kill`/`pkill`, `git reset --hard`/`git clean`, `git push --force`,
-     `find … -delete/-exec`, and sandboxed SQL. Anything unresolvable (a shell
-     var, a `..` escape, an un-sandboxed or unknown path) stays dangerous.
+     agent's own sandbox (its herdr worktree, a tmp scratchpad, or a docker
+     container belonging to that worktree) is first downgraded out of
+     `dangerous` to **unknown** (allow-and-log) — this covers `rm -rf`,
+     `kill`/`pkill`, `git reset --hard`/`git clean`, `git push --force`,
+     `find … -delete/-exec`, and sandboxed SQL. Sandboxed SQL means sqlite3 on a
+     file under a sandbox root, or `docker exec` into a container whose name
+     starts with the requesting worktree's own slug (`<slug>-mariadb`, brought up
+     by `infra/worktree/wt.sh` and thrown away with the worktree). The slug match
+     is exact and anchored, so a neighbouring task's container never waives, and
+     a client assembled in a shell variable (`DBC="docker exec … mysql …"`) is
+     resolved before the check. Anything unresolvable (a shell var set in an
+     earlier call, a `..` escape, an un-sandboxed or unknown path, a bare
+     `mysql -h <host>`) stays dangerous.
    - **unknown** (not provably safe) → escalates via `{action:"command", …}`, or is
      allowed / deferred per the `command_approval` policy below.
 
