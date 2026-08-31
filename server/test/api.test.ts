@@ -1164,7 +1164,9 @@ test("direct POST /api/decisions requires context", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "d-no-context" });
   const missing = await post("/api/decisions", { task_id: t.json.id, title: "contextless", options: [{ key: "a", label: "A" }] });
   expect(missing.status).toBe(400);
-  expect(missing.json.error).toBe("context is required");
+  // HIVE-530: the refusal now names the command that fixes it.
+  expect(missing.json.error).toContain("context is required");
+  expect(missing.json.error).toContain("hive decision ask");
 });
 
 test("needs-decision emit path requires context and defaults options", async () => {
