@@ -62,7 +62,9 @@ const COL_EMPTY: Record<string, { title: string; hint: string }> = {
 export function Card({ task }: { task: Task }) {
   const { projects, evidenceCount, spawnError, lastActivity, tasks, decisions } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
-  const age = useRelTime(lastActivity[task.id] || task.updated_at);
+  // health.since is the server's agent-only activity clock (health.ts); it is
+  // the honest "quiet for" number, where updated_at counts hive's own writes.
+  const age = useRelTime(task.health?.since || lastActivity[task.id] || task.updated_at);
   const ev = evidenceCount[task.id];
   const location = useLocation();
   const [dispatching, setDispatching] = useState(false);

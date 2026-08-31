@@ -12,7 +12,7 @@ import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { startLoop } from "./loop.ts";
-import { writeEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, verificationGate, repairRequeueProvenance, TERMINAL, type State } from "./state.ts";
+import { writeEvent, lastAgentActivity, AGENT_EVENT_SOURCES, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, verificationGate, repairRequeueProvenance, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
 import { spawnMeta } from "./cleanup.ts";
 import { raceSweep } from "./race.ts";
@@ -1752,24 +1752,23 @@ export function unparkAnswered(db: DB, nowMs: number = Date.now()): void {
   }
 }
 
-// Rows hive writes ABOUT a task never prove the agent did anything, so none of
-// them may reset its progress clock. `authority_logged` is here too: a spawn
-// hive attempted logs one, and the agent's own commands always land a `tool_use`
-// alongside it, so dropping it costs no signal.
-const NO_PROGRESS_NOISE = ["stale", "hung", "recovery", "recovery_nudge", "spawn_error", "agent_status", "ci_status", "authority_logged"];
 // A hung agent is not a dead one: it still holds its name, so reattach skips it,
 // the reaper leaves it alone, and the stale flag fires exactly once. Silence at
 // 4x the stale threshold means the WORK stopped, which needs a human eye rather
 // than a respawn — hive must not kill it, because a slow `pnpm install` and a
-// wedged one look identical from here (hive-1951).
+// wedged one look identical from here (hive-1951). The clock counts only
+// agent-generated events (see lastAgentActivity): hive's own rows, and a human
+// poking the task, must not make a frozen task look busy.
 const HUNG_MULTIPLIER = 4;
 
 // The last thing the agent itself said, for the hung notification: the wedge
 // point is usually named right there ("Installing (cms pins pnpm 9.1.0)").
 function lastAgentWord(db: DB, taskId: string): string | null {
   const r = db
-    .query("SELECT payload FROM events WHERE task_id = ? AND type IN ('assistant_text','status','note','checkpoint','blocked') ORDER BY ts DESC LIMIT 1")
-    .get(taskId) as { payload: string } | undefined;
+    .query(
+      `SELECT payload FROM events WHERE task_id = ? AND source IN (${AGENT_EVENT_SOURCES.map(() => "?").join(",")}) AND type IN ('assistant_text','status','note','checkpoint','blocked') ORDER BY ts DESC LIMIT 1`
+    )
+    .get(taskId, ...AGENT_EVENT_SOURCES) as { payload: string } | undefined;
   if (!r) return null;
   try {
     const p = JSON.parse(r.payload);
@@ -1790,18 +1789,14 @@ function humanMs(ms: number): string {
 // caller's filters (deferred, dependency-blocked, mirrors, chat supervisors)
 // already exclude everything that is quiet on purpose.
 function flagHung(db: DB, taskId: string, staleMs: number, nowMs: number): void {
-  const act = db
-    .query(
-      `SELECT ts FROM events WHERE task_id = ? AND type NOT IN (${NO_PROGRESS_NOISE.map(() => "?").join(",")}) ORDER BY ts DESC LIMIT 1`
-    )
-    .get(taskId, ...NO_PROGRESS_NOISE) as { ts: string } | undefined;
-  if (!act) return;
-  const quiet = nowMs - Date.parse(act.ts);
+  const since = lastAgentActivity(db, taskId);
+  if (!since) return;
+  const quiet = nowMs - Date.parse(since);
   if (quiet <= staleMs * HUNG_MULTIPLIER) return;
   // Once per silence window, keyed on the activity it starts from — not on "is
   // there a newer hung row", which would be true forever after the first one and
   // silence a task that woke up, spoke, and wedged again.
-  if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'hung' AND json_extract(payload, '$.since') = ? LIMIT 1").get(taskId, act.ts))
+  if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'hung' AND json_extract(payload, '$.since') = ? LIMIT 1").get(taskId, since))
     return;
   const said = lastAgentWord(db, taskId);
   const task = getTask(db, taskId);
@@ -1809,7 +1804,7 @@ function flagHung(db: DB, taskId: string, staleMs: number, nowMs: number): void 
     task_id: taskId,
     source: "reconciler",
     type: "hung",
-    payload: { since: act.ts, silent_ms: quiet, threshold_ms: staleMs * HUNG_MULTIPLIER, last_said: said },
+    payload: { since, silent_ms: quiet, threshold_ms: staleMs * HUNG_MULTIPLIER, last_said: said },
   });
   enqueue(db, {
     kind: "hung_agent",
@@ -1817,7 +1812,7 @@ function flagHung(db: DB, taskId: string, staleMs: number, nowMs: number): void 
     task_id: taskId,
     title: `No progress for ${humanMs(quiet)}: ${task?.title ?? taskId}`,
     body:
-      `The agent is still holding this task, but nothing has happened since ${act.ts}. ` +
+      `The agent is still holding this task, but nothing has happened since ${since}. ` +
       (said ? `It last said: "${said}". ` : "It said nothing before going quiet. ") +
       `It may be wedged, or just running something long. Look at the pane before killing anything.`,
   });
@@ -2265,8 +2260,9 @@ function queuedInputEpisode(
   db: DB,
   taskId: string
 ): { attempts: number; startedAt: string | null; latestDelivered: boolean | null | undefined } {
-  const rows = db.query("SELECT type, ts, payload FROM events WHERE task_id = ? ORDER BY ts DESC, rowid DESC").all(taskId) as {
+  const rows = db.query("SELECT type, source, ts, payload FROM events WHERE task_id = ? ORDER BY ts DESC, rowid DESC").all(taskId) as {
     type: string;
+    source: string;
     ts: string;
     payload: string;
   }[];
@@ -2278,7 +2274,7 @@ function queuedInputEpisode(
       if (n === 0) latestDelivered = JSON.parse(r.payload).delivered;
       n++;
       startedAt = r.ts;
-    } else if (r.type === "agent_status" || r.type === "stale") continue; // reconciler noise
+    } else if (!AGENT_EVENT_SOURCES.includes(r.source)) continue; // hive's own rows about the task, not the agent working
     else break; // real activity resets the count
   }
   return { attempts: n, startedAt, latestDelivered };

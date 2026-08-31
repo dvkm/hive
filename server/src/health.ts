@@ -11,7 +11,7 @@ import type { DB } from "./db.ts";
 import { getSetting, setSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { isSupervisedTask, neverDispatched } from "./supervision.ts";
-import { isDeferred, unmetDeps, SKIP_REASONS, TERMINAL, type State } from "./state.ts";
+import { isDeferred, unmetDeps, lastAgentActivity, SKIP_REASONS, TERMINAL, type State } from "./state.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
 import { latestSidecar, latestSidecarBatch, type SidecarReport } from "./sidecar.ts";
 import { reviewActionable, reviewActionableBatch } from "./reviewer.ts";
@@ -23,12 +23,6 @@ export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
 // the ones worth an attention item rather than just a label.
 const ATTENTION_SKIPS = new Set(["no_repo_path", "kind_excluded", "authority_denied"]);
 
-// Rows the reconciler writes about an agent, never by the agent. None of them
-// prove the agent is alive, so none of them may reset its silence clock.
-// `spawn_error` is here for the same reason: a respawn hive TRIED and failed is
-// not the agent doing something, and letting it reset the clock would hide a
-// dead task behind hive's own retry loop.
-const RECONCILER_NOISE = new Set(["stale", "hung", "recovery_nudge", "recovery", "spawn_error"]);
 const HEALTH_EVENT_TYPES = [
   "agent_status",
   "dialog_auto_approved",
@@ -216,16 +210,15 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   if (task.state === "needs_decision" || task.state === "in_review")
     return { status: "healthy", reason: null, since: task.updated_at as string };
 
-  // "Activity" excludes reconciler noise so a genuinely quiet agent keeps aging
-  // toward silent instead of resetting. `recovery` belongs in that set and was
-  // missing: hive re-diagnosed an auth-lost pane every lap, and each diagnosis
-  // wrote a `recovery` row that reset this clock — so a frozen pane read
-  // HEALTHY, lap after lap, with a byte-identical tail (#1149/#1156, 2026-08-20).
-  // A row hive wrote ABOUT an agent is not evidence the agent did anything.
-  const activity = db
-    .query(`SELECT ts FROM events WHERE task_id = ? AND type NOT IN (${[...RECONCILER_NOISE].map(() => "?").join(",")}) ORDER BY ts DESC LIMIT 1`)
-    .get(task.id, ...RECONCILER_NOISE) as { ts: string } | undefined;
-  const activityTs = activity?.ts ?? (task.updated_at as string);
+  // "Activity" means the AGENT did something. Only its own rows count (see
+  // lastAgentActivity): every row hive writes ABOUT a task, and every human
+  // poke, would otherwise reset this clock and make a frozen task read healthy.
+  // Two ways that already bit us: hive re-diagnosed an auth-lost pane every lap
+  // and each `recovery` row reset the clock, so a frozen pane read HEALTHY lap
+  // after lap with a byte-identical tail (#1149/#1156, 2026-08-20); and a
+  // refused respawn wrote spawn_error + authority_logged, dropping a task
+  // frozen for 2.5h off the stall list (hive-1951, 2026-08-31).
+  const activityTs = lastAgentActivity(db, task.id) ?? (task.updated_at as string);
   const age = nowMs - Date.parse(activityTs);
 
   // Recovery is underway if hive nudged AFTER the last real activity. Keyed off

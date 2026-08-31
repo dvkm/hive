@@ -179,11 +179,19 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             next[i] = t;
             return next;
           });
-          setLastActivity((la) => ({ ...la, [t.id]: t.updated_at }));
+          // NOT lastActivity: a task row is touched by hive's own bookkeeping
+          // (CI polls, state syncs), which says nothing about the agent working.
           bump(t.id);
         } else if (msg.type === "event") {
           const ev: Event = msg.event;
-          setLastActivity((la) => ({ ...la, [ev.task_id]: ev.ts }));
+          // Only the agent's own rows count as activity (`agent` = its `hive
+          // emit` calls, `hook` = its transcript), plus a fresh spawn. Rows hive
+          // writes ABOUT a task, and a human steering or poking it, would
+          // otherwise reset the card's age and make a frozen task look busy —
+          // which is how a task frozen since 09:51 dropped off the stall list at
+          // 12:14 (hive-1951). Same rule as the server's lastAgentActivity.
+          if (ev.source === "agent" || ev.source === "hook" || ev.type === "spawned")
+            setLastActivity((la) => ({ ...la, [ev.task_id]: ev.ts }));
           setFeedEvents((prev) => [ev, ...prev].slice(0, FEED_CAP));
           if (ev.type === "spawn_error") setSpawnError((s) => ({ ...s, [ev.task_id]: true }));
           else if (ev.type === "spawned") setSpawnError((s) => ({ ...s, [ev.task_id]: false }));

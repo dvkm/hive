@@ -110,6 +110,27 @@ test("hive's own rows about the task do not count as progress", async () => {
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'hung'").get(id)).toBeTruthy();
 });
 
+// The trap a human walked into on 2026-08-31: attempting a respawn on a frozen
+// task wrote spawn_error + authority_logged, and steering it wrote a steer row.
+// Checking on a stuck task must not make it look busy, and the quoted "last
+// said" must be the AGENT, not the person who steered it.
+test("a human poking the task does not hide it", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  wedged(db, id, 5 * 60 * 60 * 1000);
+  putEvent(db, id, "authority_logged", { action: "spawn" }, 30 * 1000, "system");
+  putEvent(db, id, "steer", { message: "are you alive?" }, 20 * 1000, "director");
+  putEvent(db, id, "note", { note: "poked it" }, 10 * 1000, "director");
+
+  await reconcileOnce(db, deps);
+
+  const row = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'hung'").get(id) as { payload: string } | undefined;
+  expect(row).toBeTruthy();
+  const p = JSON.parse(row!.payload);
+  expect(p.silent_ms).toBeGreaterThan(4 * STALE_MS);
+  expect(p.last_said).toContain("pnpm 9.1.0");
+});
+
 test("the agent speaking again re-arms the signal", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId);
