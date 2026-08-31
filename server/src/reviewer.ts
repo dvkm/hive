@@ -383,26 +383,30 @@ async function reviewOne(db: DB, t: any, deps: ReviewerDeps): Promise<void> {
 // about the same task, so the reconciler asked for a merge every cycle and the
 // merge refused every cycle, forever (HIVE-499). Callers that care about
 // freshness compare `reviewed_head_sha` to the head they are about to act on.
-export function latestAutoReviewVerdict(
-  db: DB,
-  taskId: string
-): {
+export interface AutoReviewVerdict {
   verdict: string;
   files: string[];
   risks: string[];
   questions: string[];
   reviewed_pr_url?: string;
   reviewed_head_sha?: string;
-} | null {
+}
+
+export function latestAutoReviewVerdict(db: DB, taskId: string): AutoReviewVerdict | null {
   const row = db
     .query(
       `SELECT payload FROM events WHERE task_id = ? AND type = 'auto_review'
         ORDER BY ts DESC, rowid DESC LIMIT 1`
     )
     .get(taskId) as { payload: string } | undefined;
-  if (!row) return null;
+  return row ? parseAutoReview(row.payload) : null;
+}
+
+// The row-to-verdict half of latestAutoReviewVerdict, so the batched form
+// (reviewActionableBatch) reads an auto_review row exactly the same way.
+function parseAutoReview(raw: string): AutoReviewVerdict | null {
   try {
-    const payload = JSON.parse(row.payload);
+    const payload = JSON.parse(raw);
     if (payload?.skipped || typeof payload?.verdict !== "string") return null;
     return {
       verdict: payload.verdict,
@@ -630,19 +634,7 @@ function answerPrompt(task: any, question: string, diff: string): string {
 // every risk and question the review actually raised. Anything else re-verifies.
 function hasRiskVerdicts(db: DB, taskId: string, head: string, expected: number): boolean {
   const rows = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts'").all(taskId) as { payload: string }[];
-  return rows.some((r) => {
-    try {
-      const p = JSON.parse(r.payload);
-      if (p?.reviewed_head_sha !== head) return false;
-      const covered =
-        (Array.isArray(p.verdicts) ? p.verdicts.length : 0) +
-        (Array.isArray(p.question_verdicts) ? p.question_verdicts.length : 0) +
-        (typeof p.unverified === "number" ? p.unverified : 0);
-      return covered === expected;
-    } catch {
-      return false;
-    }
-  });
+  return rows.some((r) => coversReview(r.payload, head, expected));
 }
 
 // One opus run per risk and per question, up to RISK_CONCURRENCY at a time,
@@ -728,6 +720,30 @@ export async function verifyRisks(
   broadcast({ type: "task", task: getTask(db, task.id) });
 }
 
+// Does one stored risk_verdicts row account for this exact head's whole review?
+// Split out of hasRiskVerdicts so the batched path applies the identical test.
+function coversReview(raw: string, head: string, expected: number): boolean {
+  try {
+    const p = JSON.parse(raw);
+    if (p?.reviewed_head_sha !== head) return false;
+    const covered =
+      (Array.isArray(p.verdicts) ? p.verdicts.length : 0) +
+      (Array.isArray(p.question_verdicts) ? p.question_verdicts.length : 0) +
+      (typeof p.unverified === "number" ? p.unverified : 0);
+    return covered === expected;
+  } catch {
+    return false;
+  }
+}
+
+// How many verdicts a review must have before it counts as fully verified.
+function expectedVerdicts(review: AutoReviewVerdict): number {
+  return (
+    (review.risks ?? []).slice(0, MAX_VERIFIED_RISKS).length +
+    (review.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS).length
+  );
+}
+
 // What the risk check decided for one PR head, or null when it never ran for
 // that head. Read by the reconciler (auto-merge) and by mergeTask (the 409
 // that names the confirmed risks) — both must ignore a verdict set produced
@@ -768,9 +784,154 @@ export function reviewCompleteForHead(db: DB, taskId: string, head: string | nul
   if (!head) return false;
   const review = latestAutoReviewVerdict(db, taskId);
   if (!review || review.reviewed_head_sha !== head) return false;
-  const expected =
-    (review.risks ?? []).slice(0, MAX_VERIFIED_RISKS).length + (review.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS).length;
+  const expected = expectedVerdicts(review);
   return expected === 0 || hasRiskVerdicts(db, taskId, head, expected);
+}
+
+// Is there any further review work COMING for this head, or is what we have as
+// complete as the review will ever get? Nothing coming means either no head to
+// key verdicts to or a project that never auto-reviews (the reviewer skips
+// both); otherwise the pipeline must have finished for this exact head.
+export function reviewPipelineSettled(
+  db: DB,
+  task: { id: string; head_sha?: string | null; project_id: string }
+): boolean {
+  if (!task.head_sha) return true;
+  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+  if (JSON.parse(project?.config ?? "{}").auto_review === false) return true;
+  return reviewCompleteForHead(db, task.id, task.head_sha);
+}
+
+// Can the DIRECTOR act on this review right now (HIVE-500)? The review column
+// counts everything in_review, but most of it is still the agent's or the
+// pipeline's work, not a decision waiting on a human. Two rules:
+//   - WITH a pull request: CI must not be red or still running (a red build is
+//     the agent's to fix), and the review pipeline must have settled on the
+//     live head, or the director would read a report about a stale commit.
+//   - WITHOUT a pull request: there must be something to READ — a self-review
+//     summary or a report attached as evidence. A task with neither has no
+//     work product and nothing to merge; it is unfinished agent work, and
+//     health surfaces it as stuck instead.
+// Anything false here stays VISIBLE as in-review; it just must not be counted
+// as something needing the director.
+export function reviewActionable(
+  db: DB,
+  task: { id: string; state: string; pr_url?: string | null; ci_status?: string | null; head_sha?: string | null; project_id: string }
+): boolean {
+  if (task.state !== "in_review") return false;
+  if (task.pr_url) {
+    // Matches advanceIfFinished / landQueue: only failing and pending hold.
+    // A null or 'unavailable' rollup means a repo (or check run) that never
+    // reports, and holding the review there would hide mergeable work forever.
+    if (task.ci_status === "failing" || task.ci_status === "pending") return false;
+    return reviewPipelineSettled(db, task);
+  }
+  return hasDirectorReport(db, task.id);
+}
+
+export interface ReviewActionableTask {
+  id: string;
+  state: string;
+  pr_url?: string | null;
+  ci_status?: string | null;
+  head_sha?: string | null;
+  project_id: string;
+}
+
+// Batched form of reviewActionable for list endpoints, the same reason
+// latestSidecarBatch exists: the single-task rule runs up to five queries, and
+// a board with thirty in-review cards paid all of them once per card. This
+// applies the identical rule with a fixed number of queries instead.
+// Returns the ids that ARE actionable; anything absent is not.
+export function reviewActionableBatch(db: DB, tasks: ReviewActionableTask[]): Set<string> {
+  const actionable = new Set<string>();
+  const candidates = tasks.filter((t) => t.state === "in_review");
+  if (candidates.length === 0) return actionable;
+
+  // No pull request: actionable only when there is something to READ.
+  const noPr = candidates.filter((t) => !t.pr_url);
+  if (noPr.length > 0) {
+    const ids = noPr.map((t) => t.id);
+    const ph = ids.map(() => "?").join(",");
+    for (const row of db
+      .query(`SELECT DISTINCT task_id FROM events WHERE type = 'review_summary' AND task_id IN (${ph})`)
+      .all(...ids) as { task_id: string }[])
+      actionable.add(row.task_id);
+    for (const row of db
+      .query(`SELECT DISTINCT task_id FROM evidence WHERE kind = 'report' AND task_id IN (${ph})`)
+      .all(...ids) as { task_id: string }[])
+      actionable.add(row.task_id);
+  }
+
+  // With a pull request: red or running CI is still the agent's problem.
+  const live = candidates.filter(
+    (t) => t.pr_url && t.ci_status !== "failing" && t.ci_status !== "pending"
+  );
+  if (live.length === 0) return actionable;
+
+  const projectIds = [...new Set(live.map((t) => t.project_id))];
+  const noAutoReview = new Set(
+    (db
+      .query(`SELECT id, config FROM projects WHERE id IN (${projectIds.map(() => "?").join(",")})`)
+      .all(...projectIds) as { id: string; config: string | null }[])
+      .filter((p) => {
+        try {
+          return JSON.parse(p.config ?? "{}").auto_review === false;
+        } catch {
+          return false;
+        }
+      })
+      .map((p) => p.id)
+  );
+
+  // Nothing further is coming for these, so what we have is as complete as it gets.
+  const needSettle: ReviewActionableTask[] = [];
+  for (const t of live) {
+    if (!t.head_sha || noAutoReview.has(t.project_id)) actionable.add(t.id);
+    else needSettle.push(t);
+  }
+  if (needSettle.length === 0) return actionable;
+
+  const ids = needSettle.map((t) => t.id);
+  const ph = ids.map(() => "?").join(",");
+  // Newest auto_review per task, read in the same order latestAutoReviewVerdict uses.
+  const latest = new Map<string, AutoReviewVerdict | null>();
+  for (const row of db
+    .query(
+      `SELECT task_id, payload FROM events WHERE type = 'auto_review' AND task_id IN (${ph})
+        ORDER BY ts DESC, rowid DESC`
+    )
+    .all(...ids) as { task_id: string; payload: string }[])
+    if (!latest.has(row.task_id)) latest.set(row.task_id, parseAutoReview(row.payload));
+
+  const verdictRows = new Map<string, string[]>();
+  for (const row of db
+    .query(`SELECT task_id, payload FROM events WHERE type = 'risk_verdicts' AND task_id IN (${ph})`)
+    .all(...ids) as { task_id: string; payload: string }[]) {
+    const list = verdictRows.get(row.task_id);
+    if (list) list.push(row.payload);
+    else verdictRows.set(row.task_id, [row.payload]);
+  }
+
+  for (const t of needSettle) {
+    const review = latest.get(t.id);
+    if (!review || review.reviewed_head_sha !== t.head_sha) continue;
+    const expected = expectedVerdicts(review);
+    if (expected === 0) {
+      actionable.add(t.id);
+      continue;
+    }
+    const rows = verdictRows.get(t.id) ?? [];
+    if (rows.some((raw) => coversReview(raw, t.head_sha!, expected))) actionable.add(t.id);
+  }
+  return actionable;
+}
+
+// Something the director can actually read: the agent's own review summary, or
+// a report attached as evidence (how scouts hand work over).
+export function hasDirectorReport(db: DB, taskId: string): boolean {
+  if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'review_summary' LIMIT 1").get(taskId)) return true;
+  return !!db.query("SELECT 1 FROM evidence WHERE task_id = ? AND kind = 'report' LIMIT 1").get(taskId);
 }
 
 export function confirmedRisks(db: DB, taskId: string, head: string | null | undefined): RiskVerdict[] {
