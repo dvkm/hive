@@ -102,6 +102,7 @@ import { getAway, setAway, awayNow, heldPushes, lastFlush, syncAway } from "./aw
 import type { AwayConfig } from "./away.ts";
 import { taskDiff } from "./diff.ts";
 import { authoredFiles, captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
+import { overlapHold } from "./fileScope.ts";
 import { landGraph, markLand, resolveLandPauseForDecision } from "./landQueue.ts";
 import { withMergeLock } from "./mergeLock.ts";
 import { divergence } from "./divergence.ts";
@@ -2385,6 +2386,9 @@ function listTasks(db: DB, url: URL): Response {
       spawn_error: task.state === "queued" &&
         !!db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawn_error' LIMIT 1").get(task.id) &&
         !db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawned' LIMIT 1").get(task.id),
+      // Why a queued card is waiting: the dispatcher thinks it edits the same
+      // files as something still running (HIVE-509).
+      overlap_hold: task.state === "queued" ? overlapHold(db, task.id) : null,
     };
     return compact
       ? Object.fromEntries(Object.entries(listed).filter(([, value]) =>

@@ -31,6 +31,7 @@ import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from
 import type { Exec } from "./exec.ts";
 import { defaultExec, mapLimit, projectBaseBranch, preferSafeRef, GH_LIST_TIMEOUT_MS, GH_LIST_CONCURRENCY } from "./exec.ts";
 import { captureBranchScope } from "./rebaseGuard.ts";
+import { scoreScopePrediction } from "./fileScope.ts";
 import { landOnce } from "./landQueue.ts";
 import { sidecarOnce } from "./sidecar.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
@@ -632,7 +633,13 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
           const scope = await captureBranchScope(exec, project.repo_path, data.baseRefOid || base, scopeHead);
           const afterScope = getTask(db, t.id);
           if (!afterScope || TERMINAL.includes(afterScope.state as State) || afterScope.pr_url !== t.pr_url) continue;
-          if (scope) writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: { ...scope, head_sha: data.headRefOid ?? null } });
+          if (scope) {
+            writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: { ...scope, head_sha: data.headRefOid ?? null } });
+            // Score the dispatch-time file guess against what the branch really
+            // touched (HIVE-509), so the heuristic can be tuned or dropped on
+            // evidence rather than opinion.
+            scoreScopePrediction(db, t.id, scope.files);
+          }
         }
       }
     }
