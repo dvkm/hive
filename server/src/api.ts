@@ -1071,7 +1071,7 @@ async function chatTurn(db: DB, herdr: Herdr, deps: HandlerDeps, body: any): Pro
 
   const chief = body?.scope === "chief";
   const projectId = chief ? null : body?.project_id ? String(body.project_id) : null;
-  if (!chief && !projectId) return err("project_id is required to start a chat (the supervisor session runs in the project's repo)");
+  if (!chief && !projectId) return err('a new chat needs a project, since the supervisor session runs in that project\'s repo. Name one: hive chat send --project <project-id> "<text>"');
   if (projectId && !db.query("SELECT 1 FROM projects WHERE id = ?").get(projectId)) return noProject(projectId, 400);
   if (chief && !coordinatorProjectId(db)) return err("at least one project with a repository is required", 400);
 
