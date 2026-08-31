@@ -4664,6 +4664,28 @@ function quizAnswerable(db: DB, task: { id: string; state: string; head_sha: str
   return reviewPipelineSettled(db, task);
 }
 
+// Re-emitting a review is the normal reply to a rebase, a risk finding or red
+// CI. A re-emitted review that says nothing about the understanding checks means
+// "nothing to add", not "delete them" (HIVE-545) — last-write-wins used to wipe
+// a quiz the director had already passed and drop an approved PR back out of
+// the land queue. So the checks carry forward. Only an explicit `checks: []`
+// clears them, and that empty array is stored so the clear sticks.
+// Returns the newest review that actually spoke about checks, or null when no
+// review ever did (or the last word was an explicit clear).
+function carriedUnderstandingChecks(db: DB, taskId: string): { checks: unknown[]; eventId: string; rowid: number } | null {
+  const rows = db
+    .query("SELECT id, rowid, payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC")
+    .all(taskId) as { id: string; rowid: number; payload: string }[];
+  for (const row of rows) {
+    let understanding: any;
+    try { understanding = JSON.parse(row.payload)?.understanding; } catch { continue; }
+    if (!understanding || typeof understanding !== "object" || !Array.isArray(understanding.checks)) continue;
+    if (!understanding.checks.length) return null;
+    return { checks: understanding.checks, eventId: row.id, rowid: row.rowid };
+  }
+  return null;
+}
+
 function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; checks: UnderstandingCheck[] } | null {
   const row: any = db
     .query("SELECT id, payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY ts DESC, rowid DESC LIMIT 1")
@@ -6743,6 +6765,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     if (typeof rawUnderstanding === "string") {
       try { rawUnderstanding = JSON.parse(rawUnderstanding); } catch { rawUnderstanding = null; }
     }
+    let checksProvided = false;
     if (rawUnderstanding && typeof rawUnderstanding === "object" && !Array.isArray(rawUnderstanding)) {
       const text = (value: unknown, max = 600) =>
         typeof value === "string" && value.trim() ? value.trim().slice(0, max) : undefined;
@@ -6760,6 +6783,10 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         if (affectedAreas.length) understanding.affected_areas = affectedAreas;
       }
       const rawCheck = rawUnderstanding.check;
+      // Absent (no `checks`/`check` key at all) and empty (`checks: []`) are
+      // different intents: absent carries the old checks forward, empty clears
+      // them (HIVE-545).
+      checksProvided = Array.isArray(rawUnderstanding.checks) || rawCheck !== undefined;
       const rawChecks = Array.isArray(rawUnderstanding.checks)
         ? rawUnderstanding.checks
         : Array.isArray(rawCheck)
@@ -6786,6 +6813,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         (check) => recurrenceKey(check.question)
       ).slice(0, 5);
       if (checks.length) understanding.checks = checks;
+      else if (checksProvided) understanding.checks = [];
       // Submitted a quiz that normalises to nothing? Say so. Accepting it
       // silently is what cost two tasks a round trip each: the agent believed
       // it had supplied a check, and land only said one was "required"
@@ -6804,6 +6832,13 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     }
     if (!Object.keys(payload).length)
       return err("review_summary needs a structured review section: hive emit <task-id> review_summary --json review.json");
+    // No word on the checks at all? Keep the ones this task already has.
+    const carried = checksProvided ? null : carriedUnderstandingChecks(db, taskId);
+    if (carried) {
+      const understanding = (payload.understanding ?? {}) as Record<string, unknown>;
+      understanding.checks = carried.checks;
+      payload.understanding = understanding;
+    }
     const latest = db
       .query("SELECT * FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
       .get(taskId) as any;
@@ -6814,6 +6849,30 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     )
       return json({ event: parseEvent(latest), duplicate: true }, 201);
     const event = writeEvent(db, { task_id: taskId, source, type, payload });
+    // The carried checks are the SAME questions the director already answered,
+    // so the pass carries with them — otherwise a rebase still un-lands the PR,
+    // just with the quiz re-asked instead of deleted. A changes-request or an
+    // answered decision since then means the change moved, so the director
+    // re-answers (the same guard repairDuplicateQuizPasses uses).
+    if (carried && understandingQuizStatus(db, taskId, carried.eventId) === "passed") {
+      const invalidated = db
+        .query(
+          `SELECT 1 FROM events WHERE task_id = ? AND rowid > ?
+             AND type IN ('changes_requested', 'decision_answered') LIMIT 1`
+        )
+        .get(taskId, carried.rowid);
+      if (!invalidated)
+        writeEvent(db, {
+          task_id: taskId,
+          source: "system",
+          type: "understanding_quiz_passed",
+          payload: {
+            review_event_id: event.id,
+            carried_from_review_event_id: carried.eventId,
+            reason: "review re-emitted without changing the understanding checks",
+          },
+        });
+    }
     const understandingChecks = ((payload.understanding as any)?.checks ?? []) as any[];
     if (understandingChecks.some(isEgregiousCheckWording))
       queueSteerEvent(

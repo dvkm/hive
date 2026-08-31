@@ -85,4 +85,48 @@ test("an understanding block with no checks at all is still accepted", async () 
   expect(r.json.event.payload.understanding.checks).toBeUndefined();
 });
 
+// HIVE-545: re-emitting a review (after a rebase, a risk finding, red CI) used
+// to wipe the checks and un-land an approved PR.
+test("a re-emitted review with no understanding block keeps the existing checks", async () => {
+  const taskId = await newTask();
+  await post(`/api/tasks/${taskId}/events`, { type: "review_summary", ...REVIEW_SUMMARY_EXAMPLE });
+  const again = await post(`/api/tasks/${taskId}/events`, { type: "review_summary", done: ["rebased onto main"] });
+  expect(again.status).toBe(201);
+  expect(again.json.event.payload.understanding.checks).toHaveLength(1);
+});
+
+test("an explicit empty checks array clears them, and stays cleared", async () => {
+  const taskId = await newTask();
+  await post(`/api/tasks/${taskId}/events`, { type: "review_summary", ...REVIEW_SUMMARY_EXAMPLE });
+  const cleared = await post(`/api/tasks/${taskId}/events`, {
+    type: "review_summary",
+    done: ["dropped the quiz"],
+    understanding: { background: "b", checks: [] },
+  });
+  expect(cleared.status).toBe(201);
+  expect(cleared.json.event.payload.understanding.checks).toEqual([]);
+  const after = await post(`/api/tasks/${taskId}/events`, { type: "review_summary", done: ["rebased"] });
+  expect(after.json.event.payload.understanding?.checks).toBeUndefined();
+});
+
+test("a passed quiz survives a re-emitted review", async () => {
+  const taskId = await newTask();
+  for (const to of ["in_progress", "in_review", "verifying"])
+    await post(`/api/tasks/${taskId}/transition`, { to });
+  await post(`/api/tasks/${taskId}/events`, { type: "review_summary", ...REVIEW_SUMMARY_EXAMPLE });
+  const quizzes = await (await fetch(`${BASE}/api/understanding-quizzes`)).json();
+  const quiz = quizzes.quizzes.find((q: any) => q.task_id === taskId);
+  const answered = await post(`/api/tasks/${taskId}/understanding-quiz/answer`, {
+    source: "director",
+    answer_key: REVIEW_SUMMARY_EXAMPLE.understanding.checks[0].answer_key,
+    version: quiz.version,
+  });
+  expect(answered.json.passed).toBe(true);
+  await post(`/api/tasks/${taskId}/events`, { type: "review_summary", done: ["rebased onto main"] });
+  // The quiz still exists (so the land gate can see it) and still reads passed.
+  const after = await post(`/api/tasks/${taskId}/understanding-quiz/answer`, { source: "director" });
+  expect(after.status).toBe(200);
+  expect(after.json.passed).toBe(true);
+});
+
 test.afterAll?.(() => server.stop(true));
