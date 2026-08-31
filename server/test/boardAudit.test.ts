@@ -62,7 +62,9 @@ test("merged but not closed: a live mirror over shipped hive work", () => {
   task(db, pid, { state: "in_progress", title: "[WEB-89] search is broken", jira_key: "WEB-89", jira_link_kind: "mirror", source: "external" });
   task(db, pid, { state: "done", title: "[WEB-89] fix the paid/free sort" });
 
-  expect(kinds(db)).toEqual(["merged_not_closed"]);
+  // Two separate claims about the same row, each reported once: the ticket is
+  // open over shipped work, and nothing is ever going to move the row on.
+  expect(kinds(db)).toEqual(["merged_not_closed", "stalled_tracking_only"]);
 });
 
 test("merged but not closed: a bracketed key does not match a longer one", () => {
@@ -70,7 +72,8 @@ test("merged but not closed: a bracketed key does not match a longer one", () =>
   task(db, pid, { state: "in_progress", title: "[WEB-9] a", jira_key: "WEB-9", jira_link_kind: "mirror", source: "external" });
   task(db, pid, { state: "done", title: "[WEB-91] different issue entirely" });
 
-  expect(auditBoard(db)).toEqual([]);
+  // Stalled all the same; the point here is that merged_not_closed stays quiet.
+  expect(kinds(db)).toEqual(["stalled_tracking_only"]);
 });
 
 test("closed but not merged: GitHub, not hive's own events, gives the verdict", async () => {
@@ -127,6 +130,13 @@ test("queued but unrunnable: a project with no repo checked out", () => {
 test("stalled tracking-only: a mirror parked in the review column (HIVE-541)", () => {
   const { db, pid } = setup();
   task(db, pid, { state: "in_review", source: "external", source_ref: "jira:WEB-94" });
+
+  expect(kinds(db)).toEqual(["stalled_tracking_only"]);
+});
+
+test("stalled tracking-only: in_progress counts too — no agent is running there either", () => {
+  const { db, pid } = setup();
+  task(db, pid, { state: "in_progress", source: "external", source_ref: "jira:WEB-22" });
 
   expect(kinds(db)).toEqual(["stalled_tracking_only"]);
 });
@@ -242,14 +252,15 @@ test("every check reports exactly once, then goes quiet", async () => {
     "stalled_tracking_only",
     "stuck_spawns",
   ]);
-  // Exactly one finding per check, and exactly one digest notification.
-  expect(first.length).toBe(7);
+  // One finding per check, plus the mirror row that is legitimately both
+  // merged_not_closed and stalled_tracking_only. One digest notification.
+  expect(first.length).toBe(8);
   expect(db.query("SELECT COUNT(*) AS n FROM notifications").get()).toEqual({ n: 1 } as any);
 
   // Nothing changed on the board, so a second pass says nothing at all.
   expect(await reportBoardAudit(db, { exec: gh("OPEN") })).toEqual([]);
   expect(db.query("SELECT COUNT(*) AS n FROM notifications").get()).toEqual({ n: 1 } as any);
-  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE type = 'board_audit'").get()).toEqual({ n: 7 } as any);
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE type = 'board_audit'").get()).toEqual({ n: 8 } as any);
 });
 
 test("the audit never writes to tasks or decisions", async () => {

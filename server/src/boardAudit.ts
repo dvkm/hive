@@ -275,17 +275,20 @@ function stuckSpawns(db: DB): AuditFinding[] {
 //    verifying -> done path is walked by nobody: the row just sits in a work
 //    column forever. Three were found this way on corebeat, the oldest idle
 //    83 hours, and only because someone happened to sort the review column by
-//    age.
+//    age. Widened to in_progress after the census found four more there, the
+//    oldest idle 9.4 days: the complaint is that the work columns claim six
+//    tasks are being worked on when no agent process exists for any of them, and
+//    stopping at in_review would have reported two of the six.
 //
-//    Only the two states with no exit but the review path. `queued` is already
-//    `queued_unrunnable`, and a mirror in in_progress is just an issue someone
-//    is working on — `merged_not_closed` is the check that catches that one
-//    going stale, and reporting both would be two cards for one row.
+//    `queued` stays out: `queued_unrunnable` already reports it, and queued does
+//    not claim anyone is working. A row can be reported here AND by
+//    `merged_not_closed` — they are different claims ("nothing is moving this"
+//    vs "the ticket is open over shipped work") and each fires once.
 //
 //    Never reported for a task that was actually spawned: a director can spawn
 //    a source='external' row by hand, and then it is real hive-driven work with
 //    a real agent, not a parked mirror.
-const STALLED_STATES = "('in_review','verifying')";
+const STALLED_STATES = "('in_progress','in_review','verifying')";
 
 function stalledTrackingOnly(db: DB): AuditFinding[] {
   const rows = db
@@ -299,7 +302,7 @@ function stalledTrackingOnly(db: DB): AuditFinding[] {
     .map((t) => ({
       kind: "stalled_tracking_only" as const,
       task_id: t.id,
-      note: `Sitting in ${t.state}, but it is a tracking-only row (a mirrored ticket or another agent's board entry) that hive never runs an agent on, so nothing will move it on. Close it with \`hive task move ${t.id} done\` if the work shipped, or \`cancelled\` if it did not.`,
+      note: `Sitting in ${t.state} with no agent, and hive never dispatches one: it is a tracking-only row (a mirrored ticket or another agent's board entry). Nothing will move it on, and it is inflating the count of work in flight. Close it with \`hive task move ${t.id} done\` if the work shipped, or \`cancelled\` if it did not.`,
     }));
 }
 
