@@ -39,6 +39,7 @@ import { riskLevel } from "./autoapprove.ts";
 import { runPrGardener } from "./prGardener.ts";
 import { autoAckPlans } from "./planCritic.ts";
 import { ambiguityCleared, cautionCleared, latestAutoReviewVerdict } from "./reviewer.ts";
+import { reportBoardAudit } from "./boardAudit.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
 const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
@@ -184,6 +185,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("syncPRs", () => syncPRs(db, deps));
   await step("revalidateCiDecisions", () => revalidateCiDecisions(db));
   await step("linkPRs", () => linkPRs(db, deps));
+  // Read-only board-vs-reality audit (HIVE-528). Below the offline cutoff and
+  // after linkPRs because one of its checks asks GitHub whether a PR really
+  // landed. step() isolates it, so a failure here can never stall a sync path.
+  // It reports; it never repairs.
+  await step("boardAudit", () => reportBoardAudit(db, { exec: deps.exec }));
   await step("prGardener", () => runPrGardener(db, {
     exec: deps.exec ?? defaultExec,
     nowMs: deps.nowMs,
