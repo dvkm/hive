@@ -1313,7 +1313,7 @@ test("only a review that finished for the live head counts as an answerable quiz
   const shipped = await bucket("already shipped", "head-f", { head: "head-f", risks: [] });
   s.db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(shipped);
 
-  const quizzes = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  const quizzes = (await get(s.base, "/api/understanding-quizzes?scope=all")).json.quizzes as any[];
   const mine = quizzes.filter((q) => q.project_id === p.json.id);
   expect(mine.filter((q) => q.task_state === "in_review").map((q) => q.task_id)).toEqual([answerable]);
   expect(mine.filter((q) => q.task_state === "done").map((q) => q.task_id)).toEqual([shipped]);
@@ -1330,6 +1330,20 @@ test("only a review that finished for the live head counts as an answerable quiz
   );
   const after = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
   expect(after.some((q) => q.task_id === noReview)).toBe(true);
+  await s.server.stop(true);
+});
+
+test("the quiz list defaults to live tasks; shipped ones need scope=all (HIVE-542)", async () => {
+  const s = makeServer();
+  const live = await judgmentTask(s, { verdict: "caution" });
+  const shipped = await judgmentTask(s, { verdict: "caution" });
+  s.db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(shipped.taskId);
+
+  const live_only = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  expect(live_only.map((q) => q.task_id)).toEqual([live.taskId]);
+
+  const all = (await get(s.base, "/api/understanding-quizzes?scope=all")).json.quizzes as any[];
+  expect(all.map((q) => q.task_id).sort()).toEqual([live.taskId, shipped.taskId].sort());
   await s.server.stop(true);
 });
 
