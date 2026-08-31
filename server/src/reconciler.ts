@@ -30,11 +30,13 @@ import { diagnosePane, dialogAutoApprovable, editDialogPaths, parseResetClock } 
 import { AUTO_MERGE_PAUSED, requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount } from "./api.ts";
 import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, mapLimit, projectBaseBranch, preferSafeRef } from "./exec.ts";
+import { defaultExec, mapLimit, projectBaseBranch, preferSafeRef, GH_LIST_TIMEOUT_MS, GH_LIST_CONCURRENCY } from "./exec.ts";
 import { captureBranchScope } from "./rebaseGuard.ts";
+import { scoreScopePrediction } from "./fileScope.ts";
 import { landOnce } from "./landQueue.ts";
 import { sidecarOnce } from "./sidecar.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
+import { riskLevel } from "./autoapprove.ts";
 import { runPrGardener } from "./prGardener.ts";
 import { autoAckPlans } from "./planCritic.ts";
 import { ambiguityCleared, cautionCleared, latestAutoReviewVerdict } from "./reviewer.ts";
@@ -140,7 +142,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
       setSetting(db, "reconciler_error_streak", String(streak));
       if (lastError) setSetting(db, "reconciler_last_error", lastError);
     } else {
+      // HIVE-533: clear the message with the streak. Leaving it behind pinned one
+      // transient failure in `settings` forever, and /api/health published that
+      // fossil next to consecutive_errors: 0 as if it were current.
       setSetting(db, "reconciler_error_streak", "0");
+      setSetting(db, "reconciler_last_error", "");
     }
   };
   await step("surfaceTrackingBindings", () => surfaceTrackingBindings(db));
@@ -630,7 +636,13 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
           const scope = await captureBranchScope(exec, project.repo_path, data.baseRefOid || base, scopeHead);
           const afterScope = getTask(db, t.id);
           if (!afterScope || TERMINAL.includes(afterScope.state as State) || afterScope.pr_url !== t.pr_url) continue;
-          if (scope) writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: { ...scope, head_sha: data.headRefOid ?? null } });
+          if (scope) {
+            writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: { ...scope, head_sha: data.headRefOid ?? null } });
+            // Score the dispatch-time file guess against what the branch really
+            // touched (HIVE-509), so the heuristic can be tuned or dropped on
+            // evidence rather than opinion.
+            scoreScopePrediction(db, t.id, scope.files);
+          }
         }
       }
     }
@@ -911,8 +923,14 @@ async function linkPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   // to link either.
   const projects = activeProjects(db).filter((p) => p.repo_path) as { id: string; repo_path: string }[];
   let startFailure: string | null = null;
-  for (const p of projects) {
-    const r = await exec(["gh", "pr", "list", "--state", "open", "--json", "number,title,body,url"], { cwd: p.repo_path });
+  // List every project a few at a time (HIVE-486): listing serially meant one
+  // stalled repo cost a full timeout before the next repo was even tried, so K
+  // stalled repos added K timeouts to the lap. Only the `gh` calls overlap; the
+  // linking below still runs serially, in project order.
+  const lists = await mapLimit(projects, GH_LIST_CONCURRENCY, (p) =>
+    exec(["gh", "pr", "list", "--state", "open", "--json", "number,title,body,url"], { cwd: p.repo_path, timeoutMs: GH_LIST_TIMEOUT_MS })
+  );
+  for (const r of lists) {
     // 127 is defaultExec's "the child never started" (missing binary, or a
     // repo_path that no longer exists), as opposed to gh running and failing.
     if (r.code === 127 && startFailure === null) startFailure = r.stderr.trim();
@@ -1506,18 +1524,25 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
 // Auto-answer: a decision card that sits past the project's timeout
 // (config.decision_auto_answer_hours, off unless set) and carries a
 // RECOMMENDED option gets answered with that recommendation — except
-// risk='high' cards (authority/prod), which always wait for the human.
+// high-risk cards (authority/prod), which always wait for the human.
 // The notification names what was chosen, so silence is informed consent,
 // not surprise.
+//
+// High risk is deliberately asymmetric. The card stays OPEN past the window
+// (an open card parks its task; a released one may have already shipped the
+// thing nobody approved) and the sweep escalates it once with an urgent push
+// instead. Risk is read through riskLevel(), not compared to the literal
+// string 'high' — three cards whose risk field was a whole sentence beginning
+// "high — ..." slipped past the old exact match.
 export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()): void {
   const rows = db
     .query(
-      `SELECT d.id, d.task_id, d.ts, d.title, d.options, p.config FROM decisions d
+      `SELECT d.id, d.task_id, d.ts, d.title, d.options, d.risk, p.config FROM decisions d
          JOIN tasks t ON t.id = d.task_id JOIN projects p ON p.id = t.project_id
-        WHERE d.status = 'open' AND COALESCE(d.risk, 'normal') != 'high' AND d.decision_class IS NULL
+        WHERE d.status = 'open' AND d.decision_class IS NULL
           AND ${supervisedSql("t.source", "t.agent_target")}`
     )
-    .all() as { id: string; task_id: string; ts: string; title: string; options: string; config: string }[];
+    .all() as { id: string; task_id: string; ts: string; title: string; options: string; risk: string | null; config: string }[];
   for (const r of rows) {
     if (isTrackingOnlyId(db, r.task_id)) continue;
     let hours = 0;
@@ -1528,6 +1553,29 @@ export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()
     }
     if (hours <= 0) continue;
     if (nowMs - Date.parse(r.ts) < hours * 3600_000) continue;
+    // Past the window and high risk: escalate, never answer. Once per card —
+    // the event is the dedup key, so a 30s sweep does not re-push every loop.
+    if (riskLevel(r.risk) === "high") {
+      const already = db
+        .query("SELECT 1 FROM events WHERE type = 'decision_escalated' AND json_extract(payload, '$.decision_id') = ? LIMIT 1")
+        .get(r.id);
+      if (already) continue;
+      writeEvent(db, {
+        task_id: r.task_id,
+        source: "reconciler",
+        type: "decision_escalated",
+        payload: { decision_id: r.id, reason: `high risk, open ${hours}h past the auto-answer window`, risk: r.risk ?? null },
+      });
+      enqueue(db, {
+        kind: "decision",
+        urgency: "urgent",
+        task_id: r.task_id,
+        decision_id: r.id,
+        title: `Still needs you: "${r.title.slice(0, 70)}"`,
+        body: `High risk, open ${hours}h with no reply. It stays open and its task stays blocked — high-risk cards are never auto-answered.`,
+      });
+      continue;
+    }
     let rec: any;
     try {
       rec = JSON.parse(r.options || "[]").find((o: any) => o.recommended);

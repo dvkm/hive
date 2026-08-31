@@ -18,7 +18,9 @@
 //     a `deny` or `require_decision` rule blocks the auto-spawn.
 //   - spawn failures back off exponentially per task (30s * 2^(n-1), capped at
 //     30m) so a broken repo never retry-storms; the task stays queued with the
-//     spawn_error event visible.
+//     spawn_error event visible. After SPAWN_ATTEMPT_CEILING consecutive
+//     failures with the same error signature the task is failed instead of
+//     retried forever (giveUpOnSpawn).
 //
 // Every one of those skips records WHY on the task itself (state.ts's noteSkip,
 // tasks.skip_reason) — written only when the reason changes, so a queue at rest
@@ -41,13 +43,15 @@ import { isOffline, setSetting, getSetting, now } from "./db.ts";
 import { Herdr, herdr as defaultHerdr, isHerdrUnreachable } from "./runtime/herdr.ts";
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
-import { isSelfAuditLineage, unmetDeps, noteDependencyBlock, noteSkip } from "./state.ts";
+import { isSelfAuditLineage, unmetDeps, noteDependencyBlock, noteSkip, transition, writeEvent } from "./state.ts";
+import { signature } from "./learn.ts";
 import { isTrackingOnlyTask } from "./supervision.ts";
 import { queuedSteers } from "./steer.ts";
 import { managingThreadForTask } from "./chat.ts";
 import { repoMismatchUnresolved } from "./repoTarget.ts";
 import { triageHold } from "./intake/triage.ts";
 import type { Exec } from "./exec.ts";
+import { predictScope, inFlightScope, scopeOverlap, noteOverlapHold, type FileScope } from "./fileScope.ts";
 
 // Chores included since 2026-07-12: the queue sat at 10 tasks / 1 live agent
 // because 9 were agent-filed follow-up FIXES tagged chore — "chores are titled
@@ -66,6 +70,13 @@ const BACKOFF_BASE_MS = 30_000;
 const HERDR_OUTAGE_BASE_MS = 30_000;
 const HERDR_OUTAGE_CAP_MS = 5 * 60 * 1000;
 const BACKOFF_CAP_MS = 30 * 60 * 1000;
+// Attempt ceiling. The exponential backoff above settles at one retry every 30
+// minutes and never stops, so a permanently unsatisfiable precondition (a
+// blocked worktree path, a stale resume pointer) retried 48 times a day forever
+// while the task still read as ordinary queued work. After this many CONSECUTIVE
+// spawn failures that all say the same thing, the task is not going to spawn:
+// fail it so a human sees it, with the last error attached (HIVE-526).
+export const SPAWN_ATTEMPT_CEILING = 5;
 // States that count as "working" for the max_agents cap. in_review/verifying
 // agents are parked waiting on the DIRECTOR — counting them froze the whole
 // pipeline whenever the review queue filled (seen live 2026-07-10: 3 PRs in
@@ -147,7 +158,15 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     .query(`SELECT * FROM tasks WHERE agent_target IS NULL AND state IN ('in_progress','in_review','verifying') ORDER BY updated_at ASC`)
     .all()
     .map(parseTask)
-    .filter((t: any) => !isTrackingOnlyTask(t) && !["chat_supervisor", "pr-gardener-decision"].includes(t.source) && queuedSteers(db, t.id).length > 0);
+    .filter(
+      (t: any) =>
+        !isTrackingOnlyTask(t) &&
+        !["chat_supervisor", "pr-gardener-decision"].includes(t.source) &&
+        // Taken over by the director: the worktree is theirs until they hand it
+        // back, so a queued steer must not pull an agent back into it.
+        !t.parked_for_director &&
+        queuedSteers(db, t.id).length > 0
+    );
 
   let errors = 0;
   const projectCache = new Map<string, { repo_path: string | null; config: any } | null>();
@@ -155,6 +174,19 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   const activeCount = new Map<string, number>(); // per-project live agents incl. review-parked
   const gardenerWorkingCount = new Map<string, number>();
   const gardenerActiveCount = new Map<string, number>();
+  // Predicted (or, once a branch exists, real) file scope of everything already
+  // working in a project, loaded once and extended as this cycle spawns more.
+  const inFlight = new Map<string, { id: string; number: number; scope: FileScope }[]>();
+  const inFlightFor = (pid: string) => {
+    let list = inFlight.get(pid);
+    if (!list) {
+      const rows = db
+        .query(`SELECT id, number FROM tasks WHERE project_id = ? AND agent_target IS NOT NULL AND state IN ${WORKING_STATES}`)
+        .all(pid) as { id: string; number: number }[];
+      inFlight.set(pid, (list = rows.map((r) => ({ id: r.id, number: r.number, scope: inFlightScope(db, r.id) }))));
+    }
+    return list;
+  };
 
   const getProject = (pid: string) => {
     if (!projectCache.has(pid)) {
@@ -211,9 +243,16 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   let herdrDown = false;
   // Shared spawn tail: cap bookkeeping + the herdr-outage circuit breaker.
   // Returns false when the daemon is down and the whole cycle must bail.
-  const spawnFor = async (task: any): Promise<boolean> => {
+  const spawnFor = async (task: any, scope?: FileScope): Promise<boolean> => {
     const r = await spawnAgent(db, h, task.id, { hiveUrl: deps.hiveUrl, supervise: deps.supervise, exec: deps.exec });
     if (r.ok) {
+      // The guess this task started under: it is what later candidates are
+      // checked against, and what scoreScopePrediction marks against the real
+      // branch once one exists.
+      if (scope && (scope.files.length || scope.dirs.length)) {
+        writeEvent(db, { task_id: task.id, source: "dispatcher", type: "dispatch_scope", payload: { ...scope } });
+        inFlightFor(task.project_id).push({ id: task.id, number: task.number, scope });
+      }
       if (task.source === "pr-gardener") {
         gardenerWorkingCount.set(task.project_id, gardenerWorkingFor(task.project_id) + 1);
         gardenerActiveCount.set(task.project_id, gardenerActiveFor(task.project_id) + 1);
@@ -232,7 +271,10 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     return true;
   };
 
-  const dispatchProject = async (group: { reattach: typeof queued; queued: typeof queued }) => {
+  const dispatchProject = async (pid: string, group: { reattach: typeof queued; queued: typeof queued }) => {
+    // Candidates skipped only because they look like they touch the same files as
+    // something already running. Ordering, not a block — see the tail of this fn.
+    const deferred: { task: any; scope: FileScope }[] = [];
     // Feedback on work already in flight comes back BEFORE new work starts —
     // otherwise a bounce queues behind fresh dispatch for the same slot.
     // Deliberately NOT gated on auto_dispatch, dispatch_kinds, intake review or
@@ -247,6 +289,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         if (!proj?.repo_path) continue;
         const cfg = proj.config ?? {};
         if (!hasCapacity(task, cfg)) continue;
+        if (giveUpOnSpawn(db, task)) continue;
         if (inBackoff(db, task.id, nowMs)) continue;
         if (!(await spawnFor(task))) return;
       } catch (e) {
@@ -286,6 +329,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
 
         if (!hasCapacity(task, cfg)) { noteSkip(db, task.id, "no_capacity"); continue; }
 
+        if (giveUpOnSpawn(db, task)) continue; // ceiling reached — failed, not retried
         if (inBackoff(db, task.id, nowMs)) { noteSkip(db, task.id, "spawn_backoff"); continue; } // still cooling down after a spawn failure
 
         // #989: the brief edits files that live in ANOTHER project's repo. The
@@ -317,13 +361,49 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
           continue;
         }
 
+        // File-overlap hold (HIVE-509). Two agents editing the same file land
+        // branches that conflict — or, worse, merge cleanly and contradict each
+        // other. The guess is coarse and it never blocks: an overlapping task is
+        // just moved behind the non-overlapping ones, and the tail below runs it
+        // anyway rather than let the project sit idle.
+        const scope = predictScope(db, task);
+        const clash = inFlightFor(task.project_id)
+          .map((peer) => ({ peer, files: scopeOverlap(scope, peer.scope) }))
+          .find((x) => x.files.length);
+        if (clash) {
+          noteOverlapHold(db, task.id, clash.peer, clash.files);
+          noteSkip(db, task.id, "file_overlap");
+          deferred.push({ task, scope });
+          continue;
+        }
+
         // Dispatchable: the reason (if any) is answered, so clear it before the
         // spawn — a task that starts must not keep a stale "why not" on the board.
         noteSkip(db, task.id, null);
-        if (!(await spawnFor(task))) return;
+        if (!(await spawnFor(task, scope))) return;
       } catch (e) {
         errors++;
         console.error(`[hive] dispatcher task ${task.id}:`, e);
+      }
+    }
+
+    // Nothing running and nothing dispatched, but work was held for overlap:
+    // run the first held task anyway. An idle fleet is strictly worse than a
+    // predicted conflict, and the prediction is a guess.
+    if (deferred.length && !herdrDown && workingFor(pid) === 0) {
+      const { task, scope } = deferred[0];
+      try {
+        writeEvent(db, {
+          task_id: task.id,
+          source: "dispatcher",
+          type: "dispatch_overlap_override",
+          payload: { note: "started despite a predicted file overlap — nothing else was dispatchable" },
+        });
+        noteSkip(db, task.id, null);
+        await spawnFor(task, scope);
+      } catch (e) {
+        errors++;
+        console.error(`[hive] dispatcher overlap override ${task.id}:`, e);
       }
     }
   };
@@ -340,7 +420,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   };
   for (const task of reattach) groupFor(task.project_id).reattach.push(task);
   for (const task of queued) groupFor(task.project_id).queued.push(task);
-  await Promise.all([...byProject.values()].map(dispatchProject));
+  await Promise.all([...byProject.entries()].map(([pid, g]) => dispatchProject(pid, g)));
   setSetting(db, "last_dispatch_at", now()); // cycle completed — refresh heartbeat
   console.log(
     `[hive] dispatcher run: duration_ms=${Date.now() - startedAt} steps=${queued.length} reattach=${reattach.length} errors=${errors} outcome=${errors > 0 ? "error" : "ok"}`
@@ -365,6 +445,81 @@ export function isReviewed(db: DB, taskId: string): boolean {
     }
   }
   return false;
+}
+
+// The task's own (non-infra) spawn failures since the task last got a clean
+// start. "Clean start" means either the last give-up marker or the last
+// SUCCESSFUL spawn: a task reattaches many times over its life (every review
+// handoff), so failures either side of a working spawn are unrelated and must
+// not add up towards the ceiling. Infra-tagged failures — the herdr daemon being
+// down — are somebody else's fault: the global circuit breaker owns those, so
+// they neither count towards the ceiling nor break a streak, exactly as in
+// inBackoff. Newest first.
+function ownSpawnErrors(db: DB, taskId: string): string[] {
+  const gaveUpAt = (
+    db
+      .query(
+        `SELECT MAX(ts) AS ts FROM events
+          WHERE task_id = ? AND type IN ('spawn_gave_up', 'spawned')`
+      )
+      .get(taskId) as { ts: string | null }
+  ).ts;
+  const rows = db
+    .query(
+      `SELECT payload FROM events WHERE task_id = ? AND type = 'spawn_error' AND ts > ?
+        ORDER BY ts DESC`
+    )
+    .all(taskId, gaveUpAt ?? "") as { payload: string }[];
+  const out: string[] = [];
+  // Filter FIRST, cap after — never `LIMIT` in SQL. An infra row consuming one of
+  // the newest N slots would otherwise hide a real failure from the count, so a
+  // task whose infra and real failures interleave could dodge the ceiling forever.
+  for (const r of rows) {
+    try {
+      const p = JSON.parse(r.payload);
+      if (!p.infra) out.push(String(p.error ?? ""));
+    } catch {
+      out.push(""); // unparseable payload counts as a real failure, like inBackoff
+    }
+    if (out.length === SPAWN_ATTEMPT_CEILING) break;
+  }
+  return out;
+}
+
+// Has this task run out of attempts? True once the last SPAWN_ATTEMPT_CEILING
+// failures all carry the SAME error signature — a precondition nobody is fixing
+// by retrying. The task is failed here (hive's "a human must look at this"
+// state) so it leaves the dispatch queues instead of looping forever; the last
+// error rides along on both the event and the state_change reason. A retry after
+// the director fixes the cause starts a fresh count, because ownSpawnErrors only
+// looks at failures newer than the give-up marker or the last successful spawn.
+export function giveUpOnSpawn(db: DB, task: { id: string }): boolean {
+  const errors = ownSpawnErrors(db, task.id);
+  if (errors.length < SPAWN_ATTEMPT_CEILING) return false;
+  const sig = signature(errors[0]);
+  if (!errors.every((e) => signature(e) === sig)) return false;
+  // Transition FIRST. The marker is what resets the count, so writing it before a
+  // transition that throws would silently hand the task a clean slate and let the
+  // retry storm resume — the exact failure this function exists to stop. On a
+  // throw we give up on giving up: stay in backoff and retry the whole thing next
+  // cycle. A director's retry still resets the count without a marker, because
+  // ownSpawnErrors also restarts its window at the last successful spawn.
+  try {
+    transition(db, task.id, "failed", {
+      source: "dispatcher",
+      reason: `spawn failed ${errors.length}× with the same error — needs a human: ${errors[0]}`,
+    });
+  } catch (e) {
+    console.error(`[hive] dispatcher give-up transition ${task.id}:`, e);
+    return false;
+  }
+  writeEvent(db, {
+    task_id: task.id,
+    source: "dispatcher",
+    type: "spawn_gave_up",
+    payload: { error: errors[0], attempts: errors.length },
+  });
+  return true;
 }
 
 // Exponential backoff keyed on the count of spawn_error events for the task:

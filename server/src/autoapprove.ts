@@ -25,6 +25,24 @@ import type { DB } from "./db.ts";
 // something answers it for them.
 export const NO_AUTO_ANSWER_REASON = "this card is reserved for the director and is never answered automatically";
 
+// Risk is free text: agents write "high", but also "high - if these keys are
+// real, anyone with repo read access can use them" and whole sentences with no
+// level word at all. An exact `risk = 'high'` comparison therefore let three
+// genuinely-high cards through the auto-answer sweep. Normalize once, here, and
+// compare on the level:
+//   - empty/missing -> "normal" (the historic default for an unset field);
+//   - a recognized level word at the start -> that level;
+//   - anything else (free prose) -> "high", because unrecognized text is not a
+//     licence to answer a card automatically.
+export type RiskLevel = "low" | "normal" | "medium" | "high";
+
+export function riskLevel(risk: unknown): RiskLevel {
+  const text = String(risk ?? "").trim().toLowerCase();
+  if (!text) return "normal";
+  const word = text.match(/^(low|normal|medium|high)\b/)?.[1];
+  return (word as RiskLevel) ?? "high";
+}
+
 export interface AutoApproveVerdict {
   allow: boolean;
   category: string;
@@ -78,6 +96,9 @@ function safetyBar(db: DB, d: any, answerKey: string): AutoApproveVerdict | null
   if (answerKey === "deny" && chosen && isStaleAgentDialog(db, d.id))
     return { allow: true, category: "agent_dialog_deny", reason: "denies an agent dialog by sending only its cancel keystroke" };
   if (!chosen?.recommended) return no("*", "only the raiser's recommended option can be auto-approved");
+  // Stricter than riskLevel() on purpose: this bar wants an EXPLICIT low/normal
+  // rating, so an unrated (null) card escalates rather than inheriting the
+  // "normal" default. Prose like "high — leaked prod key" fails it too.
   const risk = String(d.risk ?? "").toLowerCase();
   if (risk !== "low" && risk !== "normal") return no("*", `risk '${d.risk ?? "(none)"}' is above the auto-approve bar`);
   const blast = String(d.blast_radius ?? "");

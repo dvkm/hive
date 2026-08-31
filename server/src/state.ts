@@ -297,6 +297,7 @@ export const SKIP_REASONS: Record<string, { label: string; permanent: boolean }>
   triage_hold: { label: "waiting on your intake triage answer", permanent: false },
   repo_mismatch: { label: "brief targets another project's repo", permanent: false },
   dependency_blocked: { label: "blocked by unfinished dependencies", permanent: false },
+  file_overlap: { label: "another running task looks like it edits the same files", permanent: false },
   authority_decision: { label: "waiting on a dispatch decision card", permanent: false },
   no_capacity: { label: "at the project's max_agents cap", permanent: false },
   spawn_backoff: { label: "cooling down after a spawn failure", permanent: false },
@@ -434,9 +435,10 @@ export function mutateWithEvent<T>(
 export function expireOpenDecisions(db: DB, taskId: string, reason: string): number {
   const rows = db.query("SELECT * FROM decisions WHERE task_id = ? AND status = 'open'").all(taskId) as any[];
   for (const r of rows) {
-    db.query("UPDATE decisions SET status = 'expired' WHERE id = ?").run(r.id);
+    const expiredAt = now();
+    db.query("UPDATE decisions SET status = 'expired', answered_at = ?, answered_by = 'system' WHERE id = ?").run(expiredAt, r.id);
     writeEvent(db, { task_id: taskId, source: "system", type: "decision_expired", payload: { decision_id: r.id, reason } });
-    broadcast({ type: "decision", decision: parseDecision({ ...r, status: "expired" }) });
+    broadcast({ type: "decision", decision: parseDecision({ ...r, status: "expired", answered_at: expiredAt, answered_by: "system" }) });
   }
   return rows.length;
 }

@@ -121,3 +121,36 @@ test("a truncated PR list retires nothing", async () => {
 
   expect(getTask(db, task_id!)!.state).toBe("queued");
 });
+
+// HIVE-486: the gardener listed one project at a time on the 60s default, so a
+// stalled repo delayed every repo behind it.
+test("a sweep lists projects concurrently, so K stalled repos cost about one timeout (HIVE-486)", async () => {
+  const { db } = freshDb({ pr_gardener: { enabled: true } });
+  const STALL_MS = 150;
+  for (let i = 0; i < 3; i++) {
+    db.query("INSERT INTO projects (id, name, repo_path, config, created_at) VALUES (?,?,?,?,?)").run(
+      newId("proj"), `p${i}`, `/repo/${i}`, JSON.stringify({ default_branch: "main", pr_gardener: { enabled: true } }), now()
+    );
+  }
+  let inFlight = 0;
+  let peak = 0;
+  const timeouts: (number | undefined)[] = [];
+  const exec: Exec = async (argv, opts) => {
+    if (argv[0] === "git" && argv[1] === "fetch") return { code: 1, stdout: "", stderr: "no remote" };
+    if (argv[0] !== "gh" || argv[1] !== "pr" || argv[2] !== "list") return OK();
+    timeouts.push(opts?.timeoutMs);
+    peak = Math.max(peak, ++inFlight);
+    await new Promise((r) => setTimeout(r, STALL_MS));
+    inFlight--;
+    return OK("[]"); // a slow-but-successful list; a real timeout would throw below
+  };
+
+  const started = Date.now();
+  await runPrGardener(db, { exec, land: async () => ({ ok: true }), decide: () => ({ id: newId("dec") }) } as any);
+  const elapsed = Date.now() - started;
+
+  expect(timeouts.length).toBe(4);
+  expect(peak).toBe(4);
+  expect(elapsed).toBeLessThan(STALL_MS * 3);
+  expect(timeouts.every((ms) => ms != null && ms <= 30_000)).toBe(true);
+});

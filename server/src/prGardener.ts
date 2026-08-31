@@ -1,7 +1,7 @@
 import type { DB } from "./db.ts";
 import { getSetting, newId, now, setSetting } from "./db.ts";
 import type { Exec } from "./exec.ts";
-import { projectBaseBranch } from "./exec.ts";
+import { projectBaseBranch, mapLimit, GH_LIST_TIMEOUT_MS, GH_LIST_CONCURRENCY } from "./exec.ts";
 import { enqueue } from "./notifications.ts";
 import { getTask, transition, writeEvent, TERMINAL, type State } from "./state.ts";
 import { broadcastTask } from "./health.ts";
@@ -309,16 +309,34 @@ function openDecision(db: DB, deps: GardenerDeps, projectId: string, pr: GhPr, r
 
 export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
   const projects = activeProjects(db).filter((p): p is ProjectRow & { repo_path: string } => !!p.repo_path);
-  for (const project of projects) {
+  // Decide which projects are due and list their PRs a few at a time (HIVE-486).
+  // Listing serially meant one stalled repo cost a full timeout before the next
+  // repo was even tried. Only the `gh` list calls overlap here; every sweep
+  // below still runs serially, in project order, exactly as before.
+  const sweeps = await mapLimit(projects, GH_LIST_CONCURRENCY, async (project) => {
     const config = JSON.parse(project.config || "{}");
     const gardener: PrGardenerConfig = config.pr_gardener ?? {};
-    if (!gardener.enabled) continue;
+    if (!gardener.enabled) return null;
     const clock = (deps.nowMs ?? Date.now)();
     const setting = `pr_gardener_last:${project.id}`;
     const last = Date.parse(getSetting(db, setting) ?? "");
-    if (Number.isFinite(last) && clock - last < durationMs(gardener.cadence, 30 * 60_000)) continue;
+    if (Number.isFinite(last) && clock - last < durationMs(gardener.cadence, 30 * 60_000)) return null;
     const base = projectBaseBranch(config);
-    const listed = await deps.exec(["gh", "pr", "list", "--state", "open", "--base", base, "--limit", "100", "--json", "number,url,title,isDraft,updatedAt,mergeStateStatus,statusCheckRollup,files"], { cwd: project.repo_path });
+    const listed = await deps.exec(["gh", "pr", "list", "--state", "open", "--base", base, "--limit", "100", "--json", "number,url,title,isDraft,updatedAt,mergeStateStatus,statusCheckRollup,files"], { cwd: project.repo_path, timeoutMs: GH_LIST_TIMEOUT_MS });
+    // The adoption list is the same repo's PRs without --base, so fetch it in
+    // the same pass rather than paying a second stall later in the sweep.
+    const adoptListed = listed.code === 0 && gardener.adopt_untracked
+      ? await deps.exec(
+          ["gh", "pr", "list", "--state", "open", "--limit", String(ADOPT_LIST_LIMIT), "--json", "number,url,title,body,isDraft,labels"],
+          { cwd: project.repo_path, timeoutMs: GH_LIST_TIMEOUT_MS }
+        )
+      : null;
+    return { project, config, gardener, clock, setting, base, listed, adoptListed };
+  });
+
+  for (const sweep of sweeps) {
+    if (!sweep) continue;
+    const { project, config, gardener, clock, setting, base, listed, adoptListed } = sweep;
     if (listed.code !== 0) throw new Error(`PR Gardener could not list ${project.name} PRs: ${listed.stderr.trim()}`);
     setSetting(db, setting, new Date(clock).toISOString());
     const prs = JSON.parse(listed.stdout || "[]") as GhPr[];
@@ -337,11 +355,8 @@ export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
     // against main gets recorded too, even though the classifier below only
     // grades PRs on the configured base branch. Adoption writes one row and
     // touches no repo, so it is capped separately from the mutation budget.
-    if (gardener.adopt_untracked) {
-      const all = await deps.exec(
-        ["gh", "pr", "list", "--state", "open", "--limit", String(ADOPT_LIST_LIMIT), "--json", "number,url,title,body,isDraft,labels"],
-        { cwd: project.repo_path }
-      );
+    if (adoptListed) {
+      const all = adoptListed;
       let candidates: AdoptPr[] | null = null;
       try {
         if (all.code === 0) {
