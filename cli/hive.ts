@@ -63,8 +63,9 @@ Usage:
   hive garden [--project <id>] [--apply] [--remote] [--json]
         prune task branches + worktrees using task state, not git reachability.
         Deletes a branch only when its task is done; keeps cancelled/failed
-        branches; never touches a branch with no task or one checked out
-        somewhere. Dry run unless --apply.
+        branches; never touches a branch with no task, a ghost-* WIP rescue, a
+        branch hive does not own, or one checked out somewhere. Dry run unless
+        --apply.
   hive jira link <task-id> --parent <KEY> create and link a Jira sub-task
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor

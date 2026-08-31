@@ -34,11 +34,18 @@ function fixture() {
   const doneCheckedOut = seedTask(db, projectId, "done");
   const orphan = "abc123abc123";
   const branches = [
+    "main aaa0",
     `hive/${done} aaa1`,
     `hive/${cancelled} aaa2`,
     `hive/${live} aaa3`,
     `hive/${doneCheckedOut} aaa4`,
     `hive/${orphan} aaa5`,
+    // WIP rescued off a dying worktree: reported, never deleted, done task or not.
+    `ghost-${done} bbb1`,
+    `ghost-${cancelled}-2 bbb2`,
+    // Not hive's branches at all.
+    "replay/c15d9c29958d ccc1",
+    "claude/some-human-branch ccc2",
   ].join("\n");
   const worktrees = [
     "worktree /repo\nHEAD x\nbranch refs/heads/main",
@@ -52,6 +59,7 @@ function fixture() {
     calls.push(argv);
     if (argv.includes("worktree") && argv.includes("list")) return OK(worktrees);
     if (argv.includes("for-each-ref")) return OK(branches);
+    if (argv.includes("--merged")) return OK("main\nreplay/c15d9c29958d\n");
     if (argv[0] === "du") return OK("1048576\t" + argv[2]); // 1GB each
     if (argv.includes("status")) return OK(""); // clean
     if (argv.includes("ls-remote")) return OK(`sha\trefs/heads/hive/${done}\n`);
@@ -71,6 +79,21 @@ test("dry run classifies by task state and touches nothing", async () => {
   expect(r.worktrees.map((w) => w.task_id).sort()).toEqual([f.cancelled, f.doneCheckedOut].sort());
   expect(r.reclaimed_kb).toBe(0);
   expect(f.calls.some((c) => c.includes("-D") || c.includes("remove") || c.includes("push"))).toBe(false);
+});
+
+test("ghost and non-hive branches are reported, never deleted", async () => {
+  const f = fixture();
+  const [r] = await gardenRepos(f.db, { exec: f.exec, apply: true });
+  // A ghost branch of a DONE task still survives: it holds unlanded WIP.
+  expect(r.ghost.map((b) => b.branch).sort()).toEqual([`ghost-${f.done}`, `ghost-${f.cancelled}-2`].sort());
+  expect(r.ghost.every((b) => b.task_id)).toBe(true);
+  // The base branch is not reported; the human branches are, with merge status.
+  expect(r.other.map((b) => b.branch).sort()).toEqual(["claude/some-human-branch", "replay/c15d9c29958d"]);
+  expect(r.other.find((b) => b.branch === "replay/c15d9c29958d")!.merged).toBe(true);
+  expect(r.other.find((b) => b.branch === "claude/some-human-branch")!.merged).toBe(false);
+  const deleted = f.calls.filter((c) => c.includes("-D")).map((c) => c[c.length - 1]);
+  for (const b of [...r.ghost, ...r.other]) expect(deleted).not.toContain(b.branch);
+  expect(deleted).not.toContain("main");
 });
 
 test("apply deletes done branches, removes terminal worktrees, keeps unlanded ones", async () => {
