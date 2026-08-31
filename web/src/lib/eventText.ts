@@ -90,12 +90,17 @@ export function eventText(e: EventLike): string {
     case "risk_verdicts": {
       const vs = Array.isArray(p.verdicts) ? (p.verdicts as any[]) : [];
       const qs = Array.isArray(p.question_verdicts) ? (p.question_verdicts as any[]) : [];
-      if (!vs.length && !qs.length) return `risk check produced no verdicts`;
+      const unchecked = Number(p.unverified) || 0;
+      const why = s(p.unverified_reason);
+      // A timeout is not a verdict: say so, or an empty set reads as a clean bill.
+      if (!vs.length && !qs.length)
+        return `risk check did not finish — ${unchecked || "no"} finding${unchecked === 1 ? "" : "s"} got no verdict${why ? ` (${why})` : ""}`;
       const confirmed = vs.filter((v) => v?.verdict === "confirmed");
       const forYou = qs.filter((q) => q?.answerable === "human");
       const parts = [];
       if (vs.length) parts.push(`${confirmed.length} of ${vs.length} risks confirmed`);
       if (qs.length) parts.push(`${forYou.length} of ${qs.length} questions need you`);
+      if (unchecked) parts.push(`${unchecked} not checked${why ? ` (${why})` : ""}`);
       const head = `risk check: ${parts.join(", ")}`;
       const named = [...confirmed.map((v) => s(v.risk)), ...forYou.map((q) => s(q.question))];
       return named.length ? `${head} — ${named.join("; ")}` : head;

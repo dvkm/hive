@@ -167,11 +167,13 @@ async function defaultMerge(db: DB, taskId: string, exec: Exec): Promise<{ ok: b
 //                  changed under us because a sibling PR landed first.
 //   queue race   — the merge queue or GitHub itself was busy / rate-limited.
 //   CI pending   — required checks were still running when we asked.
+//   risk check unfinished — the per-risk verification timed out on this head;
+//                  it retries on its own, and nothing was confirmed (HIVE-539).
 //
 // Everything else (a real conflict, red CI, a missing understanding check) needs
 // a human or the agent, so it opens the pause card instead.
 const TRANSIENT_RE =
-  /base branch was modified|base.{0,20}(changed|moved|out of date|behind)|not up to date|merge queue|enqueued|try again|rate limit|secondary rate|timed? ?out|temporarily unavailable|\b50[234]\b|checks? (are )?(still )?(pending|running|in progress)|required status checks? .{0,30}(pending|expected)/i;
+  /risk check did not finish|base branch was modified|base.{0,20}(changed|moved|out of date|behind)|not up to date|merge queue|enqueued|try again|rate limit|secondary rate|timed? ?out|temporarily unavailable|\b50[234]\b|checks? (are )?(still )?(pending|running|in progress)|required status checks? .{0,30}(pending|expected)/i;
 
 export function isTransientLandFailure(reason: string): boolean {
   return TRANSIENT_RE.test(reason);
@@ -219,6 +221,36 @@ export function landHeldForQuiz(db: DB, taskId: string): boolean {
 // transient and opens the pause card, so nothing retries silently for ever.
 const RETRY_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000, 600_000];
 const MAX_TRANSIENT_RETRIES = RETRY_BACKOFF_MS.length;
+
+// A hard ceiling on attempts of ANY kind since the mark (HIVE-539). A
+// non-transient failure normally opens one pause card and stops, but a failure
+// that BOUNCES the task out of review (the destructive-rebase guard does) skips
+// the card — and the mark is sticky, so the task came back and re-attempted the
+// same doomed merge every sweep: b5f437266360 tried 52 times before a human
+// unqueued it. At the ceiling hive unqueues it itself and says so.
+const MAX_LAND_ATTEMPTS = 10;
+
+// Failed land attempts since the last land_queued mark, ordered by insertion.
+// A success or a fresh mark ends the run, exactly like retryState.
+function failedAttemptRun(db: DB, taskId: string): number {
+  const rows = db
+    .query(
+      `SELECT payload FROM events
+        WHERE task_id = ? AND type IN ('land_attempted', 'land_queued')
+        ORDER BY rowid DESC LIMIT ${MAX_LAND_ATTEMPTS + 1}`
+    )
+    .all(taskId) as { payload: string }[];
+  let failures = 0;
+  for (const row of rows) {
+    let payload: any = {};
+    try {
+      payload = JSON.parse(row.payload ?? "{}");
+    } catch {}
+    if (payload.ok !== false) break;
+    failures++;
+  }
+  return failures;
+}
 
 interface RetryState {
   transientFailures: number; // consecutive transient failures since the last non-attempt
@@ -411,6 +443,25 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         // otherwise every sweep would re-attempt and re-ask the same question.
         if (openPauseDecisionId(db, n.id)) continue;
         if (backingOff(retryState(db, n.id), nowMs)) continue;
+        // Out of attempts: stop retrying a merge that keeps refusing, and tell
+        // the director rather than looping in silence.
+        if (failedAttemptRun(db, n.id) >= MAX_LAND_ATTEMPTS) {
+          db.query("UPDATE tasks SET land_queued_at = NULL, updated_at = ? WHERE id = ?").run(now(), n.id);
+          writeEvent(db, {
+            task_id: n.id,
+            source: "reconciler",
+            type: "land_retry_exhausted",
+            payload: { attempts: MAX_LAND_ATTEMPTS },
+          });
+          enqueue(db, {
+            kind: "stale",
+            task_id: n.id,
+            title: `PR #${n.number} left the land queue after ${MAX_LAND_ATTEMPTS} failed merges`,
+            body: `${n.title} — the same merge kept failing, so hive stopped retrying. Fix what blocks it, then queue it again.`,
+          });
+          pending.delete(n.id);
+          continue;
+        }
         // Quiz passed after the mark: wait for the director's "Land now" tap.
         if (landHeldForQuiz(db, n.id)) continue;
         // A corrective steer is queued for the agent (it's between turns) but

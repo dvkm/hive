@@ -513,6 +513,20 @@ const MAX_VERIFIED_RISKS = 5;
 const MAX_VERIFIED_QUESTIONS = 5;
 const VERIFY_MODEL = "opus";
 
+// A run that TIMED OUT is not a judgement: the findings it never reached are
+// unknown, not confirmed (HIVE-539). So an `unverified` set does not close the
+// head — the next pass retries only the findings still missing a verdict and
+// carries the ones already produced forward, so a slow finding never voids the
+// verdicts beside it. Bounded, or a finding too big for the budget would re-run
+// every minute for ever.
+const MAX_VERIFY_ATTEMPTS = 3;
+
+// The 60s reviewer tick is shorter than one verification pass (up to
+// TIMEOUT_MS per finding), so without this every tick stacked ANOTHER full pass
+// on the same head: six overlapping runs all timing out, each overwriting the
+// last with an emptier result (observed on corebeat ed28a0ca27c6).
+const verifyInFlight = new Set<string>();
+
 export interface RiskVerdict {
   risk: string;
   verdict: "confirmed" | "refuted";
@@ -653,7 +667,81 @@ export async function verifyRisks(
   const risks = (input.risks ?? []).slice(0, MAX_VERIFIED_RISKS);
   const questions = (input.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS);
   if (!risks.length && !questions.length) return;
-  if (hasRiskVerdicts(db, task.id, input.head, risks.length + questions.length)) return;
+  // What this head already has a verdict for. Anything here is never re-run and
+  // never dropped: this pass only fills the gaps and rewrites the whole set.
+  // Read across EVERY pass for this head, not just the newest one — a later run
+  // that timed out wrote an emptier set over a good one, and those verdicts are
+  // still true (they were produced for this exact head). Matched by the finding's
+  // own text, so a verdict for a risk the current review no longer raises is
+  // simply never used.
+  const { knownRisk, knownQuestion } = priorVerdicts(db, task.id, input.head);
+  const todoRisks = risks.filter((r) => !knownRisk.has(r));
+  const todoQuestions = questions.filter((q) => !knownQuestion.has(q));
+  if (!todoRisks.length && !todoQuestions.length) return; // fully verified for this head
+  if (verifyAttempts(db, task.id, input.head) >= MAX_VERIFY_ATTEMPTS) return; // retries spent; the gap stands
+  const flightKey = `${task.id}:${input.head}`;
+  if (verifyInFlight.has(flightKey)) return;
+  verifyInFlight.add(flightKey);
+  try {
+    await runVerification(db, task, input, deps, { risks, questions, knownRisk, knownQuestion, todoRisks, todoQuestions });
+  } finally {
+    verifyInFlight.delete(flightKey);
+  }
+}
+
+// Every verdict any pass produced for this head, newest pass winning on a tie.
+function priorVerdicts(
+  db: DB,
+  taskId: string,
+  head: string
+): { knownRisk: Map<string, RiskVerdict>; knownQuestion: Map<string, QuestionVerdict> } {
+  const knownRisk = new Map<string, RiskVerdict>();
+  const knownQuestion = new Map<string, QuestionVerdict>();
+  const rows = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts' ORDER BY ts DESC, rowid DESC")
+    .all(taskId) as { payload: string }[];
+  for (const r of rows) {
+    let p: any;
+    try {
+      p = JSON.parse(r.payload);
+    } catch {
+      continue;
+    }
+    if (p?.reviewed_head_sha !== head) continue;
+    for (const v of Array.isArray(p.verdicts) ? p.verdicts : []) if (v?.risk && !knownRisk.has(v.risk)) knownRisk.set(v.risk, v);
+    for (const q of Array.isArray(p.question_verdicts) ? p.question_verdicts : [])
+      if (q?.question && !knownQuestion.has(q.question)) knownQuestion.set(q.question, q);
+  }
+  return { knownRisk, knownQuestion };
+}
+
+// How many verification passes this head has already written. One event per
+// finished pass, so this is the retry counter MAX_VERIFY_ATTEMPTS caps.
+function verifyAttempts(db: DB, taskId: string, head: string): number {
+  return (
+    db
+      .query(
+        "SELECT COUNT(*) n FROM events WHERE task_id = ? AND type = 'risk_verdicts' AND json_extract(payload, '$.reviewed_head_sha') = ?"
+      )
+      .get(taskId, head) as { n: number }
+  ).n;
+}
+
+async function runVerification(
+  db: DB,
+  task: any,
+  input: { head: string; diff: string; stillCurrent?: () => boolean | Promise<boolean> },
+  deps: ReviewerDeps,
+  plan: {
+    risks: string[];
+    questions: string[];
+    knownRisk: Map<string, RiskVerdict>;
+    knownQuestion: Map<string, QuestionVerdict>;
+    todoRisks: string[];
+    todoQuestions: string[];
+  }
+): Promise<void> {
+  const { risks, questions, knownRisk, knownQuestion, todoRisks, todoQuestions } = plan;
   const exec = deps.exec ?? defaultPlannerExec;
   const current = async () => (input.stillCurrent ? await input.stillCurrent() : true);
   const run = async (prompt: string) => {
@@ -667,8 +755,6 @@ export async function verifyRisks(
       return null;
     }
   };
-  const verdicts: RiskVerdict[] = [];
-  const question_verdicts: QuestionVerdict[] = [];
   let unverified = 0;
   // Why a run failed. `unverified` alone reads as "the model was unsure"; an
   // auth outage is a completely different story (hive-1800). With runs in
@@ -676,8 +762,8 @@ export async function verifyRisks(
   let unverified_reason: string | null = null;
   let aborted = false;
   const jobs = [
-    ...risks.map((risk) => ({ kind: "risk" as const, text: risk, prompt: verifyPrompt(task, risk, input.diff) })),
-    ...questions.map((q) => ({ kind: "question" as const, text: q, prompt: answerPrompt(task, q, input.diff) })),
+    ...todoRisks.map((risk) => ({ kind: "risk" as const, text: risk, prompt: verifyPrompt(task, risk, input.diff) })),
+    ...todoQuestions.map((q) => ({ kind: "question" as const, text: q, prompt: answerPrompt(task, q, input.diff) })),
   ];
   const results = await mapLimit(jobs, RISK_CONCURRENCY, async (job) => {
     if (aborted) return null;
@@ -692,17 +778,27 @@ export async function verifyRisks(
     return { job, value: job.kind === "risk" ? extractVerdict(res!.stdout) : extractAnswer(res!.stdout) };
   });
   if (aborted) return;
-  // Re-assembled in the original risks-then-questions order, so a verdict set
-  // reads the same whichever run finished first.
+  const freshRisk = new Map<string, any>();
+  const freshQuestion = new Map<string, any>();
   for (const r of results) {
     if (!r) return; // a slot bailed on stillCurrent: write nothing
-    if (!r.value) {
-      unverified++;
-    } else if (r.job.kind === "risk") {
-      verdicts.push({ risk: r.job.text, ...(r.value as any) });
-    } else {
-      question_verdicts.push({ question: r.job.text, ...(r.value as any) });
-    }
+    if (!r.value) continue;
+    (r.job.kind === "risk" ? freshRisk : freshQuestion).set(r.job.text, r.value);
+  }
+  // Re-assembled in the original risks-then-questions order, so a verdict set
+  // reads the same whichever run finished first — and an earlier pass's verdict
+  // counts exactly like one produced just now.
+  const verdicts: RiskVerdict[] = [];
+  const question_verdicts: QuestionVerdict[] = [];
+  for (const risk of risks) {
+    const v = knownRisk.get(risk) ?? freshRisk.get(risk);
+    if (v) verdicts.push({ ...(v as any), risk });
+    else unverified++;
+  }
+  for (const question of questions) {
+    const a = knownQuestion.get(question) ?? freshQuestion.get(question);
+    if (a) question_verdicts.push({ ...(a as any), question });
+    else unverified++;
   }
   if (!(await current())) return;
   writeEvent(db, {
@@ -752,7 +848,7 @@ export function riskVerdictsFor(
   db: DB,
   taskId: string,
   head: string | null | undefined
-): { verdicts: RiskVerdict[]; question_verdicts: QuestionVerdict[]; unverified: number } | null {
+): { verdicts: RiskVerdict[]; question_verdicts: QuestionVerdict[]; unverified: number; unverified_reason: string | null } | null {
   if (!head) return null;
   const rows = db
     .query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts' ORDER BY ts DESC, rowid DESC")
@@ -769,6 +865,7 @@ export function riskVerdictsFor(
       verdicts: Array.isArray(p.verdicts) ? p.verdicts : [],
       question_verdicts: Array.isArray(p.question_verdicts) ? p.question_verdicts : [],
       unverified: Number(p.unverified) || 0,
+      unverified_reason: typeof p.unverified_reason === "string" ? p.unverified_reason : null,
     };
   }
   return null;
@@ -932,6 +1029,23 @@ export function reviewActionableBatch(db: DB, tasks: ReviewActionableTask[]): Se
 export function hasDirectorReport(db: DB, taskId: string): boolean {
   if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'review_summary' LIMIT 1").get(taskId)) return true;
   return !!db.query("SELECT 1 FROM evidence WHERE task_id = ? AND kind = 'report' LIMIT 1").get(taskId);
+}
+
+// Findings the risk check never reached on this head — a timeout or a model
+// outage, not a judgement. Kept separate from confirmedRisks so the merge gate
+// can say "I could not check" instead of quoting a risk as confirmed (HIVE-539).
+export function unfinishedRiskCheck(
+  db: DB,
+  taskId: string,
+  head: string | null | undefined
+): { unverified: number; checked: number; reason: string | null } | null {
+  const found = riskVerdictsFor(db, taskId, head);
+  if (!found || !found.unverified) return null;
+  return {
+    unverified: found.unverified,
+    checked: found.verdicts.length + found.question_verdicts.length,
+    reason: found.unverified_reason,
+  };
 }
 
 export function confirmedRisks(db: DB, taskId: string, head: string | null | undefined): RiskVerdict[] {

@@ -93,7 +93,7 @@ import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove, riskLevel, NO_AUTO_ANSWER_REASON } from "./autoapprove.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
-import { confirmedRisks, cautionCleared, latestAutoReviewVerdict, reviewPipelineSettled } from "./reviewer.ts";
+import { confirmedRisks, unfinishedRiskCheck, cautionCleared, latestAutoReviewVerdict, reviewPipelineSettled } from "./reviewer.ts";
 import { explanationFor, explanationGate } from "./explainDiff.ts";
 import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
@@ -3294,6 +3294,21 @@ async function mergeTaskLocked(
       `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
         confirmed.map((c) => `“${c.risk}” — ${c.why}${c.evidence_path ? ` (${c.evidence_path})` : ""}`).join("; ") +
         `. Fix them, or merge with override_confirmed_risks=true.`,
+      409
+    );
+
+  // "I could not check" is not "I checked and it is bad" (HIVE-539). A run that
+  // timed out leaves findings with NO verdict; quoting one of them as confirmed
+  // is how a task that already fixed the finding could never land. Say what
+  // actually happened instead, and let the queue retry — the verification pass
+  // re-runs the findings it missed and keeps the ones it already got.
+  const unfinished = body?.override_confirmed_risks ? null : unfinishedRiskCheck(db, id, task.head_sha);
+  if (unfinished)
+    return err(
+      `merge blocked — the risk check did not finish on this head: ${unfinished.unverified} of ` +
+        `${unfinished.unverified + unfinished.checked} finding${unfinished.unverified + unfinished.checked === 1 ? "" : "s"} ` +
+        `got no verdict${unfinished.reason ? ` (${unfinished.reason})` : ""}. Nothing was confirmed. ` +
+        `Wait for it to retry, or merge with override_confirmed_risks=true.`,
       409
     );
 

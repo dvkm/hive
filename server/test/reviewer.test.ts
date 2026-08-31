@@ -247,7 +247,8 @@ test("extractReview parses whole JSON, envelope, and prose-wrapped output", () =
 
 // --- per-risk adversarial verification (task HIVE-406) ---------------------
 
-const { verifyRisks, extractVerdict, extractAnswer, ambiguityCleared, confirmedRisks, verifyPendingOnce } = await import("../src/reviewer.ts");
+const { verifyRisks, extractVerdict, extractAnswer, ambiguityCleared, confirmedRisks, unfinishedRiskCheck, verifyPendingOnce } =
+  await import("../src/reviewer.ts");
 
 // A pre-review that flags `n` risks, so autoReviewOnce triggers verification.
 const cautionWith = (risks: string[]) =>
@@ -403,7 +404,7 @@ test("a re-review at the same head re-verifies when the risk list grew", async (
     return { code: 0, stdout: JSON.stringify({ result }), stderr: "" };
   };
   await verifyRisks(db, task, { risks: ["r1", "r2", "r3"], questions: ["q1"], head: "head-a", diff: "diff" }, { exec: answer });
-  expect(calls).toBe(6); // 2 + 4 (three risks and one question re-run)
+  expect(calls).toBe(4); // 2 + 2: r1/r2 already have verdicts at this head, only r3 and q1 run
 
   const latest: any = events(db, id, "risk_verdicts").at(-1);
   expect(latest.payload.verdicts).toHaveLength(3);
@@ -412,7 +413,7 @@ test("a re-review at the same head re-verifies when the risk list grew", async (
 
   // A repeat of that same review is still deduped.
   await verifyRisks(db, task, { risks: ["r1", "r2", "r3"], questions: ["q1"], head: "head-a", diff: "diff" }, { exec: answer });
-  expect(calls).toBe(6);
+  expect(calls).toBe(4);
 });
 
 test("a failed verification run is counted, never reported as an all-clear", async () => {
@@ -546,4 +547,98 @@ test("after the retry budget runs out the card is flagged for a human, not silen
   const notes: any[] = db.query("SELECT title FROM notifications WHERE task_id = ? AND kind = 'failed'").all(id);
   expect(notes).toHaveLength(1);
   expect(notes[0].title).toContain("gave up");
+});
+
+// HIVE-539: a run that times out is "I do not know", never "I checked and it is
+// bad" — and the verdicts it DID produce must survive the ones that did not.
+test("a timed-out verification keeps the verdicts it got and retries only the gaps", async () => {
+  const { db, id } = setup();
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+  const review = { risks: ["r1", "r2"], questions: [] };
+
+  // Pass one: r1 answers, r2 times out.
+  const half: Exec = async (argv: string[]) =>
+    (argv[4] ?? "").includes("r1")
+      ? { code: 0, stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"checked"}' }), stderr: "" }
+      : ({ code: 124, stdout: "", stderr: "", timedOut: true } as any);
+  await verifyRisks(db, task, { ...review, head: "head-a", diff: "d" }, { exec: half });
+  let latest: any = events(db, id, "risk_verdicts").at(-1);
+  expect(latest.payload.verdicts).toHaveLength(1);
+  expect(latest.payload.unverified).toBe(1);
+
+  // Nothing was confirmed, so the merge gate must not read a confirmed risk —
+  // it reads an unfinished check instead.
+  expect(confirmedRisks(db, id, "head-a")).toHaveLength(0);
+  expect(unfinishedRiskCheck(db, id, "head-a")).toMatchObject({ unverified: 1, checked: 1 });
+  expect(ambiguityCleared(db, id, "head-a", review)).toBe(false);
+
+  // Pass two: only the gap re-runs, and the earlier verdict is carried forward.
+  let asked: string[] = [];
+  const rest: Exec = async (argv: string[]) => {
+    asked.push(argv[4] ?? "");
+    return { code: 0, stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"checked"}' }), stderr: "" };
+  };
+  await verifyRisks(db, task, { ...review, head: "head-a", diff: "d" }, { exec: rest });
+  expect(asked).toHaveLength(1);
+  expect(asked[0]).toContain("r2");
+  latest = events(db, id, "risk_verdicts").at(-1);
+  expect(latest.payload.verdicts.map((v: any) => v.risk).sort()).toEqual(["r1", "r2"]);
+  expect(latest.payload.unverified).toBeUndefined();
+  expect(unfinishedRiskCheck(db, id, "head-a")).toBeNull();
+  expect(ambiguityCleared(db, id, "head-a", review)).toBe(true);
+});
+
+test("verification retries are capped, so a finding that never fits stops burning the model", async () => {
+  const { db, id } = setup();
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+  let calls = 0;
+  const timeout: Exec = async () => {
+    calls++;
+    return { code: 124, stdout: "", stderr: "", timedOut: true } as any;
+  };
+  for (let i = 0; i < 6; i++) await verifyRisks(db, task, { risks: ["r1"], head: "head-a", diff: "d" }, { exec: timeout });
+  expect(calls).toBe(3); // MAX_VERIFY_ATTEMPTS
+  expect(events(db, id, "risk_verdicts")).toHaveLength(3);
+});
+
+test("two verification passes for one head never overlap", async () => {
+  const { db, id } = setup();
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const slow: Exec = async () => {
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((r) => setTimeout(r, 20));
+    inFlight--;
+    return { code: 0, stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"ok"}' }), stderr: "" };
+  };
+  await Promise.all([
+    verifyRisks(db, task, { risks: ["r1"], head: "head-a", diff: "d" }, { exec: slow }),
+    verifyRisks(db, task, { risks: ["r1"], head: "head-a", diff: "d" }, { exec: slow }),
+  ]);
+  expect(maxInFlight).toBe(1);
+  expect(events(db, id, "risk_verdicts")).toHaveLength(1);
+});
+
+test("an emptier later pass never loses the verdicts an earlier pass produced", async () => {
+  const { db, id } = setup();
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+  // What the old code wrote: a good set, then a pass that timed out on everything.
+  for (const payload of [
+    { reviewed_head_sha: "head-a", verdicts: [{ risk: "r1", verdict: "refuted", why: "checked" }], unverified: 1 },
+    { reviewed_head_sha: "head-a", verdicts: [], unverified: 2, unverified_reason: "timed out after 180000ms" },
+  ])
+    writeEvent(db, { task_id: id, source: "system", type: "risk_verdicts", payload: payload as any });
+
+  let asked: string[] = [];
+  const claude: Exec = async (argv: string[]) => {
+    asked.push(argv[4] ?? "");
+    return { code: 0, stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"checked"}' }), stderr: "" };
+  };
+  await verifyRisks(db, task, { risks: ["r1", "r2"], head: "head-a", diff: "d" }, { exec: claude });
+  expect(asked).toHaveLength(1); // r1's verdict survived the empty pass
+  expect(asked[0]).toContain("r2");
+  const latest: any = events(db, id, "risk_verdicts").at(-1);
+  expect(latest.payload.verdicts.map((v: any) => v.risk)).toEqual(["r1", "r2"]);
 });
