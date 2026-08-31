@@ -8,6 +8,7 @@ process.env.HIVE_HOME = HOME;
 
 const { openDb } = await import("../src/db.ts");
 const { makeHandler, repairDuplicateQuizPasses } = await import("../src/api.ts");
+const { reconcileOnce } = await import("../src/reconciler.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { writeEvent } = await import("../src/state.ts");
 const { reviewActionable, reviewActionableBatch } = await import("../src/reviewer.ts");
@@ -1628,5 +1629,32 @@ test("with quizzes pending in two projects, the total badge count matches the su
   expect(pendingPostShipQuizCount(s.db)).toBe(sumOfDigests);
   expect(pendingPostShipQuizCount(s.db, projA)).toBe(2);
   expect(pendingPostShipQuizCount(s.db, projB)).toBe(1);
+  await s.server.stop(true);
+});
+
+// HIVE-544: hive did not perform this merge — someone merged the PR on GitHub
+// and the reconciler only noticed afterwards. The quiz has to settle on that
+// path too, or a shipped task keeps saying "required" forever.
+test("a PR merged outside hive defers the unanswered quiz when the reconciler sees it", async () => {
+  const s = makeServer({ prState: "MERGED" });
+  const { taskId } = await inReviewTask(s.base, {}, false);
+  s.db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/544", taskId);
+
+  const quizzesBefore = await get(s.base, "/api/understanding-quizzes");
+  expect(quizzesBefore.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("required");
+
+  const gh: Exec = ((argv: string[]) =>
+    argv[0] === "gh"
+      ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] }))
+      : OK()) as unknown as Exec;
+  await reconcileOnce(s.db, { exec: gh });
+
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  const deferred = events.json.find((event: any) => event.type === "understanding_quiz_deferred");
+  expect(deferred).toBeTruthy();
+  expect(deferred.payload.note).toContain("merged outside hive");
+
+  const quizzes = await get(s.base, "/api/understanding-quizzes?scope=all");
+  expect(quizzes.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("deferred");
   await s.server.stop(true);
 });

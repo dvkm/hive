@@ -3558,6 +3558,9 @@ async function mergeTaskLocked(
     }
   }
 
+  // One of two places a quiz settles on a merge: this is the hive-performed
+  // merge. The other is deferQuizForExternalMerge (below), for a PR merged on
+  // GitHub that the reconciler only observes afterwards.
   if (deferQuizReviewEventId) {
     writeEvent(db, {
       task_id: id,
@@ -4808,6 +4811,28 @@ function requireUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   if (!already)
     writeEvent(db, { task_id: taskId, source: "director", type: "understanding_required", payload: { actor: actorOf(body) } });
   return json({ ok: true, understanding_required: true });
+}
+
+// Which merge path settles a quiz: BOTH of them. mergeTask (above) defers the
+// quiz when hive itself lands an auto_merge.kinds task; this defers it when the
+// PR was merged on GitHub and the reconciler only observed it afterwards
+// (HIVE-544). Before this, that second path left the quiz reading "required"
+// forever on a task that had already shipped — the same unanswered catch-up
+// item under a name that reads like a blocker.
+export function deferQuizForExternalMerge(db: DB, taskId: string): void {
+  const task = getTask(db, taskId);
+  if (!task || !understandingChecksRequired(db, task)) return;
+  const quiz = latestUnderstandingQuiz(db, taskId);
+  if (!quiz || understandingQuizStatus(db, taskId, quiz.reviewEventId) !== "required") return;
+  writeEvent(db, {
+    task_id: taskId,
+    source: "system",
+    type: "understanding_quiz_deferred",
+    payload: {
+      review_event_id: quiz.reviewEventId,
+      note: "Automatically deferred because the PR was merged outside hive; the task had already shipped.",
+    },
+  });
 }
 
 function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {

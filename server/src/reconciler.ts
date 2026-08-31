@@ -27,7 +27,7 @@ import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { activeProjects } from "./testProjects.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, editDialogPaths, parseResetClock } from "./diagnose.ts";
-import { AUTO_MERGE_PAUSED, requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount } from "./api.ts";
+import { AUTO_MERGE_PAUSED, requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount, deferQuizForExternalMerge } from "./api.ts";
 import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, mapLimit, projectBaseBranch, preferSafeRef, GH_LIST_TIMEOUT_MS, GH_LIST_CONCURRENCY } from "./exec.ts";
@@ -805,6 +805,9 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
 // out on it — so without this it would just swap a stuck `in_review` for a
 // stuck `verifying`. For it, merged IS done (HIVE-473).
 async function advanceAfterMerge(db: DB, taskId: string, deps: ReconcilerDeps): Promise<void> {
+  // The merge happened on GitHub, so nobody passed the quiz gate on the way in.
+  // Settle it the same way a hive-performed merge does (HIVE-544).
+  deferQuizForExternalMerge(db, taskId);
   if (isTrackingOnlyId(db, taskId)) {
     transition(db, taskId, "done", { source: "reconciler", reason: "PR merged (tracking-only task: no post-merge smoke)" });
     broadcast({ type: "task", task: getTask(db, taskId) });
