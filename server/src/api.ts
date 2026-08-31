@@ -6473,7 +6473,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         answer_key: string;
         explanation?: string;
       }>(
-        rawChecks.flatMap((value: unknown) => {
+        submittedChecks.flatMap((value: unknown) => {
           const check = normalizeUnderstandingCheck(value);
           return check ? [{
             question: check.question,
@@ -6485,15 +6485,20 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         (check) => recurrenceKey(check.question)
       ).slice(0, 5);
       if (checks.length) understanding.checks = checks;
-      if (!checks.length && rawCheck && typeof rawCheck === "object" && !Array.isArray(rawCheck)) {
-        const check = normalizeUnderstandingCheck(rawCheck);
-        if (check) understanding.check = {
-          question: check.question,
-          options: check.options,
-          answer_key: check.answerKey,
-          ...(check.explanation ? { explanation: check.explanation } : {}),
-        };
-      }
+      // Submitted a quiz that normalises to nothing? Say so. Accepting it
+      // silently is what cost two tasks a round trip each: the agent believed
+      // it had supplied a check, and land only said one was "required"
+      // (hive-1947).
+      if (submittedChecks.length && !checks.length)
+        return err(
+          "understanding checks were submitted but none are usable. Expected " +
+            'understanding.checks: [{"question":"...","options":[{"key":"a","label":"..."},' +
+            '{"key":"b","label":"..."}],"answer_key":"a","explanation":"..."}]. ' +
+            "options entries must be {key,label} objects (bare strings are dropped), " +
+            "each check needs 2+ options, and answer_key must equal one option key. " +
+            "Singular `check` is accepted and stored as checks[].",
+          400,
+        );
       if (Object.keys(understanding).length) payload.understanding = understanding;
     }
     if (!Object.keys(payload).length)
@@ -6508,8 +6513,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     )
       return json({ event: parseEvent(latest), duplicate: true }, 201);
     const event = writeEvent(db, { task_id: taskId, source, type, payload });
-    const understandingChecks = (payload.understanding as any)?.checks
-      ?? ((payload.understanding as any)?.check ? [(payload.understanding as any).check] : []);
+    const understandingChecks = ((payload.understanding as any)?.checks ?? []) as any[];
     if (understandingChecks.some(isEgregiousCheckWording))
       queueSteerEvent(
         db,
