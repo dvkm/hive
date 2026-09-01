@@ -55,7 +55,6 @@ test("two servers on one DB: the predecessor stands down, one keeps running laps
     }
     return { proc, out: () => text };
   };
-  const laps = (s: string) => (s.match(/reconciler run:/g) ?? []).length;
   const until = async (fn: () => boolean, ms = 10_000) => {
     const deadline = Date.now() + ms;
     while (Date.now() < deadline) {
@@ -64,14 +63,19 @@ test("two servers on one DB: the predecessor stands down, one keeps running laps
     }
     return false;
   };
+  // Poll who actually holds the DB lease, instead of counting "reconciler run:"
+  // lines against a fixed wall-clock budget — a slow/loaded CI runner can miss
+  // laps inside a tight window even though the lease handoff itself is fine.
+  const db = openDb(env.HIVE_DB);
+  const holder = () => readLease(db)?.pid;
 
   const a = start();
   try {
-    expect(await until(() => laps(a.out()) >= 2)).toBe(true); // A is doing the work
+    expect(await until(() => holder() === a.proc.pid, 15_000)).toBe(true); // A holds the lease
 
     const b = start();
     try {
-      expect(await until(() => laps(b.out()) >= 2)).toBe(true); // B took over
+      expect(await until(() => holder() === b.proc.pid, 15_000)).toBe(true); // B took over
       expect(b.out()).toContain("took the DB lease from a previous server");
 
       // A stands down on its own — it is the orphan case, so nothing external
@@ -79,9 +83,9 @@ test("two servers on one DB: the predecessor stands down, one keeps running laps
       expect(await until(() => a.proc.exitCode !== null, 5_000)).toBe(true);
       expect(a.out()).toContain("standing down");
 
-      // And B is still the one running laps afterwards.
-      const before = laps(b.out());
-      expect(await until(() => laps(b.out()) > before, 5_000)).toBe(true);
+      // And B is still the one holding (and renewing) the lease afterwards.
+      const before = readLease(db)?.at;
+      expect(await until(() => holder() === b.proc.pid && readLease(db)?.at !== before, 15_000)).toBe(true);
     } finally {
       b.proc.kill();
       await b.proc.exited;
