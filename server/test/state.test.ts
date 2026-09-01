@@ -470,3 +470,43 @@ test("defer/undefer parks a task in_progress and toggles isDeferred", () => {
   expect(getTask(db, id).deferred_until).toBeNull();
   expect(isDeferred(getTask(db, id))).toBe(false);
 });
+
+// hive-1952: a tracking-only task that reached in_review was trapped. `ready`
+// is refused for it (there is no agent), and the forward graph refused
+// in_review -> done while pointing back at `ready`. Its only exit was
+// `cancelled`, which understates work that actually shipped.
+test("a tracking-only task can close straight to done from in_review", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  db.query("UPDATE tasks SET source = 'external', state = 'in_review' WHERE id = ?").run(id);
+  const t = transition(db, id, "done", { source: "director", reason: "shipped in PR #917" });
+  expect(t.state).toBe("done");
+  // No evidence was attached: the evidence gate is hive-owned work only.
+  expect(db.query("SELECT COUNT(*) AS n FROM evidence WHERE task_id = ?").get(id)).toMatchObject({ n: 0 });
+});
+
+test("a jira mirror can close straight to done, but a hive-owned task still cannot", () => {
+  const { db, projectId } = freshDb();
+  const mirror = makeTask(db, projectId);
+  db.query("UPDATE tasks SET source_ref = 'jira:WEB-7', state = 'in_progress' WHERE id = ?").run(mirror);
+  expect(transition(db, mirror, "done").state).toBe("done");
+
+  const owned = makeTask(db, projectId);
+  transition(db, owned, "in_progress");
+  expect(() => transition(db, owned, "done")).toThrow(/done is reached via review/);
+});
+
+test("a refused tracking-only transition names its own exits instead of `ready`", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  db.query("UPDATE tasks SET source = 'external', state = 'in_review' WHERE id = ?").run(id);
+  // in_review -> queued is still invalid; the hint must not send a tracking-only
+  // task to `ready` or `requeue`, which are both refused for it.
+  expect(() => transition(db, id, "queued")).toThrow(/tracking-only/);
+  try {
+    transition(db, id, "queued");
+  } catch (e) {
+    expect(String(e)).not.toMatch(/ready --pr-url/);
+    expect(String(e)).toMatch(/hive task move/);
+  }
+});

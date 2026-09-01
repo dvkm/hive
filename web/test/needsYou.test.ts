@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { Checkpoint, Decision, Task, UnderstandingQuiz } from "../src/lib/api";
-import { getNeedsYouItems, itemProject, orderFocusItems, trackedSubtasks } from "../src/lib/needsYou";
+import { getNeedsYouItems, isInMotion, itemProject, orderFocusItems, trackedSubtasks } from "../src/lib/needsYou";
 import { inProjectFilter } from "../src/lib/projectFilter";
 import { JiraPanel, jiraMoveHint, jiraMoveSummary, jiraNextAutomaticText, jiraPanelNotice, trackingBindingNotice } from "../src/views/Task";
 
@@ -342,4 +342,20 @@ test("itemProject resolves the project for every needs-you item kind", () => {
   // "All" (empty filter) keeps everything; a project filter keeps only its own.
   expect(items.filter((item) => inProjectFilter(itemProject(item, tasks), "")).length).toBe(4);
   expect(items.filter((item) => inProjectFilter(itemProject(item, tasks), "p2")).map((item) => item.kind)).toEqual(["decision"]);
+});
+
+// HIVE-541: the "N in motion" count on the Chat view used to total every task in
+// a work column, so mirrored tickets parked there read as work being done.
+test("in motion counts hive's own work, not tracking-only rows parked in a work column", () => {
+  const own = task("own", "in_progress");
+  const mirror = task("mirror", "in_progress", { source: "director", source_ref: "jira:WEB-7" });
+  const external = task("external", "in_review", { source: "external" });
+  const spawnedExternal = task("spawned", "in_progress", { source: "external", agent_target: "claude" });
+  const supervisor = task("chief", "in_progress", { source: "chat_supervisor" });
+  const queued = task("queued", "queued");
+
+  expect([own, mirror, external, spawnedExternal, supervisor, queued].filter(isInMotion).map((t) => t.id)).toEqual([
+    "own",
+    "spawned",
+  ]);
 });

@@ -86,6 +86,21 @@ export function isTrackingOnly(task: Pick<Task, "source" | "source_ref">): boole
   return task.source === "external" || isJiraMirror(task);
 }
 
+// Work hive is actually moving right now — what "N in motion" counts. A
+// tracking-only row (a mirrored ticket, another agent's board entry) parked in a
+// work column is deliberate: the real work runs under its children, and hive
+// never dispatches an agent for the row itself. Counting those told the director
+// six things were moving on corebeat when none of them were (HIVE-541). One a
+// director spawned by hand is real hive work and still counts — that is what
+// agent_target distinguishes, same test as taskNeedsAttention.
+const IN_MOTION_STATES = ["in_progress", "needs_decision", "in_review", "verifying"];
+
+export function isInMotion(task: Task): boolean {
+  if (task.source === "chat_supervisor") return false;
+  if (isTrackingOnly(task) && !task.agent_target) return false;
+  return IN_MOTION_STATES.includes(task.state);
+}
+
 // Tracking cards are containers, not execution owners. Plain tracked cards use
 // their direct children; Jira cards also group Hive work carrying the same
 // stable issue-key prefix (e.g. [WEB-7]). Retry chains stay owned by their

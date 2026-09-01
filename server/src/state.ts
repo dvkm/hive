@@ -887,13 +887,23 @@ export function transition(
   // that closed with nothing left to merge: the caller has already verified the
   // work landed on the base branch via a different commit, so the usual
   // in_review -> verifying -> done merge path doesn't apply.
+  // hive-1952: a tracking-only task has no review gate to satisfy. `ready` is
+  // refused for it (api.ts), so the forward path in_review -> verifying -> done
+  // is unreachable and in_review became a trap whose only exit was `cancelled` —
+  // which understates work that actually shipped. It has no PR and nothing to
+  // merge, so `done` is reachable directly from any non-terminal state.
+  const trackingOnlyDone = to === "done" && !TERMINAL.includes(from) && isTrackingOnlyTask(task);
   if (opts.force) {
     if (TERMINAL.includes(from)) throw new TransitionError(`task already terminal ('${from}')`);
-  } else if (!canTransition(from, to)) {
+  } else if (!trackingOnlyDone && !canTransition(from, to)) {
     // Agents jump straight to done often enough (4/16 sampled sessions) that
-    // the error should teach the path, not just reject.
-    const hint =
-      to === "done" && (from === "in_progress" || from === "in_review")
+    // the error should teach the path, not just reject. Never point a
+    // tracking-only task at `ready` or `requeue`: both are refused for it, and
+    // an error that names a forbidden call is how the in_review trap read as
+    // two guards blaming each other.
+    const hint = isTrackingOnlyTask(task)
+      ? ` — this task is tracking-only: hive tracks it but never runs an agent on it, so \`ready\` and \`requeue\` are refused. Close it with \`hive task move ${taskId} done\` (or \`cancelled\`).`
+      : to === "done" && (from === "in_progress" || from === "in_review")
         ? " — done is reached via review: emit `ready --pr-url <url>` (in_review), then the director merges (verifying -> done)"
         : to === "queued" && ["in_progress", "in_review", "verifying"].includes(from)
         ? `; to retry a live task, POST /api/tasks/${taskId}/requeue (fails and requeues atomically)`

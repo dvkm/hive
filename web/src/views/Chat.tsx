@@ -12,6 +12,7 @@ import { eventText } from "../lib/eventText";
 import { STATE_LABEL } from "../lib/labels";
 import { StatusDot, toast } from "../lib/ui";
 import { DecisionCard } from "./DecisionCard";
+import { isInMotion } from "../lib/needsYou";
 
 // One portfolio-wide Chief of Staff conversation appears on the home route and
 // in a persistent drawer elsewhere. Its replies and the director's echoed
@@ -291,7 +292,7 @@ function ChiefBriefing({
     if (item.kind === "quiz_digest") return true;
     return false;
   }).length;
-  const working = tasks.filter((task) => task.source !== "chat_supervisor" && ["in_progress", "needs_decision", "in_review", "verifying"].includes(task.state));
+  const working = tasks.filter(isInMotion);
   const finishedCount = since ? brief?.done.length ?? 0 : 0;
   const commitments = (thread?.commitments ?? []).filter((item) => !["done", "dropped"].includes(item.status));
   const headline = !brief
