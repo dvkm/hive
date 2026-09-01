@@ -15,9 +15,10 @@ const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x
 
 // gh answers `pr view` per url: a url the map does not know does not exist on
 // GitHub, which is exactly what the 1847 slip looked like (HIVE-595).
-function makeServer(prs: Record<string, string>) {
+function makeServer(prs: Record<string, string>, remote?: string) {
   const db = openDb(":memory:");
   const exec: Exec = async (argv) => {
+    if (remote && has(argv, "git", "remote", "get-url")) return OK(remote + "\n");
     if (has(argv, "gh", "pr", "view")) {
       const url = argv[argv.indexOf("view") + 1];
       const branch = prs[url];
@@ -180,4 +181,57 @@ test("a held handoff still records the agent's note", async () => {
   const note = s.db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'note' ORDER BY id DESC LIMIT 1").get(id) as any;
   expect(JSON.parse(note.payload).note).toContain("rebased and reopened");
   await s.server.stop(true);
+});
+
+test("a PR in another repo on a same-named branch is refused", async () => {
+  // Both repos on this board use hive/<task-id> branches, so the branch check
+  // alone would accept this one.
+  const s = makeServer(
+    {
+      "https://github.com/dvkm/hive/pull/141": "hive/mine",
+      "https://github.com/corebeatcokr/monorepo/pull/900": "hive/mine",
+    },
+    "git@github.com:dvkm/hive.git"
+  );
+  const id = await seed(s.base, s.db, "https://github.com/dvkm/hive/pull/141");
+
+  const r = await post(s.base, `/api/tasks/${id}/events`, {
+    type: "ready",
+    pr_url: "https://github.com/corebeatcokr/monorepo/pull/900",
+  });
+  expect(r.json.held).toBe(true);
+  expect(r.json.reason).toBe("pr_repo_mismatch");
+  expect(r.json.message).toContain("corebeatcokr/monorepo");
+  expect((s.db.query("SELECT pr_url FROM tasks WHERE id = ?").get(id) as any).pr_url).toBe(
+    "https://github.com/dvkm/hive/pull/141"
+  );
+  await s.server.stop(true);
+});
+
+test("a PR in this task's own repo still goes through when the remote is known", async () => {
+  const s = makeServer(
+    { "https://github.com/dvkm/hive/pull/141": "hive/mine", "https://github.com/dvkm/hive/pull/166": "hive/mine" },
+    "https://github.com/dvkm/hive.git"
+  );
+  const id = await seed(s.base, s.db, "https://github.com/dvkm/hive/pull/141");
+
+  const r = await post(s.base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://github.com/dvkm/hive/pull/166" });
+  expect(r.json.held).toBeUndefined();
+  expect(r.json.task.pr_url).toBe("https://github.com/dvkm/hive/pull/166");
+  await s.server.stop(true);
+});
+
+test("an unverifiable check marks the link instead of leaving it silent", async () => {
+  const db = openDb(":memory:");
+  const exec: Exec = async (argv) => (argv[0] === "gh" ? { code: 1, stdout: "", stderr: "gh: connection refused" } : OK());
+  const server = Bun.serve({ port: 0, fetch: makeHandler(db, { exec }) });
+  const base = `http://127.0.0.1:${server.port}`;
+  const id = await seed(base, db, "https://github.com/dvkm/hive/pull/141");
+
+  await post(base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://github.com/dvkm/hive/pull/166" });
+  const linked = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_linked' ORDER BY id DESC LIMIT 1")
+    .get(id) as any;
+  expect(JSON.parse(linked.payload).branch_unverified).toBe(true);
+  await server.stop(true);
 });

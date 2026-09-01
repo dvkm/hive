@@ -6682,13 +6682,36 @@ async function resumePointerMarkerHolds(db: DB, exec: Exec, ids: string[], prUrl
 // branch actually is, the same way the stale-evidence gate does, while the
 // agent is still in the turn that made the mistake.
 //
-// Fails OPEN. Only two answers are unambiguous enough to refuse on: GitHub says
-// there is no such PR, and GitHub says the PR sits on a different branch than
-// this task's. A gh that is broken, rate-limited or offline must not strand
-// every handoff in the fleet.
+// Fails OPEN. Only unambiguous answers refuse: the url names a different
+// repository than this task's project, GitHub says there is no such PR, or
+// GitHub says the PR sits on a different branch than this task's. A gh that is
+// broken, rate-limited or offline must not strand every handoff in the fleet.
 type PrHandoffCheck = { branch: string | null; unverifiable?: boolean; problem?: { reason: string; message: string } };
 
-async function checkPrHandoff(exec: Exec, prUrl: string, task: { branch?: string | null }): Promise<PrHandoffCheck> {
+// owner/repo, lowercased, out of either a PR url or a git remote. Branch alone
+// is not enough: both repos on this board name branches `hive/<task-id>`, so a
+// PR in the OTHER repo that happens to share a branch name would be accepted
+// and later merged with `gh pr merge <that url>`. Non-github.com remotes parse
+// to null and the repo check simply does not run.
+function repoSlug(s: string): string | null {
+  const m = /(?:github\.com[/:])([^/\s]+)\/([^/\s]+?)(?:\.git)?(?:[/#?]|$)/i.exec(s.trim());
+  return m ? `${m[1]}/${m[2]}`.toLowerCase() : null;
+}
+
+async function projectRepoSlug(db: DB, exec: Exec, projectId: string | null | undefined): Promise<string | null> {
+  if (!projectId) return null;
+  const project = db.query("SELECT repo_path FROM projects WHERE id = ?").get(projectId) as { repo_path?: string | null } | undefined;
+  if (!project?.repo_path) return null;
+  const r = await exec(["git", "-C", project.repo_path, "remote", "get-url", "origin"]).catch(() => null);
+  return r && r.code === 0 ? repoSlug(r.stdout) : null;
+}
+
+async function checkPrHandoff(
+  exec: Exec,
+  prUrl: string,
+  task: { branch?: string | null },
+  projectRepo: string | null
+): Promise<PrHandoffCheck> {
   const url = prUrl.trim();
   if (!/^https?:\/\//i.test(url))
     return {
@@ -6698,8 +6721,23 @@ async function checkPrHandoff(exec: Exec, prUrl: string, task: { branch?: string
         message: `Handoff held: --pr-url ${prUrl} is not a URL. Pass the full link to the pull request that carries this task's work, like https://github.com/<owner>/<repo>/pull/<number>.`,
       },
     };
+  const urlRepo = repoSlug(url);
+  if (projectRepo && urlRepo && urlRepo !== projectRepo)
+    return {
+      branch: null,
+      problem: {
+        reason: "pr_repo_mismatch",
+        message:
+          `Handoff held: ${prUrl} is a pull request in ${urlRepo}, but this task's project is ${projectRepo}. ` +
+          `Merging it would land someone else's work in the wrong repository. ` +
+          `Emit ready with the ${projectRepo} pull request for branch ${task.branch ?? "this task"}.`,
+      },
+    };
   const result = await exec(["gh", "pr", "view", url, "--json", "headRefName"]).catch(() => null);
-  if (!result) return { branch: null };
+  // gh threw or failed without saying the PR is missing: the check did not run,
+  // so say so. `pr_linked` with neither a branch nor `branch_unverified` cannot
+  // be told apart from a verified-but-branchless link by anyone reading it.
+  if (!result) return { branch: null, unverifiable: true };
   if (result.code !== 0) {
     const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
     // Only phrasing that unambiguously means "no such PR". A bare `not found`
@@ -6717,7 +6755,7 @@ async function checkPrHandoff(exec: Exec, prUrl: string, task: { branch?: string
             `This task's branch is ${task.branch ?? "not recorded"}: find or open its real PR, then emit ready again with that URL.`,
         },
       };
-    return { branch: null };
+    return { branch: null, unverifiable: true };
   }
   let branch: string | null = null;
   let unverifiable = false;
@@ -7006,7 +7044,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     // PR's head, not the stale branch from the rejected attempt.
     let prHold: { reason: string; message: string; branch: string | null } | null = null;
     if (prUrl && prUrl !== t.pr_url) {
-      const check = await checkPrHandoff(exec, prUrl, t);
+      const check = await checkPrHandoff(exec, prUrl, t, await projectRepoSlug(db, exec, t.project_id));
       if (check.problem) {
         // Held below, AFTER the note is written: an agent explaining its
         // handoff should not lose that explanation, the way the other ready
