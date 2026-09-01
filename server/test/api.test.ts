@@ -264,9 +264,11 @@ test("only a scheduled self-audit ship can finish report-only", async () => {
     expect((await localPost(`/api/tasks/${retry}/events`, { type: "evidence", kind: "report", note: "audit findings" })).status).toBe(201);
 
     expect((await localPost(`/api/tasks/${normal.json.id}/events`, { type: "done" })).status).toBe(409);
+    // The report-only self-audit is the one `done` emit hive still accepts, and
+    // even that lands in verifying: only the director closes a task (HIVE-604).
     const done = await localPost(`/api/tasks/${retry}/events`, { type: "done" });
     expect(done.status).toBe(200);
-    expect(done.json.task).toMatchObject({ state: "done", kind: "ship", source: "requeue", pr_url: null });
+    expect(done.json.task).toMatchObject({ state: "verifying", kind: "ship", source: "requeue", pr_url: null });
   }
 });
 
@@ -623,7 +625,8 @@ test("checkpoints survive task completion; cancelled tasks drop out", async () =
   // finish the task (evidence so done passes the gate)
   await post(`/api/tasks/${t.json.id}/events`, { type: "evidence", kind: "log", note: "proof" });
   await post(`/api/tasks/${t.json.id}/transition`, { to: "in_review" });
-  await post(`/api/tasks/${t.json.id}/transition`, { to: "verifying" }); // auto-advances to done
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "verifying" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "done" }); // the director accepts it
   let open = await get("/api/checkpoints");
   const mine = open.json.checkpoints.find((c: any) => c.id === e1.json.event.id);
   expect(mine).toBeTruthy();
@@ -829,7 +832,7 @@ test("ready emit refreshes stale branch metadata for an already-linked PR", asyn
 // `unmergeable` is the agent's self-service terminal path: hive verifies the
 // cited commit against the base branch (via a real `git fetch` + `merge-base
 // --is-ancestor`) before granting `done` without the normal merge step.
-test("unmergeable emit closes the task once the landing commit is verified on the base branch", async () => {
+test("unmergeable emit hands the task to the director once the landing commit is verified on the base branch", async () => {
   const { execFileSync } = await import("node:child_process");
   const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" });
 
@@ -882,7 +885,8 @@ test("unmergeable emit closes the task once the landing commit is verified on th
     note: "PR had nothing left to merge; work landed via a different PR",
   });
   expect(r.status).toBe(200);
-  expect(r.json.task.state).toBe("done");
+  // Verified as landed, but still not closed: the director accepts it (HIVE-604).
+  expect(r.json.task.state).toBe("verifying");
 
   const events = await get(`/api/tasks/${id}/events`);
   expect(events.json.some((e: any) => e.type === "unmergeable" && e.payload.landing_commit === landingCommit)).toBe(true);
@@ -994,11 +998,19 @@ test("evidence kind is inferred from the uploaded file's extension", async () =>
   expect((await res.json()).evidence.kind).toBe("report");
 });
 
-test("task reaches done once evidence exists (verifying auto-advances: no smoke configured)", async () => {
+test("a merged task stops in verifying, and the director's move is what closes it", async () => {
   await post(`/api/tasks/${taskId}/transition`, { to: "in_review" });
-  // verifying with evidence attached and no smoke configured auto-advances
-  // straight to done (smokeThenAdvance) — no separate done transition needed.
-  const done = await post(`/api/tasks/${taskId}/transition`, { to: "verifying" });
+  // Merging no longer closes anything, with or without smoke checks: the task
+  // waits in verifying for a person to say it is done (HIVE-604).
+  const verifying = await post(`/api/tasks/${taskId}/transition`, { to: "verifying" });
+  expect(verifying.status).toBe(200);
+  expect(verifying.json.state).toBe("verifying");
+
+  const agent = await post(`/api/tasks/${taskId}/transition`, { to: "done", source: "agent" });
+  expect(agent.status).toBe(409);
+  expect((await get(`/api/tasks/${taskId}`)).json.state).toBe("verifying");
+
+  const done = await post(`/api/tasks/${taskId}/transition`, { to: "done" });
   expect(done.status).toBe(200);
   expect(done.json.state).toBe("done");
 });

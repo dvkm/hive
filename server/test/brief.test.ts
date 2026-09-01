@@ -42,7 +42,9 @@ beforeAll(async () => {
   await post(`/api/tasks/${doneOld}/transition`, { to: "in_review" });
   await post(`/api/tasks/${doneOld}/transition`, { to: "verifying" });
   addEvidence(doneOld);
-  await post(`/api/tasks/${doneOld}/events`, { type: "done", note: "old summary" });
+  db.query("UPDATE tasks SET summary = ? WHERE id = ?").run("old summary", doneOld);
+  // The director's move is the only thing that closes a task now (HIVE-604).
+  await post(`/api/tasks/${doneOld}/transition`, { to: "done" });
 
   // ---- a failed task awaiting triage ----
   failedId = (await post("/api/tasks", { project_id: projectId, title: "Broken task" })).json.id;
@@ -99,7 +101,8 @@ beforeAll(async () => {
   await post(`/api/tasks/${doneNew}/transition`, { to: "verifying" });
   addEvidence(doneNew);
   addEvidence(doneNew);
-  await post(`/api/tasks/${doneNew}/events`, { type: "done", note: "new summary" });
+  db.query("UPDATE tasks SET summary = ? WHERE id = ?").run("new summary", doneNew);
+  await post(`/api/tasks/${doneNew}/transition`, { to: "done" });
 
   db.query("INSERT INTO usage (id, task_id, ts, model, input_tokens, output_tokens, cache_read_tokens, cost_usd, source) VALUES (?,?,?,?,?,?,?,?,?)")
     .run(newId("use"), doneNew, now(), "claude-opus-4-1", 5000, 900, 100, 0.5, "agent");

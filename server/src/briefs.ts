@@ -306,7 +306,7 @@ cause and run it again, or emit \`blocked\` explaining why it cannot pass.`;
 
 function definitionOfDone(db: DB, task: { id: string; kind: string; source?: string | null }): string {
   if (isSelfAuditLineage(db, task)) {
-    return "## Definition of done\nIf the audit finds no safe material improvement, attach the findings as report evidence and emit `done` without changing code. Otherwise, merge one evidence-backed optimization through the normal ship path.";
+    return "## Definition of done\nIf the audit finds no safe material improvement, attach the findings as report evidence and emit `done` without changing code — that hands the report to the director to verify, it does not close the task. Otherwise, merge one evidence-backed optimization through the normal ship path.";
   }
   if (task.kind === "scout") {
     return "## Definition of done\nA written report captured as evidence (kind=report) that answers the question. No code changes required.";

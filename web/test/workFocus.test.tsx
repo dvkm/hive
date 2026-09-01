@@ -139,3 +139,22 @@ test("the held line survives a server that answers without a held field", () => 
   expect(heldLine({ scouts: 1, watchers: 0 })).toContain("Holding 1 scout —");
   expect(heldLine({ scouts: 2, watchers: 1 })).toContain("Holding 2 scouts and 1 watched change");
 });
+
+// HIVE-604: hive never closes a task, so everything that merges stops in
+// `verifying` and that column becomes the director's queue. The row has to be
+// worth acting on from the phone: what landed, and one button to accept it.
+test("a merged task waiting to be verified is a needs-you row with an Accept button", () => {
+  const merged = task("t9", {
+    state: "verifying",
+    ci_status: "passing",
+    pr_url: "https://github.com/example/repo/pull/123",
+  });
+  const html = render([merged]);
+
+  expect(html).toContain('class="focus-lane-count">1<');
+  expect(html).toContain("Verify");
+  expect(html).toContain("Merged #123, tests green — check it, then accept");
+  expect(html).toContain("Accept");
+  // It is the director's, not something hive is still handling.
+  expect(html).not.toContain("status-row");
+});

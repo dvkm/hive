@@ -256,7 +256,16 @@ async function main() {
     if (sub === "move") {
       const [taskId, to] = _;
       if (!taskId || !to) die("usage: hive task move <task-id> <state> [--note <s>]");
-      const t = await api("POST", `/api/tasks/${taskId}/transition`, { to, reason: flags.note, until: flags.until, days: flags.days });
+      // Same attribution the CLI already uses for `task create`: under a hive
+      // agent (HIVE_TASK_ID is set) this is an agent move, not the director's.
+      // The server refuses `done` from anything but the director (HIVE-604).
+      const t = await api("POST", `/api/tasks/${taskId}/transition`, {
+        to,
+        reason: flags.note,
+        until: flags.until,
+        days: flags.days,
+        source: process.env.HIVE_TASK_ID ? "agent" : undefined,
+      });
       // A parked task stays in_progress in the DB, so echo what actually happened.
       const parked = t.deferred_until && Date.parse(t.deferred_until) > Date.now();
       console.log(`task ${t.id} -> [${parked ? "deferred" : t.state}]  ${t.title}`);

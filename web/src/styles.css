@@ -6636,6 +6636,21 @@ a.chip-jira:hover { background: #2d5488; }
   letter-spacing: 0.04em;
   color: var(--accent);
 }
+.focus-row-wrap {
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+}
+.focus-row-wrap .focus-row {
+  flex: 1;
+  min-width: 0;
+}
+.focus-accept {
+  flex-shrink: 0;
+}
+.focus-kind-verify {
+  color: var(--green);
+}
 .focus-kind-issue {
   color: var(--red);
 }

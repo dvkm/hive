@@ -98,7 +98,9 @@ test("a dependency landing (verifying/done) moves its dependent from 'waiting' b
     []
   );
 
-  expect(items.map((item) => item.kind)).toEqual(["attention"]);
+  // The blocker sits in `verifying` waiting for the director, so it is a
+  // needs-you item in its own right now (HIVE-604) alongside the unblocked task.
+  expect(items.map((item) => item.kind)).toEqual(["verify", "attention"]);
 });
 
 test("a task blocked only by dead dependencies needs attention instead of waiting", () => {

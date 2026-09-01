@@ -383,6 +383,18 @@ function focusRow(item: NeedsYouItem): { kind: string; to: string; label: string
         detail: item.task.ci_status === "passing" ? "Tests green — yours to merge" : "Ready for your review",
         ts: item.task.needs_you_since ?? item.task.updated_at,
       };
+    // hive stops here and never closes a task itself (HIVE-604), so this row is
+    // the whole handover: what landed, what checked out, and Accept to close it.
+    case "verify":
+      return {
+        kind: "Verify",
+        to: `/tasks/${item.task.id}`,
+        label: label(item.task),
+        detail: prNumber(item.task.pr_url)
+          ? `Merged #${prNumber(item.task.pr_url)}${item.task.ci_status === "passing" ? ", tests green" : ""} — check it, then accept`
+          : "Landed — check it, then accept",
+        ts: item.task.needs_you_since ?? item.task.updated_at,
+      };
     default:
       return {
         kind: "Issue",
@@ -394,6 +406,34 @@ function focusRow(item: NeedsYouItem): { kind: string; to: string; label: string
   }
 }
 
+function prNumber(prUrl: string | null): string {
+  return String(prUrl ?? "").match(/\/pull\/(\d+)/)?.[1] ?? "";
+}
+
+// The one action a verify row needs: the director has looked, so close it.
+// This is the ONLY way a task reaches done — nothing in hive moves it there.
+function AcceptButton({ task }: { task: Task }) {
+  const [busy, setBusy] = useState(false);
+  const accept = async (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setBusy(true);
+    try {
+      await api.transition(task.id, "done", "verified by the director");
+      toast(`${taskLabel(task)} accepted`);
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <button className="btn btn-primary focus-accept" onClick={accept} disabled={busy} title="Mark this verified and close it">
+      {busy ? "…" : "Accept"}
+    </button>
+  );
+}
+
 function FocusRow({ item }: { item: NeedsYouItem }) {
   const location = useLocation();
   const row = focusRow(item);
@@ -402,13 +442,22 @@ function FocusRow({ item }: { item: NeedsYouItem }) {
   // any other path keeps the board rendered underneath and nothing on top, so
   // the click looks like it did nothing.
   const modal = row.to.startsWith("/tasks/");
-  return (
+  const link = (
     <Link className="focus-row" to={row.to} state={modal ? { backgroundLocation: location } : undefined}>
       <span className={`focus-kind focus-kind-${row.kind.toLowerCase().replace(" ", "-")}`}>{row.kind}</span>
       <span className="focus-label">{row.label}</span>
       <span className="focus-detail">{row.detail}</span>
       <span className="focus-age">{age}</span>
     </Link>
+  );
+  // A button inside an <a> is not valid HTML, so the accept action sits beside
+  // the row rather than inside it.
+  if (item.kind !== "verify") return link;
+  return (
+    <div className="focus-row-wrap">
+      {link}
+      <AcceptButton task={item.task} />
+    </div>
   );
 }
 
@@ -479,10 +528,10 @@ export function WorkFocus({ visible }: { visible: Task[] }) {
   const projectFilter = useProjectFilter();
   const items = orderFocusItems(actionableItems(needsYou, tasks, projectFilter), tasks);
   // What agents are actually on. Queued work is not being handled by anyone, so
-  // it is a single count, not thirty rows.
-  const handling = visible.filter(
-    (task) => !isTrackingOnly(task) && ["in_progress", "verifying"].includes(task.state)
-  );
+  // it is a single count, not thirty rows. `verifying` left this lane with
+  // HIVE-604: nothing is handling it, it is waiting on the director, and it is
+  // already a needs-you row above.
+  const handling = visible.filter((task) => !isTrackingOnly(task) && task.state === "in_progress");
   // In review but not yours yet: CI still running, review pass not finished.
   // Visible, deliberately not counted — the actionable ones are already above.
   const pending = visible.filter(
@@ -634,8 +683,8 @@ export default function Board() {
       ) : view === "columns" ? (
         <>
           {verifying.length > 0 && (
-            <section className="verification-strip" aria-label="Post-merge checks">
-              <span className="verification-title">Post-merge checks</span>
+            <section className="verification-strip" aria-label="Waiting for you to verify">
+              <span className="verification-title">Waiting for you to verify</span>
               {verifying.map((task) => (
                 <Link className="verification-item" to={`/tasks/${task.id}`} key={task.id}>
                   <StatusDot state={task.state} health={task.health} />

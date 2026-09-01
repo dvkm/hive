@@ -90,8 +90,10 @@ test("the mirror follows the work at every step, not just the end", async () => 
   expect(getTask(db, m).state).toBe("in_review");
   expect(mirrorStateChanges(m)).toBe(before);
 
+  // HIVE-604: the ticket stops at verifying too. A child reaching done means the
+  // director accepted that child, not that they looked at the ticket.
   transition(db, id, "done", { source: "director" });
-  expect(getTask(db, m).state).toBe("done");
+  expect(getTask(db, m).state).toBe("verifying");
 });
 
 test("a mirror with no live children is left where it is", async () => {
@@ -124,7 +126,7 @@ test("a mirror with several work children waits for all of them", async () => {
   transition(db, c, "cancelled", { source: "director" });
   expect(getTask(db, m).state).toBe("in_review");
   finish(b);
-  expect(getTask(db, m).state).toBe("done");
+  expect(getTask(db, m).state).toBe("verifying");
 });
 
 test("the link survives a requeue, and the failed attempt does not close the ticket", async () => {
@@ -139,7 +141,7 @@ test("the link survives a requeue, and the failed attempt does not close the tic
   const second = requeueTask(db, getTask(db, first));
   expect(getTask(db, second).jira_mirror_task_id).toBe(m);
   finish(second);
-  expect(getTask(db, m).state).toBe("done");
+  expect(getTask(db, m).state).toBe("verifying");
 });
 
 test("the catch-up sweep advances mirrors whose work finished unlinked", async () => {
@@ -154,7 +156,7 @@ test("the catch-up sweep advances mirrors whose work finished unlinked", async (
 
   db.query("UPDATE tasks SET jira_mirror_task_id = ? WHERE id = ?").run(m, id);
   expect(advanceReadyJiraMirrors(db)).toBe(1);
-  expect(getTask(db, m).state).toBe("done");
+  expect(getTask(db, m).state).toBe("verifying");
   expect(advanceReadyJiraMirrors(db)).toBe(0); // idempotent
 });
 
@@ -207,4 +209,20 @@ test("an unlinked task that already carries the prefix heals on the next edit", 
   }))).json();
   expect(healed.jira_mirror_task_id).toBe(m);
   expect(healed.jira_mirror_relinked).toEqual({ from: null, to: m });
+});
+
+// HIVE-604: hive never closes a Jira mirror on its own either. The mirror is
+// routed through transition(), so the director-only rule on `done` covers it.
+test("hive cannot close a mirror; the director can", async () => {
+  const m = mirror("WEB-130");
+  const id = (await post("/api/tasks", { project_id: projectId, title: "[WEB-130] the only child" })).json.id;
+  finish(id);
+  expect(getTask(db, m).state).toBe("verifying");
+
+  expect(() => transition(db, m, "done", { source: "reconciler" })).toThrow(/only the director/);
+  expect(() => transition(db, m, "done", { source: "agent", force: true })).toThrow(/only the director/);
+  expect(getTask(db, m).state).toBe("verifying");
+
+  transition(db, m, "done", { source: "director" });
+  expect(getTask(db, m).state).toBe("done");
 });

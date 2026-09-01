@@ -30,6 +30,17 @@ export type State = (typeof STATES)[number];
 
 export const TERMINAL: State[] = ["done", "failed", "cancelled"];
 
+// The sources that mean "a person did this": the web UI, the CLI when it is not
+// running under a hive agent, and anything explicitly attributed to the
+// director. Everything else — "agent", "system", "reconciler",
+// "chat_supervisor" — is hive acting on its own. api.ts reuses this list so
+// there is one definition of the director, not two.
+export const DIRECTOR_SOURCES = ["director", "web", "cli"];
+export function isDirector(source: string | null | undefined): boolean {
+  const s = String(source ?? "").trim();
+  return s === "" || DIRECTOR_SOURCES.includes(s);
+}
+
 // Defined in supervision.ts (one definition, derived from isExternalTask).
 // Re-exported here because the existing callers import it from state.
 export { isTrackingOnlyTask };
@@ -64,6 +75,8 @@ const FORWARD: Record<State, State[]> = {
   needs_decision: ["in_progress", "queued"],
   in_review: ["verifying", "in_progress"], // in_progress = captain requested changes
 
+  // done is reachable ONLY from verifying, and only when a person asks for it.
+  // See DONE_IS_DIRECTOR_ONLY below: hive never closes its own work.
   verifying: ["done", "in_progress"], // failed smoke checks bounce back
   done: [],
   failed: ["queued"], // re-queue a failed task for another attempt (attention tray)
@@ -997,7 +1010,7 @@ export function transition(
     const hint = isTrackingOnlyTask(task)
       ? ` — this task is tracking-only: hive tracks it but never runs an agent on it, so \`ready\` and \`requeue\` are refused. Close it with \`hive task move ${taskId} done\` (or \`cancelled\`).`
       : to === "done" && (from === "in_progress" || from === "in_review")
-        ? " — done is reached via review: emit `ready --pr-url <url>` (in_review), then the director merges (verifying -> done)"
+        ? " — done is reached via review: emit `ready --pr-url <url>` (in_review), then the director merges (verifying) and accepts it (done)"
         : to === "queued" && ["in_progress", "in_review", "verifying"].includes(from)
         ? `; to retry a live task, POST /api/tasks/${taskId}/requeue (fails and requeues atomically)`
         : "";
@@ -1017,6 +1030,21 @@ export function transition(
           `Run each command from the task's verification contract and attach its output with ` +
           `\`hive emit ${taskId} evidence --verify-name <name> --file <output>\`, then hand off again.`
       );
+  }
+
+  // HIVE-604, director instruction 2026-09-01: "hive should never move things to
+  // done. Only the designer should do it after they verify it." A merge takes a
+  // task to `verifying` and it stops there until a person accepts it.
+  //
+  // Enforced HERE because transition() is the one funnel every close went
+  // through: the smoke monitor, the reconciler's tracking-only close, an agent's
+  // `hive emit ... done`, and the unmergeable escape hatch. `force` does NOT lift
+  // it — that flag skips the shape of the path, not the requirement for a human.
+  if (to === "done" && !isDirector(source)) {
+    throw new TransitionError(
+      `only the director moves a task to 'done' (source was '${source}'). ` +
+        `hive stops at 'verifying' and waits for a person to verify the work.`
+    );
   }
 
   // Evidence gates apply to hive-driven work. Tracking-only tasks (source
@@ -1099,7 +1127,10 @@ export function transition(
   // A task landing in review is waiting on the director and nobody else: the
   // agent is parked until it is approved, sent back, or its understanding check
   // is answered. That is urgent by definition, not digest material.
-  else if (to === "in_review")
+  // A tracking-only row has no PR, no review and no understanding check, so the
+  // review prompt below would be false. It reaches in_review only as a Jira
+  // mirror following its children (advanceJiraMirror).
+  else if (to === "in_review" && !isTrackingOnlyTask(task))
     enqueue(db, {
       kind: "review",
       urgency: "urgent",
@@ -1125,9 +1156,10 @@ export function transition(
 // nothing to push. Advancing the mirror here is what makes that push fire.
 //
 // The mirror shows the MOST ADVANCED live child: the first child to start puts
-// the ticket In Progress, the first to reach review puts it In Review. It goes
-// terminal only when EVERY linked child has finished and at least one finished
-// as `done`: a ticket with ten sub-tasks must not close on the first one.
+// the ticket In Progress, the first to reach review puts it In Review. It moves
+// to `verifying` only when EVERY linked child has finished and at least one
+// finished as `done`: a ticket with ten sub-tasks must not close on the first
+// one. It never moves to `done` itself — HIVE-604, that is the director's.
 // failed and cancelled children are ignored — a failed attempt is a dead row,
 // and its requeued successor carries the link and blocks the mirror while it is
 // still live.
@@ -1140,18 +1172,24 @@ export function transition(
 // Backwards is therefore never written, including for a failed child: `failed`
 // has no Jira status at all (STATE_TO_JIRA), so there is nothing to move to.
 //
-// The write bypasses the FORWARD map on purpose (queued -> done is not an edge
-// hive work may take): a mirror is tracking-only, and jira sync already moves it
-// this way (applyJiraState).
+// The write goes through transition() with `force`, which bypasses the FORWARD
+// map on purpose (queued -> in_review is not an edge hive work may take): a
+// mirror is tracking-only, and jira sync already moves it this way
+// (applyJiraState). Every other transition() guard still applies.
 
-// Board order, for "most advanced" and for forward-only. Ranks are Jira's
-// columns, so in_review and verifying deliberately tie (see STATE_TO_JIRA).
+// Board order, for "most advanced" and for forward-only. in_review and
+// verifying are the same Jira column ("In Review", see STATE_TO_JIRA), but they
+// are NOT the same thing to hive: verifying is the director's accept queue, and
+// a mirror has to be able to enter it from in_review. Ranking verifying above
+// in_review is what allows that one move. It costs nothing in Jira: the sync
+// compares in Jira-status space (decideStatusSync), so a mirror going
+// in_review -> verifying pushes no second "In Review" transition.
 const MIRROR_RANK: Partial<Record<State, number>> = {
   queued: 0,
   in_progress: 1,
   in_review: 2,
-  verifying: 2,
-  done: 3,
+  verifying: 3,
+  done: 4,
 };
 
 // What a LIVE work child means for the ticket. A child that has not started
@@ -1181,8 +1219,12 @@ export function advanceJiraMirror(db: DB, mirrorId: string, source: string): voi
     // A mirror whose children are all finished but none done (every attempt
     // failed or was cancelled) is left exactly where it is.
     if (!children.some((c) => c.state === "done")) return;
-    to = "done";
-    reason = `all hive work for ${mirror.jira_key} is done`;
+    // NOT done: verifying. HIVE-604 reserves `done` for the director, and a
+    // mirror is no exception. A child reaching done means the director accepted
+    // THAT child; it does not mean they looked at the ticket, which is the
+    // thing being tracked. So the mirror joins the same accept queue and waits.
+    to = "verifying";
+    reason = `all hive work for ${mirror.jira_key} is done — waiting for the director to close the ticket`;
   } else {
     for (const c of live) {
       const shows = CHILD_SHOWS[c.state];
@@ -1195,16 +1237,18 @@ export function advanceJiraMirror(db: DB, mirrorId: string, source: string): voi
   // Forward only: never undo a human's column, never repeat one Jira status.
   if (MIRROR_RANK[to]! <= (MIRROR_RANK[mirror.state as State] ?? 0)) return;
 
-  const updated = mutateWithEvent(db, () => {
-    db.query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?").run(to, now(), mirrorId);
-    return getTask(db, mirrorId);
-  }, {
-    task_id: mirrorId,
-    source,
-    type: "state_change",
-    payload: { from: mirror.state, to, reason },
-  });
-  broadcastTask(db, updated);
+  // Through transition(), like every other state move, so the one guard that
+  // reserves `done` for the director covers this path too. `force` skips the
+  // FORWARD graph on purpose — queued -> in_review is not an edge hive work may
+  // take, but a mirror is tracking-only and jira sync already moves it that way
+  // (applyJiraState). force does NOT lift the director-only rule.
+  // A refusal here must not break the child's own transition, which has already
+  // been written: log it and leave the mirror where it is.
+  try {
+    transition(db, mirrorId, to, { source, reason, force: true });
+  } catch (e) {
+    console.error(`[hive] jira mirror ${mirror.jira_key} -> ${to}:`, e instanceof Error ? e.message : e);
+  }
 }
 
 // Catch-up sweep for mirrors whose work finished before anything propagated

@@ -798,7 +798,16 @@ test("the ticket moves to In Progress and In Review while the work is in flight"
   expect(statusNow()).toBe("In Review");
   expect(transitionPosts()).toBe(posted);
 
+  // HIVE-604: the work finishing takes the MIRROR to verifying, not done, so
+  // Jira stays In Review. hive never writes Done by itself.
   transition(db, workId, "done", { source: "director" });
+  nudge();
+  await run(db, projectId, jira.fetchImpl);
+  expect(statusNow()).toBe("In Review");
+  expect(tasks(db).find((t) => t.id === mirrorId)!.state).toBe("verifying");
+
+  // The director closing the mirror is what writes Done.
+  transition(db, mirrorId, "done", { source: "director" });
   nudge();
   await run(db, projectId, jira.fetchImpl);
   expect(statusNow()).toBe("Done");
@@ -836,6 +845,12 @@ test("a ticket with two work tasks only reaches Done when both are done", async 
   transition(db, work[1], "verifying", { source: "director" });
   transition(db, work[1], "done", { source: "director" });
   bump(db, mirrorId, 2);
+  await run(db, projectId, jira.fetchImpl);
+  // Both children done moves the mirror to verifying, which is still "In
+  // Review" to Jira (HIVE-604). Only the director closing the mirror writes Done.
+  expect(jira.byKey.get("WEB-1")!.status).toBe("In Review");
+  transition(db, mirrorId, "done", { source: "director" });
+  bump(db, mirrorId, 3);
   await run(db, projectId, jira.fetchImpl);
   expect(jira.byKey.get("WEB-1")!.status).toBe("Done");
 });

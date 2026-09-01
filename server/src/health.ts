@@ -297,7 +297,7 @@ export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null
     task.state === "failed"
       ? ((db.query("SELECT id FROM tasks WHERE parent_task_id = ? AND source = 'requeue' LIMIT 1").get(task.id) as any)?.id ?? null)
       : null;
-  const needs_you_since = ["in_review", "failed"].includes(task.state)
+  const needs_you_since = ["in_review", "verifying", "failed"].includes(task.state)
     ? task.needs_you_since ?? (db.query(
         "SELECT MAX(ts) AS ts FROM events WHERE task_id = ? AND type = 'state_change' AND json_extract(payload, '$.to') = ?"
       ).get(task.id, task.state) as { ts: string | null }).ts ?? task.updated_at
