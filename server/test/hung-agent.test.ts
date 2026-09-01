@@ -145,3 +145,42 @@ test("the agent speaking again re-arms the signal", async () => {
   expect(rows.length).toBe(2);
   expect(JSON.parse(rows[1].payload).last_said).toContain("back, running the tests");
 });
+
+// HIVE-615: a verifying task is parked on the DIRECTOR. It has no agent and no
+// pane, so "the agent is still holding this task" is false and the urgent alert
+// sent the director to fail+requeue work that had already merged.
+test("a verifying task quiet past the threshold is never hung or stale — an in_progress one still is", async () => {
+  const { db, projectId } = freshDb();
+  const parked = makeTask(db, projectId);
+  const working = makeTask(db, projectId);
+  db.query("UPDATE tasks SET state = 'verifying' WHERE id = ?").run(parked);
+  wedged(db, parked, 12 * 60 * 60 * 1000);
+  wedged(db, working, 12 * 60 * 60 * 1000);
+
+  await reconcileOnce(db, deps);
+
+  const flagged = (id: string, type: string) =>
+    !!db.query("SELECT 1 FROM events WHERE task_id = ? AND type = ?").get(id, type);
+  const notified = (id: string, kind: string) =>
+    !!db.query("SELECT 1 FROM notifications WHERE task_id = ? AND kind = ?").get(id, kind);
+
+  expect(flagged(parked, "hung")).toBe(false);
+  expect(notified(parked, "hung_agent")).toBe(false);
+  expect(notified(parked, "stale")).toBe(false);
+
+  expect(flagged(working, "hung")).toBe(true);
+  expect(notified(working, "hung_agent")).toBe(true);
+});
+
+// The binding, not just the state: an in_progress task whose agent was already
+// cleared has nobody holding it either, so the "still holding" wording is wrong.
+test("an in_progress task with no agent bound is not reported hung", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  db.query("UPDATE tasks SET agent_target = NULL WHERE id = ?").run(id);
+  wedged(db, id, 12 * 60 * 60 * 1000);
+
+  await reconcileOnce(db, deps);
+
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'hung'").get(id)).toBeFalsy();
+});
