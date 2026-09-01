@@ -20,6 +20,8 @@ import {
   missingVerifications,
   evidenceCount,
   evidenceAtSha,
+  latestEvidenceSha,
+  restampEvidence,
   changesRequestUnaddressed,
   decisionAnswerUnaddressed,
   isDeferred,
@@ -6411,6 +6413,56 @@ async function headSha(exec: Exec, cwd: string | null): Promise<string | null> {
   }
 }
 
+// Is the attached evidence still about the code at the current commit?
+//
+// Evidence is stamped with the worktree HEAD at capture time. A later commit
+// moves HEAD, so the stamp no longer matches and the artifact reads as stale.
+// Two things soften that (HIVE-574):
+//   * An identical tree at both commits means the code the evidence describes
+//     did not change (an amend, a rewritten history, an empty commit). The
+//     evidence is re-stamped onto the new commit instead of the agent being
+//     sent back to re-run a check with the same result.
+//   * When it IS stale, the caller gets both SHAs so it can say which commit
+//     the evidence is for and which one the branch is at.
+// Fails open (fresh) when there is no worktree or git cannot answer, the same
+// stance as the CI probe: broken git must not strand every handoff.
+type Freshness = { stale: false } | { stale: true; head: string; evidenceSha: string | null };
+
+async function evidenceFreshness(db: DB, exec: Exec, t: any): Promise<Freshness> {
+  const head = await headSha(exec, t.worktree_path);
+  if (!head) return { stale: false };
+  if (evidenceAtSha(db, t.id, head) >= 1) return { stale: false };
+  const evidenceSha = latestEvidenceSha(db, t.id);
+  if (evidenceSha && /^[0-9a-f]{7,40}$/i.test(evidenceSha)) {
+    const same = await exec(["git", "diff", "--quiet", evidenceSha, head], { cwd: t.worktree_path });
+    if (same.code === 0) {
+      const moved = restampEvidence(db, t.id, evidenceSha, head);
+      writeEvent(db, {
+        task_id: t.id,
+        source: "system",
+        type: "evidence_restamped",
+        payload: { from: evidenceSha, to: head, count: moved, reason: "same tree" },
+      });
+      return { stale: false };
+    }
+  }
+  return { stale: true, head, evidenceSha };
+}
+
+const shortSha = (sha: string | null) => (sha ? sha.slice(0, 7) : null);
+
+// One wording for both places that refuse stale evidence, so an agent reads the
+// same instruction whether it is refused at review time or at handoff time.
+function staleEvidenceMessage(taskId: string, head: string, evidenceSha: string | null, lead: string): string {
+  const from = shortSha(evidenceSha);
+  return (
+    `${lead} Your evidence is for ${from ? `commit ${from}` : "an earlier commit"}, the branch is at commit ${shortSha(head)}. ` +
+    `Re-run the check against the current commit and attach the result: ` +
+    `hive emit ${taskId} evidence --file ... --note ... . Then emit again. ` +
+    `You do not need a respawn for this.`
+  );
+}
+
 // hive-487: does `prUrl` still carry a `hive-task:` marker (or `[hive-<n>]`
 // title prefix) naming one of `ids`? Used to gate resume-pointer adoption at
 // dispatch time — the one place a stale/migrated pr_url would otherwise get
@@ -6745,18 +6797,28 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       // written report, not commit-bound screenshots, so they're exempt. Fails
       // open when there's no worktree / git can't resolve HEAD.
       if (!needsReport) {
-        const head = await headSha(exec, t.worktree_path);
-        if (head && evidenceAtSha(db, taskId, head) < 1) {
-          writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { reason: "stale_evidence", head_sha: head } });
+        const fresh = await evidenceFreshness(db, exec, t);
+        if (fresh.stale) {
+          const message = staleEvidenceMessage(taskId, fresh.head, fresh.evidenceSha, "Handoff held.");
+          writeEvent(db, {
+            task_id: taskId,
+            source,
+            type: "ready_held",
+            payload: {
+              reason: "stale_evidence",
+              head_sha: fresh.head,
+              evidence_sha: fresh.evidenceSha,
+              action: "re-capture evidence at the current commit, then emit ready again",
+            },
+          });
           broadcastTask(db, getTask(db, taskId));
           return json({
             held: true,
             reason: "stale_evidence",
-            head_sha: head,
-            message:
-              `Handoff held: your attached evidence is from an earlier commit, not the current one (${head.slice(0, 7)}). ` +
-              `Re-capture against the latest commit — a fresh test run or log for server/back-end changes, ` +
-              `a screenshot for UI — and attach it (hive emit ${taskId} evidence --file ... --note ...), then emit ready again.`,
+            head_sha: fresh.head,
+            evidence_sha: fresh.evidenceSha,
+            action: "re-capture evidence at the current commit, then emit ready again",
+            message,
           });
         }
       }
@@ -6850,6 +6912,29 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
   // strings via multipart. Anything else is dropped; an empty summary is a 400
   // so a mis-shaped submission fails loudly instead of storing {note:null}.
   if (type === "review_summary") {
+    // Fail early, while the agent is still on its turn (HIVE-574). Agents
+    // routinely file a review and then push, which leaves the evidence behind
+    // the branch; the handoff is refused minutes later, when the turn is over
+    // and only a respawn can deliver the news. Refusing the review itself uses
+    // the SAME test the handoff gate applies, just sooner and while someone is
+    // there to act on it. Scouts hand off a written report, not commit-bound
+    // artifacts, so they are exempt — as is a task with no evidence yet, which
+    // the handoff gate answers with `no_evidence`.
+    const rt = getTask(db, taskId);
+    if (rt?.state === "in_progress" && rt.kind !== "scout" && latestEvidenceSha(db, taskId)) {
+      const fresh = await evidenceFreshness(db, exec, rt);
+      if (fresh.stale)
+        return json(
+          {
+            error: staleEvidenceMessage(taskId, fresh.head, fresh.evidenceSha, "Review not recorded."),
+            reason: "stale_evidence",
+            head_sha: fresh.head,
+            evidence_sha: fresh.evidenceSha,
+            action: "re-capture evidence at the current commit, then emit review_summary again",
+          },
+          409
+        );
+    }
     const pick = (k: string): unknown[] | undefined => {
       const v = (fields as any)[k];
       if (Array.isArray(v)) return v;

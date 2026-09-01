@@ -42,6 +42,9 @@ landing commit:
 
 Rules:
 - Emit status before commands expected to exceed a minute.
+- Commit and push FIRST, then attach evidence, review, and \`ready\`. Evidence is
+  tied to the commit it was captured on, so a push after it leaves it behind and
+  the handoff is refused. If you do push again, re-capture the evidence.
 - Attach evidence before \`ready\`: screenshots for visual work, test output
   otherwise. Scout tasks require a report. A task never reaches Done without evidence.
 - Hand off with \`ready\` when the PR is open. If CI is pending, END THE TURN;

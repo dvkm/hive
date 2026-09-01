@@ -1136,3 +1136,39 @@ export function lastAgentActivity(db: DB, taskId: string): string | null {
     .get(taskId, ...AGENT_EVENT_SOURCES) as { ts: string } | undefined;
   return r?.ts ?? null;
 }
+
+// The commit SHA of the newest evidence the agent captured. Hive's own
+// generated explanation pages are excluded: they are stamped with whatever HEAD
+// was when hive wrote them, so they would always look like the freshest
+// evidence and hide the agent's real capture point.
+export function latestEvidenceSha(db: DB, taskId: string): string | null {
+  const row = db
+    .query(
+      `SELECT json_extract(meta, '$.commit_sha') AS sha FROM evidence
+        WHERE task_id = ? AND kind != 'explanation' AND json_extract(meta, '$.commit_sha') IS NOT NULL
+        ORDER BY ts DESC, rowid DESC LIMIT 1`
+    )
+    .get(taskId) as { sha: string } | undefined;
+  return row?.sha ?? null;
+}
+
+// Move evidence captured at `from` onto `to`. Only called once the two commits
+// are known to hold an identical tree, so the artifact still describes the code
+// at `to` exactly. Returns how many rows moved.
+export function restampEvidence(db: DB, taskId: string, from: string, to: string): number {
+  const rows = db
+    .query("SELECT id, meta FROM evidence WHERE task_id = ? AND json_extract(meta, '$.commit_sha') = ?")
+    .all(taskId, from) as { id: string; meta: string }[];
+  for (const r of rows) {
+    let meta: any;
+    try {
+      meta = JSON.parse(r.meta || "{}");
+    } catch {
+      continue;
+    }
+    meta.commit_sha = to;
+    meta.restamped_from = from;
+    db.query("UPDATE evidence SET meta = ? WHERE id = ?").run(JSON.stringify(meta), r.id);
+  }
+  return rows.length;
+}

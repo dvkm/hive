@@ -399,6 +399,14 @@ async function main() {
         ...extra,
       });
     }
+    // A held handoff comes back 200 with `held: true` and the reason. Printing
+    // only "emitted 'ready'" hid that from the agent completely, so the hold was
+    // discovered later by a human and cost a respawn to answer (HIVE-574).
+    if (result.held) {
+      console.log(`emit '${type}' on ${taskId} was HELD${result.reason ? ` (${result.reason})` : ""}`);
+      if (result.message) console.log(result.message);
+      return;
+    }
     console.log(`emitted '${type}' on ${taskId}` + (result.evidence ? ` (evidence ${result.evidence.id})` : ""));
     return;
   }
