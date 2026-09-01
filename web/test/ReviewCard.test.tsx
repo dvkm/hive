@@ -401,6 +401,55 @@ test("Have agent add it is hidden for a never-dispatched external task", async (
   expect(blockedText).toContain("never been dispatched");
 });
 
+// HIVE-576: "Have agent add it" must only appear when a check is actually
+// owed. It used to ignore quizRequired, so a mechanical change (branch-check
+// understanding_required=false) still offered the button.
+test("Have agent add it is hidden when the branch check says no understanding check is owed", async () => {
+  const originalBranchCheck = api.branchCheck;
+  api.branchCheck = (async () => ({
+    unmet_deps: [],
+    embedded_tasks: [],
+    understanding_required: false,
+    confirmed_risks: [],
+  })) as typeof api.branchCheck;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree(task("mechanical-change")));
+    });
+
+    const haveAgentBtn = renderer.root.findAll(
+      (n) => n.type === "button" && n.children.includes("Have agent add it")
+    );
+    expect(haveAgentBtn.length).toBe(0);
+  } finally {
+    api.branchCheck = originalBranchCheck;
+  }
+});
+
+test("Have agent add it still shows when a check is owed and missing", async () => {
+  const originalBranchCheck = api.branchCheck;
+  api.branchCheck = (async () => ({
+    unmet_deps: [],
+    embedded_tasks: [],
+    understanding_required: true,
+    confirmed_risks: [],
+  })) as typeof api.branchCheck;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree(task("owed-quiz")));
+    });
+
+    const haveAgentBtn = renderer.root.findAll(
+      (n) => n.type === "button" && n.children.includes("Have agent add it")
+    );
+    expect(haveAgentBtn.length).toBe(1);
+  } finally {
+    api.branchCheck = originalBranchCheck;
+  }
+});
+
 // #1556: the explanation page is the mental model, so it is embedded in the
 // card. A page written for an older head is shown but labelled; while hive is
 // still writing one, the card says so instead of showing nothing.

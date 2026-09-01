@@ -1171,7 +1171,7 @@ export function ReviewCard({
       </div>
       {/* A confirmed risk outranks a missing quiz: asking the agent to write
           questions about a change that cannot merge is the wrong next step. */}
-      {!riskBlocked && missingQuiz && !task.never_dispatched ? (
+      {!riskBlocked && quizRequired && missingQuiz && !task.never_dispatched ? (
         <div className="review-blocked review-blocked-action">
           <button className="btn btn-mini" disabled={busy} onClick={refreshUnderstandingCheck}>
             {busy ? "Asking…" : "Have agent add it"}
