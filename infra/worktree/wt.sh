@@ -24,13 +24,25 @@ TARGET="$(cd "${2:-$(git rev-parse --show-toplevel 2>/dev/null)}" 2>/dev/null &&
 up() {
   echo "==> hive worktree bootstrap: $TARGET"
   if [ -d "$TARGET/node_modules" ]; then
-    echo "   deps present — nothing to do"
+    echo "   root deps present — nothing to do"
+  else
+    echo "==> bun install"
+    # ponytail: bun only; hive has no other install step. Best-effort — a failed
+    # install warns but never blocks the spawn (the agent can re-run it by hand).
+    ( cd "$TARGET" && bun install ) || echo "   WARNING: bun install failed; run it manually in the worktree" >&2
+  fi
+
+  # web/ is a separate, non-workspace package with its own deps (react, vitest, ...)
+  # and needs its own install or bun test fails on web/test/*.test.tsx.
+  if [ ! -f "$TARGET/web/package.json" ]; then
     return 0
   fi
-  echo "==> bun install"
-  # ponytail: bun only; hive has no other install step. Best-effort — a failed
-  # install warns but never blocks the spawn (the agent can re-run it by hand).
-  ( cd "$TARGET" && bun install ) || echo "   WARNING: bun install failed; run it manually in the worktree" >&2
+  if [ -d "$TARGET/web/node_modules" ]; then
+    echo "   web/ deps present — nothing to do"
+    return 0
+  fi
+  echo "==> bun install (web/)"
+  ( cd "$TARGET/web" && bun install ) || echo "   WARNING: bun install (web/) failed; run it manually in $TARGET/web" >&2
 }
 
 down() {

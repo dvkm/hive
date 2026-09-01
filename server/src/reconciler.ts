@@ -11,30 +11,36 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
-import { writeEvent, mutateWithEvent, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, repairRequeueProvenance, currentAttemptCommitEvidenceCount, recoveryAttemptId, recoveryEpochRowid, recoveryPrHeadHasEvidence, startRecoveryEpoch, TERMINAL, type State } from "./state.ts";
+import { startLoop } from "./loop.ts";
+import { writeEvent, mutateWithEvent, lastAgentActivity, AGENT_EVENT_SOURCES, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, verificationGate, repairRequeueProvenance, currentAttemptCommitEvidenceCount, recoveryAttemptId, recoveryEpochRowid, recoveryPrHeadHasEvidence, startRecoveryEpoch, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
 import { spawnMeta, replayCleanedUpRecovery, latestSpawnRecord } from "./cleanup.ts";
+import { raceSweep } from "./race.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent, resumeReviewForDeliveredSteers } from "./steer.ts";
 import { inBackoff, isReviewed, MAX_AGENTS_DEFAULT } from "./dispatcher.ts";
 import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
+import { syncAway } from "./away.ts";
 import { parseEvidence } from "./rows.ts";
-import { broadcastTask } from "./health.ts";
+import { broadcastTask, noteToolStart } from "./health.ts";
 import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
-import { notTestProjectSql } from "./testProjects.ts";
+import { activeProjects } from "./testProjects.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, editDialogPaths, parseResetClock } from "./diagnose.ts";
-import { requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount } from "./api.ts";
+import { AUTO_MERGE_PAUSED, requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount, deferQuizForExternalMerge } from "./api.ts";
 import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, projectBaseBranch, preferSafeRef } from "./exec.ts";
+import { defaultExec, mapLimit, projectBaseBranch, preferSafeRef, GH_LIST_TIMEOUT_MS, GH_LIST_CONCURRENCY } from "./exec.ts";
 import { captureBranchScope } from "./rebaseGuard.ts";
+import { scoreScopePrediction } from "./fileScope.ts";
 import { landOnce } from "./landQueue.ts";
 import { sidecarOnce } from "./sidecar.ts";
 import { classifyEscalation, optionNeedsDirectorInput } from "./policy.ts";
+import { riskLevel } from "./autoapprove.ts";
 import { runPrGardener } from "./prGardener.ts";
 import { autoAckPlans } from "./planCritic.ts";
-import { ambiguityCleared, cautionCleared } from "./reviewer.ts";
+import { ambiguityCleared, cautionCleared, latestAutoReviewVerdict } from "./reviewer.ts";
+import { reportBoardAudit } from "./boardAudit.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
 const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
@@ -44,6 +50,12 @@ const MAX_AUTO_REQUEUE = 2;
 const MAX_SILENT_NUDGES = 3;
 const DEFAULT_FAILED_TRIAGE_REQUEUE_HOURS = 4;
 const TURN_COMPLETE_RESPAWN = "agent turn is complete; respawn required";
+// `gh pr view` is a poll: if GitHub is slow this cycle, the next cycle retries in
+// a minute anyway, so waiting the 60s defaultExec default just stalls the lap.
+const GH_PROBE_TIMEOUT_MS = 12_000;
+// ponytail: a flat cap, not per-project. Enough to hide a few stalls without
+// forking a `gh` process per open PR.
+const GH_PROBE_CONCURRENCY = 6;
 
 export interface ReconcilerDeps {
   herdr?: Herdr;
@@ -180,11 +192,16 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
       setSetting(db, "reconciler_error_streak", String(streak));
       if (lastError) setSetting(db, "reconciler_last_error", lastError);
     } else {
+      // HIVE-533: clear the message with the streak. Leaving it behind pinned one
+      // transient failure in `settings` forever, and /api/health published that
+      // fossil next to consecutive_errors: 0 as if it were current.
       setSetting(db, "reconciler_error_streak", "0");
+      setSetting(db, "reconciler_last_error", "");
     }
   };
   await step("surfaceTrackingBindings", () => surfaceTrackingBindings(db));
   await step("syncAgents", () => syncAgents(db, deps));
+  await step("archiveOrphanedDialogCards", () => archiveOrphanedDialogCards(db));
   await step("drainSteers", () => drainSteers(db, deps));
   await step("advanceFinished", () => advanceFinished(db, deps));
   await step("nagOpenDecisions", () => nagOpenDecisions(db, (deps.nowMs ?? (() => Date.now()))()));
@@ -204,6 +221,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("captureRecurringRefs", () => captureRecurringRefs(db));
   await step("repairRequeueProvenance", () => repairRequeueProvenance(db));
   await step("surfaceDeadDependencies", () => surfaceDeadDependencies(db));
+  // Best-of-N: open the compare card once a race's attempts have all settled.
+  await step("raceSweep", () => raceSweep(db, { exec: deps.exec ?? defaultExec, nowMs: deps.nowMs?.() }));
+  // Away mode flips on/off by its schedule here. On waking it sends ONE
+  // "while you were away" push for everything that was held.
+  await step("syncAway", () => syncAway(db, (deps.nowMs ?? (() => Date.now()))()));
   // Offline mode: everything above is local (herdr + sqlite) and keeps state
   // honest; everything below either needs the network (gh) or would punish
   // agents for being offline (stale flags, nudges, failure escalation). Stop here.
@@ -215,6 +237,11 @@ export async function reconcileOnce(db: DB, deps: ReconcilerDeps = {}): Promise<
   await step("syncPRs", () => syncPRs(db, deps));
   await step("revalidateCiDecisions", () => revalidateCiDecisions(db));
   await step("linkPRs", () => linkPRs(db, deps));
+  // Read-only board-vs-reality audit (HIVE-528). Below the offline cutoff and
+  // after linkPRs because one of its checks asks GitHub whether a PR really
+  // landed. step() isolates it, so a failure here can never stall a sync path.
+  // It reports; it never repairs.
+  await step("boardAudit", () => reportBoardAudit(db, { exec: deps.exec }));
   await step("prGardener", () => runPrGardener(db, {
     exec: deps.exec ?? defaultExec,
     nowMs: deps.nowMs,
@@ -343,9 +370,18 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
     .all() as { id: string; agent_target: string }[];
   for (const t of tasks) {
     if (isJiraMirrorId(db, t.id)) continue;
-    const { alive, status, unconfirmed } = await probeAgent(h, db, t.id, t.agent_target);
+    const { alive, status, unconfirmed, reason, exited } = await probeAgent(h, db, t.id, t.agent_target);
     if (unconfirmed) {
-      noteUnconfirmedDeath(db, t.id);
+      // The agent finished its turn and its process exited — the case that used
+      // to log "unconfirmed-dead" every minute forever (HIVE-572). Continue the
+      // task in place, exactly as the nudge path's turn-complete-respawn does,
+      // and only once per agent: nothing here tears anything down.
+      const cur = getTask(db, t.id);
+      if (exited && lastAgentStatus(db, t.id) === "done" && cur && !agentWorkComplete(db, cur) && !respawnTried(db, t.id, t.agent_target)) {
+        await respawnCompletedTurn(db, h, cur, deps);
+        continue;
+      }
+      noteUnconfirmedDeath(db, t.id, t.agent_target, reason, (deps.nowMs ?? (() => Date.now()))());
       continue; // herdr can't resolve it and its pane is still there: touch nothing
     }
     const next = alive ? status : "gone";
@@ -411,7 +447,7 @@ export async function probeAgent(
   db: DB,
   taskId: string,
   target: string
-): Promise<{ alive: boolean; status: AgentStatus; unconfirmed?: boolean }> {
+): Promise<{ alive: boolean; status: AgentStatus; unconfirmed?: boolean; reason?: string; exited?: boolean }> {
   const p = await h.probe(target);
   if (p.alive) return p;
   // A server takeover can briefly make `agent get` miss an agent that is
@@ -439,30 +475,52 @@ export async function probeAgent(
     const again = await h.probe(target);
     if (again.alive) return again;
   }
-  return { alive: true, status: "unknown", unconfirmed: true };
+  return {
+    alive: true,
+    status: "unknown",
+    unconfirmed: true,
+    reason: `herdr does not resolve the agent, but a pane matching it is still listed; re-adopting it failed (${re.reason})`,
+    // Positive evidence the agent PROCESS exited: every pane at the task's
+    // worktree is sitting at a bare login shell. Still not a death verdict —
+    // the only thing it unlocks is a respawn in place, never a teardown.
+    exited: re.agentGone,
+  };
 }
 
-// Unregistered-but-running (or herdr unreachable): log it — which also resets
-// the task's silence clock, so the next look is a stale threshold away — and
-// after a few laps put it in front of the director instead of guessing. Never
-// tears anything down.
-const MAX_UNCONFIRMED_DEATHS = 3;
+// Unregistered-but-running (or herdr unreachable): say so ONCE, with what was
+// checked and what happens next, then go quiet. Re-deciding every lap produced
+// 18 identical no-op events in 20 minutes and read like a fleet incident
+// (HIVE-572). If the condition is still unresolved after the grace window, put
+// it in front of the director and stop looking. Never tears anything down.
+const UNCONFIRMED_ESCALATE_MS = 5 * 60_000;
 
-function noteUnconfirmedDeath(db: DB, taskId: string): void {
-  const n = (
-    db
-      .query(
-        `SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'recovery'
-           AND json_extract(payload, '$.decision') = 'unconfirmed-dead'`
-      )
-      .get(taskId) as any
-  ).n as number;
-  // Bounded: an event per cycle forever would also reset the silence clock
-  // forever, masking a genuinely mute agent from flagStale.
-  if (n < MAX_UNCONFIRMED_DEATHS) {
-    writeEvent(db, { task_id: taskId, source: "reconciler", type: "recovery", payload: { decision: "unconfirmed-dead" } });
+function noteUnconfirmedDeath(db: DB, taskId: string, target: string, reason: string | undefined, nowMs: number): void {
+  const said = db
+    .query(
+      `SELECT ts FROM events WHERE task_id = ? AND type = 'recovery'
+         AND json_extract(payload, '$.decision') = 'unconfirmed-dead'
+         AND json_extract(payload, '$.agent_target') = ?
+       ORDER BY ts DESC LIMIT 1`
+    )
+    .get(taskId, target) as { ts: string } | undefined;
+  // Said once already for THIS agent. Stay silent — an event per lap also reset
+  // the task's silence clock forever, masking a genuinely mute agent from
+  // flagStale. A respawn changes agent_target, which starts a fresh episode.
+  if (!said) {
+    writeEvent(db, {
+      task_id: taskId,
+      source: "reconciler",
+      type: "recovery",
+      payload: {
+        decision: "unconfirmed-dead",
+        agent_target: target,
+        reason: reason ?? "herdr cannot resolve the agent and its liveness could not be confirmed either way",
+        next_step: `no action taken; checking quietly, and telling the director if it is still unresolved in ${Math.round(UNCONFIRMED_ESCALATE_MS / 60_000)}m`,
+      },
+    });
     return;
   }
+  if (nowMs - Date.parse(said.ts) < UNCONFIRMED_ESCALATE_MS) return;
   const already = db
     .query("SELECT 1 FROM notifications WHERE kind = 'agent_unreachable' AND task_id = ? LIMIT 1")
     .get(taskId);
@@ -473,7 +531,9 @@ function noteUnconfirmedDeath(db: DB, taskId: string): void {
     urgency: "urgent",
     task_id: taskId,
     title: `Agent unreachable but not dead: ${task?.title ?? taskId}`,
-    body: "herdr cannot resolve the agent, but its pane is still there (or herdr is down). Nothing was torn down — check the pane.",
+    body:
+      `herdr cannot resolve the agent, but its pane is still there (or herdr is down). Nothing was torn down — check the pane. ` +
+      (reason ?? ""),
   });
 }
 
@@ -585,20 +645,32 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     .query(`SELECT id, state, pr_url, ci_status, head_sha, pr_state, agent_target, project_id, branch FROM tasks WHERE pr_url IS NOT NULL AND state IN ${NON_TERMINAL}`)
     .all() as { id: string; state: string; pr_url: string; ci_status: string | null; head_sha: string | null; pr_state: string | null; agent_target: string | null; project_id: string; branch: string | null }[];
 
-  for (const t of tasks) {
+  // Probe every PR first, a few at a time, then act on the results serially.
+  // Serially probing meant K slow `gh` calls cost K timeouts (HIVE-438: 175s
+  // laps against a 24-40s baseline); bounded-concurrent, K slow calls cost
+  // about one. Only the network read is parallel — every DB write below stays
+  // on one thread, in the same order as before.
+  const probes = await mapLimit(tasks, GH_PROBE_CONCURRENCY, async (t) => {
     // A Jira mirror has no hive-owned PR at all, so there is nothing to record;
     // skip it outright. A non-Jira external task DOES get its observed PR facts
     // recorded (ci_status, head_sha, ...) and is skipped further down, at the
     // ACTIONABLE phase only — see the neverDispatched guard below (hive-996).
-    if (isJiraMirrorId(db, t.id)) continue;
-    const r = await exec(["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup,mergeable,headRefOid,baseRefName,baseRefOid"]);
-    if (r.code !== 0) continue; // gh unavailable / auth: skip, try next cycle
-    let data: any;
+    if (isJiraMirrorId(db, t.id)) return null;
+    const r = await exec(
+      ["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup,mergeable,headRefOid,baseRefName,baseRefOid"],
+      { timeoutMs: GH_PROBE_TIMEOUT_MS }
+    );
+    if (r.code !== 0) return null; // gh unavailable / auth: skip, try next cycle
     try {
-      data = JSON.parse(r.stdout);
+      return { t, data: JSON.parse(r.stdout) as any };
     } catch {
-      continue;
+      return null;
     }
+  });
+
+  for (const probe of probes) {
+    if (!probe) continue;
+    const { t, data } = probe;
     // The task's state may have moved on since the SELECT above — a concurrent
     // POST /merge, autoMergeReady, or an overlapping reconcile cycle can land
     // while this `await exec` was in flight and advance the task to a terminal
@@ -652,7 +724,13 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
           const scope = await captureBranchScope(exec, project.repo_path, data.baseRefOid || base, scopeHead);
           const afterScope = getTask(db, t.id);
           if (!afterScope || TERMINAL.includes(afterScope.state as State) || afterScope.pr_url !== t.pr_url) continue;
-          if (scope) writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: { ...scope, head_sha: data.headRefOid ?? null } });
+          if (scope) {
+            writeEvent(db, { task_id: t.id, source: "reconciler", type: "branch_scope", payload: { ...scope, head_sha: data.headRefOid ?? null } });
+            // Score the dispatch-time file guess against what the branch really
+            // touched (HIVE-509), so the heuristic can be tuned or dropped on
+            // evidence rather than opinion.
+            scoreScopePrediction(db, t.id, scope.files);
+          }
         }
       }
     }
@@ -692,11 +770,11 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       broadcast({ type: "task", task: getTask(db, t.id) });
     }
     // A never-dispatched external task (see supervision.ts) has no agent to
-    // nudge and isn't hive's to auto-transition through review/merge/smoke —
-    // skip the actionable phase below entirely. The bookkeeping above
-    // (ci_status, head_sha, branch_scope, pr_synchronized) already ran: it's
-    // just recording observed PR facts, useful for the tracked view.
-    if (neverDispatched(db, live)) continue;
+    // nudge, so every AGENT-DIRECTED branch below is skipped for it. It used to
+    // skip the whole actionable phase, which also swallowed the MERGED->done
+    // observation and parked merged tasks in in_review forever (HIVE-473). A
+    // terminal PR state is a fact hive observed, not a nudge, so it still runs.
+    const agentless = neverDispatched(db, live);
     // Re-check once more right before the actionable phase: the bookkeeping
     // above (probeRed, ci_status writes) awaited too, and is the last chance
     // for a PR replacement/closure race to have landed.
@@ -744,7 +822,7 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     // green and the director can merge", so failing/pending checks HOLD the
     // task in_progress (this is also what promotes a held `ready`: the moment
     // checks pass, the task moves to review; failing checks steer the agent).
-    if (String(data.state).toUpperCase() === "OPEN" && state === "in_progress") {
+    if (String(data.state).toUpperCase() === "OPEN" && state === "in_progress" && !agentless) {
       if (ci === "failing") {
         await nudgeCiFailure(db, h, t, data.headRefOid ?? null);
       } else if (ci !== "pending") {
@@ -756,11 +834,13 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
       if (state === "in_progress") transition(db, t.id, "in_review", { source: "reconciler", reason: "recovery PR merged with current evidence" });
       transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged" });
       // Post-merge smoke runs once on entering verifying.
-      try {
-        await smokeThenAdvance(db, t.id, deps.smoke ?? {});
-      } catch (e) {
-        console.error(`[hive] smoke run failed for ${t.id}:`, e);
-      }
+      await advanceAfterMerge(db, t.id, deps);
+    } else if (String(data.state).toUpperCase() === "CLOSED" && state === "in_review" && agentless) {
+      // No agent to bounce it back to and no in_progress worth returning it to,
+      // so just record the fact — once, since nothing here moves the task off
+      // in_review and the probe repeats every cycle.
+      const already = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'pr_closed' LIMIT 1").get(t.id);
+      if (!already) writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_closed", payload: { pr_url: t.pr_url } });
     } else if (String(data.state).toUpperCase() === "CLOSED" && state === "in_review") {
       // Closed-not-merged: nothing reviewable exists. Self-heal instead of
       // waiting for the director to discover it via a failed merge click.
@@ -785,42 +865,77 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
         writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_merged", payload: { pr_url: t.pr_url } });
         // in_progress can't jump straight to verifying — hop through in_review
         // first, same path a non-deferred task takes on its way to merge.
-        transition(db, t.id, "in_review", { source: "reconciler", reason: "PR merged while deferred — catching up review" });
+        // skipVerification: the PR already merged, so the verification contract
+        // has nothing left to hold back — a gate here would park the task in
+        // in_progress with no agent and no way out (HIVE-402).
+        transition(db, t.id, "in_review", { source: "reconciler", reason: "PR merged while deferred — catching up review", skipVerification: true });
         transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged (deferred task undeferred)" });
-        try {
-          await smokeThenAdvance(db, t.id, deps.smoke ?? {});
-        } catch (e) {
-          console.error(`[hive] smoke run failed for ${t.id}:`, e);
-        }
+        await advanceAfterMerge(db, t.id, deps);
       } else {
         writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_closed", payload: { pr_url: t.pr_url } });
       }
-    } else if (state === "in_progress" && ["MERGED", "CLOSED"].includes(String(data.state).toUpperCase())) {
-      // A PR can be merged/closed by a human while its task is still held in
-      // in_progress (handoff to in_review is held on pending/failing CI — see
-      // the OPEN+in_progress branch above), and the task can die before ever
-      // reaching in_review. Record the terminal PR event either way so
-      // predecessorOpenPrUrl (api.ts) never cites an already-dead PR in a
-      // requeue brief — but skip the in_review side effects (steer, smoke,
-      // verifying transition): the task never reached review, so there's
-      // nothing to bounce back or advance. One-shot per task (no transition
-      // moves it off in_progress to stop this from recurring every cycle).
-      const type = String(data.state).toUpperCase() === "MERGED" ? "pr_merged" : "pr_closed";
-      const already = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = ? LIMIT 1").get(t.id, type);
-      if (!already) writeEvent(db, { task_id: t.id, source: "reconciler", type, payload: { pr_url: t.pr_url } });
-    } else if (ci === "failing" && state === "in_review") {
+    } else if (state === "in_progress" && String(data.state).toUpperCase() === "MERGED") {
+      // A PR can be merged by a human (director hand-merge, a teammate on
+      // GitHub, auto-merge) while its task is still in_progress — handoff to
+      // in_review is otherwise held on CI (see the OPEN+in_progress branch
+      // above). This used to only record the fact and leave the task sitting
+      // in_progress until the stale sweep flagged it as a hung agent, which is
+      // the opposite of what a merged PR means (HIVE-507). Catch it up through
+      // review to verifying the same way the deferred branch above does, and
+      // tell the agent so it stands down instead of working on landed code.
+      writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_merged", payload: { pr_url: t.pr_url } });
+      transition(db, t.id, "in_review", { source: "reconciler", reason: "PR merged while in progress — catching up review", skipVerification: true });
+      transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged" });
+      await advanceAfterMerge(db, t.id, deps);
+      const msg = `hive: your PR ${t.pr_url} was already MERGED (outside hive). The task has moved on to verifying — stop work on this branch, it's already landed.`;
+      let delivered = false;
+      if (t.agent_target) {
+        try {
+          delivered = sendFailure(await h.send(t.agent_target, msg)) === null;
+        } catch {}
+      }
+      if (!delivered) queueSteerEvent(db, t.id, msg, "PR merged while in_progress; no live agent");
+    } else if (state === "in_progress" && String(data.state).toUpperCase() === "CLOSED") {
+      // Closed-not-merged with the task still in_progress: nothing reviewable
+      // exists, and nothing to bounce back from review either. Record the
+      // fact so predecessorOpenPrUrl (api.ts) never cites an already-dead PR
+      // in a requeue brief. One-shot per task.
+      const already = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'pr_closed' LIMIT 1").get(t.id);
+      if (!already) writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_closed", payload: { pr_url: t.pr_url } });
+    } else if (ci === "failing" && state === "in_review" && !agentless) {
       // Checks went red AFTER the handoff: red is not reviewable. Send it back
       // to the agent to iterate; it returns automatically when green.
       await nudgeCiFailure(db, h, t, data.headRefOid ?? null);
       transition(db, t.id, "in_progress", { source: "reconciler", reason: "CI failing — returned to the agent to iterate" });
       broadcast({ type: "task", task: getTask(db, t.id) });
-    } else if (!deferred && String(data.mergeable).toUpperCase() === "CONFLICTING") {
+    } else if (!deferred && !agentless && String(data.mergeable).toUpperCase() === "CONFLICTING") {
       // A deliberately parked task (deferred_until in the future) shouldn't
       // draw pr_conflict noise or steer an inactive agent (hive-303). No event
       // is written while deferred, so undefer's next cycle sees a fresh
       // head_sha/dedup state and nudges once, immediately.
       await nudgeConflict(db, h, t, data.headRefOid ?? null, exec);
     }
+  }
+}
+
+// Post-merge advance out of `verifying`. A task hive drives runs its smoke
+// checks. A tracking-only task (an external board row) has no hive worktree to
+// smoke and no evidence gate, and both smokeThenAdvance and sweepVerifying bail
+// out on it — so without this it would just swap a stuck `in_review` for a
+// stuck `verifying`. For it, merged IS done (HIVE-473).
+async function advanceAfterMerge(db: DB, taskId: string, deps: ReconcilerDeps): Promise<void> {
+  // The merge happened on GitHub, so nobody passed the quiz gate on the way in.
+  // Settle it the same way a hive-performed merge does (HIVE-544).
+  deferQuizForExternalMerge(db, taskId);
+  if (isTrackingOnlyId(db, taskId)) {
+    transition(db, taskId, "done", { source: "reconciler", reason: "PR merged (tracking-only task: no post-merge smoke)" });
+    broadcast({ type: "task", task: getTask(db, taskId) });
+    return;
+  }
+  try {
+    await smokeThenAdvance(db, taskId, deps.smoke ?? {});
+  } catch (e) {
+    console.error(`[hive] smoke run failed for ${taskId}:`, e);
   }
 }
 
@@ -934,12 +1049,16 @@ async function linkPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   // scratch dir that gets cleaned up, and running gh against a directory that
   // no longer exists is what wedged this step for ~10h. They have no real PRs
   // to link either.
-  const projects = db
-    .query(`SELECT id, repo_path FROM projects WHERE repo_path IS NOT NULL AND ${notTestProjectSql()}`)
-    .all() as { id: string; repo_path: string }[];
+  const projects = activeProjects(db).filter((p) => p.repo_path) as { id: string; repo_path: string }[];
   let startFailure: string | null = null;
-  for (const p of projects) {
-    const r = await exec(["gh", "pr", "list", "--state", "open", "--json", "number,title,body,url"], { cwd: p.repo_path });
+  // List every project a few at a time (HIVE-486): listing serially meant one
+  // stalled repo cost a full timeout before the next repo was even tried, so K
+  // stalled repos added K timeouts to the lap. Only the `gh` calls overlap; the
+  // linking below still runs serially, in project order.
+  const lists = await mapLimit(projects, GH_LIST_CONCURRENCY, (p) =>
+    exec(["gh", "pr", "list", "--state", "open", "--json", "number,title,body,url"], { cwd: p.repo_path, timeoutMs: GH_LIST_TIMEOUT_MS })
+  );
+  for (const r of lists) {
     // 127 is defaultExec's "the child never started" (missing binary, or a
     // repo_path that no longer exists), as opposed to gh running and failing.
     if (r.code === 127 && startFailure === null) startFailure = r.stderr.trim();
@@ -954,27 +1073,6 @@ async function linkPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     for (const pr of list) linkPrIfMarked(db, { title: pr.title, body: pr.body, url: pr.url });
   }
   noteToolStart(db, "gh", startFailure);
-}
-
-// A tool that cannot start is skipped and retried forever by design, so once it
-// stops throwing it also stops counting toward reconciler_error_streak and
-// would go completely silent. That is the #1096 failure mode again: PR linking
-// quietly off, /api/health saying ok. Three consecutive cycles of start
-// failures log once and mark health degraded; the first good cycle clears it.
-const TOOL_DEGRADED_AFTER = 3;
-export function noteToolStart(db: DB, tool: string, failure: string | null): void {
-  const streakKey = `tool_start_failures_${tool}`;
-  const degradedKey = `tool_degraded_${tool}`;
-  if (!failure) {
-    if (getSetting(db, streakKey)) setSetting(db, streakKey, "0");
-    if (getSetting(db, degradedKey)) setSetting(db, degradedKey, "");
-    return;
-  }
-  const streak = Number(getSetting(db, streakKey) ?? "0") + 1;
-  setSetting(db, streakKey, String(streak));
-  if (streak < TOOL_DEGRADED_AFTER) return;
-  if (!getSetting(db, degradedKey)) console.error(`[hive] ${tool} failed to start on ${streak} cycles in a row; marking health degraded: ${failure}`);
-  setSetting(db, degradedKey, failure);
 }
 
 // One rollup entry counts as red. Shared by ciStatusOf and the non-start probe
@@ -1285,6 +1383,40 @@ export async function probePrReadiness(
   return { ok: false };
 }
 
+// A "blocked on a dialog" card answers by sending a keystroke to a specific
+// pane (recoverBlockedDialog / resolveBlockedForDecision). If that agent died
+// or was respawned since the card opened, the keystroke has nowhere to land —
+// the card is an unanswerable orphan (seen live 2026-08-25: five stuck open).
+// syncAgents already confirms death (lastAgentStatus 'gone' — the same
+// confirmGone path that guards against the false-dead registry-wipe incident),
+// so reuse that signal instead of re-probing herdr here. Never touches
+// non-dialog cards: the title match is the same one recoverBlockedDialog uses
+// to avoid opening duplicates.
+export function archiveOrphanedDialogCards(db: DB): number {
+  const rows = db
+    .query(
+      `SELECT d.id, d.title, d.ts, d.task_id, t.agent_target FROM decisions d JOIN tasks t ON t.id = d.task_id
+        WHERE d.status = 'open' AND d.title LIKE 'Agent blocked on a dialog%'`
+    )
+    .all() as { id: string; title: string; ts: string; task_id: string; agent_target: string | null }[];
+  let archived = 0;
+  for (const r of rows) {
+    const respawned = db
+      .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'spawned' AND ts > ? LIMIT 1")
+      .get(r.task_id, r.ts);
+    const dead = !r.agent_target || lastAgentStatus(db, r.task_id) === "gone";
+    if (!respawned && !dead) continue;
+    apiDismissDecision(db, r.id, {
+      reason: "dialog_agent_gone",
+      steer:
+        `hive auto-archived your decision card "${r.title}": the agent it was waiting on ` +
+        `${respawned ? "was respawned" : "is gone"} since the card opened, so the dialog it named no longer exists. Carry on.`,
+    });
+    archived++;
+  }
+  return archived;
+}
+
 // Signal freshness. A card that cited red checks is only worth the director's
 // attention while the checks are still red. syncPRs re-probes every cycle, so
 // the moment they turn green the question is moot: close it, tell the agent, and
@@ -1362,6 +1494,61 @@ export function passedByDirector(db: DB, taskId: string): boolean {
   ).get(taskId, taskId);
 }
 
+// One attempt is usually enough to learn a merge is refused; two tolerates a
+// one-off blip. A third identical try is just noise on the card.
+const MAX_AUTO_MERGE_ATTEMPTS = 2;
+
+// How many auto-merge attempts were already refused at this exact head. A new
+// head is a new situation, so its budget starts over.
+function autoMergeFailures(db: DB, taskId: string, head: string | null): number {
+  const row = db
+    .query(
+      `SELECT COUNT(*) n FROM events
+        WHERE task_id = ? AND type = 'auto_merge_failed' AND json_valid(payload)
+          AND json_extract(payload, '$.head_sha') IS ?`
+    )
+    .get(taskId, head) as { n: number };
+  return row.n;
+}
+
+async function errorText(res: Response): Promise<string> {
+  try {
+    const body: any = await res.clone().json();
+    return String(body?.error ?? "");
+  } catch {
+    return "";
+  }
+}
+
+// Failures get their own event type: three `auto_merged` rows with ok:false
+// read like three merges in the event log, which is exactly how HIVE-473 hid
+// in plain sight. `auto_merged` now means merged.
+function recordAutoMergeFailure(
+  db: DB,
+  task: { id: string; number: number; title: string; head_sha: string | null },
+  status: number | null,
+  error: string
+): void {
+  // A pause is not a refusal — the task's readiness changed mid-merge, and the
+  // next cycle re-reads it. Recording it would burn the budget for nothing.
+  if (error === AUTO_MERGE_PAUSED) return;
+  const spent = autoMergeFailures(db, task.id, task.head_sha) + 1;
+  const gaveUp = spent >= MAX_AUTO_MERGE_ATTEMPTS;
+  writeEvent(db, {
+    task_id: task.id,
+    source: "reconciler",
+    type: "auto_merge_failed",
+    payload: { ok: false, status, error, head_sha: task.head_sha, attempts: spent, ...(gaveUp ? { gave_up: true } : {}) },
+  });
+  if (!gaveUp) return;
+  enqueue(db, {
+    kind: "failed",
+    task_id: task.id,
+    title: `Auto-merge gave up on #${task.number}`,
+    body: `Hive tried to merge this ${MAX_AUTO_MERGE_ATTEMPTS} times and was refused each time. Merge it yourself, or push a commit so hive tries again. Last error: ${(error || `HTTP ${status}`).slice(0, 200)}`,
+  });
+}
+
 export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise<void> {
   const h = deps.herdr ?? defaultHerdr;
   const rows = db
@@ -1388,23 +1575,17 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     } catch {
       continue;
     }
-    const review: any = db
-      .query("SELECT payload FROM events WHERE task_id = ? AND type = 'auto_review' ORDER BY ts DESC LIMIT 1")
-      .get(r.id);
-    if (!review) continue; // no pre-review yet — wait for it
-    let verdict: any;
-    try {
-      verdict = JSON.parse(review.payload);
-    } catch {
-      continue;
-    }
-    if (verdict.skipped) continue;
+    // Same helper the merge gate reads (understandingChecksRequired ->
+    // latestAutoReviewVerdict). Two different readings of "the latest review"
+    // is what made this loop forever (HIVE-499).
+    const verdict = latestAutoReviewVerdict(db, r.id);
+    if (!verdict) continue; // no usable pre-review yet — wait for it
     if (verdict.verdict !== "looks_good" && verdict.verdict !== "caution") continue;
     // A PR-backed task's most recent review must have been taken against the
     // PR head that's about to be merged — a delayed review from before a
     // force-push or PR replacement must never auto-merge the new head
     // (task HIVE-307). Not fatal: just wait for autoReviewOnce to catch up.
-    if (r.pr_url && (verdict.reviewed_pr_url !== r.pr_url || verdict.reviewed_head_sha !== r.head_sha)) continue;
+    if (r.pr_url && ((verdict.reviewed_pr_url ?? null) !== r.pr_url || (verdict.reviewed_head_sha ?? null) !== (r.head_sha ?? null))) continue;
     // The pre-review's risks and questions are the ambiguity signal, but they
     // are suspicions until checked: the per-risk verification pass (HIVE-406)
     // re-reads the real code for this exact head. When it refuted every risk
@@ -1430,6 +1611,18 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
     if (contested) continue; // a human pushed back once — never auto-merge this task
     const evidence = (db.query("SELECT COUNT(*) n FROM evidence WHERE task_id = ?").get(r.id) as any).n;
     if (!evidence) continue;
+    // HIVE-403: the task's own verification contract is part of "ready to
+    // ship". Any command the agent declared but never produced evidence for
+    // holds the auto-merge — same checker the review handoff uses, so the two
+    // gates can never disagree. verificationGate (not the bare check) logs the
+    // gap once per distinct name set, giving the agent's next steer something
+    // to cite instead of a silent skip every cycle.
+    if (verificationGate(db, getTask(db, r.id), "reconciler").length) continue;
+    // Nothing about this task changes between reconciler cycles, so a refusal
+    // at this head will be refused again next cycle, and the cycle after that.
+    // HIVE-473 wrote three identical 409s in two minutes and would have kept
+    // going forever. Spend a small budget per head, then stop and say so once.
+    if (autoMergeFailures(db, r.id, r.head_sha) >= MAX_AUTO_MERGE_ATTEMPTS) continue;
     try {
       const beforeMutation = () => {
         const task = getTask(db, r.id);
@@ -1439,17 +1632,19 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
         return !db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'changes_requested' LIMIT 1").get(r.id);
       };
       const res = await mergeTask(db, h, r.id, {}, { exec: deps.exec }, { beforeMutation });
-      const ok = res.status === 200;
-      writeEvent(db, { task_id: r.id, source: "reconciler", type: "auto_merged", payload: { ok, status: res.status } });
-      if (ok)
+      if (res.status === 200) {
+        writeEvent(db, { task_id: r.id, source: "reconciler", type: "auto_merged", payload: { ok: true, status: res.status } });
         enqueue(db, {
           kind: "auto_merged",
           task_id: r.id,
           title: `Auto-merged #${r.number}: ${r.title.slice(0, 70)}`,
           body: "Green CI, clean pre-review, evidence attached. Now verifying.",
         });
+        continue;
+      }
+      recordAutoMergeFailure(db, r, res.status, await errorText(res));
     } catch (e) {
-      writeEvent(db, { task_id: r.id, source: "reconciler", type: "auto_merged", payload: { ok: false, error: String((e as any)?.message ?? e) } });
+      recordAutoMergeFailure(db, r, null, String((e as any)?.message ?? e));
     }
   }
 }
@@ -1457,17 +1652,25 @@ export async function autoMergeReady(db: DB, deps: ReconcilerDeps = {}): Promise
 // Auto-answer: a decision card that sits past the project's timeout
 // (config.decision_auto_answer_hours, off unless set) and carries a
 // RECOMMENDED option gets answered with that recommendation — except
-// risk='high' cards (authority/prod), which always wait for the human.
+// high-risk cards (authority/prod), which always wait for the human.
 // The notification names what was chosen, so silence is informed consent,
 // not surprise.
+//
+// High risk is deliberately asymmetric. The card stays OPEN past the window
+// (an open card parks its task; a released one may have already shipped the
+// thing nobody approved) and the sweep escalates it once with an urgent push
+// instead. Risk is read through riskLevel(), not compared to the literal
+// string 'high' — three cards whose risk field was a whole sentence beginning
+// "high — ..." slipped past the old exact match.
 export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()): void {
   const rows = db
     .query(
-      `SELECT d.id, d.task_id, d.ts, d.title, d.options, p.config FROM decisions d
+      `SELECT d.id, d.task_id, d.ts, d.title, d.options, d.risk, p.config FROM decisions d
          JOIN tasks t ON t.id = d.task_id JOIN projects p ON p.id = t.project_id
-        WHERE d.status = 'open' AND COALESCE(d.risk, 'normal') != 'high' AND ${supervisedSql("t.source", "t.agent_target")}`
+        WHERE d.status = 'open' AND d.decision_class IS NULL
+          AND ${supervisedSql("t.source", "t.agent_target")}`
     )
-    .all() as { id: string; task_id: string; ts: string; title: string; options: string; config: string }[];
+    .all() as { id: string; task_id: string; ts: string; title: string; options: string; risk: string | null; config: string }[];
   for (const r of rows) {
     if (isTrackingOnlyId(db, r.task_id)) continue;
     let hours = 0;
@@ -1478,6 +1681,29 @@ export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()
     }
     if (hours <= 0) continue;
     if (nowMs - Date.parse(r.ts) < hours * 3600_000) continue;
+    // Past the window and high risk: escalate, never answer. Once per card —
+    // the event is the dedup key, so a 30s sweep does not re-push every loop.
+    if (riskLevel(r.risk) === "high") {
+      const already = db
+        .query("SELECT 1 FROM events WHERE type = 'decision_escalated' AND json_extract(payload, '$.decision_id') = ? LIMIT 1")
+        .get(r.id);
+      if (already) continue;
+      writeEvent(db, {
+        task_id: r.task_id,
+        source: "reconciler",
+        type: "decision_escalated",
+        payload: { decision_id: r.id, reason: `high risk, open ${hours}h past the auto-answer window`, risk: r.risk ?? null },
+      });
+      enqueue(db, {
+        kind: "decision",
+        urgency: "urgent",
+        task_id: r.task_id,
+        decision_id: r.id,
+        title: `Still needs you: "${r.title.slice(0, 70)}"`,
+        body: `High risk, open ${hours}h with no reply. It stays open and its task stays blocked — high-risk cards are never auto-answered.`,
+      });
+      continue;
+    }
     let rec: any;
     try {
       rec = JSON.parse(r.options || "[]").find((o: any) => o.recommended);
@@ -1648,6 +1874,72 @@ export function unparkAnswered(db: DB, nowMs: number = Date.now()): void {
   }
 }
 
+// A hung agent is not a dead one: it still holds its name, so reattach skips it,
+// the reaper leaves it alone, and the stale flag fires exactly once. Silence at
+// 4x the stale threshold means the WORK stopped, which needs a human eye rather
+// than a respawn — hive must not kill it, because a slow `pnpm install` and a
+// wedged one look identical from here (hive-1951). The clock counts only
+// agent-generated events (see lastAgentActivity): hive's own rows, and a human
+// poking the task, must not make a frozen task look busy.
+const HUNG_MULTIPLIER = 4;
+
+// The last thing the agent itself said, for the hung notification: the wedge
+// point is usually named right there ("Installing (cms pins pnpm 9.1.0)").
+function lastAgentWord(db: DB, taskId: string): string | null {
+  const r = db
+    .query(
+      `SELECT payload FROM events WHERE task_id = ? AND source IN (${AGENT_EVENT_SOURCES.map(() => "?").join(",")}) AND type IN ('assistant_text','status','note','checkpoint','blocked') ORDER BY ts DESC LIMIT 1`
+    )
+    .get(taskId, ...AGENT_EVENT_SOURCES) as { payload: string } | undefined;
+  if (!r) return null;
+  try {
+    const p = JSON.parse(r.payload);
+    const text = String(p.text ?? p.note ?? "").trim().replace(/\s+/g, " ");
+    return text ? text.slice(0, 240) : null;
+  } catch {
+    return null;
+  }
+}
+
+function humanMs(ms: number): string {
+  const mins = Math.round(ms / 60000);
+  return mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`;
+}
+
+// Silent past HUNG_MULTIPLIER x the stale threshold, with the agent still
+// holding its name: report it once per silence window as its own class. The
+// caller's filters (deferred, dependency-blocked, mirrors, chat supervisors)
+// already exclude everything that is quiet on purpose.
+function flagHung(db: DB, taskId: string, staleMs: number, nowMs: number): void {
+  const since = lastAgentActivity(db, taskId);
+  if (!since) return;
+  const quiet = nowMs - Date.parse(since);
+  if (quiet <= staleMs * HUNG_MULTIPLIER) return;
+  // Once per silence window, keyed on the activity it starts from — not on "is
+  // there a newer hung row", which would be true forever after the first one and
+  // silence a task that woke up, spoke, and wedged again.
+  if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'hung' AND json_extract(payload, '$.since') = ? LIMIT 1").get(taskId, since))
+    return;
+  const said = lastAgentWord(db, taskId);
+  const task = getTask(db, taskId);
+  writeEvent(db, {
+    task_id: taskId,
+    source: "reconciler",
+    type: "hung",
+    payload: { since, silent_ms: quiet, threshold_ms: staleMs * HUNG_MULTIPLIER, last_said: said },
+  });
+  enqueue(db, {
+    kind: "hung_agent",
+    urgency: "urgent",
+    task_id: taskId,
+    title: `No progress for ${humanMs(quiet)}: ${task?.title ?? taskId}`,
+    body:
+      `The agent is still holding this task, but nothing has happened since ${since}. ` +
+      (said ? `It last said: "${said}". ` : "It said nothing before going quiet. ") +
+      `It may be wedged, or just running something long. Look at the pane before killing anything.`,
+  });
+}
+
 function flagStale(db: DB, deps: ReconcilerDeps): void {
   const staleMs = deps.staleMs ?? DEFAULT_STALE_MS;
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
@@ -1678,6 +1970,7 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
       .query("SELECT ts, type FROM events WHERE task_id = ? ORDER BY ts DESC LIMIT 1")
       .get(t.id) as { ts: string; type: string } | undefined;
     if (!last) continue;
+    flagHung(db, t.id, staleMs, nowMs);
     if (last.type === "stale") continue; // already flagged; don't spam
     const age = nowMs - Date.parse(last.ts);
     if (age > staleMs) {
@@ -1942,21 +2235,33 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string, d
   }
 }
 
+// Has a turn-complete respawn already been decided for THIS agent? A respawn
+// changes agent_target, so the next agent starts a fresh episode.
+function respawnTried(db: DB, taskId: string, target: string): boolean {
+  return !!db
+    .query(
+      `SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery'
+         AND json_extract(payload, '$.prior_agent_target') = ? LIMIT 1`
+    )
+    .get(taskId, target);
+}
+
 async function respawnCompletedTurn(db: DB, h: Herdr, task: any, deps: ReconcilerDeps): Promise<void> {
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
+  const prior_agent_target = task.agent_target;
   const blocked = teardownBlocked(db, nowMs, deps.instanceId);
   if (blocked) {
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: blocked } });
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: blocked, prior_agent_target } });
     return;
   }
   const dead = recentDeadVerdicts(db, nowMs);
   if (dead >= DEAD_BURST_N) {
     openBreakerDecision(db, task, dead, Math.round(DEAD_BURST_MS / 60_000));
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "recovery breaker" } });
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "recovery breaker", prior_agent_target } });
     return;
   }
   if (inBackoff(db, task.id, nowMs)) {
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "spawn backoff" } });
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "spawn backoff", prior_agent_target } });
     return;
   }
   const project = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id) as { config: string | null } | undefined;
@@ -1964,7 +2269,7 @@ async function respawnCompletedTurn(db: DB, h: Herdr, task: any, deps: Reconcile
   const cap = Number.isFinite(config.max_agents) ? Number(config.max_agents) : MAX_AGENTS_DEFAULT;
   const otherAgents = db.query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND id != ? AND agent_target IS NOT NULL AND COALESCE(source, '') != 'chat_supervisor' AND state IN ('in_progress','needs_decision')`).get(task.project_id, task.id) as { n: number };
   if (otherAgents.n >= cap) {
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "project max_agents" } });
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "project max_agents", prior_agent_target } });
     return;
   }
 
@@ -1974,7 +2279,12 @@ async function respawnCompletedTurn(db: DB, h: Herdr, task: any, deps: Reconcile
     task_id: task.id,
     source: "reconciler",
     type: "recovery",
-    payload: { decision: "turn-complete-respawn", respawned: result.ok, ...(result.ok ? { agent_target: result.agent_target } : { error: result.error }) },
+    payload: {
+      decision: "turn-complete-respawn",
+      respawned: result.ok,
+      prior_agent_target,
+      ...(result.ok ? { agent_target: result.agent_target } : { error: result.error }),
+    },
   });
   broadcastTask(db, getTask(db, task.id));
 }
@@ -2091,8 +2401,9 @@ function queuedInputEpisode(
   db: DB,
   taskId: string
 ): { attempts: number; startedAt: string | null; latestDelivered: boolean | null | undefined } {
-  const rows = db.query("SELECT type, ts, payload FROM events WHERE task_id = ? ORDER BY ts DESC, rowid DESC").all(taskId) as {
+  const rows = db.query("SELECT type, source, ts, payload FROM events WHERE task_id = ? ORDER BY ts DESC, rowid DESC").all(taskId) as {
     type: string;
+    source: string;
     ts: string;
     payload: string;
   }[];
@@ -2104,7 +2415,7 @@ function queuedInputEpisode(
       if (n === 0) latestDelivered = JSON.parse(r.payload).delivered;
       n++;
       startedAt = r.ts;
-    } else if (r.type === "agent_status" || r.type === "stale") continue; // reconciler noise
+    } else if (!AGENT_EVENT_SOURCES.includes(r.source)) continue; // hive's own rows about the task, not the agent working
     else break; // real activity resets the count
   }
   return { attempts: n, startedAt, latestDelivered };
@@ -2345,9 +2656,5 @@ function nudgesSinceActivity(db: DB, taskId: string): number {
 
 // Background loop. Started only from index.ts (never in tests).
 export function startReconciler(db: DB, deps: ReconcilerDeps & { intervalMs?: number } = {}): () => void {
-  const intervalMs = deps.intervalMs ?? 60_000;
-  const timer = setInterval(() => {
-    reconcileOnce(db, deps).catch((e) => console.error("[hive] reconciler cycle crashed:", e));
-  }, intervalMs);
-  return () => clearInterval(timer);
+  return startLoop("reconciler", deps.intervalMs ?? 60_000, () => reconcileOnce(db, deps));
 }

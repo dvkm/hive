@@ -834,6 +834,21 @@ test("syncPRs' actionable phase skips a never-dispatched external task — no nu
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'steer'").get(id)).toBeFalsy();
 });
 
+test("syncPRs closes a never-dispatched external task once its PR MERGES (HIVE-473)", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/9", source: "external" });
+  transition(db, id, "in_progress"); // never spawned
+  transition(db, id, "in_review");
+  const gh: Exec = stub((argv) =>
+    argv[0] === "gh" ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-m" })) : OK()
+  );
+  await reconcileOnce(db, { exec: gh });
+  // merged is terminal for a task hive only tracks: no smoke to run, no evidence gate
+  expect(getTask(db, id).state).toBe("done");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'pr_merged'").get(id)).toBeTruthy();
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'steer'").get(id)).toBeFalsy();
+});
+
 test("syncPRs' actionable phase still acts on an external task that WAS spawned before (agent_target-aware, not blanket source-only)", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { pr_url: "https://gh/pr/8", agent_target: "t-agent-live", source: "external" });
@@ -1249,10 +1264,32 @@ test("autoAnswerStale answers timed-out normal-risk cards with the recommendatio
   };
   const normal = mkDecision("normal");
   const high = mkDecision("high");
+  // The live gap (HIVE-527): risk is free text, so an exact != 'high' test let
+  // a card whose risk was a whole sentence through the sweep.
+  const prose = mkDecision("high — if these keys are real, anyone with repo read access can use them");
   const herdr = new Herdr(stub(() => OK()), "herdr");
   autoAnswerStale(db, herdr, Date.now());
   expect((db.query("SELECT status, answer_key FROM decisions WHERE id = ?").get(normal) as any).answer_key).toBe("go");
   expect((db.query("SELECT status FROM decisions WHERE id = ?").get(high) as any).status).toBe("open");
+  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(prose) as any).status).toBe("open");
+});
+
+test("autoAnswerStale escalates a timed-out high-risk card once instead of answering it", async () => {
+  const { autoAnswerStale } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ decision_auto_answer_hours: 4 });
+  const id = makeTask(db, projectId, {});
+  const did = newId("dec");
+  db.query(
+    "INSERT INTO decisions (id, task_id, ts, title, risk, options, status) VALUES (?,?,?,?,'high',?, 'open')"
+  ).run(did, id, new Date(Date.now() - 5 * 3600_000).toISOString(), "rotate prod keys?",
+    JSON.stringify([{ key: "go", label: "Go", recommended: true }, { key: "no", label: "No" }]));
+  const herdr = new Herdr(stub(() => OK()), "herdr");
+  autoAnswerStale(db, herdr, Date.now());
+  autoAnswerStale(db, herdr, Date.now());
+  // Still open, and escalated exactly once — a 30s sweep must not re-push.
+  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(did) as any).status).toBe("open");
+  expect(db.query("SELECT COUNT(*) n FROM events WHERE task_id = ? AND type = 'decision_escalated'").get(id) as any).toEqual({ n: 1 });
+  expect(db.query("SELECT COUNT(*) n FROM notifications WHERE decision_id = ? AND urgency = 'urgent'").get(did) as any).toEqual({ n: 1 });
 });
 
 test("autoAnswerStale skips options that need director-supplied input (flag or keyword), notifies once", async () => {
@@ -1327,6 +1364,23 @@ test("flagStale skips a deferred task (future deferred_until) — no nudge", asy
   db.query("UPDATE tasks SET deferred_until = ? WHERE id = ?").run(new Date(Date.now() - 1000).toISOString(), id);
   await reconcileOnce(db, { staleMs: 15 * 60 * 1000, nowMs: future, herdr: statusHerdr("idle") });
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'stale'").all(id).length).toBe(1);
+});
+
+// The other half of the "parking stops the nudges" promise: flagStale above
+// keeps the stale flag off, and this keeps recoverStale from failing/requeueing a
+// parked task whose agent has (normally) exited — herdr reports it gone (HIVE-547).
+test("recoverStale leaves a deferred task alone even when its agent is gone", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "d-agent" });
+  transition(db, id, "in_progress");
+  db.query("UPDATE tasks SET deferred_until = ? WHERE id = ?").run("9999-12-31T00:00:00.000Z", id);
+  writeEvent(db, { task_id: id, source: "reconciler", type: "agent_status", payload: { status: "gone" } });
+
+  await reconcileOnce(db, { staleMs: 15 * 60 * 1000, nowMs: () => Date.now() + 60 * 60 * 1000, herdr: new Herdr(stub(() => OK(JSON.stringify({ result: { agent: null } }))), "herdr") });
+
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery'").get(id)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery_nudge'").get(id)).toBeFalsy();
 });
 
 // A herdr whose `agent get` reports a fixed status (agent alive with a pane).
@@ -1518,6 +1572,36 @@ test("syncPRs advances a merged deferred PR through verifying instead of leaving
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'undeferred'").all(id).length).toBe(1);
 });
 
+test("syncPRs advances an in_progress task whose PR merges outside hive, and stands the agent down (HIVE-507)", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/45", agent_target: "t-agent" });
+  transition(db, id, "in_progress");
+
+  const sends: string[] = [];
+  const gh: Exec = stub((argv) =>
+    argv[0] === "gh" ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] })) : OK()
+  );
+  const herdr = new Herdr(
+    stub((argv) => {
+      if (argv.includes("send")) {
+        sends.push(argv[argv.indexOf("send") + 2]);
+        return OK();
+      }
+      if (argv.includes("get")) return OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}');
+      return OK();
+    }),
+    "herdr"
+  );
+
+  await reconcileOnce(db, { exec: gh, herdr });
+
+  const task = getTask(db, id);
+  expect(task.state).toBe("verifying");
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_merged'").all(id).length).toBe(1);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'stale'").get(id)).toBeFalsy();
+  expect(sends.some((s) => s.includes("MERGED"))).toBe(true);
+});
+
 test("advanceFinished: in_progress + pr_url + idle agent -> in_review (+ event)", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { agent_target: "a1", pr_url: "https://gh/pr/1" });
@@ -1630,9 +1714,12 @@ test("reconcileOnce heartbeats last_reconcile_at and tracks a failing step's err
   await reconcileOnce(db, { exec: ghEnoent });
   expect(getSetting(db, "reconciler_error_streak")).toBe("2");
 
-  // A clean cycle (gh resolves again) resets the streak.
+  // A clean cycle (gh resolves again) resets the streak AND the message
+  // (HIVE-533: the message used to survive forever, so /api/health kept
+  // reporting a resolved fault as a current one).
   await reconcileOnce(db, { exec: stub(() => OK("[]")) });
   expect(getSetting(db, "reconciler_error_streak")).toBe("0");
+  expect(getSetting(db, "reconciler_last_error") ?? "").toBe("");
 });
 
 // task #1667: the same ENOENT no longer errors the cycle, so it would stop
@@ -1674,6 +1761,39 @@ test("linkPRs skips test/ephemeral projects entirely (task #1667)", async () => 
 
   expect(ghCalls).toBe(0);
   expect(getTask(db, task).pr_url).toBeNull();
+});
+
+// task #1693: a project already marked BOTH test AND archived (the
+// hive-1560 scratch seed proj_c964ebadad88) still had its repo_path swept by
+// every project loop, spawning tools (gh, git) against a cleaned-up cwd every
+// cycle and keeping reconciler_error_streak climbing forever.
+test("an archived project with a dead repo_path is skipped by every sweep, and the error streak resets clean (task #1693)", async () => {
+  const { db } = freshDb({ test: true, archived: true });
+  const cannotStart: Exec = async () => ({ code: 127, stdout: "", stderr: "posix_spawn gh ENOENT (cwd /nonexistent)" });
+
+  await reconcileOnce(db, { exec: cannotStart });
+  await reconcileOnce(db, { exec: cannotStart });
+  await reconcileOnce(db, { exec: cannotStart });
+
+  expect(getSetting(db, "reconciler_error_streak")).toBe("0");
+  const { degradedTools } = await import("../src/api.ts");
+  expect(degradedTools(db)).toEqual([]);
+});
+
+// archived alone (not test) must also be excluded — the reconciler sweep, not
+// just the reaper's test/no-tasks archiver, is the thing that must honor it.
+test("linkPRs skips an archived (non-test) project with a dead repo_path", async () => {
+  const { db, projectId } = freshDb({ archived: true });
+  db.query("UPDATE projects SET repo_path = ? WHERE id = ?").run("/nonexistent/repo", projectId);
+  let ghCalls = 0;
+  const exec: Exec = async (argv) => {
+    if (argv[0] === "gh" && argv[1] === "pr" && argv[2] === "list") ghCalls++;
+    return OK("[]");
+  };
+
+  await reconcileOnce(db, { exec });
+
+  expect(ghCalls).toBe(0);
 });
 
 test("reAdoptAgentsOnBoot re-adopts a live-but-unregistered agent and skips terminal tasks", async () => {
@@ -1852,4 +1972,199 @@ test("a project that did not opt in keeps getting a card per dialog", async () =
   expect(keys).toEqual([]);
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'dialog_auto_answered'").get(id)).toBeFalsy();
   expect(db.query("SELECT 1 FROM decisions WHERE task_id = ? AND status = 'open'").get(id)).toBeTruthy();
+});
+
+test("syncPRs probes stalled PRs concurrently, so K slow gh calls cost about one timeout (HIVE-438)", async () => {
+  const { db, projectId } = freshDb();
+  const STALL_MS = 150;
+  const ids = Array.from({ length: 6 }, (_, i) => {
+    const id = makeTask(db, projectId, { pr_url: `https://gh/pr/${i}` });
+    transition(db, id, "in_progress");
+    transition(db, id, "in_review");
+    return id;
+  });
+  let inFlight = 0;
+  let peak = 0;
+  const timeouts: (number | undefined)[] = [];
+  const gh: Exec = async (argv, opts) => {
+    if (argv[0] !== "gh" || argv[1] !== "pr" || argv[2] !== "view") return OK();
+    timeouts.push(opts?.timeoutMs);
+    peak = Math.max(peak, ++inFlight);
+    await new Promise((r) => setTimeout(r, STALL_MS));
+    inFlight--;
+    // A stalled probe looks like defaultExec's timeout: non-zero exit, no data.
+    return { code: 124, stdout: "", stderr: "timeout" };
+  };
+
+  await reconcileOnce(db, { exec: gh });
+
+  expect(timeouts.length).toBe(ids.length);
+  // Serial probing peaks at 1 in flight and costs 6 x STALL_MS. All 6 stalled
+  // probes overlap here (GH_PROBE_CONCURRENCY is 6), so the lap costs one
+  // timeout. Counting in-flight calls is the guarantee; wall-clock only proxies it.
+  expect(peak).toBe(ids.length);
+  // A poll must not wait the 60s defaultExec default.
+  expect(timeouts.every((ms) => ms != null && ms <= 15_000)).toBe(true);
+});
+
+// HIVE-499: a failed review attempt landing AFTER a good one used to erase it
+// for the merge gate but not for the reconciler, so the reconciler asked to
+// merge and the merge refused, once a cycle, forever.
+test("autoMergeReady merges a task whose good review is followed by a review error at the same head", async () => {
+  const { autoMergeReady } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
+  const id = makeTask(db, projectId, { kind: "chore", pr_url: "https://gh/pr/8" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x', head_sha = 'head-1' WHERE id = ?").run(id);
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
+  );
+  writeEvent(db, { task_id: id, source: "agent", type: "review_summary", payload: { done: ["done"] } });
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "auto_review",
+    payload: { verdict: "caution", summary: "s", risks: ["maybe a leak"], questions: [], reviewed_pr_url: "https://gh/pr/8", reviewed_head_sha: "head-1" },
+  });
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "risk_verdicts",
+    payload: { reviewed_head_sha: "head-1", verdicts: [{ risk: "maybe a leak", verdict: "refuted", why: "w" }], question_verdicts: [] },
+  });
+  // The retry-able failure #45 introduced, recorded after the review that stands.
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "auto_review_error",
+    payload: { error: "unparseable reviewer output", attempts: 1, reviewed_pr_url: "https://gh/pr/8", reviewed_head_sha: "head-1" },
+  });
+
+  const git: Exec = stub((argv) => {
+    if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(JSON.stringify({ state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", statusCheckRollup: [{ conclusion: "SUCCESS" }], baseRefName: "main", baseRefOid: "base-sha", headRefOid: "head-1" }));
+    return argv.includes("symbolic-ref") ? OK("main\n") : OK();
+  });
+  await autoMergeReady(db, { exec: git });
+  expect(getTask(db, id).state).toBe("done");
+});
+
+test("autoMergeReady stops retrying a merge that is refused at the same head, and says so once", async () => {
+  const { autoMergeReady } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
+  const id = makeTask(db, projectId, { kind: "chore" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x', head_sha = 'head-1' WHERE id = ?").run(id);
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
+  );
+  // Sensitive path with no quiz submitted: judgment-class, so every merge
+  // attempt is refused with the same 409.
+  writeEvent(db, {
+    task_id: id,
+    source: "system",
+    type: "auto_review",
+    payload: { verdict: "looks_good", summary: "s", risks: [], questions: [], files: ["db/migrations/007.sql"] },
+  });
+  const git: Exec = stub((argv) => {
+    if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
+    return argv.includes("symbolic-ref") ? OK("main\n") : OK();
+  });
+
+  for (let i = 0; i < 4; i++) await autoMergeReady(db, { exec: git });
+
+  expect(getTask(db, id).state).toBe("in_review");
+  const failures = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'auto_merge_failed'").all(id) as any[];
+  expect(failures.length).toBe(2); // one blip tolerated, never a third identical attempt
+  expect(JSON.parse(failures[1].payload).status).toBe(409);
+  expect(JSON.parse(failures[1].payload).gave_up).toBe(true);
+  // Failures no longer masquerade as merges in the event log.
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'auto_merged'").get(id)).toBeNull();
+  const notes = db.query("SELECT title FROM notifications WHERE task_id = ? AND kind = 'failed'").all(id) as any[];
+  expect(notes.length).toBe(1);
+  expect(notes[0].title).toContain("Auto-merge gave up");
+});
+
+// HIVE-403: a task that declared verification commands must prove it ran them
+// before auto-merge lands it. The gate is the same checker the review handoff
+// uses, so the two can never disagree about what "verified" means.
+test("autoMergeReady holds a task until every declared verification has evidence", async () => {
+  const { autoMergeReady } = await import("../src/reconciler.ts");
+  const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
+  const id = makeTask(db, projectId, { kind: "chore" });
+  db.query("UPDATE tasks SET verification_cmds = ? WHERE id = ?").run(
+    JSON.stringify([{ name: "unit", cmd: "bun test" }, { name: "typecheck", cmd: "bun run tsc --noEmit" }]),
+    id
+  );
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review", { skipVerification: true });
+  db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x' WHERE id = ?").run(id);
+  writeEvent(db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
+
+  const attach = (verifyName: string | null) => {
+    const evId = newId("evd");
+    db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+      evId, id, now(), "log", "/tmp/e.log", verifyName ?? "proof"
+    );
+    writeEvent(db, {
+      task_id: id,
+      source: "agent",
+      type: "evidence",
+      payload: { evidence_id: evId, kind: "log", ...(verifyName ? { verify_name: verifyName } : {}) },
+    });
+  };
+  const git: Exec = stub((argv) => {
+    if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
+    return argv.includes("symbolic-ref") ? OK("main\n") : OK();
+  });
+
+  attach("unit"); // one of two: enough evidence to pass the old gate, not this one
+  await autoMergeReady(db, { exec: git });
+  expect(getTask(db, id).state).toBe("in_review");
+  // ...and the gap is on the timeline for the agent's next steer, named.
+  const gap = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'verification_missing'").all(id) as { payload: string }[];
+  expect(gap.length).toBe(1);
+  expect(JSON.parse(gap[0].payload).names).toEqual(["typecheck"]);
+
+  attach("typecheck");
+  await autoMergeReady(db, { exec: git });
+  expect(getTask(db, id).state).toBe("done");
+});
+
+// HIVE-486: linkPRs listed one project at a time on the 60s default, so K
+// stalled repos added K full timeouts to the reconciler lap.
+test("linkPRs lists projects concurrently, so K stalled repos cost about one timeout (HIVE-486)", async () => {
+  const { db } = freshDb();
+  const STALL_MS = 150;
+  for (let i = 0; i < 3; i++) {
+    db.query("INSERT INTO projects (id, name, repo_path, config, created_at) VALUES (?,?,?,?,?)").run(
+      newId("proj"), `p${i}`, `/repo/${i}`, "{}", now()
+    );
+  }
+  let inFlight = 0;
+  let peak = 0;
+  const timeouts: (number | undefined)[] = [];
+  const gh: Exec = async (argv, opts) => {
+    if (argv[0] !== "gh" || argv[1] !== "pr" || argv[2] !== "list") return OK();
+    timeouts.push(opts?.timeoutMs);
+    peak = Math.max(peak, ++inFlight);
+    await new Promise((r) => setTimeout(r, STALL_MS));
+    inFlight--;
+    return { code: 124, stdout: "", stderr: "timeout" }; // what defaultExec returns on a timeout
+  };
+
+  const started = Date.now();
+  await reconcileOnce(db, { exec: gh });
+  const elapsed = Date.now() - started;
+
+  expect(timeouts.length).toBe(4);
+  // All 4 lists overlap (GH_LIST_CONCURRENCY is 4), so the step costs about one
+  // stall rather than four. In-flight count is the guarantee; elapsed is the point.
+  expect(peak).toBe(4);
+  expect(elapsed).toBeLessThan(STALL_MS * 3);
+  // A list must not wait the 60s defaultExec default.
+  expect(timeouts.every((ms) => ms != null && ms <= 30_000)).toBe(true);
 });

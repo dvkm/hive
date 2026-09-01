@@ -7,8 +7,11 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-review-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb } = await import("../src/db.ts");
-const { makeHandler, repairDuplicateQuizPasses } = await import("../src/api.ts");
+const { makeHandler, repairDuplicateQuizPasses, deferShippedQuizzes } = await import("../src/api.ts");
+const { reconcileOnce } = await import("../src/reconciler.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
+const { writeEvent } = await import("../src/state.ts");
+const { reviewActionable, reviewActionableBatch } = await import("../src/reviewer.ts");
 const { parseUnifiedDiff, taskDiff, MAX_DIFF_LINES } = await import("../src/diff.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -107,6 +110,12 @@ test("taskDiff uses git diff base...branch for a branch task, gh for a PR task",
 
 // ---- full server: merge / request-changes / reject / brief ----
 
+// Reusing an ephemeral port can misroute fetch keep-alive connections after a server stops, so every server in this file gets a unique port (HIVE-443).
+let testPortCounter = 34_567;
+function nextTestPort(): number {
+  return testPortCounter++;
+}
+
 // Build a fresh server whose git/gh + herdr are stubbed. `gitMergeCode` controls
 // the local ff-only outcome (0 = success, non-zero = conflict); `ghMergeCode`
 // independently controls `gh pr merge` (defaults to mirroring gitMergeCode, so
@@ -199,7 +208,16 @@ function makeServer(
     return OK();
   };
   const herdr = new Herdr(exec, "herdr");
-  const server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr, exec }) });
+  const handler = makeHandler(db, { herdr, exec });
+  let server: ReturnType<typeof Bun.serve>;
+  while (true) {
+    try {
+      server = Bun.serve({ port: nextTestPort(), fetch: handler });
+      break;
+    } catch (error) {
+      if ((error as { code?: string }).code !== "EADDRINUSE") throw error;
+    }
+  }
   const base = `http://127.0.0.1:${server.port}`;
   return { db, server, base, sends, removed, ghMergeCalls, updateRefCalls, prView };
 }
@@ -212,6 +230,16 @@ async function get(base: string, path: string) {
   const res = await fetch(base + path);
   return { status: res.status, json: await res.json() };
 }
+
+test("makeServer skips occupied test ports", async () => {
+  const occupied = makeServer();
+  const occupiedPort = occupied.server.port;
+  testPortCounter = occupiedPort;
+  const s = makeServer();
+  expect(s.server.port).toBeGreaterThan(occupiedPort);
+  await s.server.stop(true);
+  await occupied.server.stop(true);
+});
 
 // Drive a task to in_review with a branch set (via a stubbed spawn).
 const QUIZ = {
@@ -259,7 +287,7 @@ test("merge success writes a merged event and moves the task to verifying", asyn
   expect(ev.json.some((e: any) => e.type === "merged" && e.payload.actor === "director-tab-a")).toBe(true);
   // best-effort teardown removed the worktree
   expect(s.removed.length).toBeGreaterThan(0);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("a kind outside auto_merge.kinds blocks merge until the director answers correctly", async () => {
@@ -294,7 +322,7 @@ test("a kind outside auto_merge.kinds blocks merge until the director answers co
   expect(merge.status).toBe(200);
   quizzes = await get(s.base, "/api/understanding-quizzes");
   expect(quizzes.json.quizzes.some((item: any) => item.task_id === taskId)).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("an auto-ship kind defers its required quiz and keeps it in the backlog", async () => {
@@ -312,7 +340,7 @@ test("an auto-ship kind defers its required quiz and keeps it in the backlog", a
 
   const quizzes = await get(s.base, "/api/understanding-quizzes");
   expect(quizzes.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("deferred");
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("a failed merge on an auto-ship kind leaves the required quiz undeferred", async () => {
@@ -329,7 +357,7 @@ test("a failed merge on an auto-ship kind leaves the required quiz undeferred", 
 
   const quizzes = await get(s.base, "/api/understanding-quizzes");
   expect(quizzes.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("required");
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("hive-1006: a review_summary submitted while in_progress is not listed or answerable until review", async () => {
@@ -350,7 +378,7 @@ test("hive-1006: a review_summary submitted while in_progress is not listed or a
   const afterReview = await get(s.base, "/api/understanding-quizzes");
   expect(afterReview.json.quizzes.some((item: any) => item.task_id === t.json.id)).toBe(true);
 
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("an identical review after a merge failure keeps the completed quiz", async () => {
@@ -368,7 +396,7 @@ test("an identical review after a merge failure keeps the completed quiz", async
   const events = await get(s.base, `/api/tasks/${taskId}/events`);
   expect(events.json.filter((event: any) => event.type === "review_summary")).toHaveLength(1);
   expect((await get(s.base, "/api/understanding-quizzes")).json.quizzes.some((item: any) => item.task_id === taskId)).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("startup repair carries a completed quiz onto a legacy duplicate review", async () => {
@@ -387,10 +415,56 @@ test("startup repair carries a completed quiz onto a legacy duplicate review", a
     .get(taskId);
   expect(JSON.parse(carried.payload)).toMatchObject({
     review_event_id: "evt_legacy_duplicate",
-    reason: "identical review already understood",
+    reason: "re-emitted review asks the same understanding checks",
   });
   expect(repairDuplicateQuizPasses(s.db)).toBe(0);
-  s.server.stop(true);
+  await s.server.stop(true);
+});
+
+// HIVE-545: the repair used to demand a byte-identical payload, so a legacy
+// review that reworded its prose stayed stuck at "Understanding check required".
+test("startup repair carries a completed quiz onto a reworded legacy review", async () => {
+  const s = makeServer();
+  const { taskId } = await inReviewTask(s.base);
+  const original: any = s.db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId);
+  const payload = JSON.parse(original.payload);
+  payload.done = ["rebased onto main"];
+  payload.understanding.checks = payload.understanding.checks.map((check: any) => ({
+    ...check,
+    question: `  ${check.question}\n`,
+  }));
+  s.db
+    .query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run("evt_legacy_reworded", taskId, new Date().toISOString(), "agent", "review_summary", JSON.stringify(payload));
+
+  expect(repairDuplicateQuizPasses(s.db)).toBe(1);
+  const carried: any = s.db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'understanding_quiz_passed' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId);
+  expect(JSON.parse(carried.payload).review_event_id).toBe("evt_legacy_reworded");
+  await s.server.stop(true);
+});
+
+test("startup repair leaves a legacy review alone when its options changed", async () => {
+  const s = makeServer();
+  const { taskId } = await inReviewTask(s.base);
+  const original: any = s.db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId);
+  const payload = JSON.parse(original.payload);
+  payload.understanding.checks = payload.understanding.checks.map((check: any) => ({
+    ...check,
+    options: [{ key: "a", label: "A brand new answer" }, { key: "b", label: "Another new answer" }],
+    answer_key: "a",
+  }));
+  s.db
+    .query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run("evt_legacy_reoptioned", taskId, new Date().toISOString(), "agent", "review_summary", JSON.stringify(payload));
+
+  expect(repairDuplicateQuizPasses(s.db)).toBe(0);
+  await s.server.stop(true);
 });
 
 test("a wrong answer teaches the idea and rotates to another question", async () => {
@@ -431,7 +505,7 @@ test("a wrong answer teaches the idea and rotates to another question", async ()
   expect(finalCorrect.json.passed).toBe(true);
   expect(finalCorrect.json.completed).toBe(5);
   expect((await get(s.base, "/api/understanding-quizzes")).json.quizzes.some((item: any) => item.task_id === t.json.id)).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("a stale quiz answer returns the actor and answer that changed the card", async () => {
@@ -476,7 +550,7 @@ test("a stale quiz answer returns the actor and answer that changed the card", a
   expect(stale.json.error).toContain("director-tab-a");
   const attempts = (await get(s.base, `/api/tasks/${t.json.id}/events`)).json.filter((event: any) => event.type === "understanding_quiz_attempt");
   expect(attempts).toHaveLength(1);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("a replacement review invalidates the prior quiz version", async () => {
@@ -502,7 +576,7 @@ test("a replacement review invalidates the prior quiz version", async () => {
   expect(stale.status).toBe(409);
   const current = (await get(s.base, "/api/understanding-quizzes")).json.quizzes.find((item: any) => item.task_id === t.json.id);
   expect(current.version).not.toBe(oldCard.version);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("list completed/total tracks a two-check quiz exactly through pass (hive-1002)", async () => {
@@ -538,7 +612,7 @@ test("list completed/total tracks a two-check quiz exactly through pass (hive-10
   expect(second.json.completed).toBe(2);
 
   expect((await get(s.base, "/api/understanding-quizzes")).json.quizzes.some((item: any) => item.task_id === t.json.id)).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("explicit escape hatch ships now and keeps the quiz in Needs You until passed", async () => {
@@ -561,7 +635,7 @@ test("explicit escape hatch ships now and keeps the quiz in Needs You until pass
   expect(passed.json.correct).toBe(true);
   quizzes = await get(s.base, "/api/understanding-quizzes");
   expect(quizzes.json.quizzes.some((item: any) => item.task_id === taskId)).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("merge conflict bounces the task back to the agent with rebase instructions", async () => {
@@ -578,7 +652,7 @@ test("merge conflict bounces the task back to the agent with rebase instructions
   expect(mf.payload.conflict).toBe(true);
   expect(mf.payload.delivered).toBe(true);
   expect(ev.json.some((e: any) => e.type === "action_failed")).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("non-conflict merge failure returns 409 and does not change state", async () => {
@@ -591,7 +665,7 @@ test("non-conflict merge failure returns 409 and does not change state", async (
   const task = await get(s.base, `/api/tasks/${taskId}`);
   expect(task.json.state).toBe("in_review"); // unchanged, no bounce
   expect(s.sends.length).toBe(sendsBefore); // agent not pinged
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 // Drive a task into review via the agent's own handoff, PR attached.
@@ -625,6 +699,7 @@ test("a 'ready' with a new PR url re-links the task (replaced PR, the #90 loop)"
   const link = ev.json.filter((e: any) => e.type === "pr_linked").at(-1);
   expect(link.payload.via).toBe("ready_replaced");
   expect(link.payload.replaced).toBe("https://gh/pr/161");
+  await s.server.stop(true);
 });
 
 test("merging a PR GitHub already merged advances to verifying instead of failing", async () => {
@@ -634,7 +709,7 @@ test("merging a PR GitHub already merged advances to verifying instead of failin
   expect(r.status).toBe(200);
   // evidence + no smoke checks configured → verifying auto-advances to done
   expect(["verifying", "done"]).toContain(r.json.state);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("merging a CLOSED PR fails truthfully, no bogus conflict bounce", async () => {
@@ -647,7 +722,7 @@ test("merging a CLOSED PR fails truthfully, no bogus conflict bounce", async () 
   const task = await get(s.base, `/api/tasks/${id}`);
   expect(task.json.state).toBe("in_review"); // no bounce: nothing for the agent to rebase
   expect(s.sends.length).toBe(sendsBefore);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("PR merge fails on a stale base but the branch is a clean local ff → falls back instead of bouncing (task 328)", async () => {
@@ -661,7 +736,7 @@ test("PR merge fails on a stale base but the branch is a clean local ff → fall
   const merged = ev.json.find((e: any) => e.type === "merged");
   expect(merged.payload.method).toContain("local ff-only");
   expect(ev.json.some((e: any) => e.type === "merge_failed")).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("PR merge fails and the local ff also fails (real conflict) → still bounces to the agent", async () => {
@@ -674,7 +749,7 @@ test("PR merge fails and the local ff also fails (real conflict) → still bounc
   expect(r.json.error).toContain("local fast-forward also refused"); // the actionable ff reason, not just gh's
   const task = await get(s.base, `/api/tasks/${id}`);
   expect(task.json.state).toBe("in_progress");
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("a stale local base cannot bypass a conflict with the PR's current remote base", async () => {
@@ -691,7 +766,7 @@ test("a stale local base cannot bypass a conflict with the PR's current remote b
   expect((await get(s.base, `/api/tasks/${id}`)).json.state).toBe("in_progress");
   const ev = await get(s.base, `/api/tasks/${id}/events`);
   expect(ev.json.some((e: any) => e.type === "merged")).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("a stale local task branch cannot replace the PR head during fallback", async () => {
@@ -707,7 +782,7 @@ test("a stale local task branch cannot replace the PR head during fallback", asy
   expect((await get(s.base, `/api/tasks/${id}`)).json.state).toBe("in_progress");
   const ev = await get(s.base, `/api/tasks/${id}/events`);
   expect(ev.json.some((e: any) => e.type === "merged")).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 // Branch protection wears the same opaque "not mergeable" reason as a stale
@@ -736,7 +811,7 @@ for (const [label, blocker] of [
     expect(r.json.error).not.toContain("not 'in_review'"); // the fallback gate refused, not the state gate
     const ev = await get(s.base, `/api/tasks/${id}/events`);
     expect(ev.json.some((e: any) => e.type === "merged")).toBe(false);
-    s.server.stop(true);
+    await s.server.stop(true);
   });
 }
 
@@ -750,7 +825,7 @@ test("merge_strategy: 'local_ff' forces the local path for a PR-backed task, ski
   const ev = await get(s.base, `/api/tasks/${id}/events`);
   const merged = ev.json.find((e: any) => e.type === "merged");
   expect(merged.payload.method).toContain("local ff-only (forced");
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("merge_strategy: 'local_ff' still refuses a CLOSED PR", async () => {
@@ -762,7 +837,7 @@ test("merge_strategy: 'local_ff' still refuses a CLOSED PR", async () => {
   expect(r.json.error).toContain("CLOSED (not merged)");
   const ev = await get(s.base, `/api/tasks/${id}/events`);
   expect(ev.json.some((e: any) => e.type === "merged")).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("local ff atomically advances an un-checked-out base without switching the primary checkout", async () => {
@@ -773,7 +848,7 @@ test("local ff atomically advances an un-checked-out base without switching the 
   expect(s.updateRefCalls[0]?.slice(-3)).toEqual(["refs/heads/main", "branch-sha", "base-sha"]);
   const ev = await get(s.base, `/api/tasks/${id}/events`);
   expect(ev.json.some((e: any) => e.type === "merged")).toBe(true);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("local ff refuses to desynchronize a base checked out in another worktree", async () => {
@@ -785,7 +860,7 @@ test("local ff refuses to desynchronize a base checked out in another worktree",
   expect(s.updateRefCalls.length).toBe(0);
   const ev = await get(s.base, `/api/tasks/${id}/events`);
   expect(ev.json.some((e: any) => e.type === "merged")).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("local ff reports an atomic ref race without recording a merge", async () => {
@@ -797,7 +872,7 @@ test("local ff reports an atomic ref race without recording a merge", async () =
   expect((await get(s.base, `/api/tasks/${id}`)).json.state).toBe("in_review");
   const ev = await get(s.base, `/api/tasks/${id}/events`);
   expect(ev.json.some((e: any) => e.type === "merged")).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("ready with failing CI is HELD in_progress; with passing CI it hands off", async () => {
@@ -808,13 +883,13 @@ test("ready with failing CI is HELD in_progress; with passing CI it hands off", 
   expect(task.json.ci_status).toBe("failing");
   const ev = await get(failing.base, `/api/tasks/${id}/events`);
   expect(ev.json.some((e: any) => e.type === "ready_held")).toBe(true);
-  failing.server.stop(true);
+  await failing.server.stop(true);
 
   const green = makeServer({ rollup: [{ conclusion: "SUCCESS" }] });
   id = await inReviewWithPr(green.base, "https://gh/pr/10");
   task = await get(green.base, `/api/tasks/${id}`);
   expect(task.json.state).toBe("in_review");
-  green.server.stop(true);
+  await green.server.stop(true);
 
   const pending = makeServer({ rollup: [{ status: "IN_PROGRESS" }] });
   id = await inReviewWithPr(pending.base, "https://gh/pr/11");
@@ -823,7 +898,7 @@ test("ready with failing CI is HELD in_progress; with passing CI it hands off", 
   const held = await post(pending.base, `/api/tasks/${id}/events`, { type: "ready" });
   expect(held.json.message).toContain("End this turn");
   expect(held.json.message).not.toContain("Stay on the task");
-  pending.server.stop(true);
+  await pending.server.stop(true);
 });
 
 test("merge is blocked by a task.merge deny rule (authority gate)", async () => {
@@ -834,7 +909,7 @@ test("merge is blocked by a task.merge deny rule (authority gate)", async () => 
   expect(r.status).toBe(403);
   const task = await get(s.base, `/api/tasks/${taskId}`);
   expect(task.json.state).toBe("in_review");
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("merge refuses a task that is not in_review", async () => {
@@ -844,7 +919,7 @@ test("merge refuses a task that is not in_review", async () => {
   const r = await post(s.base, `/api/tasks/${t.json.id}/merge`, {});
   expect(r.status).toBe(409);
   expect(r.json.error).toContain("in_review");
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("merge refuses report-only scout tasks", async () => {
@@ -857,7 +932,7 @@ test("merge refuses report-only scout tasks", async () => {
   expect(r.status).toBe(409);
   expect(r.json.error).toContain("report-only");
   expect((await get(s.base, `/api/tasks/${t.json.id}`)).json.state).toBe("in_review");
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("report acceptance requires its understanding quiz", async () => {
@@ -880,7 +955,7 @@ test("report acceptance requires its understanding quiz", async () => {
   accept = await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "verifying" });
   expect(accept.status).toBe(200);
   expect(["verifying", "done"]).toContain(accept.json.state);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("passing a scout's quiz never accepts the report on its own (HIVE-421)", async () => {
@@ -901,7 +976,7 @@ test("passing a scout's quiz never accepts the report on its own (HIVE-421)", as
 
   const accept = await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "verifying" });
   expect(accept.status).toBe(200);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("request-changes returns the task to in_progress, sends notes, records an event", async () => {
@@ -916,7 +991,7 @@ test("request-changes returns the task to in_progress, sends notes, records an e
   const ev = await get(s.base, `/api/tasks/${taskId}/events`);
   const cr = ev.json.find((e: any) => e.type === "changes_requested");
   expect(cr.payload.notes).toBe("tighten the error handling");
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("request-changes requires notes", async () => {
@@ -924,7 +999,7 @@ test("request-changes requires notes", async () => {
   const { taskId } = await inReviewTask(s.base);
   const r = await post(s.base, `/api/tasks/${taskId}/request-changes`, { notes: "  " });
   expect(r.status).toBe(400);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 // ---- external-task supervision hardening (#996) ------------------------------
@@ -948,7 +1023,7 @@ test("request-changes rejects a never-dispatched external task in review", async
   expect(s.sends.length).toBe(0);
   const ev = await get(s.base, `/api/tasks/${taskId}/events`);
   expect(ev.json.some((e: any) => e.type === "changes_requested")).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 // SUPERSEDED BEHAVIOR, deliberately. hive-996 rejected this move with a 409 so
@@ -969,7 +1044,7 @@ test("task move to in_progress from in_review does not bounce a never-dispatched
   expect(s.sends.length).toBe(before); // and no agent was contacted
   const task = await get(s.base, `/api/tasks/${taskId}`);
   expect(task.json.state).toBe("in_progress");
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("request-changes and the in_progress bounce work normally on an external task that WAS spawned before (recovery, not first dispatch)", async () => {
@@ -991,7 +1066,7 @@ test("request-changes and the in_progress bounce work normally on an external ta
   expect(r.status).toBe(200);
   expect(r.json.delivered).toBe(true);
   expect(s.sends.at(-1)?.message).toContain("still reachable");
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 // #710: `hive task move <id> in_progress --note` is a reviewer bounce. It must
@@ -1008,7 +1083,7 @@ test("task move to in_progress from in_review records changes_requested and deli
   const ev = await get(s.base, `/api/tasks/${taskId}/events`);
   const cr = ev.json.find((e: any) => e.type === "changes_requested");
   expect(cr.payload.notes).toBe("the diff misses site 4");
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("tracking-only review moves use a plain transition and never contact an agent", async () => {
@@ -1038,7 +1113,7 @@ test("tracking-only review moves use a plain transition and never contact an age
   expect(verifying.json.state).toBe("verifying");
   const events = await get(s.base, `/api/tasks/${t.json.id}/events`);
   expect(events.json.some((event: any) => ["changes_requested", "steer", "spawned"].includes(event.type))).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("task move bounce respawns the agent when it has exited, note rides the fresh brief", async () => {
@@ -1055,7 +1130,7 @@ test("task move bounce respawns the agent when it has exited, note rides the fre
   expect(steer.payload.delivery).toBe("delivered");
   expect(steer.payload.message).toContain("fix X");
   expect(spawnsBefore).toBeGreaterThanOrEqual(0);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("reject path: an in_review task can be cancelled with a reason", async () => {
@@ -1067,7 +1142,7 @@ test("reject path: an in_review task can be cancelled with a reason", async () =
   const ev = await get(s.base, `/api/tasks/${taskId}/events`);
   const sc = ev.json.find((e: any) => e.type === "state_change" && e.payload.to === "cancelled");
   expect(sc.payload.reason).toBe("not the approach we want");
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("brief.to_review derivation lists in_review tasks", async () => {
@@ -1092,6 +1167,51 @@ test("brief.to_review derivation lists in_review tasks", async () => {
   const b3 = await get(s.base, `/api/brief`);
   expect(b3.json.to_review.some((t: any) => t.id === external.json.id)).toBe(false);
   expect(b3.json.to_review.some((t: any) => t.id === linked.json.id)).toBe(false);
+  await s.server.stop(true);
+});
+
+// HIVE-500: the review column counted everything in_review, so the Backlogs
+// number was mostly pipeline state. One task per bucket; only the last two are
+// the director's.
+test("brief.to_review counts only reviews the director can act on", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", { name: "actionable", repo_path: "/repo" });
+  const make = async (title: string, cols: Record<string, any>) => {
+    const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title });
+    const id = t.json.id;
+    for (const [k, v] of Object.entries(cols)) s.db.query(`UPDATE tasks SET ${k} = ? WHERE id = ?`).run(v, id);
+    s.db.query("UPDATE tasks SET state = 'in_review' WHERE id = ?").run(id);
+    return id;
+  };
+  const review = (id: string, head: string, risks: string[] = []) =>
+    writeEvent(s.db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks, questions: [], reviewed_head_sha: head } });
+  const PR = { pr_url: "https://x/pr/1", ci_status: "passing", head_sha: "head1" };
+
+  const noReview = await make("no review yet", PR);
+  const staleReview = await make("review at a stale head", PR);
+  review(staleReview, "old-head");
+  const unverified = await make("risks unverified", PR);
+  review(unverified, "head1", ["a risk nobody checked"]);
+  const noPrNoReport = await make("no PR and no report", {});
+  const noPrReport = await make("no PR but a report", {});
+  writeEvent(s.db, { task_id: noPrReport, source: "agent", type: "review_summary", payload: { done: ["read the docs"] } });
+  const redCi = await make("PR with red CI", { ...PR, ci_status: "failing" });
+  review(redCi, "head1");
+  const ready = await make("PR with green CI and a finished review", PR);
+  review(ready, "head1");
+
+  const b = await get(s.base, "/api/brief");
+  const ids = (rows: any[]) => rows.map((t: any) => t.id).sort();
+  expect(ids(b.json.to_review)).toEqual([noPrReport, ready].sort());
+  // Everything else stays visible, just uncounted.
+  expect(ids(b.json.in_review_pending)).toEqual([noReview, staleReview, unverified, noPrNoReport, redCi].sort());
+
+  // The batched rule the list endpoints use must agree with the single-task one
+  // on every bucket, or a board card and its brief row would disagree.
+  const rows = s.db.query("SELECT * FROM tasks").all() as any[];
+  const batch = reviewActionableBatch(s.db, rows);
+  for (const t of rows) expect(batch.has(t.id)).toBe(reviewActionable(s.db, t));
+
   s.server.stop(true);
 });
 
@@ -1103,7 +1223,7 @@ test("diff endpoint returns the structured shape for a branch task", async () =>
   expect(r.json.files.length).toBe(2);
   expect(r.json.files[0].path).toBe("src/a.ts");
   expect(r.json.truncated).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("diff endpoint rejects tracking-only review tasks", async () => {
@@ -1115,7 +1235,7 @@ test("diff endpoint rejects tracking-only review tasks", async () => {
   const r = await get(s.base, `/api/tasks/${t.json.id}/diff`);
   expect(r.status).toBe(409);
   expect(r.json.error).toContain("tracking-only");
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 
@@ -1175,6 +1295,107 @@ function addRiskVerdicts(s: ReturnType<typeof makeServer>, taskId: string, head:
   );
 }
 
+// HIVE-488: one task per bucket seen live on the hive project. Only the task
+// whose review actually finished for its CURRENT head is a question the
+// director can answer; the rest are the review pipeline still working, or
+// findings keyed to a head that no longer exists.
+test("only a review that finished for the live head counts as an answerable quiz", async () => {
+  const s = makeServer();
+  const p = await post(s.base, "/api/projects", {
+    name: "p",
+    repo_path: "/repo",
+    config: { default_branch: "main", auto_merge: { kinds: ["chore"] } },
+  });
+  // Bucket task: judgment-class (kind outside auto_merge.kinds) with a quiz.
+  const bucket = async (title: string, head: string | null, review: { head?: string; risks?: string[] } | null) => {
+    const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title, brief: "b", kind: "ship" });
+    await post(s.base, `/api/tasks/${t.json.id}/spawn`, {});
+    await addQuiz(s.base, t.json.id);
+    await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+    if (head) s.db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run(head, t.json.id);
+    if (review)
+      s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+        `ev-auto-${t.json.id}`,
+        t.json.id,
+        new Date().toISOString(),
+        "system",
+        "auto_review",
+        JSON.stringify({
+          verdict: "caution",
+          summary: "s",
+          risks: review.risks ?? [],
+          questions: [],
+          files: ["server/src/rows.ts"],
+          ...(review.head ? { reviewed_head_sha: review.head } : {}),
+        })
+      );
+    return t.json.id;
+  };
+  const verdicts = (taskId: string, head: string, risks: string[], verdict: "confirmed" | "refuted" = "confirmed") =>
+    s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+      `ev-rv-${taskId}`,
+      taskId,
+      new Date().toISOString(),
+      "system",
+      "risk_verdicts",
+      JSON.stringify({ reviewed_head_sha: head, verdicts: risks.map((risk) => ({ risk, verdict, why: "checked it" })) })
+    );
+
+  // ANSWERABLE: review written for the live head, every risk verified there.
+  // The verdict is `refuted` on purpose: a CONFIRMED risk hides the quiz on its
+  // own now (HIVE-570), which is a different rule with its own test below.
+  const answerable = await bucket("finished", "head-a", { head: "head-a", risks: ["a leak"] });
+  verdicts(answerable, "head-a", ["a leak"], "refuted");
+
+  // The review pass has not produced anything yet.
+  const noReview = await bucket("review not run", "head-b", null);
+  // The review landed, its risks are still waiting on verification.
+  await bucket("risks unverified", "head-c", { head: "head-c", risks: ["a leak"] });
+  // Verdict/review count mismatch: one risk still uncovered (the PR #12 bug).
+  const mismatch = await bucket("verdict count mismatch", "head-d", { head: "head-d", risks: ["a leak", "a race"] });
+  verdicts(mismatch, "head-d", ["a leak"]);
+  // Findings against a head the task has since moved off.
+  const staleHead = await bucket("stale findings", "head-new", { head: "head-old", risks: ["a leak"] });
+  verdicts(staleHead, "head-old", ["a leak"]);
+
+  // Post-ship catch-up: a shipped task, a separate class from the merge gate.
+  const shipped = await bucket("already shipped", "head-f", { head: "head-f", risks: [] });
+  s.db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(shipped);
+
+  const quizzes = (await get(s.base, "/api/understanding-quizzes?scope=all")).json.quizzes as any[];
+  const mine = quizzes.filter((q) => q.project_id === p.json.id);
+  expect(mine.filter((q) => q.task_state === "in_review").map((q) => q.task_id)).toEqual([answerable]);
+  expect(mine.filter((q) => q.task_state === "done").map((q) => q.task_id)).toEqual([shipped]);
+
+  // The pipeline finishing turns a hidden one into a director ask, no re-review.
+  verdicts(noReview, "head-b", []);
+  s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    `ev-auto-late-${noReview}`,
+    noReview,
+    new Date().toISOString(),
+    "system",
+    "auto_review",
+    JSON.stringify({ verdict: "caution", summary: "s", risks: [], questions: [], files: ["server/src/rows.ts"], reviewed_head_sha: "head-b" })
+  );
+  const after = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  expect(after.some((q) => q.task_id === noReview)).toBe(true);
+  await s.server.stop(true);
+});
+
+test("the quiz list defaults to live tasks; shipped ones need scope=all (HIVE-542)", async () => {
+  const s = makeServer();
+  const live = await judgmentTask(s, { verdict: "caution" });
+  const shipped = await judgmentTask(s, { verdict: "caution" });
+  s.db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(shipped.taskId);
+
+  const live_only = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  expect(live_only.map((q) => q.task_id)).toEqual([live.taskId]);
+
+  const all = (await get(s.base, "/api/understanding-quizzes?scope=all")).json.quizzes as any[];
+  expect(all.map((q) => q.task_id).sort()).toEqual([live.taskId, shipped.taskId].sort());
+  await s.server.stop(true);
+});
+
 test("a mechanical looks_good chore mints no quiz anywhere", async () => {
   const s = makeServer();
   const { taskId } = await judgmentTask(s, { verdict: "looks_good" });
@@ -1192,7 +1413,7 @@ test("a mechanical looks_good chore mints no quiz anywhere", async () => {
   expect(events.json.some((event: any) => event.type === "understanding_quiz_deferred")).toBe(false);
   const after = await get(s.base, "/api/understanding-quizzes");
   expect(after.json.quizzes.some((item: any) => item.task_id === taskId)).toBe(false);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("a caution verdict keeps the quiz required for the same chore", async () => {
@@ -1209,7 +1430,7 @@ test("a caution verdict keeps the quiz required for the same chore", async () =>
   expect(merge.status).toBe(200);
   const events = await get(s.base, `/api/tasks/${taskId}/events`);
   expect(events.json.some((event: any) => event.type === "understanding_quiz_deferred")).toBe(true);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 // HIVE-407: the per-risk check (HIVE-406) re-read the code for this head and
@@ -1224,7 +1445,45 @@ test("a caution whose risks were all refuted stops being judgment-class", async 
   expect(check.json.understanding_required).toBe(false);
   const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
   expect(merge.status).toBe(200);
-  s.server.stop(true);
+  await s.server.stop(true);
+});
+
+// HIVE-453: a cleared caution only speaks for the head it was cleared on. A
+// force-push after that must re-require the quiz until a review exists for
+// the NEW (live) head, even though the old review's own verdicts still look
+// clean for the head they were computed against.
+test("a force-push after a cleared caution re-requires the quiz until the new head is reviewed", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "caution", risks: ["maybe a leak"], head: "head-a" });
+  addRiskVerdicts(s, taskId, "head-a", "refuted");
+
+  const cleared = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(cleared.json.understanding_required).toBe(false);
+
+  s.db.query("UPDATE tasks SET head_sha = 'head-b' WHERE id = ?").run(taskId);
+  const forcePushed = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(forcePushed.json.understanding_required).toBe(true);
+
+  // Inside auto_merge.kinds, so it merges — but the quiz is deferred again for
+  // the new head, same as any other still-required caution.
+  const merge = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(merge.status).toBe(200);
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  expect(events.json.some((event: any) => event.type === "understanding_quiz_deferred")).toBe(true);
+  await s.server.stop(true);
+});
+
+test("a force-push after a looks_good review re-requires the quiz until the new head is reviewed", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "looks_good", head: "head-a" });
+
+  const clean = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(clean.json.understanding_required).toBe(false);
+
+  s.db.query("UPDATE tasks SET head_sha = 'head-b' WHERE id = ?").run(taskId);
+  const forcePushed = await get(s.base, `/api/tasks/${taskId}/branch-check`);
+  expect(forcePushed.json.understanding_required).toBe(true);
+  await s.server.stop(true);
 });
 
 test("a confirmed risk blocks the merge and the 409 names it", async () => {
@@ -1241,7 +1500,34 @@ test("a confirmed risk blocks the merge and the 409 names it", async () => {
   s.db.query("UPDATE tasks SET head_sha = 'head-2' WHERE id = ?").run(taskId);
   const stale = await post(s.base, `/api/tasks/${taskId}/merge`, {});
   expect(stale.status).not.toBe(409);
-  s.server.stop(true);
+  await s.server.stop(true);
+});
+
+// HIVE-539: a risk check that never produced a verdict must not be quoted as a
+// confirmed risk. The 409 says the check did not finish, and the director can
+// still merge over it.
+test("a timed-out risk check blocks with an honest reason, not a confirmed risk", async () => {
+  const s = makeServer();
+  const { taskId } = await judgmentTask(s, { verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
+  s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    `ev-rv-timeout-${taskId}`,
+    taskId,
+    new Date().toISOString(),
+    "system",
+    "risk_verdicts",
+    JSON.stringify({ reviewed_head_sha: "head-1", verdicts: [], unverified: 1, unverified_reason: "timed out after 180000ms" })
+  );
+
+  const blocked = await post(s.base, `/api/tasks/${taskId}/merge`, {});
+  expect(blocked.status).toBe(409);
+  expect(blocked.json.error).toContain("did not finish");
+  expect(blocked.json.error).toContain("timed out after 180000ms");
+  expect(blocked.json.error).not.toContain("confirmed 1 risk");
+  expect(blocked.json.error).not.toContain("maybe a leak");
+
+  const merged = await post(s.base, `/api/tasks/${taskId}/merge`, { override_confirmed_risks: true });
+  expect(merged.status).toBe(200);
+  await s.server.stop(true);
 });
 
 test("the director can merge over a confirmed risk on purpose", async () => {
@@ -1250,7 +1536,7 @@ test("the director can merge over a confirmed risk on purpose", async () => {
   addRiskVerdicts(s, taskId, "head-1", "confirmed");
   const merge = await post(s.base, `/api/tasks/${taskId}/merge`, { override_confirmed_risks: true });
   expect(merge.status).toBe(200);
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 test("a looks_good chore touching a sensitive path stays judgment-class", async () => {
@@ -1268,8 +1554,8 @@ test("a looks_good chore touching a sensitive path stays judgment-class", async 
   });
   const check2 = await get(s2.base, `/api/tasks/${custom.taskId}/branch-check`);
   expect(check2.json.understanding_required).toBe(false);
-  s.server.stop(true);
-  s2.server.stop(true);
+  await s.server.stop(true);
+  await s2.server.stop(true);
 });
 
 test("camelCase sensitive filenames still count as judgment-class", async () => {
@@ -1288,14 +1574,14 @@ test("camelCase sensitive filenames still count as judgment-class", async () => 
     const { taskId } = await judgmentTask(s, { verdict: "looks_good", files: [file] });
     const check = await get(s.base, `/api/tasks/${taskId}/branch-check`);
     expect([file, check.json.understanding_required]).toEqual([file, true]);
-    s.server.stop(true);
+    await s.server.stop(true);
   }
 
   // A path with no sensitive token anywhere stays mechanical.
   const plain = makeServer();
   const { taskId } = await judgmentTask(plain, { verdict: "looks_good", files: ["web/src/views/Board.tsx"] });
   expect((await get(plain.base, `/api/tasks/${taskId}/branch-check`)).json.understanding_required).toBe(false);
-  plain.server.stop(true);
+  await plain.server.stop(true);
 });
 
 test("the director can flag a mechanical task to require its quiz again", async () => {
@@ -1311,7 +1597,7 @@ test("the director can flag a mechanical task to require its quiz again", async 
   expect((await get(s.base, `/api/tasks/${taskId}/branch-check`)).json.understanding_required).toBe(true);
   const quizzes = await get(s.base, "/api/understanding-quizzes");
   expect(quizzes.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("required");
-  s.server.stop(true);
+  await s.server.stop(true);
 });
 
 afterAll(() => {});
@@ -1357,5 +1643,148 @@ test("five deferred quizzes push ONE catch-up digest, not five notifications", a
   expect((await get(s.base, "/api/understanding-quizzes")).json.quizzes).toHaveLength(0);
   notifyQuizDigest(s.db, t0 + QUIZ_DIGEST_MS + 60 * 1000);
   expect(digests()).toHaveLength(2);
-  s.server.stop(true);
+  await s.server.stop(true);
+});
+
+test("with quizzes pending in two projects, the total badge count matches the sum of per-project digest cards", async () => {
+  const { pendingPostShipQuizCount } = await import("../src/api.ts");
+  const s = makeServer();
+
+  async function shippedTaskWithQuiz(projectId: string, title: string) {
+    const t = await post(s.base, "/api/tasks", { project_id: projectId, title, brief: "b" });
+    await post(s.base, `/api/tasks/${t.json.id}/spawn`, {});
+    await addQuiz(s.base, t.json.id);
+    await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+    await post(s.base, `/api/tasks/${t.json.id}/transition`, { to: "verifying" });
+    return t.json.id as string;
+  }
+
+  const projA = (await post(s.base, "/api/projects", { name: "a", repo_path: "/repo-a", config: { default_branch: "main" } })).json.id;
+  const projB = (await post(s.base, "/api/projects", { name: "b", repo_path: "/repo-b", config: { default_branch: "main" } })).json.id;
+  await shippedTaskWithQuiz(projA, "review me a1");
+  await shippedTaskWithQuiz(projA, "review me a2");
+  await shippedTaskWithQuiz(projB, "review me b1");
+
+  const quizzes = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as { project_id: string }[];
+  const byProject = new Map<string, number>();
+  for (const quiz of quizzes) byProject.set(quiz.project_id, (byProject.get(quiz.project_id) ?? 0) + 1);
+  expect(byProject.get(projA)).toBe(2);
+  expect(byProject.get(projB)).toBe(1);
+
+  // The per-project counts (what the client's digest cards show) must sum to
+  // the same total the server-side badge count reports.
+  const sumOfDigests = [...byProject.values()].reduce((total, n) => total + n, 0);
+  expect(pendingPostShipQuizCount(s.db)).toBe(sumOfDigests);
+  expect(pendingPostShipQuizCount(s.db, projA)).toBe(2);
+  expect(pendingPostShipQuizCount(s.db, projB)).toBe(1);
+  await s.server.stop(true);
+});
+
+// HIVE-544: hive did not perform this merge — someone merged the PR on GitHub
+// and the reconciler only noticed afterwards. The quiz has to settle on that
+// path too, or a shipped task keeps saying "required" forever.
+test("a PR merged outside hive defers the unanswered quiz when the reconciler sees it", async () => {
+  const s = makeServer({ prState: "MERGED" });
+  const { taskId } = await inReviewTask(s.base, {}, false);
+  s.db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/544", taskId);
+
+  const quizzesBefore = await get(s.base, "/api/understanding-quizzes");
+  expect(quizzesBefore.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("required");
+
+  const gh: Exec = ((argv: string[]) =>
+    argv[0] === "gh"
+      ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] }))
+      : OK()) as unknown as Exec;
+  await reconcileOnce(s.db, { exec: gh });
+
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  const deferred = events.json.find((event: any) => event.type === "understanding_quiz_deferred");
+  expect(deferred).toBeTruthy();
+  expect(deferred.payload.note).toContain("merged outside hive");
+
+  const quizzes = await get(s.base, "/api/understanding-quizzes?scope=all");
+  expect(quizzes.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("deferred");
+  await s.server.stop(true);
+});
+
+// HIVE-544 backfill: the pile that built up before the fix above. Those tasks
+// are already terminal, so no merge path will ever reach them again.
+test("the startup sweep settles shipped quizzes, skips failed tasks, and is a no-op the second time", async () => {
+  const s = makeServer();
+  const shipped = await inReviewTask(s.base, {}, false);
+  const failed = await inReviewTask(s.base, {}, false);
+  s.db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(shipped.taskId);
+  s.db.query("UPDATE tasks SET state = 'failed' WHERE id = ?").run(failed.taskId);
+
+  expect(deferShippedQuizzes(s.db)).toBe(1);
+  expect(deferShippedQuizzes(s.db)).toBe(0);
+
+  const quizzes = await get(s.base, "/api/understanding-quizzes?scope=all");
+  const statusOf = (id: string) => quizzes.json.quizzes.find((item: any) => item.task_id === id)?.status;
+  expect(statusOf(shipped.taskId)).toBe("deferred");
+  expect(statusOf(failed.taskId)).toBe("required");
+  await s.server.stop(true);
+});
+
+// ---------------------------------------------------------------------------
+// HIVE-570. Two complaints, one cause: the risk finding was treated as an event
+// in the land queue instead of a property of the change. So the director paid
+// the quiz first and was refused afterwards, and taking the PR out of the queue
+// (the right answer to a permanent failure) deleted the explanation.
+
+test("a change with confirmed risks never presents a quiz (HIVE-570)", async () => {
+  const s = makeServer();
+  const t = await judgmentTask(s, { kind: "ship", verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
+
+  // Before the verification pass finishes, the quiz is pipeline state, not an ask.
+  expect(((await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[]).some((q) => q.task_id === t.taskId)).toBe(false);
+
+  addRiskVerdicts(s, t.taskId, "head-1", "confirmed");
+  const withRisk = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  expect(withRisk.some((q) => q.task_id === t.taskId)).toBe(false);
+
+  // The agent pushes a fix; the risk is refuted on the new head and the quiz is
+  // a fair thing to ask again.
+  const clean = await judgmentTask(s, { kind: "ship", verdict: "caution", risks: ["maybe a leak"], head: "head-2" });
+  addRiskVerdicts(s, clean.taskId, "head-2", "refuted");
+  const cleared = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  expect(cleared.some((q) => q.task_id === clean.taskId)).toBe(true);
+  await s.server.stop(true);
+});
+
+test("Ship is not offered while a confirmed risk sits on the head (HIVE-570)", async () => {
+  const s = makeServer();
+  const t = await judgmentTask(s, { kind: "ship", verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
+  addRiskVerdicts(s, t.taskId, "head-1", "confirmed");
+
+  // The review card reads this BEFORE it offers Ship, so the check that can
+  // refuse has already run by the time the button exists.
+  const check = (await get(s.base, `/api/tasks/${t.taskId}/branch-check`)).json;
+  expect(check.confirmed_risks.map((r: any) => r.risk)).toEqual(["maybe a leak"]);
+  expect(check.risk_check_unfinished).toBeNull();
+
+  // And the merge itself still refuses, ahead of the understanding check, so the
+  // refusal never arrives after the director has already answered questions.
+  const refused = await post(s.base, `/api/tasks/${t.taskId}/merge`, {});
+  expect(refused.status).toBe(409);
+  expect(refused.json.error).toContain("the risk check confirmed 1 risk");
+  expect(refused.json.error).not.toContain("understanding check");
+  await s.server.stop(true);
+});
+
+test("a confirmed risk stays readable after the task leaves the land queue (HIVE-570)", async () => {
+  const s = makeServer();
+  const t = await judgmentTask(s, { kind: "ship", verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
+  addRiskVerdicts(s, t.taskId, "head-1", "confirmed");
+
+  await post(s.base, "/api/land-queue", { task_ids: [t.taskId], queued: true });
+  await post(s.base, "/api/land-queue", { task_ids: [t.taskId], queued: false });
+
+  // The verdicts live on the task, not on the pause card, so unqueueing cannot
+  // take the explanation with it.
+  const detail = (await get(s.base, `/api/tasks/${t.taskId}`)).json;
+  const verdictEvent = [...detail.events].reverse().find((e: any) => e.type === "risk_verdicts");
+  expect(verdictEvent.payload.reviewed_head_sha).toBe("head-1");
+  expect(verdictEvent.payload.verdicts[0]).toMatchObject({ risk: "maybe a leak", verdict: "confirmed" });
+  await s.server.stop(true);
 });

@@ -98,11 +98,11 @@ test("startWatchers skips a tick while a cycle is already running", async () => 
     return new Response(`v${cycles}`, { status: 200 });
   }) as unknown as typeof fetch;
 
-  const origError = console.error;
+  const origWarn = console.warn;
   const origSetInterval = globalThis.setInterval;
   const origClearInterval = globalThis.clearInterval;
   const logs: string[] = [];
-  console.error = ((...args: any[]) => logs.push(String(args[0]))) as typeof console.error;
+  console.warn = ((...args: any[]) => logs.push(String(args[0]))) as typeof console.warn;
   globalThis.setInterval = ((callback: () => void) => {
     tick = callback;
     return 1;
@@ -119,14 +119,14 @@ test("startWatchers skips a tick while a cycle is already running", async () => 
     await new Promise(setImmediate);
     stop();
   } finally {
-    console.error = origError;
+    console.warn = origWarn;
     globalThis.setInterval = origSetInterval;
     globalThis.clearInterval = origClearInterval;
   }
 
   expect(maxActive).toBe(1);
   expect(cycles).toBe(1);
-  expect(logs.some((m) => m.includes("skipped"))).toBe(true);
+  expect(logs.some((m) => m.includes("skipping this tick"))).toBe(true);
 });
 
 test("google docs/sheets edit links rewrite to export endpoints", () => {
@@ -137,4 +137,46 @@ test("google docs/sheets edit links rewrite to export endpoints", () => {
     "https://docs.google.com/spreadsheets/d/XYZ/export?format=csv"
   );
   expect(fetchableUrl("https://example.com/page")).toBe("https://example.com/page");
+});
+
+// The classifier is allowed up to 60s. Awaiting it inside the poll loop would
+// mean one ambiguous doc change stalls every other watcher behind it, so the
+// call is fired and forgotten — while still holding its own task from dispatch.
+test("a slow triage does not delay the next watcher's tick", async () => {
+  const { db, projectId } = freshDb();
+  db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify({ intake_triage: true }), projectId);
+  const { triageHold } = await import("../src/intake/triage.ts");
+  const { getTask } = await import("../src/state.ts");
+
+  // A classifier that never answers until we let it.
+  let release!: () => void;
+  const blocked = new Promise<void>((r) => (release = r));
+  let started = 0;
+  const hang = async () => {
+    started++;
+    await blocked;
+    return { code: 0, stdout: '{"bucket":"mechanical"}', stderr: "", timedOut: false };
+  };
+
+  const A = { name: "spec-a", url: "https://example.com/a" };
+  const B = { name: "spec-b", url: "https://example.com/b" };
+  const deps = { triageExec: hang };
+  await checkWatcher(db, projectId, A, { ...deps, fetchImpl: fetchBody("a1\n") }); // baselines
+  await checkWatcher(db, projectId, B, { ...deps, fetchImpl: fetchBody("b1\n") });
+
+  // Watcher A changes: its classifier hangs. This call must still return.
+  await checkWatcher(db, projectId, A, { ...deps, fetchImpl: fetchBody("a2\n") });
+  expect(started).toBe(1);
+
+  // ...and watcher B's tick runs right behind it, classifier still hanging.
+  await checkWatcher(db, projectId, B, { ...deps, fetchImpl: fetchBody("b2\n") });
+  expect(watchTasks(db)).toHaveLength(2);
+  expect(started).toBe(2);
+
+  // Neither task escaped while its classification was in flight.
+  for (const t of watchTasks(db)) expect(triageHold(db, getTask(db, t.id))).toBe(true);
+
+  release();
+  await new Promise((r) => setTimeout(r, 10));
+  for (const t of watchTasks(db)) expect(triageHold(db, getTask(db, t.id))).toBe(false); // mechanical: released
 });

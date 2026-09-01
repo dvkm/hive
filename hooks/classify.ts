@@ -126,16 +126,62 @@ const SAFE: RegExp[] = [
   /^("?\$HIVE_CLI"?|(bun|bunx)\s+\S*hive(\.ts)?|(\.\/)?bin\/hive|hive)\s+(task\s+list|pr-marker|recall|stats|learning\s+list|authority\s+list|policy\s+list|watch\s+list)\b/,
 ];
 
-// Split a command into segments on shell chaining/pipe operators. Naive (does
-// not honour quoting), which only ever makes a safe command look UNsafe — never
-// the reverse — so it stays conservative. `&` is intentionally NOT a delimiter:
-// it collides with redirection syntax (`2>&1`), and a dangerous token after a
-// backgrounding `&` is already caught by the whole-string DANGEROUS scan.
+// Split a command into segments on shell chaining/pipe operators (`||`, `&&`,
+// `;`, `|`, newline), skipping any operator that sits inside single/double
+// quotes or is backslash-escaped — exactly what a real shell does. `&` alone is
+// intentionally NOT a delimiter: it collides with redirection syntax (`2>&1`),
+// and a dangerous token after a backgrounding `&` is already caught by the
+// whole-string DANGEROUS scan.
+//
+// The splitter used to be quote-blind, which shredded any command carrying a
+// literal pipe in an argument — `grep -rn "foo|bar" src` became `grep -rn "foo`
+// plus `bar" src`, the second piece matched nothing on the SAFE allowlist, and a
+// read-only grep escalated as "unknown" (a regex alternation in a search pattern
+// is everyday work, so this fired constantly). An UNTERMINATED quote keeps the
+// rest of the command in one segment, which can only make a command look less
+// safe, never more: "safe" needs EVERY segment to match the allowlist, and the
+// DANGEROUS scan reads the whole string regardless of segmentation.
+//
+// UNBALANCED quotes mean the command can't be parsed at all, so we fall back to
+// the old quote-blind split rather than swallowing the rest of the line: without
+// that, `ls "a; npm publish` would collapse into one `ls …` segment and pass as
+// "safe". Unparseable input keeps the strictly more conservative behaviour.
 function segments(command: string): string[] {
-  return command
-    .split(/\|\||&&|;|\||\n/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const out: string[] = [];
+  let cur = "";
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i];
+    if (quote) {
+      // Inside single quotes a backslash is literal; inside double quotes it escapes.
+      if (c === "\\" && quote === '"' && i + 1 < command.length) {
+        cur += c + command[++i];
+        continue;
+      }
+      cur += c;
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      cur += c;
+      continue;
+    }
+    if (c === "\\" && i + 1 < command.length) {
+      cur += c + command[++i]; // escaped operator (`find … -exec rm {} \;`) is not a delimiter
+      continue;
+    }
+    if (c === ";" || c === "\n" || c === "|" || (c === "&" && command[i + 1] === "&")) {
+      if ((c === "|" || c === "&") && command[i + 1] === c) i++; // `||` / `&&`
+      out.push(cur);
+      cur = "";
+      continue;
+    }
+    cur += c;
+  }
+  if (quote) return command.split(/\|\||&&|;|\||\n/).map((s) => s.trim()).filter(Boolean);
+  out.push(cur);
+  return out.map((s) => s.trim()).filter(Boolean);
 }
 
 // ---- sandbox waiver -------------------------------------------------------
@@ -375,14 +421,27 @@ export function dockerDbTargetsSandboxed(
   if (!m) return false;
   const slug = m[1].toLowerCase();
   const map = varMap(cmd, env);
-  const sqlSegs = segments(cmd).filter((s) => /\b(mysql|mariadb|psql)\b/i.test(s));
+  // Agents build the client once and reuse it: `DBC="docker exec -i
+  // <slug>-mariadb mysql …"` then `$DBC -e "delete from …"`. So find the sql
+  // segments in the SUBSTITUTED text (the line that runs the delete says only
+  // `$DBC` and names no sql client until the variable is resolved), and skip
+  // the assignment line itself, which runs nothing. Matching the raw text
+  // instead made every clean-baseline reset escalate (live 2026-08-31,
+  // dec_e01966a50764). The assignment test uses the RAW segment, before quote
+  // stripping blends `DBC=` into its value.
+  const ASSIGNMENT = /^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=("[^"]*"|'[^']*'|\S*)$/;
+  const sqlSegs = segments(cmd)
+    .filter((seg) => !ASSIGNMENT.test(seg))
+    .map((seg) => subst(seg.replace(/["']/g, ""), map))
+    .filter((s) => /\b(mysql|mariadb|psql)\b/i.test(s));
   if (!sqlSegs.length) return false;
   // Flags that consume the next token, so the container name is found reliably.
   const VALUE_FLAGS = new Set(["-u", "--user", "-e", "--env", "-w", "--workdir", "--env-file", "--detach-keys"]);
-  return sqlSegs.every((seg) => {
-    const s = subst(seg.replace(/["']/g, ""), map);
+  return sqlSegs.every((s) => {
     if (/[$`]/.test(s)) return false; // unresolved substitution
     const toks = s.trim().split(/\s+/);
+    // `FOO=bar docker exec …`: leading env assignments prefix the real command.
+    while (toks.length > 1 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[0])) toks.shift();
     if (toks[0] !== "docker" || toks[1] !== "exec") return false;
     let i = 2;
     while (i < toks.length && toks[i].startsWith("-")) {
@@ -475,7 +534,11 @@ function isHiveEmitDataOnly(cmd: string): boolean {
 // so their commands must be scanned unstripped.
 const EXECUTOR = new RegExp(
   String.raw`\b(sh|bash|zsh|ksh|dash|eval|source|exec|xargs|sqlite3|psql|mysql|osascript)\b` +
-    String.raw`|\bpython3?\b[^\n|;&]*\s-c\s|\bnode\b[^\n|;&]*\s(-e|--eval)\s|\b(perl|ruby)\b[^\n|;&]*\s-e\s`
+    String.raw`|\bpython3?\b[^\n|;&]*\s-c\s|\bnode\b[^\n|;&]*\s(-e|--eval)\s|\b(perl|ruby)\b[^\n|;&]*\s-e\s` +
+    // `python3 - <<EOF` / `node <<EOF` run the heredoc as their script with no
+    // -c/-e flag to spot, so stripHeredocs keeps that body raw — this keeps the
+    // quote stripping off it too.
+    String.raw`|\b(python[0-9.]*|node|bun|deno|perl|ruby)\b[^\n|;&]*<<`
 );
 
 // A subshell trigger ($(...), `...`, <(...)) executes even inside double
@@ -488,14 +551,85 @@ const EXECUTOR = new RegExp(
 // classify.ts hasSubshell/EXECUTOR gate gotcha, task 320).
 const SUBSHELL = /\$\(|`|<\(/;
 
-export function stripDataText(cmd: string): string {
-  return cmd
-    // heredoc bodies: <<TAG / <<-TAG / <<'TAG' … TAG (start-of-line terminator)
-    .replace(/<<-?\s*(['"]?)(\w+)\1([\s\S]*?)\n\2(?=\n|$)/g, (full, quote, _tag, body) =>
-      !quote && SUBSHELL.test(body) ? full : "<<HEREDOC_STRIPPED"
-    )
+// Interpreters that RUN their file argument, plus the shell builtins that do.
+const INTERPRETER = /^(sh|bash|zsh|ksh|dash|source|\.|python[0-9.]*|node|bun|deno|perl|ruby|osascript)$/;
+
+// The last redirect target on a heredoc's owner line — the file the body is
+// being written INTO (`cat > review.json <<'EOF'` → `review.json`).
+function redirectTarget(owner: string): string | null {
+  const hits = [...owner.matchAll(/(?:^|\s)\d*>>?\s*("[^"]*"|'[^']*'|\S+)/g)];
+  const last = hits.at(-1)?.[1];
+  return last ? last.replace(/["']/g, "") : null;
+}
+
+// True iff `target` is later RUN as a script somewhere in the command —
+// `bash x.sh`, `source x.sh`, `./x.sh`, or `chmod +x x.sh`. Merely being
+// mentioned inside another command's argument (`python3 -c "open('x.json')"`)
+// is a read, not an execution, and does not count.
+function fileIsExecuted(target: string, cmd: string): boolean {
+  const norm = (t: string) => t.replace(/["']/g, "").replace(/^\.\//, "");
+  const want = norm(target);
+  if (!want) return false;
+  for (const seg of segments(cmd)) {
+    const toks = seg.split(/\s+/).map(norm).filter(Boolean);
+    for (let i = 0; i < toks.length; i++) {
+      if (toks[i] !== want) continue;
+      if (i === 0) return true; // `./x.sh` / `x.sh` run directly
+      if (INTERPRETER.test(toks[i - 1])) return true; // `bash x.sh`, `source x.sh`
+      if (toks[0] === "chmod" && /x/.test(toks[1] ?? "")) return true;
+    }
+  }
+  return false;
+}
+
+// A heredoc body is DATA to the command that owns it: `cat > f <<'EOF'` WRITES
+// the body, it never runs it. This used to be all-or-nothing with the quote
+// stripping below, so a single executor anywhere else in the command (a
+// `python3 -c` checking the JSON it had just written) put every body back under
+// the DANGEROUS scan — and a review that merely DESCRIBED restarting a session
+// classified as power/session control and asked the director to approve
+// `cat > review.json` (dec_000470f4a7a7, hive task c7660182f42d). Decide per
+// heredoc instead, from what actually consumes that body:
+//   - owner line is an executor (`bash <<EOF`, `python3 - <<EOF`): the body IS
+//     the script being run. Keep it raw.
+//   - the file it is written to is executed later in the same command
+//     (`cat > x.sh <<'EOF' … EOF; bash x.sh`): keep it raw.
+//   - unquoted delimiter (<<EOF): the body still is not executed, but its
+//     command substitutions are. Keep only those visible, drop the prose.
+//   - quoted delimiter (<<'EOF'): 100% literal to any shell. Always data.
+export function stripHeredocs(cmd: string): string {
+  return cmd.replace(
+    /<<-?\s*(['"]?)(\w+)\1([\s\S]*?)\n\2(?=\n|$)/g,
+    (full: string, quote: string, _tag: string, body: string, offset: number) => {
+      const owner = cmd.slice(cmd.lastIndexOf("\n", offset) + 1, offset);
+      if (EXECUTOR.test(owner)) return full;
+      // `python3 - <<EOF` / `node <<EOF` read the body as their SCRIPT, and
+      // carry no `-c`/`-e` flag for EXECUTOR to spot — check the owner's own
+      // command word too.
+      const word = owner
+        .trim()
+        .split(/\s+/)
+        .find((t) => t && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
+      if (word && INTERPRETER.test(word.replace(/["']/g, "").replace(/^.*\//, ""))) return full;
+      const target = redirectTarget(owner);
+      if (target && fileIsExecuted(target, cmd)) return full;
+      if (!quote && SUBSHELL.test(body)) {
+        const expansions = body.match(/\$\([^)]*\)?|`[^`]*`|<\([^)]*\)?/g) ?? [];
+        return `<<HEREDOC_STRIPPED ${expansions.join(" ")}`;
+      }
+      return "<<HEREDOC_STRIPPED";
+    }
+  );
+}
+
+function stripQuotedText(s: string): string {
+  return s
     .replace(/'[^']*'/g, "''")
     .replace(/"(?:[^"\\]|\\.)*"/g, (full) => (SUBSHELL.test(full) ? full : '""'));
+}
+
+export function stripDataText(cmd: string): string {
+  return stripQuotedText(stripHeredocs(cmd));
 }
 
 // Force-push is only catastrophic on SHARED refs. An agent force-pushing its
@@ -529,8 +663,10 @@ export function classify(
 
   // Argument-evidence rules always see the raw command (their match is
   // usually inside quotes). No waivers apply to them.
+  // …but a heredoc body is data even to them: it is written, not executed.
+  const heredocStripped = stripHeredocs(cmd);
   for (const [rx, reason] of DANGEROUS_RAW) {
-    if (rx.test(cmd)) return { decision: "dangerous", reason };
+    if (rx.test(heredocStripped)) return { decision: "dangerous", reason };
   }
 
   const emitDataOnly = isHiveEmitDataOnly(cmd);
@@ -544,8 +680,16 @@ export function classify(
   // stripDataText already keeps any region containing one raw (see SUBSHELL
   // above), scoped to that region — no need to force the WHOLE command raw
   // just because a trigger appears somewhere in it.
-  const stripped = stripDataText(cmd);
-  const scanTarget = EXECUTOR.test(stripped) ? cmd : stripped;
+  const stripped = stripQuotedText(heredocStripped);
+  // A client assembled in a variable hides its executor inside the quotes of the
+  // assignment (`DBC="docker exec -i … mysql …"` then `$DBC -e "delete from …"`),
+  // so stripping erased both the executor and the SQL and the whole command
+  // slipped the scan. Resolve in-command assignments before deciding.
+  const resolved = stripDataText(subst(cmd, varMap(cmd, env)));
+  // The executor fallback drops back to heredocStripped, NOT the raw command:
+  // an executor elsewhere in the line is no reason to re-read a body that
+  // nothing executes (see stripHeredocs).
+  const scanTarget = EXECUTOR.test(stripped) || EXECUTOR.test(resolved) ? heredocStripped : stripped;
   for (const [rx, reason] of DANGEROUS) {
     if (!rx.test(scanTarget)) continue;
     if (emitDataOnly) continue; // arguments are data, not executed
@@ -614,9 +758,26 @@ export function actionFor(decision: Decision, reason: string): string {
   return slug ? `command.dangerous.${slug}` : "command.dangerous";
 }
 
+// How long to wait for hive's guarded-action answer. This used to be a hardcoded
+// 2s, which is shorter than the server's own p99 under swarm load: a busy hive
+// answered a routine `unknown` command in ~3s, the fetch aborted, and the agent
+// was told the command was DENIED. That reads as a policy decision when it was
+// only a slow reply, so agents re-asked, opened cards, or gave up on work the
+// authority engine would have allowed. 15s is well past the loaded-server p99 and
+// still bounded; HIVE_GUARD_TIMEOUT_MS raises it further on a heavier fleet.
+export function guardTimeoutMs(): number {
+  // Anything that is not a positive finite number (garbage, 0, negative, Infinity)
+  // counts as absent: a negative is truthy, so `|| 15_000` would keep it and yield
+  // a ~instant abort — fail-closed again, by another door.
+  const raw = Number(process.env.HIVE_GUARD_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 15_000;
+}
+
 // Ask hive's authority engine to decide a not-safe command. Fail-safe: any
-// unreachability or error DENIES (never auto-allows an unclassified command).
-async function escalate(
+// unreachability or error DENIES (never auto-allows an unclassified command) —
+// but a TIMEOUT says so in those words, so a busy server is never mistaken for
+// a director's refusal.
+export async function escalate(
   hiveUrl: string,
   taskId: string,
   command: string,
@@ -632,6 +793,7 @@ async function escalate(
   // IN CODE — it requires a decision with no rule present; unknown commands
   // default-allow (logged).
   const action = actionFor(decision, reason);
+  const timeoutMs = guardTimeoutMs();
   try {
     const res = await fetch(`${hiveUrl}/api/tasks/${taskId}/guarded-action`, {
       method: "POST",
@@ -643,7 +805,7 @@ async function escalate(
         // The Bash tool's own description: the card title reads as intent.
         summary: summary || undefined,
       }),
-      signal: AbortSignal.timeout(2000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const body: any = await res.json().catch(() => ({}));
     if (res.status === 200 && body.effect === "allow")
@@ -658,6 +820,15 @@ async function escalate(
       );
     return hookOutput(event, "deny", `unexpected guarded-action response (${res.status})`);
   } catch (e: any) {
+    // Name the timeout explicitly: "denied" and "hive was too slow to answer"
+    // need very different reactions from the agent reading this line.
+    if (e?.name === "TimeoutError" || e?.name === "AbortError")
+      return hookOutput(
+        event,
+        "deny",
+        `hive did not answer within ${timeoutMs}ms — this is a TIMEOUT, not a denial; ` +
+          `the server is busy, so retry the same command (raise HIVE_GUARD_TIMEOUT_MS if it keeps timing out)`
+      );
     return hookOutput(event, "deny", `hive unreachable, denying for safety: ${String(e?.message ?? e)}`);
   }
 }

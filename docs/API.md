@@ -75,6 +75,22 @@ that mark a braindump as belonging to THIS project — e.g. `["coredata",
 "figma.com/file/…"]`. At `POST /api/intake` the raw text is scored against every
 project's name, repo basename, and these keywords, and the braindump is re-routed
 to the best match when it strictly out-scores the requested project).
+`intake_triage` (bool, default `false`; when true, each new ambient intake task
+— source `intake_*` or `watch` — is classified by one `claude -p` sonnet call
+before it can dispatch. A request with one clear reading is marked reviewed and
+proceeds. A request that reads two or more ways opens a decision card asking
+which reading to build, and the dispatcher holds the task until you answer. Every
+classifier failure falls through to "mechanical", so triage can never wedge
+intake. Classification runs in the background, so a slow one never delays the
+next message or watcher. The card it raises carries `decision_class:
+"intake_triage"`, which every automatic answering path refuses: the standing CI
+ruling, the chat supervisor, and the `decision_auto_answer_hours` timeout. Only
+you can answer it. Answering appends your chosen option to the task's brief under
+a `## Director's answer` heading and marks the task reviewed, so it dispatches on
+the next cycle and the agent builds the reading you picked. Braindumps
+(`POST /api/intake`, source `intake_braindump`) are exempt: you typed that text
+yourself and it already raises a planner breakdown card. Jira import creates only
+tracking-only mirrors, which never dispatch, so nothing there is triaged either.)
 Domain-supervisor keys (see the Domain supervisors section):
 `supervisor_persona` (string, freeform planner identity included in every planner
 prompt), `plan_intake` (bool; when true, each new intake task auto-triggers a
@@ -197,13 +213,19 @@ evidence captured against an older commit as stale.
 visible symptom that a task pointing at a live agent is actually fine or actually
 stuck. **It is the single source of truth; clients render it, never re-derive
 it.** Shape `{status, reason, since}`:
-- `status ∈ {healthy, silent, stuck, dead}`; `reason` is a human string (or null
+- `status ∈ {healthy, deferred, silent, stuck, dead}`; `reason` is a human string (or null
   when healthy) — usually short and fixed, but the `merge_failed` cause below
   passes through raw git/gh error text, so clients must clamp it; `since` is the
   ISO ts the current condition began.
 - `null` for `queued`, `done`, `failed`, `cancelled`, and any task with no
   `agent_target`.
-- Derivation (pure function of events, precedence dead > stuck > silent >
+- **deferred** wins over every other status: the task is parked pending an offline
+  human action (`deferred_until` in the future) and is quiet ON PURPOSE. It is NOT
+  an attention status — clients must not count it as trouble, and must not nag
+  about idleness while it holds. This is how a consumer that only reads `health`
+  learns a task is parked without knowing about the `deferred_until` column
+  (HIVE-547).
+- Derivation (pure function of events, precedence deferred > dead > stuck > silent >
   healthy): **dead** = `agent_target` set but the reconciler's probe recorded the
   agent `gone`; **stuck** = herdr reports `blocked`, OR a stale-recovery escalation
   is in flight (newest event `stale`/`recovery_nudge`), OR the agent went `idle` on
@@ -256,6 +278,7 @@ never deleted, so the cancelled row + this pointer preserve the full history.
 - `auto_approved` — the chat supervisor cleared a card itself via the auto-approve bar. `payload: {decision_id, answer_key, category, reason, note}`. `source: chat_supervisor`
 - `auto_approve_declined` — the auto-approve bar rejected a card; it stays `open` for the director. `payload: {decision_id, answer_key, category, reason}`. `source: chat_supervisor`
 - `decision_expired` — a decision was cleared without an answer: dismissed, or auto-expired because its task went terminal. `payload: {decision_id, reason}` (`reason` ∈ `dismissed` | `task cancelled` | `task done` | `task failed` | `task terminal (backfill)`)
+- `verification_missing` — the review handoff was refused because the task's `verification_cmds` had no matching evidence. `payload: {names}` (the missing contract entries). Written once per distinct set of missing names, so a polling caller records the gap once.
 - `note` — a free note (e.g. a `done` summary). `payload: {note}`
 - `steer` — a steer message was dispatched to the agent. Director calls, including broadcasts, may include an optional session label: `payload: {message, target, actor}`.
 - `blocked` — agent reported blocked. `payload: {note}`
@@ -271,8 +294,8 @@ Types written by the runtime layer (Phase 2b):
   A PLAN checkpoint is the same event with structured fields instead of a bare note: `payload: {kind: "plan", goal, approach, files_expected: string[], verification_planned, note}` (`hive emit <id> checkpoint --json plan.json`; `note` defaults to `goal` so it still lists like any other checkpoint). Agents are asked for one before their first edit when the project sets `config.plan_gate.kinds` and the task's kind is in that list. Hive critiques it in the background with one sonnet one-shot (60s cap) and attaches a `plan_critique` event (`payload: {checkpoint_id, concerns: [{severity: "note"|"veto", text}], error?}`). A critic that fails, times out, or returns unparseable output attaches `concerns: []` with `error` and logs — it never blocks the agent. Each `veto` concern also steers the agent, quoting the concern. Ordinary note-only checkpoints are not critiqued.
   A plan checkpoint listed by `GET /api/checkpoints` also carries `plan: {goal, approach, files_expected, verification_planned}` and `concerns` (the critic's verdict, `[]` until the critique lands), so the Needs You card can be approved without opening the task.
   BLOCKING plans (`config.plan_gate.block === true`): the checkpoint payload also carries `blocking: true`, and the brief tells the agent to post the plan and end its turn instead of editing. The `ack` endpoint is what restarts it — `verdict: "ok"` steers "Your plan is APPROVED …", `verdict: "flag"` steers "Your plan was FLAGGED …" and asks for a corrected plan. A flag on a blocking plan always steers (queued if no agent is live) rather than queueing a corrective follow-up task, because nothing has shipped yet. With `config.plan_gate.auto_ack_hours` set, a reconciler step (`autoAckPlans`) acks any blocking plan that has waited that long, writing `checkpoint_ack` with `source: "hive"`, `actor: "auto_ack"`, `auto: true` and sending the same release steer.
-- `review_summary`: the agent's structured self-review, submitted before `ready`. `payload: {done?: string[], iffy?: (string|{what,why})[], decisions?: string[], testing?: string[], followups?: string[], understanding?: {background?: string, essence?: string, walkthrough?: string[], participate?: string, check?: {question: string, options: {key: string, label: string}[], answer_key: string, explanation?: string}}}`. Judgment-class changes require a 2-4 option understanding check (see the understanding gate below); mechanical ones may omit `understanding.checks` entirely. The review card presents the mental model before the technical audit, then uses the check as the approval gate. Questions must teach the director about the specific change or report and may not test agent procedures, debugging, merging, tools, or policy.
-- `understanding_quiz_attempt`, `understanding_quiz_passed`, `understanding_quiz_deferred`: director-only quiz outcomes tied to the latest `review_summary` by `payload.review_event_id`. Their payload includes the optional director `actor`. A new review summary creates a new check. Passing removes it from the backlog. Deferring unlocks an urgent merge but deliberately leaves the quiz open after the task finishes. `understanding_quiz_deferred` is also written with `source: "system"` when a merge auto-defers a required check for a task kind listed in the project's `config.auto_merge.kinds`.
+- `review_summary`: the agent's structured self-review, submitted before `ready`. `payload: {done?: string[], iffy?: (string|{what,why})[], decisions?: string[], testing?: string[], followups?: string[], understanding?: {background?: string, scope?: string, essence?: string, walkthrough?: string[], affected_areas?: string[], risk_assessment?: string, participate?: string, checks?: {question: string, options: {key: string, label: string}[], answer_key: string, explanation?: string}[]}}`. `checks` is an array, each `options` entry is a `{key,label}` object, and `answer_key` must equal one of those option keys; a singular `check` (object or array) is accepted as an alias and stored as `checks`. Submitting checks that normalise to nothing is a `400` naming the expected shape rather than a silent accept (hive-1947). Omitting `understanding.checks` on a re-emitted review carries the previous review's checks forward instead of dropping them, so replying to a rebase, a risk finding or red CI does not delete a quiz the director already passed; sending an explicit `"checks": []` is the only way to clear them, and the empty array is stored so the clear sticks (hive-545). Re-listing the same checks carries the director's pass too: checks are compared as values (question text, the set of option labels, and which label is correct, all whitespace- and case-normalised, order-independent), not as serialised payloads, because an agent rewords and reorders its review on every run. A changed option set or a changed correct answer is a different check and re-asks the quiz. Judgment-class changes require a 2-4 option understanding check (see the understanding gate below); mechanical ones may omit `understanding.checks` entirely. The review card presents the mental model before the technical audit, then uses the check as the approval gate. Questions must teach the director about the specific change or report and may not test agent procedures, debugging, merging, tools, or policy.
+- `understanding_quiz_attempt`, `understanding_quiz_passed`, `understanding_quiz_deferred`: director-only quiz outcomes tied to the latest `review_summary` by `payload.review_event_id`. Their payload includes the optional director `actor`. A new review summary that lists checks creates a new check. One that omits `checks` entirely reuses the carried-forward checks, and a `understanding_quiz_passed` is written for the new review with `carried_from_review_event_id` naming the review the pass came from, unless a `changes_requested` or `decision_answered` landed after that review, in which case the director answers again. Passing removes it from the backlog. Deferring unlocks an urgent merge but deliberately leaves the quiz open after the task finishes. `understanding_quiz_deferred` is also written with `source: "system"` when a merge auto-defers a required check for a task kind listed in the project's `config.auto_merge.kinds`.
 
 Understanding quiz API:
 
@@ -302,6 +325,8 @@ Understanding quiz API:
 - `stale` — task silent beyond the threshold. `payload: {silent_ms, threshold_ms}`
 - `deferred` — task parked pending an offline human action; `deferred_until` set (nudges suppressed while future-dated). `payload: {until, note}`
 - `undeferred` — a deferred task was resumed; `deferred_until` cleared. `payload: {note}`
+- `taken_over` — the director took the worktree over by hand; the agent was stopped and its slot freed. `payload: {worktree_path, branch, base, agent_stopped}`
+- `handed_back` — the worktree was handed back; a steer summarising the director's changes is queued for the next agent. `payload: {branch, base, summary, note}`
 - `steer_error` — `herdr agent send` failed. `payload: {error}`
 - `smoke_passed` / `smoke_failed` — post-deploy smoke result. `payload: {results:[{name,ok,detail}], evidence_id?}`
 - `cleaned_up` — a finished task's runtime was torn down: worktree removed (when its branch was pushed/merged) and herdr session (tab/pane) closed. `payload: {worktree_path, branch, worktree_removed, ghost_branch, session_closed, session_via, tab_id}` (`ghost_branch` non-null when tracked uncommitted work was preserved before removal). Fired on the `done`/`cancelled` transition and by the reaper.
@@ -330,6 +355,10 @@ Duplicate-detection events (written by the dedup path, `source: system`):
 Standing-authority events (written by the policy engine, `source: system` unless noted):
 - `authority_logged` — an action was allowed (matched an `allow` rule, defaulted to allow when unmatched, or passed by consuming a grant). `payload: {action, target, effect:"allow", rule_id?, via_grant?}`
 - `authority_denied` — an action was blocked by a `deny` rule. `payload: {action, target, rule_id}`
+- `dispatch_hold_overlap` — the dispatcher held a queued task because its predicted file scope overlaps a task already running, and started a non-overlapping task instead. `payload: {note, held_by, held_by_number, files}`. Deduped on the note: the dispatcher runs every 30s and must not write one per cycle. This is ORDERING only, never a block.
+- `dispatch_overlap_override` — a held task was started anyway because nothing else in the project was dispatchable. `payload: {note}`. An idle fleet is worse than a predicted conflict.
+- `dispatch_scope` — the file scope guessed for a task when it was dispatched, from paths named in its brief and (for a requeue) the files its predecessor's branch touched. `payload: {files, dirs, from}` (`from`: `["brief", "predecessor"]`). Written by the dispatcher only when the guess is non-empty.
+- `scope_prediction_scored` — once the branch exists, the dispatch-time guess is compared with what it really touched, so the heuristic can be tuned or dropped on evidence. Written once per task by the reconciler. `payload: {note, predicted, hits, actual_count, precision, recall, from}`
 - `dependency_blocked` — a task's `depends_on` isn't all merged/done, so the dispatcher held its spawn (or the reconciler held its stage). `payload: {note, blocked_by}` (`blocked_by`: `["#<n> <title>", ...]`). Deduped: re-written only when the blocking set changes.
 - `authority_required` — a `require_decision` rule opened a card gating the action. `payload: {action, target, decision_id, rule_id}`
 - `authority_granted` — the director approved the card; a single-use 24h grant was minted (`source: director`). `payload: {action, target, decision_id, expires_at}`
@@ -347,12 +376,16 @@ Standing-authority events (written by the policy engine, `source: system` unless
   "meta": {}
 }
 ```
-`kind ∈ {screenshot, test_run, log, report, link}`. `path` is the local file
-(null for link-only). `url` is the served path (fetch it from the same origin).
-`meta.commit_sha`, when present, is the git HEAD of the agent's worktree at
-capture time — `hive emit ... evidence` fills it in automatically via `git
-rev-parse HEAD` in the CLI's cwd. The review card compares it to the task's
-`head_sha` and marks the item stale when they differ.
+`kind ∈ {screenshot, test_run, log, report, link, observation}`. `path` is the
+local file (null for link-only). `url` is the served path (fetch it from the
+same origin). `meta.commit_sha`, when present, is the git HEAD of the TASK's own
+worktree at capture time — the server reads it and overwrites anything the
+caller sent, so an emit from outside the worktree still records the right commit
+(HIVE-575). The review card compares it to the task's `head_sha` and marks the
+item stale when they differ. `report`, `link`, `observation`, and `explanation`
+are never stamped: they describe something outside the repo, so no commit could
+make them stale. Use `--kind observation` for a production reading or any other
+artifact that is not derived from the code.
 
 ### Decision
 ```json
@@ -398,9 +431,24 @@ rev-parse HEAD` in the CLI's cwd. The review card compares it to the task's
 array; render the `recommended: true` option first per product rule 3.
 `draft_note` is the server-side autosaved draft. A decision is `expired` once it
 was dismissed, or its task went terminal (`done`/`failed`/`cancelled`) — expired
-cards leave the inbox and can no longer be answered. `answered_by` is the caller
-identity recorded on answer (`director|chat_supervisor|agent|system|unknown`) and
-`answered_actor` an optional free label; both are `null` until the card is answered.
+cards leave the inbox and can no longer be answered. `answered_by` names who
+resolved the card and is never null once it leaves `open`: the caller identity on
+answer (`director|chat_supervisor|agent|system|unknown`), `director` or
+`reconciler` on a dismissal, `system` on a task-terminal expiry, and
+`unattributed` on the 414 legacy rows resolved before hive recorded answerers at
+all (everything before 2026-07-22). `answered_actor` is an optional free label.
+
+**A high-risk card is only ever answered by the director.** `POST
+/api/decisions/:id/answer` returns `403 {"effect":"escalate","category":"risk_high"}`
+for any other `source`, including a bare call with no `source` (which is
+`unknown`, not the director). The one exception is a `deny` on a pending
+standing-authority grant: refusing an unexecuted command is fail-closed and stops
+the work rather than releasing it. The timeout sweep
+(`decision_auto_answer_hours`) never answers a high-risk card either; past the
+window it writes one `decision_escalated` event and raises one urgent
+notification, and the card stays open. Risk is matched on the leading level word,
+so a `risk` field that reads `"high — leaked prod key"` counts as high, and free
+prose with no level word at all is treated as high rather than auto-answerable.
 
 `bundle` is server-**derived** (never stored) context attached to each card as
 it's returned, so the director can decide in one pass without opening the task:
@@ -675,8 +723,8 @@ agent's HTTP socket cannot reach. The GitHub credential stays server-side —
 hive shells out to `gh`, and the browser only ever names a commit or a tag.
 
 ### Tasks
-- `GET /api/tasks?state=&project_id=&test=` → `200 [Task, ...]` (newest `updated_at` first; all filters optional). Tasks under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
-- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?, verification_cmds?, priority?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher and reconciler won't advance the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` (CLI: `hive task create --track`) marks a TRACKING-ONLY task: another agent using hive as its kanban. It is never auto-dispatched or staleness-supervised, is exempt from the done-evidence gate, and moves freely via transitions (`hive task move <id> <state>`). The board keeps these tasks in its separate Tracked view with the external state visible. Jira-keyed Hive work is grouped beneath the matching tracked card, with requeue chains collapsed to their latest attempt. `verification_cmds` is the task's verification contract: an array of `{name, cmd}` the agent must run before handing off (`name`: 1-32 chars of `a-z0-9-`, unique within the task; `cmd`: a non-empty string). Anything else → `400`. The agent brief renders it as a "Verification contract" section, and `hive emit <id> evidence --verify-name <name>` tags an artifact with the entry it came from (stored as `verify_name` on the `evidence` event). Nothing is gated on it yet. `priority` is one of `now`, `next`, `normal` (the default), `later`; anything else → `400`. It is ORDERING only, never preemption — see [Priority](#priority). Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`.
+- `GET /api/tasks?state=&project_id=&test=&compact=` → `200 [Task + {evidence_count, spawn_error, overlap_hold, needs_you_since}, ...]` (newest `updated_at` first; all filters optional). `needs_you_since` is the latest entry into `in_review` or `failed`, and stays fixed when CI or metadata updates the task. `overlap_hold` is `{number, files}` when a queued task is waiting because the dispatcher thinks it edits the same files as a task that is still running, and `null` otherwise (including once that task finishes). `compact=1` omits task briefs and empty/default properties for list/bootstrap clients, and is gzip-compressed when accepted; fetch `GET /api/tasks/:id` when full task data is needed. Tasks under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
+- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?, verification_cmds?, priority?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher and reconciler won't advance the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` marks a TRACKING-ONLY task: another agent using hive as its kanban. It is never auto-dispatched or staleness-supervised, is exempt from the done-evidence gate, and moves freely via transitions (`hive task move <id> <state>`). The `--track` CLI flag that used to set it is retired (it only ever produced tasks nobody could dispatch); the Jira mirror path still sets it. To park a normal task, defer it: `hive emit <id> deferred` keeps it out of the dispatcher until `hive emit <id> undefer`. The board keeps these tasks in its separate Tracked view with the external state visible. Jira-keyed Hive work is grouped beneath the matching tracked card, with requeue chains collapsed to their latest attempt. `verification_cmds` is the task's verification contract: an array of `{name, cmd}` the agent must run before handing off (`name`: 1-32 chars of `a-z0-9-`, unique within the task; `cmd`: a non-empty string). Anything else → `400`. The agent brief renders it as a "Verification contract" section, and `hive emit <id> evidence --verify-name <name>` tags an artifact with the entry it came from (stored as `verify_name` on the `evidence` event). The contract is enforced at the review handoff: `in_progress` -> `in_review` is refused with `409` until every named command has a matching evidence event, and the refusal lists exactly the missing names (see the `verification_missing` event). `priority` is one of `now`, `next`, `normal`, `later`; anything else → `400`, and a non-director `source` asking for `now` → `403`. Omit it and the task inherits its parent's priority, or starts at `next` when the title/brief reads as security work, else `normal`. It is ORDERING only, never preemption — see [Priority](#priority) for the full inheritance and authority rules. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`. A title that starts with a Jira key in brackets (`[WEB-110] ...`) is linked to that project's mirror task at creation: the mirror's id is stored on the new task as `jira_mirror_task_id` and carried to every requeued successor, so the link survives a retitle or a retry. When every linked work task has finished and at least one is `done`, the mirror moves to `done` itself, which is what makes the hive → Jira status push fire (`failed` and `cancelled` children are ignored; a live requeue successor holds the mirror open).
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
 - `POST /api/tasks/:id/jira/link` body `{parent_key (required)}` → `201 {jira_key, browse_url, warnings}` | `400` | `404`
@@ -699,7 +747,8 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   The setting defaults to false.
 - `POST /api/tasks/:id/jira/sync` body `{}` → `200` sync result | `404`
   Runs the same project Jira cycle used by the scheduler.
-- `POST /api/tasks/:id/transition` body `{to (required), reason?, source?}` → `200 Task` | `409` (invalid transition or `done` without evidence) | `404`
+- `POST /api/tasks/:id/transition` body `{to (required), reason?, source?, until?, days?}` → `200 Task` | `409` (invalid transition or `done` without evidence) | `404`
+  `to: "deferred"` is accepted even though `deferred` is not a lifecycle state: it parks the task exactly like `hive emit <id> deferred` (sets `deferred_until` from `until`/`days`, else the indefinite sentinel; the task stays `in_progress`) and returns `409` only when the task is already terminal. Moving a parked task to `in_progress` un-parks it (clears `deferred_until`, writes `undeferred`, queues the resume steer) instead of failing as a self-transition. So `hive task move <id> deferred` and `hive emit <id> deferred` agree (HIVE-547).
   When `to` is `verifying`, the project's post-deploy smoke list (`config.smoke`) runs once before the response returns. A smoke failure bounces the task back to `in_progress`, so the returned Task may be `in_progress`, not `verifying`.
 - `POST /api/tasks/:id/spawn` body `{hive_url?}` → `200 {"ok":true, "task": Task, "agent_target":"..."}` | `400` (project has no `repo_path`) | `404` | `502` (dispatch refused or herdr spawn failed; a `spawn_error` event is recorded)
   Creates the herdr worktree (`hive/<task-id>`), starts the agent with `HIVE_TASK_ID`/`HIVE_URL` + the project's resolved secrets in env and the composed brief, sets `agent_target`/`worktree_path`/`branch`, transitions `queued → in_progress`, and writes a `spawned` event.
@@ -715,7 +764,7 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   - `failed` — the task is terminal, so no spawn will ever carry it.
 
   Never throws. A herdr failure additionally records a `steer_error` event. The timeline renders the receipt (`✓` / `⏳ queued` / `⚠ undelivered`) so a steer never has to be re-sent blind. Besides the respawn drain, the reconciler re-attempts every queued steer each cycle against any agent with an active turn (receipt flips with `delivered_via:"drain"`); a successful drain writes no event of its own — the receipt flip is the record, and a fresh event would reset the task's silence clock and mask a mute agent from `stale` detection.
-- `PUT /api/tasks/:id` body `{title?, brief?, depends_on?, verification_cmds?, priority?}` (or multipart: same fields + `files`) → `200 Task` | `404` | `400` (unknown/self-referencing `depends_on` id, an invalid `verification_cmds`, or an invalid `priority`)
+- `PUT /api/tasks/:id` body `{title?, brief?, depends_on?, verification_cmds?, priority?, source?}` (or multipart: same fields + `files`) → `200 Task` | `404` | `400` (unknown/self-referencing `depends_on` id, an invalid `verification_cmds`, or an invalid `priority`) | `403` (a non-director `source` setting `priority: "now"` — see [Priority](#priority))
   Attached files are appended to the resulting `brief` under an `## Attachments` heading.
   Updates a task's editable fields. Used by the attention tray's "edit & requeue"
   flow before it re-queues a failed task, and by `hive task update <id> --depends-on <id,id>` —
@@ -733,6 +782,32 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   `herdr agent focus` so the director can watch/attach. Records a `focus_agent` event.
   Degrades gracefully (never throws): `200 {"ok":false, "focused":false, "error":"..."}`
   when the task has no agent or herdr fails.
+- `POST /api/tasks/:id/takeover` body `{}` → `200 {"ok":true, "worktree_path":"...", "branch":"...", "base":"<sha>", "agent_stopped":true}` | `404` | `409`
+  The director takes the worktree over by hand. Stops the agent (the same
+  close-the-session sequence cleanup uses), clears `agent_target` — which is what
+  frees the project's agent slot, since every dispatcher capacity count keys on
+  it — and parks the task by setting `deferred_until` far into the future, so the
+  dispatcher and the "gone quiet" nudges leave it alone. No state hop: an
+  `in_progress` task stays `in_progress`. `parked_for_director` is the timestamp,
+  and `takeover_base` is a `git stash create` commit capturing the tree at that
+  moment (a dangling object; it never touches the shared stash stack), which is
+  what lets hand-back report the director's edits alone rather than whatever the
+  agent had left uncommitted. Writes a `taken_over` event. `409` when the task is
+  terminal, has no worktree, is not a hive worker task, or is already taken over.
+  While parked, `spawnAgent` refuses — two writers on one checkout is the thing
+  this endpoint exists to prevent.
+- `POST /api/tasks/:id/handback` body `{note?}` → `200 {"ok":true, "steer_queued":true, "summary":"...", "branch":"..."}` | `404` | `409`
+  Hands the worktree back. Queues ONE steer describing what changed while the
+  task was parked (new commits, `git diff --stat` against `takeover_base`, and
+  untracked files that were not already there at take-over, each capped at 40
+  lines), plus the optional `note`, then clears
+  `parked_for_director` and lifts the park. The park is lifted only when
+  `deferred_until` still holds the take-over sentinel, so a deferral the director
+  set separately survives. Nothing respawns here: the dispatcher's existing
+  reattach pass sees a live task with no agent and queued steers and puts a fresh
+  agent on the SAME branch with those steers at the top of its brief. `summary` is
+  `null` when git could not be read (the steer then tells the agent to check git
+  itself) and `""` when nothing changed. Writes a `handed_back` event.
 - `POST /api/tasks/:id/requeue` body `{}` → `200 {"ok":true, "new_task_id":"..."}` | `404`
   The recovery banner's manual "fail + requeue": reclaims a still-live task's worktree, fails it, then creates a FRESH queued copy (`source="requeue"`, `parent_task_id` → the original) with the [Task resume context](#task) whenever the original left a branch. Reclaim matches dead-agent and context-full auto-requeue: uncommitted state is preserved to a `ghost-<task-id>` branch and recorded as a `worktree_reclaimed` event. Distinct from the attention tray's in-place requeue of an already-failed task (`POST /transition {to:"queued"}`, which reactivates the SAME task and clears its runtime binding).
   A `source="requeue"` row is only ever trusted lineage once its `created`
@@ -743,6 +818,14 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   `source="requeue_quarantined"` and loses its `parent_task_id` — so nothing
   downstream ever follows an untrusted parent chain. A verified row is never
   rechecked, so the sweep never scans every historical `requeue` task.
+- `POST /api/tasks/:id/race` body `{attempts?: 2|3, agents?: ["claude"|"codex"|"teamclaude", ...], deadline_min?: number}` → `201 {"ok":true, "race_id":"race_...", "task_ids":[...]}` | `400` | `404` | `409`
+  Best-of-N racing (HIVE-351). Runs the SAME brief N times side by side, each attempt in its own worktree and branch, ideally split across agent backends. The flagged task IS attempt 1; the rest are clones of it (same brief, kind, verification contract, priority, dependencies) with `source="race"`, a shared `race_id`, and their own `agent_override`. Clones bypass duplicate detection on purpose — N identical briefs would otherwise collapse the race back to one task. `attempts` defaults to 2; `agents` defaults to the project's own backend alternating with the other one. `deadline_min` (optional) is the release valve for an attempt that never finishes.
+  **Never automatic.** Racing multiplies token spend and review burden, so only this endpoint starts one — no dispatcher path does. `409` when the task already ran (it must be `queued` with no agent), is already in a race, or is tracking-only.
+  Once every attempt has settled (`in_review`/`verifying`/`done`/`failed`/`cancelled`) or the deadline passes, the reconciler's `raceSweep` opens ONE comparison decision card (`race_compare` event, `decision_class: "race"`, so no auto-answer path may settle it) with an option per attempt. It recommends the attempt that met its whole verification contract with the smallest diff. Answering the card picks that winner.
+- `GET /api/races/:race_id` → `200 {race_id, deadline, settled, attempts:[{task_id, number, title, agent, state, branch, pr_url, settled, diff:{files,additions,deletions}|null, verification:[{name,satisfied}], cost_usd, processed_tokens, outcome:"winner"|"loser"|null}]}` | `404`
+  The comparison itself, rendered by the task page's race panel: diff size per attempt (`git diff --numstat` against the project comparison base), the task's own verification checklist, and what each attempt has cost.
+- `POST /api/races/:race_id/pick` body `{task_id (required)}` → `200 {"ok":true, "winner":"...", "losers":[...]}` | `400` | `404` | `409` (already decided, or the pick was already cancelled)
+  Keep one attempt, cancel the rest. The winner carries on through the normal review path. Each loser gets a `race_lost` event recording its cost, branch and PR before it is cancelled, and cancellation runs the normal terminal-state teardown (agent session closed, guarded worktree removal). Because a loser's branch holds unmerged commits, that guard preserves the checkout on disk on purpose, and any PR a loser opened stays open until someone closes it. The winner gets a `race_won` event carrying the cost of the whole race.
 - `POST /api/tasks/:id/cleanup` body `{}` → `200 {"ok":true, "cleaned":bool, "worktree":{removed,reason,ghost_branch}|null, "session":{closed,via}}` | `404` | `409` (task not terminal)
   Manual force-teardown for a **terminal** task (`done`/`cancelled`/`failed`): removes its git worktree and closes its herdr session. Refuses (`409`) on a live task so an in-flight worktree is never pulled out from under a working agent. Keeps every safety guard: the worktree is removed only when its branch is pushed/merged (else `cleanup_skipped`), and any tracked uncommitted work is preserved to a `ghost-<task-id>` branch first. Backstop for the auto-teardown that fires on the `done`/`cancelled` transition and the periodic reaper sweep.
 - `POST /api/tasks/:id/merge-into` body `{target_id (required)}` → `200 Task` (now `cancelled`) | `400` (missing/self `target_id`) | `404` (task or target missing) | `409` (source is already terminal)
@@ -921,6 +1004,39 @@ does not. A merge that actually fails drops out of the queue and the whole sweep
 raises ONE notification naming what stopped, so a broken PR is not retried every
 cycle.
 
+**Merges are single-flight per target branch (HIVE-348).** The edges decide who
+MAY land; the queue then lands them one at a time. Every caller goes through
+`mergeTask`, which takes a lock keyed on the repo plus the branch being merged
+into, so the land sweep, the reconciler's auto-merge, the PR gardener and the
+director's own click can never run two merges against one base at once — the
+race that once dropped a commit through a reset and re-merge. Independent repos
+and independent target branches still land in parallel. Everything that
+validates a merge (the PR metadata probe, the destructive-rebase guard, the
+live-head match, `beforeMutation`) runs inside the lock, so a queued merge
+validates against the base its predecessor just moved. The queue also re-reads
+the approved-to-land mark immediately before each merge, so unmarking a PR
+mid-sweep stops the merges still waiting behind the one in flight.
+
+### Divergence radar (HIVE-348)
+
+Conflicts used to surface at merge time, after a review was already done. This
+shows them while the work is still in flight.
+
+- `GET /api/tasks/divergence[?project=<id>]` → `200 {projects: [{project_id, base, rows}], rows}`.
+  Rows cover every task in `in_progress`, `in_review` or `needs_decision` that
+  has a branch. Each row is `{id, number, title, state, branch, behind, files,
+  overlaps}`: `behind` is `git rev-list --count <branch>..<base>` (commits the
+  target branch has that this one does not, `null` when git could not tell,
+  never 0), `files` is how many files the branch authors, and `overlaps` lists
+  the sibling branches touching the same files as `{task_id, number, files}`
+  (capped at 5 files, symmetric so each side sees the other). Overlap reuses the
+  land graph's own detector (`authoredFiles`), not a second one. Nothing is
+  stored, and a project with no `repo_path` returns no rows without shelling out.
+
+  The board shows this as two chips on in-flight cards: "N behind" (only from 5
+  commits behind, since every branch in an active repo trails by one or two) and
+  "same files as DEMO-2", whose tooltip names the shared files.
+
 - `POST /api/tasks/:id/merge` body `{merge_strategy?: "local_ff", override_destructive_check?: boolean, actor?}` → `200 Task` (now `verifying`) | `409` (not `in_review`, missing/unpassed understanding check on a kind outside `config.auto_merge.kinds`, or the merge failed: conflict / not a fast-forward / gh refused / **destructive auto-rebase**) | `403` (denied by a `task.merge` authority rule) | `404` | `400` (local merge but no `repo_path`/`branch`). The optional director `actor` is recorded on `merged`, `merge_failed`, and `merge_blocked_destructive` events.
   Approve & merge. When `pr_url` is set: `gh pr merge <url> <method>` where
   `method` is the project's `config.merge_method` (`squash` default, or `merge` /
@@ -933,7 +1049,7 @@ cycle.
 
   **Understanding gate.** The latest review must include a valid multiple-choice understanding check. The director must pass it before merge. The explicit `quiz_later` defer endpoint temporarily unlocks the merge while keeping the quiz in Needs You until it is eventually passed. Supervisors cannot answer or defer it.
 
-  **Judgment-class only.** A task needs an understanding check at all only when it is judgment-class: the latest `auto_review` verdict is not `looks_good` (missing, errored or skipped counts), the reviewed diff touches a sensitive path (`auth`, `security`, `payment`, `billing`, `migration`, `secret`, `credential`, `password` by default, overridable with `config.understanding_checks.sensitive_paths`), the task kind is outside `config.auto_merge.kinds`, or the director flagged the task. Everything else merges with no check, mints no quiz, and never appears in `GET /api/understanding-quizzes`.
+  **Judgment-class only.** A task needs an understanding check at all only when it is judgment-class: the latest `auto_review` verdict is not `looks_good` (missing, errored or skipped counts), the reviewed diff touches a sensitive path (`auth`, `security`, `payment`, `billing`, `migration`, `secret`, `credential`, `password` by default, overridable with `config.understanding_checks.sensitive_paths`), the task kind is outside `config.auto_merge.kinds`, or the director flagged the task. Everything else merges with no check, mints no quiz, and never appears in `GET /api/understanding-quizzes`. Part of that rule also runs at handoff time (HIVE-580): `ready` is held with `{held: true, reason: "missing_understanding_check"}` when the task's latest review has no check and the task owes one *for a reason the auto review cannot change* — its kind is outside `config.auto_merge.kinds`, or the director flagged it. That way the agent adds the check on its own turn instead of learning about it from a failed land attempt after the turn ended. The handoff gate FAILS OPEN on everything else: the verdict and sensitive-path conditions need an auto review that has usually not run yet at handoff, and holding on "cannot tell" would push agents to write checks for changes the merge gate would not have asked for. The merge gate is unchanged, so nothing reaches the base branch without a required check either way.
 
   For task kinds a project opted into with `config.auto_merge.kinds`, the check never gates the merge: a missing check is ignored, and a required-but-unpassed one is deferred automatically (an `understanding_quiz_deferred` event with `source: "system"`, written only after the merge succeeds) so it stays in Needs You. Kinds outside the allow-list keep the `409`.
 
@@ -1070,11 +1186,13 @@ recognized fields (JSON keys == form field names):
 | `kind` | evidence kind (evidence type only); defaults to `screenshot` if a file is present, else `link`/`log` |
 | `caption` | evidence caption |
 | `url` | evidence URL (for link evidence, no file) |
-| `meta` | (evidence type) JSON string merged into the Evidence row's `meta`; `hive emit ... evidence` auto-fills `{commit_sha}` from `git rev-parse HEAD` in its cwd |
+| `meta` | (evidence type) JSON string merged into the Evidence row's `meta`; the server fills in `{commit_sha}` from `git rev-parse HEAD` in the task's own worktree (overwriting any caller-sent value), and skips it for the commit-free kinds `report`/`link`/`observation`/`explanation`. With no worktree (or git unable to answer) the item is stored unstamped and the response carries a `warning` saying so |
 | `title`,`context`,`risk`,`blast_radius`,`options` | decision fields (needs-decision type; `options` is a JSON string in multipart) |
 | `until`,`days` | (deferred type) auto-resume horizon: an ISO timestamp (`until`) or an integer number of days from now (`days`); neither = indefinite |
 | `model`,`input_tokens`,`output_tokens`,`cache_read_tokens`,`cache_write_tokens`,`cost_usd` | usage fields (usage type; numbers, or numeric strings in multipart; `cost_usd` optional) |
 | `verify_name` | (evidence type) the task `verification_cmds` entry this artifact came from; recorded on the `evidence` event payload (CLI: `--verify-name <name>`) |
+| `payload_path` | the absolute path the `--json` payload was read from (the CLI fills it in). Refused with `400` when it is outside the task's `worktree_path` and outside that worktree's session scratchpad (`.../<worktree-slug>/<session-uuid>/scratchpad/...`, slug = the worktree path with every non-alphanumeric character replaced by `-`). Shared paths like `/tmp/review.json` let one agent publish another agent's review. Skipped when the task has no worktree. |
+| `task_id` (or `task`) | optional self-identification stamped into a payload file: the task id, number, `#number`, or display id (e.g. `HIVE-561`). Refused with `400` when it names a different task than the one being emitted on. |
 | `file` | (multipart only) the uploaded evidence file |
 
 Behavior by `type`:
@@ -1150,6 +1268,15 @@ work. Use `POST /api/tasks/:id/events` with `type=evidence` for that.
   `[{task_id, title, project_id, ...totals}]`.
 - `GET /api/tasks/:id/usage` → `200 {task_id, usage:[Usage], totals}` | `404`
   All usage rows for a task (oldest first) plus the totals object.
+
+### Autonomy scoreboard
+- `GET /api/stats/autonomy?days=<n>&project_id=<id>&reverts=0` → `200 {window, auto_merge_precision, inbox_load, recovery, agreement}`
+  Read-only. Four questions about whether hive's own automation is earning trust. `days` defaults to 30 (clamped 1..365) and the window snaps to whole UTC days; `project_id` scopes every section; `reverts=0` turns off the git revert scan (file-overlap detection still runs).
+  `auto_merge_precision` is `{merges, measurable, clean, fixed, precision, revert_detection, cases}`. `precision` is `clean / measurable`, and it is `null` when nothing was measurable — a merge with no recorded `merged_files` and no PR number could only ever come back clean, so it is excluded rather than counted as good. `cases` carries one row per auto-merge with its `fix_signal` (`file_overlap` or `revert`, else `null`).
+  `inbox_load` is `{by_day, totals, per_day}`. `by_day` has one row per calendar day in the window with a count per attention class (`decision`, `quiz`, `checkpoint`, `dialog`, `stale`) plus `total`.
+  `recovery` is `{auto_respawns, one_cap_parks, scouts_spawned}`.
+  `agreement` is `{auto_answered, contradictions, auto_contradicted, agreement_rate}`. `agreement_rate` is `null` when hive answered no decisions itself.
+  The signals are heuristics with named ceilings (see `server/src/autonomyStats.ts`); read them as trends. `hive stats` prints the same numbers as an `AUTONOMY` section, and the web Needs-you activity summary shows them as a compact grid. Neither surface applies a threshold or raises an alert.
 
 ### Decisions
 - `GET /api/decisions?status=open[&project_id=<id>][&test=all]` → `200 [Decision, ...]` (newest first; `status` defaults to `open`; `status=all` returns every decision; `project_id` optionally scopes the list). Decisions under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
@@ -1239,6 +1366,14 @@ director turns: routine wakeup replies are suppressed after its first response.
 It may send one additional message only for newly surfaced decision cards or a
 newly completed outcome.
 
+- `GET /api/chat/supervisor` → `200 {on}`; `POST /api/chat/supervisor` body `{on}` → `200 {on, stopped}`
+  The Chief of Staff off switch (`hive chat supervisor [on|off]`), stored in the
+  global `chat_supervisor` setting. **Off is the default.** While off, a chat turn
+  persists the message, starts no task and no agent, returns `delivery:"disabled"`,
+  and posts a thread message saying the Chief of Staff is off. Turning it off also
+  cancels every live supervisor session (`stopped` counts them), since a standing
+  session is the thing the switch exists to stop.
+
 - `POST /api/chat/turn` body `{text (required), thread_id?, project_id?, scope?: "chief"}` → `202 {thread_id, delivery, agent_target?, error?}` | `400` (empty text, missing project scope, or no active project repository for Chief of Staff) | `404` (unknown `thread_id`)
   Director → supervisor. **Non-blocking by design**: it persists the director
   message, makes sure the thread's supervisor session is live (spawning it on the
@@ -1319,11 +1454,19 @@ same authority engine (`writeHookSettings` in `api.ts`; `hooks/classify.ts` +
      `POST guarded-action {action:"command.dangerous.<category>", target:<cmd>, summary:<Bash description>}`. The hook forwards the Bash tool's one-line description as the stated intent; see the `guarded-action` contract above for missing-summary behavior.
      Never auto-allowed, even under `command_approval:"allow"`.
      **Sandbox waiver**: a destructive command PROVEN to act only inside the
-     agent's own sandbox (its herdr worktree or a tmp scratchpad) is first
-     downgraded out of `dangerous` to **unknown** (allow-and-log) — this covers
-     `rm -rf`, `kill`/`pkill`, `git reset --hard`/`git clean`, `git push --force`,
-     `find … -delete/-exec`, and sandboxed SQL. Anything unresolvable (a shell
-     var, a `..` escape, an un-sandboxed or unknown path) stays dangerous.
+     agent's own sandbox (its herdr worktree, a tmp scratchpad, or a docker
+     container belonging to that worktree) is first downgraded out of
+     `dangerous` to **unknown** (allow-and-log) — this covers `rm -rf`,
+     `kill`/`pkill`, `git reset --hard`/`git clean`, `git push --force`,
+     `find … -delete/-exec`, and sandboxed SQL. Sandboxed SQL means sqlite3 on a
+     file under a sandbox root, or `docker exec` into a container whose name
+     starts with the requesting worktree's own slug (`<slug>-mariadb`, brought up
+     by `infra/worktree/wt.sh` and thrown away with the worktree). The slug match
+     is exact and anchored, so a neighbouring task's container never waives, and
+     a client assembled in a shell variable (`DBC="docker exec … mysql …"`) is
+     resolved before the check. Anything unresolvable (a shell var set in an
+     earlier call, a `..` escape, an un-sandboxed or unknown path, a bare
+     `mysql -h <host>`) stays dangerous.
    - **unknown** (not provably safe) → escalates via `{action:"command", …}`, or is
      allowed / deferred per the `command_approval` policy below.
 
@@ -1385,6 +1528,33 @@ Task routes accept a task NUMBER as well as an id (`hive://task/1247`).
 - `POST /api/notifications/ack` → `200 {"ok":true, "acked": <n>}`
   Marks all currently-undelivered notifications as seen (`delivered_at` set to now). Called when the header bell dropdown is opened, so those events are not re-pushed by the next digest.
 
+### Away mode
+Holds low-urgency phone pushes overnight and batches them into one summary.
+
+Every urgent notification pushes to the phone the moment it happens. Away mode
+classifies each outgoing push and holds the ones that can wait. The class comes
+from the notification `kind` (`decision`, `decision_nag`, `review` → `decision`;
+`quiz_digest` → `quiz-digest`; `circuit_breaker`, `agent_unreachable`,
+`auth_lost`, `incident` → `fleet_down`; everything else → `info`), and an `enqueue` can override it with an explicit
+`class`. A class listed in `always_through` is pushed immediately even while
+away; everything else is appended to a held list.
+
+Config lives in the `away_mode` settings key, the held list in `away_held`, and
+the latched schedule state in `away_active`. The reconciler step `syncAway`
+flips the latch by the schedule. On waking it sends ONE push,
+`While you were away: N items`, deep-linking `/inbox`, then clears the list.
+The manual `on` switch takes effect on the very next push, not at the next tick.
+
+- `GET /api/away` → `200 {"on": <bool>, "schedule": {"start","end","tz"}|null, "always_through": [...], "active": <bool>, "held": <n>}`
+  `active` is away RIGHT NOW (manual switch, or the schedule latch). `held` is how many pushes are waiting.
+- `POST /api/away` body `{on?, schedule?, always_through?}` → `200 {..., "active": <bool>, "flushed": <n>, "held": <n>}`
+  Any omitted field keeps its current value; `"schedule": null` clears the schedule. Turning away mode off flushes the held list immediately, so the summary push does not wait for the next reconciler tick. `flushed` is how many held pushes that summary covered.
+
+`schedule.start` is inclusive and `schedule.end` exclusive, both wall clock in
+`schedule.tz` (an IANA zone). A window that wraps midnight (`23:00` → `08:00`)
+is the normal case. An unparsable time or timezone never holds anything.
+`always_through` defaults to `["security","spend","fleet_down","second_failure"]`.
+
 ### Secrets (metadata only)
 `POST` and `DELETE` here require the API token from every caller, loopback
 included (`401` without it — see Auth); `GET` does not.
@@ -1422,6 +1592,34 @@ Subsequent messages (broadcast to all clients on every change):
 A state change therefore produces both an `event` message (`type:"state_change"`)
 and a `task` message. The client should upsert by `id`. There is no replay/backfill
 on connect; load current state via the REST endpoints, then apply stream deltas.
+
+**`project_id` on frames.** Every frame that belongs to a project carries a
+top-level `project_id`, so a client never has to join task → project itself. It
+comes from one of three places:
+
+- the task the frame names, looked up once and cached: `task`, `event`,
+  `decision`, `evidence`, `notification`, `usage`
+- a `project_id` already on the row itself: `incident`, `learning`
+- the parent chat thread: `chat_message`. A chat message row has no task and no
+  project of its own, so the server stamps the scope of its `chat_threads` row.
+  Messages on the portfolio-wide Chief of Staff thread have no project, so they
+  carry `"project_id": null` and are treated as fleet-wide.
+
+Fleet-wide frames have no project scope and carry no `project_id`: `hello`,
+`offline`, `chat_thread`, `chat_delivery`, `notify`, `reconciler_error`, and the
+reaper frames.
+
+**Query parameters (all optional).** With none, the stream behaves exactly as it
+always has: every frame, to every client. Filtering happens per client, so a
+filtered subscriber costs nothing extra for anyone else.
+
+| param | meaning |
+|-------|---------|
+| `client=app` | marks the Electron desktop client, which is the only client that can raise a native notification |
+| `project=<project_id>` | drop frames belonging to other projects. Frames with no project scope always pass |
+| `classes=<comma list>` | keep only these frame types, e.g. `classes=decision,event,task`. The `hello` headline is always sent |
+
+Example: `GET /api/stream?project=proj_e60f3994fbf7&classes=decision,event`
 
 ### Braindump intake — `POST /api/intake`
 Body `{project_id (required), text (required)}` → `202 {"ok":true, "task": Task}`
@@ -1539,12 +1737,56 @@ never stopped and a merged PR is never rolled back to make room for a
 higher-priority task. Set it at creation (`POST /api/tasks`) or later
 (`PUT /api/tasks/:id`); an unknown value is a `400` and changes nothing.
 
-It changes two things:
+**Who may set what.** Only the director may set `now`. Attribution is the task
+`source` on the request: the web UI and the CLI send none (or `"director"`),
+a spawned agent sends `"agent"`, the chat supervisor sends `"chat_supervisor"`.
+Any attributed non-director source asking for `now` gets a `403` and nothing
+changes; `next`, `normal` and `later` are open to everyone. This is because
+`now` is the one level that can borrow a slot past `max_agents`, so a
+supervisor or an agent granting itself one would spend the fleet's headroom on
+its own work.
+
+Authority applies to the value the caller asks for, not to an inherited one. An
+agent filing a follow-up under a director's `now` task keeps `now`: it is
+staying with work the director already ranked, not granting itself a level.
+
+**Where priority comes from when the caller does not say.** First match wins:
+
+1. An explicit `priority` in the request.
+2. The parent's, when `parent_task_id` is set. A follow-up matters as much as
+   the work that spawned it.
+3. `next`, when the title or brief reads as security work. The words are the
+   same list the understanding-quiz gate applies to changed paths (`auth`,
+   `token`, `security`, `payment`, `billing`, `migration`, `secret`,
+   `credential`, `password`), matched as whole words so "author" does not count.
+4. `normal`.
+
+Nothing auto-assigns `now`, and nothing auto-assigns `later`.
+
+**Inheritance elsewhere:**
+
+- A **requeue** (recovery, or a director answering a recovery card) copies the
+  failed original's priority to its successor. Without this, a `now` task would
+  fall to the back of the queue on every retry.
+- The **root-cause scout** filed on a lineage's second failure inherits that
+  lineage's priority, so it does not queue behind the work it is meant to
+  unblock.
+- **Monitor auto-tasks** (`config.monitors_auto_task`) are created at `next`:
+  something is already down.
+- **Watcher tasks** and **Jira-imported mirrors** are created at `normal`, the
+  default. They are inbound material, not an emergency.
+- Tasks created **together in a `depends_on` chain do NOT inherit from the head
+  of the chain.** `depends_on` is an ordering edge, not a lineage. Pass
+  `priority` on each task in the chain you want it on (`hive task create
+  --priority <p>`).
+
+It changes three things:
 
 - **Which queued task is picked up first.** The dispatcher orders its queue by
   priority, then by age. A `later` task never beats a `normal` one, however old
   it is. The reattach pass keeps its own ordering (oldest feedback first) —
   that is resumed work, not new work.
+- **Which item Focus shows first.** Every day in Focus promotes an item by one priority level, capped at `now`, then FIFO breaks ties. Age starts when a decision or checkpoint is created, a task enters review or failure, or its current stuck/dead health condition begins. CI and metadata updates do not reset it.
 - **Which approved PR lands first.** The land queue's dependency and conflict
   edges still decide the order; priority only breaks the tie among the PRs that
   are all ready in the same sweep.

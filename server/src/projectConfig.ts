@@ -199,6 +199,8 @@ const prGardener: Check = (v) => {
     max_actions_per_sweep: positiveInt,
     max_fix_attempts: positiveInt,
     max_gardener_agents: positiveInt,
+    adopt_untracked: bool,
+    adopt_skip_labels: strArray,
   };
   for (const [key, value] of Object.entries(v as Record<string, unknown>)) {
     if (!Object.hasOwn(checks, key)) return `.${key} is not a known PR gardener key`;
@@ -239,6 +241,7 @@ const CHECKS: Record<string, Check> = {
   test: bool, // test/ephemeral project, hidden from director surfaces (testProjects.ts)
   plan_intake: bool,
   plan_gate,
+  intake_triage: bool, // classify ambient intake before dispatch (intake/triage.ts)
   intake_keywords: strArray,
   // subprocess argv overrides (see above)
   agent_argv: argv,
@@ -293,6 +296,10 @@ const CHECKS: Record<string, Check> = {
   wait_call_warn: nonnegativeInt,
   wait_call_cap: nonnegativeInt,
   decision_auto_answer_hours: num,
+  // Quiet window after which an un-acked, unflagged checkpoint leaves the
+  // attention inbox once its task has moved on (0 disables; default 24).
+  checkpoint_expiry_hours: (v) =>
+    typeof v === "number" && Number.isFinite(v) && v >= 0 ? null : "must be a non-negative number",
   pricing: obj,
   // stored by the director, read by nothing in server/ today
   deploy_notes: str,

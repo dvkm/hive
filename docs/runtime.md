@@ -37,14 +37,27 @@ web UI now runs instead of sitting in Queued forever. Every gate below must pass
    `verifying`/`done`) is not spawned; a deduped `dependency_blocked` event
    records the visible "blocked by #N …" reason. The reconciler applies the same
    gate to stage advancement, so a manually-spawned dependent is held too.
-7. **Backoff.** On a spawn failure a single `spawn_error` event is written and
+7. **File-overlap ordering.** Before spawning, the dispatcher guesses which
+   files a queued task will touch, from the paths named in its title/brief and,
+   for a requeue, the files its predecessor's branch really touched
+   (`server/src/fileScope.ts`). If that guess overlaps a task already running,
+   the task is skipped for now and a deduped `dispatch_hold_overlap` event
+   records the reason; a non-overlapping candidate is dispatched instead. This
+   is ORDERING ONLY. If nothing else in the project is dispatchable and nothing
+   is working, the held task is started anyway and a
+   `dispatch_overlap_override` event says so — an idle fleet is worse than a
+   predicted conflict. The guess that a task started under is stored as
+   `dispatch_scope`, and once its branch exists the reconciler scores guess
+   against reality in `scope_prediction_scored`, so the heuristic can be tuned
+   or dropped on evidence.
+8. **Backoff.** On a spawn failure a single `spawn_error` event is written and
    the task stays queued; the next attempt waits `min(30s · 2^(n-1), 30m)` where
    `n` is the number of the task's *own* spawn_error events. No retry storm on a
    broken repo. Failures tagged `infra: "herdr_unreachable"` (see the circuit
    breaker below) are excluded from `n` — a daemon outage is not the task's
    fault, so it neither escalates the task's exponential delay nor strands it in
    backoff once herdr recovers.
-8. **herdr-down circuit breaker.** A spawn can fail because the herdr control
+9. **herdr-down circuit breaker.** A spawn can fail because the herdr control
    socket itself is unreachable (`ConnectionRefused` / `Os { code: 61 }`,
    `isHerdrUnreachable()`) rather than for a task-specific reason. Instead of
    every queued task independently pounding the dead socket (the 260× outage
@@ -154,7 +167,7 @@ briefing in that case).
 
 **Model selection.** Claude workers stay explicitly pinned by task kind: `ship → opus`, `scout`/`chore` → `sonnet`, overridable through `config.model` or `config.model_by_kind`. Codex workers inherit the current ChatGPT/Codex default unless `config.codex_model` or `config.codex_model_by_kind` is set. Hive bounds Codex's default token use with `medium` reasoning for ship tasks, `low` for scout/chore tasks, compaction at 64,000 tokens, and 6,000-token tool output. Override those with `config.codex_reasoning_effort`, `config.codex_reasoning_effort_by_kind`, `config.codex_auto_compact_token_limit`, and `config.codex_tool_output_token_limit`. `config.agent_argv` bypasses all of these paths. The planner one-shot remains Claude and is pinned to `sonnet` unless `config.planner_argv` overrides it.
 
-**Token controls.** The composed prompt keeps the lifecycle and standing-authority contracts inline, but stores policy, reference, prior-decision, and failure bodies behind task-scoped `hive recall` searches. Default processed-token warning/cap thresholds are 75M/200M and wait-call thresholds are 25/100; projects can override or disable each with `processed_token_warn`, `processed_token_cap`, `wait_call_warn`, and `wait_call_cap`. Warnings steer once. A cap parks an in-progress task behind a wrap-up-or-continue decision, and continuing doubles that task's effective threshold. This works for unpriced models because it does not depend on `cost_usd`.
+**Token controls.** The composed prompt keeps the lifecycle and standing-authority contracts inline, but stores policy, reference, prior-decision, and failure bodies behind task-scoped `hive recall` searches. Default processed-token warning/cap thresholds are 75M/200M and wait-call thresholds are 25/100; projects can override or disable each with `processed_token_warn`, `processed_token_cap`, `wait_call_warn`, and `wait_call_cap`. Warnings steer once. A cap parks an in-progress task behind a wrap-up-or-continue decision, and continuing doubles that task's effective threshold. This works for unpriced models because it does not depend on `cost_usd`. A chat supervisor session is the exception: it has no definition of done, so a "wrap up" steer changes nothing. At the processed-token warning its task is cancelled outright and the thread says so; the director's next message is the deliberate restart.
 
 ## Stale recovery loop (`server/src/reconciler.ts`)
 

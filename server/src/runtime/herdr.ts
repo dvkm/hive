@@ -67,7 +67,13 @@ export const HERDR_BIN = discoverHerdrBin();
 // an earlier tool's 2026-07-02 self-kill incident documents. "hive-fleet" is distinct.
 export const FLEET_LABEL = process.env.HIVE_FLEET_LABEL || "hive-fleet";
 
-export class HerdrError extends Error {}
+export class HerdrError extends Error {
+  // Set only for the "another agent holds this task's name" refusal, so callers
+  // can tell contention (wait for the holder) from a real failure (HIVE-568).
+  constructor(message: string, readonly nameHolder?: NameHolder) {
+    super(message);
+  }
+}
 
 export type AgentStatus = "idle" | "done" | "working" | "blocked" | "unknown" | "gone";
 
@@ -85,6 +91,19 @@ export interface SpawnArgs {
   // Called after the worktree exists but BEFORE the agent starts, so the caller
   // can seed the worktree (e.g. write .claude hook settings) structurally.
   prepareWorktree?: (worktreePath: string) => void | Promise<void>;
+  // How long the task has been silent (no agent-generated events), when the
+  // caller knows. Only used if `agent start` hits agent_name_taken: it names the
+  // silence in the refusal so an operator does not have to go and measure it.
+  holderQuietMs?: number;
+  // The caller's half of the release decision (HIVE-552). True means "nothing
+  // agent-generated has happened on this task for a whole stale window", which
+  // is what makes closing a FINISHED name holder safe. herdr supplies the other
+  // half (its status is `done`); both must hold or the name is left alone.
+  releaseFinishedName?: boolean;
+  // The operator's half (HIVE-579): `hive spawn <id> --force` means "I checked,
+  // it is not running". It replaces the silence proof only — a holder herdr
+  // still reports as working/idle/blocked is never closed by it.
+  forceReleaseName?: boolean;
 }
 
 export interface SpawnResult {
@@ -231,6 +250,36 @@ export function isWorktreeExistsError(r: ExecResult): boolean {
   return /already exists|already used by worktree/.test(`${r.stdout}\n${r.stderr}`);
 }
 
+// `git worktree remove` refused because the checkout directory still holds
+// files git does not know about — untracked build cache (web/.vite,
+// node_modules, dist) an agent created. Git prints
+// `error: failed to delete '<path>': Directory not empty`, drops the worktree
+// registration anyway, and leaves the directory behind. That leftover is a
+// landmine: every later `worktree add` on the path fails with `already exists`
+// (22 recorded removals hit this between 2026-07-30 and 2026-08-28).
+// Matches ONLY the leftover-cache condition, never `failed to delete` on its own:
+// git prints that prefix for any deletion failure (permission denied, file busy,
+// I/O error), and those are real problems to surface, not directories to wipe.
+export function isWorktreeNotEmptyError(r: ExecResult): boolean {
+  return /Directory not empty/.test(`${r.stdout}\n${r.stderr}`);
+}
+
+// Guard for the two places that clear a directory outright. Clearable only when
+// the path is absolute, at least three levels deep, not the repo itself, and not
+// an ancestor of the repo. That rules out `/`, `/Users`, `/Users/david` and any
+// parent of the checkout; it does NOT prove the path is a worktree, so callers
+// stay responsible for that (clearOrphanPath's three conditions, or a
+// `worktree remove --force` that already authorised the deletion).
+export function isClearableWorktreePath(repoPath: string, path: string): boolean {
+  const trim = (s: string) => s.replace(/\/+$/, "");
+  if (!path.startsWith("/")) return false;
+  const p = trim(path);
+  const repo = trim(repoPath);
+  if (p === repo) return false;
+  if (repo.startsWith(`${p}/`)) return false; // an ancestor of the repo — never ours
+  return p.split("/").filter(Boolean).length >= 3;
+}
+
 // herdr serializes worktree operations globally; two near-simultaneous spawns
 // (dispatcher + manual /spawn, or spawn racing the reaper) surface as
 // `worktree_operation_in_progress` (seen 3× live). Transient by construction —
@@ -348,20 +397,29 @@ export function paneProcessInfoArgv(paneId: string): string[] {
 // running the agent command, not a login shell.
 const LOGIN_SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "powershell", "pwsh", "cmd", "nu"]);
 
-export function paneRunsAgentCommand(stdout: string): boolean {
+// The pane's root foreground process: the entry matching herdr's shell_pid, or
+// the first one listed. Two callers need it — paneRunsAgentCommand (agent pane
+// or bare login shell?) and the name-holder refusal, which prints the pid an
+// operator has to look at.
+export function parsePaneRootProcess(stdout: string): { pid: number | null; name: string } | null {
   try {
     const info = (JSON.parse(stdout).result ?? {}).process_info;
-    if (!info) return false;
+    if (!info) return null;
     const procs: any[] = info.foreground_processes ?? [];
     const root = procs.find((x) => x.pid === info.shell_pid) ?? procs[0];
-    if (!root) return false;
+    if (!root) return null;
     const name = (String(root.argv0 ?? root.name ?? "").replace(/^-/, "").split(/[\\/]/).pop() ?? "")
       .replace(/\.exe$/i, "")
       .toLowerCase();
-    return !!name && !LOGIN_SHELLS.has(name);
+    return { pid: typeof root.pid === "number" ? root.pid : null, name };
   } catch {
-    return false;
+    return null;
   }
+}
+
+export function paneRunsAgentCommand(stdout: string): boolean {
+  const root = parsePaneRootProcess(stdout);
+  return !!root?.name && !LOGIN_SHELLS.has(root.name);
 }
 
 // Stricter than paneRunsAgentCommand (which only asks "not a login shell"): a
@@ -621,10 +679,77 @@ function withWorktreeLock<T>(repoPath: string, branch: string, fn: () => Promise
   return run;
 }
 
+// Who is holding a task's agent name, for the refusal message and the release
+// decision (HIVE-552). Every field is best-effort: an unreadable holder reads as
+// `unknown`, which never releases anything.
+export interface NameHolder {
+  status: AgentStatus;
+  paneId: string | null;
+  pid: number | null;
+  command: string | null;
+}
+
+function humanDuration(ms: number): string {
+  const mins = Math.round(ms / 60000);
+  return mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`;
+}
+
+// One line an operator can act on. Every diagnosis of this failure started with
+// pgrep because the old refusal named nothing — so name the pid first.
+export function describeHolder(holder: NameHolder, quietMs?: number): string {
+  return [
+    holder.pid ? `pid ${holder.pid}${holder.command ? ` (${holder.command})` : ""}` : "pid unknown",
+    holder.paneId ? `pane ${holder.paneId}` : null,
+    `herdr status ${holder.status}`,
+    quietMs === undefined ? null : `silent ${humanDuration(quietMs)}`,
+  ]
+    .filter(Boolean)
+    .join(", ");
+}
+
+// Is the process holding the name still there? Signal 0 checks existence
+// without touching the process. Only ever consulted for a pid herdr itself
+// named, so pid recycling would have to hit that exact number in the seconds
+// between the two reads.
+export function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: any) {
+    // EPERM = a live process owned by somebody else. Alive, just not ours.
+    return e?.code === "EPERM";
+  }
+}
+
+// When may a spawn refused by a name holder be retried (HIVE-568)? Returns the
+// ISO instant, or null when this is NOT a wait: no holder (some other failure),
+// or a holder that already reports done and has been silent past the stale
+// window — that one should have been reclaimable, so its refusal is a real
+// failure a human must look at. Everything else is a live or not-yet-stale
+// holder that will release the name on its own.
+// ponytail: the wait is the remaining stale window, but polled at most every 5
+// minutes so a holder that exits early is picked up without a full 15m sleep.
+export function heldNameRetryAt(
+  holder: NameHolder | undefined,
+  quietMs: number | undefined,
+  staleMs: number,
+  nowMs: number
+): string | null {
+  if (!holder) return null;
+  const quiet = quietMs ?? 0;
+  if (holder.status === "done" && quiet > staleMs) return null;
+  const wait = Math.min(Math.max(staleMs - quiet, 60_000), 5 * 60 * 1000);
+  return new Date(nowMs + wait).toISOString();
+}
+
 // ---- adapter ----
 
 export class Herdr {
-  constructor(private exec: Exec = defaultExec, private bin: string = HERDR_BIN) {}
+  constructor(
+    private exec: Exec = defaultExec,
+    private bin: string = HERDR_BIN,
+    private alive: (pid: number) => boolean = pidAlive
+  ) {}
 
   private run(argv: string[], opts?: { input?: string }): Promise<ExecResult> {
     return this.exec([this.bin, ...argv], opts);
@@ -667,15 +792,54 @@ export class Herdr {
     // The task's previous agent (crashed run, requeue) can still hold the name.
     // The error body names its pane/tab: close the stale session and retry once.
     if (start.code !== 0 && isAgentNameTakenError(start)) {
-      // INCIDENT HOTFIX 2026-08-25 (task b6fb44583e96): closing the name-holder
-      // here killed LIVE agents whenever recovery respawned a quiet-but-alive
-      // task (turn-complete auto-respawn from PR #190 made this constant).
-      // Until a liveness probe guards the close, never close: fail the spawn so
-      // recovery parks with a card instead of murdering the running agent.
-      throw new HerdrError(
-        `agent start refused: task ${args.taskId} already has an agent holding its name (possibly alive). ` +
-        `Verify it is dead (no panes, no worktree processes) before respawning.`
-      );
+      const ref = parseStaleAgentRef(`${start.stdout}\n${start.stderr}`);
+      const holder = await this.describeNameHolder(args.taskId, ref.paneId);
+      // HIVE-552: a claude agent that has FINISHED does not exit — it idles at
+      // its prompt forever, still holding the name. That refuses every respawn
+      // AND strands every steer (send() already refuses a `done` agent), so the
+      // task looks healthy while nobody reads its mailbox. Close the finished
+      // holder and start fresh.
+      //
+      // INCIDENT HOTFIX 2026-08-25 (task b6fb44583e96): closing the name holder
+      // UNCONDITIONALLY killed LIVE agents whenever recovery respawned a
+      // quiet-but-alive task (turn-complete auto-respawn from PR #190 made this
+      // constant). That is why the close now needs two independent proofs that
+      // the holder is finished rather than busy: herdr says its turn is over
+      // (`done` — never working/idle/blocked/unknown), and the caller says the
+      // task has been silent for a whole stale window. Anything else is still
+      // left strictly alone.
+      //
+      // HIVE-579: the liveness probe that hotfix comment was waiting for. A pid
+      // herdr named that no longer exists is not ambiguous — that agent is gone
+      // and its lease is a leak, so release it whatever its last status said.
+      // (A finished claude does NOT exit, so an alive pid is not proof of busy;
+      // that case still needs the status + silence pair, or the operator's
+      // --force in place of the silence.)
+      const holderDead = holder.pid !== null && !this.alive(holder.pid);
+      const finishedAndReleasable =
+        holder.status === "done" && (args.releaseFinishedName || args.forceReleaseName === true);
+      if (holderDead || finishedAndReleasable) {
+        await this.closeSession({
+          agentTarget: args.taskId,
+          tabId: ref.tabId,
+          expectCwd: wt.path,
+          request: {
+            caller: "spawn",
+            reason: holderDead
+              ? "dead process still holding the task name"
+              : "finished agent still holding the task name",
+            taskId: args.taskId,
+          },
+        });
+        start = await this.run(startArgv);
+      }
+      if (start.code !== 0 && isAgentNameTakenError(start))
+        throw new HerdrError(
+          `agent start refused: task ${args.taskId} already has an agent holding its name (possibly alive). ` +
+          `Holder: ${describeHolder(holder, args.holderQuietMs)}. ` +
+          `Verify it is dead (no panes, no worktree processes), then respawn with: hive spawn ${args.taskId} --force`,
+          holder
+        );
     }
     if (start.code !== 0)
       throw new HerdrError(`agent start failed: ${start.stderr.trim() || start.stdout.trim()}`);
@@ -711,6 +875,20 @@ export class Herdr {
       pane_id: agent?.pane_id ?? null,
       label,
     };
+  }
+
+  // Read the process actually holding a task's agent name. Never throws: the
+  // caller uses this to decide whether to close it, so an unreadable answer must
+  // degrade to "unknown" (= leave it alone), never to a guess.
+  private async describeNameHolder(target: string, paneIdHint: string | null): Promise<NameHolder> {
+    try {
+      const got = await this.run(agentGetArgv(target));
+      const paneId = parsePaneId(got.stdout) ?? paneIdHint;
+      const proc = paneId ? parsePaneRootProcess(await this.paneProcessInfo(paneId)) : null;
+      return { status: parseAgentProbe(got.stdout).status, paneId, pid: proc?.pid ?? null, command: proc?.name ?? null };
+    } catch {
+      return { status: "unknown", paneId: paneIdHint, pid: null, command: null };
+    }
   }
 
   // The worktree-create-and-reclaim sequence, run under spawn()'s worktree
@@ -890,13 +1068,16 @@ export class Herdr {
   // agent's: the terminal id recorded at spawn, a surviving registry label, or —
   // when both are gone — the one pane at the task's cwd whose foreground process
   // is not a login shell (a fleet tab holds a shell pane at the same cwd).
+  // `agentGone` in the result is POSITIVE evidence the agent process exited:
+  // every pane at the task's cwd is sitting at a bare login shell. Absence of
+  // evidence (unparseable process-info, no panes, herdr down) never sets it.
   async readopt(hint: {
     name: string;
     cwd?: string | null;
     tabId?: string | null;
     terminalId?: string | null;
-  }): Promise<{ readopted: boolean; paneId: string | null; terminalId: string | null; reason: string }> {
-    const miss = (reason: string) => ({ readopted: false, paneId: null, terminalId: null, reason });
+  }): Promise<{ readopted: boolean; paneId: string | null; terminalId: string | null; reason: string; agentGone?: boolean }> {
+    const miss = (reason: string, agentGone = false) => ({ readopted: false, paneId: null, terminalId: null, reason, agentGone });
     const panes = await this.listPanes();
     if (!panes.length) return miss("herdr returned no panes"); // daemon down, not a wipe
 
@@ -913,11 +1094,17 @@ export class Herdr {
     if (!pane) {
       const sameCwd = panes.filter((p) => hint.cwd && p.cwd === hint.cwd && (!hint.tabId || p.tabId === hint.tabId));
       const running: PaneInfo[] = [];
+      let shells = 0; // panes we positively read as a bare login shell
       for (const p of sameCwd) {
         const info = await this.run(paneProcessInfoArgv(p.paneId));
         if (paneRunsAgentCommand(info.stdout)) running.push(p);
+        else if (parsePaneRootProcess(info.stdout)) shells++;
       }
-      if (running.length !== 1) return miss(`no unambiguous agent pane at cwd (${sameCwd.length} panes, ${running.length} running a command)`);
+      if (running.length !== 1)
+        return miss(
+          `no unambiguous agent pane at cwd (${sameCwd.length} panes, ${running.length} running a command)`,
+          running.length === 0 && shells === sameCwd.length && sameCwd.length > 0
+        );
       pane = running[0];
       how = "cwd+process";
     }
@@ -1003,9 +1190,15 @@ export class Herdr {
     const wt = args.hintPath
       ? entries.find((e) => e.path === args.hintPath)
       : entries.find((e) => e.branch === args.branch);
-    // ponytail: an unregistered directory in the way is left alone — refusing
-    // beats `rm -rf` on a path we cannot prove is ours. Surfaces as spawn_error.
-    if (!wt) return miss("no registered worktree to reclaim", args.hintPath ?? null);
+    // An unregistered directory in the way is only cleared when it is PROVABLY
+    // debris from a failed removal (see clearOrphanPath). Anything else is left
+    // alone and surfaces as spawn_error — refusing beats `rm -rf` on a path we
+    // cannot prove is ours.
+    if (!wt) {
+      if (args.hintPath && (await this.clearOrphanPath(args.repoPath, args.hintPath, entries)))
+        return { reclaimed: true, ghost_branch: null, path: args.hintPath, reason: "orphaned directory cleared" };
+      return miss("no registered worktree to reclaim", args.hintPath ?? null);
+    }
 
     const status = await this.exec(["git", "-C", wt.path, "status", "--porcelain"]);
     if (status.code !== 0) return miss("git status failed in worktree", wt.path);
@@ -1029,7 +1222,7 @@ export class Herdr {
 
     await this.unregisterBuiltApp(wt.path);
 
-    const rm = await this.exec(["git", "-C", args.repoPath, "worktree", "remove", "--force", wt.path]);
+    const rm = await this.removeWorktreePath(args.repoPath, wt.path);
     if (rm.code !== 0) throw new HerdrError(`worktree remove failed: ${rm.stderr.trim() || rm.stdout.trim()}`);
     return {
       reclaimed: true,
@@ -1157,6 +1350,44 @@ export class Herdr {
     return withWorktreeLock(args.repoPath, args.branch, () => this.cleanupWorktreeCore(args));
   }
 
+  // `git worktree remove --force`, with the one recovery that keeps a failure
+  // from leaving a landmine behind. Force-removal already discards untracked
+  // files, so when git refuses only because the directory still holds build
+  // cache it does not track, clearing the rest destroys nothing git was not
+  // about to destroy — and NOT clearing it strands the path forever, because
+  // git drops the registration regardless (HIVE-526). Every guard that decides
+  // removal is allowed at all (branchIsSafe, the ghost-branch WIP rescue) has
+  // already run in the callers; this only finishes the removal they asked for.
+  private async removeWorktreePath(repoPath: string, path: string): Promise<ExecResult> {
+    const rm = await this.exec(["git", "-C", repoPath, "worktree", "remove", "--force", path]);
+    if (rm.code === 0 || !isWorktreeNotEmptyError(rm) || !isClearableWorktreePath(repoPath, path)) return rm;
+    const wiped = await this.exec(["rm", "-rf", path]);
+    if (wiped.code !== 0) return rm; // couldn't clear it — report the original refusal
+    const pruned = await this.exec(["git", "-C", repoPath, "worktree", "prune"]);
+    if (pruned.code !== 0) return rm;
+    return { code: 0, stdout: `cleared untracked leftovers and pruned ${path}`, stderr: "" };
+  }
+
+  // Self-heal for debris left by an older failed removal: a directory sitting on
+  // a worktree path that git no longer knows anything about. ALL THREE must
+  // hold, or the path is left untouched:
+  //   1. git has no worktree registered at it (`git worktree list`),
+  //   2. it is not a git repository or worktree checkout of its own,
+  //   3. it exists as a directory.
+  // A live worktree fails (1) and (2), so it can never be cleared here.
+  private async clearOrphanPath(repoPath: string, path: string, entries: { path: string }[]): Promise<boolean> {
+    if (!isClearableWorktreePath(repoPath, path)) return false;
+    if (entries.some((e) => e.path === path)) return false;
+    const dir = await this.exec(["test", "-d", path]);
+    if (dir.code !== 0) return false;
+    const repo = await this.exec(["git", "-C", path, "rev-parse", "--git-dir"]);
+    if (repo.code === 0) return false; // a real checkout — never ours to delete
+    const wiped = await this.exec(["rm", "-rf", path]);
+    if (wiped.code !== 0) return false;
+    await this.exec(["git", "-C", repoPath, "worktree", "prune"]);
+    return true;
+  }
+
   // Best-effort: drop a worktree's built hive.app from LaunchServices before the
   // worktree disappears, so 'open -b dev.hive.app' / hive:// deeplinks stop being
   // able to resolve to a now-gone path (task #1288 / hive-313). Never throws: a
@@ -1205,7 +1436,7 @@ export class Herdr {
       };
     }
 
-    const rm = await this.exec(["git", "-C", args.repoPath, "worktree", "remove", "--force", args.worktreePath]);
+    const rm = await this.removeWorktreePath(args.repoPath, args.worktreePath);
     if (rm.code !== 0) {
       // Task #341: the worktree was already gone from disk (e.g. removed
       // outside hive) — there's nothing left to preserve, so this must NOT

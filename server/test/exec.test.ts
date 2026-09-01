@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { defaultExec } from "../src/exec.ts";
+import { defaultExec, mapLimit } from "../src/exec.ts";
 
 const echoArgv = () => process.platform === "win32"
   ? ["cmd.exe", "/d", "/c", "echo", "hi"]
@@ -76,6 +76,28 @@ test("Windows executable PATH keeps drive-letter entries intact and uses semicol
   expect(path).toContain("C:\\Users\\Ada\\AppData\\Local\\Programs\\Herdr\\bin");
 });
 
+// HIVE-425: `proc.kill()` on timeout only signals the direct child. A render
+// run's direct child is npx; the Playwright webServer and the chromium it
+// launches are grandchildren that npx's death leaves orphaned, holding ports
+// and memory forever. The child now spawns detached (its own process group),
+// so timeout can signal the whole group via `process.kill(-pid, ...)`.
+test("defaultExec kills a timed-out subprocess's whole process group, including grandchildren (HIVE-425)", async () => {
+  const pidFile = `/tmp/hive-exec-test-grandchild-pid-${process.pid}`;
+  try {
+    const result = await defaultExec(["sh", "-c", `sleep 30 & echo $! > ${pidFile}; wait`], { timeoutMs: 300 });
+    expect(result.code).toBe(124);
+
+    const grandchildPid = Number((await Bun.file(pidFile).text()).trim());
+    expect(grandchildPid).toBeGreaterThan(0);
+
+    // SIGTERM fires immediately on timeout; give it a moment to land before asserting.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(() => process.kill(grandchildPid, 0)).toThrow();
+  } finally {
+    await Bun.file(pidFile).delete().catch(() => {});
+  }
+});
+
 // Config-sourced branch names become positional git arguments; git parses a
 // leading `-` as an option, not a ref (task #1024).
 test("isSafeRef rejects option-shaped and malformed refs, accepts real branch names", async () => {
@@ -141,4 +163,17 @@ test("safeBranch and preferSafeRef warn when rejecting a present-but-unsafe valu
   expect(calls.length).toBe(2);
   expect(calls[0].join(" ")).toContain("--output=/tmp/x");
   expect(calls[1].join(" ")).toContain("--output=/tmp/y");
+});
+
+test("mapLimit keeps results in input order and never exceeds the cap", async () => {
+  let inFlight = 0;
+  let peak = 0;
+  const out = await mapLimit([1, 2, 3, 4, 5, 6, 7], 3, async (n) => {
+    peak = Math.max(peak, ++inFlight);
+    await new Promise((r) => setTimeout(r, 5));
+    inFlight--;
+    return n * 2;
+  });
+  expect(out).toEqual([2, 4, 6, 8, 10, 12, 14]);
+  expect(peak).toBe(3);
 });

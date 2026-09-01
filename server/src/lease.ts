@@ -220,3 +220,11 @@ export function evictContenders(
   }
   return killed;
 }
+
+// What we tell an operator whose server was just refused. A scratch DB is fine
+// for a smoke test and a footgun as a long-lived server: one started this way on
+// 2026-08-25 closed the live fleet's herdr panes every 5 minutes for 7 hours. So
+// the advice always carries its own stop instruction.
+export function interloperAdvice(port: number): string {
+  return `A second server on the live DB kills working agents. For a short smoke test only, run it against a scratch DB: HIVE_DB=/tmp/smoke.db HIVE_PORT=${port} bun run server/src/index.ts — then stop it (Ctrl-C) the moment the smoke test finishes. Never leave one running.`;
+}

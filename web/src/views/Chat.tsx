@@ -12,6 +12,7 @@ import { eventText } from "../lib/eventText";
 import { STATE_LABEL } from "../lib/labels";
 import { StatusDot, toast } from "../lib/ui";
 import { DecisionCard } from "./DecisionCard";
+import { actionableItems, isInMotion } from "../lib/needsYou";
 
 // One portfolio-wide Chief of Staff conversation appears on the home route and
 // in a persistent drawer elsewhere. Its replies and the director's echoed
@@ -284,14 +285,11 @@ function ChiefBriefing({
   }, [since, needsYouKey]);
   useEffect(() => localStorage.setItem(CHIEF_LAST_SEEN, new Date().toISOString()), []);
 
-  const directorRequired = new Set(brief?.director_required_task_ids ?? []);
-  const actionCount = needsYou.filter((item) => {
-    if (item.kind === "decision") return directorRequired.has(item.decision.task_id);
-    if (item.kind === "checkpoint") return directorRequired.has(item.checkpoint.task_id);
-    if (item.kind === "quiz_digest") return true;
-    return false;
-  }).length;
-  const working = tasks.filter((task) => task.source !== "chat_supervisor" && ["in_progress", "needs_decision", "in_review", "verifying"].includes(task.state));
+  // The same count the nav badge and the board strip show (lib/needsYou.ts).
+  // This used to count only decisions the server flagged director-required, so
+  // the landing page said "3 items need you" while the nav said 8 (HIVE-556).
+  const actionCount = actionableItems(needsYou, tasks).length;
+  const working = tasks.filter(isInMotion);
   const finishedCount = since ? brief?.done.length ?? 0 : 0;
   const commitments = (thread?.commitments ?? []).filter((item) => !["done", "dropped"].includes(item.status));
   const headline = !brief

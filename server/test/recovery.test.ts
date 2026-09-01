@@ -10,7 +10,7 @@ process.env.HIVE_HOME = HOME;
 const { openDb, newId, now } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
 const { reconcileOnce, requeueStaleFailed } = await import("../src/reconciler.ts");
-const { requeueTask } = await import("../src/api.ts");
+const { requeueTask, resolveRecoveryForDecision } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { getTask } = await import("../src/state.ts");
 const { DEAD_BURST_N } = await import("../src/teardownGuard.ts");
@@ -478,6 +478,99 @@ test("requeue context includes answer notes, answerer identity, and section-only
   expect(requeue.brief).toContain("testing, followups section(s) included");
 });
 
+test("a chained requeue still surfaces the original attempt's head_sha, CI status, decisions, and review", () => {
+  const { db, projectId } = freshDb();
+  const original = makeTask(db, projectId);
+  const branch = `hive/${original}`;
+  const prUrl = "https://github.com/acme/web/pull/819";
+  db.query(
+    "UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, pr_url = ?, head_sha = ?, ci_status = ? WHERE id = ?"
+  ).run(branch, prUrl, "abc123head", "passing", original);
+  const answeredAt = now();
+  db.query(
+    `INSERT INTO decisions (id, task_id, ts, title, options, status, answer_key, answered_at, answered_by)
+     VALUES (?,?,?,?,?, 'answered', ?,?, 'director')`
+  ).run(
+    newId("dec"), original, answeredAt, "Which rollout?",
+    JSON.stringify([{ key: "staged", label: "Use staged rollout" }]),
+    "staged", answeredAt
+  );
+  putEvent(db, original, "review_summary", { done: ["shipped the thing"] });
+
+  const firstRequeue = requeueTask(db, getTask(db, original));
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL WHERE id = ?").run(firstRequeue);
+  const secondRequeue = requeueTask(db, getTask(db, firstRequeue));
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL WHERE id = ?").run(secondRequeue);
+  putEvent(db, secondRequeue, "worktree_reclaimed", { ghost_branch: `ghost-${secondRequeue}` });
+  db.query(
+    `INSERT INTO decisions (id, task_id, ts, title, options, status, answer_key, answered_at, answered_by)
+     VALUES (?,?,?,?,?, 'answered', ?,?, 'director')`
+  ).run(
+    newId("dec"), secondRequeue, answeredAt, "Which retry?",
+    JSON.stringify([{ key: "continue", label: "Continue the original PR" }]),
+    "continue", answeredAt
+  );
+  const thirdRequeue = getTask(db, requeueTask(db, getTask(db, secondRequeue)));
+
+  expect(thirdRequeue.resume_pr_url).toBe(prUrl);
+  expect(thirdRequeue.brief).toContain("last known head `abc123head`");
+  expect(thirdRequeue.brief).toContain("Last known CI status: passing");
+  expect(thirdRequeue.brief).toContain("Which rollout? — Use staged rollout");
+  expect(thirdRequeue.brief).toContain("Which retry? — Continue the original PR");
+  expect(thirdRequeue.brief).toContain("a self-review was already submitted (1 item(s) done");
+});
+
+test("a five-hop requeue chain still surfaces the original attempt's head_sha and decisions", () => {
+  const { db, projectId } = freshDb();
+  const original = makeTask(db, projectId);
+  const branch = `hive/${original}`;
+  const prUrl = "https://github.com/acme/web/pull/900";
+  db.query(
+    "UPDATE tasks SET state = 'failed', agent_target = NULL, branch = ?, pr_url = ?, head_sha = ?, ci_status = ? WHERE id = ?"
+  ).run(branch, prUrl, "deadbeef", "passing", original);
+  const answeredAt = now();
+  db.query(
+    `INSERT INTO decisions (id, task_id, ts, title, options, status, answer_key, answered_at, answered_by)
+     VALUES (?,?,?,?,?, 'answered', ?,?, 'director')`
+  ).run(
+    newId("dec"), original, answeredAt, "Which rollout?",
+    JSON.stringify([{ key: "staged", label: "Use staged rollout" }]),
+    "staged", answeredAt
+  );
+
+  let current = original;
+  for (let hop = 0; hop < 5; hop++) {
+    const next = requeueTask(db, getTask(db, current));
+    db.query("UPDATE tasks SET state = 'failed', agent_target = NULL WHERE id = ?").run(next);
+    current = next;
+  }
+  const fifthRequeue = getTask(db, requeueTask(db, getTask(db, current)));
+
+  expect(fifthRequeue.resume_pr_url).toBe(prUrl);
+  expect(fifthRequeue.brief).toContain("last known head `deadbeef`");
+  expect(fifthRequeue.brief).toContain("Last known CI status: passing");
+  expect(fifthRequeue.brief).toContain("Which rollout? — Use staged rollout");
+});
+
+test("a corrupted parent_task_id cycle does not hang requeue and still resolves sane recovery state", () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId);
+  const b = makeTask(db, projectId);
+  const c = makeTask(db, projectId);
+  // None of a/b/c owns the target branch directly — only a's resume_branch
+  // points at it (e.g. inherited from a since-deleted predecessor). Parent
+  // pointers form a genuine cycle a->b->c->a, so a real chain walk is
+  // required and only the seen-set guard stops it from spinning forever.
+  const branch = "hive/orphan-branch";
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, resume_branch = ?, parent_task_id = ? WHERE id = ?").run(branch, b, a);
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, parent_task_id = ? WHERE id = ?").run(c, b);
+  db.query("UPDATE tasks SET state = 'failed', agent_target = NULL, parent_task_id = ? WHERE id = ?").run(a, c);
+
+  const requeueId = requeueTask(db, getTask(db, a));
+
+  expect(getTask(db, requeueId).resume_branch).toBe(branch);
+}, 2000);
+
 test("a source=external task with agent_target set (regression guard: should be unreachable post-#996) is still recovered sanely, not stuck forever", async () => {
   // supervision.ts's neverDispatched, plus the createTask/spawnAgent guards in
   // api.ts, should make this state unreachable going forward — this guards the
@@ -884,7 +977,31 @@ test("agent_not_found with the task's pane still alive is NOT death", async () =
   expect(calls.some((c) => c.includes("close"))).toBe(false); // never closed
   expect(calls.some((c) => c[0] === "git" && c.includes("remove"))).toBe(false); // worktree intact
   const rec = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery'").get(id) as any;
-  expect(JSON.parse(rec.payload).decision).toBe("unconfirmed-dead");
+  const payload = JSON.parse(rec.payload);
+  expect(payload.decision).toBe("unconfirmed-dead");
+  // Says WHAT was checked and WHAT happens next, not just the verdict.
+  expect(payload.reason).toContain("pane");
+  expect(payload.next_step).toContain("director");
+  expect(payload.agent_target).toBe(getTask(db, id).agent_target);
+});
+
+// HIVE-572: it used to re-decide "unconfirmed-dead" every lap, which read like a
+// fleet incident and buried the real recovery events.
+test("unconfirmed death is said ONCE, however many laps it stays unresolved", async () => {
+  const { db, projectId } = freshDb();
+  const id = taskWithWorktree(db, projectId);
+  putEvent(db, id, "spawned");
+  const exec: Exec = async (argv) => {
+    if (isPaneList(argv)) return panes("/wt/x");
+    if (argv.includes("get")) return OK('{"error":{"code":"agent_not_found"}}');
+    return OK();
+  };
+  const herdr = new Herdr(exec, "herdr");
+
+  for (let i = 0; i < 6; i++) await reconcileOnce(db, { ...inert, herdr });
+
+  const recs = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery'").all(id);
+  expect(recs.length).toBe(1);
 });
 
 // herdr itself unreachable (pane list comes back empty) is no evidence either.
@@ -903,8 +1020,8 @@ test("agent_not_found with no pane list at all is NOT death", async () => {
   expect(getTask(db, id).state).toBe("in_progress");
 });
 
-// Three laps of "cannot tell" puts it in front of the director, once.
-test("repeated unconfirmed deaths notify the director instead of tearing down", async () => {
+// Still "cannot tell" after the grace window: put it in front of the director, once.
+test("an unconfirmed death that outlasts the grace window notifies the director", async () => {
   const { db, projectId } = freshDb();
   const id = taskWithWorktree(db, projectId);
   putEvent(db, id, "spawned");
@@ -915,10 +1032,65 @@ test("repeated unconfirmed deaths notify the director instead of tearing down", 
   };
   const herdr = new Herdr(exec, "herdr");
 
-  for (let i = 0; i < 4; i++) await reconcileOnce(db, { ...inert, herdr });
+  await reconcileOnce(db, { ...inert, herdr }); // says it once
+  const later = Date.now() + 10 * 60_000;
+  for (let i = 0; i < 3; i++) await reconcileOnce(db, { ...inert, herdr, nowMs: () => later });
 
   expect(getTask(db, id).state).toBe("in_progress");
   expect(db.query("SELECT 1 FROM notifications WHERE kind = 'agent_unreachable' AND task_id = ?").all(id).length).toBe(1);
+});
+
+// The common case behind HIVE-572: the agent finished its turn and its process
+// exited, leaving the worktree pane sitting at a bare shell. That IS knowable,
+// so hive decides once and acts instead of logging "cannot tell" forever.
+test("agent process exited after a completed turn → one decision, then a respawn", async () => {
+  const { db, projectId } = freshDb();
+  const id = taskWithWorktree(db, projectId);
+  putEvent(db, id, "spawned");
+  // The turn completed just before the process exited (past ts: the reconciler's
+  // own `gone` must sort after it).
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run(newId("evt"), id, new Date(Date.now() - 60_000).toISOString(), "herdr", "agent_status", JSON.stringify({ status: "done" }));
+  let spawns = 0;
+  const live = new Set<string>(); // agents a respawn brought back
+  const exec: Exec = async (argv) => {
+    if (isPaneList(argv)) return panes("/wt/x"); // a pane is still there...
+    if (argv.includes("process-info"))
+      return OK('{"result":{"process_info":{"shell_pid":42,"foreground_processes":[{"pid":42,"name":"-zsh"}]}}}'); // ...but it is a bare shell
+    if (argv.includes("get"))
+      return argv.some((a) => live.has(a))
+        ? OK('{"result":{"agent":{"agent_status":"working","pane_id":"w6:p9"}}}')
+        : OK('{"error":{"code":"agent_not_found"}}');
+    if (argv.includes("read")) return OK("pane tail");
+    return OK();
+  };
+  const herdr = new Herdr(exec, "herdr");
+  herdr.spawn = async (args: any) => {
+    spawns++;
+    live.add(args.taskId);
+    return {
+      agent_target: args.taskId,
+      worktree_path: `/wt/${args.taskId}`,
+      branch: `hive/${args.taskId}`,
+      workspace_id: "w1",
+      fleet_workspace_id: "wf",
+      tab_id: "wf:t1",
+      terminal_id: "term1",
+      pane_id: "pane1",
+      label: "recovered",
+    };
+  };
+
+  for (let i = 0; i < 3; i++) await reconcileOnce(db, { ...inert, herdr });
+
+  const recs = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery' ORDER BY ts")
+    .all(id) as { payload: string }[];
+  const decisions = recs.map((r) => JSON.parse(r.payload).decision);
+  expect(decisions).not.toContain("unconfirmed-dead"); // never "cannot tell"
+  expect(decisions.filter((d) => d === "turn-complete-respawn").length).toBe(1);
+  expect(spawns).toBe(1);
+  expect(getTask(db, id).state).toBe("in_progress"); // continued, not failed away
 });
 
 test("a reclaim failure never derails recovery", async () => {
@@ -944,4 +1116,34 @@ test("a reclaim failure never derails recovery", async () => {
   expect(reclaimEvent(db, id, "worktree_reclaim_failed")).toBeTruthy();
   expect(getTask(db, id).state).toBe("failed"); // recovery completed anyway
   expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").all(id).length).toBe(1);
+});
+
+test("answering a recovery card with 'requeue' writes the requeued event that chains the lineage", () => {
+  // Every other requeue path writes this event, and the board walks it forward
+  // to find the live successor. Without it a recovered task reads as dead
+  // forever, which is how ten WEB sub-tasks looked abandoned (hive-1872).
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  failAt(db, id, 1000);
+  putEvent(db, id, "recovery_card", { decision_id: "dec_recover", source_task_id: id });
+
+  expect(resolveRecoveryForDecision(db, "dec_recover", "requeue")).toBe(true);
+
+  const successor = db.query("SELECT id FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(id) as any;
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'requeued'").get(id) as any;
+  expect(JSON.parse(ev.payload).new_task_id).toBe(successor.id);
+});
+
+test("a recovery-card requeue moves the task's Jira link to the successor", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  db.query("UPDATE tasks SET jira_key = 'WEB-30', jira_link_kind = 'subtask' WHERE id = ?").run(id);
+  failAt(db, id, 1000);
+  putEvent(db, id, "recovery_card", { decision_id: "dec_jira", source_task_id: id });
+
+  resolveRecoveryForDecision(db, "dec_jira", "requeue");
+
+  const owners = db.query("SELECT id FROM tasks WHERE jira_key = 'WEB-30'").all() as any[];
+  const successor = db.query("SELECT id FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(id) as any;
+  expect(owners.map((r) => r.id)).toEqual([successor.id]);
 });

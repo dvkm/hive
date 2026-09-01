@@ -18,6 +18,7 @@ import type { DB } from "./db.ts";
 import { newId, now } from "./db.ts";
 import { listReferences } from "./learn.ts";
 import { AUTONOMY_PROFILES } from "./projectConfig.ts";
+import { activeProjects } from "./testProjects.ts";
 
 // -------------------------------------------------------------- persistence
 export interface ChatThread {
@@ -339,7 +340,7 @@ export function composeSupervisorBrief(db: DB, thread: ChatThread): string {
           refs.map((r) => `### ${r.title}\n${r.body?.trim() || ""}`.trimEnd()).join("\n\n")
       );
   } else {
-    const projects = db.query("SELECT id, name FROM projects WHERE COALESCE(json_extract(config, '$.archived'), 0) = 0 ORDER BY created_at").all() as { id: string; name: string }[];
+    const projects = activeProjects(db);
     parts.push(
       `\n## Portfolio\nYou work across every project. Choose the correct project for each worker instead of asking the director to route work:\n${projects.map((p) => `- ${p.name} (\`${p.id}\`)`).join("\n")}`,
       `## Memory and attention\nThe durable thread history and run ledger are the director's working memory. Before replying, restore the current objective, prior decisions, waiting items, and next action from them. Never make the director reconstruct context from task lists or activity feeds. On re-entry, lead with: where they left off, what materially changed, what Hive handled, and at most the few consequential choices that need them. Keep implementation detail behind the scenes unless asked.`

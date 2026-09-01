@@ -89,7 +89,7 @@ export type Kind = "ship" | "scout" | "chore";
 export type CiStatus = "passing" | "failing" | "pending" | "unavailable" | null;
 
 // Server-computed health (single source of truth; never re-derived here).
-export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
+export type HealthStatus = "healthy" | "deferred" | "silent" | "stuck" | "dead";
 export interface Health {
   status: HealthStatus;
   reason: string | null;
@@ -112,9 +112,10 @@ export interface Task {
   display_id?: string; // project-scoped human handle, e.g. HIVE-247
   project_id: string;
   title: string;
-  brief: string;
+  brief?: string | null; // omitted from the compact list; present on task detail
   state: State;
   kind: Kind;
+  priority?: "now" | "next" | "normal" | "later";
   agent_target: string | null;
   worktree_path: string | null;
   branch: string | null;
@@ -127,14 +128,23 @@ export interface Task {
   jira_key: string | null;
   jira_link_kind: "mirror" | "subtask" | null;
   parent_task_id: string | null;
+  race_id?: string | null; // best-of-N: the group of attempts this task is one of
   duplicate_of: string | null; // survivor id when cancelled as a duplicate
   depends_on: string[]; // task ids governed by the server dependency gate (docs/API.md)
   deferred_until?: string | null; // parked pending an offline human action; nudges suppressed while future-dated
+  parked_for_director?: string | null; // director took the worktree over; no agent runs on it until hand-back
   land_queued_at?: string | null; // marked approved-to-land; the land queue merges it in graph order
+  needs_you_since?: string | null; // when review/failed entered Focus; unlike updated_at, CI and metadata cannot reset it
   health?: Health | null;
   sidecar?: SidecarReport | null; // latest background check on this task's commits
+  evidence_count?: number; // list endpoint only; avoids fetching every task detail on startup
+  spawn_error?: boolean; // list endpoint only; prior spawn failed and no spawn ever succeeded
+  overlap_hold?: { number: number; files: string[] } | null; // list endpoint only; queued behind a live task that looks like it edits the same files
   requeued_to?: string | null; // successor id when failed + auto-requeued
+  review_actionable?: boolean; // in_review AND the director can act on it now (server-computed, HIVE-500)
+  skip?: { reason: string; label: string; permanent: boolean; since: string | null } | null; // queued only: why the dispatcher last skipped it
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
+  reviewed?: boolean; // intake tasks only: the director (or intake triage) signalled it is free to dispatch
   created_at: string;
   updated_at: string;
 }
@@ -191,8 +201,14 @@ export interface Decision {
   answered_at: string | null;
   // Who answered (audit trail). director when the director clicked in the inbox;
   // chat_supervisor/agent/system for programmatic callers; unknown if unattributed.
-  answered_by: "director" | "chat_supervisor" | "agent" | "system" | "unknown" | null;
+  // "reconciler" on a card the system expired, "unattributed" on a card
+  // resolved before hive recorded answerers at all (everything before
+  // 2026-07-22). null only ever appears on an open card.
+  answered_by: "director" | "chat_supervisor" | "agent" | "system" | "unknown" | "reconciler" | "unattributed" | null;
   answered_actor: string | null;
+  // Set on cards no automation may answer — today only "intake_triage", the
+  // "which reading should we build?" card raised by intake triage.
+  decision_class: string | null;
   bundle?: DecisionBundle | null;
   plan?: DecisionPlan | null;
 }
@@ -480,6 +496,17 @@ export interface TaskDetail extends Task {
   events: Event[];
   evidence: Evidence[];
   decisions: Decision[];
+  // The task's verification contract resolved against its evidence, server-side
+  // (HIVE-403). Absent when the task declared no commands.
+  verification?: VerificationItem[];
+}
+
+// One declared verification command and whether fresh evidence for it exists.
+export interface VerificationItem {
+  name: string;
+  cmd: string;
+  satisfied: boolean;
+  evidence_id: string | null;
 }
 
 // Structured branch diff for the in-review review panel (server/src/diff.ts).
@@ -513,6 +540,11 @@ export interface BranchCheck {
   unmet_deps: { id: string; number: number; title: string; state: State }[];
   embedded_tasks: { id: string; number: number; title: string }[];
   understanding_required?: boolean; // judgment-class change; the quiz gates approval (hive-1559)
+  // The risk check runs when the PR reaches review, not at the land attempt, so
+  // the card knows before the director spends anything whether Ship can work
+  // (HIVE-570). Undefined on an older server: the old land-time gate still applies.
+  confirmed_risks?: { risk: string; why: string; evidence_path?: string }[];
+  risk_check_unfinished?: { unverified: number; checked: number; reason?: string | null } | null;
 }
 
 // The land queue's ordering graph (server/src/landQueue.ts). `from` lands
@@ -521,6 +553,20 @@ export interface BranchCheck {
 export interface LandGraph {
   nodes: { id: string; number: number; project_number: number | null; title: string; land_queued_at: string | null }[];
   edges: { from: string; to: string; kind: "depends" | "conflict"; files?: string[] }[];
+}
+
+// The divergence radar (server/src/divergence.ts): for every branch still being
+// worked on, how far it trails the branch it will land on and which files it
+// shares with a sibling branch. `behind: null` means git could not tell.
+export interface DivergenceRow {
+  id: string;
+  number: number;
+  title: string;
+  state: State;
+  branch: string;
+  behind: number | null;
+  files: number;
+  overlaps: { task_id: string; number: number; files: string[] }[];
 }
 
 // One global-search hit. task_state/project_id are present only for task hits.
@@ -611,7 +657,8 @@ export interface Brief {
   fleet: Task[];
   incidents: BriefIncident[];
   intake: BriefIntake[];
-  to_review: Task[]; // Hive-owned reviews; tracking-only tasks are excluded.
+  to_review: Task[]; // Hive-owned reviews the director can act on now; tracking-only tasks are excluded.
+  in_review_pending: Task[]; // still in review but not yet the director's: red/running CI, review pipeline unfinished, or no report to read.
   spend: { totals: UsageTotals; by_model: (UsageTotals & { model: string })[] };
   learnings_new: BriefLearning[];
 }
@@ -641,6 +688,27 @@ async function req<T>(path: string, init?: RequestInit, retried = false): Promis
   return res.json() as Promise<T>;
 }
 
+const TASKS_PATH = "/api/tasks?compact=1";
+const TASKS_CACHE = "hive-task-list-v1";
+const taskCacheKey = () => new URL(BASE + TASKS_PATH, globalThis.location?.href || "http://localhost/").href;
+async function cachedTasks(): Promise<Task[] | null> {
+  if (!("caches" in globalThis)) return null;
+  try {
+    const response = await (await caches.open(TASKS_CACHE)).match(taskCacheKey());
+    return response ? response.json() : null;
+  } catch {
+    return null;
+  }
+}
+async function cacheTasks(tasks: Task[]): Promise<void> {
+  if (!("caches" in globalThis)) return;
+  try {
+    await (await caches.open(TASKS_CACHE)).put(taskCacheKey(), new Response(JSON.stringify(tasks), { headers: { "Content-Type": "application/json" } }));
+  } catch {
+    /* cache is an optional fast path */
+  }
+}
+
 // JSON when there's nothing to upload, multipart when there is. The server
 // accepts either on /send, POST /api/tasks and PUT /api/tasks/:id.
 function bodyFor(fields: Record<string, unknown>, files?: File[]): string | FormData {
@@ -649,6 +717,25 @@ function bodyFor(fields: Record<string, unknown>, files?: File[]): string | Form
   for (const [k, v] of Object.entries(fields)) if (v != null) fd.append(k, String(v));
   for (const f of files) fd.append("files", f);
   return fd;
+}
+
+// Away mode, as returned by GET/POST /api/away. `active` is the live state
+// (manual switch OR the schedule window); `on` is only the manual switch.
+export interface HeldPush {
+  at: string;
+  class: string;
+  title: string;
+  body: string | null;
+  url: string;
+}
+
+export interface Away {
+  on: boolean;
+  active: boolean;
+  schedule?: { start: string; end: string; tz: string };
+  held: number;
+  items?: HeldPush[];
+  last_flush?: { at: string; items: HeldPush[] } | null;
 }
 
 // An open (un-acked) build-time checkpoint, as returned by GET /api/checkpoints.
@@ -706,6 +793,28 @@ export interface ReviewSummary {
   testing?: string[];
   followups?: string[];
   understanding?: UnderstandingPacket;
+}
+
+// One shipped change, sized for a glance (HIVE-511). `headline` is already
+// capped server-side; the card renders it on one line regardless.
+export interface GlanceCard {
+  task_id: string;
+  number: number;
+  display_id: string;
+  title: string;
+  project_id: string;
+  kind: string;
+  state: string;
+  shipped_at: string;
+  headline: string;
+  merged_by: "auto" | "director" | null;
+  files: number;
+  additions: number;
+  deletions: number;
+  diff_unavailable: boolean;
+  areas: { area: string; churn: number }[];
+  images: { url: string; caption: string | null; phase: "before" | "after" | null }[];
+  explanation_url: string | null;
 }
 
 export interface UnderstandingQuiz {
@@ -771,7 +880,63 @@ export interface JiraTaskState {
   }[];
 }
 
+// GET /api/stats/autonomy — the read-only autonomy scoreboard. `precision` and
+// `agreement_rate` are null when there was nothing measurable, which the UI
+// shows as "no data" rather than a made-up 100%.
+export interface AutonomyStats {
+  window: { days: number; since: string; until: string };
+  auto_merge_precision: {
+    merges: number;
+    measurable: number;
+    clean: number;
+    fixed: number;
+    precision: number | null;
+    revert_detection: "on" | "off";
+  };
+  inbox_load: {
+    by_day: { day: string; total: number }[];
+    totals: { decision: number; quiz: number; checkpoint: number; dialog: number; stale: number; total: number };
+    per_day: number;
+  };
+  recovery: { auto_respawns: number; one_cap_parks: number; scouts_spawned: number };
+  agreement: { auto_answered: number; contradictions: number; auto_contradicted: number; agreement_rate: number | null };
+}
+
+export interface RaceAttempt {
+  task_id: string;
+  number: number;
+  title: string;
+  agent: string;
+  state: State;
+  branch: string | null;
+  pr_url: string | null;
+  settled: boolean;
+  diff: { files: number; additions: number; deletions: number } | null;
+  verification: { name: string; satisfied: boolean }[];
+  cost_usd: number;
+  processed_tokens: number;
+  outcome: "winner" | "loser" | null;
+}
+
+export interface RaceView {
+  race_id: string;
+  deadline: string | null;
+  settled: boolean;
+  attempts: RaceAttempt[];
+}
+
 export const api = {
+  race: (raceId: string) => req<RaceView>(`/api/races/${raceId}`),
+  startRace: (taskId: string, b: { attempts?: number; agents?: string[]; deadline_min?: number } = {}) =>
+    req<{ ok: boolean; race_id: string; task_ids: string[] }>(`/api/tasks/${taskId}/race`, {
+      method: "POST",
+      body: JSON.stringify(b),
+    }),
+  pickRaceWinner: (raceId: string, taskId: string) =>
+    req<{ ok: boolean; winner: string; losers: string[] }>(`/api/races/${raceId}/pick`, {
+      method: "POST",
+      body: JSON.stringify({ task_id: taskId }),
+    }),
   token: apiToken,
   jira: (taskId: string) => req<JiraTaskState>(`/api/tasks/${taskId}/jira`),
   jiraSync: (taskId: string) =>
@@ -789,13 +954,17 @@ export const api = {
   offline: () => req<{ on: boolean }>(`/api/offline`),
   setOffline: (on: boolean) =>
     req<{ on: boolean; steered: number }>(`/api/offline`, { method: "POST", body: JSON.stringify({ on }) }),
+  away: () => req<Away>(`/api/away`),
+  setAway: (on: boolean) => req<Away>(`/api/away`, { method: "POST", body: JSON.stringify({ on }) }),
   checkpoints: () => req<{ checkpoints: Checkpoint[] }>(`/api/checkpoints`),
   ackCheckpoint: (taskId: string, eventId: string, verdict: "ok" | "flag", note?: string) =>
     req<{ ok: boolean; delivered: boolean; followup_task_id: string | null }>(`/api/tasks/${taskId}/checkpoints/${eventId}/ack`, {
       method: "POST",
       body: JSON.stringify({ verdict, note, source: "director", actor: directorActor() }),
     }),
-  understandingQuizzes: () => req<{ quizzes: UnderstandingQuiz[] }>(`/api/understanding-quizzes`),
+  understandingQuizzes: () => req<{ quizzes: UnderstandingQuiz[] }>(`/api/understanding-quizzes?scope=all`),
+  catchup: (limit = 10, projectId?: string) =>
+    req<{ cards: GlanceCard[] }>(`/api/catchup?limit=${limit}${projectId ? `&project_id=${encodeURIComponent(projectId)}` : ""}`),
   answerUnderstandingQuiz: (taskId: string, answerKey: string, version: string, surface?: "focus") =>
     req<{ ok: boolean; correct: boolean; passed: boolean; explanation: string | null; completed?: number; total?: number; quiz?: Pick<UnderstandingQuiz, "question" | "options" | "version" | "completed" | "total"> }>(`/api/tasks/${taskId}/understanding-quiz/answer`, {
       method: "POST",
@@ -811,9 +980,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ source: "director", actor: directorActor() }),
     }),
-  tasks: (q: { state?: State; project_id?: string } = {}) => {
+  cachedTasks,
+  tasks: async (q: { state?: State; project_id?: string } = {}) => {
     const p = new URLSearchParams(q as Record<string, string>).toString();
-    return req<Task[]>(`/api/tasks${p ? "?" + p : ""}`);
+    const tasks = await req<Task[]>(p ? `/api/tasks?${p}&compact=1` : TASKS_PATH);
+    if (!p) void cacheTasks(tasks);
+    return tasks;
   },
   task: (id: string) => req<TaskDetail>(`/api/tasks/${id}`),
   pane: (id: string, lines = 200) =>
@@ -836,11 +1008,11 @@ export const api = {
     const qs = p.toString();
     return req<{ evidence: EvidenceRow[] }>(`/api/evidence${qs ? "?" + qs : ""}`);
   },
-  createTask: (b: { project_id: string; title: string; brief?: string; kind?: Kind }, files?: File[]) =>
+  createTask: (b: { project_id: string; title: string; brief?: string; kind?: Kind; priority?: string }, files?: File[]) =>
     req<Task>(`/api/tasks`, { method: "POST", body: bodyFor(b, files) }),
   intake: (b: { project_id: string; text: string }) =>
     req<{ ok: boolean; task: Task }>(`/api/intake`, { method: "POST", body: JSON.stringify(b) }),
-  updateTask: (id: string, b: { title?: string; brief?: string }, files?: File[]) =>
+  updateTask: (id: string, b: { title?: string; brief?: string; priority?: string }, files?: File[]) =>
     req<Task>(`/api/tasks/${id}`, { method: "PUT", body: bodyFor(b, files) }),
   brief: (id: string) => req<{ task_id: string; brief: string }>(`/api/tasks/${id}/brief`),
   transition: (id: string, to: State, reason?: string) =>
@@ -859,6 +1031,11 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
+  playbook: (id: string) =>
+    req<{ ok: boolean; learning_id: string; playbook: { title: string } }>(`/api/tasks/${id}/playbook`, {
+      method: "POST",
+      body: "{}",
+    }),
   spawn: (id: string) =>
     req<{ ok: boolean; task: Task; agent_target: string }>(`/api/tasks/${id}/spawn`, {
       method: "POST",
@@ -869,6 +1046,16 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
+  takeover: (id: string) =>
+    req<{ ok: boolean; worktree_path: string; branch: string | null; agent_stopped: boolean }>(
+      `/api/tasks/${id}/takeover`,
+      { method: "POST" }
+    ),
+  handback: (id: string, note?: string) =>
+    req<{ ok: boolean; steer_queued: boolean; summary: string | null; branch: string | null }>(
+      `/api/tasks/${id}/handback`,
+      { method: "POST", body: JSON.stringify({ note }) }
+    ),
   requeue: (id: string) =>
     req<{ ok: boolean; new_task_id: string }>(`/api/tasks/${id}/requeue`, {
       method: "POST",
@@ -880,6 +1067,8 @@ export const api = {
     req<{ clusters: { project_id: string; tasks: Pick<Task, "id" | "title" | "project_id" | "state">[] }[] }>(`/api/tasks/duplicates`),
   diff: (id: string) => req<DiffResult>(`/api/tasks/${id}/diff`),
   landGraph: (project?: string) => req<LandGraph>(`/api/tasks/land-graph${project ? `?project=${project}` : ""}`),
+  divergence: (project?: string) =>
+    req<{ rows: DivergenceRow[] }>(`/api/tasks/divergence${project ? `?project=${project}` : ""}`),
   landQueue: (task_ids: string[], queued = true) =>
     req<{ changed: string[]; queued: boolean }>(`/api/tasks/land-queue`, {
       method: "POST",
@@ -895,11 +1084,13 @@ export const api = {
         actor: directorActor(),
       }),
     }),
+  // In review this bounces the task back to its agent. On a task that already
+  // shipped the same call files a follow-up instead (followup_task_id).
   requestChanges: (id: string, notes: string) =>
-    req<{ ok: boolean; delivered: boolean; task: Task }>(`/api/tasks/${id}/request-changes`, {
-      method: "POST",
-      body: JSON.stringify({ notes }),
-    }),
+    req<{ ok: boolean; delivered?: boolean; task?: Task; followup_task_id?: string; followup_label?: string }>(
+      `/api/tasks/${id}/request-changes`,
+      { method: "POST", body: JSON.stringify({ notes, actor: directorActor() }) }
+    ),
 
   decisions: (status: "open" | "answered" | "all" = "open") =>
     req<Decision[]>(`/api/decisions?status=${status}`),
@@ -973,6 +1164,12 @@ export const api = {
 
   search: (q: string, limit = 50) =>
     req<{ hits: SearchHit[] }>(`/api/search?q=${encodeURIComponent(q)}&limit=${limit}`),
+
+  autonomyStats: (days = 7, project?: string) => {
+    const q = new URLSearchParams({ days: String(days) });
+    if (project) q.set("project_id", project);
+    return req<AutonomyStats>(`/api/stats/autonomy?${q}`);
+  },
 
   morningBrief: (since?: string, project?: string) => {
     const q = new URLSearchParams();

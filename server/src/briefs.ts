@@ -1,12 +1,14 @@
 // Brief composition. Composed fresh at spawn time (Phase 2) and exposed at
 // GET /api/tasks/:id/brief. Pure function of DB state.
 import type { DB } from "./db.ts";
-import { getTask } from "./state.ts";
+import { getTask, isSelfAuditLineage } from "./state.ts";
 import { prTitlePrefix, prBodyFooter } from "./marker.ts";
 import { managingThreadForTask } from "./chat.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
 import { planGateKinds, planGateBlocks } from "./planCritic.ts";
+import { figmaTokenEnv } from "./secrets.ts";
+import { matchPlaybook, playbookSection } from "./playbook.ts";
 
 // The PR marker contract (documented in docs/API.md). Both halves are REQUIRED
 // on any PR the agent opens so hive can link the PR back to this task.
@@ -40,13 +42,23 @@ landing commit:
 
 Rules:
 - Emit status before commands expected to exceed a minute.
+- Commit and push FIRST, then attach evidence, review, and \`ready\`. Evidence is
+  tied to the commit it was captured on, so a push after it leaves it behind and
+  the handoff is refused. If you do push again, re-capture the evidence.
 - Attach evidence before \`ready\`: screenshots for visual work, test output
   otherwise. Scout tasks require a report. A task never reaches Done without evidence.
+  If the artifact does not come from the code (a production reading, a link, a
+  written report), attach it with \`--kind observation\`: it is not tied to a
+  commit, so a later push never makes it stale.
 - Hand off with \`ready\` when the PR is open. If CI is pending, END THE TURN;
   hive monitors it and wakes you only if action is needed. If CI fails, fix it.
 - Before \`ready\`, submit a concise structured self-review:
 
     hive emit <task-id> review_summary --json review.json
+
+  Write review.json inside your own worktree or session scratchpad, never a
+  shared path like /tmp/review.json. Hive refuses a payload it reads from
+  anywhere else: two agents sharing one path published each other's reviews.
 
   Shape: {"done":[],"iffy":[{"what":"","why":""}],"decisions":[],
   "testing":[],"followups":[],"understanding":{"background":"","scope":"",
@@ -58,11 +70,28 @@ Rules:
   touches security, auth, payments or migrations, the task kind is outside the
   project's auto-merge list, or the director asked for a quiz on this card. For
   everything else the checks are OPTIONAL, and leaving them out blocks nothing.
+  When your task kind is outside the auto-merge list, or the director asked for
+  a quiz here, \`hive emit ... ready\` holds the handoff until your review
+  carries a check, so write it while the change is still fresh: you clear that
+  hold in the same turn, with no respawn.
+  Re-emitting a review after a rebase, a risk finding or a CI fix? Leave
+  \`understanding.checks\` out and the checks you already sent stay in place,
+  along with the director's pass. Re-listing the same questions keeps the pass
+  too, even if you reword or reorder them. Send \`"checks": []\` only when you
+  mean to drop the quiz on purpose.
   Every question must help them understand this specific change: behavior, impact, risk,
   tradeoff, or evidence. Never test whether the agent can code, debug, merge,
   use tools, follow policy, or operate Hive; agent competence belongs in internal
   checks. Never quiz project bookkeeping. If it does not improve the director's
   understanding of this review, omit it. Include \`iffy\` for every real uncertainty.
+  Write every question and option in plain everyday words: one idea per sentence,
+  no nested clauses. Use jargon only if the diff itself introduces the term, and
+  then define it in the question or explanation. Make each option plainly
+  distinct from the others, not near-duplicates. Length follows the content, not
+  a cap: a simple change earns a short question, a genuinely complex change can
+  take the words it needs. Write background, essence, walkthrough, and
+  participate the way you would explain the change to a colleague on the phone:
+  clarity first, brevity second.
 - When you hit a decision the director must make, open a REAL decision card with
   2-4 concrete options and a recommendation:
 
@@ -186,6 +215,28 @@ directly, include its \`--headless\` flag. Attach the result:
 
   hive emit <task-id> evidence --file out.png --note "logged-in dashboard"`;
 
+// Figma access for headless agents. The Figma MCP needs interactive auth, so a
+// spawned agent can never use it; without this section agents guess at UI and
+// it drifts from the design. Only shown when hive actually has a token to pass
+// through (see figmaTokenEnv), otherwise the instructions would just fail.
+function figmaSection(): string | null {
+  if (!figmaTokenEnv().FIGMA_TOKEN) return null;
+  return `## Figma (headless, no MCP)
+The Figma MCP needs interactive login, so you cannot use it. Your env has
+\`FIGMA_TOKEN\`. Read frames straight from the Figma REST API instead:
+
+  curl -sS -H "X-Figma-Token: $FIGMA_TOKEN" \\
+    "https://api.figma.com/v1/files/<fileKey>/nodes?ids=<nodeId>"      # spec JSON
+  curl -sS -H "X-Figma-Token: $FIGMA_TOKEN" \\
+    "https://api.figma.com/v1/images/<fileKey>?ids=<nodeId>&format=png" # PNG render URL
+
+The file key and node id are in the frame's Figma URL
+(\`figma.com/design/<fileKey>/...?node-id=<nodeId>\`; turn \`1-23\` into \`1:23\`).
+If the repo ships its own helper, prefer it (corebeat has
+\`scripts/figma-frame.sh\`). Check the frame BEFORE building or changing UI, and
+attach the render as evidence. Never print, commit, or echo the token.`;
+}
+
 // Standing-authority section: the active rules (global + project) that govern
 // this agent, plus the exact guarded-action protocol. The server enforces these
 // before risky actions dispatch, so agents never serially ask for permission.
@@ -253,11 +304,14 @@ output — attach what the command actually printed. If a command fails, fix the
 cause and run it again, or emit \`blocked\` explaining why it cannot pass.`;
 }
 
-function definitionOfDone(kind: string): string {
-  if (kind === "scout") {
+function definitionOfDone(db: DB, task: { id: string; kind: string; source?: string | null }): string {
+  if (isSelfAuditLineage(db, task)) {
+    return "## Definition of done\nIf the audit finds no safe material improvement, attach the findings as report evidence and emit `done` without changing code. Otherwise, merge one evidence-backed optimization through the normal ship path.";
+  }
+  if (task.kind === "scout") {
     return "## Definition of done\nA written report captured as evidence (kind=report) that answers the question. No code changes required.";
   }
-  if (kind === "chore") {
+  if (task.kind === "chore") {
     return "## Definition of done\nThe chore is complete with at least one evidence item showing the result (log, screenshot, or test run).";
   }
   return "## Definition of done\nCode merged (PR open -> reviewed -> verifying -> done), post-merge smoke checks pass, and at least one evidence item is attached. No task reaches Done without evidence.";
@@ -276,7 +330,7 @@ export function composeBrief(db: DB, taskId: string): string {
   parts.push(`# Task ${displayId}: ${task.title}`);
   parts.push(`Task identifier: ${displayId}\nLegacy task number: ${task.number}\nTask id: ${task.id}\nKind: ${task.kind}`);
   parts.push(`## Brief\n${task.brief?.trim() || "(no description provided)"}`);
-  parts.push(definitionOfDone(task.kind));
+  parts.push(definitionOfDone(db, task));
   const contract = verificationContract(task.id, task.verification_cmds);
   if (contract) parts.push(contract);
   parts.push(EMIT_PROTOCOL);
@@ -295,10 +349,18 @@ export function composeBrief(db: DB, taskId: string): string {
   if (team) parts.push(team);
   parts.push(prMarkerSection(task.number, task.id));
   parts.push(BROWSER_VERIFICATION);
+  const figma = figmaSection();
+  if (figma) parts.push(figma);
 
   // Standing authority: which scoped rules govern this agent + the guarded-action
   // protocol it MUST use before any externally-risky operation it runs itself.
   parts.push(standingAuthority(db, task.project_id, task.id));
+
+  // A past task like this one may have left a recipe. Inline the single best
+  // match (steps included) instead of trusting the crew to guess the keywords
+  // that would have recalled it.
+  const playbook = matchPlaybook(db, task.project_id, `${task.title} ${task.brief ?? ""}`);
+  if (playbook) parts.push(playbookSection(playbook));
 
   // Project history grows without bound, so briefs carry counts and retrieve
   // task-relevant facts on demand instead of replaying the whole store.

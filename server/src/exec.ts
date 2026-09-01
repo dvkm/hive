@@ -11,6 +11,22 @@ export type Exec = (
 ) => Promise<ExecResult>;
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+const KILL_GRACE_MS = 2_000;
+
+// Signals the whole process group, not just the direct child. `detached: true`
+// (setsid) makes the child its own group leader, so `-pid` reaches every
+// descendant it spawned — e.g. npx's playwright webServer and the chromium it
+// launches — which a plain `proc.kill()` leaves orphaned as an npx grandchild.
+function killGroup(pid: number): void {
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {}
+  setTimeout(() => {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {}
+  }, KILL_GRACE_MS).unref();
+}
 
 // Common CLI install dirs, appended to whatever PATH the process currently has.
 // Task #1096: under `bun --watch` (how the server actually runs, per the
@@ -47,6 +63,7 @@ export const defaultExec: Exec = async (argv, opts = {}) => {
     stdin: opts.input != null ? "pipe" : "ignore",
     stdout: "pipe",
     stderr: "pipe",
+    detached: true,
   });
   let proc: ReturnType<typeof spawn>;
   try {
@@ -88,7 +105,7 @@ export const defaultExec: Exec = async (argv, opts = {}) => {
   let timer: ReturnType<typeof setTimeout>;
   const timeout = new Promise<typeof timedOut>((resolve) => {
     timer = setTimeout(() => {
-      proc.kill();
+      killGroup(proc.pid);
       resolve(timedOut);
     }, timeoutMs);
   });
@@ -164,4 +181,31 @@ export function preferSafeRef(candidate: unknown, fallback: string): string {
   if (isSafeRef(candidate)) return candidate;
   warnUnsafeRef(candidate, fallback);
   return fallback;
+}
+
+// Run `fn` over `items` with at most `limit` in flight, preserving input order
+// in the results. Used for the reconciler's per-task `gh` probes: serial calls
+// meant K stalled ones cost K timeouts, which is what turned 24-40s reconciler
+// laps into 175s+ ones (HIVE-438), and by the reviewer's per-pass and per-risk
+// fan-out (HIVE-523). Bounded, so a fleet of 40 PRs still can't fork 40 `gh`
+// processes at once, and a review backlog can't stampede the model API.
+// `gh pr list` is heavier than a single-PR probe: it returns every open PR,
+// with check rollups and file lists. It is still a poll, so bound it well under
+// the reconciler cadence instead of waiting the 60s defaultExec default.
+export const GH_LIST_TIMEOUT_MS = 30_000;
+// ponytail: a flat cap across projects. Hive runs a handful of repos, so this
+// is really "do not fork one gh per repo at once".
+export const GH_LIST_CONCURRENCY = 4;
+
+export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
 }

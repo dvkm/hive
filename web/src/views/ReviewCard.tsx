@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
-import type { BranchCheck, DiffFile, DiffResult, Evidence, ReviewItem, ReviewSummary, Task, UnderstandingPacket } from "../lib/api";
+import type { BranchCheck, DiffFile, DiffResult, Evidence, ReviewItem, ReviewSummary, Task, UnderstandingPacket, VerificationItem } from "../lib/api";
 import { useStore } from "../lib/store";
 import { CiBadge, SidecarChip, toast } from "../lib/ui";
 import { MAX_DIFF_LINES } from "../lib/api";
@@ -14,6 +14,8 @@ import { DecisionCard } from "./DecisionCard";
 import { ReportView } from "./ReportView";
 import { UnderstandingQuiz } from "./UnderstandingQuiz";
 import { PrReference, TaskRef, TaskReference, prLabel, taskLabel } from "../lib/references";
+import { oneLine, stateChanges, whyItWasNeeded, withoutPromoted } from "../lib/reviewFocus";
+import type { StateChange } from "../lib/reviewFocus";
 
 // Staleness marker: captured-at time always shows; the commit SHA (recorded
 // by the CLI from the agent's worktree at capture time) compares against the
@@ -74,6 +76,48 @@ function EvChip({ e, headSha }: { e: Evidence; headSha: string | null }) {
   );
 }
 
+// The task's verification contract, as a checklist (HIVE-403). The director
+// should not have to infer from a pile of evidence chips whether the commands
+// the agent promised to run actually ran: one line per command, its evidence
+// linked, the unproven ones marked. The server resolves satisfied/missing with
+// the very same checker the merge gate uses, so this can't drift from it.
+export function VerificationChecklist({ items, evidence }: { items: VerificationItem[]; evidence: Evidence[] }) {
+  if (!items.length) return null;
+  const byId = new Map(evidence.map((e) => [e.id, e]));
+  const missing = items.filter((i) => !i.satisfied).length;
+  return (
+    <div className="review-verify">
+      <div className="review-verify-head">
+        <span>Verification contract</span>
+        <small>{missing ? `${missing} of ${items.length} unproven` : `all ${items.length} verified`}</small>
+      </div>
+      <ul>
+        {items.map((i) => {
+          const e = i.evidence_id ? byId.get(i.evidence_id) : undefined;
+          return (
+            <li key={i.name} className={i.satisfied ? "verify-ok" : "verify-missing"}>
+              <span className="verify-mark">{i.satisfied ? "✓" : "✗"}</span>
+              <span className="verify-name">{i.name}</span>
+              <code className="verify-cmd" title={i.cmd}>{i.cmd}</code>
+              {i.satisfied ? (
+                e?.url ? (
+                  <a className="verify-link" href={e.url} target="_blank" rel="noreferrer">
+                    {e.caption || "evidence"}
+                  </a>
+                ) : (
+                  <span className="verify-link muted">evidence attached</span>
+                )
+              ) : (
+                <span className="verify-link">no evidence</span>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 export function EvidenceStrip({ evidence, task, limit }: { evidence: Evidence[]; task: Pick<Task, "id" | "title" | "head_sha">; limit?: number }) {
   const lightbox = useLightbox();
   if (!evidence.length) return null;
@@ -101,15 +145,21 @@ export function EvidenceStrip({ evidence, task, limit }: { evidence: Evidence[];
 }
 import type { Decision, Event } from "../lib/api";
 
-// The request-changes exchange: the director's notes and the agent's replies,
-// in order. Without this, "Request changes" fired into the void — the agent's
-// response only existed in the buried timeline.
 // The pre-review's risks and questions, after the per-risk check re-read the
-// real code for this head (HIVE-406/407). Confirmed risks are red, refuted ones
-// green, and a question only the human can answer stays amber — so the director
-// reads a short verdict list instead of a wall of maybes. Verdicts recorded for
-// an older head are ignored: they say nothing about what is about to merge.
-export function RiskVerdicts({ events, headSha }: { events: Event[]; headSha: string | null }) {
+// real code for this head (HIVE-406/407).
+export interface RiskItem {
+  kind: "confirmed" | "refuted" | "human" | "answered" | "unchecked";
+  text: string;
+  detail?: string;
+}
+
+// Splits the pre-review's findings into what still needs the director and what
+// the check already settled. Verdicts recorded for an older head are ignored:
+// they say nothing about what is about to merge.
+export function riskVerdictSplit(
+  events: Event[],
+  headSha: string | null
+): { open: RiskItem[]; settled: RiskItem[]; flagged: boolean } | null {
   const review = [...events].reverse().find((e) => e.type === "auto_review" && !e.payload.skipped);
   const verdictEvent = headSha
     ? [...events].reverse().find((e) => e.type === "risk_verdicts" && e.payload.reviewed_head_sha === headSha)
@@ -119,45 +169,82 @@ export function RiskVerdicts({ events, headSha }: { events: Event[]; headSha: st
   const questions = (verdictEvent.payload.question_verdicts ?? []) as { question: string; answerable: string; answer?: string }[];
   const unverified = Number(verdictEvent.payload.unverified) || 0;
   if (!risks.length && !questions.length && !unverified) return null;
-  // "Still open" is what the director must act on: a risk the check confirmed,
-  // a question only they can answer, or an item the check could not reach.
-  const noted = risks.length + questions.length;
-  const open =
-    risks.filter((r) => r.verdict === "confirmed").length + questions.filter((q) => q.answerable === "human").length + unverified;
+  const open: RiskItem[] = [];
+  const settled: RiskItem[] = [];
+  for (const r of risks)
+    (r.verdict === "confirmed" ? open : settled).push({
+      kind: r.verdict === "confirmed" ? "confirmed" : "refuted",
+      text: r.risk,
+      detail: [r.why, r.evidence_path].filter(Boolean).join(" \u00b7 "),
+    });
+  for (const q of questions)
+    (q.answerable === "human" ? open : settled).push({
+      kind: q.answerable === "human" ? "human" : "answered",
+      text: q.question,
+      detail: q.answer ?? "",
+    });
+  if (unverified > 0) open.push({ kind: "unchecked", text: `${unverified} finding${unverified === 1 ? "" : "s"} could not be checked` });
+  return { open, settled, flagged: review.payload.verdict === "caution" };
+}
+
+const RISK_CHIP: Record<RiskItem["kind"], string> = {
+  confirmed: "confirmed",
+  refuted: "refuted",
+  human: "you answer",
+  answered: "answered",
+  unchecked: "unchecked",
+};
+
+// HIVE-557: only what is still open gets space. A refuted finding means "we
+// checked, it is not a problem" — that is a count, not two paragraphs, and it
+// used to sit ABOVE the one question the director actually had to answer.
+export function RiskVerdicts({ events, headSha }: { events: Event[]; headSha: string | null }) {
+  const split = riskVerdictSplit(events, headSha);
+  if (!split) return null;
+  const { open, settled } = split;
   return (
     <div className="risk-verdicts">
-      <span className="risk-verdicts-label">
-        Pre-review {review.payload.verdict === "caution" ? "flagged" : "noted"} {noted} thing{noted === 1 ? "" : "s"} — {open || "none"}{" "}
-        still open
-      </span>
-      <ul>
-        {risks.map((r, i) => (
-          <li key={`r${i}`} className={r.verdict === "confirmed" ? "rv-confirmed" : "rv-refuted"}>
-            <span className="rv-chip">{r.verdict === "confirmed" ? "confirmed" : "refuted"}</span>
-            <span className="rv-text" title={[r.why, r.evidence_path].filter(Boolean).join(" · ")}>
-              {r.risk}
-            </span>
-          </li>
-        ))}
-        {questions.map((q, i) => (
-          <li key={`q${i}`} className={q.answerable === "human" ? "rv-human" : "rv-refuted"}>
-            <span className="rv-chip">{q.answerable === "human" ? "you answer" : "answered"}</span>
-            <span className="rv-text" title={q.answer ?? ""}>
-              {q.question}
-            </span>
-          </li>
-        ))}
-        {unverified > 0 && (
-          <li className="rv-human">
-            <span className="rv-chip">unchecked</span>
-            <span className="rv-text">{unverified} could not be checked</span>
-          </li>
-        )}
-      </ul>
+      {open.length > 0 && (
+        <span className="risk-verdicts-label">
+          {open.length} still open
+        </span>
+      )}
+      {open.length > 0 && (
+        <ul>
+          {open.map((item, i) => (
+            <li key={i} className={item.kind === "confirmed" ? "rv-confirmed" : "rv-human"}>
+              <span className="rv-chip">{RISK_CHIP[item.kind]}</span>
+              <span className="rv-text rv-open" title={item.detail ?? ""}>
+                {item.text}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {settled.length > 0 && (
+        <details className="risk-settled">
+          <summary>
+            Pre-review checked {settled.length} other finding{settled.length === 1 ? "" : "s"} — none of them a problem
+          </summary>
+          <ul>
+            {settled.map((item, i) => (
+              <li key={i} className="rv-refuted">
+                <span className="rv-chip">{RISK_CHIP[item.kind]}</span>
+                <span className="rv-text" title={item.detail ?? ""}>
+                  {item.text}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
     </div>
   );
 }
 
+// The request-changes exchange: the director's notes and the agent's replies,
+// in order. Without this, "Request changes" fired into the void — the agent's
+// response only existed in the buried timeline.
 function ChangesThread({ events }: { events: Event[] }) {
   const firstReq = events.findIndex((e) => e.type === "changes_requested");
   if (firstReq === -1) return null;
@@ -337,6 +424,65 @@ export function ReviewUnderstanding({ packet, report = false, caveats = [], expl
   );
 }
 
+// The top of the card, in the order a person decides (HIVE-557): what changed,
+// what state it left behind, why it was needed. Everything else collapses.
+function ReviewFocus({
+  changed,
+  paths,
+  stat,
+  changes,
+  why,
+}: {
+  changed: string;
+  paths: string[];
+  stat: { files: number; add: number; del: number } | undefined;
+  changes: StateChange[];
+  why: string;
+}) {
+  if (!changed && !changes.length && !why) return null;
+  return (
+    <div className="review-focus">
+      {changed && (
+        <div className="focus-block">
+          <span className="focus-eyebrow">What changed</span>
+          <p className="focus-lead">{changed}</p>
+          {stat && stat.files > 0 && (
+            <p className="focus-stat">
+              {paths.length ? `${paths.join(", ")} · ` : ""}
+              {stat.files} file{stat.files === 1 ? "" : "s"} <span className="diff-add">+{stat.add}</span>{" "}
+              <span className="diff-del">−{stat.del}</span>
+            </p>
+          )}
+        </div>
+      )}
+      {changes.length > 0 && (
+        <div className="focus-block">
+          <span className="focus-eyebrow">Before → after</span>
+          <table className="focus-state">
+            <tbody>
+              {changes.map((c, i) => (
+                <tr key={i} className={c.before === c.after ? "focus-state-same" : ""}>
+                  <th>{c.label}</th>
+                  <td className="focus-before">{c.before}</td>
+                  <td className="focus-arrow">→</td>
+                  <td className="focus-after">{c.after}</td>
+                  {c.before === c.after && <td className="focus-note">unchanged</td>}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {why && (
+        <div className="focus-block">
+          <span className="focus-eyebrow">Why it was needed</span>
+          <p className="focus-why">{why}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ReviewSection({
   tone,
   icon,
@@ -479,7 +625,12 @@ export function ReviewCard({
   const [quizOverride, setQuizOverride] = useState<"passed" | "deferred" | null>(null);
   const [mergeErr, setMergeErr] = useState("");
   const [branchCheck, setBranchCheck] = useState<BranchCheck | null>(null);
+  // The director chose to merge despite the confirmed risks. That re-opens the
+  // understanding check the risk had silenced: the server still refuses a merge
+  // whose quiz is owed, so hiding it here would be a dead end (HIVE-570).
+  const [riskOverride, setRiskOverride] = useState(false);
   const [evidence, setEvidence] = useState<Evidence[]>([]);
+  const [verification, setVerification] = useState<VerificationItem[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
   const [openDecisions, setOpenDecisions] = useState<Decision[]>([]);
 
@@ -492,7 +643,9 @@ export function ReviewCard({
     setReviewLoaded(false);
     setQuizOverride(null);
     setEvidence([]);
+    setVerification([]);
     setBranchCheck(null);
+    setRiskOverride(false);
     // Same-route navigation between tasks re-renders this component in place
     // (no remount) — without this, a "Request changes" editor left open on
     // the previous task keeps rendering, notes and all, against the new one.
@@ -530,6 +683,7 @@ export function ReviewCard({
           setReviewEventId(ev.id);
         }
         setEvidence(t.evidence ?? []);
+        setVerification(t.verification ?? []);
         setEvents(t.events ?? []);
         setOpenDecisions((t.decisions ?? []).filter((d: Decision) => d.status === "open"));
         const mergeReason = t.health?.status === "stuck" && /^merge (?:failed|blocked): /.test(t.health.reason ?? "")
@@ -567,9 +721,31 @@ export function ReviewCard({
       ? "deferred"
       : "required";
   const quizStatus = quizOverride ?? recordedQuizStatus;
+  // The risk check already ran, back when the PR reached review (HIVE-570). If
+  // it confirmed something, Ship cannot work, so the card must say so BEFORE it
+  // asks for anything — the director used to answer the quiz, press Ship, and
+  // only then be told the merge was refused.
+  const confirmedRisks = riskOverride ? [] : branchCheck?.confirmed_risks ?? [];
+  const riskUnfinished = branchCheck?.risk_check_unfinished ?? null;
+  const riskBlocked = reportOnly
+    ? ""
+    : confirmedRisks.length
+      ? `The risk check confirmed ${confirmedRisks.length} risk${confirmedRisks.length === 1 ? "" : "s"} on this commit: ` +
+        confirmedRisks.map((r) => r.risk).join("; ") +
+        ". Send it back to the agent, or merge anyway below."
+      : riskUnfinished
+        ? `The risk check did not finish on this commit — ${riskUnfinished.unverified} of ` +
+          `${riskUnfinished.unverified + riskUnfinished.checked} finding${riskUnfinished.unverified + riskUnfinished.checked === 1 ? "" : "s"} ` +
+          `got no verdict${riskUnfinished.reason ? ` (${riskUnfinished.reason})` : ""}. Nothing was confirmed. It retries on its own.`
+        : "";
   // Mechanical changes are not judgment-class (hive-1559): no quiz is minted,
   // and its absence blocks nothing. Undefined (older server) keeps the old gate.
-  const quizRequired = branchCheck?.understanding_required !== false;
+  // A confirmed risk also silences the quiz: it is the most expensive thing hive
+  // asks of the director, and this change is not going to merge as it stands.
+  const quizRequired = branchCheck?.understanding_required !== false && !confirmedRisks.length;
+  // Would the check still block this merge if the risk were not blocking it
+  // first? That decides whether "Merge anyway" can merge or has to ask first.
+  const quizOwed = branchCheck?.understanding_required !== false && quizStatus === "required";
   const missingQuiz = reviewLoaded && (!quiz || !reviewEventId);
   const quizBlocked = !quizRequired
     ? ""
@@ -620,7 +796,7 @@ export function ReviewCard({
         : !task.pr_url && !task.branch
           ? "No PR and no branch — nothing to merge"
           : "";
-  const mergeBlocked = quizBlocked || depBlocked || deliveryBlocked;
+  const mergeBlocked = riskBlocked || quizBlocked || depBlocked || deliveryBlocked;
   const landHeld = isLandHeld({
     landActed,
     landQueuedAt: task.land_queued_at,
@@ -634,19 +810,57 @@ export function ReviewCard({
     .reverse()
     .filter(isFailureEvent);
   const caveats = review?.iffy ?? [];
+  // What the card leads with (HIVE-557). The pre-review's summary is written
+  // from the diff itself, so it goes first; the agent's own essence is the
+  // fallback, and its first Completed line the last resort. Capped either way.
+  const autoReviewSummary = [...events].reverse().find((e) => e.type === "auto_review" && !e.payload.skipped)?.payload
+    ?.summary as string | undefined;
+  const whatChangedSource = autoReviewSummary || review?.understanding?.essence || review?.done?.[0] || "";
+  const whatChanged = oneLine(whatChangedSource);
+  const changes = stateChanges([...(review?.done ?? []), ...(review?.testing ?? [])]);
+  const why = whyItWasNeeded(review?.understanding?.background, review?.done ?? []);
+  // A sentence promoted into the lead is not repeated in the collapsed audit.
+  const promoted = [why.source, whatChangedSource, ...changes.map((c) => c.source)].filter(Boolean);
+  const auditReview = review
+    ? {
+        ...review,
+        done: withoutPromoted(review.done, promoted, (d) => d),
+        testing: withoutPromoted(review.testing, promoted, (t) => t),
+      }
+    : null;
+  // The mental model repeats itself too: whatever the lead already said is
+  // dropped from the packet rather than printed a second time lower down.
+  const packet = review?.understanding
+    ? {
+        ...review.understanding,
+        essence: promoted.includes(review.understanding.essence ?? "") ? undefined : review.understanding.essence,
+        background: promoted.includes(review.understanding.background ?? "") || why.text ? undefined : review.understanding.background,
+      }
+    : undefined;
+  const diffPaths = diff && diff.files.length > 0 && diff.files.length <= 2 ? diff.files.map((f) => f.path) : [];
+  // An unanswered question addressed to the director IS a blocking issue: the
+  // card used to recommend "approve and merge" six lines above one (HIVE-557).
+  const openRisks = riskVerdictSplit(events, task.head_sha)?.open ?? [];
+  const openQuestions = openRisks.filter((r) => r.kind === "human").length;
   const recommendation = openDecisions.length
     ? "Make the open decision first"
     : mergeBlocked
       ? reportOnly ? "Understand before accepting" : "Wait to merge"
-      : reportOnly
-        ? "Accept this report"
-        : "Approve and merge";
+      : openQuestions
+        ? reportOnly
+          ? `Answer the open question${openQuestions === 1 ? "" : "s"}, then accept`
+          : `Answer the open question${openQuestions === 1 ? "" : "s"}, then merge`
+        : reportOnly
+          ? "Accept this report"
+          : "Approve and merge";
   const recommendationReason = openDecisions.length
     ? `${openDecisions.length} decision${openDecisions.length === 1 ? "" : "s"} still need your judgment.`
     : quizRequired && missingQuiz
       ? "This older review has no understanding check."
       : mergeBlocked ||
-      (reportOnly
+      (openQuestions
+        ? `Nothing else is blocking, but ${openQuestions === 1 ? "one question needs" : `${openQuestions} questions need`} an answer only you have.`
+        : reportOnly
         ? "Hive finished the research and submitted its evidence."
         : task.ci_status === "passing"
           ? "CI passed and Hive found no blocking issue."
@@ -719,7 +933,7 @@ export function ReviewCard({
     try {
       await api.requestChanges(
         task.id,
-        "Refresh the existing review_summary without changing the implementation. Preserve the review findings, regenerate the explanation in the current format, and add 1-5 multiple-choice understanding.checks. Each question must help the director understand this specific change or report: its behavior, user impact, risk, tradeoff, or evidence, with the answer taught in the explanation. Do not quiz agent procedures, debugging, merging, tools, or policy. Then submit the task for review again."
+        "Refresh the existing review_summary without changing the implementation. Preserve the review findings, regenerate the explanation in the current format, and add 1-5 multiple-choice understanding.checks. Each question must help the director understand this specific change or report: its behavior, user impact, risk, tradeoff, or evidence, with the answer taught in the explanation. Do not quiz agent procedures, debugging, merging, tools, or policy. Write every question and option in plain everyday words: one idea per sentence, no nested clauses. Use jargon only if the diff itself introduces the term, and then define it. Make each option plainly distinct from the others. Length follows the content, not a cap: a simple change earns a short question, a genuinely complex change can take the words it needs. Write background, essence, walkthrough, and participate the way you would explain the change to a colleague on the phone: clarity first, brevity second. Then submit the task for review again."
       );
       toast("Agent asked to add the understanding check");
       finish();
@@ -818,23 +1032,22 @@ export function ReviewCard({
         </div>
       )}
 
-      <div className="review-recommendation">
-        <span className="review-recommendation-label">Hive recommends</span>
+      <ReviewFocus changed={whatChanged} paths={diffPaths} stat={stat} changes={changes} why={why.text} />
+
+      {/* What needs the director, and the recommendation that has to agree with
+          it. Caveats are NOT repeated here — they live in the audit below, once. */}
+      <div className={`review-recommendation ${openRisks.length ? "review-recommendation-open" : ""}`}>
+        <span className="review-recommendation-label">{openRisks.length ? "Needs you" : "Hive recommends"}</span>
         <strong>{recommendation}</strong>
         <p>{recommendationReason}</p>
-        {caveats[0] && (
-          <div className="review-caveat">
-            <span>Watch</span>
-            <span className="review-caveat-text">{reviewItemText(caveats[0])}</span>
-            {caveats.length > 1 && <small>+{caveats.length - 1} more</small>}
-          </div>
-        )}
         <RiskVerdicts events={events} headSha={task.head_sha} />
       </div>
 
+      <VerificationChecklist items={verification} evidence={evidence} />
+
       <EvidenceStrip evidence={evidence.filter((e) => e.kind !== "explanation")} task={task} />
 
-      <details className="review-details" open={quizStatus === "required"}>
+      <details className="review-details" open={quizRequired && quizStatus === "required"}>
         <summary>
           <span>{reportOnly ? "Explain report" : review?.understanding ? "Understand this change" : "Why Hive recommends this"}</span>
           <small>
@@ -842,25 +1055,25 @@ export function ReviewCard({
               ? `finding · impact · risk`
               : review?.understanding
               ? `mental model · ${evidence.length} evidence`
-              : `${review?.done?.length ?? 0} completed · ${caveats.length} caveat${caveats.length === 1 ? "" : "s"} · ${evidence.length} evidence`}
+              : `${auditReview?.done?.length ?? 0} completed · ${caveats.length} caveat${caveats.length === 1 ? "" : "s"} · ${evidence.length} evidence`}
           </small>
         </summary>
         <div className="review-details-body">
           {(review?.understanding || explain) && (
-            <ReviewUnderstanding packet={review?.understanding ?? {}} report={reportOnly} caveats={caveats} explain={explain} />
+            <ReviewUnderstanding packet={packet ?? {}} report={reportOnly} caveats={caveats} explain={explain} />
           )}
 
           <details className="report-audit">
             <summary>
               <span>Full report and audit trail</span>
-              <small>{review?.done?.length ?? 0} findings · {evidence.length} evidence</small>
+              <small>{auditReview?.done?.length ?? 0} findings · {evidence.length} evidence</small>
             </summary>
             <div className="report-audit-body">
               <ChangesThread events={events} />
 
               <CheckpointList events={events} />
 
-              {review ? <ReviewAudit r={review} /> : task.summary && <p className="review-summary">{task.summary}</p>}
+              {auditReview ? <ReviewAudit r={auditReview} /> : task.summary && <p className="review-summary">{task.summary}</p>}
               {review && task.summary && <p className="review-summary">{task.summary}</p>}
 
               <div className="review-diffstat">
@@ -914,6 +1127,11 @@ export function ReviewCard({
         />
       )}
       {quizRequired && quizStatus === "passed" && <div className="understanding-quiz-status passed">Understanding confirmed. Approval unlocked.</div>}
+      {riskOverride && (
+        <div className="understanding-quiz-status deferred">
+          You chose to merge despite the confirmed risks. Take the understanding check above and Ship will go through.
+        </div>
+      )}
       {landHeld && (
         <div className="review-blocked review-blocked-action">
           You marked this approved to land before you took the check. It will not merge until you say so.
@@ -922,7 +1140,16 @@ export function ReviewCard({
         </div>
       )}
       {quizStatus === "deferred" && <div className="understanding-quiz-status deferred">Quiz saved in Needs You. You can continue now.</div>}
-      {!quizRequired && (
+      {/* A risk that lands AFTER the quiz was passed must say so, or the refusal
+          reads as "you did all that for nothing" (HIVE-570). */}
+      {!quizRequired && confirmedRisks.length > 0 && (
+        <div className="understanding-quiz-status deferred">
+          {quizStatus === "passed"
+            ? `You passed the understanding check on this change earlier. A new finding arrived on commit ${(task.head_sha ?? "").slice(0, 7)} — your answer is kept.`
+            : "No understanding check yet — the risk check confirmed something on this commit, so this change is not ready to ship. It comes back once the agent clears the finding."}
+        </div>
+      )}
+      {!quizRequired && confirmedRisks.length === 0 && (
         <div className="understanding-quiz-status deferred">
           Mechanical change: no understanding check needed.{" "}
           <button className="btn btn-mini" onClick={requireQuiz} disabled={busy}>Quiz me on this one</button>
@@ -930,7 +1157,7 @@ export function ReviewCard({
       )}
 
       <div className="review-actions">
-        <button className="btn btn-primary" onClick={() => merge()} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
+        <button className="btn btn-primary" onClick={() => merge(undefined, riskOverride || undefined)} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
           {busy ? "Working…" : reportOnly ? "Accept report" : surface === "focus" ? "Ship" : "Approve & merge"}
         </button>
         {!task.never_dispatched && (
@@ -942,14 +1169,32 @@ export function ReviewCard({
           Reject
         </button>
       </div>
-      {missingQuiz && !task.never_dispatched ? (
+      {/* A confirmed risk outranks a missing quiz: asking the agent to write
+          questions about a change that cannot merge is the wrong next step. */}
+      {!riskBlocked && quizRequired && missingQuiz && !task.never_dispatched ? (
         <div className="review-blocked review-blocked-action">
           <button className="btn btn-mini" disabled={busy} onClick={refreshUnderstandingCheck}>
             {busy ? "Asking…" : "Have agent add it"}
           </button>
         </div>
       ) : mergeBlocked ? (
-        <div className="review-blocked">{mergeBlocked}</div>
+        <div className={confirmedRisks.length ? "review-blocked review-blocked-action" : "review-blocked"}>
+          {mergeBlocked}
+          {confirmedRisks.length > 0 && (
+            <button
+              className="btn btn-mini"
+              disabled={busy}
+              title={
+                quizOwed
+                  ? "Merge it despite the risks. The understanding check comes back first, then Ship works."
+                  : "Merge anyway. The confirmed risks stay on the card as the record of what you accepted."
+              }
+              onClick={() => (quizOwed ? setRiskOverride(true) : merge(undefined, true))}
+            >
+              Merge anyway
+            </button>
+          )}
+        </div>
       ) : null}
       {mergeErr && (
         <div className="review-merge-error">
@@ -958,7 +1203,7 @@ export function ReviewCard({
             <button
               className="btn"
               style={{ marginLeft: "var(--s2)" }}
-              disabled={busy || !!mergeBlocked}
+              disabled={busy || !!(quizBlocked || depBlocked || deliveryBlocked)}
               title="Merge anyway. The risks above stay on the card as the record of what you accepted."
               onClick={() => merge(undefined, true)}
             >

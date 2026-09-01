@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { Checkpoint, Decision, Task, UnderstandingQuiz } from "../src/lib/api";
-import { getNeedsYouItems, itemProject, trackedSubtasks } from "../src/lib/needsYou";
+import { actionableItems, getNeedsYouItems, isInMotion, itemProject, orderFocusItems, trackedSubtasks } from "../src/lib/needsYou";
 import { inProjectFilter } from "../src/lib/projectFilter";
 import { JiraPanel, jiraMoveHint, jiraMoveSummary, jiraNextAutomaticText, jiraPanelNotice, trackingBindingNotice } from "../src/views/Task";
 
@@ -55,7 +55,7 @@ test("needs-you queue includes every actionable item", () => {
   const items = getNeedsYouItems(
     [decision],
     [
-      task("review-1", "in_review", { health: { status: "dead", reason: null, since: "now" } }),
+      task("review-1", "in_review", { review_actionable: true, health: { status: "dead", reason: null, since: "now" } }),
       task("failed-1", "failed"),
       task("requeued-1", "failed", { requeued_to: "successor" }),
       task("stuck-1", "in_progress", { health: { status: "stuck", reason: null, since: "now" } }),
@@ -133,22 +133,53 @@ test("a failed task always needs routing, even with an unmet dependency", () => 
   expect(items.map((item) => item.kind)).toEqual(["attention"]);
 });
 
-test("reviews with pending CI do not hide actionable reviews", () => {
+// HIVE-500: a review the director cannot act on yet is still listed, but as its
+// own kind, so no count and no focus card ever stops on it.
+test("reviews the director cannot act on split into review_pending", () => {
   const items = getNeedsYouItems(
     [],
     [
       task("pending", "in_review", { kind: "ship", pr_url: "https://example.com/pending", ci_status: "pending" }),
-      ...[1, 2, 3, 4].map((number) => task(`ready-${number}`, "in_review", {
+      task("no-report", "in_review", { kind: "ship" }),
+      ...[1, 2].map((number) => task(`ready-${number}`, "in_review", {
         kind: "ship",
         pr_url: `https://example.com/ready-${number}`,
         ci_status: "passing",
+        review_actionable: true,
       })),
     ],
     [],
     []
   );
 
-  expect(items.map((item) => item.id)).toEqual(["ready-1", "ready-2", "ready-3", "ready-4", "pending"]);
+  expect(items.map((item) => [item.id, item.kind])).toEqual([
+    ["pending", "review_pending"],
+    ["no-report", "review_pending"],
+    ["ready-1", "review"],
+    ["ready-2", "review"],
+  ]);
+});
+
+test("Focus gives priority a head start without starving old low-priority work", () => {
+  const tasks = [
+    task("old-later", "in_review", { priority: "later", needs_you_since: "2026-08-20T00:00:00Z", updated_at: "2026-08-24T00:00:00Z" }),
+    task("new-now", "in_review", { priority: "now", updated_at: "2026-08-23T00:00:00Z" }),
+    task("new-normal", "in_review", { priority: "normal", updated_at: "2026-08-24T00:00:00Z" }),
+    task("new-later", "in_review", { priority: "later", updated_at: "2026-08-24T00:00:00Z" }),
+  ];
+  const items = [
+    { kind: "review" as const, id: tasks[0].id, task: tasks[0] },
+    { kind: "decision" as const, id: "decision-now", decision: { id: "decision-now", task_id: tasks[1].id, ts: tasks[1].updated_at } as Decision },
+    { kind: "checkpoint" as const, id: "checkpoint-normal", checkpoint: { id: "checkpoint-normal", task_id: tasks[2].id, ts: tasks[2].updated_at } as Checkpoint },
+    { kind: "review" as const, id: tasks[3].id, task: tasks[3] },
+  ];
+
+  expect(orderFocusItems(items, tasks).map((item) => item.id)).toEqual([
+    "old-later",
+    "decision-now",
+    "checkpoint-normal",
+    "new-later",
+  ]);
 });
 
 test("tracking-only tasks never enter code-review queues", () => {
@@ -297,7 +328,7 @@ test("legacy tracking bindings remain visibly actionable", () => {
 });
 
 test("itemProject resolves the project for every needs-you item kind", () => {
-  const reviewTask = task("t-review", "in_review", { project_id: "p1", pr_url: "https://x/1", ci_status: "passing" });
+  const reviewTask = task("t-review", "in_review", { project_id: "p1", pr_url: "https://x/1", ci_status: "passing", review_actionable: true });
   const decisionTask = task("t-decision", "needs_decision", { project_id: "p2" });
   const tasks = [reviewTask, decisionTask];
   const decision = { id: "d1", task_id: "t-decision", status: "open" } as Decision;
@@ -311,4 +342,48 @@ test("itemProject resolves the project for every needs-you item kind", () => {
   // "All" (empty filter) keeps everything; a project filter keeps only its own.
   expect(items.filter((item) => inProjectFilter(itemProject(item, tasks), "")).length).toBe(4);
   expect(items.filter((item) => inProjectFilter(itemProject(item, tasks), "p2")).map((item) => item.kind)).toEqual(["decision"]);
+});
+
+// HIVE-541: the "N in motion" count on the Chat view used to total every task in
+// a work column, so mirrored tickets parked there read as work being done.
+test("in motion counts hive's own work, not tracking-only rows parked in a work column", () => {
+  const own = task("own", "in_progress");
+  const mirror = task("mirror", "in_progress", { source: "director", source_ref: "jira:WEB-7" });
+  const external = task("external", "in_review", { source: "external" });
+  const spawnedExternal = task("spawned", "in_progress", { source: "external", agent_target: "claude" });
+  const supervisor = task("chief", "in_progress", { source: "chat_supervisor" });
+  const queued = task("queued", "queued");
+
+  expect([own, mirror, external, spawnedExternal, supervisor, queued].filter(isInMotion).map((t) => t.id)).toEqual([
+    "own",
+    "spawned",
+  ]);
+});
+
+// HIVE-556. The nav badge, the landing headline and the board strip all call
+// actionableItems, so "needs you" can only ever mean one thing. This test is
+// what fails if a fourth surface starts counting its own set again.
+test("one needs-you count: waiting and pending reviews never count, and the project filter applies", () => {
+  const mine = task("mine", "in_review", { project_id: "acme", review_actionable: true });
+  const notMine = task("theirs", "in_review", { project_id: "other", review_actionable: true });
+  const pending = task("pending", "in_review", { project_id: "acme" });
+  const stuck = task("stuck", "in_progress", {
+    project_id: "acme",
+    health: { status: "stuck", since: "2026-01-01T00:00:00Z", reason: "quiet" },
+  });
+  const blocked = task("blocked", "in_progress", {
+    project_id: "acme",
+    depends_on: ["mine"],
+    health: { status: "dead", since: "2026-01-01T00:00:00Z", reason: "agent gone" },
+  });
+  const tasks = [mine, notMine, pending, stuck, blocked];
+  const items = getNeedsYouItems([{ id: "d1", task_id: "mine" } as Decision], tasks, [], []);
+
+  expect(items.map((item) => item.kind).sort()).toEqual(
+    ["attention", "decision", "review", "review", "review_pending", "waiting"],
+  );
+  // Across every project: the decision, two actionable reviews, one stuck task.
+  expect(actionableItems(items, tasks).map((item) => item.id).sort()).toEqual(["d1", "mine", "stuck", "theirs"]);
+  // Scoped to one project, the other project's review drops out.
+  expect(actionableItems(items, tasks, "acme").map((item) => item.id).sort()).toEqual(["d1", "mine", "stuck"]);
 });

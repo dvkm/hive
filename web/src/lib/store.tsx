@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { api, apiToken } from "./api";
-import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Checkpoint, UnderstandingQuiz, ChatMessage } from "./api";
+import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Checkpoint, UnderstandingQuiz, ChatMessage, Away } from "./api";
 import { getNeedsYouItems } from "./needsYou";
 import type { NeedsYouItem } from "./needsYou";
 
@@ -26,6 +26,8 @@ export interface Store {
   needsYou: NeedsYouItem[];
   offline: boolean; // offline mode: fleet drained, nothing new spawns
   setOffline: (on: boolean) => void;
+  away: Away; // away mode: low-urgency phone pushes are held and batched
+  setAway: (on: boolean) => void; // the manual switch (the schedule still applies)
   sse: SseState;
   // Director chat (persistent supervisor session). Only the open thread's
   // messages are held; SSE appends live as the supervisor replies.
@@ -78,6 +80,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setOfflineState(on); // optimistic; SSE confirms
     api.setOffline(on).catch(() => setOfflineState(!on));
   };
+  const [away, setAwayState] = useState<Away>({ on: false, active: false, held: 0 });
+  const reloadAway = () => api.away().then(setAwayState).catch(() => {});
+  const setAway = (on: boolean) => {
+    setAwayState((a) => ({ ...a, on, active: on })); // optimistic; the response is the truth
+    api.setAway(on).then(setAwayState).catch(reloadAway);
+  };
   const reloadCheckpoints = () => api.checkpoints().then((r) => setCheckpoints(r.checkpoints)).catch(() => {});
   const reloadQuizzes = () => api.understandingQuizzes().then((r) => setQuizzes(r.quizzes)).catch(() => {});
 
@@ -117,24 +125,23 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   // Initial load.
   useEffect(() => {
-    api.tasks().then((ts) => {
+    let fresh = false;
+    const loadTasks = (ts: Task[]) => {
       setTasks(ts);
       setLastActivity(Object.fromEntries(ts.map((t) => [t.id, t.updated_at])));
-      // ponytail: N+1 detail fetch to get evidence counts. Localhost, small N.
-      // Add a count column / aggregate endpoint if the board ever gets large.
-      ts.forEach((t) =>
-        api.task(t.id).then((d) => {
-          setEvidenceCount((c) => ({ ...c, [t.id]: d.evidence.length }));
-          setSpawnError((s) => ({ ...s, [t.id]: d.events.some((e) => e.type === "spawn_error") && !d.events.some((e) => e.type === "spawned") }));
-        })
-      );
-    });
+      setEvidenceCount(Object.fromEntries(ts.map((t) => [t.id, t.evidence_count ?? 0])));
+      setSpawnError(Object.fromEntries(ts.map((t) => [t.id, t.spawn_error ?? false])));
+    };
+    api.cachedTasks().then((ts) => { if (ts && !fresh) loadTasks(ts); });
+    api.tasks().then((ts) => { fresh = true; loadTasks(ts); });
     api.decisions("open").then(setDecisions);
     reloadCheckpoints();
     reloadQuizzes();
     api.offline().then((r) => setOfflineState(r.on)).catch(() => {});
+    reloadAway();
     reloadProjects();
     api.notifications().then((n) => setNotifications(n.notifications)).catch(() => setNotifications([]));
+    return () => { fresh = true; };
   }, []);
 
   // Mark all as read: optimistic local update + server ack.
@@ -172,11 +179,19 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             next[i] = t;
             return next;
           });
-          setLastActivity((la) => ({ ...la, [t.id]: t.updated_at }));
+          // NOT lastActivity: a task row is touched by hive's own bookkeeping
+          // (CI polls, state syncs), which says nothing about the agent working.
           bump(t.id);
         } else if (msg.type === "event") {
           const ev: Event = msg.event;
-          setLastActivity((la) => ({ ...la, [ev.task_id]: ev.ts }));
+          // Only the agent's own rows count as activity (`agent` = its `hive
+          // emit` calls, `hook` = its transcript), plus a fresh spawn. Rows hive
+          // writes ABOUT a task, and a human steering or poking it, would
+          // otherwise reset the card's age and make a frozen task look busy —
+          // which is how a task frozen since 09:51 dropped off the stall list at
+          // 12:14 (hive-1951). Same rule as the server's lastAgentActivity.
+          if (ev.source === "agent" || ev.source === "hook" || ev.type === "spawned")
+            setLastActivity((la) => ({ ...la, [ev.task_id]: ev.ts }));
           setFeedEvents((prev) => [ev, ...prev].slice(0, FEED_CAP));
           if (ev.type === "spawn_error") setSpawnError((s) => ({ ...s, [ev.task_id]: true }));
           else if (ev.type === "spawned") setSpawnError((s) => ({ ...s, [ev.task_id]: false }));
@@ -216,6 +231,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           setFeedEvents((prev) => [synthetic, ...prev].slice(0, FEED_CAP));
         } else if (msg.type === "offline") {
           setOfflineState(!!msg.on);
+        } else if (msg.type === "away") {
+          // The schedule flipped away mode. Refetch so the banner, the held
+          // count, and the wake-up summary all move together.
+          reloadAway();
         } else if (msg.type === "notification") {
           const n: Notification = msg.notification;
           setNotifications((prev) => (prev.some((x) => x.id === n.id) ? prev : [n, ...prev]));
@@ -243,7 +262,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, quizzes, reloadQuizzes, needsYou, offline, setOffline, sse, chatThreadId, chatMessages, chatDelivery, openChatThread, onChatMessage }}>
+    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, quizzes, reloadQuizzes, needsYou, offline, setOffline, away, setAway, sse, chatThreadId, chatMessages, chatDelivery, openChatThread, onChatMessage }}>
       {children}
     </Ctx.Provider>
   );

@@ -22,10 +22,14 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, hiveHome, isOffline } from "./db.ts";
 import { writeEvent, getTask } from "./state.ts";
+import { triageIntake } from "./intake/triage.ts";
+import type { PlannerExec } from "./planner.ts";
 import { broadcast } from "./bus.ts";
 import { getCursor, setCursor } from "./intake/gchat.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
+import { activeProjects } from "./testProjects.ts";
+import { startLoop } from "./loop.ts";
 
 export interface Watcher {
   name: string;
@@ -39,6 +43,7 @@ export interface WatchDeps {
   fetchImpl?: typeof fetch;
   exec?: Exec; // for git diff --no-index
   nowMs?: () => number;
+  triageExec?: PlannerExec; // the intake-triage classifier (injectable in tests)
 }
 
 const DEFAULT_INTERVAL_MIN = 5;
@@ -136,6 +141,14 @@ export async function checkWatcher(db: DB, projectId: string, w: Watcher, deps: 
   );
   writeEvent(db, { task_id: id, source: "system", type: "created", payload: { watcher: w.name, url: w.url } });
   broadcast({ type: "task", task: getTask(db, id) });
+  // Intake triage (config.intake_triage): a doc change that reads two ways asks
+  // the director which reading to build before this dispatches. No-op when the
+  // project has not opted in.
+  // Deliberately NOT awaited — the classifier can take up to 60s, and one slow
+  // watcher must not delay the next one's tick. triageIntake takes its dispatch
+  // hold synchronously before its first await, so the task cannot slip out while
+  // the classification runs.
+  triageIntake(db, getTask(db, id), { exec: deps.triageExec }).catch((e) => console.error(`[hive] watch: intake triage ${id}:`, e));
 
   writeFileSync(snap, body);
   setCursor(db, "watch", cursorKey, hash);
@@ -149,7 +162,7 @@ const lastPoll = new Map<string, number>();
 export async function watchOnce(db: DB, deps: WatchDeps = {}): Promise<void> {
   if (isOffline(db)) return;
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
-  const projects = db.query("SELECT id, config FROM projects").all() as { id: string; config: string }[];
+  const projects = activeProjects(db) as { id: string; config: string }[];
   for (const p of projects) {
     let watchers: Watcher[] = [];
     try {
@@ -176,18 +189,5 @@ export async function watchOnce(db: DB, deps: WatchDeps = {}): Promise<void> {
 // Each start call owns its timer and in-flight guard; a slow cycle skips ticks
 // instead of queueing them.
 export function startWatchers(db: DB, deps: WatchDeps & { intervalMs?: number } = {}): () => void {
-  let running = false;
-  const timer = setInterval(() => {
-    if (running) {
-      console.error("[hive] watch cycle skipped: previous cycle still running");
-      return;
-    }
-    running = true;
-    watchOnce(db, deps)
-      .catch((e) => console.error("[hive] watch cycle crashed:", e))
-      .finally(() => {
-        running = false;
-      });
-  }, deps.intervalMs ?? 60_000);
-  return () => clearInterval(timer);
+  return startLoop("watch", deps.intervalMs ?? 60_000, () => watchOnce(db, deps));
 }

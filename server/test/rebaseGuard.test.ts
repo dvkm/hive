@@ -8,14 +8,21 @@ const stub = (fn: (argv: string[]) => ExecResult): Exec => async (argv) => fn(ar
 
 // Route git subcommands: `diff --name-only` (authored files) and
 // `log --oneline <range> -- <file>` (did base advance on <file>).
-function gitStub(opts: { authored: string; advanced: Set<string> }): Exec {
+// `edited` names files whose branch content DIFFERS from the snapshot-base
+// content (ordinary work on top of base); everything else reads as unchanged
+// since the snapshot, i.e. a rollback.
+function gitStub(opts: { authored: string; advanced: Set<string>; edited?: Set<string> }): Exec {
   return stub((argv) => {
     if (argv.includes("diff") && argv.includes("--name-only")) return OK(opts.authored);
     if (argv[3] === "log") {
       const file = argv[argv.length - 1];
       return OK(opts.advanced.has(file) ? "abc123 some base commit\n" : "");
     }
-    if (argv.includes("rev-parse")) return OK("basesha\n");
+    if (argv.includes("rev-parse")) {
+      const [rev, path] = String(argv.at(-1)).split(":");
+      if (!path) return OK("basesha\n");
+      return OK(opts.edited?.has(path) ? `blob-${rev}-${path}\n` : `blob-${path}\n`);
+    }
     return OK();
   });
 }
@@ -49,6 +56,17 @@ test("agent legitimately adds a new file base never touched → not flagged", as
   const exec = gitStub({ authored: "src/new.ts\nsrc/task.ts\n", advanced: new Set() });
   const regressed = await detectDestructiveRebase(exec, "/repo", "main", "feat", SNAP);
   expect(regressed).toEqual([]);
+});
+
+test("editing a file base recently touched is work, not a revert (HIVE-543)", async () => {
+  // The branch authors a spec file base moved since the snapshot, but its
+  // content is NOT the old content — it changed an assertion. Not a revert.
+  const exec = gitStub({
+    authored: "e2e/tracker.spec.ts\nsrc/task.ts\n",
+    advanced: new Set(["e2e/tracker.spec.ts"]),
+    edited: new Set(["e2e/tracker.spec.ts"]),
+  });
+  expect(await detectDestructiveRebase(exec, "/repo", "main", "feat", SNAP)).toEqual([]);
 });
 
 test("git read failure → null (caller must not block on it)", async () => {

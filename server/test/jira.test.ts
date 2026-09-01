@@ -22,6 +22,7 @@ const { openDb, newId, now, setSetting } = await import("../src/db.ts");
 const { writeEvent, transition } = await import("../src/state.ts");
 const { addClient, removeClient } = await import("../src/bus.ts");
 const J = await import("../src/intake/jira.ts");
+const { TASK_PRIORITIES } = await import("../src/api.ts");
 import type { DB } from "../src/db.ts";
 
 const SITE = "https://example.atlassian.net";
@@ -48,6 +49,7 @@ interface FakeIssue {
   parentKey?: string | null;
   created?: string | null;
   updated?: string;
+  priority?: string | null; // Jira priority NAME; null = no priority set
   history?: { at: string; to: string }[]; // status transitions, oldest first
   rawHistory?: any[] | null;
   attachments?: { id: string; filename: string }[];
@@ -95,7 +97,7 @@ interface FakeOpts {
 }
 
 function fakeJira(opts: FakeOpts) {
-  const byKey = new Map(opts.issues.map((i) => [i.key, { labels: [], assignee: null, projectKey: "WEB", summary: "s", description: null, properties: {}, parentKey: null, created: "2026-01-01T00:00:00.000Z", updated: "2026-01-01T00:00:00.000Z", history: [], rawHistory: null, comments: [], attachments: [], ...i } as Required<FakeIssue>]));
+  const byKey = new Map(opts.issues.map((i) => [i.key, { labels: [], assignee: null, projectKey: "WEB", summary: "s", description: null, properties: {}, parentKey: null, created: "2026-01-01T00:00:00.000Z", updated: "2026-01-01T00:00:00.000Z", priority: "Medium", history: [], rawHistory: null, comments: [], attachments: [], ...i } as Required<FakeIssue>]));
   const calls: { method: string; path: string; body?: any }[] = [];
   const reads = new Map<string, number>();
   const changelogReads = new Map<string, number>();
@@ -191,7 +193,7 @@ function fakeJira(opts: FakeOpts) {
             summary: iss.summary, description: iss.description, created: iss.created, updated: iss.updated,
             status: { name: iss.status }, labels: [...iss.labels],
             assignee: iss.assignee ? { accountId: iss.assignee } : null,
-            priority: { name: "Medium" }, issuetype: { name: "Story" },
+            priority: iss.priority == null ? null : { name: iss.priority }, issuetype: { name: "Story" },
             project: iss.projectKey == null ? undefined : { key: iss.projectKey },
             parent: iss.parentKey ? { key: iss.parentKey } : null,
             attachment: iss.attachments.map((a) => ({ id: a.id, filename: a.filename })),
@@ -315,6 +317,16 @@ function client(fetchImpl: typeof fetch, cfg: any = CFG) {
 
 const run = (db: DB, projectId: string, f: typeof fetch, cfg: any = CFG, deps: any = {}) =>
   J.syncProjectOnce(db, projectId, J.jiraConfig({ jira: cfg })!, client(f, cfg), deps);
+
+// hive's clock and the fake Jira's are the same millisecond in a test, and a tie
+// in the conflict rule goes to Jira. Real work takes longer than 0ms, so step a
+// task's last status change forward to give the rule a real winner. `step` must
+// grow across calls: lastStateChangeAt walks the history in timestamp order.
+function bump(db: DB, taskId: string, step: number): void {
+  db.query(
+    "UPDATE events SET ts = ? WHERE id = (SELECT id FROM events WHERE task_id = ? AND type = 'state_change' ORDER BY ts DESC, id DESC LIMIT 1)"
+  ).run(new Date(Date.now() + step * 60_000).toISOString(), taskId);
+}
 
 const tasks = (db: DB) => db.query("SELECT * FROM tasks ORDER BY created_at").all() as any[];
 const syncEvents = (db: DB) =>
@@ -496,6 +508,68 @@ test("import mirrors an issue as a tracking-only task with the mapped state", as
   expect(t.state).toBe("in_review");
   expect(t.title).toBe("[WEB-1] 뉴스레터 기획");
   expect(t.brief).toContain(`${SITE}/browse/WEB-1`);
+});
+
+test("Jira priority reaches tasks.priority, so the dispatcher can actually order the queue", async () => {
+  const jira = fakeJira({
+    issues: [
+      { key: "WEB-1", id: "1", status: "To Do", priority: "Highest" },
+      { key: "WEB-2", id: "2", status: "To Do", priority: "High" },
+      { key: "WEB-3", id: "3", status: "To Do", priority: "Medium" },
+      { key: "WEB-4", id: "4", status: "To Do", priority: "Low" },
+      { key: "WEB-5", id: "5", status: "To Do", priority: "Lowest" },
+      { key: "WEB-6", id: "6", status: "To Do", priority: null }, // no priority set in Jira
+    ],
+  });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+
+  expect(Object.fromEntries(tasks(db).map((t) => [t.jira_key, t.priority]))).toEqual({
+    "WEB-1": "now", "WEB-2": "next", "WEB-3": "normal", "WEB-4": "later", "WEB-5": "later", "WEB-6": "normal",
+  });
+  // The brief keeps carrying the Jira name — it is still context for an agent.
+  expect(tasks(db)[0].brief).toContain("Priority: Highest");
+  // Nothing in the priority copy may look like a status decision.
+  expect(syncEvents(db).some((e) => e.action === "pull" || e.action === "push")).toBe(false);
+});
+
+test("a priority change in Jira moves the hive priority and moves nothing else", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Progress", priority: "Medium" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const before = tasks(db)[0];
+  expect(before.priority).toBe("normal");
+
+  jira.byKey.get("WEB-1")!.priority = "Highest";
+  await run(db, projectId, jira.fetchImpl);
+
+  const after = tasks(db)[0];
+  expect(after.priority).toBe("now");
+  expect(after.state).toBe(before.state);
+  expect(jira.calls.some((c) => c.method === "POST" && c.path.includes("/transitions"))).toBe(false);
+});
+
+test("an unrecognised Jira priority lands on normal and is logged ONCE, not every cycle", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do", priority: "Blocker" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  await run(db, projectId, jira.fetchImpl);
+
+  expect(tasks(db)[0].priority).toBe("normal");
+  const unmapped = syncEvents(db).filter((e) => e.action === "unmapped_priority");
+  expect(unmapped).toEqual([{ action: "unmapped_priority", issue: "WEB-1", jira_priority: "Blocker" }]);
+});
+
+test("the priority map covers Jira's default scheme and refuses to guess anything else", () => {
+  expect(J.jiraPriorityToPriority("Highest")).toBe("now");
+  expect(J.jiraPriorityToPriority("  high ")).toBe("next"); // case + whitespace tolerant
+  expect(J.jiraPriorityToPriority("Medium")).toBe("normal");
+  expect(J.jiraPriorityToPriority("Low")).toBe("later");
+  expect(J.jiraPriorityToPriority("Lowest")).toBe("later");
+  expect(J.jiraPriorityToPriority("P0")).toBe(null);
+  expect(J.jiraPriorityToPriority(null)).toBe(null);
+  // Every value it CAN produce has to be a rank the dispatcher understands.
+  for (const p of Object.values(J.JIRA_TO_PRIORITY)) expect(TASK_PRIORITIES).toContain(p);
 });
 
 test("import broadcasts via broadcastTask, so the live-pushed card already carries never_dispatched", async () => {
@@ -682,6 +756,88 @@ test("converged sides do nothing at all (structural loop prevention)", async () 
   const s3 = await run(db, projectId, jira.fetchImpl);
   expect(jira.writes().length).toBe(before);
   for (const s of [s2, s3]) expect([s.pushed, s.pulled, s.labeled, s.imported]).toEqual([0, 0, 0, 0]);
+});
+
+// ============================================================================
+// MIRROR FOLLOWS ITS WORK  (HIVE-562)
+// ============================================================================
+test("the ticket moves to In Progress and In Review while the work is in flight", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl); // imports the mirror
+  const mirrorId = tasks(db)[0].id;
+
+  // The work task the agent actually does, linked to the mirror.
+  const workId = newId();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, jira_mirror_task_id, created_at, updated_at)
+     VALUES (?,?,?, 'queued', 'ship', ?, ?, ?)`
+  ).run(workId, projectId, "[WEB-1] the work", mirrorId, now(), now());
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, meta) VALUES (?,?,?,?, '{}')").run(newId(), workId, now(), "log");
+
+  let step = 0;
+  const nudge = () => bump(db, mirrorId, ++step);
+  const statusNow = () => jira.byKey.get("WEB-1")!.status;
+  const transitionPosts = () =>
+    jira.calls.filter((c) => c.method === "POST" && c.path.includes("/transitions")).length;
+
+  transition(db, workId, "in_progress", { source: "agent" });
+  nudge();
+  await run(db, projectId, jira.fetchImpl);
+  expect(statusNow()).toBe("In Progress");
+
+  transition(db, workId, "in_review", { source: "agent", skipVerification: true });
+  nudge();
+  await run(db, projectId, jira.fetchImpl);
+  expect(statusNow()).toBe("In Review");
+
+  // in_review -> verifying is the same Jira column: no second transition.
+  const posted = transitionPosts();
+  transition(db, workId, "verifying", { source: "director" });
+  await run(db, projectId, jira.fetchImpl);
+  expect(statusNow()).toBe("In Review");
+  expect(transitionPosts()).toBe(posted);
+
+  transition(db, workId, "done", { source: "director" });
+  nudge();
+  await run(db, projectId, jira.fetchImpl);
+  expect(statusNow()).toBe("Done");
+
+  // Forward only, every step: the ticket never went back a column.
+  const seen = jira.byKey.get("WEB-1")!.history.map((h) => h.to);
+  expect(seen).toEqual(["In Progress", "In Review", "Done"]);
+});
+
+test("a ticket with two work tasks only reaches Done when both are done", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const mirrorId = tasks(db)[0].id;
+
+  const work = ["one", "two"].map((label) => {
+    const id = newId();
+    db.query(
+      `INSERT INTO tasks (id, project_id, title, state, kind, jira_mirror_task_id, created_at, updated_at)
+       VALUES (?,?,?, 'queued', 'ship', ?, ?, ?)`
+    ).run(id, projectId, `[WEB-1] part ${label}`, mirrorId, now(), now());
+    db.query("INSERT INTO evidence (id, task_id, ts, kind, meta) VALUES (?,?,?,?, '{}')").run(newId(), id, now(), "log");
+    return id;
+  });
+
+  for (const id of work) transition(db, id, "in_progress", { source: "agent" });
+  transition(db, work[0], "in_review", { source: "agent", skipVerification: true });
+  transition(db, work[0], "verifying", { source: "director" });
+  transition(db, work[0], "done", { source: "director" });
+  bump(db, mirrorId, 1);
+  await run(db, projectId, jira.fetchImpl);
+  expect(jira.byKey.get("WEB-1")!.status).toBe("In Review"); // furthest the work got, not Done
+
+  transition(db, work[1], "in_review", { source: "agent", skipVerification: true });
+  transition(db, work[1], "verifying", { source: "director" });
+  transition(db, work[1], "done", { source: "director" });
+  bump(db, mirrorId, 2);
+  await run(db, projectId, jira.fetchImpl);
+  expect(jira.byKey.get("WEB-1")!.status).toBe("Done");
 });
 
 // ============================================================================
@@ -1733,6 +1889,102 @@ test("manual and scheduled entry points share a per-target single-flight lock", 
   expect((await first).ok).toBe(true);
 });
 
+test("a cycle whose every request hangs aborts within its budget, and the next tick runs", async () => {
+  // The wedge this guards: with no cycle budget, dozens of issues x a 20s
+  // per-request timeout runs one cycle for minutes, and the single-flight guard
+  // then drops EVERY subsequent tick ("previous cycle still running").
+  const issues = Array.from({ length: 12 }, (_, i) => ({ key: `WEB-${i + 1}`, id: String(i + 1), status: "To Do" }));
+  const { db, projectId } = freshDb({ ...CFG });
+
+  // Discovery answers instantly; every per-issue request hangs until aborted, so
+  // only the budget can end the cycle.
+  const hang = (async (url: string, init: RequestInit = {}) => {
+    if (String(url).includes("/search/jql"))
+      return new Response(JSON.stringify({ issues: issues.map((i) => ({ key: i.key })), isLast: true }), { status: 200 });
+    return await new Promise<Response>((_resolve, reject) => {
+      const signal = init.signal;
+      if (signal?.aborted) return reject(new Error("aborted"));
+      signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    });
+  }) as unknown as typeof fetch;
+
+  const budgetMs = 200;
+  const started = Date.now();
+  const first = await J.runProjectCycle(db, projectId, {
+    fetch: hang, token: "tok", budgetMs, log: () => {},
+  });
+  const elapsed = Date.now() - started;
+
+  // It stopped on the budget, not on 12 x REQUEST_TIMEOUT_MS.
+  expect(elapsed).toBeLessThan(budgetMs * 4);
+  // ...and it says how much work it deferred rather than dropping it silently.
+  expect(first.stats!.budget_skipped).toBeGreaterThan(0);
+  expect(first.stats!.budget_skipped + first.stats!.errors).toBe(issues.length);
+
+  // The whole point: the NEXT tick actually starts instead of being skipped by
+  // the in-flight guard, and it picks up where the last one stopped.
+  const jira = fakeJira({ issues });
+  const second = await J.runProjectCycle(db, projectId, { fetch: jira.fetchImpl, token: "tok" });
+  expect(second.ok).toBe(true);
+  expect(second.error).toBeUndefined();
+});
+
+test("a budget-truncated cycle resumes at the deferred issue, so late issues are not starved", async () => {
+  const issues = Array.from({ length: 6 }, (_, i) => ({ key: `WEB-${i + 1}`, id: String(i + 1), status: "To Do" }));
+  const { db, projectId } = freshDb({ ...CFG });
+  const readOrder: string[] = [];
+
+  // Let exactly two issues through per cycle, then blow the budget.
+  const makeFetch = (allow: number) => {
+    let reads = 0;
+    const inner = fakeJira({ issues }).fetchImpl;
+    return (async (url: string, init: RequestInit = {}) => {
+      const m = /\/rest\/api\/3\/issue\/(WEB-\d+)(\?|$)/.exec(String(url));
+      if (m && !String(url).includes("/comment") && !String(url).includes("/changelog")) {
+        readOrder.push(m[1]);
+        if (++reads > allow)
+          return await new Promise<Response>((_r, reject) => {
+            init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+          });
+      }
+      return inner(url as any, init as any);
+    }) as unknown as typeof fetch;
+  };
+
+  await J.runProjectCycle(db, projectId, { fetch: makeFetch(2), token: "tok", budgetMs: 200, log: () => {} });
+  const firstPass = [...readOrder];
+  readOrder.length = 0;
+  await J.runProjectCycle(db, projectId, { fetch: makeFetch(2), token: "tok", budgetMs: 200, log: () => {} });
+
+  // The second cycle must NOT restart at WEB-1; it continues at the first issue
+  // the budget stopped it from reaching.
+  expect(firstPass[0]).toBe("WEB-1");
+  expect(readOrder[0]).not.toBe("WEB-1");
+  expect(firstPass).not.toContain(readOrder[0]); // an issue pass 1 never reached
+  const nextUnreached = issues.map((i) => i.key).find((k) => !firstPass.includes(k));
+  expect(readOrder[0]).toBe(nextUnreached);
+});
+
+test("an invalid JSON body is a named per-issue skip, not an opaque failure", async () => {
+  const jira = fakeJira({
+    issues: [{ key: "WEB-1", id: "1", status: "To Do" }, { key: "WEB-2", id: "2", status: "To Do" }],
+    invalidJsonRead: ["WEB-1"],
+  });
+  const { db, projectId } = freshDb();
+
+  const stats = await run(db, projectId, jira.fetchImpl);
+
+  // Contained to the one issue: WEB-2 still imported.
+  expect(stats.errors).toBe(1);
+  expect(stats.imported).toBe(1);
+  // The failure names the method, the path and the key, so a systemic Jira
+  // fault is diagnosable instead of a bare SyntaxError.
+  expect(stats.failures).toHaveLength(1);
+  expect(stats.failures[0]).toContain("WEB-1");
+  expect(stats.failures[0]).toContain("invalid JSON body");
+  expect(stats.failures[0]).toContain("GET");
+});
+
 test("a second Hive project cannot adopt an owned Jira target", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }] });
   const { db, projectId } = freshDb({ ...CFG });
@@ -1821,6 +2073,122 @@ test("adfToText flattens an Atlassian document to readable text", () => {
   };
   expect(J.adfToText(adf).trim()).toBe("line one\nline two");
   expect(J.adfToText(null)).toBe("");
+});
+
+test("adfToText keeps the links, images and mentions ADF hides in attrs", () => {
+  const adf = {
+    type: "doc",
+    version: 1,
+    content: [
+      {
+        type: "paragraph",
+        content: [
+          { type: "text", text: "see the ", marks: [] },
+          { type: "text", text: "design", marks: [{ type: "link", attrs: { href: "https://figma.com/design/abc/Home?node-id=1-23" } }] },
+          { type: "text", text: " and ask " },
+          { type: "mention", attrs: { id: "557", text: "@Dana" } },
+        ],
+      },
+      { type: "inlineCard", attrs: { url: "https://www.figma.com/design/KEY/Banners" } },
+      { type: "blockCard", attrs: { data: { url: "https://docs.google.com/document/d/xyz" } } },
+      {
+        type: "mediaSingle",
+        content: [{ type: "media", attrs: { type: "file", id: "media-1", alt: "mockup.png", collection: "c" } }],
+      },
+    ],
+  };
+  const text = J.adfToText(adf);
+  expect(text).toContain("see the design (https://figma.com/design/abc/Home?node-id=1-23)");
+  expect(text).toContain("@Dana");
+  expect(text).toContain("https://www.figma.com/design/KEY/Banners");
+  expect(text).toContain("https://docs.google.com/document/d/xyz");
+  expect(text).toContain("[attachment: mockup.png]");
+});
+
+test("adfToText does not double a URL hive itself wrote as a link", () => {
+  const url = "https://example.test/a";
+  expect(J.adfToText(J.textToAdf(url)).trim()).toBe(url);
+});
+
+test("briefFor names the ticket's attachments and flags visual material", () => {
+  const issue = {
+    key: "WEB-120",
+    fields: {
+      summary: "Homepage banners",
+      issuetype: { name: "Task" },
+      priority: { name: "High" },
+      assignee: null,
+      labels: [],
+      attachment: [
+        { filename: "mockup.png", content: "https://jira.test/secure/attachment/1/mockup.png" },
+        { filename: "notes.txt", content: "https://jira.test/secure/attachment/2/notes.txt" },
+      ],
+      description: {
+        type: "doc",
+        version: 1,
+        content: [
+          { type: "paragraph", content: [{ type: "text", text: "arrange the banners" }] },
+          { type: "mediaSingle", content: [{ type: "media", attrs: { id: "m1", alt: "mockup.png" } }] },
+        ],
+      },
+    },
+  };
+  const brief = J.briefFor(issue, "https://jira.test");
+  expect(brief).toContain("- mockup.png https://jira.test/secure/attachment/1/mockup.png");
+  expect(brief).toContain("- notes.txt");
+  expect(brief).toContain("[attachment: mockup.png]");
+  expect(brief).toContain("visual material");
+});
+
+test("briefFor reads visual material off the structure, not the prose", () => {
+  const proseOnly = J.briefFor(
+    {
+      key: "WEB-2",
+      fields: {
+        issuetype: { name: "Task" },
+        attachment: [],
+        description: {
+          type: "doc",
+          version: 1,
+          content: [{ type: "paragraph", content: [{ type: "text", text: "rename banner.png and drop the figma.com mention from the footer" }] }],
+        },
+      },
+    },
+    "https://jira.test"
+  );
+  expect(proseOnly).toContain("banner.png");
+  expect(proseOnly).not.toContain("visual material");
+
+  // Same words, but the design URL is a real link mark this time.
+  const linked = J.briefFor(
+    {
+      key: "WEB-3",
+      fields: {
+        issuetype: { name: "Task" },
+        description: {
+          type: "doc",
+          version: 1,
+          content: [
+            {
+              type: "paragraph",
+              content: [{ type: "text", text: "the design", marks: [{ type: "link", attrs: { href: "https://www.figma.com/design/KEY/Home?node-id=1-23" } }] }],
+            },
+          ],
+        },
+      },
+    },
+    "https://jira.test"
+  );
+  expect(linked).toContain("visual material");
+});
+
+test("briefFor stays quiet when the ticket carries nothing visual", () => {
+  const brief = J.briefFor(
+    { key: "WEB-1", fields: { issuetype: { name: "Task" }, description: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "plain" }] }] } } },
+    "https://jira.test"
+  );
+  expect(brief).not.toContain("Attachments:");
+  expect(brief).not.toContain("visual material");
 });
 
 test("status mapping is total over the real WEB workflow, in both directions", () => {
@@ -3201,10 +3569,31 @@ test("the route to shoot comes from the changed files, and a guessable one is sk
   expect(routesFromFiles(["web/app/api/users/route.ts", "web/app/insights/page.tsx"])).toEqual(["/insights"]);
 });
 
+// Corebeat web is TanStack Router: the file name is part of the URL, and the
+// `_page` folder is a layout with no path of its own. Before this, every one of
+// these fell through to `/` and the ticket got a front-page picture captioned
+// with the route it never opened.
+test("TanStack src/routes files map to their real URLs", () => {
+  expect(routesFromFiles(["web/src/routes/_page/pricing.tsx"])).toEqual(["/pricing"]);
+  expect(
+    routesFromFiles(["web/src/routes/_page/pricing.tsx", "web/src/routes/_page/search.tsx"])
+  ).toEqual(["/pricing", "/search"]);
+  // index.tsx is the parent path, not a segment.
+  expect(routesFromFiles(["web/src/routes/_page/news/index.tsx"])).toEqual(["/news"]);
+  expect(routesFromFiles(["web/src/routes/_page/index.tsx"])).toEqual(["/"]);
+  // $news_idx is a parameter hive cannot fill, so the file is skipped.
+  expect(routesFromFiles(["web/src/routes/_page/article/$news_idx.tsx"])).toEqual(["/"]);
+  // A Storybook story is not a route.
+  expect(routesFromFiles(["web/src/routes/_page/news/index.stories.tsx"])).toEqual(["/"]);
+  // Dots are TanStack's flat spelling of nesting.
+  expect(routesFromFiles(["web/src/routes/posts.index.tsx"])).toEqual(["/posts"]);
+  expect(routesFromFiles(["web/src/routes/posts.$postId.tsx"])).toEqual(["/"]);
+});
+
 // A worktree that looks like a repo with a Playwright harness. `harness: false`
 // makes it a repo with none, which is the quiet-degrade case. The webServer
 // block is what lets hive serve the PR branch itself, so a real harness has one.
-function fakeWorktree(name: string, harness: boolean, config?: string): string {
+function fakeWorktree(name: string, harness: boolean, config?: string, installed = true): string {
   const root = join(HOME, `wt-${name}-${newId()}`);
   mkdirSyncT(join(root, "web"), { recursive: true });
   if (harness) {
@@ -3213,11 +3602,19 @@ function fakeWorktree(name: string, harness: boolean, config?: string): string {
       join(root, "web", "playwright.config.ts"),
       config ?? "export default { testDir: './e2e', webServer: { command: 'npm start' } };\n"
     );
+    // A real checkout only runs if its deps are installed. `installed: false`
+    // is the fresh-worktree case, where hive must refuse rather than fall back
+    // to whatever `playwright` happens to sit on the host PATH.
+    if (installed) {
+      mkdirSyncT(join(root, "web", "node_modules", ".bin"), { recursive: true });
+      writeFileSyncT(join(root, "web", "node_modules", ".bin", "playwright"), "#!/bin/sh\n");
+    }
   }
   return root;
 }
 
-const isHarnessRun = (argv: string[]) => argv.includes("playwright");
+// The harness run is now the repo's own binary by absolute path, not `npx`.
+const isHarnessRun = (argv: string[]) => argv.some((a) => a.endsWith("/.bin/playwright"));
 
 function trustRepo(db: DB, projectId: string): void {
   const row = db.query("SELECT config FROM projects WHERE id = ?").get(projectId) as { config: string };
@@ -3368,10 +3765,13 @@ test.skipIf(process.platform !== "darwin")("the harness is forced to boot the ap
   // browser cache while booting the app from this worktree.
   const harness = seen.find((c) => isHarnessRun(c.argv))!;
   expect(harness.argv.slice(3, 5)).toEqual(["/usr/bin/env", "-i"]);
-  const npxAt = harness.argv.indexOf("npx");
-  expect(harness.argv.slice(5, npxAt).map((entry) => entry.split("=", 1)[0])).toEqual(["HOME", "PATH", "TMPDIR", "CI"]);
-  expect(harness.argv.slice(5, npxAt).join("\n")).not.toContain("HIVE_");
-  expect(harness.argv.slice(npxAt, npxAt + 3)).toEqual(["npx", "--no-install", "playwright"]);
+  const binAt = harness.argv.findIndex((a: string) => a.endsWith("/.bin/playwright"));
+  expect(harness.argv.slice(5, binAt).map((entry) => entry.split("=", 1)[0])).toEqual(["HOME", "PATH", "TMPDIR", "CI"]);
+  expect(harness.argv.slice(5, binAt).join("\n")).not.toContain("HIVE_");
+  // The repo's OWN binary, by absolute path inside this worktree. `npx` would
+  // fall back to a host-global playwright when the worktree has no deps.
+  expect(harness.argv[binAt]).toBe(join(root, "web", "node_modules", ".bin", "playwright"));
+  expect(harness.argv[binAt + 1]).toBe("test");
   expect(harness.argv).toContain("--config");
   expect(harness.config).toContain("reuseExistingServer: false");
   expect(harness.cwd).toBe(join(root, "web"));
@@ -3441,6 +3841,341 @@ test.skipIf(process.platform !== "darwin")("a failed harness run never becomes a
   expect(readdirSyncT(root).some((name) => name.startsWith(".hive-proof-"))).toBe(false);
 });
 
+test.skipIf(process.platform !== "darwin")("the reason names the real failure, not node's deprecation noise", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  // Playwright reports the failure on stdout; node writes deprecation warnings
+  // to stderr. Reading stderr first buried the only line worth showing.
+  const exec = async (argv: string[]) => {
+    if (!isHarnessRun(argv)) return { code: 0, stdout: UI_PATCH, stderr: "" };
+    return {
+      code: 1,
+      stdout: "\u001b[1A\u001b[2K1 failed\n  Error: page could not load its data, 47 request(s) failed: https://api.example.test/v1/news",
+      stderr: "(node:123) [DEP0205] DeprecationWarning: `module.register()` is deprecated.\n(Use `node --trace-deprecation ...` to show where the warning was created)",
+    };
+  };
+
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+
+  expect(stats.rendered).toBe(0);
+  const reason = String(syncEvents(db).find((e) => e.action === "render_proof")?.reason);
+  expect(reason).toContain("page could not load its data");
+  expect(reason).not.toContain("DeprecationWarning");
+  expect(reason).not.toContain("\u001b");
+});
+
+// Capture the spec hive generates for a real sync, then RUN it against a fake
+// page. Matching on the source text only proves the guard was written; running
+// it proves the guard decides correctly, which is the part that posts or
+// withholds a picture on a live ticket.
+async function generatedSpec(root: string, db: DB, projectId: string, jira: ReturnType<typeof fakeJira>) {
+  let spec = "";
+  const exec = async (argv: string[]) => {
+    if (!isHarnessRun(argv)) return { code: 0, stdout: UI_PATCH, stderr: "" };
+    const dir = join(root, "web", "e2e");
+    const name = readdirSyncT(dir).find((f) => f.startsWith("hive-proof-"))!;
+    spec = await Bun.file(join(dir, name)).text();
+    return { code: 0, stdout: "1 passed", stderr: "" };
+  };
+  await run(db, projectId, jira.fetchImpl, CFG, { exec });
+  return spec;
+}
+
+// Playwright's own `test` and the import of it are the only things the spec
+// needs from outside, so both are stubbed and the body runs as plain JS.
+function runSpec(spec: string, page: unknown): Promise<void> {
+  const body = spec
+    .replace(/^import .*$/m, "")
+    .replace(/^test\.use\(.*$/m, "");
+  const cases: Array<(args: { page: unknown }) => Promise<void>> = [];
+  const test = (_name: string, fn: (args: { page: unknown }) => Promise<void>) => cases.push(fn);
+  (test as { use?: () => void }).use = () => {};
+  new Function("test", body)(test);
+  return cases[0]({ page });
+}
+
+// A failed request carries the three facts the filter reads.
+const failedRequest = (url: string, resourceType: string, errorText = "net::ERR_FAILED") => ({
+  url: () => url,
+  resourceType: () => resourceType,
+  failure: () => ({ errorText }),
+});
+
+// `overlayText` non-null makes the page look like a dev server showing a
+// compile error over the app: HTTP 200, no failed request, still not proof.
+// `content` is what the browser reports back about what the page painted: how
+// many characters of text the body shows, and how many visible images it has.
+// The default is an ordinary page with plenty of both.
+function fakePage(
+  url: string,
+  failures: Array<ReturnType<typeof failedRequest>>,
+  overlayText: string | null = null,
+  content: { text: number; media: number } = { text: 500, media: 3 }
+) {
+  let onFailed: (r: unknown) => void = () => {};
+  let shot = false;
+  return {
+    page: {
+      locator: (_selector: string) => ({
+        first: () => ({
+          count: async () => (overlayText ? 1 : 0),
+          evaluate: async () => overlayText ?? "",
+        }),
+      }),
+      on: (event: string, fn: (r: unknown) => void) => {
+        if (event === "requestfailed") onFailed = fn;
+      },
+      goto: async () => {
+        for (const f of failures) onFailed(f);
+        return { ok: () => true, status: () => 200 };
+      },
+      waitForLoadState: async () => {},
+      evaluate: async () => content,
+      url: () => url,
+      screenshot: async () => {
+        shot = true;
+      },
+    },
+    tookShot: () => shot,
+  };
+}
+
+const PAGE_URL = "http://localhost:3000/insights";
+
+// A fresh hive worktree has no node_modules. `npx --no-install playwright` did
+// not stop there: it walked PATH and ran the host's own playwright, a different
+// package whose CLI has no `test` command. Hive must refuse instead.
+test.skipIf(process.platform !== "darwin")("an uninstalled repo is refused, never run off the host PATH", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const task = tasks(db)[0];
+  const root = fakeWorktree(task.id, true, undefined, false); // harness, but no deps
+  db.query("UPDATE tasks SET branch = ?, worktree_path = ? WHERE id = ?").run("hive/x", root, task.id);
+  trustRepo(db, projectId);
+
+  const seen: string[][] = [];
+  const exec = async (argv: string[]) => {
+    seen.push(argv);
+    return { code: 0, stdout: UI_PATCH, stderr: "" };
+  };
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+
+  expect(stats.rendered).toBe(0);
+  expect(stats.errors).toBe(0);
+  expect(db.query("SELECT id FROM evidence").all()).toHaveLength(0);
+  expect(seen.some(isHarnessRun)).toBe(false); // no browser was started at all
+  const reason = String(syncEvents(db).find((e) => e.action === "render_proof")?.reason);
+  expect(reason).toContain("no installed Playwright");
+  expect(reason).toContain("host PATH");
+});
+
+// A fresh worktree has no node_modules, but the main checkout it was cut from
+// does. Hive borrows those for the render (it cannot install: the fence denies
+// the network) and unlinks them again as soon as the run is over.
+test.skipIf(process.platform !== "darwin")("a fresh worktree borrows the main checkout's installed deps", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const task = tasks(db)[0];
+  const root = fakeWorktree(task.id, true, undefined, false); // harness, no deps
+  writeFileSyncT(join(root, "web", "package.json"), "{}\n");
+
+  // The main checkout: same layout, deps installed, one real package to link.
+  const main = join(HOME, `main-${newId()}`);
+  mkdirSyncT(join(main, "web", "node_modules", ".bin"), { recursive: true });
+  mkdirSyncT(join(main, "web", "node_modules", "react"), { recursive: true });
+  // A dev-server cache. Linking it would send Vite's startup rewrite to the
+  // main checkout, which the seatbelt denies and Vite dies on.
+  mkdirSyncT(join(main, "web", "node_modules", ".vite", "deps"), { recursive: true });
+  writeFileSyncT(join(main, "web", "package.json"), "{}\n");
+  writeFileSyncT(join(main, "web", "node_modules", ".bin", "playwright"), "#!/bin/sh\n");
+  writeFileSyncT(join(root, ".git"), `gitdir: ${join(main, ".git", "worktrees", "wt")}\n`);
+
+  db.query("UPDATE tasks SET branch = ?, worktree_path = ? WHERE id = ?").run("hive/x", root, task.id);
+  trustRepo(db, projectId);
+
+  const render = execRendering(root, 1);
+  const seen: string[][] = [];
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, {
+    exec: async (argv: string[], opts: any) => {
+      seen.push(argv);
+      if (isHarnessRun(argv)) {
+        // The borrowed packages are in place while the harness runs, reachable
+        // from inside the worktree.
+        expect(readFileSyncT(join(root, "web", "node_modules", ".bin", "playwright"), "utf8")).toBe("#!/bin/sh\n");
+        expect(existsSync(join(root, "web", "node_modules", "react"))).toBe(true);
+        expect(existsSync(join(root, "web", "node_modules", ".vite"))).toBe(false);
+      }
+      return render(argv);
+    },
+  });
+
+  expect(stats.rendered).toBe(1);
+  const harness = seen.find(isHarnessRun)!;
+  expect(harness[harness.findIndex((a) => a.endsWith("/.bin/playwright"))]).toBe(
+    join(root, "web", "node_modules", ".bin", "playwright")
+  );
+  // Gone again afterwards: a branch left wired to another checkout's deps is a
+  // mystery build waiting to happen.
+  expect(existsSync(join(root, "web", "node_modules"))).toBe(false);
+  // And the main checkout is untouched.
+  expect(existsSync(join(main, "web", "node_modules", ".bin", "playwright"))).toBe(true);
+});
+
+test.skipIf(process.platform !== "darwin")(
+  "the generated spec still shoots when only third-party and cancelled requests failed",
+  async () => {
+    const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+    const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+    const spec = await generatedSpec(root, db, projectId, jira);
+
+    // Every one of these fails on EVERY run, because the seatbelt allows only
+    // localhost. None of them means the page is broken.
+    const { page, tookShot } = fakePage(PAGE_URL, [
+      failedRequest("https://us.i.posthog.com/e/", "fetch"), // analytics beacon
+      failedRequest("https://www.google-analytics.com/g/collect", "xhr"),
+      failedRequest("https://fonts.gstatic.com/s/inter.woff2", "font"),
+      failedRequest("http://localhost:3000/hero.png", "image"), // same-origin, but not needed to render
+      failedRequest("http://localhost:3000/_next/data/next.json", "fetch", "net::ERR_ABORTED"), // cancelled prefetch
+    ]);
+
+    await runSpec(spec, page);
+
+    expect(tookShot()).toBe(true);
+  }
+);
+
+test.skipIf(process.platform !== "darwin")(
+  "the generated spec refuses a page whose own data failed to load",
+  async () => {
+    const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+    const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+    const spec = await generatedSpec(root, db, projectId, jira);
+
+    // A single-page app renders its own error boundary with HTTP 200, so the
+    // spec itself has to fail the shot; exit code alone would call that proof.
+    const { page, tookShot } = fakePage(PAGE_URL, [
+      failedRequest("https://us.i.posthog.com/e/", "fetch"), // noise, alongside the real one
+      failedRequest("http://localhost:3000/api/insights", "xhr"),
+    ]);
+
+    let thrown = "";
+    await runSpec(spec, page).catch((e) => {
+      thrown = String(e?.message ?? e);
+    });
+
+    expect(thrown).toContain("page could not load its data");
+    expect(thrown).toContain("1 request(s) failed"); // the beacon was not counted
+    expect(thrown).toContain("http://localhost:3000/api/insights");
+    expect(tookShot()).toBe(false);
+  }
+);
+
+// Found by running this code against a real checkout: the dev server answered
+// 200, no request failed, and the screenshot was a full-page Vite overlay
+// reading "Failed to resolve import". Exactly the picture that must not ship.
+test.skipIf(process.platform !== "darwin")("the generated spec refuses a dev-server error overlay", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const spec = await generatedSpec(root, db, projectId, jira);
+
+  const { page, tookShot } = fakePage(
+    PAGE_URL,
+    [],
+    '[plugin:vite:import-analysis] Failed to resolve import "lexical-schema"'
+  );
+
+  let thrown = "";
+  await runSpec(spec, page).catch((e) => {
+    thrown = String(e?.message ?? e);
+  });
+
+  expect(thrown).toContain("dev-server error overlay");
+  expect(thrown).toContain("Failed to resolve import"); // the reason names the real cause
+  expect(tookShot()).toBe(false);
+});
+
+test.skipIf(process.platform !== "darwin")("the generated spec refuses a non-2xx page", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const spec = await generatedSpec(root, db, projectId, jira);
+
+  const { page, tookShot } = fakePage(PAGE_URL, []);
+  page.goto = async () => ({ ok: () => false, status: () => 500 });
+
+  let thrown = "";
+  await runSpec(spec, page).catch((e) => {
+    thrown = String(e?.message ?? e);
+  });
+
+  expect(thrown).toContain("page answered HTTP 500");
+  expect(tookShot()).toBe(false);
+});
+
+// The corebeat run that prompted this: the app's API is unreachable inside the
+// seatbelt, so the page answered 200, failed no request hive counts, showed no
+// overlay, and painted a blank white 1280x800. A blank picture is worse than no
+// picture, so the spec fails the shot.
+test.skipIf(process.platform !== "darwin")("the generated spec refuses a blank page", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const spec = await generatedSpec(root, db, projectId, jira);
+
+  const { page, tookShot } = fakePage(PAGE_URL, [], null, { text: 0, media: 0 });
+
+  let thrown = "";
+  await runSpec(spec, page).catch((e) => {
+    thrown = String(e?.message ?? e);
+  });
+
+  expect(thrown).toContain("page rendered nothing");
+  expect(tookShot()).toBe(false);
+});
+
+// A page can be nearly wordless and still be a real picture, so text alone does
+// not condemn it: one visible image is enough to shoot.
+test.skipIf(process.platform !== "darwin")("the generated spec still shoots a wordless page that shows an image", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const spec = await generatedSpec(root, db, projectId, jira);
+
+  const { page, tookShot } = fakePage(PAGE_URL, [], null, { text: 3, media: 1 });
+
+  await runSpec(spec, page);
+
+  expect(tookShot()).toBe(true);
+});
+
+// End to end: the spec hive generated, run against a blank page, makes the
+// harness go red, and the ticket falls back to text with a reason that names
+// the empty page.
+test.skipIf(process.platform !== "darwin")("a blank page renders nothing and the reason names it", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const exec = async (argv: string[]) => {
+    if (!isHarnessRun(argv)) return { code: 0, stdout: UI_PATCH, stderr: "" };
+    const dir = join(root, "web", "e2e");
+    const name = readdirSyncT(dir).find((f) => f.startsWith("hive-proof-"))!;
+    const spec = await Bun.file(join(dir, name)).text();
+    const { page } = fakePage(PAGE_URL, [], null, { text: 0, media: 0 });
+    let thrown = "";
+    await runSpec(spec, page).catch((e) => {
+      thrown = String(e?.message ?? e);
+    });
+    return { code: 1, stdout: `1 failed\n  Error: ${thrown}`, stderr: "" };
+  };
+
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+
+  expect(stats.rendered).toBe(0);
+  expect(db.query("SELECT id FROM evidence").all()).toHaveLength(0);
+  expect(jira.byKey.get("WEB-1")!.attachments).toHaveLength(0);
+  const reason = String(syncEvents(db).find((e) => e.action === "render_proof")?.reason);
+  expect(reason).toContain("page rendered nothing");
+  expect(reason).toContain("blank");
+});
+
 test("the scratch directory is gone even when the harness throws", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
   const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
@@ -3456,17 +4191,187 @@ test("the scratch directory is gone even when the harness throws", async () => {
   expect(readdirSyncT(join(root, "web", "e2e")).some((name) => name.startsWith("hive-proof-"))).toBe(false);
 });
 
+// HIVE-511: the catchup card shows a before/after pair, so a rendered proof has
+// to say which side it is. The before pass is best effort — losing it must never
+// cost the after picture, and it must not leave a base checkout behind.
+test.skipIf(process.platform !== "darwin")("a rendered proof is stamped 'after', and a failed before pass costs nothing", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const render = execRendering(root, 1);
+  const exec = async (argv: string[]) => {
+    // A real base commit, then a worktree add that refuses: the before pass
+    // gets as far as it can and gives up.
+    if (argv.includes("merge-base")) return { code: 0, stdout: "0f1e2d3c4b5a69788796a5b4c3d2e1f001020304\n", stderr: "" };
+    if (argv.includes("worktree")) return { code: 1, stdout: "", stderr: "fatal: nope" };
+    return render(argv);
+  };
+
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+  expect(stats.rendered).toBe(1);
+
+  const shots = db.query("SELECT meta FROM evidence WHERE kind = 'screenshot'").all() as { meta: string }[];
+  expect(shots.map((row) => JSON.parse(row.meta).render_phase)).toEqual(["after"]);
+  expect(readdirSyncT(root).some((name) => name.startsWith(".hive-base-"))).toBe(false);
+});
+
 test.skipIf(process.platform !== "darwin")("the task's diff is read once per cycle, not once per check", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
   const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
   let diffReads = 0;
   const render = execRendering(root, 1);
+  // Only the diff read itself: the before/after pass (HIVE-511) also shells out
+  // to git, and those calls say nothing about how often the diff is fetched.
   const exec = async (argv: string[]) => {
-    if (!isHarnessRun(argv)) diffReads++;
+    if (argv.includes("diff")) diffReads++;
     return render(argv);
   };
 
   const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
   expect(stats.rendered).toBe(1);
   expect(diffReads).toBe(1); // the UI-scope check and the renderer share one read
+});
+
+// ============================================================================
+// REQUEUE CARRIES THE JIRA LINK  (hive-1872)
+// ============================================================================
+// Ten WEB sub-tasks sat at In Progress while their work was merged on main. The
+// tasks had died to infrastructure and been requeued; the successor that
+// finished the work carried no jira_key, and the failed row that did could
+// never push (failed maps to no Jira status). So nothing ever closed the issue.
+const { requeueTask } = await import("../src/api.ts");
+
+// A task linked to WEB-23 as a sub-task, plus the tracking-only mirror row the
+// importer creates for the same issue.
+function linkedSubtask(db: DB, projectId: string, key = "WEB-23"): string {
+  const taskId = newId();
+  const ts = now();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, jira_key, jira_link_kind, created_at, updated_at)
+     VALUES (?, ?, 'Linked work', 'in_progress', 'ship', ?, 'subtask', ?, ?)`
+  ).run(taskId, projectId, key, ts, ts);
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, source, source_ref, jira_key, jira_link_kind, created_at, updated_at)
+     VALUES (?, ?, 'Mirror', 'in_progress', 'ship', 'external', ?, ?, 'mirror', ?, ?)`
+  ).run(newId(), projectId, `jira:${key}`, key, ts, ts);
+  return taskId;
+}
+
+const finish = (db: DB, taskId: string) => {
+  db.query("UPDATE tasks SET state = 'done', updated_at = ? WHERE id = ?").run(now(), taskId);
+  writeEvent(db, { task_id: taskId, source: "director", type: "state_change", payload: { from: "in_progress", to: "done" } });
+};
+
+const linkOf = (db: DB, taskId: string) =>
+  db.query("SELECT jira_key, jira_link_kind FROM tasks WHERE id = ?").get(taskId) as any;
+
+const subtaskOwners = (db: DB, key = "WEB-23") =>
+  (db.query("SELECT id FROM tasks WHERE jira_key = ? AND jira_link_kind = 'subtask'").all(key) as any[]).map((r) => r.id);
+
+test("a requeue MOVES the Jira link to the successor, and the successor closes the issue", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-23", id: "23", status: "In Progress", parentKey: "WEB-7" }] });
+  const { db, projectId } = freshDb();
+  const original = linkedSubtask(db, projectId);
+
+  transition(db, original, "failed", { source: "reconciler", reason: "agent died" });
+  const successor = requeueTask(db, db.query("SELECT * FROM tasks WHERE id = ?").get(original));
+
+  // the link moved: the dead row no longer claims it, exactly one task holds it
+  expect(linkOf(db, original)).toEqual({ jira_key: null, jira_link_kind: null });
+  expect(linkOf(db, successor)).toEqual({ jira_key: "WEB-23", jira_link_kind: "subtask" });
+  expect(subtaskOwners(db)).toEqual([successor]);
+
+  finish(db, successor);
+  await run(db, projectId, jira.fetchImpl);
+
+  // assert on the ISSUE, not on hive's own state
+  expect(jira.byKey.get("WEB-23")!.status).toBe("Done");
+});
+
+test("the link survives a multi-hop recovery chain and lands on the task that finishes", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-43", id: "43", status: "In Progress" }] });
+  const { db, projectId } = freshDb();
+  const first = linkedSubtask(db, projectId, "WEB-43");
+
+  transition(db, first, "failed", { source: "reconciler", reason: "died" });
+  const second = requeueTask(db, db.query("SELECT * FROM tasks WHERE id = ?").get(first));
+  expect(subtaskOwners(db, "WEB-43")).toEqual([second]);
+
+  transition(db, second, "in_progress", { source: "reconciler" });
+  transition(db, second, "failed", { source: "reconciler", reason: "died again" });
+  const third = requeueTask(db, db.query("SELECT * FROM tasks WHERE id = ?").get(second));
+
+  expect(linkOf(db, first)).toEqual({ jira_key: null, jira_link_kind: null });
+  expect(linkOf(db, second)).toEqual({ jira_key: null, jira_link_kind: null });
+  expect(subtaskOwners(db, "WEB-43")).toEqual([third]);
+
+  finish(db, third);
+  await run(db, projectId, jira.fetchImpl);
+  expect(jira.byKey.get("WEB-43")!.status).toBe("Done");
+});
+
+test("a task that fails and is never requeued leaves its Jira issue alone", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-23", id: "23", status: "In Progress" }] });
+  const { db, projectId } = freshDb();
+  const taskId = linkedSubtask(db, projectId);
+
+  transition(db, taskId, "failed", { source: "reconciler", reason: "gave up" });
+  await run(db, projectId, jira.fetchImpl);
+
+  expect(jira.byKey.get("WEB-23")!.status).toBe("In Progress");
+  expect(jira.writes().filter((c) => c.path.endsWith("/transitions"))).toEqual([]);
+});
+
+test("the issue's hive-task marker does not re-link the dead predecessor after a requeue", async () => {
+  const { db, projectId } = freshDb();
+  const original = linkedSubtask(db, projectId);
+  // the sub-task hive created names the ORIGINAL task forever
+  const jira = fakeJira({ issues: [{
+    key: "WEB-23", id: "23", status: "In Progress",
+    description: J.textToAdf(`hive-task: ${original}`),
+  }] });
+
+  transition(db, original, "failed", { source: "reconciler", reason: "agent died" });
+  const successor = requeueTask(db, db.query("SELECT * FROM tasks WHERE id = ?").get(original));
+
+  const stats = await run(db, projectId, jira.fetchImpl);
+  expect(stats.errors).toBe(0);
+  expect(stats.failures).toEqual([]);
+  expect(subtaskOwners(db)).toEqual([successor]);
+
+  finish(db, successor);
+  await run(db, projectId, jira.fetchImpl);
+  expect(jira.byKey.get("WEB-23")!.status).toBe("Done");
+});
+
+// The pull direction needs no change, and this test pins why: for a sub-task
+// link hive is authoritative and reconcileLinkedTask only ever PUSHES. Pulls
+// happen on the mirror row, and a mirror can never be requeued, so moving the
+// sub-task key cannot point a pull at the wrong row.
+test("only the mirror pulls, and a mirror is never requeued, so the pull side is unaffected", async () => {
+  const jira = fakeJira({ issues: [{
+    key: "WEB-23", id: "23", status: "In Review",
+    history: [{ at: "2099-01-01T00:00:00.000Z", to: "In Review" }],
+  }] });
+  const { db, projectId } = freshDb();
+  const original = linkedSubtask(db, projectId);
+  const mirror = db.query("SELECT * FROM tasks WHERE jira_link_kind = 'mirror'").get() as any;
+
+  transition(db, original, "failed", { source: "reconciler", reason: "agent died" });
+  const successor = requeueTask(db, db.query("SELECT * FROM tasks WHERE id = ?").get(original));
+
+  expect(() => requeueTask(db, mirror)).toThrow();
+  expect(db.query("SELECT id FROM tasks WHERE jira_key = 'WEB-23' AND jira_link_kind = 'mirror'").all())
+    .toEqual([{ id: mirror.id }]);
+
+  await run(db, projectId, jira.fetchImpl);
+
+  // Jira moved most recently, so the mirror pulls; the sub-task side pushes,
+  // and it is the successor that does it.
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(mirror.id) as any).state).toBe("in_review");
+  expect(syncEvents(db).filter((e: any) => e.linked)).toContainEqual(
+    expect.objectContaining({ action: "push", issue: "WEB-23", to: "To Do", linked: true, outcome: "ok" })
+  );
+  expect(db.query(
+    "SELECT COUNT(*) AS count FROM events WHERE task_id = ? AND type = 'jira_sync'"
+  ).get(successor)).toEqual({ count: 2 });
 });

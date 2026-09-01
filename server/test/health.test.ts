@@ -17,10 +17,13 @@ function makeTask(db: DB, projectId: string, state = "in_progress", agent: strin
   return id;
 }
 let seq = 0;
-function putEvent(db: DB, taskId: string, type: string, payload: any = {}, agoMs = 0): void {
+// Source matters: only the agent's own rows (`agent` for its `hive emit` calls,
+// `hook` for transcript rows) count as activity, so the default here mirrors
+// what the agent really writes. Pass a source explicitly for hive's own rows.
+function putEvent(db: DB, taskId: string, type: string, payload: any = {}, agoMs = 0, source = type === "status" ? "agent" : "herdr"): void {
   const ts = new Date(Date.now() - agoMs + seq++).toISOString();
   db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
-    .run(newId("evt"), taskId, ts, "herdr", type, JSON.stringify(payload));
+    .run(newId("evt"), taskId, ts, source, type, JSON.stringify(payload));
 }
 const STALE = 15 * 60 * 1000;
 
@@ -86,7 +89,7 @@ test("dead: agent gone from herdr", () => {
   expect(h?.reason).toBe("agent gone from herdr");
 });
 
-test("healthy: a deferred task whose agent went gone is not dead/stuck, and needsAttention is false", () => {
+test("deferred: a parked task whose agent went gone reports its own status, not healthy/dead/stuck, and needsAttention is false", () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId); // in_progress
   const farFuture = "9999-12-31T00:00:00.000Z";
@@ -94,7 +97,8 @@ test("healthy: a deferred task whose agent went gone is not dead/stuck, and need
   putEvent(db, id, "deferred", { until: farFuture, note: "waiting on sudo" });
   putEvent(db, id, "agent_status", { status: "gone" });
   const h = computeHealth(db, getTask(db, id), Date.now());
-  expect(h?.status).toBe("healthy");
+  expect(h?.status).toBe("deferred");
+  expect(h?.reason).toBe("parked pending a human action");
   expect(needsAttention({ state: "in_progress", health: h })).toBe(false);
 });
 
@@ -305,4 +309,22 @@ test("tasksWithHealth: sidecar lookup stays a single query regardless of task co
   (db as any).query = origQuery;
   expect(sidecarQueries).toBe(1);
   for (const t of tasks) expect(t.sidecar?.sha).toBe("abc123");
+});
+
+// The board's "intake · unreviewed" chip reads this flag, so it must follow
+// dispatcher.ts's isReviewed: intake triage marking a task reviewed has to
+// clear the chip. Non-intake tasks never carry the field. Task HIVE-513.
+test("reviewed: only intake tasks carry it, and a reviewed event flips it", () => {
+  const { db, projectId } = freshDb();
+  const plain = makeTask(db, projectId);
+  const held = makeTask(db, projectId, "queued");
+  const ok = makeTask(db, projectId, "queued");
+  for (const id of [held, ok]) db.query("UPDATE tasks SET source = 'intake_gchat' WHERE id = ?").run(id);
+  putEvent(db, ok, "reviewed", { note: "triage: mechanical" });
+  const by = Object.fromEntries(
+    tasksWithHealth(db, [plain, held, ok].map((id) => getTask(db, id))).map((t: any) => [t.id, t.reviewed])
+  );
+  expect(by[plain]).toBeUndefined();
+  expect(by[held]).toBe(false);
+  expect(by[ok]).toBe(true);
 });

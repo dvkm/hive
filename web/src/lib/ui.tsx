@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { api } from "./api";
 import type { State, CiStatus, Health, SidecarReport } from "./api";
 import { STATE_LABEL, HEALTH_LABEL } from "./labels";
 import { DEP_MET_STATES } from "./needsYou";
 
-export { STATE_LABEL, HEALTH_LABEL, NEXT } from "./labels"; // callers keep importing them from here
+export { STATE_LABEL, HEALTH_LABEL, NEXT, needsLook } from "./labels"; // callers keep importing them from here
 
 // Status dot. When the server reports health, the dot reflects HEALTH (green
 // pulse / amber / orange / red) with the reason as tooltip; otherwise it falls
@@ -204,4 +205,54 @@ export function toast(msg: string) {
     el.classList.remove("toast-in");
     setTimeout(() => el.remove(), 300);
   }, 2600);
+}
+
+// ---- task priority (HIVE-430) -------------------------------------------
+// Four ordinal levels, highest first. Ordering only: it changes what an agent
+// picks up next and what lands first, never what gets stopped.
+export const PRIORITIES = ["now", "next", "normal", "later"] as const;
+export type Priority = (typeof PRIORITIES)[number];
+
+// Sort key, matching the server's PRIORITY_RANK_SQL: an unrecognised value
+// (only reachable by a hand-edited row) sorts last with 'later'. A missing
+// value is the schema default, 'normal'.
+export function priorityRank(p?: string | null): number {
+  if (p == null) return PRIORITIES.indexOf("normal");
+  const i = PRIORITIES.indexOf(p as Priority);
+  return i === -1 ? PRIORITIES.length - 1 : i;
+}
+
+// Quick-set control that reads as one of the card's chips. 'normal' is the
+// default on almost every task, so it stays invisible until you hover the card
+// (or always, on touch, where there is no hover to reveal it) — the board shows
+// a priority chip only when someone actually set one.
+export function PriorityChip({ task }: { task: { id: string; priority?: string | null } }) {
+  const p = (task.priority ?? "normal") as Priority;
+  const stop = (e: React.SyntheticEvent) => {
+    e.preventDefault(); // the card is a <Link>: without this, picking navigates
+    e.stopPropagation();
+  };
+  return (
+    <select
+      className={`chip chip-prio prio-${p}`}
+      value={p}
+      aria-label="Priority"
+      title="Priority — queue order only, never preemption"
+      onClick={stop}
+      onChange={(e) => {
+        stop(e);
+        const next = e.target.value;
+        api.updateTask(task.id, { priority: next }).then(
+          () => toast(`Priority: ${next}`),
+          (err) => toast((err as Error).message)
+        );
+      }}
+    >
+      {PRIORITIES.map((x) => (
+        <option key={x} value={x}>
+          {x}
+        </option>
+      ))}
+    </select>
+  );
 }

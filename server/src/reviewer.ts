@@ -5,24 +5,46 @@
 // (review latency is the pipeline ceiling; the diff-reading is the slow part).
 //
 // Non-blocking and advisory: the task sits in review exactly as before; the
-// event just arrives on the card, usually within a cycle. One attempt per task
-// (`auto_review` / `auto_review_error` both mark it done — no retry loops).
+// event just arrives on the card, usually within a cycle. A success (or a
+// project-level skip) is final; a failure is retried with backoff up to
+// MAX_REVIEW_ATTEMPTS times per PR head, then the card is flagged for a human.
 // Per-project opt-out: config.auto_review = false. Model: config.model_by_kind
 // .review, else sonnet. Argv override: config.reviewer_argv (verbatim).
 import type { DB } from "./db.ts";
-import { isOffline } from "./db.ts";
+import { isOffline, getSetting, setSetting } from "./db.ts";
 import { writeEvent, getTask } from "./state.ts";
 import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
-import { defaultExec, projectComparisonBase } from "./exec.ts";
+import { defaultExec, projectComparisonBase, mapLimit } from "./exec.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { modelFailure, modelErrorText, noteModelCall, isAuthFailure } from "./modelCall.ts";
+import { enqueue } from "./notifications.ts";
 import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 import { supervisedSql } from "./supervision.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { parseUnifiedDiff } from "./diff.ts";
+import { startLoop } from "./loop.ts";
 
 const TIMEOUT_MS = Number(process.env.HIVE_REVIEWER_TIMEOUT_MS || 180_000);
+// How many tasks one pass reviews at the same time. One-at-a-time made the
+// review column the auto-merge ceiling: ~0.6 reviews/min against a fleet of 4
+// agents filling it. Deliberately a constant, not a config knob — the ceiling
+// here is the model API, not anything a project would want to tune.
+const REVIEW_CONCURRENCY = 4;
+// The per-risk fan-out is nested inside the per-task one, so the two caps
+// multiply: 4 tasks x 4 risks would be 16 `claude -p` subprocesses at once,
+// which is a peak nobody chose and the kind of load that has exhausted ptys
+// here before. 2 keeps the real ceiling at roughly 8.
+// ponytail: two nested caps whose product is the true bound. If the reviewer
+// ever needs a genuine total budget, replace both with one shared semaphore
+// around the model calls -- but don't hold an outer slot across the inner
+// fan-out or it deadlocks.
+const RISK_CONCURRENCY = 2;
 const DIFF_LIMIT = 60_000;
+// The one retry reads a quarter of the diff. A shorter prompt is the only knob
+// the reviewer has when the shared model route is what's slow (HIVE-567), and
+// a partial review beats the nothing a second timeout leaves behind.
+const RETRY_DIFF_LIMIT = 15_000;
 
 export interface ReviewerDeps {
   exec?: PlannerExec; // the claude -p runner (injectable in tests)
@@ -97,7 +119,7 @@ async function livePrHead(exec: Exec, prUrl: string): Promise<string | null> {
   }
 }
 
-function reviewPrompt(task: any, diff: string): string {
+function reviewPrompt(task: any, diff: string, limit = DIFF_LIMIT): string {
   return [
     `You are pre-reviewing a PR for a busy human reviewer. Be terse and concrete; no praise, no filler.`,
     ``,
@@ -105,7 +127,7 @@ function reviewPrompt(task: any, diff: string): string {
     `Brief:\n${(task.brief ?? "").slice(0, 4000)}`,
     ``,
     `Diff (may be truncated):`,
-    diff.slice(0, DIFF_LIMIT),
+    diff.slice(0, limit),
     ``,
     PLAIN_ENGLISH,
     ``,
@@ -119,30 +141,157 @@ function reviewPrompt(task: any, diff: string): string {
   ].join("\n");
 }
 
-// One review per pass (no stampede when a backlog of reviews appears at once).
+// A failed pre-review used to be as final as a successful one: one
+// `auto_review_error` at the current head and the task was never picked again,
+// so any transient blip (a model timeout, a rate limit, an expired login)
+// silently retired that card until someone pushed a new commit. An auth outage
+// left 31 of 36 review cards in exactly that state (HIVE-497). So failures now
+// get a bounded retry budget per PR head instead.
+//
+// Five identical tries turned out to be four wasted ones: 15 timeouts across 4
+// PRs in three hours (HIVE-567) were all the SAME 180s call repeated. Measured
+// against those exact PRs, one review takes 15-40s; the timeouts all fell in
+// one 45-minute window where every model call was slow (a 15-minute explain
+// run timed out in it too). So the budget was never the problem and a bigger
+// one would not have helped. Two tries, and the second one is SMALLER — a
+// short diff is the one variable the reviewer controls when the model route is
+// the slow part.
+export const MAX_REVIEW_ATTEMPTS = 2;
+const RETRY_BASE_MS = 5 * 60_000; // 5 min before the one retry
+const MAX_RETRY_DELAY_MS = 60 * 60_000;
+
+// Does this recorded review event describe the head we are about to review?
+// Without a PR there is no head to key to, so any event for the task counts.
+function coversHead(payload: any, task: any): boolean {
+  if (!task.pr_url) return true;
+  return payload?.reviewed_pr_url === task.pr_url && payload?.reviewed_head_sha === task.head_sha;
+}
+
+// Failed pre-reviews already recorded for this task at this head, newest first.
+// `auth` marks the ones that were a property of the FLEET (no valid login), not
+// of this task.
+export function failedReviewAttempts(db: DB, task: any): { ts: string; error: string; auth: boolean }[] {
+  const rows: any[] = db
+    .query(`SELECT ts, payload FROM events WHERE task_id = ? AND type = 'auto_review_error' ORDER BY ts DESC, rowid DESC`)
+    .all(task.id);
+  const out: { ts: string; error: string; auth: boolean }[] = [];
+  for (const r of rows) {
+    let payload: any;
+    try {
+      payload = JSON.parse(r.payload);
+    } catch {
+      continue;
+    }
+    if (!coversHead(payload, task)) continue;
+    const error = String(payload?.error ?? "");
+    out.push({ ts: r.ts, error, auth: isAuthFailure(error) });
+  }
+  return out;
+}
+
+// Ready to try again? Every failure, auth or not, delays the next try — one
+// broken login must not turn the reviewer into a hot loop. But only the
+// non-auth ones spend the give-up budget: a fleet-wide outage is not this
+// card's fault, and that is also what frees the cards the HIVE-491 outage
+// poisoned, with no new commit and no manual sweep.
+function retryDue(attempts: { ts: string; auth: boolean }[], nowMs = Date.now()): boolean {
+  if (!attempts.length) return true;
+  if (attempts.filter((a) => !a.auth).length >= MAX_REVIEW_ATTEMPTS) return false;
+  const lastMs = Date.parse(attempts[0]!.ts);
+  if (!Number.isFinite(lastMs)) return true;
+  return nowMs - lastMs >= Math.min(RETRY_BASE_MS * 2 ** (attempts.length - 1), MAX_RETRY_DELAY_MS);
+}
+
+// Record a failed pre-review. When the give-up budget for this head runs out
+// the event carries `gave_up` and the director gets one notification: a card
+// hive has stopped trying to review must not keep looking like one it simply
+// has not got to yet.
+function recordReviewFailure(
+  db: DB,
+  task: any,
+  error: string,
+  reviewIdentity: Record<string, unknown>,
+  elapsedMs?: number
+): void {
+  const auth = isAuthFailure(error);
+  const spent = failedReviewAttempts(db, task).filter((a) => !a.auth).length + (auth ? 0 : 1);
+  const gaveUp = !auth && spent >= MAX_REVIEW_ATTEMPTS;
+  writeEvent(db, {
+    task_id: task.id,
+    source: "system",
+    type: "auto_review_error",
+    payload: {
+      error,
+      attempts: spent,
+      ...(elapsedMs === undefined ? {} : { elapsed_ms: elapsedMs }),
+      ...(gaveUp ? { gave_up: true } : {}),
+      ...reviewIdentity,
+    },
+  });
+  if (!gaveUp) return;
+  // A card hive has stopped reviewing looked EXACTLY like one it had not got
+  // to yet: no verdict, nothing on the review surface, quiet on the board
+  // (HIVE-567). Give-up now writes a real verdict too, the same way two
+  // unparseable runs do. `unavailable` is not `looks_good` and not `caution`,
+  // so no auto-merge path treats it as a pass — it only makes the silence
+  // visible.
+  writeEvent(db, {
+    task_id: task.id,
+    source: "system",
+    type: "auto_review",
+    payload: {
+      verdict: "unavailable",
+      summary: `auto-review could not complete after ${spent} tries. Review it yourself. Last error: ${error.slice(0, 200)}`,
+      risks: [],
+      questions: [],
+      ...reviewIdentity,
+    },
+  });
+  broadcast({ type: "task", task: getTask(db, task.id) });
+  enqueue(db, {
+    kind: "failed",
+    task_id: task.id,
+    title: `Pre-review gave up on #${task.number}`,
+    body: `Hive tried to pre-review this ${MAX_REVIEW_ATTEMPTS} times and failed every time. Review it yourself, or push a commit so hive tries again. Last error: ${error.slice(0, 200)}`,
+  });
+}
+
+// Up to REVIEW_CONCURRENCY reviews per pass, each an independent one-shot.
 export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<void> {
   if (isOffline(db)) return;
-  const t: any = db
+  // A success — a real review or a project-level skip — is what retires a card
+  // at this head. Failures are weighed per candidate below, where the auth
+  // class and the backoff clock can be read.
+  const candidates: any[] = db
     .query(
       `SELECT t.* FROM tasks t
         WHERE t.state = 'in_review'
           AND NOT EXISTS (
-            SELECT 1 FROM events e WHERE e.task_id = t.id AND e.type IN ('auto_review', 'auto_review_error')
+            SELECT 1 FROM events e WHERE e.task_id = t.id AND e.type = 'auto_review'
+              AND json_valid(e.payload)
               AND (
                 t.pr_url IS NULL
-                OR (e.type = 'auto_review' AND json_valid(e.payload) AND json_extract(e.payload, '$.skipped') IS NOT NULL)
+                OR json_extract(e.payload, '$.skipped') IS NOT NULL
                 OR (
-                  json_valid(e.payload)
-                  AND json_extract(e.payload, '$.reviewed_pr_url') = t.pr_url
+                  json_extract(e.payload, '$.reviewed_pr_url') = t.pr_url
                   AND json_extract(e.payload, '$.reviewed_head_sha') = t.head_sha
                 )
               )
           )
           AND ${supervisedSql("t.source", "t.agent_target")}
-        ORDER BY t.updated_at ASC LIMIT 1`
+        ORDER BY t.updated_at ASC`
     )
-    .get();
-  if (!t) return;
+    .all();
+  const due = candidates.filter((c) => retryDue(failedReviewAttempts(db, c))).slice(0, REVIEW_CONCURRENCY);
+  if (!due.length) return;
+  await mapLimit(due, REVIEW_CONCURRENCY, (t) => reviewOne(db, t, deps).catch((e) => {
+    console.error(`[hive] auto-review of task ${t.id} crashed:`, e);
+  }));
+}
+
+// One task's review, start to finish. Every guard below is per-task, so several
+// of these run side by side without seeing each other.
+async function reviewOne(db: DB, t: any, deps: ReviewerDeps): Promise<void> {
   // Guards against a delayed/stale review landing after the task moved on
   // (state left in_review, or the linked PR/branch/head changed underneath
   // it) — the review this pass produces is only good for the exact task and
@@ -177,16 +326,22 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
   const diff = await rawDiff(db, t, shell);
   if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
   if (!diff.ok) {
-    writeEvent(db, { task_id: t.id, source: "system", type: "auto_review_error", payload: { error: diff.error, ...reviewIdentity } });
+    recordReviewFailure(db, t, diff.error, reviewIdentity);
     return;
   }
-  const argv: string[] =
+  const base: string[] =
     Array.isArray(config.reviewer_argv) && config.reviewer_argv.length
       ? [...config.reviewer_argv]
       : [claudeBin(), "-p", "--model", config.model_by_kind?.review ?? "sonnet"];
-  argv.push(reviewPrompt(t, diff.text), "--output-format", "json");
+  const buildArgv = (prompt: string) => [...base, prompt, "--output-format", "json"];
+  // Retry smaller, never identical: the first try already spent the full
+  // budget on the full diff, so repeating it verbatim just spends it again.
+  const priorFailures = failedReviewAttempts(db, t).filter((a) => !a.auth).length;
+  const diffLimit = priorFailures ? RETRY_DIFF_LIMIT : DIFF_LIMIT;
+  const argv = buildArgv(reviewPrompt(t, diff.text, diffLimit));
 
   const exec = deps.exec ?? defaultPlannerExec;
+  const startedMs = Date.now();
   let res;
   try {
     res = await exec(argv, {
@@ -196,34 +351,49 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
     });
   } catch (e: any) {
     if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
-    writeEvent(db, { task_id: t.id, source: "system", type: "auto_review_error", payload: { error: String(e?.message ?? e), ...reviewIdentity } });
+    recordReviewFailure(db, t, String(e?.message ?? e), reviewIdentity, Date.now() - startedMs);
     return;
   }
   // The LLM call is the slow part (up to TIMEOUT_MS) — re-check right after it
   // returns, before trusting anything it said about this head.
   if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
   if (res.timedOut || res.code !== 0) {
-    writeEvent(db, {
-      task_id: t.id,
-      source: "system",
-      type: "auto_review_error",
-      payload: {
-        error: res.timedOut ? `timed out after ${TIMEOUT_MS}ms` : `exited ${res.code}: ${res.stderr.trim().slice(0, 300)}`,
-        ...reviewIdentity,
-      },
-    });
+    recordReviewFailure(db, t, modelFailure(db, res, { timeoutMs: TIMEOUT_MS }), reviewIdentity, Date.now() - startedMs);
     return;
   }
-  const review = extractReview(res.stdout);
+  noteModelCall(db, null);
+  let review = extractReview(res.stdout);
   if (!review) {
+    // Retry once with a stricter format instruction before giving up — most
+    // unparseable output is prose wrapped around the JSON, not a model that
+    // refuses the format outright (task HIVE-446).
+    const retryArgv = buildArgv(`${reviewPrompt(t, diff.text, diffLimit)}\n\nSTRICT: output ONLY the JSON object, nothing else — no prose, no markdown fences.`);
+    let retryRes;
+    try {
+      retryRes = await exec(retryArgv, { timeoutMs: TIMEOUT_MS });
+    } catch {
+      retryRes = null;
+    }
+    if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
+    if (retryRes && !retryRes.timedOut && retryRes.code === 0) review = extractReview(retryRes.stdout);
+  }
+  if (!review) {
+    // Two unparseable attempts in a row is a dead end, not a transient blip:
+    // record a real verdict (not just an error) so autoMergeReady/land surfaces
+    // stop showing "-" forever, and the NOT EXISTS guard in the query above
+    // stops retrying this exact head.
+    const streak = Number(getSetting(db, "reviewer_parse_failure_streak") ?? "0") + 1;
+    setSetting(db, "reviewer_parse_failure_streak", String(streak));
     writeEvent(db, {
       task_id: t.id,
       source: "system",
-      type: "auto_review_error",
-      payload: { error: "unparseable reviewer output", ...reviewIdentity },
+      type: "auto_review",
+      payload: { verdict: "unparseable", summary: "auto-reviewer produced unparseable output twice; needs a human look", risks: [], questions: [], ...reviewIdentity },
     });
+    broadcast({ type: "task", task: getTask(db, t.id) });
     return;
   }
+  setSetting(db, "reviewer_parse_failure_streak", "0");
   // `files` is what the reviewed diff touched. Read back by
   // understandingChecksRequired (hive-1559) to spot sensitive paths without
   // re-shelling out to git for every task on a director surface.
@@ -251,11 +421,127 @@ export async function autoReviewOnce(db: DB, deps: ReviewerDeps = {}): Promise<v
   }
 }
 
+// The latest usable review for a task, or null when there is none (only a skip
+// or a malformed payload). Lives with the code that WRITES these events; api.ts
+// and reconciler.ts import it rather than keeping a second copy.
+//
+// Failed attempts (`auto_review_error`) are NOT read here. A later failure does
+// not un-review an earlier success: the review happened, and its risk verdicts
+// are still keyed to that head. Counting it made autoMergeReady (which reads
+// successes only) and understandingChecksRequired (which read both) disagree
+// about the same task, so the reconciler asked for a merge every cycle and the
+// merge refused every cycle, forever (HIVE-499). Callers that care about
+// freshness compare `reviewed_head_sha` to the head they are about to act on.
+export interface AutoReviewVerdict {
+  verdict: string;
+  files: string[];
+  risks: string[];
+  questions: string[];
+  reviewed_pr_url?: string;
+  reviewed_head_sha?: string;
+}
+
+export function latestAutoReviewVerdict(db: DB, taskId: string): AutoReviewVerdict | null {
+  const row = db
+    .query(
+      `SELECT payload FROM events WHERE task_id = ? AND type = 'auto_review'
+        ORDER BY ts DESC, rowid DESC LIMIT 1`
+    )
+    .get(taskId) as { payload: string } | undefined;
+  return row ? parseAutoReview(row.payload) : null;
+}
+
+// The row-to-verdict half of latestAutoReviewVerdict, so the batched form
+// (reviewActionableBatch) reads an auto_review row exactly the same way.
+function parseAutoReview(raw: string): AutoReviewVerdict | null {
+  try {
+    const payload = JSON.parse(raw);
+    if (payload?.skipped || typeof payload?.verdict !== "string") return null;
+    return {
+      verdict: payload.verdict,
+      files: Array.isArray(payload.files) ? payload.files.map(String) : [],
+      risks: Array.isArray(payload.risks) ? payload.risks.map(String) : [],
+      questions: Array.isArray(payload.questions) ? payload.questions.map(String) : [],
+      reviewed_pr_url: typeof payload.reviewed_pr_url === "string" ? payload.reviewed_pr_url : undefined,
+      reviewed_head_sha: typeof payload.reviewed_head_sha === "string" ? payload.reviewed_head_sha : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Risks are normally verified at the tail of autoReviewOnce, but that pass
+// never revisits a task it has already reviewed at this head. So a review whose
+// verification did not finish keeps NO covering verdict set and nothing ever
+// produces one: ambiguityCleared rejects it on every lap and the task parks in
+// review with no card, no signal and no way out. Two ways in, both seen live:
+//   - verifyRisks returned early (stillCurrent went false mid-pass, or a run
+//     timed out) before it could write its event, and
+//   - a SECOND auto_review landed for the same head with a different risk list,
+//     leaving the first pass's verdicts no longer covering the latest review.
+// This pass is the missing half — it verifies any in_review task whose latest
+// review is still uncovered, whether or not that review is new.
+export async function verifyPendingOnce(db: DB, deps: ReviewerDeps = {}): Promise<void> {
+  if (isOffline(db)) return;
+  const shell = deps.shellExec ?? defaultExec;
+  const rows: any[] = db
+    .query(
+      `SELECT t.* FROM tasks t
+        WHERE t.state = 'in_review' AND ${supervisedSql("t.source", "t.agent_target")}
+        ORDER BY t.updated_at ASC`
+    )
+    .all();
+  // Cheap DB-only filtering first, so the bounded fan-out below spends its slots
+  // on tasks that actually need a verification run.
+  const pending: any[] = [];
+  for (const t of rows) {
+    if (!t.head_sha) continue; // nothing to key verdicts to
+    const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(t.project_id);
+    if (JSON.parse(project?.config ?? "{}").auto_review === false) continue;
+    const review = latestAutoReviewVerdict(db, t.id);
+    if (!review || review.reviewed_head_sha !== t.head_sha) continue;
+    const risks = (review.risks ?? []).slice(0, MAX_VERIFIED_RISKS);
+    const questions = (review.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS);
+    if (!risks.length && !questions.length) continue;
+    if (hasRiskVerdicts(db, t.id, t.head_sha, risks.length + questions.length)) continue;
+    pending.push({ t, risks, questions });
+    if (pending.length >= REVIEW_CONCURRENCY) break;
+  }
+  await mapLimit(pending, REVIEW_CONCURRENCY, async ({ t, risks, questions }) => {
+    const diff = await rawDiff(db, t, shell);
+    if (!diff.ok) return;
+    console.error(`[hive] verifying uncovered review for task ${t.id} at ${String(t.head_sha).slice(0, 7)}`);
+    await verifyRisks(
+      db,
+      t,
+      {
+        risks,
+        questions,
+        head: t.head_sha,
+        diff: diff.text,
+        stillCurrent: async () => {
+          const current: any = getTask(db, t.id);
+          return (
+            !!current &&
+            current.state === "in_review" &&
+            current.head_sha === t.head_sha &&
+            (!t.pr_url || (await livePrHead(shell, t.pr_url)) === t.head_sha)
+          );
+        },
+      },
+      deps
+    ).catch((e) => console.error(`[hive] verification of task ${t.id} crashed:`, e));
+  });
+}
+
 export function startAutoReviewer(db: DB, deps: ReviewerDeps & { intervalMs?: number } = {}): () => void {
-  const timer = setInterval(() => {
-    autoReviewOnce(db, deps).catch((e) => console.error("[hive] auto-review crashed:", e));
-  }, deps.intervalMs ?? 60_000);
-  return () => clearInterval(timer);
+  // startLoop, not setInterval: a pass now runs several reviews at once and can
+  // easily outlast the 60s tick. A tick landing on a running pass is dropped —
+  // the next one re-reads the board anyway.
+  return startLoop("auto-review", deps.intervalMs ?? 60_000, async () => {
+    await autoReviewOnce(db, deps);
+    await verifyPendingOnce(db, deps);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +561,20 @@ export function startAutoReviewer(db: DB, deps: ReviewerDeps & { intervalMs?: nu
 const MAX_VERIFIED_RISKS = 5;
 const MAX_VERIFIED_QUESTIONS = 5;
 const VERIFY_MODEL = "opus";
+
+// A run that TIMED OUT is not a judgement: the findings it never reached are
+// unknown, not confirmed (HIVE-539). So an `unverified` set does not close the
+// head — the next pass retries only the findings still missing a verdict and
+// carries the ones already produced forward, so a slow finding never voids the
+// verdicts beside it. Bounded, or a finding too big for the budget would re-run
+// every minute for ever.
+const MAX_VERIFY_ATTEMPTS = 3;
+
+// The 60s reviewer tick is shorter than one verification pass (up to
+// TIMEOUT_MS per finding), so without this every tick stacked ANOTHER full pass
+// on the same head: six overlapping runs all timing out, each overwriting the
+// last with an emptier result (observed on corebeat ed28a0ca27c6).
+const verifyInFlight = new Set<string>();
 
 export interface RiskVerdict {
   risk: string;
@@ -332,7 +632,70 @@ export function extractAnswer(raw: string): { answerable: "machine" | "human"; a
   });
 }
 
-function verifyPrompt(task: any, risk: string, diff: string): string {
+// Answered decisions on this task, oldest first, each with the date it was
+// answered (HIVE-571). The risk check saw only the diff, so a product ambiguity
+// the director had ALREADY ruled on came back as a merge-blocking risk: on
+// corebeat 3f6e5ffe5aaa the finding was "if the reporter meant separate
+// windows, this ships the wrong UI", which is exactly the question decision
+// dec_3874b7587abf answered. Same blind spot the scope check had, same input
+// fixes it (drift.ts directionSinceBrief).
+const MAX_SETTLED_DECISIONS = 8;
+
+function answeredDecisions(db: DB, taskId: string): { ts: string; text: string }[] {
+  const rows: any[] = db
+    .query(
+      `SELECT answered_at AS ts, title, options, answer_key, answer_note FROM decisions
+        WHERE task_id = ? AND status = 'answered' ORDER BY answered_at`
+    )
+    .all(taskId);
+  return rows.slice(-MAX_SETTLED_DECISIONS).map((d) => {
+    let label = String(d.answer_key ?? "");
+    try {
+      const opt = JSON.parse(d.options || "[]").find((o: any) => o.key === d.answer_key);
+      if (opt) label = `${opt.label ?? opt.key}${opt.detail ? ` — ${opt.detail}` : ""}`;
+    } catch {}
+    return {
+      ts: String(d.ts ?? ""),
+      text: `${d.title} → chose: ${label}${d.answer_note ? ` (${d.answer_note})` : ""}`,
+    };
+  });
+}
+
+// Commits on this branch with their dates, so the judge can tell a settled
+// question from a NEW behaviour: a decision answered on an older head does not
+// absolve code written after it. Best effort — no commits just means judging
+// on the decisions and the diff, as before.
+async function branchCommits(db: DB, task: any, exec: Exec): Promise<string[]> {
+  const project: any = db.query("SELECT repo_path, config FROM projects WHERE id = ?").get(task.project_id);
+  const repo = task.worktree_path ?? project?.repo_path;
+  const ref = task.worktree_path ? "HEAD" : task.branch;
+  if (!repo || !ref) return [];
+  const base = projectComparisonBase(JSON.parse(project?.config ?? "{}"));
+  const r = await exec([
+    "git", "-C", repo, "log", "--first-parent", "--no-merges",
+    "--date=iso-strict", "--format=%h %ad %s", "-n", "20", `${base}..${ref}`,
+  ]);
+  if (r.code !== 0) return [];
+  return r.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+// The settled-decision block of the verify prompt, or "" when the task has none.
+function settledBlock(decisions: { ts: string; text: string }[], commits: string[]): string {
+  if (!decisions.length) return "";
+  return [
+    `The director has ALREADY ruled on this task. These questions are settled:`,
+    ...decisions.map((d) => `- answered ${d.ts.slice(0, 10)}: ${d.text}`),
+    ...(commits.length ? [``, `Commits on this branch, newest first (short sha, date, subject):`, ...commits.map((c) => `- ${c}`)] : []),
+    `A risk that only re-asks a settled question is NOT a live risk. Answer 'refuted' and start`,
+    `'why' with "settled: " plus the ruling and the date, so the reader sees it in one glance.`,
+    `Two things still count as confirmed: a defect in the code itself (a real bug, not a different`,
+    `reading of what was wanted), or behaviour introduced by a commit made AFTER the ruling that`,
+    `answers it — then confirm and name that commit in 'why'.`,
+    ``,
+  ].join("\n");
+}
+
+function verifyPrompt(task: any, risk: string, diff: string, settled = ""): string {
   return [
     `A code reviewer flagged ONE risk on a pull request. Decide whether it is real.`,
     `Be adversarial: try to refute it. Say 'confirmed' only if you can point at the code that makes it true.`,
@@ -342,6 +705,7 @@ function verifyPrompt(task: any, risk: string, diff: string): string {
     `Task #${task.number}: ${task.title}`,
     task.worktree_path ? `The full checkout is at ${task.worktree_path} — read files there to check. Do not edit anything.` : ``,
     ``,
+    settled,
     `Diff (may be truncated):`,
     diff.slice(0, DIFF_LIMIT),
     ``,
@@ -383,22 +747,30 @@ function answerPrompt(task: any, question: string, diff: string): string {
 }
 
 // Already verified for this exact PR head? Then don't spend the model again.
-function hasRiskVerdicts(db: DB, taskId: string, head: string): boolean {
+//
+// The head alone is not enough to answer that. autoReviewOnce can write a
+// SECOND auto_review for the same head (overlapping reconciler laps), and the
+// new review's risk and question lists are regenerated, so they routinely
+// differ from the ones the stored verdicts were produced for. Keying only on
+// the head made that set look reusable forever, while ambiguityCleared compares
+// it against the LATEST review and rejects it on the count mismatch — the task
+// parks with no card and no signal, and nothing ever re-runs the pass to fix it
+// (observed on HIVE-445/HIVE-455: 3 risks vs 2 verdicts, 1 question vs 0).
+//
+// So a stored set counts as covering this review only when it accounts for
+// every risk and question the review actually raised. Anything else re-verifies.
+function hasRiskVerdicts(db: DB, taskId: string, head: string, expected: number): boolean {
   const rows = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts'").all(taskId) as { payload: string }[];
-  return rows.some((r) => {
-    try {
-      return JSON.parse(r.payload)?.reviewed_head_sha === head;
-    } catch {
-      return false;
-    }
-  });
+  return rows.some((r) => coversReview(r.payload, head, expected));
 }
 
-// One opus run per risk and per question, in sequence, each capped. A run that
-// fails or returns junk is left out and counted in `unverified`, so a broken
-// run never reads as an all-clear. `stillCurrent` is re-checked between runs:
-// these verdicts now decide whether a PR auto-merges, so a set produced for a
-// head that has since been force-pushed must never be written at all.
+// One opus run per risk and per question, up to RISK_CONCURRENCY at a time,
+// each capped. They are independent one-shots with no ordering between them. A
+// run that fails or returns junk is left out and counted in `unverified`, so a
+// broken run never reads as an all-clear. `stillCurrent` is checked before each
+// run starts and again before anything is written: these verdicts now decide
+// whether a PR auto-merges, so a set produced for a head that has since been
+// force-pushed must never be written at all.
 export async function verifyRisks(
   db: DB,
   task: any,
@@ -408,8 +780,88 @@ export async function verifyRisks(
   const risks = (input.risks ?? []).slice(0, MAX_VERIFIED_RISKS);
   const questions = (input.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS);
   if (!risks.length && !questions.length) return;
-  if (hasRiskVerdicts(db, task.id, input.head)) return;
+  // What this head already has a verdict for. Anything here is never re-run and
+  // never dropped: this pass only fills the gaps and rewrites the whole set.
+  // Read across EVERY pass for this head, not just the newest one — a later run
+  // that timed out wrote an emptier set over a good one, and those verdicts are
+  // still true (they were produced for this exact head). Matched by the finding's
+  // own text, so a verdict for a risk the current review no longer raises is
+  // simply never used.
+  const { knownRisk, knownQuestion } = priorVerdicts(db, task.id, input.head);
+  const todoRisks = risks.filter((r) => !knownRisk.has(r));
+  const todoQuestions = questions.filter((q) => !knownQuestion.has(q));
+  if (!todoRisks.length && !todoQuestions.length) return; // fully verified for this head
+  if (verifyAttempts(db, task.id, input.head) >= MAX_VERIFY_ATTEMPTS) return; // retries spent; the gap stands
+  const flightKey = `${task.id}:${input.head}`;
+  if (verifyInFlight.has(flightKey)) return;
+  verifyInFlight.add(flightKey);
+  try {
+    await runVerification(db, task, input, deps, { risks, questions, knownRisk, knownQuestion, todoRisks, todoQuestions });
+  } finally {
+    verifyInFlight.delete(flightKey);
+  }
+}
+
+// Every verdict any pass produced for this head, newest pass winning on a tie.
+function priorVerdicts(
+  db: DB,
+  taskId: string,
+  head: string
+): { knownRisk: Map<string, RiskVerdict>; knownQuestion: Map<string, QuestionVerdict> } {
+  const knownRisk = new Map<string, RiskVerdict>();
+  const knownQuestion = new Map<string, QuestionVerdict>();
+  const rows = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts' ORDER BY ts DESC, rowid DESC")
+    .all(taskId) as { payload: string }[];
+  for (const r of rows) {
+    let p: any;
+    try {
+      p = JSON.parse(r.payload);
+    } catch {
+      continue;
+    }
+    if (p?.reviewed_head_sha !== head) continue;
+    for (const v of Array.isArray(p.verdicts) ? p.verdicts : []) if (v?.risk && !knownRisk.has(v.risk)) knownRisk.set(v.risk, v);
+    for (const q of Array.isArray(p.question_verdicts) ? p.question_verdicts : [])
+      if (q?.question && !knownQuestion.has(q.question)) knownQuestion.set(q.question, q);
+  }
+  return { knownRisk, knownQuestion };
+}
+
+// How many verification passes this head has already written. One event per
+// finished pass, so this is the retry counter MAX_VERIFY_ATTEMPTS caps.
+function verifyAttempts(db: DB, taskId: string, head: string): number {
+  return (
+    db
+      .query(
+        "SELECT COUNT(*) n FROM events WHERE task_id = ? AND type = 'risk_verdicts' AND json_extract(payload, '$.reviewed_head_sha') = ?"
+      )
+      .get(taskId, head) as { n: number }
+  ).n;
+}
+
+async function runVerification(
+  db: DB,
+  task: any,
+  input: { head: string; diff: string; stillCurrent?: () => boolean | Promise<boolean> },
+  deps: ReviewerDeps,
+  plan: {
+    risks: string[];
+    questions: string[];
+    knownRisk: Map<string, RiskVerdict>;
+    knownQuestion: Map<string, QuestionVerdict>;
+    todoRisks: string[];
+    todoQuestions: string[];
+  }
+): Promise<void> {
+  const { risks, questions, knownRisk, knownQuestion, todoRisks, todoQuestions } = plan;
   const exec = deps.exec ?? defaultPlannerExec;
+  // Read once per pass, not once per risk: the same block goes into every
+  // risk prompt.
+  const decisions = answeredDecisions(db, task.id);
+  const settled = decisions.length
+    ? settledBlock(decisions, await branchCommits(db, task, deps.shellExec ?? defaultExec))
+    : "";
   const current = async () => (input.stillCurrent ? await input.stillCurrent() : true);
   const run = async (prompt: string) => {
     try {
@@ -422,21 +874,49 @@ export async function verifyRisks(
       return null;
     }
   };
+  let unverified = 0;
+  // Why a run failed. `unverified` alone reads as "the model was unsure"; an
+  // auth outage is a completely different story (hive-1800). With runs in
+  // flight together this is one of the reasons, not strictly the last.
+  let unverified_reason: string | null = null;
+  let aborted = false;
+  const jobs = [
+    ...todoRisks.map((risk) => ({ kind: "risk" as const, text: risk, prompt: verifyPrompt(task, risk, input.diff, settled) })),
+    ...todoQuestions.map((q) => ({ kind: "question" as const, text: q, prompt: answerPrompt(task, q, input.diff) })),
+  ];
+  const results = await mapLimit(jobs, RISK_CONCURRENCY, async (job) => {
+    if (aborted) return null;
+    if (!(await current())) {
+      aborted = true;
+      return null;
+    }
+    const res = await run(job.prompt);
+    const failed = !res || noteModelCall(db, res.code === 0 && !res.timedOut ? null : modelErrorText(res, { timeoutMs: TIMEOUT_MS }));
+    if (typeof failed === "string") unverified_reason = failed;
+    if (failed) return { job, value: null };
+    return { job, value: job.kind === "risk" ? extractVerdict(res!.stdout) : extractAnswer(res!.stdout) };
+  });
+  if (aborted) return;
+  const freshRisk = new Map<string, any>();
+  const freshQuestion = new Map<string, any>();
+  for (const r of results) {
+    if (!r) return; // a slot bailed on stillCurrent: write nothing
+    if (!r.value) continue;
+    (r.job.kind === "risk" ? freshRisk : freshQuestion).set(r.job.text, r.value);
+  }
+  // Re-assembled in the original risks-then-questions order, so a verdict set
+  // reads the same whichever run finished first — and an earlier pass's verdict
+  // counts exactly like one produced just now.
   const verdicts: RiskVerdict[] = [];
   const question_verdicts: QuestionVerdict[] = [];
-  let unverified = 0;
   for (const risk of risks) {
-    if (!(await current())) return;
-    const res = await run(verifyPrompt(task, risk, input.diff));
-    const v = !res || res.timedOut || res.code !== 0 ? null : extractVerdict(res.stdout);
-    if (v) verdicts.push({ risk, ...v });
+    const v = knownRisk.get(risk) ?? freshRisk.get(risk);
+    if (v) verdicts.push({ ...(v as any), risk });
     else unverified++;
   }
   for (const question of questions) {
-    if (!(await current())) return;
-    const res = await run(answerPrompt(task, question, input.diff));
-    const a = !res || res.timedOut || res.code !== 0 ? null : extractAnswer(res.stdout);
-    if (a) question_verdicts.push({ question, ...a });
+    const a = knownQuestion.get(question) ?? freshQuestion.get(question);
+    if (a) question_verdicts.push({ ...(a as any), question });
     else unverified++;
   }
   if (!(await current())) return;
@@ -449,9 +929,34 @@ export async function verifyRisks(
       verdicts,
       ...(question_verdicts.length ? { question_verdicts } : {}),
       ...(unverified ? { unverified } : {}),
+      ...(unverified_reason ? { unverified_reason } : {}),
     } as any,
   });
   broadcast({ type: "task", task: getTask(db, task.id) });
+}
+
+// Does one stored risk_verdicts row account for this exact head's whole review?
+// Split out of hasRiskVerdicts so the batched path applies the identical test.
+function coversReview(raw: string, head: string, expected: number): boolean {
+  try {
+    const p = JSON.parse(raw);
+    if (p?.reviewed_head_sha !== head) return false;
+    const covered =
+      (Array.isArray(p.verdicts) ? p.verdicts.length : 0) +
+      (Array.isArray(p.question_verdicts) ? p.question_verdicts.length : 0) +
+      (typeof p.unverified === "number" ? p.unverified : 0);
+    return covered === expected;
+  } catch {
+    return false;
+  }
+}
+
+// How many verdicts a review must have before it counts as fully verified.
+function expectedVerdicts(review: AutoReviewVerdict): number {
+  return (
+    (review.risks ?? []).slice(0, MAX_VERIFIED_RISKS).length +
+    (review.questions ?? []).slice(0, MAX_VERIFIED_QUESTIONS).length
+  );
 }
 
 // What the risk check decided for one PR head, or null when it never ran for
@@ -462,7 +967,7 @@ export function riskVerdictsFor(
   db: DB,
   taskId: string,
   head: string | null | undefined
-): { verdicts: RiskVerdict[]; question_verdicts: QuestionVerdict[]; unverified: number } | null {
+): { verdicts: RiskVerdict[]; question_verdicts: QuestionVerdict[]; unverified: number; unverified_reason: string | null } | null {
   if (!head) return null;
   const rows = db
     .query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts' ORDER BY ts DESC, rowid DESC")
@@ -479,9 +984,187 @@ export function riskVerdictsFor(
       verdicts: Array.isArray(p.verdicts) ? p.verdicts : [],
       question_verdicts: Array.isArray(p.question_verdicts) ? p.question_verdicts : [],
       unverified: Number(p.unverified) || 0,
+      unverified_reason: typeof p.unverified_reason === "string" ? p.unverified_reason : null,
     };
   }
   return null;
+}
+
+// Has the review pipeline actually FINISHED for this head (HIVE-488)? Read
+// from the other side, this is the same test verifyPendingOnce uses to decide a
+// task needs no further verification: the newest review was written for this
+// exact head, and every risk and question it raised already has a verdict keyed
+// to that head. Until then the missing quiz answer is a pass that has not run,
+// not a question for the director — so the director surfaces must not count it.
+export function reviewCompleteForHead(db: DB, taskId: string, head: string | null | undefined): boolean {
+  if (!head) return false;
+  const review = latestAutoReviewVerdict(db, taskId);
+  if (!review || review.reviewed_head_sha !== head) return false;
+  const expected = expectedVerdicts(review);
+  return expected === 0 || hasRiskVerdicts(db, taskId, head, expected);
+}
+
+// Is there any further review work COMING for this head, or is what we have as
+// complete as the review will ever get? Nothing coming means either no head to
+// key verdicts to or a project that never auto-reviews (the reviewer skips
+// both); otherwise the pipeline must have finished for this exact head.
+export function reviewPipelineSettled(
+  db: DB,
+  task: { id: string; head_sha?: string | null; project_id: string }
+): boolean {
+  if (!task.head_sha) return true;
+  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+  if (JSON.parse(project?.config ?? "{}").auto_review === false) return true;
+  return reviewCompleteForHead(db, task.id, task.head_sha);
+}
+
+// Can the DIRECTOR act on this review right now (HIVE-500)? The review column
+// counts everything in_review, but most of it is still the agent's or the
+// pipeline's work, not a decision waiting on a human. Two rules:
+//   - WITH a pull request: CI must not be red or still running (a red build is
+//     the agent's to fix), and the review pipeline must have settled on the
+//     live head, or the director would read a report about a stale commit.
+//   - WITHOUT a pull request: there must be something to READ — a self-review
+//     summary or a report attached as evidence. A task with neither has no
+//     work product and nothing to merge; it is unfinished agent work, and
+//     health surfaces it as stuck instead.
+// Anything false here stays VISIBLE as in-review; it just must not be counted
+// as something needing the director.
+export function reviewActionable(
+  db: DB,
+  task: { id: string; state: string; pr_url?: string | null; ci_status?: string | null; head_sha?: string | null; project_id: string }
+): boolean {
+  if (task.state !== "in_review") return false;
+  if (task.pr_url) {
+    // Matches advanceIfFinished / landQueue: only failing and pending hold.
+    // A null or 'unavailable' rollup means a repo (or check run) that never
+    // reports, and holding the review there would hide mergeable work forever.
+    if (task.ci_status === "failing" || task.ci_status === "pending") return false;
+    return reviewPipelineSettled(db, task);
+  }
+  return hasDirectorReport(db, task.id);
+}
+
+export interface ReviewActionableTask {
+  id: string;
+  state: string;
+  pr_url?: string | null;
+  ci_status?: string | null;
+  head_sha?: string | null;
+  project_id: string;
+}
+
+// Batched form of reviewActionable for list endpoints, the same reason
+// latestSidecarBatch exists: the single-task rule runs up to five queries, and
+// a board with thirty in-review cards paid all of them once per card. This
+// applies the identical rule with a fixed number of queries instead.
+// Returns the ids that ARE actionable; anything absent is not.
+export function reviewActionableBatch(db: DB, tasks: ReviewActionableTask[]): Set<string> {
+  const actionable = new Set<string>();
+  const candidates = tasks.filter((t) => t.state === "in_review");
+  if (candidates.length === 0) return actionable;
+
+  // No pull request: actionable only when there is something to READ.
+  const noPr = candidates.filter((t) => !t.pr_url);
+  if (noPr.length > 0) {
+    const ids = noPr.map((t) => t.id);
+    const ph = ids.map(() => "?").join(",");
+    for (const row of db
+      .query(`SELECT DISTINCT task_id FROM events WHERE type = 'review_summary' AND task_id IN (${ph})`)
+      .all(...ids) as { task_id: string }[])
+      actionable.add(row.task_id);
+    for (const row of db
+      .query(`SELECT DISTINCT task_id FROM evidence WHERE kind = 'report' AND task_id IN (${ph})`)
+      .all(...ids) as { task_id: string }[])
+      actionable.add(row.task_id);
+  }
+
+  // With a pull request: red or running CI is still the agent's problem.
+  const live = candidates.filter(
+    (t) => t.pr_url && t.ci_status !== "failing" && t.ci_status !== "pending"
+  );
+  if (live.length === 0) return actionable;
+
+  const projectIds = [...new Set(live.map((t) => t.project_id))];
+  const noAutoReview = new Set(
+    (db
+      .query(`SELECT id, config FROM projects WHERE id IN (${projectIds.map(() => "?").join(",")})`)
+      .all(...projectIds) as { id: string; config: string | null }[])
+      .filter((p) => {
+        try {
+          return JSON.parse(p.config ?? "{}").auto_review === false;
+        } catch {
+          return false;
+        }
+      })
+      .map((p) => p.id)
+  );
+
+  // Nothing further is coming for these, so what we have is as complete as it gets.
+  const needSettle: ReviewActionableTask[] = [];
+  for (const t of live) {
+    if (!t.head_sha || noAutoReview.has(t.project_id)) actionable.add(t.id);
+    else needSettle.push(t);
+  }
+  if (needSettle.length === 0) return actionable;
+
+  const ids = needSettle.map((t) => t.id);
+  const ph = ids.map(() => "?").join(",");
+  // Newest auto_review per task, read in the same order latestAutoReviewVerdict uses.
+  const latest = new Map<string, AutoReviewVerdict | null>();
+  for (const row of db
+    .query(
+      `SELECT task_id, payload FROM events WHERE type = 'auto_review' AND task_id IN (${ph})
+        ORDER BY ts DESC, rowid DESC`
+    )
+    .all(...ids) as { task_id: string; payload: string }[])
+    if (!latest.has(row.task_id)) latest.set(row.task_id, parseAutoReview(row.payload));
+
+  const verdictRows = new Map<string, string[]>();
+  for (const row of db
+    .query(`SELECT task_id, payload FROM events WHERE type = 'risk_verdicts' AND task_id IN (${ph})`)
+    .all(...ids) as { task_id: string; payload: string }[]) {
+    const list = verdictRows.get(row.task_id);
+    if (list) list.push(row.payload);
+    else verdictRows.set(row.task_id, [row.payload]);
+  }
+
+  for (const t of needSettle) {
+    const review = latest.get(t.id);
+    if (!review || review.reviewed_head_sha !== t.head_sha) continue;
+    const expected = expectedVerdicts(review);
+    if (expected === 0) {
+      actionable.add(t.id);
+      continue;
+    }
+    const rows = verdictRows.get(t.id) ?? [];
+    if (rows.some((raw) => coversReview(raw, t.head_sha!, expected))) actionable.add(t.id);
+  }
+  return actionable;
+}
+
+// Something the director can actually read: the agent's own review summary, or
+// a report attached as evidence (how scouts hand work over).
+export function hasDirectorReport(db: DB, taskId: string): boolean {
+  if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'review_summary' LIMIT 1").get(taskId)) return true;
+  return !!db.query("SELECT 1 FROM evidence WHERE task_id = ? AND kind = 'report' LIMIT 1").get(taskId);
+}
+
+// Findings the risk check never reached on this head — a timeout or a model
+// outage, not a judgement. Kept separate from confirmedRisks so the merge gate
+// can say "I could not check" instead of quoting a risk as confirmed (HIVE-539).
+export function unfinishedRiskCheck(
+  db: DB,
+  taskId: string,
+  head: string | null | undefined
+): { unverified: number; checked: number; reason: string | null } | null {
+  const found = riskVerdictsFor(db, taskId, head);
+  if (!found || !found.unverified) return null;
+  return {
+    unverified: found.unverified,
+    checked: found.verdicts.length + found.question_verdicts.length,
+    reason: found.unverified_reason,
+  };
 }
 
 export function confirmedRisks(db: DB, taskId: string, head: string | null | undefined): RiskVerdict[] {

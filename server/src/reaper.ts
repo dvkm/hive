@@ -13,10 +13,12 @@ import { setSetting, now, isOffline } from "./db.ts";
 import { getTask, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, parseWorktreeList, paneHasLiveProcess, type PaneInfo } from "./runtime/herdr.ts";
 import { cleanupTask, releaseReviewAgents } from "./cleanup.ts";
+import { activeProjects } from "./testProjects.ts";
 import { teardownBlocked } from "./teardownGuard.ts";
 import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
+import { startLoop } from "./loop.ts";
 
 export interface ReaperDeps {
   herdr?: Herdr;
@@ -51,9 +53,7 @@ export async function reapOnce(db: DB, deps: ReaperDeps = {}): Promise<void> {
   }
   const herdr = deps.herdr ?? defaultHerdr;
   const exec = deps.exec ?? defaultExec;
-  const projects = db
-    .query("SELECT id, repo_path FROM projects WHERE repo_path IS NOT NULL")
-    .all() as { id: string; repo_path: string }[];
+  const projects = activeProjects(db).filter((p) => p.repo_path) as { id: string; repo_path: string }[];
 
   for (const p of projects) {
     let list;
@@ -346,9 +346,5 @@ async function reapOrphan(db: DB, herdr: Herdr, repoPath: string, branch: string
 
 // Background loop. Started only from index.ts (never in tests).
 export function startReaper(db: DB, deps: ReaperDeps & { intervalMs?: number } = {}): () => void {
-  const intervalMs = deps.intervalMs ?? 300_000;
-  const timer = setInterval(() => {
-    reapOnce(db, deps).catch((e) => console.error("[hive] reaper cycle crashed:", e));
-  }, intervalMs);
-  return () => clearInterval(timer);
+  return startLoop("reaper", deps.intervalMs ?? 300_000, () => reapOnce(db, deps));
 }

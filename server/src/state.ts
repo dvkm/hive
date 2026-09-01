@@ -5,6 +5,7 @@
 // Any non-terminal state -> failed | cancelled (with a reason event).
 // Transition to `done` is REJECTED unless >= 1 evidence row exists
 // (scouts additionally require an evidence row of kind = 'report').
+import { execSync } from "node:child_process";
 import type { DB } from "./db.ts";
 import { newId, now } from "./db.ts";
 import { broadcast } from "./bus.ts";
@@ -279,6 +280,41 @@ export function noteDependencyBlock(
   broadcastTask(db, getTask(db, taskId));
 }
 
+// Why the dispatcher skipped a queued task, and whether that answer can change
+// on its own. "not yet" = the task is waiting for something that normally
+// arrives (capacity, a blocker finishing, your review). "not ever" = nothing
+// will change until a human changes a setting or the task itself — those are
+// the ones that used to sit in `queued` looking healthy for days (HIVE-525).
+export const SKIP_REASONS: Record<string, { label: string; permanent: boolean }> = {
+  no_repo_path: { label: "project has no repo path", permanent: true },
+  gardener_decision: { label: "PR gardener decision card, not agent work", permanent: true },
+  gardener_disabled: { label: "PR gardener is off for this project", permanent: true },
+  auto_dispatch_off: { label: "auto-dispatch is off for this project", permanent: true },
+  kind_excluded: { label: "kind is not in the project's dispatch_kinds", permanent: true },
+  tracking_only: { label: "tracking-only task — never dispatched", permanent: true },
+  authority_denied: { label: "an authority rule denies task.dispatch", permanent: true },
+  intake_unreviewed: { label: "unreviewed intake — waiting on your review", permanent: false },
+  triage_hold: { label: "waiting on your intake triage answer", permanent: false },
+  repo_mismatch: { label: "brief targets another project's repo", permanent: false },
+  dependency_blocked: { label: "blocked by unfinished dependencies", permanent: false },
+  file_overlap: { label: "another running task looks like it edits the same files", permanent: false },
+  authority_decision: { label: "waiting on a dispatch decision card", permanent: false },
+  no_capacity: { label: "at the project's max_agents cap", permanent: false },
+  spawn_backoff: { label: "cooling down after a spawn failure", permanent: false },
+};
+
+// Record (or clear) why a queued task was skipped. Writes ONLY when the reason
+// changed, so the 30s dispatch loop costs one UPDATE per transition and can
+// never flood — the same discipline noteDependencyBlock uses for its event.
+// Deliberately a task FIELD and not an event: a steady-state queue would
+// otherwise mint one row per task per cycle (HIVE-515 burned 485k rows that way).
+export function noteSkip(db: DB, taskId: string, reason: string | null): void {
+  const cur = db.query("SELECT skip_reason FROM tasks WHERE id = ?").get(taskId) as { skip_reason: string | null } | undefined;
+  if (!cur || (cur.skip_reason ?? null) === reason) return;
+  db.query("UPDATE tasks SET skip_reason = ?, skip_reason_at = ? WHERE id = ?").run(reason, reason ? now() : null, taskId);
+  broadcastTask(db, getTask(db, taskId));
+}
+
 // A task deferred pending an OFFLINE human action (e.g. sudo). It stays
 // in_progress, but the stale/nudge machinery skips it while deferred_until is in
 // the future — that is what stops the endless "gone quiet" nudges (task #329
@@ -491,9 +527,10 @@ export function mutateWithEvent<T>(
 export function expireOpenDecisions(db: DB, taskId: string, reason: string): number {
   const rows = db.query("SELECT * FROM decisions WHERE task_id = ? AND status = 'open'").all(taskId) as any[];
   for (const r of rows) {
-    db.query("UPDATE decisions SET status = 'expired' WHERE id = ?").run(r.id);
+    const expiredAt = now();
+    db.query("UPDATE decisions SET status = 'expired', answered_at = ?, answered_by = 'system' WHERE id = ?").run(expiredAt, r.id);
     writeEvent(db, { task_id: taskId, source: "system", type: "decision_expired", payload: { decision_id: r.id, reason } });
-    broadcast({ type: "decision", decision: parseDecision({ ...r, status: "expired" }) });
+    broadcast({ type: "decision", decision: parseDecision({ ...r, status: "expired", answered_at: expiredAt, answered_by: "system" }) });
   }
   return rows.length;
 }
@@ -531,6 +568,18 @@ function trustedRequeueParent(db: DB, task: any): boolean {
       )
       .get(task.id, task.parent_task_id)
   );
+}
+
+export function isSelfAuditLineage(db: DB, task: any | null): boolean {
+  const seen = new Set<string>();
+  let current = task;
+  while (current && !seen.has(current.id)) {
+    if (current.source === "self-audit") return true;
+    if (current.source !== "requeue" || !trustedRequeueParent(db, current)) return false;
+    seen.add(current.id);
+    current = getTask(db, current.parent_task_id);
+  }
+  return false;
 }
 
 // Verify (or quarantine) one requeue task's provenance. Idempotent: a
@@ -689,6 +738,81 @@ export function queuedInputRecoveryPending(db: DB, taskId: string): boolean {
   return !movedOn;
 }
 
+// ---- HIVE-402: the verification contract, enforced at the review handoff ----
+
+// The contract command names that still have no matching evidence. Empty when
+// the task carries no contract, so tasks without one are never gated.
+//
+// Freshness: when the task's head commit is known, evidence must have been
+// attached AFTER that commit landed — the same rule that already governs
+// screenshots (#223), applied to test runs. The commit's arrival time is the
+// first moment any event on the task recorded that head_sha; if nothing did,
+// the name merely has to be present. The comparison is >= because event
+// timestamps are millisecond strings: evidence attached in the same tick as the
+// commit's own event is fresh, not stale.
+export function missingVerifications(db: DB, task: any): string[] {
+  return verificationChecklist(db, task)
+    .filter((c) => !c.satisfied)
+    .map((c) => c.name);
+}
+
+// The same contract, item by item, for anything that has to SHOW the gate
+// rather than just enforce it (the review card's checklist, HIVE-403). Each
+// entry carries the id of the freshest evidence that satisfies it, or null when
+// nothing does — so "missing" on the card is the identical judgement the merge
+// gate makes, not a second guess at it.
+export function verificationChecklist(
+  db: DB,
+  task: any
+): { name: string; cmd: string; satisfied: boolean; evidence_id: string | null }[] {
+  const cmds = task?.verification_cmds;
+  if (!Array.isArray(cmds) || cmds.length === 0) return [];
+  let since = "";
+  if (task.head_sha) {
+    const r = db
+      .query("SELECT MIN(ts) AS ts FROM events WHERE task_id = ? AND json_extract(payload, '$.head_sha') = ?")
+      .get(task.id, task.head_sha) as { ts: string | null } | undefined;
+    since = r?.ts ?? "";
+  }
+  const rows = db
+    .query(
+      `SELECT json_extract(payload, '$.verify_name') AS name, json_extract(payload, '$.evidence_id') AS evidence_id
+         FROM events
+        WHERE task_id = ? AND type = 'evidence'
+          AND json_extract(payload, '$.verify_name') IS NOT NULL AND ts >= ?
+        ORDER BY ts ASC, rowid ASC`
+    )
+    .all(task.id, since) as { name: string; evidence_id: string | null }[];
+  const have = new Map<string, string | null>();
+  for (const r of rows) have.set(r.name, r.evidence_id); // last write wins: freshest run
+  return cmds.map((c: any) => {
+    const name = String(c?.name ?? "");
+    // `satisfied` is name-presence, exactly as the gate has always read it; the
+    // evidence id is a convenience for linking and may be absent on old rows.
+    return { name, cmd: String(c?.cmd ?? ""), satisfied: have.has(name), evidence_id: have.get(name) ?? null };
+  });
+}
+
+// Same check, plus a `verification_missing` event the agent's next steer can
+// cite. Deduped on the name set so the polling callers (the reconciler asks
+// every cycle) log the gap once instead of forever.
+export function verificationGate(db: DB, task: any, source: string): string[] {
+  const missing = missingVerifications(db, task);
+  if (missing.length === 0) return missing;
+  const last = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'verification_missing' ORDER BY ts DESC LIMIT 1")
+    .get(task.id) as { payload: string } | undefined;
+  let same = false;
+  if (last) {
+    try {
+      same = JSON.stringify(JSON.parse(last.payload).names) === JSON.stringify(missing);
+    } catch {}
+  }
+  if (!same)
+    writeEvent(db, { task_id: task.id, source, type: "verification_missing", payload: { names: missing } });
+  return missing;
+}
+
 // The finished-handoff, shared by every herdr-signal path (the reconciler's
 // poll backstop and the supervise wait loop): an agent observed idle/done/gone on an
 // in_progress task that has a real work product (a pr_url, or a scout report)
@@ -722,6 +846,8 @@ export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, s
   // #1249: no explanation page yet → hold here and let the generation (kicked
   // off by the gate) hand the task off when the page is stored.
   if (explanationGate(db, task) !== "ready") return false;
+  // HIVE-402: a contract with nothing behind it isn't reviewable either.
+  if (verificationGate(db, task, source).length > 0) return false;
   writeEvent(db, {
     task_id: taskId,
     source,
@@ -737,11 +863,102 @@ export function advanceIfFinished(db: DB, taskId: string, agentStatus: string, s
 
 // Perform a state transition. Throws TransitionError on invalid transition or
 // when a `done` transition lacks required evidence. Writes a state_change event.
+// Some handoffs land the PR URL only as free text in the transition reason
+// (e.g. `hive emit ready --note "PR <url>"` without `--pr-url`), so task.pr_url
+// never gets set and auto_review has nothing to diff. Backfill from that text —
+// but ONLY a PR in the project's own repo: the reason is prose an agent wrote,
+// so it can legitimately mention some other PR ("blocked on <url>"), and
+// backfilling that would point hive's review/land machinery at a foreign repo.
+const PR_URL_RE = /https:\/\/github\.com\/([\w.-]+\/[\w.-]+?)\/pull\/\d+/g;
+
+const repoSlugCache = new Map<string, string | null>();
+// ponytail: sync shell-out kept simple with an in-memory cache; fine at
+// per-transition and startup-sweep call rates.
+function repoSlugForPath(repoPath: string): string | null {
+  if (repoSlugCache.has(repoPath)) return repoSlugCache.get(repoPath)!;
+  let slug: string | null = null;
+  try {
+    const url = execSync("git remote get-url origin", { cwd: repoPath, encoding: "utf8" }).trim();
+    slug = url.match(/github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?$/)?.[1] ?? null;
+  } catch {
+    slug = null;
+  }
+  repoSlugCache.set(repoPath, slug);
+  return slug;
+}
+
+// The project's own owner/repo, or null if it can't be determined (no
+// repo_path, or the git remote lookup failed) — callers treat null as "can't
+// verify" and refuse to backfill rather than guessing.
+export function projectRepoSlug(db: DB, projectId: string): string | null {
+  const project = db.query("SELECT repo_path FROM projects WHERE id = ?").get(projectId) as
+    | { repo_path: string | null }
+    | undefined;
+  if (!project?.repo_path) return null;
+  return repoSlugForPath(project.repo_path);
+}
+
+// Extracts a PR URL from free text, scoped to `allowedSlug` (owner/repo). If
+// the text names more than one PR URL, the intended one is ambiguous — take
+// NONE rather than guessing. If `allowedSlug` is omitted, any single match is
+// accepted (used by the standalone unit test); real call sites always pass it.
+export function extractPrUrl(text: string | null | undefined, allowedSlug?: string | null): string | null {
+  if (!text) return null;
+  const matches = [...text.matchAll(PR_URL_RE)];
+  if (matches.length !== 1) return null;
+  const [url, slug] = matches[0];
+  if (allowedSlug !== undefined && slug !== allowedSlug) return null;
+  return url;
+}
+
+// Reconciliation sweep for tasks that got stuck before the transition()-time
+// backfill above existed: a task already sitting in in_review with pr_url
+// still null, whose state_change reason carried the URL as free text.
+// transition() can't fix these itself (it only runs on entry to in_review,
+// and throws on from === to), so this scans the task's own event history
+// instead. Idempotent — skips tasks that already have a pr_url. Startup-only
+// (see index.ts): once history is repaired this can never find anything
+// again, so running it every reconciler lap is a permanent cost for no gain.
+export function backfillStuckPrUrls(db: DB): number {
+  const rows = db
+    .query(
+      `SELECT tasks.id AS id, tasks.project_id AS project_id
+       FROM tasks WHERE tasks.state = 'in_review' AND tasks.pr_url IS NULL`
+    )
+    .all() as { id: string; project_id: string }[];
+  let backfilled = 0;
+  for (const row of rows) {
+    const allowedSlug = projectRepoSlug(db, row.project_id);
+    if (!allowedSlug) continue;
+    const events = db
+      .query(
+        "SELECT payload FROM events WHERE task_id = ? AND type = 'state_change' ORDER BY ts DESC"
+      )
+      .all(row.id) as { payload: string }[];
+    let foundPrUrl: string | null = null;
+    for (const e of events) {
+      const reason = JSON.parse(e.payload)?.reason;
+      foundPrUrl = extractPrUrl(reason, allowedSlug);
+      if (foundPrUrl) break;
+    }
+    if (!foundPrUrl) continue;
+    db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(foundPrUrl, now(), row.id);
+    writeEvent(db, {
+      task_id: row.id,
+      source: "system",
+      type: "pr_linked",
+      payload: { pr_url: foundPrUrl, via: "stuck_reason_backfill" },
+    });
+    backfilled++;
+  }
+  return backfilled;
+}
+
 export function transition(
   db: DB,
   taskId: string,
   to: State,
-  opts: { source?: string; reason?: string; force?: boolean } = {}
+  opts: { source?: string; reason?: string; force?: boolean; skipVerification?: boolean } = {}
 ): any {
   const task = getTask(db, taskId);
   if (!task) throw new TransitionError(`unknown task: ${taskId}`);
@@ -762,18 +979,43 @@ export function transition(
   // that closed with nothing left to merge: the caller has already verified the
   // work landed on the base branch via a different commit, so the usual
   // in_review -> verifying -> done merge path doesn't apply.
+  // hive-1952: a tracking-only task has no review gate to satisfy. `ready` is
+  // refused for it (api.ts), so the forward path in_review -> verifying -> done
+  // is unreachable and in_review became a trap whose only exit was `cancelled` —
+  // which understates work that actually shipped. It has no PR and nothing to
+  // merge, so `done` is reachable directly from any non-terminal state.
+  const trackingOnlyDone = to === "done" && !TERMINAL.includes(from) && isTrackingOnlyTask(task);
   if (opts.force) {
     if (TERMINAL.includes(from)) throw new TransitionError(`task already terminal ('${from}')`);
-  } else if (!canTransition(from, to)) {
+  } else if (!trackingOnlyDone && !canTransition(from, to)) {
     // Agents jump straight to done often enough (4/16 sampled sessions) that
-    // the error should teach the path, not just reject.
-    const hint =
-      to === "done" && (from === "in_progress" || from === "in_review")
+    // the error should teach the path, not just reject. Never point a
+    // tracking-only task at `ready` or `requeue`: both are refused for it, and
+    // an error that names a forbidden call is how the in_review trap read as
+    // two guards blaming each other.
+    const hint = isTrackingOnlyTask(task)
+      ? ` — this task is tracking-only: hive tracks it but never runs an agent on it, so \`ready\` and \`requeue\` are refused. Close it with \`hive task move ${taskId} done\` (or \`cancelled\`).`
+      : to === "done" && (from === "in_progress" || from === "in_review")
         ? " — done is reached via review: emit `ready --pr-url <url>` (in_review), then the director merges (verifying -> done)"
         : to === "queued" && ["in_progress", "in_review", "verifying"].includes(from)
         ? `; to retry a live task, POST /api/tasks/${taskId}/requeue (fails and requeues atomically)`
         : "";
     throw new TransitionError(`invalid transition: '${from}' -> '${to}'${hint}`);
+  }
+
+  // HIVE-402: the verification contract is enforced HERE, at the one helper every
+  // route to review funnels through (director move, agent `ready`, PR-link
+  // handoff, the reconciler's CI-green promote). skipVerification is for the one
+  // caller catching up on a PR that already merged — the work has landed, so
+  // holding it in_progress would strand it forever.
+  if (from === "in_progress" && to === "in_review" && !isTrackingOnlyTask(task) && !opts.skipVerification) {
+    const missing = verificationGate(db, task, source);
+    if (missing.length > 0)
+      throw new TransitionError(
+        `cannot hand off to review: the verification contract is unmet — no fresh evidence for: ${missing.join(", ")}. ` +
+          `Run each command from the task's verification contract and attach its output with ` +
+          `\`hive emit ${taskId} evidence --verify-name <name> --file <output>\`, then hand off again.`
+      );
   }
 
   // Evidence gates apply to hive-driven work. Tracking-only tasks (source
@@ -789,6 +1031,14 @@ export function transition(
       throw new TransitionError(
         "cannot transition to 'done': scout task requires a report evidence"
       );
+    }
+  }
+
+  if (to === "in_review" && !task.pr_url) {
+    const foundPrUrl = extractPrUrl(opts.reason, projectRepoSlug(db, task.project_id));
+    if (foundPrUrl) {
+      db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run(foundPrUrl, now(), taskId);
+      writeEvent(db, { task_id: taskId, source, type: "pr_linked", payload: { pr_url: foundPrUrl, via: "reason_backfill" } });
     }
   }
 
@@ -812,12 +1062,15 @@ export function transition(
   const updated = mutateWithEvent(db, () => {
     // Re-queuing a failed task (attention tray) resets its runtime binding so the
     // next spawn is clean — a queued task must not point at a dead agent/worktree.
+    // Any state change answers the dispatcher's "why not" (noteSkip): the task
+    // either started, or is no longer queued at all. Clear it in the same write
+    // so a stale reason can never outlive the state it described.
     if (to === "queued") {
       db.query(
-        "UPDATE tasks SET state = ?, updated_at = ?, agent_target = NULL, worktree_path = NULL, branch = NULL WHERE id = ?"
+        "UPDATE tasks SET state = ?, updated_at = ?, agent_target = NULL, worktree_path = NULL, branch = NULL, skip_reason = NULL, skip_reason_at = NULL WHERE id = ?"
       ).run(to, now(), taskId);
     } else {
-      db.query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?").run(to, now(), taskId);
+      db.query("UPDATE tasks SET state = ?, updated_at = ?, skip_reason = NULL, skip_reason_at = NULL WHERE id = ?").run(to, now(), taskId);
     }
     return getTask(db, taskId);
   }, {
@@ -833,6 +1086,9 @@ export function transition(
   // A terminal task can no longer act on any open decision — expire them so the
   // inbox clears and the answer endpoint can't be hit against a dead task.
   if (TERMINAL.includes(to)) expireOpenDecisions(db, taskId, `task ${to}`);
+  // Every move of the work moves its Jira mirror: starting the work puts the
+  // ticket In Progress, finishing it puts the ticket Done.
+  if (task.jira_mirror_task_id) advanceJiraMirror(db, task.jira_mirror_task_id, source);
   if (to === "cancelled") openCancelledDependencyDecision(db, updated, source);
   // Notify on notable terminal-ish outcomes (batched into the digest).
   if (to === "done")
@@ -859,4 +1115,169 @@ export function transition(
     }
   }
   return updated;
+}
+
+// ---- Jira mirror propagation (HIVE-546, HIVE-562) ---------------------------
+// A mirror row carries the ticket's status; the work tasks under it carry the
+// actual work. Nothing used to connect the two, so a merged task left its
+// mirror sitting in 'queued' forever and the hive -> Jira status push had
+// nothing to push. Advancing the mirror here is what makes that push fire.
+//
+// The mirror shows the MOST ADVANCED live child: the first child to start puts
+// the ticket In Progress, the first to reach review puts it In Review. It goes
+// terminal only when EVERY linked child has finished and at least one finished
+// as `done`: a ticket with ten sub-tasks must not close on the first one.
+// failed and cancelled children are ignored — a failed attempt is a dead row,
+// and its requeued successor carries the link and blocks the mirror while it is
+// still live.
+//
+// FORWARD ONLY, in Jira-status space. Two reasons:
+//  * a human who dragged the ticket to In Review must not be dragged back to In
+//    Progress because a straggler child just started;
+//  * in_review and verifying are both "In Review" to Jira, so a child moving
+//    between them must not emit a second, redundant transition.
+// Backwards is therefore never written, including for a failed child: `failed`
+// has no Jira status at all (STATE_TO_JIRA), so there is nothing to move to.
+//
+// The write bypasses the FORWARD map on purpose (queued -> done is not an edge
+// hive work may take): a mirror is tracking-only, and jira sync already moves it
+// this way (applyJiraState).
+
+// Board order, for "most advanced" and for forward-only. Ranks are Jira's
+// columns, so in_review and verifying deliberately tie (see STATE_TO_JIRA).
+const MIRROR_RANK: Partial<Record<State, number>> = {
+  queued: 0,
+  in_progress: 1,
+  in_review: 2,
+  verifying: 2,
+  done: 3,
+};
+
+// What a LIVE work child means for the ticket. A child that has not started
+// (queued) or is parked on a decision (needs_decision) says nothing about the
+// column, so it maps to nothing and cannot move the mirror.
+const CHILD_SHOWS: Partial<Record<State, State>> = {
+  in_progress: "in_progress",
+  in_review: "in_review",
+  verifying: "in_review",
+};
+
+export function advanceJiraMirror(db: DB, mirrorId: string, source: string): void {
+  const mirror = getTask(db, mirrorId);
+  if (!mirror || TERMINAL.includes(mirror.state) || !isJiraMirror(mirror)) return;
+  // needs_decision is a parked ticket: it rides as a Jira LABEL on top of
+  // whatever column the director left it in, and has no rank of its own. Moving
+  // it would both drop the label and overwrite a deliberate park.
+  if (mirror.state === "needs_decision") return;
+  const children = db
+    .query("SELECT state FROM tasks WHERE jira_mirror_task_id = ?")
+    .all(mirrorId) as { state: State }[];
+  const live = children.filter((c) => !TERMINAL.includes(c.state));
+
+  let to: State | null = null;
+  let reason = "";
+  if (live.length === 0) {
+    // A mirror whose children are all finished but none done (every attempt
+    // failed or was cancelled) is left exactly where it is.
+    if (!children.some((c) => c.state === "done")) return;
+    to = "done";
+    reason = `all hive work for ${mirror.jira_key} is done`;
+  } else {
+    for (const c of live) {
+      const shows = CHILD_SHOWS[c.state];
+      if (shows && (to == null || MIRROR_RANK[shows]! > MIRROR_RANK[to]!)) to = shows;
+    }
+    if (to == null) return; // nothing live has started yet
+    reason = `hive work for ${mirror.jira_key} is ${to}`;
+  }
+
+  // Forward only: never undo a human's column, never repeat one Jira status.
+  if (MIRROR_RANK[to]! <= (MIRROR_RANK[mirror.state as State] ?? 0)) return;
+
+  const updated = mutateWithEvent(db, () => {
+    db.query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?").run(to, now(), mirrorId);
+    return getTask(db, mirrorId);
+  }, {
+    task_id: mirrorId,
+    source,
+    type: "state_change",
+    payload: { from: mirror.state, to, reason },
+  });
+  broadcastTask(db, updated);
+}
+
+// Catch-up sweep for mirrors whose work finished before anything propagated
+// (every ticket shipped before HIVE-546, and any mirror missed while the server
+// was down). Same rule as above, so it can never close a ticket the live path
+// would not have closed. Returns how many mirrors it advanced.
+export function advanceReadyJiraMirrors(db: DB): number {
+  const mirrors = db
+    .query("SELECT DISTINCT jira_mirror_task_id AS id FROM tasks WHERE jira_mirror_task_id IS NOT NULL")
+    .all() as { id: string }[];
+  let advanced = 0;
+  for (const m of mirrors) {
+    const before = (getTask(db, m.id) as any)?.state;
+    advanceJiraMirror(db, m.id, "reconciler");
+    if (before !== (getTask(db, m.id) as any)?.state) advanced++;
+  }
+  return advanced;
+}
+
+// The last time the AGENT itself did something, for every "is this task still
+// moving?" question (health, the hung detector, any UI that shows last
+// activity). Only two sources are the agent talking: `agent` (its own `hive
+// emit` calls) and `hook` (its Claude Code / Codex transcript rows). Everything
+// else — the reconciler, the reaper, herdr, jira sync, and a human steering or
+// poking the task — is hive writing ABOUT the task, and must never reset the
+// clock. Measured the hard way (hive-1951, 2026-08-31): a refused respawn wrote
+// spawn_error + authority_logged, and a task frozen since 09:51 dropped off the
+// stall list at 12:14 while being exactly as frozen. Checking on a stuck task
+// must not hide it.
+// A `spawned` row is the one exception: an agent that has not spoken yet has
+// been silent since it started, so the spawn is where its clock begins. A
+// REFUSED spawn writes spawn_error, not spawned, so it grants nothing.
+export const AGENT_EVENT_SOURCES = ["agent", "hook"];
+export function lastAgentActivity(db: DB, taskId: string): string | null {
+  const r = db
+    .query(
+      `SELECT ts FROM events WHERE task_id = ? AND (source IN (${AGENT_EVENT_SOURCES.map(() => "?").join(",")}) OR type = 'spawned') ORDER BY ts DESC LIMIT 1`
+    )
+    .get(taskId, ...AGENT_EVENT_SOURCES) as { ts: string } | undefined;
+  return r?.ts ?? null;
+}
+
+// The commit SHA of the newest evidence the agent captured. Hive's own
+// generated explanation pages are excluded: they are stamped with whatever HEAD
+// was when hive wrote them, so they would always look like the freshest
+// evidence and hide the agent's real capture point.
+export function latestEvidenceSha(db: DB, taskId: string): string | null {
+  const row = db
+    .query(
+      `SELECT json_extract(meta, '$.commit_sha') AS sha FROM evidence
+        WHERE task_id = ? AND kind != 'explanation' AND json_extract(meta, '$.commit_sha') IS NOT NULL
+        ORDER BY ts DESC, rowid DESC LIMIT 1`
+    )
+    .get(taskId) as { sha: string } | undefined;
+  return row?.sha ?? null;
+}
+
+// Move evidence captured at `from` onto `to`. Only called once the two commits
+// are known to hold an identical tree, so the artifact still describes the code
+// at `to` exactly. Returns how many rows moved.
+export function restampEvidence(db: DB, taskId: string, from: string, to: string): number {
+  const rows = db
+    .query("SELECT id, meta FROM evidence WHERE task_id = ? AND json_extract(meta, '$.commit_sha') = ?")
+    .all(taskId, from) as { id: string; meta: string }[];
+  for (const r of rows) {
+    let meta: any;
+    try {
+      meta = JSON.parse(r.meta || "{}");
+    } catch {
+      continue;
+    }
+    meta.commit_sha = to;
+    meta.restamped_from = from;
+    db.query("UPDATE evidence SET meta = ? WHERE id = ?").run(JSON.stringify(meta), r.id);
+  }
+  return rows.length;
 }

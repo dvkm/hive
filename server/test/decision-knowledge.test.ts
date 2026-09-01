@@ -99,3 +99,27 @@ test("a resolver-claimed card (recovery) is NOT recorded as decision knowledge",
   const rows = db.query("SELECT 1 FROM learnings WHERE project_id = ? AND kind = 'decision'").all(projectId);
   expect(rows).toHaveLength(0);
 });
+
+test("a repeat decision writes a rule_candidate event; the first answer writes none", async () => {
+  const { db, projectId } = freshDb();
+  const handle = makeHandler(db, {});
+  const mk = () => createDecision(db, {
+    task_id: task(db, projectId),
+    title: "Deploy target — staging or prod?",
+    options: [{ key: "staging", label: "Staging", recommended: true }, { key: "prod", label: "Prod" }],
+  });
+  const first = mk();
+  await answer(handle, first.id, "staging");
+  const none = db.query("SELECT 1 FROM events WHERE type = 'rule_candidate'").all();
+  expect(none).toHaveLength(0);
+
+  const second = mk();
+  await answer(handle, second.id, "staging");
+  const rows = db.query("SELECT payload FROM events WHERE type = 'rule_candidate'").all() as any[];
+  expect(rows).toHaveLength(1);
+  const payload = JSON.parse(rows[0].payload);
+  expect(payload.title).toBe("Deploy target — staging or prod?");
+  expect(payload.occurrences).toBe(2);
+  expect(payload.suggested).toContain("authority rule");
+  expect(payload.decision_ids).toEqual([first.id, second.id]);
+});

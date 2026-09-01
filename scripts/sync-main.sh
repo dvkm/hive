@@ -21,8 +21,24 @@ LOG="${HIVE_SYNC_LOG:-$HOME/.hive/logs/sync-main.log}"
 mkdir -p "$(dirname "$LOG")"
 exec >>"$LOG" 2>&1
 
+# Path of the worktree that has main checked out, if any. $LIVE first: it is the
+# deploy checkout and the one that matters, and a stray review worktree can hold
+# main too (a --force checkout).
+main_worktree() {
+  if [ "$(git -C "$LIVE" branch --show-current 2>/dev/null)" = "main" ]; then
+    echo "$LIVE"
+    return
+  fi
+  git worktree list --porcelain |
+    awk '/^worktree /{p=$2} /^branch refs\/heads\/main$/{print p; exit}'
+}
+
 cd "$REPO"
 git fetch origin main --quiet
+# Captured BEFORE the sync below, which fast-forwards $LIVE itself when main is
+# checked out there. The rebuild/restart has to key off whether the live
+# checkout actually moved, not off which step moved it.
+LIVE_BEFORE=$(git -C "$LIVE" rev-parse HEAD)
 MAIN_BEFORE=$(git rev-parse refs/heads/main)
 ORIGIN_MAIN=$(git rev-parse refs/remotes/origin/main)
 AHEAD=$(git rev-list --count "$ORIGIN_MAIN..$MAIN_BEFORE")
@@ -36,9 +52,19 @@ if [ "$BEHIND" -gt 0 ]; then
   if [ "$(git branch --show-current)" = "main" ]; then
     # ff-only refuses if the working tree blocks it (untracked collisions etc.)
     git merge --ff-only "$ORIGIN_MAIN" --quiet
-  elif git worktree list --porcelain | grep -qx "branch refs/heads/main"; then
-    echo "[$(date '+%F %T')] main is checked out in another worktree; not updating its ref behind that checkout"
-    exit 1
+  elif MAIN_WT=$(main_worktree) && [ -n "$MAIN_WT" ]; then
+    # HIVE-548: this arm used to log "not updating its ref behind that
+    # checkout" and exit 1 — it did that 1093 times over 5 days while the live
+    # server ran 30-commit-stale code, so every hive fix merged in that window
+    # was dead code. Refusing to move the REF was never the point: git only
+    # blocks moving a branch out from under a checkout, and a fast-forward
+    # INSIDE that checkout moves the ref and the working tree together, which
+    # is exactly what the deploy wants. Still ff-only, so a dirty or diverged
+    # live tree refuses loudly instead of being reset.
+    if ! git -C "$MAIN_WT" merge --ff-only "$ORIGIN_MAIN" --quiet; then
+      echo "[$(date '+%F %T')] STALE DEPLOY: live checkout $MAIN_WT is $BEHIND commit(s) behind origin/main and NOT being updated — fast-forward refused (dirty or diverged working tree). The running server stays on old code until a human fixes that tree."
+      exit 1
+    fi
   else
     # The launchd job often runs while the primary checkout is on a feature
     # branch. Advance the named main ref, not whichever branch happens to be
@@ -55,8 +81,22 @@ fi
 # Deploy: ff hive-live to main, rebuild, restart — only when it actually moved.
 cd "$LIVE"
 git fetch "$REPO" main --quiet
-if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
+# "HEAD != FETCH_HEAD" is true in BOTH directions. When the live checkout is
+# AHEAD of main (a hotfix committed straight into it, or a manual merge commit)
+# the ff-merge below is a no-op, HEAD never reaches FETCH_HEAD, and every
+# 5-minute tick rebuilt and `kickstart -k`ed the server forever. On 2026-08-25
+# that restarted the live server 14 times on one unchanged sha (44eb218) and 9
+# more on d50db56, each restart a fresh pid and a multi-minute outage on :4700.
+# Deploy only when main actually carries something live does not have; a real
+# divergence still reaches the ff-merge and still fails loudly.
+if ! git merge-base --is-ancestor FETCH_HEAD HEAD; then
   git merge --ff-only FETCH_HEAD --quiet
+fi
+# HIVE-548: the sync step above may already have fast-forwarded this checkout
+# (that is how main advances when main is checked out here), so the ff-merge is
+# often a no-op by the time we reach it. Gate the deploy on the sha the live
+# checkout started this run with.
+if [ "$(git rev-parse HEAD)" != "$LIVE_BEFORE" ]; then
   (cd server && bun install --silent >/dev/null)
   (cd web && bun install --silent >/dev/null && bun run build >/dev/null)
   # Non-fatal: a failed /Applications write must not strand the server on old

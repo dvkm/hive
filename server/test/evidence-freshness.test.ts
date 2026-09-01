@@ -18,10 +18,22 @@ const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x
 // Server whose git HEAD is a mutable closure, so a test can advance the commit
 // (simulating a change-request fix push) between handoffs. gh/herdr plumbing is
 // stubbed just enough to spawn and to pass the CI probe (no checks → fail open).
-function makeServer(head: { sha: string }) {
+function makeServer(head: { sha: string; tree?: string }) {
   const db = openDb(":memory:");
+  const trees = new Map<string, string>();
+  const treeOf = (sha: string) => trees.get(sha) ?? sha;
   const exec: Exec = async (argv) => {
-    if (has(argv, "git", "rev-parse", "HEAD")) return OK(head.sha + "\n");
+    if (has(argv, "git", "rev-parse", "HEAD")) {
+      trees.set(head.sha, head.tree ?? head.sha);
+      return OK(head.sha + "\n");
+    }
+    // `git diff --quiet A B`: 0 when the two commits hold the same tree, 1 when
+    // they differ. Tests set head.tree to model a commit that rewrote history
+    // without changing any file.
+    if (has(argv, "git", "diff", "--quiet")) {
+      const [a, b] = argv.slice(argv.indexOf("--quiet") + 1);
+      return treeOf(a) === treeOf(b) ? OK() : { code: 1, stdout: "", stderr: "" };
+    }
     if (has(argv, "gh", "pr", "view")) return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [] }));
     if (has(argv, "worktree", "create"))
       return OK(JSON.stringify({ result: { worktree: { path: join(HOME, "wt"), branch: "hive/x", open_workspace_id: "w1" } } }));
@@ -40,6 +52,21 @@ async function post(base: string, path: string, body: unknown) {
   return { status: res.status, json: await res.json() };
 }
 
+// The handoff also holds when the review carries no understanding check
+// (HIVE-580). These tests are about evidence freshness, so they file one and
+// get on with it.
+const CHECKS = {
+  checks: [
+    {
+      question: "What does this change do?",
+      options: [{ key: "a", label: "the work" }, { key: "b", label: "nothing" }],
+      answer_key: "a",
+    },
+  ],
+};
+const fileReview = (base: string, id: string) =>
+  post(base, `/api/tasks/${id}/events`, { type: "review_summary", done: ["did the thing"], understanding: CHECKS });
+
 test("evidence is stamped with the worktree HEAD sha, and the ready gate rejects stale evidence", async () => {
   const head = { sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
   const s = makeServer(head);
@@ -54,6 +81,7 @@ test("evidence is stamped with the worktree HEAD sha, and the ready gate rejects
   expect(evidenceAtSha(s.db, id, head.sha)).toBe(1);
 
   // Ready at the same commit: evidence matches HEAD → hands off.
+  await fileReview(s.base, id);
   const r1 = await post(s.base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/1" });
   expect(r1.json.task.state).toBe("in_review");
 
@@ -77,6 +105,143 @@ test("evidence is stamped with the worktree HEAD sha, and the ready gate rejects
   s.server.stop(true);
 });
 
+test("a stale handoff names both commits and the action, and re-emitting after a same-tree commit clears it without an agent", async () => {
+  const head = { sha: "1111111111111111111111111111111111111111", tree: "treeA" };
+  const s = makeServer(head);
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "task", brief: "b" });
+  const id = t.json.id;
+  await post(s.base, `/api/tasks/${id}/spawn`, {});
+  await post(s.base, `/api/tasks/${id}/events`, { type: "evidence", note: "test run", kind: "log" });
+
+  // The agent files its review and THEN pushes a commit that really changes the
+  // code. The review is refused right there, while the agent is still on its
+  // turn, instead of the handoff being refused later.
+  head.sha = "2222222222222222222222222222222222222222";
+  head.tree = "treeB";
+  const review = await post(s.base, `/api/tasks/${id}/events`, {
+    type: "review_summary",
+    done: ["did the thing"],
+  });
+  expect(review.status).toBe(409);
+  expect(review.json.reason).toBe("stale_evidence");
+  expect(review.json.error).toContain("1111111");
+  expect(review.json.error).toContain("2222222");
+  expect(review.json.action).toContain("re-capture");
+
+  // Held at the gate too, naming both commits and what to do.
+  const r1 = await post(s.base, `/api/tasks/${id}/events`, { type: "ready" });
+  expect(r1.json.held).toBe(true);
+  expect(r1.json.reason).toBe("stale_evidence");
+  expect(r1.json.evidence_sha).toBe("1111111111111111111111111111111111111111");
+  expect(r1.json.head_sha).toBe("2222222222222222222222222222222222222222");
+  expect(r1.json.message).toContain("1111111");
+  expect(r1.json.message).toContain("2222222");
+  expect(r1.json.action).toContain("re-capture");
+
+  // Fresh evidence, then a commit that rewrites history but changes no file
+  // (an amend). The review still describes this code, so a plain re-emit hands
+  // off: no re-capture, no respawn.
+  await post(s.base, `/api/tasks/${id}/events`, { type: "evidence", note: "fresh run", kind: "log" });
+  await fileReview(s.base, id);
+  head.sha = "3333333333333333333333333333333333333333";
+  head.tree = "treeB";
+  const r2 = await post(s.base, `/api/tasks/${id}/events`, { type: "ready" });
+  expect(r2.json.task.state).toBe("in_review");
+  expect(evidenceAtSha(s.db, id, head.sha)).toBe(1);
+
+  s.server.stop(true);
+});
+
+test("a genuinely current review is recorded and hands off first time", async () => {
+  const head = { sha: "4444444444444444444444444444444444444444" };
+  const s = makeServer(head);
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "task", brief: "b" });
+  const id = t.json.id;
+  await post(s.base, `/api/tasks/${id}/spawn`, {});
+  await post(s.base, `/api/tasks/${id}/events`, { type: "evidence", note: "test run", kind: "log" });
+  const review = await fileReview(s.base, id);
+  expect(review.status).toBe(201);
+  const ready = await post(s.base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/9" });
+  expect(ready.json.task.state).toBe("in_review");
+
+  s.server.stop(true);
+});
+
+// HIVE-575: the stamp comes from the task's own worktree, not from whoever
+// emitted. A director driving the task from another checkout used to stamp that
+// checkout's commit, which the gate then compared against the task branch —
+// two unrelated repositories, so the handoff was held forever.
+test("the caller cannot decide which commit the evidence is stamped with", async () => {
+  const head = { sha: "5555555555555555555555555555555555555555" };
+  const s = makeServer(head);
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "task", brief: "b" });
+  const id = t.json.id;
+  await post(s.base, `/api/tasks/${id}/spawn`, {});
+
+  // An emit carrying some other repo's HEAD is stamped with the worktree's.
+  const e = await post(s.base, `/api/tasks/${id}/events`, {
+    type: "evidence",
+    note: "test run",
+    kind: "log",
+    meta: JSON.stringify({ commit_sha: "9999999999999999999999999999999999999999" }),
+  });
+  expect(e.json.evidence.meta.commit_sha).toBe(head.sha);
+
+  // So the handoff goes through instead of being held against a foreign commit.
+  await fileReview(s.base, id);
+  const ready = await post(s.base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/5" });
+  expect(ready.json.task.state).toBe("in_review");
+
+  s.server.stop(true);
+});
+
+// HIVE-575: an artifact with no relationship to a commit (a production reading,
+// a link, a written report) is never stamped and never gated on staleness.
+test("an observation is not commit-bound, so a later commit does not hold the handoff", async () => {
+  const head = { sha: "6666666666666666666666666666666666666666" };
+  const s = makeServer(head);
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "task", brief: "b" });
+  const id = t.json.id;
+  await post(s.base, `/api/tasks/${id}/spawn`, {});
+
+  const e = await post(s.base, `/api/tasks/${id}/events`, {
+    type: "evidence",
+    note: "row count on prod",
+    kind: "observation",
+  });
+  expect(e.json.evidence.meta.commit_sha).toBeUndefined();
+
+  head.sha = "7777777777777777777777777777777777777777";
+  const review = await post(s.base, `/api/tasks/${id}/events`, { type: "review_summary", done: ["ran the query"], understanding: CHECKS });
+  expect(review.status).toBe(201);
+  const ready = await post(s.base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/6" });
+  expect(ready.json.task.state).toBe("in_review");
+
+  s.server.stop(true);
+});
+
+// HIVE-575: with no worktree there is no commit to stamp. Say that at emit
+// time rather than silently stamping whatever repo the caller stood in.
+test("evidence filed with no worktree is stored unstamped and says so", async () => {
+  const head = { sha: "8888888888888888888888888888888888888888" };
+  const s = makeServer(head);
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "task", brief: "b" });
+  const e = await post(s.base, `/api/tasks/${t.json.id}/events`, { type: "evidence", note: "log", kind: "log" });
+  expect(e.json.evidence.meta.commit_sha).toBeUndefined();
+  expect(e.json.warning).toContain("no worktree");
+
+  s.server.stop(true);
+});
+
+// HIVE-2039: production evidence writes never stamp meta.attempt_id, only test
+// fixtures did. Scoping the recovery-attempt counters on attempt_id therefore
+// always counted 0 and wedged the task in in_progress. rowid > floor alone is
+// the correct scope.
 test("evidence captured through the ordinary emit path counts toward a recovery attempt", async () => {
   const head = { sha: "cccccccccccccccccccccccccccccccccccccccc" };
   const s = makeServer(head);
@@ -86,11 +251,11 @@ test("evidence captured through the ordinary emit path counts toward a recovery 
   await post(s.base, `/api/tasks/${id}/spawn`, {});
 
   // A recovery epoch opens for the replacement agent's attempt, as reconciler.ts
-  // does on requeue. Production evidence writes never stamp meta.attempt_id, so
-  // the scoped count must not require it — only rowid > floor.
+  // does on requeue.
   startRecoveryEpoch(s.db, id, "reconciler", "attempt-1");
 
   await post(s.base, `/api/tasks/${id}/events`, { type: "evidence", note: "proof", kind: "log" });
+  await fileReview(s.base, id);
   const r = await post(s.base, `/api/tasks/${id}/events`, { type: "ready" });
   expect(r.json.held).toBeUndefined();
   expect(r.json.task.state).toBe("in_review");

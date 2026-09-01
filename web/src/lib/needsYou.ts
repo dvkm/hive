@@ -1,4 +1,5 @@
 import type { Checkpoint, Decision, Task, UnderstandingQuiz } from "./api";
+import { inProjectFilter } from "./projectFilter";
 
 export interface BlockingTaskRef {
   id: string;
@@ -14,8 +15,50 @@ export type NeedsYouItem =
   | { kind: "checkpoint"; id: string; checkpoint: Checkpoint }
   | { kind: "quiz_digest"; id: string; quizzes: UnderstandingQuiz[] }
   | { kind: "review"; id: string; task: Task }
+  | { kind: "review_pending"; id: string; task: Task }
   | { kind: "attention"; id: string; task: Task }
   | { kind: "waiting"; id: string; task: Task; blockedBy: BlockingTaskRef[] };
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const PRIORITY_HEAD_START: Record<NonNullable<Task["priority"]>, number> = {
+  now: 3 * DAY_MS,
+  next: 2 * DAY_MS,
+  normal: DAY_MS,
+  later: 0,
+};
+
+function focusItemKey(item: NeedsYouItem, tasks: Map<string, Task>): [number, number] {
+  const candidates = item.kind === "quiz_digest"
+    ? item.quizzes.map((quiz) => ({ ts: quiz.ts, task: tasks.get(quiz.task_id) }))
+    : item.kind === "decision"
+      ? [{ ts: item.decision.ts, task: tasks.get(item.decision.task_id) }]
+      : item.kind === "checkpoint"
+        ? [{ ts: item.checkpoint.ts, task: tasks.get(item.checkpoint.task_id) }]
+        : [{
+            ts: item.kind === "attention"
+              ? item.task.health?.since ?? item.task.needs_you_since ?? item.task.updated_at
+              : item.task.needs_you_since ?? item.task.updated_at,
+            task: item.task,
+          }];
+
+  return candidates.reduce<[number, number]>((best, { ts, task }) => {
+    const time = Date.parse(ts);
+    const key: [number, number] = Number.isNaN(time)
+      ? [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY]
+      : [time - PRIORITY_HEAD_START[task?.priority ?? "normal"], time];
+    return key[0] < best[0] || (key[0] === best[0] && key[1] < best[1]) ? key : best;
+  }, [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY]);
+}
+
+// Priority is a head start, not a permanent lane: one day per level means an
+// old lower-priority item eventually outranks a steady stream of new urgent work.
+export function orderFocusItems(items: NeedsYouItem[], tasks: Task[]): NeedsYouItem[] {
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  return items
+    .map((item, index) => ({ item, index, key: focusItemKey(item, byId) }))
+    .sort((a, b) => a.key[0] - b.key[0] || a.key[1] - b.key[1] || a.index - b.index)
+    .map(({ item }) => item);
+}
 
 // Mirrors server/src/health.ts's needsAttention — keep both excluding the
 // same unsupervised tasks (see server/src/supervision.ts's isSupervisedTask).
@@ -42,6 +85,21 @@ export function isJiraMirror(task: Pick<Task, "source_ref">): boolean {
 // spawned has a live agent those controls should still reach.
 export function isTrackingOnly(task: Pick<Task, "source" | "source_ref">): boolean {
   return task.source === "external" || isJiraMirror(task);
+}
+
+// Work hive is actually moving right now — what "N in motion" counts. A
+// tracking-only row (a mirrored ticket, another agent's board entry) parked in a
+// work column is deliberate: the real work runs under its children, and hive
+// never dispatches an agent for the row itself. Counting those told the director
+// six things were moving on corebeat when none of them were (HIVE-541). One a
+// director spawned by hand is real hive work and still counts — that is what
+// agent_target distinguishes, same test as taskNeedsAttention.
+const IN_MOTION_STATES = ["in_progress", "needs_decision", "in_review", "verifying"];
+
+export function isInMotion(task: Task): boolean {
+  if (task.source === "chat_supervisor") return false;
+  if (isTrackingOnly(task) && !task.agent_target) return false;
+  return IN_MOTION_STATES.includes(task.state);
 }
 
 // Tracking cards are containers, not execution owners. Plain tracked cards use
@@ -77,8 +135,13 @@ export function trackedSubtasks(task: Task, tasks: Task[]): Task[] {
   }).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
 }
 
+// Can the director act on this review NOW? The server decides (reviewer.ts's
+// reviewActionable) because the answer reads events the browser never sees:
+// whether the auto-review finished for the live head, and whether a task with
+// no pull request left a report behind. Everything else stays visible as
+// "in review" but must not be counted as needing the director (HIVE-500).
 function reviewIsActionable(task: Task): boolean {
-  return task.kind === "scout" || (!!(task.pr_url || task.branch) && task.ci_status !== "pending" && task.ci_status !== "failing");
+  return task.review_actionable === true;
 }
 
 // Browser-safe mirror of server/src/state.ts's dependency gate. Exported so
@@ -132,8 +195,10 @@ export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoin
     ...quizDigests(tasks, quizzes),
     ...tasks
       .filter((task) => task.state === "in_review" && !isTrackingOnly(task))
-      .sort((a, b) => Number(reviewIsActionable(b)) - Number(reviewIsActionable(a)))
-      .map((task) => ({ kind: "review" as const, id: task.id, task })),
+      .map((task): NeedsYouItem =>
+        reviewIsActionable(task)
+          ? { kind: "review", id: task.id, task }
+          : { kind: "review_pending", id: task.id, task }),
     ...tasks.filter(taskNeedsAttention).map((task): NeedsYouItem => {
       const blockedBy = task.state === "failed" ? [] : unmetDeps(task, tasks);
       return blockedBy.length && !blockedBy.every((dep) => DEAD_DEP_STATES.has(dep.state))
@@ -151,4 +216,20 @@ export function itemProject(item: NeedsYouItem, tasks: Task[]): string | undefin
   if (item.kind === "checkpoint") return item.checkpoint.project_id;
   if (item.kind === "quiz_digest") return item.quizzes[0]?.project_id;
   return item.task.project_id;
+}
+
+// THE definition of "needs you". Every place that shows a needs-you number —
+// the nav badge, the landing headline, the board's one strip — calls this, so
+// they cannot disagree again (HIVE-556). Before this, three surfaces counted
+// three different sets and the director saw 5, 8 and 3 on one screen.
+//
+// A "waiting" or "review_pending" item is visible somewhere but is not yours to
+// act on yet, so it is never part of the number. Anything that shows a
+// DIFFERENT set must be labelled with a different word than "needs you".
+export function isActionable(item: NeedsYouItem): boolean {
+  return item.kind !== "waiting" && item.kind !== "review_pending";
+}
+
+export function actionableItems(items: NeedsYouItem[], tasks: Task[], projectFilter = ""): NeedsYouItem[] {
+  return items.filter((item) => isActionable(item) && inProjectFilter(itemProject(item, tasks), projectFilter));
 }

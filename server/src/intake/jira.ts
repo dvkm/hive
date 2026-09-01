@@ -66,6 +66,7 @@ import {
 } from "./jira-write-scope.ts";
 
 export { NEEDS_DECISION_LABEL, JIRA_WRITE_SCOPE } from "./jira-write-scope.ts";
+import { activeProjects } from "../testProjects.ts";
 
 export type FetchLike = typeof fetch;
 
@@ -83,6 +84,14 @@ const HIVE_COMMENT_PROPERTY = "hive.event_id";
 const HIVE_EVIDENCE_PROPERTY = "hive.evidence_id";
 const CHANGELOG_PAGE = 100;
 const REQUEST_TIMEOUT_MS = 20_000;
+
+// How much wall clock ONE per-project cycle may spend on its issue loop, as a
+// multiple of the poll interval. The single-flight guard means an overrunning
+// cycle does not just run long, it silently drops every subsequent tick — with
+// dozens of issues each failing at REQUEST_TIMEOUT_MS a cycle runs for many
+// minutes and the poll rate degrades to zero. Two intervals leaves a slow but
+// healthy Jira room to finish while capping how far behind the loop can fall.
+const CYCLE_BUDGET_MULTIPLIER = 2;
 // How many CONSECUTIVE observations of one absence kind must accrue before hive
 // stops syncing. Operational failures never count.
 const ABSENT_STREAK_LIMIT = 3;
@@ -290,22 +299,104 @@ export function stateToJiraStatus(state: string): string | null {
   return Object.hasOwn(STATE_TO_JIRA, state) ? STATE_TO_JIRA[state as State] ?? null : null;
 }
 
+// ---------------------------------------------------------------- priority
+// Jira's default five-level scheme onto hive's four-level one. Confirmed
+// against the live board before hardcoding: the 111 mirrored issues carry
+// Highest/High/Medium/Low/Lowest and nothing else.
+//
+// ONE-WAY, Jira -> hive. hive never writes a priority back: the director
+// triages in Jira, and a mirror is tracking-only.
+//
+// Highest maps to 'now' on purpose. authorizePriority (api.ts) reserves 'now'
+// for a director source because it can borrow a dispatch slot past max_agents —
+// but this priority WAS set by the director, in Jira, and a mirror is never
+// dispatched, so it can never spend that headroom. The importer is therefore
+// trusted with it rather than bypassing the check silently.
+export const JIRA_TO_PRIORITY: Record<string, string> = {
+  highest: "now",
+  high: "next",
+  medium: "normal",
+  low: "later",
+  lowest: "later",
+};
+
+// null means "not a name hive knows" — a renamed or added Jira priority. The
+// caller records that and falls back to 'normal' rather than guessing a rank.
+export function jiraPriorityToPriority(name: string | undefined | null): string | null {
+  const key = String(name ?? "").trim().toLowerCase();
+  return Object.hasOwn(JIRA_TO_PRIORITY, key) ? JIRA_TO_PRIORITY[key] : null;
+}
+
 const sameStatus = (a: string | null, b: string | null): boolean =>
   a != null && b != null && a.trim().toLowerCase() === b.trim().toLowerCase();
 
 // Flatten Atlassian Document Format to plain text. ADF is a nested doc tree;
 // every leaf that carries `text` is content, and paragraph-ish nodes break the
 // line. Good enough to render a brief — hive never writes descriptions back.
+//
+// `text` is not the only place content lives, and reading only it silently threw
+// away the most important part of a ticket: a pasted Figma or Google URL becomes
+// an inlineCard whose URL sits in `attrs`, an attached screenshot becomes a
+// `media` node with no text at all, and a hyperlink's destination rides as a
+// mark on the text rather than in it. Those all render here now, so nothing the
+// ticket points at is invisible to whoever reads the brief.
 export function adfToText(node: any): string {
   if (node == null) return "";
   if (typeof node === "string") return node;
   if (Array.isArray(node)) return node.map(adfToText).join("");
+  const attrs = node.attrs ?? {};
   let out = "";
   if (typeof node.text === "string") out += node.text;
+  // The visible text of a link ("see the design") almost never contains the
+  // destination. Appended only when it differs, so a bare URL hive itself wrote
+  // as a link (textToAdf) does not come back doubled.
+  const href = (Array.isArray(node.marks) ? node.marks : []).find((m: any) => m?.type === "link")?.attrs?.href;
+  if (typeof href === "string" && href.trim() && href.trim() !== node.text) out += ` (${href.trim()})`;
+  if (node.type === "inlineCard" || node.type === "blockCard" || node.type === "embedCard") {
+    const url = [attrs.url, attrs.data?.url].find((v: unknown) => typeof v === "string" && v.trim());
+    if (url) out += String(url).trim();
+  }
+  // No filename in the node — ADF carries the attachment id. briefFor lists the
+  // issue's attachments with their real filenames alongside.
+  if (node.type === "media") {
+    const name = [attrs.alt, attrs.id].find((v: unknown) => typeof v === "string" && v.trim());
+    out += `[attachment: ${name ? String(name).trim() : "unnamed"}]`;
+  }
+  if ((node.type === "mention" || node.type === "status") && typeof attrs.text === "string") out += attrs.text;
+  if (node.type === "date" && attrs.timestamp != null) {
+    const at = Number(attrs.timestamp);
+    if (Number.isFinite(at)) out += new Date(at).toISOString().slice(0, 10);
+  }
   if (Array.isArray(node.content)) out += node.content.map(adfToText).join("");
   if (node.type === "paragraph" || node.type === "heading" || node.type === "listItem") out += "\n";
+  if (node.type === "media" || node.type === "blockCard" || node.type === "embedCard") out += "\n";
   if (node.type === "hardBreak") out += "\n";
   return out;
+}
+
+// Everything the description *points at*, read off the ADF structure rather than
+// the prose it flattens to. "rename banner.png" is a sentence; a .png in
+// `fields.attachment` is an attachment. A figma.com URL counts when it came out
+// of a card node or a link mark, not when someone typed the words in a comment.
+export function adfRefs(node: any): { urls: string[]; media: boolean } {
+  const urls: string[] = [];
+  let media = false;
+  const walk = (n: any): void => {
+    if (n == null || typeof n !== "object") return;
+    if (Array.isArray(n)) return void n.forEach(walk);
+    const attrs = n.attrs ?? {};
+    if (n.type === "inlineCard" || n.type === "blockCard" || n.type === "embedCard") {
+      const url = [attrs.url, attrs.data?.url].find((v: unknown) => typeof v === "string" && v.trim());
+      if (url) urls.push(String(url).trim());
+    }
+    if (n.type === "media" || n.type === "mediaSingle" || n.type === "mediaGroup") media = true;
+    for (const mark of Array.isArray(n.marks) ? n.marks : []) {
+      if (mark?.type === "link" && typeof mark.attrs?.href === "string" && mark.attrs.href.trim()) urls.push(mark.attrs.href.trim());
+    }
+    walk(n.content);
+  };
+  walk(node);
+  return { urls, media };
 }
 
 export function hiveTaskMarker(issue: any): string | null {
@@ -588,6 +679,21 @@ export class JiraHttpError extends Error {
   }
 }
 
+// A 2xx whose body is not the JSON object the endpoint promised — a proxy error
+// page, a truncated response, an HTML login redirect. Typed for the same reason
+// the status is: a bare SyntaxError from JSON.parse carries no method, no path
+// and no key, so a systemic Jira fault reads as an opaque failure on every
+// issue instead of a per-issue skip that names what actually broke.
+export class JiraInvalidBodyError extends Error {
+  constructor(
+    readonly method: string,
+    readonly path: string,
+    readonly detail: string
+  ) {
+    super(`jira ${method} ${path} returned an invalid JSON body: ${detail}`);
+  }
+}
+
 export class JiraClient {
   constructor(
     private cfg: JiraConfig,
@@ -607,8 +713,19 @@ export class JiraClient {
     this.cfg = { ...cfg, site, project_key: projectKey, jql };
   }
 
+  // Set by the cycle that owns this client; null for one-off calls (linking,
+  // manual lookups) that are not running under a cycle budget.
+  deadlineAt: number | null = null;
+
   private auth(): string {
     return "Basic " + Buffer.from(`${this.cfg.email}:${this.token}`).toString("base64");
+  }
+
+  private requestTimeoutMs(): number {
+    if (this.deadlineAt === null) return REQUEST_TIMEOUT_MS;
+    // Floor of 1ms: AbortSignal.timeout(0) never fires in Bun, which would turn
+    // an already-blown budget into an unbounded request.
+    return Math.max(1, Math.min(REQUEST_TIMEOUT_MS, this.deadlineAt - Date.now()));
   }
 
   private async call(
@@ -627,8 +744,11 @@ export class JiraClient {
     }
     const res = await this.fetchImpl(`${this.cfg.site}${path}`, {
       // A hung request must not stall the whole cycle (and, with the in-flight
-      // guard, silently degrade the poll rate to zero).
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      // guard, silently degrade the poll rate to zero). When the cycle carries a
+      // wall-clock budget, no single request may outlive it either: without this
+      // the last request started before the deadline still runs a full 20s past
+      // it, so the cycle overshoots by a request every time.
+      signal: AbortSignal.timeout(this.requestTimeoutMs()),
       ...init,
       headers: {
         Authorization: this.auth(),
@@ -647,7 +767,14 @@ export class JiraClient {
     }
     if (res.status === 204) return null;
     const text = await res.text();
-    return text ? JSON.parse(text) : null;
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      // Snippet, not the whole body: a proxy error page can be megabytes, and
+      // this string ends up in stats.failures and the sync log.
+      throw new JiraInvalidBodyError(method, path, `${res.status} ${text.slice(0, 200)}`);
+    }
   }
 
   private async json(
@@ -657,7 +784,7 @@ export class JiraClient {
   ): Promise<any> {
     const body = await this.call(path, init, write);
     if (body === null || typeof body !== "object")
-      throw new Error(`jira ${init.method ?? "GET"} ${path} returned an invalid JSON body`);
+      throw new JiraInvalidBodyError(String(init.method ?? "GET").toUpperCase(), path, "not a JSON object");
     return body;
   }
 
@@ -696,7 +823,9 @@ export class JiraClient {
   // decision is derived from.
   async issue(key: string): Promise<any> {
     const q = new URLSearchParams({
-      fields: `${JIRA_ISSUE_FIELDS.join(",")},parent`,
+      // `attachment` is read but not validated: it is brief material, not a
+      // field any decision turns on, and an issue may legitimately carry none.
+      fields: `${JIRA_ISSUE_FIELDS.join(",")},parent,attachment`,
       properties: "hive.task_id",
     });
     return this.json(`/rest/api/3/issue/${encodeURIComponent(key)}?${q}`);
@@ -1095,6 +1224,20 @@ export function decideStatusSync(args: {
 // ============================================================================
 export function briefFor(issue: any, site: string): string {
   const f = issue.fields ?? {};
+  const description = adfToText(f.description).trim();
+  const attachments = (Array.isArray(f.attachment) ? f.attachment : [])
+    .map((a: any) => ({ filename: String(a?.filename ?? "").trim(), content: String(a?.content ?? "").trim() }))
+    .filter((a: { filename: string }) => !!a.filename);
+  // An agent cannot guess a layout from prose when the answer is in a mockup, so
+  // say plainly that one exists. Decided from the structured facts only — an
+  // embedded image, a real attachment, or a URL that came out of a card or a
+  // link mark — never from the words, so "rename banner.png" stays prose.
+  const refs = adfRefs(f.description);
+  const looksVisual = (name: string) => /\.(png|jpe?g|gif|webp|svg|pdf|fig)$/i.test(name.split(/[?#]/)[0]!);
+  const visual =
+    refs.media ||
+    attachments.some((a: { filename: string }) => looksVisual(a.filename)) ||
+    refs.urls.some((u: string) => /^https?:\/\/([^/]*\.)?figma\.com\//i.test(u) || looksVisual(u));
   return [
     `JIRA: ${site}/browse/${issue.key}`,
     `Type: ${f.issuetype?.name ?? "-"}`,
@@ -1102,7 +1245,13 @@ export function briefFor(issue: any, site: string): string {
     `Assignee: ${f.assignee?.displayName ?? f.assignee?.accountId ?? "-"}`,
     `Labels: ${(f.labels ?? []).join(", ") || "-"}`,
     "",
-    adfToText(f.description).trim() || "(no description)",
+    description || "(no description)",
+    ...(attachments.length
+      ? ["", "Attachments:", ...attachments.map((a: { filename: string; content: string }) => `- ${a.filename}${a.content ? ` ${a.content}` : ""}`)]
+      : []),
+    ...(visual
+      ? ["", "This ticket carries visual material. Look at it before you build: fetch the attachments above (Jira auth required), and render any Figma link with the Figma REST API or the repo's scripts/figma-frame.sh."]
+      : []),
   ].join("\n");
 }
 
@@ -1490,6 +1639,7 @@ export interface JiraDeps {
   exec?: Exec; // keychain resolution
   log?: (msg: string, err?: unknown) => void;
   intervalMs?: number;
+  budgetMs?: number; // wall-clock cap on one project's issue loop (tests)
   token?: string; // bypass keychain (tests)
 }
 
@@ -1579,6 +1729,7 @@ export interface SyncStats {
   aborted: number; // writes dropped because the boundary re-read disagreed
   blocked: number; // outbound actions refused because a prerequisite could not be confirmed
   skipped: number; // issues whose fresh read failed (missing input)
+  budget_skipped: number; // issues left untouched because the cycle ran out of wall-clock budget
   cancelled: number; // mirrors dispositioned because their issue is proven gone
   errors: number;
   failures: string[];
@@ -1587,7 +1738,7 @@ export interface SyncStats {
 const emptyStats = (): SyncStats => ({
   imported: 0, pushed: 0, pulled: 0, labeled: 0,
   comments_pulled: 0, comments_pushed: 0, receipts: 0, attachments: 0, rendered: 0,
-  shadow: 0, unmapped: 0, aborted: 0, blocked: 0, skipped: 0, cancelled: 0, errors: 0, failures: [],
+  shadow: 0, unmapped: 0, aborted: 0, blocked: 0, skipped: 0, budget_skipped: 0, cancelled: 0, errors: 0, failures: [],
 });
 
 interface Ctx {
@@ -1754,8 +1905,21 @@ async function reconcileIssue(ctx: Ctx, read: IssueRead, task: any): Promise<voi
   // ---- JIRA-owned fields always flow JIRA -> hive (hive never rewrites them)
   const title = titleFor(read.issue);
   const brief = briefFor(read.issue, cfg.site);
-  if (task.title !== title || task.brief !== brief) {
-    db.query("UPDATE tasks SET title = ?, brief = ?, updated_at = ? WHERE id = ?").run(title, brief, now(), task.id);
+  // Priority is one of those Jira-owned fields, and this is the ONLY place hive
+  // writes it for a mirror — a fresh import reaches here on the same cycle
+  // (importAndReconcile), so there is one rule and no second copy to drift.
+  // It rides with title/brief deliberately: it is a plain field copy, entirely
+  // separate from the status conflict rule below, so it can never move a
+  // mirror's state.
+  const jiraPriorityName: string | null = read.issue.fields?.priority?.name ?? null;
+  const mappedPriority = jiraPriorityToPriority(jiraPriorityName);
+  if (jiraPriorityName != null && mappedPriority == null)
+    logSyncOnce(db, task.id, { action: "unmapped_priority", issue: key, jira_priority: jiraPriorityName });
+  // An issue with NO priority set is not an unmapped name; both land on normal.
+  const priority = mappedPriority ?? "normal";
+  if (task.title !== title || task.brief !== brief || task.priority !== priority) {
+    db.query("UPDATE tasks SET title = ?, brief = ?, priority = ?, updated_at = ? WHERE id = ?")
+      .run(title, brief, priority, now(), task.id);
     broadcastTask(db, getTask(db, task.id));
   }
 
@@ -2465,7 +2629,7 @@ function jiraTargetOwner(db: DB, projectId: string, cfg: JiraConfig): string {
     throw new Error(`jira target ${jiraTargetKey(cfg)} already has linked tasks in multiple Hive projects`);
   if (linkedOwners.length === 1) return linkedOwners[0].project_id;
 
-  const projects = db.query("SELECT id, config FROM projects ORDER BY created_at, id").all() as { id: string; config: string }[];
+  const projects = activeProjects(db) as { id: string; config: string }[];
   for (const project of projects) {
     try {
       const candidate = jiraConfig(JSON.parse(project.config || "{}"));
@@ -2481,6 +2645,13 @@ function assertJiraTargetOwner(db: DB, projectId: string, cfg: JiraConfig): void
     throw new Error(`jira target ${jiraTargetKey(cfg)} is owned by Hive project ${owner}; refusing project ${projectId}`);
 }
 
+// Where the last budget-truncated cycle stopped, per project. Without this the
+// loop restarts at the same key every tick, so a Jira slow enough to blow the
+// budget on the first N issues would starve every issue after them forever.
+// Keyed on the DB object for the same reason the in-flight guard is: two Hive
+// instances in one process must not share a cursor.
+const cycleResumeKeys = new WeakMap<object, Map<string, string>>();
+
 export async function syncProjectOnce(
   db: DB,
   projectId: string,
@@ -2491,6 +2662,12 @@ export async function syncProjectOnce(
   assertJiraTargetOwner(db, projectId, cfg);
   const log = deps.log ?? ((m: string, e?: unknown) => console.error(`[hive] jira: ${m}`, e ?? ""));
   const ctx: Ctx = { db, cfg, client, stats: emptyStats(), exec: deps.exec ?? defaultExec, diffs: new Map(), log };
+
+  const budgetMs = deps.budgetMs ?? jiraIntervalMs(deps) * CYCLE_BUDGET_MULTIPLIER;
+  const deadline = Date.now() + budgetMs;
+  // Bound every request this cycle makes, discovery included, so the cycle
+  // cannot overshoot the budget by one in-flight request.
+  client.deadlineAt = deadline;
 
   // Discovery must succeed before any verified absence can advance: a failed
   // scope check is not evidence that anything went missing.
@@ -2510,9 +2687,28 @@ export async function syncProjectOnce(
     });
   const linkedByKey = new Map<string, typeof linked>();
   for (const row of linked) linkedByKey.set(row.jira_key, [...(linkedByKey.get(row.jira_key) ?? []), row]);
-  const keys = [...new Set([...discovered, ...linkedByKey.keys()])];
+  const allKeys = [...new Set([...discovered, ...linkedByKey.keys()])];
+  // Resume where the last budget-truncated cycle stopped, then wrap around, so
+  // every issue is reached eventually even while Jira stays slow.
+  const resumeKeys = cycleResumeKeys.get(db as object) ?? new Map<string, string>();
+  const resumeAt = resumeKeys.get(projectId);
+  const start = resumeAt ? allKeys.indexOf(resumeAt) : -1;
+  const keys = start > 0 ? [...allKeys.slice(start), ...allKeys.slice(0, start)] : allKeys;
+  resumeKeys.delete(projectId);
 
-  for (const key of keys) {
+  for (const [index, key] of keys.entries()) {
+    if (Date.now() >= deadline) {
+      // Out of budget: stop here, record what was left, and let the NEXT tick
+      // start on time rather than being dropped by the single-flight guard.
+      ctx.stats.budget_skipped = keys.length - index;
+      resumeKeys.set(projectId, key); // pick this one up first next cycle
+      cycleResumeKeys.set(db as object, resumeKeys);
+      log(
+        `cycle budget of ${budgetMs}ms exhausted for ${cfg.project_key}; ` +
+          `${ctx.stats.budget_skipped} issue(s) deferred, resuming at ${key} next tick`
+      );
+      break;
+    }
     let read: IssueObservation;
     try {
       read = await readIssue(client, cfg, key, true);
@@ -2565,7 +2761,14 @@ export async function syncProjectOnce(
       const marker = hiveTaskMarker(read.issue);
       if (marker) {
         const marked = db.query("SELECT * FROM tasks WHERE id = ? AND project_id = ?").get(marker, projectId) as any;
-        if (marked && !marked.jira_key) {
+        // The marker names the task the sub-task was created FOR, which is not
+        // always the task that still owns the link: a requeue MOVES the key to
+        // the successor (see requeueTask) and the marker keeps naming the dead
+        // predecessor. Re-linking it would both strand the issue again and hit
+        // the unique index on (jira_key, jira_link_kind). So the marker only
+        // adopts a key that nobody holds.
+        const alreadyOwned = linkedTasks.some((task) => task.jira_link_kind === "subtask");
+        if (marked && !marked.jira_key && !alreadyOwned) {
           const linked = db.query("UPDATE tasks SET jira_key = ?, jira_link_kind = 'subtask', updated_at = ? WHERE id = ? AND jira_key IS NULL")
             .run(key, now(), marked.id);
           if (linked.changes !== 1) continue;
@@ -2714,7 +2917,7 @@ export async function runProjectCycle(
     const touched =
       stats.imported || stats.pushed || stats.pulled || stats.labeled || stats.comments_pulled ||
       stats.comments_pushed || stats.receipts || stats.attachments || stats.shadow || stats.unmapped || stats.aborted ||
-      stats.blocked || stats.skipped || stats.errors;
+      stats.blocked || stats.skipped || stats.budget_skipped || stats.errors;
     if (touched)
       console.log(
         `[hive] jira ${cfg.project_key}${cfg.write ? "" : " (shadow)"}: ` +
@@ -2722,7 +2925,7 @@ export async function runProjectCycle(
           `${stats.comments_pulled} comments in, ${stats.comments_pushed} comments out, ${stats.receipts} receipts, ` +
           `${stats.attachments} attachments, ${stats.rendered} rendered, ` +
           `${stats.shadow} shadow, ${stats.unmapped} unmapped, ${stats.aborted} aborted, ${stats.blocked} blocked, ` +
-          `${stats.skipped} skipped, ${stats.errors} errors`
+          `${stats.skipped} skipped, ${stats.budget_skipped} over budget, ${stats.errors} errors`
       );
     return { ok: true, stats, state };
   } catch (e) {
@@ -2738,7 +2941,7 @@ export async function runProjectCycle(
 export async function syncJiraOnce(db: DB, deps: JiraDeps = {}): Promise<SyncStats[]> {
   const out: SyncStats[] = [];
   if (isOffline(db)) return out;
-  const projects = db.query("SELECT id FROM projects").all() as { id: string }[];
+  const projects = activeProjects(db) as { id: string }[];
   for (const p of projects) {
     const status = jiraConfigStatusFor(db, p.id);
     // A config the gate rejected cannot produce a working cycle, so running one
@@ -2764,7 +2967,7 @@ export function startJiraSync(db: DB, deps: JiraDeps = {}): () => void {
   const intervalMs = jiraIntervalMs(deps);
   let nextFireAt = Date.now() + intervalMs;
   const publishNextDue = (value: string | null) => {
-    const projects = db.query("SELECT id, config FROM projects").all() as { id: string; config: string }[];
+    const projects = activeProjects(db) as { id: string; config: string }[];
     for (const project of projects) {
       try {
         if (jiraConfig(JSON.parse(project.config || "{}"))?.enabled)

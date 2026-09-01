@@ -54,6 +54,13 @@ export function resetTeamclaudeCache(): void {
   cache = null;
 }
 
+// The proxy URL the last probe found, or null when claude runs direct. Sync so
+// a failure path (the auth alert in modelCall.ts) can name the right fix
+// without re-probing: the call that just failed warmed this cache.
+export function cachedProxyUrl(): string | null {
+  return cache?.env ? proxyUrl(cache.env) : null;
+}
+
 async function probe(exec: Exec): Promise<TeamclaudeEnv | null> {
   const r = await exec(["teamclaude", "env"], { timeoutMs: 10_000 });
   if (r.code !== 0) return null;
@@ -91,4 +98,13 @@ export function applyTeamclaudeEnv(
   const merged = { ...base, ...tc.set };
   for (const k of tc.unset) delete merged[k];
   return merged;
+}
+
+// The same routing as an OVERLAY, for herdr pane agents. herdr takes `--env K=V`
+// pairs layered onto the inherited env and has no way to unset a name, so an
+// `unset` ships as an empty value — enough that a stray inherited
+// ANTHROPIC_BASE_URL cannot silently bypass the MITM proxy.
+export function teamclaudeOverlay(tc: TeamclaudeEnv | null): Record<string, string> {
+  if (!tc) return {};
+  return { ...tc.set, ...Object.fromEntries(tc.unset.map((k) => [k, ""])) };
 }

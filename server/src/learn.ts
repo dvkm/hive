@@ -8,6 +8,8 @@ import type { DB } from "./db.ts";
 import { now, newId } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { createDecision } from "./api.ts";
+import { activeProjects } from "./testProjects.ts";
+import { writeEvent } from "./state.ts";
 
 // Normalize a message into a stable signature: ids, hashes, paths, and numbers
 // vary per occurrence; the pattern doesn't.
@@ -75,7 +77,7 @@ function normalizeUrl(u: string): string {
 // the same URL suppresses re-proposing. This is what "don't make me paste the
 // Figma link a fourth time" looks like.
 export function captureRecurringRefs(db: DB): void {
-  const projects = db.query("SELECT id FROM projects").all() as { id: string }[];
+  const projects = activeProjects(db) as { id: string }[];
   for (const p of projects) {
     const texts = db
       .query(
@@ -188,6 +190,7 @@ export function recordDecisionKnowledge(
         "UPDATE learnings SET body = ?, occurrences = occurrences + 1, last_seen = ?, status = 'active', source_task_id = ? WHERE id = ?"
       ).run(body, t, d.task_id, existing.id);
       broadcast({ type: "learning", learning: { id: existing.id, occurrences: existing.occurrences + 1 } });
+      noteRuleCandidate(db, task.project_id, d.title, label, existing.occurrences + 1);
       return;
     }
     const id = newId("lrn");
@@ -251,4 +254,40 @@ export function recordSystemLearning(
     // A ledger write must never break the failure path that triggered it.
     console.error("[hive] recordSystemLearning:", e);
   }
+}
+
+// A question the director has now answered the same way twice is a rule waiting
+// to be written. Hive does NOT mint it: minting an authority rule or an
+// auto-answer pattern stays a director click. It writes a `rule_candidate`
+// event naming the repeat and the decisions behind it, and `hive stats` counts
+// those into one digest line.
+export function noteRuleCandidate(
+  db: DB,
+  projectId: string,
+  title: string,
+  answerLabel: string,
+  occurrences: number
+): void {
+  if (occurrences < 2) return;
+  const rows = db
+    .query(
+      `SELECT d.id, d.task_id FROM decisions d JOIN tasks t ON t.id = d.task_id
+        WHERE t.project_id = ? AND d.title = ? AND d.status = 'answered'
+        ORDER BY d.answered_at ASC`
+    )
+    .all(projectId, title) as { id: string; task_id: string }[];
+  if (rows.length < 2) return;
+  writeEvent(db, {
+    task_id: rows[rows.length - 1]!.task_id,
+    source: "system",
+    type: "rule_candidate",
+    payload: {
+      project_id: projectId,
+      title,
+      occurrences,
+      answer: answerLabel,
+      suggested: `Answered "${answerLabel}" ${occurrences} times. Add an authority rule or an auto-answer pattern so hive stops asking.`,
+      decision_ids: rows.map((r) => r.id),
+    },
+  });
 }

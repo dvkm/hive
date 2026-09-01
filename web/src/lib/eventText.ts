@@ -80,19 +80,32 @@ export function eventText(e: EventLike): string {
     case "auto_review": {
       if (s(p.skipped)) return `pre-review skipped (${s(p.skipped)})`;
       const risks = Array.isArray(p.risks) && p.risks.length ? ` — risks: ${(p.risks as string[]).join("; ")}` : "";
-      return `pre-review ${s(p.verdict) === "caution" ? "⚠ CAUTION" : "✓ looks good"}: ${s(p.summary)}${risks}`;
+      // Only `looks_good` is good. `caution`, `unparseable` and `unavailable`
+      // all used to render as "✓ looks good" here, which is the opposite of
+      // what they mean (HIVE-567).
+      const verdict = s(p.verdict);
+      const label = verdict === "looks_good" ? "✓ looks good" : verdict === "caution" ? "⚠ CAUTION" : `⚠ ${verdict.toUpperCase()}`;
+      return `pre-review ${label}: ${s(p.summary)}${risks}`;
     }
     case "auto_review_error":
+      // `gave_up` means the retry budget for this PR head is spent — the card
+      // needs a human, so it must not read like one more transient blip.
+      if (p.gave_up) return `pre-review gave up after ${s(p.attempts) || "several"} tries, needs you: ${s(p.error)}`;
       return `pre-review failed: ${s(p.error)}`;
     case "risk_verdicts": {
       const vs = Array.isArray(p.verdicts) ? (p.verdicts as any[]) : [];
       const qs = Array.isArray(p.question_verdicts) ? (p.question_verdicts as any[]) : [];
-      if (!vs.length && !qs.length) return `risk check produced no verdicts`;
+      const unchecked = Number(p.unverified) || 0;
+      const why = s(p.unverified_reason);
+      // A timeout is not a verdict: say so, or an empty set reads as a clean bill.
+      if (!vs.length && !qs.length)
+        return `risk check did not finish — ${unchecked || "no"} finding${unchecked === 1 ? "" : "s"} got no verdict${why ? ` (${why})` : ""}`;
       const confirmed = vs.filter((v) => v?.verdict === "confirmed");
       const forYou = qs.filter((q) => q?.answerable === "human");
       const parts = [];
       if (vs.length) parts.push(`${confirmed.length} of ${vs.length} risks confirmed`);
       if (qs.length) parts.push(`${forYou.length} of ${qs.length} questions need you`);
+      if (unchecked) parts.push(`${unchecked} not checked${why ? ` (${why})` : ""}`);
       const head = `risk check: ${parts.join(", ")}`;
       const named = [...confirmed.map((v) => s(v.risk)), ...forYou.map((q) => s(q.question))];
       return named.length ? `${head} — ${named.join("; ")}` : head;
@@ -115,7 +128,12 @@ export function eventText(e: EventLike): string {
       return `quick checks found problems: ${findings.map((f) => `${s(f.tool)}: ${s(f.summary)}`).join("; ")}`;
     }
     case "auto_merged":
+      // ok:false is history — failures are their own event type now.
       return p.ok === false ? `automatic merge failed: ${s(p.error) || `HTTP ${s(p.status)}`}` : "automatically merged";
+    case "auto_merge_failed":
+      return p.gave_up
+        ? `automatic merge refused ${s(p.attempts)} times, stopped trying: ${s(p.error) || `HTTP ${s(p.status)}`}`
+        : `automatic merge refused: ${s(p.error) || `HTTP ${s(p.status)}`}`;
     case "cleanup_skipped":
       return `cleanup failed safely: ${s(p.reason) || "worktree preserved"}`;
     case "stack_setup":
@@ -128,9 +146,9 @@ export function eventText(e: EventLike): string {
     case "worktree_reclaim_failed":
       return `worktree reclaim failed: ${s(p.error)}`;
     case "ready_held":
-      return s(p.reason) === "no_evidence"
-        ? "handoff held: no evidence attached yet"
-        : `handoff held: CI ${s(p.ci_status)} on ${s(p.pr_url)}`;
+      if (s(p.reason) === "no_evidence") return "handoff held: no evidence attached yet";
+      if (s(p.reason) === "missing_understanding_check") return "handoff held: the review carries no understanding check";
+      return `handoff held: CI ${s(p.ci_status)} on ${s(p.pr_url)}`;
     case "ci_failure":
       return `CI failing — agent nudged to fix`;
     case "merge_failed": {
@@ -155,6 +173,8 @@ export function eventText(e: EventLike): string {
       return "agent spawned";
     case "spawn_error":
       return `spawn failed: ${s(p.error)}`;
+    case "spawn_gave_up":
+      return `gave up spawning after ${s(p.attempts) || "repeated"} identical failures: ${s(p.error)}`;
     case "agent_status":
       return `agent ${s(p.status) || "status changed"}`;
     case "dialog_auto_approved":
@@ -171,6 +191,14 @@ export function eventText(e: EventLike): string {
       return s(p.via) === "emit" ? "handed off for review" : "auto-advanced to review (agent idle)";
     case "stale":
       return "agent went silent";
+    case "hung":
+      return `no progress for ${Math.round(Number(p.silent_ms ?? 0) / 60000)} min, agent still alive${s(p.last_said) ? ` — last said: "${s(p.last_said)}"` : ""}`;
+    case "deployed":
+      return p.up_to_date
+        ? `serving checkout '${s(p.branch)}' was already current`
+        : `serving checkout '${s(p.branch)}' followed ${s(p.base)} to ${String(p.head_sha ?? "").slice(0, 7)}`;
+    case "serving_follow_conflict":
+      return `serving checkout '${s(p.branch)}' could not merge ${s(p.base)}${Array.isArray(p.files) && p.files.length ? ` (${p.files.join(", ")})` : ""}`;
     case "smoke_passed":
       return "post-deploy smoke passed";
     case "smoke_failed":
@@ -263,6 +291,12 @@ export function eventText(e: EventLike): string {
       if (s(p.direction) === "inbound") return `Jira comment${at} from ${s(p.author) || "someone"}`;
       return `comment queued for Jira${at}`;
     }
+    case "taken_over":
+      return `you took the worktree over — the agent is parked and its slot is free`;
+    case "handed_back":
+      return s(p.summary)
+        ? `handed back to an agent, steered with what you changed`
+        : `handed back to an agent — nothing changed while you had it`;
     default: {
       const words = e.type.replace(/[_-]+/g, " ");
       const note = s(p.note);
@@ -301,11 +335,14 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
   incident: "incident",
   blocked: "incident",
   stale: "incident",
+  hung: "incident",
   merge_failed: "incident",
+  auto_merge_failed: "incident",
   merge_blocked_destructive: "incident",
   scope_drift: "decision",
   action_failed: "incident",
   spawn_error: "incident",
+  spawn_gave_up: "incident",
   smoke_failed: "incident",
   steer_error: "incident",
   planner_error: "incident",
@@ -333,6 +370,7 @@ const FAILURE_TYPES = new Set([
   "recovery",
   "smoke_failed",
   "spawn_error",
+  "spawn_gave_up",
   "steer_error",
   "supervise_error",
   "usage_limit",

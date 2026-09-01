@@ -28,9 +28,12 @@ import { enqueue } from "../notifications.ts";
 import { providerFor } from "../secrets.ts";
 import type { Exec } from "../exec.ts";
 import { defaultExec } from "../exec.ts";
+import { triageIntake } from "./triage.ts";
 import { runPlanner, type PlannerExec } from "../planner.ts";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
+import { activeProjects } from "../testProjects.ts";
+import { startLoop } from "../loop.ts";
 
 export type FetchLike = typeof fetch;
 
@@ -61,6 +64,7 @@ export interface GchatDeps {
   secrets?: GchatSecrets; // bypass keychain resolution (tests)
   intervalMs?: number; // startGchatPoll only
   plannerExec?: PlannerExec; // domain-supervisor planner (auto-trigger when config.plan_intake)
+  triageExec?: PlannerExec; // the intake-triage classifier (injectable in tests)
 }
 
 // ---- module state (mirrors secrets.ts's module-level knownValues) ----
@@ -246,7 +250,8 @@ async function createIntakeTask(
   fetchImpl: FetchLike,
   notify: boolean,
   planIntake: boolean,
-  plannerExec?: PlannerExec
+  plannerExec?: PlannerExec,
+  triageExec?: PlannerExec
 ): Promise<any | null> {
   const name: string = msg.name;
   if (db.query("SELECT 1 FROM tasks WHERE source_ref = ?").get(name)) return null; // dedupe
@@ -308,6 +313,13 @@ async function createIntakeTask(
       /* runPlanner records its own planner_error event; never fail the intake */
     }
   }
+  // Intake triage (config.intake_triage): mechanical messages clear the
+  // unreviewed hold themselves, ambiguous ones raise the director's card.
+  // Deliberately NOT awaited — the classifier can take up to 60s, and one slow
+  // message must not stall the rest of the poll cycle. The task is already held
+  // (created unreviewed) and triageIntake takes its own hold synchronously
+  // before its first await, so there is no window where it could dispatch.
+  triageIntake(db, task, { exec: triageExec }).catch((e) => console.error(`[hive] gchat: intake triage ${id}:`, e));
   return task;
 }
 
@@ -319,7 +331,7 @@ export async function pollGchatOnce(db: DB, deps: GchatDeps = {}): Promise<{ cre
   const nowMs = deps.nowMs ?? (() => Date.now());
   const notify = deps.notify ?? true;
 
-  const projects = db.query("SELECT id, config FROM projects").all() as { id: string; config: string }[];
+  const projects = activeProjects(db) as { id: string; config: string }[];
   const jobs: { projectId: string; space: string; planIntake: boolean }[] = [];
   // `gchat_spaces: "*"` means every space the authorized user is in; those
   // projects can only be expanded once we hold a token (spaces.list).
@@ -377,7 +389,7 @@ export async function pollGchatOnce(db: DB, deps: GchatDeps = {}): Promise<{ cre
         const senderType = msg.sender?.type;
         const isSelf = secrets.self && msg.sender?.name === secrets.self;
         if (!isSelf && senderType !== "BOT") {
-          const made = await createIntakeTask(db, job.projectId, job.space, msg, token, fetchImpl, notify, job.planIntake, deps.plannerExec);
+          const made = await createIntakeTask(db, job.projectId, job.space, msg, token, fetchImpl, notify, job.planIntake, deps.plannerExec, deps.triageExec);
           if (made) created++;
         }
         // Advance the cursor even for skipped messages so we never refetch them.
@@ -394,22 +406,8 @@ export async function pollGchatOnce(db: DB, deps: GchatDeps = {}): Promise<{ cre
 // Production starts one background loop from index.ts. Each start call owns its
 // timer and in-flight guard; a slow cycle skips ticks instead of queueing them.
 export function startGchatPoll(db: DB, deps: GchatDeps = {}): () => void {
-  const log = deps.log ?? ((m: string, e?: unknown) => console.error(`[hive] gchat: ${m}`, e ?? ""));
   const intervalMs = deps.intervalMs ?? Number(process.env.HIVE_GCHAT_POLL_MS || 60_000);
-  let running = false;
-  const timer = setInterval(() => {
-    if (running) {
-      log("poll tick skipped: previous cycle still running");
-      return;
-    }
-    running = true;
-    pollGchatOnce(db, deps)
-      .catch((e) => console.error("[hive] gchat poll crashed:", e))
-      .finally(() => {
-        running = false;
-      });
-  }, intervalMs);
-  return () => clearInterval(timer);
+  return startLoop("gchat", intervalMs, () => pollGchatOnce(db, deps));
 }
 
 // ------------------------------------------------------------------ oauth (CLI)

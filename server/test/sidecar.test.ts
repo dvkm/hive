@@ -28,7 +28,10 @@ function freshDb(): { db: DB; projectId: string; taskId: string } {
 
 // A worktree with a tsconfig and a lint script; `results` overrides the exit
 // of a named check ("tsc" / "lint").
-function fakeWorld(results: Record<string, ExecResult> = {}, opts: { lintScript?: string; porcelain?: string[] } = {}) {
+function fakeWorld(
+  results: Record<string, ExecResult> = {},
+  opts: { lintScript?: string; porcelain?: string[]; touched?: string[] } = {}
+) {
   const calls: string[][] = [];
   // Successive `git status --porcelain` answers; the last one repeats.
   const porcelain = opts.porcelain ?? [""];
@@ -38,6 +41,8 @@ function fakeWorld(results: Record<string, ExecResult> = {}, opts: { lintScript?
     if (argv[4] === "HEAD") return OK(`${SHA}\n`);
     if (argv.includes("--git-path")) return OK(".git/rebase-merge\n.git/rebase-apply\n.git/MERGE_HEAD\n");
     if (argv.includes("--porcelain")) return OK(porcelain[Math.min(statusCalls++, porcelain.length - 1)]);
+    // Files this branch changed, for scoping tsc errors to the diff.
+    if (argv.includes("--name-only")) return OK((opts.touched ?? ["src/a.ts"]).join("\n") + "\n");
     if (argv.includes("tsc")) return results.tsc ?? OK();
     if (argv.includes("lint")) return results.lint ?? OK();
     return OK();
@@ -73,6 +78,19 @@ test("a clean worktree reports ok with no findings", async () => {
   await sidecarOnce(db, fakeWorld());
   expect(reports(db, taskId)).toEqual([{ sha: SHA, ok: true, findings: [] }]);
 });
+
+
+test("skips the install when node_modules is already there", async () => {
+  const { db, taskId } = freshDb();
+  const world = fakeWorld();
+  world.exists = (p: string) => p.endsWith("tsconfig.json") || p.endsWith("package.json") || p.endsWith("node_modules");
+  await sidecarOnce(db, world);
+
+  expect(reports(db, taskId)).toEqual([{ sha: SHA, ok: true, findings: [] }]);
+  expect(world.calls.some((c) => c[0] === "bun" && c[1] === "install")).toBe(false);
+});
+
+
 
 test("summaries are capped at 200 characters", async () => {
   const { db, taskId } = freshDb();
@@ -240,4 +258,72 @@ test("a tsc check that was skipped for budget is not a broken build", async () =
   }
   expect(reports(db, taskId)[0].findings.every((f: any) => f.summary.startsWith("skipped:"))).toBe(true);
   expect(steers(db, taskId)).toEqual([]);
+});
+
+test("tsc errors in files the diff never touched do not fail the PR", async () => {
+  const { db, taskId } = freshDb();
+  // Six pre-existing errors on the base branch, none of them in this diff.
+  const world = fakeWorld(
+    {
+      tsc: {
+        code: 2,
+        stdout: "server/src/api.ts(1191,41): error TS18047: 'thread' is possibly 'null'.\n",
+        stderr: "",
+      },
+    },
+    { touched: ["src/mine.ts"] }
+  );
+  await sidecarOnce(db, world);
+  expect(reports(db, taskId)).toEqual([{ sha: SHA, ok: true, findings: [] }]);
+});
+
+test("tsc errors inside the diff still fail the PR, and errors with no file are kept", async () => {
+  const { db, taskId } = freshDb();
+  const world = fakeWorld(
+    {
+      tsc: {
+        code: 2,
+        stdout:
+          "server/src/api.ts(1191,41): error TS18047: 'thread' is possibly 'null'.\n" +
+          "src/mine.ts(4,2): error TS2322: nope.\n" +
+          "error TS2688: Cannot find type definition file for 'bun'.\n",
+        stderr: "",
+      },
+    },
+    { touched: ["src/mine.ts"] }
+  );
+  await sidecarOnce(db, world);
+  const [report] = reports(db, taskId);
+  expect(report.ok).toBe(false);
+  // The untouched api.ts error is dropped; the diff's own error and the
+  // file-less one (which says the check itself is broken) are kept.
+  expect(report.findings[0].summary).toBe(
+    "src/mine.ts(4,2): error TS2322: nope. | error TS2688: Cannot find type definition file for 'bun'."
+  );
+});
+
+test("unparseable tsc output is reported unchanged rather than scoped away", async () => {
+  const { db, taskId } = freshDb();
+  const world = fakeWorld({ tsc: { code: 2, stdout: "segfault\n", stderr: "" } }, { touched: ["src/mine.ts"] });
+  await sidecarOnce(db, world);
+  expect(reports(db, taskId)[0]).toEqual({ sha: SHA, ok: false, findings: [{ tool: "tsc", summary: "segfault" }] });
+});
+
+test("a worktree with no node_modules is skipped, and never reported as a broken build", async () => {
+  const { db, taskId } = freshDb();
+  const world = fakeWorld({ tsc: { code: 2, stdout: "error TS2688: Cannot find type definition file for 'bun'.\n", stderr: "" } });
+  // Same repo, but dependencies were never installed.
+  const uninstalled = { ...world, exists: (p: string) => p.endsWith("tsconfig.json") || p.endsWith("package.json") };
+  await sidecarOnce(db, uninstalled);
+
+  expect(reports(db, taskId)).toEqual([
+    {
+      sha: SHA,
+      ok: false,
+      findings: [{ tool: "sidecar", summary: "skipped: this worktree has no node_modules, so nothing can be type checked. Run `bun install` in it." }],
+    },
+  ]);
+  expect(world.calls.some((c) => c.includes("tsc"))).toBe(false);
+  // A skipped check is not a build break, so the agent is never steered.
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'steer'").all(taskId)).toEqual([]);
 });

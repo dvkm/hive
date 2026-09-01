@@ -1,6 +1,8 @@
 // hive CLI — thin HTTP wrappers around the daemon. The server is the only DB writer.
 // Installed as bin/hive (bun shebang). Base URL: HIVE_URL or http://127.0.0.1:<HIVE_PORT|4700>.
 import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { REVIEW_SUMMARY_HELP } from "../server/src/reviewShape.ts";
 import { appBrowserCandidates, installedHiveAppCandidates, openUrlArgv, tailscaleCandidates } from "./platform.ts";
 
 const BASE =
@@ -11,14 +13,28 @@ const USAGE = `hive — local orchestration control plane
 Usage:
   hive serve                              start the daemon
   hive task create --project <id> --title <t> [--brief <file> | --brief-text <s>]
-        [--kind ship|scout|chore] [--parent <task-id>] [--depends-on <id,id>] [--track]
+        [--kind ship|scout|chore] [--parent <task-id>] [--depends-on <id,id>]
+        [--priority now|next|normal|later]
         (under a hive agent, HIVE_TASK_ID makes source=agent + parent automatic;
-         --track = tracking-only: never auto-dispatched, moves freely, no evidence gate)
+         to park a task instead, create it then run: hive emit <id> deferred)
+        (priority is queue ORDER, never preemption. Omit it and the task inherits
+         its parent's, or starts at 'next' when the brief is security-shaped,
+         else 'normal'. Tasks created together in a depends-on chain do NOT
+         inherit from the chain head: pass --priority on each one you want it on.
+         Only the director may set 'now' — under a hive agent it is refused.)
   hive task send <task-id> <message>   attributed teammate message under a hive agent
   hive task move <task-id> <state> [--note <s>]   states: queued in_progress needs_decision
-        in_review verifying done failed cancelled
+        in_review verifying done deferred failed cancelled
+        deferred parks the task waiting on an OFFLINE human action (same as
+        \`hive emit <id> deferred\`; [--until <iso>] or [--days <n>], else
+        indefinite). Moving a parked task back to in_progress un-parks it.
   hive task list [--state <s>] [--project <id>]
-  hive task update <task-id> --depends-on <id,id>   declare a dependency discovered mid-task
+  hive task takeover <task-id> [--open]    park the agent and edit the worktree yourself
+        (frees the agent's slot; --open starts $VISUAL/$EDITOR on the checkout)
+  hive task handback <task-id> [--note <s>]   put an agent back on the same branch,
+        steered with a summary of what you changed while you had it
+  hive task update <task-id> [--depends-on <id,id>] [--priority now|next|normal|later]
+        --depends-on declares a dependency discovered mid-task
         (e.g. "my PR needs #993's to merge first"); full replace, so pass every
         id this task should still wait on, not just the new one
   hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>] [--landing-commit <sha>] [--verify-name <name>]
@@ -29,7 +45,7 @@ Usage:
         the task without a merge step.
         --verify-name <name>: on evidence, tags the artifact with the named
         verification command it came from (see the brief's Verification contract)
-        review_summary: --json review.json with {done[], iffy[], decisions[], testing[], followups[], understanding{check{question,options[],answer_key}}}
+        ${REVIEW_SUMMARY_HELP}
         deferred: park a task waiting on an OFFLINE human action (no more "gone quiet" nudges);
                   [--until <iso>] or [--days <n>] to auto-resume, else indefinite. undefer to resume early.
         ready: PR open (or scout report written) → hand off to review (in_progress -> in_review)
@@ -47,13 +63,23 @@ Usage:
         [--body <s>] [--task <src-task-id>] [--root-cause]  (root-cause: failure only, auto-spawns a chore task)
   hive learning list [--project <id>] [--status active|resolved]
   hive learning recur <learning-id>
+  hive playbook create <task-id>          distil a done task into a reusable playbook (a reference)
+  hive playbook list [--project <id>]
   hive land <task-id...> [--off]          mark in-review tasks approved-to-land; hive merges
         them in graph order (declared dependencies first, one conflicting branch per sweep)
   hive land-graph [--project <id>]        show the review column's ordering edges
   hive recall <keywords>                  search project knowledge (references, learnings, policies)
+  hive garden [--project <id>] [--apply] [--remote] [--json]
+        prune task branches + worktrees using task state, not git reachability.
+        Deletes a branch only when its task is done; keeps cancelled/failed
+        branches; never touches a branch with no task, a ghost-* WIP rescue, a
+        branch hive does not own, or one checked out somewhere. Dry run unless
+        --apply.
   hive jira link <task-id> --parent <KEY> create and link a Jira sub-task
-  hive spawn <task-id>                    spawn a herdr agent for a task
+  hive spawn <task-id> [--force]          spawn a herdr agent for a task
+                                          (--force: the previous agent is dead, take its name)
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
+  hive chat supervisor [on|off]           chief of staff off switch (default off)
   hive chat reply <thread-id> "<text>" [--decision <id> ...]
                                               post one reply with actionable decision cards
   hive chat update <thread-id> [--phase <phase>] [--objective <text>] [--criterion <text> ...]
@@ -74,7 +100,7 @@ Usage:
   hive steer-all "message" [--project <id>] [--actor <session>]   broadcast a steer to every live agent
   hive tunnel                             expose hive to your phone over Tailscale HTTPS (private; enables push)
   hive remote                             print LAN URL + API token for phone access (PWA)
-  hive stats [--days 7]                   autonomy scorecard (steers, decisions, CI gate, cost)
+  hive stats [--days 7]                   autonomy scorecard (steers, decisions, CI gate, cost, autonomy)
   hive watch add --project <id> --name <n> --url <u> [--prompt <s>] [--kind <k>] [--interval <min>]
   hive watch list [--project <id>]        poll a doc/page; changes queue an act-on-change task
   hive watch rm --project <id> --name <n>   (Google Docs edit links auto-use the txt export; doc must be link-readable)
@@ -117,19 +143,6 @@ function parseFlags(argv: string[]): { _: string[]; flags: Record<string, any> }
 function die(msg: string, code = 1): never {
   console.error(msg);
   process.exit(code);
-}
-
-// The commit HEAD was at when evidence was captured, so the review card can
-// flag it stale against the PR's current head (task #226). Best-effort: cwd
-// may not be a git repo (or git may be missing) — evidence still gets filed.
-function gitHeadSha(): string | null {
-  try {
-    const r = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
-    if (r.exitCode !== 0) return null;
-    return r.stdout.toString().trim() || null;
-  } catch {
-    return null;
-  }
 }
 
 // Config/secret writes need the API token even over loopback (see
@@ -188,15 +201,16 @@ async function main() {
     if (sub === "create") {
       if (!flags.project) die("--project is required");
       if (!flags.title) die("--title is required");
+      // --track (source='external') is retired: it made tasks hive could never
+      // dispatch and never told anyone. Park work with `deferred` instead.
+      if (flags.track) die("--track is retired. Create the task, then park it: hive emit <id> deferred");
       const brief = flags.brief
         ? readFileSync(String(flags.brief), "utf8")
         : flags["brief-text"]
           ? String(flags["brief-text"])
           : undefined;
       // Running under a spawned agent (HIVE_TASK_ID set): attribute the task to
-      // the agent and default the parent to the spawning task. --track marks a
-      // tracking-only task (source='external'): never auto-dispatched, moves
-      // freely through states — hive as a kanban for OTHER agents' own work.
+      // the agent and default the parent to the spawning task.
       const agentTask = process.env.HIVE_TASK_ID;
       const t = await api("POST", "/api/tasks", {
         project_id: flags.project,
@@ -205,7 +219,8 @@ async function main() {
         kind: flags.kind,
         parent_task_id: flags.parent ?? agentTask ?? undefined,
         depends_on: flags["depends-on"] ? String(flags["depends-on"]) : undefined,
-        source: flags.track ? "external" : agentTask ? "agent" : undefined,
+        source: agentTask ? "agent" : undefined,
+        priority: flags.priority ? String(flags.priority) : undefined,
       });
       console.log(`created task ${t.id}  [${t.state}]  ${t.title}`);
       // #989: the server checks the brief's file paths against the chosen
@@ -223,13 +238,25 @@ async function main() {
         from_task_id: process.env.HIVE_TASK_ID || undefined,
       });
       console.log(`message to ${taskId}: ${r.delivery}`);
+      // "queued" is not delivery: nothing read it, and nothing will until the
+      // task is spawned again. Say so, and say what to do (HIVE-552) — the old
+      // bare "queued" read as "sent" while the message sat unread for hours.
+      // A Jira-linked task also answers "queued", but with ok:true — that one IS
+      // on its way out as a Jira comment, so it gets no warning.
+      if (r.delivery === "queued" && !r.ok)
+        console.log(
+          `  ⚠ nobody read it${r.error ? ` — ${r.error}` : " — no live agent"}. ` +
+            `It rides along on the next spawn: hive spawn ${taskId}`
+        );
       return;
     }
     if (sub === "move") {
       const [taskId, to] = _;
       if (!taskId || !to) die("usage: hive task move <task-id> <state> [--note <s>]");
-      const t = await api("POST", `/api/tasks/${taskId}/transition`, { to, reason: flags.note });
-      console.log(`task ${t.id} -> [${t.state}]  ${t.title}`);
+      const t = await api("POST", `/api/tasks/${taskId}/transition`, { to, reason: flags.note, until: flags.until, days: flags.days });
+      // A parked task stays in_progress in the DB, so echo what actually happened.
+      const parked = t.deferred_until && Date.parse(t.deferred_until) > Date.now();
+      console.log(`task ${t.id} -> [${parked ? "deferred" : t.state}]  ${t.title}`);
       if (t.bounce?.respawned) console.log(`  respawned the agent with your note in its brief`);
       else if (t.bounce && !t.bounce.delivered)
         console.log(`  note recorded but no agent is running — run: hive spawn ${t.id}`);
@@ -247,10 +274,45 @@ async function main() {
     }
     if (sub === "update") {
       const taskId = _[0];
-      if (!taskId) die("usage: hive task update <task-id> --depends-on <id,id>");
-      if (flags["depends-on"] === undefined) die("--depends-on is required (full replace — pass every id this task should wait on)");
-      const t = await api("PUT", `/api/tasks/${taskId}`, { depends_on: String(flags["depends-on"]) });
-      console.log(`task ${t.id} depends_on: ${t.depends_on.length ? t.depends_on.join(", ") : "(none)"}`);
+      if (!taskId) die("usage: hive task update <task-id> [--depends-on <id,id>] [--priority now|next|normal|later]");
+      if (flags["depends-on"] === undefined && flags.priority === undefined)
+        die("pass --depends-on (full replace — every id this task should wait on) and/or --priority");
+      const t = await api("PUT", `/api/tasks/${taskId}`, {
+        depends_on: flags["depends-on"] !== undefined ? String(flags["depends-on"]) : undefined,
+        priority: flags.priority ? String(flags.priority) : undefined,
+      });
+      console.log(`task ${t.id} depends_on: ${t.depends_on.length ? t.depends_on.join(", ") : "(none)"}  priority: ${t.priority}`);
+      return;
+    }
+    // Take the worktree over by hand, and hand it back when done (HIVE-352).
+    // `--open` starts $VISUAL/$EDITOR on the checkout; without it, the printed
+    // path is the whole point.
+    if (sub === "takeover") {
+      const taskId = _[0];
+      if (!taskId) die("usage: hive task takeover <task-id> [--open]");
+      const r = await api("POST", `/api/tasks/${taskId}/takeover`, {});
+      console.log(`${taskId} is yours — the agent is parked and its slot is free`);
+      console.log(`  worktree: ${r.worktree_path}`);
+      if (r.branch) console.log(`  branch:   ${r.branch}`);
+      console.log(`  hand it back with: hive task handback ${taskId}`);
+      const editor = flags.open ? process.env.VISUAL || process.env.EDITOR : null;
+      if (flags.open && !editor) console.log("  (no $VISUAL or $EDITOR set — open it yourself)");
+      else if (editor) Bun.spawn([editor, r.worktree_path], { stdout: "inherit", stderr: "inherit" });
+      return;
+    }
+    if (sub === "handback") {
+      const taskId = _[0];
+      if (!taskId) die('usage: hive task handback <task-id> [--note "<s>"]');
+      const r = await api("POST", `/api/tasks/${taskId}/handback`, { note: flags.note });
+      console.log(`${taskId} handed back${r.branch ? ` on ${r.branch}` : ""}`);
+      console.log(
+        r.summary === null
+          ? "  hive could not read the diff — the agent is told to check git itself"
+          : r.summary === ""
+            ? "  nothing changed while you had it"
+            : `  the agent's steer summarises:\n${r.summary.split("\n").map((l: string) => "    " + l).join("\n")}`
+      );
+      if (!r.steer_queued) console.log("  ⚠ the steer could not be queued — no agent will ever read it");
       return;
     }
     die(`unknown 'task' subcommand: ${sub}\n\n${USAGE}`);
@@ -283,7 +345,11 @@ async function main() {
     const [taskId, type] = _;
     if (!taskId || !type) die("usage: hive emit <task-id> <type> [--note ...] [--file path]");
     const path = `/api/tasks/${taskId}/events`;
-    const sha = type === "evidence" ? gitHeadSha() : null;
+    // No commit stamp from here: the server stamps evidence with the HEAD of
+    // the TASK's own worktree. Stamping the cwd meant an emit from anywhere
+    // else (a director driving the task, an orchestrator) recorded a different
+    // repository's commit, and the freshness gate held the handoff forever
+    // (HIVE-575).
     let result: any;
     if (flags.file) {
       const form = new FormData();
@@ -293,7 +359,6 @@ async function main() {
       if (flags.caption) form.set("caption", String(flags.caption));
       if (flags.source) form.set("source", String(flags.source));
       if (flags["verify-name"]) form.set("verify_name", String(flags["verify-name"]));
-      if (sha) form.set("meta", JSON.stringify({ commit_sha: sha }));
       const file = Bun.file(String(flags.file));
       form.set("file", file);
       const res = await fetch(BASE + path, { method: "POST", body: form });
@@ -304,8 +369,13 @@ async function main() {
       // --json <file> merges a JSON object into the event payload — used for
       // structured events like review_summary (see the agent brief).
       const extra = flags.json ? JSON.parse(readFileSync(String(flags.json), "utf8")) : {};
+      // hive-1992: the server refuses a payload read from a path other agents
+      // can write (the shared /tmp/review.json that published one agent's
+      // review under another's task), so it needs the resolved path.
+      const payloadPath = flags.json ? resolve(String(flags.json)) : undefined;
       result = await api("POST", path, {
         type,
+        payload_path: payloadPath,
         note: flags.note,
         kind: flags.kind,
         source: flags.source,
@@ -316,11 +386,21 @@ async function main() {
         pr_url: flags["pr-url"] ?? flags.url,
         landing_commit: flags["landing-commit"],
         verify_name: flags["verify-name"],
-        ...(sha && !extra.meta ? { meta: JSON.stringify({ commit_sha: sha }) } : {}),
         ...extra,
       });
     }
+    // A held handoff comes back 200 with `held: true` and the reason. Printing
+    // only "emitted 'ready'" hid that from the agent completely, so the hold was
+    // discovered later by a human and cost a respawn to answer (HIVE-574).
+    if (result.held) {
+      console.log(`emit '${type}' on ${taskId} was HELD${result.reason ? ` (${result.reason})` : ""}`);
+      if (result.message) console.log(result.message);
+      return;
+    }
     console.log(`emitted '${type}' on ${taskId}` + (result.evidence ? ` (evidence ${result.evidence.id})` : ""));
+    // e.g. "no worktree, so the evidence is not tied to a commit" — the agent
+    // should hear that at emit time, not from a held handoff later.
+    if (result.warning) console.log(result.warning);
     return;
   }
 
@@ -487,11 +567,41 @@ async function main() {
     die(`unknown 'learning' subcommand: ${sub}\n\n${USAGE}`);
   }
 
+  // Playbooks are kind='reference' learnings whose body starts with
+  // `[playbook]`, so they need no store of their own — just a create call and a
+  // filtered list.
+  if (cmd === "playbook") {
+    const sub = argv[1];
+    const { _, flags } = parseFlags(argv.slice(2));
+    if (sub === "create") {
+      const taskId = _[0];
+      if (!taskId) die("usage: hive playbook create <task-id>");
+      const r = await api("POST", `/api/tasks/${taskId}/playbook`, {});
+      console.log(`playbook ${r.learning_id}: ${r.playbook.title}`);
+      console.log(`  when to use: ${r.playbook.when_to_use}`);
+      for (const s of r.playbook.steps) console.log(`  - ${s}`);
+      return;
+    }
+    if (sub === "list") {
+      const qs = new URLSearchParams({ status: "active" });
+      if (flags.project) qs.set("project_id", String(flags.project));
+      const rows = await api("GET", "/api/learnings?" + qs.toString());
+      const books = rows.filter((l: any) => l.kind === "reference" && String(l.body ?? "").startsWith("[playbook]"));
+      if (!books.length) return console.log("(no playbooks)");
+      for (const l of books) console.log(`${l.id}  ${l.title}\n    ${String(l.body).split("\n")[0].slice(11)}`);
+      return;
+    }
+    die(`unknown 'playbook' subcommand: ${sub}\n\n${USAGE}`);
+  }
+
   if (cmd === "spawn") {
-    const { _ } = parseFlags(argv.slice(1));
+    const { _, flags } = parseFlags(argv.slice(1));
     const taskId = _[0];
-    if (!taskId) die("usage: hive spawn <task-id>");
-    const r = await api("POST", `/api/tasks/${taskId}/spawn`, {});
+    if (!taskId) die("usage: hive spawn <task-id> [--force]");
+    // --force is for the one case hive cannot see for itself: the operator has
+    // checked that the agent holding this task's name is gone. It skips the
+    // 15-minute silence window, nothing else (HIVE-579).
+    const r = await api("POST", `/api/tasks/${taskId}/spawn`, { force: flags.force === true });
     console.log(`spawned agent ${r.agent_target} for task ${taskId}`);
     return;
   }
@@ -499,6 +609,20 @@ async function main() {
   if (cmd === "chat") {
     const sub = argv[1];
     const { _, flags } = parseFlags(argv.slice(2));
+    // `hive chat supervisor [on|off]` — the Chief of Staff off switch. Off (the
+    // default) means a chat message never starts a session; turning it off also
+    // ends any session already running.
+    if (sub === "supervisor") {
+      const state = argv[2];
+      if (state === "on" || state === "off") {
+        const r = await api("POST", "/api/chat/supervisor", { on: state === "on" });
+        console.log(`chief of staff ${r.on ? "ON" : `off${r.stopped ? ` — stopped ${r.stopped} live session(s)` : ""}`}`);
+      } else {
+        const r = await api("GET", "/api/chat/supervisor");
+        console.log(`chief of staff: ${r.on ? "ON" : "off"}`);
+      }
+      return;
+    }
     // `hive chat reply <thread-id> <text>` — the supervisor session replies to
     // the director (the ONLY director-facing channel from a chat agent).
     if (sub === "reply") {
@@ -622,7 +746,7 @@ async function main() {
       console.log(`closed ${threadId}`);
       return;
     }
-    die("usage: hive chat reply <thread-id> <text>  |  hive chat send [--project <id>|--thread <id>] <text>  |  hive chat close <thread-id>");
+    die("usage: hive chat reply <thread-id> <text>  |  hive chat send [--project <id>|--thread <id>] <text>  |  hive chat close <thread-id>  |  hive chat supervisor [on|off]");
   }
 
   if (cmd === "pr-marker") {
@@ -781,7 +905,26 @@ async function main() {
     console.log(`  sidecar:        ${sidecar.n} checks, ${sidecar.caught ?? 0} caught problems (${(sidecar.n / days).toFixed(1)}/day)`);
     console.log(`  CI gate:        ${held} handoffs held, ${bounced} bounced out of review`);
     console.log(`  review->merge:  avg ${review.h ?? "-"}h`);
+    // Repeat decisions hive already answered the same way: each is a rule the
+    // director could mint once instead of answering again. Minting stays a click.
+    const candidates = db.query(
+      `SELECT json_extract(payload,'$.title') title, MAX(json_extract(payload,'$.occurrences')) n,
+              json_extract(payload,'$.decision_ids') ids
+         FROM events WHERE type='rule_candidate' AND ts > ? GROUP BY title ORDER BY n DESC`
+    ).all(since) as any[];
+    if (candidates.length) {
+      console.log(`  rules:          ${candidates.length} repeat decisions could become rules`);
+      for (const c of candidates)
+        console.log(`                  "${c.title}" (${c.n}x) ${(JSON.parse(c.ids ?? "[]") as string[]).join(", ")}`);
+    }
     for (const c of cost) console.log(`  cost:           ${c.model}  $${c.c}  (${c.t} tasks)`);
+
+    // Read-only autonomy scoreboard (same collector the /api/stats/autonomy
+    // endpoint serves). No thresholds or alerts here on purpose.
+    const { autonomyStats } = await import("../server/src/autonomyStats.ts");
+    const { renderAutonomy } = await import("./autonomySection.ts");
+    for (const line of renderAutonomy(await autonomyStats(db, { days }))) console.log(line);
+
     console.log(`\nfewer steers/nudges per shipped task = more autonomy. Compare week over week.`);
     return;
   }
@@ -982,6 +1125,29 @@ async function main() {
       `no confirmation after 10s (${id}). The notification did not render. Check that hive.app is running (hive app) ` +
         "and that hive is allowed to notify in System Settings > Notifications."
     );
+  }
+
+  // Garden the checkout: prune task branches and worktrees using TASK STATE
+  // (see server/src/branchGardener.ts). Read-only against the DB; dry run
+  // unless --apply, and origin is only touched with --remote on top of it.
+  if (cmd === "garden") {
+    const { flags } = parseFlags(argv.slice(1));
+    const { Database } = await import("bun:sqlite");
+    const { defaultDbPath } = await import("../server/src/db.ts");
+    const { gardenRepos, formatGardenReport } = await import("../server/src/branchGardener.ts");
+    const db = new Database(defaultDbPath(), { readonly: true }) as any;
+    const reports = await gardenRepos(db, {
+      apply: !!flags.apply,
+      remote: !!flags.remote,
+      projectId: flags.project as string | undefined,
+    });
+    if (flags.json) {
+      console.log(JSON.stringify(reports, null, 2));
+      return;
+    }
+    for (const r of reports) console.log(formatGardenReport(r) + "\n");
+    if (!flags.apply) console.log("dry run — nothing was deleted. Re-run with --apply (add --remote to also delete on origin).");
+    return;
   }
 
   if (cmd === "open") {

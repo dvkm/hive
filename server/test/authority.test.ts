@@ -289,8 +289,11 @@ test("guarded-action: require_decision → approve → retry passes → single-u
   expect(again.status).toBe(409);
   expect(again.json.decision_id).toBe(decisionId);
 
-  // approve the card
-  const ans = await post(`/api/decisions/${decisionId}/answer`, { answer_key: "approve" });
+  // approve the card. A prod-deploy card is high risk, so only the director
+  // may approve it — an anonymous caller is refused (HIVE-527).
+  const anon = await post(`/api/decisions/${decisionId}/answer`, { answer_key: "approve" });
+  expect(anon.status).toBe(403);
+  const ans = await post(`/api/decisions/${decisionId}/answer`, { answer_key: "approve", source: "director" });
   expect(ans.status).toBe(200);
 
   // retry now passes

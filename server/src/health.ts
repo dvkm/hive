@@ -8,21 +8,36 @@
 // the request path. The reconciler is what turns live herdr probes into
 // `agent_status` events (including `gone`), so health reads that recorded truth.
 import type { DB } from "./db.ts";
-import { getSetting } from "./db.ts";
+import { getSetting, setSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { isSupervisedTask, neverDispatched } from "./supervision.ts";
-import { isDeferred, unmetDeps, TERMINAL, type State } from "./state.ts";
+import { isDeferred, unmetDeps, lastAgentActivity, SKIP_REASONS, TERMINAL, type State } from "./state.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
 import { latestSidecar, latestSidecarBatch, type SidecarReport } from "./sidecar.ts";
+import { reviewActionable, reviewActionableBatch } from "./reviewer.ts";
+import { isReviewed } from "./dispatcher.ts";
 
-export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
+export type HealthStatus = "healthy" | "deferred" | "silent" | "stuck" | "dead";
 
-// Rows the reconciler writes about an agent, never by the agent. None of them
-// prove the agent is alive, so none of them may reset its silence clock.
-// `spawn_error` is here for the same reason: a respawn hive TRIED and failed is
-// not the agent doing something, and letting it reset the clock would hide a
-// dead task behind hive's own retry loop.
-const RECONCILER_NOISE = new Set(["stale", "recovery_nudge", "recovery", "spawn_error"]);
+// Permanent skip reasons that are this TASK's problem, not a project setting —
+// the ones worth an attention item rather than just a label.
+const ATTENTION_SKIPS = new Set(["no_repo_path", "kind_excluded", "authority_denied"]);
+
+const HEALTH_EVENT_TYPES = [
+  "agent_status",
+  "dialog_auto_approved",
+  "dialog_auto_declined",
+  "merge_failed",
+  "merge_blocked_destructive",
+  "merged",
+  "pr_merged",
+  "pr_synchronized",
+  "ready_for_review",
+  "state_change",
+  "recovery_nudge",
+  "stale",
+  "hung",
+];
 export interface Health {
   status: HealthStatus;
   reason: string | null;
@@ -83,7 +98,7 @@ function mergeFailureResolved(events: { type: string; ts: string; payload: strin
   });
 }
 
-function staleMs(): number {
+export function staleMs(): number {
   return Number(process.env.HIVE_STALE_MS || 15 * 60 * 1000);
 }
 
@@ -102,6 +117,13 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
       ? db.query("SELECT ts FROM events WHERE task_id = ? AND type = 'dead_dependencies' ORDER BY ts DESC LIMIT 1").get(task.id) as { ts: string } | undefined
       : undefined;
     if (marker) return { status: "stuck", reason: "all blocking dependencies ended without completing", since: marker.ts };
+    // A dispatcher skip the task itself can never grow out of (HIVE-525): no
+    // repo, an excluded kind, an authority deny. Project-wide switches
+    // (auto_dispatch off, gardener off, tracking-only) are deliberate and shared
+    // by every queued task there, so they stay a visible label on the card and
+    // do NOT each raise an attention item.
+    if (task.skip_reason && ATTENTION_SKIPS.has(task.skip_reason))
+      return { status: "stuck", reason: SKIP_REASONS[task.skip_reason].label, since: task.skip_reason_at ?? task.updated_at };
   }
   if (!HEALTH_STATES.has(task.state)) return null;
   // Health is agent-derived, so it needs a bound agent — with one exception: a
@@ -115,13 +137,20 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   // the agent exits normally right after emitting `deferred`, herdr reports it
   // gone, and the dead/stuck branches below would otherwise re-surface exactly
   // the "gone quiet" nag `deferred` exists to suppress (task #1078).
+  // Reported as its own status, not as "healthy": a consumer that only reads
+  // health.status would otherwise see parked work as ordinary working work, and
+  // one that treats "not healthy" as trouble would nag about it. `deferred` says
+  // exactly what is true — unfinished, deliberately quiet, waiting on a human
+  // (HIVE-547). It is NOT an attention status (needsAttention below).
   if (isDeferred(task, nowMs)) {
-    return { status: "healthy", reason: "deferred", since: task.updated_at as string };
+    return { status: "deferred", reason: "parked pending a human action", since: task.updated_at as string };
   }
 
   const events = db
-    .query("SELECT type, ts, payload FROM events WHERE task_id = ? ORDER BY ts DESC")
-    .all(task.id) as { type: string; ts: string; payload: string }[];
+    .query(`SELECT type, ts, payload FROM events
+      WHERE task_id = ? AND type IN (${HEALTH_EVENT_TYPES.map(() => "?").join(",")})
+      ORDER BY ts DESC`)
+    .all(task.id, ...HEALTH_EVENT_TYPES) as { type: string; ts: string; payload: string }[];
 
   // Latest recorded liveness from the reconciler's probe.
   let lastStatus: string | null = null;
@@ -186,14 +215,15 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   if (task.state === "needs_decision" || task.state === "in_review")
     return { status: "healthy", reason: null, since: task.updated_at as string };
 
-  // "Activity" excludes reconciler noise so a genuinely quiet agent keeps aging
-  // toward silent instead of resetting. `recovery` belongs in that set and was
-  // missing: hive re-diagnosed an auth-lost pane every lap, and each diagnosis
-  // wrote a `recovery` row that reset this clock — so a frozen pane read
-  // HEALTHY, lap after lap, with a byte-identical tail (#1149/#1156, 2026-08-20).
-  // A row hive wrote ABOUT an agent is not evidence the agent did anything.
-  const activity = events.find((e) => !RECONCILER_NOISE.has(e.type));
-  const activityTs = activity ? activity.ts : (task.updated_at as string);
+  // "Activity" means the AGENT did something. Only its own rows count (see
+  // lastAgentActivity): every row hive writes ABOUT a task, and every human
+  // poke, would otherwise reset this clock and make a frozen task read healthy.
+  // Two ways that already bit us: hive re-diagnosed an auth-lost pane every lap
+  // and each `recovery` row reset the clock, so a frozen pane read HEALTHY lap
+  // after lap with a byte-identical tail (#1149/#1156, 2026-08-20); and a
+  // refused respawn wrote spawn_error + authority_logged, dropping a task
+  // frozen for 2.5h off the stall list (hive-1951, 2026-08-31).
+  const activityTs = lastAgentActivity(db, task.id) ?? (task.updated_at as string);
   const age = nowMs - Date.parse(activityTs);
 
   // Recovery is underway if hive nudged AFTER the last real activity. Keyed off
@@ -211,6 +241,13 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
     return { status: "stuck", reason: `finished or stuck: agent ${lastStatus}, no PR`, since: activityTs };
   }
   if (age > staleMs()) {
+    // Flagged hung: the agent still holds the task but the WORK stopped. Say so
+    // in the reason, because it needs a human look, not another respawn.
+    const hung = events.find((e) => e.type === "hung" && e.ts > activityTs);
+    if (hung) {
+      const mins = Math.round(age / 60000);
+      return { status: "stuck", reason: `no progress for ${mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`} (agent still alive)`, since: activityTs };
+    }
     const escalating = events.some((e) => e.type === "stale" && e.ts > activityTs);
     return {
       status: escalating ? "stuck" : "silent",
@@ -255,25 +292,48 @@ export function sessionUtilization(
 // A task row enriched with its computed health, for API responses + SSE.
 // Failed tasks also carry `requeued_to` (their auto-requeue successor's id, if
 // any) so the attention rule can tell "awaiting triage" from "already retried".
-export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null): any {
+export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null, actionable?: Set<string>): any {
   const requeued_to =
     task.state === "failed"
       ? ((db.query("SELECT id FROM tasks WHERE parent_task_id = ? AND source = 'requeue' LIMIT 1").get(task.id) as any)?.id ?? null)
       : null;
+  const needs_you_since = ["in_review", "failed"].includes(task.state)
+    ? task.needs_you_since ?? (db.query(
+        "SELECT MAX(ts) AS ts FROM events WHERE task_id = ? AND type = 'state_change' AND json_extract(payload, '$.to') = ?"
+      ).get(task.id, task.state) as { ts: string | null }).ts ?? task.updated_at
+    : null;
   // Server-computed so the web app never has to re-derive "was this ever
   // spawned" from raw event history — see supervision.ts's neverDispatched.
   // `sidecar` is the latest background check on this task's own commits, so the
   // board card and the review card can show it without fetching every event.
   // Pass a preloaded `sidecar` when enriching a list (see tasksWithHealth) so
   // this doesn't run one sidecar query per task.
-  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, never_dispatched: neverDispatched(db, task), sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
+  // `review_actionable` (HIVE-500) is server-computed for the same reason health
+  // is: it reads events the browser never sees. Only in-review tasks carry it;
+  // everywhere else it is false and means nothing.
+  //
+  // Intake tasks are held until reviewed (dispatcher.ts's isReviewed), and
+  // intake triage can mark one reviewed on its own — so the board needs the
+  // flag to know whether to say "unreviewed". Only intake tasks pay the query.
+  const reviewed = task.source?.startsWith("intake_") ? isReviewed(db, task.id) : undefined;
+  // Why the dispatcher last skipped this task, resolved to something a human can
+  // read (HIVE-525). `permanent` is the distinction that matters on the board:
+  // "not yet" (capacity, backoff, a blocker) versus "not ever until someone
+  // changes something". Only queued tasks can carry one.
+  const skip = task.skip_reason && SKIP_REASONS[task.skip_reason]
+    ? { reason: task.skip_reason, ...SKIP_REASONS[task.skip_reason], since: task.skip_reason_at ?? null }
+    : null;
+  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), review_actionable: actionable ? actionable.has(task.id) : reviewActionable(db, task), reviewed, skip, sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
 }
 
 // Batched form of taskWithHealth for list endpoints (task HIVE-447): looks up
-// every task's sidecar report in one grouped query instead of one per task.
+// every task's sidecar report in one grouped query instead of one per task, and
+// the same for `review_actionable` (HIVE-500), whose per-task rule reads up to
+// five tables.
 export function tasksWithHealth(db: DB, tasks: any[]): any[] {
   const sidecars = latestSidecarBatch(db, tasks.map((t) => t.id));
-  return tasks.map((task) => taskWithHealth(db, task, sidecars.get(task.id) ?? null));
+  const actionable = reviewActionableBatch(db, tasks);
+  return tasks.map((task) => taskWithHealth(db, task, sidecars.get(task.id) ?? null, actionable));
 }
 
 // "Needs attention" tray eligibility (the single rule; the web mirrors it):
@@ -295,4 +355,25 @@ export function needsAttention(task: { state: string; source?: string | null; ag
 // of a raw `broadcast({type:"task"})` so every board update reflects health.
 export function broadcastTask(db: DB, task: any): void {
   broadcast({ type: "task", task: taskWithHealth(db, task) });
+}
+
+// A tool that cannot start is skipped and retried forever by design, so once it
+// stops throwing it also stops counting toward reconciler_error_streak and
+// would go completely silent. That is the #1096 failure mode again: PR linking
+// quietly off, /api/health saying ok. Three consecutive cycles of start
+// failures log once and mark health degraded; the first good cycle clears it.
+const TOOL_DEGRADED_AFTER = 3;
+export function noteToolStart(db: DB, tool: string, failure: string | null): void {
+  const streakKey = `tool_start_failures_${tool}`;
+  const degradedKey = `tool_degraded_${tool}`;
+  if (!failure) {
+    if (getSetting(db, streakKey)) setSetting(db, streakKey, "0");
+    if (getSetting(db, degradedKey)) setSetting(db, degradedKey, "");
+    return;
+  }
+  const streak = Number(getSetting(db, streakKey) ?? "0") + 1;
+  setSetting(db, streakKey, String(streak));
+  if (streak < TOOL_DEGRADED_AFTER) return;
+  if (!getSetting(db, degradedKey)) console.error(`[hive] ${tool} failed to start on ${streak} cycles in a row; marking health degraded: ${failure}`);
+  setSetting(db, degradedKey, failure);
 }

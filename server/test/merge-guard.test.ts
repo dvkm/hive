@@ -4,6 +4,7 @@ import { writeEvent, getTask } from "../src/state.ts";
 import { mergeTask } from "../src/api.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
+import { CONFIRMED_RISK_CODE, isConfirmedRiskFailure } from "../src/landQueue.ts";
 
 const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
 const stub = (fn: (argv: string[]) => ExecResult): Exec => async (argv) => fn(argv);
@@ -64,6 +65,10 @@ test("mergeTask BLOCKS a branch that reverts base work outside its scope (#314)"
   expect(res.status).toBe(409);
   const body: any = await res.json();
   expect(body.error).toContain("health.ts");
+  // The message names the two commits it compared, so the diagnosis is not a
+  // guess (HIVE-543): rebasing again is explicitly ruled out.
+  expect(body.error).toContain("B1");
+  expect(body.error).toContain("Rebasing again does not help");
   // Bounced back to the agent, and the block is recorded for the director.
   expect(getTask(db, taskId).state).toBe("in_progress");
   const ev = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_blocked_destructive'").get(taskId);
@@ -254,6 +259,119 @@ test("mergeTask never lets an option-shaped PR baseRefName reach git argv (task 
   expect(JSON.parse(merged.payload).base).toBe("main");
 });
 
+test("a same-branch re-cut (force-push) invalidates a stale snapshot and re-baselines instead of blocking (#1696)", async () => {
+  const { db, taskId } = seed();
+  const prUrl = "https://gh/pr/recut";
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run(prUrl, taskId);
+  // Simulate a snapshot taken long ago, against a head that got force-pushed
+  // away — it is no longer an ancestor of the rebuilt branch's current head.
+  writeEvent(db, { task_id: taskId, source: "reconciler", type: "branch_scope", payload: { base_sha: "old-base-sha", files: ["src/task.ts"], head_sha: "old-head" } });
+  const rebuiltFiles = "db.ts\nreconciler.ts\nsrc/task.ts\n";
+  const exec: Exec = stub((argv) => {
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(JSON.stringify({ state: "OPEN", baseRefName: "main", baseRefOid: "base-sha-now", headRefOid: "rebuilt-head", mergeStateStatus: "CLEAN", statusCheckRollup: [] }));
+    if (argv[0] === "gh" && argv.includes("merge")) return OK();
+    if (argv.includes("merge-base") && argv.includes("--is-ancestor")) return { code: 1, stdout: "", stderr: "not an ancestor" };
+    if (argv.includes("diff") && argv.includes("--name-only")) return OK(rebuiltFiles);
+    if (argv.includes("rev-parse")) return OK(`${argv.at(-1)}\n`);
+    return OK();
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec });
+
+  expect(res.status).toBe(200);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_blocked_destructive'").get(taskId)).toBeFalsy();
+  const latest: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'branch_scope' ORDER BY ts DESC LIMIT 1").get(taskId);
+  expect(JSON.parse(latest.payload).head_sha).toBe("rebuilt-head");
+});
+
+test("a real revert still blocks after the snapshot was re-baselined (#1696)", async () => {
+  const { db, taskId } = seed();
+  const prUrl = "https://gh/pr/recut2";
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run(prUrl, taskId);
+  // A prior merge attempt already re-baselined against the rebuilt branch.
+  writeEvent(db, {
+    task_id: taskId,
+    source: "director",
+    type: "branch_scope",
+    payload: { base_sha: "base-sha-now", files: ["db.ts", "reconciler.ts", "src/task.ts"], head_sha: "rebuilt-head" },
+  });
+  const exec: Exec = stub((argv) => {
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(JSON.stringify({ state: "OPEN", baseRefName: "main", baseRefOid: "base-sha-later", headRefOid: "rebuilt-head-2", mergeStateStatus: "CLEAN", statusCheckRollup: [] }));
+    if (argv[0] === "gh" && argv.includes("merge")) return OK();
+    if (argv.includes("merge-base") && argv.includes("--is-ancestor")) return OK(); // rebuilt-head is still an ancestor: a legit follow-up push
+    if (argv.includes("diff") && argv.includes("--name-only")) {
+      const range = argv.at(-1);
+      if (range === "base-sha-later...rebuilt-head") return OK("db.ts\nreconciler.ts\nsrc/task.ts\n"); // original intent, unchanged
+      if (range === "base-sha-later...rebuilt-head-2") return OK("db.ts\nreconciler.ts\nsrc/task.ts\nhealth.ts\n"); // health.ts newly reverted
+      return OK();
+    }
+    if (argv[3] === "log") return OK(argv.at(-1) === "health.ts" ? "abc base commit\n" : "");
+    // The branch's health.ts is byte-identical to its pre-advance content: base
+    // moved it and the branch put the old version back. That is a real revert.
+    if (argv.includes("rev-parse") && argv.at(-1)!.endsWith(":health.ts")) return OK("old-health-blob\n");
+    if (argv.includes("rev-parse")) return OK(`${argv.at(-1)}\n`);
+    return OK();
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec });
+
+  expect(res.status).toBe(409);
+  const body: any = await res.json();
+  expect(body.error).toContain("health.ts");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_blocked_destructive'").get(taskId)).toBeTruthy();
+});
+
+test("a transient merge-base failure (exit 128) does not re-baseline the snapshot (#1696 follow-up)", async () => {
+  const { db, taskId } = seed();
+  const prUrl = "https://gh/pr/glitch";
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run(prUrl, taskId);
+  writeEvent(db, { task_id: taskId, source: "reconciler", type: "branch_scope", payload: { base_sha: "old-base-sha", files: ["src/task.ts"], head_sha: "old-head" } });
+  const branchScopeCountBefore = (db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'branch_scope'").get(taskId) as any).n;
+  const exec: Exec = stub((argv) => {
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(JSON.stringify({ state: "OPEN", baseRefName: "main", baseRefOid: "base-sha-now", headRefOid: "some-head", mergeStateStatus: "CLEAN", statusCheckRollup: [] }));
+    if (argv[0] === "gh" && argv.includes("merge")) return OK();
+    // git object corruption / repo lock — NOT a confirmed "not an ancestor" (exit 1)
+    if (argv.includes("merge-base") && argv.includes("--is-ancestor")) return { code: 128, stdout: "", stderr: "fatal: bad object" };
+    if (argv.includes("diff") && argv.includes("--name-only")) return OK("src/task.ts\n");
+    if (argv.includes("rev-parse")) return OK(`${argv.at(-1)}\n`);
+    return OK();
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec });
+
+  expect(res.status).toBe(200);
+  // no new branch_scope re-baseline event was written for the transient failure
+  const branchScopeCountAfter = (db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'branch_scope'").get(taskId) as any).n;
+  expect(branchScopeCountAfter).toBe(branchScopeCountBefore);
+});
+
+test("merge is refused, not silently allowed, when re-baseline capture fails (#1696 follow-up)", async () => {
+  const { db, taskId } = seed();
+  const prUrl = "https://gh/pr/capturefail";
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run(prUrl, taskId);
+  writeEvent(db, { task_id: taskId, source: "reconciler", type: "branch_scope", payload: { base_sha: "old-base-sha", files: ["src/task.ts"], head_sha: "old-head" } });
+  const exec: Exec = stub((argv) => {
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(JSON.stringify({ state: "OPEN", baseRefName: "main", baseRefOid: "base-sha-now", headRefOid: "rebuilt-head", mergeStateStatus: "CLEAN", statusCheckRollup: [] }));
+    if (argv[0] === "gh" && argv.includes("merge")) return OK();
+    if (argv.includes("merge-base") && argv.includes("--is-ancestor")) return { code: 1, stdout: "", stderr: "not an ancestor" };
+    // the re-baseline capture's own diff read fails — captureBranchScope returns null
+    if (argv.includes("diff") && argv.includes("--name-only")) return { code: 128, stdout: "", stderr: "fatal: bad revision" };
+    if (argv.includes("rev-parse")) return OK(`${argv.at(-1)}\n`);
+    return OK();
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec });
+
+  expect(res.status).toBe(409);
+  const body: any = await res.json();
+  expect(body.error).toContain("could not re-verify branch scope");
+  expect(getTask(db, taskId).state).toBe("in_progress");
+});
+
 test("PR merge fails closed when its base metadata is unavailable", async () => {
   const { db, taskId } = seed();
   db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/1", taskId);
@@ -270,4 +388,68 @@ test("PR merge fails closed when its base metadata is unavailable", async () => 
   expect(getTask(db, taskId).state).toBe("in_review");
   expect(gitCalls).toBe(0);
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_failed'").get(taskId)).toBeTruthy();
+});
+
+
+// The server serves from its own checkout. A land that does not reach that
+// checkout does not run — the 2026-08-25 gap this closes.
+function servingExec(branch: string, seen: string[][]): Exec {
+  return async (argv) => {
+    seen.push(argv);
+    if (argv[0] === "gh" && argv.includes("view"))
+      return OK(JSON.stringify({ state: "OPEN", baseRefName: "main", baseRefOid: "base-sha", headRefOid: "head-sha", mergeStateStatus: "CLEAN", statusCheckRollup: [] }));
+    // One repo, two worktrees: the serving checkout and /repo share a git dir.
+    if (argv.includes("--git-common-dir")) return OK("/repo/.git");
+    if (argv.includes("--show-current")) return OK(branch);
+    return OK();
+  };
+}
+
+test("a land merges the base into the serving checkout when it is on another branch", async () => {
+  const { db, taskId } = seed();
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/9", taskId);
+  const seen: string[][] = [];
+
+  expect((await mergeTask(db, herdr, taskId, {}, { exec: servingExec("live", seen) })).status).toBe(200);
+
+  expect(seen.some((c) => c.join(" ") === "git merge main --no-edit")).toBe(true);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'deployed'").get(taskId)).toBeTruthy();
+});
+
+test("a land touches nothing when the serving checkout is already on the base branch", async () => {
+  const { db, taskId } = seed();
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/10", taskId);
+  const seen: string[][] = [];
+
+  expect((await mergeTask(db, herdr, taskId, {}, { exec: servingExec("main", seen) })).status).toBe(200);
+
+  expect(seen.some((c) => c[0] === "git" && c[1] === "merge")).toBe(false);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'deployed'").get(taskId)).toBeFalsy();
+});
+
+// HIVE-559 review: the land queue routes a confirmed risk to its agent instead
+// of the director, and it decides that from the refusal's `code`. That code is
+// built here, in mergeTask, and read in landQueue.ts — two files with nothing
+// tying them together. This test is the tie: if the gate ever stops setting the
+// code, routing would silently revert to always-ask-the-director, and this fails
+// instead.
+test("mergeTask's confirmed-risk refusal carries the code the land queue routes on", async () => {
+  const { db, taskId } = seed();
+  db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run("head-1", taskId);
+  writeEvent(db, {
+    task_id: taskId,
+    source: "reconciler",
+    type: "risk_verdicts",
+    payload: {
+      reviewed_head_sha: "head-1",
+      verdicts: [{ risk: "export drops rows", why: "the CSV writer skips the last page", evidence_path: "evidence/export.md", verdict: "confirmed" }],
+    },
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec: destructiveExec });
+  expect(res.status).toBe(409);
+  const body = (await res.json()) as { error: string; code?: string };
+  expect(body.error).toContain("the risk check confirmed");
+  expect(body.code).toBe(CONFIRMED_RISK_CODE);
+  expect(isConfirmedRiskFailure(body.code)).toBe(true);
 });

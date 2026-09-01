@@ -23,6 +23,11 @@ function columns(db: DB, table: string): string[] {
   return (db.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((r) => r.name);
 }
 
+// v24 collided this way before the check below existed, and both halves have
+// long since applied on live DBs under their own names. Renaming either one now
+// would re-run it, so this pair stays as the one grandfathered exception.
+const GRANDFATHERED_COLLISIONS = new Set(["v24-task-resume-context"]);
+
 // The skip-if-present machinery only works if every statement is one statement
 // that alreadyApplied can recognize, and if no two migrations create the same
 // object. None of that is enforceable at runtime, so enforce it here: a future
@@ -30,10 +35,20 @@ function columns(db: DB, table: string): string[] {
 // rather than shipping a migration recorded as applied without its effect.
 test("migrations are well-formed", () => {
   const names = new Set<string>();
+  const versions = new Set<string>();
   const created = new Set<string>();
   for (const m of MIGRATIONS) {
     expect(names.has(m.name)).toBe(false);
     names.add(m.name);
+
+    // Two branches each appending "v33-..." merge cleanly and leave two v33s.
+    // The names differ, so the dup check above passes and the collision ships.
+    const version = /^(v\d+)-/.exec(m.name);
+    if (!version) throw new Error(`${m.name}: migration names start with vN-`);
+    if (versions.has(version[1]) && !GRANDFATHERED_COLLISIONS.has(m.name)) {
+      throw new Error(`${m.name}: version ${version[1]} is already taken by another migration`);
+    }
+    versions.add(version[1]);
 
     for (const stmt of m.statements) {
       const create = CREATES.exec(stmt);
@@ -274,6 +289,38 @@ test("a partially-numbered DB fails the migration instead of committing duplicat
     const names = (after.query("SELECT name FROM schema_migrations").all() as { name: string }[]).map((r) => r.name);
     expect(names).not.toContain("v11-task-numbers");
     after.close();
+  } finally {
+    cleanup(path);
+  }
+});
+
+// hive-1864: --track is retired. The migration parks the tracking-only rows it
+// leaves behind and hands them back to the normal machinery, without touching
+// Jira mirrors (which also carry source='external' and must stay undispatchable).
+test("v39 retires source='external' on non-mirror tasks and parks the live ones", () => {
+  const path = tmpDb("v39");
+  try {
+    const db = openDb(path);
+    const mk = (id: string, state: string, sourceRef: string | null) =>
+      db
+        .query(
+          "INSERT INTO tasks (id, project_id, title, state, kind, source, source_ref, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"
+        )
+        .run(id, "p1", id, state, "ship", "external", sourceRef, "2026-01-01", "2026-01-01");
+    db.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run("p1", "p", "{}", "2026-01-01");
+    mk("parked", "queued", null);
+    mk("gone", "cancelled", null);
+    mk("mirror", "queued", "jira:WEB-1");
+
+    const m = MIGRATIONS.find((x) => x.name === "v39-retire-tracking-only-source")!;
+    for (const pass of [1, 2]) for (const stmt of m.statements) db.query(stmt).run(); // re-runnable
+
+    const row = (id: string) =>
+      db.query("SELECT source, deferred_until FROM tasks WHERE id = ?").get(id) as { source: string | null; deferred_until: string | null };
+    expect(row("parked")).toEqual({ source: null, deferred_until: "9999-12-31T00:00:00.000Z" });
+    expect(row("gone")).toEqual({ source: null, deferred_until: null }); // terminal: nothing to park
+    expect(row("mirror")).toEqual({ source: "external", deferred_until: null }); // mirrors untouched
+    db.close();
   } finally {
     cleanup(path);
   }

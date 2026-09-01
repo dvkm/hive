@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,7 +8,9 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-test-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb, setSetting } = await import("../src/db.ts");
-const { makeHandler } = await import("../src/api.ts");
+const { makeHandler, requeueTask } = await import("../src/api.ts");
+const { composeBrief } = await import("../src/briefs.ts");
+const { getTask } = await import("../src/state.ts");
 const { createThread } = await import("../src/chat.ts");
 import type { Fetcher } from "../src/monitors.ts";
 
@@ -52,6 +54,12 @@ beforeAll(async () => {
 test("health endpoint", async () => {
   const { json } = await get("/api/health");
   expect(json.ok).toBe(true);
+});
+
+test("shell-version endpoint reports the electron shell's version and this repo's path", async () => {
+  const { json } = await get("/api/shell-version");
+  const electronPkg = JSON.parse(readFileSync(join(json.repo_path, "electron", "package.json"), "utf8"));
+  expect(json.version).toBe(electronPkg.version);
 });
 
 test("health endpoint reports dispatcher/reaper liveness, stale before any cycle has run", async () => {
@@ -103,6 +111,21 @@ test("health endpoint surfaces reconciler heartbeat and flips ok false once fail
   // Recovery: a clean cycle resets the streak, ok recovers.
   setSetting(db, "reconciler_error_streak", "0");
   expect((await get("/api/health")).json.ok).toBe(true);
+});
+
+// HIVE-533: one transient failure pinned reconciler_last_error in settings, and
+// health published it beside consecutive_errors: 0 with no timestamp to tell a
+// live fault from a fossil. It cost real diagnosis time twice in one day.
+test("health never reports a current reconciler last_error beside a zero error streak (HIVE-533)", async () => {
+  setSetting(db, "last_reconcile_at", new Date().toISOString());
+  setSetting(db, "reconciler_error_streak", "0");
+  // A stale message left in settings by an older build must not surface.
+  setSetting(db, "reconciler_last_error", "linkPRs: ENOENT: no such file or directory, posix_spawn 'gh'");
+
+  const h = (await get("/api/health")).json;
+  expect(h.reconciler.consecutive_errors).toBe(0);
+  expect(h.reconciler.last_error).toBeNull();
+  expect(h.ok).toBe(true);
 });
 
 test("health endpoint exposes pty/session utilization once the reaper has counted", async () => {
@@ -159,6 +182,52 @@ test("agent-created task carries source + parent_task_id", async () => {
     parent_task_id: "nope",
   });
   expect(bad.status).toBe(400);
+});
+
+test("scheduler-owned self-audit source cannot be created through the task API", async () => {
+  for (const [title, source] of [["forged audit", "self-audit"], ["coerced forged audit", ["self-audit"]]] as const) {
+    const r = await post("/api/tasks", { project_id: projectId, title, source });
+    expect(r.status).toBe(400);
+    expect(db.query("SELECT 1 FROM tasks WHERE title = ?").get(title)).toBeNull();
+  }
+});
+
+test("only a scheduled self-audit ship can finish report-only", async () => {
+  const localDb = openDb(":memory:");
+  const localServer = Bun.serve({ port: 0, fetch: makeHandler(localDb) });
+  const localPost = async (path: string, body: unknown) => {
+    const res = await fetch(`http://127.0.0.1:${localServer.port}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, json: await res.json() };
+  };
+  try {
+    const project = await localPost("/api/projects", { name: "Hive", repo_path: "/repo" });
+    const { selfAuditOnce } = await import("../src/selfAudit.ts");
+    const audit = selfAuditOnce(localDb)!;
+    const normal = await localPost("/api/tasks", {
+      project_id: project.json.id,
+      title: "normal ship",
+      kind: "ship",
+    });
+    expect((await localPost(`/api/tasks/${normal.json.id}/transition`, { to: "in_progress" })).status).toBe(200);
+    expect((await localPost(`/api/tasks/${normal.json.id}/events`, { type: "evidence", kind: "report", note: "audit findings" })).status).toBe(201);
+    expect((await localPost(`/api/tasks/${audit}/transition`, { to: "in_progress" })).status).toBe(200);
+    expect((await localPost(`/api/tasks/${audit}/transition`, { to: "failed" })).status).toBe(200);
+    const retry = requeueTask(localDb, getTask(localDb, audit));
+    expect(composeBrief(localDb, retry)).toContain("emit `done` without changing code");
+    expect((await localPost(`/api/tasks/${retry}/transition`, { to: "in_progress" })).status).toBe(200);
+    expect((await localPost(`/api/tasks/${retry}/events`, { type: "evidence", kind: "report", note: "audit findings" })).status).toBe(201);
+
+    expect((await localPost(`/api/tasks/${normal.json.id}/events`, { type: "done" })).status).toBe(409);
+    const done = await localPost(`/api/tasks/${retry}/events`, { type: "done" });
+    expect(done.status).toBe(200);
+    expect(done.json.task).toMatchObject({ state: "done", kind: "ship", source: "requeue", pr_url: null });
+  } finally {
+    localServer.stop(true);
+  }
 });
 
 test("HIVE-299: follow-up task auto-depends on a parent whose PR hasn't merged yet", async () => {
@@ -529,6 +598,57 @@ test("checkpoints survive task completion; cancelled tasks drop out", async () =
   expect(open.json.checkpoints.some((c: any) => c.id === e2.json.event.id)).toBe(false);
 });
 
+test("checkpoints auto-expire out of the inbox after a quiet window on a progressed task", async () => {
+  const backdate = (eventId: string, hours: number) =>
+    db.query("UPDATE events SET ts = ? WHERE id = ?").run(new Date(Date.now() - hours * 3600_000).toISOString(), eventId);
+
+  // A task that finished normally, carrying a benign note and a flagged one.
+  const t = await post("/api/tasks", { project_id: projectId, title: "cp expiry" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_progress" });
+  const benign = await post(`/api/tasks/${t.json.id}/events`, { type: "checkpoint", note: "used the existing helper" });
+  const flagged = await post(`/api/tasks/${t.json.id}/events`, { type: "checkpoint", note: "guessed the timezone", flag: true });
+  await post(`/api/tasks/${t.json.id}/events`, { type: "evidence", kind: "log", note: "proof" });
+  await post(`/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+
+  // Still fresh: both stay.
+  let open = await get("/api/checkpoints");
+  expect(open.json.checkpoints.some((c: any) => c.id === benign.json.event.id)).toBe(true);
+  expect(open.json.checkpoints.some((c: any) => c.id === flagged.json.event.id)).toBe(true);
+
+  // Older than the 24h default, and the task moved to in_review after them.
+  backdate(benign.json.event.id, 30);
+  backdate(flagged.json.event.id, 30);
+  open = await get("/api/checkpoints");
+  expect(open.json.checkpoints.some((c: any) => c.id === benign.json.event.id)).toBe(false);
+  expect(open.json.checkpoints.some((c: any) => c.id === flagged.json.event.id)).toBe(true);
+  // Expired only from the inbox — the task timeline still carries it.
+  const evs = await get(`/api/tasks/${t.json.id}/events`);
+  expect(evs.json.some((e: any) => e.id === benign.json.event.id)).toBe(true);
+
+  // A stalled task (no forward state change after the note) keeps asking.
+  const stalled = await post("/api/tasks", { project_id: projectId, title: "cp expiry stalled" });
+  await post(`/api/tasks/${stalled.json.id}/transition`, { to: "in_progress" });
+  const stuck = await post(`/api/tasks/${stalled.json.id}/events`, { type: "checkpoint", note: "waiting on the API" });
+  backdate(stuck.json.event.id, 30);
+  open = await get("/api/checkpoints");
+  expect(open.json.checkpoints.some((c: any) => c.id === stuck.json.event.id)).toBe(true);
+
+  // checkpoint_expiry_hours = 0 turns expiry off for that project.
+  const noExpiry = await post("/api/projects", {
+    name: "cp no expiry",
+    repo_path: "/tmp/cp-no-expiry",
+    config: { checkpoint_expiry_hours: 0 },
+  });
+  const kept = await post("/api/tasks", { project_id: noExpiry.json.id, title: "cp never expires" });
+  await post(`/api/tasks/${kept.json.id}/transition`, { to: "in_progress" });
+  const keptCp = await post(`/api/tasks/${kept.json.id}/events`, { type: "checkpoint", note: "old but still asking" });
+  await post(`/api/tasks/${kept.json.id}/events`, { type: "evidence", kind: "log", note: "proof" });
+  await post(`/api/tasks/${kept.json.id}/transition`, { to: "in_review" });
+  backdate(keptCp.json.event.id, 30);
+  open = await get("/api/checkpoints");
+  expect(open.json.checkpoints.some((c: any) => c.id === keptCp.json.event.id)).toBe(true);
+});
+
 test("event ingestion: status event is recorded", async () => {
   const r = await post(`/api/tasks/${taskId}/events`, { type: "status", note: "working" });
   expect(r.status).toBe(201);
@@ -570,11 +690,31 @@ test("transition endpoint enforces the state machine", async () => {
   expect(bad2.status).toBe(409);
 });
 
+// A handoff is held when the task owes an understanding check and its latest
+// review has none (HIVE-580). Tests that only care about the pr_url plumbing
+// file this first so they reach the part they are actually about.
+const REVIEW_WITH_CHECK = {
+  type: "review_summary",
+  done: ["the work"],
+  understanding: {
+    essence: "a change",
+    checks: [
+      {
+        question: "What does this change do?",
+        options: [{ key: "a", label: "the work" }, { key: "b", label: "nothing" }],
+        answer_key: "a",
+        explanation: "It does the work.",
+      },
+    ],
+  },
+};
+
 test("in_review task with a PR refuses a direct move to verifying (must use /merge)", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "pr bypass task" });
   const id = t.json.id;
   await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
   await post(`/api/tasks/${id}/events`, { type: "evidence", note: "proof", kind: "log" });
+  await post(`/api/tasks/${id}/events`, REVIEW_WITH_CHECK);
   await post(`/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/99" });
 
   const r = await post(`/api/tasks/${id}/transition`, { to: "verifying" });
@@ -588,6 +728,7 @@ test("ready emit records the pr_url and advances in_progress -> in_review", asyn
   const id = t.json.id;
   await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
   await post(`/api/tasks/${id}/events`, { type: "evidence", note: "proof", kind: "log" });
+  await post(`/api/tasks/${id}/events`, REVIEW_WITH_CHECK);
 
   const r = await post(`/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/42", note: "PR up" });
   expect(r.status).toBe(200);
@@ -626,6 +767,7 @@ test("ready emit refreshes stale branch metadata for an already-linked PR", asyn
     const task = await call("/api/tasks", { project_id: project.json.id, title: "replace stale PR" });
     await call(`/api/tasks/${task.json.id}/transition`, { to: "in_progress" });
     await call(`/api/tasks/${task.json.id}/events`, { type: "evidence", note: "proof", kind: "log" });
+    await call(`/api/tasks/${task.json.id}/events`, REVIEW_WITH_CHECK);
     db2.query("UPDATE tasks SET branch = ?, pr_url = ? WHERE id = ?").run(
       "hive/task-rejected",
       "https://github.com/example/repo/pull/2",
@@ -876,8 +1018,14 @@ test("decision: create, draft autosave, answer flow", async () => {
   const afterDraft = await get(`/api/decisions/${decisionId}`);
   expect(afterDraft.json.draft_note).toBe("leaning yes");
 
+  // A high-risk card refuses a caller that does not name itself as the
+  // director — an unattributed answer is not a human answer (HIVE-527).
+  const anon = await post(`/api/decisions/${decisionId}/answer`, { answer_key: "yes", answer_note: "go" });
+  expect(anon.status).toBe(403);
+  expect(anon.json.category).toBe("risk_high");
+
   // answer / submit
-  const ans = await post(`/api/decisions/${decisionId}/answer`, { answer_key: "yes", answer_note: "go" });
+  const ans = await post(`/api/decisions/${decisionId}/answer`, { answer_key: "yes", answer_note: "go", source: "director" });
   expect(ans.status).toBe(200);
   expect(ans.json.status).toBe("answered");
   expect(ans.json.answer_key).toBe("yes");
@@ -1038,7 +1186,9 @@ test("direct POST /api/decisions requires context", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "d-no-context" });
   const missing = await post("/api/decisions", { task_id: t.json.id, title: "contextless", options: [{ key: "a", label: "A" }] });
   expect(missing.status).toBe(400);
-  expect(missing.json.error).toBe("context is required");
+  // HIVE-530: the refusal now names the command that fixes it.
+  expect(missing.json.error).toContain("context is required");
+  expect(missing.json.error).toContain("hive decision ask");
 });
 
 test("needs-decision emit path requires context and defaults options", async () => {
@@ -1212,6 +1362,35 @@ test("test projects, their tasks, decisions and checkpoints are hidden by defaul
   expect(directDecision.status).toBe(200);
 });
 
+test("task list includes board metadata without task-detail requests", async () => {
+  const task = await post("/api/tasks", { project_id: projectId, title: "list metadata", brief: "load only on detail" });
+  const review = await post("/api/tasks", { project_id: projectId, title: "stable review age" });
+  db.query("UPDATE tasks SET state = 'in_review', updated_at = ? WHERE id = ?").run("2026-08-24T00:00:00Z", review.json.id);
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run("evt_list_review_since", review.json.id, "2026-08-20T00:00:00Z", "agent", "state_change", JSON.stringify({ from: "in_progress", to: "in_review" }));
+  await post(`/api/tasks/${task.json.id}/events`, { type: "evidence", kind: "log", note: "proof" });
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run("evt_list_spawn_error", task.json.id, new Date().toISOString(), "herdr", "spawn_error", "{}");
+
+  let listed = (await get("/api/tasks")).json.find((item: any) => item.id === task.json.id);
+  expect(listed).toMatchObject({ brief: "load only on detail", evidence_count: 1, spawn_error: true });
+  const compactList = (await get("/api/tasks?compact=1")).json;
+  const compact = compactList.find((item: any) => item.id === task.json.id);
+  expect(compact).not.toHaveProperty("brief");
+  expect(compact).not.toHaveProperty("agent_target");
+  expect(compact).not.toHaveProperty("depends_on");
+  expect(compactList.find((item: any) => item.id === review.json.id).needs_you_since).toBe("2026-08-20T00:00:00Z");
+  expect((await get(`/api/tasks/${review.json.id}`)).json.needs_you_since).toBe("2026-08-20T00:00:00Z");
+  const compressed = await fetch(BASE + "/api/tasks?compact=1", { headers: { "Accept-Encoding": "gzip" } });
+  expect(compressed.headers.get("content-encoding")).toBe("gzip");
+  expect((await compressed.json()).some((item: any) => item.id === task.json.id)).toBe(true);
+
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run("evt_list_spawned", task.json.id, new Date().toISOString(), "herdr", "spawned", "{}");
+  listed = (await get("/api/tasks")).json.find((item: any) => item.id === task.json.id);
+  expect(listed.spawn_error).toBe(false);
+});
+
 test("a test project never pushes a notification, even for a high-risk decision", async () => {
   const tp = await post("/api/projects", { name: "hidden-notif", repo_path: "/x/scratchpad/z" });
   const tt = await post("/api/tasks", { project_id: tp.json.id, title: "scratch task" });
@@ -1226,4 +1405,76 @@ test("a test project never pushes a notification, even for a high-risk decision"
   });
   const after = await get("/api/notifications");
   expect(after.json.notifications.length).toBe(before.json.notifications.length);
+});
+
+// task #1693 follow-up: GET /api/tasks/land-graph with no ?project= iterated
+// EVERY project (including archived/test rows with a dead repo_path), calling
+// `git diff` against a cwd that no longer exists.
+test("land-graph without a project param skips an archived project with a dead repo_path", async () => {
+  const db2 = openDb(":memory:");
+  let gitCalls = 0;
+  const exec = async (argv: string[]) => {
+    if (argv[0] === "git") gitCalls++;
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const srv = Bun.serve({ port: 0, fetch: makeHandler(db2, { exec }) });
+  const base = `http://127.0.0.1:${srv.port}`;
+  const call = async (path: string, body: unknown) => {
+    const response = await fetch(base + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { status: response.status, json: await response.json() };
+  };
+  try {
+    const archived = await call("/api/projects", {
+      name: "archived-dead-repo",
+      repo_path: "/nonexistent/repo",
+      config: { test: true, archived: true },
+    });
+    for (const title of ["a", "b"]) {
+      const t = await call("/api/tasks", { project_id: archived.json.id, title });
+      db2.query("UPDATE tasks SET state = 'in_review', branch = ? WHERE id = ?").run(`hive/${title}`, t.json.id);
+    }
+
+    const graph = await fetch(base + "/api/tasks/land-graph");
+    expect(graph.status).toBe(200);
+    const body = await graph.json();
+    expect(body.nodes).toEqual([]);
+    expect(gitCalls).toBe(0);
+  } finally {
+    srv.stop(true);
+  }
+});
+
+// HIVE-547: parking was reachable only through `hive emit <id> deferred`, so a
+// director reaching for `hive task move <id> deferred` got "invalid transition".
+test("task move deferred parks the task, reports health 'deferred', and moving back to in_progress un-parks it", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "park me" });
+  const id = t.json.id;
+  await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
+  db.query("UPDATE tasks SET agent_target = ? WHERE id = ?").run("a-park", id); // health needs a bound agent
+
+  const parked = await post(`/api/tasks/${id}/transition`, { to: "deferred", reason: "waiting on the CMS spot-check" });
+  expect(parked.status).toBe(200);
+  // The lifecycle state does NOT hop (task #679) — the park rides on deferred_until.
+  expect(parked.json.state).toBe("in_progress");
+  expect(Date.parse(parked.json.deferred_until)).toBeGreaterThan(Date.now());
+  expect(parked.json.health.status).toBe("deferred");
+  expect(getTask(db, id).deferred_until).toBe(parked.json.deferred_until);
+
+  const resumed = await post(`/api/tasks/${id}/transition`, { to: "in_progress", reason: "spot-check done" });
+  expect(resumed.status).toBe(200);
+  expect(resumed.json.deferred_until).toBeNull();
+  expect(resumed.json.health.status).not.toBe("deferred");
+
+  // A dated park auto-resumes: an elapsed window is not deferred any more.
+  const dated = await post(`/api/tasks/${id}/transition`, { to: "deferred", days: "2" });
+  expect(Date.parse(dated.json.deferred_until)).toBeLessThan(Date.now() + 3 * 86_400_000);
+
+  const done = await post(`/api/tasks/${id}/transition`, { to: "cancelled" });
+  expect(done.status).toBe(200);
+  const late = await post(`/api/tasks/${id}/transition`, { to: "deferred" });
+  expect(late.status).toBe(409);
 });

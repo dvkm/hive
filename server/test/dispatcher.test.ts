@@ -9,9 +9,11 @@ process.env.HIVE_HOME = HOME;
 
 const { openDb, newId, now, getSetting } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
-const { dispatchOnce, isReviewed, inBackoff } = await import("../src/dispatcher.ts");
-const { writeEvent, getTask } = await import("../src/state.ts");
-const { createDecision } = await import("../src/api.ts");
+const { dispatchOnce, isReviewed, inBackoff, SPAWN_ATTEMPT_CEILING } = await import("../src/dispatcher.ts");
+const { selfAuditOnce } = await import("../src/selfAudit.ts");
+const { writeEvent, getTask, SKIP_REASONS } = await import("../src/state.ts");
+const { taskWithHealth, needsAttention } = await import("../src/health.ts");
+const { createDecision, requeueTask } = await import("../src/api.ts");
 const { queuedSteers } = await import("../src/steer.ts");
 const { createThread } = await import("../src/chat.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
@@ -58,12 +60,12 @@ function freshDb(config: any = {}): { db: DB; projectId: string } {
     .run(projectId, "p", "/repo", JSON.stringify(config), now());
   return { db, projectId };
 }
-function makeTask(db: DB, projectId: string, extra: Partial<{ kind: string; source: string; state: string; agent_target: string; depends_on: string[]; parent_task_id: string }> = {}): string {
+function makeTask(db: DB, projectId: string, extra: Partial<{ kind: string; source: string; state: string; agent_target: string; depends_on: string[]; parent_task_id: string; title: string; brief: string }> = {}): string {
   const id = newId();
   const t = now();
   db.query(
-    "INSERT INTO tasks (id, project_id, title, state, kind, source, agent_target, depends_on, parent_task_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
-  ).run(id, projectId, "t", extra.state ?? "queued", extra.kind ?? "ship", extra.source ?? null, extra.agent_target ?? null, extra.depends_on ? JSON.stringify(extra.depends_on) : null, extra.parent_task_id ?? null, t, t);
+    "INSERT INTO tasks (id, project_id, title, brief, state, kind, source, agent_target, depends_on, parent_task_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+  ).run(id, projectId, extra.title ?? "t", extra.brief ?? null, extra.state ?? "queued", extra.kind ?? "ship", extra.source ?? null, extra.agent_target ?? null, extra.depends_on ? JSON.stringify(extra.depends_on) : null, extra.parent_task_id ?? null, t, t);
   return id;
 }
 
@@ -83,6 +85,32 @@ test("auto_dispatch off: queued tasks are NOT spawned", async () => {
   await dispatchOnce(db, { herdr });
   expect(spawns.length).toBe(0);
   expect(getTask(db, id).state).toBe("queued");
+});
+
+test("weekly self-audit dispatches through normal safeguards when auto_dispatch is off", async () => {
+  const { db, projectId } = freshDb({});
+  db.query("UPDATE projects SET name = 'Hive' WHERE id = ?").run(projectId);
+  const id = selfAuditOnce(db)!;
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr });
+
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, id).state).toBe("in_progress");
+
+  db.query("UPDATE tasks SET state = 'failed' WHERE id = ?").run(id);
+  const retry = requeueTask(db, getTask(db, id));
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(2);
+  expect(getTask(db, retry).state).toBe("in_progress");
+
+  const excluded = freshDb({ dispatch_kinds: ["scout"] });
+  excluded.db.query("UPDATE projects SET name = 'Hive' WHERE id = ?").run(excluded.projectId);
+  const excludedId = selfAuditOnce(excluded.db)!;
+  const excludedHerdr = stubHerdr();
+  await dispatchOnce(excluded.db, { herdr: excludedHerdr.herdr });
+  expect(excludedHerdr.spawns.length).toBe(0);
+  expect(getTask(excluded.db, excludedId).state).toBe("queued");
 });
 
 test("an active chat manager's delegated task dispatches even when project auto_dispatch is off", async () => {
@@ -313,6 +341,26 @@ test("tracking-only (source=external) tasks are never auto-dispatched", async ()
   expect(getTask(db, id).state).toBe("queued");
 });
 
+// hive-1864: `defer` is now the answer for "parked, do not act on this" — the
+// role --track used to play badly. Before this the dispatcher ignored
+// deferred_until entirely and a deferred queued task spawned anyway.
+test("a deferred queued task is not dispatched until it is un-deferred", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  db.query("UPDATE tasks SET deferred_until = ? WHERE id = ?").run("9999-12-31T00:00:00.000Z", id);
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(0);
+  expect(getTask(db, id).state).toBe("queued");
+
+  // A past deadline is the same as no deadline: the park has expired.
+  db.query("UPDATE tasks SET deferred_until = ? WHERE id = ?").run("2020-01-01T00:00:00.000Z", id);
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, id).state).toBe("in_progress");
+});
+
 test("authority deny blocks auto-dispatch", async () => {
   const { db, projectId } = freshDb({ auto_dispatch: true });
   const id = makeTask(db, projectId);
@@ -348,6 +396,30 @@ test("unmet depends_on blocks spawn (visible 'blocked by'), met deps let it thro
   expect(getTask(db, child).state).toBe("in_progress");
 });
 
+test("a dependency-blocked task logs no authority event, however many laps run", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const dep = makeTask(db, projectId, { state: "in_progress" }); // never merges
+  const child = makeTask(db, projectId, { depends_on: [dep] });
+  const { herdr, spawns } = stubHerdr();
+
+  for (let i = 0; i < 5; i++) await dispatchOnce(db, { herdr });
+
+  expect(spawns.length).toBe(0);
+  const authz = db
+    .query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'authority_logged'")
+    .get(child) as { n: number };
+  expect(authz.n).toBe(0);
+
+  // the gate still runs (and still logs) once the blocker clears
+  db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(dep);
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(1);
+  const after = db
+    .query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'authority_logged'")
+    .get(child) as { n: number };
+  expect(after.n).toBe(1);
+});
+
 test("spawn failure records one spawn_error and backs off (no retry storm)", async () => {
   const { db, projectId } = freshDb({ auto_dispatch: true });
   const id = makeTask(db, projectId);
@@ -374,6 +446,101 @@ test("spawn failure records one spawn_error and backs off (no retry storm)", asy
   await dispatchOnce(db, { herdr, nowMs: clock });
   errs = db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'spawn_error'").get(id) as { n: number };
   expect(errs.n).toBe(2);
+});
+
+// HIVE-526: the exponential backoff settles at one retry every 30 minutes and
+// never stops, so an unsatisfiable precondition retried 48 times a day forever
+// while the task still read as ordinary queued work.
+test("a spawn that keeps failing the same way stops retrying and fails the task", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  const { herdr, spawns } = stubHerdr(true); // worktree create fails, always the same way
+  let t = Date.now();
+
+  // Every lap starts outside the previous backoff window, so each one retries.
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING + 2; i++) {
+    await dispatchOnce(db, { herdr, nowMs: () => t });
+    t += 31 * 60 * 1000;
+  }
+
+  const errs = db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'spawn_error'").get(id) as { n: number };
+  expect(errs.n).toBe(SPAWN_ATTEMPT_CEILING); // the ceiling, not one per lap forever
+  expect(spawns.length).toBe(0);
+  expect(getTask(db, id).state).toBe("failed");
+
+  const gave = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'spawn_gave_up'").all(id) as { payload: string }[];
+  expect(gave.length).toBe(1);
+  expect(JSON.parse(gave[0].payload).error).toContain("worktree create boom"); // the last error rides along
+});
+
+// The daemon being down is not the task's fault: the global circuit breaker owns
+// it, so it must not spend the task's attempts either.
+test("infra-tagged spawn failures never reach the ceiling", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING * 2; i++)
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "ConnectionRefused", infra: "herdr_unreachable" } });
+
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr });
+
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(spawns.length).toBe(1);
+});
+
+// The regression that let the storm survive the ceiling: infra failures are
+// filtered out of the count, but if the newest N rows are read from SQL BEFORE
+// that filter, an interleaved infra row hides a real failure and the task dodges
+// the ceiling for as long as the daemon keeps flapping.
+test("real failures interleaved with infra ones still reach the ceiling", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  // Alternating, so any window of the newest 5 rows holds only ~3 real errors.
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING * 2; i++) {
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "worktree create failed: already exists" } });
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "ConnectionRefused", infra: "herdr_unreachable" } });
+  }
+
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr, nowMs: () => Date.now() + 60 * 60 * 1000 });
+
+  expect(getTask(db, id).state).toBe("failed");
+  expect(spawns.length).toBe(0);
+});
+
+// Different failures mean something is still moving; only a stuck precondition
+// repeats itself verbatim.
+test("failures with different causes keep retrying (only one repeated error gives up)", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING * 2; i++)
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: i % 2 ? "worktree create failed" : "stack setup failed" } });
+
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr, nowMs: () => Date.now() + 60 * 60 * 1000 });
+
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(spawns.length).toBe(1);
+});
+
+// A task reattaches many times over its life (every review handoff), so old
+// failures from a previous spawn must not add up with new ones. A successful
+// spawn wipes the slate.
+test("a successful spawn resets the attempt count", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  // Ceiling-1 identical failures, then a clean spawn, then more of the same error.
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING - 1; i++)
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "worktree create boom" } });
+  writeEvent(db, { task_id: id, source: "herdr", type: "spawned", payload: { agent_id: "a1" } });
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING - 1; i++)
+    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: "worktree create boom" } });
+
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr, nowMs: () => Date.now() + 60 * 60 * 1000 });
+
+  expect(getTask(db, id).state).toBe("in_progress"); // not given up on
+  expect(spawns.length).toBe(1);
 });
 
 test("herdr unreachable: one probe per cycle (not per task) + global cooldown pauses dispatch", async () => {
@@ -465,4 +632,254 @@ test("an unanswered repo-mismatch card holds dispatch; answering it releases the
   await dispatchOnce(db, { herdr: released.herdr });
   expect(released.spawns.length).toBe(1);
   expect(getTask(db, id).state).toBe("in_progress");
+});
+
+// --- file-overlap aware dispatch (HIVE-509) ---------------------------------
+
+const eventTypes = (db: DB, taskId: string) =>
+  (db.query("SELECT type FROM events WHERE task_id = ?").all(taskId) as { type: string }[]).map((r) => r.type);
+
+test("two queued tasks naming the same file dispatch one at a time", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 3 });
+  const first = makeTask(db, projectId, { brief: "fix the skip in server/src/sidecar.ts" });
+  const second = makeTask(db, projectId, { brief: "run bun install from server/src/sidecar.ts instead" });
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr });
+
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, first).state).toBe("in_progress");
+  expect(getTask(db, second).state).toBe("queued");
+  expect(eventTypes(db, second)).toContain("dispatch_hold_overlap");
+  const hold: any = JSON.parse(
+    (db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'dispatch_hold_overlap'").get(second) as any).payload
+  );
+  expect(hold.files).toContain("sidecar.ts");
+  expect(hold.held_by).toBe(first);
+});
+
+test("a non-overlapping task is preferred over one that overlaps an in-flight branch", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 2 });
+  const running = makeTask(db, projectId, { state: "in_progress", agent_target: "a1", brief: "rework server/src/sidecar.ts" });
+  writeEvent(db, { task_id: running, source: "dispatcher", type: "dispatch_scope", payload: { files: ["server/src/sidecar.ts"], dirs: [], from: ["brief"] } });
+  const clashing = makeTask(db, projectId, { brief: "another pass over server/src/sidecar.ts" });
+  const clear = makeTask(db, projectId, { brief: "tidy web/src/views/Board.tsx" });
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr });
+
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, clear).state).toBe("in_progress");
+  expect(getTask(db, clashing).state).toBe("queued");
+});
+
+test("a bare filename in one brief still collides with the full path in another", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 3 });
+  const a = makeTask(db, projectId, { brief: "add the route in server/src/api.ts" });
+  const b = makeTask(db, projectId, { brief: "api.ts needs the same guard" });
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, a).state).toBe("in_progress");
+  expect(getTask(db, b).state).toBe("queued");
+});
+
+test("the fleet never idles purely because everything overlaps", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 3 });
+  // A chat manager holds a branch that touches api.ts. It is live, so it is a
+  // real overlap peer, but it does not occupy a worker slot — so the project has
+  // nothing working and the only queued task overlaps it.
+  const manager = makeTask(db, projectId, { source: "chat_supervisor", state: "in_progress", agent_target: "m1" });
+  writeEvent(db, { task_id: manager, source: "reconciler", type: "branch_scope", payload: { base_sha: "abc", files: ["server/src/api.ts"] } });
+  const only = makeTask(db, projectId, { brief: "add the route in server/src/api.ts" });
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr });
+
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, only).state).toBe("in_progress");
+  expect(eventTypes(db, only)).toContain("dispatch_hold_overlap");
+  expect(eventTypes(db, only)).toContain("dispatch_overlap_override");
+});
+
+test("a first task never waits on an empty fleet", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 3 });
+  const a = makeTask(db, projectId, { brief: "touch server/src/api.ts" });
+  const b = makeTask(db, projectId, { brief: "also touch server/src/api.ts" });
+  const { herdr, spawns } = stubHerdr();
+
+  await dispatchOnce(db, { herdr }); // nothing running: a goes, b is held
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, a).state).toBe("in_progress");
+  expect(getTask(db, b).state).toBe("queued");
+
+  // a finishes; b is no longer overlapping anything live, so it dispatches next
+  // cycle without needing the override.
+  db.query("UPDATE tasks SET state = 'done', agent_target = NULL WHERE id = ?").run(a);
+  await dispatchOnce(db, { herdr });
+  expect(getTask(db, b).state).toBe("in_progress");
+});
+
+test("briefs that name no paths never hold each other", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 3 });
+  makeTask(db, projectId, { brief: "make the board feel faster" });
+  makeTask(db, projectId, { brief: "make the board feel calmer" });
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(2);
+});
+
+// HIVE-525: every dispatcher skip leaves a trace on the task.
+test("each skip path records a distinct, human-readable reason", async () => {
+  const off = freshDb({}); // auto_dispatch off
+  const offId = makeTask(off.db, off.projectId);
+  await dispatchOnce(off.db, { herdr: stubHerdr().herdr });
+  expect(getTask(off.db, offId).skip_reason).toBe("auto_dispatch_off");
+
+  const { db, projectId } = freshDb({ auto_dispatch: true, dispatch_kinds: ["scout"] });
+  const wrongKind = makeTask(db, projectId, { kind: "ship" });
+  const tracked = makeTask(db, projectId, { kind: "scout", source: "external" });
+  await dispatchOnce(db, { herdr: stubHerdr().herdr });
+  expect(getTask(db, wrongKind).skip_reason).toBe("kind_excluded");
+  expect(getTask(db, tracked).skip_reason).toBe("tracking_only");
+
+  // Every reason resolves to a label the board can print.
+  const seen = ["auto_dispatch_off", "kind_excluded", "tracking_only"];
+  for (const r of seen) expect(SKIP_REASONS[r].label.length).toBeGreaterThan(0);
+  // "not ever" vs "not yet" is the distinction the board needs.
+  expect(SKIP_REASONS.kind_excluded.permanent).toBe(true);
+  expect(SKIP_REASONS.no_capacity.permanent).toBe(false);
+});
+
+test("a steady skip costs one row write and zero events, however many cycles run", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, dispatch_kinds: ["scout"] });
+  const id = makeTask(db, projectId, { kind: "ship" });
+  const { herdr } = stubHerdr();
+  for (let i = 0; i < 100; i++) await dispatchOnce(db, { herdr });
+
+  const t = getTask(db, id);
+  expect(t.skip_reason).toBe("kind_excluded");
+  const firstAt = t.skip_reason_at;
+  await dispatchOnce(db, { herdr });
+  expect(getTask(db, id).skip_reason_at).toBe(firstAt); // unchanged reason -> no rewrite
+  const events = db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ?").get(id) as { n: number };
+  expect(events.n).toBe(0);
+});
+
+test("a task that becomes dispatchable clears its skip reason", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 0 });
+  const id = makeTask(db, projectId);
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr });
+  expect(getTask(db, id).skip_reason).toBe("no_capacity");
+
+  db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify({ auto_dispatch: true, max_agents: 3 }), projectId);
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(1);
+  const t = getTask(db, id);
+  expect(t.state).toBe("in_progress");
+  expect(t.skip_reason).toBeNull();
+  expect(t.skip_reason_at).toBeNull();
+});
+
+test("a permanent per-task skip shows up as a stuck queued task, a project switch does not", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, dispatch_kinds: ["scout"] });
+  const wrongKind = makeTask(db, projectId, { kind: "ship" });
+  await dispatchOnce(db, { herdr: stubHerdr().herdr });
+  const enriched = taskWithHealth(db, getTask(db, wrongKind));
+  expect(enriched.skip.label).toBe(SKIP_REASONS.kind_excluded.label);
+  expect(enriched.skip.permanent).toBe(true);
+  expect(enriched.health?.status).toBe("stuck");
+  expect(needsAttention(enriched)).toBe(true);
+
+  const off = freshDb({});
+  const offId = makeTask(off.db, off.projectId);
+  await dispatchOnce(off.db, { herdr: stubHerdr().herdr });
+  const offTask = taskWithHealth(off.db, getTask(off.db, offId));
+  expect(offTask.skip.reason).toBe("auto_dispatch_off");
+  expect(offTask.health).toBeNull(); // a project-wide switch is a label, not an attention item
+});
+
+// HIVE-568: a task's name held by a LIVE agent is contention, not failure. The
+// holder's lease can only be reclaimed after it reports done AND the task has
+// been silent for a whole stale window (15m), which no five-retries-in-minutes
+// dispatcher can ever wait out — so every such task was failed with "needs a
+// human" while the holder was simply finishing its turn.
+const NAME_TAKEN =
+  '{"error":{"code":"agent_name_taken","message":"agent name x is already used; candidates: terminal_id=term_1 pane_id=wR:p7X workspace_id=wR tab_id=wR:t40 cwd=/wt/x"}}';
+
+// herdr stub whose `agent start` is refused by a name holder reporting `status`,
+// until release() lets the next start through.
+function stubHerdrNameHeld(status = "working") {
+  let held = true;
+  const spawns: string[] = [];
+  const exec: Exec = async (argv) => {
+    if (has(argv, "worktree", "create"))
+      return OK(`{"result":{"worktree":{"path":${JSON.stringify(WT)},"branch":"hive/x","open_workspace_id":"w1"}}}`);
+    if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
+    if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t2"}}}');
+    if (has(argv, "pane", "process-info"))
+      return OK('{"result":{"process_info":{"shell_pid":45803,"foreground_processes":[{"pid":45803,"name":"claude"}]}}}');
+    if (has(argv, "agent", "get")) return OK(`{"result":{"agent":{"pane_id":"wR:p7X","agent_status":"${status}"}}}`);
+    if (has(argv, "agent", "start")) {
+      if (held) return { code: 1, stdout: "", stderr: NAME_TAKEN };
+      spawns.push("started");
+      return OK("started");
+    }
+    return OK();
+  };
+  return { herdr: new Herdr(exec, "herdr"), spawns, release: () => (held = false) };
+}
+
+test("a name held by a live agent makes the task wait, not fail", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  const { herdr, spawns, release } = stubHerdrNameHeld("working");
+  let t = Date.now();
+
+  // Far more laps than the attempt ceiling, each one outside any backoff window.
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING + 3; i++) {
+    await dispatchOnce(db, { herdr, nowMs: () => t });
+    t += 31 * 60 * 1000;
+  }
+  expect(getTask(db, id).state).toBe("queued"); // waiting, never failed
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'spawn_gave_up'").get(id)).toMatchObject({ n: 0 });
+
+  // The holder exits; the very next cycle starts the agent.
+  release();
+  await dispatchOnce(db, { herdr, nowMs: () => t });
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, id).state).toBe("in_progress");
+});
+
+test("waiting on a held name is a wait, not a retry storm", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  const { herdr } = stubHerdrNameHeld("working");
+  const t = Date.now();
+
+  await dispatchOnce(db, { herdr, nowMs: () => t });
+  const rows = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'spawn_error'").all(id) as { payload: string }[];
+  expect(rows.length).toBe(1);
+  const held = JSON.parse(rows[0].payload).held_until;
+  expect(held).toBeTruthy();
+  // A minute later it is still waiting; past the stamped instant it tries again.
+  expect(inBackoff(db, id, t + 60_000)).toBe(true);
+  expect(inBackoff(db, id, Date.parse(held) + 1000)).toBe(false);
+});
+
+// The other half: an error a human really must fix must NOT be turned into a
+// 15-minute wait. A broken worktree still burns its attempts and fails fast.
+test("a genuine spawn failure still fails fast", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  const { herdr } = stubHerdr(true);
+  let t = Date.now();
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING + 1; i++) {
+    await dispatchOnce(db, { herdr, nowMs: () => t });
+    t += 31 * 60 * 1000;
+  }
+  expect(getTask(db, id).state).toBe("failed");
+  const errs = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'spawn_error'").all(id) as { payload: string }[];
+  expect(errs.every((e) => !JSON.parse(e.payload).held_until)).toBe(true);
 });

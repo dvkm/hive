@@ -1,10 +1,12 @@
 import type { DB } from "./db.ts";
 import { getSetting, newId, now, setSetting } from "./db.ts";
 import type { Exec } from "./exec.ts";
-import { projectBaseBranch } from "./exec.ts";
+import { projectBaseBranch, mapLimit, GH_LIST_TIMEOUT_MS, GH_LIST_CONCURRENCY } from "./exec.ts";
 import { enqueue } from "./notifications.ts";
 import { getTask, transition, writeEvent, TERMINAL, type State } from "./state.ts";
 import { broadcastTask } from "./health.ts";
+import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
+import { activeProjects, type ProjectRow } from "./testProjects.ts";
 
 export interface PrGardenerConfig {
   enabled?: boolean;
@@ -16,6 +18,8 @@ export interface PrGardenerConfig {
   max_actions_per_sweep?: number;
   max_fix_attempts?: number;
   max_gardener_agents?: number;
+  adopt_untracked?: boolean;
+  adopt_skip_labels?: string[];
 }
 
 export const DEFAULT_SENSITIVE_PATHS = [
@@ -27,6 +31,100 @@ export const DEFAULT_SENSITIVE_PATHS = [
   "**/secrets",
   "**/secrets/**",
 ];
+
+// `gh pr list --json files` pages the files array at this many entries per PR.
+export const GH_FILES_PAGE_CAP = 100;
+
+// High enough that a real repo's open PRs fit in one page; a response that
+// actually hits it is treated as truncated (see retireAdoptedTasks).
+export const ADOPT_LIST_LIMIT = 1000;
+
+// A PR carrying either of these labels is one a human is driving by hand.
+// Hive records nothing for it and the gardener leaves it alone.
+export const DEFAULT_ADOPT_SKIP_LABELS = ["no-hive", "do-not-adopt"];
+
+export type AdoptPr = {
+  number: number;
+  url: string;
+  title: string;
+  body?: string | null;
+  isDraft?: boolean;
+  labels?: { name?: string }[] | null;
+};
+
+export type AdoptOutcome = "adopted" | "marked" | "tracked" | "draft" | "labelled";
+
+// Adopt one open PR that no Hive task tracks yet.
+//
+// The adopted task is source='external', which is Hive's existing "record it,
+// never do agent work for it" lane (supervision.ts): the dispatcher never
+// spawns for it and mergeTask refuses it outright. So adoption only makes the
+// PR VISIBLE — to the board, to syncPRs, and to the gardener's own classifier,
+// which now finds a linked task instead of dead-ending. Landing or closing it
+// still needs the director to answer a gardener decision card.
+//
+// Idempotent: the pr_url / source_ref lookup matches an already-adopted task in
+// any state, including a cancelled one, so a PR the director dismissed is never
+// resurrected on the next sweep.
+export function adoptUntrackedPr(
+  db: DB,
+  projectId: string,
+  pr: AdoptPr,
+  skipLabels: string[] = DEFAULT_ADOPT_SKIP_LABELS
+): { outcome: AdoptOutcome; task_id?: string } {
+  // A marker means the PR claims a Hive task. linkPRs owns that link; adopting
+  // would double-track it. Skip on the marker alone, even if the id resolves to
+  // no local task (a marker from another Hive DB is still not ours to adopt).
+  if (taskIdFromBody(pr.body) || taskNumberFromTitle(pr.title) != null) return { outcome: "marked" };
+  const sourceRef = `pr-adopt:${pr.number}`;
+  const existing: any = db
+    .query("SELECT id FROM tasks WHERE project_id = ? AND (pr_url = ? OR source_ref = ?) LIMIT 1")
+    .get(projectId, pr.url, sourceRef);
+  if (existing) return { outcome: "tracked", task_id: existing.id };
+  if (pr.isDraft) return { outcome: "draft" };
+  const labels = (pr.labels ?? []).map((l) => String(l?.name ?? "").toLowerCase());
+  if (skipLabels.some((name) => labels.includes(name.toLowerCase()))) return { outcome: "labelled" };
+
+  const id = newId("tsk");
+  const timestamp = now();
+  db.query(
+    "INSERT INTO tasks (id, project_id, title, brief, state, kind, source, source_ref, pr_url, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+  ).run(
+    id,
+    projectId,
+    `PR #${pr.number}: ${pr.title}`,
+    `Hive adopted this pull request so it stops being invisible. It was opened outside Hive, so no Hive agent wrote it and no Hive review covers it.\n\nPR: ${pr.url}\n\nHive tracks it and the PR Gardener watches it. Hive will not merge or close it on its own. Answer the gardener's card to land or close it.`,
+    "queued",
+    "chore",
+    "external",
+    sourceRef,
+    pr.url,
+    timestamp,
+    timestamp
+  );
+  writeEvent(db, { task_id: id, source: "pr-gardener", type: "pr_adopted", payload: { pr_number: pr.number, pr_url: pr.url } });
+  broadcastTask(db, getTask(db, id));
+  return { outcome: "adopted", task_id: id };
+}
+
+// Cancel adopted tracking tasks whose PR is no longer in the open list.
+// `complete` must be true only when the caller can prove `openNumbers` holds
+// EVERY open PR. A truncated page would make PRs that are still open look
+// closed, and cancel live tracking tasks, so we refuse to act on one.
+export function retireAdoptedTasks(db: DB, projectId: string, openNumbers: Set<number>, complete: boolean): string[] {
+  if (!complete) return [];
+  const rows = db
+    .query(`SELECT id, source_ref FROM tasks WHERE project_id = ? AND source = 'external' AND source_ref LIKE 'pr-adopt:%' AND state NOT IN ('done','failed','cancelled')`)
+    .all(projectId) as { id: string; source_ref: string }[];
+  const retired: string[] = [];
+  for (const row of rows) {
+    const number = Number(row.source_ref.slice("pr-adopt:".length));
+    if (!Number.isFinite(number) || openNumbers.has(number)) continue;
+    transition(db, row.id, "cancelled", { source: "pr-gardener", reason: "the adopted PR is no longer open" });
+    retired.push(row.id);
+  }
+  return retired;
+}
 
 export type GardenerAction = "land" | "rebase" | "fix" | "close" | "decision" | "hold" | "wait";
 
@@ -46,6 +144,10 @@ export interface ClassifierInput {
   override?: string | null;
   maxFixAttempts?: number;
   autoCloseSuperseded?: boolean;
+  // The linked task is an adoption record (a PR opened outside Hive), not work
+  // a Hive agent did. Only changes the wording the director reads on the card.
+  adopted?: boolean;
+  sensitiveReason?: string;
 }
 
 export function classifyPr(p: ClassifierInput): { action: GardenerAction; reason: string } {
@@ -57,7 +159,7 @@ export function classifyPr(p: ClassifierInput): { action: GardenerAction; reason
   // never approval to ship. Leave the review card alone until they choose.
   if (p.directorDeciding) return { action: "wait", reason: "The director is still deciding whether to ship it" };
   if (p.override === "retry_fix") return { action: "fix", reason: "Another fix attempt was approved by the director" };
-  if (p.sensitive) return { action: "decision", reason: "Touches a sensitive path" };
+  if (p.sensitive) return { action: "decision", reason: p.sensitiveReason ?? "Touches a sensitive path" };
   if (p.decisionOpen) return { action: "wait", reason: "Waiting for the director's decision" };
   if (p.draft) return { action: "wait", reason: "Draft PR" };
   if (p.mergeState === "DIRTY") {
@@ -77,7 +179,12 @@ export function classifyPr(p: ClassifierInput): { action: GardenerAction; reason
   if (p.ci === "passing" && p.mergeState === "CLEAN") {
     return p.linkedTaskState === "in_review"
       ? { action: "land", reason: "Green, clean, and linked to an in-review Hive task" }
-      : { action: "decision", reason: "Ready to land, but not linked to an in-review Hive task" };
+      : {
+          action: "decision",
+          reason: p.adopted
+            ? "Green and clean, but it was opened outside Hive and no Hive review covers it"
+            : "Ready to land, but not linked to an in-review Hive task",
+        };
   }
   if (p.ci === "pending") return { action: "wait", reason: "Waiting for CI" };
   return { action: "decision", reason: `GitHub reports ${p.mergeState.toLowerCase()} merge state` };
@@ -201,17 +308,35 @@ function openDecision(db: DB, deps: GardenerDeps, projectId: string, pr: GhPr, r
 }
 
 export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
-  const projects = db.query("SELECT * FROM projects WHERE repo_path IS NOT NULL").all() as any[];
-  for (const project of projects) {
+  const projects = activeProjects(db).filter((p): p is ProjectRow & { repo_path: string } => !!p.repo_path);
+  // Decide which projects are due and list their PRs a few at a time (HIVE-486).
+  // Listing serially meant one stalled repo cost a full timeout before the next
+  // repo was even tried. Only the `gh` list calls overlap here; every sweep
+  // below still runs serially, in project order, exactly as before.
+  const sweeps = await mapLimit(projects, GH_LIST_CONCURRENCY, async (project) => {
     const config = JSON.parse(project.config || "{}");
     const gardener: PrGardenerConfig = config.pr_gardener ?? {};
-    if (!gardener.enabled) continue;
+    if (!gardener.enabled) return null;
     const clock = (deps.nowMs ?? Date.now)();
     const setting = `pr_gardener_last:${project.id}`;
     const last = Date.parse(getSetting(db, setting) ?? "");
-    if (Number.isFinite(last) && clock - last < durationMs(gardener.cadence, 30 * 60_000)) continue;
+    if (Number.isFinite(last) && clock - last < durationMs(gardener.cadence, 30 * 60_000)) return null;
     const base = projectBaseBranch(config);
-    const listed = await deps.exec(["gh", "pr", "list", "--state", "open", "--base", base, "--limit", "100", "--json", "number,url,title,isDraft,updatedAt,mergeStateStatus,statusCheckRollup,files"], { cwd: project.repo_path });
+    const listed = await deps.exec(["gh", "pr", "list", "--state", "open", "--base", base, "--limit", "100", "--json", "number,url,title,isDraft,updatedAt,mergeStateStatus,statusCheckRollup,files"], { cwd: project.repo_path, timeoutMs: GH_LIST_TIMEOUT_MS });
+    // The adoption list is the same repo's PRs without --base, so fetch it in
+    // the same pass rather than paying a second stall later in the sweep.
+    const adoptListed = listed.code === 0 && gardener.adopt_untracked
+      ? await deps.exec(
+          ["gh", "pr", "list", "--state", "open", "--limit", String(ADOPT_LIST_LIMIT), "--json", "number,url,title,body,isDraft,labels"],
+          { cwd: project.repo_path, timeoutMs: GH_LIST_TIMEOUT_MS }
+        )
+      : null;
+    return { project, config, gardener, clock, setting, base, listed, adoptListed };
+  });
+
+  for (const sweep of sweeps) {
+    if (!sweep) continue;
+    const { project, config, gardener, clock, setting, base, listed, adoptListed } = sweep;
     if (listed.code !== 0) throw new Error(`PR Gardener could not list ${project.name} PRs: ${listed.stderr.trim()}`);
     setSetting(db, setting, new Date(clock).toISOString());
     const prs = JSON.parse(listed.stdout || "[]") as GhPr[];
@@ -220,9 +345,42 @@ export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
       if (!openNumbers.has(row.pr_number)) db.query("DELETE FROM pr_gardener_items WHERE project_id = ? AND pr_number = ?").run(project.id, row.pr_number);
     }
 
-    const digest = { landed: [] as number[], closed: [] as number[], rebased: [] as number[], fixing: [] as number[], escalated: [] as number[] };
+    const digest = { adopted: [] as number[], landed: [] as number[], closed: [] as number[], rebased: [] as number[], fixing: [] as number[], escalated: [] as number[] };
     let actions = 0;
     const maxActions = gardener.max_actions_per_sweep ?? 5;
+
+    // Discovery: record open PRs that no Hive task tracks yet, so PRs opened by
+    // hand (or by another tool) stop being invisible to the board and to this
+    // gardener. Listed WITHOUT --base on purpose: a hotfix opened straight
+    // against main gets recorded too, even though the classifier below only
+    // grades PRs on the configured base branch. Adoption writes one row and
+    // touches no repo, so it is capped separately from the mutation budget.
+    if (adoptListed) {
+      const all = adoptListed;
+      let candidates: AdoptPr[] | null = null;
+      try {
+        if (all.code === 0) {
+          const parsed = JSON.parse(all.stdout || "[]");
+          if (Array.isArray(parsed)) candidates = parsed;
+        }
+      } catch {
+        candidates = null; // gh gave us nothing usable; try again next sweep
+      }
+      if (candidates) {
+        const skipLabels = gardener.adopt_skip_labels ?? DEFAULT_ADOPT_SKIP_LABELS;
+        for (const candidate of candidates) {
+          if (digest.adopted.length >= maxActions) break;
+          if (adoptUntrackedPr(db, project.id, candidate, skipLabels).outcome === "adopted") digest.adopted.push(candidate.number);
+        }
+        // An adopted task is pure bookkeeping, so once its PR stops being open
+        // there is nothing left to track. Close it out rather than let adoption
+        // ratchet the board fuller every sweep. Only ever touches tasks this
+        // code created (source_ref 'pr-adopt:<n>'), and only when gh answered.
+        // A full page means gh may have had more to give, so we cannot prove we
+        // saw every open PR and must not retire anything this sweep.
+        retireAdoptedTasks(db, project.id, new Set(candidates.map((pr) => pr.number)), candidates.length < ADOPT_LIST_LIMIT);
+      }
+    }
     const fetched = await deps.exec([
       "git",
       "fetch",
@@ -239,7 +397,14 @@ export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
         prior.action_task_id = null;
       }
       const paths = (pr.files ?? []).map((file) => file.path);
-      const sensitive = matchesSensitivePath(paths, [...DEFAULT_SENSITIVE_PATHS, ...(gardener.sensitive_paths ?? [])]);
+      // `gh pr list --json files` caps the files array at 100. A bigger PR can
+      // hide a workflow/secrets change past that cap and past the denylist
+      // below, so treat a capped list as sensitive rather than trust it.
+      const filesTruncated = paths.length >= GH_FILES_PAGE_CAP;
+      const sensitive = filesTruncated || matchesSensitivePath(paths, [...DEFAULT_SENSITIVE_PATHS, ...(gardener.sensitive_paths ?? [])]);
+      const sensitiveReason = filesTruncated
+        ? `PR file list is truncated at ${GH_FILES_PAGE_CAP} files (gh pr list cap); treating as sensitive since a denylisted path could be hidden past it`
+        : undefined;
       const stale = clock - Date.parse(pr.updatedAt) > durationMs(gardener.close_stale_after, 14 * 86_400_000);
       const superseded = fetched.code === 0 && await supersededOnBase(deps.exec, project.repo_path, base, pr.number);
       const linked = linkedTask(db, project.id, pr.url);
@@ -253,7 +418,9 @@ export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
         stale,
         superseded,
         sensitive,
+        sensitiveReason,
         linkedTaskState: linked?.state,
+        adopted: String(linked?.source_ref ?? "").startsWith("pr-adopt:"),
         directorDeciding: !!linked && !!deps.directorDeciding?.(linked.id),
         actionInFlight: activeTask(db, prior?.action_task_id),
         decisionOpen: !!prior?.decision_id,
