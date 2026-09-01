@@ -6669,6 +6669,73 @@ async function resumePointerMarkerHolds(db: DB, exec: Exec, ids: string[], prUrl
   }
 }
 
+// HIVE-595: a handoff url that points at the wrong thing is worse than no url
+// at all. `hive emit ready --pr-url` replaces a known-good PR link with
+// whatever it is handed, and the mistake only surfaces much later as a failed
+// merge that reads like a GitHub outage: "Could not resolve to a PullRequest
+// with the number of 1847", where 1847 was the task's own hive number, pasted
+// where a PR number belongs.
+//
+// Refuse, never repair. Looking up the branch's real PR would be guessing what
+// the agent meant, and a wrong guess merges the wrong work with nobody
+// noticing. So we hold the handoff and say what was passed and what this task's
+// branch actually is, the same way the stale-evidence gate does, while the
+// agent is still in the turn that made the mistake.
+//
+// Fails OPEN. Only two answers are unambiguous enough to refuse on: GitHub says
+// there is no such PR, and GitHub says the PR sits on a different branch than
+// this task's. A gh that is broken, rate-limited or offline must not strand
+// every handoff in the fleet.
+type PrHandoffCheck = { branch: string | null; problem?: { reason: string; message: string } };
+
+async function checkPrHandoff(exec: Exec, prUrl: string, task: { branch?: string | null }): Promise<PrHandoffCheck> {
+  const url = prUrl.trim();
+  if (!/^https?:\/\//i.test(url))
+    return {
+      branch: null,
+      problem: {
+        reason: "pr_url_not_a_url",
+        message: `Handoff held: --pr-url ${prUrl} is not a URL. Pass the full link to the pull request that carries this task's work, like https://github.com/<owner>/<repo>/pull/<number>.`,
+      },
+    };
+  const result = await exec(["gh", "pr", "view", url, "--json", "headRefName"]).catch(() => null);
+  if (!result) return { branch: null };
+  if (result.code !== 0) {
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+    if (/could not resolve to a pullrequest|no pull requests found|could not find|not found|404/i.test(output))
+      return {
+        branch: null,
+        problem: {
+          reason: "pr_not_found",
+          message:
+            `Handoff held: GitHub has no pull request at ${prUrl}, so this link cannot be the PR for this task. ` +
+            `A common slip is pasting the task's own hive number where the PR number goes. ` +
+            `This task's branch is ${task.branch ?? "not recorded"}: find or open its real PR, then emit ready again with that URL.`,
+        },
+      };
+    return { branch: null };
+  }
+  let branch: string | null = null;
+  try {
+    const parsed = JSON.parse(result.stdout)?.headRefName;
+    branch = isSafeRef(parsed) ? parsed : null;
+  } catch {
+    branch = null;
+  }
+  if (branch && task.branch && branch !== task.branch)
+    return {
+      branch,
+      problem: {
+        reason: "pr_branch_mismatch",
+        message:
+          `Handoff held: ${prUrl} is open on branch ${branch}, but this task's work is on ${task.branch}. ` +
+          `That PR belongs to different work, and merging it would land the wrong change. ` +
+          `Emit ready with the PR whose head branch is ${task.branch}.`,
+      },
+    };
+  return { branch };
+}
+
 async function prHeadBranch(exec: Exec, prUrl: string): Promise<string | null> {
   try {
     const result = await exec(["gh", "pr", "view", prUrl, "--json", "headRefName"]);
@@ -6928,7 +6995,24 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     // the destructive-rebase guard and cleanup must inspect the replacement
     // PR's head, not the stale branch from the rejected attempt.
     if (prUrl && prUrl !== t.pr_url) {
-      const branch = await prHeadBranch(exec, prUrl);
+      const check = await checkPrHandoff(exec, prUrl, t);
+      if (check.problem) {
+        writeEvent(db, {
+          task_id: taskId,
+          source,
+          type: "ready_held",
+          payload: {
+            reason: check.problem.reason,
+            pr_url: prUrl,
+            task_branch: t.branch ?? null,
+            ...(check.branch ? { pr_branch: check.branch } : {}),
+            kept: t.pr_url ?? null,
+          },
+        });
+        broadcastTask(db, getTask(db, taskId));
+        return json({ held: true, reason: check.problem.reason, message: check.problem.message });
+      }
+      const branch = check.branch;
       db.query("UPDATE tasks SET pr_url = ?, branch = COALESCE(?, branch), ci_status = NULL, head_sha = NULL, updated_at = ? WHERE id = ?").run(
         prUrl,
         branch,
