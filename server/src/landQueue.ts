@@ -24,7 +24,7 @@ import { authoredFiles } from "./rebaseGuard.ts";
 import { defaultExec, projectComparisonBase, type Exec } from "./exec.ts";
 import { enqueue } from "./notifications.ts";
 import { queueSteerEvent, queuedSteers } from "./steer.ts";
-import { reviewPipelineSettled } from "./reviewer.ts";
+import { reviewPipelineSettled, requestRiskRecheck } from "./reviewer.ts";
 
 export interface LandNode {
   id: string;
@@ -173,11 +173,14 @@ async function defaultMerge(db: DB, taskId: string, exec: Exec): Promise<{ ok: b
 //   CI pending   — required checks were still running when we asked.
 //   risk check unfinished — the per-risk verification timed out on this head;
 //                  it retries on its own, and nothing was confirmed (HIVE-539).
+//   risk finding stale — the finding was recorded on a commit the branch has
+//                  already moved past (HIVE-588); the check re-runs on the new
+//                  head, so there is nothing here for a human to answer.
 //
 // Everything else (a real conflict, red CI, a missing understanding check) needs
 // a human or the agent, so it opens the pause card instead.
 const TRANSIENT_RE =
-  /risk check did not finish|base branch was modified|base.{0,20}(changed|moved|out of date|behind)|not up to date|merge queue|enqueued|try again|rate limit|secondary rate|timed? ?out|temporarily unavailable|\b50[234]\b|checks? (are )?(still )?(pending|running|in progress)|required status checks? .{0,30}(pending|expected)/i;
+  /risk check did not finish|risk finding is stale|base branch was modified|base.{0,20}(changed|moved|out of date|behind)|not up to date|merge queue|enqueued|try again|rate limit|secondary rate|timed? ?out|temporarily unavailable|\b50[234]\b|checks? (are )?(still )?(pending|running|in progress)|required status checks? .{0,30}(pending|expected)/i;
 
 export function isTransientLandFailure(reason: string): boolean {
   return TRANSIENT_RE.test(reason);
@@ -377,6 +380,20 @@ function codeOfFailure(db: DB, node: LandNode, reason: string, code: string | un
 // human act, and the merge itself is re-attempted, never waved through.
 const MAX_RISK_ROUTES_PER_HEAD = 1;
 
+// How many times the director has already said "this finding is wrong" about
+// this exact commit. One is the ceiling: the check has re-run with the
+// argument, and asking the same thing again would be the no-op this replaced.
+function riskRechecksAtHead(db: DB, taskId: string, headSha: string | null): number {
+  const row = db
+    .query(
+      `SELECT COUNT(*) AS n FROM events
+        WHERE task_id = ? AND type = 'risk_recheck'
+          AND json_extract(payload, '$.head_sha') IS ?`
+    )
+    .get(taskId, headSha) as { n: number };
+  return row?.n ?? 0;
+}
+
 function riskRoutesAtHead(db: DB, taskId: string, headSha: string | null): number {
   const row = db
     .query(
@@ -455,6 +472,10 @@ async function createLandPauseCard(
   code: string | undefined
 ): Promise<void> {
   const { createDecision } = await import("./api.ts");
+  const head = headShaOf(db, node.id);
+  // Only a confirmed risk has a stored verdict to set aside, and only the first
+  // ask on a commit can tell the director anything new.
+  const riskRecheckOffered = isConfirmedRiskFailure(code) && !!head && !riskRechecksAtHead(db, node.id, head);
   const decision = createDecision(db, {
     task_id: node.id,
     title: `PR #${node.number} paused in the land queue`,
@@ -476,14 +497,28 @@ async function createLandPauseCard(
     options: [
       { key: "send_back", label: "Send it back to the agent", detail: "Unmark it and ask the agent to fix what blocked the merge.", recommended: true },
       { key: "unqueue", label: "Take it out of the queue", detail: "Leave the PR open and unmarked. Nothing is sent to the agent." },
-      { key: "retry", label: "Try landing it again", detail: "Only if you just fixed the cause yourself. One more attempt, then hive holds it." },
+      // HIVE-588: "try landing it again" is honest for a cause you can fix
+      // yourself, but a CONFIRMED risk is a stored verdict — re-attempting
+      // re-reads the same row and fails the same way, so the option looked
+      // real and behaved like a no-op. On a risk card it is replaced by the
+      // one answer that changes something: say why the finding is wrong, and
+      // hive re-runs the check with your reasoning in front of it. Offered
+      // once per commit, because a second identical ask is the no-op again.
+      riskRecheckOffered
+        ? {
+            key: "recheck",
+            label: "The finding is wrong — re-run the check",
+            detail:
+              "Write why in the note. Hive sets the stored verdict aside and runs the risk check again on this same commit, with your reasoning in front of it. If it confirms the risk again, the merge stays blocked.",
+          }
+        : { key: "retry", label: "Try landing it again", detail: "Only if you just fixed the cause yourself. One more attempt, then hive holds it." },
     ],
   });
   writeEvent(db, {
     task_id: node.id,
     source: "reconciler",
     type: "land_paused",
-    payload: { decision_id: decision.id, reason, code, head_sha: headShaOf(db, node.id), ...(dispute ? { dispute: true } : {}) },
+    payload: { decision_id: decision.id, reason, code, head_sha: head, ...(dispute ? { dispute: true } : {}) },
   });
 }
 
@@ -593,11 +628,32 @@ function openPauseDecisionId(db: DB, taskId: string): string | null {
 // steer-delivery path turns into a `changes_requested` — that is what bounced a
 // finished PR back to in_progress after an administrative "fix" answer. Only the
 // `send_back` option, which says so on the label, may touch the agent.
-export function resolveLandPauseForDecision(db: DB, decisionId: string, answerKey: string): boolean {
+export function resolveLandPauseForDecision(
+  db: DB,
+  decisionId: string,
+  answerKey: string,
+  answerNote?: string | null
+): boolean {
   const ev = db
     .query("SELECT task_id FROM events WHERE type = 'land_paused' AND json_extract(payload, '$.decision_id') = ? LIMIT 1")
     .get(decisionId) as { task_id: string } | undefined;
   if (!ev) return false;
+  // HIVE-588: the director read the finding and says it is wrong. The argument
+  // is the valuable part and it used to have nowhere to go — on one task the
+  // refutation was a commit date and two PR numbers, checkable in seconds, and
+  // the queue re-refused twice against the stored verdict anyway. Now the
+  // verdict for this head is set aside, the check re-runs from scratch, and
+  // the reasoning reaches it: the verify prompt already reads answered
+  // decisions as settled rulings. It is NOT an override — a re-run that
+  // confirms the risk again blocks the merge exactly as before.
+  if (answerKey === "recheck") {
+    const head = headShaOf(db, ev.task_id);
+    if (head) requestRiskRecheck(db, ev.task_id, head, answerNote ?? null);
+    // Re-arm the queue: a `land_queued` mark ends the failed-attempt run, which
+    // is what otherwise holds a task after two failures on one commit.
+    markLand(db, [ev.task_id], true);
+    return true;
+  }
   if (answerKey === "unqueue") {
     markLand(db, [ev.task_id], false);
     return true;

@@ -96,7 +96,7 @@ import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove, riskLevel, NO_AUTO_ANSWER_REASON } from "./autoapprove.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
-import { confirmedRisks, unfinishedRiskCheck, cautionCleared, latestAutoReviewVerdict, reviewPipelineSettled } from "./reviewer.ts";
+import { confirmedRisks, unfinishedRiskCheck, cautionCleared, latestAutoReviewVerdict, reviewPipelineSettled, livePrHead } from "./reviewer.ts";
 import { explanationFor, explanationGate } from "./explainDiff.ts";
 import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
@@ -3522,6 +3522,30 @@ async function mergeTaskLocked(
   // never reads as "you did that for nothing".
   const confirmed = body?.override_confirmed_risks ? [] : confirmedRisks(db, id, task.head_sha);
   if (confirmed.length) {
+    // HIVE-588: a verdict only ever describes the commit it was recorded on.
+    // Hive's copy of the head lags the branch — the reconciler syncs on its own
+    // lap — so a finding the agent has ALREADY fixed and pushed past would be
+    // quoted here as if it still stood, and the land queue would re-read that
+    // same refusal on every sweep. Ask GitHub for the live head before
+    // refusing: if the branch has moved, record the new head and say so. The
+    // risk check then re-runs on the new commit and the queue retries, instead
+    // of refusing forever over superseded code.
+    const liveHead = task.pr_url ? await livePrHead(deps.exec ?? defaultExec, task.pr_url) : null;
+    if (liveHead && liveHead !== task.head_sha) {
+      db.query("UPDATE tasks SET head_sha = ?, updated_at = ? WHERE id = ?").run(liveHead, now(), id);
+      writeEvent(db, {
+        task_id: id,
+        source: "system",
+        type: "risk_finding_stale",
+        payload: { verdict_head_sha: task.head_sha, head_sha: liveHead, risks: confirmed.map((c) => c.risk) },
+      });
+      return err(
+        `merge blocked — the risk finding is stale: it was recorded on commit ${String(task.head_sha ?? "").slice(0, 7)}, ` +
+          `and the branch has moved on to ${liveHead.slice(0, 7)}. Nothing is confirmed on the new commit yet. ` +
+          `The risk check re-runs on it and the merge is re-attempted.`,
+        409
+      );
+    }
     const quiz = latestUnderstandingQuiz(db, id);
     const late = quiz && understandingQuizStatus(db, id, quiz.reviewEventId) === "passed";
     return err(
@@ -7921,7 +7945,7 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     resolveGardenerDecision(db, id, answerKey),
     resolveRefCaptureForDecision(db, id, answerKey, answerNote),
     resolveDependentsWedgedForDecision(db, id, answerKey, successorId, answeredBy),
-    resolveLandPauseForDecision(db, id, answerKey),
+    resolveLandPauseForDecision(db, id, answerKey, answerNote),
     resolveIntakeTriageForDecision(db, id, answerKey, answerNote),
     resolveServingFollowForDecision(db, id, answerKey),
   ].some(Boolean);
