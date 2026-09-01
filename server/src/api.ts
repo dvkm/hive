@@ -1507,6 +1507,7 @@ const MANAGER_EVENT_TYPES = new Set([
   "stale",
   "recovery",
   "requeued",
+  "requeue_failed",
   "usage_limit",
 ]);
 
@@ -2708,7 +2709,7 @@ const FEED_CATEGORIES: Record<string, string[]> = {
   state: ["state_change", "ready_for_review"],
   decision: ["needs-decision", "decision_answered", "planned", "authority_required", "authority_granted", "auto_approved", "auto_approve_declined"],
   evidence: ["evidence", "smoke_passed"],
-  incident: ["blocked", "stale", "spawn_error", "spawn_gave_up", "smoke_failed", "steer_error", "planner_error", "supervise_error", "authority_denied", "merge_failed"],
+  incident: ["blocked", "stale", "spawn_error", "spawn_gave_up", "smoke_failed", "steer_error", "planner_error", "supervise_error", "authority_denied", "merge_failed", "requeue_failed"],
   lifecycle: ["created", "spawned", "agent_status", "status", "steer", "note", "ci_status", "pr_merged", "planning", "assistant_text", "tool_use", "agent_turn_end", "auto_resume"],
 };
 
@@ -6301,15 +6302,40 @@ export function resolveRecoveryForDecision(db: DB, decisionId: string, answerKey
   const card = recoveryCardForDecision(db, decisionId);
   if (!card) return false;
   if (answerKey !== "requeue") return true;
-  const source = getTask(db, card.source_task_id);
-  if (source) {
+  requeueForRecovery(db, card.source_task_id, decisionId);
+  return true;
+}
+
+// The requeue half of a recovery card. A director who answers "requeue" has
+// every reason to believe work is now queued, so this path is not allowed to
+// do nothing quietly: it either creates the successor or writes `requeue_failed`
+// on the original naming the reason, and the answer endpoint turns that reason
+// into an error the answerer actually sees. Three tasks were dropped exactly
+// this way (HIVE-622) — the original stayed `failed`, nothing was queued, and
+// no row anywhere said a successor had been expected.
+// Returns null when the successor was created, the refusal reason otherwise.
+export function requeueForRecovery(db: DB, sourceTaskId: string, decisionId: string): string | null {
+  let reason: string;
+  try {
+    const source = getTask(db, sourceTaskId);
+    if (!source) throw new Error(`task ${sourceTaskId} no longer exists`);
     const newId = requeueTask(db, source);
     // Every other requeue path writes this, and the board walks it forward to
     // find the live successor. Without it a recovered task looks dead forever
     // (hive-1872) even though its successor finished the work.
     writeEvent(db, { task_id: source.id, source: "director", type: "requeued", payload: { new_task_id: newId, reason: "recovery decision" } });
+    return null;
+  } catch (e: any) {
+    reason = String(e?.message ?? e);
   }
-  return true;
+  try {
+    writeEvent(db, { task_id: sourceTaskId, source: "director", type: "requeue_failed", payload: { decision_id: decisionId, reason } });
+  } catch {
+    // The task row itself is gone, so there is nowhere to hang the event. The
+    // error returned to the answerer is then the only record, which is why the
+    // caller reports it instead of swallowing it.
+  }
+  return reason;
 }
 
 function recoveryCardForDecision(db: DB, decisionId: string): { source_task_id: string } | null {
@@ -8301,6 +8327,11 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     type: "decision_answered",
     payload: { decision_id: id, answer_key: answerKey, answer_note: answerNote, answered_by: answeredBy, actor: answeredActor },
   });
+  // The requeue runs BEFORE the other resolvers, so a sibling resolver throwing
+  // can never be the reason no successor was created. `undefined` means this
+  // was not a recovery requeue at all; null means the successor exists.
+  const requeueRefusal = recoveryCard ? requeueForRecovery(db, recoveryCard.source_task_id, id) : undefined;
+
   // Each specialized resolver returns true if it OWNED this card (and did its
   // own agent-facing action). A card no resolver claims is a plain question
   // from the agent — its answer must be relayed to the agent below, or the
@@ -8311,7 +8342,9 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
     resolveGrantForDecision(db, id, answerKey, now, answerNote),
     resolveDenyGuardrailForDecision(db, id, answerKey),
     resolvePlanForDecision(db, r.task_id, id, answerKey, selectedIndices, answerNote),
-    resolveRecoveryForDecision(db, id, answerKey),
+    // Already done above when this was a requeue; still needed for the other
+    // recovery answers (abandon), which own the card but queue nothing.
+    requeueRefusal === undefined ? resolveRecoveryForDecision(db, id, answerKey) : true,
     resolveBlockedForDecision(db, herdr, id, answerKey),
     resolveDuplicateForDecision(db, id, answerKey),
     resolveRepoMismatchForDecision(db, id, answerKey),
@@ -8345,6 +8378,13 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
 
   const decision = parseDecision({ ...r, status: "answered", answer_key: answerKey, answer_note: answerNote, answered_at: answeredAt, answered_by: answeredBy, answered_actor: answeredActor });
   broadcast({ type: "decision", decision });
+  // Fail loudly. The answer is recorded either way, but a requeue that queued
+  // nothing must never read as success to whoever clicked it.
+  if (requeueRefusal)
+    return err(
+      `Your answer was saved, but no new task was queued: ${requeueRefusal}. Task ${recoveryCard!.source_task_id} is still failed and the work is not picked up. Requeue it by hand or close it.`,
+      500
+    );
   return json(decision);
 }
 

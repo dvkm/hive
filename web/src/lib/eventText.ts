@@ -180,6 +180,8 @@ export function eventText(e: EventLike): string {
       return `handoff held: CI ${s(p.ci_status)} on ${s(p.pr_url)}`;
     case "ci_failure":
       return `CI failing — agent nudged to fix`;
+    case "requeue_failed":
+      return `requeue did NOT queue a new task: ${s(p.reason) || "unknown reason"}`;
     case "merge_failed": {
       // Same delivery-receipt rule as `steer`: only claim the agent was told
       // when the send actually landed.
@@ -367,6 +369,7 @@ const CATEGORY_OF: Record<string, FeedCategory> = {
   hung: "incident",
   merge_failed: "incident",
   auto_merge_failed: "incident",
+  requeue_failed: "incident",
   merge_blocked_destructive: "incident",
   scope_drift: "decision",
   action_failed: "incident",
@@ -397,6 +400,7 @@ const FAILURE_TYPES = new Set([
   "pr_closed",
   "pr_conflict",
   "recovery",
+  "requeue_failed",
   "smoke_failed",
   "spawn_error",
   "spawn_gave_up",
