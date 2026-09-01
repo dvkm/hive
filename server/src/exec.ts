@@ -47,6 +47,41 @@ function spawnEnv(): Record<string, string | undefined> {
   return { ...inherited, PATH: buildExecutablePath() };
 }
 
+// ------------------------------------------------------- no real `gh` in tests
+// HIVE-592: a test handed the `ready` handler a fake PR url (`https://gh/pr/99`)
+// and forgot to inject an exec stub, so the real `gh` ran, failed to parse the
+// url as a PR, and asked the GitHub API about this repo instead. Live network
+// inside the unit suite: ~1 run in 10 died on a 5s timeout, weeks after the
+// test was written, and it cost a dedicated investigation to trace back.
+// Nothing enforced the stubbing discipline, so every new test was one omission
+// away from the same flake.
+//
+// So `gh` is refused at the single spawn choke point every caller routes
+// through. Only `gh`: real `git` still runs, because several test files drive
+// genuine temp repos. Set HIVE_ALLOW_GH_IN_TESTS=1 for a test that deliberately
+// wants the real binary.
+// ponytail: NODE_ENV, not a preload — `bun test` already sets it, and this is
+// the one function that can name both the command and where it came from.
+function refuseGhInTests(argv: string[]): void {
+  const bin = (argv[0] ?? "").split(/[\\/]/).pop();
+  if (bin !== "gh" && bin !== "gh.exe") return;
+  const stack = new Error().stack ?? "";
+  // The nearest *.test.ts frame is the culprit whenever the call is a direct
+  // one. Across an in-process Bun.serve boundary (api.test.ts) only server
+  // frames survive, so fall back to the stack itself — bun prints this message
+  // under the test file it is running, immediately before that test's result.
+  const from = stack.split("\n").find((l) => /\.test\.tsx?:/.test(l))?.trim();
+  const message =
+    `[hive] REAL \`gh\` CALL FROM THE TEST SUITE: ${argv.join(" ")}\n` +
+    `  ${from ? `from ${from}` : `no test frame in the stack; the running test file is the one printed above this line`}\n` +
+    `  Tests must inject an exec stub instead of shelling out to gh — a real call means network, latency, and an intermittent timeout later.\n` +
+    `  If this call is deliberate, set HIVE_ALLOW_GH_IN_TESTS=1 around it.\n${stack}`;
+  // Logged as well as thrown: a throw inside a request handler becomes a 500
+  // and the message would otherwise never reach the test output.
+  console.error(message);
+  throw new Error(message);
+}
+
 // Real implementation over Bun.spawn. `input` is written to stdin (used by
 // `hive secret set`, which reads the value from stdin so it never hits argv).
 //
@@ -57,6 +92,7 @@ function spawnEnv(): Record<string, string | undefined> {
 // returned). `proc.kill()` is best-effort cleanup; the Promise.race is what
 // actually bounds the caller, since a leaked pipe writer can outlive the kill.
 export const defaultExec: Exec = async (argv, opts = {}) => {
+  if (process.env.NODE_ENV === "test" && !process.env.HIVE_ALLOW_GH_IN_TESTS) refuseGhInTests(argv);
   const spawn = (bin: string) => Bun.spawn([bin, ...argv.slice(1)], {
     cwd: opts.cwd,
     env: spawnEnv(),
