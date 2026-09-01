@@ -15,7 +15,7 @@
     "docs:jira": "bun run scripts/generate-jira-write-scope.ts",
     "docs:jira:check": "bun run scripts/generate-jira-write-scope.ts --check",
     "test": "bun run docs:jira:check && bun test",
-    "typecheck": "bunx tsc --noEmit && cd web && { [ -d node_modules ] || { echo \"web/node_modules is missing: run 'bun install' inside web/ first\" >&2; exit 1; }; } && bunx tsc -b --noEmit"
+    "typecheck": "[ -d web/node_modules ] || { echo \"web/node_modules is missing: run 'bun install' inside web/ first\" >&2; exit 1; }; bunx tsc --noEmit && bunx tsc -b web --noEmit"
   },
   "devDependencies": {
     "@types/bun": "latest"
