@@ -248,6 +248,16 @@ async function main() {
         from_task_id: process.env.HIVE_TASK_ID || undefined,
       });
       console.log(`message to ${taskId}: ${r.delivery}`);
+      // "queued" is not delivery: nothing read it, and nothing will until the
+      // task is spawned again. Say so, and say what to do (HIVE-552) — the old
+      // bare "queued" read as "sent" while the message sat unread for hours.
+      // A Jira-linked task also answers "queued", but with ok:true — that one IS
+      // on its way out as a Jira comment, so it gets no warning.
+      if (r.delivery === "queued" && !r.ok)
+        console.log(
+          `  ⚠ nobody read it${r.error ? ` — ${r.error}` : " — no live agent"}. ` +
+            `It rides along on the next spawn: hive spawn ${taskId}`
+        );
       return;
     }
     if (sub === "move") {

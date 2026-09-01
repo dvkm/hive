@@ -4,7 +4,7 @@ import { dirname, join, normalize } from "node:path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
-import { taskWithHealth, tasksWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
+import { taskWithHealth, tasksWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization, staleMs } from "./health.ts";
 import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror, mirrorTaskIdForTitle } from "./supervision.ts";
 import { activeProjects, isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
 import { addClient, removeClient, broadcast, appClientCount, setProjectResolver } from "./bus.ts";
@@ -35,6 +35,7 @@ import {
   resolveDependentsWedgedForDecision,
   queuedInputRecoveryPending,
   isSelfAuditLineage,
+  lastAgentActivity,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
@@ -3982,10 +3983,19 @@ export async function spawnAgent(
     HIVE_AGENT: agent,
   };
 
+  // HIVE-552: a finished agent idles at its prompt holding the task name, which
+  // refuses every respawn and strands every queued steer. herdr may release such
+  // a holder, but only when it is BOTH finished (its own `done` status) and this
+  // task has been silent for a full stale window — a busy agent is never closed.
+  const lastActivity = lastAgentActivity(db, id);
+  const holderQuietMs = lastActivity ? Date.now() - Date.parse(lastActivity) : undefined;
+
   let result;
   try {
     result = await herdr.spawn({
       taskId: id,
+      holderQuietMs,
+      releaseFinishedName: holderQuietMs !== undefined && holderQuietMs > staleMs(),
       repoPath: project.repo_path,
       hiveUrl,
       title: task.title,
