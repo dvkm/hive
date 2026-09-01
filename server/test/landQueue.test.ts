@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
-import { landGraph, landOnce, markLand } from "../src/landQueue.ts";
+import { landGraph, landOnce, markLand, CONFIRMED_RISK_CODE } from "../src/landQueue.ts";
 import { transition, writeEvent } from "../src/state.ts";
 import { apiAnswerDecision } from "../src/api.ts";
 import { queueSteerEvent, queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers } from "../src/steer.ts";
@@ -55,11 +55,16 @@ const filesExec = (byBranch: Record<string, string[]>): Exec => async (argv) => 
 
 // A merge stub that lands the task the way mergeTask would (in_review →
 // verifying), so the sweep sees the state change. `red` never merges.
-function mergeStub(db: DB, failing: Record<string, string> = {}) {
+type Failure = string | { reason: string; code?: string };
+
+function mergeStub(db: DB, failing: Record<string, Failure> = {}) {
   const calls: string[] = [];
   const merge = async (id: string) => {
     calls.push(id);
-    if (failing[id]) return { ok: false, reason: failing[id] };
+    if (failing[id]) {
+      const f = failing[id];
+      return typeof f === "string" ? { ok: false, reason: f } : { ok: false, reason: f.reason, code: f.code };
+    }
     transition(db, id, "verifying", { source: "director", reason: "test merge" });
     return { ok: true };
   };
@@ -600,4 +605,154 @@ test("a new head_sha closes the stale land-queue pause card", async () => {
   const after = mergeStub(db);
   await landOnce(db, { exec: filesExec({}), merge: after.merge });
   expect(after.calls).toEqual([a]);
+});
+
+// HIVE-559: a CONFIRMED risk is agent work. Hive relays the finding to the agent
+// that wrote the code and only asks the director when the agent argues back or
+// the same risk survives the relay.
+const RISK_REASON =
+  'merge blocked — the risk check confirmed 1 risk on this head: “export drops rows” — the CSV writer skips the last page (evidence/export.md). Fix them, or merge with override_confirmed_risks=true.';
+// The refusal as mergeTask actually builds it: prose for the human, `code` for
+// the routing. merge-guard.test.ts asserts the gate really emits this pair.
+const RISK_FAILURE = { reason: RISK_REASON, code: CONFIRMED_RISK_CODE };
+
+test("a confirmed risk goes to the agent as a steer, opens no card, and holds the land", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+
+  const { calls, merge } = mergeStub(db, { [a]: RISK_FAILURE });
+  await landOnce(db, { exec: filesExec({}), merge });
+  expect(calls).toEqual([a]);
+  // No director card: the agent hears about it first.
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+  // The finding reaches the agent verbatim, evidence path included.
+  const steers = queuedSteers(db, a);
+  expect(steers).toHaveLength(1);
+  expect(steers[0].message).toContain(RISK_REASON);
+  expect(steers[0].message).toContain("evidence/export.md");
+  // Audited as a machine relay, not a director ruling.
+  const routed = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_routed_to_agent'").all(a) as any[];
+  expect(routed).toHaveLength(1);
+  expect(JSON.parse(routed[0].payload).head_sha).toBe("sha1");
+  // The land is held, and still approved: no merge, no unmark.
+  expect((db.query("SELECT state, land_queued_at FROM tasks WHERE id = ?").get(a) as any).state).toBe("in_review");
+  expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(a) as any).land_queued_at).toBeTruthy();
+
+  // A new head re-arms the merge with no card in between.
+  markSteersDelivered(db, steers.map((s) => s.id), "drain");
+  db.query("UPDATE tasks SET head_sha = 'sha2' WHERE id = ?").run(a);
+  ageLandAttempts(db, a, 3_600_000);
+  const after = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: after.merge });
+  expect(after.calls).toEqual([a]);
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(a) as any).state).toBe("verifying");
+});
+
+test("an agent that disputes a confirmed risk gets a card carrying the argument", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+
+  const first = mergeStub(db, { [a]: RISK_FAILURE });
+  await landOnce(db, { exec: filesExec({}), merge: first.merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+
+  // The agent reads it and argues the finding is wrong instead of pushing.
+  markSteersDelivered(db, queuedSteers(db, a).map((s) => s.id), "drain");
+  writeEvent(db, { task_id: a, source: "agent", type: "risk_dispute", payload: { note: "The last page is written by flush(); the finding read an older file." } });
+
+  ageLandAttempts(db, a, 3_600_000);
+  const second = mergeStub(db, { [a]: RISK_FAILURE });
+  await landOnce(db, { exec: filesExec({}), merge: second.merge });
+  const open = db.query("SELECT task_id, context FROM decisions WHERE status = 'open'").all() as any[];
+  expect(open).toHaveLength(1);
+  expect(open[0].task_id).toBe(a);
+  expect(open[0].context).toContain("The last page is written by flush()");
+  // One card, not one per sweep, and no second relay to the arguing agent.
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(1);
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'risk_routed_to_agent'").get(a) as any).n).toBe(1);
+});
+
+// The bug the risk check caught on this very PR: `answer` is the generic reply
+// channel for every steer and change-request question, so reading it as "the
+// agent disputes the risk" turned "on it, fixing now" — or a reply about
+// something else entirely — into a director card. That is the interruption this
+// feature exists to remove, so only `risk_dispute` counts.
+test("an ordinary answer after the relay is not a dispute and opens no card", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+
+  // The agent replies on the generic channel about something unrelated.
+  markSteersDelivered(db, queuedSteers(db, a).map((s) => s.id), "drain");
+  writeEvent(db, { task_id: a, source: "agent", type: "answer", payload: { note: "Yes, the export flag is behind the same env var you asked about." } });
+
+  // The relay is spent and the same commit still fails, so the director does
+  // hear about it — but as the ordinary "came back unfixed" hold, never as an
+  // argument the agent never made. That unrelated answer is nowhere near it.
+  ageLandAttempts(db, a, 3_600_000);
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'risk_routed_to_agent'").get(a) as any).n).toBe(1);
+  const open = db.query("SELECT context FROM decisions WHERE status = 'open'").all() as any[];
+  expect(open).toHaveLength(1);
+  expect(open[0].context).not.toContain("the same env var");
+  expect(open[0].context).not.toContain("disputes it");
+  expect(open[0].context).toContain("came back unfixed");
+});
+
+// The realistic dispute: delivering the steer bounces the task back to the
+// agent, so when it returns to review it is HELD by the unaddressed change
+// request and never reaches another merge attempt. The escalation still fires.
+test("a dispute escalates even while the task is held and never re-attempted", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
+
+  const steers = queuedSteers(db, a);
+  markSteersDelivered(db, steers.map((s) => s.id), "drain");
+  resumeReviewForDeliveredSteers(db, a, steers, "drain"); // → in_progress + changes_requested
+  writeEvent(db, { task_id: a, source: "agent", type: "risk_dispute", payload: { note: "the finding misread the flush path" } });
+  transition(db, a, "in_review", { source: "agent", reason: "handed back without a new commit" });
+
+  ageLandAttempts(db, a, 3_600_000);
+  const held = mergeStub(db, { [a]: RISK_FAILURE });
+  await landOnce(db, { exec: filesExec({}), merge: held.merge });
+  expect(held.calls).toEqual([]); // still held: no merge attempt at all
+  const open = db.query("SELECT task_id, context FROM decisions WHERE status = 'open'").all() as any[];
+  expect(open).toHaveLength(1);
+  expect(open[0].context).toContain("misread the flush path");
+});
+
+// The desync this design exists to prevent, made loud. If the merge gate stops
+// setting the code but the message still reads like a confirmed risk, hive keeps
+// routing to the agent (no silent revert to the director) AND records that the
+// two files have drifted apart, so a human finds out.
+test("a confirmed-risk refusal with no code still routes, and says loudly that it desynced", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+
+  // Code stripped: only the prose survives, exactly as a reworded gate would look.
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_REASON }).merge });
+
+  // Behaviour did NOT revert: the agent still gets the finding, no card opens.
+  expect(queuedSteers(db, a)).toHaveLength(1);
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+  // And the broken contract is on the record, not swallowed.
+  const desync = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_code_desync'").all(a) as any[];
+  expect(desync).toHaveLength(1);
+  expect(JSON.parse(desync[0].payload).expected_code).toBe(CONFIRMED_RISK_CODE);
+  const notes = db.query("SELECT title FROM notifications WHERE task_id = ?").all(a) as any[];
+  expect(notes.some((n) => n.title.includes(CONFIRMED_RISK_CODE))).toBe(true);
 });
