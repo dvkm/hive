@@ -81,7 +81,15 @@ test("two reaper laps over an already-cleaned terminal task: the second issues n
   await reapOnce(db, { herdr, exec });
   expect(calls.some((c) => c[0] === "git" && has(c, "worktree", "list"))).toBe(true); // still re-entered...
   expect(closes()).toEqual([]); // ...but did nothing
-  expect((db.query("SELECT COUNT(*) n FROM events WHERE task_id = ?").get("ANCIENT") as { n: number }).n).toBe(events.n);
+  // The one event lap 2 may add is the orphan-removal attribution (HIVE-624):
+  // the row lost its path in lap 1, so the fallback removal runs and must say so.
+  const after = db.query("SELECT type FROM events WHERE task_id = ?").all("ANCIENT") as { type: string }[];
+  expect(after.length - events.n).toBeLessThanOrEqual(1);
+  expect(after.filter((e) => e.type !== "reaped_orphan_worktree").length).toBe(events.n);
+
+  // ...and a third lap adds nothing at all: the attribution is once per branch.
+  await reapOnce(db, { herdr, exec });
+  expect((db.query("SELECT COUNT(*) n FROM events WHERE task_id = ?").get("ANCIENT") as { n: number }).n).toBe(after.length);
 });
 
 // Task #1280 / 2026-08-21. cleanupTask removes the path stored on the TASK ROW.
@@ -537,4 +545,92 @@ test("sweepZombiePanes leaves the live task's pane alone", async () => {
   expect(closed.some((c) => has(c, "pane", "close", "w2:p1"))).toBe(false);
   const task = db.query("SELECT agent_target FROM tasks WHERE id = ?").get("cafecafecafe") as { agent_target: string | null };
   expect(task.agent_target).not.toBeNull();
+});
+
+// HIVE-624. A worktree whose branch maps to no task row went straight to
+// reapOrphan, which called cleanupWorktree with no liveness check at all — its
+// only guard asks "is the branch pushed or merged", which is exactly when
+// removal looks safest while the agent is still live. That removed the HIVE-213
+// agent's own checkout mid-`bun test` (branch hive/46c8e9afa8af-main: suffixed,
+// so no task row matched). The guard resolves the agent by worktree PATH.
+// One exec for git AND herdr (Herdr runs git through its own injected exec).
+function orphanExec(calls: string[][], herdrReply: (argv: string[]) => ExecResult | null): Exec {
+  return async (argv) => {
+    calls.push(argv);
+    if (argv[0] === "git" && has(argv, "worktree", "list"))
+      return OK("worktree /repo\nHEAD r0\nbranch refs/heads/main\n\nworktree /wt/hive-46c8e9afa8af-main\nHEAD r1\nbranch refs/heads/hive/46c8e9afa8af-main\n");
+    if (argv[0] === "git" && argv.includes("--merged")) return OK("  main\n  hive/46c8e9afa8af-main");
+    return herdrReply(argv) ?? OK();
+  };
+}
+const orphanPanes = (label: string | null) =>
+  JSON.stringify({ result: { panes: [{ pane_id: "w9:p1", cwd: "/wt/hive-46c8e9afa8af-main", label, tab_id: "w9:t1", workspace_id: "w9" }] } });
+const removals = (calls: string[][]) => calls.filter((c) => c[0] === "git" && has(c, "worktree", "remove"));
+
+test("orphan worktree with a LIVE agent in it is not removed", async () => {
+  const { db } = freshDb();
+  const calls: string[][] = [];
+  const exec = orphanExec(calls, (argv) => {
+    if (has(argv, "pane", "list")) return OK(orphanPanes("46c8e9afa8af"));
+    if (has(argv, "agent", "get")) return OK(JSON.stringify({ result: { agent: { pane_id: "w9:p1", agent_status: "working" } } }));
+    return null;
+  });
+  const herdr = new Herdr(exec, "herdr");
+
+  await reapOnce(db, { herdr, exec });
+
+  expect(removals(calls).length).toBe(0);
+});
+
+test("orphan worktree whose pane lost its agent label but still runs the agent command is not removed", async () => {
+  const { db } = freshDb();
+  const calls: string[][] = [];
+  const exec = orphanExec(calls, (argv) => {
+    if (has(argv, "pane", "list")) return OK(orphanPanes(null));
+    if (has(argv, "pane", "process-info"))
+      return OK(JSON.stringify({ result: { process_info: { shell_pid: 42, foreground_processes: [{ pid: 42, name: "claude" }] } } }));
+    return null;
+  });
+  const herdr = new Herdr(exec, "herdr");
+
+  await reapOnce(db, { herdr, exec });
+
+  expect(removals(calls).length).toBe(0);
+});
+
+// The other half: genuine orphans must STILL be collected, or dead worktrees
+// and their ptys accumulate. And the removal must leave a durable record —
+// writing nothing at all is why this took four attempts to diagnose.
+test("orphan worktree with no agent in it is still removed, and the removal is recorded", async () => {
+  const { db } = freshDb();
+  const calls: string[][] = [];
+  const exec = orphanExec(calls, (argv) => (has(argv, "pane", "list") ? OK(JSON.stringify({ result: { panes: [] } })) : null));
+  const herdr = new Herdr(exec, "herdr");
+
+  await reapOnce(db, { herdr, exec });
+
+  expect(removals(calls).length).toBe(1);
+  const n = db.query("SELECT title, body FROM notifications").all() as { title: string; body: string }[];
+  expect(n.length).toBe(1);
+  expect(n[0].title).toContain("hive/46c8e9afa8af-main");
+  expect(n[0].body).toContain("/wt/hive-46c8e9afa8af-main");
+});
+
+// A pane at the same cwd running a bare login shell (a fleet tab's root pane, or
+// the director's own terminal) is not an agent — treating it as live would pin
+// every orphan worktree forever.
+test("a login-shell pane in the worktree does not block the sweep", async () => {
+  const { db } = freshDb();
+  const calls: string[][] = [];
+  const exec = orphanExec(calls, (argv) => {
+    if (has(argv, "pane", "list")) return OK(orphanPanes(null));
+    if (has(argv, "pane", "process-info"))
+      return OK(JSON.stringify({ result: { process_info: { shell_pid: 7, foreground_processes: [{ pid: 7, name: "-zsh" }] } } }));
+    return null;
+  });
+  const herdr = new Herdr(exec, "herdr");
+
+  await reapOnce(db, { herdr, exec });
+
+  expect(removals(calls).length).toBe(1);
 });

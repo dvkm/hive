@@ -10,12 +10,13 @@
 // reconciler loop pattern.
 import type { DB } from "./db.ts";
 import { setSetting, now, isOffline } from "./db.ts";
-import { getTask, TERMINAL, type State } from "./state.ts";
-import { Herdr, herdr as defaultHerdr, parseWorktreeList, paneHasLiveProcess, type PaneInfo } from "./runtime/herdr.ts";
+import { getTask, writeEvent, TERMINAL, type State } from "./state.ts";
+import { Herdr, herdr as defaultHerdr, parseWorktreeList, paneHasLiveProcess, paneRunsAgentCommand, type PaneInfo } from "./runtime/herdr.ts";
 import { cleanupTask, releaseReviewAgents } from "./cleanup.ts";
 import { activeProjects } from "./testProjects.ts";
 import { teardownBlocked } from "./teardownGuard.ts";
 import { broadcast } from "./bus.ts";
+import { enqueue } from "./notifications.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 import { startLoop } from "./loop.ts";
@@ -328,11 +329,60 @@ export function sweepFinishedTestProjects(db: DB): void {
   }
 }
 
+// Is this pane sitting inside that worktree checkout? Path comparison, not the
+// `hive-<taskId>` basename parse taskIdFromCwd does: the worktree that killed
+// the HIVE-213 agent was `hive-46c8e9afa8af-main` (suffixed because its base
+// branch history was disjoint), which that regex does not match at all.
+export function paneInWorktree(cwd: string | null, worktreePath: string): boolean {
+  if (!cwd || !worktreePath) return false;
+  const trim = (s: string) => s.replace(/\/+$/, "");
+  const wt = trim(worktreePath);
+  const c = trim(cwd);
+  return c === wt || c.startsWith(wt + "/");
+}
+
+// The liveness guard for a worktree with NO task row, resolved by PATH because
+// there is no agent_target to probe. Two signals, in order of confidence:
+//   1. a pane herdr's registry still labels with an agent name → probe it, and
+//      defer on the same predicate cleanupTask uses (alive AND working/blocked;
+//      "unknown" does NOT defer, so a herdr outage cannot wedge cleanup shut).
+//   2. no label (a desktop-app restart wipes the registry while the claude
+//      processes keep running — the false-dead incident) → fall back to the
+//      pane's own root process. paneRunsAgentCommand is the right test here,
+//      not "any process": a fleet tab's root pane sits at the same cwd running
+//      a login shell, and treating that as live would pin orphans forever.
+async function liveAgentInWorktree(herdr: Herdr, worktreePath: string): Promise<{ target: string; status: string } | null> {
+  for (const pane of (await herdr.listPanes()).filter((p) => paneInWorktree(p.cwd, worktreePath))) {
+    if (pane.label) {
+      const probe = await herdr.probe(pane.label).catch(() => ({ alive: false, status: "unknown" as const }));
+      if (probe.alive && (probe.status === "working" || probe.status === "blocked")) return { target: pane.label, status: probe.status };
+      continue;
+    }
+    if (paneRunsAgentCommand(await herdr.paneProcessInfo(pane.paneId))) return { target: pane.paneId, status: "unregistered" };
+  }
+  return null;
+}
+
 // A worktree with no usable task metadata — the row is gone, or it lost its
-// worktree_path/branch. Either way there is nothing to attach an event to, so
-// remove it (guarded) and broadcast a signal instead.
+// worktree_path/branch. Removal is guarded twice: an agent still working in the
+// directory defers it (see liveAgentInWorktree), and cleanupWorktree still
+// rescues uncommitted work before removing anything.
+//
+// Every outcome leaves a DURABLE record, not just a broadcast. reapOrphan used
+// to write nothing at all, so a worktree vanished from under an agent with no
+// event anywhere and three separate investigations blamed cleanupTask and the
+// deploy instead (HIVE-624). An event when a task row exists, a notification
+// when it does not (events.task_id is a NOT NULL foreign key).
 async function reapOrphan(db: DB, herdr: Herdr, repoPath: string, branch: string, worktreePath: string): Promise<void> {
   const taskId = taskIdFromBranch(branch)!;
+  const live = await liveAgentInWorktree(herdr, worktreePath);
+  if (live) {
+    // Deferrals are not recorded durably on purpose: the reaper retries every
+    // sweep, and one row per lap for the whole life of a long agent is noise.
+    console.log(`[hive] reaper orphan ${branch}: agent ${live.target} is ${live.status} in ${worktreePath} — deferring removal`);
+    broadcast({ type: "reaped_orphan_deferred", branch, worktree_path: worktreePath, agent: live.target, status: live.status });
+    return;
+  }
   const r = await herdr.cleanupWorktree({ repoPath, branch, worktreePath, taskId });
   broadcast({
     type: "reaped_orphan",
@@ -341,6 +391,31 @@ async function reapOrphan(db: DB, herdr: Herdr, repoPath: string, branch: string
     removed: r.removed,
     reason: r.reason,
     ghost_branch: r.ghost_branch,
+  });
+  if (!r.removed) return; // nothing was torn down; nothing to attribute
+  // Once per branch. git can keep listing a worktree that is already gone from
+  // disk, and cleanupWorktree calls that a successful removal — without this,
+  // every 300s lap would re-record the same teardown (the #1112 event flood).
+  const task = getTask(db, taskId);
+  const title = `Removed an orphan worktree (${branch})`;
+  if (task) {
+    const already = db
+      .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'reaped_orphan_worktree' AND json_extract(payload, '$.branch') = ? LIMIT 1")
+      .get(taskId, branch);
+    if (already) return;
+    writeEvent(db, {
+      task_id: taskId,
+      source: "reaper",
+      type: "reaped_orphan_worktree",
+      payload: { branch, worktree_path: worktreePath, reason: r.reason, ghost_branch: r.ghost_branch, why_orphan: "task row has no worktree_path/branch" },
+    });
+    return;
+  }
+  if (db.query("SELECT 1 FROM notifications WHERE title = ? LIMIT 1").get(title)) return;
+  enqueue(db, {
+    kind: "incident",
+    title,
+    body: `${worktreePath} was on branch ${branch} with no task row, so the reaper removed it (${r.reason}).${r.ghost_branch ? ` Uncommitted work was rescued to ${r.ghost_branch}.` : ""}`,
   });
 }
 
