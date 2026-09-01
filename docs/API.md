@@ -783,6 +783,8 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   that task forever, since spawn refuses a resume PR whose hive marker no longer
   names the task. Sending a non-null value is a `400` — repointing a task at a
   different PR or branch by hand is how one task's work lands on another's.
+  A clear writes a `resume_pointer_cleared` event carrying the dropped values,
+  so the timeline explains why a task that was undispatchable suddenly isn't.
   Any other field is a `400` naming it. The endpoint never accepts a write it
   then drops: a silently ignored field leaves the caller believing a change
   landed when nothing did (HIVE-585).

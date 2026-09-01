@@ -1506,6 +1506,14 @@ test("PUT /api/tasks/:id clears a stale resume pointer and refuses fields it doe
   expect(getTask(db, id).resume_pr_url).toBeNull();
   expect(getTask(db, id).resume_branch).toBeNull();
 
+  // Clearing changes whether the task can be dispatched, so it leaves a record.
+  const events = (await get(`/api/tasks/${id}/events`)).json;
+  const record = events.findLast((event: any) => event.type === "resume_pointer_cleared");
+  expect(record.payload).toEqual({
+    resume_pr_url: "https://github.com/dvkm/hive/pull/167",
+    resume_branch: "hive/predecessor",
+  });
+
   // An ordinary edit still leaves the pointers alone.
   db.query("UPDATE tasks SET resume_branch = ? WHERE id = ?").run("hive/keepme", id);
   const titled = await put(`/api/tasks/${id}`, { title: "renamed" });

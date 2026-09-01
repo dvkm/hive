@@ -2551,11 +2551,13 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
     resume_pr_url: task.resume_pr_url ?? null,
     resume_branch: task.resume_branch ?? null,
   };
+  const clearedResume: Record<string, string> = {};
   for (const field of Object.keys(resume)) {
     const value = body?.[field];
     if (value === undefined) continue;
     if (value !== null && String(value).trim() !== "")
       return err(`${field} can only be cleared here (send null) — pointing a task at a different PR or branch by hand is not supported`);
+    if (resume[field]) clearedResume[field] = resume[field]!;
     resume[field] = null;
   }
   const title = body?.title != null ? String(body.title) : task.title;
@@ -2613,6 +2615,11 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
   // moved an existing link off another ticket.
   if (relinked)
     writeEvent(db, { task_id: id, source: "director", type: "jira_mirror_relinked", payload: relinked });
+  // Clearing a resume pointer changes whether the task can be dispatched at
+  // all, so record it. Otherwise the next person to look sees a task that was
+  // blocked and now isn't, with nothing explaining the transition.
+  if (Object.keys(clearedResume).length)
+    writeEvent(db, { task_id: id, source: "director", type: "resume_pointer_cleared", payload: clearedResume });
   broadcastTask(db, updated);
   return json({ ...taskWithHealth(db, updated), ...(relinked ? { jira_mirror_relinked: relinked } : {}) });
 }
