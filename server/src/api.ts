@@ -6248,6 +6248,42 @@ async function prHeadBranch(exec: Exec, prUrl: string): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------- event ingestion (`hive emit`)
+// hive-1992: `hive emit --json <file>` used to accept ANY path, so agents that
+// wrote to the shared /tmp/review.json published each other's reviews — one
+// task's review card ended up describing a completely different change, and an
+// understanding check had already been passed against the review it replaced.
+// The CLI sends the resolved path; a payload read from outside the calling
+// agent's own sandbox is refused, not warned about.
+//
+// Legitimate homes are the task's own worktree, and its per-session scratchpad
+// (/tmp/claude-501/<worktree-slug>/<session-uuid>/scratchpad/...), whose slug is
+// the worktree path with every non-alphanumeric character turned into "-".
+function worktreeSlug(worktreePath: string): string {
+  return worktreePath.replace(/[^A-Za-z0-9]/g, "-");
+}
+
+// Every name this task legitimately answers to, so a payload that stamps its
+// own task id can be checked against all of them (uppercased for comparison).
+function taskIdentities(db: DB, task: any): string[] {
+  return [task.id, String(task.number), `#${task.number}`, taskIdentifier(db, task)].map((v) => v.toUpperCase());
+}
+
+function payloadPathRefusal(task: any, raw: unknown): string | null {
+  const path = typeof raw === "string" ? raw.trim() : "";
+  const worktree = String(task?.worktree_path ?? "").replace(/\/+$/, "");
+  // No path (a direct API caller) or no worktree on the task: nothing to
+  // compare against, so this guard stays out of the way.
+  if (!path || !worktree) return null;
+  if (path === worktree || path.startsWith(worktree + "/")) return null;
+  if (path.split("/").includes(worktreeSlug(worktree))) return null;
+  return (
+    `refusing to read ${path}: it is outside this task's worktree and session scratchpad, ` +
+    `so another agent can overwrite it between your write and this emit (that is how one task ` +
+    `published another agent's review). Write the payload inside ${worktree}/ (or your session ` +
+    `scratchpad) and emit again.`
+  );
+}
+
 async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDeps = {}): Promise<Response> {
   const task = getTask(db, taskId);
   if (!task) return noTask(taskId);
@@ -6281,6 +6317,19 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       `this task is tracking-only — hive tracks it but never runs an agent on it, so there are no agent lifecycle events to record. To close it, move it directly: \`hive task move ${taskId} done\` (or \`cancelled\`).`,
       409
     );
+  // hive-1992: a --json payload must come from this agent's own sandbox, and if
+  // it names a task it must name THIS one. Both refuse rather than warn — the
+  // warning would arrive after the wrong review is already published.
+  const pathRefusal = payloadPathRefusal(task, (fields as any).payload_path);
+  if (pathRefusal) return err(pathRefusal, 400);
+  const claimed = String((fields as any).task_id ?? (fields as any).task ?? "").trim();
+  if (claimed && !taskIdentities(db, task).includes(claimed.toUpperCase()))
+    return err(
+      `this payload says it belongs to task ${claimed}, but you are emitting on ${taskIdentifier(db, task)} (${taskId}). ` +
+        `Re-generate the payload for this task and emit again.`,
+      400
+    );
+
   const source = fields.source || "agent";
   const note = fields.note ?? null;
 

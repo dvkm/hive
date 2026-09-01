@@ -1187,6 +1187,8 @@ recognized fields (JSON keys == form field names):
 | `until`,`days` | (deferred type) auto-resume horizon: an ISO timestamp (`until`) or an integer number of days from now (`days`); neither = indefinite |
 | `model`,`input_tokens`,`output_tokens`,`cache_read_tokens`,`cache_write_tokens`,`cost_usd` | usage fields (usage type; numbers, or numeric strings in multipart; `cost_usd` optional) |
 | `verify_name` | (evidence type) the task `verification_cmds` entry this artifact came from; recorded on the `evidence` event payload (CLI: `--verify-name <name>`) |
+| `payload_path` | the absolute path the `--json` payload was read from (the CLI fills it in). Refused with `400` when it is outside the task's `worktree_path` and outside that worktree's session scratchpad (`.../<worktree-slug>/<session-uuid>/scratchpad/...`, slug = the worktree path with every non-alphanumeric character replaced by `-`). Shared paths like `/tmp/review.json` let one agent publish another agent's review. Skipped when the task has no worktree. |
+| `task_id` (or `task`) | optional self-identification stamped into a payload file: the task id, number, `#number`, or display id (e.g. `HIVE-561`). Refused with `400` when it names a different task than the one being emitted on. |
 | `file` | (multipart only) the uploaded evidence file |
 
 Behavior by `type`:
