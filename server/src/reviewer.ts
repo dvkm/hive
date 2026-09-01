@@ -41,6 +41,10 @@ const REVIEW_CONCURRENCY = 4;
 // fan-out or it deadlocks.
 const RISK_CONCURRENCY = 2;
 const DIFF_LIMIT = 60_000;
+// The one retry reads a quarter of the diff. A shorter prompt is the only knob
+// the reviewer has when the shared model route is what's slow (HIVE-567), and
+// a partial review beats the nothing a second timeout leaves behind.
+const RETRY_DIFF_LIMIT = 15_000;
 
 export interface ReviewerDeps {
   exec?: PlannerExec; // the claude -p runner (injectable in tests)
@@ -115,7 +119,7 @@ async function livePrHead(exec: Exec, prUrl: string): Promise<string | null> {
   }
 }
 
-function reviewPrompt(task: any, diff: string): string {
+function reviewPrompt(task: any, diff: string, limit = DIFF_LIMIT): string {
   return [
     `You are pre-reviewing a PR for a busy human reviewer. Be terse and concrete; no praise, no filler.`,
     ``,
@@ -123,7 +127,7 @@ function reviewPrompt(task: any, diff: string): string {
     `Brief:\n${(task.brief ?? "").slice(0, 4000)}`,
     ``,
     `Diff (may be truncated):`,
-    diff.slice(0, DIFF_LIMIT),
+    diff.slice(0, limit),
     ``,
     PLAIN_ENGLISH,
     ``,
@@ -143,8 +147,17 @@ function reviewPrompt(task: any, diff: string): string {
 // silently retired that card until someone pushed a new commit. An auth outage
 // left 31 of 36 review cards in exactly that state (HIVE-497). So failures now
 // get a bounded retry budget per PR head instead.
-export const MAX_REVIEW_ATTEMPTS = 5;
-const RETRY_BASE_MS = 5 * 60_000; // 5, 10, 20, 40 min between tries
+//
+// Five identical tries turned out to be four wasted ones: 15 timeouts across 4
+// PRs in three hours (HIVE-567) were all the SAME 180s call repeated. Measured
+// against those exact PRs, one review takes 15-40s; the timeouts all fell in
+// one 45-minute window where every model call was slow (a 15-minute explain
+// run timed out in it too). So the budget was never the problem and a bigger
+// one would not have helped. Two tries, and the second one is SMALLER — a
+// short diff is the one variable the reviewer controls when the model route is
+// the slow part.
+export const MAX_REVIEW_ATTEMPTS = 2;
+const RETRY_BASE_MS = 5 * 60_000; // 5 min before the one retry
 const MAX_RETRY_DELAY_MS = 60 * 60_000;
 
 // Does this recorded review event describe the head we are about to review?
@@ -193,7 +206,13 @@ function retryDue(attempts: { ts: string; auth: boolean }[], nowMs = Date.now())
 // the event carries `gave_up` and the director gets one notification: a card
 // hive has stopped trying to review must not keep looking like one it simply
 // has not got to yet.
-function recordReviewFailure(db: DB, task: any, error: string, reviewIdentity: Record<string, unknown>): void {
+function recordReviewFailure(
+  db: DB,
+  task: any,
+  error: string,
+  reviewIdentity: Record<string, unknown>,
+  elapsedMs?: number
+): void {
   const auth = isAuthFailure(error);
   const spent = failedReviewAttempts(db, task).filter((a) => !a.auth).length + (auth ? 0 : 1);
   const gaveUp = !auth && spent >= MAX_REVIEW_ATTEMPTS;
@@ -201,9 +220,34 @@ function recordReviewFailure(db: DB, task: any, error: string, reviewIdentity: R
     task_id: task.id,
     source: "system",
     type: "auto_review_error",
-    payload: { error, attempts: spent, ...(gaveUp ? { gave_up: true } : {}), ...reviewIdentity },
+    payload: {
+      error,
+      attempts: spent,
+      ...(elapsedMs === undefined ? {} : { elapsed_ms: elapsedMs }),
+      ...(gaveUp ? { gave_up: true } : {}),
+      ...reviewIdentity,
+    },
   });
   if (!gaveUp) return;
+  // A card hive has stopped reviewing looked EXACTLY like one it had not got
+  // to yet: no verdict, nothing on the review surface, quiet on the board
+  // (HIVE-567). Give-up now writes a real verdict too, the same way two
+  // unparseable runs do. `unavailable` is not `looks_good` and not `caution`,
+  // so no auto-merge path treats it as a pass — it only makes the silence
+  // visible.
+  writeEvent(db, {
+    task_id: task.id,
+    source: "system",
+    type: "auto_review",
+    payload: {
+      verdict: "unavailable",
+      summary: `auto-review could not complete after ${spent} tries. Review it yourself. Last error: ${error.slice(0, 200)}`,
+      risks: [],
+      questions: [],
+      ...reviewIdentity,
+    },
+  });
+  broadcast({ type: "task", task: getTask(db, task.id) });
   enqueue(db, {
     kind: "failed",
     task_id: task.id,
@@ -290,9 +334,14 @@ async function reviewOne(db: DB, t: any, deps: ReviewerDeps): Promise<void> {
       ? [...config.reviewer_argv]
       : [claudeBin(), "-p", "--model", config.model_by_kind?.review ?? "sonnet"];
   const buildArgv = (prompt: string) => [...base, prompt, "--output-format", "json"];
-  const argv = buildArgv(reviewPrompt(t, diff.text));
+  // Retry smaller, never identical: the first try already spent the full
+  // budget on the full diff, so repeating it verbatim just spends it again.
+  const priorFailures = failedReviewAttempts(db, t).filter((a) => !a.auth).length;
+  const diffLimit = priorFailures ? RETRY_DIFF_LIMIT : DIFF_LIMIT;
+  const argv = buildArgv(reviewPrompt(t, diff.text, diffLimit));
 
   const exec = deps.exec ?? defaultPlannerExec;
+  const startedMs = Date.now();
   let res;
   try {
     res = await exec(argv, {
@@ -302,14 +351,14 @@ async function reviewOne(db: DB, t: any, deps: ReviewerDeps): Promise<void> {
     });
   } catch (e: any) {
     if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
-    recordReviewFailure(db, t, String(e?.message ?? e), reviewIdentity);
+    recordReviewFailure(db, t, String(e?.message ?? e), reviewIdentity, Date.now() - startedMs);
     return;
   }
   // The LLM call is the slow part (up to TIMEOUT_MS) — re-check right after it
   // returns, before trusting anything it said about this head.
   if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
   if (res.timedOut || res.code !== 0) {
-    recordReviewFailure(db, t, modelFailure(db, res, { timeoutMs: TIMEOUT_MS }), reviewIdentity);
+    recordReviewFailure(db, t, modelFailure(db, res, { timeoutMs: TIMEOUT_MS }), reviewIdentity, Date.now() - startedMs);
     return;
   }
   noteModelCall(db, null);
@@ -318,7 +367,7 @@ async function reviewOne(db: DB, t: any, deps: ReviewerDeps): Promise<void> {
     // Retry once with a stricter format instruction before giving up — most
     // unparseable output is prose wrapped around the JSON, not a model that
     // refuses the format outright (task HIVE-446).
-    const retryArgv = buildArgv(`${reviewPrompt(t, diff.text)}\n\nSTRICT: output ONLY the JSON object, nothing else — no prose, no markdown fences.`);
+    const retryArgv = buildArgv(`${reviewPrompt(t, diff.text, diffLimit)}\n\nSTRICT: output ONLY the JSON object, nothing else — no prose, no markdown fences.`);
     let retryRes;
     try {
       retryRes = await exec(retryArgv, { timeoutMs: TIMEOUT_MS });
