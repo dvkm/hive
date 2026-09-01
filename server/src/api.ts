@@ -81,6 +81,7 @@ import {
   jiraConfig,
   jiraConfigStatusFor,
   readSyncState as readJiraSyncState,
+  jiraSyncHealth,
   runProjectCycle as runJiraProjectCycle,
   pendingOutbound,
   deliveredOutbound,
@@ -412,7 +413,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
           && reviewer.parse_failure_streak < REVIEWER_PARSE_FAILURE_STREAK_THRESHOLD
           && degraded.length === 0
           && !live.stale;
-        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, reviewer, degraded, live_checkout: live, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
+        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, reviewer, degraded, live_checkout: live, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db), jira: jiraSyncHealth(db) });
       }
 
       // ---- desktop shell self-update (HIVE-420) ----

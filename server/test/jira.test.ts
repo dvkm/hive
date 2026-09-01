@@ -4375,3 +4375,71 @@ test("only the mirror pulls, and a mirror is never requeued, so the pull side is
     "SELECT COUNT(*) AS count FROM events WHERE task_id = ? AND type = 'jira_sync'"
   ).get(successor)).toEqual({ count: 2 });
 });
+
+// ============================================================================
+// HEALTH VISIBILITY (HIVE-521)
+// ============================================================================
+test("lastSuccessPhrase says how long ago, or that there was never one", () => {
+  const nowMs = Date.parse("2026-08-29T03:35:13.000Z");
+  expect(J.lastSuccessPhrase(null, nowMs)).toBe("no successful cycle yet");
+  expect(J.lastSuccessPhrase("2026-08-29T03:34:33.000Z", nowMs)).toBe("last success 40s ago");
+  expect(J.lastSuccessPhrase("2026-08-29T03:20:13.000Z", nowMs)).toBe("last success 15m ago");
+  expect(J.lastSuccessPhrase("2026-08-29T00:35:13.000Z", nowMs)).toBe("last success 3h ago");
+});
+
+test("a dropped tick logs the last success, so a slow sync does not read as a dead one", async () => {
+  const { db, projectId } = freshDb({ ...CFG });
+  db.query("UPDATE projects SET created_at = ? WHERE id = ?").run("2020-01-01T00:00:00.000Z", projectId);
+  J.writeSyncState(db, projectId, { last_success_at: new Date(Date.now() - 40_000).toISOString() });
+
+  let release: () => void = () => {};
+  let entered: () => void = () => {};
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const started = new Promise<void>((resolve) => (entered = resolve));
+  const slow = (async () => {
+    entered();
+    await gate;
+    return new Response(JSON.stringify({ issues: [], isLast: true }), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  const first = J.runProjectCycle(db, projectId, { fetch: slow, token: "tok", log: () => {} });
+  await started;
+  const lines: string[] = [];
+  const overlap = await J.runProjectCycle(db, projectId, { fetch: slow, token: "tok", log: (m: string) => lines.push(m) });
+  expect(overlap.ok).toBe(false);
+  expect(lines.length).toBe(1);
+  expect(lines[0]).toContain("skipping this tick");
+  expect(lines[0]).toMatch(/last success \d+s ago/);
+
+  release();
+  expect((await first).ok).toBe(true);
+});
+
+test("jiraSyncHealth reports one row per enabled project, and flags a target with no recent success", () => {
+  const { db, projectId } = freshDb({ ...CFG });
+  const off = newId("proj");
+  db.query("INSERT INTO projects (id, name, repo_path, config, created_at) VALUES (?,?,?,?,?)").run(
+    off, "off", "/repo", JSON.stringify({ jira: { ...CFG, enabled: false } }), now()
+  );
+  const plain = newId("proj");
+  db.query("INSERT INTO projects (id, name, repo_path, config, created_at) VALUES (?,?,?,?,?)").run(
+    plain, "plain", "/repo", "{}", now()
+  );
+
+  // Never synced at all: stale, because "never" is indistinguishable from wedged.
+  expect(J.jiraSyncHealth(db)).toEqual([
+    expect.objectContaining({ project_id: projectId, target: "example.atlassian.net/WEB", stale: true, last_success_at: null }),
+  ]);
+
+  // A cycle that succeeded 40s ago is healthy even though the next tick is
+  // already being dropped.
+  J.writeSyncState(db, projectId, { last_success_at: new Date(Date.now() - 40_000).toISOString(), consecutive_failures: 0 });
+  expect(J.jiraSyncHealth(db)[0]!.stale).toBe(false);
+
+  // An hour with no success is the real wedge signal.
+  J.writeSyncState(db, projectId, {
+    last_success_at: new Date(Date.now() - 3600_000).toISOString(),
+    consecutive_failures: 4, last_error: "boom",
+  });
+  expect(J.jiraSyncHealth(db)[0]).toMatchObject({ stale: true, consecutive_failures: 4, last_error: "boom" });
+});

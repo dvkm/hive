@@ -653,13 +653,15 @@ once; caps park an in-progress task behind a wrap-up-or-continue decision. A
 ## Endpoints
 
 ### Health
-`GET /api/health` → `200 {"ok": true, "version": "0.1.0", "dispatcher": {"last_run": "<iso>|null", "stale": bool}, "reaper": {"last_run": "<iso>|null", "stale": bool}, "herdr_outage": {"paused_until": "<iso>", "streak": int} | null, "sessions": {"panes": int, "max": int, "pct": float, "warn": bool, "at": "<iso>|null"} | null}`
+`GET /api/health` → `200 {"ok": true, "version": "0.1.0", "dispatcher": {"last_run": "<iso>|null", "stale": bool}, "reaper": {"last_run": "<iso>|null", "stale": bool}, "herdr_outage": {"paused_until": "<iso>", "streak": int} | null, "sessions": {"panes": int, "max": int, "pct": float, "warn": bool, "at": "<iso>|null"} | null, "jira": [{"project_id": str, "target": str, "last_success_at": "<iso>|null", "last_attempt_at": "<iso>|null", "stale": bool, "consecutive_failures": int, "last_error": str|null}]}`
 
 `dispatcher`/`reaper` report the last time each background loop's cycle completed (heartbeat, written on every completion path — including the offline-drain no-op and the herdr-down cooldown skip — so a wedged cycle ages toward stale instead of a fresh tick re-marking it fresh). `stale` flags when a loop has missed ~3 cycles (floored at 5min) — the signal for "loop stopped ticking" vs. "process is up but a background loop silently died" (incident 2026-07-17).
 
 `herdr_outage` surfaces a sustained herdr-daemon outage. When the dispatcher's circuit breaker is backing off it keeps refreshing `last_dispatch_at`, so `dispatcher` reads healthy even though nothing is spawning for the whole cooldown; this field makes the outage observable instead. It is non-null (`paused_until` = end of the backoff window, `streak` = consecutive outage count) ONLY while the backoff window is still in the future, and `null` otherwise (no outage, or the window has passed).
 
 `sessions` surfaces PTY / herdr-session utilization — the pty pool is a hard, low OS cap (macOS `kern.tty.ptmx_max`, 511) whose exhaustion is otherwise SILENT (it hit 511/511 twice on 2026-07-25 and every spawn failed with `openpty: Os { code: 6 }`). `panes` is the live pane count the reaper records each sweep (one pty each), `max` the cap (`HIVE_PTY_MAX`, default 511), `pct` the ratio, and `warn` flips true at ≥80% (`HIVE_PTY_WARN_PCT`) so a leak is visible before it hits the wall. `null` until the first pane sweep has run.
+
+`jira` reports one row per project with Jira sync enabled, and `[]` when none have it. `stale` means no SUCCESSFUL cycle in ~3 intervals (floored at 5min), which is the only reliable "this target wedged" signal: a big target routinely takes longer than one interval, so the log line `previous cycle still running for target ...; skipping this tick` is normal and says so by carrying `last success 40s ago`. Reading 414 of those skips as a dead sync is exactly what this field exists to prevent (HIVE-521). A stale target does NOT flip the top-level `ok`: one honest slow cycle can cross the floor, and a false alarm here breaks every agent gate that reads health.
 
 ### Projects
 - `GET /api/projects[?archived=all][?test=all]` → `200 [Project, ...]` (oldest first)

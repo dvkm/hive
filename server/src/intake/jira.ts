@@ -1523,6 +1523,17 @@ const BLANK_STATE: JiraSyncState = {
   consecutive_failures: 0, next_due_at: null, interval_ms: 0, running: false, stats: null,
 };
 
+// "last success 40s ago" reads completely differently from a bare "skipping
+// this tick" (HIVE-521): 414 healthy skip lines with no success context is what
+// made a working sync look dead.
+export function lastSuccessPhrase(at: string | null, nowMs = Date.now()): string {
+  if (!at) return "no successful cycle yet";
+  const s = Math.max(0, Math.round((nowMs - Date.parse(at)) / 1000));
+  if (s < 90) return `last success ${s}s ago`;
+  if (s < 5400) return `last success ${Math.round(s / 60)}m ago`;
+  return `last success ${Math.round(s / 3600)}h ago`;
+}
+
 export function readSyncState(db: DB, projectId: string): JiraSyncState {
   const r = db.query("SELECT cursor FROM intake_cursors WHERE source = ? AND key = ?").get(STATE_SOURCE, projectId) as
     | { cursor: string | null }
@@ -2893,8 +2904,15 @@ export async function runProjectCycle(
   }
   if (active.has(target)) {
     const error = `jira sync cycle already running for target ${target}`;
-    log(`previous cycle still running for target ${target}; skipping this tick`);
-    return { ok: false, error, state: readSyncState(db, projectId) };
+    // A dropped tick is DESIGNED behaviour (see loop.ts), not a fault: a big
+    // target routinely outruns its interval. So this goes out at normal level,
+    // not through `log` (console.error), and carries the last success time —
+    // without it a healthy-but-slow sync is indistinguishable from a wedged one.
+    const state = readSyncState(db, projectId);
+    (deps.log ?? ((m: string) => console.log(`[hive] jira: ${m}`)))(
+      `previous cycle still running for target ${target}; skipping this tick; ${lastSuccessPhrase(state.last_success_at)}`
+    );
+    return { ok: false, error, state };
   }
   active.add(target);
 
@@ -2925,7 +2943,8 @@ export async function runProjectCycle(
           `${stats.comments_pulled} comments in, ${stats.comments_pushed} comments out, ${stats.receipts} receipts, ` +
           `${stats.attachments} attachments, ${stats.rendered} rendered, ` +
           `${stats.shadow} shadow, ${stats.unmapped} unmapped, ${stats.aborted} aborted, ${stats.blocked} blocked, ` +
-          `${stats.skipped} skipped, ${stats.budget_skipped} over budget, ${stats.errors} errors`
+          `${stats.skipped} skipped, ${stats.budget_skipped} over budget, ${stats.errors} errors ` +
+          `in ${Math.round((Date.now() - Date.parse(startedAt)) / 1000)}s`
       );
     return { ok: true, stats, state };
   } catch (e) {
@@ -2935,6 +2954,47 @@ export async function runProjectCycle(
     active.delete(target);
     if (active.size === 0) activeTargetCycles.delete(db as object);
   }
+}
+
+// Jira sync liveness for /api/health (HIVE-521). The dispatcher, reaper and
+// reconciler all report staleness there; a Jira target that genuinely wedged
+// was invisible, so the log was the only signal — and the log could not tell a
+// slow-but-working target from a dead one either. One row per project with sync
+// enabled. `stale` means no SUCCESSFUL cycle in three intervals (floored at
+// 5min, matching api.ts's loop-liveness convention) — including "never".
+//
+// ponytail: reported only, it does not flip the top-level `ok`. A genuinely
+// large target can run one honest cycle past the floor, and a false alarm on
+// /api/health breaks every agent gate that reads it.
+const JIRA_STALE_FLOOR_MS = 5 * 60 * 1000;
+export interface JiraSyncHealth {
+  project_id: string;
+  target: string;
+  last_success_at: string | null;
+  last_attempt_at: string | null;
+  stale: boolean;
+  consecutive_failures: number;
+  last_error: string | null;
+}
+export function jiraSyncHealth(db: DB, nowMs = Date.now()): JiraSyncHealth[] {
+  const staleMs = Math.max(JIRA_STALE_FLOOR_MS, jiraIntervalMs() * 3);
+  const out: JiraSyncHealth[] = [];
+  for (const p of activeProjects(db) as { id: string }[]) {
+    const cfg = jiraConfigStatusFor(db, p.id).config;
+    if (!cfg?.enabled) continue;
+    const state = readSyncState(db, p.id);
+    const ageMs = state.last_success_at ? nowMs - Date.parse(state.last_success_at) : null;
+    out.push({
+      project_id: p.id,
+      target: jiraTargetKey(cfg),
+      last_success_at: state.last_success_at,
+      last_attempt_at: state.last_attempt_at,
+      stale: ageMs === null || ageMs > staleMs,
+      consecutive_failures: state.consecutive_failures,
+      last_error: state.last_error,
+    });
+  }
+  return out;
 }
 
 // One cycle across every project that opted in. Hard no-op when none have.
