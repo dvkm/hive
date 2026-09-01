@@ -26,7 +26,7 @@ bun run test
 bun run typecheck
 ```
 
-Run this before handing off. It is the same pair of `tsc` runs CI does (`.github/workflows/ci.yml`): the root tsconfig, which covers `server/src` and `cli`, plus `web/`. A bare `tsc --noEmit` at the root never looks at `web/src`, so a type error there stays invisible until CI fails. Needs `bun install` in both the root and `web/`.
+Run this before handing off. It is the same pair of `tsc` runs CI does (`.github/workflows/ci.yml`): the root tsconfig, which covers `server/src` and `cli`, plus `web/`. A bare `tsc --noEmit` at the root never looks at `web/src`, so a type error there stays invisible until CI fails. Needs `bun install` in both the root and `web/`; if `web/node_modules` is missing the command says so and stops, instead of printing a wall of module-resolution errors.
 
 ## Run
 
