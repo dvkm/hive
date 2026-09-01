@@ -147,11 +147,19 @@ async function req<T>(path: string, init?: RequestInit, retried = false): Promis
 const TASKS_PATH = "/api/tasks?compact=1";
 const TASKS_CACHE = "hive-task-list-v1";
 const taskCacheKey = () => new URL(BASE + TASKS_PATH, globalThis.location?.href || "http://localhost/").href;
+// A cached board older than this is worse than no board: it paints a confident
+// snapshot of a fleet that has moved on, and every action aimed at it 409s.
+const TASKS_CACHE_MAX_AGE_MS = 5 * 60 * 1000;
+const CACHED_AT = "x-hive-cached-at";
 async function cachedTasks(): Promise<Task[] | null> {
   if (!("caches" in globalThis)) return null;
   try {
     const response = await (await caches.open(TASKS_CACHE)).match(taskCacheKey());
-    return response ? response.json() : null;
+    if (!response) return null;
+    // Undated entries predate the stamp, so treat them as too old to trust.
+    const cachedAt = Number(response.headers.get(CACHED_AT));
+    if (!cachedAt || Date.now() - cachedAt > TASKS_CACHE_MAX_AGE_MS) return null;
+    return response.json();
   } catch {
     return null;
   }
@@ -159,7 +167,7 @@ async function cachedTasks(): Promise<Task[] | null> {
 async function cacheTasks(tasks: Task[]): Promise<void> {
   if (!("caches" in globalThis)) return;
   try {
-    await (await caches.open(TASKS_CACHE)).put(taskCacheKey(), new Response(JSON.stringify(tasks), { headers: { "Content-Type": "application/json" } }));
+    await (await caches.open(TASKS_CACHE)).put(taskCacheKey(), new Response(JSON.stringify(tasks), { headers: { "Content-Type": "application/json", [CACHED_AT]: String(Date.now()) } }));
   } catch {
     /* cache is an optional fast path */
   }

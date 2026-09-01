@@ -29,6 +29,12 @@ export interface Store {
   away: Away; // away mode: low-urgency phone pushes are held and batched
   setAway: (on: boolean) => void; // the manual switch (the schedule still applies)
   sse: SseState;
+  // How the task list on screen got there. "loading" = still painted from the
+  // browser cache while the first fetch is in flight (milliseconds, normally).
+  // "failed" = the fetch rejected, so the board is stale or empty and a retry
+  // is scheduled. "live" = a fetch landed.
+  taskSync: "loading" | "live" | "failed";
+  retryTaskSync: () => void;
   // Director chat (persistent supervisor session). Only the open thread's
   // messages are held; SSE appends live as the supervisor replies.
   chatThreadId: string | null;
@@ -68,6 +74,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [feedEvents, setFeedEvents] = useState<Event[]>([]);
   const [evidenceMeta, setEvidenceMeta] = useState<Record<string, { url: string | null; kind: Evidence["kind"] }>>({});
   const [sse, setSse] = useState<SseState>("connecting");
+  const [taskSync, setTaskSync] = useState<Store["taskSync"]>("loading");
+  const refreshTasks = useRef<() => void>(() => {});
   const bumped = useRef(false);
 
   const bump = (id: string) => setRev((r) => ({ ...r, [id]: (r[id] || 0) + 1 }));
@@ -126,22 +134,43 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   // Initial load.
   useEffect(() => {
     let fresh = false;
+    let done = false;
     const loadTasks = (ts: Task[]) => {
       setTasks(ts);
       setLastActivity(Object.fromEntries(ts.map((t) => [t.id, t.updated_at])));
       setEvidenceCount(Object.fromEntries(ts.map((t) => [t.id, t.evidence_count ?? 0])));
       setSpawnError(Object.fromEntries(ts.map((t) => [t.id, t.spawn_error ?? false])));
     };
-    api.cachedTasks().then((ts) => { if (ts && !fresh) loadTasks(ts); });
-    api.tasks().then((ts) => { fresh = true; loadTasks(ts); });
-    api.decisions("open").then(setDecisions);
+    api.cachedTasks().then((ts) => { if (ts && !fresh) loadTasks(ts); }).catch(() => {});
+    // A refresh that fails silently is the whole bug: the cached board stays on
+    // screen looking live, and every action the director takes 409s against a
+    // task that has moved on. So say so, and keep retrying with backoff.
+    let attempt = 0;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const refresh = () => {
+      clearTimeout(retry);
+      api.tasks().then((ts) => {
+        if (done) return;
+        fresh = true;
+        attempt = 0;
+        loadTasks(ts);
+        setTaskSync("live");
+      }).catch(() => {
+        if (done) return;
+        setTaskSync("failed");
+        retry = setTimeout(refresh, Math.min(30_000, 2_000 * 2 ** attempt++));
+      });
+    };
+    refreshTasks.current = refresh;
+    refresh();
+    api.decisions("open").then(setDecisions).catch(() => {});
     reloadCheckpoints();
     reloadQuizzes();
     api.offline().then((r) => setOfflineState(r.on)).catch(() => {});
     reloadAway();
     reloadProjects();
     api.notifications().then((n) => setNotifications(n.notifications)).catch(() => setNotifications([]));
-    return () => { fresh = true; };
+    return () => { fresh = true; done = true; clearTimeout(retry); };
   }, []);
 
   // Mark all as read: optimistic local update + server ack.
@@ -262,7 +291,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, quizzes, reloadQuizzes, needsYou, offline, setOffline, away, setAway, sse, chatThreadId, chatMessages, chatDelivery, openChatThread, onChatMessage }}>
+    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, quizzes, reloadQuizzes, needsYou, offline, setOffline, away, setAway, sse, taskSync, retryTaskSync: () => refreshTasks.current(), chatThreadId, chatMessages, chatDelivery, openChatThread, onChatMessage }}>
       {children}
     </Ctx.Provider>
   );

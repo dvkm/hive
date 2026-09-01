@@ -16,6 +16,7 @@ import {
   faScaleBalanced,
   faHeart,
   faRocket,
+  faTriangleExclamation,
 } from "@fortawesome/free-solid-svg-icons";
 import { useStore } from "./lib/store";
 import { actionableItems } from "./lib/needsYou";
@@ -217,13 +218,36 @@ function MobileNav({
 }
 
 function ConnDot() {
-  const { sse } = useStore();
+  const { sse, taskSync, tasks } = useStore();
   const label = sse === "open" ? "live" : sse === "connecting" ? "connecting" : "reconnecting";
+  // The board is painted from the browser cache until the first fetch lands.
+  // That is normally milliseconds, so this stays quiet; when the fetch fails
+  // outright the banner below the header takes over and says so loudly.
+  const cached = taskSync === "loading" && tasks.length > 0;
   return (
     <span className={`conn conn-${sse}`} title={`SSE ${label}`} aria-label={`Hive is ${label}`}>
       <span className="conn-dot" />
-      <span className="conn-label">{label}</span>
+      <span className="conn-label">{cached ? "cached" : label}</span>
     </span>
+  );
+}
+
+// The refresh of the task list failed. Whatever is on screen is either a stale
+// snapshot or nothing at all, so actions taken against it will be rejected.
+function StaleBanner() {
+  const { taskSync, tasks, retryTaskSync } = useStore();
+  if (taskSync !== "failed") return null;
+  return (
+    <div className="stale-banner" role="alert">
+      <FontAwesomeIcon icon={faTriangleExclamation} />
+      <span className="away-banner-text">
+        {tasks.length
+          ? "This board is out of date. Hive could not load the latest tasks, so actions may be rejected."
+          : "The task list did not load. This is not an empty board."}
+      </span>
+      <span className="muted">Retrying.</span>
+      <button className="btn btn-mini" onClick={retryTaskSync}>Retry now</button>
+    </div>
   );
 }
 
@@ -346,6 +370,7 @@ export default function App() {
         <ConnDot />
       </header>
       <AwayBanner away={away} onResume={() => setAway(false)} />
+      <StaleBanner />
       <MobileNav inboxCount={inboxCount} offline={offline} setOffline={setOffline} />
       <main className="content" id="main-content">
         <Routes location={background || location}>
