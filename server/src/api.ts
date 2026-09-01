@@ -56,6 +56,7 @@ import {
 import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable, HerdrError, heldNameRetryAt } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
+import { seedWorktree, type SeedResult } from "./worktreeSeed.ts";
 import { takeOver, handBack, TakeoverError } from "./takeover.ts";
 import { figmaTokenEnv, resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { teamclaudeEnv, teamclaudeOverlay, usesTeamclaude } from "./teamclaude.ts";
@@ -4272,6 +4273,12 @@ export async function spawnAgent(
   const lastActivity = lastAgentActivity(db, id);
   const holderQuietMs = lastActivity ? Date.now() - Date.parse(lastActivity) : undefined;
 
+  // HIVE-355: spawn-to-ready, recorded per spawn so the warm-worktree win shows
+  // up in the event stream rather than in somebody's stopwatch.
+  const spawnStarted = Date.now();
+  // Held in an object so TypeScript does not narrow them to `null`: both are
+  // written from inside the prepareWorktree callback, which it cannot see run.
+  const timing: { seed: SeedResult | null; setupMs: number | null } = { seed: null, setupMs: null };
   let result;
   try {
     result = await herdr.spawn({
@@ -4296,11 +4303,32 @@ export async function spawnAgent(
       // agents don't have to install deps / bring up their stack themselves.
       prepareWorktree: async (worktreePath) => {
         if (agent === "claude") writeHookSettings(worktreePath, id, hiveUrl, config.command_approval);
+        // HIVE-355: seed the untracked config a fresh checkout is missing and
+        // clone the warm state (node_modules) BEFORE setup_argv, so the project's
+        // own setup hook finds the work already done and no-ops. Best-effort by
+        // construction — a failed seed only means setup_argv does it the slow way.
+        const seed = (timing.seed = await seedWorktree(project.repo_path, worktreePath, config, opts.exec ?? defaultExec));
+        if (seed.seeded.length || seed.warmed.length || seed.skipped.length)
+          writeEvent(db, { task_id: id, source: "herdr", type: "worktree_seeded", payload: { ...seed } });
+        // A project with no seed config at all is the deliberate default and stays
+        // quiet. A project that NAMED something we could not find is a different
+        // thing: the spawn still succeeds, so nothing else would ever report it,
+        // and the agent gets a worktree that looks warm and is not. The `_failed`
+        // suffix puts it in the durable failure history (web/src/lib/eventText.ts).
+        if (seed.misconfigured.length)
+          writeEvent(db, {
+            task_id: id,
+            source: "herdr",
+            type: "worktree_seed_failed",
+            payload: { misconfigured: seed.misconfigured },
+          });
+        const setupStarted = Date.now();
         const setup = await runStackCmd(db, id, config.setup_argv, project.repo_path, worktreePath, opts.exec ?? defaultExec, {
           type: "stack_setup",
           source: "herdr",
           timeoutMs: Number(config.stack_setup_timeout_ms) || 600_000,
         });
+        timing.setupMs = Date.now() - setupStarted;
         // Unlike teardown, a failed setup ABORTS the spawn: starting an agent
         // whose deps/stack never came up burns a whole run on confusing
         // downstream failures. Throwing here surfaces out of herdr.spawn into
@@ -4357,6 +4385,12 @@ export async function spawnAgent(
       // auto-spawns it with a live pane/pty that the agent never uses, so cleanup
       // must close it or it leaks a pty forever (2026-07-25).
       workspace_id: result.workspace_id,
+      // Spawn-to-ready breakdown, in milliseconds. seed_ms + setup_ms are the
+      // two halves warm worktrees trade against each other: a cloned
+      // node_modules pushes cost out of setup_ms and into a much smaller seed_ms.
+      spawn_ms: Date.now() - spawnStarted,
+      ...(timing.seed ? { seed_ms: timing.seed.ms, seeded: timing.seed.seeded, warmed: timing.seed.warmed } : {}),
+      ...(timing.setupMs === null ? {} : { setup_ms: timing.setupMs }),
     },
   });
   // The agent is up and holding the queued steers in its brief — receipt them.

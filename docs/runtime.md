@@ -139,7 +139,7 @@ hive uses herdr the way a prior orchestration tool proved it should be used: age
    integration branch instead of a possibly stale local ref.
 
 Read-only branch comparisons (review diffs, scope-drift footprints, and stacked-branch checks) likewise use `origin/<base>`. Local branch state is reserved for operations that intentionally act on the checkout, such as merging and cleanup.
-2. **Prepare the worktree** (callback) wires Hive's Stop/SubagentStop/PostToolUse hooks before the agent starts (`.claude/settings.local.json` for Claude; per-invocation Codex hook config for ChatGPT), so lifecycle reporting is structural, not brief-dependent (`hooks/`), then runs
+2. **Prepare the worktree** (callback) wires Hive's Stop/SubagentStop/PostToolUse hooks before the agent starts (`.claude/settings.local.json` for Claude; per-invocation Codex hook config for ChatGPT), so lifecycle reporting is structural, not brief-dependent (`hooks/`), then **seeds the worktree** (`worktreeSeed.ts`, see below), then runs
    the per-project spawn hook `config.setup_argv` (e.g.
    `["bun", "infra/worktree/wt.ts", "up", "{worktree}"]`) so agents don't have to
    install deps / bring up their stack themselves. It is the symmetric partner of
@@ -147,6 +147,27 @@ Read-only branch comparisons (review diffs, scope-drift footprints, and stacked-
    substitute `{worktree}`, resolve a relative `argv[0]` against `repo_path`, and
    are best-effort under a 120s timeout (a failed setup emits a `stack_setup`
    event but never blocks the spawn).
+### Warm worktrees (seeding, step 2)
+
+A fresh worktree is missing the two things that make it slow to start on, and git will never hand over either. `seedWorktree` fills both in from the **main checkout**, right before `setup_argv` runs, so a project's own setup hook finds the work already done and no-ops. Both are opt-in per project and best-effort: a seed that fails only means `setup_argv` does it the slow way.
+
+- **`config.worktree_seed`** — a list of globs naming the untracked files the worktree needs to run, copied from the main checkout. These are gitignored by design, so `worktree create` otherwise hands an agent a checkout that cannot boot. A file the worktree already has is never overwritten, and a pattern that escapes the worktree is refused.
+
+  ```json
+  "worktree_seed": [".env", ".env.local", "config.env"]
+  ```
+
+- **`config.worktree_warm`** — directories cloned from the main checkout instead of rebuilt, each paired with the lockfile whose contents must still match. On APFS and btrfs the clone is copy-on-write, so a large `node_modules` lands in milliseconds and costs no disk until something writes to it; elsewhere it degrades to a real copy. A branch that changed the lockfile is refused the clone and does the real install, which is the only way it can legitimately need different deps.
+
+  ```json
+  "worktree_warm": [{ "dir": "node_modules", "lock": "bun.lock" },
+                    { "dir": "web/node_modules", "lock": "web/bun.lock" }]
+  ```
+
+  Omitting `lock` clones unconditionally. Only do that for a directory no branch can invalidate.
+
+Each spawn records what it did. A `worktree_seeded` event lists what was seeded, warmed, and skipped with the reason; the `spawned` event carries the spawn-to-ready breakdown in milliseconds as `spawn_ms`, `seed_ms`, and `setup_ms`. `seed_ms` and `setup_ms` are the two halves warm worktrees trade against each other: a cloned `node_modules` moves cost out of `setup_ms` and into a much smaller `seed_ms`.
+
 3. **Ensure the fleet workspace** — adopt-or-create a dedicated named workspace
    labelled **`hive-fleet`** (`HIVE_FLEET_LABEL` override), `--no-focus` so a
    spawn never steals the space the captain is watching. NOT `"hive"`: herdr

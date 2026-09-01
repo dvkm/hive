@@ -229,6 +229,23 @@ const plan_gate: Check = (v) => {
   return null;
 };
 
+// HIVE-355 warm worktrees. `worktree_seed` is an allowlist of globs naming the
+// untracked files a fresh worktree needs to run (.env, config.env); they are
+// copied from the main checkout. `worktree_warm` names directories to clone
+// from the main checkout instead of rebuilding (node_modules), each with the
+// lockfile whose contents must still match for that clone to be valid.
+const worktreeWarm: Check = (v) => {
+  if (!Array.isArray(v)) return "must be an array";
+  for (const entry of v) {
+    if (obj(entry)) return "each entry must be an object";
+    const e = entry as Record<string, unknown>;
+    for (const key of Object.keys(e)) if (key !== "dir" && key !== "lock") return `.${key} is not supported`;
+    if (typeof e.dir !== "string" || !e.dir) return ".dir must be a non-empty string";
+    if (e.lock !== undefined && (typeof e.lock !== "string" || !e.lock)) return ".lock must be a non-empty string";
+  }
+  return null;
+};
+
 const CHECKS: Record<string, Check> = {
   // dispatch / autonomy
   auto_dispatch: bool,
@@ -248,6 +265,8 @@ const CHECKS: Record<string, Check> = {
   reviewer_argv: argv,
   planner_argv: argv,
   setup_argv: argv,
+  worktree_seed: strArray,
+  worktree_warm: worktreeWarm,
   cleanup_argv: argv,
   stack_setup_timeout_ms: num,
   // agent behaviour

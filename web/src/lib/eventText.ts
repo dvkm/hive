@@ -145,6 +145,21 @@ export function eventText(e: EventLike): string {
       return p.delivered === false ? `recovery nudge failed: ${s(p.error)}` : "recovery nudge delivered";
     case "worktree_reclaim_failed":
       return `worktree reclaim failed: ${s(p.error)}`;
+    case "worktree_seeded": {
+      const did = [
+        p.seeded?.length ? `copied ${p.seeded.length} config file${p.seeded.length === 1 ? "" : "s"}` : null,
+        p.warmed?.length ? `reused ${p.warmed.join(", ")}` : null,
+      ].filter(Boolean);
+      return did.length ? `worktree seeded: ${did.join(", ")}` : "worktree seeded: nothing to copy or reuse";
+    }
+    case "worktree_seed_failed": {
+      // The spawn still worked; the project asked for something that is not there.
+      const bad = Array.isArray(p.misconfigured) ? p.misconfigured : [];
+      const first = bad[0] ? `${s(bad[0].path)} — ${s(bad[0].reason)}` : "see the event payload";
+      return bad.length > 1
+        ? `worktree setup config is wrong (${bad.length} problems), so the agent started cold: ${first}`
+        : `worktree setup config is wrong, so the agent started cold: ${first}`;
+    }
     case "ready_held":
       if (s(p.reason) === "no_evidence") return "handoff held: no evidence attached yet";
       if (s(p.reason) === "missing_understanding_check") return "handoff held: the review carries no understanding check";
