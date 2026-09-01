@@ -764,7 +764,7 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   - `failed` — the task is terminal, so no spawn will ever carry it.
 
   Never throws. A herdr failure additionally records a `steer_error` event. The timeline renders the receipt (`✓` / `⏳ queued` / `⚠ undelivered`) so a steer never has to be re-sent blind. Besides the respawn drain, the reconciler re-attempts every queued steer each cycle against any agent with an active turn (receipt flips with `delivered_via:"drain"`); a successful drain writes no event of its own — the receipt flip is the record, and a fresh event would reset the task's silence clock and mask a mute agent from `stale` detection.
-- `PUT /api/tasks/:id` body `{title?, brief?, depends_on?, verification_cmds?, priority?, source?}` (or multipart: same fields + `files`) → `200 Task` | `404` | `400` (unknown/self-referencing `depends_on` id, an invalid `verification_cmds`, or an invalid `priority`) | `403` (a non-director `source` setting `priority: "now"` — see [Priority](#priority))
+- `PUT /api/tasks/:id` body `{title?, brief?, depends_on?, verification_cmds?, priority?, resume_pr_url?, resume_branch?, source?}` (or multipart: same fields + `files`) → `200 Task` | `404` | `400` (a field this endpoint does not write, an unknown/self-referencing `depends_on` id, an invalid `verification_cmds`, an invalid `priority`, or a non-null `resume_pr_url`/`resume_branch`) | `403` (a non-director `source` setting `priority: "now"` — see [Priority](#priority))
   Attached files are appended to the resulting `brief` under an `## Attachments` heading.
   Updates a task's editable fields. Used by the attention tray's "edit & requeue"
   flow before it re-queues a failed task, and by `hive task update <id> --depends-on <id,id>` —
@@ -777,6 +777,15 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   send `[]` or `null` to clear it. `priority` is a plain scalar: omit it to leave
   it alone, send one of `now`/`next`/`normal`/`later` to change it. A rejected
   value changes nothing.
+  `resume_pr_url` and `resume_branch` are **clear-only**: send `null` to drop a
+  stale adoption pointer (`hive task update <id> --clear-resume` does the same).
+  A pointer at a PR that no longer resolves otherwise blocks every dispatch of
+  that task forever, since spawn refuses a resume PR whose hive marker no longer
+  names the task. Sending a non-null value is a `400` — repointing a task at a
+  different PR or branch by hand is how one task's work lands on another's.
+  Any other field is a `400` naming it. The endpoint never accepts a write it
+  then drops: a silently ignored field leaves the caller believing a change
+  landed when nothing did (HIVE-585).
 - `POST /api/tasks/:id/focus-agent` body `{}` → `200 {"ok":true, "focused":true, "target":"..."}` | `404`
   The board's "view agent" affordance: focuses the task's herdr tab via
   `herdr agent focus` so the director can watch/attach. Records a `focus_agent` event.

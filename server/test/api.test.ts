@@ -1478,3 +1478,37 @@ test("task move deferred parks the task, reports health 'deferred', and moving b
   const late = await post(`/api/tasks/${id}/transition`, { to: "deferred" });
   expect(late.status).toBe(409);
 });
+
+// HIVE-585: a stale resume_pr_url (a PR number that no longer resolves) made a
+// task undispatchable forever, because PUT answered 200 and silently dropped
+// the clear. The pointer is now clear-only, and any field this endpoint cannot
+// write is a 400 that names it.
+test("PUT /api/tasks/:id clears a stale resume pointer and refuses fields it does not write", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "stale resume pointer" });
+  const id = t.json.id;
+  db.query("UPDATE tasks SET resume_pr_url = ?, resume_branch = ? WHERE id = ?")
+    .run("https://github.com/dvkm/hive/pull/167", "hive/predecessor", id);
+
+  const unknown = await put(`/api/tasks/${id}`, { state: "done", resume_ghost_branch: "x" });
+  expect(unknown.status).toBe(400);
+  expect(unknown.json.error).toMatch(/state/);
+  expect(unknown.json.error).toMatch(/resume_ghost_branch/);
+  expect(getTask(db, id).resume_pr_url).toBe("https://github.com/dvkm/hive/pull/167");
+
+  // Repointing at a different PR by hand stays unsupported — that is how one
+  // task's work lands on another task's branch.
+  const repoint = await put(`/api/tasks/${id}`, { resume_pr_url: "https://github.com/dvkm/hive/pull/11" });
+  expect(repoint.status).toBe(400);
+  expect(getTask(db, id).resume_pr_url).toBe("https://github.com/dvkm/hive/pull/167");
+
+  const cleared = await put(`/api/tasks/${id}`, { resume_pr_url: null, resume_branch: null });
+  expect(cleared.status).toBe(200);
+  expect(getTask(db, id).resume_pr_url).toBeNull();
+  expect(getTask(db, id).resume_branch).toBeNull();
+
+  // An ordinary edit still leaves the pointers alone.
+  db.query("UPDATE tasks SET resume_branch = ? WHERE id = ?").run("hive/keepme", id);
+  const titled = await put(`/api/tasks/${id}`, { title: "renamed" });
+  expect(titled.status).toBe(200);
+  expect(getTask(db, id).resume_branch).toBe("hive/keepme");
+});
