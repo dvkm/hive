@@ -157,7 +157,7 @@ A fresh worktree is missing the two things that make it slow to start on, and gi
   "worktree_seed": [".env", ".env.local", "config.env"]
   ```
 
-- **`config.worktree_warm`** — directories cloned from the main checkout instead of rebuilt, each paired with the lockfile whose contents must still match. On APFS and btrfs the clone is copy-on-write, so a large `node_modules` lands in milliseconds and costs no disk until something writes to it; elsewhere it degrades to a real copy. A branch that changed the lockfile is refused the clone and does the real install, which is the only way it can legitimately need different deps.
+- **`config.worktree_warm`** — directories cloned from the main checkout instead of rebuilt, each paired with the lockfile whose contents must still match. On APFS and btrfs the clone is copy-on-write, so a large `node_modules` costs no disk until something writes to it and lands far faster than reinstalling it — `cp` clones the tree file by file, so tens of thousands of files still take a second or two, against a minute or more for a real install; elsewhere it degrades to a real copy. A branch that changed the lockfile is refused the clone and does the real install, which is the only way it can legitimately need different deps.
 
   ```json
   "worktree_warm": [{ "dir": "node_modules", "lock": "bun.lock" },

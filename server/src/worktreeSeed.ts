@@ -9,7 +9,8 @@
 //
 // Both already exist in the MAIN checkout, so seed from there: copy (1),
 // CLONE (2). On APFS/btrfs a clone is copy-on-write, so a 400MB node_modules
-// lands in milliseconds and costs no disk until something writes to it. The
+// costs no disk until something writes to it. `cp` clones file by file, so a
+// huge tree still takes a second or two — against a minute or more to install. The
 // clone is invalidated by lockfile mismatch, which is the only way a branch
 // can legitimately need different deps. It lands by atomic rename, so a killed
 // copy can never leave a node_modules that looks complete and is not.
