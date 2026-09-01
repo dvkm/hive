@@ -3,9 +3,9 @@
 import { dirname, join, normalize } from "node:path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
-import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
-import { taskWithHealth, tasksWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
-import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
+import { newId, now, evidenceDir, isOffline, setSetting, getSetting, supervisorEnabled } from "./db.ts";
+import { taskWithHealth, tasksWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization, staleMs } from "./health.ts";
+import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror, mirrorTaskIdForTitle } from "./supervision.ts";
 import { activeProjects, isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
 import { addClient, removeClient, broadcast, appClientCount, setProjectResolver } from "./bus.ts";
 import {
@@ -35,6 +35,7 @@ import {
   resolveDependentsWedgedForDecision,
   queuedInputRecoveryPending,
   isSelfAuditLineage,
+  lastAgentActivity,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
@@ -48,7 +49,7 @@ import {
   parsePolicy,
   parseIncident,
 } from "./rows.ts";
-import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from "./runtime/herdr.ts";
+import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable, HerdrError, heldNameRetryAt } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { takeOver, handBack, TakeoverError } from "./takeover.ts";
@@ -105,7 +106,7 @@ import { taskDiff } from "./diff.ts";
 import { catchupCards } from "./glance.ts";
 import { authoredFiles, captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { overlapHold } from "./fileScope.ts";
-import { landGraph, markLand, resolveLandPauseForDecision } from "./landQueue.ts";
+import { landGraph, markLand, resolveLandPauseForDecision, CONFIRMED_RISK_CODE } from "./landQueue.ts";
 import { withMergeLock } from "./mergeLock.ts";
 import { divergence } from "./divergence.ts";
 import { followServingBranch, resolveServingFollowForDecision } from "./servingBranch.ts";
@@ -160,8 +161,11 @@ function json(data: unknown, status = 200): Response {
     headers: { "Content-Type": "application/json", ...CORS },
   });
 }
-function err(message: string, status = 400): Response {
-  return json({ error: message }, status);
+// `code` is the machine-readable half of a refusal. Prose is for humans and is
+// rewritten freely; anything that ROUTES on a refusal must read the code, so a
+// reworded message can never silently change behaviour (HIVE-559 review).
+function err(message: string, status = 400, code?: string): Response {
+  return json({ error: message, ...(code ? { code } : {}) }, status);
 }
 
 // HIVE-530: a refusal states the cause AND the next action. When a command
@@ -277,6 +281,47 @@ const HOOKS_DIR = join(import.meta.dir, "..", "..", "hooks");
 const REPO_ROOT = join(import.meta.dir, "..", "..");
 const ELECTRON_PKG = join(REPO_ROOT, "electron", "package.json");
 
+// HIVE-548: sync-main.sh spent five days logging that it had DECLINED to update
+// the live checkout, and nothing else noticed. The server ran 30 commits behind
+// main, so every fix merged in that window was dead code. "The running code is
+// not the merged code" now surfaces beside dispatcher/reaper staleness.
+// Being behind by a few commits is normal in the minutes between a merge and
+// the next 5-minute sync tick, so `stale` also requires the newest unmerged
+// commit to have been sitting there for several ticks.
+const LIVE_DRIFT_STALE_MS = 15 * 60 * 1000;
+const LIVE_DRIFT_CACHE_MS = 60_000;
+export type LiveCheckout = { behind: number; stale: boolean; head: string | null; error: string | null };
+let liveDriftCache: { at: number; repo: string; value: LiveCheckout } | null = null;
+
+function gitLine(repo: string, args: string[]): string | null {
+  const r = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
+  if (r.exitCode !== 0) return null;
+  return new TextDecoder().decode(r.stdout).trim();
+}
+
+// Uncached; /api/health calls the memoized liveCheckout() below.
+export function measureLiveCheckout(repo: string = REPO_ROOT): LiveCheckout {
+  const head = gitLine(repo, ["rev-parse", "--short", "HEAD"]);
+  const behindRaw = gitLine(repo, ["rev-list", "--count", "HEAD..refs/remotes/origin/main"]);
+  if (head === null || behindRaw === null)
+    return { behind: 0, stale: false, head, error: "could not read git state for the running checkout" };
+  const behind = Number(behindRaw);
+  if (behind === 0) return { behind: 0, stale: false, head, error: null };
+  // Committer date of origin/main's tip: how long the newest thing we are
+  // missing has been waiting for the sync job to bring it over.
+  const tipAt = gitLine(repo, ["log", "-1", "--format=%cI", "refs/remotes/origin/main"]);
+  const ageMs = tipAt ? Date.now() - Date.parse(tipAt) : null;
+  return { behind, stale: ageMs === null || ageMs > LIVE_DRIFT_STALE_MS, head, error: null };
+}
+
+export function liveCheckout(repo: string = REPO_ROOT): LiveCheckout {
+  if (liveDriftCache && liveDriftCache.repo === repo && Date.now() - liveDriftCache.at < LIVE_DRIFT_CACHE_MS)
+    return liveDriftCache.value;
+  const value = measureLiveCheckout(repo);
+  liveDriftCache = { at: Date.now(), repo, value };
+  return value;
+}
+
 // The API token (minted on boot in index.ts) presented as `Authorization:
 // Bearer <t>` or `?token=<t>` — EventSource cannot set headers, so the SSE
 // stream needs the query form. No token minted → nothing can authenticate.
@@ -357,10 +402,12 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         const reconciler = reconcilerHealth(db);
         const reviewer = reviewerHealth(db);
         const degraded = degradedTools(db);
+        const live = liveCheckout();
         const ok = reconciler.consecutive_errors < RECONCILE_ERROR_STREAK_THRESHOLD
           && reviewer.parse_failure_streak < REVIEWER_PARSE_FAILURE_STREAK_THRESHOLD
-          && degraded.length === 0;
-        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, reviewer, degraded, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
+          && degraded.length === 0
+          && !live.stale;
+        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, reviewer, degraded, live_checkout: live, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
       }
 
       // ---- desktop shell self-update (HIVE-420) ----
@@ -464,6 +511,11 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (pathname === "/api/intake" && method === "POST") return intake(db, await req.json(), deps);
 
       // ---- director chat (persistent supervisor session over hive) ----
+      if (pathname === "/api/chat/supervisor" && method === "GET")
+        return json({ on: supervisorEnabled(db) });
+      if (pathname === "/api/chat/supervisor" && method === "POST")
+        return setSupervisorSwitch(db, await req.json());
+
       if (pathname === "/api/chat/turn" && method === "POST")
         return await chatTurn(db, herdr, deps, await req.json());
       if (pathname === "/api/chat/threads" && method === "GET")
@@ -1107,6 +1159,46 @@ function intake(db: DB, body: any, deps: HandlerDeps): Response {
 }
 
 // ---------------------------------------------------------------- chat
+const SUPERVISOR_OFF_NOTICE =
+  "The Chief of Staff is off, so nothing was started for this message. Your message is saved in this thread. " +
+  "Turn it back on with `hive chat supervisor on` if you want a session to pick it up.";
+
+// Read/flip the off switch. Turning it OFF also ends any live supervisor
+// session, because leaving one running is exactly the state the switch exists
+// to stop. Cancelling fires the terminal hook, which tears the session down.
+function setSupervisorSwitch(db: DB, body: any): Response {
+  const on = !!body?.on;
+  setSetting(db, "chat_supervisor", on ? "on" : "off");
+  let stopped = 0;
+  if (!on) {
+    const live = db
+      .query(`SELECT id FROM tasks WHERE source = 'chat_supervisor' AND state NOT IN ('done','failed','cancelled')`)
+      .all() as { id: string }[];
+    for (const t of live) {
+      transition(db, t.id, "cancelled", { source: "director", reason: "chat supervisor turned off" });
+      stopped++;
+    }
+  }
+  return json({ on, stopped });
+}
+
+// A standing session that crossed its processed-token warning stops here rather
+// than running for another week. Terminal means it is never resurrected (see
+// deliverToSupervisor); the director's next chat message is the deliberate
+// restart, and only if the switch is on.
+export function haltChatSupervisor(db: DB, taskId: string, processed: number, warn: number): void {
+  const thread = managingThreadForTask(db, taskId);
+  writeEvent(db, { task_id: taskId, source: "system", type: "chat_supervisor_halted", payload: { processed_tokens: processed, warn } });
+  transition(db, taskId, "cancelled", { source: "system", reason: `chat supervisor passed ${warn.toLocaleString()} processed tokens` });
+  if (thread)
+    postThreadNotice(
+      db,
+      thread.id,
+      `Your Chief of Staff session was stopped after processing ${processed.toLocaleString()} tokens. ` +
+        `Send a message to start a fresh one.`
+    );
+}
+
 // One director→supervisor turn. NON-BLOCKING by design: persist the message,
 // make sure the thread's persistent supervisor session is live (spawn it on the
 // first message), deliver the message into that session, and return immediately.
@@ -1189,7 +1281,8 @@ async function chatTurnOnThread(
   chatDeliveryStatus(thread.id, "queued");
   withThreadLock(thread.id, async () => {
     const delivery = await deliverToSupervisor(db, herdr, deps, thread.id, wire);
-    if (delivery.delivery === "failed")
+    if (delivery.delivery === "disabled") postThreadNotice(db, thread.id, SUPERVISOR_OFF_NOTICE);
+    else if (delivery.delivery === "failed")
       postThreadNotice(db, thread.id, `Your Chief of Staff could not start: ${delivery.error ?? "spawn failed"}. Send the message again to retry.`);
   }).catch((e) => {
     chatDeliveryStatus(thread.id, "failed", String((e as any)?.message ?? e));
@@ -1251,6 +1344,13 @@ async function deliverToSupervisor(
   message: string
 ): Promise<{ delivery: string; agent_target?: string; error?: string }> {
   const thread = getThread(db, threadId)!;
+  // The off switch. Checked here, at the one choke point every spawn/respawn
+  // path goes through (director turn, keep-warm), so "off" means no task, no
+  // agent, no silent resurrection.
+  if (!supervisorEnabled(db)) {
+    chatDeliveryStatus(threadId, "disabled");
+    return { delivery: "disabled" };
+  }
   const wireMessage = thread.project_id
     ? message
     : `${message}\n\n[chief reply policy]\nWork silently. Do not send acknowledgments, progress updates, task lists, or wakeup summaries. If director input is genuinely required, send one short bundled reply with up to five \`--decision <id>\` flags so Hive renders answerable cards. Otherwise reply only with a direct answer or the final verified outcome.`;
@@ -2094,6 +2194,49 @@ export function looksSecuritySensitive(text: string): boolean {
   return new RegExp(`\\b(${DEFAULT_SENSITIVE_PATHS.join("|")})s?\\b`, "i").test(text ?? "");
 }
 
+// Why a new work task's brief looks like it was written from the Jira TITLE
+// alone, or null when it looks fine. Two arms, because WEB-118 failed the
+// second one: the bad brief was several hundred chars of prose whose entire
+// content was "this ticket has no description, ask the reporter" — a length
+// check alone waves that straight through.
+//
+// The second arm refuses task creation outright, so it has to be far more
+// conservative than a warning would be: a false positive blocks a legitimate
+// filing with a 400 and the caller has no override. So every pattern is
+// anchored to the TICKET itself ("the issue has no description", "no spec on
+// WEB-118") rather than matching a bare phrase anywhere in the prose. A real
+// spec that happens to say "the card renders no description when the field is
+// empty" is about the product, not the ticket, and must sail through.
+const TICKET = String.raw`(?:this |the )?(?:ticket|issue|jira(?: (?:issue|ticket))?|[A-Z][A-Z0-9]{1,9}-\d+)`;
+const ABSENT_SPEC_CLAIMS: RegExp[] = [
+  // "the issue has no description", "WEB-118 carries only a title"
+  new RegExp(String.raw`\b${TICKET}\b[^.\n]{0,30}?\s(?:has|have|had|carries|contains|includes|provides|comes with)\s+(?:no|only a|nothing but a)\s+(?:description|spec(?:ification)?|body|details|requirements|title)\b`, "gi"),
+  // "there is no description on the Jira issue", "no spec attached to WEB-118"
+  new RegExp(String.raw`\b(?:there (?:is|was|are|were) )?no\s+(?:description|spec(?:ification)?|requirements)\b[^.\n]{0,30}?\b(?:on|for|in|attached to)\s+${TICKET}\b`, "gi"),
+  // "the ticket is title-only", "a title-only issue"
+  new RegExp(String.raw`\b${TICKET}\b[^.\n]{0,20}?\sis\s+title[- ]only\b`, "gi"),
+  new RegExp(String.raw`\btitle[- ]only\s+${TICKET}\b`, "gi"),
+  // proposing to go back to the reporter because the spec is missing
+  /\b(?:ask|asking|check with|go back to)\s+the\s+(?:reporter|requester|filer)\b[^.\n]{0,40}?\b(?:for (?:a |the )?(?:spec(?:ification)?|description|requirements|details)|what (?:they|he|she) wants?)/gi,
+  /\b(?:spec(?:ification)?|description|requirements)\s+(?:is |are )?needed from the (?:reporter|requester|filer)\b/gi,
+  /\bawaiting (?:a |the )?spec(?:ification)?\b/gi,
+];
+// "no need to ask the reporter for a spec" is the OPPOSITE claim, and reads as
+// a match to the arm above. Look back a short way for the negation that flips it.
+const NEGATED_BEFORE = /\b(?:no need|without need(?:ing)?|don'?t need|do not need|no reason|not necessary|rather than|instead of|no point)\b[^.\n]{0,30}$/i;
+
+export function thinBriefReason(brief: string): string | null {
+  if (brief.length < 150) return `brief is title-only (${brief.length} chars)`;
+  for (const re of ABSENT_SPEC_CLAIMS) {
+    re.lastIndex = 0;
+    for (const m of brief.matchAll(re)) {
+      if (NEGATED_BEFORE.test(brief.slice(Math.max(0, m.index - 60), m.index))) continue;
+      return `brief claims the ticket has no spec ("${m[0].trim()}")`;
+    }
+  }
+  return null;
+}
+
 // Accepts JSON or multipart; attached files are saved under the new task's id
 // and their absolute paths appended to the brief, so the agent that picks the
 // task up can read them.
@@ -2160,6 +2303,23 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   const id = newId();
   const { block } = await attachFiles(id, files);
   const brief = ((body.brief ?? "") + block).trim();
+  // The ticket this work implements, parsed from the '[WEB-110] ' title prefix
+  // once and stored (HIVE-546). Stored, not re-derived: a retitle or a requeue
+  // used to lose the ticket silently.
+  const mirrorTaskId = mirrorTaskIdForTitle(db, String(body.project_id), body.title);
+  // A work task filed from the Jira issue's title while the real spec sits
+  // unread in the linked mirror's brief (HIVE-551/WEB-118): refuse rather than
+  // let a title-only brief silently drop 100s of chars of spec the mirror
+  // already has.
+  if (mirrorTaskId) {
+    const mirrorBrief = (db.query("SELECT brief FROM tasks WHERE id = ?").get(mirrorTaskId) as { brief: string | null } | undefined)?.brief ?? "";
+    const why = mirrorBrief.length > 200 ? thinBriefReason(brief) : null;
+    if (why)
+      return err(
+        `${why}, but linked mirror task ${mirrorTaskId} already has a ${mirrorBrief.length}-char spec — read that mirror's brief and write --brief-text from it instead of from the Jira title`,
+        400
+      );
+  }
   const row = {
     id,
     project_id: body.project_id,
@@ -2178,18 +2338,19 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
     depends_on: deps.length ? JSON.stringify(deps) : null,
     verification_cmds: verifyCmds ? JSON.stringify(verifyCmds) : null,
     priority,
+    jira_mirror_task_id: mirrorTaskId,
     created_at: t,
     updated_at: t,
   };
   db.query(
     `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
-      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, priority, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, priority, jira_mirror_task_id, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.project_id, row.title, row.brief, row.state, row.kind,
     row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
     row.summary, row.source, row.parent_task_id, row.depends_on, row.verification_cmds,
-    row.priority, row.created_at, row.updated_at
+    row.priority, row.jira_mirror_task_id, row.created_at, row.updated_at
   );
   writeEvent(db, {
     task_id: row.id,
@@ -2396,11 +2557,32 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
     if (denied) return denied;
     priority = parsed;
   }
-  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, updated_at = ? WHERE id = ?")
-    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, now(), id);
+  // Re-resolve the mirror when the title changes (HIVE-550). Adding the missing
+  // '[WEB-119] ' prefix by hand is the repair path a human reaches for when a
+  // work task was filed unlinked, and resolving only at creation made that
+  // repair silently do nothing. Never CLEAR a link here: dropping the prefix
+  // shouldn't throw away a link the board already relies on.
+  let mirrorTaskId: string | null = task.jira_mirror_task_id ?? null;
+  let relinked: { from: string | null; to: string } | null = null;
+  // Also re-resolve when the task is still unlinked: a task filed before its
+  // mirror existed (or already carrying the prefix but linked to nothing) heals
+  // on the next edit instead of staying orphaned forever.
+  if (title !== task.title || !mirrorTaskId) {
+    const resolved = mirrorTaskIdForTitle(db, task.project_id, title);
+    if (resolved && resolved !== mirrorTaskId) {
+      relinked = { from: mirrorTaskId, to: resolved };
+      mirrorTaskId = resolved;
+    }
+  }
+  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, jira_mirror_task_id = ?, updated_at = ? WHERE id = ?")
+    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, mirrorTaskId, now(), id);
   const updated = getTask(db, id);
+  // Say it out loud rather than repointing in silence — especially when this
+  // moved an existing link off another ticket.
+  if (relinked)
+    writeEvent(db, { task_id: id, source: "director", type: "jira_mirror_relinked", payload: relinked });
   broadcastTask(db, updated);
-  return json(taskWithHealth(db, updated));
+  return json({ ...taskWithHealth(db, updated), ...(relinked ? { jira_mirror_relinked: relinked } : {}) });
 }
 
 // Manual merge: fold this task into `target_id`, cancelling it as a duplicate.
@@ -2902,8 +3084,29 @@ function getTaskFull(db: DB, id: string): Response {
 }
 
 async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
-  if (!body?.to) return err("'to' state is required: hive task move <task-id> <queued|in_progress|needs_decision|in_review|verifying|done|failed|cancelled>");
+  if (!body?.to) return err("'to' state is required: hive task move <task-id> <queued|in_progress|needs_decision|in_review|verifying|done|deferred|failed|cancelled>");
   const to = body.to as State;
+  // `deferred` is not a lifecycle state (the task stays in_progress, task #679)
+  // but the director thinks of parking as a move — and `hive emit <id> deferred`
+  // used to be the ONLY way to do it. Accept the move and park it, so the two
+  // ways of saying "park this" agree (HIVE-547).
+  if (String(to) === "deferred" || String(to) === "defer") {
+    const t = getTask(db, id);
+    if (!t) return noTask(id);
+    if (TERMINAL.includes(t.state as State)) return err(`task is ${t.state}; there is nothing to park`, 409);
+    return json(taskWithHealth(db, deferTask(db, id, deferUntil(body?.until, body?.days), { source: body.source ?? "director", note: body.reason })));
+  }
+  // The way back out. A parked task is already in_progress, so a plain move
+  // there would be an invalid self-transition — un-defer instead, which also
+  // steers the (idle) agent to pick the work back up.
+  if (to === "in_progress") {
+    const t = getTask(db, id);
+    if (t && isDeferred(t)) {
+      const task = undeferTask(db, id, { source: body.source ?? "director", note: body.reason });
+      queueSteerEvent(db, id, `This task was un-deferred${body?.reason ? `: ${body.reason}` : ""} — re-read your last steps, emit a status note, and continue.`, "un-deferred");
+      return json(taskWithHealth(db, task));
+    }
+  }
   // A reviewer bounce (`hive task move <id> in_progress --note`) IS a
   // request-changes: it must deliver the note and keep an agent on the task. A
   // plain transition here dropped the note into the event log, respawned nobody,
@@ -3014,7 +3217,17 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
     if (found) embedded_tasks = found;
   }
   // The review card only blocks on the understanding check when this says so.
-  return json({ unmet_deps, embedded_tasks, understanding_required: understandingChecksRequired(db, task) });
+  // The risk check ran when the PR reached review, not at the land attempt
+  // (HIVE-565), so its verdict is known before the director spends any effort:
+  // the card can refuse Ship and skip the quiz instead of asking for both and
+  // then blocking the merge.
+  return json({
+    unmet_deps,
+    embedded_tasks,
+    understanding_required: understandingChecksRequired(db, task),
+    confirmed_risks: confirmedRisks(db, task.id, task.head_sha),
+    risk_check_unfinished: unfinishedRiskCheck(db, task.id, task.head_sha),
+  });
 }
 
 // Map our merge_method config onto gh's flag. Squash is the default.
@@ -3258,6 +3471,45 @@ async function mergeTaskLocked(
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   const config = JSON.parse(project?.config ?? "{}");
   const autoShipKind = Array.isArray(config.auto_merge?.kinds) && config.auto_merge.kinds.includes(task.kind);
+  // The risk check (HIVE-406) re-read the real code for this exact head. Risks
+  // it CONFIRMED are the ones that survived an adversarial second look, so the
+  // director sees that short list verbatim instead of the whole caution blob.
+  // Refuted risks say nothing here. Overridable, like the rebase guard below.
+  //
+  // This runs BEFORE the understanding check (HIVE-565). The quiz is the most
+  // expensive thing hive asks of the director, and asking for it on a change
+  // the machine is about to refuse is the wrong order. A risk that lands AFTER
+  // the quiz was passed — a new push, a late verdict — says so, so the refusal
+  // never reads as "you did that for nothing".
+  const confirmed = body?.override_confirmed_risks ? [] : confirmedRisks(db, id, task.head_sha);
+  if (confirmed.length) {
+    const quiz = latestUnderstandingQuiz(db, id);
+    const late = quiz && understandingQuizStatus(db, id, quiz.reviewEventId) === "passed";
+    return err(
+      (late ? `you passed the understanding check on this change earlier; a new finding arrived on commit ${String(task.head_sha ?? "").slice(0, 7)}. ` : "") +
+        `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
+        confirmed.map((c) => `“${c.risk}” — ${c.why}${c.evidence_path ? ` (${c.evidence_path})` : ""}`).join("; ") +
+        `. Fix them, or merge with override_confirmed_risks=true.`,
+      409,
+      CONFIRMED_RISK_CODE
+    );
+  }
+
+  // "I could not check" is not "I checked and it is bad" (HIVE-539). A run that
+  // timed out leaves findings with NO verdict; quoting one of them as confirmed
+  // is how a task that already fixed the finding could never land. Say what
+  // actually happened instead, and let the queue retry — the verification pass
+  // re-runs the findings it missed and keeps the ones it already got.
+  const unfinished = body?.override_confirmed_risks ? null : unfinishedRiskCheck(db, id, task.head_sha);
+  if (unfinished)
+    return err(
+      `merge blocked — the risk check did not finish on this head: ${unfinished.unverified} of ` +
+        `${unfinished.unverified + unfinished.checked} finding${unfinished.unverified + unfinished.checked === 1 ? "" : "s"} ` +
+        `got no verdict${unfinished.reason ? ` (${unfinished.reason})` : ""}. Nothing was confirmed. ` +
+        `Wait for it to retry, or merge with override_confirmed_risks=true.`,
+      409
+    );
+
   // Mechanical changes (hive-1559) never mint a quiz, so nothing here to gate on.
   let deferQuizReviewEventId: string | null = null;
   if (understandingChecksRequired(db, task)) {
@@ -3294,34 +3546,6 @@ async function mergeTaskLocked(
     const names = blockingDeps.map((b) => `#${b.number} ${b.title} (${b.state})`).join(", ");
     return err(`blocked by unmet dependenc${blockingDeps.length === 1 ? "y" : "ies"}: ${names} — not yet merged/done`, 409);
   }
-
-  // The risk check (HIVE-406) re-read the real code for this exact head. Risks
-  // it CONFIRMED are the ones that survived an adversarial second look, so the
-  // director sees that short list verbatim instead of the whole caution blob.
-  // Refuted risks say nothing here. Overridable, like the rebase guard below.
-  const confirmed = body?.override_confirmed_risks ? [] : confirmedRisks(db, id, task.head_sha);
-  if (confirmed.length)
-    return err(
-      `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
-        confirmed.map((c) => `“${c.risk}” — ${c.why}${c.evidence_path ? ` (${c.evidence_path})` : ""}`).join("; ") +
-        `. Fix them, or merge with override_confirmed_risks=true.`,
-      409
-    );
-
-  // "I could not check" is not "I checked and it is bad" (HIVE-539). A run that
-  // timed out leaves findings with NO verdict; quoting one of them as confirmed
-  // is how a task that already fixed the finding could never land. Say what
-  // actually happened instead, and let the queue retry — the verification pass
-  // re-runs the findings it missed and keeps the ones it already got.
-  const unfinished = body?.override_confirmed_risks ? null : unfinishedRiskCheck(db, id, task.head_sha);
-  if (unfinished)
-    return err(
-      `merge blocked — the risk check did not finish on this head: ${unfinished.unverified} of ` +
-        `${unfinished.unverified + unfinished.checked} finding${unfinished.unverified + unfinished.checked === 1 ? "" : "s"} ` +
-        `got no verdict${unfinished.reason ? ` (${unfinished.reason})` : ""}. Nothing was confirmed. ` +
-        `Wait for it to retry, or merge with override_confirmed_risks=true.`,
-      409
-    );
 
   const exec = deps.exec ?? defaultExec;
   let prView: any = null;
@@ -3429,14 +3653,21 @@ async function mergeTaskLocked(
           const files = captureFailed
             ? ""
             : regressed!.slice(0, 10).join(", ") + (regressed!.length > 10 ? `, …(+${regressed!.length - 10})` : "");
+          // Name the exact comparison so the diagnosis is not guesswork: WHAT the
+          // branch is believed to have rolled back, the base commit it was
+          // measured against, and the older state it matches (HIVE-543).
+          const baseShaProbe = captureFailed ? null : await exec(["git", "-C", project.repo_path, "rev-parse", guardBase]);
+          const baseSha = (baseShaProbe?.code === 0 ? baseShaProbe.stdout.trim() : guardBase).slice(0, 7);
           const reason = captureFailed
             ? `could not re-verify branch scope for '${task.branch}' after a same-branch re-cut (snapshot capture failed)`
-            : `branch '${task.branch}' reverts base work outside this task's scope (${files})`;
+            : `branch '${task.branch}' drops base work outside this task's scope: ${files} — ` +
+              `each of those still matches its older ${snapshot!.base_sha.slice(0, 7)} content, so the branch ` +
+              `discards what '${base}' (${baseSha}) landed on them since`;
           writeEvent(db, {
             task_id: id,
             source: "director",
             type: "merge_blocked_destructive",
-            payload: { base, branch: task.branch, regressed, reason, actor },
+            payload: { base, branch: task.branch, regressed, reason, actor, base_sha: baseSha, snapshot_base_sha: snapshot?.base_sha ?? null },
           });
           recordSystemLearning(
             db,
@@ -3449,20 +3680,20 @@ async function mergeTaskLocked(
             await herdr
               .send(
                 task.agent_target,
-                `hive: merge into '${base}' BLOCKED — your branch '${task.branch}' now reverts commits ` +
-                  `already on '${base}' outside this task's scope (${files}). This is the destructive ` +
+                `hive: merge into '${base}' BLOCKED — ${reason}. This is the destructive ` +
                   `auto-rebase pattern from task #314: an auto-resolve dropped intervening work while CI stayed ` +
-                  `green. Do NOT trust the rebase — abandon this branch and re-cut a clean one off CURRENT ` +
-                  `'${base}', re-apply only your task's change, and push. If those reverts are intentional, the ` +
-                  `director can override.`
+                  `green. Rebasing again will NOT clear this; staleness is not the problem. Abandon this branch ` +
+                  `and re-cut a clean one off CURRENT '${base}', re-apply only your task's change, and push. ` +
+                  `Never make the check pass by weakening or reverting your own tests. If the drops are ` +
+                  `intentional, the director can override.`
               )
               .catch(() => {});
           }
           transition(db, id, "in_progress", { source: "director", reason: "merge blocked: destructive auto-rebase" });
           return err(
             `merge blocked — ${reason}; ` +
-              `the auto-rebase likely dropped intervening commits (task #314). Re-cut off current '${base}', or ` +
-              `merge with override_destructive_check=true if intentional.`,
+              `the auto-rebase likely dropped intervening commits (task #314). Rebasing again does not help. ` +
+              `Re-cut off current '${base}', or merge with override_destructive_check=true if intentional.`,
             409
           );
         }
@@ -3569,6 +3800,9 @@ async function mergeTaskLocked(
     }
   }
 
+  // One of two places a quiz settles on a merge: this is the hive-performed
+  // merge. The other is deferQuizForExternalMerge (below), for a PR merged on
+  // GitHub that the reconciler only observes afterwards.
   if (deferQuizReviewEventId) {
     writeEvent(db, {
       task_id: id,
@@ -3914,10 +4148,19 @@ export async function spawnAgent(
     HIVE_AGENT: agent,
   };
 
+  // HIVE-552: a finished agent idles at its prompt holding the task name, which
+  // refuses every respawn and strands every queued steer. herdr may release such
+  // a holder, but only when it is BOTH finished (its own `done` status) and this
+  // task has been silent for a full stale window — a busy agent is never closed.
+  const lastActivity = lastAgentActivity(db, id);
+  const holderQuietMs = lastActivity ? Date.now() - Date.parse(lastActivity) : undefined;
+
   let result;
   try {
     result = await herdr.spawn({
       taskId: id,
+      holderQuietMs,
+      releaseFinishedName: holderQuietMs !== undefined && holderQuietMs > staleMs(),
       repoPath: project.repo_path,
       hiveUrl,
       title: task.title,
@@ -3952,7 +4195,21 @@ export async function spawnAgent(
     // (not per-task) and inBackoff excludes them, so an outage doesn't pound the
     // dead socket once per queued task nor inflate the task's own backoff.
     const infra = isHerdrUnreachable(msg) ? "herdr_unreachable" : undefined;
-    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: msg, ...(infra ? { infra } : {}) } });
+    // HIVE-568: a name held by a LIVE holder is contention, not failure. The
+    // lease can only be reclaimed once the holder reports done AND the task has
+    // been silent for a whole stale window (15m) — far longer than the
+    // dispatcher's five quick retries, so every such task used to be failed with
+    // "needs a human" while the holder was simply finishing its turn. Stamp the
+    // event with the earliest moment a retry could work; the dispatcher waits for
+    // it instead of spending an attempt. A holder that is already done AND past
+    // the window is a genuine failure — left untagged, so it still fails fast.
+    const heldUntil = e instanceof HerdrError ? heldNameRetryAt(e.nameHolder, holderQuietMs, staleMs(), Date.now()) : null;
+    writeEvent(db, {
+      task_id: id,
+      source: "herdr",
+      type: "spawn_error",
+      payload: { error: msg, ...(infra ? { infra } : {}), ...(heldUntil ? { held_until: heldUntil } : {}) },
+    });
     recordSystemLearning(db, task.project_id, `spawn failure: ${signature(msg)}`, msg, id);
     return { ok: false, error: msg };
   }
@@ -4500,6 +4757,12 @@ function quizAnswerable(db: DB, task: { id: string; state: string; head_sha: str
   // Shipped: the post-ship catch-up class. Its head is settled, so it is
   // answerable, and it only ever feeds the digest.
   if (task.state !== "in_review") return true;
+  // A change the risk check already refused is not a change to quiz anybody on
+  // (HIVE-570). The quiz is the most expensive thing hive asks of the director,
+  // and asking for it on a PR that cannot merge spends his effort before the
+  // machine spends any of its own. The finding goes back to the agent; the quiz
+  // comes back on its own once the next push clears the risk.
+  if (confirmedRisks(db, task.id, task.head_sha).length) return false;
   // The director asked for this one by hand, so it is their question whatever
   // the pipeline is doing.
   if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1").get(task.id)) return true;
@@ -4507,6 +4770,28 @@ function quizAnswerable(db: DB, task: { id: string; state: string; head_sha: str
   // reviewer skips both, so nothing further is coming and this is as complete
   // as the review gets.
   return reviewPipelineSettled(db, task);
+}
+
+// Re-emitting a review is the normal reply to a rebase, a risk finding or red
+// CI. A re-emitted review that says nothing about the understanding checks means
+// "nothing to add", not "delete them" (HIVE-545) — last-write-wins used to wipe
+// a quiz the director had already passed and drop an approved PR back out of
+// the land queue. So the checks carry forward. Only an explicit `checks: []`
+// clears them, and that empty array is stored so the clear sticks.
+// Returns the newest review that actually spoke about checks, or null when no
+// review ever did (or the last word was an explicit clear).
+function carriedUnderstandingChecks(db: DB, taskId: string): { checks: unknown[]; eventId: string; rowid: number } | null {
+  const rows = db
+    .query("SELECT id, rowid, payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC")
+    .all(taskId) as { id: string; rowid: number; payload: string }[];
+  for (const row of rows) {
+    let understanding: any;
+    try { understanding = JSON.parse(row.payload)?.understanding; } catch { continue; }
+    if (!understanding || typeof understanding !== "object" || !Array.isArray(understanding.checks)) continue;
+    if (!understanding.checks.length) return null;
+    return { checks: understanding.checks, eventId: row.id, rowid: row.rowid };
+  }
+  return null;
 }
 
 function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; checks: UnderstandingCheck[] } | null {
@@ -4819,6 +5104,51 @@ function requireUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   if (!already)
     writeEvent(db, { task_id: taskId, source: "director", type: "understanding_required", payload: { actor: actorOf(body) } });
   return json({ ok: true, understanding_required: true });
+}
+
+// Which merge path settles a quiz: BOTH of them. mergeTask (above) defers the
+// quiz when hive itself lands an auto_merge.kinds task; this defers it when the
+// PR was merged on GitHub and the reconciler only observed it afterwards
+// (HIVE-544). Before this, that second path left the quiz reading "required"
+// forever on a task that had already shipped — the same unanswered catch-up
+// item under a name that reads like a blocker.
+export function deferQuizForExternalMerge(db: DB, taskId: string): void {
+  settleShippedQuiz(db, taskId, "Automatically deferred because the PR was merged outside hive; the task had already shipped.");
+}
+
+// Marks an unanswered quiz as deferred. Returns false (and writes nothing) when
+// there is no quiz, when the task is not judgment-class, or when the quiz was
+// already passed or deferred — so calling it twice is a no-op.
+function settleShippedQuiz(db: DB, taskId: string, note: string): boolean {
+  const task = getTask(db, taskId);
+  if (!task || !understandingChecksRequired(db, task)) return false;
+  const quiz = latestUnderstandingQuiz(db, taskId);
+  if (!quiz || understandingQuizStatus(db, taskId, quiz.reviewEventId) !== "required") return false;
+  writeEvent(db, {
+    task_id: taskId,
+    source: "system",
+    type: "understanding_quiz_deferred",
+    payload: { review_event_id: quiz.reviewEventId, note },
+  });
+  return true;
+}
+
+// Backfill for the pile that accumulated before the fix above: tasks that
+// already shipped but whose quiz still reads "required", because nothing on the
+// external-merge path ever settled it. Settle them the same way a merge would.
+// `failed` is deliberately NOT swept: that work never shipped, so its quiz is a
+// real signal, not a catch-up item. Idempotent — a second run settles nothing.
+export function deferShippedQuizzes(db: DB): number {
+  const rows = db
+    .query(
+      `SELECT DISTINCT t.id FROM tasks t JOIN events e ON e.task_id = t.id AND e.type = 'review_summary'
+        WHERE t.state IN ('done', 'verifying')`
+    )
+    .all() as { id: string }[];
+  let swept = 0;
+  for (const row of rows)
+    if (settleShippedQuiz(db, row.id, "Automatically deferred: the task had already shipped when this quiz was still unanswered.")) swept++;
+  return swept;
 }
 
 function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
@@ -5466,14 +5796,17 @@ export function requeueTask(db: DB, source: any): string {
     if (jiraKey)
       db.query("UPDATE tasks SET jira_key = NULL, jira_link_kind = NULL, updated_at = ? WHERE id = ?").run(t, fresh.id);
     db.query(
-      `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, resume_branch, resume_ghost_branch, resume_pr_url, priority, jira_key, jira_link_kind, created_at, updated_at)
-       VALUES (?,?,?,?, 'queued', ?, 'requeue', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, resume_branch, resume_ghost_branch, resume_pr_url, priority, jira_key, jira_link_kind, jira_mirror_task_id, created_at, updated_at)
+       VALUES (?,?,?,?, 'queued', ?, 'requeue', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id, fresh.project_id, fresh.title, brief || null, fresh.kind, fresh.id,
       resume?.branch ?? null, resume?.ghostBranch ?? null, resume?.prUrl ?? null,
       // The successor IS the same work, so it keeps the original's place in the
       // queue. Losing it would push a 'now' task to the back on every retry.
-      fresh.priority ?? "normal", jiraKey, jiraKey ? "subtask" : null, t, t
+      // The mirror link is COPIED, not moved: the successor is more work for the
+      // same ticket, and the dead predecessor no longer blocks it (failed rows
+      // are ignored when the mirror decides it is done).
+      fresh.priority ?? "normal", jiraKey, jiraKey ? "subtask" : null, fresh.jira_mirror_task_id ?? null, t, t
     );
   })();
   writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title: fresh.title, requeue_of: fresh.id } });
@@ -6110,6 +6443,42 @@ async function prHeadBranch(exec: Exec, prUrl: string): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------- event ingestion (`hive emit`)
+// hive-1992: `hive emit --json <file>` used to accept ANY path, so agents that
+// wrote to the shared /tmp/review.json published each other's reviews — one
+// task's review card ended up describing a completely different change, and an
+// understanding check had already been passed against the review it replaced.
+// The CLI sends the resolved path; a payload read from outside the calling
+// agent's own sandbox is refused, not warned about.
+//
+// Legitimate homes are the task's own worktree, and its per-session scratchpad
+// (/tmp/claude-501/<worktree-slug>/<session-uuid>/scratchpad/...), whose slug is
+// the worktree path with every non-alphanumeric character turned into "-".
+function worktreeSlug(worktreePath: string): string {
+  return worktreePath.replace(/[^A-Za-z0-9]/g, "-");
+}
+
+// Every name this task legitimately answers to, so a payload that stamps its
+// own task id can be checked against all of them (uppercased for comparison).
+function taskIdentities(db: DB, task: any): string[] {
+  return [task.id, String(task.number), `#${task.number}`, taskIdentifier(db, task)].map((v) => v.toUpperCase());
+}
+
+function payloadPathRefusal(task: any, raw: unknown): string | null {
+  const path = typeof raw === "string" ? raw.trim() : "";
+  const worktree = String(task?.worktree_path ?? "").replace(/\/+$/, "");
+  // No path (a direct API caller) or no worktree on the task: nothing to
+  // compare against, so this guard stays out of the way.
+  if (!path || !worktree) return null;
+  if (path === worktree || path.startsWith(worktree + "/")) return null;
+  if (path.split("/").includes(worktreeSlug(worktree))) return null;
+  return (
+    `refusing to read ${path}: it is outside this task's worktree and session scratchpad, ` +
+    `so another agent can overwrite it between your write and this emit (that is how one task ` +
+    `published another agent's review). Write the payload inside ${worktree}/ (or your session ` +
+    `scratchpad) and emit again.`
+  );
+}
+
 async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDeps = {}): Promise<Response> {
   const task = getTask(db, taskId);
   if (!task) return noTask(taskId);
@@ -6135,7 +6504,27 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
   const type = fields.type;
   if (!type) return err('event \'type\' is required: hive emit <task-id> <status|evidence|ready|blocked|done|deferred> --note "..."');
   if (isTrackingOnlyTask(task) && ["needs-decision", "done", "ready", "unmergeable"].includes(type))
-    return err("this task is tracking-only — hive tracks it but never runs an agent on it, so there are no agent lifecycle events to record", 409);
+    return err(
+      // hive-1952: say what IS allowed. This message used to stop at "no agent
+      // lifecycle events", and the state machine's own error then sent the
+      // caller back to `ready` — the two guards pointed at each other and an
+      // in_review mirror had no exit but `cancelled`.
+      `this task is tracking-only — hive tracks it but never runs an agent on it, so there are no agent lifecycle events to record. To close it, move it directly: \`hive task move ${taskId} done\` (or \`cancelled\`).`,
+      409
+    );
+  // hive-1992: a --json payload must come from this agent's own sandbox, and if
+  // it names a task it must name THIS one. Both refuse rather than warn — the
+  // warning would arrive after the wrong review is already published.
+  const pathRefusal = payloadPathRefusal(task, (fields as any).payload_path);
+  if (pathRefusal) return err(pathRefusal, 400);
+  const claimed = String((fields as any).task_id ?? (fields as any).task ?? "").trim();
+  if (claimed && !taskIdentities(db, task).includes(claimed.toUpperCase()))
+    return err(
+      `this payload says it belongs to task ${claimed}, but you are emitting on ${taskIdentifier(db, task)} (${taskId}). ` +
+        `Re-generate the payload for this task and emit again.`,
+      400
+    );
+
   const source = fields.source || "agent";
   const note = fields.note ?? null;
 
@@ -6484,6 +6873,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     if (typeof rawUnderstanding === "string") {
       try { rawUnderstanding = JSON.parse(rawUnderstanding); } catch { rawUnderstanding = null; }
     }
+    let checksProvided = false;
     if (rawUnderstanding && typeof rawUnderstanding === "object" && !Array.isArray(rawUnderstanding)) {
       const text = (value: unknown, max = 600) =>
         typeof value === "string" && value.trim() ? value.trim().slice(0, max) : undefined;
@@ -6501,6 +6891,10 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         if (affectedAreas.length) understanding.affected_areas = affectedAreas;
       }
       const rawCheck = rawUnderstanding.check;
+      // Absent (no `checks`/`check` key at all) and empty (`checks: []`) are
+      // different intents: absent carries the old checks forward, empty clears
+      // them (HIVE-545).
+      checksProvided = Array.isArray(rawUnderstanding.checks) || rawCheck !== undefined;
       const rawChecks = Array.isArray(rawUnderstanding.checks)
         ? rawUnderstanding.checks
         : Array.isArray(rawCheck)
@@ -6527,6 +6921,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         (check) => recurrenceKey(check.question)
       ).slice(0, 5);
       if (checks.length) understanding.checks = checks;
+      else if (checksProvided) understanding.checks = [];
       // Submitted a quiz that normalises to nothing? Say so. Accepting it
       // silently is what cost two tasks a round trip each: the agent believed
       // it had supplied a check, and land only said one was "required"
@@ -6545,6 +6940,13 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     }
     if (!Object.keys(payload).length)
       return err("review_summary needs a structured review section: hive emit <task-id> review_summary --json review.json");
+    // No word on the checks at all? Keep the ones this task already has.
+    const carried = checksProvided ? null : carriedUnderstandingChecks(db, taskId);
+    if (carried) {
+      const understanding = (payload.understanding ?? {}) as Record<string, unknown>;
+      understanding.checks = carried.checks;
+      payload.understanding = understanding;
+    }
     const latest = db
       .query("SELECT * FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
       .get(taskId) as any;
@@ -6555,6 +6957,30 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     )
       return json({ event: parseEvent(latest), duplicate: true }, 201);
     const event = writeEvent(db, { task_id: taskId, source, type, payload });
+    // The carried checks are the SAME questions the director already answered,
+    // so the pass carries with them — otherwise a rebase still un-lands the PR,
+    // just with the quiz re-asked instead of deleted. A changes-request or an
+    // answered decision since then means the change moved, so the director
+    // re-answers (the same guard repairDuplicateQuizPasses uses).
+    if (carried && understandingQuizStatus(db, taskId, carried.eventId) === "passed") {
+      const invalidated = db
+        .query(
+          `SELECT 1 FROM events WHERE task_id = ? AND rowid > ?
+             AND type IN ('changes_requested', 'decision_answered') LIMIT 1`
+        )
+        .get(taskId, carried.rowid);
+      if (!invalidated)
+        writeEvent(db, {
+          task_id: taskId,
+          source: "system",
+          type: "understanding_quiz_passed",
+          payload: {
+            review_event_id: event.id,
+            carried_from_review_event_id: carried.eventId,
+            reason: "review re-emitted without changing the understanding checks",
+          },
+        });
+    }
     const understandingChecks = ((payload.understanding as any)?.checks ?? []) as any[];
     if (understandingChecks.some(isEgregiousCheckWording))
       queueSteerEvent(
@@ -7316,14 +7742,19 @@ export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: an
 // no usable options, or one that's simply no longer relevant). Expires it and
 // broadcasts so the inbox clears live. No resolver hooks fire — dismissing is
 // explicitly "take no action".
-export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; steer: string }): Response {
+export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; steer: string; why?: string }): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
   if (!r) return err("decision not found. List the open ones: curl -s \"$HIVE_URL/api/decisions?status=open\"", 404);
   if (r.status !== "open") return err(`decision already ${r.status}`, 409);
   const source = moot ? "reconciler" : "director";
   const expiredAt = now();
-  db.query("UPDATE decisions SET status = 'expired', answered_at = ?, answered_by = ?, answered_actor = ? WHERE id = ?")
-    .run(expiredAt, source, moot ? "reconciler-moot" : null, id);
+  // Say WHY it closed, on the card, where the director was already looking
+  // (HIVE-570). Nine land-pause cards died as moot inside two minutes last
+  // night and each one took its explanation with it: the row read "Answered:
+  // null". The note keeps the row honest without keeping the question alive.
+  const note = moot ? moot.why ?? `Hive closed this on its own (${moot.reason}). Nothing here needs an answer.` : null;
+  db.query("UPDATE decisions SET status = 'expired', answered_at = ?, answered_by = ?, answered_actor = ?, answer_note = ? WHERE id = ?")
+    .run(expiredAt, source, moot ? "reconciler-moot" : null, note, id);
   writeEvent(db, { task_id: r.task_id, source, type: "decision_expired", payload: { decision_id: id, reason: moot?.reason ?? "dismissed" } });
   // An authority card's pending grant must die with it: left 'pending', every
   // retry of the gated command resolves to this expired decision id and the
@@ -7358,7 +7789,7 @@ export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; 
   const task = getTask(db, r.task_id);
   if (!remaining && task && task.state === "needs_decision")
     transition(db, r.task_id, "in_progress", { source, reason: moot?.reason ?? "last open decision dismissed" });
-  const decision = parseDecision({ ...r, status: "expired", answered_at: expiredAt, answered_by: source });
+  const decision = parseDecision({ ...r, status: "expired", answered_at: expiredAt, answered_by: source, answer_note: note });
   broadcast({ type: "decision", decision });
   return json(decision);
 }

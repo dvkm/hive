@@ -8,8 +8,8 @@ import { RaceCompare } from "./Race";
 import type { Decision, Evidence, JiraTaskState, TaskDetail, UsageTotals } from "../lib/api";
 import { useStore } from "../lib/store";
 import { splitAttachments } from "../lib/attachments";
-import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, NEXT, PriorityChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
-import { ReviewAudit, ReviewCard, ReviewUnderstanding } from "./ReviewCard";
+import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, needsLook, NEXT, PriorityChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { ReviewAudit, ReviewCard, ReviewUnderstanding, RiskVerdicts } from "./ReviewCard";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
 import { ReportView } from "./ReportView";
@@ -101,13 +101,22 @@ function EvidenceItem({ e, onOpen }: { e: Evidence; onOpen?: () => void }) {
 
 function DecisionMini({ d }: { d: Decision }) {
   const answered = d.status !== "open";
+  // An expired card was never answered, so "Answered: null" was a lie that also
+  // deleted the only explanation the director had (HIVE-570). Say it closed, say
+  // why, and keep the question it was asking about visible underneath.
+  const expired = d.status === "expired";
   return (
     <div className={`dmini ${answered ? "dmini-done" : "dmini-open"}`}>
       <div className="dmini-head">
         <strong><ReferenceText text={d.title} taskId={d.task_id} bundle={d.bundle} /></strong>
         <span className={`chip chip-risk risk-${d.risk || "unknown"}`}>{d.risk || "?"}</span>
       </div>
-      {answered ? (
+      {expired ? (
+        <div className="dmini-answer">
+          <div>Closed without an answer.{d.answer_note ? ` ${d.answer_note}` : ""}</div>
+          {d.context && <div className="dmini-context">{d.context}</div>}
+        </div>
+      ) : answered ? (
         <div className="dmini-answer">
           Answered: <code>{d.answer_key}</code>
           {d.answer_note && <> — {d.answer_note}</>}
@@ -726,7 +735,7 @@ export function TaskBody({ id }: { id: string }) {
   const health = t.health;
   // A review has already left the agent's hands. A gone worker is expected at
   // this point, not a recovery action for the director.
-  const unhealthy = !codeReview && health && health.status !== "healthy";
+  const unhealthy = !codeReview && needsLook(health);
 
   return (
     <div className={`task ${codeReview ? "task-reviewing" : ""}`}>
@@ -814,6 +823,16 @@ export function TaskBody({ id }: { id: string }) {
         )}
 
         {codeReview && <ReviewCard task={t} onDone={refresh} />}
+
+        {/* The risk check's verdicts belong to the CHANGE, not to the land queue
+            (HIVE-570). The review card carries them while the task sits in
+            review; this keeps them readable everywhere else — after a merge,
+            after a bounce, and above all after the PR is taken out of the queue,
+            which is the right answer to a permanent failure and used to be what
+            erased the explanation. */}
+        {!codeReview && (
+          <RiskVerdicts events={t.events} headSha={t.head_sha} />
+        )}
 
         {t.race_id && <RaceCompare raceId={t.race_id} taskId={t.id} onPicked={refresh} />}
 

@@ -712,6 +712,47 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       `CREATE INDEX idx_tasks_race ON tasks(race_id) WHERE race_id IS NOT NULL`,
     ],
   },
+  // HIVE-546: the durable link from a work task to the Jira mirror it implements.
+  // Before this the only connection was the '[WEB-110] ' prefix in the title, so
+  // a merged task told its mirror nothing and the board read as if the work had
+  // never happened. Deliberately NOT jira_key: a mirror can have many work
+  // children (WEB-23 has ten) and jira_key is unique per (key, link kind), and a
+  // work task is not the issue — it implements it.
+  // The backfill re-runs safely: it only fills rows that are still NULL.
+  {
+    name: "v44-task-jira-mirror-link",
+    statements: [
+      `ALTER TABLE tasks ADD COLUMN jira_mirror_task_id TEXT`,
+      `CREATE INDEX idx_tasks_jira_mirror ON tasks(jira_mirror_task_id) WHERE jira_mirror_task_id IS NOT NULL`,
+      `UPDATE tasks SET jira_mirror_task_id = (
+         SELECT m.id FROM tasks m
+          WHERE m.project_id = tasks.project_id
+            AND m.jira_link_kind = 'mirror' AND m.jira_key IS NOT NULL
+            AND substr(tasks.title, 1, length(m.jira_key) + 2) = '[' || m.jira_key || ']')
+       WHERE jira_mirror_task_id IS NULL
+         AND COALESCE(jira_link_kind, '') <> 'mirror'
+         AND COALESCE(source, '') <> 'external'
+         AND title LIKE '[%'`,
+    ],
+  },
+  // HIVE-554: v39 only caught tasks that existed at deploy time. `source`
+  // stays directly settable through the task-create API body (not just the
+  // retired --track flag), so rows created after v39 ran are still stranded
+  // the same way — never dispatched, and now unreachable by defer/undefer
+  // since the source check short-circuits first. Same fix, re-run once more
+  // for the rows v39 missed. Jira mirrors are untouched by the same guard.
+  // Re-runnable: the park runs before the source clear, and once source is
+  // cleared the WHERE matches nothing.
+  {
+    name: "v45-retire-tracking-only-source-again",
+    statements: [
+      `UPDATE tasks SET deferred_until = '9999-12-31T00:00:00.000Z'
+         WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'
+           AND state NOT IN ('done', 'failed', 'cancelled') AND deferred_until IS NULL`,
+      `UPDATE tasks SET source = NULL
+         WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings
@@ -726,6 +767,15 @@ export function setSetting(db: DB, key: string, value: string): void {
   db.query(
     "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
   ).run(key, value, new Date().toISOString());
+}
+
+// Chief of Staff / chat supervisor sessions. OFF by default (director's call,
+// 2026-09-01): two standing sessions processed ~150M tokens in a week and
+// produced one answered decision. Off means a chat message never spawns or
+// respawns a supervisor session; the thread says so instead. Toggle with
+// `hive chat supervisor on|off` (POST /api/chat/supervisor).
+export function supervisorEnabled(db: DB): boolean {
+  return getSetting(db, "chat_supervisor") === "on";
 }
 
 // Offline mode: nothing new spawns, network-dependent supervision pauses,

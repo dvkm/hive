@@ -69,6 +69,7 @@ Who moves each edge:
 | `in_review -> verifying` | the reconciler, once the PR is merged |
 | `verifying -> done` | the reconciler, once post-merge smoke checks pass |
 | anything -> `failed` / `cancelled` | the reconciler or the director |
+| `in_review` / `in_progress` -> `done` | the director, for a tracking-only task only (see Source below): hive never runs an agent on it, so there is no PR to merge and no review to pass |
 
 Two rules the server enforces. A task cannot reach `done` without at least one evidence item. And `failed` is not the end: a failed task can go back to `queued` for another attempt, so a chain that looks like it stopped at a failure has often already been requeued.
 

@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
-import { landGraph, landOnce, markLand } from "../src/landQueue.ts";
+import { landGraph, landOnce, markLand, CONFIRMED_RISK_CODE } from "../src/landQueue.ts";
 import { transition, writeEvent } from "../src/state.ts";
 import { apiAnswerDecision } from "../src/api.ts";
 import { queueSteerEvent, queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers } from "../src/steer.ts";
@@ -55,11 +55,16 @@ const filesExec = (byBranch: Record<string, string[]>): Exec => async (argv) => 
 
 // A merge stub that lands the task the way mergeTask would (in_review →
 // verifying), so the sweep sees the state change. `red` never merges.
-function mergeStub(db: DB, failing: Record<string, string> = {}) {
+type Failure = string | { reason: string; code?: string };
+
+function mergeStub(db: DB, failing: Record<string, Failure> = {}) {
   const calls: string[] = [];
   const merge = async (id: string) => {
     calls.push(id);
-    if (failing[id]) return { ok: false, reason: failing[id] };
+    if (failing[id]) {
+      const f = failing[id];
+      return typeof f === "string" ? { ok: false, reason: f } : { ok: false, reason: f.reason, code: f.code };
+    }
     transition(db, id, "verifying", { source: "director", reason: "test merge" });
     return { ok: true };
   };
@@ -360,6 +365,15 @@ test("a stale pause card closes itself once the PR leaves the queue", async () =
   markLand(db, [a], false); // director unmarks it
   await landOnce(db, { exec: filesExec({}), merge: mergeStub(db).merge });
   expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(0);
+
+  // HIVE-570: taking the PR out of the queue is the RIGHT answer to a permanent
+  // failure, and it must not be how the explanation disappears. The closed card
+  // says what ended the pause and repeats why the merge had stopped.
+  const closed = db.query("SELECT status, answer_key, answer_note FROM decisions").get() as any;
+  expect(closed.status).toBe("expired");
+  expect(closed.answer_key).toBeNull();
+  expect(closed.answer_note).toContain("you took it out of the land queue");
+  expect(closed.answer_note).toContain("CI is red");
 });
 
 test("a queued corrective steer holds the retry; delivery + a new head resumes it (HIVE-444)", async () => {
@@ -448,6 +462,9 @@ test("repeated failures that never open a card take the task out of the queue", 
     // back in the queue — that is the loop.
     if ((db.query("SELECT state FROM tasks WHERE id = ?").get(a) as any).state !== "in_review")
       transition(db, a, "in_review", { source: "agent", reason: "pushed again" });
+    // Each push is a new commit, which re-arms the queue (HIVE-555). The
+    // attempt ceiling is what stops this loop.
+    db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run(`sha${i}`, a);
     ageLandAttempts(db, a, 3_600_000);
   }
   expect(calls).toHaveLength(10); // MAX_LAND_ATTEMPTS
@@ -469,4 +486,273 @@ test("an unfinished risk check retries on the backoff instead of opening a card"
   expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
   const attempt: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'land_attempted'").get(a);
   expect(JSON.parse(attempt.payload).transient).toBe(true);
+});
+
+// HIVE-569: a timeout is transient, but retrying it spends the same busy route
+// that caused it. It must wait minutes, not 30 seconds, and give up after three.
+test("a capacity failure waits out the congestion instead of retrying into it", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  const reason = "merge blocked — the risk check did not finish on this head: 2 of 2 findings got no verdict (timed out after 180000ms).";
+
+  const first = mergeStub(db, { [a]: reason });
+  await landOnce(db, { exec: filesExec({}), merge: first.merge });
+  expect(first.calls).toEqual([a]);
+
+  // 60s later a "base moved" would already be retrying. A timeout is not.
+  ageLandAttempts(db, a, 60_000);
+  const tooSoon = mergeStub(db, { [a]: reason });
+  await landOnce(db, { exec: filesExec({}), merge: tooSoon.merge });
+  expect(tooSoon.calls).toEqual([]);
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+
+  // Past the 5 minute step it tries again, and burns its budget the same way.
+  for (let i = 0; i < 3; i++) {
+    ageLandAttempts(db, a, 3_600_000);
+    const { merge } = mergeStub(db, { [a]: reason });
+    await landOnce(db, { exec: filesExec({}), merge });
+  }
+  // Three capacity failures is the whole budget: attempt 4 stops being treated
+  // as transient and becomes one card, instead of a fourth 180s timeout.
+  const attempts = (db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'land_attempted'").get(a) as any).n;
+  expect(attempts).toBe(4);
+  const card = db.query("SELECT context FROM decisions WHERE status = 'open'").get() as any;
+  expect(card).toBeTruthy();
+  expect(card.context).toContain("busy shared route");
+
+  // And a further sweep adds nothing: no fifth attempt, no second card.
+  ageLandAttempts(db, a, 3_600_000);
+  const after = mergeStub(db, { [a]: reason });
+  await landOnce(db, { exec: filesExec({}), merge: after.merge });
+  expect(after.calls).toEqual([]);
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(1);
+});
+
+// A base that keeps moving costs nothing shared, so it keeps the fast cadence.
+test("a non-capacity transient failure still retries on the short backoff", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  const first = mergeStub(db, { [a]: "Base branch was modified. Review and try the merge again." });
+  await landOnce(db, { exec: filesExec({}), merge: first.merge });
+  ageLandAttempts(db, a, 60_000);
+  const retry = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: retry.merge });
+  expect(retry.calls).toEqual([a]);
+});
+
+// HIVE-555: a permanent blocker gave the same answer every 30s sweep forever.
+// One PR alone produced 52 of 116 land failures on one machine.
+test("a non-transient failure retries once, then holds instead of re-failing forever", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+  const reason = "the branch drops work that is already on main";
+
+  // First attempt: fails, opens the pause card.
+  const first = mergeStub(db, { [a]: reason });
+  await landOnce(db, { exec: filesExec({}), merge: first.merge });
+  expect(first.calls).toEqual([a]);
+  const card = db.query("SELECT id FROM decisions WHERE status = 'open'").get() as any;
+  expect(card).toBeTruthy();
+
+  // The director answers "retry". That buys exactly one more attempt.
+  apiAnswerDecision(db, stubHerdr, card.id, { answer_key: "retry" });
+  const second = mergeStub(db, { [a]: reason });
+  await landOnce(db, { exec: filesExec({}), merge: second.merge });
+  expect(second.calls).toEqual([a]);
+
+  // From here every sweep is a no-op: no merge, no new card, no event spam.
+  for (let i = 0; i < 5; i++) {
+    const later = mergeStub(db, { [a]: reason });
+    await landOnce(db, { exec: filesExec({}), merge: later.merge });
+    expect(later.calls).toEqual([]);
+  }
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'land_attempted'").get(a) as any).n).toBe(2);
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'land_blocked'").get(a) as any).n).toBe(1);
+  // Still queued, just paused: the approval did not evaporate.
+  expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(a) as any).land_queued_at).toBeTruthy();
+
+  // A new head_sha re-arms it: the agent pushed, so the verdict may differ.
+  db.query("UPDATE tasks SET head_sha = 'sha2' WHERE id = ?").run(a);
+  const rearmed = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: rearmed.merge });
+  expect(rearmed.calls).toEqual([a]);
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(a) as any).state).toBe("verifying");
+});
+
+test("a new head_sha closes the stale land-queue pause card", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+
+  const { merge } = mergeStub(db, { [a]: "the branch drops work that is already on main" });
+  await landOnce(db, { exec: filesExec({}), merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(1);
+
+  db.query("UPDATE tasks SET head_sha = 'sha2' WHERE id = ?").run(a);
+  const next = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: next.merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(0);
+
+  // Closing the card queues its "nothing to reply to" note, which holds one
+  // sweep. Once that drains, the new commit gets its attempt.
+  const steers = queuedSteers(db, a);
+  markSteersDelivered(db, steers.map((s) => s.id), "drain");
+  const after = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: after.merge });
+  expect(after.calls).toEqual([a]);
+});
+
+// HIVE-559: a CONFIRMED risk is agent work. Hive relays the finding to the agent
+// that wrote the code and only asks the director when the agent argues back or
+// the same risk survives the relay.
+const RISK_REASON =
+  'merge blocked — the risk check confirmed 1 risk on this head: “export drops rows” — the CSV writer skips the last page (evidence/export.md). Fix them, or merge with override_confirmed_risks=true.';
+// The refusal as mergeTask actually builds it: prose for the human, `code` for
+// the routing. merge-guard.test.ts asserts the gate really emits this pair.
+const RISK_FAILURE = { reason: RISK_REASON, code: CONFIRMED_RISK_CODE };
+
+test("a confirmed risk goes to the agent as a steer, opens no card, and holds the land", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+
+  const { calls, merge } = mergeStub(db, { [a]: RISK_FAILURE });
+  await landOnce(db, { exec: filesExec({}), merge });
+  expect(calls).toEqual([a]);
+  // No director card: the agent hears about it first.
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+  // The finding reaches the agent verbatim, evidence path included.
+  const steers = queuedSteers(db, a);
+  expect(steers).toHaveLength(1);
+  expect(steers[0].message).toContain(RISK_REASON);
+  expect(steers[0].message).toContain("evidence/export.md");
+  // Audited as a machine relay, not a director ruling.
+  const routed = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_routed_to_agent'").all(a) as any[];
+  expect(routed).toHaveLength(1);
+  expect(JSON.parse(routed[0].payload).head_sha).toBe("sha1");
+  // The land is held, and still approved: no merge, no unmark.
+  expect((db.query("SELECT state, land_queued_at FROM tasks WHERE id = ?").get(a) as any).state).toBe("in_review");
+  expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(a) as any).land_queued_at).toBeTruthy();
+
+  // A new head re-arms the merge with no card in between.
+  markSteersDelivered(db, steers.map((s) => s.id), "drain");
+  db.query("UPDATE tasks SET head_sha = 'sha2' WHERE id = ?").run(a);
+  ageLandAttempts(db, a, 3_600_000);
+  const after = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: after.merge });
+  expect(after.calls).toEqual([a]);
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(a) as any).state).toBe("verifying");
+});
+
+test("an agent that disputes a confirmed risk gets a card carrying the argument", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+
+  const first = mergeStub(db, { [a]: RISK_FAILURE });
+  await landOnce(db, { exec: filesExec({}), merge: first.merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+
+  // The agent reads it and argues the finding is wrong instead of pushing.
+  markSteersDelivered(db, queuedSteers(db, a).map((s) => s.id), "drain");
+  writeEvent(db, { task_id: a, source: "agent", type: "risk_dispute", payload: { note: "The last page is written by flush(); the finding read an older file." } });
+
+  ageLandAttempts(db, a, 3_600_000);
+  const second = mergeStub(db, { [a]: RISK_FAILURE });
+  await landOnce(db, { exec: filesExec({}), merge: second.merge });
+  const open = db.query("SELECT task_id, context FROM decisions WHERE status = 'open'").all() as any[];
+  expect(open).toHaveLength(1);
+  expect(open[0].task_id).toBe(a);
+  expect(open[0].context).toContain("The last page is written by flush()");
+  // One card, not one per sweep, and no second relay to the arguing agent.
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(1);
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'risk_routed_to_agent'").get(a) as any).n).toBe(1);
+});
+
+// The bug the risk check caught on this very PR: `answer` is the generic reply
+// channel for every steer and change-request question, so reading it as "the
+// agent disputes the risk" turned "on it, fixing now" — or a reply about
+// something else entirely — into a director card. That is the interruption this
+// feature exists to remove, so only `risk_dispute` counts.
+test("an ordinary answer after the relay is not a dispute and opens no card", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+
+  // The agent replies on the generic channel about something unrelated.
+  markSteersDelivered(db, queuedSteers(db, a).map((s) => s.id), "drain");
+  writeEvent(db, { task_id: a, source: "agent", type: "answer", payload: { note: "Yes, the export flag is behind the same env var you asked about." } });
+
+  // The relay is spent and the same commit still fails, so the director does
+  // hear about it — but as the ordinary "came back unfixed" hold, never as an
+  // argument the agent never made. That unrelated answer is nowhere near it.
+  ageLandAttempts(db, a, 3_600_000);
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'risk_routed_to_agent'").get(a) as any).n).toBe(1);
+  const open = db.query("SELECT context FROM decisions WHERE status = 'open'").all() as any[];
+  expect(open).toHaveLength(1);
+  expect(open[0].context).not.toContain("the same env var");
+  expect(open[0].context).not.toContain("disputes it");
+  expect(open[0].context).toContain("came back unfixed");
+});
+
+// The realistic dispute: delivering the steer bounces the task back to the
+// agent, so when it returns to review it is HELD by the unaddressed change
+// request and never reaches another merge attempt. The escalation still fires.
+test("a dispute escalates even while the task is held and never re-attempted", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
+
+  const steers = queuedSteers(db, a);
+  markSteersDelivered(db, steers.map((s) => s.id), "drain");
+  resumeReviewForDeliveredSteers(db, a, steers, "drain"); // → in_progress + changes_requested
+  writeEvent(db, { task_id: a, source: "agent", type: "risk_dispute", payload: { note: "the finding misread the flush path" } });
+  transition(db, a, "in_review", { source: "agent", reason: "handed back without a new commit" });
+
+  ageLandAttempts(db, a, 3_600_000);
+  const held = mergeStub(db, { [a]: RISK_FAILURE });
+  await landOnce(db, { exec: filesExec({}), merge: held.merge });
+  expect(held.calls).toEqual([]); // still held: no merge attempt at all
+  const open = db.query("SELECT task_id, context FROM decisions WHERE status = 'open'").all() as any[];
+  expect(open).toHaveLength(1);
+  expect(open[0].context).toContain("misread the flush path");
+});
+
+// The desync this design exists to prevent, made loud. If the merge gate stops
+// setting the code but the message still reads like a confirmed risk, hive keeps
+// routing to the agent (no silent revert to the director) AND records that the
+// two files have drifted apart, so a human finds out.
+test("a confirmed-risk refusal with no code still routes, and says loudly that it desynced", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+
+  // Code stripped: only the prose survives, exactly as a reworded gate would look.
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_REASON }).merge });
+
+  // Behaviour did NOT revert: the agent still gets the finding, no card opens.
+  expect(queuedSteers(db, a)).toHaveLength(1);
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+  // And the broken contract is on the record, not swallowed.
+  const desync = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_code_desync'").all(a) as any[];
+  expect(desync).toHaveLength(1);
+  expect(JSON.parse(desync[0].payload).expected_code).toBe(CONFIRMED_RISK_CODE);
+  const notes = db.query("SELECT title FROM notifications WHERE task_id = ?").all(a) as any[];
+  expect(notes.some((n) => n.title.includes(CONFIRMED_RISK_CODE))).toBe(true);
 });

@@ -81,3 +81,25 @@ export function everSpawned(db: DB, taskId: string): boolean {
 export function neverDispatched(db: DB, task: { id: string; source?: string | null }): boolean {
   return isExternalTask(task.source) && !everSpawned(db, task.id);
 }
+
+// ---------------------------------------------------------------- jira links
+// A work task that implements a mirrored ticket is titled '[WEB-110] ...'. That
+// prefix is a display convention, not a link: it is lost the moment someone
+// retitles the task. So it is parsed ONCE, when the task is created, and stored
+// in tasks.jira_mirror_task_id (HIVE-546). Nothing downstream re-derives it.
+const JIRA_TITLE_PREFIX = /^\[([A-Z][A-Z0-9_]*-\d+)\]/;
+
+export function jiraKeyFromTitle(title: string | null | undefined): string | null {
+  return JIRA_TITLE_PREFIX.exec(String(title ?? ""))?.[1] ?? null;
+}
+
+// The mirror row a new work task belongs to, or null when the title names no
+// ticket or hive has never mirrored it.
+export function mirrorTaskIdForTitle(db: DB, projectId: string, title: string | null | undefined): string | null {
+  const key = jiraKeyFromTitle(title);
+  if (!key) return null;
+  const row = db
+    .query("SELECT id FROM tasks WHERE project_id = ? AND jira_key = ? AND jira_link_kind = 'mirror'")
+    .get(projectId, key) as { id: string } | undefined;
+  return row?.id ?? null;
+}

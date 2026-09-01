@@ -772,6 +772,9 @@ textarea { font-family: inherit; }
   box-shadow: 0 0 0 3px rgba(70, 201, 139, 0.16);
   animation: pulse 1.6s infinite;
 }
+.sdot-h-deferred {
+  background: var(--text-faint);
+}
 .sdot-h-silent {
   background: var(--amber);
   box-shadow: 0 0 0 3px rgba(226, 165, 66, 0.16);
@@ -803,6 +806,9 @@ textarea { font-family: inherit; }
 .card-attn-age {
   flex-shrink: 0;
   white-space: nowrap;
+}
+.attn-deferred {
+  color: var(--text-dim);
 }
 .attn-silent {
   color: var(--amber);
@@ -1594,6 +1600,13 @@ textarea { font-family: inherit; }
 .dmini-answer {
   color: var(--text-dim);
   font-size: 13px;
+}
+/* An expired card keeps the question it was asking about, so the explanation
+   survives the card (HIVE-570). Quieter than the closing line above it. */
+.dmini-context {
+  margin-top: 4px;
+  white-space: pre-wrap;
+  opacity: 0.85;
 }
 
 /* ---- decision inbox ---- */
