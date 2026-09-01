@@ -30,6 +30,13 @@ export type State = (typeof STATES)[number];
 
 export const TERMINAL: State[] = ["done", "failed", "cancelled"];
 
+// States where an AGENT still owes work, so going quiet can mean it is wedged.
+// Every other state is parked on a person (needs_decision, in_review,
+// verifying) or finished (TERMINAL): there is no agent and no pane, so silence
+// there is the design and never a symptom (HIVE-615). `queued` is not here
+// either — nothing has been spawned yet.
+export const AGENT_HELD: State[] = ["in_progress"];
+
 // The sources that mean "a person did this": the web UI, the CLI when it is not
 // running under a hive agent, and anything explicitly attributed to the
 // director. Everything else — "agent", "system", "reconciler",

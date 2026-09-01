@@ -12,7 +12,7 @@ import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { startLoop } from "./loop.ts";
-import { evidenceCount, writeEvent, mutateWithEvent, lastAgentActivity, AGENT_EVENT_SOURCES, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, verificationGate, repairRequeueProvenance, currentAttemptCommitEvidenceCount, recoveryAttemptId, recoveryEpochRowid, recoveryPrHeadHasEvidence, startRecoveryEpoch, TERMINAL, type State } from "./state.ts";
+import { evidenceCount, writeEvent, mutateWithEvent, lastAgentActivity, AGENT_EVENT_SOURCES, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, verificationGate, repairRequeueProvenance, currentAttemptCommitEvidenceCount, recoveryAttemptId, recoveryEpochRowid, recoveryPrHeadHasEvidence, startRecoveryEpoch, TERMINAL, AGENT_HELD, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
 import { spawnMeta, replayCleanedUpRecovery, latestSpawnRecord } from "./cleanup.ts";
 import { raceSweep } from "./race.ts";
@@ -1903,6 +1903,13 @@ function humanMs(ms: number): string {
 // caller's filters (deferred, dependency-blocked, mirrors, chat supervisors)
 // already exclude everything that is quiet on purpose.
 function flagHung(db: DB, taskId: string, staleMs: number, nowMs: number): void {
+  // "The agent is still holding this task" has to be TRUE before we say it: the
+  // task must be in a state where an agent owes work AND still be bound to one.
+  // A verifying task is parked on the director with no agent and no pane, so the
+  // alert described a hang that cannot happen — and the director acted on it by
+  // requeueing work that had already merged (HIVE-615).
+  const holder = getTask(db, taskId);
+  if (!holder || !AGENT_HELD.includes(holder.state as State) || !holder.agent_target) return;
   const since = lastAgentActivity(db, taskId);
   if (!since) return;
   const quiet = nowMs - Date.parse(since);
@@ -1935,9 +1942,11 @@ function flagHung(db: DB, taskId: string, staleMs: number, nowMs: number): void 
 function flagStale(db: DB, deps: ReconcilerDeps): void {
   const staleMs = deps.staleMs ?? DEFAULT_STALE_MS;
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
-  // Only tasks that are actively worked (an agent could go silent).
-  // needs_decision / in_review are parked on the DIRECTOR — silence there is
-  // expected, and flagging it spawned pointless recovery nudges (2026-07-10).
+  // Only tasks that are actively worked (an agent could go silent) — AGENT_HELD.
+  // needs_decision / in_review / verifying are parked on the DIRECTOR — silence
+  // there is expected, and flagging it spawned pointless recovery nudges
+  // (2026-07-10) and, for verifying, an urgent "no progress" alert on a queue
+  // whose whole job is to wait (HIVE-615).
   // Never-spawned tracking-only tasks are externally driven, and chat
   // supervisors are intentionally idle between turns/wakeups: neither gets
   // worker staleness. A manually-spawned external task has a real agent that
@@ -1948,7 +1957,7 @@ function flagStale(db: DB, deps: ReconcilerDeps): void {
   const nowIso = new Date(nowMs).toISOString();
   const tasks = db
     .query(
-      `SELECT id FROM tasks WHERE state IN ('in_progress','verifying') AND ${supervisedSql()}
+      `SELECT id FROM tasks WHERE state IN (${AGENT_HELD.map((s) => `'${s}'`).join(",")}) AND ${supervisedSql()}
          AND (deferred_until IS NULL OR deferred_until <= ?)`
     )
     .all(nowIso) as { id: string }[];
