@@ -10,6 +10,24 @@ import { join } from "node:path";
 
 const { openDb } = await import("../src/db.ts");
 const { claimLease, renewLease, holdsLease, readLease } = await import("../src/lease.ts");
+const { spawnGuarded } = await import("./spawnGuarded.ts");
+
+// Every wait below polls until its condition holds, so it returns the instant the
+// condition flips — a measured lease handoff is ~100ms per phase on an idle
+// machine. The deadline therefore costs a healthy run nothing; it only decides
+// how loaded a runner has to be before working logic is reported as broken.
+// 15s was not enough on a busy linux runner (#128 flaked again on PR #130).
+// 60s is ~600x the measured handoff: a genuinely broken handoff never reaches
+// it, a merely slow runner always beats it.
+const DEADLINE_MS = 60_000;
+const until = async (fn: () => boolean | Promise<boolean>, ms = DEADLINE_MS) => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await fn()) return true;
+    await Bun.sleep(50);
+  }
+  return false;
+};
 
 test("claiming the lease displaces the previous holder, who can no longer renew", () => {
   const db = openDb(":memory:");
@@ -44,7 +62,9 @@ test("two servers on one DB: the predecessor stands down, one keeps running laps
     HIVE_REAP_MS: "600000",
   };
   const start = () => {
-    const proc = Bun.spawn([process.execPath, "run", entry], { env, stdout: "pipe", stderr: "pipe" });
+    // spawnGuarded, not Bun.spawn: a server started here must not outlive a run
+    // that is cut short. See spawnGuarded.ts.
+    const { proc, kill } = spawnGuarded([process.execPath, "run", entry], { env, stdout: "pipe", stderr: "pipe" });
     let text = "";
     // Both streams: the lease messages are console.warn/error (stderr), the
     // reconciler laps are console.log (stdout).
@@ -53,23 +73,7 @@ test("two servers on one DB: the predecessor stands down, one keeps running laps
         for await (const chunk of stream as ReadableStream<Uint8Array>) text += new TextDecoder().decode(chunk);
       })().catch(() => {});
     }
-    return { proc, out: () => text };
-  };
-  // Every wait below polls until the condition holds, so it returns the instant
-  // the lease moves — a measured handoff is ~100ms per phase on an idle machine.
-  // The deadline therefore costs a healthy run nothing; it only decides how
-  // loaded a runner has to be before working lease logic is reported as broken.
-  // 15s was not enough on a busy linux runner (#128 flaked again on PR #130).
-  // 60s is ~600x the measured handoff: a genuinely broken handoff never reaches
-  // it, a merely slow runner always beats it.
-  const DEADLINE_MS = 60_000;
-  const until = async (fn: () => boolean, ms = DEADLINE_MS) => {
-    const deadline = Date.now() + ms;
-    while (Date.now() < deadline) {
-      if (fn()) return true;
-      await Bun.sleep(50);
-    }
-    return false;
+    return { proc, kill, out: () => text };
   };
   // Poll who actually holds the DB lease, instead of counting "reconciler run:"
   // lines against a fixed wall-clock budget — a slow/loaded CI runner can miss
@@ -95,11 +99,11 @@ test("two servers on one DB: the predecessor stands down, one keeps running laps
       const before = readLease(db)?.at;
       expect(await until(() => holder() === b.proc.pid && readLease(db)?.at !== before)).toBe(true);
     } finally {
-      b.proc.kill();
+      b.kill();
       await b.proc.exited;
     }
   } finally {
-    a.proc.kill();
+    a.kill();
     await a.proc.exited;
   }
   // The outer timeout has to cover the SUM of all four waits, not just the
@@ -107,6 +111,66 @@ test("two servers on one DB: the predecessor stands down, one keeps running laps
   // yet add up. 4 x 60s is 240s, so 300s here. A healthy run finishes all four
   // phases in ~400ms, so this ceiling is never approached either.
 }, 300_000);
+
+// The leak the guard exists for (HIVE-586): the test above spawns REAL servers,
+// and when a run is cut short its `finally` never runs. Two such servers were
+// found still up the next morning. So prove the hard case, not the tidy one:
+// stand in a runner that spawns a server and then hangs, kill that runner the way
+// a timeout would (SIGKILL, no chance to clean up), and require the server to be
+// gone — no process, and nothing answering on the port it had.
+test("a runner killed mid-wait takes its spawned server down with it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hive-guard-"));
+  const runner = Bun.spawn([process.execPath, "run", join(import.meta.dir, "fixtures", "guarded-server-runner.ts")], {
+    env: {
+      ...process.env,
+      HIVE_DB: join(dir, "hive.db"),
+      HIVE_HOME: dir,
+      HIVE_PORT: "0", // ephemeral: never collides with a neighbour's server
+      HIVE_RECONCILE_MS: "60000",
+      HIVE_DISPATCH_MS: "60000",
+      HIVE_MONITOR_MS: "60000",
+      HIVE_MANAGER_WAKE_MS: "60000",
+      HIVE_REAP_MS: "600000",
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  let text = "";
+  for (const stream of [runner.stdout, runner.stderr]) {
+    (async () => {
+      for await (const chunk of stream as ReadableStream<Uint8Array>) text += new TextDecoder().decode(chunk);
+    })().catch(() => {});
+  }
+  const answers = async (port: number) => {
+    try {
+      await fetch(`http://127.0.0.1:${port}/api/health`);
+      return true; // any HTTP reply, including an error status, means a listener
+    } catch {
+      return false;
+    }
+  };
+
+  // Wait for the server to be really up: pid announced by the runner, port
+  // announced by the server itself.
+  expect(await until(() => /SERVER_PID \d+/.test(text) && /server on http:\/\/[^:]+:\d+/.test(text))).toBe(true);
+  const pid = Number(text.match(/SERVER_PID (\d+)/)![1]);
+  const port = Number(text.match(/server on http:\/\/[^:]+:(\d+)/)![1]);
+  expect(await until(() => answers(port))).toBe(true);
+
+  runner.kill("SIGKILL"); // the cut-short run: no finally, no cleanup
+  await runner.exited;
+
+  const alive = () => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  expect(await until(() => !alive(), 30_000)).toBe(true);
+  expect(await answers(port)).toBe(false);
+}, 120_000);
 
 // ---------------------------------------------------------------- enforcement
 // The lease above is an ASK. These cover what happens when a second server does
@@ -142,7 +206,7 @@ test("the refusal advice tells the operator to stop the scratch server", () => {
 // "live" db. The process must die before it serves, leases or reconciles.
 test("a throwaway server that forgets HIVE_DB exits instead of attaching to the fleet db", async () => {
   const home = mkdtempSync(join(tmpdir(), "hive-fakehome-"));
-  const proc = Bun.spawn([process.execPath, "run", join(import.meta.dir, "..", "src", "index.ts")], {
+  const { proc } = spawnGuarded([process.execPath, "run", join(import.meta.dir, "..", "src", "index.ts")], {
     // NODE_ENV: "" — this spawns a real server process, not a test; it must hit
     // index.ts's own interloperReason refusal below, not openDb's test-only guard.
     env: { ...process.env, HOME: home, USERPROFILE: home, HIVE_DB: "", HIVE_PORT: "4791", HIVE_HOME: home, NODE_ENV: "" },
