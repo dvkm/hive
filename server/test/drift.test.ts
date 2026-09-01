@@ -10,7 +10,8 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-drift-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb, newId, now } = await import("../src/db.ts");
-const { driftCheckOnce, extractDrift, resolveScopeDriftForDecision, startDriftWatch } = await import("../src/drift.ts");
+const { driftCheckOnce, extractDrift, resolveScopeDriftForDecision, startDriftWatch, directionSinceBrief, splitByDirection } =
+  await import("../src/drift.ts");
 const { transition } = await import("../src/state.ts");
 import type { DB } from "../src/db.ts";
 import type { Exec } from "../src/exec.ts";
@@ -35,8 +36,12 @@ function setup(config: any = {}, brief = BRIEF): { db: DB; id: string } {
 // A stub `git` for one branch state: N commits over the given files. The log
 // call must ask for the branch's OWN commits — a plain `base..branch` also
 // lists whatever a `git merge main` dragged in.
-const git = (files: string[], commits: string[]): Exec => async (argv) => {
+const git = (files: string[], commits: string[], added: Record<string, string[]> = {}): Exec => async (argv) => {
   if (argv.includes("--name-only")) return { code: 0, stdout: files.join("\n"), stderr: "" };
+  if (argv.includes("--unified=0")) {
+    const diff = Object.entries(added).map(([f, lines]) => [`+++ b/${f}`, ...lines.map((l) => `+${l}`)].join("\n"));
+    return { code: 0, stdout: diff.join("\n"), stderr: "" };
+  }
   if (argv.includes("--format=%s")) {
     expect(argv).toContain("--first-parent");
     expect(argv).toContain("--no-merges");
@@ -80,24 +85,31 @@ test("an over-scope run raises the drift card before the third review round", as
   expect(card).toHaveLength(1);
   expect(card[0].title).toContain("growing past its brief");
   expect(card[0].context).toContain("web/src/lib/needsYou.ts");
-  expect(JSON.parse(card[0].options).map((o: any) => o.key)).toEqual(["trim", "split", "continue"]);
-  expect(JSON.parse(card[0].options).find((o: any) => o.recommended).key).toBe("trim");
+  // Trim DELETES requested work and these cards auto-answer on a timeout, so the
+  // recommendation is split — it preserves the work either way (HIVE-560).
+  expect(JSON.parse(card[0].options).map((o: any) => o.key)).toEqual(["split", "continue", "trim"]);
+  expect(JSON.parse(card[0].options).find((o: any) => o.recommended).key).toBe("split");
   // The task is parked for the director and the drift is on the record.
   expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("needs_decision");
   expect(events(db, id, "scope_drift")[0].payload.beyond).toContain("server/src/state.ts");
 });
 
-// The prompt is what the brief asked for: footprint vs brief, no diff.
+// The prompt: footprint vs brief, plus a sample of the added lines.
 test("the judge is asked about the brief, the files and the commit subjects", async () => {
   const { db } = setup();
   const seen: string[] = [];
   await driftCheckOnce(db, {
-    shellExec: git(OVER, ["mirror the rule into web", "add the predicate", "wip"]),
+    shellExec: git(OVER, ["mirror the rule into web", "add the predicate", "wip"], {
+      "server/src/state.ts": ["// HIVE-560: the reason this line exists"],
+    }),
     exec: judge({ drifting: false, beyond: [], why: "in scope" }, seen),
   });
   expect(seen[0]).toContain("Do NOT alter task semantics");
   expect(seen[0]).toContain("web/src/lib/needsYou.ts");
   expect(seen[0]).toContain("mirror the rule into web");
+  // Content, not just paths: the judge must be able to read WHY a file changed
+  // instead of guessing from its name (HIVE-560).
+  expect(seen[0]).toContain("// HIVE-560: the reason this line exists");
   expect(seen[0]).toContain("--disallowed-tools=");
 });
 
@@ -325,4 +337,123 @@ test("a branch rebased onto an ahead-of-local-main origin/main shows zero footpr
   expect(await driftCheckOnce(db, { shellExec: recording, exec: judge({ drifting: false, beyond: [], why: "" }) })).toBeNull();
   expect(argvs.some((a) => a.some((x) => x.startsWith("main.")))).toBe(false);
   expect(openCards(db, id)).toHaveLength(0);
+});
+
+// HIVE-560. The checker compared work against the BRIEF alone, so any direction
+// given mid-run read as scope creep — three tasks in one night, all answered
+// "continue", and the recommended answer would have deleted correct work.
+const steerTask = (db: DB, id: string, message: string) =>
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    newId("ev"), id, now(), "director", "steer", JSON.stringify({ message, delivery: "delivered" })
+  );
+
+const answerCard = (db: DB, id: string, title: string, label: string) =>
+  db.query(
+    "INSERT INTO decisions (id, task_id, ts, title, options, status, answer_key, answered_at) VALUES (?,?,?,?,?, 'answered', 'a', ?)"
+  ).run(newId("dec"), id, now(), title, JSON.stringify([{ key: "a", label }]), now());
+
+test("a steer and an answered decision are part of the ask, not scope creep (HIVE-560)", async () => {
+  const { db, id } = setup();
+  steerTask(db, id, "also mirror the rule into web/src/lib/needsYou.ts while you are in there");
+  answerCard(db, id, "one table or two?", "merge onto one table — write the schema migration");
+  const seen: string[] = [];
+
+  // The judge sees the direction alongside the brief...
+  expect(await driftCheckOnce(db, {
+    shellExec: git(OVER, ["r3", "r2", "r1"]),
+    exec: judge({ drifting: true, beyond: ["web/src/lib/needsYou.ts mirrors the rule"], why: "grew into the web layer" }, seen),
+  })).toBe(id);
+  expect(seen[0]).toContain("also mirror the rule into web/src/lib/needsYou.ts");
+  expect(seen[0]).toContain("merge onto one table");
+
+  // ...and even when it flags that work anyway, a path the direction named is
+  // not carded. No card means no auto-answered "trim" deleting requested work.
+  expect(openCards(db, id)).toHaveLength(0);
+  const check = events(db, id, "scope_drift_check")[0].payload;
+  expect(check.covered_by_direction).toEqual(["web/src/lib/needsYou.ts mirrors the rule"]);
+});
+
+test("real scope creep — a file nobody mentioned — still raises the card (HIVE-560)", async () => {
+  const { db, id } = setup();
+  steerTask(db, id, "also mirror the rule into web/src/lib/needsYou.ts");
+  expect(await driftCheckOnce(db, {
+    shellExec: git(OVER, ["r3", "r2", "r1"]),
+    exec: judge({
+      drifting: true,
+      beyond: ["web/src/lib/needsYou.ts mirrors the rule", "server/src/health.ts rewritten"],
+      why: "health.ts was rewritten and nobody asked",
+    }),
+  })).toBe(id);
+  const card = openCards(db, id);
+  expect(card).toHaveLength(1);
+  expect(card[0].context).toContain("server/src/health.ts");
+  expect(card[0].context).not.toContain("needsYou");
+});
+
+test("directionSinceBrief reads director steers and answered decisions, not hive's own steers", () => {
+  const { db, id } = setup();
+  steerTask(db, id, "unlink 비고 from the homepage too");
+  answerCard(db, id, "one table or two?", "merge onto one table");
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    newId("ev"), id, now(), "system", "steer", JSON.stringify({ message: "do not retry the land", delivery: "queued" })
+  );
+  const direction = directionSinceBrief(db, id);
+  expect(direction.map((d) => d.kind).sort()).toEqual(["decision", "steer"]);
+  expect(direction.find((d) => d.kind === "steer")!.text).toContain("unlink 비고");
+  expect(direction.find((d) => d.kind === "decision")!.text).toContain("merge onto one table");
+  expect(JSON.stringify(direction)).not.toContain("do not retry");
+});
+
+test("splitByDirection only clears items the direction actually names", () => {
+  const direction = [{ kind: "steer" as const, ts: now(), text: "please also touch server/src/health.ts and web/src/views/" }];
+  const { flag, covered } = splitByDirection(
+    ["server/src/health.ts hardened", "web/src/views/Task.tsx rewritten", "server/src/state.ts refactored"],
+    direction
+  );
+  expect(covered).toEqual(["server/src/health.ts hardened", "web/src/views/Task.tsx rewritten"]);
+  expect(flag).toEqual(["server/src/state.ts refactored"]);
+  // No direction at all: nothing is cleared.
+  expect(splitByDirection(["server/src/state.ts refactored"], []).flag).toHaveLength(1);
+});
+
+// The judge's confident-but-false claim (HIVE-511): a test for THIS task's own
+// feature, added to an existing test file, was called unrelated "with no stated
+// reason" — from the filename alone, because the prompt never showed content.
+test("the judge is shown the added lines of every file it is judging (HIVE-560)", async () => {
+  const { db } = setup();
+  const seen: string[] = [];
+  await driftCheckOnce(db, {
+    shellExec: git(["server/src/supervision.ts", "server/test/jira.test.ts"], ["r3", "r2", "r1"], {
+      "server/test/jira.test.ts": ["// HIVE-511: the catchup card shows a before/after pair, so a rendered proof", "// has to say which side it is."],
+    }),
+    exec: judge({ drifting: false, beyond: [], why: "in scope" }, seen),
+  });
+  expect(seen[0]).toContain("HIVE-511: the catchup card shows a before/after pair");
+  expect(seen[0]).toContain("Judge by CONTENT, never by a file's NAME");
+});
+
+// A steer arriving mid-run must not be a reason to check less carefully: the
+// footprint sampling is bounded, so a huge diff cannot blow up the prompt.
+test("the added-line sample is bounded per file and overall", async () => {
+  const { addedLineSamples } = await import("../src/drift.ts");
+  const many = Object.fromEntries(
+    Array.from({ length: 40 }, (_, i) => [`server/src/f${i}.ts`, Array.from({ length: 30 }, (_, j) => `line ${j} ` + "x".repeat(400))])
+  );
+  const samples = await addedLineSamples(git([], [], many), "/repo", "origin/main", "hive/abc");
+  const lines = Object.values(samples).flat();
+  expect(lines.length).toBeLessThanOrEqual(200);
+  for (const [, ls] of Object.entries(samples)) expect(ls.length).toBeLessThanOrEqual(8);
+  for (const l of lines) expect(l.length).toBeLessThanOrEqual(160);
+});
+
+// The brief itself can be rewritten mid-run (the director rewrote WEB-118's).
+// The check reads tasks.brief, which the edit endpoint updates in place, so it
+// already measures against the CURRENT brief.
+test("the check measures against the current brief, not the original (HIVE-560)", async () => {
+  const { db, id } = setup();
+  db.query("UPDATE tasks SET brief = ? WHERE id = ?").run("Rewritten: unlink 비고 from the public reader UI.", id);
+  const seen: string[] = [];
+  await driftCheckOnce(db, { shellExec: git(WITHIN, ["r3", "r2", "r1"]), exec: judge({ drifting: false, beyond: [], why: "in scope" }, seen) });
+  expect(seen[0]).toContain("Rewritten: unlink 비고");
+  expect(seen[0]).not.toContain("Do NOT alter task semantics");
 });
