@@ -368,7 +368,7 @@ test("a risk about behaviour added after the ruling is still confirmed", async (
   expect(confirmedRisks(db, id, "head-a").map((c: any) => c.risk)).toEqual(["autoplay fights the fixed-size creative"]);
 });
 
-test("a task with no answered decision gets the prompt unchanged", async () => {
+test("a task with no answered decision still gets the repair block, but no settled-decision section", async () => {
   const { db, id } = setup();
   const prompts: string[] = [];
   const claude = async (argv: string[]) => {
