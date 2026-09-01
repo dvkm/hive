@@ -735,6 +735,24 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
          AND title LIKE '[%'`,
     ],
   },
+  // HIVE-554: v39 only caught tasks that existed at deploy time. `source`
+  // stays directly settable through the task-create API body (not just the
+  // retired --track flag), so rows created after v39 ran are still stranded
+  // the same way — never dispatched, and now unreachable by defer/undefer
+  // since the source check short-circuits first. Same fix, re-run once more
+  // for the rows v39 missed. Jira mirrors are untouched by the same guard.
+  // Re-runnable: the park runs before the source clear, and once source is
+  // cleared the WHERE matches nothing.
+  {
+    name: "v45-retire-tracking-only-source-again",
+    statements: [
+      `UPDATE tasks SET deferred_until = '9999-12-31T00:00:00.000Z'
+         WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'
+           AND state NOT IN ('done', 'failed', 'cancelled') AND deferred_until IS NULL`,
+      `UPDATE tasks SET source = NULL
+         WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings
