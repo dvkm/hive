@@ -97,11 +97,11 @@ test("seeds and warms the worktree before setup_argv, and records the timings", 
   const seeded: any = db
     .query("SELECT payload FROM events WHERE task_id = ? AND type = 'worktree_seeded'")
     .get(taskId);
-  expect(JSON.parse(seeded.payload)).toMatchObject({ seeded: [".env"], warmed: ["node_modules"] });
+  expect(JSON.parse(seeded.payload)).toMatchObject({ seeded: [".env"], warmed: [{ dir: "node_modules", method: "clone" }] });
 
   const spawned: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'spawned'").get(taskId);
   const p = JSON.parse(spawned.payload);
-  expect(p.warmed).toEqual(["node_modules"]);
+  expect(p.warmed).toEqual([{ dir: "node_modules", method: "clone" }]);
   for (const key of ["spawn_ms", "seed_ms", "setup_ms"]) expect(typeof p[key]).toBe("number");
   expect(p.spawn_ms).toBeGreaterThanOrEqual(p.seed_ms + p.setup_ms);
 

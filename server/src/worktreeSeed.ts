@@ -26,7 +26,11 @@ import { defaultExec } from "./exec.ts";
 
 export interface SeedResult {
   seeded: string[]; // untracked files copied in
-  warmed: string[]; // directories cloned in
+  // Directories warmed, and HOW. `clone` is the copy-on-write path this exists
+  // for; `copy` is a real byte copy, which is no faster than the install it
+  // replaces. They look identical from the outside, so a slow machine would be
+  // indistinguishable from a fast one in the stats unless we say which ran.
+  warmed: { dir: string; method: WarmMethod }[];
   // Expected, correct outcomes. A lockfile that genuinely changed, a file the
   // worktree already owns: the design working, so these stay quiet.
   skipped: { path: string; reason: string }[];
@@ -37,14 +41,21 @@ export interface SeedResult {
   ms: number;
 }
 
-// Copy-on-write clone flags per platform. macOS `cp -c` FAILS outright when the
-// filesystem cannot clone, so the caller falls back; Linux's `--reflink=auto`
-// degrades to a plain copy on its own. Anything else takes the fs fallback.
+// How a directory actually got warmed. Recorded per entry because the fast path
+// is a filesystem feature, not a code path we can assume: the same config on the
+// same repo clones on APFS/btrfs and byte-copies everywhere else.
+export type WarmMethod = "clone" | "copy";
+
+// Copy-on-write clone flags per platform. Both variants FAIL when the filesystem
+// cannot clone — macOS `cp -c` refuses, and `--reflink=always` is chosen over
+// `auto` precisely so it refuses too instead of silently degrading to a byte
+// copy. A non-zero exit is then the honest signal that the fast path was not
+// available, and the fallback below records itself as `copy`.
 // A big enough budget that even a real byte copy finishes; defaultExec's 60s
 // default would kill a large tree half-written.
 const CLONE_TIMEOUT_MS = 300_000;
 const CLONE_ARGV: string[] | null =
-  process.platform === "darwin" ? ["cp", "-Rc"] : process.platform === "linux" ? ["cp", "-R", "--reflink=auto"] : null;
+  process.platform === "darwin" ? ["cp", "-Rc"] : process.platform === "linux" ? ["cp", "-R", "--reflink=always"] : null;
 
 // Keep a config-supplied path inside the tree it claims to be relative to.
 // projects.config is already an RCE surface (see projectConfig.ts), so this is
@@ -64,7 +75,7 @@ function insideTree(root: string, rel: string): string | null {
 // lockfile rule exists to prevent, so it must not come back in through here.
 // Temp lives beside `dst` on purpose — same directory means same filesystem,
 // which is what makes the rename atomic rather than a copy.
-async function cloneDir(src: string, dst: string, exec: Exec): Promise<void> {
+async function cloneDir(src: string, dst: string, exec: Exec): Promise<WarmMethod> {
   mkdirSync(dirname(dst), { recursive: true });
   const tmp = `${dst}.hive-warm-${process.pid}-${Date.now()}`;
   if (CLONE_ARGV) {
@@ -73,12 +84,17 @@ async function cloneDir(src: string, dst: string, exec: Exec): Promise<void> {
     // than degrading). Clear whatever it left in temp so the fallback below
     // starts from nothing instead of merging into a partial tree.
     if (r.code !== 0) rmSync(tmp, { recursive: true, force: true });
-    else return void renameSync(tmp, dst);
+    else {
+      renameSync(tmp, dst);
+      return "clone";
+    }
   }
   // ponytail: a real byte copy, so no faster than the install it replaces on a
-  // filesystem without reflinks. Correct everywhere, which is what matters.
+  // filesystem without reflinks. Correct everywhere, which is what matters —
+  // and reported as `copy` so nobody reads the slow path as the fast one.
   cpSync(src, tmp, { recursive: true });
   renameSync(tmp, dst);
+  return "copy";
 }
 
 // Same bytes on both sides? That is the whole invalidation rule: a branch that
@@ -185,8 +201,7 @@ export async function seedWorktree(
       }
     }
     try {
-      await cloneDir(src, dst, exec);
-      out.warmed.push(dir);
+      out.warmed.push({ dir, method: await cloneDir(src, dst, exec) });
     } catch (e: any) {
       // Nothing to undo: the rename never ran, so `dst` was never created.
       out.misconfigured.push({ path: dir, reason: String(e?.message ?? e).slice(0, 200) });

@@ -166,7 +166,7 @@ A fresh worktree is missing the two things that make it slow to start on, and gi
 
   Omitting `lock` clones unconditionally. Only do that for a directory no branch can invalidate.
 
-Each spawn records what it did. A `worktree_seeded` event lists what was seeded, warmed, and skipped with the reason; the `spawned` event carries the spawn-to-ready breakdown in milliseconds as `spawn_ms`, `seed_ms`, and `setup_ms`. `seed_ms` and `setup_ms` are the two halves warm worktrees trade against each other: a cloned `node_modules` moves cost out of `setup_ms` and into a much smaller `seed_ms`.
+Each spawn records what it did. A `worktree_seeded` event lists what was seeded, warmed, and skipped with the reason. Each warmed directory records how it was warmed: `clone` is the copy-on-write clone this feature exists for, and `copy` is a full byte copy, which happens on a filesystem without copy-on-write support and is no faster than a fresh install. The `spawned` event carries the same `warmed` list, so a machine on the slow path is visible in the stats rather than looking identical to a fast one. The `spawned` event also carries the spawn-to-ready breakdown in milliseconds as `spawn_ms`, `seed_ms`, and `setup_ms`. `seed_ms` and `setup_ms` are the two halves warm worktrees trade against each other: a cloned `node_modules` moves cost out of `setup_ms` and into a much smaller `seed_ms`.
 
 3. **Ensure the fleet workspace** — adopt-or-create a dedicated named workspace
    labelled **`hive-fleet`** (`HIVE_FLEET_LABEL` override), `--no-focus` so a

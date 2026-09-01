@@ -4389,6 +4389,8 @@ export async function spawnAgent(
       // two halves warm worktrees trade against each other: a cloned
       // node_modules pushes cost out of setup_ms and into a much smaller seed_ms.
       spawn_ms: Date.now() - spawnStarted,
+      // `warmed` carries how each directory was warmed: a `copy` entry means this
+      // machine's filesystem cannot do copy-on-write, which is why seed_ms is big.
       ...(timing.seed ? { seed_ms: timing.seed.ms, seeded: timing.seed.seeded, warmed: timing.seed.warmed } : {}),
       ...(timing.setupMs === null ? {} : { setup_ms: timing.setupMs }),
     },

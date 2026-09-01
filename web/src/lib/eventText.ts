@@ -149,14 +149,19 @@ export function eventText(e: EventLike): string {
       return `worktree reclaim failed: ${s(p.error)}`;
     case "worktree_seeded": {
       const seeded = list(p.seeded);
-      const warmed = list(p.warmed);
+      // Warm entries carry HOW they were warmed. A byte copy is not the win
+      // this feature exists for, so say which one happened rather than letting
+      // a slow machine read exactly like a fast one.
+      const warmed = list(p.warmed) as { dir?: unknown; method?: unknown }[];
       // A skip is the design working — the deps really changed, or the file is
       // already there — but it is not "nothing happened". It is the reason a
       // spawn was slow, which is exactly what someone reads this line to find.
       const skipped = list(p.skipped) as { path?: unknown; reason?: unknown }[];
       const did = [
         seeded.length ? `copied ${seeded.length} config file${seeded.length === 1 ? "" : "s"}` : null,
-        warmed.length ? `reused ${warmed.map(s).join(", ")}` : null,
+        warmed.length
+          ? `reused ${warmed.map((w) => `${s(w.dir)} (${s(w.method) === "clone" ? "copy-on-write clone" : "full copy"})`).join(", ")}`
+          : null,
         skipped.length ? `skipped ${skipped.map((k) => `${s(k.path)} (${s(k.reason)})`).join(", ")}` : null,
       ].filter(Boolean);
       return did.length ? `worktree seeded: ${did.join(", ")}` : "worktree seeded: nothing to copy or reuse";

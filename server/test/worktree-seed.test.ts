@@ -51,7 +51,7 @@ test("a glob matches, and a file the worktree already has is never clobbered", a
 test("clones node_modules when the lockfile still matches", async () => {
   const { repo, wt } = trees("LOCK-V1");
   const r = await seedWorktree(repo, wt, { worktree_warm: [{ dir: "node_modules", lock: "bun.lock" }] }, realExec);
-  expect(r.warmed).toEqual(["node_modules"]);
+  expect(r.warmed).toEqual([{ dir: "node_modules", method: "clone" }]);
   expect(readFileSync(join(wt, "node_modules", "left-pad", "index.js"), "utf8")).toBe("module.exports=1");
 });
 
@@ -126,7 +126,9 @@ test("a clone that fails leaves nothing half-built behind", async () => {
   // Every `cp` fails, so the exec path bails and the fs fallback still finishes.
   const failing: Exec = async () => ({ code: 1, stdout: "", stderr: "cp: no clone support" });
   const r = await seedWorktree(repo, wt, { worktree_warm: [{ dir: "node_modules", lock: "bun.lock" }] }, failing);
-  expect(r.warmed).toEqual(["node_modules"]);
+  // The fallback ran, so it must NOT claim the fast path: a byte copy on a
+  // filesystem without clone support has to be visible as one in the stats.
+  expect(r.warmed).toEqual([{ dir: "node_modules", method: "copy" }]);
   expect(readFileSync(join(wt, "node_modules", "left-pad", "index.js"), "utf8")).toBe("module.exports=1");
 });
 
@@ -143,7 +145,7 @@ test("a cp that dies part-way never leaves a half-built node_modules", async () 
     return { code: 137, stdout: "", stderr: "Killed" };
   };
   const r = await seedWorktree(repo, wt, { worktree_warm: [{ dir: "node_modules", lock: "bun.lock" }] }, killedPartWay);
-  expect(r.warmed).toEqual(["node_modules"]);
+  expect(r.warmed).toEqual([{ dir: "node_modules", method: "copy" }]);
   expect(readFileSync(join(wt, "node_modules", "left-pad", "index.js"), "utf8")).toBe("module.exports=1");
   expect(existsSync(join(wt, "node_modules", "half-written"))).toBe(false);
 });
