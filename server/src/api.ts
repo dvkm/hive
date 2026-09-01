@@ -6901,6 +6901,28 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
           });
         }
       }
+      // Missing-check gate (HIVE-580). The land gate already refuses a merge
+      // whose latest review carries no understanding check, but it runs in a
+      // different process after the agent's turn is over: four PRs in one day
+      // each cost a failed land attempt, a decision card and a respawn to add
+      // two sentences the agent could have written while it still had the
+      // change in its head. Same helper the merge gate reads, so there is one
+      // rule and no drift — just applied while someone is still there to act
+      // on it. It sits BEFORE the CI hold on purpose: a CI-pending handoff is
+      // promoted later by the reconciler, which never passes through here.
+      if (understandingChecksRequired(db, t) && !latestUnderstandingQuiz(db, taskId)) {
+        writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { reason: "missing_understanding_check" } });
+        broadcastTask(db, getTask(db, taskId));
+        return json({
+          held: true,
+          reason: "missing_understanding_check",
+          action: "add understanding.checks to your review, then emit ready again",
+          message:
+            "This task kind requires an understanding check and your latest review has none.\n" +
+            `Add one to your review and emit it again: hive emit ${taskId} review_summary --json ...\n` +
+            "You do not need a respawn for this.",
+        });
+      }
       const pr = prUrl ?? t.pr_url;
       if (pr) {
         let ci: string | null = null;

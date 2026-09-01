@@ -52,6 +52,21 @@ async function post(base: string, path: string, body: unknown) {
   return { status: res.status, json: await res.json() };
 }
 
+// The handoff also holds when the review carries no understanding check
+// (HIVE-580). These tests are about evidence freshness, so they file one and
+// get on with it.
+const CHECKS = {
+  checks: [
+    {
+      question: "What does this change do?",
+      options: [{ key: "a", label: "the work" }, { key: "b", label: "nothing" }],
+      answer_key: "a",
+    },
+  ],
+};
+const fileReview = (base: string, id: string) =>
+  post(base, `/api/tasks/${id}/events`, { type: "review_summary", done: ["did the thing"], understanding: CHECKS });
+
 test("evidence is stamped with the worktree HEAD sha, and the ready gate rejects stale evidence", async () => {
   const head = { sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
   const s = makeServer(head);
@@ -66,6 +81,7 @@ test("evidence is stamped with the worktree HEAD sha, and the ready gate rejects
   expect(evidenceAtSha(s.db, id, head.sha)).toBe(1);
 
   // Ready at the same commit: evidence matches HEAD → hands off.
+  await fileReview(s.base, id);
   const r1 = await post(s.base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/1" });
   expect(r1.json.task.state).toBe("in_review");
 
@@ -127,6 +143,7 @@ test("a stale handoff names both commits and the action, and re-emitting after a
   // (an amend). The review still describes this code, so a plain re-emit hands
   // off: no re-capture, no respawn.
   await post(s.base, `/api/tasks/${id}/events`, { type: "evidence", note: "fresh run", kind: "log" });
+  await fileReview(s.base, id);
   head.sha = "3333333333333333333333333333333333333333";
   head.tree = "treeB";
   const r2 = await post(s.base, `/api/tasks/${id}/events`, { type: "ready" });
@@ -144,7 +161,7 @@ test("a genuinely current review is recorded and hands off first time", async ()
   const id = t.json.id;
   await post(s.base, `/api/tasks/${id}/spawn`, {});
   await post(s.base, `/api/tasks/${id}/events`, { type: "evidence", note: "test run", kind: "log" });
-  const review = await post(s.base, `/api/tasks/${id}/events`, { type: "review_summary", done: ["did the thing"] });
+  const review = await fileReview(s.base, id);
   expect(review.status).toBe(201);
   const ready = await post(s.base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/9" });
   expect(ready.json.task.state).toBe("in_review");
@@ -174,6 +191,7 @@ test("the caller cannot decide which commit the evidence is stamped with", async
   expect(e.json.evidence.meta.commit_sha).toBe(head.sha);
 
   // So the handoff goes through instead of being held against a foreign commit.
+  await fileReview(s.base, id);
   const ready = await post(s.base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/5" });
   expect(ready.json.task.state).toBe("in_review");
 
@@ -198,7 +216,7 @@ test("an observation is not commit-bound, so a later commit does not hold the ha
   expect(e.json.evidence.meta.commit_sha).toBeUndefined();
 
   head.sha = "7777777777777777777777777777777777777777";
-  const review = await post(s.base, `/api/tasks/${id}/events`, { type: "review_summary", done: ["ran the query"] });
+  const review = await post(s.base, `/api/tasks/${id}/events`, { type: "review_summary", done: ["ran the query"], understanding: CHECKS });
   expect(review.status).toBe(201);
   const ready = await post(s.base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/6" });
   expect(ready.json.task.state).toBe("in_review");

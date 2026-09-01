@@ -690,11 +690,31 @@ test("transition endpoint enforces the state machine", async () => {
   expect(bad2.status).toBe(409);
 });
 
+// A handoff is held when the task owes an understanding check and its latest
+// review has none (HIVE-580). Tests that only care about the pr_url plumbing
+// file this first so they reach the part they are actually about.
+const REVIEW_WITH_CHECK = {
+  type: "review_summary",
+  done: ["the work"],
+  understanding: {
+    essence: "a change",
+    checks: [
+      {
+        question: "What does this change do?",
+        options: [{ key: "a", label: "the work" }, { key: "b", label: "nothing" }],
+        answer_key: "a",
+        explanation: "It does the work.",
+      },
+    ],
+  },
+};
+
 test("in_review task with a PR refuses a direct move to verifying (must use /merge)", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "pr bypass task" });
   const id = t.json.id;
   await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
   await post(`/api/tasks/${id}/events`, { type: "evidence", note: "proof", kind: "log" });
+  await post(`/api/tasks/${id}/events`, REVIEW_WITH_CHECK);
   await post(`/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/99" });
 
   const r = await post(`/api/tasks/${id}/transition`, { to: "verifying" });
@@ -708,6 +728,7 @@ test("ready emit records the pr_url and advances in_progress -> in_review", asyn
   const id = t.json.id;
   await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
   await post(`/api/tasks/${id}/events`, { type: "evidence", note: "proof", kind: "log" });
+  await post(`/api/tasks/${id}/events`, REVIEW_WITH_CHECK);
 
   const r = await post(`/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/42", note: "PR up" });
   expect(r.status).toBe(200);
@@ -746,6 +767,7 @@ test("ready emit refreshes stale branch metadata for an already-linked PR", asyn
     const task = await call("/api/tasks", { project_id: project.json.id, title: "replace stale PR" });
     await call(`/api/tasks/${task.json.id}/transition`, { to: "in_progress" });
     await call(`/api/tasks/${task.json.id}/events`, { type: "evidence", note: "proof", kind: "log" });
+    await call(`/api/tasks/${task.json.id}/events`, REVIEW_WITH_CHECK);
     db2.query("UPDATE tasks SET branch = ?, pr_url = ? WHERE id = ?").run(
       "hive/task-rejected",
       "https://github.com/example/repo/pull/2",

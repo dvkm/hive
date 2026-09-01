@@ -146,9 +146,9 @@ export function eventText(e: EventLike): string {
     case "worktree_reclaim_failed":
       return `worktree reclaim failed: ${s(p.error)}`;
     case "ready_held":
-      return s(p.reason) === "no_evidence"
-        ? "handoff held: no evidence attached yet"
-        : `handoff held: CI ${s(p.ci_status)} on ${s(p.pr_url)}`;
+      if (s(p.reason) === "no_evidence") return "handoff held: no evidence attached yet";
+      if (s(p.reason) === "missing_understanding_check") return "handoff held: the review carries no understanding check";
+      return `handoff held: CI ${s(p.ci_status)} on ${s(p.pr_url)}`;
     case "ci_failure":
       return `CI failing — agent nudged to fix`;
     case "merge_failed": {

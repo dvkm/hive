@@ -69,7 +69,11 @@ Rules:
   judgment-class work: the auto-review verdict is not \`looks_good\`, the diff
   touches security, auth, payments or migrations, the task kind is outside the
   project's auto-merge list, or the director asked for a quiz on this card. For
-  everything else the checks are OPTIONAL, and leaving them out blocks nothing.
+  everything else the checks are OPTIONAL. In practice the auto-review has
+  usually not run yet when you hand off, and no verdict counts as "not
+  \`looks_good\`", so \`hive emit ... ready\` holds the handoff when your latest
+  review has no checks. Write them with the review while the change is still
+  fresh; you clear that hold in the same turn, with no respawn.
   Re-emitting a review after a rebase, a risk finding or a CI fix? Leave
   \`understanding.checks\` out and the checks you already sent stay in place,
   along with the director's pass. Re-listing the same questions keeps the pass

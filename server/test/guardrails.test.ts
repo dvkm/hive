@@ -475,7 +475,57 @@ test("emit ready without evidence is held with instructions; passes once evidenc
   db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
     "evd_gate_t", id, new Date().toISOString(), "log", "/tmp/p.log", "proof"
   );
+  // Evidence alone is not enough: this task owes an understanding check, and the
+  // handoff now says so while the agent is still on its turn (HIVE-580).
+  const noCheck = await post(`/api/tasks/${id}/events`, { type: "ready" });
+  expect(noCheck.json.held).toBe(true);
+  expect(noCheck.json.reason).toBe("missing_understanding_check");
+  expect(noCheck.json.message).toContain("emit it again");
+
+  await post(`/api/tasks/${id}/events`, {
+    type: "review_summary",
+    done: ["gated the handoff"],
+    understanding: {
+      essence: "hold the handoff instead of the merge",
+      checks: [
+        {
+          question: "When does the handoff get held?",
+          options: [{ key: "a", label: "when the review has no check" }, { key: "b", label: "never" }],
+          answer_key: "a",
+          explanation: "The same rule the merge gate reads, applied at handoff time.",
+        },
+      ],
+    },
+  });
   await post(`/api/tasks/${id}/events`, { type: "ready" });
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_review");
+});
+
+test("emit ready passes with no checks when the merge gate would not want one", async () => {
+  // The parity case (HIVE-580): kind inside auto_merge.kinds plus a clean
+  // auto review at this head is exactly what makes the merge gate skip the
+  // check, so the handoff must not invent a requirement the merge would drop.
+  const p = await post("/api/projects", {
+    name: "mechanical-p",
+    repo_path: "/repo",
+    config: { auto_merge: { kinds: ["chore"] } },
+  });
+  const id = (await post("/api/tasks", { project_id: p.json.id, title: "mechanical", kind: "chore" })).json.id;
+  await post(`/api/tasks/${id}/spawn`, {});
+  db.query("UPDATE tasks SET head_sha = 'deadbeef' WHERE id = ?").run(id);
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    "evd_mech", id, new Date().toISOString(), "log", "/tmp/m.log", "proof"
+  );
+  const { writeEvent } = await import("../src/state.ts");
+  writeEvent(db, {
+    task_id: id,
+    source: "hive",
+    type: "auto_review",
+    payload: { verdict: "looks_good", files: ["server/src/api.ts"], risks: [], questions: [], reviewed_head_sha: "deadbeef" },
+  });
+
+  const res = await post(`/api/tasks/${id}/events`, { type: "ready" });
+  expect(res.json.held).toBeUndefined();
   expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_review");
 });
 
