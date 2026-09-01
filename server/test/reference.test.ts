@@ -156,3 +156,30 @@ test("localhost / PR / non-doc links are not captured", () => {
   captureRecurringRefs(db);
   expect(openCards(db)).toHaveLength(0);
 });
+
+test("every recall is logged with its result counts, and the stats read it back", async () => {
+  const { makeHandler } = await import("../src/api.ts");
+  const { db, projectId } = freshDb();
+  addReference(db, projectId, "Design file", FIGMA);
+  const handle = makeHandler(db, {});
+  const search = async (q: string) => {
+    const res = await handle(new Request(`http://x/api/knowledge?project_id=${projectId}&q=${encodeURIComponent(q)}`));
+    return res.json();
+  };
+  await search("figma");
+  await search("kubernetes");
+  await search("kubernetes");
+  await search(""); // the "list everything" index — not a search
+
+  const logged = db.query("SELECT q, n_references FROM recall_log ORDER BY rowid").all() as any[];
+  expect(logged.map((r) => r.q)).toEqual(["figma", "kubernetes", "kubernetes", ""]);
+  expect(logged[0].n_references).toBe(1);
+  expect(logged[1].n_references).toBe(0);
+
+  const res = await handle(new Request(`http://x/api/knowledge/stats?project_id=${projectId}`));
+  const stats = await res.json();
+  expect(stats.queries).toBe(3); // the empty-q index listing is excluded
+  expect(stats.zero_result_queries).toBe(2);
+  expect(stats.zero_result_share).toBeCloseTo(2 / 3);
+  expect(stats.top_zero_result_queries).toEqual([{ q: "kubernetes", count: 2 }]);
+});

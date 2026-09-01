@@ -885,6 +885,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // Knowledge search: agents recall project references/learnings/policies on
       // demand instead of carrying the whole store in every brief.
       if (pathname === "/api/knowledge" && method === "GET") return knowledgeSearch(db, url);
+      if (pathname === "/api/knowledge/stats" && method === "GET") return recallStats(db, url);
       m = pathname.match(/^\/api\/learnings\/([^/]+)$/);
       if (m) {
         if (method === "GET") {
@@ -6321,6 +6322,16 @@ function knowledgeSearch(db: DB, url: URL): Response {
   // A silent empty result reads as "nothing to know" and the caller proceeds on
   // its own judgement. Say the keywords missed, and where the full index is.
   const no_matches = terms.length > 0 && !refs.length && !learnings.length && !policies.length && !decisions.length;
+
+  // Telemetry (hive-1846): every recall is logged with its query and per-kind
+  // counts, so misses are countable. Counts only, never matched content.
+  // ponytail: a plain INSERT on the request path — a few hundred recalls a day,
+  // same SQLite file. Batch it only if recall ever shows up in latency.
+  db.query(
+    `INSERT INTO recall_log (id, ts, project_id, task_id, q, n_references, n_learnings, n_policies, n_decisions)
+     VALUES (?,?,?,?,?,?,?,?,?)`
+  ).run(newId("rcl"), now(), projectId, taskId, terms.join(" "), refs.length, learnings.length, policies.length, decisions.length);
+
   return json({
     query: terms.join(" "),
     references: refs,
@@ -6333,6 +6344,35 @@ function knowledgeSearch(db: DB, url: URL): Response {
           note: `No stored knowledge mentions ${terms.map((t) => `"${t}"`).join(" or ")}. That is not proof nothing is known; the keywords may simply be wrong. Run 'hive recall' with no keywords to list everything stored for this project.`,
         }
       : {}),
+  });
+}
+
+// Read the recall telemetry back (hive-1846): how often a keyword search comes
+// back empty across all four kinds, and which queries miss most. Queries with no
+// keywords are the "list everything" index, not a search, so they are excluded
+// from both numbers. `days` windows the sample (default: everything).
+function recallStats(db: DB, url: URL): Response {
+  const projectId = url.searchParams.get("project_id");
+  if (!projectId) return err("project_id is required: hive recall --stats --project <project-id>");
+  const days = Number(url.searchParams.get("days") ?? 0);
+  const since = days > 0 ? new Date(Date.now() - days * 86400_000).toISOString() : "";
+  const rows = db
+    .query(
+      `SELECT q, (n_references + n_learnings + n_policies + n_decisions) AS hits
+         FROM recall_log WHERE project_id = ? AND q != '' AND ts >= ?`
+    )
+    .all(projectId, since) as { q: string; hits: number }[];
+  const zeros = rows.filter((r) => r.hits === 0);
+  const byQuery = new Map<string, number>();
+  for (const r of zeros) byQuery.set(r.q, (byQuery.get(r.q) ?? 0) + 1);
+  return json({
+    queries: rows.length,
+    zero_result_queries: zeros.length,
+    zero_result_share: rows.length ? zeros.length / rows.length : 0,
+    top_zero_result_queries: [...byQuery]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 20)
+      .map(([q, count]) => ({ q, count })),
   });
 }
 
