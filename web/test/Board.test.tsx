@@ -110,26 +110,17 @@ const links = async (t: Task, project: Record<string, unknown>) => {
   return renderer.root.findAll((n) => n.type === "a").map((n) => String(n.props.href));
 };
 
-test("the Jira chip links to the server-canonicalized site", async () => {
+// A board card links to ONE place: its own task page. The Jira link, the PR
+// link and the rest moved there (HIVE-556) so the card stays scannable at
+// column width. Nothing may leak a project-config URL back onto the board.
+test("a board card links only to its own task page", async () => {
   const hrefs = await links(task("j1", { jira_key: "WEB-123" }), {
     id: "project",
     name: "p",
     config: { jira: { site: "https://evil.atlassian.net" } },
     jira_site: "https://example.atlassian.net",
   });
-  expect(hrefs).toContain("https://example.atlassian.net/browse/WEB-123");
-  expect(hrefs.join(" ")).not.toContain("evil.atlassian.net");
-});
-
-test("no Jira chip is rendered when the server validated no site", async () => {
-  const hrefs = await links(task("j2", { jira_key: "WEB-124" }), {
-    id: "project",
-    name: "p",
-    config: { jira: { site: "https://evil.atlassian.net" } },
-    jira_site: null,
-  });
-  expect(hrefs.join(" ")).not.toContain("browse/WEB-124");
-  expect(hrefs.join(" ")).not.toContain("evil.atlassian.net");
+  expect(hrefs).toEqual(["/tasks/j1"]);
 });
 
 // The board says WHY a review card will wait its turn — one line, and only
@@ -175,9 +166,9 @@ test("a review card with no edges and no mark shows no land line at all", async 
   expect(renderer.toJSON()).toBeNull();
 });
 
-// The background-check chip (task HIVE-405). Green when the agent's last commit
-// passed hive's own tsc/lint pass, amber with a count when it didn't, and absent
-// before the first check — a card with no chip must not read as "clean".
+// The background-check chip (task HIVE-405). On the board card only a FAILING
+// check earns space: amber with a count when the agent's last commit did not
+// pass hive's own tsc/lint pass, and nothing at all otherwise (HIVE-556).
 const checkChips = async (t: Task) => {
   let renderer!: ReturnType<typeof create>;
   await act(async () => {
@@ -188,12 +179,10 @@ const checkChips = async (t: Task) => {
     .map((n) => ({ className: String(n.props.className), title: String(n.props.title), text: n.children.join("") }));
 };
 
-test("a clean sidecar report renders one green checks chip", async () => {
-  const [chip, ...rest] = await checkChips(task("s-ok", { sidecar: { sha: "abc1234def", ok: true, findings: [] } }));
-  expect(rest).toEqual([]);
-  expect(chip.className).toContain("chip-check-ok");
-  expect(chip.text).toContain("checks");
-  expect(chip.title).toContain("abc1234");
+test("a clean sidecar report renders no chip on the board card", async () => {
+  // Green changes nothing the director would do, so it costs the card nothing
+  // (HIVE-556). The full report is still on the task page.
+  expect(await checkChips(task("s-ok", { sidecar: { sha: "abc1234def", ok: true, findings: [] } }))).toEqual([]);
 });
 
 test("a sidecar report with findings renders an amber chip counting them, and lists them on hover", async () => {

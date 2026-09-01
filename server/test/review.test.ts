@@ -1331,19 +1331,21 @@ test("only a review that finished for the live head counts as an answerable quiz
       );
     return t.json.id;
   };
-  const verdicts = (taskId: string, head: string, risks: string[]) =>
+  const verdicts = (taskId: string, head: string, risks: string[], verdict: "confirmed" | "refuted" = "confirmed") =>
     s.db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
       `ev-rv-${taskId}`,
       taskId,
       new Date().toISOString(),
       "system",
       "risk_verdicts",
-      JSON.stringify({ reviewed_head_sha: head, verdicts: risks.map((risk) => ({ risk, verdict: "confirmed", why: "checked it" })) })
+      JSON.stringify({ reviewed_head_sha: head, verdicts: risks.map((risk) => ({ risk, verdict, why: "checked it" })) })
     );
 
   // ANSWERABLE: review written for the live head, every risk verified there.
+  // The verdict is `refuted` on purpose: a CONFIRMED risk hides the quiz on its
+  // own now (HIVE-570), which is a different rule with its own test below.
   const answerable = await bucket("finished", "head-a", { head: "head-a", risks: ["a leak"] });
-  verdicts(answerable, "head-a", ["a leak"]);
+  verdicts(answerable, "head-a", ["a leak"], "refuted");
 
   // The review pass has not produced anything yet.
   const noReview = await bucket("review not run", "head-b", null);
@@ -1721,5 +1723,68 @@ test("the startup sweep settles shipped quizzes, skips failed tasks, and is a no
   const statusOf = (id: string) => quizzes.json.quizzes.find((item: any) => item.task_id === id)?.status;
   expect(statusOf(shipped.taskId)).toBe("deferred");
   expect(statusOf(failed.taskId)).toBe("required");
+  await s.server.stop(true);
+});
+
+// ---------------------------------------------------------------------------
+// HIVE-570. Two complaints, one cause: the risk finding was treated as an event
+// in the land queue instead of a property of the change. So the director paid
+// the quiz first and was refused afterwards, and taking the PR out of the queue
+// (the right answer to a permanent failure) deleted the explanation.
+
+test("a change with confirmed risks never presents a quiz (HIVE-570)", async () => {
+  const s = makeServer();
+  const t = await judgmentTask(s, { kind: "ship", verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
+
+  // Before the verification pass finishes, the quiz is pipeline state, not an ask.
+  expect(((await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[]).some((q) => q.task_id === t.taskId)).toBe(false);
+
+  addRiskVerdicts(s, t.taskId, "head-1", "confirmed");
+  const withRisk = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  expect(withRisk.some((q) => q.task_id === t.taskId)).toBe(false);
+
+  // The agent pushes a fix; the risk is refuted on the new head and the quiz is
+  // a fair thing to ask again.
+  const clean = await judgmentTask(s, { kind: "ship", verdict: "caution", risks: ["maybe a leak"], head: "head-2" });
+  addRiskVerdicts(s, clean.taskId, "head-2", "refuted");
+  const cleared = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  expect(cleared.some((q) => q.task_id === clean.taskId)).toBe(true);
+  await s.server.stop(true);
+});
+
+test("Ship is not offered while a confirmed risk sits on the head (HIVE-570)", async () => {
+  const s = makeServer();
+  const t = await judgmentTask(s, { kind: "ship", verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
+  addRiskVerdicts(s, t.taskId, "head-1", "confirmed");
+
+  // The review card reads this BEFORE it offers Ship, so the check that can
+  // refuse has already run by the time the button exists.
+  const check = (await get(s.base, `/api/tasks/${t.taskId}/branch-check`)).json;
+  expect(check.confirmed_risks.map((r: any) => r.risk)).toEqual(["maybe a leak"]);
+  expect(check.risk_check_unfinished).toBeNull();
+
+  // And the merge itself still refuses, ahead of the understanding check, so the
+  // refusal never arrives after the director has already answered questions.
+  const refused = await post(s.base, `/api/tasks/${t.taskId}/merge`, {});
+  expect(refused.status).toBe(409);
+  expect(refused.json.error).toContain("the risk check confirmed 1 risk");
+  expect(refused.json.error).not.toContain("understanding check");
+  await s.server.stop(true);
+});
+
+test("a confirmed risk stays readable after the task leaves the land queue (HIVE-570)", async () => {
+  const s = makeServer();
+  const t = await judgmentTask(s, { kind: "ship", verdict: "caution", risks: ["maybe a leak"], head: "head-1" });
+  addRiskVerdicts(s, t.taskId, "head-1", "confirmed");
+
+  await post(s.base, "/api/land-queue", { task_ids: [t.taskId], queued: true });
+  await post(s.base, "/api/land-queue", { task_ids: [t.taskId], queued: false });
+
+  // The verdicts live on the task, not on the pause card, so unqueueing cannot
+  // take the explanation with it.
+  const detail = (await get(s.base, `/api/tasks/${t.taskId}`)).json;
+  const verdictEvent = [...detail.events].reverse().find((e: any) => e.type === "risk_verdicts");
+  expect(verdictEvent.payload.reviewed_head_sha).toBe("head-1");
+  expect(verdictEvent.payload.verdicts[0]).toMatchObject({ risk: "maybe a leak", verdict: "confirmed" });
   await s.server.stop(true);
 });

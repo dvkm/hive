@@ -799,3 +799,87 @@ test("a permanent per-task skip shows up as a stuck queued task, a project switc
   expect(offTask.skip.reason).toBe("auto_dispatch_off");
   expect(offTask.health).toBeNull(); // a project-wide switch is a label, not an attention item
 });
+
+// HIVE-568: a task's name held by a LIVE agent is contention, not failure. The
+// holder's lease can only be reclaimed after it reports done AND the task has
+// been silent for a whole stale window (15m), which no five-retries-in-minutes
+// dispatcher can ever wait out — so every such task was failed with "needs a
+// human" while the holder was simply finishing its turn.
+const NAME_TAKEN =
+  '{"error":{"code":"agent_name_taken","message":"agent name x is already used; candidates: terminal_id=term_1 pane_id=wR:p7X workspace_id=wR tab_id=wR:t40 cwd=/wt/x"}}';
+
+// herdr stub whose `agent start` is refused by a name holder reporting `status`,
+// until release() lets the next start through.
+function stubHerdrNameHeld(status = "working") {
+  let held = true;
+  const spawns: string[] = [];
+  const exec: Exec = async (argv) => {
+    if (has(argv, "worktree", "create"))
+      return OK(`{"result":{"worktree":{"path":${JSON.stringify(WT)},"branch":"hive/x","open_workspace_id":"w1"}}}`);
+    if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');
+    if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t2"}}}');
+    if (has(argv, "pane", "process-info"))
+      return OK('{"result":{"process_info":{"shell_pid":45803,"foreground_processes":[{"pid":45803,"name":"claude"}]}}}');
+    if (has(argv, "agent", "get")) return OK(`{"result":{"agent":{"pane_id":"wR:p7X","agent_status":"${status}"}}}`);
+    if (has(argv, "agent", "start")) {
+      if (held) return { code: 1, stdout: "", stderr: NAME_TAKEN };
+      spawns.push("started");
+      return OK("started");
+    }
+    return OK();
+  };
+  return { herdr: new Herdr(exec, "herdr"), spawns, release: () => (held = false) };
+}
+
+test("a name held by a live agent makes the task wait, not fail", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  const { herdr, spawns, release } = stubHerdrNameHeld("working");
+  let t = Date.now();
+
+  // Far more laps than the attempt ceiling, each one outside any backoff window.
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING + 3; i++) {
+    await dispatchOnce(db, { herdr, nowMs: () => t });
+    t += 31 * 60 * 1000;
+  }
+  expect(getTask(db, id).state).toBe("queued"); // waiting, never failed
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'spawn_gave_up'").get(id)).toMatchObject({ n: 0 });
+
+  // The holder exits; the very next cycle starts the agent.
+  release();
+  await dispatchOnce(db, { herdr, nowMs: () => t });
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, id).state).toBe("in_progress");
+});
+
+test("waiting on a held name is a wait, not a retry storm", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  const { herdr } = stubHerdrNameHeld("working");
+  const t = Date.now();
+
+  await dispatchOnce(db, { herdr, nowMs: () => t });
+  const rows = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'spawn_error'").all(id) as { payload: string }[];
+  expect(rows.length).toBe(1);
+  const held = JSON.parse(rows[0].payload).held_until;
+  expect(held).toBeTruthy();
+  // A minute later it is still waiting; past the stamped instant it tries again.
+  expect(inBackoff(db, id, t + 60_000)).toBe(true);
+  expect(inBackoff(db, id, Date.parse(held) + 1000)).toBe(false);
+});
+
+// The other half: an error a human really must fix must NOT be turned into a
+// 15-minute wait. A broken worktree still burns its attempts and fails fast.
+test("a genuine spawn failure still fails fast", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  const id = makeTask(db, projectId);
+  const { herdr } = stubHerdr(true);
+  let t = Date.now();
+  for (let i = 0; i < SPAWN_ATTEMPT_CEILING + 1; i++) {
+    await dispatchOnce(db, { herdr, nowMs: () => t });
+    t += 31 * 60 * 1000;
+  }
+  expect(getTask(db, id).state).toBe("failed");
+  const errs = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'spawn_error'").all(id) as { payload: string }[];
+  expect(errs.every((e) => !JSON.parse(e.payload).held_until)).toBe(true);
+});

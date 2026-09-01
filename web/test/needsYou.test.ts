@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { Checkpoint, Decision, Task, UnderstandingQuiz } from "../src/lib/api";
-import { getNeedsYouItems, isInMotion, itemProject, orderFocusItems, trackedSubtasks } from "../src/lib/needsYou";
+import { actionableItems, getNeedsYouItems, isInMotion, itemProject, orderFocusItems, trackedSubtasks } from "../src/lib/needsYou";
 import { inProjectFilter } from "../src/lib/projectFilter";
 import { JiraPanel, jiraMoveHint, jiraMoveSummary, jiraNextAutomaticText, jiraPanelNotice, trackingBindingNotice } from "../src/views/Task";
 
@@ -358,4 +358,32 @@ test("in motion counts hive's own work, not tracking-only rows parked in a work 
     "own",
     "spawned",
   ]);
+});
+
+// HIVE-556. The nav badge, the landing headline and the board strip all call
+// actionableItems, so "needs you" can only ever mean one thing. This test is
+// what fails if a fourth surface starts counting its own set again.
+test("one needs-you count: waiting and pending reviews never count, and the project filter applies", () => {
+  const mine = task("mine", "in_review", { project_id: "acme", review_actionable: true });
+  const notMine = task("theirs", "in_review", { project_id: "other", review_actionable: true });
+  const pending = task("pending", "in_review", { project_id: "acme" });
+  const stuck = task("stuck", "in_progress", {
+    project_id: "acme",
+    health: { status: "stuck", since: "2026-01-01T00:00:00Z", reason: "quiet" },
+  });
+  const blocked = task("blocked", "in_progress", {
+    project_id: "acme",
+    depends_on: ["mine"],
+    health: { status: "dead", since: "2026-01-01T00:00:00Z", reason: "agent gone" },
+  });
+  const tasks = [mine, notMine, pending, stuck, blocked];
+  const items = getNeedsYouItems([{ id: "d1", task_id: "mine" } as Decision], tasks, [], []);
+
+  expect(items.map((item) => item.kind).sort()).toEqual(
+    ["attention", "decision", "review", "review", "review_pending", "waiting"],
+  );
+  // Across every project: the decision, two actionable reviews, one stuck task.
+  expect(actionableItems(items, tasks).map((item) => item.id).sort()).toEqual(["d1", "mine", "stuck", "theirs"]);
+  // Scoped to one project, the other project's review drops out.
+  expect(actionableItems(items, tasks, "acme").map((item) => item.id).sort()).toEqual(["d1", "mine", "stuck"]);
 });

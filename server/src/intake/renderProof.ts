@@ -30,7 +30,7 @@ import { evidenceDir, newId, now } from "../db.ts";
 import { writeEvent } from "../state.ts";
 import { broadcast } from "../bus.ts";
 import type { Exec } from "../exec.ts";
-import { defaultExec } from "../exec.ts";
+import { defaultExec, projectComparisonBase } from "../exec.ts";
 
 // Two pictures, never a contact sheet of every viewport: the director's rule is
 // a couple of captioned proofs.
@@ -395,7 +395,7 @@ export function borrowDeps(dir: string, root: string): () => void {
   return undo;
 }
 
-function saveEvidence(db: DB, taskId: string, file: string, caption: string): void {
+function saveEvidence(db: DB, taskId: string, file: string, caption: string, phase: "before" | "after"): void {
   const destDir = join(evidenceDir(), taskId);
   mkdirSync(destDir, { recursive: true });
   const fileName = `proof_${Date.now()}_${newId()}.png`;
@@ -403,17 +403,155 @@ function saveEvidence(db: DB, taskId: string, file: string, caption: string): vo
   copyFileSync(file, path);
   const id = newId("ev");
   const url = `/evidence/${taskId}/${fileName}`;
+  // `render_phase` is what lets the catchup card show the pair side by side
+  // (HIVE-511). Anything without it is a lone screenshot, as before.
+  const meta = { rendered_at_review: true, render_phase: phase };
   db.query(
     "INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,?)"
-  ).run(id, taskId, now(), "screenshot", path, url, caption, JSON.stringify({ rendered_at_review: true }));
-  broadcast({ type: "evidence", evidence: { id, task_id: taskId, kind: "screenshot", url, caption, meta: { rendered_at_review: true } } });
+  ).run(id, taskId, now(), "screenshot", path, url, caption, JSON.stringify(meta));
+  broadcast({ type: "evidence", evidence: { id, task_id: taskId, kind: "screenshot", url, caption, meta } });
+}
+
+// One harness run: write the generated spec + config into the checkout, run
+// Playwright fenced, and return the PNGs it produced (or a reason).
+async function runHarness(
+  opts: { root: string; dir: string; testDir: string; config: string; fence: string[]; playwright: string; routes: string[]; runId: string },
+  exec: Exec
+): Promise<{ shots: string[]; outDir: string } | { reason: string }> {
+  const { root, dir, testDir, config, fence, playwright, routes, runId } = opts;
+  // The output has to live inside the task worktree: that is the only place the
+  // seatbelt lets the browser write.
+  const outDir = join(root, `.hive-proof-${runId}`);
+  const specName = `hive-proof-${runId}.spec.ts`;
+  const configName = `hive-proof-${runId}.config.ts`;
+  const specPath = join(dir, testDir, specName);
+  const configPath = join(dir, configName);
+  const specRel = join(testDir, specName);
+  mkdirSync(outDir, { recursive: true });
+
+  let result;
+  try {
+    writeFileSync(specPath, specSource(routes, outDir));
+    writeFileSync(configPath, configSource(config));
+    result = await exec([...fence, "/usr/bin/env", "-i", `HOME=${process.env.HOME ?? ""}`, `PATH=${process.env.PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"}`, `TMPDIR=${process.env.TMPDIR ?? "/private/tmp"}`, "CI=1", playwright, "test", specRel, "--config", configName, "--reporter=line", "--retries=0"], {
+      cwd: dir,
+      timeoutMs: RENDER_TIMEOUT_MS,
+    });
+  } finally {
+    rmSync(specPath, { force: true });
+    rmSync(configPath, { force: true });
+  }
+
+  // A red run is not proof. It may have landed on an error page, a crash, or
+  // a server that never came up, and that picture would go straight onto a
+  // live Jira issue. Only a clean run is allowed to produce evidence.
+  // The reason is the only thing a person gets when nothing rendered, so it
+  // has to name the real failure. Playwright puts that on stdout while node
+  // puts its deprecation warnings on stderr, and reading stderr first buried
+  // "page could not load its data" under "module.register() is deprecated".
+  // Read both, drop the noise, and prefer the line that carries the error.
+  const detail = () => {
+    const lines = `${result!.stdout ?? ""}\n${result!.stderr ?? ""}`
+      .replace(/\u001b\[[0-9;]*[A-Za-z]/g, "")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line && !/DeprecationWarning|trace-deprecation|^\(node:\d+\)/.test(line));
+    const errors = lines.filter((line) => /Error:/.test(line));
+    return (errors.length ? errors : lines.slice(-3)).join(" ").slice(0, 300);
+  };
+  if (result.code !== 0) return { reason: `harness run failed (exit ${result.code}): ${detail()}` };
+
+  const shots = existsSync(outDir) ? readdirSync(outDir).filter((f) => f.endsWith(".png")).sort() : [];
+  if (!shots.length) return { reason: `harness passed but produced no image: ${detail()}` };
+  return { shots, outDir };
+}
+
+// The commit this branch forked from, so the SAME routes can be rendered
+// before the change as well as after. Null when hive cannot work it out — the
+// before pass is a bonus, never a reason to lose the after picture.
+async function baseCommit(db: DB, task: { project_id?: string | null }, root: string, exec: Exec): Promise<string | null> {
+  let config: any = {};
+  if (task.project_id) {
+    const row = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id) as { config?: string } | undefined;
+    try {
+      config = JSON.parse(row?.config ?? "{}");
+    } catch {
+      /* a project with unparseable config still has a default base */
+    }
+  }
+  const r = await exec(["git", "-C", root, "merge-base", "HEAD", projectComparisonBase(config)]);
+  const sha = r.code === 0 ? r.stdout.trim().split(/\s+/)[0] : "";
+  return /^[0-9a-f]{7,40}$/.test(sha) ? sha : null;
+}
+
+// Render the SAME routes as they looked BEFORE the change (HIVE-511), so the
+// catchup card can show a before/after pair — the highest-value visual there is
+// for UI work.
+//
+// The base checkout is a detached git worktree created INSIDE the task's
+// worktree, for one reason: the seatbelt only grants writes under that root, so
+// a sibling directory could not run a browser at all. Its node_modules are
+// symlinked from the real checkout, because a fresh worktree has none and hive
+// will not install packages on a repo's behalf.
+//
+// Every failure here is silent by design. A route that did not exist yet
+// answers 404 and fails the run, which is correct: a brand-new page HAS no
+// before. The after picture is already saved by then.
+async function renderBase(
+  db: DB,
+  task: { id: string; project_id?: string | null },
+  root: string,
+  harness: { config: string; dir: string; testDir: string },
+  fence: string[],
+  routes: string[],
+  exec: Exec
+): Promise<number> {
+  const base = await baseCommit(db, task, root, exec);
+  if (!base) return 0;
+  const runId = newId();
+  const baseRoot = join(root, `.hive-base-${runId}`);
+  const rel = relative(root, harness.dir);
+  try {
+    const added = await exec(["git", "-C", root, "worktree", "add", "--detach", baseRoot, base]);
+    if (added.code !== 0) return 0;
+    // Both levels a JS repo installs at: the repo root and the UI package.
+    for (const dir of new Set([".", rel].filter((d) => d && d !== ".." && !d.startsWith(`..${sep}`)))) {
+      const from = join(root, dir, "node_modules");
+      const to = join(baseRoot, dir, "node_modules");
+      if (existsSync(from) && !existsSync(to)) symlinkSync(from, to);
+    }
+    const baseDir = join(baseRoot, rel);
+    if (!existsSync(join(baseDir, harness.config))) return 0;
+    const run = await runHarness(
+      { root, dir: baseDir, testDir: harness.testDir, config: harness.config, fence, playwright: playwrightBinOr(baseDir, baseRoot), routes, runId },
+      exec
+    );
+    if ("reason" in run) return 0;
+    run.shots.forEach((shot, i) =>
+      saveEvidence(db, task.id, join(run.outDir, shot), `Before this change: ${routes[i] ?? routes[0]}`, "before")
+    );
+    rmSync(run.outDir, { recursive: true, force: true });
+    return run.shots.length;
+  } catch {
+    return 0;
+  } finally {
+    await exec(["git", "-C", root, "worktree", "remove", "--force", baseRoot]);
+    rmSync(baseRoot, { recursive: true, force: true });
+  }
+}
+
+// The base checkout's own Playwright, which is the symlinked one. Falls back to
+// the string form so runHarness can fail with a reason instead of throwing.
+function playwrightBinOr(dir: string, root: string): string {
+  const bin = playwrightBin(dir, root);
+  return typeof bin === "string" ? bin : "";
 }
 
 // Render up to two screenshots for a task and store them as evidence rows.
 // Never throws: every failure comes back as a reason for the caller to log.
 export async function renderProofs(
   db: DB,
-  task: { id: string; worktree_path?: string | null },
+  task: { id: string; project_id?: string | null; worktree_path?: string | null },
   files: string[],
   exec: Exec = defaultExec
 ): Promise<RenderOutcome> {
@@ -433,60 +571,25 @@ export async function renderProofs(
 
   const routes = routesFromFiles(files);
   const runId = newId();
-  const outDir = join(root, `.hive-proof-${runId}`);
-  const specName = `hive-proof-${runId}.spec.ts`;
-  const configName = `hive-proof-${runId}.config.ts`;
-  const specPath = join(harness.dir, harness.testDir, specName);
-  const configPath = join(harness.dir, configName);
-  const specRel = join(harness.testDir, specName);
-  mkdirSync(outDir, { recursive: true });
-
-  // The outer `finally` is the only thing that deletes the proof directory, so
-  // no path out of here can leak it into the worktree.
+  let outDir: string | null = null;
   try {
-    let result;
-    try {
-      writeFileSync(specPath, specSource(routes, outDir));
-      writeFileSync(configPath, configSource(harness.config));
-      result = await exec([...fence.argv, "/usr/bin/env", "-i", `HOME=${process.env.HOME ?? ""}`, `PATH=${process.env.PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"}`, `TMPDIR=${process.env.TMPDIR ?? "/private/tmp"}`, "CI=1", playwright, "test", specRel, "--config", configName, "--reporter=line", "--retries=0"], {
-        cwd: harness.dir,
-        timeoutMs: RENDER_TIMEOUT_MS,
-      });
-    } finally {
-      rmSync(specPath, { force: true });
-      rmSync(configPath, { force: true });
-    }
-
-    // A red run is not proof. It may have landed on an error page, a crash, or
-    // a server that never came up, and that picture would go straight onto a
-    // live Jira issue. Only a clean run is allowed to produce evidence.
-    // The reason is the only thing a person gets when nothing rendered, so it
-    // has to name the real failure. Playwright puts that on stdout while node
-    // puts its deprecation warnings on stderr, and reading stderr first buried
-    // "page could not load its data" under "module.register() is deprecated".
-    // Read both, drop the noise, and prefer the line that carries the error.
-    const detail = () => {
-      const lines = `${result!.stdout ?? ""}\n${result!.stderr ?? ""}`
-        .replace(/\u001b\[[0-9;]*[A-Za-z]/g, "")
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line && !/DeprecationWarning|trace-deprecation|^\(node:\d+\)/.test(line));
-      const errors = lines.filter((line) => /Error:/.test(line));
-      return (errors.length ? errors : lines.slice(-3)).join(" ").slice(0, 300);
-    };
-    if (result.code !== 0)
-      return { created: 0, reason: `harness run failed (exit ${result.code}): ${detail()}` };
-
-    const shots = existsSync(outDir) ? readdirSync(outDir).filter((f) => f.endsWith(".png")).sort() : [];
-    if (!shots.length) return { created: 0, reason: `harness passed but produced no image: ${detail()}` };
-    shots.forEach((shot, i) =>
-      saveEvidence(db, task.id, join(outDir, shot), `Rendered at review: ${routes[i] ?? routes[0]}`)
+    const run = await runHarness(
+      { root, dir: harness.dir, testDir: harness.testDir, config: harness.config, fence: fence.argv, playwright, routes, runId },
+      exec
     );
-    return { created: shots.length };
+    if ("reason" in run) return { created: 0, reason: run.reason };
+    outDir = run.outDir;
+    run.shots.forEach((shot, i) =>
+      saveEvidence(db, task.id, join(run.outDir, shot), `Rendered at review: ${routes[i] ?? routes[0]}`, "after")
+    );
+    // The pair, best effort. The after picture is already banked.
+    const before = await renderBase(db, task, root, harness, fence.argv, routes, exec);
+    return { created: run.shots.length + before };
   } catch (e) {
     return { created: 0, reason: `render failed: ${String(e instanceof Error ? e.message : e)}` };
   } finally {
-    rmSync(outDir, { recursive: true, force: true });
+    if (outDir) rmSync(outDir, { recursive: true, force: true });
+    rmSync(join(root, `.hive-proof-${runId}`), { recursive: true, force: true });
     unborrow();
   }
 }

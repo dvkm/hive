@@ -607,3 +607,232 @@ test("a task with no verification contract renders no checklist", async () => {
   });
   expect(renderer.root.findAll((n) => n.props?.className === "review-verify")).toHaveLength(0);
 });
+
+// ---------------------------------------------------------------------------
+// HIVE-570. The risk check runs when the PR reaches review, so the card knows
+// before it asks the director for anything whether Ship can work. It used to ask
+// for the quiz first and refuse the merge afterwards.
+
+// An unreviewed detail: no review_summary at all, so the ONLY reason the quiz
+// could be hidden here is the confirmed risk, not a passed or missing check.
+function riskyDetail(id: string): TaskDetail {
+  return {
+    ...task(id, "agent"),
+    head_sha: "abc1234def",
+    events: [
+      {
+        id: "auto-1",
+        task_id: id,
+        ts: "2026-01-01T00:00:00.000Z",
+        source: "system",
+        type: "auto_review",
+        payload: { verdict: "caution", risks: ["a leak"], questions: [] },
+      } as any,
+      {
+        id: "rv-1",
+        task_id: id,
+        ts: "2026-01-01T00:00:01.000Z",
+        source: "system",
+        type: "risk_verdicts",
+        payload: { reviewed_head_sha: "abc1234def", verdicts: [{ risk: "a leak", verdict: "confirmed", why: "checked it" }] },
+      } as any,
+    ],
+    evidence: [],
+    decisions: [],
+  };
+}
+
+async function renderWithConfirmedRisk(detailFor: (id: string) => TaskDetail) {
+  const originalTask = api.task;
+  const originalBranchCheck = api.branchCheck;
+  api.task = (async (id: string) => detailFor(id)) as typeof api.task;
+  api.branchCheck = (async () => ({
+    unmet_deps: [],
+    embedded_tasks: [],
+    confirmed_risks: [{ risk: "a leak", why: "checked it" }],
+    risk_check_unfinished: null,
+  })) as typeof api.branchCheck;
+  let renderer!: ReturnType<typeof create>;
+  try {
+    const t = { ...task("risky"), head_sha: "abc1234def" };
+    await act(async () => {
+      renderer = create(tree(t));
+    });
+  } finally {
+    api.task = originalTask;
+    api.branchCheck = originalBranchCheck;
+  }
+  return renderer;
+}
+
+const buttonNamed = (renderer: ReturnType<typeof create>, label: string) =>
+  renderer.root.findAll((n) => n.type === "button" && n.children.includes(label));
+
+test("a confirmed risk disables Approve & merge and says which risk (HIVE-570)", async () => {
+  const renderer = await renderWithConfirmedRisk(riskyDetail);
+  const merge = buttonNamed(renderer, "Approve & merge")[0];
+  expect(merge.props.disabled).toBe(true);
+  expect(merge.props.title).toContain("a leak");
+  // Overriding is still possible, and its button is not disabled by the very
+  // block it exists to override.
+  const anyway = buttonNamed(renderer, "Merge anyway");
+  expect(anyway).toHaveLength(1);
+  expect(anyway[0].props.disabled).toBe(false);
+});
+
+test("a confirmed risk means no understanding check is asked (HIVE-570)", async () => {
+  const renderer = await renderWithConfirmedRisk(riskyDetail);
+  expect(renderer.root.findAllByType(UnderstandingQuiz)).toHaveLength(0);
+  const text = JSON.stringify(renderer.toJSON());
+  expect(text).toContain("not ready");
+  // And it must not be mislabelled as a mechanical change with no check needed.
+  expect(text).not.toContain("Mechanical change");
+});
+
+test("a risk found after a passed quiz says the answer was kept (HIVE-570)", async () => {
+  const late = (id: string): TaskDetail => {
+    const risky = riskyDetail(id);
+    const passed = passingDetail(id);
+    return { ...risky, events: [...passed.events, ...risky.events] };
+  };
+  const renderer = await renderWithConfirmedRisk(late);
+  const text = JSON.stringify(renderer.toJSON());
+  expect(text).toContain("You passed the understanding check on this change earlier");
+  expect(text).toContain("abc1234");
+  expect(text).toContain("your answer is kept");
+});
+
+test("the risk verdicts stay on the card so the finding is readable (HIVE-570)", async () => {
+  const renderer = await renderWithConfirmedRisk(riskyDetail);
+  const text = JSON.stringify(renderer.toJSON());
+  expect(text).toContain("a leak");
+  expect(text).toContain("confirmed");
+});
+
+test("Merge anyway re-opens the check it silenced instead of dead-ending (HIVE-570)", async () => {
+  // The server still refuses a merge whose understanding check is owed, so the
+  // override has to bring the check back rather than merge straight past it.
+  const originalTask = api.task;
+  const originalBranchCheck = api.branchCheck;
+  const merges: unknown[][] = [];
+  const originalMerge = api.merge;
+  api.task = (async (id: string) => riskyDetail(id)) as typeof api.task;
+  api.branchCheck = (async () => ({
+    unmet_deps: [],
+    embedded_tasks: [],
+    confirmed_risks: [{ risk: "a leak", why: "checked it" }],
+    risk_check_unfinished: null,
+  })) as typeof api.branchCheck;
+  api.merge = (async (...args: unknown[]) => {
+    merges.push(args);
+    return {} as never;
+  }) as typeof api.merge;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree({ ...task("risky-override"), head_sha: "abc1234def" }));
+    });
+
+    await act(async () => {
+      buttonNamed(renderer, "Merge anyway")[0].props.onClick();
+    });
+
+    // No merge was attempted; the check is back and says why.
+    expect(merges).toHaveLength(0);
+    const text = JSON.stringify(renderer.toJSON());
+    expect(text).toContain("You chose to merge despite the confirmed risks");
+    // Ship is now gated on the check, not on the risk.
+    const merge = buttonNamed(renderer, "Approve & merge")[0];
+    expect(merge.props.title).not.toContain("a leak");
+  } finally {
+    api.task = originalTask;
+    api.branchCheck = originalBranchCheck;
+    api.merge = originalMerge;
+  }
+});
+
+// HIVE-557: the card that started the redesign. One refuted finding, one
+// question only the director can answer, and a review line carrying the
+// before/after state.
+const HIVE_554_WHY =
+  "Diagnosed why 7 rows were still stranded despite v39 already running: source is settable through the task-create API body, so rows created after v39 were never touched.";
+
+function focusDetail(id: string): TaskDetail {
+  return {
+    ...task(id, "agent"),
+    head_sha: "sha1",
+    events: [
+      {
+        id: "rev-1",
+        task_id: id,
+        ts: "2026-01-01T00:00:00.000Z",
+        source: "agent",
+        type: "review_summary",
+        payload: {
+          done: [HIVE_554_WHY, "Verified on a copy of the live DB: stranded-row count 7 -> 0."],
+          iffy: [{ what: "Applied the migration SQL directly to the live database.", why: "A restart needs a decision." }],
+        },
+      } as any,
+      {
+        id: "ar-1",
+        task_id: id,
+        ts: "2026-01-01T00:00:01.000Z",
+        source: "system",
+        type: "auto_review",
+        payload: { verdict: "looks_good", summary: "Adds migration v45 to server/src/db.ts, a re-run of v39's guard." },
+      } as any,
+      {
+        id: "rv-1",
+        task_id: id,
+        ts: "2026-01-01T00:00:02.000Z",
+        source: "system",
+        type: "risk_verdicts",
+        payload: {
+          reviewed_head_sha: "sha1",
+          verdicts: [{ verdict: "refuted", risk: "the count gap is unexplained", why: "set-based migration" }],
+          question_verdicts: [{ answerable: "human", question: "Can you confirm the live DB shows zero stranded rows?" }],
+        },
+      } as any,
+    ],
+    evidence: [],
+    decisions: [],
+  };
+}
+
+test("the card leads with what changed and its recommendation agrees with the open question (HIVE-557)", async () => {
+  const originalTask = api.task;
+  const originalBranchCheck = api.branchCheck;
+  api.task = (async (id: string) => focusDetail(id)) as typeof api.task;
+  api.branchCheck = (async () => ({
+    unmet_deps: [],
+    embedded_tasks: [],
+    understanding_required: false,
+    confirmed_risks: [],
+  })) as typeof api.branchCheck;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree({ ...task("focus-557"), head_sha: "sha1" }));
+    });
+    const text = JSON.stringify(renderer.toJSON());
+
+    // 1. what changed, from hive's own pre-review of the diff
+    expect(text).toContain("What changed");
+    expect(text).toContain("Adds migration v45");
+    // 2. before → after, as a table
+    expect(text).toContain("Before → after");
+    expect(text).toContain("stranded-row count");
+    // 3. why, pulled from the line that explains the cause
+    expect(text).toContain("Why it was needed");
+    // 4. the recommendation cannot say "approve and merge" over an open question
+    expect(text).toContain("Answer the open question, then merge");
+    expect(text).not.toContain("Approve and merge</strong>");
+    // 5. the refuted finding is a count, not a paragraph above the open one
+    expect(text).toContain("Pre-review checked ");
+    // 6. and nothing the lead already said is repeated lower down
+    expect(text.split(HIVE_554_WHY.slice(0, 60)).length - 1).toBe(1);
+  } finally {
+    api.task = originalTask;
+    api.branchCheck = originalBranchCheck;
+  }
+});

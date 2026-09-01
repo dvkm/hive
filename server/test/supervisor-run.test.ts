@@ -33,6 +33,7 @@ beforeEach(() => {
   ).run(managerId, projectId, "manager", t, t);
   threadId = createThread(db, { project_id: projectId, task_id: managerId, title: "Ship a reliable manager" }).id;
   setSetting(db, "api_token", TOKEN); // PUT /api/projects/:id is write-gated
+  setSetting(db, "chat_supervisor", "on"); // these tests drive a live manager session; the switch ships off
   handle = makeHandler(db, { herdr });
 });
 

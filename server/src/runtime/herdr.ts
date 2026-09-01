@@ -67,7 +67,13 @@ export const HERDR_BIN = discoverHerdrBin();
 // an earlier tool's 2026-07-02 self-kill incident documents. "hive-fleet" is distinct.
 export const FLEET_LABEL = process.env.HIVE_FLEET_LABEL || "hive-fleet";
 
-export class HerdrError extends Error {}
+export class HerdrError extends Error {
+  // Set only for the "another agent holds this task's name" refusal, so callers
+  // can tell contention (wait for the holder) from a real failure (HIVE-568).
+  constructor(message: string, readonly nameHolder?: NameHolder) {
+    super(message);
+  }
+}
 
 export type AgentStatus = "idle" | "done" | "working" | "blocked" | "unknown" | "gone";
 
@@ -672,7 +678,7 @@ function withWorktreeLock<T>(repoPath: string, branch: string, fn: () => Promise
 // Who is holding a task's agent name, for the refusal message and the release
 // decision (HIVE-552). Every field is best-effort: an unreadable holder reads as
 // `unknown`, which never releases anything.
-interface NameHolder {
+export interface NameHolder {
   status: AgentStatus;
   paneId: string | null;
   pid: number | null;
@@ -695,6 +701,27 @@ export function describeHolder(holder: NameHolder, quietMs?: number): string {
   ]
     .filter(Boolean)
     .join(", ");
+}
+
+// When may a spawn refused by a name holder be retried (HIVE-568)? Returns the
+// ISO instant, or null when this is NOT a wait: no holder (some other failure),
+// or a holder that already reports done and has been silent past the stale
+// window — that one should have been reclaimable, so its refusal is a real
+// failure a human must look at. Everything else is a live or not-yet-stale
+// holder that will release the name on its own.
+// ponytail: the wait is the remaining stale window, but polled at most every 5
+// minutes so a holder that exits early is picked up without a full 15m sleep.
+export function heldNameRetryAt(
+  holder: NameHolder | undefined,
+  quietMs: number | undefined,
+  staleMs: number,
+  nowMs: number
+): string | null {
+  if (!holder) return null;
+  const quiet = quietMs ?? 0;
+  if (holder.status === "done" && quiet > staleMs) return null;
+  const wait = Math.min(Math.max(staleMs - quiet, 60_000), 5 * 60 * 1000);
+  return new Date(nowMs + wait).toISOString();
 }
 
 // ---- adapter ----
@@ -772,7 +799,8 @@ export class Herdr {
         throw new HerdrError(
           `agent start refused: task ${args.taskId} already has an agent holding its name (possibly alive). ` +
           `Holder: ${describeHolder(holder, args.holderQuietMs)}. ` +
-          `Verify it is dead (no panes, no worktree processes) before respawning.`
+          `Verify it is dead (no panes, no worktree processes) before respawning.`,
+          holder
         );
     }
     if (start.code !== 0)
@@ -1002,13 +1030,16 @@ export class Herdr {
   // agent's: the terminal id recorded at spawn, a surviving registry label, or —
   // when both are gone — the one pane at the task's cwd whose foreground process
   // is not a login shell (a fleet tab holds a shell pane at the same cwd).
+  // `agentGone` in the result is POSITIVE evidence the agent process exited:
+  // every pane at the task's cwd is sitting at a bare login shell. Absence of
+  // evidence (unparseable process-info, no panes, herdr down) never sets it.
   async readopt(hint: {
     name: string;
     cwd?: string | null;
     tabId?: string | null;
     terminalId?: string | null;
-  }): Promise<{ readopted: boolean; paneId: string | null; terminalId: string | null; reason: string }> {
-    const miss = (reason: string) => ({ readopted: false, paneId: null, terminalId: null, reason });
+  }): Promise<{ readopted: boolean; paneId: string | null; terminalId: string | null; reason: string; agentGone?: boolean }> {
+    const miss = (reason: string, agentGone = false) => ({ readopted: false, paneId: null, terminalId: null, reason, agentGone });
     const panes = await this.listPanes();
     if (!panes.length) return miss("herdr returned no panes"); // daemon down, not a wipe
 
@@ -1025,11 +1056,17 @@ export class Herdr {
     if (!pane) {
       const sameCwd = panes.filter((p) => hint.cwd && p.cwd === hint.cwd && (!hint.tabId || p.tabId === hint.tabId));
       const running: PaneInfo[] = [];
+      let shells = 0; // panes we positively read as a bare login shell
       for (const p of sameCwd) {
         const info = await this.run(paneProcessInfoArgv(p.paneId));
         if (paneRunsAgentCommand(info.stdout)) running.push(p);
+        else if (parsePaneRootProcess(info.stdout)) shells++;
       }
-      if (running.length !== 1) return miss(`no unambiguous agent pane at cwd (${sameCwd.length} panes, ${running.length} running a command)`);
+      if (running.length !== 1)
+        return miss(
+          `no unambiguous agent pane at cwd (${sameCwd.length} panes, ${running.length} running a command)`,
+          running.length === 0 && shells === sameCwd.length && sameCwd.length > 0
+        );
       pane = running[0];
       how = "cwd+process";
     }

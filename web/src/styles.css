@@ -428,7 +428,7 @@ textarea { font-family: inherit; }
 .board {
   display: grid;
   grid-auto-flow: column;
-  grid-auto-columns: minmax(248px, 1fr);
+  grid-auto-columns: minmax(220px, 1fr);
   gap: 14px;
   padding: 18px 20px 24px;
   height: 100%;
@@ -581,6 +581,13 @@ textarea { font-family: inherit; }
   font-size: var(--t-md);
   line-height: 1.38;
   text-wrap: pretty;
+  /* Two lines maximum. A long descriptive title is good for searching and
+     terrible for scanning a 220px column (HIVE-556); the full text is the
+     tooltip and the card's own page. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 /* Human-friendly task identifier (HIVE-42); legacy PR markers keep global numbers.
    Shared across board cards, review cards, the task header, and the feed. */
@@ -662,20 +669,19 @@ textarea { font-family: inherit; }
   margin-top: 8px;
   flex-wrap: wrap;
 }
+/* A card chip must never grow wider than its column. Every one of these carries
+   its full text as a tooltip, and the card's own page spells it out. */
+.card-meta > .chip {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .card-age {
   margin-left: auto;
   font-size: 11.5px;
   color: var(--text-faint);
   white-space: nowrap;
-}
-.card-summary {
-  margin-top: 8px;
-  font-size: 12.5px;
-  color: var(--text-dim);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
 }
 .card-subtasks {
   display: flex;
@@ -971,10 +977,6 @@ textarea { font-family: inherit; }
   color: var(--red);
   border-color: rgba(239, 93, 107, 0.5);
 }
-.chip-planned {
-  color: var(--purple);
-  border-color: rgba(155, 125, 214, 0.4);
-}
 /* Priority chip (HIVE-430). It IS the quick-set control: a bare <select>
    painted as a chip. 'normal' is the default on nearly every task, so it stays
    invisible until the card is hovered — set a priority and the chip shows. */
@@ -1120,12 +1122,6 @@ textarea { font-family: inherit; }
   background: rgba(226, 165, 66, 0.14);
   color: var(--amber);
 }
-.evc {
-  font-size: 11.5px;
-  color: var(--text-faint);
-  margin-left: auto;
-}
-
 /* ---- task page ---- */
 .task {
   display: grid;
@@ -1600,6 +1596,13 @@ textarea { font-family: inherit; }
 .dmini-answer {
   color: var(--text-dim);
   font-size: 13px;
+}
+/* An expired card keeps the question it was asking about, so the explanation
+   survives the card (HIVE-570). Quieter than the closing line above it. */
+.dmini-context {
+  margin-top: 4px;
+  white-space: pre-wrap;
+  opacity: 0.85;
 }
 
 /* ---- decision inbox ---- */
@@ -3930,44 +3933,42 @@ a.dbundle-fact:hover {
 }
 
 /* board banner nudging to the brief */
-.brief-banner {
+/* ---- the one needs-you strip on /work (HIVE-556) ---- */
+/* Replaces the brief banner AND the Needs attention tray. Not dismissible:
+   it is the single thing this page is meant to answer. */
+.needs-you-strip {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin: 0 0 14px;
-  padding: 8px 14px;
+  margin: 14px 20px 0;
+  padding: 9px 14px;
   border: 1px solid var(--accent-dim);
   border-radius: var(--radius);
   background: rgba(91, 140, 255, 0.08);
   color: var(--text);
   text-decoration: none;
-  font-size: 13px;
+  flex-shrink: 0;
 }
-.brief-banner:hover {
+.needs-you-strip:hover {
   border-color: var(--accent);
 }
-.brief-banner-dot {
-  color: var(--accent);
+.needs-you-strip-count {
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--accent-bright);
 }
-.brief-banner-text {
-  font-weight: 500;
+.needs-you-strip-text {
+  font-weight: 600;
 }
-.brief-banner-go {
+.needs-you-strip-parts {
+  font-weight: 400;
+  color: var(--text-dim);
+}
+.needs-you-strip-go {
+  margin-left: auto;
   color: var(--accent);
   font-size: 12px;
-}
-.brief-banner-x {
-  margin-left: auto;
-  background: none;
-  border: none;
-  color: var(--text-faint);
-  font-size: 18px;
-  line-height: 1;
-  cursor: pointer;
-  padding: 0 4px;
-}
-.brief-banner-x:hover {
-  color: var(--text);
 }
 
 /* ---- review panel + inline diff viewer (in-review tasks) ---- */
@@ -4200,30 +4201,90 @@ a.dbundle-fact:hover {
   color: var(--text-dim);
   font-size: var(--t-sm);
 }
-.review-caveat {
+/* ---- what changed / before → after / why (HIVE-557) ---- */
+.review-focus {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.focus-eyebrow {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text-faint);
+  font-size: var(--t-eyebrow);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.focus-lead {
+  margin: 0;
+  font-size: 15.5px;
+  line-height: 1.45;
+  color: var(--text);
+}
+.focus-stat {
+  margin: 5px 0 0;
+  color: var(--text-faint);
+  font-size: var(--t-xs);
+  font-family: var(--mono);
+}
+.focus-state {
+  border-collapse: collapse;
+  font-size: var(--t-sm);
+}
+.focus-state th {
+  padding: 3px 12px 3px 0;
+  text-align: left;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+.focus-state td {
+  padding: 3px 8px 3px 0;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.focus-before { color: var(--text-faint); }
+.focus-arrow { color: var(--text-faint); padding-right: 8px; }
+.focus-after { color: var(--green); font-weight: 650; }
+.focus-state-same .focus-after { color: var(--text-dim); font-weight: 400; }
+.focus-note {
+  color: var(--text-faint);
+  font-family: inherit;
+  font-size: var(--t-xs);
+}
+.focus-why {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: var(--t-sm);
+  line-height: 1.5;
+}
+.review-recommendation-open {
+  border-color: color-mix(in srgb, var(--yellow) 45%, var(--border-soft));
+}
+.review-recommendation-open .review-recommendation-label { color: var(--yellow); }
+.rv-open {
+  white-space: normal;
+  overflow: visible;
+  color: var(--text);
+}
+.risk-settled > summary {
+  cursor: pointer;
+  color: var(--text-faint);
+  font-size: var(--t-xs);
+}
+.risk-settled ul {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.risk-settled li {
   display: flex;
   align-items: baseline;
   gap: 8px;
-  margin-top: 12px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border-soft);
-  color: var(--text-dim);
-  font-size: var(--t-sm);
-}
-.review-caveat > :first-child {
-  flex: none;
-  color: var(--yellow);
-  font-weight: 650;
-}
-.review-caveat-text {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.review-caveat small {
-  flex: none;
-  color: var(--text-faint);
 }
 .risk-verdicts {
   margin-top: 12px;
@@ -6203,6 +6264,166 @@ a.chip-jira:hover { background: #2d5488; }
   padding: 6px 0;
   border-bottom: 1px solid var(--border-soft);
   font-size: 13px;
+}
+
+/* Catch up (HIVE-511): one glanceable card per shipped change. The whole point
+   is that a card fits without scrolling, so the visual slot is a fixed height
+   and the card is the text around it. The slot is bounded rather than the card
+   because Request changes opens a note inside the card and must not be clipped.
+   A screenshot is `object-fit: cover` into this box: without a definite height
+   the img falls back to its natural size and a tall page render drags the whole
+   grid row past the viewport, which is the one thing this page may not do. */
+:root {
+  --glance-visual: 176px;
+}
+.glance-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 14px;
+}
+.glance-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 260px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+}
+.glance-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.glance-head a {
+  font-weight: 600;
+}
+.glance-when {
+  margin-left: auto;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+/* One line, always. A payload that grew back into prose gets clipped here
+   rather than pushing the visual off the card. */
+.glance-line {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.35;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.glance-shots {
+  height: var(--glance-visual);
+  display: flex;
+  gap: 6px;
+}
+.glance-shot {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg);
+  cursor: zoom-in;
+}
+.glance-shot img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: top center;
+  display: block;
+}
+.glance-shot-tag {
+  position: absolute;
+  left: 4px;
+  bottom: 4px;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(11, 12, 10, 0.82);
+  color: var(--text-dim);
+}
+.glance-areas {
+  height: var(--glance-visual);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+}
+.glance-areas li {
+  display: grid;
+  grid-template-columns: minmax(0, 96px) 1fr auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.glance-area-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.glance-area-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--bg-elev2);
+  overflow: hidden;
+}
+.glance-area-bar i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+.glance-area-churn {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.glance-noshape {
+  height: var(--glance-visual);
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+  font-size: 12px;
+  border: 1px dashed var(--border-soft);
+  border-radius: 8px;
+}
+/* An unread diff must not read like an empty one, so it is marked, not muted
+   into the same grey as the numbers it replaces. */
+.glance-unavailable {
+  color: var(--amber);
+  font-style: italic;
+}
+.glance-facts {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.glance-facts a {
+  margin-left: auto;
+}
+/* Request changes lives on the card (HIVE-505 pairing): a mini button while
+   closed, its own full-width row once the note is open. */
+.glance-facts {
+  flex-wrap: wrap;
+}
+.glance-facts .request-changes,
+.glance-facts .request-changes-filed {
+  flex-basis: 100%;
 }
 
 /* Request changes on shipped work: a button that opens into its note. */

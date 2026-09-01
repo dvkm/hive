@@ -9,6 +9,7 @@ import {
   faComments,
   faSatelliteDish,
   faImage,
+  faEye,
   faBookOpen,
   faChartColumn,
   faFolder,
@@ -17,8 +18,8 @@ import {
   faRocket,
 } from "@fortawesome/free-solid-svg-icons";
 import { useStore } from "./lib/store";
-import { itemProject } from "./lib/needsYou";
-import { useProjectFilter, inProjectFilter } from "./lib/projectFilter";
+import { actionableItems } from "./lib/needsYou";
+import { useProjectFilter } from "./lib/projectFilter";
 import { relTime } from "./lib/time";
 import { toast } from "./lib/ui";
 import { pushState, enablePush } from "./lib/push";
@@ -30,6 +31,7 @@ import TaskPage from "./views/Task";
 import TaskModal from "./views/TaskModal";
 import Decisions from "./views/Decisions";
 import Review from "./views/Review";
+import Catchup from "./views/Catchup";
 import Policies from "./views/Policies";
 import Monitors from "./views/Monitors";
 import Learnings from "./views/Learnings";
@@ -67,6 +69,7 @@ const SECONDARY_NAV: { label: string; items: [string, string, IconDefinition][] 
   {
     label: "Observe",
     items: [
+      ["/catchup", "Catch up", faEye],
       ["/feed", "Activity", faSatelliteDish],
       ["/evidence", "Evidence", faImage],
       ["/supervisors", "Agent sessions", faComments],
@@ -287,10 +290,9 @@ export function Bell() {
 export default function App() {
   const { needsYou, tasks, offline, setOffline, away, setAway } = useStore();
   const projectFilter = useProjectFilter();
-  const inboxCount = needsYou.filter(
-    // "waiting" and "review_pending" are visible but not yours to act on yet.
-    (item) => item.kind !== "waiting" && item.kind !== "review_pending" && inProjectFilter(itemProject(item, tasks), projectFilter),
-  ).length;
+  // One shared definition (lib/needsYou.ts) so this badge, the landing
+  // headline and the board strip always show the same number.
+  const inboxCount = actionableItems(needsYou, tasks, projectFilter).length;
   const location = useLocation();
   // Board card clicks push /tasks/:id with state.backgroundLocation set to the
   // board's location — that keeps the board mounted and rendered underneath
@@ -347,6 +349,7 @@ export default function App() {
           <Route path="/tasks/:id" element={<TaskPage />} />
           <Route path="/decisions" element={<Decisions />} />
           <Route path="/review" element={<Review />} />
+          <Route path="/catchup" element={<Catchup />} />
           <Route path="/supervisors" element={<Supervisors />} />
           <Route path="/terminals" element={<Terminals />} />
           <Route path="/learnings" element={<Learnings />} />

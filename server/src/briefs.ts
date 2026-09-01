@@ -42,6 +42,9 @@ landing commit:
 
 Rules:
 - Emit status before commands expected to exceed a minute.
+- Commit and push FIRST, then attach evidence, review, and \`ready\`. Evidence is
+  tied to the commit it was captured on, so a push after it leaves it behind and
+  the handoff is refused. If you do push again, re-capture the evidence.
 - Attach evidence before \`ready\`: screenshots for visual work, test output
   otherwise. Scout tasks require a report. A task never reaches Done without evidence.
 - Hand off with \`ready\` when the PR is open. If CI is pending, END THE TURN;
@@ -64,6 +67,10 @@ Rules:
   touches security, auth, payments or migrations, the task kind is outside the
   project's auto-merge list, or the director asked for a quiz on this card. For
   everything else the checks are OPTIONAL, and leaving them out blocks nothing.
+  Re-emitting a review after a rebase, a risk finding or a CI fix? Leave
+  \`understanding.checks\` out and the checks you already sent stay in place,
+  along with the director's pass. Send \`"checks": []\` only when you mean to
+  drop the quiz on purpose.
   Every question must help them understand this specific change: behavior, impact, risk,
   tradeoff, or evidence. Never test whether the agent can code, debug, merge,
   use tools, follow policy, or operate Hive; agent competence belongs in internal
