@@ -3150,7 +3150,17 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
     if (found) embedded_tasks = found;
   }
   // The review card only blocks on the understanding check when this says so.
-  return json({ unmet_deps, embedded_tasks, understanding_required: understandingChecksRequired(db, task) });
+  // The risk check ran when the PR reached review, not at the land attempt
+  // (HIVE-565), so its verdict is known before the director spends any effort:
+  // the card can refuse Ship and skip the quiz instead of asking for both and
+  // then blocking the merge.
+  return json({
+    unmet_deps,
+    embedded_tasks,
+    understanding_required: understandingChecksRequired(db, task),
+    confirmed_risks: confirmedRisks(db, task.id, task.head_sha),
+    risk_check_unfinished: unfinishedRiskCheck(db, task.id, task.head_sha),
+  });
 }
 
 // Map our merge_method config onto gh's flag. Squash is the default.
@@ -3394,6 +3404,44 @@ async function mergeTaskLocked(
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   const config = JSON.parse(project?.config ?? "{}");
   const autoShipKind = Array.isArray(config.auto_merge?.kinds) && config.auto_merge.kinds.includes(task.kind);
+  // The risk check (HIVE-406) re-read the real code for this exact head. Risks
+  // it CONFIRMED are the ones that survived an adversarial second look, so the
+  // director sees that short list verbatim instead of the whole caution blob.
+  // Refuted risks say nothing here. Overridable, like the rebase guard below.
+  //
+  // This runs BEFORE the understanding check (HIVE-565). The quiz is the most
+  // expensive thing hive asks of the director, and asking for it on a change
+  // the machine is about to refuse is the wrong order. A risk that lands AFTER
+  // the quiz was passed — a new push, a late verdict — says so, so the refusal
+  // never reads as "you did that for nothing".
+  const confirmed = body?.override_confirmed_risks ? [] : confirmedRisks(db, id, task.head_sha);
+  if (confirmed.length) {
+    const quiz = latestUnderstandingQuiz(db, id);
+    const late = quiz && understandingQuizStatus(db, id, quiz.reviewEventId) === "passed";
+    return err(
+      (late ? `you passed the understanding check on this change earlier; a new finding arrived on commit ${String(task.head_sha ?? "").slice(0, 7)}. ` : "") +
+        `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
+        confirmed.map((c) => `“${c.risk}” — ${c.why}${c.evidence_path ? ` (${c.evidence_path})` : ""}`).join("; ") +
+        `. Fix them, or merge with override_confirmed_risks=true.`,
+      409
+    );
+  }
+
+  // "I could not check" is not "I checked and it is bad" (HIVE-539). A run that
+  // timed out leaves findings with NO verdict; quoting one of them as confirmed
+  // is how a task that already fixed the finding could never land. Say what
+  // actually happened instead, and let the queue retry — the verification pass
+  // re-runs the findings it missed and keeps the ones it already got.
+  const unfinished = body?.override_confirmed_risks ? null : unfinishedRiskCheck(db, id, task.head_sha);
+  if (unfinished)
+    return err(
+      `merge blocked — the risk check did not finish on this head: ${unfinished.unverified} of ` +
+        `${unfinished.unverified + unfinished.checked} finding${unfinished.unverified + unfinished.checked === 1 ? "" : "s"} ` +
+        `got no verdict${unfinished.reason ? ` (${unfinished.reason})` : ""}. Nothing was confirmed. ` +
+        `Wait for it to retry, or merge with override_confirmed_risks=true.`,
+      409
+    );
+
   // Mechanical changes (hive-1559) never mint a quiz, so nothing here to gate on.
   let deferQuizReviewEventId: string | null = null;
   if (understandingChecksRequired(db, task)) {
@@ -3430,34 +3478,6 @@ async function mergeTaskLocked(
     const names = blockingDeps.map((b) => `#${b.number} ${b.title} (${b.state})`).join(", ");
     return err(`blocked by unmet dependenc${blockingDeps.length === 1 ? "y" : "ies"}: ${names} — not yet merged/done`, 409);
   }
-
-  // The risk check (HIVE-406) re-read the real code for this exact head. Risks
-  // it CONFIRMED are the ones that survived an adversarial second look, so the
-  // director sees that short list verbatim instead of the whole caution blob.
-  // Refuted risks say nothing here. Overridable, like the rebase guard below.
-  const confirmed = body?.override_confirmed_risks ? [] : confirmedRisks(db, id, task.head_sha);
-  if (confirmed.length)
-    return err(
-      `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
-        confirmed.map((c) => `“${c.risk}” — ${c.why}${c.evidence_path ? ` (${c.evidence_path})` : ""}`).join("; ") +
-        `. Fix them, or merge with override_confirmed_risks=true.`,
-      409
-    );
-
-  // "I could not check" is not "I checked and it is bad" (HIVE-539). A run that
-  // timed out leaves findings with NO verdict; quoting one of them as confirmed
-  // is how a task that already fixed the finding could never land. Say what
-  // actually happened instead, and let the queue retry — the verification pass
-  // re-runs the findings it missed and keeps the ones it already got.
-  const unfinished = body?.override_confirmed_risks ? null : unfinishedRiskCheck(db, id, task.head_sha);
-  if (unfinished)
-    return err(
-      `merge blocked — the risk check did not finish on this head: ${unfinished.unverified} of ` +
-        `${unfinished.unverified + unfinished.checked} finding${unfinished.unverified + unfinished.checked === 1 ? "" : "s"} ` +
-        `got no verdict${unfinished.reason ? ` (${unfinished.reason})` : ""}. Nothing was confirmed. ` +
-        `Wait for it to retry, or merge with override_confirmed_risks=true.`,
-      409
-    );
 
   const exec = deps.exec ?? defaultExec;
   let prView: any = null;
