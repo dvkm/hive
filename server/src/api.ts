@@ -105,7 +105,7 @@ import type { AwayConfig } from "./away.ts";
 import { taskDiff } from "./diff.ts";
 import { authoredFiles, captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { overlapHold } from "./fileScope.ts";
-import { landGraph, markLand, resolveLandPauseForDecision } from "./landQueue.ts";
+import { landGraph, markLand, resolveLandPauseForDecision, CONFIRMED_RISK_CODE } from "./landQueue.ts";
 import { withMergeLock } from "./mergeLock.ts";
 import { divergence } from "./divergence.ts";
 import { followServingBranch, resolveServingFollowForDecision } from "./servingBranch.ts";
@@ -160,8 +160,11 @@ function json(data: unknown, status = 200): Response {
     headers: { "Content-Type": "application/json", ...CORS },
   });
 }
-function err(message: string, status = 400): Response {
-  return json({ error: message }, status);
+// `code` is the machine-readable half of a refusal. Prose is for humans and is
+// rewritten freely; anything that ROUTES on a refusal must read the code, so a
+// reworded message can never silently change behaviour (HIVE-559 review).
+function err(message: string, status = 400, code?: string): Response {
+  return json({ error: message, ...(code ? { code } : {}) }, status);
 }
 
 // HIVE-530: a refusal states the cause AND the next action. When a command
@@ -3376,7 +3379,8 @@ async function mergeTaskLocked(
       `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
         confirmed.map((c) => `“${c.risk}” — ${c.why}${c.evidence_path ? ` (${c.evidence_path})` : ""}`).join("; ") +
         `. Fix them, or merge with override_confirmed_risks=true.`,
-      409
+      409,
+      CONFIRMED_RISK_CODE
     );
 
   // "I could not check" is not "I checked and it is bad" (HIVE-539). A run that

@@ -145,19 +145,22 @@ export interface LandDeps {
   exec?: Exec;
   // Injected so the sweep is testable without gh/git. Defaults to POST /merge's
   // own mergeTask, so the queue lands PRs exactly the way the review click does.
-  merge?: (taskId: string) => Promise<{ ok: boolean; reason?: string }>;
+  merge?: (taskId: string) => Promise<{ ok: boolean; reason?: string; code?: string }>;
 }
 
-async function defaultMerge(db: DB, taskId: string, exec: Exec): Promise<{ ok: boolean; reason?: string }> {
+async function defaultMerge(db: DB, taskId: string, exec: Exec): Promise<{ ok: boolean; reason?: string; code?: string }> {
   const { mergeTask } = await import("./api.ts");
   const { herdr: defaultHerdr } = await import("./runtime/herdr.ts");
   const res = await mergeTask(db, defaultHerdr, taskId, {}, { exec });
   if (res.status === 200) return { ok: true };
   let reason = `merge failed (${res.status})`;
+  let code: string | undefined;
   try {
-    reason = ((await res.clone().json()) as any)?.error ?? reason;
+    const body = (await res.clone().json()) as any;
+    reason = body?.error ?? reason;
+    code = typeof body?.code === "string" ? body.code : undefined;
   } catch {}
-  return { ok: false, reason };
+  return { ok: false, reason, code };
 }
 
 // A land failure that will very likely clear on its own. The queue already
@@ -267,10 +270,44 @@ const MAX_NON_TRANSIENT_ATTEMPTS = 2;
 // human — every one was fixed by the agent as soon as someone relayed it by
 // hand. So hive relays it first and only asks the director when the agent
 // argues back or the same risk survives the relay.
+//
+// The routing decision reads the refusal's machine-readable `code`, NOT its
+// prose. The message is built in api.ts and consumed here; nothing tied the two
+// files together, so a reworded sentence would have reverted every confirmed
+// risk to the old always-ask-the-director path with nobody the wiser.
+// `CONFIRMED_RISK_CODE` is that contract, exported from this one module and
+// imported by api.ts, so it cannot desync.
+export const CONFIRMED_RISK_CODE = "confirmed_risk";
+
+export function isConfirmedRiskFailure(code: string | undefined): boolean {
+  return code === CONFIRMED_RISK_CODE;
+}
+
+// The tripwire for the failure this design is meant to remove. If a refusal
+// still READS like a confirmed risk but arrived with no code, the two sides have
+// drifted apart. Rather than quietly falling back to the director, hive keeps
+// routing (so behaviour does not regress) and says loudly that the contract
+// broke, once per merge attempt.
 const CONFIRMED_RISK_RE = /the risk check confirmed/i;
 
-export function isConfirmedRiskFailure(reason: string): boolean {
-  return CONFIRMED_RISK_RE.test(reason);
+function codeOfFailure(db: DB, node: LandNode, reason: string, code: string | undefined): string | undefined {
+  if (code || !CONFIRMED_RISK_RE.test(reason)) return code;
+  writeEvent(db, {
+    task_id: node.id,
+    source: "reconciler",
+    type: "risk_code_desync",
+    payload: { reason, expected_code: CONFIRMED_RISK_CODE },
+  });
+  enqueue(db, {
+    kind: "stale",
+    task_id: node.id,
+    title: `Land refusal lost its ${CONFIRMED_RISK_CODE} code`,
+    body:
+      `PR #${node.number} was refused with a confirmed-risk message that carried no \`code\` field. ` +
+      `The merge gate in server/src/api.ts and the land queue have drifted apart. Risk routing still ran, ` +
+      `but fix the missing code before it stops working.`,
+  });
+  return CONFIRMED_RISK_CODE;
 }
 
 // One relay against ONE commit is the ceiling. Counted per head_sha, so a real
@@ -312,7 +349,7 @@ function riskRoutesAtHead(db: DB, taskId: string, headSha: string | null): numbe
 // the quiet outcome rather than a false escalation.
 const RISK_DISPUTE_EVENT = "risk_dispute";
 
-function pendingRiskDispute(db: DB, taskId: string, headSha: string | null): { dispute: string; reason: string } | null {
+function pendingRiskDispute(db: DB, taskId: string, headSha: string | null): { dispute: string; reason: string; code: string } | null {
   const routed = db
     .query("SELECT rowid AS rid, payload FROM events WHERE task_id = ? AND type = 'risk_routed_to_agent' ORDER BY rowid DESC LIMIT 1")
     .get(taskId) as { rid: number; payload: string } | undefined;
@@ -329,7 +366,11 @@ function pendingRiskDispute(db: DB, taskId: string, headSha: string | null): { d
     )
     .get(taskId, RISK_DISPUTE_EVENT, routed.rid) as { note: string | null } | undefined;
   if (!disputed?.note) return null;
-  return { dispute: disputed.note, reason: payload.reason ?? "the risk check confirmed a risk on this head" };
+  return {
+    dispute: disputed.note,
+    reason: payload.reason ?? "the risk check confirmed a risk on this head",
+    code: payload.code ?? CONFIRMED_RISK_CODE,
+  };
 }
 
 // Did we already open a card for the current relay episode? Without this the
@@ -352,7 +393,8 @@ async function createLandPauseCard(
   db: DB,
   node: LandNode,
   reason: string,
-  dispute: string | null
+  dispute: string | null,
+  code: string | undefined
 ): Promise<void> {
   const { createDecision } = await import("./api.ts");
   const decision = createDecision(db, {
@@ -363,7 +405,7 @@ async function createLandPauseCard(
       (dispute
         ? `Hive sent this finding to the agent first. The agent disputes it: “${dispute.slice(0, 500)}” — ` +
           `that argument is why you are seeing this instead of a fix.\n\n`
-        : isConfirmedRiskFailure(reason)
+        : isConfirmedRiskFailure(code)
           ? `Hive already relayed this finding to the agent on this same commit and the branch came back unfixed.\n\n`
           : "") +
       `Retrying only helps if that cause has changed. Nothing has changed on its own, so the same merge will ` +
@@ -379,7 +421,7 @@ async function createLandPauseCard(
     task_id: node.id,
     source: "reconciler",
     type: "land_paused",
-    payload: { decision_id: decision.id, reason, head_sha: headShaOf(db, node.id), ...(dispute ? { dispute: true } : {}) },
+    payload: { decision_id: decision.id, reason, code, head_sha: headShaOf(db, node.id), ...(dispute ? { dispute: true } : {}) },
   });
 }
 
@@ -608,7 +650,7 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
     const byId = new Map(nodes.map((n) => [n.id, n]));
     const landed = new Set<string>();
     const pending = new Set(nodes.filter((n) => n.land_queued_at).map((n) => n.id));
-    const failed: { node: LandNode; reason: string }[] = [];
+    const failed: { node: LandNode; reason: string; code: string | undefined }[] = [];
 
     while (pending.size) {
       const batch: LandNode[] = [];
@@ -641,7 +683,7 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         // sweep — the escalation has to happen here.
         const argued = pendingRiskDispute(db, n.id, headShaOf(db, n.id));
         if (argued && !escalatedSinceRelay(db, n.id)) {
-          await createLandPauseCard(db, n, argued.reason, argued.dispute);
+          await createLandPauseCard(db, n, argued.reason, argued.dispute, argued.code);
           continue;
         }
         if (backingOff(retryState(db, n.id), nowMs)) continue;
@@ -728,6 +770,7 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         const result = await merge(node.id);
         pending.delete(node.id);
         const reason = result.reason ?? "merge failed";
+        const code = result.ok ? undefined : codeOfFailure(db, node, reason, result.code);
         // Waiting on the director's quiz answer: hold quietly, log nothing. A
         // sweep runs every 30s and this refusal is a local check, so an event
         // per sweep would be pure timeline noise.
@@ -742,13 +785,13 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
           landed.add(node.id);
           db.query("UPDATE tasks SET land_queued_at = NULL WHERE id = ?").run(node.id);
         } else if (!transient) {
-          failed.push({ node, reason });
+          failed.push({ node, reason, code });
         }
         writeEvent(db, {
           task_id: node.id,
           source: "reconciler",
           type: "land_attempted",
-          payload: { ok: result.ok, reason: result.reason, ...(result.ok ? {} : { transient, head_sha: headShaOf(db, node.id) }) },
+          payload: { ok: result.ok, reason: result.reason, ...(result.ok ? {} : { transient, code, head_sha: headShaOf(db, node.id) }) },
         });
       }
     }
@@ -760,7 +803,7 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         body: [...landed].map((id) => `#${byId.get(id)?.number}`).join(", "),
       });
 
-    for (const { node, reason } of failed) {
+    for (const { node, reason, code } of failed) {
       if (openPauseDecisionId(db, node.id)) continue; // already asked
       // HIVE-559: a confirmed risk is agent work. It wrote the code, it can fix
       // the finding, and every one of these the director answered by hand was
@@ -769,7 +812,7 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
       // and a risk that reached it would go silent with no card ever — the
       // agent ignoring the relay would simply bury the finding. Escalate on a
       // dispute, or once the relay is spent and the same commit still fails.
-      if (isConfirmedRiskFailure(reason)) {
+      if (isConfirmedRiskFailure(code)) {
         // Bounced back to its agent already (a conflict, a change request): the
         // agent has the finding and no card is owed. The held-task escalation
         // earlier in this sweep covers a dispute raised from there.
@@ -790,13 +833,13 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
               task_id: node.id,
               source: "reconciler",
               type: "risk_routed_to_agent",
-              payload: { reason, head_sha: head, round: routes + 1 },
+              payload: { reason, code, head_sha: head, round: routes + 1 },
             });
             continue;
           }
           // Undeliverable — nothing will ever carry it, so ask the director.
         }
-        await createLandPauseCard(db, node, reason, dispute);
+        await createLandPauseCard(db, node, reason, dispute, code);
         continue;
       }
       // Already asked once and retried once against this same commit: a second
@@ -816,7 +859,7 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
       // instructions. Asking the director what to do about work hive has
       // already routed is the duplicate card this task exists to remove.
       if (getTask(db, node.id)?.state !== "in_review") continue;
-      await createLandPauseCard(db, node, reason, null);
+      await createLandPauseCard(db, node, reason, null, code);
     }
   }
 }
