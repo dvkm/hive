@@ -333,14 +333,43 @@ const sameStatus = (a: string | null, b: string | null): boolean =>
 // Flatten Atlassian Document Format to plain text. ADF is a nested doc tree;
 // every leaf that carries `text` is content, and paragraph-ish nodes break the
 // line. Good enough to render a brief — hive never writes descriptions back.
+//
+// `text` is not the only place content lives, and reading only it silently threw
+// away the most important part of a ticket: a pasted Figma or Google URL becomes
+// an inlineCard whose URL sits in `attrs`, an attached screenshot becomes a
+// `media` node with no text at all, and a hyperlink's destination rides as a
+// mark on the text rather than in it. Those all render here now, so nothing the
+// ticket points at is invisible to whoever reads the brief.
 export function adfToText(node: any): string {
   if (node == null) return "";
   if (typeof node === "string") return node;
   if (Array.isArray(node)) return node.map(adfToText).join("");
+  const attrs = node.attrs ?? {};
   let out = "";
   if (typeof node.text === "string") out += node.text;
+  // The visible text of a link ("see the design") almost never contains the
+  // destination. Appended only when it differs, so a bare URL hive itself wrote
+  // as a link (textToAdf) does not come back doubled.
+  const href = (Array.isArray(node.marks) ? node.marks : []).find((m: any) => m?.type === "link")?.attrs?.href;
+  if (typeof href === "string" && href.trim() && href.trim() !== node.text) out += ` (${href.trim()})`;
+  if (node.type === "inlineCard" || node.type === "blockCard" || node.type === "embedCard") {
+    const url = [attrs.url, attrs.data?.url].find((v: unknown) => typeof v === "string" && v.trim());
+    if (url) out += String(url).trim();
+  }
+  // No filename in the node — ADF carries the attachment id. briefFor lists the
+  // issue's attachments with their real filenames alongside.
+  if (node.type === "media") {
+    const name = [attrs.alt, attrs.id].find((v: unknown) => typeof v === "string" && v.trim());
+    out += `[attachment: ${name ? String(name).trim() : "unnamed"}]`;
+  }
+  if ((node.type === "mention" || node.type === "status") && typeof attrs.text === "string") out += attrs.text;
+  if (node.type === "date" && attrs.timestamp != null) {
+    const at = Number(attrs.timestamp);
+    if (Number.isFinite(at)) out += new Date(at).toISOString().slice(0, 10);
+  }
   if (Array.isArray(node.content)) out += node.content.map(adfToText).join("");
   if (node.type === "paragraph" || node.type === "heading" || node.type === "listItem") out += "\n";
+  if (node.type === "media" || node.type === "blockCard" || node.type === "embedCard") out += "\n";
   if (node.type === "hardBreak") out += "\n";
   return out;
 }
@@ -769,7 +798,9 @@ export class JiraClient {
   // decision is derived from.
   async issue(key: string): Promise<any> {
     const q = new URLSearchParams({
-      fields: `${JIRA_ISSUE_FIELDS.join(",")},parent`,
+      // `attachment` is read but not validated: it is brief material, not a
+      // field any decision turns on, and an issue may legitimately carry none.
+      fields: `${JIRA_ISSUE_FIELDS.join(",")},parent,attachment`,
       properties: "hive.task_id",
     });
     return this.json(`/rest/api/3/issue/${encodeURIComponent(key)}?${q}`);
@@ -1168,6 +1199,16 @@ export function decideStatusSync(args: {
 // ============================================================================
 export function briefFor(issue: any, site: string): string {
   const f = issue.fields ?? {};
+  const description = adfToText(f.description).trim();
+  const attachments = (Array.isArray(f.attachment) ? f.attachment : [])
+    .map((a: any) => ({ filename: String(a?.filename ?? "").trim(), content: String(a?.content ?? "").trim() }))
+    .filter((a: { filename: string }) => !!a.filename);
+  // An agent cannot guess a layout from prose when the answer is in a mockup, so
+  // say plainly that one exists. Image attachments and design links are the two
+  // ways a ticket carries that.
+  const visual =
+    attachments.some((a: { filename: string }) => /\.(png|jpe?g|gif|webp|svg|pdf|fig)$/i.test(a.filename)) ||
+    /figma\.com|\.png|\.jpe?g|\[attachment:/i.test(description);
   return [
     `JIRA: ${site}/browse/${issue.key}`,
     `Type: ${f.issuetype?.name ?? "-"}`,
@@ -1175,7 +1216,13 @@ export function briefFor(issue: any, site: string): string {
     `Assignee: ${f.assignee?.displayName ?? f.assignee?.accountId ?? "-"}`,
     `Labels: ${(f.labels ?? []).join(", ") || "-"}`,
     "",
-    adfToText(f.description).trim() || "(no description)",
+    description || "(no description)",
+    ...(attachments.length
+      ? ["", "Attachments:", ...attachments.map((a: { filename: string; content: string }) => `- ${a.filename}${a.content ? ` ${a.content}` : ""}`)]
+      : []),
+    ...(visual
+      ? ["", "This ticket carries visual material. Look at it before you build: fetch the attachments above (Jira auth required), and render any Figma link with the Figma REST API or the repo's scripts/figma-frame.sh."]
+      : []),
   ].join("\n");
 }
 

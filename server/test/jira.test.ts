@@ -1983,6 +1983,80 @@ test("adfToText flattens an Atlassian document to readable text", () => {
   expect(J.adfToText(null)).toBe("");
 });
 
+test("adfToText keeps the links, images and mentions ADF hides in attrs", () => {
+  const adf = {
+    type: "doc",
+    version: 1,
+    content: [
+      {
+        type: "paragraph",
+        content: [
+          { type: "text", text: "see the ", marks: [] },
+          { type: "text", text: "design", marks: [{ type: "link", attrs: { href: "https://figma.com/design/abc/Home?node-id=1-23" } }] },
+          { type: "text", text: " and ask " },
+          { type: "mention", attrs: { id: "557", text: "@Dana" } },
+        ],
+      },
+      { type: "inlineCard", attrs: { url: "https://www.figma.com/design/KEY/Banners" } },
+      { type: "blockCard", attrs: { data: { url: "https://docs.google.com/document/d/xyz" } } },
+      {
+        type: "mediaSingle",
+        content: [{ type: "media", attrs: { type: "file", id: "media-1", alt: "mockup.png", collection: "c" } }],
+      },
+    ],
+  };
+  const text = J.adfToText(adf);
+  expect(text).toContain("see the design (https://figma.com/design/abc/Home?node-id=1-23)");
+  expect(text).toContain("@Dana");
+  expect(text).toContain("https://www.figma.com/design/KEY/Banners");
+  expect(text).toContain("https://docs.google.com/document/d/xyz");
+  expect(text).toContain("[attachment: mockup.png]");
+});
+
+test("adfToText does not double a URL hive itself wrote as a link", () => {
+  const url = "https://example.test/a";
+  expect(J.adfToText(J.textToAdf(url)).trim()).toBe(url);
+});
+
+test("briefFor names the ticket's attachments and flags visual material", () => {
+  const issue = {
+    key: "WEB-120",
+    fields: {
+      summary: "Homepage banners",
+      issuetype: { name: "Task" },
+      priority: { name: "High" },
+      assignee: null,
+      labels: [],
+      attachment: [
+        { filename: "mockup.png", content: "https://jira.test/secure/attachment/1/mockup.png" },
+        { filename: "notes.txt", content: "https://jira.test/secure/attachment/2/notes.txt" },
+      ],
+      description: {
+        type: "doc",
+        version: 1,
+        content: [
+          { type: "paragraph", content: [{ type: "text", text: "arrange the banners" }] },
+          { type: "mediaSingle", content: [{ type: "media", attrs: { id: "m1", alt: "mockup.png" } }] },
+        ],
+      },
+    },
+  };
+  const brief = J.briefFor(issue, "https://jira.test");
+  expect(brief).toContain("- mockup.png https://jira.test/secure/attachment/1/mockup.png");
+  expect(brief).toContain("- notes.txt");
+  expect(brief).toContain("[attachment: mockup.png]");
+  expect(brief).toContain("visual material");
+});
+
+test("briefFor stays quiet when the ticket carries nothing visual", () => {
+  const brief = J.briefFor(
+    { key: "WEB-1", fields: { issuetype: { name: "Task" }, description: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "plain" }] }] } } },
+    "https://jira.test"
+  );
+  expect(brief).not.toContain("Attachments:");
+  expect(brief).not.toContain("visual material");
+});
+
 test("status mapping is total over the real WEB workflow, in both directions", () => {
   expect(J.jiraStatusToState("To Do")).toBe("queued");
   expect(J.jiraStatusToState("in progress")).toBe("in_progress"); // case-insensitive
