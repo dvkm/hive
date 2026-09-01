@@ -6237,9 +6237,30 @@ function listIncidents(db: DB, url: URL): Response {
 // ---------------------------------------------------------------- learnings (regression ledger)
 // On-demand knowledge lookup across a project's references, failure learnings,
 // and policies (global + project). `project_id` or `task_id` scopes it; `q` is a
-// space-separated set of keywords, ALL of which must appear (title or body,
-// case-insensitive). No q → return all references + policies (the "what exists"
-// index). LIKE, not FTS — a few hundred rows, keep it boring.
+// space-separated set of keywords. ANY term may match (title or body,
+// case-insensitive); rows are ranked by how many distinct terms hit, title hits
+// worth more than body hits. No q → return all references + policies (the "what
+// exists" index). Substring matching, not FTS — a few hundred rows, keep it boring.
+const RECALL_LIMIT = 20;
+
+// Rank rows by term overlap. One wrong keyword must not erase a good match, so
+// a row survives on a single hit and sorts below rows that hit more terms.
+// Ties keep the SQL order (Array#sort is stable), which is the no-q order.
+function rankByTerms<T extends { title: string; body?: string | null }>(rows: T[], terms: string[], limit: number): T[] {
+  if (!terms.length) return rows.slice(0, limit);
+  const scored = rows
+    .map((row) => {
+      const title = row.title.toLowerCase();
+      const body = String(row.body ?? "").toLowerCase();
+      let score = 0;
+      for (const t of terms) score += title.includes(t) ? 2 : body.includes(t) ? 1 : 0;
+      return { row, score };
+    })
+    .filter((s) => s.score > 0);
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map((s) => s.row);
+}
+
 function knowledgeSearch(db: DB, url: URL): Response {
   let projectId = url.searchParams.get("project_id");
   const taskId = url.searchParams.get("task_id");
@@ -6248,34 +6269,42 @@ function knowledgeSearch(db: DB, url: URL): Response {
     projectId = t?.project_id ?? null;
   }
   if (!projectId) return err("project_id or task_id is required. Run 'hive recall <keywords>' with HIVE_TASK_ID set, or pass ?project_id=<project-id>");
-  const terms = (url.searchParams.get("q") ?? "").trim().split(/\s+/).filter(Boolean);
-  const like = (cols: string) =>
-    terms.length ? " AND " + terms.map(() => `(${cols}) LIKE ?`).join(" AND ") : "";
+  const terms = (url.searchParams.get("q") ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean);
 
-  const refs = db
-    .query(
-      `SELECT title, body FROM learnings WHERE project_id = ? AND kind = 'reference' AND status = 'active'${like("title || ' ' || COALESCE(body,'')")} ORDER BY first_seen`
-    )
-    .all(projectId, ...terms.map((t) => `%${t}%`)) as any[];
-  const learnings = db
-    .query(
-      `SELECT title, body, occurrences FROM learnings WHERE project_id = ? AND kind = 'failure' AND status = 'active'${like("title || ' ' || COALESCE(body,'')")} ORDER BY last_seen DESC LIMIT 20`
-    )
-    .all(projectId, ...terms.map((t) => `%${t}%`)) as any[];
-  const policies = db
-    .query(
-      `SELECT title, body FROM policies WHERE active = 1 AND (scope = 'global' OR scope = ?)${like("title || ' ' || body")} ORDER BY created_at`
-    )
-    .all(`project:${projectId}`, ...terms.map((t) => `%${t}%`)) as any[];
+  const byKind = (cols: string, kind: string, order: string) =>
+    db
+      .query(`SELECT ${cols} FROM learnings WHERE project_id = ? AND kind = ? AND status = 'active' ORDER BY ${order}`)
+      .all(projectId, kind) as any[];
+
+  const refs = rankByTerms(byKind("title, body", "reference", "first_seen"), terms, Number.MAX_SAFE_INTEGER);
+  const learnings = rankByTerms(byKind("title, body, occurrences", "failure", "last_seen DESC"), terms, RECALL_LIMIT);
+  const policies = rankByTerms(
+    db
+      .query(`SELECT title, body FROM policies WHERE active = 1 AND (scope = 'global' OR scope = ?) ORDER BY created_at`)
+      .all(`project:${projectId}`) as any[],
+    terms,
+    Number.MAX_SAFE_INTEGER
+  );
   // Answers to past decision cards — so a crew consults the prior ruling before
   // re-raising the same question.
-  const decisions = db
-    .query(
-      `SELECT title, body, occurrences FROM learnings WHERE project_id = ? AND kind = 'decision' AND status = 'active'${like("title || ' ' || COALESCE(body,'')")} ORDER BY last_seen DESC LIMIT 20`
-    )
-    .all(projectId, ...terms.map((t) => `%${t}%`)) as any[];
+  const decisions = rankByTerms(byKind("title, body, occurrences", "decision", "last_seen DESC"), terms, RECALL_LIMIT);
 
-  return json({ query: terms.join(" "), references: refs, learnings, policies, decisions });
+  // A silent empty result reads as "nothing to know" and the caller proceeds on
+  // its own judgement. Say the keywords missed, and where the full index is.
+  const no_matches = terms.length > 0 && !refs.length && !learnings.length && !policies.length && !decisions.length;
+  return json({
+    query: terms.join(" "),
+    references: refs,
+    learnings,
+    policies,
+    decisions,
+    ...(no_matches
+      ? {
+          no_matches: true,
+          note: `No stored knowledge mentions ${terms.map((t) => `"${t}"`).join(" or ")}. That is not proof nothing is known; the keywords may simply be wrong. Run 'hive recall' with no keywords to list everything stored for this project.`,
+        }
+      : {}),
+  });
 }
 
 function listLearnings(db: DB, url: URL): Response {
