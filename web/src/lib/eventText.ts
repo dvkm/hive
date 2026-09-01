@@ -10,6 +10,8 @@ export interface EventLike {
 }
 
 const s = (v: unknown): string => (v == null ? "" : String(v));
+// Payload values are untyped, so an array field has to be narrowed before use.
+const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 
 // One quiet sentence per event, e.g. "moved to In Review",
 // "evidence attached: board screenshot", "decision answered: sqlite".
@@ -146,15 +148,17 @@ export function eventText(e: EventLike): string {
     case "worktree_reclaim_failed":
       return `worktree reclaim failed: ${s(p.error)}`;
     case "worktree_seeded": {
+      const seeded = list(p.seeded);
+      const warmed = list(p.warmed);
       const did = [
-        p.seeded?.length ? `copied ${p.seeded.length} config file${p.seeded.length === 1 ? "" : "s"}` : null,
-        p.warmed?.length ? `reused ${p.warmed.join(", ")}` : null,
+        seeded.length ? `copied ${seeded.length} config file${seeded.length === 1 ? "" : "s"}` : null,
+        warmed.length ? `reused ${warmed.map(s).join(", ")}` : null,
       ].filter(Boolean);
       return did.length ? `worktree seeded: ${did.join(", ")}` : "worktree seeded: nothing to copy or reuse";
     }
     case "worktree_seed_failed": {
       // The spawn still worked; the project asked for something that is not there.
-      const bad = Array.isArray(p.misconfigured) ? p.misconfigured : [];
+      const bad = list(p.misconfigured) as { path?: unknown; reason?: unknown }[];
       const first = bad[0] ? `${s(bad[0].path)} — ${s(bad[0].reason)}` : "see the event payload";
       return bad.length > 1
         ? `worktree setup config is wrong (${bad.length} problems), so the agent started cold: ${first}`
