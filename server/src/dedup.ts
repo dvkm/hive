@@ -87,12 +87,22 @@ export function mergeInto(db: DB, sourceId: string, targetId: string, reason?: s
   if (!source) throw new Error("unknown source task");
   if (!target) throw new Error("unknown target task");
 
-  // Fold the source brief onto the survivor only when it adds something.
+  // Fold the source brief onto the survivor's OWN brief, not just an event.
+  // Title similarity says nothing about which row carries the content, so a
+  // stub survivor can win over the real filing; without this the instructions
+  // only survive in the event log, where nobody working the task reads them.
   const srcBrief = (source.brief ?? "").trim();
-  const note =
-    srcBrief && srcBrief !== (target.brief ?? "").trim()
-      ? `Folded from duplicate ${source.id} "${source.title}":\n${srcBrief}`
-      : undefined;
+  const tgtBrief = (target.brief ?? "").trim();
+  const adds = !!srcBrief && srcBrief !== tgtBrief && !tgtBrief.includes(srcBrief);
+  const note = adds ? `Folded from duplicate ${source.id} "${source.title}":\n${srcBrief}` : undefined;
+  // Empty survivor takes the brief verbatim; a survivor that already has one
+  // keeps it and gets the source appended. Never overwrite, never drop.
+  if (adds)
+    db.query("UPDATE tasks SET brief = ?, updated_at = ? WHERE id = ?").run(
+      tgtBrief ? `${tgtBrief}\n\n${note}` : srcBrief,
+      now(),
+      targetId
+    );
   writeEvent(db, {
     task_id: targetId,
     source: "system",
@@ -117,12 +127,26 @@ export function mergeInto(db: DB, sourceId: string, targetId: string, reason?: s
 export function openDuplicateDecision(db: DB, task: any, match: DupMatch): any {
   const recommendMerge = match.tier === "exact" || match.score >= STRONG_THRESHOLD;
   const pct = Math.round(match.score * 100);
+  // Title similarity is the one dimension that does NOT say which row holds the
+  // work. Spell out the brief asymmetry so the answer is an informed one.
+  const survivorBrief = (match.survivor.brief ?? "").trim();
+  const taskBrief = (task.brief ?? "").trim();
+  let briefLine = "";
+  if (taskBrief && !survivorBrief)
+    briefLine =
+      `Heads up: the existing task has no brief, and this one has ${taskBrief.length} characters of instructions. ` +
+      `Merging copies them onto the existing task, so nothing is lost. `;
+  else if (taskBrief && survivorBrief && taskBrief.length >= survivorBrief.length * 2)
+    briefLine =
+      `Heads up: this task's brief is ${taskBrief.length} characters and the existing one's is ${survivorBrief.length}. ` +
+      `Merging appends this brief to it, so nothing is lost. `;
   const decision = createDecision(db, {
     task_id: task.id,
     title: `Possible duplicate of "${match.survivor.title}"`,
     context:
       `This new task looks like a duplicate of existing task ${match.survivor.id} ` +
       `"${match.survivor.title}" (${match.tier} match, ${pct}% title similarity). ` +
+      briefLine +
       `Merge into it, or keep them separate?`,
     risk: "normal",
     blast_radius: `Task ${task.id} would be folded into ${match.survivor.id}.`,
