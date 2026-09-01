@@ -132,15 +132,53 @@ test("a path that escapes the worktree is refused, not followed", async () => {
   expect(r.misconfigured.some((m) => m.reason === "escapes the worktree")).toBe(true);
 });
 
+// Stand in for a filesystem with no reflink support (ext4): the clone flags are
+// refused, the plain `cp -R` that follows works. Both run as child processes, so
+// the slow byte copy never blocks the server's event loop.
+const noReflinkExec: Exec = async (argv) => {
+  if (argv.includes("-Rc") || argv.includes("--reflink=always"))
+    return { code: 1, stdout: "", stderr: "cp: no clone support" };
+  cpSync(argv[argv.length - 2]!, argv[argv.length - 1]!, { recursive: true });
+  return { code: 0, stdout: "", stderr: "" };
+};
+
 test("a clone that fails leaves nothing half-built behind", async () => {
   const { repo, wt } = trees();
-  // Every `cp` fails, so the exec path bails and the fs fallback still finishes.
-  const failing: Exec = async () => ({ code: 1, stdout: "", stderr: "cp: no clone support" });
-  const r = await seedWorktree(repo, wt, { worktree_warm: [{ dir: "node_modules", lock: "bun.lock" }] }, failing);
+  const r = await seedWorktree(repo, wt, { worktree_warm: [{ dir: "node_modules", lock: "bun.lock" }] }, noReflinkExec);
   // The fallback ran, so it must NOT claim the fast path: a byte copy on a
   // filesystem without clone support has to be visible as one in the stats.
   expect(r.warmed).toEqual([{ dir: "node_modules", method: "copy" }]);
   expect(readFileSync(join(wt, "node_modules", "left-pad", "index.js"), "utf8")).toBe("module.exports=1");
+});
+
+// The slow path must stay OFF the event loop. A byte copy of a real
+// node_modules takes seconds, and doing it in-process would freeze every other
+// spawn and API request for all of them. So the fallback has to be a child
+// process too: proved by it arriving as a second `cp` through exec.
+test("the byte-copy fallback runs as a child process, not in-process", async () => {
+  const { repo, wt } = trees();
+  const calls: string[][] = [];
+  const r = await seedWorktree(
+    repo,
+    wt,
+    { worktree_warm: [{ dir: "node_modules", lock: "bun.lock" }] },
+    async (argv) => {
+      calls.push(argv);
+      return noReflinkExec(argv);
+    }
+  );
+  expect(r.warmed).toEqual([{ dir: "node_modules", method: "copy" }]);
+  expect(calls.length).toBe(2);
+  expect(calls[1]!.slice(0, 2)).toEqual(["cp", "-R"]);
+});
+
+test("a fallback copy that fails too is loud, and leaves no node_modules", async () => {
+  const { repo, wt } = trees();
+  const allFail: Exec = async () => ({ code: 1, stdout: "", stderr: "cp: Read-only file system" });
+  const r = await seedWorktree(repo, wt, { worktree_warm: [{ dir: "node_modules", lock: "bun.lock" }] }, allFail);
+  expect(r.warmed).toEqual([]);
+  expect(existsSync(join(wt, "node_modules"))).toBe(false);
+  expect(r.misconfigured[0]!.reason).toContain("Read-only file system");
 });
 
 test("a cp that dies part-way never leaves a half-built node_modules", async () => {
@@ -151,9 +189,12 @@ test("a cp that dies part-way never leaves a half-built node_modules", async () 
   const killedPartWay: Exec = async (argv) => {
     const dest = argv[argv.length - 1]!;
     expect(dest).not.toBe(join(wt, "node_modules")); // built beside it, not on it
-    mkdirSync(join(dest, "half-written"), { recursive: true });
-    expect(existsSync(join(wt, "node_modules"))).toBe(false);
-    return { code: 137, stdout: "", stderr: "Killed" };
+    if (argv.includes("-Rc") || argv.includes("--reflink=always")) {
+      mkdirSync(join(dest, "half-written"), { recursive: true });
+      expect(existsSync(join(wt, "node_modules"))).toBe(false);
+      return { code: 137, stdout: "", stderr: "terminated" };
+    }
+    return noReflinkExec(argv);
   };
   const r = await seedWorktree(repo, wt, { worktree_warm: [{ dir: "node_modules", lock: "bun.lock" }] }, killedPartWay);
   expect(r.warmed).toEqual([{ dir: "node_modules", method: "copy" }]);

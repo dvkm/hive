@@ -56,6 +56,12 @@ export type WarmMethod = "clone" | "copy";
 const CLONE_TIMEOUT_MS = 300_000;
 const CLONE_ARGV: string[] | null =
   process.platform === "darwin" ? ["cp", "-Rc"] : process.platform === "linux" ? ["cp", "-R", "--reflink=always"] : null;
+// The fallback when the clone is refused. A plain `cp -R`, run as a CHILD
+// PROCESS on purpose: a real byte copy of a large node_modules takes seconds,
+// and doing it in-process would block Bun's single event loop for every one of
+// them, stalling all the other spawns and API requests the server is serving.
+// Awaiting a child keeps the slow path off the loop.
+const COPY_ARGV: string[] | null = process.platform === "win32" ? null : ["cp", "-R"];
 
 // The seed list is meant for a handful of small config files (.env and
 // friends). A pattern like `**/*` would happily copy the whole main checkout
@@ -97,10 +103,20 @@ async function cloneDir(src: string, dst: string, exec: Exec): Promise<WarmMetho
       return "clone";
     }
   }
-  // ponytail: a real byte copy, so no faster than the install it replaces on a
-  // filesystem without reflinks. Correct everywhere, which is what matters —
-  // and reported as `copy` so nobody reads the slow path as the fast one.
-  cpSync(src, tmp, { recursive: true });
+  // A real byte copy, so no faster than the install it replaces on a filesystem
+  // without reflinks. Correct everywhere, which is what matters — and reported
+  // as `copy` so nobody reads the slow path as the fast one.
+  if (COPY_ARGV) {
+    const r = await exec([...COPY_ARGV, src, tmp], { timeoutMs: CLONE_TIMEOUT_MS });
+    if (r.code !== 0) {
+      rmSync(tmp, { recursive: true, force: true });
+      throw new Error(`cp -R failed: ${(r.stderr || r.stdout || "").trim().slice(0, 200)}`);
+    }
+  } else {
+    // ponytail: no `cp` on Windows, and the server does not run there. A
+    // blocking copy beats a second platform's argv to maintain.
+    cpSync(src, tmp, { recursive: true });
+  }
   renameSync(tmp, dst);
   return "copy";
 }
