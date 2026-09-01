@@ -158,8 +158,9 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
     // React to dialogs EVERY cycle, not just on a status transition. Claude's
     // startup trust dialog reports `idle`, auto-mode setup reports `done`, and
     // tool permission dialogs report `blocked`. Idempotent: a handled dialog
-    // disappears from the pane.
-    if (next === "blocked" || next === "idle" || next === "done") {
+    // disappears from the pane. ("done" needs no arm of its own: normalizeStatus
+    // already folds it into `idle`.)
+    if (next === "blocked" || next === "idle") {
       try {
         await handleBlockedAgent(db, h, t.id, t.agent_target);
       } catch (e) {
