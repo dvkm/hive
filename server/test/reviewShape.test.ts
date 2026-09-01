@@ -129,4 +129,100 @@ test("a passed quiz survives a re-emitted review", async () => {
   expect(after.json.passed).toBe(true);
 });
 
+// HIVE-545 (second pass): an agent that RE-LISTS the same checks with drifted
+// wording used to wipe the answers just as thoroughly as one that omitted them.
+// Answer whichever check is currently being asked, until the whole quiz passes.
+async function passQuiz(taskId: string, checks: { question: string; answer_key: string }[]) {
+  for (let i = 0; i < checks.length; i++) {
+    const quizzes = await (await fetch(`${BASE}/api/understanding-quizzes`)).json();
+    const quiz = quizzes.quizzes.find((q: any) => q.task_id === taskId);
+    const answered = await post(`/api/tasks/${taskId}/understanding-quiz/answer`, {
+      source: "director",
+      answer_key: checks.find((check) => check.question === quiz.question)!.answer_key,
+      version: quiz.version,
+    });
+    expect(answered.status).toBe(200);
+  }
+  const done = await post(`/api/tasks/${taskId}/understanding-quiz/answer`, { source: "director" });
+  expect(done.json.passed).toBe(true);
+}
+
+async function readyTaskWithQuiz() {
+  const taskId = await newTask();
+  for (const to of ["in_progress", "in_review", "verifying"])
+    await post(`/api/tasks/${taskId}/transition`, { to });
+  await post(`/api/tasks/${taskId}/events`, { type: "review_summary", ...REVIEW_SUMMARY_EXAMPLE });
+  await passQuiz(taskId, REVIEW_SUMMARY_EXAMPLE.understanding.checks as any);
+  return taskId;
+}
+
+const EXAMPLE_CHECK = REVIEW_SUMMARY_EXAMPLE.understanding.checks[0] as any;
+const reword = (text: string) => `  ${text.replace(/ /g, "  ")}\n`;
+
+test("a passed quiz survives a review that re-lists the same checks, reworded", async () => {
+  const taskId = await readyTaskWithQuiz();
+  const again = await post(`/api/tasks/${taskId}/events`, {
+    type: "review_summary",
+    done: ["rebased onto main"],
+    understanding: {
+      background: "b",
+      checks: [{ ...EXAMPLE_CHECK, question: reword(EXAMPLE_CHECK.question) }],
+    },
+  });
+  expect(again.status).toBe(201);
+  const after = await post(`/api/tasks/${taskId}/understanding-quiz/answer`, { source: "director" });
+  expect(after.json.passed).toBe(true);
+});
+
+test("a passed quiz survives the same checks listed in a different order", async () => {
+  const taskId = await newTask();
+  for (const to of ["in_progress", "in_review", "verifying"])
+    await post(`/api/tasks/${taskId}/transition`, { to });
+  const two = [
+    { question: "What breaks if this ships?", options: [{ key: "a", label: "Nothing" }, { key: "b", label: "Landing" }], answer_key: "a" },
+    { question: "Where does the fix live?", options: [{ key: "a", label: "The CLI" }, { key: "b", label: "The server" }], answer_key: "b" },
+  ];
+  await post(`/api/tasks/${taskId}/events`, { type: "review_summary", done: ["shipped"], understanding: { background: "b", checks: two } });
+  // Answer both, so the whole quiz is passed rather than half of it.
+  await passQuiz(taskId, two);
+  const again = await post(`/api/tasks/${taskId}/events`, {
+    type: "review_summary",
+    done: ["rebased"],
+    understanding: { background: "b", checks: [two[1], two[0]] },
+  });
+  expect(again.status).toBe(201);
+  const after = await post(`/api/tasks/${taskId}/understanding-quiz/answer`, { source: "director" });
+  expect(after.json.passed).toBe(true);
+});
+
+// Trap: the question is untouched but the ANSWERS on offer changed. That is a
+// different check, and carrying the pass would credit the director with an
+// answer to something they never saw.
+test("changed options re-ask the quiz even when the question is identical", async () => {
+  const taskId = await readyTaskWithQuiz();
+  const changed = await post(`/api/tasks/${taskId}/events`, {
+    type: "review_summary",
+    done: ["reworked the options"],
+    understanding: {
+      background: "b",
+      checks: [{ ...EXAMPLE_CHECK, options: [{ key: "a", label: "A brand new answer" }, { key: "b", label: "Another new answer" }] }],
+    },
+  });
+  expect(changed.status).toBe(201);
+  const after = await post(`/api/tasks/${taskId}/understanding-quiz/answer`, { source: "director" });
+  expect(after.json.passed).not.toBe(true);
+});
+
+test("a changed correct answer re-asks the quiz", async () => {
+  const taskId = await readyTaskWithQuiz();
+  const otherKey = EXAMPLE_CHECK.options.find((o: any) => o.key !== EXAMPLE_CHECK.answer_key).key;
+  await post(`/api/tasks/${taskId}/events`, {
+    type: "review_summary",
+    done: ["fixed the answer key"],
+    understanding: { background: "b", checks: [{ ...EXAMPLE_CHECK, answer_key: otherKey }] },
+  });
+  const after = await post(`/api/tasks/${taskId}/understanding-quiz/answer`, { source: "director" });
+  expect(after.json.passed).not.toBe(true);
+});
+
 test.afterAll?.(() => server.stop(true));

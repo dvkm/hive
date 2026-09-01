@@ -4577,6 +4577,33 @@ function normalizeUnderstandingChecks(understanding: unknown): UnderstandingChec
   }).slice(0, 5);
 }
 
+// Semantic identity for one check. An agent regenerates this text on every
+// run, so whitespace and wording drift is the normal case and byte-identity is
+// the wrong equivalence (HIVE-545). Two checks are the same when they ask the
+// same question, offer the same set of answers, and mark the same one correct.
+// The OPTIONS are part of the identity on purpose: same question, different
+// options is a DIFFERENT check, and carrying an answer across that would
+// record the director as having answered something they never saw.
+function understandingCheckKey(check: UnderstandingCheck): string {
+  const labels = check.options.map((option) => recurrenceKey(option.label)).sort().join("|");
+  const answer = recurrenceKey(check.options.find((option) => option.key === check.answerKey)?.label ?? "");
+  return [recurrenceKey(check.question), labels, answer].join("::");
+}
+
+// Same quiz? Order-independent, because the order a reviewer happens to list
+// its questions in is not part of what the director answered. Nothing maps an
+// answer back to a position: the only thing carried is a WHOLE-quiz pass, which
+// means every question in the set was answered however it was ordered.
+function sameUnderstandingChecks(a: unknown, b: unknown): boolean {
+  const left = normalizeUnderstandingChecks({ checks: a });
+  const right = normalizeUnderstandingChecks({ checks: b });
+  if (!left.length || left.length !== right.length) return false;
+  return (
+    left.map(understandingCheckKey).sort().join("\n") ===
+    right.map(understandingCheckKey).sort().join("\n")
+  );
+}
+
 // listUnderstandingQuizzes and answerUnderstandingQuiz must agree on which task
 // states have an actionable quiz, or the list can advertise an item the answer
 // endpoint then rejects (hive-1006).
@@ -4758,12 +4785,12 @@ export function repairDuplicateQuizPasses(db: DB): number {
   let repaired = 0;
   for (const review of latest) {
     if (understandingQuizStatus(db, review.task_id, review.id) === "passed") continue;
-    const prior = db
+    const priors = db
       .query(
-        `SELECT older.id
+        `SELECT older.id, older.payload
            FROM events older
           WHERE older.task_id = ? AND older.type = 'review_summary'
-            AND older.rowid < ? AND older.payload = ?
+            AND older.rowid < ?
             AND EXISTS (
               SELECT 1 FROM events passed
                WHERE passed.task_id = older.task_id AND passed.type = 'understanding_quiz_passed'
@@ -4773,9 +4800,17 @@ export function repairDuplicateQuizPasses(db: DB): number {
                WHERE invalidated.task_id = older.task_id
                  AND invalidated.rowid > older.rowid AND invalidated.rowid < ?
                  AND invalidated.type IN ('changes_requested', 'decision_answered'))
-          ORDER BY older.rowid DESC LIMIT 1`
+          ORDER BY older.rowid DESC`
       )
-      .get(review.task_id, review.rowid, review.payload, review.rowid) as { id: string } | undefined;
+      .all(review.task_id, review.rowid, review.rowid) as { id: string; payload: string }[];
+    // Compare the checks, not the serialised payload: a re-emitted review
+    // rewrites its prose and its whitespace, and none of that changes what the
+    // director was asked (HIVE-545).
+    const checksOf = (payload: string): unknown => {
+      try { return JSON.parse(payload)?.understanding?.checks; } catch { return undefined; }
+    };
+    const reviewChecks = checksOf(review.payload);
+    const prior = priors.find((older) => sameUnderstandingChecks(checksOf(older.payload), reviewChecks));
     if (!prior) continue;
     writeEvent(db, {
       task_id: review.task_id,
@@ -4784,7 +4819,7 @@ export function repairDuplicateQuizPasses(db: DB): number {
       payload: {
         review_event_id: review.id,
         carried_from_review_event_id: prior.id,
-        reason: "identical review already understood",
+        reason: "re-emitted review asks the same understanding checks",
       },
     });
     repaired++;
@@ -6833,12 +6868,20 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     if (!Object.keys(payload).length)
       return err("review_summary needs a structured review section: hive emit <task-id> review_summary --json review.json");
     // No word on the checks at all? Keep the ones this task already has.
-    const carried = checksProvided ? null : carriedUnderstandingChecks(db, taskId);
-    if (carried) {
+    const previousChecks = carriedUnderstandingChecks(db, taskId);
+    if (previousChecks && !checksProvided) {
       const understanding = (payload.understanding ?? {}) as Record<string, unknown>;
-      understanding.checks = carried.checks;
+      understanding.checks = previousChecks.checks;
       payload.understanding = understanding;
     }
+    // Re-listed the SAME checks instead of omitting them? Still the same quiz,
+    // so the answers still count. Re-wording and re-ordering are what an agent
+    // does on every run; only a real change to a question, its options, or its
+    // correct answer sends the director back to the quiz (HIVE-545).
+    const carried =
+      previousChecks && sameUnderstandingChecks(previousChecks.checks, (payload.understanding as any)?.checks)
+        ? previousChecks
+        : null;
     const latest = db
       .query("SELECT * FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
       .get(taskId) as any;
