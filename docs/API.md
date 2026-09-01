@@ -1556,6 +1556,32 @@ flips the latch by the schedule. On waking it sends ONE push,
 `While you were away: N items`, deep-linking `/inbox`, then clears the list.
 The manual `on` switch takes effect on the very next push, not at the next tick.
 
+## Attention budget
+
+How many things need the director right now, and what Hive stopped doing
+because of it. The count is not a second definition of "needs you": the server
+calls the same `actionableItems` rules the board and the nav badge call
+(`web/src/lib/needsYou.ts`), so the number here and the number on screen cannot
+disagree.
+
+Over budget, Hive pauses only its OPTIONAL generators — auto-dispatching queued
+scouts (a queued scout is skipped with `skip_reason = "attention_budget"`) and
+filing new watcher tasks. Nothing already running is stopped, and a monitor
+firing still files its incident task. The threshold lives in the
+`attention_budget` settings key; `0` turns the budget off.
+
+Everything paused is DEFERRED, never dropped. A held scout stays `queued` and
+dispatches on a later cycle. A held watcher change advances neither its cursor
+nor its snapshot, so once the queue drains it is filed as one task carrying
+everything that accumulated. The hold itself is recorded (source `watch_held`
+in `intake_cursors`) and reported in `held`, so a quiet board can say work is
+being held instead of looking like nothing happened. Nothing is ever removed
+from the count to keep the number low: the budget holds supply, never display.
+
+- `GET /api/attention` → `200 {"count": <n>, "threshold": <n>, "over": <bool>, "paused": ["new scouts", "watcher tasks"], "held": {"scouts": <n>, "watchers": <n>}}`
+  `?project=<id>` scopes the count to one project. `paused` is empty when nothing is paused; `held` is what the pause is currently sitting on.
+- `POST /api/attention` body `{"threshold": <n>}` → `200 {...}` (same shape). `threshold` must be a number >= 0.
+
 - `GET /api/away` → `200 {"on": <bool>, "schedule": {"start","end","tz"}|null, "always_through": [...], "active": <bool>, "held": <n>}`
   `active` is away RIGHT NOW (manual switch, or the schedule latch). `held` is how many pushes are waiting.
 - `POST /api/away` body `{on?, schedule?, always_through?}` → `200 {..., "active": <bool>, "flushed": <n>, "held": <n>}`

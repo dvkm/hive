@@ -293,6 +293,16 @@ export default function App() {
   // One shared definition (lib/needsYou.ts) so this badge, the landing
   // headline and the board strip always show the same number.
   const inboxCount = actionableItems(needsYou, tasks, projectFilter).length;
+  // The same number in the tab title and on the installed app's icon, so a
+  // backgrounded hive still says how many things are waiting. Zero clears both
+  // rather than showing a "0" badge.
+  useEffect(() => {
+    document.title = inboxCount > 0 ? `(${inboxCount}) hive` : "hive";
+    const nav = navigator as Navigator & { setAppBadge?: (n?: number) => Promise<void>; clearAppBadge?: () => Promise<void> };
+    // Unsupported outside installed PWAs on most browsers; failing is normal.
+    if (inboxCount > 0) nav.setAppBadge?.(inboxCount).catch(() => {});
+    else nav.clearAppBadge?.().catch(() => {});
+  }, [inboxCount]);
   const location = useLocation();
   // Board card clicks push /tasks/:id with state.backgroundLocation set to the
   // board's location — that keeps the board mounted and rendered underneath

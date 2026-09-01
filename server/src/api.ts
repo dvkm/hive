@@ -69,6 +69,7 @@ import {
 import { enqueue, ackNotifications, markShown, recordDeliveryError, lastDeliveryError } from "./notifications.ts";
 import { authorize, resolveGrantForDecision, resolveDenyGuardrailForDecision, type AuthzInput } from "./authority.ts";
 import { isReviewed } from "./dispatcher.ts";
+import { attentionBudget, setAttentionThreshold } from "./attention.ts";
 import { runPlanner, resolvePlanForDecision, decisionPlan, selectedPlanIndices, type PlannerExec } from "./planner.ts";
 import { claudeProfileEnvForRepo } from "./claudeProfiles.ts";
 import { makePlaybook } from "./playbook.ts";
@@ -685,6 +686,19 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         return json({ on: isOffline(db) });
       if (pathname === "/api/offline" && method === "POST")
         return await setOffline(db, herdr, await req.json());
+
+      // The attention budget: how many things need the director, the threshold,
+      // and what hive paused because of it (server/src/attention.ts).
+      if (pathname === "/api/attention" && method === "GET")
+        return json(attentionBudget(db, url.searchParams.get("project") ?? ""));
+      if (pathname === "/api/attention" && method === "POST") {
+        const body: any = await req.json();
+        const threshold = Number(body?.threshold);
+        if (!Number.isFinite(threshold) || threshold < 0)
+          return err("threshold must be a number >= 0 (0 turns the budget off)");
+        setAttentionThreshold(db, threshold);
+        return json(attentionBudget(db));
+      }
 
       if (pathname === "/api/away" && method === "GET")
         return json({ ...getAway(db), active: awayNow(db), held: heldPushes(db).length, items: heldPushes(db), last_flush: lastFlush(db) });
@@ -5118,8 +5132,16 @@ export function pendingPostShipQuizCount(db: DB, projectId?: string): number {
 const UNDERSTANDING_QUIZ_LIVE_STATES = ["in_review", "verifying"];
 
 function listUnderstandingQuizzes(db: DB, url: URL): Response {
-  const projectId = url.searchParams.get("project_id");
-  const states = url.searchParams.get("scope") === "all"
+  return json({
+    quizzes: openUnderstandingQuizzes(db, url.searchParams.get("project_id"), url.searchParams.get("scope") === "all"),
+  });
+}
+
+// The open understanding checks, exactly as the inbox sees them. Exported as
+// rows (not a Response) so the attention budget counts the SAME quizzes the
+// director is shown — see server/src/attention.ts.
+export function openUnderstandingQuizzes(db: DB, projectId: string | null, allScopes = false): any[] {
+  const states = allScopes
     ? UNDERSTANDING_QUIZ_ANSWERABLE_STATES
     : UNDERSTANDING_QUIZ_LIVE_STATES;
   const statePlaceholders = states.map(() => "?").join(",");
@@ -5172,7 +5194,7 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
       status,
     }];
   });
-  return json({ quizzes });
+  return quizzes;
 }
 
 function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
@@ -5359,7 +5381,7 @@ const CHECKPOINT_NOT_EXPIRED_SQL = `NOT (
        AND json_extract(s.payload, '$.to') IN ('in_review', 'verifying', 'done'))
 )`;
 
-function openCheckpointRows(db: DB, projectId: string | null, includeTest = false): any[] {
+export function openCheckpointRows(db: DB, projectId: string | null, includeTest = false): any[] {
   // Un-acked checkpoints stay reviewable AFTER the task finishes — agents
   // finish faster than the director's attention cycle, and 21 of the first 25
   // checkpoints vanished unreviewed when this filtered to live states

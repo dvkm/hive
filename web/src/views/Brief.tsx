@@ -11,6 +11,7 @@ import { CheckpointsInbox } from "./Checkpoints";
 import { UnderstandingQuiz } from "./UnderstandingQuiz";
 import { RequestChanges } from "./RequestChanges";
 import { HeldSummary } from "./Away";
+import { AttentionBudgetBanner } from "./Board";
 import { fmtUsd, fmtTokens } from "./Analytics";
 import { itemProject, orderFocusItems } from "../lib/needsYou";
 import type { NeedsYouItem } from "../lib/needsYou";
@@ -268,6 +269,10 @@ export default function Brief() {
         ))}
       </div>
 
+      {/* Same honest line as the board: if hive is holding work back because
+          you are over budget, a quiet inbox must say so rather than read as
+          "nothing to do". Nothing is removed from the count above to get there. */}
+      <AttentionBudgetBanner count={actionCount} />
       <HeldSummary />
 
       {data && actionCount === 0 && (
