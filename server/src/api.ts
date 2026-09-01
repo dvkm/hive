@@ -3150,7 +3150,17 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
     if (found) embedded_tasks = found;
   }
   // The review card only blocks on the understanding check when this says so.
-  return json({ unmet_deps, embedded_tasks, understanding_required: understandingChecksRequired(db, task) });
+  // The risk check ran when the PR reached review, not at the land attempt
+  // (HIVE-565), so its verdict is known before the director spends any effort:
+  // the card can refuse Ship and skip the quiz instead of asking for both and
+  // then blocking the merge.
+  return json({
+    unmet_deps,
+    embedded_tasks,
+    understanding_required: understandingChecksRequired(db, task),
+    confirmed_risks: confirmedRisks(db, task.id, task.head_sha),
+    risk_check_unfinished: unfinishedRiskCheck(db, task.id, task.head_sha),
+  });
 }
 
 // Map our merge_method config onto gh's flag. Squash is the default.
@@ -3394,6 +3404,44 @@ async function mergeTaskLocked(
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   const config = JSON.parse(project?.config ?? "{}");
   const autoShipKind = Array.isArray(config.auto_merge?.kinds) && config.auto_merge.kinds.includes(task.kind);
+  // The risk check (HIVE-406) re-read the real code for this exact head. Risks
+  // it CONFIRMED are the ones that survived an adversarial second look, so the
+  // director sees that short list verbatim instead of the whole caution blob.
+  // Refuted risks say nothing here. Overridable, like the rebase guard below.
+  //
+  // This runs BEFORE the understanding check (HIVE-565). The quiz is the most
+  // expensive thing hive asks of the director, and asking for it on a change
+  // the machine is about to refuse is the wrong order. A risk that lands AFTER
+  // the quiz was passed — a new push, a late verdict — says so, so the refusal
+  // never reads as "you did that for nothing".
+  const confirmed = body?.override_confirmed_risks ? [] : confirmedRisks(db, id, task.head_sha);
+  if (confirmed.length) {
+    const quiz = latestUnderstandingQuiz(db, id);
+    const late = quiz && understandingQuizStatus(db, id, quiz.reviewEventId) === "passed";
+    return err(
+      (late ? `you passed the understanding check on this change earlier; a new finding arrived on commit ${String(task.head_sha ?? "").slice(0, 7)}. ` : "") +
+        `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
+        confirmed.map((c) => `“${c.risk}” — ${c.why}${c.evidence_path ? ` (${c.evidence_path})` : ""}`).join("; ") +
+        `. Fix them, or merge with override_confirmed_risks=true.`,
+      409
+    );
+  }
+
+  // "I could not check" is not "I checked and it is bad" (HIVE-539). A run that
+  // timed out leaves findings with NO verdict; quoting one of them as confirmed
+  // is how a task that already fixed the finding could never land. Say what
+  // actually happened instead, and let the queue retry — the verification pass
+  // re-runs the findings it missed and keeps the ones it already got.
+  const unfinished = body?.override_confirmed_risks ? null : unfinishedRiskCheck(db, id, task.head_sha);
+  if (unfinished)
+    return err(
+      `merge blocked — the risk check did not finish on this head: ${unfinished.unverified} of ` +
+        `${unfinished.unverified + unfinished.checked} finding${unfinished.unverified + unfinished.checked === 1 ? "" : "s"} ` +
+        `got no verdict${unfinished.reason ? ` (${unfinished.reason})` : ""}. Nothing was confirmed. ` +
+        `Wait for it to retry, or merge with override_confirmed_risks=true.`,
+      409
+    );
+
   // Mechanical changes (hive-1559) never mint a quiz, so nothing here to gate on.
   let deferQuizReviewEventId: string | null = null;
   if (understandingChecksRequired(db, task)) {
@@ -3430,34 +3478,6 @@ async function mergeTaskLocked(
     const names = blockingDeps.map((b) => `#${b.number} ${b.title} (${b.state})`).join(", ");
     return err(`blocked by unmet dependenc${blockingDeps.length === 1 ? "y" : "ies"}: ${names} — not yet merged/done`, 409);
   }
-
-  // The risk check (HIVE-406) re-read the real code for this exact head. Risks
-  // it CONFIRMED are the ones that survived an adversarial second look, so the
-  // director sees that short list verbatim instead of the whole caution blob.
-  // Refuted risks say nothing here. Overridable, like the rebase guard below.
-  const confirmed = body?.override_confirmed_risks ? [] : confirmedRisks(db, id, task.head_sha);
-  if (confirmed.length)
-    return err(
-      `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
-        confirmed.map((c) => `“${c.risk}” — ${c.why}${c.evidence_path ? ` (${c.evidence_path})` : ""}`).join("; ") +
-        `. Fix them, or merge with override_confirmed_risks=true.`,
-      409
-    );
-
-  // "I could not check" is not "I checked and it is bad" (HIVE-539). A run that
-  // timed out leaves findings with NO verdict; quoting one of them as confirmed
-  // is how a task that already fixed the finding could never land. Say what
-  // actually happened instead, and let the queue retry — the verification pass
-  // re-runs the findings it missed and keeps the ones it already got.
-  const unfinished = body?.override_confirmed_risks ? null : unfinishedRiskCheck(db, id, task.head_sha);
-  if (unfinished)
-    return err(
-      `merge blocked — the risk check did not finish on this head: ${unfinished.unverified} of ` +
-        `${unfinished.unverified + unfinished.checked} finding${unfinished.unverified + unfinished.checked === 1 ? "" : "s"} ` +
-        `got no verdict${unfinished.reason ? ` (${unfinished.reason})` : ""}. Nothing was confirmed. ` +
-        `Wait for it to retry, or merge with override_confirmed_risks=true.`,
-      409
-    );
 
   const exec = deps.exec ?? defaultExec;
   let prView: any = null;
@@ -4676,6 +4696,28 @@ function quizAnswerable(db: DB, task: { id: string; state: string; head_sha: str
   // reviewer skips both, so nothing further is coming and this is as complete
   // as the review gets.
   return reviewPipelineSettled(db, task);
+}
+
+// Re-emitting a review is the normal reply to a rebase, a risk finding or red
+// CI. A re-emitted review that says nothing about the understanding checks means
+// "nothing to add", not "delete them" (HIVE-545) — last-write-wins used to wipe
+// a quiz the director had already passed and drop an approved PR back out of
+// the land queue. So the checks carry forward. Only an explicit `checks: []`
+// clears them, and that empty array is stored so the clear sticks.
+// Returns the newest review that actually spoke about checks, or null when no
+// review ever did (or the last word was an explicit clear).
+function carriedUnderstandingChecks(db: DB, taskId: string): { checks: unknown[]; eventId: string; rowid: number } | null {
+  const rows = db
+    .query("SELECT id, rowid, payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC")
+    .all(taskId) as { id: string; rowid: number; payload: string }[];
+  for (const row of rows) {
+    let understanding: any;
+    try { understanding = JSON.parse(row.payload)?.understanding; } catch { continue; }
+    if (!understanding || typeof understanding !== "object" || !Array.isArray(understanding.checks)) continue;
+    if (!understanding.checks.length) return null;
+    return { checks: understanding.checks, eventId: row.id, rowid: row.rowid };
+  }
+  return null;
 }
 
 function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; checks: UnderstandingCheck[] } | null {
@@ -6757,6 +6799,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     if (typeof rawUnderstanding === "string") {
       try { rawUnderstanding = JSON.parse(rawUnderstanding); } catch { rawUnderstanding = null; }
     }
+    let checksProvided = false;
     if (rawUnderstanding && typeof rawUnderstanding === "object" && !Array.isArray(rawUnderstanding)) {
       const text = (value: unknown, max = 600) =>
         typeof value === "string" && value.trim() ? value.trim().slice(0, max) : undefined;
@@ -6774,6 +6817,10 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         if (affectedAreas.length) understanding.affected_areas = affectedAreas;
       }
       const rawCheck = rawUnderstanding.check;
+      // Absent (no `checks`/`check` key at all) and empty (`checks: []`) are
+      // different intents: absent carries the old checks forward, empty clears
+      // them (HIVE-545).
+      checksProvided = Array.isArray(rawUnderstanding.checks) || rawCheck !== undefined;
       const rawChecks = Array.isArray(rawUnderstanding.checks)
         ? rawUnderstanding.checks
         : Array.isArray(rawCheck)
@@ -6800,6 +6847,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         (check) => recurrenceKey(check.question)
       ).slice(0, 5);
       if (checks.length) understanding.checks = checks;
+      else if (checksProvided) understanding.checks = [];
       // Submitted a quiz that normalises to nothing? Say so. Accepting it
       // silently is what cost two tasks a round trip each: the agent believed
       // it had supplied a check, and land only said one was "required"
@@ -6818,6 +6866,13 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     }
     if (!Object.keys(payload).length)
       return err("review_summary needs a structured review section: hive emit <task-id> review_summary --json review.json");
+    // No word on the checks at all? Keep the ones this task already has.
+    const carried = checksProvided ? null : carriedUnderstandingChecks(db, taskId);
+    if (carried) {
+      const understanding = (payload.understanding ?? {}) as Record<string, unknown>;
+      understanding.checks = carried.checks;
+      payload.understanding = understanding;
+    }
     const latest = db
       .query("SELECT * FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
       .get(taskId) as any;
@@ -6828,6 +6883,30 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     )
       return json({ event: parseEvent(latest), duplicate: true }, 201);
     const event = writeEvent(db, { task_id: taskId, source, type, payload });
+    // The carried checks are the SAME questions the director already answered,
+    // so the pass carries with them — otherwise a rebase still un-lands the PR,
+    // just with the quiz re-asked instead of deleted. A changes-request or an
+    // answered decision since then means the change moved, so the director
+    // re-answers (the same guard repairDuplicateQuizPasses uses).
+    if (carried && understandingQuizStatus(db, taskId, carried.eventId) === "passed") {
+      const invalidated = db
+        .query(
+          `SELECT 1 FROM events WHERE task_id = ? AND rowid > ?
+             AND type IN ('changes_requested', 'decision_answered') LIMIT 1`
+        )
+        .get(taskId, carried.rowid);
+      if (!invalidated)
+        writeEvent(db, {
+          task_id: taskId,
+          source: "system",
+          type: "understanding_quiz_passed",
+          payload: {
+            review_event_id: event.id,
+            carried_from_review_event_id: carried.eventId,
+            reason: "review re-emitted without changing the understanding checks",
+          },
+        });
+    }
     const understandingChecks = ((payload.understanding as any)?.checks ?? []) as any[];
     if (understandingChecks.some(isEgregiousCheckWording))
       queueSteerEvent(
