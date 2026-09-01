@@ -549,6 +549,46 @@ test("after the retry budget runs out the card is flagged for a human, not silen
   expect(notes[0].title).toContain("gave up");
 });
 
+// HIVE-567: 15 timeouts across 4 PRs left every one of those cards with NO
+// verdict at all, so a task hive had given up on looked exactly like one it
+// simply had not reached yet.
+test("giving up leaves a visible terminal verdict, not silence", async () => {
+  const { db, id } = setup();
+  const failing = async () => ({ code: 1, stdout: "", stderr: "timed out after 180000ms" });
+  for (let i = 0; i < MAX_REVIEW_ATTEMPTS + 2; i++) {
+    await autoReviewOnce(db, { exec: failing, shellExec: ghDiff });
+    ageEvents(db, id);
+  }
+  const revs = events(db, id, "auto_review");
+  expect(revs).toHaveLength(1);
+  expect(revs[0].payload.verdict).toBe("unavailable");
+  expect(revs[0].payload.summary).toContain("could not complete");
+  expect(revs[0].payload.reviewed_head_sha).toBe("review-head");
+  // Never a pass: no auto-merge path may read this as a reviewed, clean PR.
+  expect(revs[0].payload.verdict).not.toBe("looks_good");
+});
+
+// HIVE-567: four identical 180s runs was three wasted ones. Two tries, and the
+// second reads a much shorter diff.
+test("the one retry is smaller than the first attempt, and there is no third", async () => {
+  const { db, id } = setup();
+  const bigDiff: Exec = async (argv) =>
+    argv.includes("diff")
+      ? { code: 0, stdout: "+x\n".repeat(30_000), stderr: "" }
+      : { code: 0, stdout: JSON.stringify({ headRefOid: "review-head" }), stderr: "" };
+  const prompts: number[] = [];
+  const failing = async (argv: string[]) => {
+    prompts.push(argv[4]!.length);
+    return { code: 1, stdout: "", stderr: "timed out after 180000ms" };
+  };
+  for (let i = 0; i < 4; i++) {
+    await autoReviewOnce(db, { exec: failing, shellExec: bigDiff });
+    ageEvents(db, id);
+  }
+  expect(prompts).toHaveLength(2); // no third attempt
+  expect(prompts[1]).toBeLessThan(prompts[0]! / 2);
+});
+
 // HIVE-539: a run that times out is "I do not know", never "I checked and it is
 // bad" — and the verdicts it DID produce must survive the ones that did not.
 test("a timed-out verification keeps the verdicts it got and retries only the gaps", async () => {
