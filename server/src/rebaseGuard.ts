@@ -46,20 +46,20 @@ export async function captureBranchScope(
 }
 
 // Compare the branch's CURRENT authored files against the pre-rebase snapshot.
-// A file that is (a) newly authored — not in the snapshot's intent — and (b) one
-// that base advanced since the snapshot is a base commit the auto-rebase
-// reverted: the branch is re-writing work that already landed on base. Returns
-// the regressed files (empty = clean). Returns null when it can't decide (git
-// error / no snapshot) so the caller does not block on a read failure.
+// A file is a scope violation only when all three hold: (a) it is newly authored
+// — not in the snapshot's intent, (b) base advanced it since the snapshot, and
+// (c) the branch's copy of it is byte-identical to the pre-advance version, i.e.
+// the branch DROPPED base's commits rather than building on them. (c) is the
+// HIVE-543 fix: without it, editing one assertion in a spec file base recently
+// touched read as "reverts base work", which pushed agents to weaken their own
+// tests to get past the gate. Returns the regressed files (empty = clean), or
+// null when it can't decide (git error) so the caller does not block on a read
+// failure.
 //
-// ponytail: heuristic, two known ceilings. (1) It only sees reverts of commits
-// that landed on base AFTER the snapshot — the branch must have been snapshotted
-// while still clean (the reconciler's first-sight capture makes this the normal
-// case, since a rebase only runs once a PR falls behind). (2) A legitimate later
-// push that starts editing a base-owned file it did not originally touch reads
-// as a revert; that is rare and the merge block is overridable
-// (body.override_destructive_check). Both err toward blocking, never toward
-// silently landing a bad merge.
+// ponytail: still a heuristic, with a narrower ceiling than before. It catches
+// the wholesale drop (#314's signature: the file returns to its old content
+// exactly); a partial revert that also adds new lines slips through to PR
+// review. Blocking stays overridable (body.override_destructive_check).
 export async function detectDestructiveRebase(
   exec: Exec,
   repoPath: string,
@@ -74,7 +74,19 @@ export async function detectDestructiveRebase(
   for (const f of current) {
     if (known.has(f)) continue; // in the original intent — a legitimate task change
     const log = await exec(["git", "-C", repoPath, "log", "--oneline", `${snapshot.base_sha}..${base}`, "--", f]);
-    if (log.code === 0 && log.stdout.trim()) regressed.push(f);
+    if (log.code !== 0 || !log.stdout.trim()) continue; // base never touched it
+    // Base moved this file, and the branch touches it too. That is only a revert
+    // if the branch's content is the pre-move content — an edit on top of base's
+    // version is ordinary work.
+    if ((await blobId(exec, repoPath, branch, f)) === (await blobId(exec, repoPath, snapshot.base_sha, f))) regressed.push(f);
   }
   return regressed;
+}
+
+// Content id of <rev>:<path>, or "" when the path does not exist at that rev
+// (so "missing on both sides" compares equal — the branch dropped a file base
+// added, which is a real revert).
+async function blobId(exec: Exec, repoPath: string, rev: string, path: string): Promise<string> {
+  const r = await exec(["git", "-C", repoPath, "rev-parse", `${rev}:${path}`]);
+  return r.code === 0 ? r.stdout.trim() : "";
 }
