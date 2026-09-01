@@ -5,7 +5,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { taskWithHealth, tasksWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
-import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
+import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror, mirrorTaskIdForTitle } from "./supervision.ts";
 import { activeProjects, isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
 import { addClient, removeClient, broadcast, appClientCount, setProjectResolver } from "./bus.ts";
 import {
@@ -2149,6 +2149,10 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   const id = newId();
   const { block } = await attachFiles(id, files);
   const brief = ((body.brief ?? "") + block).trim();
+  // The ticket this work implements, parsed from the '[WEB-110] ' title prefix
+  // once and stored (HIVE-546). Stored, not re-derived: a retitle or a requeue
+  // used to lose the ticket silently.
+  const mirrorTaskId = mirrorTaskIdForTitle(db, String(body.project_id), body.title);
   const row = {
     id,
     project_id: body.project_id,
@@ -2167,18 +2171,19 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
     depends_on: deps.length ? JSON.stringify(deps) : null,
     verification_cmds: verifyCmds ? JSON.stringify(verifyCmds) : null,
     priority,
+    jira_mirror_task_id: mirrorTaskId,
     created_at: t,
     updated_at: t,
   };
   db.query(
     `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
-      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, priority, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, priority, jira_mirror_task_id, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.project_id, row.title, row.brief, row.state, row.kind,
     row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
     row.summary, row.source, row.parent_task_id, row.depends_on, row.verification_cmds,
-    row.priority, row.created_at, row.updated_at
+    row.priority, row.jira_mirror_task_id, row.created_at, row.updated_at
   );
   writeEvent(db, {
     task_id: row.id,
@@ -5455,14 +5460,17 @@ export function requeueTask(db: DB, source: any): string {
     if (jiraKey)
       db.query("UPDATE tasks SET jira_key = NULL, jira_link_kind = NULL, updated_at = ? WHERE id = ?").run(t, fresh.id);
     db.query(
-      `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, resume_branch, resume_ghost_branch, resume_pr_url, priority, jira_key, jira_link_kind, created_at, updated_at)
-       VALUES (?,?,?,?, 'queued', ?, 'requeue', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, resume_branch, resume_ghost_branch, resume_pr_url, priority, jira_key, jira_link_kind, jira_mirror_task_id, created_at, updated_at)
+       VALUES (?,?,?,?, 'queued', ?, 'requeue', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id, fresh.project_id, fresh.title, brief || null, fresh.kind, fresh.id,
       resume?.branch ?? null, resume?.ghostBranch ?? null, resume?.prUrl ?? null,
       // The successor IS the same work, so it keeps the original's place in the
       // queue. Losing it would push a 'now' task to the back on every retry.
-      fresh.priority ?? "normal", jiraKey, jiraKey ? "subtask" : null, t, t
+      // The mirror link is COPIED, not moved: the successor is more work for the
+      // same ticket, and the dead predecessor no longer blocks it (failed rows
+      // are ignored when the mirror decides it is done).
+      fresh.priority ?? "normal", jiraKey, jiraKey ? "subtask" : null, fresh.jira_mirror_task_id ?? null, t, t
     );
   })();
   writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title: fresh.title, requeue_of: fresh.id } });
