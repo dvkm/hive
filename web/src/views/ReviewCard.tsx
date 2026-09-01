@@ -521,6 +521,10 @@ export function ReviewCard({
   const [quizOverride, setQuizOverride] = useState<"passed" | "deferred" | null>(null);
   const [mergeErr, setMergeErr] = useState("");
   const [branchCheck, setBranchCheck] = useState<BranchCheck | null>(null);
+  // The director chose to merge despite the confirmed risks. That re-opens the
+  // understanding check the risk had silenced: the server still refuses a merge
+  // whose quiz is owed, so hiding it here would be a dead end (HIVE-570).
+  const [riskOverride, setRiskOverride] = useState(false);
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [verification, setVerification] = useState<VerificationItem[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
@@ -537,6 +541,7 @@ export function ReviewCard({
     setEvidence([]);
     setVerification([]);
     setBranchCheck(null);
+    setRiskOverride(false);
     // Same-route navigation between tasks re-renders this component in place
     // (no remount) — without this, a "Request changes" editor left open on
     // the previous task keeps rendering, notes and all, against the new one.
@@ -612,9 +617,31 @@ export function ReviewCard({
       ? "deferred"
       : "required";
   const quizStatus = quizOverride ?? recordedQuizStatus;
+  // The risk check already ran, back when the PR reached review (HIVE-570). If
+  // it confirmed something, Ship cannot work, so the card must say so BEFORE it
+  // asks for anything — the director used to answer the quiz, press Ship, and
+  // only then be told the merge was refused.
+  const confirmedRisks = riskOverride ? [] : branchCheck?.confirmed_risks ?? [];
+  const riskUnfinished = branchCheck?.risk_check_unfinished ?? null;
+  const riskBlocked = reportOnly
+    ? ""
+    : confirmedRisks.length
+      ? `The risk check confirmed ${confirmedRisks.length} risk${confirmedRisks.length === 1 ? "" : "s"} on this commit: ` +
+        confirmedRisks.map((r) => r.risk).join("; ") +
+        ". Send it back to the agent, or merge anyway below."
+      : riskUnfinished
+        ? `The risk check did not finish on this commit — ${riskUnfinished.unverified} of ` +
+          `${riskUnfinished.unverified + riskUnfinished.checked} finding${riskUnfinished.unverified + riskUnfinished.checked === 1 ? "" : "s"} ` +
+          `got no verdict${riskUnfinished.reason ? ` (${riskUnfinished.reason})` : ""}. Nothing was confirmed. It retries on its own.`
+        : "";
   // Mechanical changes are not judgment-class (hive-1559): no quiz is minted,
   // and its absence blocks nothing. Undefined (older server) keeps the old gate.
-  const quizRequired = branchCheck?.understanding_required !== false;
+  // A confirmed risk also silences the quiz: it is the most expensive thing hive
+  // asks of the director, and this change is not going to merge as it stands.
+  const quizRequired = branchCheck?.understanding_required !== false && !confirmedRisks.length;
+  // Would the check still block this merge if the risk were not blocking it
+  // first? That decides whether "Merge anyway" can merge or has to ask first.
+  const quizOwed = branchCheck?.understanding_required !== false && quizStatus === "required";
   const missingQuiz = reviewLoaded && (!quiz || !reviewEventId);
   const quizBlocked = !quizRequired
     ? ""
@@ -665,7 +692,7 @@ export function ReviewCard({
         : !task.pr_url && !task.branch
           ? "No PR and no branch — nothing to merge"
           : "";
-  const mergeBlocked = quizBlocked || depBlocked || deliveryBlocked;
+  const mergeBlocked = riskBlocked || quizBlocked || depBlocked || deliveryBlocked;
   const landHeld = isLandHeld({
     landActed,
     landQueuedAt: task.land_queued_at,
@@ -961,6 +988,11 @@ export function ReviewCard({
         />
       )}
       {quizRequired && quizStatus === "passed" && <div className="understanding-quiz-status passed">Understanding confirmed. Approval unlocked.</div>}
+      {riskOverride && (
+        <div className="understanding-quiz-status deferred">
+          You chose to merge despite the confirmed risks. Take the understanding check above and Ship will go through.
+        </div>
+      )}
       {landHeld && (
         <div className="review-blocked review-blocked-action">
           You marked this approved to land before you took the check. It will not merge until you say so.
@@ -969,7 +1001,16 @@ export function ReviewCard({
         </div>
       )}
       {quizStatus === "deferred" && <div className="understanding-quiz-status deferred">Quiz saved in Needs You. You can continue now.</div>}
-      {!quizRequired && (
+      {/* A risk that lands AFTER the quiz was passed must say so, or the refusal
+          reads as "you did all that for nothing" (HIVE-570). */}
+      {!quizRequired && confirmedRisks.length > 0 && (
+        <div className="understanding-quiz-status deferred">
+          {quizStatus === "passed"
+            ? `You passed the understanding check on this change earlier. A new finding arrived on commit ${(task.head_sha ?? "").slice(0, 7)} — your answer is kept.`
+            : "No understanding check yet — the risk check confirmed something on this commit, so this change is not ready to ship. It comes back once the agent clears the finding."}
+        </div>
+      )}
+      {!quizRequired && confirmedRisks.length === 0 && (
         <div className="understanding-quiz-status deferred">
           Mechanical change: no understanding check needed.{" "}
           <button className="btn btn-mini" onClick={requireQuiz} disabled={busy}>Quiz me on this one</button>
@@ -977,7 +1018,7 @@ export function ReviewCard({
       )}
 
       <div className="review-actions">
-        <button className="btn btn-primary" onClick={() => merge()} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
+        <button className="btn btn-primary" onClick={() => merge(undefined, riskOverride || undefined)} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
           {busy ? "Working…" : reportOnly ? "Accept report" : surface === "focus" ? "Ship" : "Approve & merge"}
         </button>
         {!task.never_dispatched && (
@@ -989,14 +1030,32 @@ export function ReviewCard({
           Reject
         </button>
       </div>
-      {missingQuiz && !task.never_dispatched ? (
+      {/* A confirmed risk outranks a missing quiz: asking the agent to write
+          questions about a change that cannot merge is the wrong next step. */}
+      {!riskBlocked && missingQuiz && !task.never_dispatched ? (
         <div className="review-blocked review-blocked-action">
           <button className="btn btn-mini" disabled={busy} onClick={refreshUnderstandingCheck}>
             {busy ? "Asking…" : "Have agent add it"}
           </button>
         </div>
       ) : mergeBlocked ? (
-        <div className="review-blocked">{mergeBlocked}</div>
+        <div className={confirmedRisks.length ? "review-blocked review-blocked-action" : "review-blocked"}>
+          {mergeBlocked}
+          {confirmedRisks.length > 0 && (
+            <button
+              className="btn btn-mini"
+              disabled={busy}
+              title={
+                quizOwed
+                  ? "Merge it despite the risks. The understanding check comes back first, then Ship works."
+                  : "Merge anyway. The confirmed risks stay on the card as the record of what you accepted."
+              }
+              onClick={() => (quizOwed ? setRiskOverride(true) : merge(undefined, true))}
+            >
+              Merge anyway
+            </button>
+          )}
+        </div>
       ) : null}
       {mergeErr && (
         <div className="review-merge-error">
@@ -1005,7 +1064,7 @@ export function ReviewCard({
             <button
               className="btn"
               style={{ marginLeft: "var(--s2)" }}
-              disabled={busy || !!mergeBlocked}
+              disabled={busy || !!(quizBlocked || depBlocked || deliveryBlocked)}
               title="Merge anyway. The risks above stay on the card as the record of what you accepted."
               onClick={() => merge(undefined, true)}
             >

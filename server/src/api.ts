@@ -4689,6 +4689,12 @@ function quizAnswerable(db: DB, task: { id: string; state: string; head_sha: str
   // Shipped: the post-ship catch-up class. Its head is settled, so it is
   // answerable, and it only ever feeds the digest.
   if (task.state !== "in_review") return true;
+  // A change the risk check already refused is not a change to quiz anybody on
+  // (HIVE-570). The quiz is the most expensive thing hive asks of the director,
+  // and asking for it on a PR that cannot merge spends his effort before the
+  // machine spends any of its own. The finding goes back to the agent; the quiz
+  // comes back on its own once the next push clears the risk.
+  if (confirmedRisks(db, task.id, task.head_sha).length) return false;
   // The director asked for this one by hand, so it is their question whatever
   // the pipeline is doing.
   if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1").get(task.id)) return true;
@@ -7668,14 +7674,19 @@ export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: an
 // no usable options, or one that's simply no longer relevant). Expires it and
 // broadcasts so the inbox clears live. No resolver hooks fire — dismissing is
 // explicitly "take no action".
-export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; steer: string }): Response {
+export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; steer: string; why?: string }): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
   if (!r) return err("decision not found. List the open ones: curl -s \"$HIVE_URL/api/decisions?status=open\"", 404);
   if (r.status !== "open") return err(`decision already ${r.status}`, 409);
   const source = moot ? "reconciler" : "director";
   const expiredAt = now();
-  db.query("UPDATE decisions SET status = 'expired', answered_at = ?, answered_by = ?, answered_actor = ? WHERE id = ?")
-    .run(expiredAt, source, moot ? "reconciler-moot" : null, id);
+  // Say WHY it closed, on the card, where the director was already looking
+  // (HIVE-570). Nine land-pause cards died as moot inside two minutes last
+  // night and each one took its explanation with it: the row read "Answered:
+  // null". The note keeps the row honest without keeping the question alive.
+  const note = moot ? moot.why ?? `Hive closed this on its own (${moot.reason}). Nothing here needs an answer.` : null;
+  db.query("UPDATE decisions SET status = 'expired', answered_at = ?, answered_by = ?, answered_actor = ?, answer_note = ? WHERE id = ?")
+    .run(expiredAt, source, moot ? "reconciler-moot" : null, note, id);
   writeEvent(db, { task_id: r.task_id, source, type: "decision_expired", payload: { decision_id: id, reason: moot?.reason ?? "dismissed" } });
   // An authority card's pending grant must die with it: left 'pending', every
   // retry of the gated command resolves to this expired decision id and the
@@ -7710,7 +7721,7 @@ export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; 
   const task = getTask(db, r.task_id);
   if (!remaining && task && task.state === "needs_decision")
     transition(db, r.task_id, "in_progress", { source, reason: moot?.reason ?? "last open decision dismissed" });
-  const decision = parseDecision({ ...r, status: "expired", answered_at: expiredAt, answered_by: source });
+  const decision = parseDecision({ ...r, status: "expired", answered_at: expiredAt, answered_by: source, answer_note: note });
   broadcast({ type: "decision", decision });
   return json(decision);
 }

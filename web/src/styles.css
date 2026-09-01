@@ -1601,6 +1601,13 @@ textarea { font-family: inherit; }
   color: var(--text-dim);
   font-size: 13px;
 }
+/* An expired card keeps the question it was asking about, so the explanation
+   survives the card (HIVE-570). Quieter than the closing line above it. */
+.dmini-context {
+  margin-top: 4px;
+  white-space: pre-wrap;
+  opacity: 0.85;
+}
 
 /* ---- decision inbox ---- */
 .inbox {
