@@ -98,6 +98,34 @@ function spawnMeta(db: DB, taskId: string): { tab_id: string | null; workspace_i
   }
 }
 
+// Deferral must be bounded: an agent wedged in "working" forever would pin its
+// worktree (and its pty) forever, and the live checkout would accumulate dead
+// worktrees with nothing to reap them. After DEFER_CAP_MS of continuous
+// deferral we tear down anyway — cleanupWorktree still preserves uncommitted
+// work to a ghost branch, so the cap costs a running agent its cwd but never
+// costs anyone their code.
+export const DEFER_CAP_MS = 30 * 60_000;
+
+// True once the FIRST deferral in the current run is older than the cap. The
+// run is bounded by the newest terminal-ish cleanup event, so a task that gets
+// cleaned, reopened and re-deferred starts its clock fresh instead of
+// inheriting a stale one.
+function deferExpired(db: DB, taskId: string, nowMs = Date.now()): boolean {
+  const rows = db
+    .query(
+      "SELECT type, ts FROM events WHERE task_id = ? AND type IN ('cleanup_deferred','cleaned_up','cleanup_skipped') ORDER BY ts DESC"
+    )
+    .all(taskId) as { type: string; ts: string }[];
+  let first: string | null = null;
+  for (const r of rows) {
+    if (r.type !== "cleanup_deferred") break; // end of the current deferral run
+    first = r.ts;
+  }
+  if (!first) return false; // nothing deferred yet
+  const t = Date.parse(first);
+  return Number.isFinite(t) && nowMs - t >= DEFER_CAP_MS;
+}
+
 // Tear down a finished task. `force` skips the terminal-state guard (used by the
 // manual endpoint and the reaper, which have already established eligibility).
 export async function cleanupTask(
@@ -110,6 +138,37 @@ export async function cleanupTask(
   const task = getTask(db, taskId);
   if (!task) return noop;
   if (!opts.force && !TERMINAL.includes(task.state as State)) return noop;
+
+  // A task can go terminal while its agent is STILL WORKING in the worktree:
+  // the PR merges, or the stale timer fails the task, mid-turn. Tearing down
+  // here runs `git worktree remove --force` on that agent's own cwd, and the
+  // agent dies on the next file it touches (2026-09-01: three agents lost this
+  // way in five hours, one of them the agent investigating this bug). The
+  // branch-pushed/merged guard in cleanupWorktree does NOT catch it — a pushed
+  // branch is exactly when removal looks safest and the agent is still live.
+  // So: defer while the agent is demonstrably working. The reaper retries every
+  // sweep, so this delays teardown, never cancels it.
+  if (task.agent_target) {
+    const probe = await herdr.probe(task.agent_target).catch(() => ({ alive: false, status: "unknown" as const }));
+    // Only a definite "working" defers. probe() reports {alive,status:"unknown"}
+    // when the herdr call itself fails, so a herdr outage can never wedge
+    // cleanup shut and leak worktrees + ptys.
+    if (probe.alive && probe.status === "working" && !deferExpired(db, taskId)) {
+      // One event per deferral run, not one per sweep: the reaper sweeps often
+      // and this would otherwise flood the task timeline (see cleanup_skipped).
+      const last = db
+        .query("SELECT type FROM events WHERE task_id = ? AND type IN ('cleanup_deferred','cleaned_up','cleanup_skipped') ORDER BY ts DESC LIMIT 1")
+        .get(taskId) as { type: string } | undefined;
+      if (last?.type !== "cleanup_deferred")
+        writeEvent(db, {
+          task_id: taskId,
+          source: "cleanup",
+          type: "cleanup_deferred",
+          payload: { reason: "agent still working in worktree", agent_target: task.agent_target },
+        });
+      return noop;
+    }
+  }
 
   const project = db.query("SELECT repo_path, config FROM projects WHERE id = ?").get(task.project_id) as
     | { repo_path: string | null; config: string | null }
