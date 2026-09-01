@@ -520,13 +520,21 @@ test("hive control-plane tampering is dangerous", () => {
   // Literal base URL, and ${HIVE_URL} in braces — same call, other spellings.
   expect(classify("curl -X POST http://127.0.0.1:4700/api/authority/rules -d x").decision).toBe("dangerous");
   expect(classify('curl -X PUT "${HIVE_URL}/api/authority/rules/42" -d x').decision).toBe("dangerous");
+  // hive-2049 follow-up: the rule keys on the network tool, not on the base URL
+  // sitting next to the path. A closing quote between them, or the base hidden
+  // in another variable, is the same call and must stay dangerous.
+  expect(classify('curl -X POST "$HIVE_URL"/api/authority/rules -d x').decision).toBe("dangerous");
+  expect(classify("H=$HIVE_URL; curl $H/api/authority/rules -X POST -d x").decision).toBe("dangerous");
+  expect(classify('curl -X POST "$HIVE_URL"/api/decisions/dec_1/answer -d x').decision).toBe("dangerous");
+  expect(classify("H=$HIVE_URL; curl $H/api/decisions/dec_1/answer -X POST -d x").decision).toBe("dangerous");
+  expect(classify("wget --post-data=x $H/api/authority/rules").decision).toBe("dangerous");
 });
 
 // hive-2049: the control-plane rules used to match a BARE path, so any command
 // whose text merely contained one classified as tampering — a Python heredoc
 // rewriting `server/test/authority.test.ts` in the agent's own worktree put a
 // `command.dangerous.hive-authority-rule-tampering` card in front of the
-// director. Only a path hanging off a hive BASE URL is a call to hive.
+// director. Only a command that invokes a network tool is a call to hive.
 test("a control-plane path in file/doc text is not tampering", () => {
   const refactor = [
     "python3 - <<'PYEOF'",
