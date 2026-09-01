@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
 import { transition, setTerminalHook, type State } from "../src/state.ts";
-import { cleanupTask, runStackCmd } from "../src/cleanup.ts";
+import { cleanupTask, runStackCmd, DEFER_CAP_MS } from "../src/cleanup.ts";
 import { Herdr, tabCloseArgv, paneCloseArgv } from "../src/runtime/herdr.ts";
 import { makeHandler } from "../src/api.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
@@ -398,4 +398,89 @@ test("POST /cleanup: 404 unknown, 409 on a live task, 200 forces teardown on a t
   expect(body.ok).toBe(true);
   expect(body.worktree.removed).toBe(true);
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'cleaned_up'").all(done).length).toBe(1);
+});
+
+// ---- HIVE-213: never tear down a worktree an agent is still working in ----
+
+// A merged/clean branch: cleanupWorktree's own guard says "safe to remove", so
+// only the new liveness guard can stop the teardown. `agentStatus` drives what
+// `herdr agent get` reports back.
+function livenessExec(branch: string, agentStatus: string): { exec: Exec; calls: string[][] } {
+  return stubExec((argv) => {
+    if (argv[0] === "git" && argv.includes("--merged")) return OK(`  main\n  ${branch}`);
+    if (argv[0] === "git" && argv.includes("ls-remote")) return OK("");
+    if (argv[0] === "git" && has(argv, "status", "--porcelain")) return OK("");
+    if (has(argv, "agent", "get")) return OK(JSON.stringify({ agent: { pane_id: "p1", agent_status: agentStatus } }));
+    return OK();
+  });
+}
+
+test("cleanupTask defers teardown while the agent is still WORKING in the worktree", async () => {
+  const { db, projectId } = freshDb();
+  const branch = "hive/CT-live";
+  const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-CT-live" });
+  const { exec, calls } = livenessExec(branch, "working");
+
+  const out = await cleanupTask(db, new Herdr(exec, "herdr"), id, { force: true });
+
+  expect(out.cleaned).toBe(false);
+  // the actual bug: this is the call that deleted a live agent's cwd
+  expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(false);
+  // and the session that hosts it must survive too
+  expect(calls.some((c) => has(c, "tab", "close"))).toBe(false);
+  // runtime binding intact, so the agent is still reachable
+  const task = db.query("SELECT worktree_path, agent_target FROM tasks WHERE id = ?").get(id) as any;
+  expect(task.worktree_path).toBe("/wt/hive-CT-live");
+  expect(task.agent_target).not.toBeNull();
+
+  const ev = db.query("SELECT * FROM events WHERE task_id = ? AND type = 'cleanup_deferred'").all(id);
+  expect(ev.length).toBe(1);
+});
+
+test("cleanupTask does NOT defer for an idle agent — a finished task still gets reaped", async () => {
+  const { db, projectId } = freshDb();
+  const branch = "hive/CT-idle";
+  const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-CT-idle" });
+  const { exec, calls } = livenessExec(branch, "idle");
+
+  const out = await cleanupTask(db, new Herdr(exec, "herdr"), id, { force: true });
+
+  expect(out.cleaned).toBe(true);
+  expect(out.worktree?.removed).toBe(true);
+  expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(true);
+});
+
+test("cleanupTask deferral is bounded: a wedged 'working' agent cannot pin its worktree forever", async () => {
+  const { db, projectId } = freshDb();
+  const branch = "hive/CT-wedged";
+  const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-CT-wedged" });
+  // a deferral run that started well past the cap
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
+    newId("evt"), id, new Date(Date.now() - DEFER_CAP_MS - 60_000).toISOString(),
+    "cleanup", "cleanup_deferred", JSON.stringify({ reason: "agent still working in worktree" })
+  );
+  const { exec, calls } = livenessExec(branch, "working");
+
+  const out = await cleanupTask(db, new Herdr(exec, "herdr"), id, { force: true });
+
+  expect(out.cleaned).toBe(true);
+  expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(true);
+});
+
+test("cleanupTask does not defer when the herdr probe itself fails (no outage-wedged cleanup)", async () => {
+  const { db, projectId } = freshDb();
+  const branch = "hive/CT-noherdr";
+  const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-CT-noherdr" });
+  const { exec, calls } = stubExec((argv) => {
+    if (argv[0] === "git" && argv.includes("--merged")) return OK(`  main\n  ${branch}`);
+    if (argv[0] === "git" && argv.includes("ls-remote")) return OK("");
+    if (argv[0] === "git" && has(argv, "status", "--porcelain")) return OK("");
+    if (has(argv, "agent", "get")) return FAIL("herdr is down");
+    return OK();
+  });
+
+  const out = await cleanupTask(db, new Herdr(exec, "herdr"), id, { force: true });
+
+  expect(out.cleaned).toBe(true);
+  expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(true);
 });
