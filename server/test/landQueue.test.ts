@@ -360,6 +360,15 @@ test("a stale pause card closes itself once the PR leaves the queue", async () =
   markLand(db, [a], false); // director unmarks it
   await landOnce(db, { exec: filesExec({}), merge: mergeStub(db).merge });
   expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(0);
+
+  // HIVE-570: taking the PR out of the queue is the RIGHT answer to a permanent
+  // failure, and it must not be how the explanation disappears. The closed card
+  // says what ended the pause and repeats why the merge had stopped.
+  const closed = db.query("SELECT status, answer_key, answer_note FROM decisions").get() as any;
+  expect(closed.status).toBe("expired");
+  expect(closed.answer_key).toBeNull();
+  expect(closed.answer_note).toContain("you took it out of the land queue");
+  expect(closed.answer_note).toContain("CI is red");
 });
 
 test("a queued corrective steer holds the retry; delivery + a new head resumes it (HIVE-444)", async () => {

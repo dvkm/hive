@@ -428,7 +428,10 @@ async function revalidateLandPauseCards(db: DB): Promise<void> {
   // stopped the merge may genuinely differ now and the old question is stale.
   const rows = db
     .query(
-      `SELECT d.id AS id, d.title AS title FROM events e
+      `SELECT d.id AS id, d.title AS title,
+              json_extract(e.payload, '$.reason') AS pause_reason,
+              t.state AS state, t.land_queued_at AS land_queued_at
+         FROM events e
          JOIN decisions d ON d.id = json_extract(e.payload, '$.decision_id')
          JOIN tasks t ON t.id = e.task_id
         WHERE e.type = 'land_paused' AND d.status = 'open'
@@ -436,11 +439,25 @@ async function revalidateLandPauseCards(db: DB): Promise<void> {
                OR (t.head_sha IS NOT NULL AND json_extract(e.payload, '$.head_sha') IS NOT NULL
                    AND t.head_sha != json_extract(e.payload, '$.head_sha')))`
     )
-    .all() as { id: string; title: string }[];
+    .all() as { id: string; title: string; pause_reason: string | null; state: string; land_queued_at: string | null }[];
   for (const r of rows) {
     const { apiDismissDecision } = await import("./api.ts");
+    // The card is about the PAUSE, so it ends when the pause ends. But the
+    // reason the merge stopped is the part the director was reading, and taking
+    // the PR out of the queue is the RIGHT answer to a permanent failure — so
+    // closing the card must not be how that explanation disappears (HIVE-570).
+    // It is repeated here, along with what actually ended the pause.
+    const ended =
+      r.state !== "in_review"
+        ? "the task left review"
+        : !r.land_queued_at
+          ? "you took it out of the land queue"
+          : "the agent pushed a new commit";
     apiDismissDecision(db, r.id, {
       reason: "land_blocker_cleared",
+      why:
+        `Hive closed this because ${ended}, so the pause it asked about is over.` +
+        (r.pause_reason ? ` The merge had stopped with: ${String(r.pause_reason).slice(0, 300)}` : ""),
       steer:
         `hive closed the land-queue card "${r.title}" on its own: the PR is no longer sitting in the queue waiting ` +
         `on that answer. Carry on with the work you were given; nothing here needs a reply.`,

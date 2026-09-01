@@ -540,6 +540,11 @@ export interface BranchCheck {
   unmet_deps: { id: string; number: number; title: string; state: State }[];
   embedded_tasks: { id: string; number: number; title: string }[];
   understanding_required?: boolean; // judgment-class change; the quiz gates approval (hive-1559)
+  // The risk check runs when the PR reaches review, not at the land attempt, so
+  // the card knows before the director spends anything whether Ship can work
+  // (HIVE-570). Undefined on an older server: the old land-time gate still applies.
+  confirmed_risks?: { risk: string; why: string; evidence_path?: string }[];
+  risk_check_unfinished?: { unverified: number; checked: number; reason?: string | null } | null;
 }
 
 // The land queue's ordering graph (server/src/landQueue.ts). `from` lands
