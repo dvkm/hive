@@ -100,6 +100,10 @@ export interface SpawnArgs {
   // is what makes closing a FINISHED name holder safe. herdr supplies the other
   // half (its status is `done`); both must hold or the name is left alone.
   releaseFinishedName?: boolean;
+  // The operator's half (HIVE-579): `hive spawn <id> --force` means "I checked,
+  // it is not running". It replaces the silence proof only — a holder herdr
+  // still reports as working/idle/blocked is never closed by it.
+  forceReleaseName?: boolean;
 }
 
 export interface SpawnResult {
@@ -703,6 +707,20 @@ export function describeHolder(holder: NameHolder, quietMs?: number): string {
     .join(", ");
 }
 
+// Is the process holding the name still there? Signal 0 checks existence
+// without touching the process. Only ever consulted for a pid herdr itself
+// named, so pid recycling would have to hit that exact number in the seconds
+// between the two reads.
+export function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: any) {
+    // EPERM = a live process owned by somebody else. Alive, just not ours.
+    return e?.code === "EPERM";
+  }
+}
+
 // When may a spawn refused by a name holder be retried (HIVE-568)? Returns the
 // ISO instant, or null when this is NOT a wait: no holder (some other failure),
 // or a holder that already reports done and has been silent past the stale
@@ -727,7 +745,11 @@ export function heldNameRetryAt(
 // ---- adapter ----
 
 export class Herdr {
-  constructor(private exec: Exec = defaultExec, private bin: string = HERDR_BIN) {}
+  constructor(
+    private exec: Exec = defaultExec,
+    private bin: string = HERDR_BIN,
+    private alive: (pid: number) => boolean = pidAlive
+  ) {}
 
   private run(argv: string[], opts?: { input?: string }): Promise<ExecResult> {
     return this.exec([this.bin, ...argv], opts);
@@ -786,12 +808,28 @@ export class Herdr {
       // (`done` — never working/idle/blocked/unknown), and the caller says the
       // task has been silent for a whole stale window. Anything else is still
       // left strictly alone.
-      if (args.releaseFinishedName && holder.status === "done") {
+      //
+      // HIVE-579: the liveness probe that hotfix comment was waiting for. A pid
+      // herdr named that no longer exists is not ambiguous — that agent is gone
+      // and its lease is a leak, so release it whatever its last status said.
+      // (A finished claude does NOT exit, so an alive pid is not proof of busy;
+      // that case still needs the status + silence pair, or the operator's
+      // --force in place of the silence.)
+      const holderDead = holder.pid !== null && !this.alive(holder.pid);
+      const finishedAndReleasable =
+        holder.status === "done" && (args.releaseFinishedName || args.forceReleaseName === true);
+      if (holderDead || finishedAndReleasable) {
         await this.closeSession({
           agentTarget: args.taskId,
           tabId: ref.tabId,
           expectCwd: wt.path,
-          request: { caller: "spawn", reason: "finished agent still holding the task name", taskId: args.taskId },
+          request: {
+            caller: "spawn",
+            reason: holderDead
+              ? "dead process still holding the task name"
+              : "finished agent still holding the task name",
+            taskId: args.taskId,
+          },
         });
         start = await this.run(startArgv);
       }
@@ -799,7 +837,7 @@ export class Herdr {
         throw new HerdrError(
           `agent start refused: task ${args.taskId} already has an agent holding its name (possibly alive). ` +
           `Holder: ${describeHolder(holder, args.holderQuietMs)}. ` +
-          `Verify it is dead (no panes, no worktree processes) before respawning.`,
+          `Verify it is dead (no panes, no worktree processes), then respawn with: hive spawn ${args.taskId} --force`,
           holder
         );
     }

@@ -36,6 +36,7 @@ import {
   workspaceCloseArgv,
   parsePaneRootProcess,
   describeHolder,
+  pidAlive,
 } from "../src/runtime/herdr.ts";
 
 // A recording stub: canned results per matched argv, records every call.
@@ -592,7 +593,7 @@ function nameTakenExec(status: string) {
 
 test("spawn releases a FINISHED name holder and starts fresh", async () => {
   const { exec, calls, has, starts } = nameTakenExec("done");
-  const h = new Herdr(exec, "herdr");
+  const h = new Herdr(exec, "herdr", () => true);
   const r = await h.spawn({
     taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b",
     releaseFinishedName: true, holderQuietMs: 6 * 3600_000,
@@ -604,7 +605,7 @@ test("spawn releases a FINISHED name holder and starts fresh", async () => {
 
 test("spawn leaves a WORKING name holder alone even when the caller allows release", async () => {
   const { exec, calls, has, starts } = nameTakenExec("working");
-  const h = new Herdr(exec, "herdr");
+  const h = new Herdr(exec, "herdr", () => true);
   await expect(
     h.spawn({
       taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b",
@@ -617,16 +618,75 @@ test("spawn leaves a WORKING name holder alone even when the caller allows relea
 
 test("spawn leaves a finished holder alone until the task has been silent", async () => {
   const { exec, calls, has } = nameTakenExec("done");
-  const h = new Herdr(exec, "herdr");
+  const h = new Herdr(exec, "herdr", () => true);
   await expect(
     h.spawn({ taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b" })
   ).rejects.toThrow(/already has an agent holding its name/);
   expect(calls.some((c) => has(c, "tab", "close"))).toBe(false);
 });
 
+// HIVE-579: the leak the 2026-08-25 hotfix left behind. The agent's process is
+// GONE and herdr already says its turn is done, but the task has only been quiet
+// for a few minutes, so every `hive spawn` was refused until the 15-minute
+// window closed. A pid that no longer exists is proof enough on its own.
+test("spawn releases a name held by a pid that no longer exists", async () => {
+  const { exec, calls, has, starts } = nameTakenExec("done");
+  const h = new Herdr(exec, "herdr", () => false); // pid 28260 is gone
+  const r = await h.spawn({ taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b", holderQuietMs: 60_000 });
+  expect(r.agent_target).toBe("x");
+  expect(calls.some((c) => has(c, "tab", "close", "wR:t40"))).toBe(true);
+  expect(starts()).toBe(2);
+});
+
+// A dead process is dead whatever its last reported status was: `working` is
+// just the last thing herdr saw before it died.
+test("a dead pid releases the name even when herdr still reports it working", async () => {
+  const { exec, calls, has } = nameTakenExec("working");
+  const h = new Herdr(exec, "herdr", () => false);
+  const r = await h.spawn({ taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b" });
+  expect(r.agent_target).toBe("x");
+  expect(calls.some((c) => has(c, "tab", "close", "wR:t40"))).toBe(true);
+});
+
+// --force is the operator saying "I checked, it is gone". It replaces the
+// silence window only.
+test("--force releases a finished holder without waiting out the silence window", async () => {
+  const { exec, calls, has } = nameTakenExec("done");
+  const h = new Herdr(exec, "herdr", () => true);
+  const r = await h.spawn({
+    taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b",
+    forceReleaseName: true, holderQuietMs: 60_000,
+  });
+  expect(r.agent_target).toBe("x");
+  expect(calls.some((c) => has(c, "tab", "close", "wR:t40"))).toBe(true);
+});
+
+test("--force still leaves a live WORKING holder alone", async () => {
+  const { exec, calls, has, starts } = nameTakenExec("working");
+  const h = new Herdr(exec, "herdr", () => true);
+  await expect(
+    h.spawn({ taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b", forceReleaseName: true })
+  ).rejects.toThrow(/already has an agent holding its name/);
+  expect(calls.some((c) => has(c, "tab", "close"))).toBe(false);
+  expect(starts()).toBe(1);
+});
+
+test("the refusal points at the escape hatch instead of stopping at 'verify it is dead'", async () => {
+  const { exec } = nameTakenExec("working");
+  const h = new Herdr(exec, "herdr", () => true);
+  await expect(
+    h.spawn({ taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b" })
+  ).rejects.toThrow(/hive spawn x --force/);
+});
+
+test("pidAlive reads this process as alive and a never-used pid as gone", () => {
+  expect(pidAlive(process.pid)).toBe(true);
+  expect(pidAlive(0x7ffffff)).toBe(false);
+});
+
 test("the refusal names the pid and the idle time, so nobody has to pgrep", async () => {
   const { exec } = nameTakenExec("working");
-  const h = new Herdr(exec, "herdr");
+  const h = new Herdr(exec, "herdr", () => true);
   await expect(
     h.spawn({ taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b", holderQuietMs: 6 * 3600_000 + 12 * 60_000 })
   ).rejects.toThrow(/pid 28260 \(claude\), pane wR:p7X, herdr status working, silent 6h 12m/);

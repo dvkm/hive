@@ -76,7 +76,8 @@ Usage:
         branch hive does not own, or one checked out somewhere. Dry run unless
         --apply.
   hive jira link <task-id> --parent <KEY> create and link a Jira sub-task
-  hive spawn <task-id>                    spawn a herdr agent for a task
+  hive spawn <task-id> [--force]          spawn a herdr agent for a task
+                                          (--force: the previous agent is dead, take its name)
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
   hive chat supervisor [on|off]           chief of staff off switch (default off)
   hive chat reply <thread-id> "<text>" [--decision <id> ...]
@@ -594,10 +595,13 @@ async function main() {
   }
 
   if (cmd === "spawn") {
-    const { _ } = parseFlags(argv.slice(1));
+    const { _, flags } = parseFlags(argv.slice(1));
     const taskId = _[0];
-    if (!taskId) die("usage: hive spawn <task-id>");
-    const r = await api("POST", `/api/tasks/${taskId}/spawn`, {});
+    if (!taskId) die("usage: hive spawn <task-id> [--force]");
+    // --force is for the one case hive cannot see for itself: the operator has
+    // checked that the agent holding this task's name is gone. It skips the
+    // 15-minute silence window, nothing else (HIVE-579).
+    const r = await api("POST", `/api/tasks/${taskId}/spawn`, { force: flags.force === true });
     console.log(`spawned agent ${r.agent_target} for task ${taskId}`);
     return;
   }
