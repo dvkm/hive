@@ -1,6 +1,7 @@
 // hive CLI — thin HTTP wrappers around the daemon. The server is the only DB writer.
 // Installed as bin/hive (bun shebang). Base URL: HIVE_URL or http://127.0.0.1:<HIVE_PORT|4700>.
 import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { REVIEW_SUMMARY_HELP } from "../server/src/reviewShape.ts";
 import { appBrowserCandidates, installedHiveAppCandidates, openUrlArgv, tailscaleCandidates } from "./platform.ts";
 
@@ -376,8 +377,13 @@ async function main() {
       // --json <file> merges a JSON object into the event payload — used for
       // structured events like review_summary (see the agent brief).
       const extra = flags.json ? JSON.parse(readFileSync(String(flags.json), "utf8")) : {};
+      // hive-1992: the server refuses a payload read from a path other agents
+      // can write (the shared /tmp/review.json that published one agent's
+      // review under another's task), so it needs the resolved path.
+      const payloadPath = flags.json ? resolve(String(flags.json)) : undefined;
       result = await api("POST", path, {
         type,
+        payload_path: payloadPath,
         note: flags.note,
         kind: flags.kind,
         source: flags.source,

@@ -80,7 +80,12 @@ export function eventText(e: EventLike): string {
     case "auto_review": {
       if (s(p.skipped)) return `pre-review skipped (${s(p.skipped)})`;
       const risks = Array.isArray(p.risks) && p.risks.length ? ` — risks: ${(p.risks as string[]).join("; ")}` : "";
-      return `pre-review ${s(p.verdict) === "caution" ? "⚠ CAUTION" : "✓ looks good"}: ${s(p.summary)}${risks}`;
+      // Only `looks_good` is good. `caution`, `unparseable` and `unavailable`
+      // all used to render as "✓ looks good" here, which is the opposite of
+      // what they mean (HIVE-567).
+      const verdict = s(p.verdict);
+      const label = verdict === "looks_good" ? "✓ looks good" : verdict === "caution" ? "⚠ CAUTION" : `⚠ ${verdict.toUpperCase()}`;
+      return `pre-review ${label}: ${s(p.summary)}${risks}`;
     }
     case "auto_review_error":
       // `gave_up` means the retry budget for this PR head is spent — the card

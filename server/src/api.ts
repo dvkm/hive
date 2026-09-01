@@ -49,7 +49,7 @@ import {
   parsePolicy,
   parseIncident,
 } from "./rows.ts";
-import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from "./runtime/herdr.ts";
+import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable, HerdrError, heldNameRetryAt } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { takeOver, handBack, TakeoverError } from "./takeover.ts";
@@ -2130,6 +2130,49 @@ export function looksSecuritySensitive(text: string): boolean {
   return new RegExp(`\\b(${DEFAULT_SENSITIVE_PATHS.join("|")})s?\\b`, "i").test(text ?? "");
 }
 
+// Why a new work task's brief looks like it was written from the Jira TITLE
+// alone, or null when it looks fine. Two arms, because WEB-118 failed the
+// second one: the bad brief was several hundred chars of prose whose entire
+// content was "this ticket has no description, ask the reporter" — a length
+// check alone waves that straight through.
+//
+// The second arm refuses task creation outright, so it has to be far more
+// conservative than a warning would be: a false positive blocks a legitimate
+// filing with a 400 and the caller has no override. So every pattern is
+// anchored to the TICKET itself ("the issue has no description", "no spec on
+// WEB-118") rather than matching a bare phrase anywhere in the prose. A real
+// spec that happens to say "the card renders no description when the field is
+// empty" is about the product, not the ticket, and must sail through.
+const TICKET = String.raw`(?:this |the )?(?:ticket|issue|jira(?: (?:issue|ticket))?|[A-Z][A-Z0-9]{1,9}-\d+)`;
+const ABSENT_SPEC_CLAIMS: RegExp[] = [
+  // "the issue has no description", "WEB-118 carries only a title"
+  new RegExp(String.raw`\b${TICKET}\b[^.\n]{0,30}?\s(?:has|have|had|carries|contains|includes|provides|comes with)\s+(?:no|only a|nothing but a)\s+(?:description|spec(?:ification)?|body|details|requirements|title)\b`, "gi"),
+  // "there is no description on the Jira issue", "no spec attached to WEB-118"
+  new RegExp(String.raw`\b(?:there (?:is|was|are|were) )?no\s+(?:description|spec(?:ification)?|requirements)\b[^.\n]{0,30}?\b(?:on|for|in|attached to)\s+${TICKET}\b`, "gi"),
+  // "the ticket is title-only", "a title-only issue"
+  new RegExp(String.raw`\b${TICKET}\b[^.\n]{0,20}?\sis\s+title[- ]only\b`, "gi"),
+  new RegExp(String.raw`\btitle[- ]only\s+${TICKET}\b`, "gi"),
+  // proposing to go back to the reporter because the spec is missing
+  /\b(?:ask|asking|check with|go back to)\s+the\s+(?:reporter|requester|filer)\b[^.\n]{0,40}?\b(?:for (?:a |the )?(?:spec(?:ification)?|description|requirements|details)|what (?:they|he|she) wants?)/gi,
+  /\b(?:spec(?:ification)?|description|requirements)\s+(?:is |are )?needed from the (?:reporter|requester|filer)\b/gi,
+  /\bawaiting (?:a |the )?spec(?:ification)?\b/gi,
+];
+// "no need to ask the reporter for a spec" is the OPPOSITE claim, and reads as
+// a match to the arm above. Look back a short way for the negation that flips it.
+const NEGATED_BEFORE = /\b(?:no need|without need(?:ing)?|don'?t need|do not need|no reason|not necessary|rather than|instead of|no point)\b[^.\n]{0,30}$/i;
+
+export function thinBriefReason(brief: string): string | null {
+  if (brief.length < 150) return `brief is title-only (${brief.length} chars)`;
+  for (const re of ABSENT_SPEC_CLAIMS) {
+    re.lastIndex = 0;
+    for (const m of brief.matchAll(re)) {
+      if (NEGATED_BEFORE.test(brief.slice(Math.max(0, m.index - 60), m.index))) continue;
+      return `brief claims the ticket has no spec ("${m[0].trim()}")`;
+    }
+  }
+  return null;
+}
+
 // Accepts JSON or multipart; attached files are saved under the new task's id
 // and their absolute paths appended to the brief, so the agent that picks the
 // task up can read them.
@@ -2206,9 +2249,10 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   // already has.
   if (mirrorTaskId) {
     const mirrorBrief = (db.query("SELECT brief FROM tasks WHERE id = ?").get(mirrorTaskId) as { brief: string | null } | undefined)?.brief ?? "";
-    if (brief.length < 80 && mirrorBrief.length > 200)
+    const why = mirrorBrief.length > 200 ? thinBriefReason(brief) : null;
+    if (why)
       return err(
-        `brief is title-only (${brief.length} chars) but linked mirror task ${mirrorTaskId} has a ${mirrorBrief.length}-char spec — include it in --brief-text instead of just the Jira title`,
+        `${why}, but linked mirror task ${mirrorTaskId} already has a ${mirrorBrief.length}-char spec — read that mirror's brief and write --brief-text from it instead of from the Jira title`,
         400
       );
   }
@@ -2449,11 +2493,32 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
     if (denied) return denied;
     priority = parsed;
   }
-  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, updated_at = ? WHERE id = ?")
-    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, now(), id);
+  // Re-resolve the mirror when the title changes (HIVE-550). Adding the missing
+  // '[WEB-119] ' prefix by hand is the repair path a human reaches for when a
+  // work task was filed unlinked, and resolving only at creation made that
+  // repair silently do nothing. Never CLEAR a link here: dropping the prefix
+  // shouldn't throw away a link the board already relies on.
+  let mirrorTaskId: string | null = task.jira_mirror_task_id ?? null;
+  let relinked: { from: string | null; to: string } | null = null;
+  // Also re-resolve when the task is still unlinked: a task filed before its
+  // mirror existed (or already carrying the prefix but linked to nothing) heals
+  // on the next edit instead of staying orphaned forever.
+  if (title !== task.title || !mirrorTaskId) {
+    const resolved = mirrorTaskIdForTitle(db, task.project_id, title);
+    if (resolved && resolved !== mirrorTaskId) {
+      relinked = { from: mirrorTaskId, to: resolved };
+      mirrorTaskId = resolved;
+    }
+  }
+  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, jira_mirror_task_id = ?, updated_at = ? WHERE id = ?")
+    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, mirrorTaskId, now(), id);
   const updated = getTask(db, id);
+  // Say it out loud rather than repointing in silence — especially when this
+  // moved an existing link off another ticket.
+  if (relinked)
+    writeEvent(db, { task_id: id, source: "director", type: "jira_mirror_relinked", payload: relinked });
   broadcastTask(db, updated);
-  return json(taskWithHealth(db, updated));
+  return json({ ...taskWithHealth(db, updated), ...(relinked ? { jira_mirror_relinked: relinked } : {}) });
 }
 
 // Manual merge: fold this task into `target_id`, cancelling it as a duplicate.
@@ -4046,7 +4111,21 @@ export async function spawnAgent(
     // (not per-task) and inBackoff excludes them, so an outage doesn't pound the
     // dead socket once per queued task nor inflate the task's own backoff.
     const infra = isHerdrUnreachable(msg) ? "herdr_unreachable" : undefined;
-    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: msg, ...(infra ? { infra } : {}) } });
+    // HIVE-568: a name held by a LIVE holder is contention, not failure. The
+    // lease can only be reclaimed once the holder reports done AND the task has
+    // been silent for a whole stale window (15m) — far longer than the
+    // dispatcher's five quick retries, so every such task used to be failed with
+    // "needs a human" while the holder was simply finishing its turn. Stamp the
+    // event with the earliest moment a retry could work; the dispatcher waits for
+    // it instead of spending an attempt. A holder that is already done AND past
+    // the window is a genuine failure — left untagged, so it still fails fast.
+    const heldUntil = e instanceof HerdrError ? heldNameRetryAt(e.nameHolder, holderQuietMs, staleMs(), Date.now()) : null;
+    writeEvent(db, {
+      task_id: id,
+      source: "herdr",
+      type: "spawn_error",
+      payload: { error: msg, ...(infra ? { infra } : {}), ...(heldUntil ? { held_until: heldUntil } : {}) },
+    });
     recordSystemLearning(db, task.project_id, `spawn failure: ${signature(msg)}`, msg, id);
     return { ok: false, error: msg };
   }
@@ -6252,6 +6331,42 @@ async function prHeadBranch(exec: Exec, prUrl: string): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------- event ingestion (`hive emit`)
+// hive-1992: `hive emit --json <file>` used to accept ANY path, so agents that
+// wrote to the shared /tmp/review.json published each other's reviews — one
+// task's review card ended up describing a completely different change, and an
+// understanding check had already been passed against the review it replaced.
+// The CLI sends the resolved path; a payload read from outside the calling
+// agent's own sandbox is refused, not warned about.
+//
+// Legitimate homes are the task's own worktree, and its per-session scratchpad
+// (/tmp/claude-501/<worktree-slug>/<session-uuid>/scratchpad/...), whose slug is
+// the worktree path with every non-alphanumeric character turned into "-".
+function worktreeSlug(worktreePath: string): string {
+  return worktreePath.replace(/[^A-Za-z0-9]/g, "-");
+}
+
+// Every name this task legitimately answers to, so a payload that stamps its
+// own task id can be checked against all of them (uppercased for comparison).
+function taskIdentities(db: DB, task: any): string[] {
+  return [task.id, String(task.number), `#${task.number}`, taskIdentifier(db, task)].map((v) => v.toUpperCase());
+}
+
+function payloadPathRefusal(task: any, raw: unknown): string | null {
+  const path = typeof raw === "string" ? raw.trim() : "";
+  const worktree = String(task?.worktree_path ?? "").replace(/\/+$/, "");
+  // No path (a direct API caller) or no worktree on the task: nothing to
+  // compare against, so this guard stays out of the way.
+  if (!path || !worktree) return null;
+  if (path === worktree || path.startsWith(worktree + "/")) return null;
+  if (path.split("/").includes(worktreeSlug(worktree))) return null;
+  return (
+    `refusing to read ${path}: it is outside this task's worktree and session scratchpad, ` +
+    `so another agent can overwrite it between your write and this emit (that is how one task ` +
+    `published another agent's review). Write the payload inside ${worktree}/ (or your session ` +
+    `scratchpad) and emit again.`
+  );
+}
+
 async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDeps = {}): Promise<Response> {
   const task = getTask(db, taskId);
   if (!task) return noTask(taskId);
@@ -6285,6 +6400,19 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       `this task is tracking-only — hive tracks it but never runs an agent on it, so there are no agent lifecycle events to record. To close it, move it directly: \`hive task move ${taskId} done\` (or \`cancelled\`).`,
       409
     );
+  // hive-1992: a --json payload must come from this agent's own sandbox, and if
+  // it names a task it must name THIS one. Both refuse rather than warn — the
+  // warning would arrive after the wrong review is already published.
+  const pathRefusal = payloadPathRefusal(task, (fields as any).payload_path);
+  if (pathRefusal) return err(pathRefusal, 400);
+  const claimed = String((fields as any).task_id ?? (fields as any).task ?? "").trim();
+  if (claimed && !taskIdentities(db, task).includes(claimed.toUpperCase()))
+    return err(
+      `this payload says it belongs to task ${claimed}, but you are emitting on ${taskIdentifier(db, task)} (${taskId}). ` +
+        `Re-generate the payload for this task and emit again.`,
+      400
+    );
+
   const source = fields.source || "agent";
   const note = fields.note ?? null;
 

@@ -479,6 +479,60 @@ test("an unfinished risk check retries on the backoff instead of opening a card"
   expect(JSON.parse(attempt.payload).transient).toBe(true);
 });
 
+// HIVE-569: a timeout is transient, but retrying it spends the same busy route
+// that caused it. It must wait minutes, not 30 seconds, and give up after three.
+test("a capacity failure waits out the congestion instead of retrying into it", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  const reason = "merge blocked — the risk check did not finish on this head: 2 of 2 findings got no verdict (timed out after 180000ms).";
+
+  const first = mergeStub(db, { [a]: reason });
+  await landOnce(db, { exec: filesExec({}), merge: first.merge });
+  expect(first.calls).toEqual([a]);
+
+  // 60s later a "base moved" would already be retrying. A timeout is not.
+  ageLandAttempts(db, a, 60_000);
+  const tooSoon = mergeStub(db, { [a]: reason });
+  await landOnce(db, { exec: filesExec({}), merge: tooSoon.merge });
+  expect(tooSoon.calls).toEqual([]);
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+
+  // Past the 5 minute step it tries again, and burns its budget the same way.
+  for (let i = 0; i < 3; i++) {
+    ageLandAttempts(db, a, 3_600_000);
+    const { merge } = mergeStub(db, { [a]: reason });
+    await landOnce(db, { exec: filesExec({}), merge });
+  }
+  // Three capacity failures is the whole budget: attempt 4 stops being treated
+  // as transient and becomes one card, instead of a fourth 180s timeout.
+  const attempts = (db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'land_attempted'").get(a) as any).n;
+  expect(attempts).toBe(4);
+  const card = db.query("SELECT context FROM decisions WHERE status = 'open'").get() as any;
+  expect(card).toBeTruthy();
+  expect(card.context).toContain("busy shared route");
+
+  // And a further sweep adds nothing: no fifth attempt, no second card.
+  ageLandAttempts(db, a, 3_600_000);
+  const after = mergeStub(db, { [a]: reason });
+  await landOnce(db, { exec: filesExec({}), merge: after.merge });
+  expect(after.calls).toEqual([]);
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(1);
+});
+
+// A base that keeps moving costs nothing shared, so it keeps the fast cadence.
+test("a non-capacity transient failure still retries on the short backoff", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  markLand(db, [a], true);
+  const first = mergeStub(db, { [a]: "Base branch was modified. Review and try the merge again." });
+  await landOnce(db, { exec: filesExec({}), merge: first.merge });
+  ageLandAttempts(db, a, 60_000);
+  const retry = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: retry.merge });
+  expect(retry.calls).toEqual([a]);
+});
+
 // HIVE-555: a permanent blocker gave the same answer every 30s sweep forever.
 // One PR alone produced 52 of 116 land failures on one machine.
 test("a non-transient failure retries once, then holds instead of re-failing forever", async () => {
