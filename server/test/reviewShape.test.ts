@@ -10,15 +10,14 @@ const { makeHandler } = await import("../src/api.ts");
 const { REVIEW_SUMMARY_HELP, REVIEW_SUMMARY_EXAMPLE } = await import("../src/reviewShape.ts");
 
 const db = openDb(":memory:");
-const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
-const BASE = `http://127.0.0.1:${server.port}`;
+const handler = makeHandler(db);
 
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, {
+  const res = await handler(new Request("http://127.0.0.1" + path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  });
+  }));
   return { status: res.status, json: (await res.json()) as any };
 }
 
@@ -114,7 +113,7 @@ test("a passed quiz survives a re-emitted review", async () => {
   for (const to of ["in_progress", "in_review", "verifying"])
     await post(`/api/tasks/${taskId}/transition`, { to });
   await post(`/api/tasks/${taskId}/events`, { type: "review_summary", ...REVIEW_SUMMARY_EXAMPLE });
-  const quizzes = await (await fetch(`${BASE}/api/understanding-quizzes`)).json();
+  const quizzes = await (await handler(new Request("http://127.0.0.1/api/understanding-quizzes"))).json();
   const quiz = quizzes.quizzes.find((q: any) => q.task_id === taskId);
   const answered = await post(`/api/tasks/${taskId}/understanding-quiz/answer`, {
     source: "director",
@@ -134,7 +133,7 @@ test("a passed quiz survives a re-emitted review", async () => {
 // Answer whichever check is currently being asked, until the whole quiz passes.
 async function passQuiz(taskId: string, checks: { question: string; answer_key: string }[]) {
   for (let i = 0; i < checks.length; i++) {
-    const quizzes = await (await fetch(`${BASE}/api/understanding-quizzes`)).json();
+    const quizzes = await (await handler(new Request("http://127.0.0.1/api/understanding-quizzes"))).json();
     const quiz = quizzes.quizzes.find((q: any) => q.task_id === taskId);
     const answered = await post(`/api/tasks/${taskId}/understanding-quiz/answer`, {
       source: "director",
@@ -225,4 +224,3 @@ test("a changed correct answer re-asks the quiz", async () => {
   expect(after.json.passed).not.toBe(true);
 });
 
-test.afterAll?.(() => server.stop(true));

@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,28 +33,25 @@ function stubExec(stdout: string): { exec: PlannerExec; calls: string[][] } {
   return { exec, calls };
 }
 
-let server: any;
-let BASE = "";
+let handler: ReturnType<typeof makeHandler>;
 let projectId = "";
 
 beforeAll(async () => {
-  server = Bun.serve({ port: 0, fetch: makeHandler(db, { plannerExec: stubExec(VALID).exec }) });
-  BASE = `http://127.0.0.1:${server.port}`;
-  const p = await (await fetch(BASE + "/api/projects", {
+  handler = makeHandler(db, { plannerExec: stubExec(VALID).exec });
+  const p = await (await handler(new Request("http://127.0.0.1/api/projects", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: "acme", repo_path: "/repo" }),
-  })).json();
+  }))).json();
   projectId = p.id;
 });
-afterAll(() => server.stop(true));
 
 async function mkTask(done: boolean) {
-  const t = await (await fetch(BASE + "/api/tasks", {
+  const t = await (await handler(new Request("http://127.0.0.1/api/tasks", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_id: projectId, title: "Prune push subscriptions", brief: "Drop unauthenticated rows." }),
-  })).json();
+  }))).json();
   if (done) db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(t.id);
   return t;
 }
@@ -64,7 +61,7 @@ test("a done task distils into a well-formed [playbook] reference row", async ()
   writeEvent(db, { task_id: t.id, source: "agent", type: "status", payload: { note: "wrote the pruner" } });
   writeEvent(db, { task_id: t.id, source: "agent", type: "checkpoint", payload: { note: "kept it a single sweep" } });
 
-  const res = await fetch(BASE + `/api/tasks/${t.id}/playbook`, { method: "POST", body: "{}" });
+  const res = await handler(new Request("http://127.0.0.1" + `/api/tasks/${t.id}/playbook`, { method: "POST", body: "{}" }));
   expect(res.status).toBe(201);
   const body = await res.json();
   expect(body.ok).toBe(true);
@@ -89,27 +86,23 @@ test("a done task distils into a well-formed [playbook] reference row", async ()
 
 test("the prompt carries the brief and the key events", async () => {
   const stub = stubExec(VALID);
-  const s = Bun.serve({ port: 0, fetch: makeHandler(db, { plannerExec: stub.exec }) });
-  try {
-    const t = await mkTask(true);
-    writeEvent(db, { task_id: t.id, source: "agent", type: "checkpoint", payload: { note: "reused the existing table" } });
-    // An event type outside the key set must not reach the prompt.
-    writeEvent(db, { task_id: t.id, source: "agent", type: "heartbeat", payload: { note: "still alive" } });
-    const res = await fetch(`http://127.0.0.1:${s.port}/api/tasks/${t.id}/playbook`, { method: "POST", body: "{}" });
-    expect(res.status).toBe(201);
-    const prompt = stub.calls[0].find((a) => a.includes("Task #"))!;
-    expect(prompt).toContain("Drop unauthenticated rows.");
-    expect(prompt).toContain("reused the existing table");
-    expect(prompt).not.toContain("still alive");
-    expect(stub.calls[0]).toContain("sonnet");
-  } finally {
-    s.stop(true);
-  }
+  const h = makeHandler(db, { plannerExec: stub.exec });
+  const t = await mkTask(true);
+  writeEvent(db, { task_id: t.id, source: "agent", type: "checkpoint", payload: { note: "reused the existing table" } });
+  // An event type outside the key set must not reach the prompt.
+  writeEvent(db, { task_id: t.id, source: "agent", type: "heartbeat", payload: { note: "still alive" } });
+  const res = await h(new Request("http://127.0.0.1" + `/api/tasks/${t.id}/playbook`, { method: "POST", body: "{}" }));
+  expect(res.status).toBe(201);
+  const prompt = stub.calls[0].find((a) => a.includes("Task #"))!;
+  expect(prompt).toContain("Drop unauthenticated rows.");
+  expect(prompt).toContain("reused the existing table");
+  expect(prompt).not.toContain("still alive");
+  expect(stub.calls[0]).toContain("sonnet");
 });
 
 test("a task that is not done is refused with 409", async () => {
   const t = await mkTask(false);
-  const res = await fetch(BASE + `/api/tasks/${t.id}/playbook`, { method: "POST", body: "{}" });
+  const res = await handler(new Request("http://127.0.0.1" + `/api/tasks/${t.id}/playbook`, { method: "POST", body: "{}" }));
   expect(res.status).toBe(409);
   const body = await res.json();
   expect(body.ok).toBe(false);
@@ -118,7 +111,7 @@ test("a task that is not done is refused with 409", async () => {
 });
 
 test("an unknown task is a 404", async () => {
-  const res = await fetch(BASE + "/api/tasks/nope/playbook", { method: "POST", body: "{}" });
+  const res = await handler(new Request("http://127.0.0.1/api/tasks/nope/playbook", { method: "POST", body: "{}" }));
   expect(res.status).toBe(404);
 });
 
@@ -129,15 +122,11 @@ test("unusable model output is rejected rather than stored", async () => {
     ["empty steps", JSON.stringify({ title: "t", when_to_use: "x", steps: [] })],
   ];
   for (const [why, stdout] of cases) {
-    const s = Bun.serve({ port: 0, fetch: makeHandler(db, { plannerExec: stubExec(stdout).exec }) });
-    try {
-      const t = await mkTask(true);
-      const res = await fetch(`http://127.0.0.1:${s.port}/api/tasks/${t.id}/playbook`, { method: "POST", body: "{}" });
-      expect([why, res.status]).toEqual([why, 502]);
-      expect(db.query("SELECT COUNT(*) c FROM learnings WHERE source_task_id = ?").get(t.id)).toEqual({ c: 0 });
-    } finally {
-      s.stop(true);
-    }
+    const h = makeHandler(db, { plannerExec: stubExec(stdout).exec });
+    const t = await mkTask(true);
+    const res = await h(new Request("http://127.0.0.1" + `/api/tasks/${t.id}/playbook`, { method: "POST", body: "{}" }));
+    expect([why, res.status]).toEqual([why, 502]);
+    expect(db.query("SELECT COUNT(*) c FROM learnings WHERE source_task_id = ?").get(t.id)).toEqual({ c: 0 });
   }
 });
 
@@ -157,28 +146,24 @@ test("two tasks with the same model-generated title both survive, each keeping i
     when_to_use: "You are deleting rows nothing else reads.",
     steps: ["Write the sweep", "Test it"],
   });
-  const s = Bun.serve({ port: 0, fetch: makeHandler(db, { plannerExec: stubExec(COLLIDE).exec }) });
-  try {
-    const a = await mkTask(true);
-    const b = await mkTask(true);
-    const ra = await (await fetch(`http://127.0.0.1:${s.port}/api/tasks/${a.id}/playbook`, { method: "POST", body: "{}" })).json();
-    const rb = await (await fetch(`http://127.0.0.1:${s.port}/api/tasks/${b.id}/playbook`, { method: "POST", body: "{}" })).json();
+  const h = makeHandler(db, { plannerExec: stubExec(COLLIDE).exec });
+  const a = await mkTask(true);
+  const b = await mkTask(true);
+  const ra = await (await h(new Request("http://127.0.0.1" + `/api/tasks/${a.id}/playbook`, { method: "POST", body: "{}" }))).json();
+  const rb = await (await h(new Request("http://127.0.0.1" + `/api/tasks/${b.id}/playbook`, { method: "POST", body: "{}" }))).json();
 
-    expect(rb.learning_id).not.toBe(ra.learning_id);
-    const rowA: any = db.query("SELECT * FROM learnings WHERE id = ?").get(ra.learning_id);
-    const rowB: any = db.query("SELECT * FROM learnings WHERE id = ?").get(rb.learning_id);
-    expect(rowA.source_task_id).toBe(a.id);
-    expect(rowB.source_task_id).toBe(b.id);
-    expect(rowA.title).toBe("Prune a table safely");
-    expect(rowB.title).toBe(`Prune a table safely (task #${b.number})`);
-    expect(rowA.body).toContain(`task #${a.number}`);
-    expect(rowB.body).toContain(`task #${b.number}`);
+  expect(rb.learning_id).not.toBe(ra.learning_id);
+  const rowA: any = db.query("SELECT * FROM learnings WHERE id = ?").get(ra.learning_id);
+  const rowB: any = db.query("SELECT * FROM learnings WHERE id = ?").get(rb.learning_id);
+  expect(rowA.source_task_id).toBe(a.id);
+  expect(rowB.source_task_id).toBe(b.id);
+  expect(rowA.title).toBe("Prune a table safely");
+  expect(rowB.title).toBe(`Prune a table safely (task #${b.number})`);
+  expect(rowA.body).toContain(`task #${a.number}`);
+  expect(rowB.body).toContain(`task #${b.number}`);
 
-    // Re-promoting the same task rewrites its own row instead of adding one.
-    const again = await (await fetch(`http://127.0.0.1:${s.port}/api/tasks/${a.id}/playbook`, { method: "POST", body: "{}" })).json();
-    expect(again.learning_id).toBe(ra.learning_id);
-    expect(db.query("SELECT COUNT(*) c FROM learnings WHERE title LIKE 'Prune a table safely%'").get()).toEqual({ c: 2 });
-  } finally {
-    s.stop(true);
-  }
+  // Re-promoting the same task rewrites its own row instead of adding one.
+  const again = await (await h(new Request("http://127.0.0.1" + `/api/tasks/${a.id}/playbook`, { method: "POST", body: "{}" }))).json();
+  expect(again.learning_id).toBe(ra.learning_id);
+  expect(db.query("SELECT COUNT(*) c FROM learnings WHERE title LIKE 'Prune a table safely%'").get()).toEqual({ c: 2 });
 });

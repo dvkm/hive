@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,17 +10,15 @@ const { openDb, newId, now } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
 
 const db = openDb(":memory:");
-const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
-const BASE = `http://127.0.0.1:${server.port}`;
-afterAll(() => server.stop(true));
+const handler = makeHandler(db);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function post(path: string, body: unknown): Promise<{ status: number; json: any }> {
-  const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const res = await handler(new Request("http://127.0.0.1" + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
   return { status: res.status, json: await res.json() };
 }
 async function get(path: string): Promise<{ status: number; json: any }> {
-  const res = await fetch(BASE + path);
+  const res = await handler(new Request("http://127.0.0.1" + path));
   return { status: res.status, json: await res.json() };
 }
 function addEvidence(taskId: string) {
@@ -228,23 +226,19 @@ test("done-since is based on completion events, not later task edits", async () 
 
 test("empty brief on a fresh DB has all sections empty", async () => {
   const fresh = openDb(":memory:");
-  const srv = Bun.serve({ port: 0, fetch: makeHandler(fresh) });
-  try {
-    const res = await fetch(`http://127.0.0.1:${srv.port}/api/brief`);
-    const json: any = await res.json();
-    expect(json.done).toEqual([]);
-    expect(json.director_required_task_ids).toEqual([]);
-    expect(json.failed_or_attention).toEqual([]);
-    expect(json.decisions).toEqual([]);
-    expect(json.fleet).toEqual([]);
-    expect(json.incidents).toEqual([]);
-    expect(json.intake).toEqual([]);
-    expect(json.learnings_new).toEqual([]);
-    expect(json.spend.totals.calls).toBe(0);
-    expect(json.spend.by_model).toEqual([]);
-  } finally {
-    srv.stop(true);
-  }
+  const freshHandler = makeHandler(fresh);
+  const res = await freshHandler(new Request("http://127.0.0.1/api/brief"));
+  const json: any = await res.json();
+  expect(json.done).toEqual([]);
+  expect(json.director_required_task_ids).toEqual([]);
+  expect(json.failed_or_attention).toEqual([]);
+  expect(json.decisions).toEqual([]);
+  expect(json.fleet).toEqual([]);
+  expect(json.incidents).toEqual([]);
+  expect(json.intake).toEqual([]);
+  expect(json.learnings_new).toEqual([]);
+  expect(json.spend.totals.calls).toBe(0);
+  expect(json.spend.by_model).toEqual([]);
 });
 
 test("?project scopes the spend rollup to that project only", async () => {

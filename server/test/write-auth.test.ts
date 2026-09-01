@@ -1,9 +1,10 @@
 // Config/secret writes are token-gated even over loopback (task #1025, scout
 // #991): those two stores are where a caller-supplied value gets paired with a
-// credential. Everything else — reads, task flow — stays trustless. These run
-// over a real 127.0.0.1 socket so the loopback path itself is exercised, and
+// credential. Everything else — reads, task flow — stays trustless. requireWriteAuth
+// gates on the token alone, not the caller's IP, so calling the handler directly
+// (no request IP) exercises the same loopback path a real socket would. These
 // assert the STORE is unchanged, not just the status code.
-import { test, expect, afterAll } from "bun:test";
+import { test, expect } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,18 +17,17 @@ const { makeHandler } = await import("../src/api.ts");
 const TOKEN = "test-token";
 const db = openDb(":memory:");
 setSetting(db, "api_token", TOKEN);
-const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
-const BASE = `http://127.0.0.1:${server.port}`;
-afterAll(() => server.stop(true));
+const handler = makeHandler(db);
+const BASE = "http://127.0.0.1";
 
 const call = (path: string, init: RequestInit & { token?: string } = {}) =>
-  fetch(BASE + path, {
+  handler(new Request(BASE + path, {
     ...init,
     headers: {
       "Content-Type": "application/json",
       ...(init.token ? { Authorization: `Bearer ${init.token}` } : {}),
     },
-  });
+  }));
 
 const project = await (await call("/api/projects", {
   method: "POST",
@@ -132,19 +132,18 @@ test("reads and the task flow stay trustless on loopback", async () => {
 
 test("no token minted → the gate fails closed while reads keep working", async () => {
   const bare = openDb(":memory:");
-  const bareServer = Bun.serve({ port: 0, fetch: makeHandler(bare) });
-  const p: any = await (await fetch(`http://127.0.0.1:${bareServer.port}/api/projects`, {
+  const bareHandler = makeHandler(bare);
+  const p: any = await (await bareHandler(new Request("http://127.0.0.1/api/projects", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: "bare", repo_path: "/repo" }),
-  })).json();
-  const res = await fetch(`http://127.0.0.1:${bareServer.port}/api/projects/${p.id}`, {
+  }))).json();
+  const res = await bareHandler(new Request(`http://127.0.0.1/api/projects/${p.id}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json", Authorization: "Bearer anything" },
     body: JSON.stringify({ name: "pwned" }),
-  });
+  }));
   expect(res.status).toBe(401);
   expect((bare.query("SELECT name FROM projects WHERE id = ?").get(p.id) as any).name).toBe("bare");
-  expect((await fetch(`http://127.0.0.1:${bareServer.port}/api/projects/${p.id}`)).status).toBe(200);
-  bareServer.stop(true);
+  expect((await bareHandler(new Request(`http://127.0.0.1/api/projects/${p.id}`))).status).toBe(200);
 });

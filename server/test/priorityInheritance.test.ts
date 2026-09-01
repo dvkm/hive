@@ -49,16 +49,23 @@ function makeTask(
 const priorityOf = (db: DB, id: string) =>
   (db.query("SELECT priority FROM tasks WHERE id = ?").get(id) as any).priority;
 
-// A live server + JSON helpers, torn down by the caller's finally.
-function serve(db: DB) {
-  const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
-  const BASE = `http://127.0.0.1:${server.port}`;
+// Call the handler directly instead of standing up a real HTTP server (see
+// thinBriefVsMirror.test.ts for why: a live socket can outlive its server).
+function makeApi(db: DB) {
+  const handler = makeHandler(db);
   return {
-    server,
     post: (path: string, body: unknown) =>
-      fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+      handler(new Request("http://127.0.0.1" + path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })),
     put: (path: string, body: unknown) =>
-      fetch(BASE + path, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+      handler(new Request("http://127.0.0.1" + path, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })),
   };
 }
 
@@ -95,21 +102,17 @@ test("the root-cause scout inherits the failing lineage's priority", () => {
 test("a follow-up task defaults to its parent's priority, and an explicit value still wins", async () => {
   const { db, projectId } = freshDb();
   const parent = makeTask(db, projectId, { priority: "next", state: "in_progress" });
-  const { server, post } = serve(db);
-  try {
-    const child = (await (await post("/api/tasks", {
-      project_id: projectId, title: "follow-up", parent_task_id: parent,
-    })).json()) as any;
-    expect(child.priority).toBe("next");
+  const { post } = makeApi(db);
+  const child = (await (await post("/api/tasks", {
+    project_id: projectId, title: "follow-up", parent_task_id: parent,
+  })).json()) as any;
+  expect(child.priority).toBe("next");
 
-    // Explicit beats inherited — including downwards.
-    const pinned = (await (await post("/api/tasks", {
-      project_id: projectId, title: "follow-up 2", parent_task_id: parent, priority: "later",
-    })).json()) as any;
-    expect(pinned.priority).toBe("later");
-  } finally {
-    server.stop(true);
-  }
+  // Explicit beats inherited — including downwards.
+  const pinned = (await (await post("/api/tasks", {
+    project_id: projectId, title: "follow-up 2", parent_task_id: parent, priority: "later",
+  })).json()) as any;
+  expect(pinned.priority).toBe("later");
 });
 
 // ------------------------------------------------------- source defaults
@@ -127,20 +130,16 @@ test("a monitor auto-task arrives at 'next'", async () => {
 
 test("a security-shaped brief starts at 'next', ordinary wording stays 'normal'", async () => {
   const { db, projectId } = freshDb();
-  const { server, post } = serve(db);
+  const { post } = makeApi(db);
   const priorityFor = async (title: string, brief?: string) =>
     ((await (await post("/api/tasks", { project_id: projectId, title, brief })).json()) as any).priority;
-  try {
-    expect(await priorityFor("Rotate the deploy token")).toBe("next");
-    expect(await priorityFor("Tidy the header", "The password reset link expires too early")).toBe("next");
-    // Whole words only: "author" and "authority" are not "auth".
-    expect(await priorityFor("Show the commit author in the sidebar")).toBe("normal");
-    expect(await priorityFor("Rename the standing authority panel")).toBe("normal");
-    // Nothing here ever reaches 'now'.
-    expect(await priorityFor("Fix the billing page auth redirect")).toBe("next");
-  } finally {
-    server.stop(true);
-  }
+  expect(await priorityFor("Rotate the deploy token")).toBe("next");
+  expect(await priorityFor("Tidy the header", "The password reset link expires too early")).toBe("next");
+  // Whole words only: "author" and "authority" are not "auth".
+  expect(await priorityFor("Show the commit author in the sidebar")).toBe("normal");
+  expect(await priorityFor("Rename the standing authority panel")).toBe("normal");
+  // Nothing here ever reaches 'now'.
+  expect(await priorityFor("Fix the billing page auth redirect")).toBe("next");
 });
 
 test("watcher and Jira-imported tasks stay at the default 'normal'", () => {
@@ -167,36 +166,32 @@ test("watcher and Jira-imported tasks stay at the default 'normal'", () => {
 
 test("only the director may set 'now'", async () => {
   const { db, projectId } = freshDb();
-  const { server, post, put } = serve(db);
-  try {
-    // The web UI and the CLI send no source at all.
-    expect((await post("/api/tasks", { project_id: projectId, title: "director now", priority: "now" })).status).toBe(201);
-    // ...and "director" spelled out is the same thing.
-    expect((await post("/api/tasks", { project_id: projectId, title: "d2", priority: "now", source: "director" })).status).toBe(201);
+  const { post, put } = makeApi(db);
+  // The web UI and the CLI send no source at all.
+  expect((await post("/api/tasks", { project_id: projectId, title: "director now", priority: "now" })).status).toBe(201);
+  // ...and "director" spelled out is the same thing.
+  expect((await post("/api/tasks", { project_id: projectId, title: "d2", priority: "now", source: "director" })).status).toBe(201);
 
-    for (const source of ["agent", "chat_supervisor"]) {
-      const denied = await post("/api/tasks", { project_id: projectId, title: `${source} now`, priority: "now", source });
-      expect(denied.status).toBe(403);
-      expect(((await denied.json()) as any).error).toMatch(/only the director may set priority 'now'/);
-      // Nothing was created.
-      expect(db.query("SELECT COUNT(*) c FROM tasks WHERE title = ?").get(`${source} now`) as any).toMatchObject({ c: 0 });
+  for (const source of ["agent", "chat_supervisor"]) {
+    const denied = await post("/api/tasks", { project_id: projectId, title: `${source} now`, priority: "now", source });
+    expect(denied.status).toBe(403);
+    expect(((await denied.json()) as any).error).toMatch(/only the director may set priority 'now'/);
+    // Nothing was created.
+    expect(db.query("SELECT COUNT(*) c FROM tasks WHERE title = ?").get(`${source} now`) as any).toMatchObject({ c: 0 });
 
-      // 'next' and below are open to everyone.
-      const allowed = await post("/api/tasks", { project_id: projectId, title: `${source} next`, priority: "next", source });
-      expect(allowed.status).toBe(201);
-      expect(((await allowed.json()) as any).priority).toBe("next");
-    }
-
-    // The same rule on the update path, and a refused update changes nothing.
-    const task = (await (await post("/api/tasks", { project_id: projectId, title: "later on" , priority: "later" })).json()) as any;
-    const deniedPut = await put(`/api/tasks/${task.id}`, { priority: "now", source: "agent" });
-    expect(deniedPut.status).toBe(403);
-    expect(priorityOf(db, task.id)).toBe("later");
-    expect((await put(`/api/tasks/${task.id}`, { priority: "now" })).status).toBe(200);
-    expect(priorityOf(db, task.id)).toBe("now");
-  } finally {
-    server.stop(true);
+    // 'next' and below are open to everyone.
+    const allowed = await post("/api/tasks", { project_id: projectId, title: `${source} next`, priority: "next", source });
+    expect(allowed.status).toBe(201);
+    expect(((await allowed.json()) as any).priority).toBe("next");
   }
+
+  // The same rule on the update path, and a refused update changes nothing.
+  const task = (await (await post("/api/tasks", { project_id: projectId, title: "later on" , priority: "later" })).json()) as any;
+  const deniedPut = await put(`/api/tasks/${task.id}`, { priority: "now", source: "agent" });
+  expect(deniedPut.status).toBe(403);
+  expect(priorityOf(db, task.id)).toBe("later");
+  expect((await put(`/api/tasks/${task.id}`, { priority: "now" })).status).toBe(200);
+  expect(priorityOf(db, task.id)).toBe("now");
 });
 
 test("an agent's follow-up inherits a 'now' parent without being blocked", async () => {
@@ -204,12 +199,8 @@ test("an agent's follow-up inherits a 'now' parent without being blocked", async
   // set it on the parent, so the follow-up may keep it.
   const { db, projectId } = freshDb();
   const parent = makeTask(db, projectId, { priority: "now", state: "in_progress" });
-  const { server, post } = serve(db);
-  try {
-    const res = await post("/api/tasks", { project_id: projectId, title: "follow-up", parent_task_id: parent, source: "agent" });
-    expect(res.status).toBe(201);
-    expect(((await res.json()) as any).priority).toBe("now");
-  } finally {
-    server.stop(true);
-  }
+  const { post } = makeApi(db);
+  const res = await post("/api/tasks", { project_id: projectId, title: "follow-up", parent_task_id: parent, source: "agent" });
+  expect(res.status).toBe(201);
+  expect(((await res.json()) as any).priority).toBe("now");
 });

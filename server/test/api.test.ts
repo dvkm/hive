@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,29 +29,27 @@ const testExec: Exec = (argv, opts) =>
     : defaultExec(argv, opts);
 
 const db = openDb(":memory:");
-const server = Bun.serve({ port: 0, fetch: makeHandler(db, { exec: testExec }) });
-const BASE = `http://127.0.0.1:${server.port}`;
-
-afterAll(() => server.stop(true));
+const handler = makeHandler(db, { exec: testExec });
+const BASE = "http://127.0.0.1";
 
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, {
+  const res = await handler(new Request(BASE + path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  });
+  }));
   return { status: res.status, json: await res.json() };
 }
 async function get(path: string) {
-  const res = await fetch(BASE + path);
+  const res = await handler(new Request(BASE + path));
   return { status: res.status, json: await res.json() };
 }
 async function put(path: string, body: unknown) {
-  const res = await fetch(BASE + path, {
+  const res = await handler(new Request(BASE + path, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  });
+  }));
   return { status: res.status, json: await res.json() };
 }
 
@@ -208,16 +206,16 @@ test("scheduler-owned self-audit source cannot be created through the task API",
 
 test("only a scheduled self-audit ship can finish report-only", async () => {
   const localDb = openDb(":memory:");
-  const localServer = Bun.serve({ port: 0, fetch: makeHandler(localDb) });
+  const localHandler = makeHandler(localDb);
   const localPost = async (path: string, body: unknown) => {
-    const res = await fetch(`http://127.0.0.1:${localServer.port}${path}`, {
+    const res = await localHandler(new Request("http://127.0.0.1" + path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    });
+    }));
     return { status: res.status, json: await res.json() };
   };
-  try {
+  {
     const project = await localPost("/api/projects", { name: "Hive", repo_path: "/repo" });
     const { selfAuditOnce } = await import("../src/selfAudit.ts");
     const audit = selfAuditOnce(localDb)!;
@@ -239,8 +237,6 @@ test("only a scheduled self-audit ship can finish report-only", async () => {
     const done = await localPost(`/api/tasks/${retry}/events`, { type: "done" });
     expect(done.status).toBe(200);
     expect(done.json.task).toMatchObject({ state: "done", kind: "ship", source: "requeue", pr_url: null });
-  } finally {
-    localServer.stop(true);
   }
 });
 
@@ -766,17 +762,17 @@ test("ready emit refreshes stale branch metadata for an already-linked PR", asyn
       return { code: 0, stdout: JSON.stringify({ headRefName: "hive/task-recut" }), stderr: "" };
     return { code: 1, stdout: "", stderr: "not needed" };
   };
-  const srv = Bun.serve({ port: 0, fetch: makeHandler(db2, { exec }) });
+  const srvHandler = makeHandler(db2, { exec });
   const call = async (path: string, body: unknown) => {
-    const response = await fetch(`http://127.0.0.1:${srv.port}${path}`, {
+    const response = await srvHandler(new Request("http://127.0.0.1" + path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    });
+    }));
     return { status: response.status, json: await response.json() };
   };
 
-  try {
+  {
     const project = await call("/api/projects", { name: "replacement-pr", repo_path: "/tmp/x" });
     const task = await call("/api/tasks", { project_id: project.json.id, title: "replace stale PR" });
     await call(`/api/tasks/${task.json.id}/transition`, { to: "in_progress" });
@@ -795,8 +791,6 @@ test("ready emit refreshes stale branch metadata for an already-linked PR", asyn
     expect(ready.status).toBe(200);
     expect(ready.json.task.pr_url).toBe("https://github.com/example/repo/pull/2");
     expect(ready.json.task.branch).toBe("hive/task-recut");
-  } finally {
-    srv.stop(true);
   }
 });
 
@@ -879,13 +873,12 @@ test("POST /merge returns instead of hanging when the post-merge smoke check fai
       : OK();
   const smokeFetch: Fetcher = async () => ({ status: 500, body: "down" });
   const db2 = openDb(":memory:");
-  const srv = Bun.serve({ port: 0, fetch: makeHandler(db2, { exec, fetch: smokeFetch }) });
-  const base2 = `http://127.0.0.1:${srv.port}`;
+  const srvHandler = makeHandler(db2, { exec, fetch: smokeFetch });
   const post2 = async (path: string, body: unknown) => {
-    const res = await fetch(base2 + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const res = await srvHandler(new Request("http://127.0.0.1" + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
     return { status: res.status, json: await res.json() };
   };
-  try {
+  {
     const p = await post2("/api/projects", {
       name: "smoke-proj",
       repo_path: "/tmp/x",
@@ -915,8 +908,6 @@ test("POST /merge returns instead of hanging when the post-merge smoke check fai
     expect(Date.now() - start).toBeLessThan(3000);
     expect(merged.status).toBe(200);
     expect(merged.json.state).toBe("in_progress"); // bounced back by the failing smoke check
-  } finally {
-    srv.stop(true);
   }
 });
 
@@ -926,12 +917,12 @@ test("evidence upload round-trips through /evidence", async () => {
   form.set("kind", "screenshot");
   form.set("caption", "a shot");
   form.set("file", new File([new Uint8Array([1, 2, 3, 4])], "shot.png", { type: "image/png" }));
-  const res = await fetch(`${BASE}/api/tasks/${taskId}/events`, { method: "POST", body: form });
+  const res = await handler(new Request(`${BASE}/api/tasks/${taskId}/events`, { method: "POST", body: form }));
   expect(res.status).toBe(201);
   const data = await res.json();
   expect(data.evidence.url).toStartWith(`/evidence/${taskId}/`);
 
-  const fetched = await fetch(BASE + data.evidence.url);
+  const fetched = await handler(new Request(BASE + data.evidence.url));
   expect(fetched.status).toBe(200);
   const bytes = new Uint8Array(await fetched.arrayBuffer());
   expect(Array.from(bytes)).toEqual([1, 2, 3, 4]);
@@ -958,7 +949,7 @@ test("evidence kind is inferred from the uploaded file's extension", async () =>
     form.set("type", "evidence");
     form.set("note", name);
     form.set("file", new File([new Uint8Array([1])], name, { type }));
-    const res = await fetch(`${BASE}/api/tasks/${t.json.id}/events`, { method: "POST", body: form });
+    const res = await handler(new Request(`${BASE}/api/tasks/${t.json.id}/events`, { method: "POST", body: form }));
     return (await res.json()).evidence.kind;
   };
   expect(await up("shot.png", "image/png")).toBe("screenshot");
@@ -969,7 +960,7 @@ test("evidence kind is inferred from the uploaded file's extension", async () =>
   form.set("type", "evidence");
   form.set("kind", "report");
   form.set("file", new File([new Uint8Array([1])], "notes.txt", { type: "text/plain" }));
-  const res = await fetch(`${BASE}/api/tasks/${t.json.id}/events`, { method: "POST", body: form });
+  const res = await handler(new Request(`${BASE}/api/tasks/${t.json.id}/events`, { method: "POST", body: form }));
   expect((await res.json()).evidence.kind).toBe("report");
 });
 
@@ -1023,11 +1014,11 @@ test("decision: create, draft autosave, answer flow", async () => {
   await post(`/api/decisions/${otherDecision.json.id}/dismiss`, {});
 
   // draft autosave
-  const draft = await fetch(`${BASE}/api/decisions/${decisionId}/draft`, {
+  const draft = await handler(new Request(`${BASE}/api/decisions/${decisionId}/draft`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ draft_note: "leaning yes" }),
-  });
+  }));
   expect(draft.status).toBe(200);
   const afterDraft = await get(`/api/decisions/${decisionId}`);
   expect(afterDraft.json.draft_note).toBe("leaning yes");
@@ -1270,14 +1261,14 @@ test("policies CRUD", async () => {
   const list = await get("/api/policies?scope=global");
   expect(list.json.some((x: any) => x.id === p.json.id)).toBe(true);
 
-  const upd = await fetch(`${BASE}/api/policies/${p.json.id}`, {
+  const upd = await handler(new Request(`${BASE}/api/policies/${p.json.id}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ active: false }),
-  });
+  }));
   expect((await upd.json()).active).toBe(false);
 
-  const del = await fetch(`${BASE}/api/policies/${p.json.id}`, { method: "DELETE" });
+  const del = await handler(new Request(`${BASE}/api/policies/${p.json.id}`, { method: "DELETE" }));
   expect(del.status).toBe(200);
 });
 
@@ -1292,7 +1283,7 @@ test("brief endpoint counts policies and retrieves their bodies through recall",
 });
 
 test("SSE stream sends a hello headline", async () => {
-  const res = await fetch(BASE + "/api/stream");
+  const res = await handler(new Request(BASE + "/api/stream"));
   const reader = res.body!.getReader();
   const { value } = await reader.read();
   const text = new TextDecoder().decode(value);
@@ -1395,9 +1386,12 @@ test("task list includes board metadata without task-detail requests", async () 
   expect(compact).not.toHaveProperty("depends_on");
   expect(compactList.find((item: any) => item.id === review.json.id).needs_you_since).toBe("2026-08-20T00:00:00Z");
   expect((await get(`/api/tasks/${review.json.id}`)).json.needs_you_since).toBe("2026-08-20T00:00:00Z");
-  const compressed = await fetch(BASE + "/api/tasks?compact=1", { headers: { "Accept-Encoding": "gzip" } });
+  const compressed = await handler(new Request(BASE + "/api/tasks?compact=1", { headers: { "Accept-Encoding": "gzip" } }));
   expect(compressed.headers.get("content-encoding")).toBe("gzip");
-  expect((await compressed.json()).some((item: any) => item.id === task.json.id)).toBe(true);
+  // Calling the handler directly skips the fetch client, which normally
+  // decodes Content-Encoding transparently — decompress by hand instead.
+  const decompressed = await new Response(compressed.body!.pipeThrough(new DecompressionStream("gzip"))).json();
+  expect(decompressed.some((item: any) => item.id === task.json.id)).toBe(true);
 
   db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
     .run("evt_list_spawned", task.json.id, new Date().toISOString(), "herdr", "spawned", "{}");
@@ -1431,17 +1425,16 @@ test("land-graph without a project param skips an archived project with a dead r
     if (argv[0] === "git") gitCalls++;
     return { code: 0, stdout: "", stderr: "" };
   };
-  const srv = Bun.serve({ port: 0, fetch: makeHandler(db2, { exec }) });
-  const base = `http://127.0.0.1:${srv.port}`;
+  const srvHandler = makeHandler(db2, { exec });
   const call = async (path: string, body: unknown) => {
-    const response = await fetch(base + path, {
+    const response = await srvHandler(new Request("http://127.0.0.1" + path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    });
+    }));
     return { status: response.status, json: await response.json() };
   };
-  try {
+  {
     const archived = await call("/api/projects", {
       name: "archived-dead-repo",
       repo_path: "/nonexistent/repo",
@@ -1452,13 +1445,11 @@ test("land-graph without a project param skips an archived project with a dead r
       db2.query("UPDATE tasks SET state = 'in_review', branch = ? WHERE id = ?").run(`hive/${title}`, t.json.id);
     }
 
-    const graph = await fetch(base + "/api/tasks/land-graph");
+    const graph = await srvHandler(new Request("http://127.0.0.1/api/tasks/land-graph"));
     expect(graph.status).toBe(200);
     const body = await graph.json();
     expect(body.nodes).toEqual([]);
     expect(gitCalls).toBe(0);
-  } finally {
-    srv.stop(true);
   }
 });
 

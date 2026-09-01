@@ -258,38 +258,33 @@ test("land order: priority picks the winner of a conflicting pair, and only one 
 
 test("create/update accept a valid priority and reject anything else", async () => {
   const { db, projectId } = freshDb();
-  const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
-  const BASE = `http://127.0.0.1:${server.port}`;
+  const handler = makeHandler(db);
   const post = (path: string, body: unknown) =>
-    fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    handler(new Request("http://127.0.0.1" + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
   const put = (path: string, body: unknown) =>
-    fetch(BASE + path, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  try {
-    const created = await post("/api/tasks", { project_id: projectId, title: "t", priority: "now" });
-    expect(created.status).toBe(201);
-    expect(((await created.json()) as any).priority).toBe("now");
+    handler(new Request("http://127.0.0.1" + path, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
+  const created = await post("/api/tasks", { project_id: projectId, title: "t", priority: "now" });
+  expect(created.status).toBe(201);
+  expect(((await created.json()) as any).priority).toBe("now");
 
-    // Omitted on create means 'normal', and the value rides on GET.
-    const plain = (await (await post("/api/tasks", { project_id: projectId, title: "t2" })).json()) as any;
-    expect(plain.priority).toBe("normal");
-    expect(((await (await fetch(`${BASE}/api/tasks/${plain.id}`)).json()) as any).priority).toBe("normal");
+  // Omitted on create means 'normal', and the value rides on GET.
+  const plain = (await (await post("/api/tasks", { project_id: projectId, title: "t2" })).json()) as any;
+  expect(plain.priority).toBe("normal");
+  expect(((await (await handler(new Request(`http://127.0.0.1/api/tasks/${plain.id}`))).json()) as any).priority).toBe("normal");
 
-    const bad = await post("/api/tasks", { project_id: projectId, title: "t3", priority: "urgent" });
-    expect(bad.status).toBe(400);
-    expect(((await bad.json()) as any).error).toMatch(/invalid priority/);
+  const bad = await post("/api/tasks", { project_id: projectId, title: "t3", priority: "urgent" });
+  expect(bad.status).toBe(400);
+  expect(((await bad.json()) as any).error).toMatch(/invalid priority/);
 
-    const bumped = (await (await put(`/api/tasks/${plain.id}`, { priority: "later" })).json()) as any;
-    expect(bumped.priority).toBe("later");
+  const bumped = (await (await put(`/api/tasks/${plain.id}`, { priority: "later" })).json()) as any;
+  expect(bumped.priority).toBe("later");
 
-    const badUpdate = await put(`/api/tasks/${plain.id}`, { priority: "" });
-    expect(badUpdate.status).toBe(400);
-    // A rejected update leaves the stored value alone.
-    expect((db.query("SELECT priority FROM tasks WHERE id = ?").get(plain.id) as any).priority).toBe("later");
+  const badUpdate = await put(`/api/tasks/${plain.id}`, { priority: "" });
+  expect(badUpdate.status).toBe(400);
+  // A rejected update leaves the stored value alone.
+  expect((db.query("SELECT priority FROM tasks WHERE id = ?").get(plain.id) as any).priority).toBe("later");
 
-    // Omitting priority on an update leaves it alone.
-    const renamed = (await (await put(`/api/tasks/${plain.id}`, { title: "renamed" })).json()) as any;
-    expect(renamed.priority).toBe("later");
-  } finally {
-    server.stop(true);
-  }
+  // Omitting priority on an update leaves it alone.
+  const renamed = (await (await put(`/api/tasks/${plain.id}`, { title: "renamed" })).json()) as any;
+  expect(renamed.priority).toBe("later");
 });

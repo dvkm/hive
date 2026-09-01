@@ -1,6 +1,6 @@
 // Round-1 autonomy guardrails: per-task cost warn/cap, broadcast steer, policy
 // auto-broadcast, decision-dismiss recovery, decision aging nags, intake noise.
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,26 +33,27 @@ const exec: Exec = async (argv) => {
   return OK();
 };
 
-let server: any;
-let BASE = "";
 let projectId = "";
 const db = openDb(":memory:");
 const herdr = new Herdr(exec, "herdr");
+// Call the handler directly instead of standing up a real HTTP server. Bun
+// 1.3.14's global fetch pool keeps sockets alive past the server they belong
+// to, and the OS hands those ephemeral ports straight back to the next
+// `Bun.serve({ port: 0 })`, so a request can go out on a socket belonging to a
+// dead server. No socket, no port, no pool, no flake.
+const handler = makeHandler(db, { herdr });
 
 beforeAll(async () => {
-  server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr }) });
-  BASE = `http://127.0.0.1:${server.port}`;
   const p = await post("/api/projects", { name: "p", repo_path: "/repo" });
   projectId = p.json.id;
 });
-afterAll(() => server.stop(true));
 
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const res = await handler(new Request("http://127.0.0.1" + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
   return { status: res.status, json: await res.json() };
 }
 async function get(path: string) {
-  const res = await fetch(BASE + path);
+  const res = await handler(new Request("http://127.0.0.1" + path));
   return { status: res.status, json: await res.json() };
 }
 const newTask = async (title: string) => (await post("/api/tasks", { project_id: projectId, title })).json.id;
@@ -852,12 +853,12 @@ test("a zero-risk explainer verdict flips the recommended option away from Deny;
 
 test("GET /pane returns the agent's pane text with ANSI stripped; 404 when agentless", async () => {
   const id = await newTask("watch me work");
-  const bare = await fetch(`${BASE}/api/tasks/${id}/pane`);
+  const bare = await handler(new Request("http://127.0.0.1" + `/api/tasks/${id}/pane`));
   expect(bare.status).toBe(404); // not spawned yet
   await post(`/api/tasks/${id}/spawn`, {});
   // stub herdr serves agent read via the generic OK(); patch exec path: our stub returns "" for reads,
-  // so exercise the strip logic through a direct fetch and shape-check the response.
-  const r = await fetch(`${BASE}/api/tasks/${id}/pane?lines=50`);
+  // so exercise the strip logic through a direct call and shape-check the response.
+  const r = await handler(new Request("http://127.0.0.1" + `/api/tasks/${id}/pane?lines=50`));
   expect(r.status).toBe(200);
   const body: any = await r.json();
   expect(body.agent_target).toBe(id);

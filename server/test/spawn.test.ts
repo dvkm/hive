@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,34 +48,30 @@ function stubHerdr(sendResult: ExecResult = OK()) {
 const TOKEN = "test-token";
 const db = openDb(":memory:");
 setSetting(db, "api_token", TOKEN); // the /secrets writes below are gated
-let server: any;
-let BASE = "";
 let projectId = "";
 let taskId = "";
 const { herdr, sends, calls, exec: herdrExec } = stubHerdr();
+const handler = makeHandler(db, { herdr, exec: herdrExec });
 
 beforeAll(async () => {
-  server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr, exec: herdrExec }) });
-  BASE = `http://127.0.0.1:${server.port}`;
-  const p = await (await fetch(BASE + "/api/projects", {
+  const p = await (await handler(new Request("http://127.0.0.1/api/projects", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: "p", repo_path: "/repo", config: {} }),
-  })).json();
+  }))).json();
   projectId = p.id;
-  const t = await (await fetch(BASE + "/api/tasks", {
+  const t = await (await handler(new Request("http://127.0.0.1/api/tasks", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_id: projectId, title: "spawn me" }),
-  })).json();
+  }))).json();
   taskId = t.id;
 });
-afterAll(() => server.stop(true));
 
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` }, body: JSON.stringify(body) });
+  const res = await handler(new Request("http://127.0.0.1" + path, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` }, body: JSON.stringify(body) }));
   return { status: res.status, json: await res.json() };
 }
 async function get(path: string) {
-  const res = await fetch(BASE + path);
+  const res = await handler(new Request("http://127.0.0.1" + path));
   return { status: res.status, json: await res.json() };
 }
 
@@ -240,16 +236,14 @@ test("send degrades gracefully when the task has no agent (records event, surfac
 test("send surfaces a herdr failure without throwing", async () => {
   const { herdr: failHerdr } = stubHerdr({ code: 1, stdout: "", stderr: "agent not found" });
   const db2 = openDb(":memory:");
-  const srv = Bun.serve({ port: 0, fetch: makeHandler(db2, { herdr: failHerdr }) });
-  const base2 = `http://127.0.0.1:${srv.port}`;
-  const p = await (await fetch(base2 + "/api/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "p2", repo_path: "/r" }) })).json();
-  const t = await (await fetch(base2 + "/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ project_id: p.id, title: "t" }) })).json();
-  await fetch(base2 + `/api/tasks/${t.id}/spawn`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-  const res = await fetch(base2 + `/api/tasks/${t.id}/send`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: "go" }) });
+  const handler2 = makeHandler(db2, { herdr: failHerdr });
+  const p = await (await handler2(new Request("http://127.0.0.1/api/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "p2", repo_path: "/r" }) }))).json();
+  const t = await (await handler2(new Request("http://127.0.0.1/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ project_id: p.id, title: "t" }) }))).json();
+  await handler2(new Request(`http://127.0.0.1/api/tasks/${t.id}/spawn`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }));
+  const res = await handler2(new Request(`http://127.0.0.1/api/tasks/${t.id}/send`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: "go" }) }));
   const jsonBody = await res.json();
   expect(jsonBody.ok).toBe(false);
   expect(jsonBody.error).toContain("agent not found");
-  srv.stop(true);
 });
 
 test("incidents endpoint returns the documented shape", async () => {
@@ -273,7 +267,7 @@ test("secrets API stores names/metadata only (no values)", async () => {
   // no value/ref leaks in the list
   expect(JSON.stringify(list.json)).not.toContain("value");
 
-  const del = await fetch(BASE + `/api/projects/${projectId}/secrets/API_KEY`, { method: "DELETE", headers: { Authorization: `Bearer ${TOKEN}` } });
+  const del = await handler(new Request(`http://127.0.0.1/api/projects/${projectId}/secrets/API_KEY`, { method: "DELETE", headers: { Authorization: `Bearer ${TOKEN}` } }));
   expect(del.status).toBe(200);
 });
 
@@ -303,7 +297,7 @@ test("secrets API ignores a caller-supplied ref, so a secret cannot alias anothe
     (db.query("SELECT ref FROM secrets WHERE project_id = ? AND name = 'STOLEN'").get(projectId) as any).ref
   ).toBe(`hive/${projectId}/STOLEN`);
 
-  await fetch(BASE + `/api/projects/${projectId}/secrets/STOLEN`, { method: "DELETE", headers: { Authorization: `Bearer ${TOKEN}` } });
+  await handler(new Request(`http://127.0.0.1/api/projects/${projectId}/secrets/STOLEN`, { method: "DELETE", headers: { Authorization: `Bearer ${TOKEN}` } }));
 });
 
 test("modelForTask: per-kind default, config.model, config.model_by_kind override in order", async () => {

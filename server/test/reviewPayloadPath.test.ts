@@ -12,15 +12,22 @@ const { openDb } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
 
 const db = openDb(":memory:");
-const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
-const BASE = `http://127.0.0.1:${server.port}`;
+// Call the handler directly instead of standing up a real HTTP server.
+// HIVE-591: bun 1.3.14's global fetch pool keeps sockets alive past the server
+// that owned them, and the OS hands freed ephemeral ports straight back to the
+// next `Bun.serve({ port: 0 })`, so a request can go out on a dead socket and
+// get an empty/null/never-arriving response. No port, no socket, no pool, no
+// flake.
+const handler = makeHandler(db);
 
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const res = await handler(
+    new Request("http://127.0.0.1" + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+  );
   return { status: res.status, json: (await res.json()) as any };
 }
 

@@ -1,6 +1,6 @@
 // HIVE-402: the verification contract enforced at the in_progress -> in_review
 // handoff. Every route funnels through transition(), so the gate lives there.
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,16 +13,14 @@ const { makeHandler } = await import("../src/api.ts");
 const { transition, writeEvent, getTask, TransitionError, missingVerifications } = await import("../src/state.ts");
 
 const db = openDb(":memory:");
-const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
-const BASE = `http://127.0.0.1:${server.port}`;
-afterAll(() => server.stop(true));
+const handler = makeHandler(db);
 
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, {
+  const res = await handler(new Request("http://127.0.0.1" + path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  });
+  }));
   return { status: res.status, json: (await res.json()) as any };
 }
 

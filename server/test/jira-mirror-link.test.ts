@@ -2,7 +2,7 @@
 // and the mirror advancing when that work is done.
 // HIVE-562: the mirror also follows the work WHILE it is in flight, so a ticket
 // says In Progress / In Review instead of To Do until the very end.
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,16 +15,19 @@ const { makeHandler, requeueTask } = await import("../src/api.ts");
 const { getTask, transition, advanceReadyJiraMirrors } = await import("../src/state.ts");
 
 const db = openDb(":memory:");
-const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
-const BASE = `http://127.0.0.1:${server.port}`;
-afterAll(() => server.stop(true));
+// Call the handler directly instead of standing up a real HTTP server. Bun
+// 1.3.14's global fetch pool keeps sockets alive past the server they belong
+// to, and the OS hands those ephemeral ports straight back to the next
+// `Bun.serve({ port: 0 })`, so a request can go out on a socket belonging to a
+// dead server. No socket, no port, no pool, no flake.
+const handler = makeHandler(db);
 
 let projectId = "";
 
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, {
+  const res = await handler(new Request("http://127.0.0.1" + path, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-  });
+  }));
   return { status: res.status, json: (await res.json()) as any };
 }
 
@@ -162,28 +165,28 @@ test("retitling a task with a [KEY] prefix forms the link", async () => {
   const { json: created } = await post("/api/tasks", { project_id: projectId, title: "free-article reads ignore the cap" });
   expect(created.jira_mirror_task_id).toBe(null);
 
-  const res = await fetch(`${BASE}/api/tasks/${created.id}`, {
+  const res = await handler(new Request("http://127.0.0.1" + `/api/tasks/${created.id}`, {
     method: "PUT", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title: "[WEB-119] free-article reads ignore the cap" }),
-  });
+  }));
   const updated = await res.json();
   expect(updated.jira_mirror_task_id).toBe(m);
   expect(updated.jira_mirror_relinked).toEqual({ from: null, to: m });
 
   // Moving an existing link to another ticket is reported, not silent.
   const m2 = mirror("WEB-120");
-  const moved = await (await fetch(`${BASE}/api/tasks/${created.id}`, {
+  const moved = await (await handler(new Request("http://127.0.0.1" + `/api/tasks/${created.id}`, {
     method: "PUT", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title: "[WEB-120] free-article reads ignore the cap" }),
-  })).json();
+  }))).json();
   expect(moved.jira_mirror_task_id).toBe(m2);
   expect(moved.jira_mirror_relinked).toEqual({ from: m, to: m2 });
 
   // A retitle that drops the prefix keeps the link rather than clearing it.
-  const stripped = await (await fetch(`${BASE}/api/tasks/${created.id}`, {
+  const stripped = await (await handler(new Request("http://127.0.0.1" + `/api/tasks/${created.id}`, {
     method: "PUT", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title: "free-article reads ignore the cap" }),
-  })).json();
+  }))).json();
   expect(stripped.jira_mirror_task_id).toBe(m2);
   expect(stripped.jira_mirror_relinked).toBeUndefined();
 });
@@ -198,10 +201,10 @@ test("an unlinked task that already carries the prefix heals on the next edit", 
      VALUES (?,?,?, 'queued', 'ship', ?, ?)`
   ).run(id, projectId, "[WEB-121] reads ignore the cap", now(), now());
 
-  const healed = await (await fetch(`${BASE}/api/tasks/${id}`, {
+  const healed = await (await handler(new Request("http://127.0.0.1" + `/api/tasks/${id}`, {
     method: "PUT", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ brief: "unchanged title, brief edit only" }),
-  })).json();
+  }))).json();
   expect(healed.jira_mirror_task_id).toBe(m);
   expect(healed.jira_mirror_relinked).toEqual({ from: null, to: m });
 });

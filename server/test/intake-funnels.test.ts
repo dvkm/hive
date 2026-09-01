@@ -92,24 +92,20 @@ const watchFetch = (body: string) =>
 test("POST /api/tasks: an ambient-source task is classified exactly once", async () => {
   const db = openDb(":memory:");
   const { calls, exec } = counter();
-  const server = Bun.serve({ port: 0, fetch: makeHandler(db, { triageExec: exec }) });
-  try {
-    const pid = project(db, { intake_triage: true });
-    const res = await fetch(`http://127.0.0.1:${server.port}/api/tasks`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project_id: pid, title: "make the dashboard faster", brief: "the dashboard feels slow", source: "intake_gchat" }),
-    });
-    const task = await res.json();
-    await settle();
+  const handler = makeHandler(db, { triageExec: exec });
+  const pid = project(db, { intake_triage: true });
+  const res = await handler(new Request("http://127.0.0.1/api/tasks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project_id: pid, title: "make the dashboard faster", brief: "the dashboard feels slow", source: "intake_gchat" }),
+  }));
+  const task = await res.json();
+  await settle();
 
-    expect(calls.length).toBe(1);
-    expect(triageEvents(db, task.id)).toBe(1);
-    expect(openCards(db, task.id).length).toBe(1);
-    expect(triageHold(db, getTask(db, task.id))).toBe(true);
-  } finally {
-    server.stop(true);
-  }
+  expect(calls.length).toBe(1);
+  expect(triageEvents(db, task.id)).toBe(1);
+  expect(openCards(db, task.id).length).toBe(1);
+  expect(triageHold(db, getTask(db, task.id))).toBe(true);
 });
 
 test("Google Chat: one message is classified exactly once", async () => {
@@ -158,27 +154,23 @@ test("braindump: never classified, so the director is asked once, not twice", as
   const db = openDb(":memory:");
   const { calls, exec } = counter();
   // The planner is a subprocess too; stub it so this test spawns nothing.
-  const server = Bun.serve({
-    port: 0,
-    fetch: makeHandler(db, { triageExec: exec, plannerExec: async () => ({ code: 1, stdout: "", stderr: "stubbed", timedOut: false }) }),
+  const handler = makeHandler(db, {
+    triageExec: exec,
+    plannerExec: async () => ({ code: 1, stdout: "", stderr: "stubbed", timedOut: false }),
   });
-  try {
-    const pid = project(db, { intake_triage: true });
-    const res = await fetch(`http://127.0.0.1:${server.port}/api/intake`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project_id: pid, text: "make the dashboard faster" }),
-    });
-    const { task } = await res.json();
-    await settle();
+  const pid = project(db, { intake_triage: true });
+  const res = await handler(new Request("http://127.0.0.1/api/intake", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project_id: pid, text: "make the dashboard faster" }),
+  }));
+  const { task } = await res.json();
+  await settle();
 
-    expect(task.source).toBe("intake_braindump");
-    expect(calls.length).toBe(0);
-    expect(triageEvents(db, task.id)).toBe(0);
-    expect(openCards(db, task.id).length).toBe(0);
-  } finally {
-    server.stop(true);
-  }
+  expect(task.source).toBe("intake_braindump");
+  expect(calls.length).toBe(0);
+  expect(triageEvents(db, task.id)).toBe(0);
+  expect(openCards(db, task.id).length).toBe(0);
 });
 
 // Every other project — corebeat included — must be untouched until its config
@@ -207,36 +199,32 @@ test("answering the card releases the task and appends the chosen reading", asyn
   const { exec } = counter();
   const { herdr } = await import("../src/runtime/herdr.ts");
   const { apiAnswerDecision } = await import("../src/api.ts");
-  const server = Bun.serve({ port: 0, fetch: makeHandler(db, { triageExec: exec }) });
-  try {
-    const pid = project(db, { intake_triage: true, auto_dispatch: true });
-    const res = await fetch(`http://127.0.0.1:${server.port}/api/tasks`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project_id: pid, title: "make the dashboard faster", brief: "the dashboard feels slow", source: "intake_gchat" }),
-    });
-    const { id } = await res.json();
-    await settle();
+  const handler = makeHandler(db, { triageExec: exec });
+  const pid = project(db, { intake_triage: true, auto_dispatch: true });
+  const res = await handler(new Request("http://127.0.0.1/api/tasks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project_id: pid, title: "make the dashboard faster", brief: "the dashboard feels slow", source: "intake_gchat" }),
+  }));
+  const { id } = await res.json();
+  await settle();
 
-    const card = openCards(db, id)[0];
-    expect(triageHold(db, getTask(db, id))).toBe(true);
-    expect(isReviewed(db, id)).toBe(false);
+  const card = openCards(db, id)[0];
+  expect(triageHold(db, getTask(db, id))).toBe(true);
+  expect(isReviewed(db, id)).toBe(false);
 
-    const answered = apiAnswerDecision(db, herdr, card.id, { answer_key: "refresh", source: "director" });
-    expect(answered.status).toBe(200);
+  const answered = apiAnswerDecision(db, herdr, card.id, { answer_key: "refresh", source: "director" });
+  expect(answered.status).toBe(200);
 
-    // Released: reviewed, no open card, nothing holding it back from the next
-    // dispatcher cycle.
-    expect(isReviewed(db, id)).toBe(true);
-    expect(triageHold(db, getTask(db, id))).toBe(false);
-    expect(openCards(db, id).length).toBe(0);
-    // ...and the agent is told which reading won.
-    const brief = getTask(db, id).brief;
-    expect(brief).toContain("Director's answer");
-    expect(brief).toContain("Which slowness should we fix first?");
-    expect(brief).toContain("Live refresh");
-    expect(brief).toContain("the dashboard feels slow"); // original brief kept
-  } finally {
-    server.stop(true);
-  }
+  // Released: reviewed, no open card, nothing holding it back from the next
+  // dispatcher cycle.
+  expect(isReviewed(db, id)).toBe(true);
+  expect(triageHold(db, getTask(db, id))).toBe(false);
+  expect(openCards(db, id).length).toBe(0);
+  // ...and the agent is told which reading won.
+  const brief = getTask(db, id).brief;
+  expect(brief).toContain("Director's answer");
+  expect(brief).toContain("Which slowness should we fix first?");
+  expect(brief).toContain("Live refresh");
+  expect(brief).toContain("the dashboard feels slow"); // original brief kept
 });

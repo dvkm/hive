@@ -38,7 +38,7 @@ function makeMirror(db: DB, projectId: string, key: string, brief: string): stri
 // it, so a later test's request was answered by an earlier test's server (and
 // its long-dead in-memory db). That is order- and state-dependent by
 // construction. No socket, no port, no pool, no flake.
-function serve(db: DB) {
+function makeApi(db: DB) {
   const handler = makeHandler(db);
   return {
     post: (path: string, body: unknown) =>
@@ -54,7 +54,7 @@ test("refuses a title-only brief when the linked mirror has a substantial spec",
   const { db, projectId } = freshDb();
   const spec = "x".repeat(300);
   makeMirror(db, projectId, "WEB-118", spec);
-  const { post } = serve(db);
+  const { post } = makeApi(db);
   const res = await post("/api/tasks", {
     project_id: projectId,
     title: "[WEB-118] fix the thing",
@@ -69,7 +69,7 @@ test("allows creation when the new brief already carries the spec", async () => 
   const { db, projectId } = freshDb();
   const spec = "x".repeat(300);
   makeMirror(db, projectId, "WEB-119", spec);
-  const { post } = serve(db);
+  const { post } = makeApi(db);
   const res = await post("/api/tasks", {
     project_id: projectId,
     title: "[WEB-119] fix the thing",
@@ -81,7 +81,7 @@ test("allows creation when the new brief already carries the spec", async () => 
 
 test("allows creation when no mirror is linked", async () => {
   const { db, projectId } = freshDb();
-  const { post } = serve(db);
+  const { post } = makeApi(db);
   const res = await post("/api/tasks", {
     project_id: projectId,
     title: "just a normal task",
@@ -96,7 +96,7 @@ test("allows creation when no mirror is linked", async () => {
 test("refuses a long brief that claims the ticket has no spec", async () => {
   const { db, projectId } = freshDb();
   makeMirror(db, projectId, "WEB-218", "x".repeat(300));
-  const { post } = serve(db);
+  const { post } = makeApi(db);
   const res = await post("/api/tasks", {
     project_id: projectId,
     title: "[WEB-218] fix the thing",
@@ -114,7 +114,7 @@ test("refuses a long brief that claims the ticket has no spec", async () => {
 test("allows a substantial brief that does not claim the spec is missing", async () => {
   const { db, projectId } = freshDb();
   makeMirror(db, projectId, "WEB-113", "x".repeat(300));
-  const { post } = serve(db);
+  const { post } = makeApi(db);
   const res = await post("/api/tasks", {
     project_id: projectId,
     title: "[WEB-113] add the column",
@@ -130,7 +130,7 @@ test("allows a substantial brief that does not claim the spec is missing", async
 test("stays quiet when the mirror brief is itself thin", async () => {
   const { db, projectId } = freshDb();
   makeMirror(db, projectId, "WEB-2", "tweak the footer");
-  const { post } = serve(db);
+  const { post } = makeApi(db);
   const res = await post("/api/tasks", {
     project_id: projectId,
     title: "[WEB-2] tweak the footer",
@@ -167,7 +167,7 @@ test("still fires on the real WEB-118 shape", () => {
 test("a substantial brief is accepted end to end even when it mentions a missing description", async () => {
   const { db, projectId } = freshDb();
   makeMirror(db, projectId, "WEB-314", "x".repeat(300));
-  const { post } = serve(db);
+  const { post } = makeApi(db);
   const res = await post("/api/tasks", {
     project_id: projectId,
     title: "[WEB-314] show placeholder copy on empty cards",

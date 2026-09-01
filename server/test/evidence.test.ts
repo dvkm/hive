@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,21 +10,19 @@ const { openDb } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
 
 const db = openDb(":memory:");
-const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
-const BASE = `http://127.0.0.1:${server.port}`;
-afterAll(() => server.stop(true));
+const handler = makeHandler(db);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, {
+  const res = await handler(new Request("http://127.0.0.1" + path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  });
+  }));
   return { status: res.status, json: await res.json() };
 }
 async function get(path: string) {
-  const res = await fetch(BASE + path);
+  const res = await handler(new Request("http://127.0.0.1" + path));
   return { status: res.status, json: await res.json() };
 }
 
@@ -45,7 +43,7 @@ beforeAll(async () => {
   shot.set("kind", "screenshot");
   shot.set("caption", "the board");
   shot.set("file", new File([new Uint8Array([1, 2, 3])], "board.png", { type: "image/png" }));
-  await fetch(`${BASE}/api/tasks/${taskId}/events`, { method: "POST", body: shot });
+  await handler(new Request(`http://127.0.0.1/api/tasks/${taskId}/events`, { method: "POST", body: shot }));
   await sleep(5);
 
   // test_run evidence (multi-line text → inline preview)
@@ -61,7 +59,7 @@ beforeAll(async () => {
       { type: "text/plain" }
     )
   );
-  await fetch(`${BASE}/api/tasks/${taskId}/events`, { method: "POST", body: run });
+  await handler(new Request(`http://127.0.0.1/api/tasks/${taskId}/events`, { method: "POST", body: run }));
   await sleep(5);
 
   // evidence on the other project/task (filter checks)
@@ -70,7 +68,7 @@ beforeAll(async () => {
   other.set("kind", "screenshot");
   other.set("caption", "elsewhere");
   other.set("file", new File([new Uint8Array([9])], "x.png", { type: "image/png" }));
-  await fetch(`${BASE}/api/tasks/${otherTaskId}/events`, { method: "POST", body: other });
+  await handler(new Request(`http://127.0.0.1/api/tasks/${otherTaskId}/events`, { method: "POST", body: other }));
 });
 
 test("lists all evidence newest-first, joined to task + project", async () => {
@@ -128,7 +126,7 @@ test("empty nameless file part is dropped, event still ingests (no 500)", async 
   form.set("type", "evidence");
   form.set("note", "note-only with a malformed empty file part");
   form.set("file", new Blob([])); // no filename, zero bytes → File w/ name undefined
-  const res = await fetch(`${BASE}/api/tasks/${taskId}/events`, { method: "POST", body: form });
+  const res = await handler(new Request(`http://127.0.0.1/api/tasks/${taskId}/events`, { method: "POST", body: form }));
   expect(res.status).toBe(201);
   const body = await res.json();
   expect(body.evidence.path).toBeNull(); // junk part skipped, ingested as a log
@@ -140,7 +138,7 @@ test("nameless file WITH content is saved under a fallback name", async () => {
   form.set("kind", "log");
   form.set("caption", "nameless log");
   form.set("file", new File(["real log content"], "")); // empty name → parses as undefined
-  const res = await fetch(`${BASE}/api/tasks/${taskId}/events`, { method: "POST", body: form });
+  const res = await handler(new Request(`http://127.0.0.1/api/tasks/${taskId}/events`, { method: "POST", body: form }));
   expect(res.status).toBe(201);
   const body = await res.json();
   expect(body.evidence.path).toContain("_file"); // stamped with the fallback name

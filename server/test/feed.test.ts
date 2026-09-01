@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,21 +10,19 @@ const { openDb } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
 
 const db = openDb(":memory:");
-const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
-const BASE = `http://127.0.0.1:${server.port}`;
-afterAll(() => server.stop(true));
+const handler = makeHandler(db);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, {
+  const res = await handler(new Request("http://127.0.0.1" + path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  });
+  }));
   return { status: res.status, json: await res.json() };
 }
 async function get(path: string) {
-  const res = await fetch(BASE + path);
+  const res = await handler(new Request("http://127.0.0.1" + path));
   return { status: res.status, json: await res.json() };
 }
 
@@ -53,7 +51,7 @@ beforeAll(async () => {
   form.set("kind", "screenshot");
   form.set("caption", "board screenshot");
   form.set("file", new File([new Uint8Array([1, 2, 3])], "shot.png", { type: "image/png" }));
-  await fetch(`${BASE}/api/tasks/${taskId}/events`, { method: "POST", body: form });
+  await handler(new Request(`http://127.0.0.1/api/tasks/${taskId}/events`, { method: "POST", body: form }));
 
   // an unrelated task in a different project (project-filter check)
   const t2 = (await post("/api/tasks", { project_id: otherProjectId, title: "Other task" })).json.id;
