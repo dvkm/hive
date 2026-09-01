@@ -24,6 +24,7 @@ import { authoredFiles } from "./rebaseGuard.ts";
 import { defaultExec, projectComparisonBase, type Exec } from "./exec.ts";
 import { enqueue } from "./notifications.ts";
 import { queueSteerEvent, queuedSteers } from "./steer.ts";
+import { reviewPipelineSettled } from "./reviewer.ts";
 
 export interface LandNode {
   id: string;
@@ -287,6 +288,40 @@ function failedAttemptRun(db: DB, taskId: string): number {
 // pushes a new head_sha. Measured on one machine: 116 land failures were only 30
 // real blockages, and a single PR contributed 52 of them (HIVE-555).
 const MAX_NON_TRANSIENT_ATTEMPTS = 2;
+
+// A ceiling on the "wait for the auto review" hold (HIVE-581). Holding is right
+// while a review is on its way, but a reviewer that keeps erroring never
+// settles, and a task that never merges and never says why is the worst failure
+// shape here: it looks fine until someone goes looking hours later. So the hold
+// expires. Past the ceiling the task falls through to the merge attempt exactly
+// as it did before this change — today's noisy refusal and its pause card,
+// which is the signal. Fifteen minutes is several times a normal review.
+const REVIEW_WAIT_CEILING_MS = 900_000;
+
+// Have we been waiting on the reviewer for THIS head past the ceiling? The first
+// hold writes one `land_review_wait` event and holds; later sweeps measure from
+// it. Keyed to the head, so a new push starts a fresh wait. One event per head,
+// so the wait leaves a trace without a per-sweep log.
+function reviewWaitExpired(db: DB, taskId: string, headSha: string | null, nowMs: number): boolean {
+  const rows = db
+    .query("SELECT ts, payload FROM events WHERE task_id = ? AND type = 'land_review_wait' ORDER BY rowid DESC LIMIT 5")
+    .all(taskId) as { ts: string; payload: string }[];
+  for (const row of rows) {
+    let payload: any = {};
+    try {
+      payload = JSON.parse(row.payload ?? "{}");
+    } catch {}
+    if ((payload.head_sha ?? null) !== headSha) continue;
+    return nowMs - Date.parse(row.ts) >= REVIEW_WAIT_CEILING_MS;
+  }
+  writeEvent(db, {
+    task_id: taskId,
+    source: "reconciler",
+    type: "land_review_wait",
+    payload: { head_sha: headSha, ceiling_ms: REVIEW_WAIT_CEILING_MS },
+  });
+  return false;
+}
 
 // HIVE-559: a CONFIRMED risk is agent work, not a director ruling. Measured over
 // 24h on one machine: 18 pause cards for confirmed risks, 0 of them needed a
@@ -728,6 +763,20 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         // Red or still-running CI holds only this node. Independent nodes can
         // still enter the same batch (they land one after another, not at once).
         if (n.ci_status === "failing" || n.ci_status === "pending") continue;
+        // The reviewer has not spoken for this head yet (HIVE-581). The merge
+        // asks understandingChecksRequired, and that reads "no verdict" as
+        // "needs a check" — so attempting now refuses a task that would land
+        // free a couple of minutes later. Nothing here needs a human, so hold
+        // quietly: no attempt, no failed land_attempted, no pause card.
+        // reviewPipelineSettled (not a bare !verdict) is what keeps a project
+        // with auto review off, or a task with no head, from stalling forever.
+        // The ceiling keeps an erroring reviewer from wedging the task in
+        // silence: past it, fall through and attempt the merge as before.
+        if (
+          !reviewPipelineSettled(db, { id: n.id, head_sha: headShaOf(db, n.id), project_id }) &&
+          !reviewWaitExpired(db, n.id, headShaOf(db, n.id), nowMs)
+        )
+          continue;
         // A pause card already waiting on the director holds the task too —
         // otherwise every sweep would re-attempt and re-ask the same question.
         if (openPauseDecisionId(db, n.id)) continue;
