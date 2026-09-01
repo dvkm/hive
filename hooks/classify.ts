@@ -368,18 +368,32 @@ export const pidLookup = {
 // headless browser it launched (--headless / remote-debugging-port), a process
 // whose match pattern names a sandbox path, or — for a plain numeric
 // `kill <pid>` — a process whose OWN working directory resolves inside the
-// sandbox. That last case is the dev server an agent starts in its worktree and
-// later finds by PID: it matches no pattern, so it used to open a decision card,
-// and agents left the servers running instead. Eleven such processes held one
-// worktree open for 11 hours of failed respawns (hive-1837).
+// agent's OWN worktree. That last case is the dev server an agent starts in its
+// worktree and later finds by PID: it matches no pattern, so it used to open a
+// decision card, and agents left the servers running instead. Eleven such
+// processes held one worktree open for 11 hours of failed respawns (hive-1837).
+// The PID branch deliberately trusts ONLY the requesting agent's worktree, not
+// the other sandbox roots: /tmp, /private/tmp and /var/folders are shared by
+// every agent on the box, so a cwd there proves nothing about ownership and one
+// agent could silently kill another's dev server. Losing an agent mid-work is
+// the expensive failure here, so those fall through to a decision card.
 // ponytail: the pattern branches stay pattern-based, so `pkill -f
 // remote-debugging-port` could hit a human's debug Chrome too; scope to the
 // agent's own port/profile if that bites. The PID branch is NOT pattern-based:
 // it resolves the actual target and fails closed when the lookup returns
-// nothing (process already gone, lsof missing, permission denied).
-function killTargetsSandboxed(cmd: string, env: Record<string, string | undefined>): boolean {
+// nothing (process already gone, lsof missing, permission denied) or when the
+// hook's cwd is not itself inside a worktree.
+function killTargetsSandboxed(
+  cmd: string,
+  env: Record<string, string | undefined>,
+  cwd?: string
+): boolean {
   const map = varMap(cmd, env);
   const roots = sandboxRoots(env);
+  // The agent's own worktree: `~/.herdr/worktrees/<repo>/<dir>/`, taken from the
+  // hook's own cwd the same way dockerDbTargetsSandboxed derives its slug.
+  const own = cwd ? /^(.*\/worktrees\/[^/]+\/[A-Za-z0-9._-]+)\//.exec(comparablePath(cwd) + "/") : null;
+  const ownRoots = own ? [own[1] + "/"] : [];
   const killSegs = segments(cmd).filter((s) => /\b(kill(all)?|pkill)\b/i.test(s));
   if (!killSegs.length) return false;
   return killSegs.every((seg) => {
@@ -395,10 +409,11 @@ function killTargetsSandboxed(cmd: string, env: Record<string, string | undefine
     if (targets.every((t) => /^%\d+$/.test(t))) return true;
     // Only bare `kill` takes PIDs; pkill/killall take patterns and names.
     if (!/^kill\b/.test(body.trim())) return false;
+    if (!ownRoots.length) return false;
     return targets.every((t) => {
       if (!/^\d+$/.test(t)) return false;
       const dir = pidLookup.cwd(Number(t));
-      return !!dir && absoluteCommandPath(dir) && !dir.includes("..") && withinRoots(dir, roots);
+      return !!dir && absoluteCommandPath(dir) && !dir.includes("..") && withinRoots(dir, ownRoots);
     });
   });
 }
@@ -735,7 +750,7 @@ export function classify(
     if (emitDataOnly) continue; // arguments are data, not executed
     if (reason === "recursive/forced rm" && (rmTargetsSandboxed(cmd, env, cwd) || isContainerOrVcsRm(cmd)))
       continue;
-    if (reason === "process kill" && killTargetsSandboxed(cmd, env)) continue;
+    if (reason === "process kill" && killTargetsSandboxed(cmd, env, cwd)) continue;
     if (reason === "find with -delete/-exec" && findDeleteTargetsSandboxed(cmd, env, cwd)) continue;
     if (reason === "force push" && forcePushOwnBranch(cmd, env)) continue;
     if ((reason.startsWith("hard reset") || reason.startsWith("git clean")) && gitResetInSandbox(cmd, env, cwd))
