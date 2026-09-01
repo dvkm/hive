@@ -85,6 +85,11 @@ export const SPAWN_ATTEMPT_CEILING = 5;
 // depth via REVIEW_OVERHANG below.
 const WORKING_STATES = "('in_progress','needs_decision')";
 const ACTIVE_STATES = "('in_progress','needs_decision','in_review','verifying')";
+// ...and neither does a DEFERRED task (HIVE-619). Deferring parks a task on an
+// OFFLINE human action, often with no end date, so its slot was never given
+// back: two corebeat tasks held 2 of 12 slots forever with no live agent on
+// either. Same exclusion the queued scan above uses, for the same reason.
+const NOT_DEFERRED = "(deferred_until IS NULL OR deferred_until <= ?)";
 // ponytail: fixed 2× multiplier — total live agents (incl. review-parked) may
 // reach max_agents*2 before dispatch pauses; make it config if it ever matters.
 // Both counts key on agent_target, so a review agent RELEASED after handoff
@@ -122,6 +127,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   }
   const h = deps.herdr ?? defaultHerdr;
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
+  const nowIso = new Date(nowMs).toISOString();
 
   // herdr-down circuit breaker: a prior cycle hit an unreachable daemon and set a
   // global cooldown. Skip dispatch entirely (don't pound the dead socket once per
@@ -144,7 +150,7 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
       `SELECT * FROM tasks WHERE state = 'queued' AND (deferred_until IS NULL OR deferred_until <= ?)
         ORDER BY ${PRIORITY_RANK_SQL}, created_at ASC`
     )
-    .all(new Date(nowMs).toISOString())
+    .all(nowIso)
     .map(parseTask);
 
   // Reattach candidates: a live task with NO agent but feedback waiting for one.
@@ -203,16 +209,16 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
   const countFor = (cache: Map<string, number>, states: string, pid: string, gardener: boolean) => {
     if (!cache.has(pid)) {
       const row: any = db
-        .query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND agent_target IS NOT NULL AND ${gardener ? "source = 'pr-gardener'" : "COALESCE(source, '') NOT IN ('chat_supervisor', 'pr-gardener', 'pr-gardener-decision')"} AND state IN ${states}`)
-        .get(pid);
+        .query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND agent_target IS NOT NULL AND ${gardener ? "source = 'pr-gardener'" : "COALESCE(source, '') NOT IN ('chat_supervisor', 'pr-gardener', 'pr-gardener-decision')"} AND state IN ${states} AND ${NOT_DEFERRED}`)
+        .get(pid, nowIso);
       cache.set(pid, row.n as number);
     }
     return cache.get(pid)!;
   };
   const nowInFlight = (pid: string) =>
     (db
-      .query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND priority = 'now' AND agent_target IS NOT NULL AND state IN ${WORKING_STATES}`)
-      .get(pid) as { n: number }).n;
+      .query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND priority = 'now' AND agent_target IS NOT NULL AND state IN ${WORKING_STATES} AND ${NOT_DEFERRED}`)
+      .get(pid, nowIso) as { n: number }).n;
   const workingFor = (pid: string) => countFor(workingCount, WORKING_STATES, pid, false);
   const activeFor = (pid: string) => countFor(activeCount, ACTIVE_STATES, pid, false);
   const gardenerWorkingFor = (pid: string) => countFor(gardenerWorkingCount, WORKING_STATES, pid, true);

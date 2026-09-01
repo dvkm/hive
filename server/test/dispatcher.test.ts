@@ -254,6 +254,35 @@ test("review-parked agents don't consume working slots, but bound overhang at 2x
   expect(spawns.length).toBe(2);
 });
 
+test("a deferred in_progress task frees its slot; undeferring takes it back", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 1 });
+  // parked on an offline human action, with no end date: an agent binding but
+  // nobody working it, so it must not hold the only slot (HIVE-619)
+  const parked = makeTask(db, projectId, { state: "in_progress", agent_target: "a0" });
+  db.query("UPDATE tasks SET deferred_until = '9999-01-01T00:00:00.000Z' WHERE id = ?").run(parked);
+  makeTask(db, projectId);
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(1);
+
+  // undeferred, the same task consumes the slot again and nothing new spawns
+  const back = freshDb({ auto_dispatch: true, max_agents: 1 });
+  makeTask(back.db, back.projectId, { state: "in_progress", agent_target: "a0" });
+  makeTask(back.db, back.projectId);
+  const second = stubHerdr();
+  await dispatchOnce(back.db, { herdr: second.herdr });
+  expect(second.spawns.length).toBe(0);
+
+  // a defer whose date has already passed is over: the slot is held again
+  const expired = freshDb({ auto_dispatch: true, max_agents: 1 });
+  const wasDeferred = makeTask(expired.db, expired.projectId, { state: "in_progress", agent_target: "a0" });
+  expired.db.query("UPDATE tasks SET deferred_until = '2020-01-01T00:00:00.000Z' WHERE id = ?").run(wasDeferred);
+  makeTask(expired.db, expired.projectId);
+  const third = stubHerdr();
+  await dispatchOnce(expired.db, { herdr: third.herdr });
+  expect(third.spawns.length).toBe(0);
+});
+
 test("a slow setup_argv on project A does not delay spawning a queued task on project B", async () => {
   const db = openDb(":memory:");
   const projA = newId("proj");
