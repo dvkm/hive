@@ -448,6 +448,9 @@ test("repeated failures that never open a card take the task out of the queue", 
     // back in the queue — that is the loop.
     if ((db.query("SELECT state FROM tasks WHERE id = ?").get(a) as any).state !== "in_review")
       transition(db, a, "in_review", { source: "agent", reason: "pushed again" });
+    // Each push is a new commit, which re-arms the queue (HIVE-555). The
+    // attempt ceiling is what stops this loop.
+    db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run(`sha${i}`, a);
     ageLandAttempts(db, a, 3_600_000);
   }
   expect(calls).toHaveLength(10); // MAX_LAND_ATTEMPTS
@@ -469,4 +472,69 @@ test("an unfinished risk check retries on the backoff instead of opening a card"
   expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
   const attempt: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'land_attempted'").get(a);
   expect(JSON.parse(attempt.payload).transient).toBe(true);
+});
+
+// HIVE-555: a permanent blocker gave the same answer every 30s sweep forever.
+// One PR alone produced 52 of 116 land failures on one machine.
+test("a non-transient failure retries once, then holds instead of re-failing forever", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+  const reason = "the branch drops work that is already on main";
+
+  // First attempt: fails, opens the pause card.
+  const first = mergeStub(db, { [a]: reason });
+  await landOnce(db, { exec: filesExec({}), merge: first.merge });
+  expect(first.calls).toEqual([a]);
+  const card = db.query("SELECT id FROM decisions WHERE status = 'open'").get() as any;
+  expect(card).toBeTruthy();
+
+  // The director answers "retry". That buys exactly one more attempt.
+  apiAnswerDecision(db, stubHerdr, card.id, { answer_key: "retry" });
+  const second = mergeStub(db, { [a]: reason });
+  await landOnce(db, { exec: filesExec({}), merge: second.merge });
+  expect(second.calls).toEqual([a]);
+
+  // From here every sweep is a no-op: no merge, no new card, no event spam.
+  for (let i = 0; i < 5; i++) {
+    const later = mergeStub(db, { [a]: reason });
+    await landOnce(db, { exec: filesExec({}), merge: later.merge });
+    expect(later.calls).toEqual([]);
+  }
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'land_attempted'").get(a) as any).n).toBe(2);
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'land_blocked'").get(a) as any).n).toBe(1);
+  // Still queued, just paused: the approval did not evaporate.
+  expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(a) as any).land_queued_at).toBeTruthy();
+
+  // A new head_sha re-arms it: the agent pushed, so the verdict may differ.
+  db.query("UPDATE tasks SET head_sha = 'sha2' WHERE id = ?").run(a);
+  const rearmed = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: rearmed.merge });
+  expect(rearmed.calls).toEqual([a]);
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(a) as any).state).toBe("verifying");
+});
+
+test("a new head_sha closes the stale land-queue pause card", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+
+  const { merge } = mergeStub(db, { [a]: "the branch drops work that is already on main" });
+  await landOnce(db, { exec: filesExec({}), merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(1);
+
+  db.query("UPDATE tasks SET head_sha = 'sha2' WHERE id = ?").run(a);
+  const next = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: next.merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(0);
+
+  // Closing the card queues its "nothing to reply to" note, which holds one
+  // sweep. Once that drains, the new commit gets its attempt.
+  const steers = queuedSteers(db, a);
+  markSteersDelivered(db, steers.map((s) => s.id), "drain");
+  const after = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: after.merge });
+  expect(after.calls).toEqual([a]);
 });
