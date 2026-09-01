@@ -55,7 +55,15 @@ test("two servers on one DB: the predecessor stands down, one keeps running laps
     }
     return { proc, out: () => text };
   };
-  const until = async (fn: () => boolean, ms = 10_000) => {
+  // Every wait below polls until the condition holds, so it returns the instant
+  // the lease moves — a measured handoff is ~100ms per phase on an idle machine.
+  // The deadline therefore costs a healthy run nothing; it only decides how
+  // loaded a runner has to be before working lease logic is reported as broken.
+  // 15s was not enough on a busy linux runner (#128 flaked again on PR #130).
+  // 60s is ~600x the measured handoff: a genuinely broken handoff never reaches
+  // it, a merely slow runner always beats it.
+  const DEADLINE_MS = 60_000;
+  const until = async (fn: () => boolean, ms = DEADLINE_MS) => {
     const deadline = Date.now() + ms;
     while (Date.now() < deadline) {
       if (fn()) return true;
@@ -71,21 +79,21 @@ test("two servers on one DB: the predecessor stands down, one keeps running laps
 
   const a = start();
   try {
-    expect(await until(() => holder() === a.proc.pid, 15_000)).toBe(true); // A holds the lease
+    expect(await until(() => holder() === a.proc.pid)).toBe(true); // A holds the lease
 
     const b = start();
     try {
-      expect(await until(() => holder() === b.proc.pid, 15_000)).toBe(true); // B took over
+      expect(await until(() => holder() === b.proc.pid)).toBe(true); // B took over
       expect(b.out()).toContain("took the DB lease from a previous server");
 
       // A stands down on its own — it is the orphan case, so nothing external
       // kills it. Its process must be gone, not merely quiet.
-      expect(await until(() => a.proc.exitCode !== null, 5_000)).toBe(true);
+      expect(await until(() => a.proc.exitCode !== null)).toBe(true);
       expect(a.out()).toContain("standing down");
 
       // And B is still the one holding (and renewing) the lease afterwards.
       const before = readLease(db)?.at;
-      expect(await until(() => holder() === b.proc.pid && readLease(db)?.at !== before, 15_000)).toBe(true);
+      expect(await until(() => holder() === b.proc.pid && readLease(db)?.at !== before)).toBe(true);
     } finally {
       b.proc.kill();
       await b.proc.exited;
@@ -94,7 +102,11 @@ test("two servers on one DB: the predecessor stands down, one keeps running laps
     a.proc.kill();
     await a.proc.exited;
   }
-}, 30_000);
+  // The outer timeout has to cover the SUM of all four waits, not just the
+  // biggest one: four slow-but-passing waits each beat their own DEADLINE_MS
+  // yet add up. 4 x 60s is 240s, so 300s here. A healthy run finishes all four
+  // phases in ~400ms, so this ceiling is never approached either.
+}, 300_000);
 
 // ---------------------------------------------------------------- enforcement
 // The lease above is an ASK. These cover what happens when a second server does
