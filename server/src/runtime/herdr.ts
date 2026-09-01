@@ -910,6 +910,29 @@ export class Herdr {
       ]);
       if (fetched.code !== 0)
         throw new HerdrError(`base fetch failed: ${fetched.stderr.trim() || fetched.stdout.trim()}`);
+      // HIVE-620: the repo was re-rooted when it went public (2026-08-27) and a
+      // checkout's local `main` can still carry the OLD root commit. herdr
+      // resolves a bare base name against LOCAL refs, so a spawn there hands the
+      // agent a worktree with no history in common with origin/main. On
+      // 2026-09-01 that cost a whole run: the fix was written against a file
+      // that is 290 lines on the dead history and 558 on the real one, and
+      // nothing noticed until `gh pr create` said "no history in common with
+      // main". An empty merge-base is the proof, so refuse the spawn here
+      // rather than pay for that run again.
+      // Only a local base branch that RESOLVES to a sha can be disjoint; a repo
+      // that has never checked the branch out has nothing to be wrong about.
+      const localBase = await this.exec(["git", "-C", args.repoPath, "rev-parse", "--verify", "--quiet", `refs/heads/${base}`]);
+      if (localBase.code === 0 && localBase.stdout.trim()) {
+        // Both refs exist by here (the fetch just wrote the remote one), so the
+        // only thing a non-zero merge-base means is "no common ancestor".
+        const shared = await this.exec(["git", "-C", args.repoPath, "merge-base", `refs/heads/${base}`, remoteBase]);
+        if (shared.code !== 0)
+          throw new HerdrError(
+            `base ${base} is disjoint from ${remoteBase}: the local ${base} in ${args.repoPath} ` +
+              `(${localBase.stdout.trim().slice(0, 12)}) shares no history with the remote base. ` +
+              `Repair that checkout before spawning — an agent on it cannot open a PR.`
+          );
+      }
       base = remoteBase;
     }
     let create = await this.run(worktreeCreateArgv(args.repoPath, branch, base));
