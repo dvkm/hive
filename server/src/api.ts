@@ -2457,11 +2457,32 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
     if (denied) return denied;
     priority = parsed;
   }
-  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, updated_at = ? WHERE id = ?")
-    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, now(), id);
+  // Re-resolve the mirror when the title changes (HIVE-550). Adding the missing
+  // '[WEB-119] ' prefix by hand is the repair path a human reaches for when a
+  // work task was filed unlinked, and resolving only at creation made that
+  // repair silently do nothing. Never CLEAR a link here: dropping the prefix
+  // shouldn't throw away a link the board already relies on.
+  let mirrorTaskId: string | null = task.jira_mirror_task_id ?? null;
+  let relinked: { from: string | null; to: string } | null = null;
+  // Also re-resolve when the task is still unlinked: a task filed before its
+  // mirror existed (or already carrying the prefix but linked to nothing) heals
+  // on the next edit instead of staying orphaned forever.
+  if (title !== task.title || !mirrorTaskId) {
+    const resolved = mirrorTaskIdForTitle(db, task.project_id, title);
+    if (resolved && resolved !== mirrorTaskId) {
+      relinked = { from: mirrorTaskId, to: resolved };
+      mirrorTaskId = resolved;
+    }
+  }
+  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, jira_mirror_task_id = ?, updated_at = ? WHERE id = ?")
+    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, mirrorTaskId, now(), id);
   const updated = getTask(db, id);
+  // Say it out loud rather than repointing in silence — especially when this
+  // moved an existing link off another ticket.
+  if (relinked)
+    writeEvent(db, { task_id: id, source: "director", type: "jira_mirror_relinked", payload: relinked });
   broadcastTask(db, updated);
-  return json(taskWithHealth(db, updated));
+  return json({ ...taskWithHealth(db, updated), ...(relinked ? { jira_mirror_relinked: relinked } : {}) });
 }
 
 // Manual merge: fold this task into `target_id`, cancelling it as a duplicate.
