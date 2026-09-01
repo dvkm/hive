@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,20 +11,18 @@ const { makeHandler } = await import("../src/api.ts");
 const { costUsd, priceFor } = await import("../src/pricing.ts");
 
 const db = openDb(":memory:");
-const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
-const BASE = `http://127.0.0.1:${server.port}`;
-afterAll(() => server.stop(true));
+const handler = makeHandler(db);
 
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, {
+  const res = await handler(new Request("http://127.0.0.1" + path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  });
+  }));
   return { status: res.status, json: await res.json() };
 }
 async function get(path: string) {
-  const res = await fetch(BASE + path);
+  const res = await handler(new Request("http://127.0.0.1" + path));
   return { status: res.status, json: await res.json() };
 }
 
@@ -85,7 +83,7 @@ test("usage ingestion (multipart): string fields coerced", async () => {
   form.set("input_tokens", "1000000");
   form.set("output_tokens", "0");
   form.set("cache_read_tokens", "0");
-  const res = await fetch(`${BASE}/api/tasks/${taskId}/events`, { method: "POST", body: form });
+  const res = await handler(new Request(`http://127.0.0.1/api/tasks/${taskId}/events`, { method: "POST", body: form }));
   expect(res.status).toBe(201);
   const j = await res.json();
   expect(j.usage.input_tokens).toBe(1_000_000);
@@ -197,7 +195,7 @@ test("summary rollups + since window (injected timestamps)", async () => {
 });
 
 test("SSE broadcasts a usage message on ingest", async () => {
-  const res = await fetch(BASE + "/api/stream");
+  const res = await handler(new Request("http://127.0.0.1/api/stream"));
   const reader = res.body!.getReader();
   await reader.read(); // hello headline
   const p = post(`/api/tasks/${taskId}/events`, {

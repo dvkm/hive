@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,16 +11,19 @@ const { makeHandler } = await import("../src/api.ts");
 const { normalizeTitle, titleSimilarity, NEAR_THRESHOLD, STRONG_THRESHOLD } = await import("../src/dedup.ts");
 
 const db = openDb(":memory:");
-const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
-const BASE = `http://127.0.0.1:${server.port}`;
-afterAll(() => server.stop(true));
+// Call the handler directly instead of standing up a real HTTP server. Bun
+// 1.3.14's global fetch pool keeps sockets alive past the server they belong
+// to, and the OS hands those ephemeral ports straight back to the next
+// `Bun.serve({ port: 0 })`, so a request can go out on a socket belonging to a
+// dead server. No socket, no port, no pool, no flake.
+const handler = makeHandler(db);
 
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const res = await handler(new Request("http://127.0.0.1" + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
   return { status: res.status, json: await res.json() };
 }
 async function get(path: string) {
-  const res = await fetch(BASE + path);
+  const res = await handler(new Request("http://127.0.0.1" + path));
   return { status: res.status, json: await res.json() };
 }
 const mkTask = async (title: string, brief?: string) =>

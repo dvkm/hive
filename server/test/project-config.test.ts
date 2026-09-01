@@ -3,7 +3,7 @@
 // spawned agent with all of the project's secrets in its env. These tests assert
 // both halves: malformed values are REJECTED at the API, and a valid config with
 // those same keys set still drives a real spawn.
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -41,25 +41,27 @@ const db = openDb(":memory:");
 // handler, so every schema assertion below has to get past it first.
 const TOKEN = "test-token";
 setSetting(db, "api_token", TOKEN);
-let server: any;
-let BASE = "";
+let handler: (req: Request) => Response | Promise<Response>;
 let projectId = "";
-afterAll(() => server.stop(true));
 
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const res = await handler(
+    new Request("http://127.0.0.1" + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+  );
   return { status: res.status, json: await res.json() };
 }
 async function put(path: string, body: unknown) {
-  const res = await fetch(BASE + path, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
-    body: JSON.stringify(body),
-  });
+  const res = await handler(
+    new Request("http://127.0.0.1" + path, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify(body),
+    })
+  );
   return { status: res.status, json: await res.json() };
 }
 async function get(path: string) {
-  const res = await fetch(BASE + path);
+  const res = await handler(new Request("http://127.0.0.1" + path));
   return { status: res.status, json: await res.json() };
 }
 
@@ -84,8 +86,7 @@ const GOOD_CONFIG = {
 };
 
 beforeAll(async () => {
-  server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr }) });
-  BASE = `http://127.0.0.1:${server.port}`;
+  handler = makeHandler(db, { herdr });
   const p = await post("/api/projects", { name: "cfg", repo_path: "/repo", config: GOOD_CONFIG });
   projectId = p.json.id;
 });
@@ -230,11 +231,13 @@ test("codex token settings reject invalid values", async () => {
 // caller must never learn anything from the schema, so auth answers first.
 test("the token gate answers before the schema does", async () => {
   const before = (await get(`/api/projects/${projectId}`)).json.config;
-  const res = await fetch(`${BASE}/api/projects/${projectId}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ config: { agent_argv: "not-an-array" } }),
-  });
+  const res = await handler(
+    new Request(`http://127.0.0.1/api/projects/${projectId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config: { agent_argv: "not-an-array" } }),
+    })
+  );
   expect(res.status).toBe(401);
   expect((await get(`/api/projects/${projectId}`)).json.config).toEqual(before);
 });

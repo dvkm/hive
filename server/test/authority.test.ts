@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -242,16 +242,14 @@ test("brief injects the standing-authority section + guarded-action protocol", (
 
 // ---------------------------------------------------------------- HTTP round trip
 const rt = openDb(":memory:");
-const server = Bun.serve({ port: 0, fetch: makeHandler(rt) });
-const BASE = `http://127.0.0.1:${server.port}`;
-afterAll(() => server.stop(true));
+const handler = makeHandler(rt);
 
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const res = await handler(new Request("http://127.0.0.1" + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
   return { status: res.status, json: await res.json() };
 }
 async function get(path: string) {
-  const res = await fetch(BASE + path);
+  const res = await handler(new Request("http://127.0.0.1" + path));
   return { status: res.status, json: await res.json() };
 }
 
@@ -271,7 +269,7 @@ test("authority rules CRUD over HTTP", async () => {
   expect(c.json.scope).toBe(`project:${projectId}`);
   const list = await get(`/api/authority/rules?project_id=${projectId}`);
   expect(list.json.some((x: any) => x.id === c.json.id)).toBe(true);
-  const upd = await fetch(`${BASE}/api/authority/rules/${c.json.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ active: false }) });
+  const upd = await handler(new Request(`http://127.0.0.1/api/authority/rules/${c.json.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ active: false }) }));
   expect((await upd.json()).active).toBe(false);
 });
 

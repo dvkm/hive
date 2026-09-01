@@ -164,34 +164,30 @@ test("GET/POST /api/away toggles, holds, and flushes on the way out", async () =
   const db = freshDb();
   const herdr = { send: async () => ({ code: 0, stdout: "{}", stderr: "" }), run: async () => ({ code: 0, stdout: "{}", stderr: "" }) } as any;
   const { push, sent } = recordingPush();
-  const server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr }) });
-  const BASE = `http://127.0.0.1:${server.port}`;
+  const handler = makeHandler(db, { herdr });
   const post = (body: any): Promise<any> =>
-    fetch(`${BASE}/api/away`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) => r.json());
-  try {
-    let r: any = await (await fetch(`${BASE}/api/away`)).json();
-    expect(r.on).toBe(false);
-    expect(r.active).toBe(false);
-    expect(r.always_through).toEqual(["security", "spend", "fleet_down", "second_failure"]);
+    handler(new Request("http://127.0.0.1/api/away", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })).then((r) => r.json());
 
-    r = await post({ on: true, schedule: SEOUL });
-    expect(r.on).toBe(true);
-    expect(r.active).toBe(true);
-    expect(r.schedule).toEqual(SEOUL);
+  let r: any = await (await handler(new Request("http://127.0.0.1/api/away"))).json();
+  expect(r.on).toBe(false);
+  expect(r.active).toBe(false);
+  expect(r.always_through).toEqual(["security", "spend", "fleet_down", "second_failure"]);
 
-    enqueue(db, { kind: "decision", urgency: "urgent", title: "held one" }, { push });
-    expect(sent.length).toBe(0);
-    r = await (await fetch(`${BASE}/api/away`)).json();
-    expect(r.held).toBe(1);
+  r = await post({ on: true, schedule: SEOUL });
+  expect(r.on).toBe(true);
+  expect(r.active).toBe(true);
+  expect(r.schedule).toEqual(SEOUL);
 
-    // omitted fields keep their value: this only clears the manual switch
-    r = await post({ on: false, schedule: null });
-    expect(r.on).toBe(false);
-    expect(r.active).toBe(false);
-    expect(r.flushed).toBe(1);
-    expect(r.always_through).toEqual(["security", "spend", "fleet_down", "second_failure"]);
-    expect(heldPushes(db).length).toBe(0);
-  } finally {
-    server.stop(true);
-  }
+  enqueue(db, { kind: "decision", urgency: "urgent", title: "held one" }, { push });
+  expect(sent.length).toBe(0);
+  r = await (await handler(new Request("http://127.0.0.1/api/away"))).json();
+  expect(r.held).toBe(1);
+
+  // omitted fields keep their value: this only clears the manual switch
+  r = await post({ on: false, schedule: null });
+  expect(r.on).toBe(false);
+  expect(r.active).toBe(false);
+  expect(r.flushed).toBe(1);
+  expect(r.always_through).toEqual(["security", "spend", "fleet_down", "second_failure"]);
+  expect(heldPushes(db).length).toBe(0);
 });

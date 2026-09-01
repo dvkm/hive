@@ -228,30 +228,27 @@ test("the Stop hook's agent_turn_end resumes the agent; SubagentStop does not", 
     return { code: 0, stdout: "", stderr: "" };
   };
   const { db, projectId } = freshDb();
-  const server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr: new Herdr(exec, "herdr") }) });
-  const base = `http://127.0.0.1:${server.port}`;
+  const handler = makeHandler(db, { herdr: new Herdr(exec, "herdr") });
   const turnEnd = (id: string, hook: string) =>
-    fetch(`${base}/api/tasks/${id}/events`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type: "agent_turn_end", source: "hook", payload: { hook } }),
-    });
-  try {
-    // A subagent finishing mid-turn is not the agent stopping.
-    const sub = makeTask(db, projectId);
-    said(db, sub, INCIDENT);
-    expect((await turnEnd(sub, "SubagentStop")).status).toBe(201);
-    expect(sent.length).toBe(0);
+    handler(
+      new Request("http://127.0.0.1" + `/api/tasks/${id}/events`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "agent_turn_end", source: "hook", payload: { hook } }),
+      })
+    );
+  // A subagent finishing mid-turn is not the agent stopping.
+  const sub = makeTask(db, projectId);
+  said(db, sub, INCIDENT);
+  expect((await turnEnd(sub, "SubagentStop")).status).toBe(201);
+  expect(sent.length).toBe(0);
 
-    const id = makeTask(db, projectId);
-    said(db, id, INCIDENT);
-    expect((await turnEnd(id, "Stop")).status).toBe(201);
-    expect(sent.length).toBe(1);
-    expect(sent[0]).toContain(INCIDENT);
-    // The steer carries its own delivery receipt, as every hive steer does.
-    const steer = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'steer'").get(id) as any;
-    expect(JSON.parse(steer.payload).delivery).toBe("delivered");
-  } finally {
-    server.stop(true);
-  }
+  const id = makeTask(db, projectId);
+  said(db, id, INCIDENT);
+  expect((await turnEnd(id, "Stop")).status).toBe(201);
+  expect(sent.length).toBe(1);
+  expect(sent[0]).toContain(INCIDENT);
+  // The steer carries its own delivery receipt, as every hive steer does.
+  const steer = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'steer'").get(id) as any;
+  expect(JSON.parse(steer.payload).delivery).toBe("delivered");
 });

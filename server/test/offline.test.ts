@@ -48,26 +48,21 @@ test("offline endpoint: toggles, broadcasts, steers working agents with prep/res
     run: async () => ({ code: 0, stdout: "{}", stderr: "" }),
   } as any;
 
-  const server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr }) });
-  const BASE = `http://127.0.0.1:${server.port}`;
-  try {
-    let r = await (await fetch(`${BASE}/api/offline`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on: true }) })).json();
-    expect(r.on).toBe(true);
-    expect(isOffline(db)).toBe(true);
+  const handler = makeHandler(db, { herdr });
+  let r = await (await handler(new Request("http://127.0.0.1/api/offline", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on: true }) }))).json();
+  expect(r.on).toBe(true);
+  expect(isOffline(db)).toBe(true);
 
-    // idempotent re-set steers nothing extra
-    r = await (await fetch(`${BASE}/api/offline`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on: true }) })).json();
-    expect(r.steered).toBe(0);
+  // idempotent re-set steers nothing extra
+  r = await (await handler(new Request("http://127.0.0.1/api/offline", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on: true }) }))).json();
+  expect(r.steered).toBe(0);
 
-    r = await (await fetch(`${BASE}/api/offline`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on: false }) })).json();
-    expect(r.on).toBe(false);
-    expect(isOffline(db)).toBe(false);
+  r = await (await handler(new Request("http://127.0.0.1/api/offline", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on: false }) }))).json();
+  expect(r.on).toBe(false);
+  expect(isOffline(db)).toBe(false);
 
-    const g = await (await fetch(`${BASE}/api/offline`)).json();
-    expect(g.on).toBe(false);
-  } finally {
-    server.stop(true);
-  }
+  const g = await (await handler(new Request("http://127.0.0.1/api/offline"))).json();
+  expect(g.on).toBe(false);
   // herdr send may be wrapped by the steer path; assert the prep + resume texts went out
   expect(sent.some((m) => m.includes("OFFLINE PREP"))).toBe(true);
   expect(sent.some((m) => m.includes("Back ONLINE"))).toBe(true);

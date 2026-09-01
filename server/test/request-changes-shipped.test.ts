@@ -27,17 +27,17 @@ function fixture(task: Record<string, any>) {
     `INSERT INTO tasks (id, project_id, title, brief, state, kind, pr_url, head_sha, created_at, updated_at)
      VALUES (?,?,?,?, 'done', ?, ?, ?, ?, ?)`
   ).run(id, projectId, task.title, task.brief ?? null, task.kind ?? "ship", task.pr_url ?? null, task.head_sha ?? null, t, t);
-  const server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr: new Herdr(exec, "herdr"), exec }) });
-  return { db, id, projectId, server, base: `http://127.0.0.1:${server.port}` };
+  const handler = makeHandler(db, { herdr: new Herdr(exec, "herdr"), exec });
+  return { db, id, projectId, handler };
 }
 
-const post = async (base: string, path: string, body: unknown) => {
-  const res = await fetch(base + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+const post = async (handler: ReturnType<typeof makeHandler>, path: string, body: unknown) => {
+  const res = await handler(new Request("http://127.0.0.1" + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
   return { status: res.status, json: (await res.json()) as any };
 };
 
 test("a note on a shipped task files one queued follow-up carrying the PR, and leaves the original done", async () => {
-  const { db, id, projectId, server, base } = fixture({
+  const { db, id, projectId, handler } = fixture({
     title: "Add the away switch",
     brief: "Original brief text",
     pr_url: "https://github.com/acme/hive/pull/34",
@@ -50,7 +50,7 @@ test("a note on a shipped task files one queued follow-up carrying the PR, and l
     payload: { method: "local ff-only", base: "main", merged_files: ["server/src/away.ts", "web/src/views/Brief.tsx"] },
   });
 
-  const r = await post(base, `/api/tasks/${id}/request-changes`, { notes: "The switch should hold pushes for 4 hours, not 1." });
+  const r = await post(handler, `/api/tasks/${id}/request-changes`, { notes: "The switch should hold pushes for 4 hours, not 1." });
   expect(r.status).toBe(200);
   expect(r.json.followup_task_id).toBeTruthy();
   expect(r.json.followup_label).toBe("HIVE-2");
@@ -74,13 +74,12 @@ test("a note on a shipped task files one queued follow-up carrying the PR, and l
   const queued = db.query("SELECT COUNT(*) AS n FROM tasks WHERE state = 'queued'").get() as any;
   expect(queued.n).toBe(1);
   expect(getTask(db, id).state).toBe("done");
-  server.stop(true);
 });
 
 test("a report-only task with no PR still produces a usable brief", async () => {
-  const { db, id, server, base } = fixture({ title: "Survey the flake rate", kind: "scout" });
+  const { db, id, handler } = fixture({ title: "Survey the flake rate", kind: "scout" });
 
-  const r = await post(base, `/api/tasks/${id}/request-changes`, { note: "Break the numbers down per project." });
+  const r = await post(handler, `/api/tasks/${id}/request-changes`, { note: "Break the numbers down per project." });
   expect(r.status).toBe(200);
 
   const followup = getTask(db, r.json.followup_task_id);
@@ -89,13 +88,11 @@ test("a report-only task with no PR still produces a usable brief", async () => 
   expect(followup.brief).toContain("none — this task shipped no PR");
   expect(followup.brief).toContain("Break the numbers down per project.");
   expect(getTask(db, id).state).toBe("done");
-  server.stop(true);
 });
 
 test("an empty note is refused and files nothing", async () => {
-  const { db, id, server, base } = fixture({ title: "Add the away switch" });
-  const r = await post(base, `/api/tasks/${id}/request-changes`, { note: "   " });
+  const { db, id, handler } = fixture({ title: "Add the away switch" });
+  const r = await post(handler, `/api/tasks/${id}/request-changes`, { note: "   " });
   expect(r.status).toBe(400);
   expect((db.query("SELECT COUNT(*) AS n FROM tasks").get() as any).n).toBe(1);
-  server.stop(true);
 });

@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -41,38 +41,34 @@ function stubExec(stdout: string, opts: { code?: number; hang?: boolean } = {}):
   return { exec, calls, callOptions };
 }
 
-let server: any;
-let BASE = "";
+const handler = makeHandler(db);
 let projectId = "";
 beforeAll(async () => {
-  server = Bun.serve({ port: 0, fetch: makeHandler(db) });
-  BASE = `http://127.0.0.1:${server.port}`;
-  const p = await (await fetch(BASE + "/api/projects", {
+  const p = await (await handler(new Request("http://127.0.0.1/api/projects", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       name: "acme", repo_path: "/repo",
       config: { supervisor_persona: "Pragmatic staff engineer.", playbook: "Ship small PRs." },
     }),
-  })).json();
+  }))).json();
   projectId = p.id;
   // one global policy + one active learning so we can assert prompt composition
-  await fetch(BASE + "/api/policies", {
+  await handler(new Request("http://127.0.0.1/api/policies", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title: "No em-dashes", body: "Use commas." }),
-  });
-  await fetch(BASE + "/api/learnings", {
+  }));
+  await handler(new Request("http://127.0.0.1/api/learnings", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_id: projectId, title: "flaky smoke on empty list", body: "guard empty", kind: "failure" }),
-  });
+  }));
 });
-afterAll(() => server.stop(true));
 
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const res = await handler(new Request("http://127.0.0.1" + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
   return { status: res.status, json: await res.json() };
 }
 async function get(path: string) {
-  const res = await fetch(BASE + path);
+  const res = await handler(new Request("http://127.0.0.1" + path));
   return { status: res.status, json: await res.json() };
 }
 async function mkTask(title = "Build onboarding flow", brief = "New users need a guided setup.") {
@@ -150,33 +146,27 @@ test("timeout kills the planner and records planner_error", async () => {
 
 test("plan endpoint -> decision card; approve creates linked child tasks", async () => {
   const t = await mkTask();
-  const handler = makeHandler(db, { plannerExec: stubExec(VALID).exec });
-  const s2 = Bun.serve({ port: 0, fetch: handler });
-  const base2 = `http://127.0.0.1:${s2.port}`;
-  try {
-    const r = await (await fetch(base2 + `/api/tasks/${t.id}/plan`, { method: "POST", body: "{}" })).json();
-    expect(r.ok).toBe(true);
-    expect(r.decision.title).toContain("Proposed breakdown");
-    expect(r.decision.plan.proposed_tasks.length).toBe(2);
-    // planning + planned events present
-    const full = (await get(`/api/tasks/${t.id}`)).json;
-    const types = full.events.map((e: any) => e.type);
-    expect(types).toContain("planning");
-    expect(types).toContain("planned");
+  const handler2 = makeHandler(db, { plannerExec: stubExec(VALID).exec });
+  const r = await (await handler2(new Request(`http://127.0.0.1/api/tasks/${t.id}/plan`, { method: "POST", body: "{}" }))).json();
+  expect(r.ok).toBe(true);
+  expect(r.decision.title).toContain("Proposed breakdown");
+  expect(r.decision.plan.proposed_tasks.length).toBe(2);
+  // planning + planned events present
+  const full = (await get(`/api/tasks/${t.id}`)).json;
+  const types = full.events.map((e: any) => e.type);
+  expect(types).toContain("planning");
+  expect(types).toContain("planned");
 
-    // approve the card
-    await post(`/api/decisions/${r.decision.id}/answer`, { answer_key: "approve" });
-    const kids = (await get(`/api/tasks?project_id=${projectId}`)).json.filter(
-      (x: any) => x.parent_task_id === t.id
-    );
-    expect(kids.length).toBe(2);
-    expect(kids.every((k: any) => k.source === "planner")).toBe(true);
-    expect(kids.every((k: any) => k.state === "queued")).toBe(true);
-    expect(kids.map((k: any) => k.title).sort()).toEqual(["Design schema", "Research competitors"]);
-    expect(kids.find((k: any) => k.title === "Design schema").brief).toBe("users + steps tables");
-  } finally {
-    s2.stop(true);
-  }
+  // approve the card
+  await post(`/api/decisions/${r.decision.id}/answer`, { answer_key: "approve" });
+  const kids = (await get(`/api/tasks?project_id=${projectId}`)).json.filter(
+    (x: any) => x.parent_task_id === t.id
+  );
+  expect(kids.length).toBe(2);
+  expect(kids.every((k: any) => k.source === "planner")).toBe(true);
+  expect(kids.every((k: any) => k.state === "queued")).toBe(true);
+  expect(kids.map((k: any) => k.title).sort()).toEqual(["Design schema", "Research competitors"]);
+  expect(kids.find((k: any) => k.title === "Design schema").brief).toBe("users + steps tables");
 });
 
 test("tracking-only tasks cannot run or approve planner work", async () => {
@@ -279,43 +269,37 @@ test("reject creates no child tasks", async () => {
 });
 
 test("braindump intake -> queued chore + decision card; approve queues children and retires the braindump", async () => {
-  const handler = makeHandler(db, { plannerExec: stubExec(VALID).exec });
-  const s2 = Bun.serve({ port: 0, fetch: handler });
-  const base2 = `http://127.0.0.1:${s2.port}`;
-  try {
-    const res = await fetch(base2 + "/api/intake", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project_id: projectId, text: "sso login is a mess\nalso the docs lie" }),
-    });
-    expect(res.status).toBe(202);
-    const { task } = await res.json();
-    expect(task.state).toBe("queued");
-    expect(task.kind).toBe("chore");
-    expect(task.source).toBe("intake_braindump");
-    expect(task.title).toBe("[braindump] sso login is a mess");
-    expect(task.brief).toContain("also the docs lie"); // raw text preserved verbatim
+  const handler2 = makeHandler(db, { plannerExec: stubExec(VALID).exec });
+  const res = await handler2(new Request("http://127.0.0.1/api/intake", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project_id: projectId, text: "sso login is a mess\nalso the docs lie" }),
+  }));
+  expect(res.status).toBe(202);
+  const { task } = await res.json();
+  expect(task.state).toBe("queued");
+  expect(task.kind).toBe("chore");
+  expect(task.source).toBe("intake_braindump");
+  expect(task.title).toBe("[braindump] sso login is a mess");
+  expect(task.brief).toContain("also the docs lie"); // raw text preserved verbatim
 
-    // the planner runs out-of-band but resolves before the next round-trip
-    const full = (await get(`/api/tasks/${task.id}`)).json;
-    expect(full.decisions.length).toBe(1);
-    const decision = full.decisions[0];
-    expect(decision.title).toContain("Proposed breakdown");
+  // the planner runs out-of-band but resolves before the next round-trip
+  const full = (await get(`/api/tasks/${task.id}`)).json;
+  expect(full.decisions.length).toBe(1);
+  const decision = full.decisions[0];
+  expect(decision.title).toContain("Proposed breakdown");
 
-    // never auto-dispatched while the breakdown is unapproved
-    expect(isReviewed(db, task.id)).toBe(false);
+  // never auto-dispatched while the breakdown is unapproved
+  expect(isReviewed(db, task.id)).toBe(false);
 
-    await post(`/api/decisions/${decision.id}/answer`, { answer_key: "approve" });
-    const kids = (await get(`/api/tasks?project_id=${projectId}`)).json.filter(
-      (x: any) => x.parent_task_id === task.id
-    );
-    expect(kids.length).toBe(2);
-    expect(kids.every((k: any) => k.state === "queued")).toBe(true);
-    // the braindump container is retired off the board once its plan is approved
-    expect((await get(`/api/tasks/${task.id}`)).json.state).toBe("cancelled");
-  } finally {
-    s2.stop(true);
-  }
+  await post(`/api/decisions/${decision.id}/answer`, { answer_key: "approve" });
+  const kids = (await get(`/api/tasks?project_id=${projectId}`)).json.filter(
+    (x: any) => x.parent_task_id === task.id
+  );
+  expect(kids.length).toBe(2);
+  expect(kids.every((k: any) => k.state === "queued")).toBe(true);
+  // the braindump container is retired off the board once its plan is approved
+  expect((await get(`/api/tasks/${task.id}`)).json.state).toBe("cancelled");
 });
 
 test("braindump intake rejects empty text and unknown projects", async () => {
@@ -325,20 +309,16 @@ test("braindump intake rejects empty text and unknown projects", async () => {
 
 test("a long braindump first line is elided into the title", async () => {
   // via the stubbed handler: the default one would spawn a real `claude -p`
-  const s2 = Bun.serve({ port: 0, fetch: makeHandler(db, { plannerExec: stubExec(VALID).exec }) });
-  try {
-    const long = "a".repeat(200);
-    const res = await fetch(`http://127.0.0.1:${s2.port}/api/intake`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project_id: projectId, text: long }),
-    });
-    const { task } = await res.json();
-    expect(task.title).toBe(`[braindump] ${"a".repeat(71)}…`);
-    expect(task.brief).toBe(long); // the full text is never truncated
-  } finally {
-    s2.stop(true);
-  }
+  const handler2 = makeHandler(db, { plannerExec: stubExec(VALID).exec });
+  const long = "a".repeat(200);
+  const res = await handler2(new Request("http://127.0.0.1/api/intake", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project_id: projectId, text: long }),
+  }));
+  const { task } = await res.json();
+  expect(task.title).toBe(`[braindump] ${"a".repeat(71)}…`);
+  expect(task.brief).toBe(long); // the full text is never truncated
 });
 
 test("auto-trigger on intake when project config.plan_intake is set", async () => {

@@ -27,7 +27,7 @@ const PLAN = {
   verification_planned: "bun test server/test/plan-critic.test.ts",
 };
 
-function makeServer(opts: { concerns?: any[]; plannerCode?: number; stdout?: string } = {}) {
+function makeApi(opts: { concerns?: any[]; plannerCode?: number; stdout?: string } = {}) {
   const db = openDb(":memory:");
   const sent: string[] = [];
   const prompts: string[] = [];
@@ -95,7 +95,7 @@ async function waitForEvent(handler: Handler, id: string, type: string) {
 }
 
 test("a plan checkpoint keeps its fields and gets a critique linked to it", async () => {
-  const s = makeServer({ concerns: [{ severity: "note", text: "The plan never says how failures are logged." }] });
+  const s = makeApi({ concerns: [{ severity: "note", text: "The plan never says how failures are logged." }] });
   const { id } = await makeTask(s.handler);
   const res = await post(s.handler, `/api/tasks/${id}/events`, { type: "checkpoint", ...PLAN });
   expect(res.status).toBe(201);
@@ -117,7 +117,7 @@ test("a plan checkpoint keeps its fields and gets a critique linked to it", asyn
 });
 
 test("a veto concern steers the agent, quoting the concern", async () => {
-  const s = makeServer({ concerns: [{ severity: "veto", text: "This plan edits the wrong module." }] });
+  const s = makeApi({ concerns: [{ severity: "veto", text: "This plan edits the wrong module." }] });
   const { id } = await makeTask(s.handler);
   await post(s.handler, `/api/tasks/${id}/spawn`, {});
   await post(s.handler, `/api/tasks/${id}/events`, { type: "checkpoint", ...PLAN });
@@ -130,7 +130,7 @@ test("a veto concern steers the agent, quoting the concern", async () => {
 });
 
 test("an ordinary checkpoint is not critiqued", async () => {
-  const s = makeServer({ concerns: [{ severity: "veto", text: "nope" }] });
+  const s = makeApi({ concerns: [{ severity: "veto", text: "nope" }] });
   const { id } = await makeTask(s.handler);
   const res = await post(s.handler, `/api/tasks/${id}/events`, { type: "checkpoint", note: "assumed UTC, it is the default" });
   expect(res.json.event.payload.note).toBe("assumed UTC, it is the default");
@@ -144,7 +144,7 @@ test("an ordinary checkpoint is not critiqued", async () => {
 });
 
 test("a critic failure attaches no concerns and never steers", async () => {
-  const s = makeServer({ plannerCode: 1 });
+  const s = makeApi({ plannerCode: 1 });
   const { id } = await makeTask(s.handler);
   await post(s.handler, `/api/tasks/${id}/spawn`, {});
   await post(s.handler, `/api/tasks/${id}/events`, { type: "checkpoint", ...PLAN });
@@ -155,7 +155,7 @@ test("a critic failure attaches no concerns and never steers", async () => {
 });
 
 test("unparseable critic output is treated as no concerns", async () => {
-  const s = makeServer({ stdout: "I could not review this plan." });
+  const s = makeApi({ stdout: "I could not review this plan." });
   const { id } = await makeTask(s.handler);
   await post(s.handler, `/api/tasks/${id}/events`, { type: "checkpoint", ...PLAN });
   const critique = await waitForEvent(s.handler, id, "plan_critique");
@@ -163,7 +163,7 @@ test("unparseable critic output is treated as no concerns", async () => {
 });
 
 test("the plan checkpoint instruction appears only for the kinds the project opts in", async () => {
-  const s = makeServer();
+  const s = makeApi();
   const off = await makeTask(s.handler);
   expect(composeBrief(s.db, off.id)).not.toContain("Plan checkpoint (before your first edit)");
 
@@ -177,7 +177,7 @@ test("the plan checkpoint instruction appears only for the kinds the project opt
 });
 
 test("plan_gate config is validated", async () => {
-  const s = makeServer();
+  const s = makeApi();
   const bad = await post(s.handler, "/api/projects", { name: "bad", repo_path: "/repo", config: { plan_gate: { kinds: "ship" } } });
   expect(bad.status).toBe(400);
   const worse = await post(s.handler, "/api/projects", { name: "worse", repo_path: "/repo", config: { plan_gate: { kinds: [], nope: 1 } } });
@@ -189,7 +189,7 @@ test("plan_gate config is validated", async () => {
 const BLOCKING = { kinds: ["ship"], block: true };
 
 test("blocking on: the brief tells the agent to wait, and the ack releases it", async () => {
-  const s = makeServer({ concerns: [{ severity: "note", text: "The plan skips the migration." }] });
+  const s = makeApi({ concerns: [{ severity: "note", text: "The plan skips the migration." }] });
   const { id } = await makeTask(s.handler, { plan_gate: BLOCKING });
   const brief = composeBrief(s.db, id);
   expect(brief).toContain("This project BLOCKS on the plan");
@@ -219,7 +219,7 @@ test("blocking on: the brief tells the agent to wait, and the ack releases it", 
 });
 
 test("blocking on: a flag tells the agent to re-plan and wait again", async () => {
-  const s = makeServer();
+  const s = makeApi();
   const { id } = await makeTask(s.handler, { plan_gate: BLOCKING });
   // A live agent target, as a real spawn would leave it: the flag steers the
   // parked agent instead of spawning a corrective task.
@@ -236,7 +236,7 @@ test("blocking on: a flag tells the agent to re-plan and wait again", async () =
 });
 
 test("blocking off: nothing about the plan checkpoint changes", async () => {
-  const s = makeServer();
+  const s = makeApi();
   const { id } = await makeTask(s.handler, { plan_gate: { kinds: ["ship"] } });
   expect(composeBrief(s.db, id)).toContain("this checkpoint never blocks you");
   await post(s.handler, `/api/tasks/${id}/spawn`, {});
@@ -253,7 +253,7 @@ test("blocking off: nothing about the plan checkpoint changes", async () => {
 });
 
 test("auto-ack releases a plan the director never acked, and only after the window", async () => {
-  const s = makeServer();
+  const s = makeApi();
   const { id } = await makeTask(s.handler, { plan_gate: { ...BLOCKING, auto_ack_hours: 4 } });
   await post(s.handler, `/api/tasks/${id}/spawn`, {});
   const res = await post(s.handler, `/api/tasks/${id}/events`, { type: "checkpoint", ...PLAN });
@@ -277,7 +277,7 @@ test("auto-ack releases a plan the director never acked, and only after the wind
 });
 
 test("auto-ack is off by default: a blocking plan waits for a human", async () => {
-  const s = makeServer();
+  const s = makeApi();
   const { id } = await makeTask(s.handler, { plan_gate: BLOCKING });
   await post(s.handler, `/api/tasks/${id}/spawn`, {});
   await post(s.handler, `/api/tasks/${id}/events`, { type: "checkpoint", ...PLAN });
@@ -289,7 +289,7 @@ test("auto-ack is off by default: a blocking plan waits for a human", async () =
 });
 
 test("plan_gate.auto_ack_hours is validated", async () => {
-  const s = makeServer();
+  const s = makeApi();
   const bad = await post(s.handler, "/api/projects", {
     name: "bad",
     repo_path: "/repo",

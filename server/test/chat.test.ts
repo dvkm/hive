@@ -3,7 +3,7 @@
 // into the live session; the session replies asynchronously via
 // POST /api/chat/threads/:id/reply. herdr is stubbed (injected exec) so the
 // test never spawns a real agent.
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -85,31 +85,31 @@ const exec: Exec = async (argv) => {
 };
 const herdr = new Herdr(exec, "herdr");
 
-let server: any;
-let BASE = "";
+// Call the handler directly instead of standing up a real HTTP server: bun
+// 1.3.14's global fetch pool keeps sockets alive past the server they belong
+// to, and the OS hands those ephemeral ports straight back to the next
+// `Bun.serve({ port: 0 })`. No socket, no port, no pool, no flake.
+const handler = makeHandler(db, { herdr });
 let projectId = "";
 beforeAll(async () => {
-  server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr }) });
-  BASE = `http://127.0.0.1:${server.port}`;
-  const p: any = await (await fetch(BASE + "/api/projects", {
+  const p: any = await (await handler(new Request("http://127.0.0.1/api/projects", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: "acme", repo_path: WT }),
-  })).json();
+  }))).json();
   projectId = p.id;
   // The Chief of Staff ships OFF (hive-1996). Every test below exercises a
   // running supervisor, so turn it on; the off-switch tests flip it back.
-  await fetch(BASE + "/api/chat/supervisor", {
+  await handler(new Request("http://127.0.0.1/api/chat/supervisor", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on: true }),
-  });
+  }));
 });
-afterAll(() => server.stop(true));
 
 async function post(path: string, body: unknown): Promise<{ status: number; json: any }> {
-  const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const res = await handler(new Request("http://127.0.0.1" + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
   return { status: res.status, json: await res.json() };
 }
 async function get(path: string): Promise<{ status: number; json: any }> {
-  const res = await fetch(BASE + path);
+  const res = await handler(new Request("http://127.0.0.1" + path));
   return { status: res.status, json: await res.json() };
 }
 
@@ -508,10 +508,10 @@ test("an arbitrary body.task_id cannot hijack an unrelated task as the chat supe
   // as the supervisor session and could respawn it on a send failure,
   // clobbering that task's agent/worktree/brief). task_id is undocumented and
   // unused by the CLI, so chatTurn ignores it outright.
-  const victim: any = await (await fetch(BASE + "/api/tasks", {
+  const victim: any = await (await handler(new Request("http://127.0.0.1/api/tasks", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_id: projectId, title: "unrelated ship task" }),
-  })).json();
+  }))).json();
   expect(victim.source).not.toBe("chat_supervisor");
 
   const { status, json } = await turn({

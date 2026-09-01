@@ -1,6 +1,6 @@
 // Steer delivery receipts + queued redelivery (server/src/steer.ts).
 // The bug: a steer to a task with no live agent vanished, so it got re-sent 3×.
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,26 +48,22 @@ function stubHerdr(sendResult: () => ExecResult = () => OK(), getResult: () => E
   return { herdr: new Herdr(exec, "herdr"), briefs, sends };
 }
 
-let server: any;
-let BASE = "";
 let projectId = "";
 const db = openDb(":memory:");
 const { herdr, briefs, sends } = stubHerdr();
+const handler = makeHandler(db, { herdr });
 
 beforeAll(async () => {
-  server = Bun.serve({ port: 0, fetch: makeHandler(db, { herdr }) });
-  BASE = `http://127.0.0.1:${server.port}`;
   const p = await post("/api/projects", { name: "p", repo_path: "/repo" });
   projectId = p.json.id;
 });
-afterAll(() => server.stop(true));
 
 async function post(path: string, body: unknown) {
-  const res = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const res = await handler(new Request("http://127.0.0.1" + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
   return { status: res.status, json: await res.json() };
 }
 async function get(path: string) {
-  const res = await fetch(BASE + path);
+  const res = await handler(new Request("http://127.0.0.1" + path));
   return { status: res.status, json: await res.json() };
 }
 const newTask = async (title: string) => (await post("/api/tasks", { project_id: projectId, title })).json.id;
@@ -177,23 +173,21 @@ test("a send to a pane-less agent is a failure, not a silent delivery", async ()
 test("a failing herdr send retries once, then queues the steer", async () => {
   const fail = stubHerdr(() => OK('{"error":{"code":"agent_not_found"}}'));
   const db2 = openDb(":memory:");
-  const srv = Bun.serve({ port: 0, fetch: makeHandler(db2, { herdr: fail.herdr }) });
-  const b2 = `http://127.0.0.1:${srv.port}`;
-  const p = await (await fetch(b2 + "/api/projects", { method: "POST", body: JSON.stringify({ name: "p", repo_path: "/r" }) })).json();
-  const t = await (await fetch(b2 + "/api/tasks", { method: "POST", body: JSON.stringify({ project_id: p.id, title: "dead agent" }) })).json();
-  await fetch(b2 + `/api/tasks/${t.id}/spawn`, { method: "POST", body: "{}" });
+  const h2 = makeHandler(db2, { herdr: fail.herdr });
+  const p = await (await h2(new Request("http://127.0.0.1/api/projects", { method: "POST", body: JSON.stringify({ name: "p", repo_path: "/r" }) }))).json();
+  const t = await (await h2(new Request("http://127.0.0.1/api/tasks", { method: "POST", body: JSON.stringify({ project_id: p.id, title: "dead agent" }) }))).json();
+  await h2(new Request(`http://127.0.0.1/api/tasks/${t.id}/spawn`, { method: "POST", body: "{}" }));
 
-  const res = await (await fetch(b2 + `/api/tasks/${t.id}/send`, { method: "POST", body: JSON.stringify({ message: "retry me" }) })).json();
+  const res = await (await h2(new Request(`http://127.0.0.1/api/tasks/${t.id}/send`, { method: "POST", body: JSON.stringify({ message: "retry me" }) }))).json();
   expect(res.delivery).toBe("queued");
   expect(res.error).toBe("agent_not_found");
   expect(fail.sends).toEqual(["retry me", "retry me"]); // tried twice
-  const events = await (await fetch(b2 + `/api/tasks/${t.id}/events`)).json();
+  const events = await (await h2(new Request(`http://127.0.0.1/api/tasks/${t.id}/events`))).json();
   expect(events.some((e: any) => e.type === "steer_error")).toBe(true);
 
   // A respawn drains the queue.
-  await fetch(b2 + `/api/tasks/${t.id}/spawn`, { method: "POST", body: "{}" });
+  await h2(new Request(`http://127.0.0.1/api/tasks/${t.id}/spawn`, { method: "POST", body: "{}" }));
   expect(fail.briefs.at(-1)).toContain("1. retry me");
-  srv.stop(true);
 });
 
 // ---- reconciler drain (queued steer -> live agent, no respawn needed) ----
@@ -202,15 +196,14 @@ test("a failing herdr send retries once, then queues the steer", async () => {
 async function drainFixture(sendResult: () => ExecResult, getResult: () => ExecResult) {
   const s = stubHerdr(sendResult, getResult);
   const db2 = openDb(":memory:");
-  const srv = Bun.serve({ port: 0, fetch: makeHandler(db2, { herdr: s.herdr }) });
-  const b = `http://127.0.0.1:${srv.port}`;
+  const handler = makeHandler(db2, { herdr: s.herdr });
   const call = async (p: string, body?: unknown) =>
-    (await fetch(b + p, body === undefined ? {} : { method: "POST", body: JSON.stringify(body) })).json();
+    (await handler(new Request("http://127.0.0.1" + p, body === undefined ? {} : { method: "POST", body: JSON.stringify(body) }))).json();
   const proj = await call("/api/projects", { name: "p", repo_path: "/r" });
   const task = await call("/api/tasks", { project_id: proj.id, title: "live agent, blipping socket" });
   await call(`/api/tasks/${task.id}/spawn`, {}); // sets agent_target, -> in_progress
   const steer = async (id: string) => (await call(`/api/tasks/${id}/events`)).filter((e: any) => e.type === "steer")[0];
-  return { ...s, db: db2, id: task.id, call, steer, stop: () => srv.stop(true) };
+  return { ...s, db: db2, id: task.id, call, steer };
 }
 
 // The gap #80 left behind: herdr blips for a few seconds while the agent is
@@ -238,7 +231,6 @@ test("the reconciler drains a queued steer to an agent that is alive", async () 
   // Idempotent: a delivered steer is not re-sent on the next cycle.
   await reconcileOnce(f.db, { herdr: f.herdr, exec: NO_GH });
   expect(f.sends.length).toBe(3);
-  f.stop();
 });
 
 // A genuinely dead agent must keep its steers queued for the next spawn's brief.
@@ -266,7 +258,6 @@ test("the reconciler leaves a queued steer alone when the agent is dead", async 
   await f.call(`/api/tasks/${f.id}/spawn`, {});
   expect(f.briefs.at(-1)).toContain("1. rebase onto main");
   expect((await f.steer(f.id)).payload.delivered_via).toBe("respawn");
-  f.stop();
 });
 
 test("a steer to a completed turn is queued, then reattached on the same task", async () => {
@@ -286,7 +277,6 @@ test("a steer to a completed turn is queued, then reattached on the same task", 
   expect((await f.call(`/api/tasks/${f.id}`)).agent_target).toBe(f.id);
   expect(f.briefs.at(-1)).toContain("1. continue with the requested fix");
   expect((await f.steer(f.id)).payload.delivered_via).toBe("respawn");
-  f.stop();
 });
 
 test("a verifying task reattaches after its completed turn is released", async () => {
@@ -306,7 +296,6 @@ test("a verifying task reattaches after its completed turn is released", async (
   expect(task.state).toBe("verifying");
   expect(f.briefs.at(-1)).toContain("1. attach the missing verification evidence");
   expect((await f.steer(f.id)).payload.delivered_via).toBe("respawn");
-  f.stop();
 });
 
 // Queuing a steer for a task nothing will ever respawn would be a lie.
@@ -482,7 +471,7 @@ test("a queued steer's attachment path rides along into the respawn brief", asyn
   const fd = new FormData();
   fd.append("message", "review this trace");
   fd.append("files", new File([new Uint8Array([1, 2, 3, 4])], "trace.log", { type: "text/plain" }));
-  const res = await (await fetch(BASE + `/api/tasks/${id}/send`, { method: "POST", body: fd })).json();
+  const res = await (await handler(new Request(`http://127.0.0.1/api/tasks/${id}/send`, { method: "POST", body: fd }))).json();
   expect(res.delivery).toBe("queued");
   expect(res.attachments?.[0]).toMatch(/trace\.log$/);
 

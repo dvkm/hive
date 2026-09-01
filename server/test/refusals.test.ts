@@ -1,7 +1,7 @@
 // HIVE-530: a refusal states the cause AND the next action. These lock in the
 // wording for the refusals a person actually meets from a `hive <verb>` run, so
 // changing one is a deliberate edit here rather than a surprise in CI.
-import { test, expect, afterAll } from "bun:test";
+import { test, expect } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,16 +11,19 @@ const { openDb } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
 
 const db = openDb(":memory:");
-const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
-const BASE = `http://127.0.0.1:${server.port}`;
-afterAll(() => server.stop(true));
+// Call the handler directly instead of standing up a real HTTP server. Bun
+// 1.3.14's global fetch pool keeps sockets alive past the server they belong
+// to, and the OS hands those ephemeral ports straight back to the next
+// `Bun.serve({ port: 0 })`, so a request can go out on a socket belonging to a
+// dead server. No socket, no port, no pool, no flake.
+const handler = makeHandler(db);
 
 async function call(method: string, path: string, body?: unknown) {
-  const res = await fetch(BASE + path, {
+  const res = await handler(new Request("http://127.0.0.1" + path, {
     method,
     headers: body ? { "Content-Type": "application/json" } : {},
     body: body ? JSON.stringify(body) : undefined,
-  });
+  }));
   return { status: res.status, error: String((await res.json()).error ?? "") };
 }
 

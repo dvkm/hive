@@ -4,7 +4,7 @@
 // ran, so the tests assert what the board would actually display: the ticket
 // link, a persistent error, what is still queued, and that manual retry is the
 // same code path as the timer rather than a second one.
-import { test, expect, afterAll, beforeEach } from "bun:test";
+import { test, expect, beforeEach } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,9 +18,6 @@ const J = await import("../src/intake/jira.ts");
 
 let db = openDb(":memory:");
 let handler = makeHandler(db);
-const server = Bun.serve({ port: 0, fetch: (request) => handler(request) });
-const BASE = `http://127.0.0.1:${server.port}`;
-afterAll(() => server.stop(true));
 beforeEach(() => {
   db.close();
   db = openDb(":memory:");
@@ -29,19 +26,19 @@ beforeEach(() => {
 });
 
 const get = async (p: string) => {
-  const r = await fetch(BASE + p);
+  const r = await handler(new Request("http://127.0.0.1" + p));
   return { status: r.status, json: (await r.json()) as any };
 };
 const post = async (p: string) => {
-  const r = await fetch(BASE + p, { method: "POST" });
+  const r = await handler(new Request("http://127.0.0.1" + p, { method: "POST" }));
   return { status: r.status, json: (await r.json()) as any };
 };
 const postJson = async (p: string, body: unknown) => {
-  const r = await fetch(BASE + p, {
+  const r = await handler(new Request("http://127.0.0.1" + p, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  });
+  }));
   return { status: r.status, json: (await r.json()) as any };
 };
 
@@ -278,25 +275,21 @@ test("a definite Jira rejection stays retryable after credentials recover", asyn
       ? new Response("credentials rejected", { status: 403 })
       : new Response(JSON.stringify({ id: "posted-after-recovery" }), { status: 200 })
     : new Response(JSON.stringify({ comments: [], startAt: 0, maxResults: 100, total: 0 }), { status: 200 }));
-  const retryServer = Bun.serve({ port: 0, fetch: makeHandler(db, { jira: { fetch: jiraFetch, token: "tok" } }) });
-  try {
-    const response = await fetch(`http://127.0.0.1:${retryServer.port}/api/tasks/${jiraTask}/jira/sync`, { method: "POST" });
-    const body = await response.json() as any;
-    expect(response.status).toBe(502);
-    expect(body.ok).toBe(false);
-    expect(body.error).toContain(`${key} comment_push`);
-    expect(body.error).toContain("403 credentials rejected");
-    const failedState = await (await fetch(`http://127.0.0.1:${retryServer.port}/api/tasks/${jiraTask}/jira`)).json() as any;
-    expect(failedState.pending).toEqual({ comments: 1, receipts: 0, unknown: [] });
+  const retryHandler = makeHandler(db, { jira: { fetch: jiraFetch, token: "tok" } });
+  const response = await retryHandler(new Request(`http://127.0.0.1/api/tasks/${jiraTask}/jira/sync`, { method: "POST" }));
+  const body = await response.json() as any;
+  expect(response.status).toBe(502);
+  expect(body.ok).toBe(false);
+  expect(body.error).toContain(`${key} comment_push`);
+  expect(body.error).toContain("403 credentials rejected");
+  const failedState = await (await retryHandler(new Request(`http://127.0.0.1/api/tasks/${jiraTask}/jira`))).json() as any;
+  expect(failedState.pending).toEqual({ comments: 1, receipts: 0, unknown: [] });
 
-    rejected = false;
-    const recovered = await fetch(`http://127.0.0.1:${retryServer.port}/api/tasks/${jiraTask}/jira/sync`, { method: "POST" });
-    expect(recovered.status).toBe(200);
-    const recoveredState = await (await fetch(`http://127.0.0.1:${retryServer.port}/api/tasks/${jiraTask}/jira`)).json() as any;
-    expect(recoveredState.pending).toEqual({ comments: 0, receipts: 0, unknown: [] });
-  } finally {
-    retryServer.stop(true);
-  }
+  rejected = false;
+  const recovered = await retryHandler(new Request(`http://127.0.0.1/api/tasks/${jiraTask}/jira/sync`, { method: "POST" }));
+  expect(recovered.status).toBe(200);
+  const recoveredState = await (await retryHandler(new Request(`http://127.0.0.1/api/tasks/${jiraTask}/jira`))).json() as any;
+  expect(recoveredState.pending).toEqual({ comments: 0, receipts: 0, unknown: [] });
 });
 
 test("a rejected tracking-only recovery answer leaves its card open", async () => {
@@ -317,32 +310,24 @@ test("a rejected tracking-only recovery answer leaves its card open", async () =
 test("manual retry returns 502 when the comment list read fails", async () => {
   const { jiraTask, key } = seed(CFG);
   const jiraFetch = retryJiraFetch(key, () => new Response("comment read exploded", { status: 500 }));
-  const retryServer = Bun.serve({ port: 0, fetch: makeHandler(db, { jira: { fetch: jiraFetch, token: "tok" } }) });
-  try {
-    const response = await fetch(`http://127.0.0.1:${retryServer.port}/api/tasks/${jiraTask}/jira/sync`, { method: "POST" });
-    const body = await response.json() as any;
-    expect(response.status).toBe(502);
-    expect(body.ok).toBe(false);
-    expect(body.error).toContain(`${key}: jira GET`);
-    expect(body.error).toContain("500 comment read exploded");
-  } finally {
-    retryServer.stop(true);
-  }
+  const retryHandler = makeHandler(db, { jira: { fetch: jiraFetch, token: "tok" } });
+  const response = await retryHandler(new Request(`http://127.0.0.1/api/tasks/${jiraTask}/jira/sync`, { method: "POST" }));
+  const body = await response.json() as any;
+  expect(response.status).toBe(502);
+  expect(body.ok).toBe(false);
+  expect(body.error).toContain(`${key}: jira GET`);
+  expect(body.error).toContain("500 comment read exploded");
 });
 
 test("manual retry treats incomplete comment pagination as an operational failure", async () => {
   const { jiraTask, key } = seed(CFG);
   const jiraFetch = retryJiraFetch(key, () => new Response(JSON.stringify({ comments: [] }), { status: 200 }));
-  const retryServer = Bun.serve({ port: 0, fetch: makeHandler(db, { jira: { fetch: jiraFetch, token: "tok" } }) });
-  try {
-    const response = await fetch(`http://127.0.0.1:${retryServer.port}/api/tasks/${jiraTask}/jira/sync`, { method: "POST" });
-    const body = await response.json() as any;
-    expect(response.status).toBe(502);
-    expect(body.ok).toBe(false);
-    expect(body.error).toContain(`${key}: incomplete Jira comment history`);
-  } finally {
-    retryServer.stop(true);
-  }
+  const retryHandler = makeHandler(db, { jira: { fetch: jiraFetch, token: "tok" } });
+  const response = await retryHandler(new Request(`http://127.0.0.1/api/tasks/${jiraTask}/jira/sync`, { method: "POST" }));
+  const body = await response.json() as any;
+  expect(response.status).toBe(502);
+  expect(body.ok).toBe(false);
+  expect(body.error).toContain(`${key}: incomplete Jira comment history`);
 });
 
 test("manual retry returns 502 with the operational issue read failure", async () => {
@@ -355,17 +340,13 @@ test("manual retry returns 502 with the operational issue read failure", async (
       return new Response("read exploded", { status: 500 });
     return new Response("unexpected request", { status: 500 });
   }) as unknown as typeof fetch;
-  const retryServer = Bun.serve({ port: 0, fetch: makeHandler(db, { jira: { fetch: jiraFetch, token: "tok" } }) });
-  try {
-    const response = await fetch(`http://127.0.0.1:${retryServer.port}/api/tasks/${jiraTask}/jira/sync`, { method: "POST" });
-    const body = await response.json() as any;
-    expect(response.status).toBe(502);
-    expect(body.ok).toBe(false);
-    expect(body.error).toContain(`${key}: jira GET`);
-    expect(body.error).toContain("500 read exploded");
-  } finally {
-    retryServer.stop(true);
-  }
+  const retryHandler = makeHandler(db, { jira: { fetch: jiraFetch, token: "tok" } });
+  const response = await retryHandler(new Request(`http://127.0.0.1/api/tasks/${jiraTask}/jira/sync`, { method: "POST" }));
+  const body = await response.json() as any;
+  expect(response.status).toBe(502);
+  expect(body.ok).toBe(false);
+  expect(body.error).toContain(`${key}: jira GET`);
+  expect(body.error).toContain("500 read exploded");
 });
 
 test("manual retry refuses a task that is not linked to Jira", async () => {
