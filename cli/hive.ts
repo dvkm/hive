@@ -1021,7 +1021,10 @@ async function main() {
       for (const it of items) console.log(`- ${it.title}${it.body ? `\n  ${String(it.body).replace(/\n/g, "\n  ")}` : ""}`);
     };
     if (!r.references.length && !r.learnings.length && !r.policies.length && !(r.decisions?.length)) {
-      console.log(q ? `no project knowledge matches "${q}"` : "no project knowledge stored yet");
+      // A bare empty result reads as "nothing to know". Say the keywords missed,
+      // and name the command that lists everything stored.
+      if (r.note) console.log(r.note);
+      else console.log(q ? `no project knowledge matches "${q}"` : "no project knowledge stored yet");
       return;
     }
     show("References (durable facts)", r.references);

@@ -90,7 +90,7 @@ test("captureRecurringRefs proposes a card for a link in >=3 tasks, once, and sa
   expect(openCards(db)).toHaveLength(0);
 });
 
-test("knowledgeSearch scopes to a project and AND-matches keywords across kinds", async () => {
+test("knowledgeSearch scopes to a project and ranks keyword matches across kinds", async () => {
   const { makeHandler } = await import("../src/api.ts");
   const { db, projectId } = freshDb();
   addReference(db, projectId, "Design file", FIGMA);
@@ -106,12 +106,40 @@ test("knowledgeSearch scopes to a project and AND-matches keywords across kinds"
   };
   expect((await search("figma")).references).toHaveLength(1);
   expect((await search("migration collation")).learnings).toHaveLength(1); // both terms present
-  expect((await search("migration figma")).learnings).toHaveLength(0); // AND: not both in one row
+  // one right keyword + one wrong one still finds the row (no AND cliff)
+  expect((await search("migration figma")).learnings).toHaveLength(1);
   expect((await search("staging")).policies).toHaveLength(1);
+  // a query that hits nothing says so instead of returning bare empty arrays
+  const miss = await search("kubernetes");
+  expect(miss.no_matches).toBe(true);
+  expect(miss.note).toContain("hive recall");
+  // a query that hits something carries no miss signal
+  expect((await search("figma")).no_matches).toBeUndefined();
   // task_id resolves the project
   const tid = task(db, projectId, "t");
   const byTask = await handle(new Request(`http://x/api/knowledge?task_id=${tid}&q=figma`));
   expect((await byTask.json()).references).toHaveLength(1);
+});
+
+test("knowledgeSearch ranks by how many keywords hit, and the no-q index is unfiltered", async () => {
+  const { makeHandler } = await import("../src/api.ts");
+  const { db, projectId } = freshDb();
+  const { recordSystemLearning } = require("../src/learn.ts");
+  recordSystemLearning(db, projectId, "migration collation mismatch", "utf8mb4 vs general_ci");
+  recordSystemLearning(db, projectId, "migration lock timeout", "long DDL blocks writes");
+  const handle = makeHandler(db, {});
+  const search = async (q: string) => {
+    const res = await handle(new Request(`http://x/api/knowledge?project_id=${projectId}${q ? `&q=${encodeURIComponent(q)}` : ""}`));
+    return res.json();
+  };
+  // both rows mention "migration"; only one mentions "collation", so it ranks first
+  const ranked = (await search("migration collation")).learnings;
+  expect(ranked).toHaveLength(2);
+  expect(ranked[0].title).toBe("migration collation mismatch");
+  // no q → the whole index, no miss signal
+  const all = await search("");
+  expect(all.learnings).toHaveLength(2);
+  expect(all.no_matches).toBeUndefined();
 });
 
 test("localhost / PR / non-doc links are not captured", () => {
