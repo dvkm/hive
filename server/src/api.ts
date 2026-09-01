@@ -3970,7 +3970,12 @@ async function spawnTask(
   const blocked = authzBlock(db, { project_id: task.project_id, action: "task.spawn", target: task.title, task_id: id });
   if (blocked) return blocked;
 
-  const r = await spawnAgent(db, herdr, id, { hiveUrl: body?.hive_url, supervise: deps.supervise, exec: deps.exec });
+  const r = await spawnAgent(db, herdr, id, {
+    hiveUrl: body?.hive_url,
+    supervise: deps.supervise,
+    exec: deps.exec,
+    force: body?.force === true,
+  });
   if (!r.ok) return err(`spawn failed: ${r.error}`, 502);
   return json({ ok: true, task: getTask(db, id), agent_target: r.agent_target });
 }
@@ -4068,7 +4073,7 @@ export async function spawnAgent(
   db: DB,
   herdr: Herdr,
   id: string,
-  opts: { hiveUrl?: string; supervise?: boolean; briefOverride?: string; exec?: Exec } = {}
+  opts: { hiveUrl?: string; supervise?: boolean; briefOverride?: string; exec?: Exec; force?: boolean } = {}
 ): Promise<{ ok: true; agent_target: string } | { ok: false; error: string }> {
   const task = getTask(db, id);
   if (!task) return { ok: false, error: "task not found" };
@@ -4163,6 +4168,10 @@ export async function spawnAgent(
       taskId: id,
       holderQuietMs,
       releaseFinishedName: holderQuietMs !== undefined && holderQuietMs > staleMs(),
+      // HIVE-579: `hive spawn <id> --force` / {"force":true}. The operator has
+      // verified the holder is gone, so the silence window is skipped. It still
+      // will not close a holder herdr reports as anything but `done`.
+      forceReleaseName: opts.force === true,
       repoPath: project.repo_path,
       hiveUrl,
       title: task.title,
