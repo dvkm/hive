@@ -899,6 +899,52 @@ test("a confirmed-risk card offers a re-check, and answering it sets the stored 
   expect(JSON.parse(second.options).map((o: any) => o.key)).toContain("retry");
 });
 
+// HIVE-588: a card can sit open for hours, and the agent can push while it
+// sits. The ruling is about the commit the card was built on, so answering it
+// must never set aside verdicts about the commit that replaced it.
+test("a re-check answered after the branch moved sets nothing aside on the new commit", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  setHead(db, a, "sha1");
+  writeEvent(db, {
+    task_id: a,
+    source: "system",
+    type: "risk_verdicts",
+    payload: { reviewed_head_sha: "sha1", verdicts: [{ risk: "export drops rows", why: "the CSV writer skips the last page", verdict: "confirmed" }] },
+  });
+  markLand(db, [a], true);
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
+  markSteersDelivered(db, queuedSteers(db, a).map((s) => s.id), "drain");
+  ageLandAttempts(db, a, 3_600_000);
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
+  const card = db.query("SELECT id FROM decisions WHERE status = 'open'").get() as any;
+
+  // The agent pushes while the card is open, and the new commit gets its own
+  // confirmed finding — one the director has never read.
+  setHead(db, a, "sha2");
+  writeEvent(db, {
+    task_id: a,
+    source: "system",
+    type: "risk_verdicts",
+    payload: { reviewed_head_sha: "sha2", verdicts: [{ risk: "new code deletes the audit row", why: "brand new", verdict: "confirmed" }] },
+  });
+
+  const res = apiAnswerDecision(db, stubHerdr, card.id, {
+    answer_key: "recheck",
+    answer_note: "The finding cites a commit from before PR #101 landed the flush fix.",
+    source: "director",
+  });
+  expect(res.status).toBe(200);
+  // Nothing was set aside: the ruling was about sha1, and sha2's finding still
+  // blocks the merge until the check itself clears it.
+  expect(confirmedRisks(db, a, "sha2")).toHaveLength(1);
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'risk_recheck'").get(a) as any).toMatchObject({ n: 0 });
+  // Still re-armed, so the sweep re-evaluates the new head cleanly.
+  const task = db.query("SELECT state, land_queued_at FROM tasks WHERE id = ?").get(a) as any;
+  expect(task.state).toBe("in_review");
+  expect(task.land_queued_at).toBeTruthy();
+});
+
 // A finding about a commit the branch has already moved past is stale by
 // construction. The merge gate says so instead of quoting it, and the queue
 // reads that as something to retry — no card, no relay, no director.

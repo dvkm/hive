@@ -635,8 +635,10 @@ export function resolveLandPauseForDecision(
   answerNote?: string | null
 ): boolean {
   const ev = db
-    .query("SELECT task_id FROM events WHERE type = 'land_paused' AND json_extract(payload, '$.decision_id') = ? LIMIT 1")
-    .get(decisionId) as { task_id: string } | undefined;
+    .query(
+      "SELECT task_id, json_extract(payload, '$.head_sha') AS head_sha FROM events WHERE type = 'land_paused' AND json_extract(payload, '$.decision_id') = ? LIMIT 1"
+    )
+    .get(decisionId) as { task_id: string; head_sha: string | null } | undefined;
   if (!ev) return false;
   // HIVE-588: the director read the finding and says it is wrong. The argument
   // is the valuable part and it used to have nowhere to go — on one task the
@@ -647,8 +649,17 @@ export function resolveLandPauseForDecision(
   // decisions as settled rulings. It is NOT an override — a re-run that
   // confirms the risk again blocks the merge exactly as before.
   if (answerKey === "recheck") {
-    const head = headShaOf(db, ev.task_id);
-    if (head) requestRiskRecheck(db, ev.task_id, head, answerNote ?? null);
+    // The ruling is about the commit the card was BUILT on, not whatever the
+    // branch points at now. A card can sit open for hours and the agent can
+    // push in the meantime, so reading the live head here would set aside
+    // verdicts about brand-new code the director never saw. If the head has
+    // moved, the card is stale: set nothing aside and just re-arm, and the
+    // sweep checks the new commit from scratch — same rule the merge gate
+    // already applies to a verdict whose head no longer matches.
+    const live = headShaOf(db, ev.task_id);
+    const head = ev.head_sha ?? live;
+    const moved = !!ev.head_sha && !!live && live !== ev.head_sha;
+    if (head && !moved) requestRiskRecheck(db, ev.task_id, head, answerNote ?? null);
     // Re-arm the queue: a `land_queued` mark ends the failed-attempt run, which
     // is what otherwise holds a task after two failures on one commit.
     markLand(db, [ev.task_id], true);
