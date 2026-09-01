@@ -415,8 +415,54 @@ test("startup repair carries a completed quiz onto a legacy duplicate review", a
     .get(taskId);
   expect(JSON.parse(carried.payload)).toMatchObject({
     review_event_id: "evt_legacy_duplicate",
-    reason: "identical review already understood",
+    reason: "re-emitted review asks the same understanding checks",
   });
+  expect(repairDuplicateQuizPasses(s.db)).toBe(0);
+  await s.server.stop(true);
+});
+
+// HIVE-545: the repair used to demand a byte-identical payload, so a legacy
+// review that reworded its prose stayed stuck at "Understanding check required".
+test("startup repair carries a completed quiz onto a reworded legacy review", async () => {
+  const s = makeServer();
+  const { taskId } = await inReviewTask(s.base);
+  const original: any = s.db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId);
+  const payload = JSON.parse(original.payload);
+  payload.done = ["rebased onto main"];
+  payload.understanding.checks = payload.understanding.checks.map((check: any) => ({
+    ...check,
+    question: `  ${check.question}\n`,
+  }));
+  s.db
+    .query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run("evt_legacy_reworded", taskId, new Date().toISOString(), "agent", "review_summary", JSON.stringify(payload));
+
+  expect(repairDuplicateQuizPasses(s.db)).toBe(1);
+  const carried: any = s.db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'understanding_quiz_passed' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId);
+  expect(JSON.parse(carried.payload).review_event_id).toBe("evt_legacy_reworded");
+  await s.server.stop(true);
+});
+
+test("startup repair leaves a legacy review alone when its options changed", async () => {
+  const s = makeServer();
+  const { taskId } = await inReviewTask(s.base);
+  const original: any = s.db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId);
+  const payload = JSON.parse(original.payload);
+  payload.understanding.checks = payload.understanding.checks.map((check: any) => ({
+    ...check,
+    options: [{ key: "a", label: "A brand new answer" }, { key: "b", label: "Another new answer" }],
+    answer_key: "a",
+  }));
+  s.db
+    .query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run("evt_legacy_reoptioned", taskId, new Date().toISOString(), "agent", "review_summary", JSON.stringify(payload));
+
   expect(repairDuplicateQuizPasses(s.db)).toBe(0);
   await s.server.stop(true);
 });
