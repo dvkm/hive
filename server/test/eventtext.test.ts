@@ -98,3 +98,12 @@ test("Jira audit text distinguishes pending, shadow, and confirmed writes", () =
   expect(isFailureEvent({ type: "jira_sync", payload: { outcome: "terminal_unknown" } })).toBe(true);
   expect(isFailureEvent({ type: "jira_sync", payload: { outcome: "failed" } })).toBe(true);
 });
+
+test("worktree_seeded names a skipped warm dir instead of claiming nothing happened", () => {
+  expect(
+    eventText({
+      type: "worktree_seeded",
+      payload: { seeded: [], warmed: [], skipped: [{ path: "node_modules", reason: "bun.lock differs from main checkout" }] },
+    })
+  ).toBe("worktree seeded: skipped node_modules (bun.lock differs from main checkout)");
+});

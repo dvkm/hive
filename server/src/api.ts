@@ -56,6 +56,7 @@ import {
 import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable, HerdrError, heldNameRetryAt } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
+import { seedWorktree, type SeedResult } from "./worktreeSeed.ts";
 import { takeOver, handBack, TakeoverError } from "./takeover.ts";
 import { figmaTokenEnv, resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { teamclaudeEnv, teamclaudeOverlay, usesTeamclaude } from "./teamclaude.ts";
@@ -4195,6 +4196,37 @@ function referencesUrl(text: string, url: string): boolean {
 // the `spawned`/`spawn_error` events and the queued->in_progress transition.
 // Assumes callers have already run their own gates (authority, dispatch policy).
 // Returns {ok:false} instead of throwing so the dispatcher can back off.
+// HIVE-355: identity of a seed misconfiguration, for reporting it once instead
+// of on every spawn. Path plus reason, with numbers blanked so a byte or file
+// count in the message does not make the same cap failure look new each time.
+function seedFailureSignature(misconfigured: { path: string; reason: string }[]): string {
+  return misconfigured
+    .map((m) => `${m.path}: ${m.reason.replace(/\d+/g, "#")}`)
+    .sort()
+    .join("\n");
+}
+
+// Has this project already reported this exact seed problem? Looks back over
+// the recent worktree_seed_failed events for the whole project, not just this
+// task: the config that is broken is per project, so the noise is too.
+function seedFailureReported(db: DB, projectId: string, signature: string): boolean {
+  const rows = db
+    .query(
+      `SELECT events.payload AS payload FROM events
+         JOIN tasks ON tasks.id = events.task_id
+        WHERE events.type = 'worktree_seed_failed' AND tasks.project_id = ?
+        ORDER BY events.ts DESC LIMIT 50`
+    )
+    .all(projectId) as { payload: string }[];
+  return rows.some((r) => {
+    try {
+      return JSON.parse(r.payload)?.signature === signature;
+    } catch {
+      return false;
+    }
+  });
+}
+
 export async function spawnAgent(
   db: DB,
   herdr: Herdr,
@@ -4288,6 +4320,12 @@ export async function spawnAgent(
   const lastActivity = lastAgentActivity(db, id);
   const holderQuietMs = lastActivity ? Date.now() - Date.parse(lastActivity) : undefined;
 
+  // HIVE-355: spawn-to-ready, recorded per spawn so the warm-worktree win shows
+  // up in the event stream rather than in somebody's stopwatch.
+  const spawnStarted = Date.now();
+  // Held in an object so TypeScript does not narrow them to `null`: both are
+  // written from inside the prepareWorktree callback, which it cannot see run.
+  const timing: { seed: SeedResult | null; setupMs: number | null } = { seed: null, setupMs: null };
   let result;
   try {
     result = await herdr.spawn({
@@ -4312,11 +4350,38 @@ export async function spawnAgent(
       // agents don't have to install deps / bring up their stack themselves.
       prepareWorktree: async (worktreePath) => {
         if (agent === "claude") writeHookSettings(worktreePath, id, hiveUrl, config.command_approval);
+        // HIVE-355: seed the untracked config a fresh checkout is missing and
+        // clone the warm state (node_modules) BEFORE setup_argv, so the project's
+        // own setup hook finds the work already done and no-ops. Best-effort by
+        // construction — a failed seed only means setup_argv does it the slow way.
+        const seed = (timing.seed = await seedWorktree(project.repo_path, worktreePath, config, opts.exec ?? defaultExec));
+        if (seed.seeded.length || seed.warmed.length || seed.skipped.length)
+          writeEvent(db, { task_id: id, source: "herdr", type: "worktree_seeded", payload: { ...seed } });
+        // A project with no seed config at all is the deliberate default and stays
+        // quiet. A project that NAMED something we could not find is a different
+        // thing: the spawn still succeeds, so nothing else would ever report it,
+        // and the agent gets a worktree that looks warm and is not. The `_failed`
+        // suffix puts it in the durable failure history (web/src/lib/eventText.ts).
+        // ...but only ONCE per project per distinct problem. A warm dir that
+        // was never built, or a lockfile nobody has, is broken on every spawn
+        // forever, and re-reporting it every spawn buries the failure history
+        // it is supposed to stand out in. A different problem is a different
+        // signature and reports again.
+        const seedSignature = seedFailureSignature(seed.misconfigured);
+        if (seed.misconfigured.length && !seedFailureReported(db, task.project_id, seedSignature))
+          writeEvent(db, {
+            task_id: id,
+            source: "herdr",
+            type: "worktree_seed_failed",
+            payload: { misconfigured: seed.misconfigured, signature: seedSignature },
+          });
+        const setupStarted = Date.now();
         const setup = await runStackCmd(db, id, config.setup_argv, project.repo_path, worktreePath, opts.exec ?? defaultExec, {
           type: "stack_setup",
           source: "herdr",
           timeoutMs: Number(config.stack_setup_timeout_ms) || 600_000,
         });
+        timing.setupMs = Date.now() - setupStarted;
         // Unlike teardown, a failed setup ABORTS the spawn: starting an agent
         // whose deps/stack never came up burns a whole run on confusing
         // downstream failures. Throwing here surfaces out of herdr.spawn into
@@ -4373,6 +4438,14 @@ export async function spawnAgent(
       // auto-spawns it with a live pane/pty that the agent never uses, so cleanup
       // must close it or it leaks a pty forever (2026-07-25).
       workspace_id: result.workspace_id,
+      // Spawn-to-ready breakdown, in milliseconds. seed_ms + setup_ms are the
+      // two halves warm worktrees trade against each other: a cloned
+      // node_modules pushes cost out of setup_ms and into a much smaller seed_ms.
+      spawn_ms: Date.now() - spawnStarted,
+      // `warmed` carries how each directory was warmed: a `copy` entry means this
+      // machine's filesystem cannot do copy-on-write, which is why seed_ms is big.
+      ...(timing.seed ? { seed_ms: timing.seed.ms, seeded: timing.seed.seeded, warmed: timing.seed.warmed } : {}),
+      ...(timing.setupMs === null ? {} : { setup_ms: timing.setupMs }),
     },
   });
   // The agent is up and holding the queued steers in its brief — receipt them.

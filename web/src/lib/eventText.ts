@@ -10,6 +10,8 @@ export interface EventLike {
 }
 
 const s = (v: unknown): string => (v == null ? "" : String(v));
+// Payload values are untyped, so an array field has to be narrowed before use.
+const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 
 // One quiet sentence per event, e.g. "moved to In Review",
 // "evidence attached: board screenshot", "decision answered: sqlite".
@@ -145,6 +147,33 @@ export function eventText(e: EventLike): string {
       return p.delivered === false ? `recovery nudge failed: ${s(p.error)}` : "recovery nudge delivered";
     case "worktree_reclaim_failed":
       return `worktree reclaim failed: ${s(p.error)}`;
+    case "worktree_seeded": {
+      const seeded = list(p.seeded);
+      // Warm entries carry HOW they were warmed. A byte copy is not the win
+      // this feature exists for, so say which one happened rather than letting
+      // a slow machine read exactly like a fast one.
+      const warmed = list(p.warmed) as { dir?: unknown; method?: unknown }[];
+      // A skip is the design working — the deps really changed, or the file is
+      // already there — but it is not "nothing happened". It is the reason a
+      // spawn was slow, which is exactly what someone reads this line to find.
+      const skipped = list(p.skipped) as { path?: unknown; reason?: unknown }[];
+      const did = [
+        seeded.length ? `copied ${seeded.length} config file${seeded.length === 1 ? "" : "s"}` : null,
+        warmed.length
+          ? `reused ${warmed.map((w) => `${s(w.dir)} (${s(w.method) === "clone" ? "copy-on-write clone" : "full copy"})`).join(", ")}`
+          : null,
+        skipped.length ? `skipped ${skipped.map((k) => `${s(k.path)} (${s(k.reason)})`).join(", ")}` : null,
+      ].filter(Boolean);
+      return did.length ? `worktree seeded: ${did.join(", ")}` : "worktree seeded: nothing to copy or reuse";
+    }
+    case "worktree_seed_failed": {
+      // The spawn still worked; the project asked for something that is not there.
+      const bad = list(p.misconfigured) as { path?: unknown; reason?: unknown }[];
+      const first = bad[0] ? `${s(bad[0].path)} — ${s(bad[0].reason)}` : "see the event payload";
+      return bad.length > 1
+        ? `worktree setup config is wrong (${bad.length} problems), so the agent started cold: ${first}`
+        : `worktree setup config is wrong, so the agent started cold: ${first}`;
+    }
     case "ready_held":
       if (s(p.reason) === "no_evidence") return "handoff held: no evidence attached yet";
       if (s(p.reason) === "missing_understanding_check") return "handoff held: the review carries no understanding check";
