@@ -276,6 +276,47 @@ const HOOKS_DIR = join(import.meta.dir, "..", "..", "hooks");
 const REPO_ROOT = join(import.meta.dir, "..", "..");
 const ELECTRON_PKG = join(REPO_ROOT, "electron", "package.json");
 
+// HIVE-548: sync-main.sh spent five days logging that it had DECLINED to update
+// the live checkout, and nothing else noticed. The server ran 30 commits behind
+// main, so every fix merged in that window was dead code. "The running code is
+// not the merged code" now surfaces beside dispatcher/reaper staleness.
+// Being behind by a few commits is normal in the minutes between a merge and
+// the next 5-minute sync tick, so `stale` also requires the newest unmerged
+// commit to have been sitting there for several ticks.
+const LIVE_DRIFT_STALE_MS = 15 * 60 * 1000;
+const LIVE_DRIFT_CACHE_MS = 60_000;
+export type LiveCheckout = { behind: number; stale: boolean; head: string | null; error: string | null };
+let liveDriftCache: { at: number; repo: string; value: LiveCheckout } | null = null;
+
+function gitLine(repo: string, args: string[]): string | null {
+  const r = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
+  if (r.exitCode !== 0) return null;
+  return new TextDecoder().decode(r.stdout).trim();
+}
+
+// Uncached; /api/health calls the memoized liveCheckout() below.
+export function measureLiveCheckout(repo: string = REPO_ROOT): LiveCheckout {
+  const head = gitLine(repo, ["rev-parse", "--short", "HEAD"]);
+  const behindRaw = gitLine(repo, ["rev-list", "--count", "HEAD..refs/remotes/origin/main"]);
+  if (head === null || behindRaw === null)
+    return { behind: 0, stale: false, head, error: "could not read git state for the running checkout" };
+  const behind = Number(behindRaw);
+  if (behind === 0) return { behind: 0, stale: false, head, error: null };
+  // Committer date of origin/main's tip: how long the newest thing we are
+  // missing has been waiting for the sync job to bring it over.
+  const tipAt = gitLine(repo, ["log", "-1", "--format=%cI", "refs/remotes/origin/main"]);
+  const ageMs = tipAt ? Date.now() - Date.parse(tipAt) : null;
+  return { behind, stale: ageMs === null || ageMs > LIVE_DRIFT_STALE_MS, head, error: null };
+}
+
+export function liveCheckout(repo: string = REPO_ROOT): LiveCheckout {
+  if (liveDriftCache && liveDriftCache.repo === repo && Date.now() - liveDriftCache.at < LIVE_DRIFT_CACHE_MS)
+    return liveDriftCache.value;
+  const value = measureLiveCheckout(repo);
+  liveDriftCache = { at: Date.now(), repo, value };
+  return value;
+}
+
 // The API token (minted on boot in index.ts) presented as `Authorization:
 // Bearer <t>` or `?token=<t>` — EventSource cannot set headers, so the SSE
 // stream needs the query form. No token minted → nothing can authenticate.
@@ -356,10 +397,12 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         const reconciler = reconcilerHealth(db);
         const reviewer = reviewerHealth(db);
         const degraded = degradedTools(db);
+        const live = liveCheckout();
         const ok = reconciler.consecutive_errors < RECONCILE_ERROR_STREAK_THRESHOLD
           && reviewer.parse_failure_streak < REVIEWER_PARSE_FAILURE_STREAK_THRESHOLD
-          && degraded.length === 0;
-        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, reviewer, degraded, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
+          && degraded.length === 0
+          && !live.stale;
+        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, reviewer, degraded, live_checkout: live, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
       }
 
       // ---- desktop shell self-update (HIVE-420) ----
