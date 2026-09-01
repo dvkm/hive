@@ -538,3 +538,96 @@ test("a new head_sha closes the stale land-queue pause card", async () => {
   await landOnce(db, { exec: filesExec({}), merge: after.merge });
   expect(after.calls).toEqual([a]);
 });
+
+// HIVE-559: a CONFIRMED risk is agent work. Hive relays the finding to the agent
+// that wrote the code and only asks the director when the agent argues back or
+// the same risk survives the relay.
+const RISK_REASON =
+  'merge blocked — the risk check confirmed 1 risk on this head: “export drops rows” — the CSV writer skips the last page (evidence/export.md). Fix them, or merge with override_confirmed_risks=true.';
+
+test("a confirmed risk goes to the agent as a steer, opens no card, and holds the land", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+
+  const { calls, merge } = mergeStub(db, { [a]: RISK_REASON });
+  await landOnce(db, { exec: filesExec({}), merge });
+  expect(calls).toEqual([a]);
+  // No director card: the agent hears about it first.
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+  // The finding reaches the agent verbatim, evidence path included.
+  const steers = queuedSteers(db, a);
+  expect(steers).toHaveLength(1);
+  expect(steers[0].message).toContain(RISK_REASON);
+  expect(steers[0].message).toContain("evidence/export.md");
+  // Audited as a machine relay, not a director ruling.
+  const routed = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_routed_to_agent'").all(a) as any[];
+  expect(routed).toHaveLength(1);
+  expect(JSON.parse(routed[0].payload).head_sha).toBe("sha1");
+  // The land is held, and still approved: no merge, no unmark.
+  expect((db.query("SELECT state, land_queued_at FROM tasks WHERE id = ?").get(a) as any).state).toBe("in_review");
+  expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(a) as any).land_queued_at).toBeTruthy();
+
+  // A new head re-arms the merge with no card in between.
+  markSteersDelivered(db, steers.map((s) => s.id), "drain");
+  db.query("UPDATE tasks SET head_sha = 'sha2' WHERE id = ?").run(a);
+  ageLandAttempts(db, a, 3_600_000);
+  const after = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: after.merge });
+  expect(after.calls).toEqual([a]);
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(a) as any).state).toBe("verifying");
+});
+
+test("an agent that disputes a confirmed risk gets a card carrying the argument", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+
+  const first = mergeStub(db, { [a]: RISK_REASON });
+  await landOnce(db, { exec: filesExec({}), merge: first.merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+
+  // The agent reads it and argues the finding is wrong instead of pushing.
+  markSteersDelivered(db, queuedSteers(db, a).map((s) => s.id), "drain");
+  writeEvent(db, { task_id: a, source: "agent", type: "answer", payload: { note: "The last page is written by flush(); the finding read an older file." } });
+
+  ageLandAttempts(db, a, 3_600_000);
+  const second = mergeStub(db, { [a]: RISK_REASON });
+  await landOnce(db, { exec: filesExec({}), merge: second.merge });
+  const open = db.query("SELECT task_id, context FROM decisions WHERE status = 'open'").all() as any[];
+  expect(open).toHaveLength(1);
+  expect(open[0].task_id).toBe(a);
+  expect(open[0].context).toContain("The last page is written by flush()");
+  // One card, not one per sweep, and no second relay to the arguing agent.
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_REASON }).merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(1);
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'risk_routed_to_agent'").get(a) as any).n).toBe(1);
+});
+
+// The realistic dispute: delivering the steer bounces the task back to the
+// agent, so when it returns to review it is HELD by the unaddressed change
+// request and never reaches another merge attempt. The escalation still fires.
+test("a dispute escalates even while the task is held and never re-attempted", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_REASON }).merge });
+
+  const steers = queuedSteers(db, a);
+  markSteersDelivered(db, steers.map((s) => s.id), "drain");
+  resumeReviewForDeliveredSteers(db, a, steers, "drain"); // → in_progress + changes_requested
+  writeEvent(db, { task_id: a, source: "agent", type: "answer", payload: { note: "the finding misread the flush path" } });
+  transition(db, a, "in_review", { source: "agent", reason: "handed back without a new commit" });
+
+  ageLandAttempts(db, a, 3_600_000);
+  const held = mergeStub(db, { [a]: RISK_REASON });
+  await landOnce(db, { exec: filesExec({}), merge: held.merge });
+  expect(held.calls).toEqual([]); // still held: no merge attempt at all
+  const open = db.query("SELECT task_id, context FROM decisions WHERE status = 'open'").all() as any[];
+  expect(open).toHaveLength(1);
+  expect(open[0].context).toContain("misread the flush path");
+});

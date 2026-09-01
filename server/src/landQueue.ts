@@ -262,6 +262,110 @@ function failedAttemptRun(db: DB, taskId: string): number {
 // real blockages, and a single PR contributed 52 of them (HIVE-555).
 const MAX_NON_TRANSIENT_ATTEMPTS = 2;
 
+// HIVE-559: a CONFIRMED risk is agent work, not a director ruling. Measured over
+// 24h on one machine: 18 pause cards for confirmed risks, 0 of them needed a
+// human — every one was fixed by the agent as soon as someone relayed it by
+// hand. So hive relays it first and only asks the director when the agent
+// argues back or the same risk survives the relay.
+const CONFIRMED_RISK_RE = /the risk check confirmed/i;
+
+export function isConfirmedRiskFailure(reason: string): boolean {
+  return CONFIRMED_RISK_RE.test(reason);
+}
+
+// Two relays against ONE commit is the ceiling. Counted per head_sha, so a real
+// fix (a new commit) starts fresh and an agent that hands the same branch back
+// unchanged runs out. Never auto-overrides: `override_confirmed_risks` stays a
+// human act, and the merge itself is re-attempted, never waved through.
+const MAX_RISK_ROUTES_PER_HEAD = 2;
+
+function riskRoutesAtHead(db: DB, taskId: string, headSha: string | null): number {
+  const row = db
+    .query(
+      `SELECT COUNT(*) AS n FROM events
+        WHERE task_id = ? AND type = 'risk_routed_to_agent'
+          AND json_extract(payload, '$.head_sha') IS ?`
+    )
+    .get(taskId, headSha) as { n: number };
+  return row?.n ?? 0;
+}
+
+// The agent's reply since the last relay, when it still applies to THIS commit.
+// A dispute is an ESCALATION, not a retry: if the agent says the finding is
+// wrong, that is exactly when a person should look, and the argument is what
+// makes the card cheap to answer. A new head means the agent pushed instead, so
+// the relay did its job and there is nothing to escalate.
+function pendingRiskDispute(db: DB, taskId: string, headSha: string | null): { dispute: string; reason: string } | null {
+  const routed = db
+    .query("SELECT rowid AS rid, payload FROM events WHERE task_id = ? AND type = 'risk_routed_to_agent' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId) as { rid: number; payload: string } | undefined;
+  if (!routed) return null;
+  let payload: any = {};
+  try {
+    payload = JSON.parse(routed.payload ?? "{}");
+  } catch {}
+  if ((payload.head_sha ?? null) !== headSha) return null;
+  const answer = db
+    .query(
+      `SELECT json_extract(payload, '$.note') AS note FROM events
+        WHERE task_id = ? AND type = 'answer' AND rowid > ? ORDER BY rowid DESC LIMIT 1`
+    )
+    .get(taskId, routed.rid) as { note: string | null } | undefined;
+  if (!answer?.note) return null;
+  return { dispute: answer.note, reason: payload.reason ?? "the risk check confirmed a risk on this head" };
+}
+
+// Did we already open a card for the current relay episode? Without this the
+// dispute escalation below would re-ask the same question every sweep for as
+// long as the agent's argument stands.
+function escalatedSinceRelay(db: DB, taskId: string): boolean {
+  const row = db
+    .query(
+      `SELECT (SELECT MAX(rowid) FROM events WHERE task_id = ? AND type = 'risk_routed_to_agent') AS routed,
+              (SELECT MAX(rowid) FROM events WHERE task_id = ? AND type = 'land_paused') AS paused`
+    )
+    .get(taskId, taskId) as { routed: number | null; paused: number | null };
+  return !!(row?.routed && row?.paused && row.paused > row.routed);
+}
+
+// The pause card, shared by both callers: the failed-merge path below and the
+// dispute escalation, which fires while the task is being HELD and so never
+// reaches a merge attempt of its own.
+async function createLandPauseCard(
+  db: DB,
+  node: LandNode,
+  reason: string,
+  dispute: string | null
+): Promise<void> {
+  const { createDecision } = await import("./api.ts");
+  const decision = createDecision(db, {
+    task_id: node.id,
+    title: `PR #${node.number} paused in the land queue`,
+    context:
+      `${node.title}\n\nIt is still approved to land, but the merge stopped: ${reason.slice(0, 300)}\n\n` +
+      (dispute
+        ? `Hive sent this finding to the agent first. The agent disputes it: “${dispute.slice(0, 500)}” — ` +
+          `that argument is why you are seeing this instead of a fix.\n\n`
+        : isConfirmedRiskFailure(reason)
+          ? `Hive already relayed this finding to the agent on this same commit and the branch came back unfixed.\n\n`
+          : "") +
+      `Retrying only helps if that cause has changed. Nothing has changed on its own, so the same merge will ` +
+      `fail the same way. Hive retries once and then holds the PR quietly until the agent pushes a new commit ` +
+      `or you take it out of the queue (\`hive land ${node.id} --off\`).`,
+    options: [
+      { key: "send_back", label: "Send it back to the agent", detail: "Unmark it and ask the agent to fix what blocked the merge.", recommended: true },
+      { key: "unqueue", label: "Take it out of the queue", detail: "Leave the PR open and unmarked. Nothing is sent to the agent." },
+      { key: "retry", label: "Try landing it again", detail: "Only if you just fixed the cause yourself. One more attempt, then hive holds it." },
+    ],
+  });
+  writeEvent(db, {
+    task_id: node.id,
+    source: "reconciler",
+    type: "land_paused",
+    payload: { decision_id: decision.id, reason, head_sha: headShaOf(db, node.id), ...(dispute ? { dispute: true } : {}) },
+  });
+}
+
 // Consecutive trailing NON-transient failures against `headSha`. A success, a
 // transient failure, a fresh `land_queued` mark or an attempt on a different
 // head ends the run — the count is about this commit and this blocker.
@@ -514,6 +618,15 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         // A pause card already waiting on the director holds the task too —
         // otherwise every sweep would re-attempt and re-ask the same question.
         if (openPauseDecisionId(db, n.id)) continue;
+        // The agent argued back about a risk hive relayed to it (HIVE-559). It
+        // is being held below (a queued steer, an unaddressed change request),
+        // so no merge attempt will ever reach the card path at the end of this
+        // sweep — the escalation has to happen here.
+        const argued = pendingRiskDispute(db, n.id, headShaOf(db, n.id));
+        if (argued && !escalatedSinceRelay(db, n.id)) {
+          await createLandPauseCard(db, n, argued.reason, argued.dispute);
+          continue;
+        }
         if (backingOff(retryState(db, n.id), nowMs)) continue;
         // Retried once against an unchanged blocker and an unchanged commit:
         // stop. Only a new head_sha or a human re-arms it (HIVE-555).
@@ -649,27 +762,35 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
       // instructions. Asking the director what to do about work hive has
       // already routed is the duplicate card this task exists to remove.
       if (getTask(db, node.id)?.state !== "in_review") continue;
-      const { createDecision } = await import("./api.ts");
-      const decision = createDecision(db, {
-        task_id: node.id,
-        title: `PR #${node.number} paused in the land queue`,
-        context:
-          `${node.title}\n\nIt is still approved to land, but the merge stopped: ${reason.slice(0, 300)}\n\n` +
-          `Retrying only helps if that cause has changed. Nothing has changed on its own, so the same merge will ` +
-          `fail the same way. Hive retries once and then holds the PR quietly until the agent pushes a new commit ` +
-          `or you take it out of the queue (\`hive land ${node.id} --off\`).`,
-        options: [
-          { key: "send_back", label: "Send it back to the agent", detail: "Unmark it and ask the agent to fix what blocked the merge.", recommended: true },
-          { key: "unqueue", label: "Take it out of the queue", detail: "Leave the PR open and unmarked. Nothing is sent to the agent." },
-          { key: "retry", label: "Try landing it again", detail: "Only if you just fixed the cause yourself. One more attempt, then hive holds it." },
-        ],
-      });
-      writeEvent(db, {
-        task_id: node.id,
-        source: "reconciler",
-        type: "land_paused",
-        payload: { decision_id: decision.id, reason, head_sha: headShaOf(db, node.id) },
-      });
+      const head = headShaOf(db, node.id);
+      let dispute: string | null = null;
+      // HIVE-559: a confirmed risk goes to the AGENT first. It wrote the code,
+      // it can fix the finding, and every one of these the director answered by
+      // hand was answered by relaying it. Escalate only on a dispute, or when
+      // the relay has already been spent twice against this same commit.
+      if (isConfirmedRiskFailure(reason)) {
+        dispute = pendingRiskDispute(db, node.id, head)?.dispute ?? null;
+        const routes = riskRoutesAtHead(db, node.id, head);
+        if (!dispute && routes < MAX_RISK_ROUTES_PER_HEAD) {
+          const msg =
+            `hive: your PR #${node.number} is held in the land queue — the risk check confirmed a risk on the commit ` +
+            `you pushed. This is the finding, verbatim:\n\n${reason}\n\n` +
+            `Fix it and push; the merge re-arms itself on the new commit. If you believe the finding is WRONG, do not ` +
+            `push a no-op — say why with \`hive emit ${node.id} answer --note "..."\` and a human reads it. ` +
+            `Nothing merges until one of those two things happens.`;
+          if (queueSteerEvent(db, node.id, msg, "confirmed risk routed to the agent")) {
+            writeEvent(db, {
+              task_id: node.id,
+              source: "reconciler",
+              type: "risk_routed_to_agent",
+              payload: { reason, head_sha: head, round: routes + 1 },
+            });
+            continue;
+          }
+          // Undeliverable — nothing will ever carry it, so ask the director.
+        }
+      }
+      await createLandPauseCard(db, node, reason, dispute);
     }
   }
 }
