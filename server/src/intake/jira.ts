@@ -374,6 +374,31 @@ export function adfToText(node: any): string {
   return out;
 }
 
+// Everything the description *points at*, read off the ADF structure rather than
+// the prose it flattens to. "rename banner.png" is a sentence; a .png in
+// `fields.attachment` is an attachment. A figma.com URL counts when it came out
+// of a card node or a link mark, not when someone typed the words in a comment.
+export function adfRefs(node: any): { urls: string[]; media: boolean } {
+  const urls: string[] = [];
+  let media = false;
+  const walk = (n: any): void => {
+    if (n == null || typeof n !== "object") return;
+    if (Array.isArray(n)) return void n.forEach(walk);
+    const attrs = n.attrs ?? {};
+    if (n.type === "inlineCard" || n.type === "blockCard" || n.type === "embedCard") {
+      const url = [attrs.url, attrs.data?.url].find((v: unknown) => typeof v === "string" && v.trim());
+      if (url) urls.push(String(url).trim());
+    }
+    if (n.type === "media" || n.type === "mediaSingle" || n.type === "mediaGroup") media = true;
+    for (const mark of Array.isArray(n.marks) ? n.marks : []) {
+      if (mark?.type === "link" && typeof mark.attrs?.href === "string" && mark.attrs.href.trim()) urls.push(mark.attrs.href.trim());
+    }
+    walk(n.content);
+  };
+  walk(node);
+  return { urls, media };
+}
+
 export function hiveTaskMarker(issue: any): string | null {
   const property = issue?.properties?.["hive.task_id"];
   if (typeof property === "string" && property.trim()) return property.trim();
@@ -1204,11 +1229,15 @@ export function briefFor(issue: any, site: string): string {
     .map((a: any) => ({ filename: String(a?.filename ?? "").trim(), content: String(a?.content ?? "").trim() }))
     .filter((a: { filename: string }) => !!a.filename);
   // An agent cannot guess a layout from prose when the answer is in a mockup, so
-  // say plainly that one exists. Image attachments and design links are the two
-  // ways a ticket carries that.
+  // say plainly that one exists. Decided from the structured facts only — an
+  // embedded image, a real attachment, or a URL that came out of a card or a
+  // link mark — never from the words, so "rename banner.png" stays prose.
+  const refs = adfRefs(f.description);
+  const looksVisual = (name: string) => /\.(png|jpe?g|gif|webp|svg|pdf|fig)$/i.test(name.split(/[?#]/)[0]!);
   const visual =
-    attachments.some((a: { filename: string }) => /\.(png|jpe?g|gif|webp|svg|pdf|fig)$/i.test(a.filename)) ||
-    /figma\.com|\.png|\.jpe?g|\[attachment:/i.test(description);
+    refs.media ||
+    attachments.some((a: { filename: string }) => looksVisual(a.filename)) ||
+    refs.urls.some((u: string) => /^https?:\/\/([^/]*\.)?figma\.com\//i.test(u) || looksVisual(u));
   return [
     `JIRA: ${site}/browse/${issue.key}`,
     `Type: ${f.issuetype?.name ?? "-"}`,

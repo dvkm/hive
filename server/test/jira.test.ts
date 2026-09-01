@@ -2048,6 +2048,48 @@ test("briefFor names the ticket's attachments and flags visual material", () => 
   expect(brief).toContain("visual material");
 });
 
+test("briefFor reads visual material off the structure, not the prose", () => {
+  const proseOnly = J.briefFor(
+    {
+      key: "WEB-2",
+      fields: {
+        issuetype: { name: "Task" },
+        attachment: [],
+        description: {
+          type: "doc",
+          version: 1,
+          content: [{ type: "paragraph", content: [{ type: "text", text: "rename banner.png and drop the figma.com mention from the footer" }] }],
+        },
+      },
+    },
+    "https://jira.test"
+  );
+  expect(proseOnly).toContain("banner.png");
+  expect(proseOnly).not.toContain("visual material");
+
+  // Same words, but the design URL is a real link mark this time.
+  const linked = J.briefFor(
+    {
+      key: "WEB-3",
+      fields: {
+        issuetype: { name: "Task" },
+        description: {
+          type: "doc",
+          version: 1,
+          content: [
+            {
+              type: "paragraph",
+              content: [{ type: "text", text: "the design", marks: [{ type: "link", attrs: { href: "https://www.figma.com/design/KEY/Home?node-id=1-23" } }] }],
+            },
+          ],
+        },
+      },
+    },
+    "https://jira.test"
+  );
+  expect(linked).toContain("visual material");
+});
+
 test("briefFor stays quiet when the ticket carries nothing visual", () => {
   const brief = J.briefFor(
     { key: "WEB-1", fields: { issuetype: { name: "Task" }, description: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "plain" }] }] } } },
