@@ -725,6 +725,59 @@ function settledBlock(decisions: { ts: string; text: string }[]): string {
   ].join("\n");
 }
 
+// Evidence attached to the task, so the judge can see what the commit alone
+// does not (HIVE-603). On task 3391a3e296d8 the brief asked for 20 consecutive
+// runs, the agent did 24 and attached them as evidence, and the risk check —
+// which reads only the commit — blocked the merge twice for "the commit does
+// not evidence them". No number of extra runs could have cleared that; only
+// restating them somewhere the checker looks. Captions are short, and are
+// exactly the kind of claim the judge is being asked to weigh.
+//
+// A caption is the agent's own report, not proof, so it settles whether the
+// work was DONE, never whether the code is right. Each one carries the commit
+// it was captured on: evidence from an older commit says nothing about this one.
+const MAX_PROMPT_EVIDENCE = 8;
+
+function taskEvidence(db: DB, taskId: string, head: string): string[] {
+  const rows: any[] = db
+    .query(
+      `SELECT kind, caption, json_extract(meta, '$.commit_sha') AS sha FROM evidence
+        WHERE task_id = ? AND kind != 'explanation' AND trim(coalesce(caption, '')) != '' ORDER BY rowid`
+    )
+    .all(taskId);
+  return rows.slice(-MAX_PROMPT_EVIDENCE).map((r) => {
+    const when = !r.sha ? "not tied to a commit" : r.sha === head ? "captured on the commit under review" : "captured on an earlier commit";
+    return `${String(r.caption).trim().slice(0, 300)} [${r.kind}, ${when}]`;
+  });
+}
+
+// The attached-evidence block, or "" when the task has none. `useIt` is the one
+// line that differs between judging a risk and answering a question.
+function evidenceBlock(items: string[], useIt: string[]): string {
+  if (!items.length) return "";
+  return [
+    `The agent attached this evidence to the task. It is the agent's own caption, not the commit:`,
+    ...items.map((e) => `- ${e}`),
+    ...useIt,
+    `A caption settles only whether the work was done. A defect you can point at in the code stays`,
+    `a real finding, and a caption captured on an earlier commit, or not tied to one, proves nothing`,
+    `about this commit.`,
+    ``,
+  ].join("\n");
+}
+
+const RISK_USE_EVIDENCE = [
+  `A risk that says only "the commit does not show this was checked" is NOT a live risk when a`,
+  `caption above reports that check on the commit under review. Answer 'refuted' and start 'why'`,
+  `with "evidence: " plus the caption, so the reader sees what it rests on.`,
+];
+
+const QUESTION_USE_EVIDENCE = [
+  `If a caption above answers the question for the commit under review, that IS an answer from this`,
+  `repository: say "machine" and quote the caption. Do not send a check to the human that the agent`,
+  `has already reported doing on this commit.`,
+];
+
 function verifyPrompt(task: any, risk: string, diff: string, settled = ""): string {
   return [
     `A code reviewer flagged ONE risk on a pull request. Decide whether it is real.`,
@@ -750,7 +803,7 @@ function verifyPrompt(task: any, risk: string, diff: string, settled = ""): stri
     .join("\n");
 }
 
-function answerPrompt(task: any, question: string, diff: string): string {
+function answerPrompt(task: any, question: string, diff: string, context = ""): string {
   return [
     `A code reviewer asked ONE question about a pull request before merging it.`,
     `Decide who can answer it. Answer it yourself ("machine") only if reading this repository settles it.`,
@@ -763,6 +816,7 @@ function answerPrompt(task: any, question: string, diff: string): string {
     `Task #${task.number}: ${task.title}`,
     task.worktree_path ? `The full checkout is at ${task.worktree_path} — read files there to check. Do not edit anything.` : ``,
     ``,
+    context,
     `Diff (may be truncated):`,
     diff.slice(0, DIFF_LIMIT),
     ``,
@@ -935,7 +989,8 @@ async function runVerification(
   // risk prompt.
   const decisions = answeredDecisions(db, task.id);
   const commits = await branchCommits(db, task, deps.shellExec ?? defaultExec);
-  const settled = repairBlock(commits) + (decisions.length ? settledBlock(decisions) : "");
+  const evidence = taskEvidence(db, task.id, input.head);
+  const settled = repairBlock(commits) + (decisions.length ? settledBlock(decisions) : "") + evidenceBlock(evidence, RISK_USE_EVIDENCE);
   const current = async () => (input.stillCurrent ? await input.stillCurrent() : true);
   const run = async (prompt: string) => {
     try {
@@ -956,7 +1011,7 @@ async function runVerification(
   let aborted = false;
   const jobs = [
     ...todoRisks.map((risk) => ({ kind: "risk" as const, text: risk, prompt: verifyPrompt(task, risk, input.diff, settled) })),
-    ...todoQuestions.map((q) => ({ kind: "question" as const, text: q, prompt: answerPrompt(task, q, input.diff) })),
+    ...todoQuestions.map((q) => ({ kind: "question" as const, text: q, prompt: answerPrompt(task, q, input.diff, evidenceBlock(evidence, QUESTION_USE_EVIDENCE)) })),
   ];
   const results = await mapLimit(jobs, RISK_CONCURRENCY, async (job) => {
     if (aborted) return null;
