@@ -1104,7 +1104,7 @@ export function transition(
       kind: "review",
       urgency: "urgent",
       task_id: taskId,
-      title: `Review #${task.number}: ${task.title}`,
+      title: `Review task ${task.number}: ${task.title}`,
       body: "Approve, request changes, or answer the understanding check.",
     });
   // Auto-teardown on an unambiguously-final state. failed is excluded (still retriable).
