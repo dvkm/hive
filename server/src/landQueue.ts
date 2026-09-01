@@ -252,6 +252,54 @@ function failedAttemptRun(db: DB, taskId: string): number {
   return failures;
 }
 
+// A non-transient failure is permanent until something actually changes: the
+// scope check, the missing understanding check, the confirmed risk and the
+// "task is not in_review" refusal all give the SAME answer on the same commit,
+// every sweep, forever. So a task gets ONE retry after the first non-transient
+// failure (the director answering "retry" on the pause card), and after that it
+// is held — still queued, not merged — until a human unqueues it or the agent
+// pushes a new head_sha. Measured on one machine: 116 land failures were only 30
+// real blockages, and a single PR contributed 52 of them (HIVE-555).
+const MAX_NON_TRANSIENT_ATTEMPTS = 2;
+
+// Consecutive trailing NON-transient failures against `headSha`. A success, a
+// transient failure, a fresh `land_queued` mark or an attempt on a different
+// head ends the run — the count is about this commit and this blocker.
+function nonTransientFailuresAtHead(db: DB, taskId: string, headSha: string | null): number {
+  const rows = db
+    .query(
+      `SELECT payload FROM events
+        WHERE task_id = ? AND type IN ('land_attempted', 'land_queued')
+        ORDER BY rowid DESC LIMIT 20`
+    )
+    .all(taskId) as { payload: string }[];
+  let failures = 0;
+  for (const row of rows) {
+    let payload: any = {};
+    try {
+      payload = JSON.parse(row.payload ?? "{}");
+    } catch {}
+    if (payload.ok !== false || payload.transient) break;
+    // Attempts written before this field existed carry no head: treat them as
+    // "unknown head" and stop counting rather than blocking on stale history.
+    if ((payload.head_sha ?? null) !== headSha) break;
+    failures++;
+  }
+  return failures;
+}
+
+// Log the hold once per episode, not once per 30s sweep.
+function alreadyBlocked(db: DB, taskId: string): boolean {
+  const row = db
+    .query(
+      `SELECT type FROM events
+        WHERE task_id = ? AND type IN ('land_blocked', 'land_attempted', 'land_queued', 'land_unqueued')
+        ORDER BY rowid DESC LIMIT 1`
+    )
+    .get(taskId) as { type: string } | undefined;
+  return row?.type === "land_blocked";
+}
+
 interface RetryState {
   transientFailures: number; // consecutive transient failures since the last non-attempt
   lastAttemptMs: number;
@@ -343,13 +391,17 @@ export function resolveLandPauseForDecision(db: DB, decisionId: string, answerKe
 // later. Same when the director simply unmarks the task. Modelled on
 // revalidateCiDecisions: showing a stale question is worse than showing none.
 async function revalidateLandPauseCards(db: DB): Promise<void> {
+  // A new head_sha closes the card too: the agent pushed, so the verdict that
+  // stopped the merge may genuinely differ now and the old question is stale.
   const rows = db
     .query(
       `SELECT d.id AS id, d.title AS title FROM events e
          JOIN decisions d ON d.id = json_extract(e.payload, '$.decision_id')
          JOIN tasks t ON t.id = e.task_id
         WHERE e.type = 'land_paused' AND d.status = 'open'
-          AND (t.state != 'in_review' OR t.land_queued_at IS NULL)`
+          AND (t.state != 'in_review' OR t.land_queued_at IS NULL
+               OR (t.head_sha IS NOT NULL AND json_extract(e.payload, '$.head_sha') IS NOT NULL
+                   AND t.head_sha != json_extract(e.payload, '$.head_sha')))`
     )
     .all() as { id: string; title: string }[];
   for (const r of rows) {
@@ -380,6 +432,23 @@ function alreadyHeldForSteer(db: DB, taskId: string): boolean {
   return row?.type === "land_retry_held";
 }
 
+// The commit the PR currently points at. `null` when hive has not synced one
+// yet; a null head simply means "no re-arm signal available", never a block.
+function headShaOf(db: DB, taskId: string): string | null {
+  return (db.query("SELECT head_sha FROM tasks WHERE id = ?").get(taskId) as { head_sha: string | null } | undefined)?.head_sha ?? null;
+}
+
+function lastLandFailureReason(db: DB, taskId: string): string | null {
+  const row = db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'land_attempted' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId) as { payload: string } | undefined;
+  try {
+    return JSON.parse(row?.payload ?? "{}")?.reason ?? null;
+  } catch {
+    return null;
+  }
+}
+
 // One sweep of the land queue for every project that has one. Lands everything
 // whose edges are satisfied and skips the rest for the next sweep.
 //
@@ -391,7 +460,10 @@ function alreadyHeldForSteer(db: DB, taskId: string): boolean {
 //
 // A failure that looks transient (base moved, merge-queue race, CI pending)
 // retries on a backoff and opens NO card. Anything else opens exactly one pause
-// card for that task and holds it until the card is answered.
+// card for that task and holds it until the card is answered, and gets at most
+// one retry after that: a permanent blocker gives the same answer on the same
+// commit every sweep, so hive holds the task instead of re-failing it forever
+// (HIVE-555). A new head_sha or a human re-arms it.
 export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
   const exec = deps.exec ?? defaultExec;
   const merge = deps.merge ?? ((id: string) => defaultMerge(db, id, exec));
@@ -443,6 +515,18 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         // otherwise every sweep would re-attempt and re-ask the same question.
         if (openPauseDecisionId(db, n.id)) continue;
         if (backingOff(retryState(db, n.id), nowMs)) continue;
+        // Retried once against an unchanged blocker and an unchanged commit:
+        // stop. Only a new head_sha or a human re-arms it (HIVE-555).
+        if (nonTransientFailuresAtHead(db, n.id, headShaOf(db, n.id)) >= MAX_NON_TRANSIENT_ATTEMPTS) {
+          if (!alreadyBlocked(db, n.id))
+            writeEvent(db, {
+              task_id: n.id,
+              source: "reconciler",
+              type: "land_blocked",
+              payload: { reason: lastLandFailureReason(db, n.id), head_sha: headShaOf(db, n.id) },
+            });
+          continue;
+        }
         // Out of attempts: stop retrying a merge that keeps refusing, and tell
         // the director rather than looping in silence.
         if (failedAttemptRun(db, n.id) >= MAX_LAND_ATTEMPTS) {
@@ -534,7 +618,7 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
           task_id: node.id,
           source: "reconciler",
           type: "land_attempted",
-          payload: { ok: result.ok, reason: result.reason, ...(result.ok ? {} : { transient }) },
+          payload: { ok: result.ok, reason: result.reason, ...(result.ok ? {} : { transient, head_sha: headShaOf(db, node.id) }) },
         });
       }
     }
@@ -548,6 +632,19 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
 
     for (const { node, reason } of failed) {
       if (openPauseDecisionId(db, node.id)) continue; // already asked
+      // Already asked once and retried once against this same commit: a second
+      // card would ask the identical question with the identical answer. Record
+      // the hold and stop (HIVE-555).
+      if (nonTransientFailuresAtHead(db, node.id, headShaOf(db, node.id)) >= MAX_NON_TRANSIENT_ATTEMPTS) {
+        if (!alreadyBlocked(db, node.id))
+          writeEvent(db, {
+            task_id: node.id,
+            source: "reconciler",
+            type: "land_blocked",
+            payload: { reason, head_sha: headShaOf(db, node.id) },
+          });
+        continue;
+      }
       // A conflict bounce already sent the task to its agent with rebase
       // instructions. Asking the director what to do about work hive has
       // already routed is the duplicate card this task exists to remove.
@@ -558,14 +655,21 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         title: `PR #${node.number} paused in the land queue`,
         context:
           `${node.title}\n\nIt is still approved to land, but the merge stopped: ${reason.slice(0, 300)}\n\n` +
-          `The approval sticks, so "Try landing it again" needs no re-marking.`,
+          `Retrying only helps if that cause has changed. Nothing has changed on its own, so the same merge will ` +
+          `fail the same way. Hive retries once and then holds the PR quietly until the agent pushes a new commit ` +
+          `or you take it out of the queue (\`hive land ${node.id} --off\`).`,
         options: [
-          { key: "retry", label: "Try landing it again", detail: "Keep it queued; the next sweep re-attempts the merge.", recommended: true },
+          { key: "send_back", label: "Send it back to the agent", detail: "Unmark it and ask the agent to fix what blocked the merge.", recommended: true },
           { key: "unqueue", label: "Take it out of the queue", detail: "Leave the PR open and unmarked. Nothing is sent to the agent." },
-          { key: "send_back", label: "Send it back to the agent", detail: "Unmark it and ask the agent to fix what blocked the merge." },
+          { key: "retry", label: "Try landing it again", detail: "Only if you just fixed the cause yourself. One more attempt, then hive holds it." },
         ],
       });
-      writeEvent(db, { task_id: node.id, source: "reconciler", type: "land_paused", payload: { decision_id: decision.id, reason } });
+      writeEvent(db, {
+        task_id: node.id,
+        source: "reconciler",
+        type: "land_paused",
+        payload: { decision_id: decision.id, reason, head_sha: headShaOf(db, node.id) },
+      });
     }
   }
 }
