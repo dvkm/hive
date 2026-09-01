@@ -4,7 +4,7 @@
 // "safe"), and anything unrecognized must fall to "unknown" (never "safe").
 import { test, expect } from "bun:test";
 import { join } from "node:path";
-import { classify, actionFor, escalate, guardTimeoutMs } from "../../hooks/classify.ts";
+import { classify, actionFor, escalate, guardTimeoutMs, pidLookup } from "../../hooks/classify.ts";
 
 const dangerous = [
   "rm -rf /",
@@ -270,6 +270,47 @@ test("agent-tooling kill downgrades to unknown; general kill stays dangerous", (
   expect(classify("killall node", env).decision).toBe("dangerous");
   expect(classify("kill -9 1234", env).decision).toBe("dangerous");
   expect(classify('kill %1; pkill -f "vite --mode dev"', env).decision).toBe("dangerous"); // pkill part unprovable
+});
+
+// The dev-server case from hive-1837: an agent backgrounds vite in its own
+// worktree, later finds it by PID, and the kill used to open a decision card —
+// so agents left the servers running and the worktree could not be reused.
+test("kill <pid> is waived when the process runs inside the agent's own sandbox", () => {
+  const env = { HOME: "/Users/ada" };
+  const wt = "/Users/ada/.herdr/worktrees/monorepo/hive-82218c1c44cd";
+  const real = pidLookup.cwd;
+  const cwds: Record<number, string | null> = {
+    4242: wt,
+    4243: `${wt}/apps/web`,
+    4244: "/private/tmp/claude-501/sess/scratchpad",
+    9999: "/Users/ada/projects/monorepo",
+    7777: null, // lookup failed / process already gone
+  };
+  pidLookup.cwd = (pid) => cwds[pid] ?? null;
+  try {
+    expect(classify("kill 4242", env).decision).toBe("unknown");
+    expect(classify("kill -9 4243", env).decision).toBe("unknown");
+    expect(classify("kill -TERM 4244", env).decision).toBe("unknown");
+    expect(classify("kill -s TERM 4242", env).decision).toBe("unknown");
+    expect(classify("kill 4242 4243", env).decision).toBe("unknown");
+    // outside the sandbox, unresolvable, or mixed with one that is → still gated
+    expect(classify("kill 9999", env).decision).toBe("dangerous");
+    expect(classify("kill -9 9999", env).decision).toBe("dangerous");
+    expect(classify("kill 7777", env).decision).toBe("dangerous");
+    expect(classify("kill 4242 9999", env).decision).toBe("dangerous");
+    // a PID is not a pattern: pkill/killall never take this branch
+    expect(classify("pkill 4242", env).decision).toBe("dangerous");
+    expect(classify("killall 4242", env).decision).toBe("dangerous");
+    expect(classify("sudo kill 4242", env).decision).toBe("dangerous");
+    // job control and pidfiles keep working without any PID lookup
+    pidLookup.cwd = () => {
+      throw new Error("must not resolve a PID here");
+    };
+    expect(classify("kill %1 2>/dev/null", env).decision).toBe("unknown");
+    expect(classify("pkill -F /tmp/claude-501/sess/scratchpad/dev.pid", env).decision).toBe("unknown");
+  } finally {
+    pidLookup.cwd = real;
+  }
 });
 
 test("git reset --hard / clean inside the agent's own worktree downgrades; the main checkout stays dangerous", () => {
