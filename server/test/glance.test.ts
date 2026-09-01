@@ -158,3 +158,27 @@ test("an essence too short to say anything gives way to the task title", async (
   const [card] = await catchupCards(db, {}, async () => OK());
   expect(card.headline).toBe("Stop the reconciler retiring live cards");
 });
+
+test("a git diff that fails reads as unavailable, not as a change with no files", async () => {
+  const { db, projectId } = seed();
+  shipped(db, projectId, { pr_url: "" });
+  // A wrong repo_path or a branch that no longer exists: git exits non-zero.
+  const fail = async (): Promise<ExecResult> => ({ code: 128, stdout: "", stderr: "fatal: bad revision" });
+
+  const [card] = await catchupCards(db, {}, fail);
+  expect(card.diff_unavailable).toBe(true);
+  expect(card.files).toBe(0);
+
+  // The failure is not cached, so the next read gets the real answer.
+  const [again] = await catchupCards(db, {}, async () => OK("3\t1\tserver/src/glance.ts\n"));
+  expect(again.diff_unavailable).toBe(false);
+  expect(again.files).toBe(1);
+});
+
+test("an empty diff that git really reported is a 0, not an unavailable", async () => {
+  const { db, projectId } = seed();
+  shipped(db, projectId, { pr_url: "" });
+  const [card] = await catchupCards(db, {}, async () => OK());
+  expect(card.diff_unavailable).toBe(false);
+  expect(card.files).toBe(0);
+});

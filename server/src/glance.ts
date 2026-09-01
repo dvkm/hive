@@ -43,6 +43,10 @@ export interface GlanceCard {
   files: number;
   additions: number;
   deletions: number;
+  // The diff could not be read at all (a wrong repo_path, a deleted branch, a
+  // gh call that failed). The counts above are then meaningless, and the card
+  // says so instead of showing a confident 0.
+  diff_unavailable: boolean;
   areas: GlanceArea[];
   images: GlanceImage[];
   explanation_url: string | null;
@@ -113,13 +117,16 @@ async function fileStats(
   db: DB,
   task: any,
   exec: Exec
-): Promise<{ path: string; additions: number; deletions: number }[]> {
+): Promise<{ files: { path: string; additions: number; deletions: number }[]; ok: boolean }> {
   const key = task.pr_url || (task.head_sha ? `sha:${task.head_sha}` : task.branch ? `br:${task.project_id}:${task.branch}` : "");
-  if (!key) return [];
+  if (!key) return { files: [], ok: false };
   const hit = statsCache.get(key);
-  if (hit) return hit;
+  if (hit) return { files: hit, ok: true };
 
   let files: { path: string; additions: number; deletions: number }[] = [];
+  // Did any source actually answer? An empty diff and a diff we could not read
+  // are different facts, and only one of them may render as 0.
+  let ok = false;
   if (task.pr_url) {
     const r = await exec(["gh", "pr", "view", task.pr_url, "--json", "files"]);
     if (r.code === 0) {
@@ -129,6 +136,7 @@ async function fileStats(
           additions: Number(f.additions) || 0,
           deletions: Number(f.deletions) || 0,
         }));
+        ok = true;
       } catch {
         /* a gh answer we cannot parse is the same as no stats */
       }
@@ -147,11 +155,16 @@ async function fileStats(
       }
       const base = projectComparisonBase(config);
       const r = await exec(["git", "-C", project.repo_path, "diff", "--numstat", `${base}...${task.branch}`]);
-      if (r.code === 0) files = parseNumstat(r.stdout);
+      if (r.code === 0) {
+        files = parseNumstat(r.stdout);
+        ok = true;
+      }
     }
   }
-  if (files.length) statsCache.set(key, files);
-  return files;
+  // Only a real answer is worth keeping. Caching a failure would freeze
+  // "unavailable" onto the card until the server restarts.
+  if (ok) statsCache.set(key, files);
+  return { files, ok };
 }
 
 // Short enough to say nothing. "Two changes." is a real essence a real agent
@@ -233,7 +246,7 @@ export async function catchupCards(
 
   return await Promise.all(
     tasks.map(async (task) => {
-      const files = await fileStats(db, task, exec);
+      const { files, ok } = await fileStats(db, task, exec);
       return {
         task_id: task.id,
         number: task.number,
@@ -248,6 +261,7 @@ export async function catchupCards(
         files: files.length,
         additions: files.reduce((n, f) => n + f.additions, 0),
         deletions: files.reduce((n, f) => n + f.deletions, 0),
+        diff_unavailable: !ok,
         areas: areasFromFiles(files),
         images: imagesFor(db, task.id),
         explanation_url: explanationUrl(db, task.id),

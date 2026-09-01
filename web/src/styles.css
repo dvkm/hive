@@ -6327,6 +6327,12 @@ a.chip-jira:hover { background: #2d5488; }
   border: 1px dashed var(--border-soft);
   border-radius: 8px;
 }
+/* An unread diff must not read like an empty one, so it is marked, not muted
+   into the same grey as the numbers it replaces. */
+.glance-unavailable {
+  color: var(--amber);
+  font-style: italic;
+}
 .glance-facts {
   display: flex;
   align-items: center;

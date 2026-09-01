@@ -60,10 +60,15 @@ function Visual({ card }: { card: GlanceCard }) {
   if (card.areas.length) return <AreaBars areas={card.areas} />;
   // Neither a picture nor a diff shape: say so in the visual's place rather
   // than leaving a hole the eye has to interpret. A scout ships a report, so
-  // "no diff" is the answer, not a gap.
+  // "no diff" is the answer, not a gap. A diff we could not read is a third
+  // thing, and it must never look like an empty one.
   return (
     <p className="glance-noshape">
-      {card.kind === "scout" ? "A report, not a code change." : "No diff shape recorded for this change."}
+      {card.diff_unavailable
+        ? "Diff unavailable: this change could not be read."
+        : card.kind === "scout"
+          ? "A report, not a code change."
+          : "No diff shape recorded for this change."}
     </p>
   );
 }
@@ -82,9 +87,15 @@ function Card({ card }: { card: GlanceCard }) {
       <p className="glance-line" title={card.title}>{capLine(card.headline) || card.title}</p>
       <Visual card={card} />
       <footer className="glance-facts">
-        <span>{card.files} file{card.files === 1 ? "" : "s"}</span>
-        <span className="diff-add">+{card.additions}</span>
-        <span className="diff-del">−{card.deletions}</span>
+        {card.diff_unavailable ? (
+          <span className="glance-unavailable" title="The diff could not be read, so these counts are unknown">diff unavailable</span>
+        ) : (
+          <>
+            <span>{card.files} file{card.files === 1 ? "" : "s"}</span>
+            <span className="diff-add">+{card.additions}</span>
+            <span className="diff-del">−{card.deletions}</span>
+          </>
+        )}
         {/* See it, dislike it, file the rework without leaving the card. The
             note becomes a follow-up task carrying this change's context. */}
         <RequestChanges taskId={card.task_id} compact />

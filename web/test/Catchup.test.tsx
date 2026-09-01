@@ -26,6 +26,7 @@ const card = (over: Partial<GlanceCard> = {}): GlanceCard => ({
   files: 3,
   additions: 120,
   deletions: 4,
+  diff_unavailable: false,
   areas: [{ area: "web/src", churn: 124 }],
   images: [],
   explanation_url: "/evidence/x/explain.html",
@@ -101,4 +102,13 @@ test("every card carries Request changes, so disliking a change never leaves the
     (n) => n.type === "button" && n.children[0] === "Request changes"
   );
   expect(buttons).toHaveLength(2);
+});
+
+test("a change whose diff could not be read says so instead of showing zeros", async () => {
+  const renderer = await render([card({ diff_unavailable: true, files: 0, additions: 0, deletions: 0, areas: [], images: [] })]);
+  const text = JSON.stringify(renderer.toJSON());
+  expect(text).toContain("diff unavailable");
+  expect(text).toContain("could not be read");
+  // The lie this replaces: a confident "0 files, +0, -0" on a decision surface.
+  expect(text).not.toContain("0 files");
 });

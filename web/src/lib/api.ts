@@ -806,6 +806,7 @@ export interface GlanceCard {
   files: number;
   additions: number;
   deletions: number;
+  diff_unavailable: boolean;
   areas: { area: string; churn: number }[];
   images: { url: string; caption: string | null; phase: "before" | "after" | null }[];
   explanation_url: string | null;
