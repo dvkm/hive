@@ -195,3 +195,75 @@ for (const state of ["done", "failed", "verifying"] as const) {
     expect(labels[0].children.join("")).toContain("Confirm you understood the change");
   });
 }
+
+// HIVE-570: the risk verdicts belong to the change, not to the land queue. The
+// review card carries them while the task is in review; after it ships (or gets
+// bounced) the task page has to keep them, or the record of what was found and
+// what the director accepted disappears with the card that asked about it.
+test("the task page keeps the risk verdicts after the task leaves review (HIVE-570)", async () => {
+  const t = task("shipped", { state: "done", head_sha: "abc1234def" });
+  const withVerdicts: TaskDetail = {
+    ...detail(t),
+    events: [
+      {
+        id: "auto-1",
+        task_id: t.id,
+        ts: "2026-01-01T00:00:00.000Z",
+        source: "system",
+        type: "auto_review",
+        payload: { verdict: "caution", risks: ["a leak"], questions: [] },
+      } as any,
+      {
+        id: "rv-1",
+        task_id: t.id,
+        ts: "2026-01-01T00:00:01.000Z",
+        source: "system",
+        type: "risk_verdicts",
+        payload: { reviewed_head_sha: "abc1234def", verdicts: [{ risk: "a leak", verdict: "confirmed", why: "checked it" }] },
+      } as any,
+    ],
+  };
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t, fakeStore, withVerdicts));
+  });
+  const text = JSON.stringify(renderer.toJSON());
+  expect(text).toContain("a leak");
+  expect(text).toContain("confirmed");
+  expect(text).toContain("still open");
+});
+
+// A card hive closed on its own was never answered. Saying "Answered: null" both
+// lied and deleted the only explanation the director had (HIVE-570).
+test("an expired decision says it closed without an answer, and why (HIVE-570)", async () => {
+  const t = task("expired-card", { state: "in_progress" });
+  const withExpired: TaskDetail = {
+    ...detail(t),
+    decisions: [
+      {
+        id: "dec-1",
+        task_id: t.id,
+        ts: "2026-01-01T00:00:00.000Z",
+        title: "PR #1 paused in the land queue",
+        context: "It is still approved to land, but the merge stopped: CI is red",
+        risk: "normal",
+        blast_radius: null,
+        options: [],
+        status: "expired",
+        answer_key: null,
+        answer_note: "Hive closed this because you took it out of the land queue, so the pause it asked about is over.",
+        answered_at: "2026-01-01T00:01:00.000Z",
+        answered_by: "reconciler",
+      } as any,
+    ],
+  };
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t, fakeStore, withExpired));
+  });
+  const text = JSON.stringify(renderer.toJSON());
+  expect(text).toContain("Closed without an answer");
+  expect(text).toContain("you took it out of the land queue");
+  expect(text).toContain("CI is red");
+  expect(text).not.toContain("Answered:");
+});
