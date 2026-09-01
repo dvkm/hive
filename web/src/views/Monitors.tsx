@@ -5,7 +5,7 @@ import { useStore } from "../lib/store";
 import { relTime } from "../lib/time";
 
 export default function Monitors() {
-  const { projects } = useStore();
+  const { projects, projectsLoaded } = useStore();
   const [incidents, setIncidents] = useState<Incident[] | null>(null);
   const [available, setAvailable] = useState(true);
 
@@ -26,7 +26,7 @@ export default function Monitors() {
       {!available && (
         <div className="notice">Incidents API not running yet — showing configured monitors only.</div>
       )}
-      {projects.length === 0 && <div className="muted pad">No projects.</div>}
+      {projects.length === 0 && projectsLoaded && <div className="muted pad">No projects.</div>}
       {projects.map((p) => {
         const monitors = p.config?.monitors || [];
         const incs = forProject(p.id);

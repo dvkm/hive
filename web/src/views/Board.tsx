@@ -779,7 +779,7 @@ export default function Board() {
 // queues a task directly. Both surface live via SSE, so no manual refresh.
 // Exported so the command palette can open it over any view.
 export function NewTaskModal({ onClose }: { onClose: () => void }) {
-  const { projects } = useStore();
+  const { projects, projectsLoaded } = useStore();
   const [mode, setMode] = useState<"braindump" | "manual">("braindump");
   const [project, setProject] = useState("");
   const [dump, setDump] = useState("");
@@ -835,7 +835,7 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
           </button>
         </div>
         {projects.length === 0 ? (
-          <div className="muted">No projects yet. Create one first.</div>
+          projectsLoaded ? <div className="muted">No projects yet. Create one first.</div> : null
         ) : (
           <>
             <label className="fld">
