@@ -17,7 +17,7 @@ import { latestSidecar, latestSidecarBatch, type SidecarReport } from "./sidecar
 import { reviewActionable, reviewActionableBatch } from "./reviewer.ts";
 import { isReviewed } from "./dispatcher.ts";
 
-export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
+export type HealthStatus = "healthy" | "deferred" | "silent" | "stuck" | "dead";
 
 // Permanent skip reasons that are this TASK's problem, not a project setting —
 // the ones worth an attention item rather than just a label.
@@ -137,8 +137,13 @@ export function computeHealth(db: DB, task: any, nowMs = Date.now()): Health | n
   // the agent exits normally right after emitting `deferred`, herdr reports it
   // gone, and the dead/stuck branches below would otherwise re-surface exactly
   // the "gone quiet" nag `deferred` exists to suppress (task #1078).
+  // Reported as its own status, not as "healthy": a consumer that only reads
+  // health.status would otherwise see parked work as ordinary working work, and
+  // one that treats "not healthy" as trouble would nag about it. `deferred` says
+  // exactly what is true — unfinished, deliberately quiet, waiting on a human
+  // (HIVE-547). It is NOT an attention status (needsAttention below).
   if (isDeferred(task, nowMs)) {
-    return { status: "healthy", reason: "deferred", since: task.updated_at as string };
+    return { status: "deferred", reason: "parked pending a human action", since: task.updated_at as string };
   }
 
   const events = db

@@ -4,7 +4,7 @@ import type { State, CiStatus, Health, SidecarReport } from "./api";
 import { STATE_LABEL, HEALTH_LABEL } from "./labels";
 import { DEP_MET_STATES } from "./needsYou";
 
-export { STATE_LABEL, HEALTH_LABEL, NEXT } from "./labels"; // callers keep importing them from here
+export { STATE_LABEL, HEALTH_LABEL, NEXT, needsLook } from "./labels"; // callers keep importing them from here
 
 // Status dot. When the server reports health, the dot reflects HEALTH (green
 // pulse / amber / orange / red) with the reason as tooltip; otherwise it falls

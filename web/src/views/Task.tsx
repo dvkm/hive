@@ -8,7 +8,7 @@ import { RaceCompare } from "./Race";
 import type { Decision, Evidence, JiraTaskState, TaskDetail, UsageTotals } from "../lib/api";
 import { useStore } from "../lib/store";
 import { splitAttachments } from "../lib/attachments";
-import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, NEXT, PriorityChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, needsLook, NEXT, PriorityChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { ReviewAudit, ReviewCard, ReviewUnderstanding } from "./ReviewCard";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
@@ -726,7 +726,7 @@ export function TaskBody({ id }: { id: string }) {
   const health = t.health;
   // A review has already left the agent's hands. A gone worker is expected at
   // this point, not a recovery action for the director.
-  const unhealthy = !codeReview && health && health.status !== "healthy";
+  const unhealthy = !codeReview && needsLook(health);
 
   return (
     <div className={`task ${codeReview ? "task-reviewing" : ""}`}>

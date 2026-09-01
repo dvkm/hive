@@ -213,13 +213,19 @@ evidence captured against an older commit as stale.
 visible symptom that a task pointing at a live agent is actually fine or actually
 stuck. **It is the single source of truth; clients render it, never re-derive
 it.** Shape `{status, reason, since}`:
-- `status ∈ {healthy, silent, stuck, dead}`; `reason` is a human string (or null
+- `status ∈ {healthy, deferred, silent, stuck, dead}`; `reason` is a human string (or null
   when healthy) — usually short and fixed, but the `merge_failed` cause below
   passes through raw git/gh error text, so clients must clamp it; `since` is the
   ISO ts the current condition began.
 - `null` for `queued`, `done`, `failed`, `cancelled`, and any task with no
   `agent_target`.
-- Derivation (pure function of events, precedence dead > stuck > silent >
+- **deferred** wins over every other status: the task is parked pending an offline
+  human action (`deferred_until` in the future) and is quiet ON PURPOSE. It is NOT
+  an attention status — clients must not count it as trouble, and must not nag
+  about idleness while it holds. This is how a consumer that only reads `health`
+  learns a task is parked without knowing about the `deferred_until` column
+  (HIVE-547).
+- Derivation (pure function of events, precedence deferred > dead > stuck > silent >
   healthy): **dead** = `agent_target` set but the reconciler's probe recorded the
   agent `gone`; **stuck** = herdr reports `blocked`, OR a stale-recovery escalation
   is in flight (newest event `stale`/`recovery_nudge`), OR the agent went `idle` on
@@ -737,7 +743,8 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   The setting defaults to false.
 - `POST /api/tasks/:id/jira/sync` body `{}` → `200` sync result | `404`
   Runs the same project Jira cycle used by the scheduler.
-- `POST /api/tasks/:id/transition` body `{to (required), reason?, source?}` → `200 Task` | `409` (invalid transition or `done` without evidence) | `404`
+- `POST /api/tasks/:id/transition` body `{to (required), reason?, source?, until?, days?}` → `200 Task` | `409` (invalid transition or `done` without evidence) | `404`
+  `to: "deferred"` is accepted even though `deferred` is not a lifecycle state: it parks the task exactly like `hive emit <id> deferred` (sets `deferred_until` from `until`/`days`, else the indefinite sentinel; the task stays `in_progress`) and returns `409` only when the task is already terminal. Moving a parked task to `in_progress` un-parks it (clears `deferred_until`, writes `undeferred`, queues the resume steer) instead of failing as a self-transition. So `hive task move <id> deferred` and `hive emit <id> deferred` agree (HIVE-547).
   When `to` is `verifying`, the project's post-deploy smoke list (`config.smoke`) runs once before the response returns. A smoke failure bounces the task back to `in_progress`, so the returned Task may be `in_progress`, not `verifying`.
 - `POST /api/tasks/:id/spawn` body `{hive_url?}` → `200 {"ok":true, "task": Task, "agent_target":"..."}` | `400` (project has no `repo_path`) | `404` | `502` (dispatch refused or herdr spawn failed; a `spawn_error` event is recorded)
   Creates the herdr worktree (`hive/<task-id>`), starts the agent with `HIVE_TASK_ID`/`HIVE_URL` + the project's resolved secrets in env and the composed brief, sets `agent_target`/`worktree_path`/`branch`, transitions `queued → in_progress`, and writes a `spawned` event.

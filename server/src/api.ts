@@ -2896,8 +2896,29 @@ function getTaskFull(db: DB, id: string): Response {
 }
 
 async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
-  if (!body?.to) return err("'to' state is required: hive task move <task-id> <queued|in_progress|needs_decision|in_review|verifying|done|failed|cancelled>");
+  if (!body?.to) return err("'to' state is required: hive task move <task-id> <queued|in_progress|needs_decision|in_review|verifying|done|deferred|failed|cancelled>");
   const to = body.to as State;
+  // `deferred` is not a lifecycle state (the task stays in_progress, task #679)
+  // but the director thinks of parking as a move — and `hive emit <id> deferred`
+  // used to be the ONLY way to do it. Accept the move and park it, so the two
+  // ways of saying "park this" agree (HIVE-547).
+  if (String(to) === "deferred" || String(to) === "defer") {
+    const t = getTask(db, id);
+    if (!t) return noTask(id);
+    if (TERMINAL.includes(t.state as State)) return err(`task is ${t.state}; there is nothing to park`, 409);
+    return json(taskWithHealth(db, deferTask(db, id, deferUntil(body?.until, body?.days), { source: body.source ?? "director", note: body.reason })));
+  }
+  // The way back out. A parked task is already in_progress, so a plain move
+  // there would be an invalid self-transition — un-defer instead, which also
+  // steers the (idle) agent to pick the work back up.
+  if (to === "in_progress") {
+    const t = getTask(db, id);
+    if (t && isDeferred(t)) {
+      const task = undeferTask(db, id, { source: body.source ?? "director", note: body.reason });
+      queueSteerEvent(db, id, `This task was un-deferred${body?.reason ? `: ${body.reason}` : ""} — re-read your last steps, emit a status note, and continue.`, "un-deferred");
+      return json(taskWithHealth(db, task));
+    }
+  }
   // A reviewer bounce (`hive task move <id> in_progress --note`) IS a
   // request-changes: it must deliver the note and keep an agent on the task. A
   // plain transition here dropped the note into the event log, respawned nobody,

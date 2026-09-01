@@ -1288,6 +1288,23 @@ test("flagStale skips a deferred task (future deferred_until) — no nudge", asy
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'stale'").all(id).length).toBe(1);
 });
 
+// The other half of the "parking stops the nudges" promise: flagStale above
+// keeps the stale flag off, and this keeps recoverStale from failing/requeueing a
+// parked task whose agent has (normally) exited — herdr reports it gone (HIVE-547).
+test("recoverStale leaves a deferred task alone even when its agent is gone", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent_target: "d-agent" });
+  transition(db, id, "in_progress");
+  db.query("UPDATE tasks SET deferred_until = ? WHERE id = ?").run("9999-12-31T00:00:00.000Z", id);
+  writeEvent(db, { task_id: id, source: "reconciler", type: "agent_status", payload: { status: "gone" } });
+
+  await reconcileOnce(db, { staleMs: 15 * 60 * 1000, nowMs: () => Date.now() + 60 * 60 * 1000, herdr: new Herdr(stub(() => OK(JSON.stringify({ result: { agent: null } }))), "herdr") });
+
+  expect(getTask(db, id).state).toBe("in_progress");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery'").get(id)).toBeFalsy();
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery_nudge'").get(id)).toBeFalsy();
+});
+
 // A herdr whose `agent get` reports a fixed status (agent alive with a pane).
 const statusHerdr = (status: string) =>
   new Herdr(stub(() => OK(`{"result":{"agent":{"agent_status":"${status}","pane_id":"w1:p1"}}}`)), "herdr");
