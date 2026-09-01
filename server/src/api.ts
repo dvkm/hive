@@ -6686,7 +6686,7 @@ async function resumePointerMarkerHolds(db: DB, exec: Exec, ids: string[], prUrl
 // there is no such PR, and GitHub says the PR sits on a different branch than
 // this task's. A gh that is broken, rate-limited or offline must not strand
 // every handoff in the fleet.
-type PrHandoffCheck = { branch: string | null; problem?: { reason: string; message: string } };
+type PrHandoffCheck = { branch: string | null; unverifiable?: boolean; problem?: { reason: string; message: string } };
 
 async function checkPrHandoff(exec: Exec, prUrl: string, task: { branch?: string | null }): Promise<PrHandoffCheck> {
   const url = prUrl.trim();
@@ -6702,7 +6702,11 @@ async function checkPrHandoff(exec: Exec, prUrl: string, task: { branch?: string
   if (!result) return { branch: null };
   if (result.code !== 0) {
     const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-    if (/could not resolve to a pullrequest|no pull requests found|could not find|not found|404/i.test(output))
+    // Only phrasing that unambiguously means "no such PR". A bare `not found`
+    // or `404` also comes back when the token cannot see a private repo
+    // ("HTTP 404: Not Found"), and holding a correct handoff during a token
+    // problem is worse than letting the land queue catch a bad link later.
+    if (/could not resolve to a pullrequest|no pull requests found/i.test(output))
       return {
         branch: null,
         problem: {
@@ -6716,11 +6720,17 @@ async function checkPrHandoff(exec: Exec, prUrl: string, task: { branch?: string
     return { branch: null };
   }
   let branch: string | null = null;
+  let unverifiable = false;
   try {
     const parsed = JSON.parse(result.stdout)?.headRefName;
     branch = isSafeRef(parsed) ? parsed : null;
+    // An unusual branch name is not evidence of anything, so we still link it —
+    // but the branch check did not run, and the timeline should say so rather
+    // than imply the branch was verified.
+    if (!branch) unverifiable = true;
   } catch {
     branch = null;
+    unverifiable = true;
   }
   if (branch && task.branch && branch !== task.branch)
     return {
@@ -6733,7 +6743,7 @@ async function checkPrHandoff(exec: Exec, prUrl: string, task: { branch?: string
           `Emit ready with the PR whose head branch is ${task.branch}.`,
       },
     };
-  return { branch };
+  return { branch, unverifiable };
 }
 
 async function prHeadBranch(exec: Exec, prUrl: string): Promise<string | null> {
@@ -6994,42 +7004,35 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     // and head_sha reset because they described the old PR. Refresh branch too:
     // the destructive-rebase guard and cleanup must inspect the replacement
     // PR's head, not the stale branch from the rejected attempt.
+    let prHold: { reason: string; message: string; branch: string | null } | null = null;
     if (prUrl && prUrl !== t.pr_url) {
       const check = await checkPrHandoff(exec, prUrl, t);
       if (check.problem) {
+        // Held below, AFTER the note is written: an agent explaining its
+        // handoff should not lose that explanation, the way the other ready
+        // holds (stale_review, no_evidence) don't.
+        prHold = { ...check.problem, branch: check.branch };
+      } else {
+        const branch = check.branch;
+        db.query("UPDATE tasks SET pr_url = ?, branch = COALESCE(?, branch), ci_status = NULL, head_sha = NULL, updated_at = ? WHERE id = ?").run(
+          prUrl,
+          branch,
+          now(),
+          taskId
+        );
         writeEvent(db, {
           task_id: taskId,
           source,
-          type: "ready_held",
+          type: "pr_linked",
           payload: {
-            reason: check.problem.reason,
             pr_url: prUrl,
-            task_branch: t.branch ?? null,
-            ...(check.branch ? { pr_branch: check.branch } : {}),
-            kept: t.pr_url ?? null,
+            via: t.pr_url ? "ready_replaced" : "ready",
+            ...(t.pr_url ? { replaced: t.pr_url } : {}),
+            ...(branch ? { branch } : {}),
+            ...(check.unverifiable ? { branch_unverified: true } : {}),
           },
         });
-        broadcastTask(db, getTask(db, taskId));
-        return json({ held: true, reason: check.problem.reason, message: check.problem.message });
       }
-      const branch = check.branch;
-      db.query("UPDATE tasks SET pr_url = ?, branch = COALESCE(?, branch), ci_status = NULL, head_sha = NULL, updated_at = ? WHERE id = ?").run(
-        prUrl,
-        branch,
-        now(),
-        taskId
-      );
-      writeEvent(db, {
-        task_id: taskId,
-        source,
-        type: "pr_linked",
-        payload: {
-          pr_url: prUrl,
-          via: t.pr_url ? "ready_replaced" : "ready",
-          ...(t.pr_url ? { replaced: t.pr_url } : {}),
-          ...(branch ? { branch } : {}),
-        },
-      });
     } else if (prUrl) {
       const branch = await prHeadBranch(exec, prUrl);
       if (branch && branch !== t.branch) {
@@ -7043,6 +7046,22 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       }
     }
     if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });
+    if (prHold) {
+      writeEvent(db, {
+        task_id: taskId,
+        source,
+        type: "ready_held",
+        payload: {
+          reason: prHold.reason,
+          pr_url: prUrl,
+          task_branch: t.branch ?? null,
+          ...(prHold.branch ? { pr_branch: prHold.branch } : {}),
+          kept: t.pr_url ?? null,
+        },
+      });
+      broadcastTask(db, getTask(db, taskId));
+      return json({ held: true, reason: prHold.reason, message: prHold.message });
+    }
     if (t.state === "in_progress") {
       if (decisionAnswerUnaddressed(db, taskId)) {
         writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { reason: "stale_review" } });

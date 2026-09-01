@@ -134,3 +134,50 @@ test("a pr_url that is not even a URL is refused without asking gh", async () =>
   expect(r.json.reason).toBe("pr_url_not_a_url");
   await s.server.stop(true);
 });
+
+// The three risk findings on the first cut of this change (HIVE-595).
+
+test("a 404 from an unauthorised token fails open instead of holding", async () => {
+  const db = openDb(":memory:");
+  const exec: Exec = async (argv) =>
+    argv[0] === "gh"
+      ? { code: 1, stdout: "", stderr: "GraphQL: Could not resolve to a Repository\nHTTP 404: Not Found (https://api.github.com/...)" }
+      : OK();
+  const server = Bun.serve({ port: 0, fetch: makeHandler(db, { exec }) });
+  const base = `http://127.0.0.1:${server.port}`;
+  const id = await seed(base, db, "https://github.com/dvkm/hive/pull/141");
+
+  const r = await post(base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://github.com/dvkm/hive/pull/166" });
+  expect(r.json.held).toBeUndefined();
+  expect(r.json.task.pr_url).toBe("https://github.com/dvkm/hive/pull/166");
+  await server.stop(true);
+});
+
+test("a branch name we cannot verify links, but is marked unverified", async () => {
+  const s = makeServer({ "https://github.com/dvkm/hive/pull/141": "hive/mine", "https://github.com/dvkm/hive/pull/166": "feature/oops~1" });
+  const id = await seed(s.base, s.db, "https://github.com/dvkm/hive/pull/141");
+
+  const r = await post(s.base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://github.com/dvkm/hive/pull/166" });
+  expect(r.json.held).toBeUndefined();
+  expect(r.json.task.pr_url).toBe("https://github.com/dvkm/hive/pull/166");
+  const linked = s.db
+    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_linked' ORDER BY id DESC LIMIT 1")
+    .get(id) as any;
+  expect(JSON.parse(linked.payload).branch_unverified).toBe(true);
+  await s.server.stop(true);
+});
+
+test("a held handoff still records the agent's note", async () => {
+  const s = makeServer({ "https://github.com/dvkm/hive/pull/141": "hive/mine" });
+  const id = await seed(s.base, s.db, "https://github.com/dvkm/hive/pull/141");
+
+  const r = await post(s.base, `/api/tasks/${id}/events`, {
+    type: "ready",
+    pr_url: "https://github.com/dvkm/hive/pull/1847",
+    note: "rebased and reopened, here is why",
+  });
+  expect(r.json.reason).toBe("pr_not_found");
+  const note = s.db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'note' ORDER BY id DESC LIMIT 1").get(id) as any;
+  expect(JSON.parse(note.payload).note).toContain("rebased and reopened");
+  await s.server.stop(true);
+});
