@@ -221,7 +221,10 @@ test("a throwaway server that forgets HIVE_DB exits instead of attaching to the 
     stdout: "pipe",
     stderr: "pipe",
   });
-  const [code, err] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+  const [code, err] = await Promise.all([
+    proc.exited,
+    new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+  ]);
   expect(code).toBe(1);
   expect(err).toContain("REFUSING TO START");
   expect(err).toContain("HIVE_DB=");

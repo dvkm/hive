@@ -1,7 +1,7 @@
 // Human-readable event sentences, in ONE place so any view can reuse them.
 // Pure: a function of the event alone (type + payload), no React, no store.
 import { STATE_LABEL } from "./labels"; // not ./ui — that imports react, and the server tests import this file
-import type { State } from "./api";
+import type { State } from "./domain"; // not ./api — that pulls in DOM globals the server-test tsconfig doesn't have
 
 // The event shape this module needs — a subset of Event / FeedEvent.
 export interface EventLike {

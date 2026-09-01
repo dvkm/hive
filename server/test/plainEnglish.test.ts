@@ -38,7 +38,7 @@ test("the agent brief and the planner prompt both carry the plain-English bar", 
 });
 
 test("the drift judge and the auto-reviewer both carry the plain-English bar", async () => {
-  expect(driftPrompt({ brief: "b" }, { files: ["x.ts"], commits: ["c"] })).toContain(PLAIN_ENGLISH);
+  expect(driftPrompt({ brief: "b" }, { files: ["x.ts"], commits: ["c"], samples: {} })).toContain(PLAIN_ENGLISH);
 
   const { db, id } = seed();
   transition(db, id, "in_progress");
