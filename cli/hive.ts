@@ -39,6 +39,9 @@ Usage:
         id this task should still wait on, not just the new one
         --clear-resume drops a stale "adopt this PR" pointer that is blocking
         every dispatch of the task (the PR no longer carries its hive marker)
+        --clear-pr detaches a wrong pr_url — a link to a pull request that is
+        not this task's work, which the reconciler would otherwise read as this
+        task's state
   hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>] [--landing-commit <sha>] [--verify-name <name>]
         types: status | evidence | needs-decision | ready | done | unmergeable | blocked | deferred | undefer | review_summary | <custom>
         unmergeable: this task's PR has nothing left to merge (GitHub refused to
@@ -286,18 +289,23 @@ async function main() {
     }
     if (sub === "update") {
       const taskId = _[0];
-      if (!taskId) die("usage: hive task update <task-id> [--depends-on <id,id>] [--priority now|next|normal|later] [--clear-resume]");
-      if (flags["depends-on"] === undefined && flags.priority === undefined && flags["clear-resume"] === undefined)
-        die("pass --depends-on (full replace — every id this task should wait on), --priority, and/or --clear-resume");
+      if (!taskId) die("usage: hive task update <task-id> [--depends-on <id,id>] [--priority now|next|normal|later] [--clear-resume] [--clear-pr]");
+      if (flags["depends-on"] === undefined && flags.priority === undefined && flags["clear-resume"] === undefined && flags["clear-pr"] === undefined)
+        die("pass --depends-on (full replace — every id this task should wait on), --priority, --clear-resume, and/or --clear-pr");
       // --clear-resume drops a stale adoption pointer at a PR that no longer
       // resolves, which otherwise blocks every dispatch of this task forever.
       const t = await api("PUT", `/api/tasks/${taskId}`, {
         depends_on: flags["depends-on"] !== undefined ? String(flags["depends-on"]) : undefined,
         priority: flags.priority ? String(flags.priority) : undefined,
         ...(flags["clear-resume"] ? { resume_pr_url: null, resume_branch: null } : {}),
+        // --clear-pr detaches a pr_url that points at someone else's pull
+        // request, so the reconciler stops reading that PR's state as this
+        // task's (#2093).
+        ...(flags["clear-pr"] ? { pr_url: null } : {}),
       });
       console.log(`task ${t.id} depends_on: ${t.depends_on.length ? t.depends_on.join(", ") : "(none)"}  priority: ${t.priority}`);
       if (flags["clear-resume"]) console.log("  resume pointer cleared — it can be dispatched again");
+      if (flags["clear-pr"]) console.log("  PR link cleared — hive no longer reads that pull request as this task's");
       return;
     }
     // Take the worktree over by hand, and hand it back when done (HIVE-352).

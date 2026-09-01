@@ -197,7 +197,7 @@ test("reconciler backfills in_progress tasks whose PR is already open", async ()
   const id = makeTask(db, projectId, { pr_url: "https://gh/pr/6" }); // linked before the hand-off existed
   transition(db, id, "in_progress", { source: "director" });
   const gh: Exec = stub((argv) => {
-    if (argv.includes("view")) return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [] }));
+    if (argv.includes("view")) return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], body: `hive-task: ${id}` }));
     return { code: 1, stdout: "", stderr: "skip" };
   });
   await reconcileOnce(db, { exec: gh });

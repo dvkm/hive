@@ -767,7 +767,7 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   - `failed` — the task is terminal, so no spawn will ever carry it.
 
   Never throws. A herdr failure additionally records a `steer_error` event. The timeline renders the receipt (`✓` / `⏳ queued` / `⚠ undelivered`) so a steer never has to be re-sent blind. Besides the respawn drain, the reconciler re-attempts every queued steer each cycle against any agent with an active turn (receipt flips with `delivered_via:"drain"`); a successful drain writes no event of its own — the receipt flip is the record, and a fresh event would reset the task's silence clock and mask a mute agent from `stale` detection.
-- `PUT /api/tasks/:id` body `{title?, brief?, depends_on?, verification_cmds?, priority?, resume_pr_url?, resume_branch?, source?}` (or multipart: same fields + `files`) → `200 Task` | `404` | `400` (a field this endpoint does not write, an unknown/self-referencing `depends_on` id, an invalid `verification_cmds`, an invalid `priority`, or a non-null `resume_pr_url`/`resume_branch`) | `403` (a non-director `source` setting `priority: "now"` — see [Priority](#priority))
+- `PUT /api/tasks/:id` body `{title?, brief?, depends_on?, verification_cmds?, priority?, pr_url?, resume_pr_url?, resume_branch?, source?}` (or multipart: same fields + `files`) → `200 Task` | `404` | `400` (a field this endpoint does not write, an unknown/self-referencing `depends_on` id, an invalid `verification_cmds`, an invalid `priority`, or a non-null `pr_url`/`resume_pr_url`/`resume_branch`) | `403` (a non-director `source` setting `priority: "now"` — see [Priority](#priority))
   Attached files are appended to the resulting `brief` under an `## Attachments` heading.
   Updates a task's editable fields. Used by the attention tray's "edit & requeue"
   flow before it re-queues a failed task, and by `hive task update <id> --depends-on <id,id>` —
@@ -788,6 +788,11 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   different PR or branch by hand is how one task's work lands on another's.
   A clear writes a `resume_pointer_cleared` event carrying the dropped values,
   so the timeline explains why a task that was undispatchable suddenly isn't.
+  `pr_url` is **clear-only** in the same way (`hive task update <id> --clear-pr`):
+  send `null` to detach a link to a pull request that is not this task's work.
+  Clearing it also drops the `ci_status`, `head_sha` and `pr_state` that
+  described that PR, and writes a `pr_link_cleared` event. Linking the right PR
+  is the marker's job (`POST /api/tasks/link-pr`, or the agent's `ready`).
   Any other field is a `400` naming it. The endpoint never accepts a write it
   then drops: a silently ignored field leaves the caller believing a change
   landed when nothing did (HIVE-585).

@@ -27,7 +27,7 @@ import { supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { activeProjects } from "./testProjects.ts";
 import { recordSystemLearning, captureRecurringRefs } from "./learn.ts";
 import { diagnosePane, dialogAutoApprovable, editDialogPaths, parseResetClock } from "./diagnose.ts";
-import { AUTO_MERGE_PAUSED, requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount, deferQuizForExternalMerge } from "./api.ts";
+import { AUTO_MERGE_PAUSED, requeueTask, openRecoveryDecision, openBreakerDecision, linkPrIfMarked, taskFromPrMarker, handOffToReview, createDecision, mergeTask, apiAnswerDecision, apiDismissDecision, spawnAgent, internalSteer, pendingPostShipQuizCount, deferQuizForExternalMerge } from "./api.ts";
 import { teardownBlocked, recentDeadVerdicts, DEAD_BURST_N, DEAD_BURST_MS } from "./teardownGuard.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, mapLimit, projectBaseBranch, preferSafeRef, GH_LIST_TIMEOUT_MS, GH_LIST_CONCURRENCY } from "./exec.ts";
@@ -637,6 +637,34 @@ async function advanceFinished(db: DB, _deps: ReconcilerDeps): Promise<void> {
   }
 }
 
+// True when the PR's hive marker names this exact task. A PR with no marker at
+// all is NOT a match: every hive-dispatched PR is required to carry one.
+function prMarkerNamesTask(db: DB, task: { id: string }, data: any): boolean {
+  const marked = taskFromPrMarker(db, { title: data?.title, body: data?.body });
+  return marked?.task?.id === task.id;
+}
+
+// Record a wrong link once per (task, pr_url) so the timeline says why this
+// task stopped moving, without refilling every cycle.
+function noteBadPrLink(db: DB, task: { id: string; pr_url: string }, data: any): void {
+  const marked = taskFromPrMarker(db, { title: data?.title, body: data?.body });
+  const already = db
+    .query(`SELECT 1 FROM events WHERE task_id = ? AND type = 'pr_link_mismatch' AND json_extract(payload, '$.pr_url') = ? LIMIT 1`)
+    .get(task.id, task.pr_url);
+  if (already) return;
+  writeEvent(db, {
+    task_id: task.id,
+    source: "reconciler",
+    type: "pr_link_mismatch",
+    payload: {
+      pr_url: task.pr_url,
+      pr_title: data?.title ?? null,
+      marker_task_id: marked?.task?.id ?? null,
+      note: `${task.pr_url} does not carry this task's hive marker, so hive will not act on it. Clear the link with \`hive task update ${task.id} --clear-pr\`, then link the right PR.`,
+    },
+  });
+}
+
 // ---- PR / CI sync via gh ----
 async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   const exec = deps.exec ?? defaultExec;
@@ -657,7 +685,7 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     // ACTIONABLE phase only — see the neverDispatched guard below (hive-996).
     if (isJiraMirrorId(db, t.id)) return null;
     const r = await exec(
-      ["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup,mergeable,headRefOid,baseRefName,baseRefOid"],
+      ["gh", "pr", "view", t.pr_url, "--json", "state,statusCheckRollup,mergeable,headRefOid,baseRefName,baseRefOid,title,body"],
       { timeoutMs: GH_PROBE_TIMEOUT_MS }
     );
     if (r.code !== 0) return null; // gh unavailable / auth: skip, try next cycle
@@ -775,6 +803,19 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     // observation and parked merged tasks in in_review forever (HIVE-473). A
     // terminal PR state is a fact hive observed, not a nudge, so it still runs.
     const agentless = neverDispatched(db, live);
+    // #2093: a stored pr_url can point at a PR that is not this task's. The
+    // hive repo was re-created public on 2026-08-27, so every hive PR number
+    // from before that date now resolves to a DIFFERENT pull request in the
+    // new repo — and a merged one of those walked an unfinished task all the
+    // way to the director's verify queue. Trust a link only when the PR still
+    // carries this task's marker (the same one link-pr resolves). No marker,
+    // or someone else's marker, means the link is wrong: record it once and
+    // leave the task alone. Skipped for a never-dispatched external task,
+    // whose PR is human-opened and carries no hive marker at all (HIVE-473).
+    if (!agentless && !prMarkerNamesTask(db, live, data)) {
+      noteBadPrLink(db, live, data);
+      continue;
+    }
     // Re-check once more right before the actionable phase: the bookkeeping
     // above (probeRed, ci_status writes) awaited too, and is the last chance
     // for a PR replacement/closure race to have landed.

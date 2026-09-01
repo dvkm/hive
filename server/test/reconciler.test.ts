@@ -159,7 +159,7 @@ test("syncPRs hands off a PR whose CI never started, and tells the director inst
     if (argv[0] !== "gh") return OK();
     if (argv[1] === "api") return OK(BILLING_ANNOTATION);
     if (argv[1] === "pr" && argv[2] === "view")
-      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "FAILURE", detailsUrl: JOB_URL }] }));
+      return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", statusCheckRollup: [{ conclusion: "FAILURE", detailsUrl: JOB_URL }] }));
     return OK("[]");
   });
   await reconcileOnce(db, { exec: gh });
@@ -448,7 +448,7 @@ test("syncPRs updates ci_status and transitions in_review->verifying on merge", 
   transition(db, id, "in_review");
 
   const gh: Exec = stub((argv) => {
-    if (argv[0] === "gh") return OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] }));
+    if (argv[0] === "gh") return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] }));
     return OK();
   });
   await reconcileOnce(db, { exec: gh });
@@ -458,6 +458,47 @@ test("syncPRs updates ci_status and transitions in_review->verifying on merge", 
   expect(task.state).toBe("verifying");
   const merged = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_merged'").get(id) as any;
   expect(JSON.parse(merged.payload)).toEqual({ pr_url: "https://gh/pr/1" });
+});
+
+// #2093: hive's repo was re-created public on 2026-08-27, so every stored PR
+// URL from before that date now resolves to a DIFFERENT pull request in the new
+// repo. One of those merged and walked an unfinished task to the verify queue.
+test("syncPRs leaves a task alone when the merged PR's marker names someone else", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/113" });
+  const other = makeTask(db, projectId);
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+
+  const gh: Exec = stub((argv) =>
+    argv[0] === "gh"
+      ? OK(JSON.stringify({ body: `hive-task: ${other}`, title: "[hive-1992] someone else's work", state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] }))
+      : OK()
+  );
+  await reconcileOnce(db, { exec: gh });
+  await reconcileOnce(db, { exec: gh });
+
+  expect(getTask(db, id).state).toBe("in_review");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'pr_merged'").get(id)).toBeFalsy();
+  // Recorded once, not once per cycle.
+  const flagged = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'pr_link_mismatch'").all(id) as { payload: string }[];
+  expect(flagged.length).toBe(1);
+  expect(JSON.parse(flagged[0].payload)).toMatchObject({ pr_url: "https://gh/pr/113", marker_task_id: other });
+});
+
+test("syncPRs will not act on a merged PR carrying no hive marker at all", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { pr_url: "https://gh/pr/113" });
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+
+  const gh: Exec = stub((argv) =>
+    argv[0] === "gh" ? OK(JSON.stringify({ title: "someone's hand-opened PR", body: "no marker here", state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] })) : OK()
+  );
+  await reconcileOnce(db, { exec: gh });
+
+  expect(getTask(db, id).state).toBe("in_review");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'pr_link_mismatch'").get(id)).toBeTruthy();
 });
 
 test("syncPRs advances an evidenced recovery merged while still in progress", async () => {
@@ -473,7 +514,7 @@ test("syncPRs advances an evidenced recovery merged while still in progress", as
     newId("evd"), id, now(), "log", JSON.stringify({ commit_sha: head })
   );
   const gh: Exec = stub((argv) => argv[0] === "gh"
-    ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: head }))
+    ? OK(JSON.stringify({ body: `hive-task: ${id}`, state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: head }))
     : OK());
 
   await reconcileOnce(db, { exec: gh, herdr: statusHerdr("working") });
@@ -497,7 +538,7 @@ test("syncPRs requires a new landing when an external merge omits recovery work"
   transition(db, id, "in_review");
 
   const gh: Exec = stub((argv) => argv[0] === "gh"
-    ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "force-pushed-head" }))
+    ? OK(JSON.stringify({ body: `hive-task: ${id}`, state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "force-pushed-head" }))
     : OK());
   await reconcileOnce(db, { exec: gh, herdr: statusHerdr("working") });
 
@@ -525,7 +566,7 @@ test("syncPRs does not claim an inherited merge omitted work before recovery com
     .run("hive/inherited-merged", prUrl, id);
   startRecoveryEpoch(db, id, "reconciler");
   const gh: Exec = stub((argv) => argv[0] === "gh"
-    ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "inherited-head" }))
+    ? OK(JSON.stringify({ body: `hive-task: ${id}`, state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "inherited-head" }))
     : OK());
 
   await reconcileOnce(db, { exec: gh });
@@ -564,9 +605,9 @@ test("syncPRs skips a task that raced ahead to done instead of throwing (task #6
       ).run(newId("ev"), racer, now(), "log", "/tmp/x", "/evidence/x", "c", "{}");
       transition(db, racer, "verifying");
       transition(db, racer, "done");
-      return OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] }));
+      return OK(JSON.stringify({ body: `hive-task: ${racer}`, state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] }));
     }
-    return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "FAILURE" }] }));
+    return OK(JSON.stringify({ body: `hive-task: ${other}`, state: "OPEN", statusCheckRollup: [{ conclusion: "FAILURE" }] }));
   });
 
   await reconcileOnce(db, { exec: gh });
@@ -589,7 +630,7 @@ test("syncPRs never merges/closes a task for a PR it was already replaced with (
     // to a brand-new PR while this cycle's `gh pr view` for the OLD one is
     // still in flight.
     db.query("UPDATE tasks SET pr_url = ?, updated_at = ? WHERE id = ?").run("https://gh/pr/new", now(), id);
-    return OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] }));
+    return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] }));
   });
   await reconcileOnce(db, { exec: gh });
 
@@ -606,7 +647,7 @@ test("syncPRs persists the PR's head_sha so the review card can flag stale evide
 
   const gh: Exec = stub((argv) => {
     if (argv[0] === "gh")
-      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-a" }));
+      return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-a" }));
     return OK();
   });
   await reconcileOnce(db, { exec: gh });
@@ -615,7 +656,7 @@ test("syncPRs persists the PR's head_sha so the review card can flag stale evide
   // a later poll with a new head commit updates it
   const gh2: Exec = stub((argv) => {
     if (argv[0] === "gh")
-      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-b" }));
+      return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-b" }));
     return OK();
   });
   await reconcileOnce(db, { exec: gh2 });
@@ -633,7 +674,7 @@ test("syncPRs discards facts fetched for a PR replaced in flight", async () => {
   const gh: Exec = stub((argv) => {
     if (argv[0] === "gh") {
       db.query("UPDATE tasks SET pr_url = ?, ci_status = NULL, head_sha = NULL WHERE id = ?").run(newPr, id);
-      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "FAILURE" }], headRefOid: "stale-old-head" }));
+      return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", statusCheckRollup: [{ conclusion: "FAILURE" }], headRefOid: "stale-old-head" }));
     }
     return OK();
   });
@@ -659,7 +700,7 @@ test("syncPRs rechecks PR identity after branch scope capture", async () => {
 
   const exec: Exec = stub((argv) => {
     if (argv[0] === "gh")
-      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ status: "IN_PROGRESS" }], headRefOid: "stale-old-head", baseRefName: "main", baseRefOid: "old-base" }));
+      return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", statusCheckRollup: [{ status: "IN_PROGRESS" }], headRefOid: "stale-old-head", baseRefName: "main", baseRefOid: "old-base" }));
     if (argv.includes("diff") && argv.includes("--name-only")) {
       db.query("UPDATE tasks SET pr_url = ?, ci_status = NULL, head_sha = NULL WHERE id = ?").run(newPr, id);
       return OK("src/task.ts\n");
@@ -686,7 +727,7 @@ test("syncPRs snapshots branch scope against the PR's exact base commit", async 
   const diffs: string[] = [];
   const exec: Exec = stub((argv) => {
     if (argv[0] === "gh")
-      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], headRefOid: "head", baseRefName: "staging", baseRefOid: "staging-sha" }));
+      return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", statusCheckRollup: [], headRefOid: "head", baseRefName: "staging", baseRefOid: "staging-sha" }));
     if (argv.includes("diff") && argv.includes("--name-only")) {
       diffs.push(argv.at(-1)!);
       return OK("src/task.ts\n");
@@ -714,7 +755,7 @@ test("syncPRs never lets an option-shaped PR baseRefName reach git argv (task #1
   const argvs: string[][] = [];
   const exec: Exec = stub((argv) => {
     argvs.push(argv);
-    if (argv[0] === "gh") return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], headRefOid: "head", baseRefName: payload }));
+    if (argv[0] === "gh") return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", statusCheckRollup: [], headRefOid: "head", baseRefName: payload }));
     if (argv.includes("diff") && argv.includes("--name-only")) return OK("src/task.ts\n");
     if (argv.includes("rev-parse")) return OK("staging-sha\n");
     return OK();
@@ -748,7 +789,7 @@ test("syncPRs bounces an in_review task whose CI turned red, steers once per sha
   );
   const gh: Exec = stub((argv) => {
     if (argv[0] === "gh")
-      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "FAILURE" }], headRefOid: "sha-red" }));
+      return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", statusCheckRollup: [{ conclusion: "FAILURE" }], headRefOid: "sha-red" }));
     return OK();
   });
   await reconcileOnce(db, { exec: gh, herdr });
@@ -766,7 +807,7 @@ test("syncPRs bounces an in_review task whose CI turned red, steers once per sha
   // checks go green → promoted to review automatically
   const ghGreen: Exec = stub((argv) => {
     if (argv[0] === "gh")
-      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-green" }));
+      return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-green" }));
     return OK();
   });
   await reconcileOnce(db, { exec: ghGreen, herdr });
@@ -779,7 +820,7 @@ test("syncPRs bounces an in_review task whose PR was closed without merging", as
   transition(db, id, "in_progress");
   transition(db, id, "in_review");
   const gh: Exec = stub((argv) =>
-    argv[0] === "gh" ? OK(JSON.stringify({ state: "CLOSED", statusCheckRollup: [] })) : OK()
+    argv[0] === "gh" ? OK(JSON.stringify({ body: `hive-task: ${id}`, state: "CLOSED", statusCheckRollup: [] })) : OK()
   );
   const herdr = new Herdr(
     stub((argv) =>
@@ -800,7 +841,7 @@ test("syncPRs records pr_closed for a PR closed while its task is still in_progr
   const id = makeTask(db, projectId, { pr_url: "https://gh/pr/4", agent_target: "t-agent" });
   transition(db, id, "in_progress");
   const gh: Exec = stub((argv) =>
-    argv[0] === "gh" ? OK(JSON.stringify({ state: "CLOSED", statusCheckRollup: [] })) : OK()
+    argv[0] === "gh" ? OK(JSON.stringify({ body: `hive-task: ${id}`, state: "CLOSED", statusCheckRollup: [] })) : OK()
   );
   const herdr = new Herdr(
     stub((argv) =>
@@ -825,7 +866,7 @@ test("syncPRs' actionable phase skips a never-dispatched external task — no nu
   transition(db, id, "in_review");
   const gh: Exec = stub((argv) =>
     argv[0] === "gh"
-      ? OK(JSON.stringify({ state: "CLOSED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-x" }))
+      ? OK(JSON.stringify({ body: `hive-task: ${id}`, state: "CLOSED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-x" }))
       : OK()
   );
   await reconcileOnce(db, { exec: gh });
@@ -841,7 +882,7 @@ test("syncPRs closes a never-dispatched external task once its PR MERGES (HIVE-4
   transition(db, id, "in_progress"); // never spawned
   transition(db, id, "in_review");
   const gh: Exec = stub((argv) =>
-    argv[0] === "gh" ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-m" })) : OK()
+    argv[0] === "gh" ? OK(JSON.stringify({ body: `hive-task: ${id}`, state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-m" })) : OK()
   );
   await reconcileOnce(db, { exec: gh });
   // Merged is NOT terminal, even for a row hive only tracks: there is no smoke to
@@ -857,7 +898,7 @@ test("syncPRs' actionable phase still acts on an external task that WAS spawned 
   writeEvent(db, { task_id: id, source: "herdr", type: "spawned", payload: { agent_target: "t-agent-live" } });
   transition(db, id, "in_progress");
   transition(db, id, "in_review");
-  const gh: Exec = stub((argv) => (argv[0] === "gh" ? OK(JSON.stringify({ state: "CLOSED", statusCheckRollup: [] })) : OK()));
+  const gh: Exec = stub((argv) => (argv[0] === "gh" ? OK(JSON.stringify({ body: `hive-task: ${id}`, state: "CLOSED", statusCheckRollup: [] })) : OK()));
   const herdr = new Herdr(
     stub((argv) => (argv.includes("get") ? OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}') : OK())),
     "herdr"
@@ -1235,7 +1276,7 @@ test("autoMergeReady rechecks queued work at every destructive merge boundary", 
       if ((argv[0] === "gh" && argv.includes("merge")) || argv.includes("merge") || argv.includes("update-ref"))
         destructive.push(argv);
       if (argv[0] === "gh" && argv.includes("view"))
-        return OK(JSON.stringify({ state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", statusCheckRollup: [{ conclusion: "SUCCESS" }], baseRefName: "main", baseRefOid: "base-sha", headRefOid: "branch-sha" }));
+        return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", statusCheckRollup: [{ conclusion: "SUCCESS" }], baseRefName: "main", baseRefOid: "base-sha", headRefOid: "branch-sha" }));
       if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
       if (argv.includes("symbolic-ref")) return OK(mode === "local-update" ? "other\n" : "main\n");
       if (argv.includes("worktree") && argv.includes("list")) return OK("");
@@ -1441,7 +1482,7 @@ test("conflict watchdog: a CONFLICTING PR nudges the agent once per head SHA", a
   const gh = (sha: string): Exec =>
     stub((argv) => {
       if (argv[0] === "gh")
-        return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], mergeable: "CONFLICTING", headRefOid: sha }));
+        return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", statusCheckRollup: [], mergeable: "CONFLICTING", headRefOid: sha }));
       return OK();
     });
 
@@ -1475,7 +1516,7 @@ test("conflict watchdog: a lost nudge (exit 0 + agent_not_found) records deliver
   );
   const gh: Exec = stub((argv) =>
     argv[0] === "gh"
-      ? OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], mergeable: "CONFLICTING", headRefOid: "sha1" }))
+      ? OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", statusCheckRollup: [], mergeable: "CONFLICTING", headRefOid: "sha1" }))
       : OK()
   );
 
@@ -1493,7 +1534,7 @@ test("conflict watchdog: a mergeable PR is left alone", async () => {
   const { h, sends } = sendCapturingHerdr("idle");
   const gh: Exec = stub((argv) => {
     if (argv[0] === "gh")
-      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], mergeable: "MERGEABLE", headRefOid: "sha1" }));
+      return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", statusCheckRollup: [], mergeable: "MERGEABLE", headRefOid: "sha1" }));
     return OK();
   });
   await reconcileOnce(db, { herdr: h, exec: gh });
@@ -1513,7 +1554,7 @@ test("conflict watchdog follows GitHub's remote base even when local main is an 
   const exec = (sha: string): Exec =>
     stub((argv) => {
       if (argv[0] === "gh")
-        return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], mergeable: "CONFLICTING", headRefOid: sha }));
+        return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", statusCheckRollup: [], mergeable: "CONFLICTING", headRefOid: sha }));
       return OK();
     });
 
@@ -1536,7 +1577,7 @@ test("conflict watchdog: a deferred task emits no pr_conflict and steers nobody;
   const { h, sends } = sendCapturingHerdr("idle");
   const gh: Exec = stub((argv) =>
     argv[0] === "gh"
-      ? OK(JSON.stringify({ state: "OPEN", statusCheckRollup: [], mergeable: "CONFLICTING", headRefOid: "sha1" }))
+      ? OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", statusCheckRollup: [], mergeable: "CONFLICTING", headRefOid: "sha1" }))
       : OK()
   );
 
@@ -1565,7 +1606,7 @@ test("syncPRs advances a merged deferred PR through verifying instead of leaving
   db.query("UPDATE tasks SET deferred_until = ? WHERE id = ?").run("9999-12-31T00:00:00.000Z", id);
 
   const gh: Exec = stub((argv) =>
-    argv[0] === "gh" ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] })) : OK()
+    argv[0] === "gh" ? OK(JSON.stringify({ body: `hive-task: ${id}`, state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] })) : OK()
   );
   const herdr = new Herdr(
     stub((argv) => (argv.includes("get") ? OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}') : OK())),
@@ -1587,7 +1628,7 @@ test("syncPRs advances an in_progress task whose PR merges outside hive, and sta
 
   const sends: string[] = [];
   const gh: Exec = stub((argv) =>
-    argv[0] === "gh" ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] })) : OK()
+    argv[0] === "gh" ? OK(JSON.stringify({ body: `hive-task: ${id}`, state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] })) : OK()
   );
   const herdr = new Herdr(
     stub((argv) => {
@@ -2052,7 +2093,7 @@ test("autoMergeReady merges a task whose good review is followed by a review err
   const git: Exec = stub((argv) => {
     if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
     if (argv[0] === "gh" && argv.includes("view"))
-      return OK(JSON.stringify({ state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", statusCheckRollup: [{ conclusion: "SUCCESS" }], baseRefName: "main", baseRefOid: "base-sha", headRefOid: "head-1" }));
+      return OK(JSON.stringify({ body: `hive-task: ${id}`, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", statusCheckRollup: [{ conclusion: "SUCCESS" }], baseRefName: "main", baseRefOid: "base-sha", headRefOid: "head-1" }));
     return argv.includes("symbolic-ref") ? OK("main\n") : OK();
   });
   await autoMergeReady(db, { exec: git });
