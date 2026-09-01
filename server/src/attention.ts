@@ -22,6 +22,7 @@ import { parseTask, parseDecision } from "./rows.ts";
 import { tasksWithHealth } from "./health.ts";
 import { notTestProjectSql } from "./testProjects.ts";
 import { openCheckpointRows, openUnderstandingQuizzes } from "./api.ts";
+import { heldWatchChanges } from "./watch.ts";
 import { getNeedsYouItems, isActionable, itemProject, inProjectFilter } from "../../web/src/lib/needsYou.ts";
 
 // Conductor's 3-5 concurrent-workspace sweet spot is where 5 comes from. It is
@@ -85,6 +86,11 @@ export interface AttentionBudget {
   over: boolean;
   // What is paused right now, in the director's words. Empty when nothing is.
   paused: string[];
+  // What the pause is holding. Nothing here is dropped: a held scout sits in
+  // `queued` and dispatches later, and a held watcher change keeps its cursor
+  // so it is filed in full once the queue drains. A quiet board that is quiet
+  // because work is being held must never look like a board with nothing on it.
+  held: { scouts: number; watchers: number };
 }
 
 // The budget is the DIRECTOR's, not a project's: three projects at four items
@@ -94,7 +100,16 @@ export function attentionBudget(db: DB, projectId = ""): AttentionBudget {
   const threshold = attentionThreshold(db);
   const count = actionable(db, projectId).length;
   const over = threshold > 0 && count > threshold;
-  return { count, threshold, over, paused: over ? ["new scouts", "watcher tasks"] : [] };
+  const scouts = (db
+    .query("SELECT COUNT(*) AS n FROM tasks WHERE state = 'queued' AND skip_reason = 'attention_budget'")
+    .get() as { n: number }).n;
+  return {
+    count,
+    threshold,
+    over,
+    paused: over ? ["new scouts", "watcher tasks"] : [],
+    held: { scouts, watchers: heldWatchChanges(db) },
+  };
 }
 
 // Is hive over budget right now? Used by the optional generators before they

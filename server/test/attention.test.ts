@@ -12,7 +12,7 @@ const { openDb, newId, now } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
 const { attentionBudget, attentionThreshold, setAttentionThreshold, overAttentionBudget, ATTENTION_BUDGET_DEFAULT } =
   await import("../src/attention.ts");
-const { checkWatcher } = await import("../src/watch.ts");
+const { checkWatcher, heldWatchChanges } = await import("../src/watch.ts");
 const { dispatchOnce } = await import("../src/dispatcher.ts");
 const { getTask } = await import("../src/state.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
@@ -84,20 +84,27 @@ test("a raised threshold lets more through before anything pauses", () => {
   expect(overAttentionBudget(db)).toBe(false);
 });
 
-test("over budget, a watcher does NOT file a task, and files it once afterwards", async () => {
+test("over budget a watcher change is HELD, not dropped: it is filed in full once the queue drains", async () => {
   const { db, projectId } = freshDb();
   await checkWatcher(db, projectId, W, { fetchImpl: fetchBody("v1\n") }); // baseline
 
   openDecisions(db, projectId, 6);
   await checkWatcher(db, projectId, W, { fetchImpl: fetchBody("v2\n") });
   expect(watchTasks(db)).toHaveLength(0);
+  // The hold is recorded, so a quiet board can say work is being held rather
+  // than looking like nothing happened.
+  expect(heldWatchChanges(db)).toBe(1);
+  expect(attentionBudget(db).held).toMatchObject({ watchers: 1 });
 
-  // Queue drains: the change is still filed, once, with the accumulated diff.
+  // Queue drains: the change is still filed, once, and the diff covers
+  // everything that happened while it was held (v1 -> v3, not v2 -> v3).
   db.query("UPDATE decisions SET status = 'answered'").run();
   await checkWatcher(db, projectId, W, { fetchImpl: fetchBody("v3\n") });
   const tasks = watchTasks(db);
   expect(tasks).toHaveLength(1);
+  expect(tasks[0].brief).toContain("-v1");
   expect(tasks[0].brief).toContain("+v3");
+  expect(heldWatchChanges(db)).toBe(0);
 });
 
 // The spawn stub from dispatcher.test.ts, trimmed to what a successful spawn needs.
@@ -128,6 +135,20 @@ test("over budget, a queued scout waits and says why; ship work still dispatches
   expect(getTask(db, scout).state).toBe("queued");
   expect(getTask(db, scout).skip_reason).toBe("attention_budget");
   expect(getTask(db, ship).state).toBe("in_progress");
+  // Held, not dropped: the scout is still queued and the board can say so.
+  expect(attentionBudget(db).held).toMatchObject({ scouts: 1 });
+});
+
+test("a held scout dispatches as soon as the queue drains", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true });
+  openDecisions(db, projectId, 6);
+  const scout = makeTask(db, projectId, { kind: "scout" });
+  await dispatchOnce(db, { herdr: stubHerdr().herdr });
+  expect(getTask(db, scout).state).toBe("queued");
+
+  db.query("UPDATE decisions SET status = 'answered'").run();
+  await dispatchOnce(db, { herdr: stubHerdr().herdr });
+  expect(getTask(db, scout).state).toBe("in_progress");
 });
 
 test("under budget, the same scout dispatches", async () => {

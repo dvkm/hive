@@ -1,4 +1,4 @@
-import type { Checkpoint, Decision, Task, UnderstandingQuiz } from "./api";
+import type { Checkpoint, Decision, Task, UnderstandingQuiz } from "./domain";
 
 // Does an item belong to the active project filter? An empty filter ("" = All)
 // matches everything. Lives here, next to the needs-you rules, so this module

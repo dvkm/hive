@@ -68,6 +68,19 @@ function snapshotPath(projectId: string, name: string): string {
 
 const sha = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex");
 
+// Watcher changes seen but not filed because the director is over their
+// attention budget. Kept in the same cursor table the watchers already use.
+export const WATCH_HELD = "watch_held";
+
+function clearHold(db: DB, cursorKey: string): void {
+  db.query("DELETE FROM intake_cursors WHERE source = ? AND key = ?").run(WATCH_HELD, cursorKey);
+}
+
+// How many watched sources have a change waiting on the director right now.
+export function heldWatchChanges(db: DB): number {
+  return (db.query("SELECT COUNT(*) AS n FROM intake_cursors WHERE source = ?").get(WATCH_HELD) as { n: number }).n;
+}
+
 // An unfinished task from this watcher: don't stack another on top of it.
 function activeWatchTask(db: DB, refPrefix: string): boolean {
   return !!db
@@ -107,13 +120,25 @@ export async function checkWatcher(db: DB, projectId: string, w: Watcher, deps: 
   if (prevHash === hash) return;
 
   const refPrefix = `watch:${projectId}:${w.name}:`;
-  if (activeWatchTask(db, refPrefix)) return; // cursor NOT advanced; re-check after it finishes
+  if (activeWatchTask(db, refPrefix)) {
+    // Held, but by its own predecessor rather than by the budget: that task is
+    // already visible on the board, so don't also report it as budget-held.
+    clearHold(db, cursorKey);
+    return; // cursor NOT advanced; re-check after it finishes
+  }
 
   // Attention budget (HIVE-356): the director already has more waiting than one
-  // person can hold, so don't file another task on top of it. The cursor is NOT
-  // advanced, exactly like the active-task case above, so the change is filed
-  // once — with everything that accumulated meanwhile — after the queue drains.
-  if (overAttentionBudget(db)) return;
+  // person can hold, so don't file another task on top of it. The change is
+  // DEFERRED, never dropped — neither the cursor nor the snapshot is advanced
+  // (both happen at the end of this function), so the next check after the
+  // queue drains files ONE task carrying everything that accumulated. The hold
+  // is recorded so the board can say a change is being held rather than letting
+  // an unnoticed observation look like nothing happened.
+  if (overAttentionBudget(db)) {
+    setCursor(db, WATCH_HELD, cursorKey, now());
+    return;
+  }
+  clearHold(db, cursorKey);
 
   const old = existsSync(snap) ? readFileSync(snap, "utf8") : "";
   const diff = old ? await unifiedDiff(deps.exec ?? defaultExec, snap, body) : "(no previous snapshot)";

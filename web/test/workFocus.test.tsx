@@ -8,7 +8,7 @@ import { StaticRouter } from "react-router-dom/server";
 import { Ctx, type Store } from "../src/lib/store";
 import type { Decision, Task } from "../src/lib/api";
 import { getNeedsYouItems } from "../src/lib/needsYou";
-import { WorkFocus } from "../src/views/Board";
+import { WorkFocus, heldLine } from "../src/views/Board";
 
 (globalThis as unknown as { window: typeof globalThis }).window = globalThis;
 Object.defineProperty(globalThis, "localStorage", {
@@ -129,4 +129,13 @@ test("a decision row navigates for real: no modal state on a non-task link", () 
 
   expect(rows.find((row) => row.to === "/decisions#dcard-d2")?.state).toBeUndefined();
   expect(rows.find((row) => row.to === "/tasks/t8")?.state).toBeDefined();
+});
+
+test("the held line survives a server that answers without a held field", () => {
+  // An older server answers /api/attention with no `held`. Reading through it
+  // threw and blanked the whole board, which is the opposite of the point.
+  expect(heldLine(undefined)).toBe("Nothing is being held yet.");
+  expect(heldLine({ scouts: 0, watchers: 0 })).toBe("Nothing is being held yet.");
+  expect(heldLine({ scouts: 1, watchers: 0 })).toContain("Holding 1 scout —");
+  expect(heldLine({ scouts: 2, watchers: 1 })).toContain("Holding 2 scouts and 1 watched change");
 });

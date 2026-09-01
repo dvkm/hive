@@ -433,6 +433,23 @@ function StatusRow({ task }: { task: Task }) {
 // has stopped ADDING optional work. It never stops or throttles what is already
 // running — the point is that supply stops outrunning the human, not that the
 // fleet gets smaller.
+//
+// The banner also says WHAT is being held, and that it is held rather than
+// dropped. A board that is quiet because nothing needs you and a board that is
+// quiet because hive is sitting on things look identical, and only one of them
+// means you can stop reading. Nothing is ever taken out of the count to make
+// the number look better: the pause holds supply, never display.
+// `held` is optional on purpose: an older server answers /api/attention without
+// it, and a missing field must not take the whole board down with it.
+export function heldLine(held?: { scouts: number; watchers: number }): string {
+  const parts = [
+    (held?.scouts ?? 0) > 0 ? `${held!.scouts} scout${held!.scouts === 1 ? "" : "s"}` : "",
+    (held?.watchers ?? 0) > 0 ? `${held!.watchers} watched change${held!.watchers === 1 ? "" : "s"}` : "",
+  ].filter(Boolean);
+  if (!parts.length) return "Nothing is being held yet.";
+  return `Holding ${parts.join(" and ")} — nothing is dropped, they are filed once you are back under.`;
+}
+
 export function AttentionBudgetBanner({ count }: { count: number }) {
   const [budget, setBudget] = useState<AttentionBudget | null>(null);
   useEffect(() => {
@@ -444,8 +461,8 @@ export function AttentionBudgetBanner({ count }: { count: number }) {
   return (
     <div className="attn-budget" role="status">
       <strong>{count} things need you.</strong>{" "}
-      That is over your budget of {budget.threshold}, so hive paused {budget.paused.join(" and ")} until the queue drains.
-      Nothing already running was stopped.
+      That is over your budget of {budget.threshold}, so hive paused {budget.paused.join(" and ")}.
+      Nothing already running was stopped. {heldLine(budget.held)}
     </div>
   );
 }
