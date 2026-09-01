@@ -22,6 +22,8 @@ const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x
 const REPO = join(HOME, "main");
 const WT = join(HOME, "wt");
 const WT2 = join(HOME, "wt2");
+const WT3 = join(HOME, "wt3");
+const WT4 = join(HOME, "wt4");
 beforeAll(() => {
   mkdirSync(join(REPO, "node_modules", "left-pad"), { recursive: true });
   writeFileSync(join(REPO, "node_modules", "left-pad", "index.js"), "1");
@@ -32,6 +34,10 @@ beforeAll(() => {
   writeFileSync(join(WT, "bun.lock"), "LOCK-V1");
   mkdirSync(WT2, { recursive: true });
   writeFileSync(join(WT2, "bun.lock"), "LOCK-V1");
+  for (const wt of [WT3, WT4]) {
+    mkdirSync(wt, { recursive: true });
+    writeFileSync(join(wt, "bun.lock"), "LOCK-V1");
+  }
 });
 
 // Each test gets its OWN worktree: the first one warms WT, which would make the
@@ -136,4 +142,47 @@ test("a warm config naming a lockfile nobody has raises a failure event, and the
   const failed: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'worktree_seed_failed'").get(taskId);
   expect(failed).toBeTruthy();
   expect(JSON.parse(failed.payload).misconfigured[0].reason).toContain("pnpm-lock.yaml is missing");
+});
+
+test("the same broken seed config reports once per project, not on every spawn", async () => {
+  const db = openDb(":memory:");
+  const projectId = "proj_noisy";
+  db.query("INSERT INTO projects (id, name, repo_path, config, created_at) VALUES (?,?,?,?,?)").run(
+    projectId,
+    "noisy",
+    REPO,
+    // A warm dir that does not exist in the main checkout: broken now and on
+    // every future spawn, which is exactly the config that used to shout forever.
+    JSON.stringify({ agent: "codex", worktree_warm: [{ dir: "vendor" }] }),
+    new Date().toISOString()
+  );
+  const mk = (taskId: string) =>
+    db.query("INSERT INTO tasks (id, project_id, title, kind, state, created_at, updated_at) VALUES (?,?,?,?,?,?,?)").run(
+      taskId, projectId, "noisy seed", "ship", "queued", new Date().toISOString(), new Date().toISOString()
+    );
+  mk("t_noisy1");
+  mk("t_noisy2");
+
+  const first = herdrExecFor(WT3);
+  expect((await spawnAgent(db, new Herdr(first, "herdr"), "t_noisy1", { exec: first })).ok).toBe(true);
+  const second = herdrExecFor(WT4);
+  expect((await spawnAgent(db, new Herdr(second, "herdr"), "t_noisy2", { exec: second })).ok).toBe(true);
+
+  // One event for the project, on the spawn that found it first.
+  const rows = db
+    .query("SELECT task_id FROM events WHERE type = 'worktree_seed_failed' AND task_id IN ('t_noisy1','t_noisy2')")
+    .all() as { task_id: string }[];
+  expect(rows.map((r) => r.task_id)).toEqual(["t_noisy1"]);
+
+  // A DIFFERENT problem is still reported: the dedupe is per problem, not a
+  // permanent mute on the project.
+  db.query("UPDATE projects SET config = ? WHERE id = ?").run(
+    JSON.stringify({ agent: "codex", worktree_warm: [{ dir: "node_modules", lock: "pnpm-lock.yaml" }] }),
+    projectId
+  );
+  mk("t_noisy3");
+  const third = herdrExecFor(WT3);
+  expect((await spawnAgent(db, new Herdr(third, "herdr"), "t_noisy3", { exec: third })).ok).toBe(true);
+  const later: any = db.query("SELECT payload FROM events WHERE task_id = 't_noisy3' AND type = 'worktree_seed_failed'").get();
+  expect(JSON.parse(later.payload).misconfigured[0].reason).toContain("pnpm-lock.yaml is missing");
 });

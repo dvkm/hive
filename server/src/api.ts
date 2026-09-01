@@ -4180,6 +4180,37 @@ function referencesUrl(text: string, url: string): boolean {
 // the `spawned`/`spawn_error` events and the queued->in_progress transition.
 // Assumes callers have already run their own gates (authority, dispatch policy).
 // Returns {ok:false} instead of throwing so the dispatcher can back off.
+// HIVE-355: identity of a seed misconfiguration, for reporting it once instead
+// of on every spawn. Path plus reason, with numbers blanked so a byte or file
+// count in the message does not make the same cap failure look new each time.
+function seedFailureSignature(misconfigured: { path: string; reason: string }[]): string {
+  return misconfigured
+    .map((m) => `${m.path}: ${m.reason.replace(/\d+/g, "#")}`)
+    .sort()
+    .join("\n");
+}
+
+// Has this project already reported this exact seed problem? Looks back over
+// the recent worktree_seed_failed events for the whole project, not just this
+// task: the config that is broken is per project, so the noise is too.
+function seedFailureReported(db: DB, projectId: string, signature: string): boolean {
+  const rows = db
+    .query(
+      `SELECT events.payload AS payload FROM events
+         JOIN tasks ON tasks.id = events.task_id
+        WHERE events.type = 'worktree_seed_failed' AND tasks.project_id = ?
+        ORDER BY events.ts DESC LIMIT 50`
+    )
+    .all(projectId) as { payload: string }[];
+  return rows.some((r) => {
+    try {
+      return JSON.parse(r.payload)?.signature === signature;
+    } catch {
+      return false;
+    }
+  });
+}
+
 export async function spawnAgent(
   db: DB,
   herdr: Herdr,
@@ -4315,12 +4346,18 @@ export async function spawnAgent(
         // thing: the spawn still succeeds, so nothing else would ever report it,
         // and the agent gets a worktree that looks warm and is not. The `_failed`
         // suffix puts it in the durable failure history (web/src/lib/eventText.ts).
-        if (seed.misconfigured.length)
+        // ...but only ONCE per project per distinct problem. A warm dir that
+        // was never built, or a lockfile nobody has, is broken on every spawn
+        // forever, and re-reporting it every spawn buries the failure history
+        // it is supposed to stand out in. A different problem is a different
+        // signature and reports again.
+        const seedSignature = seedFailureSignature(seed.misconfigured);
+        if (seed.misconfigured.length && !seedFailureReported(db, task.project_id, seedSignature))
           writeEvent(db, {
             task_id: id,
             source: "herdr",
             type: "worktree_seed_failed",
-            payload: { misconfigured: seed.misconfigured },
+            payload: { misconfigured: seed.misconfigured, signature: seedSignature },
           });
         const setupStarted = Date.now();
         const setup = await runStackCmd(db, id, config.setup_argv, project.repo_path, worktreePath, opts.exec ?? defaultExec, {
