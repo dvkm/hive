@@ -750,3 +750,89 @@ test("Merge anyway re-opens the check it silenced instead of dead-ending (HIVE-5
     api.merge = originalMerge;
   }
 });
+
+// HIVE-557: the card that started the redesign. One refuted finding, one
+// question only the director can answer, and a review line carrying the
+// before/after state.
+const HIVE_554_WHY =
+  "Diagnosed why 7 rows were still stranded despite v39 already running: source is settable through the task-create API body, so rows created after v39 were never touched.";
+
+function focusDetail(id: string): TaskDetail {
+  return {
+    ...task(id, "agent"),
+    head_sha: "sha1",
+    events: [
+      {
+        id: "rev-1",
+        task_id: id,
+        ts: "2026-01-01T00:00:00.000Z",
+        source: "agent",
+        type: "review_summary",
+        payload: {
+          done: [HIVE_554_WHY, "Verified on a copy of the live DB: stranded-row count 7 -> 0."],
+          iffy: [{ what: "Applied the migration SQL directly to the live database.", why: "A restart needs a decision." }],
+        },
+      } as any,
+      {
+        id: "ar-1",
+        task_id: id,
+        ts: "2026-01-01T00:00:01.000Z",
+        source: "system",
+        type: "auto_review",
+        payload: { verdict: "looks_good", summary: "Adds migration v45 to server/src/db.ts, a re-run of v39's guard." },
+      } as any,
+      {
+        id: "rv-1",
+        task_id: id,
+        ts: "2026-01-01T00:00:02.000Z",
+        source: "system",
+        type: "risk_verdicts",
+        payload: {
+          reviewed_head_sha: "sha1",
+          verdicts: [{ verdict: "refuted", risk: "the count gap is unexplained", why: "set-based migration" }],
+          question_verdicts: [{ answerable: "human", question: "Can you confirm the live DB shows zero stranded rows?" }],
+        },
+      } as any,
+    ],
+    evidence: [],
+    decisions: [],
+  };
+}
+
+test("the card leads with what changed and its recommendation agrees with the open question (HIVE-557)", async () => {
+  const originalTask = api.task;
+  const originalBranchCheck = api.branchCheck;
+  api.task = (async (id: string) => focusDetail(id)) as typeof api.task;
+  api.branchCheck = (async () => ({
+    unmet_deps: [],
+    embedded_tasks: [],
+    understanding_required: false,
+    confirmed_risks: [],
+  })) as typeof api.branchCheck;
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(tree({ ...task("focus-557"), head_sha: "sha1" }));
+    });
+    const text = JSON.stringify(renderer.toJSON());
+
+    // 1. what changed, from hive's own pre-review of the diff
+    expect(text).toContain("What changed");
+    expect(text).toContain("Adds migration v45");
+    // 2. before → after, as a table
+    expect(text).toContain("Before → after");
+    expect(text).toContain("stranded-row count");
+    // 3. why, pulled from the line that explains the cause
+    expect(text).toContain("Why it was needed");
+    // 4. the recommendation cannot say "approve and merge" over an open question
+    expect(text).toContain("Answer the open question, then merge");
+    expect(text).not.toContain("Approve and merge</strong>");
+    // 5. the refuted finding is a count, not a paragraph above the open one
+    expect(text).toContain("Pre-review checked ");
+    // 6. and nothing the lead already said is repeated lower down
+    expect(text.split(HIVE_554_WHY.slice(0, 60)).length - 1).toBe(1);
+  } finally {
+    api.task = originalTask;
+    api.branchCheck = originalBranchCheck;
+  }
+});
