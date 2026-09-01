@@ -428,7 +428,7 @@ textarea { font-family: inherit; }
 .board {
   display: grid;
   grid-auto-flow: column;
-  grid-auto-columns: minmax(248px, 1fr);
+  grid-auto-columns: minmax(220px, 1fr);
   gap: 14px;
   padding: 18px 20px 24px;
   height: 100%;
@@ -581,6 +581,13 @@ textarea { font-family: inherit; }
   font-size: var(--t-md);
   line-height: 1.38;
   text-wrap: pretty;
+  /* Two lines maximum. A long descriptive title is good for searching and
+     terrible for scanning a 220px column (HIVE-556); the full text is the
+     tooltip and the card's own page. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 /* Human-friendly task identifier (HIVE-42); legacy PR markers keep global numbers.
    Shared across board cards, review cards, the task header, and the feed. */
@@ -662,20 +669,19 @@ textarea { font-family: inherit; }
   margin-top: 8px;
   flex-wrap: wrap;
 }
+/* A card chip must never grow wider than its column. Every one of these carries
+   its full text as a tooltip, and the card's own page spells it out. */
+.card-meta > .chip {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .card-age {
   margin-left: auto;
   font-size: 11.5px;
   color: var(--text-faint);
   white-space: nowrap;
-}
-.card-summary {
-  margin-top: 8px;
-  font-size: 12.5px;
-  color: var(--text-dim);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
 }
 .card-subtasks {
   display: flex;
@@ -971,10 +977,6 @@ textarea { font-family: inherit; }
   color: var(--red);
   border-color: rgba(239, 93, 107, 0.5);
 }
-.chip-planned {
-  color: var(--purple);
-  border-color: rgba(155, 125, 214, 0.4);
-}
 /* Priority chip (HIVE-430). It IS the quick-set control: a bare <select>
    painted as a chip. 'normal' is the default on nearly every task, so it stays
    invisible until the card is hovered — set a priority and the chip shows. */
@@ -1120,12 +1122,6 @@ textarea { font-family: inherit; }
   background: rgba(226, 165, 66, 0.14);
   color: var(--amber);
 }
-.evc {
-  font-size: 11.5px;
-  color: var(--text-faint);
-  margin-left: auto;
-}
-
 /* ---- task page ---- */
 .task {
   display: grid;
@@ -3937,44 +3933,42 @@ a.dbundle-fact:hover {
 }
 
 /* board banner nudging to the brief */
-.brief-banner {
+/* ---- the one needs-you strip on /work (HIVE-556) ---- */
+/* Replaces the brief banner AND the Needs attention tray. Not dismissible:
+   it is the single thing this page is meant to answer. */
+.needs-you-strip {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin: 0 0 14px;
-  padding: 8px 14px;
+  margin: 14px 20px 0;
+  padding: 9px 14px;
   border: 1px solid var(--accent-dim);
   border-radius: var(--radius);
   background: rgba(91, 140, 255, 0.08);
   color: var(--text);
   text-decoration: none;
-  font-size: 13px;
+  flex-shrink: 0;
 }
-.brief-banner:hover {
+.needs-you-strip:hover {
   border-color: var(--accent);
 }
-.brief-banner-dot {
-  color: var(--accent);
+.needs-you-strip-count {
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--accent-bright);
 }
-.brief-banner-text {
-  font-weight: 500;
+.needs-you-strip-text {
+  font-weight: 600;
 }
-.brief-banner-go {
+.needs-you-strip-parts {
+  font-weight: 400;
+  color: var(--text-dim);
+}
+.needs-you-strip-go {
+  margin-left: auto;
   color: var(--accent);
   font-size: 12px;
-}
-.brief-banner-x {
-  margin-left: auto;
-  background: none;
-  border: none;
-  color: var(--text-faint);
-  font-size: 18px;
-  line-height: 1;
-  cursor: pointer;
-  padding: 0 4px;
-}
-.brief-banner-x:hover {
-  color: var(--text);
 }
 
 /* ---- review panel + inline diff viewer (in-review tasks) ---- */

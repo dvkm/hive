@@ -1,4 +1,5 @@
 import type { Checkpoint, Decision, Task, UnderstandingQuiz } from "./api";
+import { inProjectFilter } from "./projectFilter";
 
 export interface BlockingTaskRef {
   id: string;
@@ -215,4 +216,20 @@ export function itemProject(item: NeedsYouItem, tasks: Task[]): string | undefin
   if (item.kind === "checkpoint") return item.checkpoint.project_id;
   if (item.kind === "quiz_digest") return item.quizzes[0]?.project_id;
   return item.task.project_id;
+}
+
+// THE definition of "needs you". Every place that shows a needs-you number —
+// the nav badge, the landing headline, the board's one strip — calls this, so
+// they cannot disagree again (HIVE-556). Before this, three surfaces counted
+// three different sets and the director saw 5, 8 and 3 on one screen.
+//
+// A "waiting" or "review_pending" item is visible somewhere but is not yours to
+// act on yet, so it is never part of the number. Anything that shows a
+// DIFFERENT set must be labelled with a different word than "needs you".
+export function isActionable(item: NeedsYouItem): boolean {
+  return item.kind !== "waiting" && item.kind !== "review_pending";
+}
+
+export function actionableItems(items: NeedsYouItem[], tasks: Task[], projectFilter = ""): NeedsYouItem[] {
+  return items.filter((item) => isActionable(item) && inProjectFilter(itemProject(item, tasks), projectFilter));
 }

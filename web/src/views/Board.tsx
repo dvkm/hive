@@ -6,8 +6,7 @@ import type { DivergenceRow, Health, Kind, LandGraph, State, Task } from "../lib
 import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, needsLook, PRIORITIES, PriorityChip, priorityRank, SidecarChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
-import { AttentionTray, needsAttention, isWaiting } from "./attention";
-import { isJiraMirror, isTrackingOnly, trackedSubtasks } from "../lib/needsYou";
+import { actionableItems, isJiraMirror, isTrackingOnly, trackedSubtasks } from "../lib/needsYou";
 import { taskLabel } from "../lib/references";
 
 // A compact "why this card needs attention" line: e.g. "agent gone" or
@@ -27,7 +26,7 @@ function HealthLine({ health }: { health: Health }) {
 const COLUMNS: { state: State; label: string }[] = [
   { state: "queued", label: "Queued" },
   { state: "in_progress", label: "Working" },
-  { state: "needs_decision", label: "Needs You" },
+  { state: "needs_decision", label: "Blocked" },
   { state: "in_review", label: "Ready to Merge" },
   { state: "done", label: "Done" },
 ];
@@ -60,12 +59,15 @@ const COL_EMPTY: Record<string, { title: string; hint: string }> = {
 };
 
 export function Card({ task }: { task: Task }) {
-  const { projects, evidenceCount, spawnError, lastActivity, tasks, decisions } = useStore();
-  const project = projects.find((p) => p.id === task.project_id);
+  const { projects, spawnError, lastActivity, tasks, decisions } = useStore();
+  // One rule decides every chip on this card: show it only if it changes what
+  // the director would DO. A project name while a project filter is on says
+  // what the filter buttons already say, so it is dropped there.
+  const projectFilter = useProjectFilter();
+  const project = projectFilter ? undefined : projects.find((p) => p.id === task.project_id);
   // health.since is the server's agent-only activity clock (health.ts); it is
   // the honest "quiet for" number, where updated_at counts hive's own writes.
   const age = useRelTime(task.health?.since || lastActivity[task.id] || task.updated_at);
-  const ev = evidenceCount[task.id];
   const location = useLocation();
   const [dispatching, setDispatching] = useState(false);
 
@@ -83,17 +85,6 @@ export function Card({ task }: { task: Task }) {
     }
   };
 
-  const viewAgent = async (e: React.MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    try {
-      const r = await api.focusAgent(task.id);
-      toast(r.ok ? "Focused agent tab in herdr" : `Can't focus: ${r.error}`);
-    } catch (err) {
-      toast((err as Error).message);
-    }
-  };
-
   const health = task.health;
   const unhealthy = needsLook(health);
   const trackingOnly = isTrackingOnly(task);
@@ -108,12 +99,13 @@ export function Card({ task }: { task: Task }) {
       <div className="card-top">
         <StatusDot state={task.state} health={task.health} />
         <span className="card-num" title={`Legacy task #${task.number}`}>{taskLabel(task)}</span>
-        <span className="card-title">{task.title}</span>
+        {/* Clamped to two lines in CSS; the full title is the tooltip and the
+            card's own page. A six-line title made the card all title. */}
+        <span className="card-title" title={task.title}>{task.title}</span>
       </div>
       {unhealthy && <HealthLine health={health!} />}
       <div className="card-meta">
         {project && <span className="chip">{project.name}</span>}
-        <span className={`chip chip-kind chip-${task.kind}`}>{task.kind}</span>
         <PriorityChip task={task} />
         {awaitingTriage ? (
           // Intake triage read this request two ways and parked it on one
@@ -131,34 +123,7 @@ export function Card({ task }: { task: Task }) {
             intake · unreviewed
           </span>
         )}
-        {task.source === "intake_braindump" && (
-          <span className="chip chip-intake" title="A braindump; Claude is drafting a breakdown to approve">
-            braindump
-          </span>
-        )}
-        {task.source === "external" && (
-          <span className="chip" title="Tracking-only: driven by an outside agent, never auto-dispatched">
-            tracked
-          </span>
-        )}
-        {task.jira_key && project?.jira_site && (
-          <a
-            className="chip chip-jira"
-            href={`${project.jira_site}/browse/${encodeURIComponent(task.jira_key)}`}
-            target="_blank"
-            rel="noreferrer"
-            title={`Open ${task.jira_key} in Jira`}
-            onClick={(e) => e.stopPropagation()}
-          >
-            {task.jira_key} ↗
-          </a>
-        )}
         {trackingOnly && <span className="chip">{STATE_LABEL[task.state]}</span>}
-        {task.source === "planner" && (
-          <span className="chip chip-planned" title="Created from an approved planner breakdown">
-            planned
-          </span>
-        )}
         {task.state === "queued" && spawnError[task.id] && (
           <span className="chip chip-error" title="A previous spawn failed; see the task timeline">
             ⚠ spawn failed
@@ -184,7 +149,9 @@ export function Card({ task }: { task: Task }) {
             {task.skip.label}
           </span>
         )}
-        <SidecarChip sidecar={task.sidecar} />
+        {/* Only a FAILING check earns board space; a green one changes nothing
+            the director would do. Both are always on the task page. */}
+        {task.sidecar && !task.sidecar.ok && <SidecarChip sidecar={task.sidecar} />}
         <BlockedBy depends_on={task.depends_on} tasks={tasks} />
         {/* A taken-over task is deferred too (that is how it is parked), so this
             comes first: "you are holding this one" beats "parked". */}
@@ -199,7 +166,6 @@ export function Card({ task }: { task: Task }) {
         )}
         <span className="card-age">{age}</span>
       </div>
-      {task.summary && <div className="card-summary">{task.summary}</div>}
       {subtasks.length > 0 && (
         <div className="card-subtasks">
           <div className="card-subtasks-head">
@@ -224,25 +190,11 @@ export function Card({ task }: { task: Task }) {
             {dispatching ? "dispatching…" : "dispatch now"}
           </button>
         )}
-        {task.agent_target && task.state === "in_progress" && !jiraMirror && (
-          <button className="btn btn-mini" onClick={viewAgent} title="Focus this agent's tab in herdr">
-            view agent
-          </button>
-        )}
-        {!trackingOnly && task.pr_url && (
-          <a
-            className="pr"
-            href={task.pr_url}
-            target="_blank"
-            rel="noreferrer"
-            title={`Pull request linked to ${taskLabel(task)}`}
-            onClick={(e) => e.stopPropagation()}
-          >
-            PR ↔ {taskLabel(task)}
-          </a>
-        )}
-        {!trackingOnly && <CiBadge status={task.ci_status} />}
-        {ev != null && ev > 0 && <span className="evc" title="evidence items">◱ {ev}</span>}
+        {/* PR link, green CI, evidence count and "view agent" all moved to the
+            card's own page (HIVE-556): they are detail, not a reason to act.
+            A CI result that is NOT passing stays, because that one stops a
+            merge. */}
+        {!trackingOnly && task.ci_status && task.ci_status !== "passing" && <CiBadge status={task.ci_status} />}
       </div>
     </Link>
   );
@@ -344,38 +296,38 @@ export function DivergenceChips({ task, rows, tasks }: { task: Task; rows: Diver
   );
 }
 
-const BANNER_DISMISS_KEY = "hive.brief.bannerDismissed";
+// ONE rendering of "what needs you" on this page. It used to be three: a
+// dismissible brief banner, a Needs attention tray, and the cards themselves,
+// so the same fact was read three times before any work was visible
+// (HIVE-556). The number and the set come from lib/needsYou.ts, the same
+// source as the nav badge, so the two can never disagree.
+//
+// Nothing is hidden: the strip links to /inbox, where every one of these items
+// has its full card and its buttons.
+const STRIP_LABELS: Record<string, [string, string]> = {
+  decision: ["decision", "decisions"],
+  checkpoint: ["checkpoint", "checkpoints"],
+  quiz_digest: ["catch-up", "catch-ups"],
+  review: ["to review", "to review"],
+  attention: ["issue", "issues"],
+};
 
-// Slim, dismissible banner nudging the director to Needs you when there are
-// actionable decisions, reviews, or tasks needing attention.
-// Dismissal is keyed on the current item signature, so a fresh decision or a new
-// unhealthy task brings it back rather than staying hidden forever.
-function BriefBanner() {
-  const { decisions, tasks } = useStore();
-  const attn = tasks.filter((t) => needsAttention(t) && !isWaiting(t, tasks)).length;
-  const decs = decisions.length;
-  const review = tasks.filter((t) => t.state === "in_review" && !isTrackingOnly(t)).length;
-  const sig = `${decs}:${attn}:${review}`;
-  const [dismissed, setDismissed] = useState<string>(() => localStorage.getItem(BANNER_DISMISS_KEY) || "");
-  if (decs + attn + review === 0 || dismissed === sig) return null;
-  const parts: string[] = [];
-  if (decs > 0) parts.push(`${decs} decision${decs === 1 ? "" : "s"}`);
-  if (review > 0) parts.push(`${review} to review`);
-  if (attn > 0) parts.push(`${attn} need${attn === 1 ? "s" : ""} attention`);
-  const dismiss = (e: React.MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    localStorage.setItem(BANNER_DISMISS_KEY, sig);
-    setDismissed(sig);
-  };
+export function NeedsYouStrip() {
+  const { needsYou, tasks } = useStore();
+  const projectFilter = useProjectFilter();
+  const items = actionableItems(needsYou, tasks, projectFilter);
+  if (items.length === 0) return null;
+  const parts = Object.entries(STRIP_LABELS).flatMap(([kind, [one, many]]) => {
+    const n = items.filter((item) => item.kind === kind).length;
+    return n > 0 ? [`${n} ${n === 1 ? one : many}`] : [];
+  });
   return (
-    <Link to="/inbox" className="brief-banner">
-      <span className="brief-banner-dot">◆</span>
-      <span className="brief-banner-text">Your brief: {parts.join(", ")}</span>
-      <span className="brief-banner-go">Open →</span>
-      <button className="brief-banner-x" onClick={dismiss} title="Dismiss" aria-label="Dismiss">
-        ×
-      </button>
+    <Link to="/inbox" className="needs-you-strip">
+      <span className="needs-you-strip-count">{items.length}</span>
+      <span className="needs-you-strip-text">
+        needs you<span className="needs-you-strip-parts"> · {parts.join(" · ")}</span>
+      </span>
+      <span className="needs-you-strip-go">Open →</span>
     </Link>
   );
 }
@@ -431,8 +383,7 @@ export default function Board() {
 
   return (
     <div className="board-wrap">
-      <BriefBanner />
-      <AttentionTray tasks={visible} />
+      <NeedsYouStrip />
       <div className="board-switch">
         <span className="board-switch-label">Project</span>
         <button className={`board-chip ${projectFilter ? "" : "board-chip-on"}`} onClick={() => setFilter("")}>
