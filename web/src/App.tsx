@@ -17,8 +17,8 @@ import {
   faRocket,
 } from "@fortawesome/free-solid-svg-icons";
 import { useStore } from "./lib/store";
-import { itemProject } from "./lib/needsYou";
-import { useProjectFilter, inProjectFilter } from "./lib/projectFilter";
+import { actionableItems } from "./lib/needsYou";
+import { useProjectFilter } from "./lib/projectFilter";
 import { relTime } from "./lib/time";
 import { toast } from "./lib/ui";
 import { pushState, enablePush } from "./lib/push";
@@ -287,10 +287,9 @@ export function Bell() {
 export default function App() {
   const { needsYou, tasks, offline, setOffline, away, setAway } = useStore();
   const projectFilter = useProjectFilter();
-  const inboxCount = needsYou.filter(
-    // "waiting" and "review_pending" are visible but not yours to act on yet.
-    (item) => item.kind !== "waiting" && item.kind !== "review_pending" && inProjectFilter(itemProject(item, tasks), projectFilter),
-  ).length;
+  // One shared definition (lib/needsYou.ts) so this badge, the landing
+  // headline and the board strip always show the same number.
+  const inboxCount = actionableItems(needsYou, tasks, projectFilter).length;
   const location = useLocation();
   // Board card clicks push /tasks/:id with state.backgroundLocation set to the
   // board's location — that keeps the board mounted and rendered underneath
