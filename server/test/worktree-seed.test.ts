@@ -160,3 +160,14 @@ test("a cp that dies part-way never leaves a half-built node_modules", async () 
   expect(readFileSync(join(wt, "node_modules", "left-pad", "index.js"), "utf8")).toBe("module.exports=1");
   expect(existsSync(join(wt, "node_modules", "half-written"))).toBe(false);
 });
+
+test("a wide-open seed pattern stops at the cap instead of copying the whole checkout", async () => {
+  const { repo, wt } = trees();
+  // `**/*` is the pattern the cap exists for: it matches everything in the main
+  // checkout, so without a limit every spawn would copy the lot.
+  mkdirSync(join(repo, "junk"), { recursive: true });
+  for (let i = 0; i < 200; i++) writeFileSync(join(repo, "junk", `f${i}.txt`), "x");
+  const r = await seedWorktree(repo, wt, { worktree_seed: ["**/*"] }, realExec);
+  expect(r.seeded.length).toBe(100);
+  expect(r.misconfigured.some((m) => m.reason.includes("worktree_seed stopped at"))).toBe(true);
+});

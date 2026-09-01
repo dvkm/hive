@@ -19,7 +19,7 @@
 // own setup hook sees the warm state and no-ops (hive's own `wt.sh up` already
 // short-circuits on `[ -d node_modules ]`). Everything here is best-effort: a
 // seed that fails is a slow spawn, never a broken one, so nothing throws.
-import { existsSync, mkdirSync, cpSync, copyFileSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, cpSync, copyFileSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve, isAbsolute } from "node:path";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
@@ -56,6 +56,14 @@ export type WarmMethod = "clone" | "copy";
 const CLONE_TIMEOUT_MS = 300_000;
 const CLONE_ARGV: string[] | null =
   process.platform === "darwin" ? ["cp", "-Rc"] : process.platform === "linux" ? ["cp", "-R", "--reflink=always"] : null;
+
+// The seed list is meant for a handful of small config files (.env and
+// friends). A pattern like `**/*` would happily copy the whole main checkout
+// into every spawn, so cap both how many files one seed run copies and how many
+// bytes. Hitting either cap stops the run and is reported as misconfigured: a
+// seed list that big is a mistake in the config, not a slow spawn to shrug at.
+const SEED_MAX_FILES = 100;
+const SEED_MAX_BYTES = 32 * 1024 * 1024;
 
 // Keep a config-supplied path inside the tree it claims to be relative to.
 // projects.config is already an RCE surface (see projectConfig.ts), so this is
@@ -127,7 +135,10 @@ export async function seedWorktree(
   const warm = Array.isArray(config.worktree_warm) ? config.worktree_warm : [];
 
   const unmatched: string[] = [];
+  let seedBytes = 0;
+  let capped = "";
   for (const pattern of patterns) {
+    if (capped) break;
     let matched = 0;
     try {
       // Bun.Glob scans the main checkout, so the allowlist selects real files
@@ -147,13 +158,23 @@ export async function seedWorktree(
           out.skipped.push({ path: rel, reason: "already present in worktree" });
           continue;
         }
+        const size = statSync(src).size;
+        if (out.seeded.length >= SEED_MAX_FILES || seedBytes + size > SEED_MAX_BYTES) {
+          capped = `worktree_seed stopped at ${out.seeded.length} files / ${seedBytes} bytes: the patterns match far more than the config files this is for`;
+          break;
+        }
         mkdirSync(dirname(dst), { recursive: true });
         copyFileSync(src, dst);
+        seedBytes += size;
         out.seeded.push(rel);
       }
     } catch (e: any) {
       out.misconfigured.push({ path: pattern, reason: String(e?.message ?? e).slice(0, 200) });
       continue;
+    }
+    if (capped) {
+      out.misconfigured.push({ path: pattern, reason: capped });
+      break;
     }
     if (!matched) {
       unmatched.push(pattern);
