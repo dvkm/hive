@@ -2131,10 +2131,42 @@ export function looksSecuritySensitive(text: string): boolean {
 // second one: the bad brief was several hundred chars of prose whose entire
 // content was "this ticket has no description, ask the reporter" — a length
 // check alone waves that straight through.
+//
+// The second arm refuses task creation outright, so it has to be far more
+// conservative than a warning would be: a false positive blocks a legitimate
+// filing with a 400 and the caller has no override. So every pattern is
+// anchored to the TICKET itself ("the issue has no description", "no spec on
+// WEB-118") rather than matching a bare phrase anywhere in the prose. A real
+// spec that happens to say "the card renders no description when the field is
+// empty" is about the product, not the ticket, and must sail through.
+const TICKET = String.raw`(?:this |the )?(?:ticket|issue|jira(?: (?:issue|ticket))?|[A-Z][A-Z0-9]{1,9}-\d+)`;
+const ABSENT_SPEC_CLAIMS: RegExp[] = [
+  // "the issue has no description", "WEB-118 carries only a title"
+  new RegExp(String.raw`\b${TICKET}\b[^.\n]{0,30}?\s(?:has|have|had|carries|contains|includes|provides|comes with)\s+(?:no|only a|nothing but a)\s+(?:description|spec(?:ification)?|body|details|requirements|title)\b`, "gi"),
+  // "there is no description on the Jira issue", "no spec attached to WEB-118"
+  new RegExp(String.raw`\b(?:there (?:is|was|are|were) )?no\s+(?:description|spec(?:ification)?|requirements)\b[^.\n]{0,30}?\b(?:on|for|in|attached to)\s+${TICKET}\b`, "gi"),
+  // "the ticket is title-only", "a title-only issue"
+  new RegExp(String.raw`\b${TICKET}\b[^.\n]{0,20}?\sis\s+title[- ]only\b`, "gi"),
+  new RegExp(String.raw`\btitle[- ]only\s+${TICKET}\b`, "gi"),
+  // proposing to go back to the reporter because the spec is missing
+  /\b(?:ask|asking|check with|go back to)\s+the\s+(?:reporter|requester|filer)\b[^.\n]{0,40}?\b(?:for (?:a |the )?(?:spec(?:ification)?|description|requirements|details)|what (?:they|he|she) wants?)/gi,
+  /\b(?:spec(?:ification)?|description|requirements)\s+(?:is |are )?needed from the (?:reporter|requester|filer)\b/gi,
+  /\bawaiting (?:a |the )?spec(?:ification)?\b/gi,
+];
+// "no need to ask the reporter for a spec" is the OPPOSITE claim, and reads as
+// a match to the arm above. Look back a short way for the negation that flips it.
+const NEGATED_BEFORE = /\b(?:no need|without need(?:ing)?|don'?t need|do not need|no reason|not necessary|rather than|instead of|no point)\b[^.\n]{0,30}$/i;
+
 export function thinBriefReason(brief: string): string | null {
   if (brief.length < 150) return `brief is title-only (${brief.length} chars)`;
-  const claim = /\b(no description|has no spec|without a spec|title[ -]only|only a title|carries only a title|ask the reporter|asking the reporter|spec(?:ification)? (?:is )?needed from|needs a spec from|awaiting a spec)\b/i.exec(brief);
-  return claim ? `brief claims the ticket has no spec ("${claim[0]}")` : null;
+  for (const re of ABSENT_SPEC_CLAIMS) {
+    re.lastIndex = 0;
+    for (const m of brief.matchAll(re)) {
+      if (NEGATED_BEFORE.test(brief.slice(Math.max(0, m.index - 60), m.index))) continue;
+      return `brief claims the ticket has no spec ("${m[0].trim()}")`;
+    }
+  }
+  return null;
 }
 
 // Accepts JSON or multipart; attached files are saved under the new task's id

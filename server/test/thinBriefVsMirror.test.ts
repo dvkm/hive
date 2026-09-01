@@ -10,7 +10,7 @@ process.env.HIVE_HOME = mkdtempSync(join(tmpdir(), "hive-thin-brief-"));
 
 const { openDb, newId, now } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
-const { makeHandler } = await import("../src/api.ts");
+const { makeHandler, thinBriefReason } = await import("../src/api.ts");
 
 function freshDb(): { db: DB; projectId: string } {
   const db = openDb(":memory:");
@@ -146,6 +146,50 @@ test("stays quiet when the mirror brief is itself thin", async () => {
       project_id: projectId,
       title: "[WEB-2] tweak the footer",
       kind: "chore",
+    });
+    expect(res.status).toBe(201);
+  } finally {
+    server.stop();
+  }
+});
+
+// The false positives the risk check named. This guard REFUSES with a 400, so
+// an over-eager match blocks a legitimate filing outright and the caller has no
+// way around it. A substantial spec that merely uses the words "no description"
+// or "ask the reporter" about the PRODUCT must be accepted.
+test("does not fire on a real spec that talks about a missing description in the UI", () => {
+  const brief =
+    "When the tracker field is empty the card renders no description of the run below the title, which reads as a bug. " +
+    "Render the placeholder copy instead, keep the row height fixed, and cover it with a snapshot test in the card spec.";
+  expect(thinBriefReason(brief)).toBeNull();
+});
+
+test("does not fire on a brief that says there is no need to ask the reporter", () => {
+  const brief =
+    "The spec is already on the mirror task and it is complete, so there is no need to ask the reporter for a spec here. " +
+    "Add the new column to the tracker form, persist a single dash as an empty value, and expose it through the public reader.";
+  expect(thinBriefReason(brief)).toBeNull();
+});
+
+test("still fires on the real WEB-118 shape", () => {
+  const brief =
+    "WEB-118 carries only a title and there is no description on the Jira issue, so we cannot tell what the reporter wants. " +
+    "The right move is to ask the reporter for a spec before any code is written.";
+  expect(thinBriefReason(brief)).not.toBeNull();
+});
+
+test("a substantial brief is accepted end to end even when it mentions a missing description", async () => {
+  const { db, projectId } = freshDb();
+  makeMirror(db, projectId, "WEB-314", "x".repeat(300));
+  const { server, post } = serve(db);
+  try {
+    const res = await post("/api/tasks", {
+      project_id: projectId,
+      title: "[WEB-314] show placeholder copy on empty cards",
+      kind: "chore",
+      brief:
+        "When the tracker field is empty the card renders no description of the run below the title, which reads as a bug. " +
+        "Render the placeholder copy instead, keep the row height fixed, and cover it with a snapshot test in the card spec.",
     });
     expect(res.status).toBe(201);
   } finally {
