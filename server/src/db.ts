@@ -753,6 +753,30 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
          WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'`,
     ],
   },
+  // Telemetry for `hive recall` (hive-1846). One row per knowledge search: the
+  // raw query and how many rows each kind returned. Counts only — never the
+  // matched content — so this stays a measurement of hit rate, not a copy of the
+  // knowledge store. Reading it back tells us whether recall misses often enough
+  // to justify better retrieval (embeddings) or just better keywords.
+  // No foreign keys on project_id/task_id on purpose: telemetry must never turn
+  // a recall into a 500 because the caller passed an id that does not exist.
+  {
+    name: "v46-recall-log",
+    statements: [
+      `CREATE TABLE recall_log (
+        id TEXT PRIMARY KEY,
+        ts TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        task_id TEXT,
+        q TEXT NOT NULL,
+        n_references INTEGER NOT NULL DEFAULT 0,
+        n_learnings INTEGER NOT NULL DEFAULT 0,
+        n_policies INTEGER NOT NULL DEFAULT 0,
+        n_decisions INTEGER NOT NULL DEFAULT 0
+      )`,
+      `CREATE INDEX idx_recall_log_project_ts ON recall_log(project_id, ts)`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings

@@ -71,6 +71,7 @@ Usage:
         them in graph order (declared dependencies first, one conflicting branch per sweep)
   hive land-graph [--project <id>]        show the review column's ordering edges
   hive recall <keywords>                  search project knowledge (references, learnings, policies)
+  hive recall --stats [--days N]          recall hit rate: share of searches finding nothing, top misses
   hive garden [--project <id>] [--apply] [--remote] [--json]
         prune task branches + worktrees using task state, not git reachability.
         Deletes a branch only when its task is done; keeps cancelled/failed
@@ -1013,6 +1014,24 @@ async function main() {
     if (flags.project) qs.set("project_id", String(flags.project));
     else if (process.env.HIVE_TASK_ID) qs.set("task_id", process.env.HIVE_TASK_ID);
     else die("run under a hive task (HIVE_TASK_ID) or pass --project <id>");
+    // --stats reads the recall telemetry instead of searching: how often a
+    // keyword search finds nothing, and which queries miss most.
+    if (flags.stats) {
+      if (!qs.get("project_id")) {
+        const t = await api("GET", `/api/tasks/${qs.get("task_id")}`);
+        qs.set("project_id", t.project_id);
+      }
+      qs.delete("task_id");
+      if (flags.days) qs.set("days", String(flags.days));
+      const s = await api("GET", "/api/knowledge/stats?" + qs.toString());
+      const pct = (s.zero_result_share * 100).toFixed(1);
+      console.log(`${s.queries} keyword recalls, ${s.zero_result_queries} found nothing (${pct}%)`);
+      if (s.top_zero_result_queries.length) {
+        console.log("\nQueries that found nothing, most frequent first:");
+        for (const r of s.top_zero_result_queries) console.log(`  ${String(r.count).padStart(3)}x  ${r.q}`);
+      }
+      return;
+    }
     if (q) qs.set("q", q);
     const r = await api("GET", "/api/knowledge?" + qs.toString());
     const show = (label: string, items: any[]) => {
