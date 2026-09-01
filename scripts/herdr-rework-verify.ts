@@ -80,8 +80,8 @@ async function main() {
   log("scratch hive server:", BASE, " home:", HOME);
 
   const post = async (p: string, body: unknown) =>
-    (await fetch(BASE + p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })).json();
-  const get = async (p: string) => (await fetch(BASE + p)).json();
+    (await fetch(BASE + p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })).json() as any;
+  const get = async (p: string) => (await fetch(BASE + p)).json() as any;
 
   // ---- PHASE 1: real interactive claude spawns into the visible fleet ----
   hr("PHASE 1: interactive claude — visible, labelled fleet tab");
