@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import type { Project, PrGardenerItem, Kind, State } from "../lib/api";
-import { useStore } from "../lib/store";
+import { keepTrying, useStore } from "../lib/store";
 import { STATE_LABEL, toast } from "../lib/ui";
 import { isAbsoluteRepoPath, repoPathPlaceholder } from "../lib/paths";
 
@@ -21,20 +21,30 @@ function restConfig(config: Project["config"]): Record<string, unknown> {
 export default function Projects() {
   const { tasks, reloadProjects } = useStore();
   const [projects, setProjects] = useState<Project[]>([]);
+  // False until a fetch has really landed. An empty list on its own does not
+  // mean there are no projects — the fetch may just have failed.
+  const [loaded, setLoaded] = useState(false);
   const [adding, setAdding] = useState(false);
   const [openId, setOpenId] = useState<string | null>(null);
 
   // The Projects surface shows archived projects too (with a toggle to restore).
+  // Rejecting on failure is deliberate: keepTrying needs the rejection to
+  // schedule its retry, and the old list stays on screen meanwhile.
   const load = () =>
-    api.projects({ archived: true }).then(setProjects).catch(() => setProjects([]));
+    api.projects({ archived: true }).then((p) => {
+      setProjects(p);
+      setLoaded(true);
+    });
+  const loop = useRef<ReturnType<typeof keepTrying>>();
   useEffect(() => {
-    load();
+    loop.current = keepTrying(load);
+    return () => loop.current?.stop();
   }, []);
 
   // Any create/edit/archive both refreshes this list and the shared store list
   // (board switcher, new-task modal, policies).
   const refresh = () => {
-    load();
+    loop.current?.run();
     reloadProjects();
   };
 
@@ -58,10 +68,12 @@ export default function Projects() {
       </p>
 
       {projects.length === 0 ? (
-        <div className="empty">
-          <div className="empty-big">No projects yet</div>
-          <div className="muted">Add your first to start queueing work against a repo.</div>
-        </div>
+        loaded ? (
+          <div className="empty">
+            <div className="empty-big">No projects yet</div>
+            <div className="muted">Add your first to start queueing work against a repo.</div>
+          </div>
+        ) : null
       ) : (
         <div className="proj-list">
           {projects.map((p) => (
