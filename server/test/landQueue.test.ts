@@ -20,6 +20,20 @@ function ageLandAttempts(db: DB, taskId: string, byMs: number): void {
     db.query("UPDATE events SET ts = ? WHERE id = ?").run(new Date(Date.parse(r.ts) - byMs).toISOString(), r.id);
 }
 
+// Point the task at a commit the auto reviewer has already cleared. The land
+// queue waits for a verdict on the current head before it attempts anything
+// (HIVE-581), so a test that sets head_sha has to give it one — a real refusal
+// (a confirmed risk, a scope failure) can only happen after the review ran.
+function setHead(db: DB, taskId: string, sha: string, verdict = "looks_good"): void {
+  db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run(sha, taskId);
+  writeEvent(db, {
+    task_id: taskId,
+    source: "system",
+    type: "auto_review",
+    payload: { verdict, files: ["src/a.ts"], risks: [], questions: [], reviewed_head_sha: sha },
+  });
+}
+
 function freshDb(): { db: DB; projectId: string } {
   const db = openDb(":memory:");
   const projectId = newId("proj");
@@ -464,7 +478,7 @@ test("repeated failures that never open a card take the task out of the queue", 
       transition(db, a, "in_review", { source: "agent", reason: "pushed again" });
     // Each push is a new commit, which re-arms the queue (HIVE-555). The
     // attempt ceiling is what stops this loop.
-    db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run(`sha${i}`, a);
+    setHead(db, a, `sha${i}`);
     ageLandAttempts(db, a, 3_600_000);
   }
   expect(calls).toHaveLength(10); // MAX_LAND_ATTEMPTS
@@ -547,7 +561,7 @@ test("a non-capacity transient failure still retries on the short backoff", asyn
 test("a non-transient failure retries once, then holds instead of re-failing forever", async () => {
   const { db, projectId } = freshDb();
   const a = makeTask(db, projectId, { branch: "a" });
-  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  setHead(db, a, "sha1");
   markLand(db, [a], true);
   const reason = "the branch drops work that is already on main";
 
@@ -576,7 +590,7 @@ test("a non-transient failure retries once, then holds instead of re-failing for
   expect((db.query("SELECT land_queued_at FROM tasks WHERE id = ?").get(a) as any).land_queued_at).toBeTruthy();
 
   // A new head_sha re-arms it: the agent pushed, so the verdict may differ.
-  db.query("UPDATE tasks SET head_sha = 'sha2' WHERE id = ?").run(a);
+  setHead(db, a, "sha2");
   const rearmed = mergeStub(db);
   await landOnce(db, { exec: filesExec({}), merge: rearmed.merge });
   expect(rearmed.calls).toEqual([a]);
@@ -586,14 +600,14 @@ test("a non-transient failure retries once, then holds instead of re-failing for
 test("a new head_sha closes the stale land-queue pause card", async () => {
   const { db, projectId } = freshDb();
   const a = makeTask(db, projectId, { branch: "a" });
-  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  setHead(db, a, "sha1");
   markLand(db, [a], true);
 
   const { merge } = mergeStub(db, { [a]: "the branch drops work that is already on main" });
   await landOnce(db, { exec: filesExec({}), merge });
   expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(1);
 
-  db.query("UPDATE tasks SET head_sha = 'sha2' WHERE id = ?").run(a);
+  setHead(db, a, "sha2");
   const next = mergeStub(db);
   await landOnce(db, { exec: filesExec({}), merge: next.merge });
   expect((db.query("SELECT COUNT(*) AS n FROM decisions WHERE status = 'open'").get() as any).n).toBe(0);
@@ -619,7 +633,7 @@ const RISK_FAILURE = { reason: RISK_REASON, code: CONFIRMED_RISK_CODE };
 test("a confirmed risk goes to the agent as a steer, opens no card, and holds the land", async () => {
   const { db, projectId } = freshDb();
   const a = makeTask(db, projectId, { branch: "a" });
-  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  setHead(db, a, "sha1");
   markLand(db, [a], true);
 
   const { calls, merge } = mergeStub(db, { [a]: RISK_FAILURE });
@@ -642,7 +656,7 @@ test("a confirmed risk goes to the agent as a steer, opens no card, and holds th
 
   // A new head re-arms the merge with no card in between.
   markSteersDelivered(db, steers.map((s) => s.id), "drain");
-  db.query("UPDATE tasks SET head_sha = 'sha2' WHERE id = ?").run(a);
+  setHead(db, a, "sha2");
   ageLandAttempts(db, a, 3_600_000);
   const after = mergeStub(db);
   await landOnce(db, { exec: filesExec({}), merge: after.merge });
@@ -654,7 +668,7 @@ test("a confirmed risk goes to the agent as a steer, opens no card, and holds th
 test("an agent that disputes a confirmed risk gets a card carrying the argument", async () => {
   const { db, projectId } = freshDb();
   const a = makeTask(db, projectId, { branch: "a" });
-  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  setHead(db, a, "sha1");
   markLand(db, [a], true);
 
   const first = mergeStub(db, { [a]: RISK_FAILURE });
@@ -686,7 +700,7 @@ test("an agent that disputes a confirmed risk gets a card carrying the argument"
 test("an ordinary answer after the relay is not a dispute and opens no card", async () => {
   const { db, projectId } = freshDb();
   const a = makeTask(db, projectId, { branch: "a" });
-  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  setHead(db, a, "sha1");
   markLand(db, [a], true);
   await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
   expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
@@ -714,7 +728,7 @@ test("an ordinary answer after the relay is not a dispute and opens no card", as
 test("a dispute escalates even while the task is held and never re-attempted", async () => {
   const { db, projectId } = freshDb();
   const a = makeTask(db, projectId, { branch: "a" });
-  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  setHead(db, a, "sha1");
   markLand(db, [a], true);
   await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
 
@@ -740,7 +754,7 @@ test("a dispute escalates even while the task is held and never re-attempted", a
 test("a confirmed-risk refusal with no code still routes, and says loudly that it desynced", async () => {
   const { db, projectId } = freshDb();
   const a = makeTask(db, projectId, { branch: "a" });
-  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  setHead(db, a, "sha1");
   markLand(db, [a], true);
 
   // Code stripped: only the prose survives, exactly as a reworded gate would look.
@@ -755,4 +769,45 @@ test("a confirmed-risk refusal with no code still routes, and says loudly that i
   expect(JSON.parse(desync[0].payload).expected_code).toBe(CONFIRMED_RISK_CODE);
   const notes = db.query("SELECT title FROM notifications WHERE task_id = ?").all(a) as any[];
   expect(notes.some((n) => n.title.includes(CONFIRMED_RISK_CODE))).toBe(true);
+});
+
+test("a queued task waits for the auto review, then lands on the next sweep (HIVE-581)", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run("headsha1", a);
+  markLand(db, [a], true);
+
+  // The reviewer has not written anything for this head yet: no attempt, no
+  // failed land_attempted, no card.
+  const early = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: early.merge });
+  expect(early.calls).toEqual([]);
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'land_attempted'").get(a) as any).n).toBe(0);
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+
+  // The verdict arrives; the same task lands on the next sweep, no human input.
+  writeEvent(db, {
+    task_id: a,
+    source: "system",
+    type: "auto_review",
+    payload: { verdict: "looks_good", files: ["src/a.ts"], risks: [], questions: [], reviewed_head_sha: "headsha1" },
+  });
+  const after = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: after.merge });
+  expect(after.calls).toEqual([a]);
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(a) as any).state).toBe("verifying");
+});
+
+test("a project with auto review disabled lands without waiting for a verdict", async () => {
+  const { db, projectId } = freshDb();
+  db.query("UPDATE projects SET config = ? WHERE id = ?").run(
+    JSON.stringify({ default_branch: "main", auto_review: false }), projectId
+  );
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run("headsha1", a);
+  markLand(db, [a], true);
+
+  const { calls, merge } = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge });
+  expect(calls).toEqual([a]);
 });

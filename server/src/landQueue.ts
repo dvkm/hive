@@ -24,6 +24,7 @@ import { authoredFiles } from "./rebaseGuard.ts";
 import { defaultExec, projectComparisonBase, type Exec } from "./exec.ts";
 import { enqueue } from "./notifications.ts";
 import { queueSteerEvent, queuedSteers } from "./steer.ts";
+import { reviewPipelineSettled } from "./reviewer.ts";
 
 export interface LandNode {
   id: string;
@@ -728,6 +729,14 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         // Red or still-running CI holds only this node. Independent nodes can
         // still enter the same batch (they land one after another, not at once).
         if (n.ci_status === "failing" || n.ci_status === "pending") continue;
+        // The reviewer has not spoken for this head yet (HIVE-581). The merge
+        // asks understandingChecksRequired, and that reads "no verdict" as
+        // "needs a check" — so attempting now refuses a task that would land
+        // free a couple of minutes later. Nothing here needs a human, so hold
+        // quietly: no attempt, no failed land_attempted, no pause card.
+        // reviewPipelineSettled (not a bare !verdict) is what keeps a project
+        // with auto review off, or a task with no head, from stalling forever.
+        if (!reviewPipelineSettled(db, { id: n.id, head_sha: headShaOf(db, n.id), project_id })) continue;
         // A pause card already waiting on the director holds the task too —
         // otherwise every sweep would re-attempt and re-ask the same question.
         if (openPauseDecisionId(db, n.id)) continue;
