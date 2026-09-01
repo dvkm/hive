@@ -30,13 +30,23 @@ function makeMirror(db: DB, projectId: string, key: string, brief: string): stri
   return id;
 }
 
+// Call the handler directly instead of standing up a real HTTP server.
+// HIVE-589: this file used to serve on port 0 and stop() each server without
+// forcing, which closes the listening socket but leaves the already-open
+// keep-alive connection running on the old handler. Once the OS handed that
+// freed port to a later Bun.serve, bun's fetch pool still had a live socket to
+// it, so a later test's request was answered by an earlier test's server (and
+// its long-dead in-memory db). That is order- and state-dependent by
+// construction. No socket, no port, no pool, no flake.
 function serve(db: DB) {
-  const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
-  const BASE = `http://127.0.0.1:${server.port}`;
+  const handler = makeHandler(db);
   return {
-    server,
     post: (path: string, body: unknown) =>
-      fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+      handler(new Request("http://127.0.0.1" + path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })),
   };
 }
 
@@ -44,52 +54,40 @@ test("refuses a title-only brief when the linked mirror has a substantial spec",
   const { db, projectId } = freshDb();
   const spec = "x".repeat(300);
   makeMirror(db, projectId, "WEB-118", spec);
-  const { server, post } = serve(db);
-  try {
-    const res = await post("/api/tasks", {
-      project_id: projectId,
-      title: "[WEB-118] fix the thing",
-      kind: "chore",
-    });
-    expect(res.status).toBe(400);
-    const body = await res.json();
-    expect(String(body.error)).toContain("mirror task");
-  } finally {
-    server.stop();
-  }
+  const { post } = serve(db);
+  const res = await post("/api/tasks", {
+    project_id: projectId,
+    title: "[WEB-118] fix the thing",
+    kind: "chore",
+  });
+  expect(res.status).toBe(400);
+  const body = await res.json();
+  expect(String(body.error)).toContain("mirror task");
 });
 
 test("allows creation when the new brief already carries the spec", async () => {
   const { db, projectId } = freshDb();
   const spec = "x".repeat(300);
   makeMirror(db, projectId, "WEB-119", spec);
-  const { server, post } = serve(db);
-  try {
-    const res = await post("/api/tasks", {
-      project_id: projectId,
-      title: "[WEB-119] fix the thing",
-      kind: "chore",
-      brief: spec,
-    });
-    expect(res.status).toBe(201);
-  } finally {
-    server.stop();
-  }
+  const { post } = serve(db);
+  const res = await post("/api/tasks", {
+    project_id: projectId,
+    title: "[WEB-119] fix the thing",
+    kind: "chore",
+    brief: spec,
+  });
+  expect(res.status).toBe(201);
 });
 
 test("allows creation when no mirror is linked", async () => {
   const { db, projectId } = freshDb();
-  const { server, post } = serve(db);
-  try {
-    const res = await post("/api/tasks", {
-      project_id: projectId,
-      title: "just a normal task",
-      kind: "chore",
-    });
-    expect(res.status).toBe(201);
-  } finally {
-    server.stop();
-  }
+  const { post } = serve(db);
+  const res = await post("/api/tasks", {
+    project_id: projectId,
+    title: "just a normal task",
+    kind: "chore",
+  });
+  expect(res.status).toBe(201);
 });
 
 // The shape that actually got through in production: a long, confident brief
@@ -98,59 +96,47 @@ test("allows creation when no mirror is linked", async () => {
 test("refuses a long brief that claims the ticket has no spec", async () => {
   const { db, projectId } = freshDb();
   makeMirror(db, projectId, "WEB-218", "x".repeat(300));
-  const { server, post } = serve(db);
-  try {
-    const res = await post("/api/tasks", {
-      project_id: projectId,
-      title: "[WEB-218] fix the thing",
-      kind: "chore",
-      brief:
-        "WEB-218 carries only a title and there is no description on the Jira issue, so we cannot tell what the reporter wants here. " +
-        "The right move is to ask the reporter for a spec before any code is written. " +
-        "Until then this task should stay parked and nobody should guess at requirements.",
-    });
-    expect(res.status).toBe(400);
-    expect(String((await res.json()).error)).toContain("mirror task");
-  } finally {
-    server.stop();
-  }
+  const { post } = serve(db);
+  const res = await post("/api/tasks", {
+    project_id: projectId,
+    title: "[WEB-218] fix the thing",
+    kind: "chore",
+    brief:
+      "WEB-218 carries only a title and there is no description on the Jira issue, so we cannot tell what the reporter wants here. " +
+      "The right move is to ask the reporter for a spec before any code is written. " +
+      "Until then this task should stay parked and nobody should guess at requirements.",
+  });
+  expect(res.status).toBe(400);
+  expect(String((await res.json()).error)).toContain("mirror task");
 });
 
 // WEB-113 shape: both sides substantial and consistent. Stays quiet.
 test("allows a substantial brief that does not claim the spec is missing", async () => {
   const { db, projectId } = freshDb();
   makeMirror(db, projectId, "WEB-113", "x".repeat(300));
-  const { server, post } = serve(db);
-  try {
-    const res = await post("/api/tasks", {
-      project_id: projectId,
-      title: "[WEB-113] add the column",
-      kind: "chore",
-      brief:
-        "Add a new text column beside the existing one in the tracker form, save it when the value is a single dash, " +
-        "and map it through to the public reader. Rename the old field and stop publishing it. Done when the e2e spec passes.",
-    });
-    expect(res.status).toBe(201);
-  } finally {
-    server.stop();
-  }
+  const { post } = serve(db);
+  const res = await post("/api/tasks", {
+    project_id: projectId,
+    title: "[WEB-113] add the column",
+    kind: "chore",
+    brief:
+      "Add a new text column beside the existing one in the tracker form, save it when the value is a single dash, " +
+      "and map it through to the public reader. Rename the old field and stop publishing it. Done when the e2e spec passes.",
+  });
+  expect(res.status).toBe(201);
 });
 
 // WEB-2 shape: the mirror itself is title-only, so a thin work brief is honest.
 test("stays quiet when the mirror brief is itself thin", async () => {
   const { db, projectId } = freshDb();
   makeMirror(db, projectId, "WEB-2", "tweak the footer");
-  const { server, post } = serve(db);
-  try {
-    const res = await post("/api/tasks", {
-      project_id: projectId,
-      title: "[WEB-2] tweak the footer",
-      kind: "chore",
-    });
-    expect(res.status).toBe(201);
-  } finally {
-    server.stop();
-  }
+  const { post } = serve(db);
+  const res = await post("/api/tasks", {
+    project_id: projectId,
+    title: "[WEB-2] tweak the footer",
+    kind: "chore",
+  });
+  expect(res.status).toBe(201);
 });
 
 // The false positives the risk check named. This guard REFUSES with a 400, so
@@ -181,18 +167,14 @@ test("still fires on the real WEB-118 shape", () => {
 test("a substantial brief is accepted end to end even when it mentions a missing description", async () => {
   const { db, projectId } = freshDb();
   makeMirror(db, projectId, "WEB-314", "x".repeat(300));
-  const { server, post } = serve(db);
-  try {
-    const res = await post("/api/tasks", {
-      project_id: projectId,
-      title: "[WEB-314] show placeholder copy on empty cards",
-      kind: "chore",
-      brief:
-        "When the tracker field is empty the card renders no description of the run below the title, which reads as a bug. " +
-        "Render the placeholder copy instead, keep the row height fixed, and cover it with a snapshot test in the card spec.",
-    });
-    expect(res.status).toBe(201);
-  } finally {
-    server.stop();
-  }
+  const { post } = serve(db);
+  const res = await post("/api/tasks", {
+    project_id: projectId,
+    title: "[WEB-314] show placeholder copy on empty cards",
+    kind: "chore",
+    brief:
+      "When the tracker field is empty the card renders no description of the run below the title, which reads as a bug. " +
+      "Render the placeholder copy instead, keep the row height fixed, and cover it with a snapshot test in the card spec.",
+  });
+  expect(res.status).toBe(201);
 });
