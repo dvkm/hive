@@ -273,11 +273,14 @@ export function isConfirmedRiskFailure(reason: string): boolean {
   return CONFIRMED_RISK_RE.test(reason);
 }
 
-// Two relays against ONE commit is the ceiling. Counted per head_sha, so a real
+// One relay against ONE commit is the ceiling. Counted per head_sha, so a real
 // fix (a new commit) starts fresh and an agent that hands the same branch back
-// unchanged runs out. Never auto-overrides: `override_confirmed_risks` stays a
+// unchanged runs out. It is 1, not 2, because HIVE-555 already stops the queue
+// re-attempting the same commit after two non-transient failures — a second
+// relay could never be reached, and a constant the surrounding code cannot
+// honour is a lie. Never auto-overrides: `override_confirmed_risks` stays a
 // human act, and the merge itself is re-attempted, never waved through.
-const MAX_RISK_ROUTES_PER_HEAD = 2;
+const MAX_RISK_ROUTES_PER_HEAD = 1;
 
 function riskRoutesAtHead(db: DB, taskId: string, headSha: string | null): number {
   const row = db
@@ -295,6 +298,20 @@ function riskRoutesAtHead(db: DB, taskId: string, headSha: string | null): numbe
 // wrong, that is exactly when a person should look, and the argument is what
 // makes the card cheap to answer. A new head means the agent pushed instead, so
 // the relay did its job and there is nothing to escalate.
+//
+// The signal is its own event type, NOT `answer`. `answer` is the generic reply
+// channel for every steer and change-request question, so reading it here made
+// "on it, fixing now" — or a reply about something else entirely — escalate to
+// the director. That is the exact interruption this feature exists to remove,
+// so disputing takes a deliberate, separate act:
+//   hive emit <task-id> risk_dispute --note "why the finding is wrong"
+// `risk_dispute` needs no server or CLI plumbing: unknown event types already
+// ingest through the generic path in ingestEvent, which stores `{ note }`.
+// An agent that disputes on the wrong channel is not read as a dispute — it
+// spends its relay instead and gets the ordinary pause card, which errs toward
+// the quiet outcome rather than a false escalation.
+const RISK_DISPUTE_EVENT = "risk_dispute";
+
 function pendingRiskDispute(db: DB, taskId: string, headSha: string | null): { dispute: string; reason: string } | null {
   const routed = db
     .query("SELECT rowid AS rid, payload FROM events WHERE task_id = ? AND type = 'risk_routed_to_agent' ORDER BY rowid DESC LIMIT 1")
@@ -305,14 +322,14 @@ function pendingRiskDispute(db: DB, taskId: string, headSha: string | null): { d
     payload = JSON.parse(routed.payload ?? "{}");
   } catch {}
   if ((payload.head_sha ?? null) !== headSha) return null;
-  const answer = db
+  const disputed = db
     .query(
       `SELECT json_extract(payload, '$.note') AS note FROM events
-        WHERE task_id = ? AND type = 'answer' AND rowid > ? ORDER BY rowid DESC LIMIT 1`
+        WHERE task_id = ? AND type = ? AND rowid > ? ORDER BY rowid DESC LIMIT 1`
     )
-    .get(taskId, routed.rid) as { note: string | null } | undefined;
-  if (!answer?.note) return null;
-  return { dispute: answer.note, reason: payload.reason ?? "the risk check confirmed a risk on this head" };
+    .get(taskId, RISK_DISPUTE_EVENT, routed.rid) as { note: string | null } | undefined;
+  if (!disputed?.note) return null;
+  return { dispute: disputed.note, reason: payload.reason ?? "the risk check confirmed a risk on this head" };
 }
 
 // Did we already open a card for the current relay episode? Without this the
@@ -745,6 +762,43 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
 
     for (const { node, reason } of failed) {
       if (openPauseDecisionId(db, node.id)) continue; // already asked
+      // HIVE-559: a confirmed risk is agent work. It wrote the code, it can fix
+      // the finding, and every one of these the director answered by hand was
+      // answered by relaying it. So this runs BEFORE the HIVE-555 quiet-hold
+      // gate below: that gate stops the queue after two failures on one commit,
+      // and a risk that reached it would go silent with no card ever — the
+      // agent ignoring the relay would simply bury the finding. Escalate on a
+      // dispute, or once the relay is spent and the same commit still fails.
+      if (isConfirmedRiskFailure(reason)) {
+        // Bounced back to its agent already (a conflict, a change request): the
+        // agent has the finding and no card is owed. The held-task escalation
+        // earlier in this sweep covers a dispute raised from there.
+        if (getTask(db, node.id)?.state !== "in_review") continue;
+        const head = headShaOf(db, node.id);
+        const dispute = pendingRiskDispute(db, node.id, head)?.dispute ?? null;
+        const routes = riskRoutesAtHead(db, node.id, head);
+        if (!dispute && routes < MAX_RISK_ROUTES_PER_HEAD) {
+          const msg =
+            `hive: your PR #${node.number} is held in the land queue — the risk check confirmed a risk on the commit ` +
+            `you pushed. This is the finding, verbatim:\n\n${reason}\n\n` +
+            `Fix it and push; the merge re-arms itself on the new commit. If you believe the finding is WRONG, do not ` +
+            `push a no-op — say why with \`hive emit ${node.id} risk_dispute --note "..."\` and a human reads it. ` +
+            `That exact command is the only thing read as a dispute; a plain \`answer\` is not, so it will not reach ` +
+            `anyone here. Nothing merges until one of those two things happens.`;
+          if (queueSteerEvent(db, node.id, msg, "confirmed risk routed to the agent")) {
+            writeEvent(db, {
+              task_id: node.id,
+              source: "reconciler",
+              type: "risk_routed_to_agent",
+              payload: { reason, head_sha: head, round: routes + 1 },
+            });
+            continue;
+          }
+          // Undeliverable — nothing will ever carry it, so ask the director.
+        }
+        await createLandPauseCard(db, node, reason, dispute);
+        continue;
+      }
       // Already asked once and retried once against this same commit: a second
       // card would ask the identical question with the identical answer. Record
       // the hold and stop (HIVE-555).
@@ -762,35 +816,7 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
       // instructions. Asking the director what to do about work hive has
       // already routed is the duplicate card this task exists to remove.
       if (getTask(db, node.id)?.state !== "in_review") continue;
-      const head = headShaOf(db, node.id);
-      let dispute: string | null = null;
-      // HIVE-559: a confirmed risk goes to the AGENT first. It wrote the code,
-      // it can fix the finding, and every one of these the director answered by
-      // hand was answered by relaying it. Escalate only on a dispute, or when
-      // the relay has already been spent twice against this same commit.
-      if (isConfirmedRiskFailure(reason)) {
-        dispute = pendingRiskDispute(db, node.id, head)?.dispute ?? null;
-        const routes = riskRoutesAtHead(db, node.id, head);
-        if (!dispute && routes < MAX_RISK_ROUTES_PER_HEAD) {
-          const msg =
-            `hive: your PR #${node.number} is held in the land queue — the risk check confirmed a risk on the commit ` +
-            `you pushed. This is the finding, verbatim:\n\n${reason}\n\n` +
-            `Fix it and push; the merge re-arms itself on the new commit. If you believe the finding is WRONG, do not ` +
-            `push a no-op — say why with \`hive emit ${node.id} answer --note "..."\` and a human reads it. ` +
-            `Nothing merges until one of those two things happens.`;
-          if (queueSteerEvent(db, node.id, msg, "confirmed risk routed to the agent")) {
-            writeEvent(db, {
-              task_id: node.id,
-              source: "reconciler",
-              type: "risk_routed_to_agent",
-              payload: { reason, head_sha: head, round: routes + 1 },
-            });
-            continue;
-          }
-          // Undeliverable — nothing will ever carry it, so ask the director.
-        }
-      }
-      await createLandPauseCard(db, node, reason, dispute);
+      await createLandPauseCard(db, node, reason, null);
     }
   }
 }

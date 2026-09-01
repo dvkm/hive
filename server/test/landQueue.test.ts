@@ -592,7 +592,7 @@ test("an agent that disputes a confirmed risk gets a card carrying the argument"
 
   // The agent reads it and argues the finding is wrong instead of pushing.
   markSteersDelivered(db, queuedSteers(db, a).map((s) => s.id), "drain");
-  writeEvent(db, { task_id: a, source: "agent", type: "answer", payload: { note: "The last page is written by flush(); the finding read an older file." } });
+  writeEvent(db, { task_id: a, source: "agent", type: "risk_dispute", payload: { note: "The last page is written by flush(); the finding read an older file." } });
 
   ageLandAttempts(db, a, 3_600_000);
   const second = mergeStub(db, { [a]: RISK_REASON });
@@ -605,6 +605,36 @@ test("an agent that disputes a confirmed risk gets a card carrying the argument"
   await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_REASON }).merge });
   expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(1);
   expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'risk_routed_to_agent'").get(a) as any).n).toBe(1);
+});
+
+// The bug the risk check caught on this very PR: `answer` is the generic reply
+// channel for every steer and change-request question, so reading it as "the
+// agent disputes the risk" turned "on it, fixing now" — or a reply about
+// something else entirely — into a director card. That is the interruption this
+// feature exists to remove, so only `risk_dispute` counts.
+test("an ordinary answer after the relay is not a dispute and opens no card", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = 'sha1' WHERE id = ?").run(a);
+  markLand(db, [a], true);
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_REASON }).merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+
+  // The agent replies on the generic channel about something unrelated.
+  markSteersDelivered(db, queuedSteers(db, a).map((s) => s.id), "drain");
+  writeEvent(db, { task_id: a, source: "agent", type: "answer", payload: { note: "Yes, the export flag is behind the same env var you asked about." } });
+
+  // The relay is spent and the same commit still fails, so the director does
+  // hear about it — but as the ordinary "came back unfixed" hold, never as an
+  // argument the agent never made. That unrelated answer is nowhere near it.
+  ageLandAttempts(db, a, 3_600_000);
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_REASON }).merge });
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'risk_routed_to_agent'").get(a) as any).n).toBe(1);
+  const open = db.query("SELECT context FROM decisions WHERE status = 'open'").all() as any[];
+  expect(open).toHaveLength(1);
+  expect(open[0].context).not.toContain("the same env var");
+  expect(open[0].context).not.toContain("disputes it");
+  expect(open[0].context).toContain("came back unfixed");
 });
 
 // The realistic dispute: delivering the steer bounces the task back to the
@@ -620,7 +650,7 @@ test("a dispute escalates even while the task is held and never re-attempted", a
   const steers = queuedSteers(db, a);
   markSteersDelivered(db, steers.map((s) => s.id), "drain");
   resumeReviewForDeliveredSteers(db, a, steers, "drain"); // → in_progress + changes_requested
-  writeEvent(db, { task_id: a, source: "agent", type: "answer", payload: { note: "the finding misread the flush path" } });
+  writeEvent(db, { task_id: a, source: "agent", type: "risk_dispute", payload: { note: "the finding misread the flush path" } });
   transition(db, a, "in_review", { source: "agent", reason: "handed back without a new commit" });
 
   ageLandAttempts(db, a, 3_600_000);
