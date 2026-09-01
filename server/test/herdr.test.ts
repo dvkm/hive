@@ -259,6 +259,7 @@ test("spawn throws when worktree create fails", async () => {
 
 test("spawn refreshes its base from origin and cuts the worktree from that remote ref", async () => {
   const { exec, calls } = stubExec((argv) => {
+    if (argv.includes("rev-parse") || argv.includes("merge-base")) return OK("0c3b3092aaaa\n");
     if (argv[0] === "git") return OK();
     if (argv.includes("worktree") && argv.includes("create"))
       return OK('{"result":{"worktree":{"path":"/wt/x","branch":"hive/x"}}}');
@@ -273,6 +274,35 @@ test("spawn refreshes its base from origin and cuts the worktree from that remot
   ]);
   const create = calls.find((c) => c.includes("worktree") && c.includes("create"))!;
   expect(create.slice(create.indexOf("--base"), create.indexOf("--base") + 2)).toEqual(["--base", "origin/staging"]);
+});
+
+test("spawn refuses a base whose local branch shares no history with the remote base", async () => {
+  // The 2026-09-01 incident: local `main` still on the pre-re-root history, so
+  // `git merge-base main origin/main` answers nothing.
+  const { exec, calls } = stubExec((argv) => {
+    if (argv.includes("rev-parse")) return OK("b51d2e35deadbeef\n");
+    if (argv.includes("merge-base")) return FAIL("");
+    if (argv[0] === "git") return OK();
+    return OK();
+  });
+  await expect(
+    new Herdr(exec, "herdr").spawn({ taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b", base: "main" })
+  ).rejects.toThrow(/base main is disjoint from origin\/main/);
+  expect(calls.some((c) => c.includes("worktree") && c.includes("create"))).toBe(false);
+});
+
+test("spawn proceeds when the local base branch still shares history with the remote base", async () => {
+  const { exec, calls } = stubExec((argv) => {
+    if (argv.includes("rev-parse")) return OK("0c3b3092aaaa\n");
+    if (argv.includes("merge-base")) return OK("0c3b3092aaaa\n");
+    if (argv[0] === "git") return OK();
+    if (argv.includes("worktree") && argv.includes("create"))
+      return OK('{"result":{"worktree":{"path":"/wt/x","branch":"hive/x"}}}');
+    if (argv.includes("workspace") && argv.includes("list")) return OK('{"result":{"workspaces":[]}}');
+    return OK();
+  });
+  await new Herdr(exec, "herdr").spawn({ taskId: "x", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b", base: "main" });
+  expect(calls.some((c) => c.includes("worktree") && c.includes("create"))).toBe(true);
 });
 
 test("spawn stops before worktree creation when the authoritative base cannot be fetched", async () => {

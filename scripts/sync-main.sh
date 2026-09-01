@@ -44,6 +44,14 @@ ORIGIN_MAIN=$(git rev-parse refs/remotes/origin/main)
 AHEAD=$(git rev-list --count "$ORIGIN_MAIN..$MAIN_BEFORE")
 BEHIND=$(git rev-list --count "$MAIN_BEFORE..$ORIGIN_MAIN")
 
+# HIVE-620: a re-rooted repo (hive went public 2026-08-27 with a fresh root
+# commit) leaves a local main with NO commit in common with origin/main. That
+# counts as diverged, but "reconcile by merge commit" is the wrong advice for
+# it, and a checkout in this state hands every agent a dead-history worktree.
+if [ "$AHEAD" -gt 0 ] && [ "$BEHIND" -gt 0 ] && ! git merge-base "$MAIN_BEFORE" "$ORIGIN_MAIN" >/dev/null 2>&1; then
+  echo "[$(date '+%F %T')] DISJOINT: local main ($(git rev-parse --short "$MAIN_BEFORE")) shares NO history with origin/main ($(git rev-parse --short "$ORIGIN_MAIN")) — the repo was re-rooted. Do NOT merge; reset local main to origin/main once anything unpushed is rescued."
+  exit 1
+fi
 if [ "$AHEAD" -gt 0 ] && [ "$BEHIND" -gt 0 ]; then
   echo "[$(date '+%F %T')] DIVERGED: local main +$AHEAD / origin/main +$BEHIND — not touching it; reconcile by MERGE COMMIT (never squash), see docs"
   exit 1
