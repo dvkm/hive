@@ -340,7 +340,7 @@ function ChiefBriefing({
 }
 
 export default function Chat({ embedded = false }: { embedded?: boolean }) {
-  const { projects, tasks, decisions, feedEvents, chatThreadId, chatMessages, chatDelivery, openChatThread } = useStore();
+  const { projects, projectsLoaded, tasks, decisions, feedEvents, chatThreadId, chatMessages, chatDelivery, openChatThread } = useStore();
   const [lastSeen] = useState(() => localStorage.getItem(CHIEF_LAST_SEEN));
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -536,7 +536,10 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
                   ) : (
                     "Ask your Chief of Staff to start work, catch you up, or resolve a blocker."
                   )
-                ) : (
+                ) : projectsLoaded ? (
+                  // Only once the list has really landed: an empty list from a
+                  // failed fetch would greet an established install with
+                  // first-run onboarding.
                   <div className="manager-project-empty">
                     <div className="manager-project-mark" aria-hidden="true">01</div>
                     <div>
@@ -545,7 +548,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
                     </div>
                     <Link className="manager-project-cta" to="/projects">Add a project <span aria-hidden="true">→</span></Link>
                   </div>
-                )}
+                ) : null}
               </div>
             )}
             {visibleMessages.map((m) => (

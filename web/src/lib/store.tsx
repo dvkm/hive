@@ -35,6 +35,12 @@ export interface Store {
   // is scheduled. "live" = a fetch landed.
   taskSync: "loading" | "live" | "failed";
   retryTaskSync: () => void;
+  // False until that list has landed from the server at least once. A screen
+  // that makes a positive claim about an empty list ("no projects yet",
+  // "nothing needs you") must not make it while this is false: the list may
+  // simply have failed to load, and the loader is still retrying.
+  projectsLoaded: boolean;
+  decisionsLoaded: boolean;
   // Director chat (persistent supervisor session). Only the open thread's
   // messages are held; SSE appends live as the supervisor replies.
   chatThreadId: string | null;
@@ -62,6 +68,32 @@ export const useStore = () => {
 
 const BASE = import.meta.env.VITE_HIVE_URL || "";
 
+// One retry-with-backoff loop, shared by every initial load. A loader that
+// rejects keeps trying (2s, 4s, ... capped at 30s) instead of leaving its
+// empty state on screen as if the server had answered "nothing here".
+function keepTrying(load: () => Promise<unknown>, onResult?: (ok: boolean) => void) {
+  let attempt = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  const run = () => {
+    clearTimeout(timer);
+    return load().then(
+      () => {
+        if (stopped) return;
+        attempt = 0;
+        onResult?.(true);
+      },
+      () => {
+        if (stopped) return;
+        onResult?.(false);
+        timer = setTimeout(run, Math.min(30_000, 2_000 * 2 ** attempt++));
+      }
+    );
+  };
+  run();
+  return { run, stop: () => { stopped = true; clearTimeout(timer); } };
+}
+
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -79,7 +111,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const bumped = useRef(false);
 
   const bump = (id: string) => setRev((r) => ({ ...r, [id]: (r[id] || 0) + 1 }));
-  const reloadProjects = () => api.projects().then(setProjects).catch(() => setProjects([]));
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
+  const [decisionsLoaded, setDecisionsLoaded] = useState(false);
+  // load* rejects so keepTrying can retry it; reload* is the fire-and-forget
+  // version the UI calls after an edit.
+  const loadProjects = () => api.projects().then((p) => { setProjects(p); setProjectsLoaded(true); });
+  const reloadProjects = () => { loadProjects().catch(() => {}); };
+  const loadDecisions = () => api.decisions("open").then((d) => { setDecisions(d); setDecisionsLoaded(true); });
   const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
   const [quizzes, setQuizzes] = useState<UnderstandingQuiz[]>([]);
   const needsYou = getNeedsYouItems(decisions, tasks, checkpoints, quizzes);
@@ -89,13 +127,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     api.setOffline(on).catch(() => setOfflineState(!on));
   };
   const [away, setAwayState] = useState<Away>({ on: false, active: false, held: 0 });
-  const reloadAway = () => api.away().then(setAwayState).catch(() => {});
+  const loadAway = () => api.away().then(setAwayState);
+  const reloadAway = () => { loadAway().catch(() => {}); };
   const setAway = (on: boolean) => {
     setAwayState((a) => ({ ...a, on, active: on })); // optimistic; the response is the truth
     api.setAway(on).then(setAwayState).catch(reloadAway);
   };
-  const reloadCheckpoints = () => api.checkpoints().then((r) => setCheckpoints(r.checkpoints)).catch(() => {});
-  const reloadQuizzes = () => api.understandingQuizzes().then((r) => setQuizzes(r.quizzes)).catch(() => {});
+  const loadCheckpoints = () => api.checkpoints().then((r) => setCheckpoints(r.checkpoints));
+  const reloadCheckpoints = () => { loadCheckpoints().catch(() => {}); };
+  const loadQuizzes = () => api.understandingQuizzes().then((r) => setQuizzes(r.quizzes));
+  const reloadQuizzes = () => { loadQuizzes().catch(() => {}); };
 
   // Chat: the open thread + its messages. A ref mirrors the id so the SSE
   // handler (closed over once) knows which thread's messages to append.
@@ -145,32 +186,25 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     // A refresh that fails silently is the whole bug: the cached board stays on
     // screen looking live, and every action the director takes 409s against a
     // task that has moved on. So say so, and keep retrying with backoff.
-    let attempt = 0;
-    let retry: ReturnType<typeof setTimeout> | undefined;
-    const refresh = () => {
-      clearTimeout(retry);
-      api.tasks().then((ts) => {
-        if (done) return;
-        fresh = true;
-        attempt = 0;
-        loadTasks(ts);
-        setTaskSync("live");
-      }).catch(() => {
-        if (done) return;
-        setTaskSync("failed");
-        retry = setTimeout(refresh, Math.min(30_000, 2_000 * 2 ** attempt++));
-      });
-    };
-    refreshTasks.current = refresh;
-    refresh();
-    api.decisions("open").then(setDecisions).catch(() => {});
-    reloadCheckpoints();
-    reloadQuizzes();
-    api.offline().then((r) => setOfflineState(r.on)).catch(() => {});
-    reloadAway();
-    reloadProjects();
-    api.notifications().then((n) => setNotifications(n.notifications)).catch(() => setNotifications([]));
-    return () => { fresh = true; done = true; clearTimeout(retry); };
+    const loads = [
+      keepTrying(
+        () => api.tasks().then((ts) => {
+          if (done) return;
+          fresh = true;
+          loadTasks(ts);
+        }),
+        (ok) => setTaskSync(ok ? "live" : "failed")
+      ),
+      keepTrying(loadProjects),
+      keepTrying(loadDecisions),
+      keepTrying(loadCheckpoints),
+      keepTrying(loadQuizzes),
+      keepTrying(loadAway),
+      keepTrying(() => api.offline().then((r) => setOfflineState(r.on))),
+      keepTrying(() => api.notifications().then((n) => setNotifications(n.notifications))),
+    ];
+    refreshTasks.current = loads[0].run;
+    return () => { fresh = true; done = true; loads.forEach((l) => l.stop()); };
   }, []);
 
   // Mark all as read: optimistic local update + server ack.
@@ -291,7 +325,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, quizzes, reloadQuizzes, needsYou, offline, setOffline, away, setAway, sse, taskSync, retryTaskSync: () => refreshTasks.current(), chatThreadId, chatMessages, chatDelivery, openChatThread, onChatMessage }}>
+    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, quizzes, reloadQuizzes, needsYou, offline, setOffline, away, setAway, sse, taskSync, retryTaskSync: () => refreshTasks.current(), projectsLoaded, decisionsLoaded, chatThreadId, chatMessages, chatDelivery, openChatThread, onChatMessage }}>
       {children}
     </Ctx.Provider>
   );

@@ -74,6 +74,7 @@ test("Focus and Backlogs show task evidence inline", async () => {
     rev: {},
     reloadCheckpoints: () => {},
     reloadQuizzes: () => {},
+    decisionsLoaded: true,
   } as unknown as Store;
   let renderer!: ReturnType<typeof create>;
   await act(async () => {
@@ -133,6 +134,7 @@ test("Focus resets local card state and evidence when advancing to the next item
     rev: {},
     reloadCheckpoints: () => {},
     reloadQuizzes: () => {},
+    decisionsLoaded: true,
   } as unknown as Store;
   let renderer!: ReturnType<typeof create>;
   await act(async () => {
@@ -176,6 +178,7 @@ test("the project picker scopes Focus to the chosen project", async () => {
     rev: {},
     reloadCheckpoints: () => {},
     reloadQuizzes: () => {},
+    decisionsLoaded: true,
   } as unknown as Store;
   let renderer!: ReturnType<typeof create>;
   await act(async () => {
@@ -213,6 +216,7 @@ test("Focus shows every checkpoint for its current task on one page", async () =
     rev: {},
     reloadCheckpoints: () => {},
     reloadQuizzes: () => {},
+    decisionsLoaded: true,
   } as unknown as Store;
   let renderer!: ReturnType<typeof create>;
   await act(async () => {
@@ -245,6 +249,7 @@ test("Focus arrows step past an item you cannot act on", async () => {
     rev: {},
     reloadCheckpoints: () => {},
     reloadQuizzes: () => {},
+    decisionsLoaded: true,
   } as unknown as Store;
   let renderer!: ReturnType<typeof create>;
   await act(async () => {
@@ -286,6 +291,7 @@ test("Backlog task links open against the backlog location for modal history", a
     rev: {},
     reloadCheckpoints: () => {},
     reloadQuizzes: () => {},
+    decisionsLoaded: true,
   } as unknown as Store;
   let renderer!: ReturnType<typeof create>;
   await act(async () => {
@@ -329,6 +335,7 @@ test("five deferred quizzes are one catch-up row, and finishing the flow clears 
     rev: {},
     reloadCheckpoints: () => {},
     reloadQuizzes: () => {},
+    decisionsLoaded: true,
   } as unknown as Store;
 
   values.set("hive.inbox.mode", "backlogs");
@@ -412,6 +419,7 @@ test("two projects with pending quizzes get separate digest rows whose counts su
     rev: {},
     reloadCheckpoints: () => {},
     reloadQuizzes: () => {},
+    decisionsLoaded: true,
   } as unknown as Store;
 
   values.set("hive.inbox.mode", "backlogs");
@@ -472,6 +480,7 @@ test("Focus shows a blocking plan's fields and the critic's concerns on the card
     rev: {},
     reloadCheckpoints: () => {},
     reloadQuizzes: () => {},
+    decisionsLoaded: true,
   } as unknown as Store;
   let renderer!: ReturnType<typeof create>;
   await act(async () => {
@@ -510,6 +519,7 @@ test("Focus gives a verify item a real card and states the queue size once", asy
     rev: {},
     reloadCheckpoints: () => {},
     reloadQuizzes: () => {},
+    decisionsLoaded: true,
   } as unknown as Store;
   let renderer!: ReturnType<typeof create>;
   await act(async () => {

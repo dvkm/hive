@@ -136,7 +136,7 @@ export function AutonomyPanel({ project }: { project?: string }) {
 }
 
 export default function Brief() {
-  const { needsYou: allNeedsYou, reloadQuizzes, tasks, projects } = useStore();
+  const { needsYou: allNeedsYou, reloadQuizzes, tasks, projects, decisionsLoaded } = useStore();
   const location = useLocation();
   // Same project filter the board and the other inboxes use, so picking a
   // project anywhere scopes this queue too.
@@ -276,7 +276,9 @@ export default function Brief() {
       <AttentionBudgetBanner count={actionCount} />
       <HeldSummary />
 
-      {data && actionCount === 0 && (
+      {/* decisionsLoaded: an open-decisions fetch that failed leaves the count
+          at zero, and "nothing needs you" would then be a lie. */}
+      {data && decisionsLoaded && actionCount === 0 && (
         <div className="brief-quiet">
           <div className="empty-big">All quiet.</div>
           <div className="muted">
