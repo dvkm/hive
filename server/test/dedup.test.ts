@@ -231,3 +231,33 @@ test("following the printed recovery: cancel the survivor, recreate, task surviv
   expect(retry.warning ?? null).toBeNull();
   expect((await openDecisionsFor(retry.id)).length).toBe(0);
 });
+
+// ---- #2057: a real brief never loses to an empty one ----
+test("merging into a stub survivor carries the duplicate's brief onto it", async () => {
+  const stub = await mkTask("Turn on warm worktrees for hive's own project");
+  const real = await mkTask("Turn on warm worktrees for the hive project", "Set warm_worktrees on proj_e60f3994fbf7. This is live DB state in projects.config, not a file in the repo.");
+  const dec = (await openDecisionsFor(real.id))[0];
+  // The card says what merging is about to throw away, not just the title score.
+  expect(dec.context).toContain("the existing task has no brief");
+
+  await post(`/api/decisions/${dec.id}/answer`, { answer_key: "merge" });
+  const survivor = (await get(`/api/tasks/${stub.id}`)).json;
+  expect(survivor.brief).toContain("projects.config");
+});
+
+test("a survivor that already has a brief keeps it and gains the duplicate's", async () => {
+  const survivor = await mkTask("Rotate the signing keys", "original brief");
+  const dup = await mkTask("rotate the signing keys.", "extra instructions from the second filing");
+  expect(dup.state).toBe("cancelled");
+
+  const s = (await get(`/api/tasks/${survivor.id}`)).json;
+  expect(s.brief).toContain("original brief");
+  expect(s.brief).toContain("extra instructions from the second filing");
+});
+
+test("an empty duplicate brief never blanks the survivor's", async () => {
+  const survivor = await mkTask("Prune the stale feature flags", "the real brief");
+  const dup = await mkTask("prune the stale feature flags.");
+  expect(dup.state).toBe("cancelled");
+  expect((await get(`/api/tasks/${survivor.id}`)).json.brief).toBe("the real brief");
+});
