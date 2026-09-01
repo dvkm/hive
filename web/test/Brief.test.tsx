@@ -493,3 +493,34 @@ test("Focus shows a blocking plan's fields and the critic's concerns on the card
   // The agent is parked, and the card says so.
   expect(renderer.root.findAll((node) => String(node.props.className ?? "").includes("cp-waiting"))).toHaveLength(1);
 });
+
+// HIVE-611: the verify queue used to render a title-less strip of thumbnails,
+// with the pager saying "1 of 3" and a line under it saying "2 more waiting".
+test("Focus gives a verify item a real card and states the queue size once", async () => {
+  values.set("hive.inbox.mode", "focus");
+  values.delete("hive.board.project");
+  const verifying: Task = { ...task, id: "task-v", number: 9, title: "Verify me", state: "verifying" };
+  api.evidence = (async () => ({ evidence: [] })) as typeof api.evidence;
+  api.task = (async () => ({ ...verifying, events: [], evidence: [], decisions: [] })) as typeof api.task;
+  const store = {
+    tasks: [verifying],
+    projects: [{ id: task.project_id, name: "Project" }],
+    needsYou: [{ kind: "verify", id: verifying.id, task: verifying }],
+    checkpoints: [],
+    rev: {},
+    reloadCheckpoints: () => {},
+    reloadQuizzes: () => {},
+  } as unknown as Store;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(
+      <MemoryRouter>
+        <Ctx.Provider value={store}>
+          <LightboxProvider><Brief /></LightboxProvider>
+        </Ctx.Provider>
+      </MemoryRouter>
+    );
+  });
+  expect(renderer.root.findAllByProps({ className: "review-card verify-card" })).toHaveLength(1);
+  expect(JSON.stringify(renderer.toJSON())).not.toContain("more waiting");
+});
