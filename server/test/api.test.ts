@@ -13,9 +13,22 @@ const { composeBrief } = await import("../src/briefs.ts");
 const { getTask } = await import("../src/state.ts");
 const { createThread } = await import("../src/chat.ts");
 import type { Fetcher } from "../src/monitors.ts";
+import { defaultExec, type Exec } from "../src/exec.ts";
 
 const db = openDb(":memory:");
-const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
+
+// HIVE-592: tests here hand the API fake PR urls like `https://gh/pr/99`, and
+// the `ready` handler looks a PR's branch up by shelling out to `gh`. Real `gh`
+// does not recognise those urls as PRs, so it asked the GitHub API about this
+// repo instead: live network on every run, and an intermittent 5s timeout.
+// Refuse `gh` for this shared server. Real `git` still runs, because other
+// tests in this file drive genuine temp repos.
+const exec: Exec = async (argv, opts) =>
+  argv[0] === "gh"
+    ? { code: 1, stdout: "", stderr: "gh is refused in api.test.ts" }
+    : defaultExec(argv, opts);
+
+const server = Bun.serve({ port: 0, fetch: makeHandler(db, { exec }) });
 const BASE = `http://127.0.0.1:${server.port}`;
 
 afterAll(() => server.stop(true));

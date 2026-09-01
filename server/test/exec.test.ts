@@ -177,3 +177,30 @@ test("mapLimit keeps results in input order and never exceeds the cap", async ()
   expect(out).toEqual([2, 4, 6, 8, 10, 12, 14]);
   expect(peak).toBe(3);
 });
+
+// HIVE-592: a forgotten exec stub let a test shell out to the real `gh`, which
+// hit the GitHub API and turned into an intermittent 5s timeout weeks later.
+// The refusal has to fire, and it has to name the test that caused it.
+test("defaultExec refuses a real gh call from inside the test suite and names the caller (HIVE-592)", async () => {
+  const err = await defaultExec(["gh", "pr", "view", "https://gh/pr/99"]).then(
+    () => { throw new Error("expected a refusal, got a real gh result"); },
+    (e) => String(e.message)
+  );
+  expect(err).toContain("REAL `gh` CALL");
+  expect(err).toContain("gh pr view https://gh/pr/99");
+  expect(err).toContain("exec.test.ts");
+});
+
+test("the gh refusal leaves real git alone and can be opted out of (HIVE-592)", async () => {
+  const git = await defaultExec(["git", "--version"]);
+  expect(git.code).toBe(0);
+  process.env.HIVE_ALLOW_GH_IN_TESTS = "1";
+  try {
+    // Not the real gh — just proof the guard is off: this reaches the spawn path
+    // and comes back as a normal missing-binary result instead of a throw.
+    const r = await defaultExec([`gh-not-a-real-binary-${Date.now()}`]);
+    expect(r.code).not.toBe(0);
+  } finally {
+    delete process.env.HIVE_ALLOW_GH_IN_TESTS;
+  }
+});
