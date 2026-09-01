@@ -60,7 +60,11 @@ const COL_EMPTY: Record<string, { title: string; hint: string }> = {
 
 export function Card({ task }: { task: Task }) {
   const { projects, spawnError, lastActivity, tasks, decisions } = useStore();
-  const project = projects.find((p) => p.id === task.project_id);
+  // One rule decides every chip on this card: show it only if it changes what
+  // the director would DO. A project name while a project filter is on says
+  // what the filter buttons already say, so it is dropped there.
+  const projectFilter = useProjectFilter();
+  const project = projectFilter ? undefined : projects.find((p) => p.id === task.project_id);
   // health.since is the server's agent-only activity clock (health.ts); it is
   // the honest "quiet for" number, where updated_at counts hive's own writes.
   const age = useRelTime(task.health?.since || lastActivity[task.id] || task.updated_at);
