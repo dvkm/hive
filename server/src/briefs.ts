@@ -47,6 +47,9 @@ Rules:
   the handoff is refused. If you do push again, re-capture the evidence.
 - Attach evidence before \`ready\`: screenshots for visual work, test output
   otherwise. Scout tasks require a report. A task never reaches Done without evidence.
+  If the artifact does not come from the code (a production reading, a link, a
+  written report), attach it with \`--kind observation\`: it is not tied to a
+  commit, so a later push never makes it stale.
 - Hand off with \`ready\` when the PR is open. If CI is pending, END THE TURN;
   hive monitors it and wakes you only if action is needed. If CI fails, fix it.
 - Before \`ready\`, submit a concise structured self-review:

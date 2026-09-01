@@ -376,12 +376,16 @@ Standing-authority events (written by the policy engine, `source: system` unless
   "meta": {}
 }
 ```
-`kind ∈ {screenshot, test_run, log, report, link}`. `path` is the local file
-(null for link-only). `url` is the served path (fetch it from the same origin).
-`meta.commit_sha`, when present, is the git HEAD of the agent's worktree at
-capture time — `hive emit ... evidence` fills it in automatically via `git
-rev-parse HEAD` in the CLI's cwd. The review card compares it to the task's
-`head_sha` and marks the item stale when they differ.
+`kind ∈ {screenshot, test_run, log, report, link, observation}`. `path` is the
+local file (null for link-only). `url` is the served path (fetch it from the
+same origin). `meta.commit_sha`, when present, is the git HEAD of the TASK's own
+worktree at capture time — the server reads it and overwrites anything the
+caller sent, so an emit from outside the worktree still records the right commit
+(HIVE-575). The review card compares it to the task's `head_sha` and marks the
+item stale when they differ. `report`, `link`, `observation`, and `explanation`
+are never stamped: they describe something outside the repo, so no commit could
+make them stale. Use `--kind observation` for a production reading or any other
+artifact that is not derived from the code.
 
 ### Decision
 ```json
@@ -1182,7 +1186,7 @@ recognized fields (JSON keys == form field names):
 | `kind` | evidence kind (evidence type only); defaults to `screenshot` if a file is present, else `link`/`log` |
 | `caption` | evidence caption |
 | `url` | evidence URL (for link evidence, no file) |
-| `meta` | (evidence type) JSON string merged into the Evidence row's `meta`; `hive emit ... evidence` auto-fills `{commit_sha}` from `git rev-parse HEAD` in its cwd |
+| `meta` | (evidence type) JSON string merged into the Evidence row's `meta`; the server fills in `{commit_sha}` from `git rev-parse HEAD` in the task's own worktree (overwriting any caller-sent value), and skips it for the commit-free kinds `report`/`link`/`observation`/`explanation`. With no worktree (or git unable to answer) the item is stored unstamped and the response carries a `warning` saying so |
 | `title`,`context`,`risk`,`blast_radius`,`options` | decision fields (needs-decision type; `options` is a JSON string in multipart) |
 | `until`,`days` | (deferred type) auto-resume horizon: an ISO timestamp (`until`) or an integer number of days from now (`days`); neither = indefinite |
 | `model`,`input_tokens`,`output_tokens`,`cache_read_tokens`,`cache_write_tokens`,`cost_usd` | usage fields (usage type; numbers, or numeric strings in multipart; `cost_usd` optional) |

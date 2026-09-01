@@ -6413,6 +6413,13 @@ async function headSha(exec: Exec, cwd: string | null): Promise<string | null> {
   }
 }
 
+// Evidence kinds that describe something outside the repo: a written report, a
+// link, a production measurement, hive's own generated explanation page. There
+// is no commit they could be "current" against, so they are never stamped and
+// commit-staleness never applies to them (HIVE-575). Test output and
+// screenshots ARE code-derived, and stay gated.
+const COMMIT_FREE_EVIDENCE_KINDS = new Set(["report", "link", "observation", "explanation"]);
+
 // Is the attached evidence still about the code at the current commit?
 //
 // Evidence is stamped with the worktree HEAD at capture time. A later commit
@@ -6433,7 +6440,11 @@ async function evidenceFreshness(db: DB, exec: Exec, t: any): Promise<Freshness>
   if (!head) return { stale: false };
   if (evidenceAtSha(db, t.id, head) >= 1) return { stale: false };
   const evidenceSha = latestEvidenceSha(db, t.id);
-  if (evidenceSha && /^[0-9a-f]{7,40}$/i.test(evidenceSha)) {
+  // Nothing commit-bound attached (only reports, links, production readings, or
+  // artifacts filed with no worktree to stamp them): there is no commit to be
+  // stale against, so the gate has nothing to say (HIVE-575).
+  if (!evidenceSha) return { stale: false };
+  if (/^[0-9a-f]{7,40}$/i.test(evidenceSha)) {
     const same = await exec(["git", "diff", "--quiet", evidenceSha, head], { cwd: t.worktree_path });
     if (same.code === 0) {
       const moved = restampEvidence(db, t.id, evidenceSha, head);
@@ -6453,13 +6464,21 @@ const shortSha = (sha: string | null) => (sha ? sha.slice(0, 7) : null);
 
 // One wording for both places that refuse stale evidence, so an agent reads the
 // same instruction whether it is refused at review time or at handoff time.
-function staleEvidenceMessage(taskId: string, head: string, evidenceSha: string | null, lead: string): string {
+function staleEvidenceMessage(
+  taskId: string,
+  head: string,
+  evidenceSha: string | null,
+  lead: string,
+  worktreePath?: string | null
+): string {
   const from = shortSha(evidenceSha);
   return (
     `${lead} Your evidence is for ${from ? `commit ${from}` : "an earlier commit"}, the branch is at commit ${shortSha(head)}. ` +
     `Re-run the check against the current commit and attach the result: ` +
+    (worktreePath ? `run it in this task's worktree (${worktreePath}), then ` : "") +
     `hive emit ${taskId} evidence --file ... --note ... . Then emit again. ` +
-    `You do not need a respawn for this.`
+    `If the artifact is not tied to a commit at all (a production reading, a link, a written report), ` +
+    `attach it with --kind observation. You do not need a respawn for this.`
   );
 }
 
@@ -6598,18 +6617,34 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       servedUrl = saved.url;
     }
     if (servedUrl && !resolveEvidenceUrl(servedUrl)) return err("evidence url must be a valid HTTP(S) URL or path", 400);
-    // Tie the artifact to the commit it was captured from: the worktree HEAD at
-    // emit time. The ready gate reads meta.commit_sha to reject stale evidence.
+    // Tie the artifact to the commit it was captured from: the HEAD of the
+    // TASK's own worktree, never the caller's cwd (HIVE-575). The director and
+    // orchestrators drive a task from somewhere else all the time; a cwd stamp
+    // put another repository's commit on the evidence, and the ready gate then
+    // compared two unrelated commits and held the handoff forever. Whatever the
+    // caller sent is overwritten for the same reason.
+    // Kinds that describe something outside the repo are never stamped: there
+    // is no commit a written report, a link, or a production measurement could
+    // be "current" against, so commit-staleness must not apply to them.
     let meta = fields.meta ?? "{}";
     const evTask = getTask(db, taskId);
-    const sha = fields.commit_sha ?? (await headSha(exec, evTask?.worktree_path ?? null));
-    if (sha) {
-      try {
-        const m = JSON.parse(meta);
-        if (m && typeof m === "object" && m.commit_sha == null) m.commit_sha = sha;
-        meta = JSON.stringify(m);
-      } catch {
-        // non-JSON meta: leave it, the sha stamp is best-effort
+    let warning: string | null = null;
+    if (!COMMIT_FREE_EVIDENCE_KINDS.has(kind)) {
+      const sha = await headSha(exec, evTask?.worktree_path ?? null);
+      if (sha) {
+        try {
+          const m = JSON.parse(meta);
+          if (m && typeof m === "object") m.commit_sha = sha;
+          meta = JSON.stringify(m);
+        } catch {
+          // non-JSON meta: leave it, the sha stamp is best-effort
+        }
+      } else {
+        // Say it plainly rather than stamping something else: without a commit
+        // the freshness gate has nothing to check this artifact against.
+        warning = evTask?.worktree_path
+          ? `Stored without a commit stamp: git could not read HEAD in this task's worktree (${evTask.worktree_path}).`
+          : "Stored without a commit stamp: this task has no worktree, so the evidence is not tied to a commit.";
       }
     }
     const ev = {
@@ -6636,7 +6671,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       type: "evidence",
       payload: { evidence_id: ev.id, kind, caption: ev.caption, ...(verifyName ? { verify_name: verifyName } : {}) },
     });
-    return json({ evidence, event }, 201);
+    return json({ evidence, event, ...(warning ? { warning } : {}) }, 201);
   }
 
   // --- needs-decision (minimal card; full cards go via POST /api/decisions) ---
@@ -6799,7 +6834,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       if (!needsReport) {
         const fresh = await evidenceFreshness(db, exec, t);
         if (fresh.stale) {
-          const message = staleEvidenceMessage(taskId, fresh.head, fresh.evidenceSha, "Handoff held.");
+          const message = staleEvidenceMessage(taskId, fresh.head, fresh.evidenceSha, "Handoff held.", t.worktree_path);
           writeEvent(db, {
             task_id: taskId,
             source,
@@ -6926,7 +6961,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       if (fresh.stale)
         return json(
           {
-            error: staleEvidenceMessage(taskId, fresh.head, fresh.evidenceSha, "Review not recorded."),
+            error: staleEvidenceMessage(taskId, fresh.head, fresh.evidenceSha, "Review not recorded.", rt.worktree_path),
             reason: "stale_evidence",
             head_sha: fresh.head,
             evidence_sha: fresh.evidenceSha,
