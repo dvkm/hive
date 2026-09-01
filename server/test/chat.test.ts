@@ -96,6 +96,11 @@ beforeAll(async () => {
     body: JSON.stringify({ name: "acme", repo_path: WT }),
   })).json();
   projectId = p.id;
+  // The Chief of Staff ships OFF (hive-1996). Every test below exercises a
+  // running supervisor, so turn it on; the off-switch tests flip it back.
+  await fetch(BASE + "/api/chat/supervisor", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on: true }),
+  });
 });
 afterAll(() => server.stop(true));
 
@@ -741,4 +746,57 @@ test("keep-warm never respawns a closed thread", async () => {
   keepSupervisorWarm(db, herdr, {}, { task_id: task, type: "agent_status", payload: { status: "gone" } });
   await threadIdle(closedThread);
   expect(briefs.length).toBe(before);
+});
+
+// ---- the off switch (hive-1996) ----
+// Two standing sessions processed ~150M tokens in a week for one answered
+// decision. These tests must run last: turning the switch off cancels every
+// live supervisor session.
+
+test("a supervisor that crosses its processed-token warning stops instead of running on", async () => {
+  const { checkUsageGuardrails } = await import("../src/costs.ts");
+  const start = await turn({ project_id: projectId, text: "the session that never ends" });
+  const taskId = (await get(`/api/chat/threads/${start.json.thread_id}`)).json.task_id;
+  db.query("INSERT INTO usage (id, task_id, ts, model, input_tokens, output_tokens, cost_usd) VALUES (?,?,?,?,?,?,?)")
+    .run(newId(), taskId, now(), "claude-opus-5", 80_000_000, 0, 0);
+
+  checkUsageGuardrails(db, taskId);
+
+  expect((await get(`/api/tasks/${taskId}`)).json.state).toBe("cancelled");
+  const messages = (await get(`/api/chat/threads/${start.json.thread_id}`)).json.messages;
+  expect(messages.at(-1).text).toContain("was stopped after processing");
+  // Terminal, so keep-warm cannot bring it back.
+  const before = briefs.length;
+  keepSupervisorWarm(db, herdr, {}, { task_id: taskId, type: "agent_status", payload: { status: "gone" } });
+  await threadIdle(start.json.thread_id);
+  expect(briefs.length).toBe(before);
+});
+
+test("turning the switch off ends the live sessions", async () => {
+  const start = await turn({ project_id: projectId, text: "running right up until the switch flips" });
+  const taskId = (await get(`/api/chat/threads/${start.json.thread_id}`)).json.task_id;
+  const r = await post("/api/chat/supervisor", { on: false });
+  expect(r.json.on).toBe(false);
+  expect(r.json.stopped).toBeGreaterThan(0);
+  expect((await get(`/api/tasks/${taskId}`)).json.state).toBe("cancelled");
+  expect((await get("/api/chat/supervisor")).json.on).toBe(false);
+});
+
+test("with the switch off a message starts nothing and says so in the thread", async () => {
+  const before = briefs.length;
+  const r = await turn({ project_id: projectId, text: "anybody there?" });
+  expect(r.status).toBe(202);
+  expect(r.delivery).toBe("disabled");
+  expect(briefs.length).toBe(before); // no agent spawned
+
+  const thread = (await get(`/api/chat/threads/${r.json.thread_id}`)).json;
+  expect(thread.task_id).toBeFalsy(); // no backing task created
+  expect(thread.messages.map((m: any) => m.role)).toEqual(["director", "assistant"]);
+  expect(thread.messages.at(-1).text).toContain("Chief of Staff is off");
+});
+
+test("the switch is off by default", async () => {
+  const { openDb, supervisorEnabled } = await import("../src/db.ts");
+  const fresh = openDb(":memory:");
+  expect(supervisorEnabled(fresh)).toBe(false);
 });

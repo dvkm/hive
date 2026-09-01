@@ -11,7 +11,7 @@ import type { DB } from "./db.ts";
 import { now } from "./db.ts";
 import { getTask, writeEvent } from "./state.ts";
 import { queueSteerEvent } from "./steer.ts";
-import { createDecision } from "./api.ts";
+import { createDecision, haltChatSupervisor } from "./api.ts";
 
 // OFF by default (director's call, 2026-07-12): historical usage rows are inflated by the
 // per-Stop cumulative double-count (fixed at ingestion the same day), so
@@ -129,6 +129,13 @@ export function checkUsageGuardrails(db: DB, taskId: string): void {
 
   if (processedWarn > 0 && processed >= processedWarn && !countEvents(db, taskId, "processed_token_warning") && processed < effectiveProcessedCap) {
     writeEvent(db, { task_id: taskId, source: "system", type: "processed_token_warning", payload: { processed_tokens: processed, warn: processedWarn } });
+    // A chat supervisor is a standing session with no definition of done, so a
+    // steer telling it to "hand off" changes nothing: it just keeps going. At
+    // the warning it stops instead, and the director restarts it deliberately.
+    if (task.source === "chat_supervisor") {
+      haltChatSupervisor(db, taskId, processed, processedWarn);
+      return;
+    }
     queueSteer(db, taskId, `Usage check: this task has processed ${processed.toLocaleString()} tokens. Tighten scope and hand off as soon as the definition of done is met.`);
   }
   if (waitWarn > 0 && waits >= waitWarn && !countEvents(db, taskId, "wait_call_warning") && waits < effectiveWaitCap) {

@@ -1360,6 +1360,14 @@ director turns: routine wakeup replies are suppressed after its first response.
 It may send one additional message only for newly surfaced decision cards or a
 newly completed outcome.
 
+- `GET /api/chat/supervisor` → `200 {on}`; `POST /api/chat/supervisor` body `{on}` → `200 {on, stopped}`
+  The Chief of Staff off switch (`hive chat supervisor [on|off]`), stored in the
+  global `chat_supervisor` setting. **Off is the default.** While off, a chat turn
+  persists the message, starts no task and no agent, returns `delivery:"disabled"`,
+  and posts a thread message saying the Chief of Staff is off. Turning it off also
+  cancels every live supervisor session (`stopped` counts them), since a standing
+  session is the thing the switch exists to stop.
+
 - `POST /api/chat/turn` body `{text (required), thread_id?, project_id?, scope?: "chief"}` → `202 {thread_id, delivery, agent_target?, error?}` | `400` (empty text, missing project scope, or no active project repository for Chief of Staff) | `404` (unknown `thread_id`)
   Director → supervisor. **Non-blocking by design**: it persists the director
   message, makes sure the thread's supervisor session is live (spawning it on the
