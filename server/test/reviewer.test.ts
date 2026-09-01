@@ -411,6 +411,72 @@ test("the verify prompt says the branch it reads already contains this work", as
   expect(events(db, id, "risk_verdicts")[0].payload.verdicts[0].verdict).toBe("refuted");
 });
 
+// HIVE-603: the risk check read only the commit, so a PR whose evidence proved
+// the work was done was blocked twice for not evidencing it, with no way out.
+function addEvidence(db: DB, taskId: string, caption: string, sha: string | null, kind = "text") {
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,?)").run(
+    newId("ev"), taskId, now(), kind, null, null, caption, JSON.stringify(sha ? { commit_sha: sha } : {})
+  );
+}
+
+test("evidence attached to the task reaches the risk prompt, stamped with the commit it came from", async () => {
+  const { db, id } = setup();
+  addEvidence(db, id, "24 valid full-suite runs, lease test clean in all", "head-a");
+  addEvidence(db, id, "screenshot from an older build", "head-old", "screenshot");
+  addEvidence(db, id, "a production reading", null, "observation");
+  const prompts: string[] = [];
+  const claude = async (argv: string[]) => {
+    prompts.push(argv[4] ?? "");
+    return { code: 0, stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"evidence: 24 valid full-suite runs"}' }), stderr: "" };
+  };
+  const git: Exec = async () => ({ code: 0, stdout: "aaa1111 2026-09-01T09:00:00Z fix the lease", stderr: "" });
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+
+  await verifyRisks(db, task, { risks: ["the commit does not evidence 20 consecutive runs"], head: "head-a", diff: "d" }, { exec: claude, shellExec: git });
+
+  const p = prompts[0];
+  expect(p).toContain("24 valid full-suite runs, lease test clean in all [text, captured on the commit under review]");
+  expect(p).toContain("screenshot from an older build [screenshot, captured on an earlier commit]");
+  expect(p).toContain("a production reading [observation, not tied to a commit]");
+  expect(p).toContain("Answer 'refuted'");
+  // A caption never absolves the code itself.
+  expect(p).toContain("A defect you can point at in the code stays");
+  expect(events(db, id, "risk_verdicts")[0].payload.verdicts[0].verdict).toBe("refuted");
+});
+
+test("a task with no evidence gets no evidence block", async () => {
+  const { db, id } = setup();
+  const prompts: string[] = [];
+  const claude = async (argv: string[]) => {
+    prompts.push(argv[4] ?? "");
+    return { code: 0, stdout: JSON.stringify({ result: '{"verdict":"confirmed","why":"nothing shows it ran"}' }), stderr: "" };
+  };
+  const git: Exec = async () => ({ code: 0, stdout: "", stderr: "" });
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+  await verifyRisks(db, task, { risks: ["r1"], head: "head-a", diff: "d" }, { exec: claude, shellExec: git });
+  expect(prompts[0]).not.toContain("attached this evidence");
+});
+
+test("the question prompt sees the same evidence, told to answer from it", async () => {
+  const { db, id } = setup();
+  addEvidence(db, id, "ran the suite 24 times, no flake", "head-a");
+  const prompts: string[] = [];
+  const claude = async (argv: string[]) => {
+    prompts.push(argv[4] ?? "");
+    return { code: 0, stdout: JSON.stringify({ result: '{"answerable":"machine","answer":"evidence: ran the suite 24 times, no flake"}' }), stderr: "" };
+  };
+  const git: Exec = async () => ({ code: 0, stdout: "", stderr: "" });
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+
+  await verifyRisks(db, task, { questions: ["was this run enough times to trust it?"], head: "head-a", diff: "d" }, { exec: claude, shellExec: git });
+
+  const p = prompts[0];
+  expect(p).toContain("ran the suite 24 times, no flake [text, captured on the commit under review]");
+  expect(p).toContain('say "machine" and quote the caption');
+  expect(p).not.toContain("Answer 'refuted'"); // risk vocabulary stays out of the question prompt
+  expect(events(db, id, "risk_verdicts")[0].payload.question_verdicts[0].answerable).toBe("machine");
+});
+
 test("a question only the human can answer is recorded as human-only", async () => {
   const { db, id } = setup();
   const claude = async () => ({ code: 0, stdout: JSON.stringify({ result: '{"answerable":"human","answer":"check the installed app"}' }), stderr: "" });
