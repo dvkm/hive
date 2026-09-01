@@ -102,9 +102,11 @@ test("two servers on one DB: the predecessor stands down, one keeps running laps
     a.proc.kill();
     await a.proc.exited;
   }
-  // Only one wait can blow its deadline (the first failure throws), so the
-  // slowest failing run is one DEADLINE_MS plus the fast phases around it.
-}, 120_000);
+  // The outer timeout has to cover the SUM of all four waits, not just the
+  // biggest one: four slow-but-passing waits each beat their own DEADLINE_MS
+  // yet add up. 4 x 60s is 240s, so 300s here. A healthy run finishes all four
+  // phases in ~400ms, so this ceiling is never approached either.
+}, 300_000);
 
 // ---------------------------------------------------------------- enforcement
 // The lease above is an ASK. These cover what happens when a second server does
