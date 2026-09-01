@@ -12,23 +12,24 @@ const { makeHandler, requeueTask } = await import("../src/api.ts");
 const { composeBrief } = await import("../src/briefs.ts");
 const { getTask } = await import("../src/state.ts");
 const { createThread } = await import("../src/chat.ts");
+const { defaultExec } = await import("../src/exec.ts");
+import type { Exec } from "../src/exec.ts";
 import type { Fetcher } from "../src/monitors.ts";
-import { defaultExec, type Exec } from "../src/exec.ts";
 
-const db = openDb(":memory:");
-
-// HIVE-592: tests here hand the API fake PR urls like `https://gh/pr/99`, and
-// the `ready` handler looks a PR's branch up by shelling out to `gh`. Real `gh`
-// does not recognise those urls as PRs, so it asked the GitHub API about this
-// repo instead: live network on every run, and an intermittent 5s timeout.
-// Refuse `gh` for this shared server. Real `git` still runs, because other
-// tests in this file drive genuine temp repos.
-const exec: Exec = async (argv, opts) =>
+// HIVE-590: tests hand this server fake PR urls like https://gh/pr/99, and the
+// `ready` handler asks gh for that PR's head branch. That ran the real gh CLI,
+// which treats the url as a branch name and queries the GitHub API for this
+// repo. Half a second on a good day, and once in ~20 runs slow enough to blow
+// bun's 5s test timeout. gh can never answer anything useful for a fake url, so
+// refuse it here. git still runs for real, since the unmergeable tests below
+// drive actual repos.
+const testExec: Exec = (argv, opts) =>
   argv[0] === "gh"
-    ? { code: 1, stdout: "", stderr: "gh is refused in api.test.ts" }
+    ? Promise.resolve({ code: 1, stdout: "", stderr: "gh is stubbed out in api.test.ts" })
     : defaultExec(argv, opts);
 
-const server = Bun.serve({ port: 0, fetch: makeHandler(db, { exec }) });
+const db = openDb(":memory:");
+const server = Bun.serve({ port: 0, fetch: makeHandler(db, { exec: testExec }) });
 const BASE = `http://127.0.0.1:${server.port}`;
 
 afterAll(() => server.stop(true));
