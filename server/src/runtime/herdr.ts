@@ -67,7 +67,13 @@ export const HERDR_BIN = discoverHerdrBin();
 // an earlier tool's 2026-07-02 self-kill incident documents. "hive-fleet" is distinct.
 export const FLEET_LABEL = process.env.HIVE_FLEET_LABEL || "hive-fleet";
 
-export class HerdrError extends Error {}
+export class HerdrError extends Error {
+  // Set only for the "another agent holds this task's name" refusal, so callers
+  // can tell contention (wait for the holder) from a real failure (HIVE-568).
+  constructor(message: string, readonly nameHolder?: NameHolder) {
+    super(message);
+  }
+}
 
 export type AgentStatus = "idle" | "done" | "working" | "blocked" | "unknown" | "gone";
 
@@ -672,7 +678,7 @@ function withWorktreeLock<T>(repoPath: string, branch: string, fn: () => Promise
 // Who is holding a task's agent name, for the refusal message and the release
 // decision (HIVE-552). Every field is best-effort: an unreadable holder reads as
 // `unknown`, which never releases anything.
-interface NameHolder {
+export interface NameHolder {
   status: AgentStatus;
   paneId: string | null;
   pid: number | null;
@@ -695,6 +701,27 @@ export function describeHolder(holder: NameHolder, quietMs?: number): string {
   ]
     .filter(Boolean)
     .join(", ");
+}
+
+// When may a spawn refused by a name holder be retried (HIVE-568)? Returns the
+// ISO instant, or null when this is NOT a wait: no holder (some other failure),
+// or a holder that already reports done and has been silent past the stale
+// window — that one should have been reclaimable, so its refusal is a real
+// failure a human must look at. Everything else is a live or not-yet-stale
+// holder that will release the name on its own.
+// ponytail: the wait is the remaining stale window, but polled at most every 5
+// minutes so a holder that exits early is picked up without a full 15m sleep.
+export function heldNameRetryAt(
+  holder: NameHolder | undefined,
+  quietMs: number | undefined,
+  staleMs: number,
+  nowMs: number
+): string | null {
+  if (!holder) return null;
+  const quiet = quietMs ?? 0;
+  if (holder.status === "done" && quiet > staleMs) return null;
+  const wait = Math.min(Math.max(staleMs - quiet, 60_000), 5 * 60 * 1000);
+  return new Date(nowMs + wait).toISOString();
 }
 
 // ---- adapter ----
@@ -772,7 +799,8 @@ export class Herdr {
         throw new HerdrError(
           `agent start refused: task ${args.taskId} already has an agent holding its name (possibly alive). ` +
           `Holder: ${describeHolder(holder, args.holderQuietMs)}. ` +
-          `Verify it is dead (no panes, no worktree processes) before respawning.`
+          `Verify it is dead (no panes, no worktree processes) before respawning.`,
+          holder
         );
     }
     if (start.code !== 0)

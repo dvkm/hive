@@ -49,7 +49,7 @@ import {
   parsePolicy,
   parseIncident,
 } from "./rows.ts";
-import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from "./runtime/herdr.ts";
+import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable, HerdrError, heldNameRetryAt } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { takeOver, handBack, TakeoverError } from "./takeover.ts";
@@ -4107,7 +4107,21 @@ export async function spawnAgent(
     // (not per-task) and inBackoff excludes them, so an outage doesn't pound the
     // dead socket once per queued task nor inflate the task's own backoff.
     const infra = isHerdrUnreachable(msg) ? "herdr_unreachable" : undefined;
-    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: msg, ...(infra ? { infra } : {}) } });
+    // HIVE-568: a name held by a LIVE holder is contention, not failure. The
+    // lease can only be reclaimed once the holder reports done AND the task has
+    // been silent for a whole stale window (15m) — far longer than the
+    // dispatcher's five quick retries, so every such task used to be failed with
+    // "needs a human" while the holder was simply finishing its turn. Stamp the
+    // event with the earliest moment a retry could work; the dispatcher waits for
+    // it instead of spending an attempt. A holder that is already done AND past
+    // the window is a genuine failure — left untagged, so it still fails fast.
+    const heldUntil = e instanceof HerdrError ? heldNameRetryAt(e.nameHolder, holderQuietMs, staleMs(), Date.now()) : null;
+    writeEvent(db, {
+      task_id: id,
+      source: "herdr",
+      type: "spawn_error",
+      payload: { error: msg, ...(infra ? { infra } : {}), ...(heldUntil ? { held_until: heldUntil } : {}) },
+    });
     recordSystemLearning(db, task.project_id, `spawn failure: ${signature(msg)}`, msg, id);
     return { ok: false, error: msg };
   }
