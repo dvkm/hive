@@ -71,7 +71,9 @@ const BASE = import.meta.env.VITE_HIVE_URL || "";
 // One retry-with-backoff loop, shared by every initial load. A loader that
 // rejects keeps trying (2s, 4s, ... capped at 30s) instead of leaving its
 // empty state on screen as if the server had answered "nothing here".
-function keepTrying(load: () => Promise<unknown>, onResult?: (ok: boolean) => void) {
+// Exported so views that fetch on their own (Projects, the auto-dispatch
+// section of Policies) retry the same way.
+export function keepTrying(load: () => Promise<unknown>, onResult?: (ok: boolean) => void) {
   let attempt = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let stopped = false;

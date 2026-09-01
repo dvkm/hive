@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import type { Policy, AuthorityRule, Project } from "../lib/api";
-import { useStore } from "../lib/store";
+import { keepTrying, useStore } from "../lib/store";
 import { toast } from "../lib/ui";
 
 // The Policies page is a settings surface for standing configuration: three
@@ -431,18 +431,29 @@ function AuthorityModal({ projects, onClose, onSaved }: { projects: Project[]; o
 // Reads live project config (auto_dispatch) and writes it back on toggle. Kept
 // as its own fetch (not the store) so the switch reflects the freshest config
 // immediately after a write.
-function AutoDispatchSection() {
+export function AutoDispatchSection() {
   const [projects, setProjects] = useState<Project[]>([]);
-  const load = () => api.projects().then(setProjects).catch(() => setProjects([]));
+  // False until a fetch has really landed. An empty list on its own does not
+  // mean there are no projects — the fetch may just have failed.
+  const [loaded, setLoaded] = useState(false);
+  // Rejecting on failure is deliberate: keepTrying needs the rejection to
+  // schedule its retry, and the old list stays on screen meanwhile.
+  const load = () =>
+    api.projects().then((p) => {
+      setProjects(p);
+      setLoaded(true);
+    });
+  const loop = useRef<ReturnType<typeof keepTrying>>();
   useEffect(() => {
-    load();
+    loop.current = keepTrying(load);
+    return () => loop.current?.stop();
   }, []);
 
   const toggle = async (p: Project) => {
     const auto_dispatch = !(p.config?.auto_dispatch === true);
     await api.updateProject(p.id, { config: { ...p.config, auto_dispatch } });
     toast(auto_dispatch ? "Auto-dispatch on" : "Auto-dispatch off");
-    load();
+    loop.current?.run();
   };
 
   return (
@@ -454,9 +465,11 @@ function AutoDispatchSection() {
       <div className="notice pol-caution">Turning this on spends tokens autonomously — agents start without you clicking dispatch.</div>
 
       {projects.length === 0 ? (
-        <div className="pol-empty">
-          <p>No projects yet. Auto-dispatch is configured per project, so this list fills in once you have one.</p>
-        </div>
+        loaded ? (
+          <div className="pol-empty">
+            <p>No projects yet. Auto-dispatch is configured per project, so this list fills in once you have one.</p>
+          </div>
+        ) : null
       ) : (
         <div className="pol-list">
           {projects.map((p) => {
