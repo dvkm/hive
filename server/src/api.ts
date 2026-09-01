@@ -2198,16 +2198,19 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   // used to lose the ticket silently.
   const mirrorTaskId = mirrorTaskIdForTitle(db, String(body.project_id), body.title);
   // A work task filed from the Jira issue's title while the real spec sits
-  // unread in the linked mirror's brief (HIVE-551/WEB-118): refuse rather than
-  // let a title-only brief silently drop 100s of chars of spec the mirror
-  // already has.
+  // unread in the linked mirror's brief (HIVE-551/553, root-caused WEB-118): a
+  // heuristic, not NLP, so it warns rather than refuses — the corebeat sweep
+  // found one contradiction (WEB-118) out of three linked tasks, and a title
+  // that's genuinely just a title (WEB-2) must still be allowed through.
+  let mirrorMismatch: { mirror_task_id: string; mirror_brief_len: number; work_brief_len: number } | null = null;
   if (mirrorTaskId) {
-    const mirrorBrief = (db.query("SELECT brief FROM tasks WHERE id = ?").get(mirrorTaskId) as { brief: string | null } | undefined)?.brief ?? "";
-    if (brief.length < 80 && mirrorBrief.length > 200)
-      return err(
-        `brief is title-only (${brief.length} chars) but linked mirror task ${mirrorTaskId} has a ${mirrorBrief.length}-char spec — include it in --brief-text instead of just the Jira title`,
-        400
-      );
+    const mirrorBrief = ((db.query("SELECT brief FROM tasks WHERE id = ?").get(mirrorTaskId) as { brief: string | null } | undefined)?.brief ?? "").trim();
+    if (
+      mirrorBrief.length > 200 &&
+      (brief.length < mirrorBrief.length / 3 || /no (description|spec|brief)|title.only|spec needed/i.test(brief))
+    ) {
+      mirrorMismatch = { mirror_task_id: mirrorTaskId, mirror_brief_len: mirrorBrief.length, work_brief_len: brief.length };
+    }
   }
   const row = {
     id,
@@ -2247,6 +2250,7 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
     type: "created",
     payload: { title: row.title, ...(parent ? { parent_task_id: parent } : {}) },
   });
+  if (mirrorMismatch) writeEvent(db, { task_id: row.id, source: "system", type: "brief_mirror_mismatch", payload: mirrorMismatch });
   // Re-read so the assigned `number` (set by the DB trigger) rides on the
   // returned task and the broadcast payload.
   const created = getTask(db, row.id);
@@ -2280,7 +2284,10 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   // never gets a card it can't act on. A strong mismatch rides back on the
   // response as `warning` (the CLI prints it) and holds dispatch via its card.
   const repoWarning = noteRepoMismatch(db, getTask(db, row.id));
-  const warning = [dupWarning, repoWarning].filter(Boolean).join("\n  ") || undefined;
+  const mirrorMismatchWarning = mirrorMismatch
+    ? `brief looks thin (${mirrorMismatch.work_brief_len} chars) but linked mirror task ${mirrorMismatch.mirror_task_id} has a ${mirrorMismatch.mirror_brief_len}-char spec — check it isn't missing from this brief`
+    : undefined;
+  const warning = [dupWarning, repoWarning, mirrorMismatchWarning].filter(Boolean).join("\n  ") || undefined;
   // Ambient intake only (source intake_*/watch), and only when the project opted
   // in. Deliberately not awaited: a 60s classifier must not hold the create
   // response, and the dispatcher holds the task meanwhile.

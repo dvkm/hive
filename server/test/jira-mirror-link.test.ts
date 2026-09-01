@@ -96,6 +96,16 @@ test("the link survives a requeue, and the failed attempt does not close the tic
   expect(getTask(db, m).state).toBe("done");
 });
 
+test("a thin work brief linked to a mirror with a real spec warns the director", async () => {
+  const m = mirror("WEB-118");
+  db.query("UPDATE tasks SET brief = ? WHERE id = ?").run("x".repeat(300), m);
+  const { json } = await post("/api/tasks", { project_id: projectId, title: "[WEB-118] fix the thing" });
+  expect(json.jira_mirror_task_id).toBe(m);
+  expect(String(json.warning)).toContain("mirror task " + m);
+  const event = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'brief_mirror_mismatch'").get(json.id) as { payload: string };
+  expect(JSON.parse(event.payload)).toEqual({ mirror_task_id: m, mirror_brief_len: 300, work_brief_len: 0 });
+});
+
 test("the catch-up sweep advances mirrors whose work finished unlinked", async () => {
   const m = mirror("WEB-111", "in_review");
   // A row from before the link existed: linked by the migration's backfill rule.

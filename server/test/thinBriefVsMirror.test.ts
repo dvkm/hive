@@ -1,6 +1,7 @@
-// HIVE-551: a work task filed from a Jira issue's TITLE while the real spec
-// sits unread in the linked mirror task's brief must be refused, not silently
-// created with a thin brief (root cause of WEB-118).
+// HIVE-551/553: a work task filed from a Jira issue's TITLE while the real spec
+// sits unread in the linked mirror task's brief must warn, not silently create
+// with a thin brief (root cause of WEB-118) — but must not refuse, since a
+// title-only mirror (WEB-2) is a legitimate case.
 import { test, expect } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -40,10 +41,10 @@ function serve(db: DB) {
   };
 }
 
-test("refuses a title-only brief when the linked mirror has a substantial spec", async () => {
+test("warns, but still creates, a title-only brief when the linked mirror has a substantial spec", async () => {
   const { db, projectId } = freshDb();
   const spec = "x".repeat(300);
-  makeMirror(db, projectId, "WEB-118", spec);
+  const m = makeMirror(db, projectId, "WEB-118", spec);
   const { server, post } = serve(db);
   try {
     const res = await post("/api/tasks", {
@@ -51,9 +52,11 @@ test("refuses a title-only brief when the linked mirror has a substantial spec",
       title: "[WEB-118] fix the thing",
       kind: "chore",
     });
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(201);
     const body = await res.json();
-    expect(String(body.error)).toContain("mirror task");
+    expect(String(body.warning)).toContain("mirror task");
+    const event = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'brief_mirror_mismatch'").get(body.id) as { payload: string };
+    expect(JSON.parse(event.payload)).toEqual({ mirror_task_id: m, mirror_brief_len: spec.length, work_brief_len: 0 });
   } finally {
     server.stop();
   }
