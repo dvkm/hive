@@ -2512,6 +2512,13 @@ async function linkPrEndpoint(db: DB, body: any, deps: HandlerDeps): Promise<Res
   return json({ ok: true, ...res });
 }
 
+// Every field PUT /api/tasks/:id actually writes; anything else is a 400.
+// `source` is not stored — it only says who is asking, for the priority check.
+const UPDATABLE_TASK_FIELDS = [
+  "title", "brief", "depends_on", "verification_cmds", "priority",
+  "resume_pr_url", "resume_branch", "source",
+];
+
 // Update a task's editable fields (title / brief / depends_on). Used by the
 // attention tray's "edit & requeue" flow before it re-queues a failed task,
 // and by an agent that discovers mid-task it needs another task's PR to land
@@ -2530,6 +2537,31 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
   if (isJiraMirror(task))
     return err(`tracking-only task fields are owned by Jira (${task.source_ref}) — edit the issue there instead`, 409);
   const { fields: body, files } = await bodyWithFiles(req);
+  // Accept-and-drop is how a caller ends up believing a write landed when
+  // nothing changed (HIVE-585): a PUT that returned 200 for `resume_pr_url`
+  // cost the director an afternoon before they read the DB. Name the field and
+  // refuse instead. (In multipart, uploads land in `files`, not here.)
+  const unknown = Object.keys(body ?? {}).filter((k) => !UPDATABLE_TASK_FIELDS.includes(k));
+  if (unknown.length)
+    return err(`cannot update ${unknown.join(", ")} — PUT /api/tasks/:id writes only: ${UPDATABLE_TASK_FIELDS.join(", ")}`);
+  // resume_pr_url / resume_branch are CLEAR-only. A pointer at a PR that no
+  // longer resolves makes the task permanently undispatchable, and the
+  // dispatch guard refusing it is right to stay. Setting a new pointer by hand
+  // is deliberately not offered — that is how one task's work lands on another
+  // task's branch.
+  const resume: Record<string, string | null> = {
+    resume_pr_url: task.resume_pr_url ?? null,
+    resume_branch: task.resume_branch ?? null,
+  };
+  const clearedResume: Record<string, string> = {};
+  for (const field of Object.keys(resume)) {
+    const value = body?.[field];
+    if (value === undefined) continue;
+    if (value !== null && String(value).trim() !== "")
+      return err(`${field} can only be cleared here (send null) — pointing a task at a different PR or branch by hand is not supported`);
+    if (resume[field]) clearedResume[field] = resume[field]!;
+    resume[field] = null;
+  }
   const title = body?.title != null ? String(body.title) : task.title;
   const { block } = await attachFiles(id, files);
   // `base` stays null when the caller sent no brief and the task had none, so a
@@ -2578,13 +2610,18 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
       mirrorTaskId = resolved;
     }
   }
-  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, jira_mirror_task_id = ?, updated_at = ? WHERE id = ?")
-    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, mirrorTaskId, now(), id);
+  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, jira_mirror_task_id = ?, resume_pr_url = ?, resume_branch = ?, updated_at = ? WHERE id = ?")
+    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, mirrorTaskId, resume.resume_pr_url, resume.resume_branch, now(), id);
   const updated = getTask(db, id);
   // Say it out loud rather than repointing in silence — especially when this
   // moved an existing link off another ticket.
   if (relinked)
     writeEvent(db, { task_id: id, source: "director", type: "jira_mirror_relinked", payload: relinked });
+  // Clearing a resume pointer changes whether the task can be dispatched at
+  // all, so record it. Otherwise the next person to look sees a task that was
+  // blocked and now isn't, with nothing explaining the transition.
+  if (Object.keys(clearedResume).length)
+    writeEvent(db, { task_id: id, source: "director", type: "resume_pointer_cleared", payload: clearedResume });
   broadcastTask(db, updated);
   return json({ ...taskWithHealth(db, updated), ...(relinked ? { jira_mirror_relinked: relinked } : {}) });
 }
