@@ -50,6 +50,10 @@ Rules:
 
     hive emit <task-id> review_summary --json review.json
 
+  Write review.json inside your own worktree or session scratchpad, never a
+  shared path like /tmp/review.json. Hive refuses a payload it reads from
+  anywhere else: two agents sharing one path published each other's reviews.
+
   Shape: {"done":[],"iffy":[{"what":"","why":""}],"decisions":[],
   "testing":[],"followups":[],"understanding":{"background":"","scope":"",
   "essence":"","walkthrough":[],"affected_areas":[],"risk_assessment":"",
