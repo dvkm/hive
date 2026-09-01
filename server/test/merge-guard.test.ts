@@ -64,6 +64,10 @@ test("mergeTask BLOCKS a branch that reverts base work outside its scope (#314)"
   expect(res.status).toBe(409);
   const body: any = await res.json();
   expect(body.error).toContain("health.ts");
+  // The message names the two commits it compared, so the diagnosis is not a
+  // guess (HIVE-543): rebasing again is explicitly ruled out.
+  expect(body.error).toContain("B1");
+  expect(body.error).toContain("Rebasing again does not help");
   // Bounced back to the agent, and the block is recorded for the director.
   expect(getTask(db, taskId).state).toBe("in_progress");
   const ev = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'merge_blocked_destructive'").get(taskId);
@@ -303,6 +307,9 @@ test("a real revert still blocks after the snapshot was re-baselined (#1696)", a
       return OK();
     }
     if (argv[3] === "log") return OK(argv.at(-1) === "health.ts" ? "abc base commit\n" : "");
+    // The branch's health.ts is byte-identical to its pre-advance content: base
+    // moved it and the branch put the old version back. That is a real revert.
+    if (argv.includes("rev-parse") && argv.at(-1)!.endsWith(":health.ts")) return OK("old-health-blob\n");
     if (argv.includes("rev-parse")) return OK(`${argv.at(-1)}\n`);
     return OK();
   });

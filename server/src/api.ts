@@ -3487,14 +3487,21 @@ async function mergeTaskLocked(
           const files = captureFailed
             ? ""
             : regressed!.slice(0, 10).join(", ") + (regressed!.length > 10 ? `, …(+${regressed!.length - 10})` : "");
+          // Name the exact comparison so the diagnosis is not guesswork: WHAT the
+          // branch is believed to have rolled back, the base commit it was
+          // measured against, and the older state it matches (HIVE-543).
+          const baseShaProbe = captureFailed ? null : await exec(["git", "-C", project.repo_path, "rev-parse", guardBase]);
+          const baseSha = (baseShaProbe?.code === 0 ? baseShaProbe.stdout.trim() : guardBase).slice(0, 7);
           const reason = captureFailed
             ? `could not re-verify branch scope for '${task.branch}' after a same-branch re-cut (snapshot capture failed)`
-            : `branch '${task.branch}' reverts base work outside this task's scope (${files})`;
+            : `branch '${task.branch}' drops base work outside this task's scope: ${files} — ` +
+              `each of those still matches its older ${snapshot!.base_sha.slice(0, 7)} content, so the branch ` +
+              `discards what '${base}' (${baseSha}) landed on them since`;
           writeEvent(db, {
             task_id: id,
             source: "director",
             type: "merge_blocked_destructive",
-            payload: { base, branch: task.branch, regressed, reason, actor },
+            payload: { base, branch: task.branch, regressed, reason, actor, base_sha: baseSha, snapshot_base_sha: snapshot?.base_sha ?? null },
           });
           recordSystemLearning(
             db,
@@ -3507,20 +3514,20 @@ async function mergeTaskLocked(
             await herdr
               .send(
                 task.agent_target,
-                `hive: merge into '${base}' BLOCKED — your branch '${task.branch}' now reverts commits ` +
-                  `already on '${base}' outside this task's scope (${files}). This is the destructive ` +
+                `hive: merge into '${base}' BLOCKED — ${reason}. This is the destructive ` +
                   `auto-rebase pattern from task #314: an auto-resolve dropped intervening work while CI stayed ` +
-                  `green. Do NOT trust the rebase — abandon this branch and re-cut a clean one off CURRENT ` +
-                  `'${base}', re-apply only your task's change, and push. If those reverts are intentional, the ` +
-                  `director can override.`
+                  `green. Rebasing again will NOT clear this; staleness is not the problem. Abandon this branch ` +
+                  `and re-cut a clean one off CURRENT '${base}', re-apply only your task's change, and push. ` +
+                  `Never make the check pass by weakening or reverting your own tests. If the drops are ` +
+                  `intentional, the director can override.`
               )
               .catch(() => {});
           }
           transition(db, id, "in_progress", { source: "director", reason: "merge blocked: destructive auto-rebase" });
           return err(
             `merge blocked — ${reason}; ` +
-              `the auto-rebase likely dropped intervening commits (task #314). Re-cut off current '${base}', or ` +
-              `merge with override_destructive_check=true if intentional.`,
+              `the auto-rebase likely dropped intervening commits (task #314). Rebasing again does not help. ` +
+              `Re-cut off current '${base}', or merge with override_destructive_check=true if intentional.`,
             409
           );
         }
