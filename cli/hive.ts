@@ -78,6 +78,7 @@ Usage:
   hive jira link <task-id> --parent <KEY> create and link a Jira sub-task
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
+  hive chat supervisor [on|off]           chief of staff off switch (default off)
   hive chat reply <thread-id> "<text>" [--decision <id> ...]
                                               post one reply with actionable decision cards
   hive chat update <thread-id> [--phase <phase>] [--objective <text>] [--criterion <text> ...]
@@ -604,6 +605,20 @@ async function main() {
   if (cmd === "chat") {
     const sub = argv[1];
     const { _, flags } = parseFlags(argv.slice(2));
+    // `hive chat supervisor [on|off]` — the Chief of Staff off switch. Off (the
+    // default) means a chat message never starts a session; turning it off also
+    // ends any session already running.
+    if (sub === "supervisor") {
+      const state = argv[2];
+      if (state === "on" || state === "off") {
+        const r = await api("POST", "/api/chat/supervisor", { on: state === "on" });
+        console.log(`chief of staff ${r.on ? "ON" : `off${r.stopped ? ` — stopped ${r.stopped} live session(s)` : ""}`}`);
+      } else {
+        const r = await api("GET", "/api/chat/supervisor");
+        console.log(`chief of staff: ${r.on ? "ON" : "off"}`);
+      }
+      return;
+    }
     // `hive chat reply <thread-id> <text>` — the supervisor session replies to
     // the director (the ONLY director-facing channel from a chat agent).
     if (sub === "reply") {
@@ -727,7 +742,7 @@ async function main() {
       console.log(`closed ${threadId}`);
       return;
     }
-    die("usage: hive chat reply <thread-id> <text>  |  hive chat send [--project <id>|--thread <id>] <text>  |  hive chat close <thread-id>");
+    die("usage: hive chat reply <thread-id> <text>  |  hive chat send [--project <id>|--thread <id>] <text>  |  hive chat close <thread-id>  |  hive chat supervisor [on|off]");
   }
 
   if (cmd === "pr-marker") {

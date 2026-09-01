@@ -769,6 +769,15 @@ export function setSetting(db: DB, key: string, value: string): void {
   ).run(key, value, new Date().toISOString());
 }
 
+// Chief of Staff / chat supervisor sessions. OFF by default (director's call,
+// 2026-09-01): two standing sessions processed ~150M tokens in a week and
+// produced one answered decision. Off means a chat message never spawns or
+// respawns a supervisor session; the thread says so instead. Toggle with
+// `hive chat supervisor on|off` (POST /api/chat/supervisor).
+export function supervisorEnabled(db: DB): boolean {
+  return getSetting(db, "chat_supervisor") === "on";
+}
+
 // Offline mode: nothing new spawns, network-dependent supervision pauses,
 // working agents were told to park after their current step. See docs/API.md.
 export function isOffline(db: DB): boolean {

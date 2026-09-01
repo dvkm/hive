@@ -3,7 +3,7 @@
 import { dirname, join, normalize } from "node:path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
-import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
+import { newId, now, evidenceDir, isOffline, setSetting, getSetting, supervisorEnabled } from "./db.ts";
 import { taskWithHealth, tasksWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization, staleMs } from "./health.ts";
 import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror, mirrorTaskIdForTitle } from "./supervision.ts";
 import { activeProjects, isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
@@ -510,6 +510,11 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (pathname === "/api/intake" && method === "POST") return intake(db, await req.json(), deps);
 
       // ---- director chat (persistent supervisor session over hive) ----
+      if (pathname === "/api/chat/supervisor" && method === "GET")
+        return json({ on: supervisorEnabled(db) });
+      if (pathname === "/api/chat/supervisor" && method === "POST")
+        return setSupervisorSwitch(db, await req.json());
+
       if (pathname === "/api/chat/turn" && method === "POST")
         return await chatTurn(db, herdr, deps, await req.json());
       if (pathname === "/api/chat/threads" && method === "GET")
@@ -1143,6 +1148,46 @@ function intake(db: DB, body: any, deps: HandlerDeps): Response {
 }
 
 // ---------------------------------------------------------------- chat
+const SUPERVISOR_OFF_NOTICE =
+  "The Chief of Staff is off, so nothing was started for this message. Your message is saved in this thread. " +
+  "Turn it back on with `hive chat supervisor on` if you want a session to pick it up.";
+
+// Read/flip the off switch. Turning it OFF also ends any live supervisor
+// session, because leaving one running is exactly the state the switch exists
+// to stop. Cancelling fires the terminal hook, which tears the session down.
+function setSupervisorSwitch(db: DB, body: any): Response {
+  const on = !!body?.on;
+  setSetting(db, "chat_supervisor", on ? "on" : "off");
+  let stopped = 0;
+  if (!on) {
+    const live = db
+      .query(`SELECT id FROM tasks WHERE source = 'chat_supervisor' AND state NOT IN ('done','failed','cancelled')`)
+      .all() as { id: string }[];
+    for (const t of live) {
+      transition(db, t.id, "cancelled", { source: "director", reason: "chat supervisor turned off" });
+      stopped++;
+    }
+  }
+  return json({ on, stopped });
+}
+
+// A standing session that crossed its processed-token warning stops here rather
+// than running for another week. Terminal means it is never resurrected (see
+// deliverToSupervisor); the director's next chat message is the deliberate
+// restart, and only if the switch is on.
+export function haltChatSupervisor(db: DB, taskId: string, processed: number, warn: number): void {
+  const thread = managingThreadForTask(db, taskId);
+  writeEvent(db, { task_id: taskId, source: "system", type: "chat_supervisor_halted", payload: { processed_tokens: processed, warn } });
+  transition(db, taskId, "cancelled", { source: "system", reason: `chat supervisor passed ${warn.toLocaleString()} processed tokens` });
+  if (thread)
+    postThreadNotice(
+      db,
+      thread.id,
+      `Your Chief of Staff session was stopped after processing ${processed.toLocaleString()} tokens. ` +
+        `Send a message to start a fresh one.`
+    );
+}
+
 // One director→supervisor turn. NON-BLOCKING by design: persist the message,
 // make sure the thread's persistent supervisor session is live (spawn it on the
 // first message), deliver the message into that session, and return immediately.
@@ -1225,7 +1270,8 @@ async function chatTurnOnThread(
   chatDeliveryStatus(thread.id, "queued");
   withThreadLock(thread.id, async () => {
     const delivery = await deliverToSupervisor(db, herdr, deps, thread.id, wire);
-    if (delivery.delivery === "failed")
+    if (delivery.delivery === "disabled") postThreadNotice(db, thread.id, SUPERVISOR_OFF_NOTICE);
+    else if (delivery.delivery === "failed")
       postThreadNotice(db, thread.id, `Your Chief of Staff could not start: ${delivery.error ?? "spawn failed"}. Send the message again to retry.`);
   }).catch((e) => {
     chatDeliveryStatus(thread.id, "failed", String((e as any)?.message ?? e));
@@ -1287,6 +1333,13 @@ async function deliverToSupervisor(
   message: string
 ): Promise<{ delivery: string; agent_target?: string; error?: string }> {
   const thread = getThread(db, threadId)!;
+  // The off switch. Checked here, at the one choke point every spawn/respawn
+  // path goes through (director turn, keep-warm), so "off" means no task, no
+  // agent, no silent resurrection.
+  if (!supervisorEnabled(db)) {
+    chatDeliveryStatus(threadId, "disabled");
+    return { delivery: "disabled" };
+  }
   const wireMessage = thread.project_id
     ? message
     : `${message}\n\n[chief reply policy]\nWork silently. Do not send acknowledgments, progress updates, task lists, or wakeup summaries. If director input is genuinely required, send one short bundled reply with up to five \`--decision <id>\` flags so Hive renders answerable cards. Otherwise reply only with a direct answer or the final verified outcome.`;
