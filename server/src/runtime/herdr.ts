@@ -1030,13 +1030,16 @@ export class Herdr {
   // agent's: the terminal id recorded at spawn, a surviving registry label, or —
   // when both are gone — the one pane at the task's cwd whose foreground process
   // is not a login shell (a fleet tab holds a shell pane at the same cwd).
+  // `agentGone` in the result is POSITIVE evidence the agent process exited:
+  // every pane at the task's cwd is sitting at a bare login shell. Absence of
+  // evidence (unparseable process-info, no panes, herdr down) never sets it.
   async readopt(hint: {
     name: string;
     cwd?: string | null;
     tabId?: string | null;
     terminalId?: string | null;
-  }): Promise<{ readopted: boolean; paneId: string | null; terminalId: string | null; reason: string }> {
-    const miss = (reason: string) => ({ readopted: false, paneId: null, terminalId: null, reason });
+  }): Promise<{ readopted: boolean; paneId: string | null; terminalId: string | null; reason: string; agentGone?: boolean }> {
+    const miss = (reason: string, agentGone = false) => ({ readopted: false, paneId: null, terminalId: null, reason, agentGone });
     const panes = await this.listPanes();
     if (!panes.length) return miss("herdr returned no panes"); // daemon down, not a wipe
 
@@ -1053,11 +1056,17 @@ export class Herdr {
     if (!pane) {
       const sameCwd = panes.filter((p) => hint.cwd && p.cwd === hint.cwd && (!hint.tabId || p.tabId === hint.tabId));
       const running: PaneInfo[] = [];
+      let shells = 0; // panes we positively read as a bare login shell
       for (const p of sameCwd) {
         const info = await this.run(paneProcessInfoArgv(p.paneId));
         if (paneRunsAgentCommand(info.stdout)) running.push(p);
+        else if (parsePaneRootProcess(info.stdout)) shells++;
       }
-      if (running.length !== 1) return miss(`no unambiguous agent pane at cwd (${sameCwd.length} panes, ${running.length} running a command)`);
+      if (running.length !== 1)
+        return miss(
+          `no unambiguous agent pane at cwd (${sameCwd.length} panes, ${running.length} running a command)`,
+          running.length === 0 && shells === sameCwd.length && sameCwd.length > 0
+        );
       pane = running[0];
       how = "cwd+process";
     }

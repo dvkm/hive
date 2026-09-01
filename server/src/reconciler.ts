@@ -321,9 +321,18 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
     .all() as { id: string; agent_target: string }[];
   for (const t of tasks) {
     if (isJiraMirrorId(db, t.id)) continue;
-    const { alive, status, unconfirmed } = await probeAgent(h, db, t.id, t.agent_target);
+    const { alive, status, unconfirmed, reason, exited } = await probeAgent(h, db, t.id, t.agent_target);
     if (unconfirmed) {
-      noteUnconfirmedDeath(db, t.id);
+      // The agent finished its turn and its process exited — the case that used
+      // to log "unconfirmed-dead" every minute forever (HIVE-572). Continue the
+      // task in place, exactly as the nudge path's turn-complete-respawn does,
+      // and only once per agent: nothing here tears anything down.
+      const cur = getTask(db, t.id);
+      if (exited && lastAgentStatus(db, t.id) === "done" && cur && !agentWorkComplete(db, cur) && !respawnTried(db, t.id, t.agent_target)) {
+        await respawnCompletedTurn(db, h, cur, deps);
+        continue;
+      }
+      noteUnconfirmedDeath(db, t.id, t.agent_target, reason, (deps.nowMs ?? (() => Date.now()))());
       continue; // herdr can't resolve it and its pane is still there: touch nothing
     }
     const next = alive ? status : "gone";
@@ -389,7 +398,7 @@ export async function probeAgent(
   db: DB,
   taskId: string,
   target: string
-): Promise<{ alive: boolean; status: AgentStatus; unconfirmed?: boolean }> {
+): Promise<{ alive: boolean; status: AgentStatus; unconfirmed?: boolean; reason?: string; exited?: boolean }> {
   const p = await h.probe(target);
   if (p.alive) return p;
   // A server takeover can briefly make `agent get` miss an agent that is
@@ -417,30 +426,52 @@ export async function probeAgent(
     const again = await h.probe(target);
     if (again.alive) return again;
   }
-  return { alive: true, status: "unknown", unconfirmed: true };
+  return {
+    alive: true,
+    status: "unknown",
+    unconfirmed: true,
+    reason: `herdr does not resolve the agent, but a pane matching it is still listed; re-adopting it failed (${re.reason})`,
+    // Positive evidence the agent PROCESS exited: every pane at the task's
+    // worktree is sitting at a bare login shell. Still not a death verdict —
+    // the only thing it unlocks is a respawn in place, never a teardown.
+    exited: re.agentGone,
+  };
 }
 
-// Unregistered-but-running (or herdr unreachable): log it — which also resets
-// the task's silence clock, so the next look is a stale threshold away — and
-// after a few laps put it in front of the director instead of guessing. Never
-// tears anything down.
-const MAX_UNCONFIRMED_DEATHS = 3;
+// Unregistered-but-running (or herdr unreachable): say so ONCE, with what was
+// checked and what happens next, then go quiet. Re-deciding every lap produced
+// 18 identical no-op events in 20 minutes and read like a fleet incident
+// (HIVE-572). If the condition is still unresolved after the grace window, put
+// it in front of the director and stop looking. Never tears anything down.
+const UNCONFIRMED_ESCALATE_MS = 5 * 60_000;
 
-function noteUnconfirmedDeath(db: DB, taskId: string): void {
-  const n = (
-    db
-      .query(
-        `SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'recovery'
-           AND json_extract(payload, '$.decision') = 'unconfirmed-dead'`
-      )
-      .get(taskId) as any
-  ).n as number;
-  // Bounded: an event per cycle forever would also reset the silence clock
-  // forever, masking a genuinely mute agent from flagStale.
-  if (n < MAX_UNCONFIRMED_DEATHS) {
-    writeEvent(db, { task_id: taskId, source: "reconciler", type: "recovery", payload: { decision: "unconfirmed-dead" } });
+function noteUnconfirmedDeath(db: DB, taskId: string, target: string, reason: string | undefined, nowMs: number): void {
+  const said = db
+    .query(
+      `SELECT ts FROM events WHERE task_id = ? AND type = 'recovery'
+         AND json_extract(payload, '$.decision') = 'unconfirmed-dead'
+         AND json_extract(payload, '$.agent_target') = ?
+       ORDER BY ts DESC LIMIT 1`
+    )
+    .get(taskId, target) as { ts: string } | undefined;
+  // Said once already for THIS agent. Stay silent — an event per lap also reset
+  // the task's silence clock forever, masking a genuinely mute agent from
+  // flagStale. A respawn changes agent_target, which starts a fresh episode.
+  if (!said) {
+    writeEvent(db, {
+      task_id: taskId,
+      source: "reconciler",
+      type: "recovery",
+      payload: {
+        decision: "unconfirmed-dead",
+        agent_target: target,
+        reason: reason ?? "herdr cannot resolve the agent and its liveness could not be confirmed either way",
+        next_step: `no action taken; checking quietly, and telling the director if it is still unresolved in ${Math.round(UNCONFIRMED_ESCALATE_MS / 60_000)}m`,
+      },
+    });
     return;
   }
+  if (nowMs - Date.parse(said.ts) < UNCONFIRMED_ESCALATE_MS) return;
   const already = db
     .query("SELECT 1 FROM notifications WHERE kind = 'agent_unreachable' AND task_id = ? LIMIT 1")
     .get(taskId);
@@ -451,7 +482,9 @@ function noteUnconfirmedDeath(db: DB, taskId: string): void {
     urgency: "urgent",
     task_id: taskId,
     title: `Agent unreachable but not dead: ${task?.title ?? taskId}`,
-    body: "herdr cannot resolve the agent, but its pane is still there (or herdr is down). Nothing was torn down — check the pane.",
+    body:
+      `herdr cannot resolve the agent, but its pane is still there (or herdr is down). Nothing was torn down — check the pane. ` +
+      (reason ?? ""),
   });
 }
 
@@ -2114,21 +2147,33 @@ async function recoverSilent(db: DB, h: Herdr, taskId: string, target: string, d
   }
 }
 
+// Has a turn-complete respawn already been decided for THIS agent? A respawn
+// changes agent_target, so the next agent starts a fresh episode.
+function respawnTried(db: DB, taskId: string, target: string): boolean {
+  return !!db
+    .query(
+      `SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery'
+         AND json_extract(payload, '$.prior_agent_target') = ? LIMIT 1`
+    )
+    .get(taskId, target);
+}
+
 async function respawnCompletedTurn(db: DB, h: Herdr, task: any, deps: ReconcilerDeps): Promise<void> {
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
+  const prior_agent_target = task.agent_target;
   const blocked = teardownBlocked(db, nowMs, deps.instanceId);
   if (blocked) {
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: blocked } });
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: blocked, prior_agent_target } });
     return;
   }
   const dead = recentDeadVerdicts(db, nowMs);
   if (dead >= DEAD_BURST_N) {
     openBreakerDecision(db, task, dead, Math.round(DEAD_BURST_MS / 60_000));
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "recovery breaker" } });
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "recovery breaker", prior_agent_target } });
     return;
   }
   if (inBackoff(db, task.id, nowMs)) {
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "spawn backoff" } });
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "spawn backoff", prior_agent_target } });
     return;
   }
   const project = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id) as { config: string | null } | undefined;
@@ -2136,7 +2181,7 @@ async function respawnCompletedTurn(db: DB, h: Herdr, task: any, deps: Reconcile
   const cap = Number.isFinite(config.max_agents) ? Number(config.max_agents) : MAX_AGENTS_DEFAULT;
   const otherAgents = db.query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND id != ? AND agent_target IS NOT NULL AND COALESCE(source, '') != 'chat_supervisor' AND state IN ('in_progress','needs_decision')`).get(task.project_id, task.id) as { n: number };
   if (otherAgents.n >= cap) {
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "project max_agents" } });
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "project max_agents", prior_agent_target } });
     return;
   }
 
@@ -2146,7 +2191,12 @@ async function respawnCompletedTurn(db: DB, h: Herdr, task: any, deps: Reconcile
     task_id: task.id,
     source: "reconciler",
     type: "recovery",
-    payload: { decision: "turn-complete-respawn", respawned: result.ok, ...(result.ok ? { agent_target: result.agent_target } : { error: result.error }) },
+    payload: {
+      decision: "turn-complete-respawn",
+      respawned: result.ok,
+      prior_agent_target,
+      ...(result.ok ? { agent_target: result.agent_target } : { error: result.error }),
+    },
   });
   broadcastTask(db, getTask(db, task.id));
 }
