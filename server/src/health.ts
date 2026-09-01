@@ -98,7 +98,7 @@ function mergeFailureResolved(events: { type: string; ts: string; payload: strin
   });
 }
 
-function staleMs(): number {
+export function staleMs(): number {
   return Number(process.env.HIVE_STALE_MS || 15 * 60 * 1000);
 }
 
