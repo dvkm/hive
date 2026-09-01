@@ -12,6 +12,8 @@ import { getTask, writeEvent, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
+import { enqueue } from "./notifications.ts";
+import { createHash } from "node:crypto";
 
 // Per-project stack lifecycle command. Two symmetric hooks share this runner:
 //   config.setup_argv    = ["infra/worktree/wt.sh", "up",   "{worktree}"]  (spawn time, before agent starts)
@@ -98,32 +100,51 @@ function spawnMeta(db: DB, taskId: string): { tab_id: string | null; workspace_i
   }
 }
 
-// Deferral must be bounded: an agent wedged in "working" forever would pin its
-// worktree (and its pty) forever, and the live checkout would accumulate dead
-// worktrees with nothing to reap them. After DEFER_CAP_MS of continuous
-// deferral we tear down anyway — cleanupWorktree still preserves uncommitted
-// work to a ghost branch, so the cap costs a running agent its cwd but never
-// costs anyone their code.
+// Deferral must be bounded, but bounded by the RIGHT thing. Capping on "how
+// long have we been deferring" punishes exactly the agent we are protecting: a
+// 66-round run is hours long and would lose its worktree on the clock alone.
+// So the cap measures LACK OF PROGRESS instead. Every sweep we fingerprint the
+// agent's pane; while that fingerprint keeps changing the agent is demonstrably
+// alive and we defer indefinitely. Once it stops changing for DEFER_CAP_MS the
+// agent is wedged (herdr still says "working", nothing is actually happening),
+// and we release so the worktree and its pty cannot be pinned forever.
+//
+// A live claude pane always moves — spinner, elapsed timer, token counter — so
+// "fingerprint unchanged for 30 minutes" means the process behind it is not
+// running, not merely thinking slowly.
 export const DEFER_CAP_MS = 30 * 60_000;
 
-// True once the FIRST deferral in the current run is older than the cap. The
-// run is bounded by the newest terminal-ish cleanup event, so a task that gets
-// cleaned, reopened and re-deferred starts its clock fresh instead of
-// inheriting a stale one.
-function deferExpired(db: DB, taskId: string, nowMs = Date.now()): boolean {
-  const rows = db
+// How often a still-progressing agent re-stamps its deferral. The reaper sweeps
+// every 300s, so this logs at most one progress event every other sweep: enough
+// resolution under a 30-minute cap, without flooding the task timeline.
+export const PROGRESS_MIN_GAP_MS = 10 * 60_000;
+
+// The current deferral run's anchor: the newest cleanup_deferred event, but only
+// if nothing terminal-ish has happened since. A task that gets cleaned, reopened
+// and re-deferred therefore starts a fresh clock instead of inheriting a stale one.
+function lastDeferral(db: DB, taskId: string): { ts: string; fingerprint: string | null } | null {
+  const r = db
     .query(
-      "SELECT type, ts FROM events WHERE task_id = ? AND type IN ('cleanup_deferred','cleaned_up','cleanup_skipped') ORDER BY ts DESC"
+      "SELECT type, ts, payload FROM events WHERE task_id = ? AND type IN ('cleanup_deferred','cleaned_up','cleanup_skipped') ORDER BY ts DESC, rowid DESC LIMIT 1"
     )
-    .all(taskId) as { type: string; ts: string }[];
-  let first: string | null = null;
-  for (const r of rows) {
-    if (r.type !== "cleanup_deferred") break; // end of the current deferral run
-    first = r.ts;
+    .get(taskId) as { type: string; ts: string; payload: string } | undefined;
+  if (!r || r.type !== "cleanup_deferred") return null;
+  let fingerprint: string | null = null;
+  try {
+    fingerprint = JSON.parse(r.payload)?.fingerprint ?? null;
+  } catch {
+    /* legacy/unparseable payload — treated as "no fingerprint recorded" */
   }
-  if (!first) return false; // nothing deferred yet
-  const t = Date.parse(first);
-  return Number.isFinite(t) && nowMs - t >= DEFER_CAP_MS;
+  return { ts: r.ts, fingerprint };
+}
+
+// A cheap digest of the agent's pane tail. Any change at all counts as progress;
+// we never interpret the text. A failed read yields a stable error string, which
+// deliberately reads as "no progress" so a herdr that answers `probe` but not
+// `read` still cannot pin the worktree forever.
+async function paneFingerprint(herdr: Herdr, target: string): Promise<string> {
+  const text = await herdr.read(target, 40).catch((e) => `(fingerprint read failed: ${String((e as any)?.message ?? e)})`);
+  return createHash("sha1").update(text).digest("hex").slice(0, 16);
 }
 
 // Tear down a finished task. `force` skips the terminal-state guard (used by the
@@ -146,27 +167,67 @@ export async function cleanupTask(
   // way in five hours, one of them the agent investigating this bug). The
   // branch-pushed/merged guard in cleanupWorktree does NOT catch it — a pushed
   // branch is exactly when removal looks safest and the agent is still live.
-  // So: defer while the agent is demonstrably working. The reaper retries every
+  // So: defer while the agent is demonstrably alive. The reaper retries every
   // sweep, so this delays teardown, never cancels it.
   if (task.agent_target) {
     const probe = await herdr.probe(task.agent_target).catch(() => ({ alive: false, status: "unknown" as const }));
-    // Only a definite "working" defers. probe() reports {alive,status:"unknown"}
-    // when the herdr call itself fails, so a herdr outage can never wedge
-    // cleanup shut and leak worktrees + ptys.
-    if (probe.alive && probe.status === "working" && !deferExpired(db, taskId)) {
-      // One event per deferral run, not one per sweep: the reaper sweeps often
-      // and this would otherwise flood the task timeline (see cleanup_skipped).
-      const last = db
-        .query("SELECT type FROM events WHERE task_id = ? AND type IN ('cleanup_deferred','cleaned_up','cleanup_skipped') ORDER BY ts DESC LIMIT 1")
-        .get(taskId) as { type: string } | undefined;
-      if (last?.type !== "cleanup_deferred")
+    // "working" AND "blocked" both defer. A blocked agent is paused on a dialog
+    // or a confirmation prompt: alive, holding its worktree, and about to carry
+    // on the moment someone answers — the state in which it is least able to
+    // defend itself. "unknown" deliberately does NOT defer: probe() reports it
+    // when the herdr call itself fails, and an outage that wedged cleanup shut
+    // would leak worktrees and ptys (the July pty-pool failure).
+    if (probe.alive && (probe.status === "working" || probe.status === "blocked")) {
+      const last = lastDeferral(db, taskId);
+      const fingerprint = await paneFingerprint(herdr, task.agent_target);
+      const sinceMs = last ? Date.now() - Date.parse(last.ts) : 0;
+      const moved = !last || (fingerprint !== last.fingerprint && sinceMs >= PROGRESS_MIN_GAP_MS);
+
+      if (moved) {
+        // Re-stamping the run on observed progress is what lets a genuinely long
+        // agent defer indefinitely; the cap below then only bites a pane that
+        // has stopped moving altogether.
         writeEvent(db, {
           task_id: taskId,
           source: "cleanup",
           type: "cleanup_deferred",
-          payload: { reason: "agent still working in worktree", agent_target: task.agent_target },
+          payload: {
+            reason: "agent still live in worktree",
+            agent_target: task.agent_target,
+            status: probe.status,
+            fingerprint,
+          },
         });
-      return noop;
+        return noop;
+      }
+      if (!Number.isFinite(sinceMs) || sinceMs < DEFER_CAP_MS) return noop;
+
+      // Hard release. This is the one path that can still remove a worktree an
+      // agent might be sitting in, and it is exactly the event that took three
+      // attempts to diagnose — so it announces itself instead of being inferred
+      // from a gap in the logs hours later. cleanupWorktree still rescues any
+      // uncommitted work to a ghost branch before removing anything.
+      writeEvent(db, {
+        task_id: taskId,
+        source: "cleanup",
+        type: "cleanup_force_released",
+        payload: {
+          agent_target: task.agent_target,
+          status: probe.status,
+          stalled_ms: sinceMs,
+          fingerprint,
+          reason: `pane unchanged for ${Math.round(sinceMs / 60_000)}m — treating the agent as wedged`,
+        },
+      });
+      enqueue(db, {
+        kind: "incident",
+        task_id: taskId,
+        urgency: "urgent",
+        title: `Tore down a worktree an agent may still be in (${taskId})`,
+        body: `Agent ${task.agent_target} still reports "${probe.status}", but its pane has not changed for ${Math.round(
+          sinceMs / 60_000
+        )} minutes, so cleanup treated it as wedged and removed the worktree. Uncommitted work was rescued to a ghost branch. If the agent was in fact alive, this is the HIVE-213 failure mode recurring.`,
+      });
     }
   }
 

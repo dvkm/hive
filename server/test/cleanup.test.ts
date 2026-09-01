@@ -404,15 +404,33 @@ test("POST /cleanup: 404 unknown, 409 on a live task, 200 forces teardown on a t
 
 // A merged/clean branch: cleanupWorktree's own guard says "safe to remove", so
 // only the new liveness guard can stop the teardown. `agentStatus` drives what
-// `herdr agent get` reports back.
-function livenessExec(branch: string, agentStatus: string): { exec: Exec; calls: string[][] } {
+// `herdr agent get` reports, and `pane()` drives what `herdr agent read`
+// returns — the progress signal the deferral cap measures.
+function livenessExec(
+  branch: string,
+  agentStatus: string,
+  pane: () => string = () => "thinking..."
+): { exec: Exec; calls: string[][] } {
   return stubExec((argv) => {
     if (argv[0] === "git" && argv.includes("--merged")) return OK(`  main\n  ${branch}`);
     if (argv[0] === "git" && argv.includes("ls-remote")) return OK("");
     if (argv[0] === "git" && has(argv, "status", "--porcelain")) return OK("");
+    if (has(argv, "agent", "read")) return OK(JSON.stringify({ result: { read: { text: pane() } } }));
     if (has(argv, "agent", "get")) return OK(JSON.stringify({ agent: { pane_id: "p1", agent_status: agentStatus } }));
     return OK();
   });
+}
+
+const deferrals = (db: DB, id: string) =>
+  db.query("SELECT * FROM events WHERE task_id = ? AND type = 'cleanup_deferred' ORDER BY ts").all(id) as any[];
+
+// Backdate the whole deferral run so the next sweep looks like it happened
+// `minutes` later, without sleeping.
+function backdate(db: DB, id: string, minutes: number) {
+  db.query("UPDATE events SET ts = ? WHERE task_id = ? AND type = 'cleanup_deferred'").run(
+    new Date(Date.now() - minutes * 60_000).toISOString(),
+    id
+  );
 }
 
 test("cleanupTask defers teardown while the agent is still WORKING in the worktree", async () => {
@@ -433,8 +451,20 @@ test("cleanupTask defers teardown while the agent is still WORKING in the worktr
   expect(task.worktree_path).toBe("/wt/hive-CT-live");
   expect(task.agent_target).not.toBeNull();
 
-  const ev = db.query("SELECT * FROM events WHERE task_id = ? AND type = 'cleanup_deferred'").all(id);
-  expect(ev.length).toBe(1);
+  expect(deferrals(db, id).length).toBe(1);
+});
+
+test("cleanupTask defers teardown for a BLOCKED agent — paused on a dialog, not finished", async () => {
+  const { db, projectId } = freshDb();
+  const branch = "hive/CT-blocked";
+  const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-CT-blocked" });
+  const { exec, calls } = livenessExec(branch, "blocked");
+
+  const out = await cleanupTask(db, new Herdr(exec, "herdr"), id, { force: true });
+
+  expect(out.cleaned).toBe(false);
+  expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(false);
+  expect(JSON.parse(deferrals(db, id)[0].payload).status).toBe("blocked");
 });
 
 test("cleanupTask does NOT defer for an idle agent — a finished task still gets reaped", async () => {
@@ -450,21 +480,50 @@ test("cleanupTask does NOT defer for an idle agent — a finished task still get
   expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(true);
 });
 
-test("cleanupTask deferral is bounded: a wedged 'working' agent cannot pin its worktree forever", async () => {
+test("a long-running agent keeps its worktree past the cap as long as its pane keeps moving", async () => {
+  const { db, projectId } = freshDb();
+  const branch = "hive/CT-long";
+  const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-CT-long" });
+  let round = 0;
+  const { exec, calls } = livenessExec(branch, "working", () => `round ${round}`);
+
+  // Five sweeps, each an hour after the last — far past DEFER_CAP_MS — with the
+  // pane advancing between them. This is the long run the old wall-clock cap
+  // would have torn down.
+  for (let i = 0; i < 5; i++) {
+    round++;
+    const out = await cleanupTask(db, new Herdr(exec, "herdr"), id, { force: true });
+    expect(out.cleaned).toBe(false);
+    backdate(db, id, 60);
+  }
+  expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(false);
+  // one progress stamp per sweep, and no force-release
+  expect(deferrals(db, id).length).toBe(5);
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'cleanup_force_released'").all(id).length).toBe(0);
+});
+
+test("a wedged agent — pane frozen past the cap — is released loudly", async () => {
   const { db, projectId } = freshDb();
   const branch = "hive/CT-wedged";
   const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-CT-wedged" });
-  // a deferral run that started well past the cap
-  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
-    newId("evt"), id, new Date(Date.now() - DEFER_CAP_MS - 60_000).toISOString(),
-    "cleanup", "cleanup_deferred", JSON.stringify({ reason: "agent still working in worktree" })
-  );
-  const { exec, calls } = livenessExec(branch, "working");
+  const { exec, calls } = livenessExec(branch, "working", () => "frozen");
+
+  // first sweep records the deferral + fingerprint
+  expect((await cleanupTask(db, new Herdr(exec, "herdr"), id, { force: true })).cleaned).toBe(false);
+  // ...and nothing moves for longer than the cap
+  backdate(db, id, DEFER_CAP_MS / 60_000 + 1);
 
   const out = await cleanupTask(db, new Herdr(exec, "herdr"), id, { force: true });
 
   expect(out.cleaned).toBe(true);
   expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(true);
+  // the release must announce itself: an event AND an urgent notification
+  const released = db.query("SELECT * FROM events WHERE task_id = ? AND type = 'cleanup_force_released'").all(id) as any[];
+  expect(released.length).toBe(1);
+  const n = db.query("SELECT * FROM notifications WHERE task_id = ?").all(id) as any[];
+  expect(n.length).toBe(1);
+  expect(n[0].urgency).toBe("urgent");
+  expect(n[0].kind).toBe("incident");
 });
 
 test("cleanupTask does not defer when the herdr probe itself fails (no outage-wedged cleanup)", async () => {
