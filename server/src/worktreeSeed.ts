@@ -11,13 +11,14 @@
 // CLONE (2). On APFS/btrfs a clone is copy-on-write, so a 400MB node_modules
 // lands in milliseconds and costs no disk until something writes to it. The
 // clone is invalidated by lockfile mismatch, which is the only way a branch
-// can legitimately need different deps.
+// can legitimately need different deps. It lands by atomic rename, so a killed
+// copy can never leave a node_modules that looks complete and is not.
 //
 // Runs after `worktree create` and BEFORE config.setup_argv, so a project's
 // own setup hook sees the warm state and no-ops (hive's own `wt.sh up` already
 // short-circuits on `[ -d node_modules ]`). Everything here is best-effort: a
 // seed that fails is a slow spawn, never a broken one, so nothing throws.
-import { existsSync, mkdirSync, cpSync, copyFileSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, cpSync, copyFileSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { dirname, join, relative, resolve, isAbsolute } from "node:path";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
@@ -55,24 +56,28 @@ function insideTree(root: string, rel: string): string | null {
   return back && !back.startsWith("..") ? full : null;
 }
 
-// Throw away a clone that did not finish. Only ever called on `dst`, which
-// insideTree has already proved sits under this task's own worktree.
-function discard(dst: string): void {
-  rmSync(dst, { recursive: true, force: true });
-}
-
+// Build the clone under a temp name beside the target, then rename it into
+// place. A rename is atomic, so `dst` never exists in a half-copied state: a
+// killed `cp` leaves a stray temp directory, which is garbage, not a
+// node_modules that looks complete and is not. That is the exact failure the
+// lockfile rule exists to prevent, so it must not come back in through here.
+// Temp lives beside `dst` on purpose — same directory means same filesystem,
+// which is what makes the rename atomic rather than a copy.
 async function cloneDir(src: string, dst: string, exec: Exec): Promise<void> {
   mkdirSync(dirname(dst), { recursive: true });
+  const tmp = `${dst}.hive-warm-${process.pid}-${Date.now()}`;
   if (CLONE_ARGV) {
-    const r = await exec([...CLONE_ARGV, src, dst], { timeoutMs: CLONE_TIMEOUT_MS });
-    if (r.code === 0) return;
-    // Failed or killed part-way. A half-copied node_modules is worse than none,
-    // and the "already present" guard would keep it forever. Start clean.
-    discard(dst);
+    const r = await exec([...CLONE_ARGV, src, tmp], { timeoutMs: CLONE_TIMEOUT_MS });
+    // Non-zero means this filesystem cannot clone (macOS `cp -c` refuses rather
+    // than degrading). Clear whatever it left in temp so the fallback below
+    // starts from nothing instead of merging into a partial tree.
+    if (r.code !== 0) rmSync(tmp, { recursive: true, force: true });
+    else return void renameSync(tmp, dst);
   }
   // ponytail: a real byte copy, so no faster than the install it replaces on a
   // filesystem without reflinks. Correct everywhere, which is what matters.
-  cpSync(src, dst, { recursive: true });
+  cpSync(src, tmp, { recursive: true });
+  renameSync(tmp, dst);
 }
 
 // Same bytes on both sides? That is the whole invalidation rule: a branch that
@@ -182,7 +187,7 @@ export async function seedWorktree(
       await cloneDir(src, dst, exec);
       out.warmed.push(dir);
     } catch (e: any) {
-      discard(dst); // the fs fallback can throw mid-copy too
+      // Nothing to undo: the rename never ran, so `dst` was never created.
       out.misconfigured.push({ path: dir, reason: String(e?.message ?? e).slice(0, 200) });
     }
   }

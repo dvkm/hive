@@ -129,3 +129,21 @@ test("a clone that fails leaves nothing half-built behind", async () => {
   expect(r.warmed).toEqual(["node_modules"]);
   expect(readFileSync(join(wt, "node_modules", "left-pad", "index.js"), "utf8")).toBe("module.exports=1");
 });
+
+test("a cp that dies part-way never leaves a half-built node_modules", async () => {
+  const { repo, wt } = trees();
+  // Stand in for a killed `cp`: it writes some of the tree, then exits non-zero.
+  // Everything it wrote goes to a temp path, so the destination must still be
+  // untouched, and the fallback copy that follows must not inherit the scraps.
+  const killedPartWay: Exec = async (argv) => {
+    const dest = argv[argv.length - 1]!;
+    expect(dest).not.toBe(join(wt, "node_modules")); // built beside it, not on it
+    mkdirSync(join(dest, "half-written"), { recursive: true });
+    expect(existsSync(join(wt, "node_modules"))).toBe(false);
+    return { code: 137, stdout: "", stderr: "Killed" };
+  };
+  const r = await seedWorktree(repo, wt, { worktree_warm: [{ dir: "node_modules", lock: "bun.lock" }] }, killedPartWay);
+  expect(r.warmed).toEqual(["node_modules"]);
+  expect(readFileSync(join(wt, "node_modules", "left-pad", "index.js"), "utf8")).toBe("module.exports=1");
+  expect(existsSync(join(wt, "node_modules", "half-written"))).toBe(false);
+});
