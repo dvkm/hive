@@ -51,7 +51,12 @@ test("a glob matches, and a file the worktree already has is never clobbered", a
 test("clones node_modules when the lockfile still matches", async () => {
   const { repo, wt } = trees("LOCK-V1");
   const r = await seedWorktree(repo, wt, { worktree_warm: [{ dir: "node_modules", lock: "bun.lock" }] }, realExec);
-  expect(r.warmed).toEqual([{ dir: "node_modules", method: "clone" }]);
+  // Which method runs is the FILESYSTEM's answer, not ours: APFS clones, a CI
+  // runner on ext4 without reflink support byte-copies. Both are correct here,
+  // so pin the directory and require an honest label. The forced-fallback tests
+  // below are where "copy" is asserted deterministically.
+  expect(r.warmed.map((w) => w.dir)).toEqual(["node_modules"]);
+  expect(["clone", "copy"]).toContain(r.warmed[0]!.method);
   expect(readFileSync(join(wt, "node_modules", "left-pad", "index.js"), "utf8")).toBe("module.exports=1");
 });
 

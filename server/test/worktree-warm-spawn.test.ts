@@ -97,11 +97,14 @@ test("seeds and warms the worktree before setup_argv, and records the timings", 
   const seeded: any = db
     .query("SELECT payload FROM events WHERE task_id = ? AND type = 'worktree_seeded'")
     .get(taskId);
-  expect(JSON.parse(seeded.payload)).toMatchObject({ seeded: [".env"], warmed: [{ dir: "node_modules", method: "clone" }] });
+  // method is whatever this filesystem can do: APFS clones, ext4 without
+  // reflink support byte-copies. What matters here is that it is reported.
+  expect(JSON.parse(seeded.payload)).toMatchObject({ seeded: [".env"], warmed: [{ dir: "node_modules" }] });
 
   const spawned: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'spawned'").get(taskId);
   const p = JSON.parse(spawned.payload);
-  expect(p.warmed).toEqual([{ dir: "node_modules", method: "clone" }]);
+  expect(p.warmed.map((w: any) => w.dir)).toEqual(["node_modules"]);
+  expect(["clone", "copy"]).toContain(p.warmed[0].method);
   for (const key of ["spawn_ms", "seed_ms", "setup_ms"]) expect(typeof p[key]).toBe("number");
   expect(p.spawn_ms).toBeGreaterThanOrEqual(p.seed_ms + p.setup_ms);
 
