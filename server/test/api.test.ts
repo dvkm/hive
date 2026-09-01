@@ -12,10 +12,24 @@ const { makeHandler, requeueTask } = await import("../src/api.ts");
 const { composeBrief } = await import("../src/briefs.ts");
 const { getTask } = await import("../src/state.ts");
 const { createThread } = await import("../src/chat.ts");
+const { defaultExec } = await import("../src/exec.ts");
+import type { Exec } from "../src/exec.ts";
 import type { Fetcher } from "../src/monitors.ts";
 
+// HIVE-590: tests hand this server fake PR urls like https://gh/pr/99, and the
+// `ready` handler asks gh for that PR's head branch. That ran the real gh CLI,
+// which treats the url as a branch name and queries the GitHub API for this
+// repo. Half a second on a good day, and once in ~20 runs slow enough to blow
+// bun's 5s test timeout. gh can never answer anything useful for a fake url, so
+// refuse it here. git still runs for real, since the unmergeable tests below
+// drive actual repos.
+const testExec: Exec = (argv, opts) =>
+  argv[0] === "gh"
+    ? Promise.resolve({ code: 1, stdout: "", stderr: "gh is stubbed out in api.test.ts" })
+    : defaultExec(argv, opts);
+
 const db = openDb(":memory:");
-const server = Bun.serve({ port: 0, fetch: makeHandler(db) });
+const server = Bun.serve({ port: 0, fetch: makeHandler(db, { exec: testExec }) });
 const BASE = `http://127.0.0.1:${server.port}`;
 
 afterAll(() => server.stop(true));
