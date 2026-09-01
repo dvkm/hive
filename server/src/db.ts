@@ -712,6 +712,29 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       `CREATE INDEX idx_tasks_race ON tasks(race_id) WHERE race_id IS NOT NULL`,
     ],
   },
+  // HIVE-546: the durable link from a work task to the Jira mirror it implements.
+  // Before this the only connection was the '[WEB-110] ' prefix in the title, so
+  // a merged task told its mirror nothing and the board read as if the work had
+  // never happened. Deliberately NOT jira_key: a mirror can have many work
+  // children (WEB-23 has ten) and jira_key is unique per (key, link kind), and a
+  // work task is not the issue — it implements it.
+  // The backfill re-runs safely: it only fills rows that are still NULL.
+  {
+    name: "v44-task-jira-mirror-link",
+    statements: [
+      `ALTER TABLE tasks ADD COLUMN jira_mirror_task_id TEXT`,
+      `CREATE INDEX idx_tasks_jira_mirror ON tasks(jira_mirror_task_id) WHERE jira_mirror_task_id IS NOT NULL`,
+      `UPDATE tasks SET jira_mirror_task_id = (
+         SELECT m.id FROM tasks m
+          WHERE m.project_id = tasks.project_id
+            AND m.jira_link_kind = 'mirror' AND m.jira_key IS NOT NULL
+            AND substr(tasks.title, 1, length(m.jira_key) + 2) = '[' || m.jira_key || ']')
+       WHERE jira_mirror_task_id IS NULL
+         AND COALESCE(jira_link_kind, '') <> 'mirror'
+         AND COALESCE(source, '') <> 'external'
+         AND title LIKE '[%'`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings

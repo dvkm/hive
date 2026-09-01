@@ -23,7 +23,7 @@ import { startDriftWatch } from "./drift.ts";
 import { startPromoter } from "./promoter.ts";
 import { selfAuditOnce, startSelfAudit } from "./selfAudit.ts";
 import { followServingBranchOnBoot } from "./servingBranch.ts";
-import { setEventHook, setTerminalHook, expireOrphanedDecisions, repairRequeueProvenance, backfillStuckPrUrls } from "./state.ts";
+import { setEventHook, setTerminalHook, expireOrphanedDecisions, repairRequeueProvenance, backfillStuckPrUrls, advanceReadyJiraMirrors } from "./state.ts";
 import { bootstrapAuthority } from "./authority.ts";
 import { cleanupTask } from "./cleanup.ts";
 import { herdr as defaultHerdr } from "./runtime/herdr.ts";
@@ -225,6 +225,15 @@ startWatchers(db);
 // Hard no-op until a project sets enabled:true, and a second gate (write:false)
 // keeps it read-only until the director has read a shadow cycle.
 startJiraSync(db);
+// Mirrors whose work finished while this server was down (and every ticket
+// shipped before the link existed) are advanced once, here — the same rule the
+// live path uses, so it closes nothing the live path would not have (HIVE-546).
+try {
+  const advanced = advanceReadyJiraMirrors(db);
+  if (advanced) console.log(`[hive] advanced ${advanced} jira mirror(s) whose linked work is done`);
+} catch (e) {
+  console.error("[hive] jira mirror catch-up:", e);
+}
 
 // Auto-reviewer: pre-review every task that reaches in_review (sonnet one-shot
 // over the PR diff) and post the result onto the review card. Opt-out per
