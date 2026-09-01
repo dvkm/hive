@@ -179,6 +179,21 @@ export function isTransientLandFailure(reason: string): boolean {
   return TRANSIENT_RE.test(reason);
 }
 
+// A transient failure whose cause is SHORTAGE: the model route, GitHub or an
+// upstream was saturated, so the call timed out, was rate-limited or was
+// refused. Retrying one of these is not neutral — the attempt spends the very
+// resource that was short, on the same shared route, for the full timeout. Live
+// on 2026-08-31 one task retried an unfinished risk check 4 times in 20 minutes,
+// 180s per attempt, against 1 successful merge fleet-wide; the same review call
+// takes 15-38s when the route is free (HIVE-569). "Base moved" and "CI still
+// running" are NOT capacity failures: retrying those costs nothing shared.
+const CAPACITY_RE =
+  /risk check did not finish|timed? ?out|rate limit|secondary rate|temporarily unavailable|overloaded|too many requests|\b(429|50[234])\b/i;
+
+export function isCapacityLandFailure(reason: string): boolean {
+  return CAPACITY_RE.test(reason);
+}
+
 // A refusal that is waiting on the DIRECTOR, not on the queue and not on the
 // agent: an understanding check that has been submitted but not yet answered.
 // The review card already asks that question, so a land-queue card here would be
@@ -221,6 +236,14 @@ export function landHeldForQuiz(db: DB, taskId: string): boolean {
 // transient and opens the pause card, so nothing retries silently for ever.
 const RETRY_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000, 600_000];
 const MAX_TRANSIENT_RETRIES = RETRY_BACKOFF_MS.length;
+
+// Capacity failures wait far longer and give up far sooner. The point is to sit
+// out the congestion instead of adding to it: a saturated route needs minutes,
+// not seconds, and three attempts spread over roughly an hour is the whole
+// budget. Past that the stall stops counting as transient and becomes the pause
+// card, exactly like any other cause that never clears (HIVE-569).
+const CAPACITY_BACKOFF_MS = [300_000, 900_000, 2_700_000];
+const MAX_CAPACITY_RETRIES = CAPACITY_BACKOFF_MS.length;
 
 // A hard ceiling on attempts of ANY kind since the mark (HIVE-539). A
 // non-transient failure normally opens one pause card and stops, but a failure
@@ -302,6 +325,7 @@ function alreadyBlocked(db: DB, taskId: string): boolean {
 
 interface RetryState {
   transientFailures: number; // consecutive transient failures since the last non-attempt
+  capacityFailures: number; // of those, the ones caused by a shortage (timeout, 429, 503)
   lastAttemptMs: number;
 }
 
@@ -319,6 +343,7 @@ function retryState(db: DB, taskId: string): RetryState {
     )
     .all(taskId) as { ts: string; payload: string }[];
   let transientFailures = 0;
+  let capacityFailures = 0;
   let lastAttemptMs = 0;
   for (const row of rows) {
     let payload: any = {};
@@ -328,14 +353,22 @@ function retryState(db: DB, taskId: string): RetryState {
     if (payload.ok !== false || !payload.transient) break;
     if (!lastAttemptMs) lastAttemptMs = Date.parse(row.ts) || 0;
     transientFailures++;
+    // Classified from the reason already stored on the attempt, so old rows and
+    // rows written before this existed read correctly with no new field.
+    if (isCapacityLandFailure(String(payload.reason ?? ""))) capacityFailures++;
   }
-  return { transientFailures, lastAttemptMs };
+  return { transientFailures, capacityFailures, lastAttemptMs };
 }
 
 // Is this task inside its backoff window, i.e. too soon to retry again?
+// A run that contains ANY capacity failure waits on the long curve. Mixing the
+// two the other way round would let one "base moved" in between reset a
+// congested task back to a 30s cadence.
 function backingOff(state: RetryState, nowMs: number): boolean {
   if (!state.transientFailures || !state.lastAttemptMs) return false;
-  const wait = RETRY_BACKOFF_MS[Math.min(state.transientFailures, RETRY_BACKOFF_MS.length) - 1];
+  let wait = RETRY_BACKOFF_MS[Math.min(state.transientFailures, RETRY_BACKOFF_MS.length) - 1];
+  if (state.capacityFailures)
+    wait = Math.max(wait, CAPACITY_BACKOFF_MS[Math.min(state.capacityFailures, CAPACITY_BACKOFF_MS.length) - 1]);
   return nowMs - state.lastAttemptMs < wait;
 }
 
@@ -604,10 +637,12 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         if (!result.ok && isQuizHold(reason)) continue;
         // A transient cause that has already burned its retries is no longer
         // transient: it is a stall the director needs to see.
+        const priorRetries = retryState(db, node.id);
         const transient =
           !result.ok &&
           isTransientLandFailure(reason) &&
-          retryState(db, node.id).transientFailures < MAX_TRANSIENT_RETRIES;
+          priorRetries.transientFailures < MAX_TRANSIENT_RETRIES &&
+          priorRetries.capacityFailures < MAX_CAPACITY_RETRIES;
         if (result.ok) {
           landed.add(node.id);
           db.query("UPDATE tasks SET land_queued_at = NULL WHERE id = ?").run(node.id);
@@ -655,9 +690,13 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         title: `PR #${node.number} paused in the land queue`,
         context:
           `${node.title}\n\nIt is still approved to land, but the merge stopped: ${reason.slice(0, 300)}\n\n` +
-          `Retrying only helps if that cause has changed. Nothing has changed on its own, so the same merge will ` +
-          `fail the same way. Hive retries once and then holds the PR quietly until the agent pushes a new commit ` +
-          `or you take it out of the queue (\`hive land ${node.id} --off\`).`,
+          (isCapacityLandFailure(reason)
+            ? `That looks like a busy shared route, not a problem with the branch. Hive already waited it out over ` +
+              `about an hour and it did not clear, so it stopped retrying: each attempt spends the same capacity that ` +
+              `was short. Retry once the fleet is quieter, or take it out of the queue (\`hive land ${node.id} --off\`).`
+            : `Retrying only helps if that cause has changed. Nothing has changed on its own, so the same merge will ` +
+              `fail the same way. Hive retries once and then holds the PR quietly until the agent pushes a new commit ` +
+              `or you take it out of the queue (\`hive land ${node.id} --off\`).`),
         options: [
           { key: "send_back", label: "Send it back to the agent", detail: "Unmark it and ask the agent to fix what blocked the merge.", recommended: true },
           { key: "unqueue", label: "Take it out of the queue", detail: "Leave the PR open and unmarked. Nothing is sent to the agent." },
