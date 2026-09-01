@@ -632,7 +632,70 @@ export function extractAnswer(raw: string): { answerable: "machine" | "human"; a
   });
 }
 
-function verifyPrompt(task: any, risk: string, diff: string): string {
+// Answered decisions on this task, oldest first, each with the date it was
+// answered (HIVE-571). The risk check saw only the diff, so a product ambiguity
+// the director had ALREADY ruled on came back as a merge-blocking risk: on
+// corebeat 3f6e5ffe5aaa the finding was "if the reporter meant separate
+// windows, this ships the wrong UI", which is exactly the question decision
+// dec_3874b7587abf answered. Same blind spot the scope check had, same input
+// fixes it (drift.ts directionSinceBrief).
+const MAX_SETTLED_DECISIONS = 8;
+
+function answeredDecisions(db: DB, taskId: string): { ts: string; text: string }[] {
+  const rows: any[] = db
+    .query(
+      `SELECT answered_at AS ts, title, options, answer_key, answer_note FROM decisions
+        WHERE task_id = ? AND status = 'answered' ORDER BY answered_at`
+    )
+    .all(taskId);
+  return rows.slice(-MAX_SETTLED_DECISIONS).map((d) => {
+    let label = String(d.answer_key ?? "");
+    try {
+      const opt = JSON.parse(d.options || "[]").find((o: any) => o.key === d.answer_key);
+      if (opt) label = `${opt.label ?? opt.key}${opt.detail ? ` — ${opt.detail}` : ""}`;
+    } catch {}
+    return {
+      ts: String(d.ts ?? ""),
+      text: `${d.title} → chose: ${label}${d.answer_note ? ` (${d.answer_note})` : ""}`,
+    };
+  });
+}
+
+// Commits on this branch with their dates, so the judge can tell a settled
+// question from a NEW behaviour: a decision answered on an older head does not
+// absolve code written after it. Best effort — no commits just means judging
+// on the decisions and the diff, as before.
+async function branchCommits(db: DB, task: any, exec: Exec): Promise<string[]> {
+  const project: any = db.query("SELECT repo_path, config FROM projects WHERE id = ?").get(task.project_id);
+  const repo = task.worktree_path ?? project?.repo_path;
+  const ref = task.worktree_path ? "HEAD" : task.branch;
+  if (!repo || !ref) return [];
+  const base = projectComparisonBase(JSON.parse(project?.config ?? "{}"));
+  const r = await exec([
+    "git", "-C", repo, "log", "--first-parent", "--no-merges",
+    "--date=iso-strict", "--format=%h %ad %s", "-n", "20", `${base}..${ref}`,
+  ]);
+  if (r.code !== 0) return [];
+  return r.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+// The settled-decision block of the verify prompt, or "" when the task has none.
+function settledBlock(decisions: { ts: string; text: string }[], commits: string[]): string {
+  if (!decisions.length) return "";
+  return [
+    `The director has ALREADY ruled on this task. These questions are settled:`,
+    ...decisions.map((d) => `- answered ${d.ts.slice(0, 10)}: ${d.text}`),
+    ...(commits.length ? [``, `Commits on this branch, newest first (short sha, date, subject):`, ...commits.map((c) => `- ${c}`)] : []),
+    `A risk that only re-asks a settled question is NOT a live risk. Answer 'refuted' and start`,
+    `'why' with "settled: " plus the ruling and the date, so the reader sees it in one glance.`,
+    `Two things still count as confirmed: a defect in the code itself (a real bug, not a different`,
+    `reading of what was wanted), or behaviour introduced by a commit made AFTER the ruling that`,
+    `answers it — then confirm and name that commit in 'why'.`,
+    ``,
+  ].join("\n");
+}
+
+function verifyPrompt(task: any, risk: string, diff: string, settled = ""): string {
   return [
     `A code reviewer flagged ONE risk on a pull request. Decide whether it is real.`,
     `Be adversarial: try to refute it. Say 'confirmed' only if you can point at the code that makes it true.`,
@@ -642,6 +705,7 @@ function verifyPrompt(task: any, risk: string, diff: string): string {
     `Task #${task.number}: ${task.title}`,
     task.worktree_path ? `The full checkout is at ${task.worktree_path} — read files there to check. Do not edit anything.` : ``,
     ``,
+    settled,
     `Diff (may be truncated):`,
     diff.slice(0, DIFF_LIMIT),
     ``,
@@ -792,6 +856,12 @@ async function runVerification(
 ): Promise<void> {
   const { risks, questions, knownRisk, knownQuestion, todoRisks, todoQuestions } = plan;
   const exec = deps.exec ?? defaultPlannerExec;
+  // Read once per pass, not once per risk: the same block goes into every
+  // risk prompt.
+  const decisions = answeredDecisions(db, task.id);
+  const settled = decisions.length
+    ? settledBlock(decisions, await branchCommits(db, task, deps.shellExec ?? defaultExec))
+    : "";
   const current = async () => (input.stillCurrent ? await input.stillCurrent() : true);
   const run = async (prompt: string) => {
     try {
@@ -811,7 +881,7 @@ async function runVerification(
   let unverified_reason: string | null = null;
   let aborted = false;
   const jobs = [
-    ...todoRisks.map((risk) => ({ kind: "risk" as const, text: risk, prompt: verifyPrompt(task, risk, input.diff) })),
+    ...todoRisks.map((risk) => ({ kind: "risk" as const, text: risk, prompt: verifyPrompt(task, risk, input.diff, settled) })),
     ...todoQuestions.map((q) => ({ kind: "question" as const, text: q, prompt: answerPrompt(task, q, input.diff) })),
   ];
   const results = await mapLimit(jobs, RISK_CONCURRENCY, async (job) => {
