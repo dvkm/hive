@@ -118,10 +118,40 @@ export function VerificationChecklist({ items, evidence }: { items: Verification
   );
 }
 
+// A BEFORE:/AFTER: caption pair is one thing, not two screenshots that happen
+// to share a timestamp (HIVE-611). Rank orders the pair; anything else is 2.
+function pairRank(e: Evidence): number {
+  const cap = (e.caption ?? "").trimStart();
+  if (/^before\b/i.test(cap)) return 0;
+  if (/^after\b/i.test(cap)) return 1;
+  return 2;
+}
+
+// Oldest first, except that each before/after pair sits together at the
+// earliest time either half was captured, and reads before → after however it
+// was emitted. Without this the AFTER shot can land first and the reader meets
+// the outcome before the problem. Two pairs on one task stay two pairs: the
+// n-th BEFORE belongs with the n-th AFTER, not with every other BEFORE.
+export function orderEvidence(evidence: Evidence[]): Evidence[] {
+  const byTs = (a: Evidence, b: Evidence) => a.ts.localeCompare(b.ts);
+  const befores = evidence.filter((e) => pairRank(e) === 0).sort(byTs);
+  const afters = evidence.filter((e) => pairRank(e) === 1).sort(byTs);
+  const slot = new Map<string, string>();
+  for (let i = 0; i < Math.max(befores.length, afters.length); i++) {
+    const pair = [befores[i], afters[i]].filter((e): e is Evidence => !!e);
+    const ts = pair.reduce((min, e) => (min && min < e.ts ? min : e.ts), "");
+    for (const e of pair) slot.set(e.id, `${ts}#${String(i).padStart(4, "0")}`);
+  }
+  const key = (e: Evidence) => slot.get(e.id) ?? e.ts;
+  return [...evidence].sort(
+    (a, b) => key(a).localeCompare(key(b)) || pairRank(a) - pairRank(b) || a.ts.localeCompare(b.ts)
+  );
+}
+
 export function EvidenceStrip({ evidence, task, limit }: { evidence: Evidence[]; task: Pick<Task, "id" | "title" | "head_sha">; limit?: number }) {
   const lightbox = useLightbox();
   if (!evidence.length) return null;
-  const ordered = [...evidence].sort((a, b) => a.ts.localeCompare(b.ts));
+  const ordered = orderEvidence(evidence);
   const visible = limit ? ordered.slice(-limit) : ordered;
   const images = visible.filter((e) => e.kind === "screenshot" && e.url);
   const lightboxImages: LightboxImage[] = images.map((e) => ({
@@ -134,15 +164,21 @@ export function EvidenceStrip({ evidence, task, limit }: { evidence: Evidence[];
   return (
     <div className="review-evidence brief-evidence">
       {visible.map((e) => e.kind === "screenshot" && e.url ? (
-        <button key={e.id} className="rev-thumb" title={e.caption || "screenshot"} onClick={() => lightbox.open(lightboxImages, images.findIndex((image) => image.id === e.id))}>
-          <img src={e.url} alt={e.caption || "screenshot"} />
-          <EvAge e={e} headSha={task.head_sha} />
-        </button>
+        // The caption is the only thing telling two shots of the same screen
+        // apart, so it is on the card, not in a tooltip (HIVE-611).
+        <figure key={e.id} className="rev-thumb-fig">
+          <button className="rev-thumb" title={e.caption || "screenshot"} onClick={() => lightbox.open(lightboxImages, images.findIndex((image) => image.id === e.id))}>
+            <img src={e.url} alt={e.caption || "screenshot"} />
+            <EvAge e={e} headSha={task.head_sha} />
+          </button>
+          {e.caption && <figcaption className="rev-thumb-cap" title={e.caption}>{e.caption}</figcaption>}
+        </figure>
       ) : <EvChip key={e.id} e={e} headSha={task.head_sha} />)}
       {limit && evidence.length > limit && <Link className="brief-evidence-more" to={`/tasks/${task.id}`}>+{evidence.length - limit} more</Link>}
     </div>
   );
 }
+
 import type { Decision, Event } from "../lib/api";
 
 // The pre-review's risks and questions, after the per-risk check re-read the
@@ -426,6 +462,37 @@ export function ReviewUnderstanding({ packet, report = false, caveats = [], expl
 
 // The top of the card, in the order a person decides (HIVE-557): what changed,
 // what state it left behind, why it was needed. Everything else collapses.
+// The agent's LATEST self-review that actually carries sections (early buggy
+// submissions stored {note:null}). Shared so the verify card reads exactly the
+// same review the review card did.
+export function latestReviewSummaryEvent(events: Event[]): Event | undefined {
+  return [...events]
+    .reverse()
+    .find(
+      (e: any) =>
+        e.type === "review_summary" &&
+        e.payload &&
+        (["done", "iffy", "decisions", "testing", "followups"].some((k) => (e.payload[k] ?? []).length) ||
+          (e.payload.understanding && typeof e.payload.understanding === "object"))
+    );
+}
+
+// #1249: hive writes one page per PR head explaining the change, stored as
+// ordinary evidence, so the newest one is the current one. #1556: a page
+// written for an older head is shown but labelled, never passed off as current.
+export function explainStateOf(evidence: Evidence[], events: Event[], headSha: string | null): ExplainState {
+  const pages = [...evidence].reverse().filter((e) => e.kind === "explanation" && e.url);
+  // Same match rule as the server's explanationFor(): a page counts as current
+  // only when its recorded commit is the PR's head.
+  const current = headSha ? pages.find((e) => e.meta?.commit_sha === headSha) : pages[0];
+  const page = current ?? pages[0];
+  const stale = !!page && !current;
+  const lastEvent = [...events].reverse().find((e) => e.type.startsWith("explanation_"))?.type;
+  if (page?.url && !stale) return { status: "ready", url: page.url, stale: false };
+  if (lastEvent === "explanation_generating") return { status: "generating" };
+  return page?.url ? { status: "ready", url: page.url, stale: true } : null;
+}
+
 function ReviewFocus({
   changed,
   paths,
@@ -667,17 +734,7 @@ export function ReviewCard({
       .task(task.id)
       .then((t) => {
         if (!live) return;
-        // events are ts-ascending; take the agent's LATEST self-review that
-        // actually carries sections (early buggy submissions stored {note:null})
-        const ev = [...(t.events ?? [])]
-          .reverse()
-          .find(
-            (e: any) =>
-              e.type === "review_summary" &&
-              e.payload &&
-              (["done", "iffy", "decisions", "testing", "followups"].some((k) => (e.payload[k] ?? []).length) ||
-                (e.payload.understanding && typeof e.payload.understanding === "object"))
-          );
+        const ev = latestReviewSummaryEvent(t.events ?? []);
         if (ev) {
           setReview(ev.payload as ReviewSummary);
           setReviewEventId(ev.id);
@@ -758,24 +815,7 @@ export function ReviewCard({
       : quizStatus === "required"
         ? "Pass the understanding check, or explicitly save it for later."
         : "";
-  // #1249: hive writes one page per PR head explaining the change. It is stored
-  // as ordinary evidence, so the newest one is the current one. #1556: a page
-  // written for an older head is shown but labelled, never passed off as current.
-  const explainPages = [...evidence].reverse().filter((e) => e.kind === "explanation" && e.url);
-  // Same match rule as the server's explanationFor(): a page counts as current
-  // only when its recorded commit is the PR's head.
-  const explainCurrent = task.head_sha ? explainPages.find((e) => e.meta?.commit_sha === task.head_sha) : explainPages[0];
-  const explainPage = explainCurrent ?? explainPages[0];
-  const explainStale = !!explainPage && !explainCurrent;
-  const lastExplainEvent = [...events].reverse().find((e) => e.type.startsWith("explanation_"))?.type;
-  const explain: ExplainState =
-    explainPage?.url && !explainStale
-      ? { status: "ready", url: explainPage.url, stale: false }
-      : lastExplainEvent === "explanation_generating"
-        ? { status: "generating" }
-        : explainPage?.url
-          ? { status: "ready", url: explainPage.url, stale: true }
-          : null;
+  const explain = explainStateOf(evidence, events, task.head_sha);
   // Live, not the agent's evidence prose (task #1000): recomputed on every
   // review via GET .../branch-check, same as CI/quiz below.
   const unmetDeps = branchCheck?.unmet_deps ?? [];
@@ -1262,6 +1302,122 @@ export function ReviewCard({
         </div>
       )}
 
+    </section>
+  );
+}
+
+// The verify queue's card (HIVE-611). hive stops every merge at `verifying` and
+// waits for the director (HIVE-604), so this is the surface he uses most — but
+// it used to render as nothing but a row of unlabelled thumbnails. It reads in
+// the same order the review card established (HIVE-557): what shipped, the
+// before → after, why it was needed, then what needs you.
+export function VerifyCard({ task, onDone, surface }: { task: Task; onDone?: () => void; surface?: "focus" }) {
+  const { projects } = useStore();
+  const project = projects.find((p) => p.id === task.project_id);
+  const [evidence, setEvidence] = useState<Evidence[]>([]);
+  const [events, setEvents] = useState<Event[]>([]);
+  const [review, setReview] = useState<ReviewSummary | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let live = true;
+    setEvidence([]);
+    setEvents([]);
+    setReview(null);
+    api
+      .task(task.id)
+      .then((t) => {
+        if (!live) return;
+        setEvidence(t.evidence ?? []);
+        setEvents(t.events ?? []);
+        const ev = latestReviewSummaryEvent(t.events ?? []);
+        if (ev) setReview(ev.payload as ReviewSummary);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [task.id]);
+
+  const autoReviewSummary = [...events].reverse().find((e) => e.type === "auto_review" && !e.payload.skipped)?.payload
+    ?.summary as string | undefined;
+  const whatChangedSource = autoReviewSummary || review?.understanding?.essence || review?.done?.[0] || task.summary || "";
+  const whatChanged = oneLine(whatChangedSource);
+  const changes = stateChanges([...(review?.done ?? []), ...(review?.testing ?? [])]);
+  const why = whyItWasNeeded(review?.understanding?.background, review?.done ?? []);
+  const promoted = [why.source, whatChangedSource, ...changes.map((c) => c.source)].filter(Boolean);
+  const packet = review?.understanding
+    ? {
+        ...review.understanding,
+        essence: promoted.includes(review.understanding.essence ?? "") ? undefined : review.understanding.essence,
+        background: promoted.includes(review.understanding.background ?? "") || why.text ? undefined : review.understanding.background,
+      }
+    : undefined;
+  const explain = explainStateOf(evidence, events, task.head_sha);
+
+  const markDone = async () => {
+    if (busy) return;
+    setBusy(true);
+    // Focus is a queue: move on at once rather than holding the card through
+    // the round trip, same as the review card.
+    if (surface === "focus") onDone?.();
+    try {
+      await api.transition(task.id, "done");
+      toast("Marked done");
+      if (surface !== "focus") onDone?.();
+    } catch (e) {
+      toast((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="review-card verify-card">
+      <div className="review-card-head">
+        <div className="review-card-heading">
+          <div className="review-card-meta">
+            <TaskRef task={task} className="card-num" />
+            {project && <span>{project.name}</span>}
+            <span>{task.kind}</span>
+          </div>
+          <h3 className="review-card-title">
+            <Link to={`/tasks/${task.id}`}>{task.title}</Link>
+          </h3>
+        </div>
+        <div className="review-status">
+          {task.pr_url && <PrReference className="pr" url={task.pr_url} label={`${prLabel(task.pr_url)} ↗`} />}
+        </div>
+      </div>
+
+      <ReviewFocus changed={whatChanged} paths={[]} stat={undefined} changes={changes} why={why.text} />
+
+      <EvidenceStrip evidence={evidence.filter((e) => e.kind !== "explanation")} task={task} />
+
+      {(packet || explain) && (
+        <details className="review-details">
+          <summary>
+            <span>Understand this change</span>
+            <small>{evidence.length} evidence</small>
+          </summary>
+          <div className="review-details-body">
+            <ReviewUnderstanding packet={packet ?? {}} caveats={review?.iffy ?? []} explain={explain} />
+          </div>
+        </details>
+      )}
+
+      <div className="review-recommendation">
+        <span className="review-recommendation-label">Needs you</span>
+        <strong>Check it, then close it</strong>
+        <p>This merged and is waiting on you. Nothing else moves it.</p>
+      </div>
+
+      <div className="review-actions">
+        <button className="btn btn-primary" onClick={markDone} disabled={busy}>
+          {busy ? "Working…" : "Verified — mark done"}
+        </button>
+        <Link className="btn" to={`/tasks/${task.id}`}>Open task</Link>
+      </div>
     </section>
   );
 }

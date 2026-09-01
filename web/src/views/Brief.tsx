@@ -5,7 +5,7 @@ import type { AutonomyStats, Brief, Evidence } from "../lib/api";
 import { useStore } from "../lib/store";
 import { StatusDot, HEALTH_LABEL } from "../lib/ui";
 import { DecisionCard } from "./DecisionCard";
-import { EvidenceStrip, ReviewAudit, ReviewCard, ReviewUnderstanding } from "./ReviewCard";
+import { EvidenceStrip, ReviewAudit, ReviewCard, ReviewUnderstanding, VerifyCard } from "./ReviewCard";
 import { AttentionRows, BlockedByLine } from "./attention";
 import { CheckpointsInbox } from "./Checkpoints";
 import { UnderstandingQuiz } from "./UnderstandingQuiz";
@@ -345,14 +345,16 @@ export default function Brief() {
           {focusItem.kind === "review" && (
             <ReviewCard task={focusItem.task} surface="focus" onDone={() => setReviewed((items) => new Set(items).add(focusItem.id))} />
           )}
+          {focusItem.kind === "verify" && (
+            <VerifyCard task={focusItem.task} surface="focus" onDone={() => setReviewed((items) => new Set(items).add(focusItem.id))} />
+          )}
           {focusItem.kind === "attention" && <div className="brief-attn"><AttentionRows tasks={[focusItem.task]} /></div>}
-          {focusItem.kind !== "review" && (
+          {focusItem.kind !== "review" && focusItem.kind !== "verify" && (
             <TaskEvidence
               taskId={focusItem.kind === "decision" ? focusItem.decision.task_id : focusItem.kind === "checkpoint" ? focusItem.checkpoint.task_id : focusItem.kind === "quiz_digest" ? remainingIn(focusItem)[0].task_id : focusItem.task.id}
               title={focusItem.kind === "decision" ? focusItem.decision.title : focusItem.kind === "checkpoint" ? focusItem.checkpoint.task_title : focusItem.kind === "quiz_digest" ? remainingIn(focusItem)[0].task_title : focusItem.task.title}
             />
           )}
-          {focusCount > 1 && <div className="brief-queue-note">{focusCount - 1} more waiting.</div>}
         </section>
       )}
 

@@ -3622,9 +3622,6 @@ a.dbundle-fact:hover {
   padding: 0 6px;
   line-height: 18px;
 }
-.brief-focus .brief-queue-note {
-  margin-top: 14px;
-}
 .brief-backlog-list {
   list-style: none;
   margin: 0;
@@ -3671,6 +3668,9 @@ a.dbundle-fact:hover {
 .brief-backlog-list .brief-evidence {
   grid-column: 1 / -1;
   margin: 0;
+}
+.brief-backlog-list .brief-evidence .rev-thumb-fig {
+  max-width: 150px;
 }
 .brief-backlog-list .brief-evidence .rev-thumb img {
   height: 64px;
@@ -3767,12 +3767,6 @@ a.dbundle-fact:hover {
   flex-direction: column;
   gap: 18px;
 }
-.brief-queue-note {
-  color: var(--text-faint);
-  font-size: var(--t-xs);
-  text-align: center;
-}
-
 /* attention rows reuse the tray row styles; give them a bordered container */
 .brief-attn {
   border: 1px solid var(--border);
@@ -4774,9 +4768,26 @@ a.dbundle-fact:hover {
 .review-evidence {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   margin: 10px 0 4px;
+}
+.rev-thumb-fig {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  max-width: 220px;
+}
+.rev-thumb-cap {
+  color: var(--text-faint);
+  font-size: var(--t-xs);
+  line-height: 1.3;
+  /* Two lines is enough to tell BEFORE from AFTER; the full text is the title. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .rev-thumb {
   position: relative;
