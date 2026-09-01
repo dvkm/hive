@@ -4753,17 +4753,30 @@ function touchesSensitivePath(files: string[], tokens: string[]): boolean {
 //      migrations by default, per-project via config.understanding_checks),
 //   3. its kind is outside the project's auto_merge.kinds allow-list, or
 //   4. the director flagged the task (POST .../understanding-quiz/require).
-export function understandingChecksRequired(
+// The part of the rule that does not need the auto review to have run: a kind
+// the project never auto-merges, and a card the director flagged by hand. Both
+// are already true when the agent hands off, which is what lets the emit gate
+// (HIVE-580) hold on them without guessing at a verdict that does not exist
+// yet. Everything below this line reads the review, so it can only be decided
+// later — a caller that runs before the review must treat "not certain" as
+// "let it through", not as "no check needed".
+export function understandingCheckCertain(
   db: DB,
-  task: { id: string; kind: string; project_id: string; head_sha?: string | null }
+  task: { id: string; kind: string; project_id: string }
 ): boolean {
   const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
   const config = JSON.parse(project?.config ?? "{}");
   if (!(Array.isArray(config.auto_merge?.kinds) && config.auto_merge.kinds.includes(task.kind))) return true;
-  const flagged = db
-    .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1")
-    .get(task.id);
-  if (flagged) return true;
+  return !!db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1").get(task.id);
+}
+
+export function understandingChecksRequired(
+  db: DB,
+  task: { id: string; kind: string; project_id: string; head_sha?: string | null }
+): boolean {
+  if (understandingCheckCertain(db, task)) return true;
+  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+  const config = JSON.parse(project?.config ?? "{}");
   const review = latestAutoReviewVerdict(db, task.id);
   if (!review) return true;
   // A review's verdict only speaks for the head it looked at. A force-push
@@ -6900,6 +6913,45 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
             message,
           });
         }
+      }
+      // Missing-check gate (HIVE-580). The land gate already refuses a merge
+      // whose latest review carries no understanding check, but it runs in a
+      // different process after the agent's turn is over: four PRs in one day
+      // each cost a failed land attempt, a decision card and a respawn to add
+      // two sentences the agent could have written while it still had the
+      // change in its head.
+      //
+      // FAIL OPEN. This holds only on the signals that say a check is owed no
+      // matter what the auto review turns out to say (understandingCheckCertain
+      // — the same source the merge gate reads, so the two cannot drift). The
+      // rest of the rule needs a verdict that usually does not exist yet at
+      // handoff, and refusing on "cannot tell" would push agents to invent
+      // checks for mechanical work that owes none. Anything let through here is
+      // still caught by the merge gate, which is unchanged.
+      //
+      // It sits BEFORE the CI hold on purpose: a CI-pending handoff is promoted
+      // later by the reconciler, which never passes through here. And AFTER the
+      // verification contract, which transition() enforces at the end of this
+      // path: an agent that both skipped its verification commands and filed no
+      // check must hear that it did not verify its work before it hears
+      // anything about a quiz, so this hold stands aside while a declared
+      // verification is unmet and lets that 409 come through.
+      if (
+        missingVerifications(db, t).length === 0 &&
+        understandingCheckCertain(db, t) &&
+        !latestUnderstandingQuiz(db, taskId)
+      ) {
+        writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { reason: "missing_understanding_check" } });
+        broadcastTask(db, getTask(db, taskId));
+        return json({
+          held: true,
+          reason: "missing_understanding_check",
+          action: "add understanding.checks to your review, then emit ready again",
+          message:
+            "This task always needs an understanding check, and your latest review has none.\n" +
+            `Add one to your review and emit it again: hive emit ${taskId} review_summary --json ...\n` +
+            "You do not need a respawn for this.",
+        });
       }
       const pr = prUrl ?? t.pr_url;
       if (pr) {

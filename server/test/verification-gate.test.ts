@@ -119,8 +119,10 @@ test("evidence from before the newest commit is stale and rejected", async () =>
 
 test("the agent's own `ready` emit is gated the same way", async () => {
   const id = await workingTask();
-  // No PR: the emit path's CI and explanation gates step aside, so what is left
-  // to hold the handoff is the verification contract alone.
+  // No PR: the emit path's CI and explanation gates step aside. This task also
+  // owes an understanding check and has filed none, so it trips both gates —
+  // and the unmet contract is the one it must hear about (HIVE-580 stands
+  // aside for it), not the quiz.
   db.query("UPDATE tasks SET pr_url = NULL WHERE id = ?").run(id);
   attach(id, "unit");
   const res = await post(`/api/tasks/${id}/events`, { type: "ready", note: "handing off" });

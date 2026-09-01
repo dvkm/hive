@@ -70,6 +70,10 @@ Rules:
   touches security, auth, payments or migrations, the task kind is outside the
   project's auto-merge list, or the director asked for a quiz on this card. For
   everything else the checks are OPTIONAL, and leaving them out blocks nothing.
+  When your task kind is outside the auto-merge list, or the director asked for
+  a quiz here, \`hive emit ... ready\` holds the handoff until your review
+  carries a check, so write it while the change is still fresh: you clear that
+  hold in the same turn, with no respawn.
   Re-emitting a review after a rebase, a risk finding or a CI fix? Leave
   \`understanding.checks\` out and the checks you already sent stay in place,
   along with the director's pass. Re-listing the same questions keeps the pass
