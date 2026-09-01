@@ -144,19 +144,6 @@ function die(msg: string, code = 1): never {
   process.exit(code);
 }
 
-// The commit HEAD was at when evidence was captured, so the review card can
-// flag it stale against the PR's current head (task #226). Best-effort: cwd
-// may not be a git repo (or git may be missing) — evidence still gets filed.
-function gitHeadSha(): string | null {
-  try {
-    const r = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
-    if (r.exitCode !== 0) return null;
-    return r.stdout.toString().trim() || null;
-  } catch {
-    return null;
-  }
-}
-
 // Config/secret writes need the API token even over loopback (see
 // requireWriteAuth in server/src/api.ts). Being on this machine as this user IS
 // the capability: we read the token the server minted out of its own DB, the
@@ -357,7 +344,11 @@ async function main() {
     const [taskId, type] = _;
     if (!taskId || !type) die("usage: hive emit <task-id> <type> [--note ...] [--file path]");
     const path = `/api/tasks/${taskId}/events`;
-    const sha = type === "evidence" ? gitHeadSha() : null;
+    // No commit stamp from here: the server stamps evidence with the HEAD of
+    // the TASK's own worktree. Stamping the cwd meant an emit from anywhere
+    // else (a director driving the task, an orchestrator) recorded a different
+    // repository's commit, and the freshness gate held the handoff forever
+    // (HIVE-575).
     let result: any;
     if (flags.file) {
       const form = new FormData();
@@ -367,7 +358,6 @@ async function main() {
       if (flags.caption) form.set("caption", String(flags.caption));
       if (flags.source) form.set("source", String(flags.source));
       if (flags["verify-name"]) form.set("verify_name", String(flags["verify-name"]));
-      if (sha) form.set("meta", JSON.stringify({ commit_sha: sha }));
       const file = Bun.file(String(flags.file));
       form.set("file", file);
       const res = await fetch(BASE + path, { method: "POST", body: form });
@@ -395,7 +385,6 @@ async function main() {
         pr_url: flags["pr-url"] ?? flags.url,
         landing_commit: flags["landing-commit"],
         verify_name: flags["verify-name"],
-        ...(sha && !extra.meta ? { meta: JSON.stringify({ commit_sha: sha }) } : {}),
         ...extra,
       });
     }
@@ -408,6 +397,9 @@ async function main() {
       return;
     }
     console.log(`emitted '${type}' on ${taskId}` + (result.evidence ? ` (evidence ${result.evidence.id})` : ""));
+    // e.g. "no worktree, so the evidence is not tied to a commit" — the agent
+    // should hear that at emit time, not from a held handoff later.
+    if (result.warning) console.log(result.warning);
     return;
   }
 

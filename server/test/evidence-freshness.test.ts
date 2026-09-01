@@ -151,3 +151,71 @@ test("a genuinely current review is recorded and hands off first time", async ()
 
   s.server.stop(true);
 });
+
+// HIVE-575: the stamp comes from the task's own worktree, not from whoever
+// emitted. A director driving the task from another checkout used to stamp that
+// checkout's commit, which the gate then compared against the task branch —
+// two unrelated repositories, so the handoff was held forever.
+test("the caller cannot decide which commit the evidence is stamped with", async () => {
+  const head = { sha: "5555555555555555555555555555555555555555" };
+  const s = makeServer(head);
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "task", brief: "b" });
+  const id = t.json.id;
+  await post(s.base, `/api/tasks/${id}/spawn`, {});
+
+  // An emit carrying some other repo's HEAD is stamped with the worktree's.
+  const e = await post(s.base, `/api/tasks/${id}/events`, {
+    type: "evidence",
+    note: "test run",
+    kind: "log",
+    meta: JSON.stringify({ commit_sha: "9999999999999999999999999999999999999999" }),
+  });
+  expect(e.json.evidence.meta.commit_sha).toBe(head.sha);
+
+  // So the handoff goes through instead of being held against a foreign commit.
+  const ready = await post(s.base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/5" });
+  expect(ready.json.task.state).toBe("in_review");
+
+  s.server.stop(true);
+});
+
+// HIVE-575: an artifact with no relationship to a commit (a production reading,
+// a link, a written report) is never stamped and never gated on staleness.
+test("an observation is not commit-bound, so a later commit does not hold the handoff", async () => {
+  const head = { sha: "6666666666666666666666666666666666666666" };
+  const s = makeServer(head);
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "task", brief: "b" });
+  const id = t.json.id;
+  await post(s.base, `/api/tasks/${id}/spawn`, {});
+
+  const e = await post(s.base, `/api/tasks/${id}/events`, {
+    type: "evidence",
+    note: "row count on prod",
+    kind: "observation",
+  });
+  expect(e.json.evidence.meta.commit_sha).toBeUndefined();
+
+  head.sha = "7777777777777777777777777777777777777777";
+  const review = await post(s.base, `/api/tasks/${id}/events`, { type: "review_summary", done: ["ran the query"] });
+  expect(review.status).toBe(201);
+  const ready = await post(s.base, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/6" });
+  expect(ready.json.task.state).toBe("in_review");
+
+  s.server.stop(true);
+});
+
+// HIVE-575: with no worktree there is no commit to stamp. Say that at emit
+// time rather than silently stamping whatever repo the caller stood in.
+test("evidence filed with no worktree is stored unstamped and says so", async () => {
+  const head = { sha: "8888888888888888888888888888888888888888" };
+  const s = makeServer(head);
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "task", brief: "b" });
+  const e = await post(s.base, `/api/tasks/${t.json.id}/events`, { type: "evidence", note: "log", kind: "log" });
+  expect(e.json.evidence.meta.commit_sha).toBeUndefined();
+  expect(e.json.warning).toContain("no worktree");
+
+  s.server.stop(true);
+});
