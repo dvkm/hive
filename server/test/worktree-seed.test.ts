@@ -2,7 +2,7 @@
 // copy/clone actually happens: seed the untracked config a fresh worktree is
 // missing, and clone the warm state only while its lockfile still matches.
 import { test, expect } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, cpSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { seedWorktree } from "../src/worktreeSeed.ts";
@@ -50,13 +50,19 @@ test("a glob matches, and a file the worktree already has is never clobbered", a
 
 test("clones node_modules when the lockfile still matches", async () => {
   const { repo, wt } = trees("LOCK-V1");
-  const r = await seedWorktree(repo, wt, { worktree_warm: [{ dir: "node_modules", lock: "bun.lock" }] }, realExec);
-  // Which method runs is the FILESYSTEM's answer, not ours: APFS clones, a CI
-  // runner on ext4 without reflink support byte-copies. Both are correct here,
-  // so pin the directory and require an honest label. The forced-fallback tests
-  // below are where "copy" is asserted deterministically.
-  expect(r.warmed.map((w) => w.dir)).toEqual(["node_modules"]);
-  expect(["clone", "copy"]).toContain(r.warmed[0]!.method);
+  // `cp` SUCCEEDS here, which is the only thing that means the copy-on-write
+  // path ran: both platform flags (macOS -c, Linux --reflink=always) refuse
+  // rather than degrade. Stubbed rather than run for real because whether a
+  // machine can clone is a property of its filesystem — APFS can, a CI runner
+  // on ext4 cannot — and this test is about which label we record, not about
+  // what the test host happens to support. It still does the copy, so a warm
+  // that recorded success without moving bytes would fail below.
+  const cloningExec: Exec = async (argv) => {
+    cpSync(argv[argv.length - 2]!, argv[argv.length - 1]!, { recursive: true });
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const r = await seedWorktree(repo, wt, { worktree_warm: [{ dir: "node_modules", lock: "bun.lock" }] }, cloningExec);
+  expect(r.warmed).toEqual([{ dir: "node_modules", method: "clone" }]);
   expect(readFileSync(join(wt, "node_modules", "left-pad", "index.js"), "utf8")).toBe("module.exports=1");
 });
 

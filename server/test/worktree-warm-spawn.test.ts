@@ -3,7 +3,7 @@
 // long each half took. A seed that runs after setup_argv is worthless — the
 // install it was meant to skip has already happened.
 import { test, expect, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, cpSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -79,11 +79,14 @@ test("seeds and warms the worktree before setup_argv, and records the timings", 
       sawAtSetup = { env: existsSync(join(WT, ".env")), modules: existsSync(join(WT, "node_modules", "left-pad", "index.js")) };
       return OK();
     }
-    // The clone shells out to `cp`. Run it for real: a stub that returns 0
-    // without copying would make this test pass while nothing was warmed.
+    // The clone shells out to `cp`. Do the copy for real — a stub that returned
+    // 0 without moving bytes would make this test pass while nothing was warmed
+    // — but succeed unconditionally, because whether the real `cp` can clone
+    // depends on the host filesystem (APFS can, a CI runner on ext4 cannot) and
+    // this test is about the recorded label, not about the test host.
     if (argv[0] === "cp") {
-      const p = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
-      return { code: await p.exited, stdout: "", stderr: await new Response(p.stderr).text() };
+      cpSync(argv[argv.length - 2]!, argv[argv.length - 1]!, { recursive: true });
+      return OK();
     }
     return herdrExec(argv, opts);
   };
@@ -97,14 +100,12 @@ test("seeds and warms the worktree before setup_argv, and records the timings", 
   const seeded: any = db
     .query("SELECT payload FROM events WHERE task_id = ? AND type = 'worktree_seeded'")
     .get(taskId);
-  // method is whatever this filesystem can do: APFS clones, ext4 without
-  // reflink support byte-copies. What matters here is that it is reported.
-  expect(JSON.parse(seeded.payload)).toMatchObject({ seeded: [".env"], warmed: [{ dir: "node_modules" }] });
+  // `cp` succeeded above, so this must record the copy-on-write path by name.
+  expect(JSON.parse(seeded.payload)).toMatchObject({ seeded: [".env"], warmed: [{ dir: "node_modules", method: "clone" }] });
 
   const spawned: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'spawned'").get(taskId);
   const p = JSON.parse(spawned.payload);
-  expect(p.warmed.map((w: any) => w.dir)).toEqual(["node_modules"]);
-  expect(["clone", "copy"]).toContain(p.warmed[0].method);
+  expect(p.warmed).toEqual([{ dir: "node_modules", method: "clone" }]);
   for (const key of ["spawn_ms", "seed_ms", "setup_ms"]) expect(typeof p[key]).toBe("number");
   expect(p.spawn_ms).toBeGreaterThanOrEqual(p.seed_ms + p.setup_ms);
 
