@@ -1526,6 +1526,29 @@ test("task move deferred parks the task, reports health 'deferred', and moving b
   expect(late.status).toBe(409);
 });
 
+// #2093: a task can carry a link to a pull request that is not its work at all
+// (hive's repo was re-created, so every old PR number now resolves to a
+// different PR). Detaching it was impossible until this.
+test("PUT /api/tasks/:id detaches a wrong PR link and drops the CI facts that described it", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "wrong pr link" });
+  const id = t.json.id;
+  db.query("UPDATE tasks SET pr_url = ?, ci_status = ?, head_sha = ?, pr_state = ? WHERE id = ?")
+    .run("https://github.com/dvkm/hive/pull/113", "passing", "someone-elses-head", "MERGED", id);
+
+  // Pointing at a different PR by hand stays unsupported — the marker links it.
+  const repoint = await put(`/api/tasks/${id}`, { pr_url: "https://github.com/dvkm/hive/pull/163" });
+  expect(repoint.status).toBe(400);
+  expect(getTask(db, id).pr_url).toBe("https://github.com/dvkm/hive/pull/113");
+
+  const cleared = await put(`/api/tasks/${id}`, { pr_url: null });
+  expect(cleared.status).toBe(200);
+  expect(getTask(db, id)).toMatchObject({ pr_url: null, ci_status: null, head_sha: null, pr_state: null });
+
+  const events = (await get(`/api/tasks/${id}/events`)).json;
+  const record = events.findLast((event: any) => event.type === "pr_link_cleared");
+  expect(record.payload).toEqual({ pr_url: "https://github.com/dvkm/hive/pull/113" });
+});
+
 // HIVE-585: a stale resume_pr_url (a PR number that no longer resolves) made a
 // task undispatchable forever, because PUT answered 200 and silently dropped
 // the clear. The pointer is now clear-only, and any field this endpoint cannot

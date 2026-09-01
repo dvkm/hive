@@ -2445,6 +2445,23 @@ function dupSuspectedWarning(survivor: any, decisionId: string): string {
 // moves to `in_review`, which is the ONLY state POST /merge accepts and the only
 // one the Review lane renders. Without this the Approve & merge button is
 // unreachable. The reconciler re-checks open PRs as a time-based fallback.
+// Resolve a PR's hive marker to the task it names: the `hive-task: <id>` body
+// footer first (the stable machine key), then the `[hive-<number>]` title
+// prefix. THE one resolver — linkPrIfMarked writes links with it, and the
+// reconciler checks a stored link against it before acting on the PR (#2093).
+export function taskFromPrMarker(
+  db: DB,
+  pr: { title?: string | null; body?: string | null }
+): { task: any; via: "id" | "number" } | null {
+  const id = taskIdFromBody(pr.body);
+  const byId: any = id ? getTask(db, id) : null;
+  if (byId) return { task: byId, via: "id" };
+  const n = taskNumberFromTitle(pr.title);
+  if (n == null) return null;
+  const byNumber: any = db.query("SELECT * FROM tasks WHERE number = ?").get(n);
+  return byNumber ? { task: byNumber, via: "number" } : null;
+}
+
 export function linkPrIfMarked(
   db: DB,
   pr: { title?: string | null; body?: string | null; url: string },
@@ -2456,17 +2473,9 @@ export function linkPrIfMarked(
   // the reconciler must never silently repoint a task at a different PR.
   allowRelink = false
 ): { task_id: string; number: number; linked: boolean } | null {
-  const id = taskIdFromBody(pr.body);
-  let task: any = id ? getTask(db, id) : null;
-  let via = "id";
-  if (!task) {
-    const n = taskNumberFromTitle(pr.title);
-    if (n != null) {
-      task = db.query("SELECT * FROM tasks WHERE number = ?").get(n);
-      via = "number";
-    }
-  }
-  if (!task) return null;
+  const resolved = taskFromPrMarker(db, pr);
+  if (!resolved) return null;
+  const { task, via } = resolved;
   if (isTrackingOnlyTask(task)) return { task_id: task.id, number: task.number, linked: false };
   if (task.pr_url && !(allowRelink && task.pr_url !== pr.url))
     return { task_id: task.id, number: task.number, linked: false };
@@ -2530,7 +2539,7 @@ async function linkPrEndpoint(db: DB, body: any, deps: HandlerDeps): Promise<Res
 // `source` is not stored — it only says who is asking, for the priority check.
 const UPDATABLE_TASK_FIELDS = [
   "title", "brief", "depends_on", "verification_cmds", "priority",
-  "resume_pr_url", "resume_branch", "source",
+  "pr_url", "resume_pr_url", "resume_branch", "source",
 ];
 
 // Update a task's editable fields (title / brief / depends_on). Used by the
@@ -2563,7 +2572,13 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
   // dispatch guard refusing it is right to stay. Setting a new pointer by hand
   // is deliberately not offered — that is how one task's work lands on another
   // task's branch.
+  // pr_url is clear-only for the same reason (#2093): a task can carry a link
+  // to someone else's pull request — hive's repo was re-created and every old
+  // PR number now resolves to a different PR — and until this there was no way
+  // to detach one. Pointing a task at a NEW pr by hand stays unsupported; the
+  // marked PR links itself.
   const resume: Record<string, string | null> = {
+    pr_url: task.pr_url ?? null,
     resume_pr_url: task.resume_pr_url ?? null,
     resume_branch: task.resume_branch ?? null,
   };
@@ -2624,8 +2639,11 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
       mirrorTaskId = resolved;
     }
   }
-  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, jira_mirror_task_id = ?, resume_pr_url = ?, resume_branch = ?, updated_at = ? WHERE id = ?")
-    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, mirrorTaskId, resume.resume_pr_url, resume.resume_branch, now(), id);
+  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, jira_mirror_task_id = ?, pr_url = ?, resume_pr_url = ?, resume_branch = ?, updated_at = ? WHERE id = ?")
+    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, mirrorTaskId, resume.pr_url, resume.resume_pr_url, resume.resume_branch, now(), id);
+  // The CI facts described the detached PR, so they go with it.
+  if (clearedResume.pr_url)
+    db.query("UPDATE tasks SET ci_status = NULL, head_sha = NULL, pr_state = NULL WHERE id = ?").run(id);
   const updated = getTask(db, id);
   // Say it out loud rather than repointing in silence — especially when this
   // moved an existing link off another ticket.
@@ -2634,8 +2652,12 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
   // Clearing a resume pointer changes whether the task can be dispatched at
   // all, so record it. Otherwise the next person to look sees a task that was
   // blocked and now isn't, with nothing explaining the transition.
-  if (Object.keys(clearedResume).length)
-    writeEvent(db, { task_id: id, source: "director", type: "resume_pointer_cleared", payload: clearedResume });
+  if (clearedResume.pr_url)
+    writeEvent(db, { task_id: id, source: "director", type: "pr_link_cleared", payload: { pr_url: clearedResume.pr_url } });
+  const clearedPointers = { ...clearedResume };
+  delete clearedPointers.pr_url;
+  if (Object.keys(clearedPointers).length)
+    writeEvent(db, { task_id: id, source: "director", type: "resume_pointer_cleared", payload: clearedPointers });
   broadcastTask(db, updated);
   return json({ ...taskWithHealth(db, updated), ...(relinked ? { jira_mirror_relinked: relinked } : {}) });
 }

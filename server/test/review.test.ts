@@ -1615,7 +1615,7 @@ test("a PR merged outside hive defers the unanswered quiz when the reconciler se
 
   const gh: Exec = ((argv: string[]) =>
     argv[0] === "gh"
-      ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] }))
+      ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }], body: `hive-task: ${taskId}` }))
       : OK()) as unknown as Exec;
   await reconcileOnce(s.db, { exec: gh });
 
