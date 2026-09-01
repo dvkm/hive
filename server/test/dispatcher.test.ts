@@ -283,6 +283,22 @@ test("a deferred in_progress task frees its slot; undeferring takes it back", as
   expect(third.spawns.length).toBe(0);
 });
 
+test("a deferred task with a queued steer is not reattached", async () => {
+  const { db, projectId } = freshDb({ auto_dispatch: true, max_agents: 2 });
+  const parked = makeTask(db, projectId, { state: "in_progress" }); // agent released, none running
+  db.query("UPDATE tasks SET deferred_until = '9999-01-01T00:00:00.000Z' WHERE id = ?").run(parked);
+  writeEvent(db, { task_id: parked, source: "director", type: "steer", payload: { message: "hi", delivery: "queued" } });
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(0);
+  expect(queuedSteers(db, parked).length).toBe(1);
+
+  // undeferred, the same steer pulls an agent back onto it
+  db.query("UPDATE tasks SET deferred_until = NULL WHERE id = ?").run(parked);
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(1);
+});
+
 test("a slow setup_argv on project A does not delay spawning a queued task on project B", async () => {
   const db = openDb(":memory:");
   const projA = newId("proj");

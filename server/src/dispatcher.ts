@@ -43,7 +43,7 @@ import { isOffline, setSetting, getSetting, now } from "./db.ts";
 import { Herdr, herdr as defaultHerdr, isHerdrUnreachable } from "./runtime/herdr.ts";
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
-import { isSelfAuditLineage, unmetDeps, noteDependencyBlock, noteSkip, transition, writeEvent } from "./state.ts";
+import { isDeferred, isSelfAuditLineage, unmetDeps, noteDependencyBlock, noteSkip, transition, writeEvent } from "./state.ts";
 import { signature } from "./learn.ts";
 import { isTrackingOnlyTask } from "./supervision.ts";
 import { queuedSteers } from "./steer.ts";
@@ -172,6 +172,9 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         // Taken over by the director: the worktree is theirs until they hand it
         // back, so a queued steer must not pull an agent back into it.
         !t.parked_for_director &&
+        // Deferred is parked too: putting a fresh agent back on a task that is
+        // waiting on an offline human just re-fills the slot we stopped counting.
+        !isDeferred(t, nowMs) &&
         queuedSteers(db, t.id).length > 0
     );
 
