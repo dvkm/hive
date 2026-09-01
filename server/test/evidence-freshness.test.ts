@@ -9,7 +9,7 @@ process.env.HIVE_HOME = HOME;
 const { openDb } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
-const { evidenceAtSha } = await import("../src/state.ts");
+const { evidenceAtSha, startRecoveryEpoch } = await import("../src/state.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
 
 const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
@@ -234,6 +234,31 @@ test("evidence filed with no worktree is stored unstamped and says so", async ()
   const e = await post(s.base, `/api/tasks/${t.json.id}/events`, { type: "evidence", note: "log", kind: "log" });
   expect(e.json.evidence.meta.commit_sha).toBeUndefined();
   expect(e.json.warning).toContain("no worktree");
+
+  s.server.stop(true);
+});
+
+// HIVE-2039: production evidence writes never stamp meta.attempt_id, only test
+// fixtures did. Scoping the recovery-attempt counters on attempt_id therefore
+// always counted 0 and wedged the task in in_progress. rowid > floor alone is
+// the correct scope.
+test("evidence captured through the ordinary emit path counts toward a recovery attempt", async () => {
+  const head = { sha: "cccccccccccccccccccccccccccccccccccccccc" };
+  const s = makeServer(head);
+  const p = await post(s.base, "/api/projects", { name: "p", repo_path: "/repo" });
+  const t = await post(s.base, "/api/tasks", { project_id: p.json.id, title: "task", brief: "b" });
+  const id = t.json.id;
+  await post(s.base, `/api/tasks/${id}/spawn`, {});
+
+  // A recovery epoch opens for the replacement agent's attempt, as reconciler.ts
+  // does on requeue.
+  startRecoveryEpoch(s.db, id, "reconciler", "attempt-1");
+
+  await post(s.base, `/api/tasks/${id}/events`, { type: "evidence", note: "proof", kind: "log" });
+  await fileReview(s.base, id);
+  const r = await post(s.base, `/api/tasks/${id}/events`, { type: "ready" });
+  expect(r.json.held).toBeUndefined();
+  expect(r.json.task.state).toBe("in_review");
 
   s.server.stop(true);
 });

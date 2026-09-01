@@ -12,9 +12,9 @@ import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { startLoop } from "./loop.ts";
-import { writeEvent, lastAgentActivity, AGENT_EVENT_SOURCES, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, verificationGate, repairRequeueProvenance, TERMINAL, type State } from "./state.ts";
+import { writeEvent, mutateWithEvent, lastAgentActivity, AGENT_EVENT_SOURCES, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, verificationGate, repairRequeueProvenance, currentAttemptCommitEvidenceCount, recoveryAttemptId, recoveryEpochRowid, recoveryPrHeadHasEvidence, startRecoveryEpoch, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
-import { spawnMeta } from "./cleanup.ts";
+import { spawnMeta, replayCleanedUpRecovery, latestSpawnRecord } from "./cleanup.ts";
 import { raceSweep } from "./race.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent, resumeReviewForDeliveredSteers } from "./steer.ts";
 import { inBackoff, isReviewed, MAX_AGENTS_DEFAULT } from "./dispatcher.ts";
@@ -68,6 +68,55 @@ export interface ReconcilerDeps {
 }
 
 const DEFAULT_STALE_MS = 15 * 60 * 1000;
+
+// A recovery epoch's PR merged externally (by a human, or GitHub auto-merge)
+// without ever carrying the commit this recovery attempt evidenced — or
+// carrying none at all. Trust the merge (it landed, hive's link would
+// otherwise cite a dead PR), but don't let it silently close out unfinished
+// recovery work: clear the stale PR pointers, open a fresh recovery epoch so
+// old evidence can't satisfy the next review, bounce back to in_progress if
+// review/verifying had already been reached, and tell the agent what to do
+// next.
+function holdMergedRecovery(db: DB, task: any, prUrl: string, headSha: string | null, commitMissing: boolean): void {
+  const merged = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'pr_merged' LIMIT 1").get(task.id);
+  if (!merged) writeEvent(db, { task_id: task.id, source: "reconciler", type: "pr_merged", payload: { pr_url: prUrl } });
+  if (commitMissing)
+    writeEvent(db, {
+      task_id: task.id,
+      source: "reconciler",
+      type: "recovery_pr_mismatch",
+      payload: { pr_url: prUrl, head_sha: headSha, merged: true },
+    });
+  mutateWithEvent(
+    db,
+    () =>
+      db.query(
+        `UPDATE tasks SET
+           pr_url = NULL,
+           head_sha = NULL,
+           ci_status = NULL,
+           resume_pr_url = CASE WHEN resume_pr_url = ? THEN NULL ELSE resume_pr_url END,
+           updated_at = ?
+         WHERE id = ? AND pr_url = ?`
+      ).run(prUrl, now(), task.id, prUrl),
+    { task_id: task.id, source: "reconciler", type: "pr_context_reset", payload: { from_pr_url: prUrl, to_pr_url: null } }
+  );
+  startRecoveryEpoch(db, task.id, "reconciler", recoveryAttemptId(db, task.id) ?? undefined);
+  if (task.state === "in_review" || task.state === "verifying")
+    transition(db, task.id, "in_progress", {
+      source: "reconciler",
+      reason: commitMissing ? "merged PR omitted recovery work" : "inherited PR merged before recovery commit",
+    });
+  queueSteerEvent(
+    db,
+    task.id,
+    commitMissing
+      ? `PR ${prUrl} was merged without the commit evidenced by this recovery attempt. Preserve the inherited and rescued work on a new pull request, attach fresh evidence from its live head, and emit ready with the new PR URL.`
+      : `PR ${prUrl} merged before this recovery attempt evidenced a commit. Verify the inherited branch and rescued-work pointers against the merged result. Continue only with work that is still missing, and open a replacement PR only if additional work remains.`,
+    commitMissing ? "merged PR omitted recovery work" : "inherited PR merged before recovery commit"
+  );
+  broadcast({ type: "task", task: getTask(db, task.id) });
+}
 
 function isTrackingOnlyId(db: DB, id: string): boolean {
   const task = getTask(db, id);
@@ -733,6 +782,42 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
     if (!live) continue;
     state = live.state;
     deferred = isDeferred(live);
+    // A recovery epoch is open: the PR this task is linked to may not carry
+    // the commit this attempt actually evidenced (a merged-externally race, or
+    // a force-push that dropped it). Externally merged work is real — trust
+    // it — but hold the task open for more work rather than silently closing
+    // out a recovery that never landed. Late rescue/evidence events from an
+    // OLDER epoch must never satisfy either check (see recoveryPrHeadHasEvidence).
+    const recoveryEpoch = recoveryEpochRowid(db, live.id);
+    if (String(data.state).toUpperCase() === "MERGED" && recoveryEpoch) {
+      const commitEvidence = currentAttemptCommitEvidenceCount(db, live.id);
+      if (!commitEvidence || !recoveryPrHeadHasEvidence(db, live, data.headRefOid ?? null)) {
+        holdMergedRecovery(db, live, t.pr_url, data.headRefOid ?? null, commitEvidence > 0);
+        continue;
+      }
+    }
+    if (
+      String(data.state).toUpperCase() === "OPEN" &&
+      state === "in_review" &&
+      recoveryEpoch &&
+      !recoveryPrHeadHasEvidence(db, live, data.headRefOid ?? null)
+    ) {
+      writeEvent(db, {
+        task_id: t.id,
+        source: "reconciler",
+        type: "recovery_pr_mismatch",
+        payload: { pr_url: t.pr_url, head_sha: data.headRefOid ?? null },
+      });
+      queueSteerEvent(
+        db,
+        t.id,
+        "The pull request no longer contains the commit evidenced by this recovery attempt. Push the recovered work to the PR and attach fresh evidence from its live head before requesting review again.",
+        "recovery commit missing from PR"
+      );
+      transition(db, t.id, "in_progress", { source: "reconciler", reason: "recovery commit missing from pull request" });
+      broadcast({ type: "task", task: getTask(db, t.id) });
+      continue;
+    }
     // Time-based fallback for the link-time hand-off — but review means "CI is
     // green and the director can merge", so failing/pending checks HOLD the
     // task in_progress (this is also what promotes a held `ready`: the moment
@@ -744,8 +829,9 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
         if (handOffToReview(db, t.id, "reconciler")) broadcast({ type: "task", task: getTask(db, t.id) });
       }
     }
-    if (String(data.state).toUpperCase() === "MERGED" && state === "in_review") {
+    if (String(data.state).toUpperCase() === "MERGED" && (state === "in_review" || (state === "in_progress" && recoveryEpoch))) {
       writeEvent(db, { task_id: t.id, source: "reconciler", type: "pr_merged", payload: { pr_url: t.pr_url } });
+      if (state === "in_progress") transition(db, t.id, "in_review", { source: "reconciler", reason: "recovery PR merged with current evidence" });
       transition(db, t.id, "verifying", { source: "reconciler", reason: "PR merged" });
       // Post-merge smoke runs once on entering verifying.
       await advanceAfterMerge(db, t.id, deps);
@@ -2025,12 +2111,14 @@ export async function reclaimDeadWorktree(db: DB, h: Herdr, task: any): Promise<
       taskId: task.id,
       hintPath: task.worktree_path,
     });
+    const spawnRowid = latestSpawnRecord(db, task.id).rowid || null;
     writeEvent(db, {
       task_id: task.id,
       source: "reconciler",
       type: r.reclaimed ? "worktree_reclaimed" : "worktree_reclaim_skipped",
-      payload: { ghost_branch: r.ghost_branch, path: r.path, reason: r.reason },
+      payload: { ghost_branch: r.ghost_branch, path: r.path, reason: r.reason, spawn_rowid: spawnRowid },
     });
+    if (r.reclaimed) replayCleanedUpRecovery(db, task.id);
   } catch (e) {
     writeEvent(db, {
       task_id: task.id,
