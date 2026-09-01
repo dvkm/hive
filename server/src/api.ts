@@ -5,9 +5,8 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { taskWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
-import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror, isTrackingOnlyTask } from "./supervision.ts";
+import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
 import { isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
-import { REF_PREFIX as JIRA_REF_PREFIX } from "./intake/jira.ts";
 import { addClient, removeClient, broadcast } from "./bus.ts";
 import {
   transition,
@@ -71,7 +70,7 @@ import { costUsd } from "./pricing.ts";
 import { checkCostGuardrails, resolveCostCapForDecision, taskSpend } from "./costs.ts";
 import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove } from "./autoapprove.ts";
-import { vapidPublicKey, saveSubscription, removeSubscription } from "./push.ts";
+import { vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { autoResumeOnTurnEnd } from "./resume.ts";
 import { ciStatusOf } from "./reconciler.ts";
@@ -364,7 +363,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         return json({ key: vapidPublicKey(db) });
       if (pathname === "/api/push/subscribe" && method === "POST") {
         try {
-          saveSubscription(db, await req.json());
+          // Cast is type-level only: saveSubscription validates the shape at this
+          // trust boundary and throws, and the catch below turns that into a 400.
+          saveSubscription(db, (await req.json()) as PushSub);
           return json({ ok: true });
         } catch (e: any) {
           return err(String(e?.message ?? e), 400);
