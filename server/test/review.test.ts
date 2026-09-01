@@ -7,7 +7,8 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-review-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb } = await import("../src/db.ts");
-const { makeHandler, repairDuplicateQuizPasses } = await import("../src/api.ts");
+const { makeHandler, repairDuplicateQuizPasses, deferShippedQuizzes } = await import("../src/api.ts");
+const { reconcileOnce } = await import("../src/reconciler.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { writeEvent } = await import("../src/state.ts");
 const { reviewActionable, reviewActionableBatch } = await import("../src/reviewer.ts");
@@ -1313,7 +1314,7 @@ test("only a review that finished for the live head counts as an answerable quiz
   const shipped = await bucket("already shipped", "head-f", { head: "head-f", risks: [] });
   s.db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(shipped);
 
-  const quizzes = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  const quizzes = (await get(s.base, "/api/understanding-quizzes?scope=all")).json.quizzes as any[];
   const mine = quizzes.filter((q) => q.project_id === p.json.id);
   expect(mine.filter((q) => q.task_state === "in_review").map((q) => q.task_id)).toEqual([answerable]);
   expect(mine.filter((q) => q.task_state === "done").map((q) => q.task_id)).toEqual([shipped]);
@@ -1330,6 +1331,20 @@ test("only a review that finished for the live head counts as an answerable quiz
   );
   const after = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
   expect(after.some((q) => q.task_id === noReview)).toBe(true);
+  await s.server.stop(true);
+});
+
+test("the quiz list defaults to live tasks; shipped ones need scope=all (HIVE-542)", async () => {
+  const s = makeServer();
+  const live = await judgmentTask(s, { verdict: "caution" });
+  const shipped = await judgmentTask(s, { verdict: "caution" });
+  s.db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(shipped.taskId);
+
+  const live_only = (await get(s.base, "/api/understanding-quizzes")).json.quizzes as any[];
+  expect(live_only.map((q) => q.task_id)).toEqual([live.taskId]);
+
+  const all = (await get(s.base, "/api/understanding-quizzes?scope=all")).json.quizzes as any[];
+  expect(all.map((q) => q.task_id).sort()).toEqual([live.taskId, shipped.taskId].sort());
   await s.server.stop(true);
 });
 
@@ -1614,5 +1629,51 @@ test("with quizzes pending in two projects, the total badge count matches the su
   expect(pendingPostShipQuizCount(s.db)).toBe(sumOfDigests);
   expect(pendingPostShipQuizCount(s.db, projA)).toBe(2);
   expect(pendingPostShipQuizCount(s.db, projB)).toBe(1);
+  await s.server.stop(true);
+});
+
+// HIVE-544: hive did not perform this merge — someone merged the PR on GitHub
+// and the reconciler only noticed afterwards. The quiz has to settle on that
+// path too, or a shipped task keeps saying "required" forever.
+test("a PR merged outside hive defers the unanswered quiz when the reconciler sees it", async () => {
+  const s = makeServer({ prState: "MERGED" });
+  const { taskId } = await inReviewTask(s.base, {}, false);
+  s.db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://gh/pr/544", taskId);
+
+  const quizzesBefore = await get(s.base, "/api/understanding-quizzes");
+  expect(quizzesBefore.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("required");
+
+  const gh: Exec = ((argv: string[]) =>
+    argv[0] === "gh"
+      ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }] }))
+      : OK()) as unknown as Exec;
+  await reconcileOnce(s.db, { exec: gh });
+
+  const events = await get(s.base, `/api/tasks/${taskId}/events`);
+  const deferred = events.json.find((event: any) => event.type === "understanding_quiz_deferred");
+  expect(deferred).toBeTruthy();
+  expect(deferred.payload.note).toContain("merged outside hive");
+
+  const quizzes = await get(s.base, "/api/understanding-quizzes?scope=all");
+  expect(quizzes.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("deferred");
+  await s.server.stop(true);
+});
+
+// HIVE-544 backfill: the pile that built up before the fix above. Those tasks
+// are already terminal, so no merge path will ever reach them again.
+test("the startup sweep settles shipped quizzes, skips failed tasks, and is a no-op the second time", async () => {
+  const s = makeServer();
+  const shipped = await inReviewTask(s.base, {}, false);
+  const failed = await inReviewTask(s.base, {}, false);
+  s.db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(shipped.taskId);
+  s.db.query("UPDATE tasks SET state = 'failed' WHERE id = ?").run(failed.taskId);
+
+  expect(deferShippedQuizzes(s.db)).toBe(1);
+  expect(deferShippedQuizzes(s.db)).toBe(0);
+
+  const quizzes = await get(s.base, "/api/understanding-quizzes?scope=all");
+  const statusOf = (id: string) => quizzes.json.quizzes.find((item: any) => item.task_id === id)?.status;
+  expect(statusOf(shipped.taskId)).toBe("deferred");
+  expect(statusOf(failed.taskId)).toBe("required");
   await s.server.stop(true);
 });

@@ -1,6 +1,7 @@
 // hive CLI — thin HTTP wrappers around the daemon. The server is the only DB writer.
 // Installed as bin/hive (bun shebang). Base URL: HIVE_URL or http://127.0.0.1:<HIVE_PORT|4700>.
 import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { REVIEW_SUMMARY_HELP } from "../server/src/reviewShape.ts";
 import { appBrowserCandidates, installedHiveAppCandidates, openUrlArgv, tailscaleCandidates } from "./platform.ts";
 
@@ -23,7 +24,10 @@ Usage:
          Only the director may set 'now' — under a hive agent it is refused.)
   hive task send <task-id> <message>   attributed teammate message under a hive agent
   hive task move <task-id> <state> [--note <s>]   states: queued in_progress needs_decision
-        in_review verifying done failed cancelled
+        in_review verifying done deferred failed cancelled
+        deferred parks the task waiting on an OFFLINE human action (same as
+        \`hive emit <id> deferred\`; [--until <iso>] or [--days <n>], else
+        indefinite). Moving a parked task back to in_progress un-parks it.
   hive task list [--state <s>] [--project <id>]
   hive task takeover <task-id> [--open]    park the agent and edit the worktree yourself
         (frees the agent's slot; --open starts $VISUAL/$EDITOR on the checkout)
@@ -245,13 +249,25 @@ async function main() {
         from_task_id: process.env.HIVE_TASK_ID || undefined,
       });
       console.log(`message to ${taskId}: ${r.delivery}`);
+      // "queued" is not delivery: nothing read it, and nothing will until the
+      // task is spawned again. Say so, and say what to do (HIVE-552) — the old
+      // bare "queued" read as "sent" while the message sat unread for hours.
+      // A Jira-linked task also answers "queued", but with ok:true — that one IS
+      // on its way out as a Jira comment, so it gets no warning.
+      if (r.delivery === "queued" && !r.ok)
+        console.log(
+          `  ⚠ nobody read it${r.error ? ` — ${r.error}` : " — no live agent"}. ` +
+            `It rides along on the next spawn: hive spawn ${taskId}`
+        );
       return;
     }
     if (sub === "move") {
       const [taskId, to] = _;
       if (!taskId || !to) die("usage: hive task move <task-id> <state> [--note <s>]");
-      const t = await api("POST", `/api/tasks/${taskId}/transition`, { to, reason: flags.note });
-      console.log(`task ${t.id} -> [${t.state}]  ${t.title}`);
+      const t = await api("POST", `/api/tasks/${taskId}/transition`, { to, reason: flags.note, until: flags.until, days: flags.days });
+      // A parked task stays in_progress in the DB, so echo what actually happened.
+      const parked = t.deferred_until && Date.parse(t.deferred_until) > Date.now();
+      console.log(`task ${t.id} -> [${parked ? "deferred" : t.state}]  ${t.title}`);
       if (t.bounce?.respawned) console.log(`  respawned the agent with your note in its brief`);
       else if (t.bounce && !t.bounce.delivered)
         console.log(`  note recorded but no agent is running — run: hive spawn ${t.id}`);
@@ -361,8 +377,13 @@ async function main() {
       // --json <file> merges a JSON object into the event payload — used for
       // structured events like review_summary (see the agent brief).
       const extra = flags.json ? JSON.parse(readFileSync(String(flags.json), "utf8")) : {};
+      // hive-1992: the server refuses a payload read from a path other agents
+      // can write (the shared /tmp/review.json that published one agent's
+      // review under another's task), so it needs the resolved path.
+      const payloadPath = flags.json ? resolve(String(flags.json)) : undefined;
       result = await api("POST", path, {
         type,
+        payload_path: payloadPath,
         note: flags.note,
         kind: flags.kind,
         source: flags.source,

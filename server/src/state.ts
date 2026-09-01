@@ -887,13 +887,23 @@ export function transition(
   // that closed with nothing left to merge: the caller has already verified the
   // work landed on the base branch via a different commit, so the usual
   // in_review -> verifying -> done merge path doesn't apply.
+  // hive-1952: a tracking-only task has no review gate to satisfy. `ready` is
+  // refused for it (api.ts), so the forward path in_review -> verifying -> done
+  // is unreachable and in_review became a trap whose only exit was `cancelled` —
+  // which understates work that actually shipped. It has no PR and nothing to
+  // merge, so `done` is reachable directly from any non-terminal state.
+  const trackingOnlyDone = to === "done" && !TERMINAL.includes(from) && isTrackingOnlyTask(task);
   if (opts.force) {
     if (TERMINAL.includes(from)) throw new TransitionError(`task already terminal ('${from}')`);
-  } else if (!canTransition(from, to)) {
+  } else if (!trackingOnlyDone && !canTransition(from, to)) {
     // Agents jump straight to done often enough (4/16 sampled sessions) that
-    // the error should teach the path, not just reject.
-    const hint =
-      to === "done" && (from === "in_progress" || from === "in_review")
+    // the error should teach the path, not just reject. Never point a
+    // tracking-only task at `ready` or `requeue`: both are refused for it, and
+    // an error that names a forbidden call is how the in_review trap read as
+    // two guards blaming each other.
+    const hint = isTrackingOnlyTask(task)
+      ? ` — this task is tracking-only: hive tracks it but never runs an agent on it, so \`ready\` and \`requeue\` are refused. Close it with \`hive task move ${taskId} done\` (or \`cancelled\`).`
+      : to === "done" && (from === "in_progress" || from === "in_review")
         ? " — done is reached via review: emit `ready --pr-url <url>` (in_review), then the director merges (verifying -> done)"
         : to === "queued" && ["in_progress", "in_review", "verifying"].includes(from)
         ? `; to retry a live task, POST /api/tasks/${taskId}/requeue (fails and requeues atomically)`
@@ -967,6 +977,8 @@ export function transition(
   // A terminal task can no longer act on any open decision — expire them so the
   // inbox clears and the answer endpoint can't be hit against a dead task.
   if (TERMINAL.includes(to)) expireOpenDecisions(db, taskId, `task ${to}`);
+  // The work finishing is what tells its Jira mirror the ticket is done.
+  if (TERMINAL.includes(to) && task.jira_mirror_task_id) advanceJiraMirror(db, task.jira_mirror_task_id, source);
   if (to === "cancelled") openCancelledDependencyDecision(db, updated, source);
   // Notify on notable terminal-ish outcomes (batched into the digest).
   if (to === "done")
@@ -993,6 +1005,58 @@ export function transition(
     }
   }
   return updated;
+}
+
+// ---- Jira mirror propagation (HIVE-546) -------------------------------------
+// A mirror row carries the ticket's status; the work tasks under it carry the
+// actual work. Nothing used to connect the two, so a merged task left its
+// mirror sitting in 'queued' forever and the hive -> Jira status push had
+// nothing to push. Advancing the mirror here is what makes that push fire.
+//
+// A mirror advances only when EVERY linked child has finished and at least one
+// finished as `done`: a ticket with ten sub-tasks must not close on the first
+// one. failed and cancelled children are ignored — a failed attempt is a dead
+// row, and its requeued successor carries the link and blocks the mirror while
+// it is still live.
+//
+// The write bypasses the FORWARD map on purpose (queued -> done is not an edge
+// hive work may take): a mirror is tracking-only, and jira sync already moves it
+// this way (applyJiraState).
+export function advanceJiraMirror(db: DB, mirrorId: string, source: string): void {
+  const mirror = getTask(db, mirrorId);
+  if (!mirror || TERMINAL.includes(mirror.state) || !isJiraMirror(mirror)) return;
+  const children = db
+    .query("SELECT state FROM tasks WHERE jira_mirror_task_id = ?")
+    .all(mirrorId) as { state: State }[];
+  if (!children.some((c) => c.state === "done")) return;
+  if (children.some((c) => !TERMINAL.includes(c.state))) return;
+  const updated = mutateWithEvent(db, () => {
+    db.query("UPDATE tasks SET state = 'done', updated_at = ? WHERE id = ?").run(now(), mirrorId);
+    return getTask(db, mirrorId);
+  }, {
+    task_id: mirrorId,
+    source,
+    type: "state_change",
+    payload: { from: mirror.state, to: "done", reason: `all hive work for ${mirror.jira_key} is done` },
+  });
+  broadcastTask(db, updated);
+}
+
+// Catch-up sweep for mirrors whose work finished before anything propagated
+// (every ticket shipped before HIVE-546, and any mirror missed while the server
+// was down). Same rule as above, so it can never close a ticket the live path
+// would not have closed. Returns how many mirrors it advanced.
+export function advanceReadyJiraMirrors(db: DB): number {
+  const mirrors = db
+    .query("SELECT DISTINCT jira_mirror_task_id AS id FROM tasks WHERE jira_mirror_task_id IS NOT NULL")
+    .all() as { id: string }[];
+  let advanced = 0;
+  for (const m of mirrors) {
+    const before = (getTask(db, m.id) as any)?.state;
+    advanceJiraMirror(db, m.id, "reconciler");
+    if (before !== (getTask(db, m.id) as any)?.state) advanced++;
+  }
+  return advanced;
 }
 
 // The last time the AGENT itself did something, for every "is this task still

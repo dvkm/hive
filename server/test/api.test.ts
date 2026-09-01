@@ -1425,3 +1425,34 @@ test("land-graph without a project param skips an archived project with a dead r
     srv.stop(true);
   }
 });
+
+// HIVE-547: parking was reachable only through `hive emit <id> deferred`, so a
+// director reaching for `hive task move <id> deferred` got "invalid transition".
+test("task move deferred parks the task, reports health 'deferred', and moving back to in_progress un-parks it", async () => {
+  const t = await post("/api/tasks", { project_id: projectId, title: "park me" });
+  const id = t.json.id;
+  await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
+  db.query("UPDATE tasks SET agent_target = ? WHERE id = ?").run("a-park", id); // health needs a bound agent
+
+  const parked = await post(`/api/tasks/${id}/transition`, { to: "deferred", reason: "waiting on the CMS spot-check" });
+  expect(parked.status).toBe(200);
+  // The lifecycle state does NOT hop (task #679) — the park rides on deferred_until.
+  expect(parked.json.state).toBe("in_progress");
+  expect(Date.parse(parked.json.deferred_until)).toBeGreaterThan(Date.now());
+  expect(parked.json.health.status).toBe("deferred");
+  expect(getTask(db, id).deferred_until).toBe(parked.json.deferred_until);
+
+  const resumed = await post(`/api/tasks/${id}/transition`, { to: "in_progress", reason: "spot-check done" });
+  expect(resumed.status).toBe(200);
+  expect(resumed.json.deferred_until).toBeNull();
+  expect(resumed.json.health.status).not.toBe("deferred");
+
+  // A dated park auto-resumes: an elapsed window is not deferred any more.
+  const dated = await post(`/api/tasks/${id}/transition`, { to: "deferred", days: "2" });
+  expect(Date.parse(dated.json.deferred_until)).toBeLessThan(Date.now() + 3 * 86_400_000);
+
+  const done = await post(`/api/tasks/${id}/transition`, { to: "cancelled" });
+  expect(done.status).toBe(200);
+  const late = await post(`/api/tasks/${id}/transition`, { to: "deferred" });
+  expect(late.status).toBe(409);
+});

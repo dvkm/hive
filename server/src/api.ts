@@ -4,8 +4,8 @@ import { dirname, join, normalize } from "node:path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
 import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
-import { taskWithHealth, tasksWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization } from "./health.ts";
-import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror } from "./supervision.ts";
+import { taskWithHealth, tasksWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization, staleMs } from "./health.ts";
+import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror, mirrorTaskIdForTitle } from "./supervision.ts";
 import { activeProjects, isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
 import { addClient, removeClient, broadcast, appClientCount, setProjectResolver } from "./bus.ts";
 import {
@@ -35,6 +35,7 @@ import {
   resolveDependentsWedgedForDecision,
   queuedInputRecoveryPending,
   isSelfAuditLineage,
+  lastAgentActivity,
   type State,
 } from "./state.ts";
 import { composeBrief } from "./briefs.ts";
@@ -276,6 +277,47 @@ const HOOKS_DIR = join(import.meta.dir, "..", "..", "hooks");
 const REPO_ROOT = join(import.meta.dir, "..", "..");
 const ELECTRON_PKG = join(REPO_ROOT, "electron", "package.json");
 
+// HIVE-548: sync-main.sh spent five days logging that it had DECLINED to update
+// the live checkout, and nothing else noticed. The server ran 30 commits behind
+// main, so every fix merged in that window was dead code. "The running code is
+// not the merged code" now surfaces beside dispatcher/reaper staleness.
+// Being behind by a few commits is normal in the minutes between a merge and
+// the next 5-minute sync tick, so `stale` also requires the newest unmerged
+// commit to have been sitting there for several ticks.
+const LIVE_DRIFT_STALE_MS = 15 * 60 * 1000;
+const LIVE_DRIFT_CACHE_MS = 60_000;
+export type LiveCheckout = { behind: number; stale: boolean; head: string | null; error: string | null };
+let liveDriftCache: { at: number; repo: string; value: LiveCheckout } | null = null;
+
+function gitLine(repo: string, args: string[]): string | null {
+  const r = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
+  if (r.exitCode !== 0) return null;
+  return new TextDecoder().decode(r.stdout).trim();
+}
+
+// Uncached; /api/health calls the memoized liveCheckout() below.
+export function measureLiveCheckout(repo: string = REPO_ROOT): LiveCheckout {
+  const head = gitLine(repo, ["rev-parse", "--short", "HEAD"]);
+  const behindRaw = gitLine(repo, ["rev-list", "--count", "HEAD..refs/remotes/origin/main"]);
+  if (head === null || behindRaw === null)
+    return { behind: 0, stale: false, head, error: "could not read git state for the running checkout" };
+  const behind = Number(behindRaw);
+  if (behind === 0) return { behind: 0, stale: false, head, error: null };
+  // Committer date of origin/main's tip: how long the newest thing we are
+  // missing has been waiting for the sync job to bring it over.
+  const tipAt = gitLine(repo, ["log", "-1", "--format=%cI", "refs/remotes/origin/main"]);
+  const ageMs = tipAt ? Date.now() - Date.parse(tipAt) : null;
+  return { behind, stale: ageMs === null || ageMs > LIVE_DRIFT_STALE_MS, head, error: null };
+}
+
+export function liveCheckout(repo: string = REPO_ROOT): LiveCheckout {
+  if (liveDriftCache && liveDriftCache.repo === repo && Date.now() - liveDriftCache.at < LIVE_DRIFT_CACHE_MS)
+    return liveDriftCache.value;
+  const value = measureLiveCheckout(repo);
+  liveDriftCache = { at: Date.now(), repo, value };
+  return value;
+}
+
 // The API token (minted on boot in index.ts) presented as `Authorization:
 // Bearer <t>` or `?token=<t>` — EventSource cannot set headers, so the SSE
 // stream needs the query form. No token minted → nothing can authenticate.
@@ -356,10 +398,12 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         const reconciler = reconcilerHealth(db);
         const reviewer = reviewerHealth(db);
         const degraded = degradedTools(db);
+        const live = liveCheckout();
         const ok = reconciler.consecutive_errors < RECONCILE_ERROR_STREAK_THRESHOLD
           && reviewer.parse_failure_streak < REVIEWER_PARSE_FAILURE_STREAK_THRESHOLD
-          && degraded.length === 0;
-        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, reviewer, degraded, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
+          && degraded.length === 0
+          && !live.stale;
+        return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, reviewer, degraded, live_checkout: live, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db) });
       }
 
       // ---- desktop shell self-update (HIVE-420) ----
@@ -2083,6 +2127,49 @@ export function looksSecuritySensitive(text: string): boolean {
   return new RegExp(`\\b(${DEFAULT_SENSITIVE_PATHS.join("|")})s?\\b`, "i").test(text ?? "");
 }
 
+// Why a new work task's brief looks like it was written from the Jira TITLE
+// alone, or null when it looks fine. Two arms, because WEB-118 failed the
+// second one: the bad brief was several hundred chars of prose whose entire
+// content was "this ticket has no description, ask the reporter" — a length
+// check alone waves that straight through.
+//
+// The second arm refuses task creation outright, so it has to be far more
+// conservative than a warning would be: a false positive blocks a legitimate
+// filing with a 400 and the caller has no override. So every pattern is
+// anchored to the TICKET itself ("the issue has no description", "no spec on
+// WEB-118") rather than matching a bare phrase anywhere in the prose. A real
+// spec that happens to say "the card renders no description when the field is
+// empty" is about the product, not the ticket, and must sail through.
+const TICKET = String.raw`(?:this |the )?(?:ticket|issue|jira(?: (?:issue|ticket))?|[A-Z][A-Z0-9]{1,9}-\d+)`;
+const ABSENT_SPEC_CLAIMS: RegExp[] = [
+  // "the issue has no description", "WEB-118 carries only a title"
+  new RegExp(String.raw`\b${TICKET}\b[^.\n]{0,30}?\s(?:has|have|had|carries|contains|includes|provides|comes with)\s+(?:no|only a|nothing but a)\s+(?:description|spec(?:ification)?|body|details|requirements|title)\b`, "gi"),
+  // "there is no description on the Jira issue", "no spec attached to WEB-118"
+  new RegExp(String.raw`\b(?:there (?:is|was|are|were) )?no\s+(?:description|spec(?:ification)?|requirements)\b[^.\n]{0,30}?\b(?:on|for|in|attached to)\s+${TICKET}\b`, "gi"),
+  // "the ticket is title-only", "a title-only issue"
+  new RegExp(String.raw`\b${TICKET}\b[^.\n]{0,20}?\sis\s+title[- ]only\b`, "gi"),
+  new RegExp(String.raw`\btitle[- ]only\s+${TICKET}\b`, "gi"),
+  // proposing to go back to the reporter because the spec is missing
+  /\b(?:ask|asking|check with|go back to)\s+the\s+(?:reporter|requester|filer)\b[^.\n]{0,40}?\b(?:for (?:a |the )?(?:spec(?:ification)?|description|requirements|details)|what (?:they|he|she) wants?)/gi,
+  /\b(?:spec(?:ification)?|description|requirements)\s+(?:is |are )?needed from the (?:reporter|requester|filer)\b/gi,
+  /\bawaiting (?:a |the )?spec(?:ification)?\b/gi,
+];
+// "no need to ask the reporter for a spec" is the OPPOSITE claim, and reads as
+// a match to the arm above. Look back a short way for the negation that flips it.
+const NEGATED_BEFORE = /\b(?:no need|without need(?:ing)?|don'?t need|do not need|no reason|not necessary|rather than|instead of|no point)\b[^.\n]{0,30}$/i;
+
+export function thinBriefReason(brief: string): string | null {
+  if (brief.length < 150) return `brief is title-only (${brief.length} chars)`;
+  for (const re of ABSENT_SPEC_CLAIMS) {
+    re.lastIndex = 0;
+    for (const m of brief.matchAll(re)) {
+      if (NEGATED_BEFORE.test(brief.slice(Math.max(0, m.index - 60), m.index))) continue;
+      return `brief claims the ticket has no spec ("${m[0].trim()}")`;
+    }
+  }
+  return null;
+}
+
 // Accepts JSON or multipart; attached files are saved under the new task's id
 // and their absolute paths appended to the brief, so the agent that picks the
 // task up can read them.
@@ -2149,6 +2236,23 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   const id = newId();
   const { block } = await attachFiles(id, files);
   const brief = ((body.brief ?? "") + block).trim();
+  // The ticket this work implements, parsed from the '[WEB-110] ' title prefix
+  // once and stored (HIVE-546). Stored, not re-derived: a retitle or a requeue
+  // used to lose the ticket silently.
+  const mirrorTaskId = mirrorTaskIdForTitle(db, String(body.project_id), body.title);
+  // A work task filed from the Jira issue's title while the real spec sits
+  // unread in the linked mirror's brief (HIVE-551/WEB-118): refuse rather than
+  // let a title-only brief silently drop 100s of chars of spec the mirror
+  // already has.
+  if (mirrorTaskId) {
+    const mirrorBrief = (db.query("SELECT brief FROM tasks WHERE id = ?").get(mirrorTaskId) as { brief: string | null } | undefined)?.brief ?? "";
+    const why = mirrorBrief.length > 200 ? thinBriefReason(brief) : null;
+    if (why)
+      return err(
+        `${why}, but linked mirror task ${mirrorTaskId} already has a ${mirrorBrief.length}-char spec — read that mirror's brief and write --brief-text from it instead of from the Jira title`,
+        400
+      );
+  }
   const row = {
     id,
     project_id: body.project_id,
@@ -2167,18 +2271,19 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
     depends_on: deps.length ? JSON.stringify(deps) : null,
     verification_cmds: verifyCmds ? JSON.stringify(verifyCmds) : null,
     priority,
+    jira_mirror_task_id: mirrorTaskId,
     created_at: t,
     updated_at: t,
   };
   db.query(
     `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
-      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, priority, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, priority, jira_mirror_task_id, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.project_id, row.title, row.brief, row.state, row.kind,
     row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
     row.summary, row.source, row.parent_task_id, row.depends_on, row.verification_cmds,
-    row.priority, row.created_at, row.updated_at
+    row.priority, row.jira_mirror_task_id, row.created_at, row.updated_at
   );
   writeEvent(db, {
     task_id: row.id,
@@ -2385,11 +2490,32 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
     if (denied) return denied;
     priority = parsed;
   }
-  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, updated_at = ? WHERE id = ?")
-    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, now(), id);
+  // Re-resolve the mirror when the title changes (HIVE-550). Adding the missing
+  // '[WEB-119] ' prefix by hand is the repair path a human reaches for when a
+  // work task was filed unlinked, and resolving only at creation made that
+  // repair silently do nothing. Never CLEAR a link here: dropping the prefix
+  // shouldn't throw away a link the board already relies on.
+  let mirrorTaskId: string | null = task.jira_mirror_task_id ?? null;
+  let relinked: { from: string | null; to: string } | null = null;
+  // Also re-resolve when the task is still unlinked: a task filed before its
+  // mirror existed (or already carrying the prefix but linked to nothing) heals
+  // on the next edit instead of staying orphaned forever.
+  if (title !== task.title || !mirrorTaskId) {
+    const resolved = mirrorTaskIdForTitle(db, task.project_id, title);
+    if (resolved && resolved !== mirrorTaskId) {
+      relinked = { from: mirrorTaskId, to: resolved };
+      mirrorTaskId = resolved;
+    }
+  }
+  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, jira_mirror_task_id = ?, updated_at = ? WHERE id = ?")
+    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, mirrorTaskId, now(), id);
   const updated = getTask(db, id);
+  // Say it out loud rather than repointing in silence — especially when this
+  // moved an existing link off another ticket.
+  if (relinked)
+    writeEvent(db, { task_id: id, source: "director", type: "jira_mirror_relinked", payload: relinked });
   broadcastTask(db, updated);
-  return json(taskWithHealth(db, updated));
+  return json({ ...taskWithHealth(db, updated), ...(relinked ? { jira_mirror_relinked: relinked } : {}) });
 }
 
 // Manual merge: fold this task into `target_id`, cancelling it as a duplicate.
@@ -2891,8 +3017,29 @@ function getTaskFull(db: DB, id: string): Response {
 }
 
 async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
-  if (!body?.to) return err("'to' state is required: hive task move <task-id> <queued|in_progress|needs_decision|in_review|verifying|done|failed|cancelled>");
+  if (!body?.to) return err("'to' state is required: hive task move <task-id> <queued|in_progress|needs_decision|in_review|verifying|done|deferred|failed|cancelled>");
   const to = body.to as State;
+  // `deferred` is not a lifecycle state (the task stays in_progress, task #679)
+  // but the director thinks of parking as a move — and `hive emit <id> deferred`
+  // used to be the ONLY way to do it. Accept the move and park it, so the two
+  // ways of saying "park this" agree (HIVE-547).
+  if (String(to) === "deferred" || String(to) === "defer") {
+    const t = getTask(db, id);
+    if (!t) return noTask(id);
+    if (TERMINAL.includes(t.state as State)) return err(`task is ${t.state}; there is nothing to park`, 409);
+    return json(taskWithHealth(db, deferTask(db, id, deferUntil(body?.until, body?.days), { source: body.source ?? "director", note: body.reason })));
+  }
+  // The way back out. A parked task is already in_progress, so a plain move
+  // there would be an invalid self-transition — un-defer instead, which also
+  // steers the (idle) agent to pick the work back up.
+  if (to === "in_progress") {
+    const t = getTask(db, id);
+    if (t && isDeferred(t)) {
+      const task = undeferTask(db, id, { source: body.source ?? "director", note: body.reason });
+      queueSteerEvent(db, id, `This task was un-deferred${body?.reason ? `: ${body.reason}` : ""} — re-read your last steps, emit a status note, and continue.`, "un-deferred");
+      return json(taskWithHealth(db, task));
+    }
+  }
   // A reviewer bounce (`hive task move <id> in_progress --note`) IS a
   // request-changes: it must deliver the note and keep an agent on the task. A
   // plain transition here dropped the note into the event log, respawned nobody,
@@ -3418,14 +3565,21 @@ async function mergeTaskLocked(
           const files = captureFailed
             ? ""
             : regressed!.slice(0, 10).join(", ") + (regressed!.length > 10 ? `, …(+${regressed!.length - 10})` : "");
+          // Name the exact comparison so the diagnosis is not guesswork: WHAT the
+          // branch is believed to have rolled back, the base commit it was
+          // measured against, and the older state it matches (HIVE-543).
+          const baseShaProbe = captureFailed ? null : await exec(["git", "-C", project.repo_path, "rev-parse", guardBase]);
+          const baseSha = (baseShaProbe?.code === 0 ? baseShaProbe.stdout.trim() : guardBase).slice(0, 7);
           const reason = captureFailed
             ? `could not re-verify branch scope for '${task.branch}' after a same-branch re-cut (snapshot capture failed)`
-            : `branch '${task.branch}' reverts base work outside this task's scope (${files})`;
+            : `branch '${task.branch}' drops base work outside this task's scope: ${files} — ` +
+              `each of those still matches its older ${snapshot!.base_sha.slice(0, 7)} content, so the branch ` +
+              `discards what '${base}' (${baseSha}) landed on them since`;
           writeEvent(db, {
             task_id: id,
             source: "director",
             type: "merge_blocked_destructive",
-            payload: { base, branch: task.branch, regressed, reason, actor },
+            payload: { base, branch: task.branch, regressed, reason, actor, base_sha: baseSha, snapshot_base_sha: snapshot?.base_sha ?? null },
           });
           recordSystemLearning(
             db,
@@ -3438,20 +3592,20 @@ async function mergeTaskLocked(
             await herdr
               .send(
                 task.agent_target,
-                `hive: merge into '${base}' BLOCKED — your branch '${task.branch}' now reverts commits ` +
-                  `already on '${base}' outside this task's scope (${files}). This is the destructive ` +
+                `hive: merge into '${base}' BLOCKED — ${reason}. This is the destructive ` +
                   `auto-rebase pattern from task #314: an auto-resolve dropped intervening work while CI stayed ` +
-                  `green. Do NOT trust the rebase — abandon this branch and re-cut a clean one off CURRENT ` +
-                  `'${base}', re-apply only your task's change, and push. If those reverts are intentional, the ` +
-                  `director can override.`
+                  `green. Rebasing again will NOT clear this; staleness is not the problem. Abandon this branch ` +
+                  `and re-cut a clean one off CURRENT '${base}', re-apply only your task's change, and push. ` +
+                  `Never make the check pass by weakening or reverting your own tests. If the drops are ` +
+                  `intentional, the director can override.`
               )
               .catch(() => {});
           }
           transition(db, id, "in_progress", { source: "director", reason: "merge blocked: destructive auto-rebase" });
           return err(
             `merge blocked — ${reason}; ` +
-              `the auto-rebase likely dropped intervening commits (task #314). Re-cut off current '${base}', or ` +
-              `merge with override_destructive_check=true if intentional.`,
+              `the auto-rebase likely dropped intervening commits (task #314). Rebasing again does not help. ` +
+              `Re-cut off current '${base}', or merge with override_destructive_check=true if intentional.`,
             409
           );
         }
@@ -3558,6 +3712,9 @@ async function mergeTaskLocked(
     }
   }
 
+  // One of two places a quiz settles on a merge: this is the hive-performed
+  // merge. The other is deferQuizForExternalMerge (below), for a PR merged on
+  // GitHub that the reconciler only observes afterwards.
   if (deferQuizReviewEventId) {
     writeEvent(db, {
       task_id: id,
@@ -3903,10 +4060,19 @@ export async function spawnAgent(
     HIVE_AGENT: agent,
   };
 
+  // HIVE-552: a finished agent idles at its prompt holding the task name, which
+  // refuses every respawn and strands every queued steer. herdr may release such
+  // a holder, but only when it is BOTH finished (its own `done` status) and this
+  // task has been silent for a full stale window — a busy agent is never closed.
+  const lastActivity = lastAgentActivity(db, id);
+  const holderQuietMs = lastActivity ? Date.now() - Date.parse(lastActivity) : undefined;
+
   let result;
   try {
     result = await herdr.spawn({
       taskId: id,
+      holderQuietMs,
+      releaseFinishedName: holderQuietMs !== undefined && holderQuietMs > staleMs(),
       repoPath: project.repo_path,
       hiveUrl,
       title: task.title,
@@ -4661,9 +4827,25 @@ export function pendingPostShipQuizCount(db: DB, projectId?: string): number {
   }).length;
 }
 
+// Quizzes split into two very different classes, and only one of them is
+// something anyone is waiting on:
+//   - live (in_review, verifying): the task has not finished, so the quiz can
+//     still change what happens to it.
+//   - shipped (done, failed): the post-ship catch-up backlog. Real, but nothing
+//     is blocked on it and it only ever grows.
+// The default is LIVE, because every counter that reads this endpoint without
+// thinking about it was reporting the shipped pile as a pending queue
+// (HIVE-542: 104 "pending" quizzes, 1 of them on a live task). The web UI wants
+// both classes — it builds the "Catch up on N shipped changes" digest from the
+// shipped ones — so it asks for `?scope=all` explicitly.
+const UNDERSTANDING_QUIZ_LIVE_STATES = ["in_review", "verifying"];
+
 function listUnderstandingQuizzes(db: DB, url: URL): Response {
   const projectId = url.searchParams.get("project_id");
-  const statePlaceholders = UNDERSTANDING_QUIZ_ANSWERABLE_STATES.map(() => "?").join(",");
+  const states = url.searchParams.get("scope") === "all"
+    ? UNDERSTANDING_QUIZ_ANSWERABLE_STATES
+    : UNDERSTANDING_QUIZ_LIVE_STATES;
+  const statePlaceholders = states.map(() => "?").join(",");
   const rows = db
     .query(
       `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state, t.kind, t.head_sha
@@ -4677,7 +4859,7 @@ function listUnderstandingQuizzes(db: DB, url: URL): Response {
                AND (newer.ts > e.ts OR (newer.ts = e.ts AND newer.rowid > e.rowid)))
         ORDER BY t.number DESC`
     )
-    .all(...UNDERSTANDING_QUIZ_ANSWERABLE_STATES, projectId, projectId) as any[];
+    .all(...states, projectId, projectId) as any[];
   const quizzes = rows.flatMap((row) => {
     let payload: any;
     try { payload = JSON.parse(row.payload); } catch { return []; }
@@ -4814,6 +4996,51 @@ function requireUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   if (!already)
     writeEvent(db, { task_id: taskId, source: "director", type: "understanding_required", payload: { actor: actorOf(body) } });
   return json({ ok: true, understanding_required: true });
+}
+
+// Which merge path settles a quiz: BOTH of them. mergeTask (above) defers the
+// quiz when hive itself lands an auto_merge.kinds task; this defers it when the
+// PR was merged on GitHub and the reconciler only observed it afterwards
+// (HIVE-544). Before this, that second path left the quiz reading "required"
+// forever on a task that had already shipped — the same unanswered catch-up
+// item under a name that reads like a blocker.
+export function deferQuizForExternalMerge(db: DB, taskId: string): void {
+  settleShippedQuiz(db, taskId, "Automatically deferred because the PR was merged outside hive; the task had already shipped.");
+}
+
+// Marks an unanswered quiz as deferred. Returns false (and writes nothing) when
+// there is no quiz, when the task is not judgment-class, or when the quiz was
+// already passed or deferred — so calling it twice is a no-op.
+function settleShippedQuiz(db: DB, taskId: string, note: string): boolean {
+  const task = getTask(db, taskId);
+  if (!task || !understandingChecksRequired(db, task)) return false;
+  const quiz = latestUnderstandingQuiz(db, taskId);
+  if (!quiz || understandingQuizStatus(db, taskId, quiz.reviewEventId) !== "required") return false;
+  writeEvent(db, {
+    task_id: taskId,
+    source: "system",
+    type: "understanding_quiz_deferred",
+    payload: { review_event_id: quiz.reviewEventId, note },
+  });
+  return true;
+}
+
+// Backfill for the pile that accumulated before the fix above: tasks that
+// already shipped but whose quiz still reads "required", because nothing on the
+// external-merge path ever settled it. Settle them the same way a merge would.
+// `failed` is deliberately NOT swept: that work never shipped, so its quiz is a
+// real signal, not a catch-up item. Idempotent — a second run settles nothing.
+export function deferShippedQuizzes(db: DB): number {
+  const rows = db
+    .query(
+      `SELECT DISTINCT t.id FROM tasks t JOIN events e ON e.task_id = t.id AND e.type = 'review_summary'
+        WHERE t.state IN ('done', 'verifying')`
+    )
+    .all() as { id: string }[];
+  let swept = 0;
+  for (const row of rows)
+    if (settleShippedQuiz(db, row.id, "Automatically deferred: the task had already shipped when this quiz was still unanswered.")) swept++;
+  return swept;
 }
 
 function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
@@ -5461,14 +5688,17 @@ export function requeueTask(db: DB, source: any): string {
     if (jiraKey)
       db.query("UPDATE tasks SET jira_key = NULL, jira_link_kind = NULL, updated_at = ? WHERE id = ?").run(t, fresh.id);
     db.query(
-      `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, resume_branch, resume_ghost_branch, resume_pr_url, priority, jira_key, jira_link_kind, created_at, updated_at)
-       VALUES (?,?,?,?, 'queued', ?, 'requeue', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, parent_task_id, resume_branch, resume_ghost_branch, resume_pr_url, priority, jira_key, jira_link_kind, jira_mirror_task_id, created_at, updated_at)
+       VALUES (?,?,?,?, 'queued', ?, 'requeue', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id, fresh.project_id, fresh.title, brief || null, fresh.kind, fresh.id,
       resume?.branch ?? null, resume?.ghostBranch ?? null, resume?.prUrl ?? null,
       // The successor IS the same work, so it keeps the original's place in the
       // queue. Losing it would push a 'now' task to the back on every retry.
-      fresh.priority ?? "normal", jiraKey, jiraKey ? "subtask" : null, t, t
+      // The mirror link is COPIED, not moved: the successor is more work for the
+      // same ticket, and the dead predecessor no longer blocks it (failed rows
+      // are ignored when the mirror decides it is done).
+      fresh.priority ?? "normal", jiraKey, jiraKey ? "subtask" : null, fresh.jira_mirror_task_id ?? null, t, t
     );
   })();
   writeEvent(db, { task_id: id, source: "reconciler", type: "created", payload: { title: fresh.title, requeue_of: fresh.id } });
@@ -6105,6 +6335,42 @@ async function prHeadBranch(exec: Exec, prUrl: string): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------- event ingestion (`hive emit`)
+// hive-1992: `hive emit --json <file>` used to accept ANY path, so agents that
+// wrote to the shared /tmp/review.json published each other's reviews — one
+// task's review card ended up describing a completely different change, and an
+// understanding check had already been passed against the review it replaced.
+// The CLI sends the resolved path; a payload read from outside the calling
+// agent's own sandbox is refused, not warned about.
+//
+// Legitimate homes are the task's own worktree, and its per-session scratchpad
+// (/tmp/claude-501/<worktree-slug>/<session-uuid>/scratchpad/...), whose slug is
+// the worktree path with every non-alphanumeric character turned into "-".
+function worktreeSlug(worktreePath: string): string {
+  return worktreePath.replace(/[^A-Za-z0-9]/g, "-");
+}
+
+// Every name this task legitimately answers to, so a payload that stamps its
+// own task id can be checked against all of them (uppercased for comparison).
+function taskIdentities(db: DB, task: any): string[] {
+  return [task.id, String(task.number), `#${task.number}`, taskIdentifier(db, task)].map((v) => v.toUpperCase());
+}
+
+function payloadPathRefusal(task: any, raw: unknown): string | null {
+  const path = typeof raw === "string" ? raw.trim() : "";
+  const worktree = String(task?.worktree_path ?? "").replace(/\/+$/, "");
+  // No path (a direct API caller) or no worktree on the task: nothing to
+  // compare against, so this guard stays out of the way.
+  if (!path || !worktree) return null;
+  if (path === worktree || path.startsWith(worktree + "/")) return null;
+  if (path.split("/").includes(worktreeSlug(worktree))) return null;
+  return (
+    `refusing to read ${path}: it is outside this task's worktree and session scratchpad, ` +
+    `so another agent can overwrite it between your write and this emit (that is how one task ` +
+    `published another agent's review). Write the payload inside ${worktree}/ (or your session ` +
+    `scratchpad) and emit again.`
+  );
+}
+
 async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDeps = {}): Promise<Response> {
   const task = getTask(db, taskId);
   if (!task) return noTask(taskId);
@@ -6130,7 +6396,27 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
   const type = fields.type;
   if (!type) return err('event \'type\' is required: hive emit <task-id> <status|evidence|ready|blocked|done|deferred> --note "..."');
   if (isTrackingOnlyTask(task) && ["needs-decision", "done", "ready", "unmergeable"].includes(type))
-    return err("this task is tracking-only — hive tracks it but never runs an agent on it, so there are no agent lifecycle events to record", 409);
+    return err(
+      // hive-1952: say what IS allowed. This message used to stop at "no agent
+      // lifecycle events", and the state machine's own error then sent the
+      // caller back to `ready` — the two guards pointed at each other and an
+      // in_review mirror had no exit but `cancelled`.
+      `this task is tracking-only — hive tracks it but never runs an agent on it, so there are no agent lifecycle events to record. To close it, move it directly: \`hive task move ${taskId} done\` (or \`cancelled\`).`,
+      409
+    );
+  // hive-1992: a --json payload must come from this agent's own sandbox, and if
+  // it names a task it must name THIS one. Both refuse rather than warn — the
+  // warning would arrive after the wrong review is already published.
+  const pathRefusal = payloadPathRefusal(task, (fields as any).payload_path);
+  if (pathRefusal) return err(pathRefusal, 400);
+  const claimed = String((fields as any).task_id ?? (fields as any).task ?? "").trim();
+  if (claimed && !taskIdentities(db, task).includes(claimed.toUpperCase()))
+    return err(
+      `this payload says it belongs to task ${claimed}, but you are emitting on ${taskIdentifier(db, task)} (${taskId}). ` +
+        `Re-generate the payload for this task and emit again.`,
+      400
+    );
+
   const source = fields.source || "agent";
   const note = fields.note ?? null;
 

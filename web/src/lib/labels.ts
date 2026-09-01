@@ -16,10 +16,18 @@ export const STATE_LABEL: Record<State, string> = {
 
 export const HEALTH_LABEL: Record<Health["status"], string> = {
   healthy: "Healthy",
+  deferred: "Deferred",
   silent: "Silent",
   stuck: "Stuck",
   dead: "Agent gone",
 };
+
+// Health worth a human look. `deferred` is deliberately quiet work (parked on a
+// human), so it must not colour a card or count toward a column's attention
+// badge the way a stuck or dead agent does (HIVE-547).
+export function needsLook(health: Health | null | undefined): boolean {
+  return !!health && health.status !== "healthy" && health.status !== "deferred";
+}
 
 // Who answered a decision, for the audit trail in the timeline. "director" is
 // the implicit default and stays unlabelled ("You answered"); everyone else is

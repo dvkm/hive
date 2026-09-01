@@ -85,6 +85,15 @@ export interface SpawnArgs {
   // Called after the worktree exists but BEFORE the agent starts, so the caller
   // can seed the worktree (e.g. write .claude hook settings) structurally.
   prepareWorktree?: (worktreePath: string) => void | Promise<void>;
+  // How long the task has been silent (no agent-generated events), when the
+  // caller knows. Only used if `agent start` hits agent_name_taken: it names the
+  // silence in the refusal so an operator does not have to go and measure it.
+  holderQuietMs?: number;
+  // The caller's half of the release decision (HIVE-552). True means "nothing
+  // agent-generated has happened on this task for a whole stale window", which
+  // is what makes closing a FINISHED name holder safe. herdr supplies the other
+  // half (its status is `done`); both must hold or the name is left alone.
+  releaseFinishedName?: boolean;
 }
 
 export interface SpawnResult {
@@ -378,20 +387,29 @@ export function paneProcessInfoArgv(paneId: string): string[] {
 // running the agent command, not a login shell.
 const LOGIN_SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "powershell", "pwsh", "cmd", "nu"]);
 
-export function paneRunsAgentCommand(stdout: string): boolean {
+// The pane's root foreground process: the entry matching herdr's shell_pid, or
+// the first one listed. Two callers need it — paneRunsAgentCommand (agent pane
+// or bare login shell?) and the name-holder refusal, which prints the pid an
+// operator has to look at.
+export function parsePaneRootProcess(stdout: string): { pid: number | null; name: string } | null {
   try {
     const info = (JSON.parse(stdout).result ?? {}).process_info;
-    if (!info) return false;
+    if (!info) return null;
     const procs: any[] = info.foreground_processes ?? [];
     const root = procs.find((x) => x.pid === info.shell_pid) ?? procs[0];
-    if (!root) return false;
+    if (!root) return null;
     const name = (String(root.argv0 ?? root.name ?? "").replace(/^-/, "").split(/[\\/]/).pop() ?? "")
       .replace(/\.exe$/i, "")
       .toLowerCase();
-    return !!name && !LOGIN_SHELLS.has(name);
+    return { pid: typeof root.pid === "number" ? root.pid : null, name };
   } catch {
-    return false;
+    return null;
   }
+}
+
+export function paneRunsAgentCommand(stdout: string): boolean {
+  const root = parsePaneRootProcess(stdout);
+  return !!root?.name && !LOGIN_SHELLS.has(root.name);
 }
 
 // Stricter than paneRunsAgentCommand (which only asks "not a login shell"): a
@@ -651,6 +669,34 @@ function withWorktreeLock<T>(repoPath: string, branch: string, fn: () => Promise
   return run;
 }
 
+// Who is holding a task's agent name, for the refusal message and the release
+// decision (HIVE-552). Every field is best-effort: an unreadable holder reads as
+// `unknown`, which never releases anything.
+interface NameHolder {
+  status: AgentStatus;
+  paneId: string | null;
+  pid: number | null;
+  command: string | null;
+}
+
+function humanDuration(ms: number): string {
+  const mins = Math.round(ms / 60000);
+  return mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`;
+}
+
+// One line an operator can act on. Every diagnosis of this failure started with
+// pgrep because the old refusal named nothing — so name the pid first.
+export function describeHolder(holder: NameHolder, quietMs?: number): string {
+  return [
+    holder.pid ? `pid ${holder.pid}${holder.command ? ` (${holder.command})` : ""}` : "pid unknown",
+    holder.paneId ? `pane ${holder.paneId}` : null,
+    `herdr status ${holder.status}`,
+    quietMs === undefined ? null : `silent ${humanDuration(quietMs)}`,
+  ]
+    .filter(Boolean)
+    .join(", ");
+}
+
 // ---- adapter ----
 
 export class Herdr {
@@ -697,15 +743,37 @@ export class Herdr {
     // The task's previous agent (crashed run, requeue) can still hold the name.
     // The error body names its pane/tab: close the stale session and retry once.
     if (start.code !== 0 && isAgentNameTakenError(start)) {
-      // INCIDENT HOTFIX 2026-08-25 (task b6fb44583e96): closing the name-holder
-      // here killed LIVE agents whenever recovery respawned a quiet-but-alive
-      // task (turn-complete auto-respawn from PR #190 made this constant).
-      // Until a liveness probe guards the close, never close: fail the spawn so
-      // recovery parks with a card instead of murdering the running agent.
-      throw new HerdrError(
-        `agent start refused: task ${args.taskId} already has an agent holding its name (possibly alive). ` +
-        `Verify it is dead (no panes, no worktree processes) before respawning.`
-      );
+      const ref = parseStaleAgentRef(`${start.stdout}\n${start.stderr}`);
+      const holder = await this.describeNameHolder(args.taskId, ref.paneId);
+      // HIVE-552: a claude agent that has FINISHED does not exit — it idles at
+      // its prompt forever, still holding the name. That refuses every respawn
+      // AND strands every steer (send() already refuses a `done` agent), so the
+      // task looks healthy while nobody reads its mailbox. Close the finished
+      // holder and start fresh.
+      //
+      // INCIDENT HOTFIX 2026-08-25 (task b6fb44583e96): closing the name holder
+      // UNCONDITIONALLY killed LIVE agents whenever recovery respawned a
+      // quiet-but-alive task (turn-complete auto-respawn from PR #190 made this
+      // constant). That is why the close now needs two independent proofs that
+      // the holder is finished rather than busy: herdr says its turn is over
+      // (`done` — never working/idle/blocked/unknown), and the caller says the
+      // task has been silent for a whole stale window. Anything else is still
+      // left strictly alone.
+      if (args.releaseFinishedName && holder.status === "done") {
+        await this.closeSession({
+          agentTarget: args.taskId,
+          tabId: ref.tabId,
+          expectCwd: wt.path,
+          request: { caller: "spawn", reason: "finished agent still holding the task name", taskId: args.taskId },
+        });
+        start = await this.run(startArgv);
+      }
+      if (start.code !== 0 && isAgentNameTakenError(start))
+        throw new HerdrError(
+          `agent start refused: task ${args.taskId} already has an agent holding its name (possibly alive). ` +
+          `Holder: ${describeHolder(holder, args.holderQuietMs)}. ` +
+          `Verify it is dead (no panes, no worktree processes) before respawning.`
+        );
     }
     if (start.code !== 0)
       throw new HerdrError(`agent start failed: ${start.stderr.trim() || start.stdout.trim()}`);
@@ -741,6 +809,20 @@ export class Herdr {
       pane_id: agent?.pane_id ?? null,
       label,
     };
+  }
+
+  // Read the process actually holding a task's agent name. Never throws: the
+  // caller uses this to decide whether to close it, so an unreadable answer must
+  // degrade to "unknown" (= leave it alone), never to a guess.
+  private async describeNameHolder(target: string, paneIdHint: string | null): Promise<NameHolder> {
+    try {
+      const got = await this.run(agentGetArgv(target));
+      const paneId = parsePaneId(got.stdout) ?? paneIdHint;
+      const proc = paneId ? parsePaneRootProcess(await this.paneProcessInfo(paneId)) : null;
+      return { status: parseAgentProbe(got.stdout).status, paneId, pid: proc?.pid ?? null, command: proc?.name ?? null };
+    } catch {
+      return { status: "unknown", paneId: paneIdHint, pid: null, command: null };
+    }
   }
 
   // The worktree-create-and-reclaim sequence, run under spawn()'s worktree

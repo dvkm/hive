@@ -13,7 +13,10 @@ export const REVIEW_SUMMARY_HELP = `review_summary: --json review.json with {don
         answer_key must equal one of those keys. Bare-string options mint no
         quiz. Singular \`check\` is accepted as an alias and stored as checks[].
         Re-emitting a review WITHOUT a checks key keeps the checks it already
-        has; send \`"checks": []\` to clear them on purpose.`;
+        has; send \`"checks": []\` to clear them on purpose.
+        Write the file inside your task's worktree or session scratchpad — a
+        shared path like /tmp/review.json is REFUSED, because a second agent
+        writing the same file publishes its review under your task.`;
 
 // A minimal payload that must always mint a quiz. Kept realistic, not empty:
 // the test posts exactly this.
