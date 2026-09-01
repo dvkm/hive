@@ -3,7 +3,7 @@ import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
 import type { DivergenceRow, Health, Kind, LandGraph, State, Task } from "../lib/api";
-import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, PRIORITIES, PriorityChip, priorityRank, SidecarChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
+import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, needsLook, PRIORITIES, PriorityChip, priorityRank, SidecarChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
 import { AttentionTray, needsAttention, isWaiting } from "./attention";
@@ -95,7 +95,7 @@ export function Card({ task }: { task: Task }) {
   };
 
   const health = task.health;
-  const unhealthy = health && health.status !== "healthy";
+  const unhealthy = needsLook(health);
   const trackingOnly = isTrackingOnly(task);
   const jiraMirror = isJiraMirror(task);
   const subtasks = trackingOnly ? trackedSubtasks(task, tasks) : [];
@@ -480,7 +480,7 @@ export default function Board() {
           <div className="board">
           {COLUMNS.map(({ state, label }) => {
             const list = byState(state);
-            const attention = list.filter((t) => t.health && t.health.status !== "healthy").length;
+            const attention = list.filter((t) => needsLook(t.health)).length;
             return (
               <section className="column" key={state}>
                 <header className="col-head">

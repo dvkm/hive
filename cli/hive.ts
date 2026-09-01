@@ -23,7 +23,10 @@ Usage:
          Only the director may set 'now' — under a hive agent it is refused.)
   hive task send <task-id> <message>   attributed teammate message under a hive agent
   hive task move <task-id> <state> [--note <s>]   states: queued in_progress needs_decision
-        in_review verifying done failed cancelled
+        in_review verifying done deferred failed cancelled
+        deferred parks the task waiting on an OFFLINE human action (same as
+        \`hive emit <id> deferred\`; [--until <iso>] or [--days <n>], else
+        indefinite). Moving a parked task back to in_progress un-parks it.
   hive task list [--state <s>] [--project <id>]
   hive task takeover <task-id> [--open]    park the agent and edit the worktree yourself
         (frees the agent's slot; --open starts $VISUAL/$EDITOR on the checkout)
@@ -250,8 +253,10 @@ async function main() {
     if (sub === "move") {
       const [taskId, to] = _;
       if (!taskId || !to) die("usage: hive task move <task-id> <state> [--note <s>]");
-      const t = await api("POST", `/api/tasks/${taskId}/transition`, { to, reason: flags.note });
-      console.log(`task ${t.id} -> [${t.state}]  ${t.title}`);
+      const t = await api("POST", `/api/tasks/${taskId}/transition`, { to, reason: flags.note, until: flags.until, days: flags.days });
+      // A parked task stays in_progress in the DB, so echo what actually happened.
+      const parked = t.deferred_until && Date.parse(t.deferred_until) > Date.now();
+      console.log(`task ${t.id} -> [${parked ? "deferred" : t.state}]  ${t.title}`);
       if (t.bounce?.respawned) console.log(`  respawned the agent with your note in its brief`);
       else if (t.bounce && !t.bounce.delivered)
         console.log(`  note recorded but no agent is running — run: hive spawn ${t.id}`);

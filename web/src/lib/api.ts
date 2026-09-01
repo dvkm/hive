@@ -89,7 +89,7 @@ export type Kind = "ship" | "scout" | "chore";
 export type CiStatus = "passing" | "failing" | "pending" | "unavailable" | null;
 
 // Server-computed health (single source of truth; never re-derived here).
-export type HealthStatus = "healthy" | "silent" | "stuck" | "dead";
+export type HealthStatus = "healthy" | "deferred" | "silent" | "stuck" | "dead";
 export interface Health {
   status: HealthStatus;
   reason: string | null;
