@@ -13,6 +13,7 @@ const { composeBrief } = await import("../src/briefs.ts");
 const { getTask } = await import("../src/state.ts");
 const { createThread } = await import("../src/chat.ts");
 const { defaultExec } = await import("../src/exec.ts");
+const { writeSyncState: writeJiraSyncState } = await import("../src/intake/jira.ts");
 import type { Exec } from "../src/exec.ts";
 import type { Fetcher } from "../src/monitors.ts";
 
@@ -138,6 +139,35 @@ test("health never reports a current reconciler last_error beside a zero error s
   expect(h.reconciler.consecutive_errors).toBe(0);
   expect(h.reconciler.last_error).toBeNull();
   expect(h.ok).toBe(true);
+});
+
+// HIVE-521: 414 "previous cycle still running" lines were read as a wedged Jira
+// sync, because /api/health had nothing to check them against. A target that
+// genuinely wedges must be visible here, not only in the log.
+test("health endpoint reports Jira sync liveness per enabled project (HIVE-521)", async () => {
+  // No project has Jira configured, so there is nothing to report.
+  expect((await get("/api/health")).json.jira).toEqual([]);
+
+  const jira = { site: "https://example.atlassian.net", email: "j@example.com", project_key: "WEB", enabled: true };
+  db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify({ jira }), projectId);
+  try {
+    // Never synced → stale, because "never" is indistinguishable from wedged.
+    let row = (await get("/api/health")).json.jira[0];
+    expect(row).toMatchObject({ project_id: projectId, target: "example.atlassian.net/WEB", stale: true, last_success_at: null });
+    // ok does not flip on a stale target: a big target can honestly outrun the
+    // window, and a false alarm here breaks every agent gate that reads health.
+    expect((await get("/api/health")).json.ok).toBe(true);
+
+    writeJiraSyncState(db, projectId, { last_success_at: new Date(Date.now() - 40_000).toISOString() });
+    row = (await get("/api/health")).json.jira[0];
+    expect(row.stale).toBe(false);
+
+    writeJiraSyncState(db, projectId, { last_success_at: new Date(Date.now() - 3600_000).toISOString(), consecutive_failures: 5, last_error: "boom" });
+    row = (await get("/api/health")).json.jira[0];
+    expect(row).toMatchObject({ stale: true, consecutive_failures: 5, last_error: "boom" });
+  } finally {
+    db.query("UPDATE projects SET config = '{}' WHERE id = ?").run(projectId);
+  }
 });
 
 test("health endpoint exposes pty/session utilization once the reaper has counted", async () => {
