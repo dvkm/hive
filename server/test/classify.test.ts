@@ -671,3 +671,64 @@ test("the guard timeout defaults to 15s and is tunable", () => {
     else process.env.HIVE_GUARD_TIMEOUT_MS = prev;
   }
 });
+
+// A heredoc body is written, not run. The classifier used to give up on that
+// the moment ANY executor appeared elsewhere in the command, so the everyday
+// "write a review file, check it parses, emit it" line was scanned in full and
+// its 7.5KB of English classified as power/session control — a decision card
+// asking the director to approve `cat > review.json` (dec_000470f4a7a7, hive
+// task c7660182f42d). A gate that fires on prose teaches people to approve
+// without reading, which is the opposite of the point.
+test("a quoted heredoc body is data even when the command also runs an executor", () => {
+  const env = { HOME: "/Users/ada" };
+  const reviewEmit = [
+    "SP=/tmp/sp",
+    "cat > $SP/review.json <<'EOF'",
+    '{"iffy":[{"what":"keep-warm does not reboot the session",',
+    '  "why":"the Chief-of-Staff switch should halt sessions past the token threshold"}]}',
+    "EOF",
+    `python3 -c "import json;json.load(open('$SP/review.json'));print('valid json')" \\`,
+    '  && "$HIVE_CLI" emit c7660182f42d review_summary --json $SP/review.json',
+  ].join("\n");
+  expect(classify(reviewEmit, env).decision).not.toBe("dangerous");
+
+  // every dangerous family, described in prose inside a quoted heredoc, next to
+  // a real executor — all data.
+  const prose = [
+    "cat > notes.md <<'EOF'",
+    "we should not reboot the box, sudo anything, pkill -f hive, rm -rf /,",
+    "git push --force, DROP TABLE tasks, or run terraform destroy",
+    "EOF",
+    'python3 -c "print(1)"',
+  ].join("\n");
+  expect(classify(prose, env).decision).not.toBe("dangerous");
+
+  // control-plane tampering described in a review is prose too: the RAW-scanned
+  // rules read the heredoc-stripped text now, not the body.
+  const tamperProse =
+    "cat > r.json <<'EOF'\n" +
+    '{"why":"agents must not POST /api/decisi' + 'ons/dec_1/answer themselves"}\n' +
+    "EOF";
+  expect(classify(tamperProse, env).decision).not.toBe("dangerous");
+
+  // a real invocation is still caught, heredoc or not
+  expect(classify("pkill -f hive", env)).toEqual({ decision: "dangerous", reason: "process kill" });
+  expect(classify("cat > x <<'EOF'\nhello\nEOF\npkill -f hive", env).decision).toBe("dangerous");
+});
+
+test("a heredoc body that something EXECUTES is still scanned", () => {
+  const env = { HOME: "/Users/ada" };
+  // fed straight to a shell: the body IS the script
+  expect(classify("bash <<'EOF'\nrm -rf /\nEOF", env).decision).toBe("dangerous");
+  expect(classify("python3 - <<'EOF'\nimport os\nos.system('rm -rf /')\nEOF", env).decision).toBe("dangerous");
+  // written to a file, then that file is run
+  expect(classify("cat > x.sh <<'EOF'\nrm -rf /\nEOF\nbash x.sh", env).decision).toBe("dangerous");
+  expect(classify("cat > x.sh <<'EOF'\nrm -rf /\nEOF\nsource x.sh", env).decision).toBe("dangerous");
+  expect(classify("cat > x.sh <<'EOF'\nrm -rf /\nEOF\nchmod +x x.sh", env).decision).toBe("dangerous");
+  expect(classify("cat > x.sh <<'EOF'\nrm -rf /\nEOF\n./x.sh", env).decision).toBe("dangerous");
+  // written and only READ back: data
+  expect(classify("cat > x.txt <<'EOF'\nrm -rf /\nEOF\ncat x.txt", env).decision).not.toBe("dangerous");
+  // unquoted heredoc: the body is not run, but its command substitution is
+  expect(classify("cat > x.txt <<EOF\nnotes about $(rm -rf /srv)\nEOF", env).decision).toBe("dangerous");
+  expect(classify("cat > x.txt <<EOF\nnotes about rebooting $USER\nEOF", env).decision).not.toBe("dangerous");
+});
