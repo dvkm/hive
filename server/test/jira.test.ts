@@ -318,6 +318,16 @@ function client(fetchImpl: typeof fetch, cfg: any = CFG) {
 const run = (db: DB, projectId: string, f: typeof fetch, cfg: any = CFG, deps: any = {}) =>
   J.syncProjectOnce(db, projectId, J.jiraConfig({ jira: cfg })!, client(f, cfg), deps);
 
+// hive's clock and the fake Jira's are the same millisecond in a test, and a tie
+// in the conflict rule goes to Jira. Real work takes longer than 0ms, so step a
+// task's last status change forward to give the rule a real winner. `step` must
+// grow across calls: lastStateChangeAt walks the history in timestamp order.
+function bump(db: DB, taskId: string, step: number): void {
+  db.query(
+    "UPDATE events SET ts = ? WHERE id = (SELECT id FROM events WHERE task_id = ? AND type = 'state_change' ORDER BY ts DESC, id DESC LIMIT 1)"
+  ).run(new Date(Date.now() + step * 60_000).toISOString(), taskId);
+}
+
 const tasks = (db: DB) => db.query("SELECT * FROM tasks ORDER BY created_at").all() as any[];
 const syncEvents = (db: DB) =>
   (db.query("SELECT payload FROM events WHERE type = 'jira_sync' ORDER BY ts, id").all() as { payload: string }[])
@@ -746,6 +756,88 @@ test("converged sides do nothing at all (structural loop prevention)", async () 
   const s3 = await run(db, projectId, jira.fetchImpl);
   expect(jira.writes().length).toBe(before);
   for (const s of [s2, s3]) expect([s.pushed, s.pulled, s.labeled, s.imported]).toEqual([0, 0, 0, 0]);
+});
+
+// ============================================================================
+// MIRROR FOLLOWS ITS WORK  (HIVE-562)
+// ============================================================================
+test("the ticket moves to In Progress and In Review while the work is in flight", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl); // imports the mirror
+  const mirrorId = tasks(db)[0].id;
+
+  // The work task the agent actually does, linked to the mirror.
+  const workId = newId();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, jira_mirror_task_id, created_at, updated_at)
+     VALUES (?,?,?, 'queued', 'ship', ?, ?, ?)`
+  ).run(workId, projectId, "[WEB-1] the work", mirrorId, now(), now());
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, meta) VALUES (?,?,?,?, '{}')").run(newId(), workId, now(), "log");
+
+  let step = 0;
+  const nudge = () => bump(db, mirrorId, ++step);
+  const statusNow = () => jira.byKey.get("WEB-1")!.status;
+  const transitionPosts = () =>
+    jira.calls.filter((c) => c.method === "POST" && c.path.includes("/transitions")).length;
+
+  transition(db, workId, "in_progress", { source: "agent" });
+  nudge();
+  await run(db, projectId, jira.fetchImpl);
+  expect(statusNow()).toBe("In Progress");
+
+  transition(db, workId, "in_review", { source: "agent", skipVerification: true });
+  nudge();
+  await run(db, projectId, jira.fetchImpl);
+  expect(statusNow()).toBe("In Review");
+
+  // in_review -> verifying is the same Jira column: no second transition.
+  const posted = transitionPosts();
+  transition(db, workId, "verifying", { source: "director" });
+  await run(db, projectId, jira.fetchImpl);
+  expect(statusNow()).toBe("In Review");
+  expect(transitionPosts()).toBe(posted);
+
+  transition(db, workId, "done", { source: "director" });
+  nudge();
+  await run(db, projectId, jira.fetchImpl);
+  expect(statusNow()).toBe("Done");
+
+  // Forward only, every step: the ticket never went back a column.
+  const seen = jira.byKey.get("WEB-1")!.history.map((h) => h.to);
+  expect(seen).toEqual(["In Progress", "In Review", "Done"]);
+});
+
+test("a ticket with two work tasks only reaches Done when both are done", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const mirrorId = tasks(db)[0].id;
+
+  const work = ["one", "two"].map((label) => {
+    const id = newId();
+    db.query(
+      `INSERT INTO tasks (id, project_id, title, state, kind, jira_mirror_task_id, created_at, updated_at)
+       VALUES (?,?,?, 'queued', 'ship', ?, ?, ?)`
+    ).run(id, projectId, `[WEB-1] part ${label}`, mirrorId, now(), now());
+    db.query("INSERT INTO evidence (id, task_id, ts, kind, meta) VALUES (?,?,?,?, '{}')").run(newId(), id, now(), "log");
+    return id;
+  });
+
+  for (const id of work) transition(db, id, "in_progress", { source: "agent" });
+  transition(db, work[0], "in_review", { source: "agent", skipVerification: true });
+  transition(db, work[0], "verifying", { source: "director" });
+  transition(db, work[0], "done", { source: "director" });
+  bump(db, mirrorId, 1);
+  await run(db, projectId, jira.fetchImpl);
+  expect(jira.byKey.get("WEB-1")!.status).toBe("In Review"); // furthest the work got, not Done
+
+  transition(db, work[1], "in_review", { source: "agent", skipVerification: true });
+  transition(db, work[1], "verifying", { source: "director" });
+  transition(db, work[1], "done", { source: "director" });
+  bump(db, mirrorId, 2);
+  await run(db, projectId, jira.fetchImpl);
+  expect(jira.byKey.get("WEB-1")!.status).toBe("Done");
 });
 
 // ============================================================================
