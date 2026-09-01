@@ -129,30 +129,32 @@ test("no smoke config is a no-op", async () => {
   expect(r).toEqual({ ran: false, passed: false });
 });
 
-test("smokeThenAdvance: passing smoke (or none configured) auto-advances verifying -> done; missing evidence blocks", async () => {
-  const { smokeThenAdvance } = await import("../src/monitors.ts");
+test("runSmokeAfterMerge runs the checks and never closes the task: it waits for the director (HIVE-604)", async () => {
+  const { runSmokeAfterMerge } = await import("../src/monitors.ts");
   const evFor = (db: DB, id: string) =>
     db.query("INSERT INTO evidence (id, task_id, ts, kind, caption, meta) VALUES (?,?,?,?,?,'{}')")
       .run(newId("ev"), id, now(), "log", "proof");
 
-  // no smoke configured + evidence present -> done
+  // no smoke configured + evidence present -> still verifying, waiting on a person
   {
     const { db, projectId } = freshDb({});
     const id = makeTask(db, projectId);
     transition(db, id, "in_progress"); transition(db, id, "in_review"); transition(db, id, "verifying");
     evFor(db, id);
-    await smokeThenAdvance(db, id);
-    expect(getTask(db, id).state).toBe("done");
+    await runSmokeAfterMerge(db, id);
+    expect(getTask(db, id).state).toBe("verifying");
   }
-  // passing smoke + evidence -> done
+  // passing smoke + evidence -> still verifying, waiting on a person
   {
     const smoke = [{ name: "h", url: "u", expect_status: 200 }];
     const { db, projectId } = freshDb({ smoke });
     const id = makeTask(db, projectId);
     transition(db, id, "in_progress"); transition(db, id, "in_review"); transition(db, id, "verifying");
     evFor(db, id);
-    await smokeThenAdvance(db, id, { fetch: async () => ({ status: 200, body: "" }) });
-    expect(getTask(db, id).state).toBe("done");
+    await runSmokeAfterMerge(db, id, { fetch: async () => ({ status: 200, body: "" }) });
+    expect(getTask(db, id).state).toBe("verifying");
+    // the pass is still recorded as evidence, which is what the director reads
+    expect(db.query("SELECT COUNT(*) AS n FROM evidence WHERE task_id = ? AND kind = 'test_run'").get(id)).toEqual({ n: 1 });
   }
   // failing smoke -> bounced to in_progress (unchanged behavior)
   {
@@ -161,7 +163,7 @@ test("smokeThenAdvance: passing smoke (or none configured) auto-advances verifyi
     const id = makeTask(db, projectId);
     transition(db, id, "in_progress"); transition(db, id, "in_review"); transition(db, id, "verifying");
     evFor(db, id);
-    await smokeThenAdvance(db, id, { fetch: async () => ({ status: 500, body: "" }) });
+    await runSmokeAfterMerge(db, id, { fetch: async () => ({ status: 500, body: "" }) });
     expect(getTask(db, id).state).toBe("in_progress");
   }
   {
@@ -172,17 +174,17 @@ test("smokeThenAdvance: passing smoke (or none configured) auto-advances verifyi
     transition(db, id, "in_progress"); transition(db, id, "in_review"); transition(db, id, "verifying");
     evFor(db, id);
     let fetches = 0;
-    const result = await smokeThenAdvance(db, id, { fetch: async () => { fetches++; return { status: 200, body: "" }; } });
+    const result = await runSmokeAfterMerge(db, id, { fetch: async () => { fetches++; return { status: 200, body: "" }; } });
     expect(result).toEqual({ ran: false, passed: false });
     expect(fetches).toBe(0);
     expect(getTask(db, id).state).toBe("verifying");
   }
-  // no evidence -> stays verifying (done gate holds)
+  // no evidence -> stays verifying (nothing here closes a task anyway)
   {
     const { db, projectId } = freshDb({});
     const id = makeTask(db, projectId);
     transition(db, id, "in_progress"); transition(db, id, "in_review"); transition(db, id, "verifying");
-    await smokeThenAdvance(db, id);
+    await runSmokeAfterMerge(db, id);
     expect(getTask(db, id).state).toBe("verifying");
   }
 });

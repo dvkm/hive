@@ -23,6 +23,7 @@ export type NeedsYouItem =
   | { kind: "checkpoint"; id: string; checkpoint: Checkpoint }
   | { kind: "quiz_digest"; id: string; quizzes: UnderstandingQuiz[] }
   | { kind: "review"; id: string; task: Task }
+  | { kind: "verify"; id: string; task: Task }
   | { kind: "review_pending"; id: string; task: Task }
   | { kind: "attention"; id: string; task: Task }
   | { kind: "waiting"; id: string; task: Task; blockedBy: BlockingTaskRef[] };
@@ -201,6 +202,14 @@ export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoin
     ...decisions.map((decision) => ({ kind: "decision" as const, id: decision.id, decision })),
     ...checkpoints.map((checkpoint) => ({ kind: "checkpoint" as const, id: checkpoint.id, checkpoint })),
     ...quizDigests(tasks, quizzes),
+    // hive never closes a task (HIVE-604): every merge stops in `verifying` and
+    // waits for the director to verify it. That makes `verifying` the director's
+    // queue, so it belongs in the SAME needs-you set as reviews rather than in a
+    // second notion of pending. Tracking-only rows are included: a mirrored
+    // ticket has no PR to smoke, but the issue behind it still needs a person.
+    ...tasks
+      .filter((task) => task.state === "verifying")
+      .map((task): NeedsYouItem => ({ kind: "verify", id: task.id, task })),
     ...tasks
       .filter((task) => task.state === "in_review" && !isTrackingOnly(task))
       .map((task): NeedsYouItem =>

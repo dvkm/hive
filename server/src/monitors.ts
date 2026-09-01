@@ -41,7 +41,7 @@ const DEFAULT_FETCH_TIMEOUT_MS = 15_000;
 
 // Bounded (task #641): a stalled or unreachable smoke/monitor URL used to hang
 // this fetch forever — for smoke checks that wedges the merge request itself,
-// since POST /merge awaits smokeThenAdvance synchronously before responding.
+// since POST /merge awaits runSmokeAfterMerge synchronously before responding.
 // Same shape as the exec() timeout fix (task #621) for this separate,
 // previously-unbounded await path.
 export const defaultFetcher: Fetcher = async (url, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS) => {
@@ -199,25 +199,12 @@ export async function runSmoke(db: DB, taskId: string, deps: MonitorDeps = {}): 
   return { ran: true, passed };
 }
 
-// runSmoke + auto-advance: a verifying task with passing smoke — or with NO
-// smoke configured (nothing to wait for; the merge + CI was the verification)
-// — moves to done without a manual click. Before this, verifying was a dead
-// end (merged tasks from a consuming project parked forever, pinning dispatcher slots,
-// 2026-07-10). The done transition still enforces evidence; a task without any
-// stays verifying for the director rather than sneaking through.
-export async function smokeThenAdvance(db: DB, taskId: string, deps: MonitorDeps = {}): Promise<{ ran: boolean; passed: boolean }> {
+// Post-merge smoke for a task that just entered `verifying`. It runs the checks
+// and nothing else: a pass writes evidence, a fail bounces the task back to the
+// agent (both inside runSmoke). It does NOT close the task. hive never moves a
+// task to done — the director does that after verifying it (HIVE-604). A
+// tracking-only row has no hive worktree to smoke, so there is nothing to run.
+export async function runSmokeAfterMerge(db: DB, taskId: string, deps: MonitorDeps = {}): Promise<{ ran: boolean; passed: boolean }> {
   if (isTrackingOnlyTask(getTask(db, taskId) ?? {})) return { ran: false, passed: false };
-  const r = await runSmoke(db, taskId, deps);
-  const task = getTask(db, taskId);
-  if (task?.state === "verifying" && (r.passed || !r.ran)) {
-    try {
-      transition(db, taskId, "done", {
-        source: "system",
-        reason: r.ran ? "post-merge smoke passed" : "merged; no smoke checks configured",
-      });
-    } catch {
-      /* e.g. no evidence attached — stays verifying for the director */
-    }
-  }
-  return r;
+  return runSmoke(db, taskId, deps);
 }

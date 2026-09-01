@@ -51,7 +51,7 @@ function actionable(db: DB, projectId = ""): { project_id?: string }[] {
     db
       .query(
         `SELECT t.*,
-          CASE WHEN t.state IN ('in_review', 'failed') THEN COALESCE(
+          CASE WHEN t.state IN ('in_review', 'verifying', 'failed') THEN COALESCE(
             (SELECT MAX(e.ts) FROM events e WHERE e.task_id = t.id AND e.type = 'state_change'
               AND json_extract(e.payload, '$.to') = t.state), t.updated_at)
           END AS needs_you_since

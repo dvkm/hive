@@ -749,7 +749,8 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   The setting defaults to false.
 - `POST /api/tasks/:id/jira/sync` body `{}` → `200` sync result | `404`
   Runs the same project Jira cycle used by the scheduler.
-- `POST /api/tasks/:id/transition` body `{to (required), reason?, source?, until?, days?}` → `200 Task` | `409` (invalid transition or `done` without evidence) | `404`
+- `POST /api/tasks/:id/transition` body `{to (required), reason?, source?, until?, days?}` → `200 Task` | `409` (invalid transition, `done` without evidence, or `done` from anything but the director) | `404`
+  `done` is DIRECTOR-ONLY (HIVE-604). Hive never closes its own work: the smoke monitor, the reconciler and an agent's own emits all stop at `verifying`, and only a `source` of `director`/`web`/`cli` (or none) may move `verifying → done`. A non-director source asking for `done` gets a `409`.
   `to: "deferred"` is accepted even though `deferred` is not a lifecycle state: it parks the task exactly like `hive emit <id> deferred` (sets `deferred_until` from `until`/`days`, else the indefinite sentinel; the task stays `in_progress`) and returns `409` only when the task is already terminal. Moving a parked task to `in_progress` un-parks it (clears `deferred_until`, writes `undeferred`, queues the resume steer) instead of failing as a self-transition. So `hive task move <id> deferred` and `hive emit <id> deferred` agree (HIVE-547).
   When `to` is `verifying`, the project's post-deploy smoke list (`config.smoke`) runs once before the response returns. A smoke failure bounces the task back to `in_progress`, so the returned Task may be `in_progress`, not `verifying`.
 - `POST /api/tasks/:id/spawn` body `{hive_url?}` → `200 {"ok":true, "task": Task, "agent_target":"..."}` | `400` (project has no `repo_path`) | `404` | `502` (dispatch refused or herdr spawn failed; a `spawn_error` event is recorded)
@@ -1216,15 +1217,20 @@ Behavior by `type`:
   `proceed`/`dismiss` (the emit path defaults rather than dropping the agent's
   signal). → `201 {decision: Decision, task: Task}`
 - `ready` → the finished-handoff signal. Records or replaces `pr_url` when supplied (writing a `pr_linked` event, refreshing `branch` from the pull request head when available, and clearing prior `ci_status`/`head_sha` on replacement), then advances `in_progress → in_review` with a `ready_for_review` event. Idempotent: on a task that isn't `in_progress` (already advanced) it acks without transitioning. → `200 {task: Task}`
-- `done` → records the `note` as summary + `note` event, then transitions the
-  task to `done` (evidence rule enforced). → `200 {task: Task}` | `409`
-- `unmergeable` (HIVE-314) → self-service terminal path for a task whose own PR
+- `done` → refused with `409` for ordinary work: hive never closes a task, so an
+  agent hands off with `ready` and the director accepts it later (HIVE-604). The
+  one exception is a report-only self-audit (a scheduled self-audit `ship` with a
+  `report` evidence item, no PR, still `in_progress`): it has no review path, so
+  it records the `note` as summary and moves to `verifying`, where the director
+  accepts it like anything else. → `200 {task: Task}` | `409`
+- `unmergeable` (HIVE-314) → self-service landing path for a task whose own PR
   has nothing left to merge (e.g. GitHub refuses `reopenPullRequest` because
   head==base) but the work already landed via a different PR/commit. Fetches
   the project's base branch and verifies `landing_commit` is an ancestor of it
   (`git merge-base --is-ancestor`); on success writes an `unmergeable` event and
-  transitions straight to `done`, bypassing the normal in_review → verifying
-  merge step (evidence rule still enforced). → `200 {task: Task}` | `400`
+  transitions to `verifying`, bypassing the normal in_review → merge step. It is
+  NOT terminal: the director still accepts it (HIVE-604). Already-`verifying`
+  tasks just ack. → `200 {task: Task}` | `400`
   (bad/missing `landing_commit`) | `409` (commit not verifiable on the base
   branch, or task not eligible)
 - `usage` → inserts a Usage row (cost computed server-side when `cost_usd` is

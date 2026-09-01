@@ -30,6 +30,17 @@ export type State = (typeof STATES)[number];
 
 export const TERMINAL: State[] = ["done", "failed", "cancelled"];
 
+// The sources that mean "a person did this": the web UI, the CLI when it is not
+// running under a hive agent, and anything explicitly attributed to the
+// director. Everything else — "agent", "system", "reconciler",
+// "chat_supervisor" — is hive acting on its own. api.ts reuses this list so
+// there is one definition of the director, not two.
+export const DIRECTOR_SOURCES = ["director", "web", "cli"];
+export function isDirector(source: string | null | undefined): boolean {
+  const s = String(source ?? "").trim();
+  return s === "" || DIRECTOR_SOURCES.includes(s);
+}
+
 // Defined in supervision.ts (one definition, derived from isExternalTask).
 // Re-exported here because the existing callers import it from state.
 export { isTrackingOnlyTask };
@@ -64,6 +75,8 @@ const FORWARD: Record<State, State[]> = {
   needs_decision: ["in_progress", "queued"],
   in_review: ["verifying", "in_progress"], // in_progress = captain requested changes
 
+  // done is reachable ONLY from verifying, and only when a person asks for it.
+  // See DONE_IS_DIRECTOR_ONLY below: hive never closes its own work.
   verifying: ["done", "in_progress"], // failed smoke checks bounce back
   done: [],
   failed: ["queued"], // re-queue a failed task for another attempt (attention tray)
@@ -997,7 +1010,7 @@ export function transition(
     const hint = isTrackingOnlyTask(task)
       ? ` — this task is tracking-only: hive tracks it but never runs an agent on it, so \`ready\` and \`requeue\` are refused. Close it with \`hive task move ${taskId} done\` (or \`cancelled\`).`
       : to === "done" && (from === "in_progress" || from === "in_review")
-        ? " — done is reached via review: emit `ready --pr-url <url>` (in_review), then the director merges (verifying -> done)"
+        ? " — done is reached via review: emit `ready --pr-url <url>` (in_review), then the director merges (verifying) and accepts it (done)"
         : to === "queued" && ["in_progress", "in_review", "verifying"].includes(from)
         ? `; to retry a live task, POST /api/tasks/${taskId}/requeue (fails and requeues atomically)`
         : "";
@@ -1017,6 +1030,21 @@ export function transition(
           `Run each command from the task's verification contract and attach its output with ` +
           `\`hive emit ${taskId} evidence --verify-name <name> --file <output>\`, then hand off again.`
       );
+  }
+
+  // HIVE-604, director instruction 2026-09-01: "hive should never move things to
+  // done. Only the designer should do it after they verify it." A merge takes a
+  // task to `verifying` and it stops there until a person accepts it.
+  //
+  // Enforced HERE because transition() is the one funnel every close went
+  // through: the smoke monitor, the reconciler's tracking-only close, an agent's
+  // `hive emit ... done`, and the unmergeable escape hatch. `force` does NOT lift
+  // it — that flag skips the shape of the path, not the requirement for a human.
+  if (to === "done" && !isDirector(source)) {
+    throw new TransitionError(
+      `only the director moves a task to 'done' (source was '${source}'). ` +
+        `hive stops at 'verifying' and waits for a person to verify the work.`
+    );
   }
 
   // Evidence gates apply to hive-driven work. Tracking-only tasks (source

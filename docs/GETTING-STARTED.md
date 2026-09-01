@@ -67,11 +67,11 @@ Who moves each edge:
 | `in_progress -> in_review` | the agent, with `hive emit <id> ready` |
 | `in_review -> in_progress` | the director, when they request changes |
 | `in_review -> verifying` | the reconciler, once the PR is merged |
-| `verifying -> done` | the reconciler, once post-merge smoke checks pass |
+| `verifying -> done` | the director, and only the director, after they verify the work |
 | anything -> `failed` / `cancelled` | the reconciler or the director |
 | `in_review` / `in_progress` -> `done` | the director, for a tracking-only task only (see Source below): hive never runs an agent on it, so there is no PR to merge and no review to pass |
 
-Two rules the server enforces. A task cannot reach `done` without at least one evidence item. And `failed` is not the end: a failed task can go back to `queued` for another attempt, so a chain that looks like it stopped at a failure has often already been requeued.
+Three rules the server enforces. Hive never moves a task to `done`: every merge stops in `verifying` and waits for a person, so `verifying` is the director's accept queue and not a passing phase. A task cannot reach `done` without at least one evidence item. And `failed` is not the end: a failed task can go back to `queued` for another attempt, so a chain that looks like it stopped at a failure has often already been requeued.
 
 ### 5. Source
 

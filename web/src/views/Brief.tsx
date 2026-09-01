@@ -25,6 +25,7 @@ const ITEM_LABELS: Record<NeedsYouItem["kind"], string> = {
   checkpoint: "Checkpoint",
   quiz_digest: "Catch up",
   review: "Review",
+  verify: "Verify",
   review_pending: "In review",
   attention: "Issue",
   waiting: "Waiting",

@@ -12,13 +12,13 @@ import type { DB } from "./db.ts";
 import { now, newId, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { startLoop } from "./loop.ts";
-import { writeEvent, mutateWithEvent, lastAgentActivity, AGENT_EVENT_SOURCES, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, verificationGate, repairRequeueProvenance, currentAttemptCommitEvidenceCount, recoveryAttemptId, recoveryEpochRowid, recoveryPrHeadHasEvidence, startRecoveryEpoch, TERMINAL, type State } from "./state.ts";
+import { evidenceCount, writeEvent, mutateWithEvent, lastAgentActivity, AGENT_EVENT_SOURCES, transition, getTask, advanceIfFinished, unmetDeps, noteDependencyBlock, isDeferred, undeferTask, isTrackingOnlyTask, queuedInputRecoveryPending, verificationGate, repairRequeueProvenance, currentAttemptCommitEvidenceCount, recoveryAttemptId, recoveryEpochRowid, recoveryPrHeadHasEvidence, startRecoveryEpoch, TERMINAL, type State } from "./state.ts";
 import { Herdr, herdr as defaultHerdr, sendFailure, type AgentStatus } from "./runtime/herdr.ts";
 import { spawnMeta, replayCleanedUpRecovery, latestSpawnRecord } from "./cleanup.ts";
 import { raceSweep } from "./race.ts";
 import { queuedSteers, markSteersDelivered, queueSteerEvent, resumeReviewForDeliveredSteers } from "./steer.ts";
 import { inBackoff, isReviewed, MAX_AGENTS_DEFAULT } from "./dispatcher.ts";
-import { smokeThenAdvance, type MonitorDeps } from "./monitors.ts";
+import { runSmokeAfterMerge, type MonitorDeps } from "./monitors.ts";
 import { enqueue } from "./notifications.ts";
 import { syncAway } from "./away.ts";
 import { parseEvidence } from "./rows.ts";
@@ -61,7 +61,7 @@ export interface ReconcilerDeps {
   herdr?: Herdr;
   exec?: Exec; // for `gh`
   staleMs?: number; // default 15m
-  smoke?: MonitorDeps; // deps for smokeThenAdvance on merge->verifying
+  smoke?: MonitorDeps; // deps for runSmokeAfterMerge on merge->verifying
   nowMs?: () => number; // injectable clock (tests)
   supervise?: boolean; // start the herdr push-wait loop on agents this loop spawns
   instanceId?: string; // this server's lease instance; a displaced server must not reap
@@ -918,22 +918,22 @@ async function syncPRs(db: DB, deps: ReconcilerDeps): Promise<void> {
   }
 }
 
-// Post-merge advance out of `verifying`. A task hive drives runs its smoke
-// checks. A tracking-only task (an external board row) has no hive worktree to
-// smoke and no evidence gate, and both smokeThenAdvance and sweepVerifying bail
-// out on it — so without this it would just swap a stuck `in_review` for a
-// stuck `verifying`. For it, merged IS done (HIVE-473).
+// Post-merge smoke for a task that just reached `verifying`. A task hive drives
+// runs its checks. A tracking-only task (an external board row) has no hive
+// worktree to smoke, so there is nothing to run for it — it waits in `verifying`
+// like everything else. It used to close here (HIVE-473, "merged IS done"), but
+// hive no longer closes anything: the ISSUE still needs verifying even when the
+// ROW has nothing to run, and only the director says it is done (HIVE-604).
 async function advanceAfterMerge(db: DB, taskId: string, deps: ReconcilerDeps): Promise<void> {
   // The merge happened on GitHub, so nobody passed the quiz gate on the way in.
   // Settle it the same way a hive-performed merge does (HIVE-544).
   deferQuizForExternalMerge(db, taskId);
   if (isTrackingOnlyId(db, taskId)) {
-    transition(db, taskId, "done", { source: "reconciler", reason: "PR merged (tracking-only task: no post-merge smoke)" });
     broadcast({ type: "task", task: getTask(db, taskId) });
     return;
   }
   try {
-    await smokeThenAdvance(db, taskId, deps.smoke ?? {});
+    await runSmokeAfterMerge(db, taskId, deps.smoke ?? {});
   } catch (e) {
     console.error(`[hive] smoke run failed for ${taskId}:`, e);
   }
@@ -1746,32 +1746,24 @@ export function autoAnswerStale(db: DB, herdr: Herdr, nowMs: number = Date.now()
   }
 }
 
-// Verifying watchdog: a task enters `verifying` exactly once (merge time) and
-// smoke runs exactly once — a crash, restart, or the silent evidence-gate catch
-// in smokeThenAdvance leaves it wedged forever with no signal. Sweep: re-run
-// the advance for any verifying task idle past the threshold; if it STILL
-// won't advance (the done gate wants evidence), steer the agent to attach it
-// and tell the director once.
+// Verifying is where every merged task now waits for the director (HIVE-604),
+// so sitting there is normal and is NOT a wedge. One thing can still make a task
+// unacceptable: the done gate needs at least one evidence item (a report, for a
+// scout), and the director cannot attach it. Sweep for exactly that and steer
+// the agent once, so nothing lands in the queue the director is unable to close.
 const VERIFY_WEDGE_MS = 15 * 60 * 1000;
 
 export async function sweepVerifying(db: DB, deps: ReconcilerDeps = {}): Promise<void> {
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
   const rows = db
-    .query("SELECT id, title, updated_at FROM tasks WHERE state = 'verifying'")
-    .all() as { id: string; title: string; updated_at: string }[];
+    .query("SELECT id, title, kind, updated_at FROM tasks WHERE state = 'verifying'")
+    .all() as { id: string; title: string; kind: string; updated_at: string }[];
   for (const r of rows) {
     if (isTrackingOnlyId(db, r.id)) continue;
     if (nowMs - Date.parse(r.updated_at) < VERIFY_WEDGE_MS) continue;
-    try {
-      await smokeThenAdvance(db, r.id, deps.smoke ?? {});
-    } catch (e) {
-      console.error(`[hive] verify sweep ${r.id}:`, e);
-    }
-    const after = getTask(db, r.id);
-    if (after?.state !== "verifying") {
-      broadcast({ type: "task", task: after });
-      continue;
-    }
+    const missingEvidence =
+      evidenceCount(db, r.id) < 1 || (r.kind === "scout" && evidenceCount(db, r.id, "report") < 1);
+    if (!missingEvidence) continue; // waiting on a person is the point, not a fault
     const already = db
       .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'verify_wedged' LIMIT 1")
       .get(r.id);
@@ -1780,12 +1772,12 @@ export async function sweepVerifying(db: DB, deps: ReconcilerDeps = {}): Promise
     queueSteerEvent(
       db,
       r.id,
-      "Your task is merged but WEDGED in verifying: the done gate needs at least one evidence item and " +
-        "none is attached. Attach proof of the shipped behavior (screenshot/test output/log) with " +
-        "`hive emit <task-id> evidence --file ... --note ...` — the task completes automatically after.",
+      "Your task is merged and waiting for the director to verify it, but it has NO evidence attached, " +
+        "so they cannot accept it. Attach proof of the shipped behavior (screenshot/test output/log) with " +
+        "`hive emit <task-id> evidence --file ... --note ...`.",
       "queued by verify sweep"
     );
-    enqueue(db, { kind: "stale", task_id: r.id, title: `Wedged in verifying (needs evidence): ${r.title}` });
+    enqueue(db, { kind: "stale", task_id: r.id, title: `Waiting to verify, no evidence attached: ${r.title}` });
   }
 }
 

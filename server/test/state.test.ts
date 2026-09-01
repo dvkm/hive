@@ -328,10 +328,41 @@ test("force bypasses the FORWARD graph (HIVE-314: unmergeable PR, work landed el
   // force still enforces the done evidence gate.
   expect(() => transition(db, id, "done", { force: true })).toThrow(/no evidence/);
   addEvidence(db, id);
-  const t = transition(db, id, "done", { source: "agent", reason: "unmergeable: landed via abc123", force: true });
+  // force does not make hive the director: an agent still cannot close a task.
+  expect(() => transition(db, id, "done", { source: "agent", reason: "unmergeable: landed via abc123", force: true }))
+    .toThrow(/only the director moves a task to 'done'/);
+  const t = transition(db, id, "done", { source: "director", reason: "verified: landed via abc123", force: true });
   expect(t.state).toBe("done");
   const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'state_change' ORDER BY ts DESC LIMIT 1").get(id) as { payload: string };
   expect(JSON.parse(ev.payload)).toMatchObject({ from: "in_progress", to: "done" });
+});
+
+// HIVE-604: "hive should never move things to done. Only the designer should do
+// it after they verify it." transition() is the single funnel, so this is the
+// one place the rule has to hold for every path into done.
+test("only the director moves a task to done; hive's own sources stop at verifying", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  transition(db, id, "in_progress");
+  transition(db, id, "in_review");
+  transition(db, id, "verifying");
+  addEvidence(db, id);
+  for (const source of ["system", "reconciler", "agent", "chat_supervisor"])
+    expect(() => transition(db, id, "done", { source })).toThrow(/only the director moves a task to 'done'/);
+  expect(getTask(db, id).state).toBe("verifying");
+  // The web UI ("director"), and the CLI when no agent is driving it (no source
+  // at all), are the same person.
+  expect(transition(db, id, "done", { source: "director" }).state).toBe("done");
+});
+
+test("a tracking-only row also waits for the director instead of closing itself", () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  db.query("UPDATE tasks SET source = 'external', source_ref = 'jira:WEB-1' WHERE id = ?").run(id);
+  transition(db, id, "in_progress");
+  // No evidence gate for a mirror, but the director gate still applies.
+  expect(() => transition(db, id, "done", { source: "reconciler" })).toThrow(/only the director moves a task to 'done'/);
+  expect(transition(db, id, "done", { source: "director" }).state).toBe("done");
 });
 
 test("force still refuses a task that is already terminal", () => {

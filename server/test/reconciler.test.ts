@@ -478,7 +478,8 @@ test("syncPRs advances an evidenced recovery merged while still in progress", as
 
   await reconcileOnce(db, { exec: gh, herdr: statusHerdr("working") });
 
-  expect(getTask(db, id).state).toBe("done");
+  // Merged stops at verifying: only the director closes a task (HIVE-604).
+  expect(getTask(db, id).state).toBe("verifying");
   expect(db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'pr_merged'").get(id)).toEqual({ n: 1 });
 });
 
@@ -843,8 +844,9 @@ test("syncPRs closes a never-dispatched external task once its PR MERGES (HIVE-4
     argv[0] === "gh" ? OK(JSON.stringify({ state: "MERGED", statusCheckRollup: [{ conclusion: "SUCCESS" }], headRefOid: "sha-m" })) : OK()
   );
   await reconcileOnce(db, { exec: gh });
-  // merged is terminal for a task hive only tracks: no smoke to run, no evidence gate
-  expect(getTask(db, id).state).toBe("done");
+  // Merged is NOT terminal, even for a row hive only tracks: there is no smoke to
+  // run, but the issue behind it still waits for the director (HIVE-604).
+  expect(getTask(db, id).state).toBe("verifying");
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'pr_merged'").get(id)).toBeTruthy();
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'steer'").get(id)).toBeFalsy();
 });
@@ -899,7 +901,7 @@ test("autoAnswerStale skips a never-dispatched external task's open decision", a
   expect((db.query("SELECT status FROM decisions WHERE id = ?").get(did) as any).status).toBe("open");
 });
 
-test("sweepVerifying re-runs the advance and flags evidence-wedged tasks once", async () => {
+test("sweepVerifying flags a verifying task with no evidence once, and leaves an evidenced one alone", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { state: "queued" });
   transition(db, id, "in_progress");
@@ -908,20 +910,26 @@ test("sweepVerifying re-runs the advance and flags evidence-wedged tasks once", 
   db.query("UPDATE tasks SET updated_at = ? WHERE id = ?").run(new Date(Date.now() - 20 * 60 * 1000).toISOString(), id);
 
   const { sweepVerifying } = await import("../src/reconciler.ts");
-  await sweepVerifying(db, {}); // no evidence: done gate refuses → wedged
+  await sweepVerifying(db, {}); // no evidence: the director could never accept it → flagged
   expect(getTask(db, id).state).toBe("verifying");
   let wedged = db.query("SELECT * FROM events WHERE task_id = ? AND type='verify_wedged'").all(id);
   expect(wedged.length).toBe(1);
   await sweepVerifying(db, {}); // no double-flag
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type='verify_wedged'").all(id).length).toBe(1);
 
-  // evidence attached → the next sweep completes the task
+  // Evidence attached: the director can now accept it, so the sweep says nothing
+  // and the task keeps waiting for a person (HIVE-604) instead of closing itself.
+  const second = makeTask(db, projectId, { state: "queued" });
+  transition(db, second, "in_progress");
+  transition(db, second, "in_review");
+  transition(db, second, "verifying");
   db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
-    newId("evd"), id, now(), "log", "/tmp/x.log", "proof"
+    newId("evd"), second, now(), "log", "/tmp/x.log", "proof"
   );
-  db.query("UPDATE tasks SET updated_at = ? WHERE id = ?").run(new Date(Date.now() - 20 * 60 * 1000).toISOString(), id);
+  db.query("UPDATE tasks SET updated_at = ? WHERE id = ?").run(new Date(Date.now() - 20 * 60 * 1000).toISOString(), second);
   await sweepVerifying(db, {});
-  expect(getTask(db, id).state).toBe("done");
+  expect(getTask(db, second).state).toBe("verifying");
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type='verify_wedged'").all(second).length).toBe(0);
 });
 
 test("autoMergeReady merges opted-in, green, clean-review, uncontested tasks without requiring a quiz", async () => {
@@ -967,13 +975,13 @@ test("autoMergeReady merges opted-in, green, clean-review, uncontested tasks wit
     return argv.includes("symbolic-ref") ? OK("main\n") : OK();
   });
   await autoMergeReady(db, { exec: git });
-  expect(getTask(db, clean).state).toBe("done"); // merged; no smoke configured → straight through verifying
+  expect(getTask(db, clean).state).toBe("verifying"); // merged; waits for the director to accept it
   expect(getTask(db, risky).state).toBe("in_review"); // risks → human review
   // Mechanical change (hive-1559): its quiz is not judgment-class, so nothing is
   // deferred into the post-ship backlog. A sensitive path still parks one there.
-  expect(getTask(db, mechanical).state).toBe("done");
+  expect(getTask(db, mechanical).state).toBe("verifying");
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_deferred'").get(mechanical)).toBeNull();
-  expect(getTask(db, sensitive).state).toBe("done");
+  expect(getTask(db, sensitive).state).toBe("verifying");
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_deferred'").get(sensitive)).toBeTruthy();
 });
 
@@ -1034,8 +1042,8 @@ test("autoMergeReady merges a caution whose risks were all refuted, and parks on
   });
   await autoMergeReady(db, { exec: git });
 
-  expect(getTask(db, refuted).state).toBe("done"); // caution, everything refuted → lands like looks_good
-  expect(getTask(db, cleanLooksGood).state).toBe("done"); // looks_good with soft notes, all cleared
+  expect(getTask(db, refuted).state).toBe("verifying"); // caution, everything refuted → lands like looks_good
+  expect(getTask(db, cleanLooksGood).state).toBe("verifying"); // looks_good with soft notes, all cleared
   expect(getTask(db, confirmedRisk).state).toBe("in_review"); // one confirmed risk → the director decides
   expect(getTask(db, humanQuestion).state).toBe("in_review"); // only a human can answer it
   expect(getTask(db, staleVerdicts).state).toBe("in_review"); // verdicts belong to an older head
@@ -2048,7 +2056,7 @@ test("autoMergeReady merges a task whose good review is followed by a review err
     return argv.includes("symbolic-ref") ? OK("main\n") : OK();
   });
   await autoMergeReady(db, { exec: git });
-  expect(getTask(db, id).state).toBe("done");
+  expect(getTask(db, id).state).toBe("verifying");
 });
 
 test("autoMergeReady stops retrying a merge that is refused at the same head, and says so once", async () => {
@@ -2131,7 +2139,7 @@ test("autoMergeReady holds a task until every declared verification has evidence
 
   attach("typecheck");
   await autoMergeReady(db, { exec: git });
-  expect(getTask(db, id).state).toBe("done");
+  expect(getTask(db, id).state).toBe("verifying");
 });
 
 // HIVE-486: linkPRs listed one project at a time on the 60s default, so K

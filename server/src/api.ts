@@ -36,6 +36,7 @@ import {
   dependentsWedgedForDecision,
   resolveDependentsWedgedForDecision,
   queuedInputRecoveryPending,
+  isDirector,
   isSelfAuditLineage,
   lastAgentActivity,
   recoveryEpochRowid,
@@ -59,7 +60,7 @@ import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { takeOver, handBack, TakeoverError } from "./takeover.ts";
 import { figmaTokenEnv, resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { teamclaudeEnv, teamclaudeOverlay, usesTeamclaude } from "./teamclaude.ts";
-import { smokeThenAdvance, type Fetcher } from "./monitors.ts";
+import { runSmokeAfterMerge, type Fetcher } from "./monitors.ts";
 import {
   deploymentsStatus,
   startDeploy,
@@ -2185,12 +2186,8 @@ function parsePriority(raw: any): string | Response {
 // "director"), agents send "agent", the chat supervisor sends "chat_supervisor".
 // ponytail: stated-source attribution, the same trust model the rest of this
 // local API runs on. Swap in a real caller identity if hive ever grows one.
-const DIRECTOR_TASK_SOURCES = ["director", "web", "cli"];
-
-function isDirectorSource(source: any): boolean {
-  const s = source == null ? "" : String(source).trim();
-  return s === "" || DIRECTOR_TASK_SOURCES.includes(s);
-}
+// One definition, in state.ts, shared with the done gate (HIVE-604).
+const isDirectorSource = isDirector;
 
 // Returns a 403 when this source may not set this priority, else null.
 function authorizePriority(source: any, priority: string): Response | null {
@@ -2671,7 +2668,7 @@ function listTasks(db: DB, url: URL): Response {
   if (!includeTest) where.push(notTestProjectSql("p.config"));
   const sql =
     `SELECT t.*,
-      CASE WHEN t.state IN ('in_review', 'failed') THEN COALESCE(
+      CASE WHEN t.state IN ('in_review', 'verifying', 'failed') THEN COALESCE(
         (SELECT MAX(e.ts) FROM events e WHERE e.task_id = t.id AND e.type = 'state_change'
           AND json_extract(e.payload, '$.to') = t.state), t.updated_at)
       END AS needs_you_since
@@ -3226,7 +3223,7 @@ async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {
   // Post-deploy smoke runs once when a task enters `verifying`. runSmoke may
   // bounce the task back to in_progress on failure; re-read to reflect that.
   if (to === "verifying") {
-    await smokeThenAdvance(db, id, { fetch: deps.fetch }).catch((e) => console.error("[hive] smoke run failed:", e));
+    await runSmokeAfterMerge(db, id, { fetch: deps.fetch }).catch((e) => console.error("[hive] smoke run failed:", e));
     return json(getTask(db, id));
   }
   return json(task);
@@ -3958,7 +3955,7 @@ async function mergeTaskLocked(
   );
   // in_review → verifying (runs post-deploy smoke once).
   transition(db, id, "verifying", { source: "director", reason: `merged (${method})` });
-  await smokeThenAdvance(db, id, { fetch: deps.fetch }).catch((e) => console.error("[hive] smoke run failed:", e));
+  await runSmokeAfterMerge(db, id, { fetch: deps.fetch }).catch((e) => console.error("[hive] smoke run failed:", e));
 
   // Best-effort worktree teardown now the branch is merged. Never fails the
   // request — a leftover worktree is a cleanup nuisance, not a merge failure.
@@ -7072,14 +7069,29 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
   }
 
   // --- done ---
+  // Nobody but the director closes a task (HIVE-604). An agent emitting `done`
+  // is not refused outright — that would strand the one case with no review path
+  // (a self-audit that only ever produces a report, no PR to merge). It is
+  // redirected to `verifying`, where the director accepts it like everything
+  // else. Everyone else is told the path instead.
   if (type === "done") {
     const t = getTask(db, taskId);
     const blocked = authzBlock(db, { project_id: t.project_id, action: "task.done", target: t.title, task_id: taskId });
     if (blocked) return blocked;
+    const reportOnlySelfAudit = isSelfAuditLineage(db, t) && t.kind === "ship" && t.state === "in_progress" && !t.pr_url && evidenceCount(db, taskId, "report") > 0;
+    if (!reportOnlySelfAudit)
+      return err(
+        "hive never closes a task: only the director marks work done, after verifying it. " +
+          "Hand off with `hive emit " + taskId + " ready --pr-url <url>` and the task waits in review.",
+        409
+      );
     if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });
     if (note) db.query("UPDATE tasks SET summary = ? WHERE id = ?").run(note, taskId);
-    const reportOnlySelfAudit = isSelfAuditLineage(db, t) && t.kind === "ship" && t.state === "in_progress" && !t.pr_url && evidenceCount(db, taskId, "report") > 0;
-    const task = transition(db, taskId, "done", { source, reason: note ?? undefined, force: reportOnlySelfAudit });
+    const task = transition(db, taskId, "verifying", {
+      source,
+      reason: note ?? "self-audit report delivered — waiting for the director to verify",
+      force: true,
+    });
     return json({ task });
   }
 
@@ -7087,8 +7099,9 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
   // e.g. GitHub refuses reopenPullRequest because head==base, but the work
   // already landed via a different PR/commit). The agent points at the commit
   // that actually carries the work; hive verifies it against the base branch
-  // before granting a terminal 'done' without going through the normal
-  // in_review -> verifying merge step.
+  // before moving it to 'verifying' without going through the normal
+  // in_review -> merge step. It stops there like any other merged task: the
+  // director still says whether it is done (HIVE-604).
   if (type === "unmergeable") {
     const landingCommit = String(fields.landing_commit ?? fields.commit_sha ?? "").trim();
     if (!/^[0-9a-f]{7,40}$/i.test(landingCommit))
@@ -7114,15 +7127,16 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     if (note) writeEvent(db, { task_id: taskId, source, type: "note", payload: { note } });
     writeEvent(db, { task_id: taskId, source, type: "unmergeable", payload: { landing_commit: landingCommit, base, note: note ?? null } });
     if (note) db.query("UPDATE tasks SET summary = ? WHERE id = ?").run(note, taskId);
+    if (t.state === "verifying") return json({ task: getTask(db, taskId) });
     try {
-      const task = transition(db, taskId, "done", {
+      const task = transition(db, taskId, "verifying", {
         source,
         reason: note ?? `unmergeable: work landed via ${landingCommit}, verified on ${base}`,
         force: true,
       });
       return json({ task });
     } catch (e: any) {
-      return err(e.message ?? "could not close task", 409);
+      return err(e.message ?? "could not hand the task over for verification", 409);
     }
   }
 
