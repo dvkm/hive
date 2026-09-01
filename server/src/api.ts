@@ -2196,6 +2196,18 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   // once and stored (HIVE-546). Stored, not re-derived: a retitle or a requeue
   // used to lose the ticket silently.
   const mirrorTaskId = mirrorTaskIdForTitle(db, String(body.project_id), body.title);
+  // A work task filed from the Jira issue's title while the real spec sits
+  // unread in the linked mirror's brief (HIVE-551/WEB-118): refuse rather than
+  // let a title-only brief silently drop 100s of chars of spec the mirror
+  // already has.
+  if (mirrorTaskId) {
+    const mirrorBrief = (db.query("SELECT brief FROM tasks WHERE id = ?").get(mirrorTaskId) as { brief: string | null } | undefined)?.brief ?? "";
+    if (brief.length < 80 && mirrorBrief.length > 200)
+      return err(
+        `brief is title-only (${brief.length} chars) but linked mirror task ${mirrorTaskId} has a ${mirrorBrief.length}-char spec — include it in --brief-text instead of just the Jira title`,
+        400
+      );
+  }
   const row = {
     id,
     project_id: body.project_id,
