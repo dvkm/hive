@@ -127,14 +127,22 @@ function pairRank(e: Evidence): number {
   return 2;
 }
 
-// Oldest first, except that the whole before/after set sits together at the
-// earliest time any of it was captured, and reads before → after inside that
-// slot however it was emitted. Without this the AFTER shot can land first and
-// the reader meets the outcome before the problem.
+// Oldest first, except that each before/after pair sits together at the
+// earliest time either half was captured, and reads before → after however it
+// was emitted. Without this the AFTER shot can land first and the reader meets
+// the outcome before the problem. Two pairs on one task stay two pairs: the
+// n-th BEFORE belongs with the n-th AFTER, not with every other BEFORE.
 export function orderEvidence(evidence: Evidence[]): Evidence[] {
-  const paired = evidence.filter((e) => pairRank(e) < 2);
-  const pairTs = paired.reduce((min, e) => (min && min < e.ts ? min : e.ts), "");
-  const key = (e: Evidence) => (pairRank(e) < 2 ? pairTs : e.ts);
+  const byTs = (a: Evidence, b: Evidence) => a.ts.localeCompare(b.ts);
+  const befores = evidence.filter((e) => pairRank(e) === 0).sort(byTs);
+  const afters = evidence.filter((e) => pairRank(e) === 1).sort(byTs);
+  const slot = new Map<string, string>();
+  for (let i = 0; i < Math.max(befores.length, afters.length); i++) {
+    const pair = [befores[i], afters[i]].filter((e): e is Evidence => !!e);
+    const ts = pair.reduce((min, e) => (min && min < e.ts ? min : e.ts), "");
+    for (const e of pair) slot.set(e.id, `${ts}#${String(i).padStart(4, "0")}`);
+  }
+  const key = (e: Evidence) => slot.get(e.id) ?? e.ts;
   return [...evidence].sort(
     (a, b) => key(a).localeCompare(key(b)) || pairRank(a) - pairRank(b) || a.ts.localeCompare(b.ts)
   );
