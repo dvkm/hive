@@ -811,3 +811,29 @@ test("a project with auto review disabled lands without waiting for a verdict", 
   await landOnce(db, { exec: filesExec({}), merge });
   expect(calls).toEqual([a]);
 });
+
+test("an erroring reviewer cannot hold the land queue forever (HIVE-581)", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run("headsha1", a);
+  markLand(db, [a], true);
+
+  // No verdict ever arrives. The first sweep holds and records the wait.
+  const early = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: early.merge });
+  expect(early.calls).toEqual([]);
+  const wait = db.query("SELECT id FROM events WHERE task_id = ? AND type = 'land_review_wait'").all(a) as any[];
+  expect(wait).toHaveLength(1);
+
+  // Still inside the ceiling: still holding, and no second wait event.
+  const again = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: again.merge });
+  expect(again.calls).toEqual([]);
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'land_review_wait'").get(a) as any).n).toBe(1);
+
+  // Past the ceiling the hold expires and the merge is attempted as before.
+  db.query("UPDATE events SET ts = ? WHERE id = ?").run(new Date(Date.now() - 3_600_000).toISOString(), wait[0].id);
+  const late = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: late.merge });
+  expect(late.calls).toEqual([a]);
+});
