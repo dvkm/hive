@@ -6271,6 +6271,13 @@ function knowledgeSearch(db: DB, url: URL): Response {
   if (!projectId) return err("project_id or task_id is required. Run 'hive recall <keywords>' with HIVE_TASK_ID set, or pass ?project_id=<project-id>");
   const terms = (url.searchParams.get("q") ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean);
 
+  // ponytail: no SQL LIMIT here on purpose. Ranking needs every candidate row —
+  // a LIMIT would cut rows before scoring and reintroduce the silent cliff this
+  // endpoint exists to remove, so the top-N cap is applied in JS after ranking.
+  // Note refs and policies were never capped, before or after; this change
+  // extends the same unbounded fetch to failures and decisions. Fine at the few
+  // hundred active rows per project we have. When a project reaches the low
+  // thousands and recall gets slow, upgrade: index + score in SQL, or FTS.
   const byKind = (cols: string, kind: string, order: string) =>
     db
       .query(`SELECT ${cols} FROM learnings WHERE project_id = ? AND kind = ? AND status = 'active' ORDER BY ${order}`)
