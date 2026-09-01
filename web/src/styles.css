@@ -6212,6 +6212,166 @@ a.chip-jira:hover { background: #2d5488; }
   font-size: 13px;
 }
 
+/* Catch up (HIVE-511): one glanceable card per shipped change. The whole point
+   is that a card fits without scrolling, so the visual slot is a fixed height
+   and the card is the text around it. The slot is bounded rather than the card
+   because Request changes opens a note inside the card and must not be clipped.
+   A screenshot is `object-fit: cover` into this box: without a definite height
+   the img falls back to its natural size and a tall page render drags the whole
+   grid row past the viewport, which is the one thing this page may not do. */
+:root {
+  --glance-visual: 176px;
+}
+.glance-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 14px;
+}
+.glance-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 260px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+}
+.glance-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.glance-head a {
+  font-weight: 600;
+}
+.glance-when {
+  margin-left: auto;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+/* One line, always. A payload that grew back into prose gets clipped here
+   rather than pushing the visual off the card. */
+.glance-line {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.35;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.glance-shots {
+  height: var(--glance-visual);
+  display: flex;
+  gap: 6px;
+}
+.glance-shot {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg);
+  cursor: zoom-in;
+}
+.glance-shot img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: top center;
+  display: block;
+}
+.glance-shot-tag {
+  position: absolute;
+  left: 4px;
+  bottom: 4px;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(11, 12, 10, 0.82);
+  color: var(--text-dim);
+}
+.glance-areas {
+  height: var(--glance-visual);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+}
+.glance-areas li {
+  display: grid;
+  grid-template-columns: minmax(0, 96px) 1fr auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.glance-area-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.glance-area-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--bg-elev2);
+  overflow: hidden;
+}
+.glance-area-bar i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+.glance-area-churn {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.glance-noshape {
+  height: var(--glance-visual);
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+  font-size: 12px;
+  border: 1px dashed var(--border-soft);
+  border-radius: 8px;
+}
+/* An unread diff must not read like an empty one, so it is marked, not muted
+   into the same grey as the numbers it replaces. */
+.glance-unavailable {
+  color: var(--amber);
+  font-style: italic;
+}
+.glance-facts {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.glance-facts a {
+  margin-left: auto;
+}
+/* Request changes lives on the card (HIVE-505 pairing): a mini button while
+   closed, its own full-width row once the note is open. */
+.glance-facts {
+  flex-wrap: wrap;
+}
+.glance-facts .request-changes,
+.glance-facts .request-changes-filed {
+  flex-basis: 100%;
+}
+
 /* Request changes on shipped work: a button that opens into its note. */
 /* The Done row is a single no-wrap flex line, so let the open note claim its
    own line instead of squeezing the title and summary. */

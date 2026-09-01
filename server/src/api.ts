@@ -103,6 +103,7 @@ import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infr
 import { getAway, setAway, awayNow, heldPushes, lastFlush, syncAway } from "./away.ts";
 import type { AwayConfig } from "./away.ts";
 import { taskDiff } from "./diff.ts";
+import { catchupCards } from "./glance.ts";
 import { authoredFiles, captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { overlapHold } from "./fileScope.ts";
 import { landGraph, markLand, resolveLandPauseForDecision, CONFIRMED_RISK_CODE } from "./landQueue.ts";
@@ -665,6 +666,16 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       if (pathname === "/api/checkpoints" && method === "GET") return listOpenCheckpoints(db, url);
       if (pathname === "/api/understanding-quizzes" && method === "GET") return listUnderstandingQuizzes(db, url);
+      // The glance layer over shipped work (HIVE-511): one small card per
+      // change, not the long explanation page.
+      if (pathname === "/api/catchup" && method === "GET")
+        return json({
+          cards: await catchupCards(
+            db,
+            { projectId: url.searchParams.get("project_id"), limit: Number(url.searchParams.get("limit")) || undefined },
+            deps.exec ?? defaultExec
+          ),
+        });
 
       if (pathname === "/api/offline" && method === "GET")
         return json({ on: isOffline(db) });

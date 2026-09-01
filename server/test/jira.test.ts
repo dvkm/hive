@@ -4191,13 +4191,38 @@ test("the scratch directory is gone even when the harness throws", async () => {
   expect(readdirSyncT(join(root, "web", "e2e")).some((name) => name.startsWith("hive-proof-"))).toBe(false);
 });
 
+// HIVE-511: the catchup card shows a before/after pair, so a rendered proof has
+// to say which side it is. The before pass is best effort — losing it must never
+// cost the after picture, and it must not leave a base checkout behind.
+test.skipIf(process.platform !== "darwin")("a rendered proof is stamped 'after', and a failed before pass costs nothing", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const render = execRendering(root, 1);
+  const exec = async (argv: string[]) => {
+    // A real base commit, then a worktree add that refuses: the before pass
+    // gets as far as it can and gives up.
+    if (argv.includes("merge-base")) return { code: 0, stdout: "0f1e2d3c4b5a69788796a5b4c3d2e1f001020304\n", stderr: "" };
+    if (argv.includes("worktree")) return { code: 1, stdout: "", stderr: "fatal: nope" };
+    return render(argv);
+  };
+
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+  expect(stats.rendered).toBe(1);
+
+  const shots = db.query("SELECT meta FROM evidence WHERE kind = 'screenshot'").all() as { meta: string }[];
+  expect(shots.map((row) => JSON.parse(row.meta).render_phase)).toEqual(["after"]);
+  expect(readdirSyncT(root).some((name) => name.startsWith(".hive-base-"))).toBe(false);
+});
+
 test.skipIf(process.platform !== "darwin")("the task's diff is read once per cycle, not once per check", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
   const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
   let diffReads = 0;
   const render = execRendering(root, 1);
+  // Only the diff read itself: the before/after pass (HIVE-511) also shells out
+  // to git, and those calls say nothing about how often the diff is fetched.
   const exec = async (argv: string[]) => {
-    if (!isHarnessRun(argv)) diffReads++;
+    if (argv.includes("diff")) diffReads++;
     return render(argv);
   };
 
