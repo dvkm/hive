@@ -381,6 +381,34 @@ test("a task with no answered decision gets the prompt unchanged", async () => {
   const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
   await verifyRisks(db, task, { risks: ["r1"], head: "head-a", diff: "d" }, { exec: claude, shellExec: git });
   expect(prompts[0]).not.toContain("ALREADY ruled");
+  expect(prompts[0]).toContain("AFTER this work landed on it"); // repairBlock still applies
+});
+
+// HIVE-587: repair work always looks clean at review time, so the judge was
+// told the state it sees is the work's own output.
+test("the verify prompt says the branch it reads already contains this work", async () => {
+  const { db, id } = setup({}, { branch: "hive/stale" });
+  const prompts: string[] = [];
+  const claude = async (argv: string[]) => {
+    prompts.push(argv[4] ?? "");
+    return { code: 0, stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"the merge under review is what made it current"}' }), stderr: "" };
+  };
+  const gitArgs: string[][] = [];
+  const git: Exec = async (argv) => {
+    gitArgs.push(argv);
+    return { code: 0, stdout: "60e3c7a0 2026-09-01T10:00:00Z Merge main into hive/stale", stderr: "" };
+  };
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+
+  await verifyRisks(db, task, { risks: ["the branch is 0 commits behind main, so the premise was stale"], head: "head-a", diff: "d" }, { exec: claude, shellExec: git });
+
+  const p = prompts[0];
+  expect(p).toContain("AFTER this work landed on it");
+  expect(p).toContain("60e3c7a0 2026-09-01T10:00:00Z Merge main into hive/stale"); // the merge is listed
+  expect(p).toContain("answer 'refuted'");
+  expect(p).not.toContain("ALREADY ruled"); // no decisions on this task
+  expect(gitArgs[0]).not.toContain("--no-merges"); // a repair merge must not be filtered out
+  expect(events(db, id, "risk_verdicts")[0].payload.verdicts[0].verdict).toBe("refuted");
 });
 
 test("a question only the human can answer is recorded as human-only", async () => {

@@ -663,29 +663,59 @@ function answeredDecisions(db: DB, taskId: string): { ts: string; text: string }
 
 // Commits on this branch with their dates, so the judge can tell a settled
 // question from a NEW behaviour: a decision answered on an older head does not
-// absolve code written after it. Best effort — no commits just means judging
-// on the decisions and the diff, as before.
+// absolve code written after it. They also say what this work itself changed,
+// which is what repairBlock needs. Merge commits are kept: on repair work the
+// merge IS the change under review (HIVE-587). Best effort — no commits just
+// means judging on the decisions and the diff, as before.
 async function branchCommits(db: DB, task: any, exec: Exec): Promise<string[]> {
   const project: any = db.query("SELECT repo_path, config FROM projects WHERE id = ?").get(task.project_id);
   const repo = task.worktree_path ?? project?.repo_path;
   const ref = task.worktree_path ? "HEAD" : task.branch;
   if (!repo || !ref) return [];
   const base = projectComparisonBase(JSON.parse(project?.config ?? "{}"));
-  const r = await exec([
-    "git", "-C", repo, "log", "--first-parent", "--no-merges",
-    "--date=iso-strict", "--format=%h %ad %s", "-n", "20", `${base}..${ref}`,
-  ]);
+  let r;
+  try {
+    r = await exec([
+      "git", "-C", repo, "log", "--first-parent",
+      "--date=iso-strict", "--format=%h %ad %s", "-n", "20", `${base}..${ref}`,
+    ]);
+  } catch {
+    return [];
+  }
   if (r.code !== 0) return [];
   return r.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
 }
 
+// A repaired state is not proof there was nothing to repair (HIVE-587).
+//
+// The judge reads the branch AFTER the work landed, so on any fix-the-drift
+// task — merge main in, resolve conflicts, unstick a stale branch, clean up bad
+// rows — the problem the brief describes is gone by the time it looks. On task
+// d24883422489 that produced two merge-blocking risks ("already 0 commits
+// behind main", "a clean fast-forward-style merge, not a real conflict
+// resolution"), both resting on a state the work under review had created
+// twenty minutes earlier. The more thoroughly the agent fixed it, the more
+// confidently the check reported it was never broken.
+function repairBlock(commits: string[]): string {
+  return [
+    `You are reading the branch AFTER this work landed on it.${commits.length ? " These commits are part of it:" : ""}`,
+    ...commits.map((c) => `- ${c}`),
+    `So anything the brief says was wrong may be gone BECAUSE this work fixed it: a branch no longer`,
+    `behind, conflicts that no longer show, data that is now clean. "The problem is not there now" is`,
+    `never on its own proof it was never there. If a risk rests only on the state you can see now, and`,
+    `this change is what would have produced that state, answer 'refuted' — unless you can point at`,
+    `something that was true BEFORE these commits.`,
+    ``,
+  ].join("\n");
+}
+
 // The settled-decision block of the verify prompt, or "" when the task has none.
-function settledBlock(decisions: { ts: string; text: string }[], commits: string[]): string {
+// The commits it dates the rulings against are already listed by repairBlock.
+function settledBlock(decisions: { ts: string; text: string }[]): string {
   if (!decisions.length) return "";
   return [
     `The director has ALREADY ruled on this task. These questions are settled:`,
     ...decisions.map((d) => `- answered ${d.ts.slice(0, 10)}: ${d.text}`),
-    ...(commits.length ? [``, `Commits on this branch, newest first (short sha, date, subject):`, ...commits.map((c) => `- ${c}`)] : []),
     `A risk that only re-asks a settled question is NOT a live risk. Answer 'refuted' and start`,
     `'why' with "settled: " plus the ruling and the date, so the reader sees it in one glance.`,
     `Two things still count as confirmed: a defect in the code itself (a real bug, not a different`,
@@ -859,9 +889,8 @@ async function runVerification(
   // Read once per pass, not once per risk: the same block goes into every
   // risk prompt.
   const decisions = answeredDecisions(db, task.id);
-  const settled = decisions.length
-    ? settledBlock(decisions, await branchCommits(db, task, deps.shellExec ?? defaultExec))
-    : "";
+  const commits = await branchCommits(db, task, deps.shellExec ?? defaultExec);
+  const settled = repairBlock(commits) + (decisions.length ? settledBlock(decisions) : "");
   const current = async () => (input.stillCurrent ? await input.stillCurrent() : true);
   const run = async (prompt: string) => {
     try {
