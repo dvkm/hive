@@ -88,12 +88,20 @@ test("two servers on one DB: the predecessor stands down, one keeps running laps
     const b = start();
     try {
       expect(await until(() => holder() === b.proc.pid)).toBe(true); // B took over
-      expect(b.out()).toContain("took the DB lease from a previous server");
+      // Wait for the line, never read it once: the server writes the lease ROW
+      // and only then prints, and the print still has to cross a pipe before the
+      // reader task above appends it. The poll above returns the instant the row
+      // flips, so a single read here sees "" — that is exactly how this test
+      // failed in 620ms on 2026-09-01, on runners a few hundred ms slower than
+      // the ones where it passed.
+      expect(await until(() => b.out().includes("took the DB lease from a previous server"))).toBe(true);
 
       // A stands down on its own — it is the orphan case, so nothing external
       // kills it. Its process must be gone, not merely quiet.
       expect(await until(() => a.proc.exitCode !== null)).toBe(true);
-      expect(a.out()).toContain("standing down");
+      // Same race on the way out: exitCode flips before the last of A's output
+      // has been drained out of the pipe.
+      expect(await until(() => a.out().includes("standing down"))).toBe(true);
 
       // And B is still the one holding (and renewing) the lease afterwards.
       const before = readLease(db)?.at;
@@ -106,11 +114,11 @@ test("two servers on one DB: the predecessor stands down, one keeps running laps
     a.kill();
     await a.proc.exited;
   }
-  // The outer timeout has to cover the SUM of all four waits, not just the
-  // biggest one: four slow-but-passing waits each beat their own DEADLINE_MS
-  // yet add up. 4 x 60s is 240s, so 300s here. A healthy run finishes all four
+  // The outer timeout has to cover the SUM of all six waits, not just the
+  // biggest one: six slow-but-passing waits each beat their own DEADLINE_MS
+  // yet add up. 6 x 60s is 360s, so 400s here. A healthy run finishes all six
   // phases in ~400ms, so this ceiling is never approached either.
-}, 300_000);
+}, 400_000);
 
 // The leak the guard exists for (HIVE-586): the test above spawns REAL servers,
 // and when a run is cut short its `finally` never runs. Two such servers were
