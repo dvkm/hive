@@ -534,7 +534,11 @@ function isHiveEmitDataOnly(cmd: string): boolean {
 // so their commands must be scanned unstripped.
 const EXECUTOR = new RegExp(
   String.raw`\b(sh|bash|zsh|ksh|dash|eval|source|exec|xargs|sqlite3|psql|mysql|osascript)\b` +
-    String.raw`|\bpython3?\b[^\n|;&]*\s-c\s|\bnode\b[^\n|;&]*\s(-e|--eval)\s|\b(perl|ruby)\b[^\n|;&]*\s-e\s`
+    String.raw`|\bpython3?\b[^\n|;&]*\s-c\s|\bnode\b[^\n|;&]*\s(-e|--eval)\s|\b(perl|ruby)\b[^\n|;&]*\s-e\s` +
+    // `python3 - <<EOF` / `node <<EOF` run the heredoc as their script with no
+    // -c/-e flag to spot, so stripHeredocs keeps that body raw — this keeps the
+    // quote stripping off it too.
+    String.raw`|\b(python[0-9.]*|node|bun|deno|perl|ruby)\b[^\n|;&]*<<`
 );
 
 // A subshell trigger ($(...), `...`, <(...)) executes even inside double
@@ -547,14 +551,85 @@ const EXECUTOR = new RegExp(
 // classify.ts hasSubshell/EXECUTOR gate gotcha, task 320).
 const SUBSHELL = /\$\(|`|<\(/;
 
-export function stripDataText(cmd: string): string {
-  return cmd
-    // heredoc bodies: <<TAG / <<-TAG / <<'TAG' … TAG (start-of-line terminator)
-    .replace(/<<-?\s*(['"]?)(\w+)\1([\s\S]*?)\n\2(?=\n|$)/g, (full, quote, _tag, body) =>
-      !quote && SUBSHELL.test(body) ? full : "<<HEREDOC_STRIPPED"
-    )
+// Interpreters that RUN their file argument, plus the shell builtins that do.
+const INTERPRETER = /^(sh|bash|zsh|ksh|dash|source|\.|python[0-9.]*|node|bun|deno|perl|ruby|osascript)$/;
+
+// The last redirect target on a heredoc's owner line — the file the body is
+// being written INTO (`cat > review.json <<'EOF'` → `review.json`).
+function redirectTarget(owner: string): string | null {
+  const hits = [...owner.matchAll(/(?:^|\s)\d*>>?\s*("[^"]*"|'[^']*'|\S+)/g)];
+  const last = hits.at(-1)?.[1];
+  return last ? last.replace(/["']/g, "") : null;
+}
+
+// True iff `target` is later RUN as a script somewhere in the command —
+// `bash x.sh`, `source x.sh`, `./x.sh`, or `chmod +x x.sh`. Merely being
+// mentioned inside another command's argument (`python3 -c "open('x.json')"`)
+// is a read, not an execution, and does not count.
+function fileIsExecuted(target: string, cmd: string): boolean {
+  const norm = (t: string) => t.replace(/["']/g, "").replace(/^\.\//, "");
+  const want = norm(target);
+  if (!want) return false;
+  for (const seg of segments(cmd)) {
+    const toks = seg.split(/\s+/).map(norm).filter(Boolean);
+    for (let i = 0; i < toks.length; i++) {
+      if (toks[i] !== want) continue;
+      if (i === 0) return true; // `./x.sh` / `x.sh` run directly
+      if (INTERPRETER.test(toks[i - 1])) return true; // `bash x.sh`, `source x.sh`
+      if (toks[0] === "chmod" && /x/.test(toks[1] ?? "")) return true;
+    }
+  }
+  return false;
+}
+
+// A heredoc body is DATA to the command that owns it: `cat > f <<'EOF'` WRITES
+// the body, it never runs it. This used to be all-or-nothing with the quote
+// stripping below, so a single executor anywhere else in the command (a
+// `python3 -c` checking the JSON it had just written) put every body back under
+// the DANGEROUS scan — and a review that merely DESCRIBED restarting a session
+// classified as power/session control and asked the director to approve
+// `cat > review.json` (dec_000470f4a7a7, hive task c7660182f42d). Decide per
+// heredoc instead, from what actually consumes that body:
+//   - owner line is an executor (`bash <<EOF`, `python3 - <<EOF`): the body IS
+//     the script being run. Keep it raw.
+//   - the file it is written to is executed later in the same command
+//     (`cat > x.sh <<'EOF' … EOF; bash x.sh`): keep it raw.
+//   - unquoted delimiter (<<EOF): the body still is not executed, but its
+//     command substitutions are. Keep only those visible, drop the prose.
+//   - quoted delimiter (<<'EOF'): 100% literal to any shell. Always data.
+export function stripHeredocs(cmd: string): string {
+  return cmd.replace(
+    /<<-?\s*(['"]?)(\w+)\1([\s\S]*?)\n\2(?=\n|$)/g,
+    (full: string, quote: string, _tag: string, body: string, offset: number) => {
+      const owner = cmd.slice(cmd.lastIndexOf("\n", offset) + 1, offset);
+      if (EXECUTOR.test(owner)) return full;
+      // `python3 - <<EOF` / `node <<EOF` read the body as their SCRIPT, and
+      // carry no `-c`/`-e` flag for EXECUTOR to spot — check the owner's own
+      // command word too.
+      const word = owner
+        .trim()
+        .split(/\s+/)
+        .find((t) => t && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
+      if (word && INTERPRETER.test(word.replace(/["']/g, "").replace(/^.*\//, ""))) return full;
+      const target = redirectTarget(owner);
+      if (target && fileIsExecuted(target, cmd)) return full;
+      if (!quote && SUBSHELL.test(body)) {
+        const expansions = body.match(/\$\([^)]*\)?|`[^`]*`|<\([^)]*\)?/g) ?? [];
+        return `<<HEREDOC_STRIPPED ${expansions.join(" ")}`;
+      }
+      return "<<HEREDOC_STRIPPED";
+    }
+  );
+}
+
+function stripQuotedText(s: string): string {
+  return s
     .replace(/'[^']*'/g, "''")
     .replace(/"(?:[^"\\]|\\.)*"/g, (full) => (SUBSHELL.test(full) ? full : '""'));
+}
+
+export function stripDataText(cmd: string): string {
+  return stripQuotedText(stripHeredocs(cmd));
 }
 
 // Force-push is only catastrophic on SHARED refs. An agent force-pushing its
@@ -588,8 +663,10 @@ export function classify(
 
   // Argument-evidence rules always see the raw command (their match is
   // usually inside quotes). No waivers apply to them.
+  // …but a heredoc body is data even to them: it is written, not executed.
+  const heredocStripped = stripHeredocs(cmd);
   for (const [rx, reason] of DANGEROUS_RAW) {
-    if (rx.test(cmd)) return { decision: "dangerous", reason };
+    if (rx.test(heredocStripped)) return { decision: "dangerous", reason };
   }
 
   const emitDataOnly = isHiveEmitDataOnly(cmd);
@@ -603,13 +680,16 @@ export function classify(
   // stripDataText already keeps any region containing one raw (see SUBSHELL
   // above), scoped to that region — no need to force the WHOLE command raw
   // just because a trigger appears somewhere in it.
-  const stripped = stripDataText(cmd);
+  const stripped = stripQuotedText(heredocStripped);
   // A client assembled in a variable hides its executor inside the quotes of the
   // assignment (`DBC="docker exec -i … mysql …"` then `$DBC -e "delete from …"`),
   // so stripping erased both the executor and the SQL and the whole command
   // slipped the scan. Resolve in-command assignments before deciding.
   const resolved = stripDataText(subst(cmd, varMap(cmd, env)));
-  const scanTarget = EXECUTOR.test(stripped) || EXECUTOR.test(resolved) ? cmd : stripped;
+  // The executor fallback drops back to heredocStripped, NOT the raw command:
+  // an executor elsewhere in the line is no reason to re-read a body that
+  // nothing executes (see stripHeredocs).
+  const scanTarget = EXECUTOR.test(stripped) || EXECUTOR.test(resolved) ? heredocStripped : stripped;
   for (const [rx, reason] of DANGEROUS) {
     if (!rx.test(scanTarget)) continue;
     if (emitDataOnly) continue; // arguments are data, not executed
