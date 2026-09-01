@@ -475,8 +475,9 @@ test("emit ready without evidence is held with instructions; passes once evidenc
   db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
     "evd_gate_t", id, new Date().toISOString(), "log", "/tmp/p.log", "proof"
   );
-  // Evidence alone is not enough: this task owes an understanding check, and the
-  // handoff now says so while the agent is still on its turn (HIVE-580).
+  // Evidence alone is not enough: this project auto-merges nothing, so every
+  // task owes an understanding check whatever the auto review later says, and
+  // the handoff says so while the agent is still on its turn (HIVE-580).
   const noCheck = await post(`/api/tasks/${id}/events`, { type: "ready" });
   expect(noCheck.json.held).toBe(true);
   expect(noCheck.json.reason).toBe("missing_understanding_check");
@@ -501,10 +502,11 @@ test("emit ready without evidence is held with instructions; passes once evidenc
   expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_review");
 });
 
-test("emit ready passes with no checks when the merge gate would not want one", async () => {
-  // The parity case (HIVE-580): kind inside auto_merge.kinds plus a clean
-  // auto review at this head is exactly what makes the merge gate skip the
-  // check, so the handoff must not invent a requirement the merge would drop.
+test("emit ready fails open when the auto review has not run yet", async () => {
+  // The fail-open case (HIVE-580). This kind is inside auto_merge.kinds, so the
+  // only thing that could still owe a check is the auto review — and it has not
+  // run. The handoff must not guess: it lets this through, and the merge gate
+  // asks later if the verdict turns out to want a check.
   const p = await post("/api/projects", {
     name: "mechanical-p",
     repo_path: "/repo",
@@ -516,17 +518,23 @@ test("emit ready passes with no checks when the merge gate would not want one", 
   db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
     "evd_mech", id, new Date().toISOString(), "log", "/tmp/m.log", "proof"
   );
-  const { writeEvent } = await import("../src/state.ts");
-  writeEvent(db, {
-    task_id: id,
-    source: "hive",
-    type: "auto_review",
-    payload: { verdict: "looks_good", files: ["server/src/api.ts"], risks: [], questions: [], reviewed_head_sha: "deadbeef" },
-  });
 
   const res = await post(`/api/tasks/${id}/events`, { type: "ready" });
   expect(res.json.held).toBeUndefined();
   expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_review");
+
+  // Same project, same kind, but the director asked for a quiz on this card:
+  // that signal does not depend on the review, so the handoff holds on it.
+  const id2 = (await post("/api/tasks", { project_id: p.json.id, title: "flagged", kind: "chore" })).json.id;
+  await post(`/api/tasks/${id2}/spawn`, {});
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
+    "evd_flag", id2, new Date().toISOString(), "log", "/tmp/f.log", "proof"
+  );
+  const { writeEvent } = await import("../src/state.ts");
+  writeEvent(db, { task_id: id2, source: "human", type: "understanding_required", payload: {} });
+  const held = await post(`/api/tasks/${id2}/events`, { type: "ready" });
+  expect(held.json.held).toBe(true);
+  expect(held.json.reason).toBe("missing_understanding_check");
 });
 
 test("idle backstop never re-reviews after changes_requested until new evidence arrives", async () => {
