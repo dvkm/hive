@@ -277,6 +277,33 @@ export function replayCleanedUpRecovery(db: DB, taskId?: string): number {
   return forwarded;
 }
 
+// Deferral must be bounded: an agent wedged in "working" forever would pin its
+// worktree AND its pty forever, with nothing left to reap them. After
+// DEFER_CAP_MS of continuous deferral, tear down anyway — cleanupWorktree still
+// rescues uncommitted work to a ghost branch first, so the cap can cost a stuck
+// agent its working directory but never costs anyone their code.
+export const DEFER_CAP_MS = 30 * 60_000;
+
+// True once the FIRST deferral of the CURRENT run is older than the cap. The run
+// is bounded by the newest other cleanup event, so a task that is cleaned,
+// respawned and deferred again starts a fresh clock instead of inheriting a
+// stale one.
+function deferExpired(db: DB, taskId: string, nowMs = Date.now()): boolean {
+  const rows = db
+    .query(
+      "SELECT type, ts FROM events WHERE task_id = ? AND type IN ('cleanup_deferred','cleaned_up','cleanup_skipped') ORDER BY ts DESC"
+    )
+    .all(taskId) as { type: string; ts: string }[];
+  let first: string | null = null;
+  for (const r of rows) {
+    if (r.type !== "cleanup_deferred") break; // end of the current deferral run
+    first = r.ts;
+  }
+  if (!first) return false; // nothing deferred yet
+  const t = Date.parse(first);
+  return Number.isFinite(t) && nowMs - t >= DEFER_CAP_MS;
+}
+
 // Tear down a finished task. `force` skips the terminal-state guard (used by the
 // manual endpoint and the reaper, which have already established eligibility).
 export async function cleanupTask(
@@ -318,6 +345,50 @@ export async function cleanupTask(
   }
   const defaultBranch = projectBaseBranch(config);
   if (!ownsCleanupGeneration()) return noop;
+
+  // A task can go terminal while its agent is STILL WORKING in the worktree:
+  // its PR merges, or the stale timer fails it, mid-turn. Everything below then
+  // runs against that live agent — `cleanup_argv` (docker compose down) inside
+  // its working directory, then `git worktree remove --force` on the directory
+  // itself — and the agent then fails on the next file it touches. 2026-09-01:
+  // three agents lost their worktree this way in five hours, one of them the
+  // agent fixing this.
+  //
+  // branchIsSafe in cleanupWorktree cannot catch this. It asks "is the branch
+  // pushed or merged", and a pushed branch is exactly when removal looks safest
+  // while the agent is still live.
+  //
+  // So defer while the agent is demonstrably working. The reaper retries every
+  // sweep, so teardown is DELAYED, never cancelled. Same instinct as
+  // releaseReviewAgent below, which already refuses to close a session out from
+  // under a live agent (2026-08-19 false-dead incident).
+  if (task.agent_target && !deferExpired(db, taskId)) {
+    // Only a definite "working" defers. probe() reports status "unknown" when
+    // the herdr call itself fails, so a herdr outage can never wedge cleanup
+    // shut and leak worktrees + ptys — the failure that exhausted the pty pool
+    // in July. Deliberately narrower than releaseReviewAgent's "must be
+    // positively idle": this path holds a worktree, not just a session.
+    const probe = await herdr
+      .probe(task.agent_target)
+      .catch(() => ({ alive: false, status: "unknown" as const }));
+    if (probe.alive && probe.status === "working") {
+      // One event per deferral run, not one per sweep: the reaper sweeps often
+      // and this would otherwise flood the timeline (see cleanup_skipped).
+      const last = db
+        .query(
+          "SELECT type FROM events WHERE task_id = ? AND type IN ('cleanup_deferred','cleaned_up','cleanup_skipped') ORDER BY ts DESC LIMIT 1"
+        )
+        .get(taskId) as { type: string } | undefined;
+      if (last?.type !== "cleanup_deferred")
+        writeEvent(db, {
+          task_id: taskId,
+          source: "cleanup",
+          type: "cleanup_deferred",
+          payload: { reason: "agent still working in worktree", agent_target: task.agent_target },
+        });
+      return noop;
+    }
+  }
 
   // 0) per-project stack teardown (docker etc.) — BEFORE the worktree goes
   // away, since the command usually lives inside it.
