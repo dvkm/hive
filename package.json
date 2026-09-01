@@ -14,7 +14,8 @@
     "benchmark:score": "bun run scripts/autonomy-benchmark-score.ts",
     "docs:jira": "bun run scripts/generate-jira-write-scope.ts",
     "docs:jira:check": "bun run scripts/generate-jira-write-scope.ts --check",
-    "test": "bun run docs:jira:check && bun test"
+    "test": "bun run docs:jira:check && bun test",
+    "typecheck": "bunx tsc --noEmit && cd web && bunx tsc -b --noEmit"
   },
   "devDependencies": {
     "@types/bun": "latest"
