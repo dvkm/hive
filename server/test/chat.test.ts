@@ -772,6 +772,25 @@ test("a supervisor that crosses its processed-token warning stops instead of run
   expect(briefs.length).toBe(before);
 });
 
+test("a supervisor that was already warned still halts on the next check", async () => {
+  const { checkUsageGuardrails } = await import("../src/costs.ts");
+  const start = await turn({ project_id: projectId, text: "warned days ago and still going" });
+  const taskId = (await get(`/api/chat/threads/${start.json.thread_id}`)).json.task_id;
+  // The live case: the warning was logged before the halt existed, so the halt
+  // must not treat "already warned" as "already handled".
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run(newId(), taskId, now(), "system", "processed_token_warning", JSON.stringify({ processed_tokens: 75_000_000 }));
+  db.query("INSERT INTO usage (id, task_id, ts, model, input_tokens, output_tokens, cost_usd) VALUES (?,?,?,?,?,?,?)")
+    .run(newId(), taskId, now(), "claude-opus-5", 250_000_000, 0, 0); // also past the 200M cap
+
+  checkUsageGuardrails(db, taskId);
+
+  expect((await get(`/api/tasks/${taskId}`)).json.state).toBe("cancelled");
+  expect((await get(`/api/chat/threads/${start.json.thread_id}`)).json.messages.at(-1).text).toContain(
+    "was stopped after processing"
+  );
+});
+
 test("turning the switch off ends the live sessions", async () => {
   const start = await turn({ project_id: projectId, text: "running right up until the switch flips" });
   const taskId = (await get(`/api/chat/threads/${start.json.thread_id}`)).json.task_id;

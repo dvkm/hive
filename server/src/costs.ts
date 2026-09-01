@@ -127,15 +127,19 @@ export function checkUsageGuardrails(db: DB, taskId: string): void {
   const effectiveProcessedCap = processedCap > 0 ? processedCap * 2 ** processedRaised : Infinity;
   const effectiveWaitCap = waitCap > 0 ? waitCap * 2 ** waitRaised : Infinity;
 
+  // A chat supervisor is a standing session with no definition of done, so a
+  // steer telling it to "hand off" changes nothing: it just keeps going. Past
+  // the threshold it stops instead, and the director restarts it deliberately.
+  // This keys off the CURRENT token total, not off the absence of a prior
+  // warning event, so a session that was already warned - or one that is somehow
+  // resumed while still over the line - halts every time it is checked.
+  if (task.source === "chat_supervisor" && processedWarn > 0 && processed >= processedWarn) {
+    haltChatSupervisor(db, taskId, processed, processedWarn);
+    return;
+  }
+
   if (processedWarn > 0 && processed >= processedWarn && !countEvents(db, taskId, "processed_token_warning") && processed < effectiveProcessedCap) {
     writeEvent(db, { task_id: taskId, source: "system", type: "processed_token_warning", payload: { processed_tokens: processed, warn: processedWarn } });
-    // A chat supervisor is a standing session with no definition of done, so a
-    // steer telling it to "hand off" changes nothing: it just keeps going. At
-    // the warning it stops instead, and the director restarts it deliberately.
-    if (task.source === "chat_supervisor") {
-      haltChatSupervisor(db, taskId, processed, processedWarn);
-      return;
-    }
     queueSteer(db, taskId, `Usage check: this task has processed ${processed.toLocaleString()} tokens. Tighten scope and hand off as soon as the definition of done is met.`);
   }
   if (waitWarn > 0 && waits >= waitWarn && !countEvents(db, taskId, "wait_call_warning") && waits < effectiveWaitCap) {
