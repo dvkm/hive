@@ -341,3 +341,13 @@ test("a repo with its own typecheck script gets that, not a bare tsc --noEmit", 
   expect(world.calls.some((c) => c.join(" ") === "bun run typecheck")).toBe(true);
   expect(world.calls.some((c) => c.join(" ") === "bun x tsc --noEmit")).toBe(false);
 });
+
+test("a repo with no typecheck script still falls back to a bare tsc --noEmit", async () => {
+  const { db } = freshDb();
+  // fakeWorld's package.json defines only `lint`, which is the fallback case.
+  const world = fakeWorld();
+  await sidecarOnce(db, world);
+
+  expect(world.calls.some((c) => c.join(" ") === "bun x tsc --noEmit")).toBe(true);
+  expect(world.calls.some((c) => c.join(" ") === "bun run typecheck")).toBe(false);
+});
