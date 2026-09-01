@@ -72,6 +72,19 @@ const DANGEROUS: [RegExp, string][] = [
   [/\bhelm\s+(delete|uninstall)\b/i, "helm delete/uninstall"],
 ];
 
+// A control-plane path only means "an agent is calling hive" when it hangs off
+// a hive BASE URL — `$HIVE_URL/…`, `http://127.0.0.1:4700/…`. A bare path is
+// text: source files, docs and tests are full of it. The bare-path form used to
+// match, so editing `server/test/authority.test.ts` in the agent's own worktree
+// (a Python heredoc doing string replacement, hive-2049) classified as
+// authority-rule tampering — the category that guards the permission system —
+// and asked the director to approve a test refactor. A gate that cries wolf on
+// its most serious category erodes the response to a real one.
+// ponytail: a base hidden in a non-HIVE_URL variable (`H=$HIVE_URL; curl
+// $H/api/authority/rules`) slips to "unknown", which the authority engine still
+// allows-and-logs. Resolve the var here if that ever shows up live.
+const HIVE_BASE = String.raw`(?:\$\{?HIVE_URL\}?|https?:\/\/[^\s"'\`)]+)`;
+
 // Rules whose evidence is an ARGUMENT (a URL, a file path) rather than
 // executable shell text — matched against the RAW command, never the
 // data-stripped scan target (the argument is usually quoted).
@@ -79,8 +92,8 @@ const DANGEROUS_RAW: [RegExp, string][] = [
   [/(^|[\s;&|])"\$HIVE_CLI"\s+serve\b/i, "hive server restart"],
   // Agents answering their own decision cards / minting authority rules defeats
   // the whole escalation model — attempted live 2026-07-10 (dec_c698522e5c30).
-  [/\/api\/decisions\/[^\s"']+\/(answer|dismiss)/i, "hive decision tampering"],
-  [/\/api\/authority\/rules/i, "hive authority-rule tampering"],
+  [new RegExp(HIVE_BASE + String.raw`\/api\/decisions\/[^\s"']+\/(answer|dismiss)`, "i"), "hive decision tampering"],
+  [new RegExp(HIVE_BASE + String.raw`\/api\/authority\/rules`, "i"), "hive authority-rule tampering"],
   [/(id_rsa|id_ed25519|id_ecdsa)\b/i, "private SSH key"],
   [/\.aws\/credentials\b/i, "AWS credentials file"],
   [/\.ssh\/(?!known_hosts\b|config\b)/i, "SSH key material"],

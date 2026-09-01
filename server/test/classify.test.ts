@@ -517,6 +517,30 @@ test("hive control-plane tampering is dangerous", () => {
   expect(classify('curl -X POST "$HIVE_URL/api/decisions/dec_123/answer" -d x').decision).toBe("dangerous");
   expect(classify("curl $HIVE_URL/api/decisions/dec_9/dismiss").decision).toBe("dangerous");
   expect(classify('curl -X POST "$HIVE_URL/api/authority/rules" -d x').decision).toBe("dangerous");
+  // Literal base URL, and ${HIVE_URL} in braces — same call, other spellings.
+  expect(classify("curl -X POST http://127.0.0.1:4700/api/authority/rules -d x").decision).toBe("dangerous");
+  expect(classify('curl -X PUT "${HIVE_URL}/api/authority/rules/42" -d x').decision).toBe("dangerous");
+});
+
+// hive-2049: the control-plane rules used to match a BARE path, so any command
+// whose text merely contained one classified as tampering — a Python heredoc
+// rewriting `server/test/authority.test.ts` in the agent's own worktree put a
+// `command.dangerous.hive-authority-rule-tampering` card in front of the
+// director. Only a path hanging off a hive BASE URL is a call to hive.
+test("a control-plane path in file/doc text is not tampering", () => {
+  const refactor = [
+    "python3 - <<'PYEOF'",
+    "import pathlib",
+    "p = pathlib.Path('server/test/authority.test.ts')",
+    "s = p.read_text().replace('await fetch(`${BASE}/api/authority/rules/', 'await handler(new Request(`${BASE}/api/authority/rules/')",
+    "p.write_text(s)",
+    "PYEOF",
+  ].join("\n");
+  expect(classify(refactor).decision).not.toBe("dangerous");
+  expect(classify('grep -rn "POST /api/authority/rules" docs/API.md').decision).toBe("safe");
+  expect(classify('grep -rn "/api/decisions/:id/answer" docs/API.md').decision).toBe("safe");
+  // A test server's own base is not hive's control plane.
+  expect(classify(`sed -i '' 's|fetch(\`\${BASE}/api/decisions/x/answer\`|handler(|' server/test/api.test.ts`).decision).not.toBe("dangerous");
 });
 
 test("actionFor namespaces dangerous commands by classifier category", () => {
