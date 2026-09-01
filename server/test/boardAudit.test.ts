@@ -62,9 +62,7 @@ test("merged but not closed: a live mirror over shipped hive work", () => {
   task(db, pid, { state: "in_progress", title: "[WEB-89] search is broken", jira_key: "WEB-89", jira_link_kind: "mirror", source: "external" });
   task(db, pid, { state: "done", title: "[WEB-89] fix the paid/free sort" });
 
-  // Two separate claims about the same row, each reported once: the ticket is
-  // open over shipped work, and nothing is ever going to move the row on.
-  expect(kinds(db)).toEqual(["merged_not_closed", "stalled_tracking_only"]);
+  expect(kinds(db)).toEqual(["merged_not_closed"]);
 });
 
 test("merged but not closed: a bracketed key does not match a longer one", () => {
@@ -72,8 +70,7 @@ test("merged but not closed: a bracketed key does not match a longer one", () =>
   task(db, pid, { state: "in_progress", title: "[WEB-9] a", jira_key: "WEB-9", jira_link_kind: "mirror", source: "external" });
   task(db, pid, { state: "done", title: "[WEB-91] different issue entirely" });
 
-  // Stalled all the same; the point here is that merged_not_closed stays quiet.
-  expect(kinds(db)).toEqual(["stalled_tracking_only"]);
+  expect(auditBoard(db)).toEqual([]);
 });
 
 test("closed but not merged: GitHub, not hive's own events, gives the verdict", async () => {
@@ -125,33 +122,6 @@ test("queued but unrunnable: a project with no repo checked out", () => {
   task(db, pid, { state: "queued" });
 
   expect(kinds(db)).toEqual(["queued_unrunnable"]);
-});
-
-test("stalled tracking-only: a mirror parked in the review column (HIVE-541)", () => {
-  const { db, pid } = setup();
-  task(db, pid, { state: "in_review", source: "external", source_ref: "jira:WEB-94" });
-
-  expect(kinds(db)).toEqual(["stalled_tracking_only"]);
-});
-
-test("stalled tracking-only: in_progress counts too — no agent is running there either", () => {
-  const { db, pid } = setup();
-  task(db, pid, { state: "in_progress", source: "external", source_ref: "jira:WEB-22" });
-
-  expect(kinds(db)).toEqual(["stalled_tracking_only"]);
-});
-
-test("stalled tracking-only: a row a director actually spawned is real work", () => {
-  const { db, pid } = setup();
-  const id = task(db, pid, { state: "in_review", source: "external", source_ref: "jira:WEB-94" });
-  db.query("UPDATE tasks SET agent_target = 'claude' WHERE id = ?").run(id);
-
-  expect(kinds(db)).toEqual([]);
-
-  // Still real work after cleanup nulls agent_target: the spawn is on record.
-  db.query("UPDATE tasks SET agent_target = NULL WHERE id = ?").run(id);
-  event(db, id, "spawned", {});
-  expect(kinds(db)).toEqual([]);
 });
 
 test("orphaned external identity: the key stays on the finished predecessor", () => {
@@ -240,7 +210,6 @@ test("every check reports exactly once, then goes quiet", async () => {
   task(db, pid, { state: "done", title: "abandoned" }, "2026-08-02T00:00:00.000Z");
   const stuck = task(db, pid, { state: "queued", title: "broken repo" });
   for (let i = 0; i < 7; i++) event(db, stuck, "spawn_error", { error: "boom" });
-  task(db, pid, { state: "in_review", source: "external", source_ref: "jira:WEB-95" });
 
   const first = await reportBoardAudit(db, { exec: gh("OPEN") });
   expect([...new Set(first.map((f) => f.kind))].sort()).toEqual([
@@ -249,18 +218,16 @@ test("every check reports exactly once, then goes quiet", async () => {
     "orphaned_external_key",
     "provenance_break",
     "queued_unrunnable",
-    "stalled_tracking_only",
     "stuck_spawns",
   ]);
-  // One finding per check, plus the mirror row that is legitimately both
-  // merged_not_closed and stalled_tracking_only. One digest notification.
-  expect(first.length).toBe(8);
+  // Exactly one finding per check, and exactly one digest notification.
+  expect(first.length).toBe(6);
   expect(db.query("SELECT COUNT(*) AS n FROM notifications").get()).toEqual({ n: 1 } as any);
 
   // Nothing changed on the board, so a second pass says nothing at all.
   expect(await reportBoardAudit(db, { exec: gh("OPEN") })).toEqual([]);
   expect(db.query("SELECT COUNT(*) AS n FROM notifications").get()).toEqual({ n: 1 } as any);
-  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE type = 'board_audit'").get()).toEqual({ n: 8 } as any);
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE type = 'board_audit'").get()).toEqual({ n: 6 } as any);
 });
 
 test("the audit never writes to tasks or decisions", async () => {
