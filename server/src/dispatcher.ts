@@ -477,7 +477,10 @@ function ownSpawnErrors(db: DB, taskId: string): string[] {
   for (const r of rows) {
     try {
       const p = JSON.parse(r.payload);
-      if (!p.infra) out.push(String(p.error ?? ""));
+      // held_until = the name is owned by a live agent that will release it
+      // (HIVE-568). Waiting is the only correct action, so like infra rows these
+      // never spend an attempt — inBackoff holds the task until the lease clears.
+      if (!p.infra && !p.held_until) out.push(String(p.error ?? ""));
     } catch {
       out.push(""); // unparseable payload counts as a real failure, like inBackoff
     }
@@ -532,13 +535,20 @@ export function inBackoff(db: DB, taskId: string, nowMs: number): boolean {
   const rows = db
     .query("SELECT ts, payload FROM events WHERE task_id = ? AND type = 'spawn_error' ORDER BY ts DESC")
     .all(taskId) as { ts: string; payload: string }[];
-  const own = rows.filter((r) => {
+  const parsed = rows.map((r) => {
     try {
-      return !JSON.parse(r.payload).infra;
+      return { ts: r.ts, p: JSON.parse(r.payload) as { infra?: string; held_until?: string } };
     } catch {
-      return true; // unparseable payload counts as a real failure
+      return { ts: r.ts, p: {} }; // unparseable payload counts as a real failure
     }
   });
+  // The newest attempt was refused because another agent still holds this task's
+  // name (HIVE-568). That is contention, not failure: sit out the wait the holder
+  // needs, then retry. Held rows are also kept out of the exponential count below,
+  // so contention never inflates the delay for a later, real failure.
+  const heldUntil = parsed[0]?.p.held_until;
+  if (heldUntil && nowMs < Date.parse(heldUntil)) return true;
+  const own = parsed.filter((r) => !r.p.infra && !r.p.held_until);
   if (!own.length) return false;
   const delay = Math.min(BACKOFF_BASE_MS * 2 ** (own.length - 1), BACKOFF_CAP_MS);
   return nowMs - Date.parse(own[0].ts) < delay;
