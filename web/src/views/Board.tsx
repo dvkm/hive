@@ -2,11 +2,12 @@ import { useEffect, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
-import type { DivergenceRow, Health, Kind, LandGraph, State, Task } from "../lib/api";
+import type { AttentionBudget, DivergenceRow, Health, Kind, LandGraph, State, Task } from "../lib/api";
 import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, needsLook, PRIORITIES, PriorityChip, priorityRank, SidecarChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
-import { actionableItems, isJiraMirror, isTrackingOnly, trackedSubtasks } from "../lib/needsYou";
+import { actionableItems, isJiraMirror, isTrackingOnly, orderFocusItems, trackedSubtasks } from "../lib/needsYou";
+import type { NeedsYouItem } from "../lib/needsYou";
 import { taskLabel } from "../lib/references";
 
 // A compact "why this card needs attention" line: e.g. "agent gone" or
@@ -332,10 +333,204 @@ export function NeedsYouStrip() {
   );
 }
 
+// ---- attention-first work view (HIVE-356) -------------------------------
+// The board's default. Four of the five kanban columns were status, not action:
+// Queued, Working, Ready to merge and Done all say what the machine is doing,
+// and only one of them ever needs the director. So the page leads with the
+// things that need him, in the order hive would hand them over, and collapses
+// everything the agents are handling to one line each.
+//
+// The needs-you set and its order are NOT redefined here: actionableItems() and
+// orderFocusItems() (lib/needsYou.ts) are the same functions behind the nav
+// badge and the inbox, so the number on this page cannot disagree with them.
+// The old columns are still one click away under View.
+
+// Where a row goes when it's clicked, and the one line it says. Everything an
+// item needs to be worth ten seconds: what kind of ask it is, which task, and
+// what it wants.
+function focusRow(item: NeedsYouItem): { kind: string; to: string; label: string; detail: string; ts: string } {
+  const label = (task: Task) => `${taskLabel(task)} ${task.title}`;
+  switch (item.kind) {
+    case "decision":
+      return {
+        kind: "Decision",
+        to: `/decisions#dcard-${item.decision.id}`,
+        label: item.decision.title,
+        detail: "Waiting on your answer",
+        ts: item.decision.ts,
+      };
+    case "checkpoint":
+      return {
+        kind: "Checkpoint",
+        to: `/tasks/${item.checkpoint.task_id}`,
+        label: item.checkpoint.task_title,
+        detail: item.checkpoint.note,
+        ts: item.checkpoint.ts,
+      };
+    case "quiz_digest":
+      return {
+        kind: "Catch up",
+        to: "/inbox",
+        label: `${item.quizzes.length} shipped ${item.quizzes.length === 1 ? "change" : "changes"}`,
+        detail: "Read what shipped, one at a time",
+        ts: item.quizzes[0]?.ts ?? "",
+      };
+    case "review":
+      return {
+        kind: "Review",
+        to: `/tasks/${item.task.id}`,
+        label: label(item.task),
+        detail: item.task.ci_status === "passing" ? "Tests green — yours to merge" : "Ready for your review",
+        ts: item.task.needs_you_since ?? item.task.updated_at,
+      };
+    default:
+      return {
+        kind: "Issue",
+        to: `/tasks/${item.task.id}`,
+        label: label(item.task),
+        detail: item.task.health?.reason || (item.task.state === "failed" ? "Failed — needs routing" : "Needs a look"),
+        ts: item.task.health?.since ?? item.task.needs_you_since ?? item.task.updated_at,
+      };
+  }
+}
+
+function FocusRow({ item }: { item: NeedsYouItem }) {
+  const location = useLocation();
+  const row = focusRow(item);
+  const age = useRelTime(row.ts);
+  // Only /tasks/:id has a modal route (App.tsx). Handing backgroundLocation to
+  // any other path keeps the board rendered underneath and nothing on top, so
+  // the click looks like it did nothing.
+  const modal = row.to.startsWith("/tasks/");
+  return (
+    <Link className="focus-row" to={row.to} state={modal ? { backgroundLocation: location } : undefined}>
+      <span className={`focus-kind focus-kind-${row.kind.toLowerCase().replace(" ", "-")}`}>{row.kind}</span>
+      <span className="focus-label">{row.label}</span>
+      <span className="focus-detail">{row.detail}</span>
+      <span className="focus-age">{age}</span>
+    </Link>
+  );
+}
+
+// One line for one task an agent is on. No chips, no buttons: this half of the
+// page exists to be skipped, not read.
+function StatusRow({ task }: { task: Task }) {
+  const location = useLocation();
+  const { lastActivity } = useStore();
+  const age = useRelTime(task.health?.since || lastActivity[task.id] || task.updated_at);
+  return (
+    <Link className="status-row" to={`/tasks/${task.id}`} state={{ backgroundLocation: location }}>
+      <StatusDot state={task.state} health={task.health} />
+      <span className="status-row-id">{taskLabel(task)}</span>
+      <span className="status-row-title">{task.title}</span>
+      <span className="status-row-state">{STATE_LABEL[task.state]}</span>
+      <span className="status-row-age">{age}</span>
+    </Link>
+  );
+}
+
+// Over budget: more is waiting on the director than one person tracks, so hive
+// has stopped ADDING optional work. It never stops or throttles what is already
+// running — the point is that supply stops outrunning the human, not that the
+// fleet gets smaller.
+export function AttentionBudgetBanner({ count }: { count: number }) {
+  const [budget, setBudget] = useState<AttentionBudget | null>(null);
+  useEffect(() => {
+    let live = true;
+    api.attention().then((b) => live && setBudget(b)).catch(() => {});
+    return () => { live = false; };
+  }, [count]);
+  if (!budget || budget.threshold <= 0 || count <= budget.threshold) return null;
+  return (
+    <div className="attn-budget" role="status">
+      <strong>{count} things need you.</strong>{" "}
+      That is over your budget of {budget.threshold}, so hive paused {budget.paused.join(" and ")} until the queue drains.
+      Nothing already running was stopped.
+    </div>
+  );
+}
+
+type BoardView = "focus" | "columns" | "tracked";
+const VIEW_KEY = "hive.board.view";
+const readView = (): BoardView => {
+  const saved = localStorage.getItem(VIEW_KEY);
+  return saved === "columns" || saved === "tracked" ? saved : "focus";
+};
+
+export function WorkFocus({ visible }: { visible: Task[] }) {
+  const { needsYou, tasks } = useStore();
+  const projectFilter = useProjectFilter();
+  const items = orderFocusItems(actionableItems(needsYou, tasks, projectFilter), tasks);
+  // What agents are actually on. Queued work is not being handled by anyone, so
+  // it is a single count, not thirty rows.
+  const handling = visible.filter(
+    (task) => !isTrackingOnly(task) && ["in_progress", "verifying"].includes(task.state)
+  );
+  // In review but not yours yet: CI still running, review pass not finished.
+  // Visible, deliberately not counted — the actionable ones are already above.
+  const pending = visible.filter(
+    (task) => !isTrackingOnly(task) && task.state === "in_review" && !items.some((item) => "task" in item && item.task.id === task.id)
+  );
+  const queued = visible.filter((task) => !isTrackingOnly(task) && task.state === "queued").length;
+  // Today's finished work, not hive's lifetime total: 1300-odd done tasks is a
+  // fact about the database, not about this morning.
+  const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  const done = visible.filter(
+    (task) => !isTrackingOnly(task) && task.state === "done" && Date.parse(task.updated_at) >= dayAgo
+  ).length;
+
+  return (
+    <div className="work-focus">
+      <AttentionBudgetBanner count={items.length} />
+      <section className="focus-lane">
+        <header className="focus-lane-head">
+          <h2>Needs you</h2>
+          <span className="focus-lane-count">{items.length}</span>
+          {items.length > 0 && <Link className="focus-lane-go" to="/inbox">Work through them →</Link>}
+        </header>
+        {items.length === 0 ? (
+          <Empty
+            compact
+            title="Nothing needs you."
+            hint="Agents park here when they hit a call only you can make, or a branch is ready to merge."
+          />
+        ) : (
+          <div className="focus-rows">
+            {items.map((item) => <FocusRow key={`${item.kind}:${item.id}`} item={item} />)}
+          </div>
+        )}
+      </section>
+
+      <section className="status-lane">
+        <header className="status-lane-head">
+          <h2>Hive is handling</h2>
+          <span className="status-lane-counts">
+            {queued} queued · {handling.length + pending.length} in flight · {done} done today
+          </span>
+        </header>
+        {handling.length + pending.length === 0 ? (
+          <div className="muted status-lane-empty">No agents working right now.</div>
+        ) : (
+          <div className="status-rows">
+            {[...handling, ...pending].map((task) => <StatusRow key={task.id} task={task} />)}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
 export default function Board() {
   const { tasks, projects } = useStore();
   const [adding, setAdding] = useState(false);
-  const [view, setView] = useState<"work" | "tracked">("work");
+  // Attention-first by default (HIVE-356). The five columns are still here for
+  // anyone who wants them; the choice sticks so the board opens the way it was
+  // left.
+  const [view, setView] = useState<BoardView>(readView);
+  const chooseView = (next: BoardView) => {
+    setView(next);
+    localStorage.setItem(VIEW_KEY, next);
+  };
   // Compact project filter (All / per project), shared across board/inboxes and
   // persisted across reloads. Setting it broadcasts to every mounted view.
   const projectFilter = useProjectFilter();
@@ -383,7 +578,9 @@ export default function Board() {
 
   return (
     <div className="board-wrap">
-      <NeedsYouStrip />
+      {/* The focus view leads with the same items in full, so the strip would
+          say the same thing twice. */}
+      {view !== "focus" && <NeedsYouStrip />}
       <div className="board-switch">
         <span className="board-switch-label">Project</span>
         <button className={`board-chip ${projectFilter ? "" : "board-chip-on"}`} onClick={() => setFilter("")}>
@@ -399,8 +596,9 @@ export default function Board() {
           </button>
         ))}
         <span className="board-switch-label board-view-label">View</span>
-        <button className={`board-chip ${view === "work" ? "board-chip-on" : ""}`} onClick={() => setView("work")}>Work</button>
-        <button className={`board-chip ${view === "tracked" ? "board-chip-on" : ""}`} onClick={() => setView("tracked")}>Tracked {tracked.length}</button>
+        <button className={`board-chip ${view === "focus" ? "board-chip-on" : ""}`} onClick={() => chooseView("focus")}>Focus</button>
+        <button className={`board-chip ${view === "columns" ? "board-chip-on" : ""}`} onClick={() => chooseView("columns")}>Columns</button>
+        <button className={`board-chip ${view === "tracked" ? "board-chip-on" : ""}`} onClick={() => chooseView("tracked")}>Tracked {tracked.length}</button>
         <input
           className="board-search"
           placeholder="Filter cards…"
@@ -414,7 +612,9 @@ export default function Board() {
           }}
         />
       </div>
-      {view === "work" ? (
+      {view === "focus" ? (
+        <WorkFocus visible={visible} />
+      ) : view === "columns" ? (
         <>
           {verifying.length > 0 && (
             <section className="verification-strip" aria-label="Post-merge checks">

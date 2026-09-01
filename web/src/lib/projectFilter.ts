@@ -12,12 +12,10 @@ export function getProjectFilter(): string {
   return localStorage.getItem(KEY) || "";
 }
 
-// Does an item belong to the active project filter? An empty filter ("" = All)
-// matches everything. Used by the board, the decisions/review inboxes, and the
-// focus/backlogs queue so the scoping rule lives in exactly one place.
-export function inProjectFilter(projectId: string | undefined, filter: string): boolean {
-  return !filter || projectId === filter;
-}
+// The scoping rule itself lives in needsYou.ts (React-free, so the server can
+// import it). Re-exported here because every caller reaches for it next to the
+// filter it scopes by.
+export { inProjectFilter } from "./needsYou";
 
 export function setProjectFilter(id: string) {
   if (id) localStorage.setItem(KEY, id);

@@ -1,5 +1,13 @@
 import type { Checkpoint, Decision, Task, UnderstandingQuiz } from "./api";
-import { inProjectFilter } from "./projectFilter";
+
+// Does an item belong to the active project filter? An empty filter ("" = All)
+// matches everything. Lives here, next to the needs-you rules, so this module
+// stays free of React and the server can import it too (server/src/attention.ts
+// counts the SAME items the board counts). projectFilter.ts re-exports it, so
+// every existing caller is unchanged.
+export function inProjectFilter(projectId: string | undefined, filter: string): boolean {
+  return !filter || projectId === filter;
+}
 
 export interface BlockingTaskRef {
   id: string;

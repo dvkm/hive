@@ -52,6 +52,7 @@ import { repoMismatchUnresolved } from "./repoTarget.ts";
 import { triageHold } from "./intake/triage.ts";
 import type { Exec } from "./exec.ts";
 import { predictScope, inFlightScope, scopeOverlap, noteOverlapHold, type FileScope } from "./fileScope.ts";
+import { overAttentionBudget } from "./attention.ts";
 
 // Chores included since 2026-07-12: the queue sat at 10 tasks / 1 live agent
 // because 9 were agent-filed follow-up FIXES tagged chore — "chores are titled
@@ -169,6 +170,10 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
     );
 
   let errors = 0;
+  // Counting what needs the director reads every task's health, so do it at
+  // most once a cycle and only if a scout actually wants a slot.
+  let budgetOver: boolean | undefined;
+  const overBudget = () => (budgetOver ??= overAttentionBudget(db));
   const projectCache = new Map<string, { repo_path: string | null; config: any } | null>();
   const workingCount = new Map<string, number>(); // per-project working slots used
   const activeCount = new Map<string, number>(); // per-project live agents incl. review-parked
@@ -322,6 +327,16 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
         // here stranded every requeued braindump in 'queued' forever ("failed —
         // awaiting triage" with a successor nobody spawns, task #135).
         if (!kinds.includes(task.kind) && task.source !== "requeue" && !gardenerTask) { noteSkip(db, task.id, "kind_excluded"); continue; } // chore / human-titled tasks excluded
+
+        // Attention budget (HIVE-356): more is waiting on the director than a
+        // person can hold, so hive stops ADDING optional work. A scout is an
+        // investigation nobody is blocked on this minute; it waits until the
+        // needs-you queue drains. Ship and chore work is untouched, and nothing
+        // already running is stopped.
+        if (task.kind === "scout" && task.source !== "requeue" && overBudget()) {
+          noteSkip(db, task.id, "attention_budget");
+          continue;
+        }
 
         if (task.source?.startsWith("intake_") && !isReviewed(db, task.id)) { noteSkip(db, task.id, "intake_unreviewed"); continue; } // unreviewed intake
         if (triageHold(db, task)) { noteSkip(db, task.id, "triage_hold"); continue; } // intake triage asked the director which reading to build

@@ -729,6 +729,15 @@ export interface HeldPush {
   url: string;
 }
 
+// GET /api/attention — how many things need the director fleet-wide, the
+// threshold, and which optional generators are paused because of it.
+export interface AttentionBudget {
+  count: number;
+  threshold: number;
+  over: boolean;
+  paused: string[];
+}
+
 export interface Away {
   on: boolean;
   active: boolean;
@@ -954,6 +963,10 @@ export const api = {
   offline: () => req<{ on: boolean }>(`/api/offline`),
   setOffline: (on: boolean) =>
     req<{ on: boolean; steered: number }>(`/api/offline`, { method: "POST", body: JSON.stringify({ on }) }),
+  // The attention budget: the threshold and what hive paused because of it.
+  // The COUNT the board shows is still actionableItems() locally, so the number
+  // on screen can never disagree with the nav badge.
+  attention: () => req<AttentionBudget>(`/api/attention`),
   away: () => req<Away>(`/api/away`),
   setAway: (on: boolean) => req<Away>(`/api/away`, { method: "POST", body: JSON.stringify({ on }) }),
   checkpoints: () => req<{ checkpoints: Checkpoint[] }>(`/api/checkpoints`),

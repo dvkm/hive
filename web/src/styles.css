@@ -6562,3 +6562,130 @@ a.chip-jira:hover { background: #2d5488; }
   font-size: 13px;
   margin: var(--s3) 0 0;
 }
+
+/* ---- attention-first work view (HIVE-356) ---- */
+/* The default /work. Needs-you rows read first, at full contrast; everything
+   agents are handling sits below them, dimmer and one line tall, so the page
+   answers "what needs me" before it answers "what is happening". */
+.work-focus {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s5);
+  padding: var(--s4) var(--s5) var(--s6);
+  overflow-y: auto;
+}
+.attn-budget {
+  padding: var(--s3) var(--s4);
+  border: 1px solid var(--amber);
+  border-radius: var(--radius);
+  background: rgba(213, 167, 84, 0.1);
+  color: var(--text);
+  font-size: var(--t-sm);
+  line-height: 1.5;
+}
+.focus-lane-head,
+.status-lane-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s3);
+  margin-bottom: var(--s3);
+}
+.focus-lane-head h2,
+.status-lane-head h2 {
+  margin: 0;
+  font-size: var(--t-lg);
+  font-family: var(--font-display);
+}
+.focus-lane-count {
+  font-family: var(--mono);
+  font-weight: 700;
+  color: var(--accent-bright);
+}
+.focus-lane-go {
+  margin-left: auto;
+  color: var(--accent);
+  font-size: var(--t-xs);
+}
+.focus-rows,
+.status-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.focus-row,
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: var(--s3) var(--s4);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  color: var(--text);
+  text-decoration: none;
+}
+.focus-row:hover,
+.status-row:hover {
+  border-color: var(--accent-dim);
+}
+.focus-kind {
+  flex-shrink: 0;
+  min-width: 76px;
+  font-size: var(--t-eyebrow);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+}
+.focus-kind-issue {
+  color: var(--red);
+}
+.focus-label {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.focus-detail {
+  color: var(--text-dim);
+  font-size: var(--t-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.focus-age,
+.status-row-age {
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--text-faint);
+  font-size: var(--t-xs);
+  font-family: var(--mono);
+}
+/* Below the fold on purpose: quieter type, no chips, nothing to decide. */
+.status-lane-counts {
+  color: var(--text-dim);
+  font-size: var(--t-sm);
+}
+.status-row {
+  background: transparent;
+  border-color: transparent;
+  padding: var(--s2) var(--s4);
+  color: var(--text-dim);
+}
+.status-row-id {
+  font-family: var(--mono);
+  font-size: var(--t-xs);
+  color: var(--text-faint);
+}
+.status-row-title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.status-row-state {
+  font-size: var(--t-xs);
+  color: var(--text-faint);
+}
+.status-lane-empty {
+  padding: var(--s2) var(--s4);
+  font-size: var(--t-sm);
+}

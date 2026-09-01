@@ -30,6 +30,7 @@ import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 import { activeProjects } from "./testProjects.ts";
 import { startLoop } from "./loop.ts";
+import { overAttentionBudget } from "./attention.ts";
 
 export interface Watcher {
   name: string;
@@ -107,6 +108,12 @@ export async function checkWatcher(db: DB, projectId: string, w: Watcher, deps: 
 
   const refPrefix = `watch:${projectId}:${w.name}:`;
   if (activeWatchTask(db, refPrefix)) return; // cursor NOT advanced; re-check after it finishes
+
+  // Attention budget (HIVE-356): the director already has more waiting than one
+  // person can hold, so don't file another task on top of it. The cursor is NOT
+  // advanced, exactly like the active-task case above, so the change is filed
+  // once — with everything that accumulated meanwhile — after the queue drains.
+  if (overAttentionBudget(db)) return;
 
   const old = existsSync(snap) ? readFileSync(snap, "utf8") : "";
   const diff = old ? await unifiedDiff(deps.exec ?? defaultExec, snap, body) : "(no previous snapshot)";
