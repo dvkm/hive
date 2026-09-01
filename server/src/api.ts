@@ -2126,6 +2126,17 @@ export function looksSecuritySensitive(text: string): boolean {
   return new RegExp(`\\b(${DEFAULT_SENSITIVE_PATHS.join("|")})s?\\b`, "i").test(text ?? "");
 }
 
+// Why a new work task's brief looks like it was written from the Jira TITLE
+// alone, or null when it looks fine. Two arms, because WEB-118 failed the
+// second one: the bad brief was several hundred chars of prose whose entire
+// content was "this ticket has no description, ask the reporter" — a length
+// check alone waves that straight through.
+export function thinBriefReason(brief: string): string | null {
+  if (brief.length < 150) return `brief is title-only (${brief.length} chars)`;
+  const claim = /\b(no description|has no spec|without a spec|title[ -]only|only a title|carries only a title|ask the reporter|asking the reporter|spec(?:ification)? (?:is )?needed from|needs a spec from|awaiting a spec)\b/i.exec(brief);
+  return claim ? `brief claims the ticket has no spec ("${claim[0]}")` : null;
+}
+
 // Accepts JSON or multipart; attached files are saved under the new task's id
 // and their absolute paths appended to the brief, so the agent that picks the
 // task up can read them.
@@ -2202,9 +2213,10 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   // already has.
   if (mirrorTaskId) {
     const mirrorBrief = (db.query("SELECT brief FROM tasks WHERE id = ?").get(mirrorTaskId) as { brief: string | null } | undefined)?.brief ?? "";
-    if (brief.length < 80 && mirrorBrief.length > 200)
+    const why = mirrorBrief.length > 200 ? thinBriefReason(brief) : null;
+    if (why)
       return err(
-        `brief is title-only (${brief.length} chars) but linked mirror task ${mirrorTaskId} has a ${mirrorBrief.length}-char spec — include it in --brief-text instead of just the Jira title`,
+        `${why}, but linked mirror task ${mirrorTaskId} already has a ${mirrorBrief.length}-char spec — read that mirror's brief and write --brief-text from it instead of from the Jira title`,
         400
       );
   }

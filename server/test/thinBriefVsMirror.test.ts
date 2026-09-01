@@ -91,3 +91,64 @@ test("allows creation when no mirror is linked", async () => {
     server.stop();
   }
 });
+
+// The shape that actually got through in production: a long, confident brief
+// whose whole content is "this ticket has no description, ask the reporter".
+// A length-only guard passes this; the phrase arm is what catches it.
+test("refuses a long brief that claims the ticket has no spec", async () => {
+  const { db, projectId } = freshDb();
+  makeMirror(db, projectId, "WEB-218", "x".repeat(300));
+  const { server, post } = serve(db);
+  try {
+    const res = await post("/api/tasks", {
+      project_id: projectId,
+      title: "[WEB-218] fix the thing",
+      kind: "chore",
+      brief:
+        "WEB-218 carries only a title and there is no description on the Jira issue, so we cannot tell what the reporter wants here. " +
+        "The right move is to ask the reporter for a spec before any code is written. " +
+        "Until then this task should stay parked and nobody should guess at requirements.",
+    });
+    expect(res.status).toBe(400);
+    expect(String((await res.json()).error)).toContain("mirror task");
+  } finally {
+    server.stop();
+  }
+});
+
+// WEB-113 shape: both sides substantial and consistent. Stays quiet.
+test("allows a substantial brief that does not claim the spec is missing", async () => {
+  const { db, projectId } = freshDb();
+  makeMirror(db, projectId, "WEB-113", "x".repeat(300));
+  const { server, post } = serve(db);
+  try {
+    const res = await post("/api/tasks", {
+      project_id: projectId,
+      title: "[WEB-113] add the column",
+      kind: "chore",
+      brief:
+        "Add a new text column beside the existing one in the tracker form, save it when the value is a single dash, " +
+        "and map it through to the public reader. Rename the old field and stop publishing it. Done when the e2e spec passes.",
+    });
+    expect(res.status).toBe(201);
+  } finally {
+    server.stop();
+  }
+});
+
+// WEB-2 shape: the mirror itself is title-only, so a thin work brief is honest.
+test("stays quiet when the mirror brief is itself thin", async () => {
+  const { db, projectId } = freshDb();
+  makeMirror(db, projectId, "WEB-2", "tweak the footer");
+  const { server, post } = serve(db);
+  try {
+    const res = await post("/api/tasks", {
+      project_id: projectId,
+      title: "[WEB-2] tweak the footer",
+      kind: "chore",
+    });
+    expect(res.status).toBe(201);
+  } finally {
+    server.stop();
+  }
+});
