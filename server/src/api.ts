@@ -2127,6 +2127,49 @@ export function looksSecuritySensitive(text: string): boolean {
   return new RegExp(`\\b(${DEFAULT_SENSITIVE_PATHS.join("|")})s?\\b`, "i").test(text ?? "");
 }
 
+// Why a new work task's brief looks like it was written from the Jira TITLE
+// alone, or null when it looks fine. Two arms, because WEB-118 failed the
+// second one: the bad brief was several hundred chars of prose whose entire
+// content was "this ticket has no description, ask the reporter" — a length
+// check alone waves that straight through.
+//
+// The second arm refuses task creation outright, so it has to be far more
+// conservative than a warning would be: a false positive blocks a legitimate
+// filing with a 400 and the caller has no override. So every pattern is
+// anchored to the TICKET itself ("the issue has no description", "no spec on
+// WEB-118") rather than matching a bare phrase anywhere in the prose. A real
+// spec that happens to say "the card renders no description when the field is
+// empty" is about the product, not the ticket, and must sail through.
+const TICKET = String.raw`(?:this |the )?(?:ticket|issue|jira(?: (?:issue|ticket))?|[A-Z][A-Z0-9]{1,9}-\d+)`;
+const ABSENT_SPEC_CLAIMS: RegExp[] = [
+  // "the issue has no description", "WEB-118 carries only a title"
+  new RegExp(String.raw`\b${TICKET}\b[^.\n]{0,30}?\s(?:has|have|had|carries|contains|includes|provides|comes with)\s+(?:no|only a|nothing but a)\s+(?:description|spec(?:ification)?|body|details|requirements|title)\b`, "gi"),
+  // "there is no description on the Jira issue", "no spec attached to WEB-118"
+  new RegExp(String.raw`\b(?:there (?:is|was|are|were) )?no\s+(?:description|spec(?:ification)?|requirements)\b[^.\n]{0,30}?\b(?:on|for|in|attached to)\s+${TICKET}\b`, "gi"),
+  // "the ticket is title-only", "a title-only issue"
+  new RegExp(String.raw`\b${TICKET}\b[^.\n]{0,20}?\sis\s+title[- ]only\b`, "gi"),
+  new RegExp(String.raw`\btitle[- ]only\s+${TICKET}\b`, "gi"),
+  // proposing to go back to the reporter because the spec is missing
+  /\b(?:ask|asking|check with|go back to)\s+the\s+(?:reporter|requester|filer)\b[^.\n]{0,40}?\b(?:for (?:a |the )?(?:spec(?:ification)?|description|requirements|details)|what (?:they|he|she) wants?)/gi,
+  /\b(?:spec(?:ification)?|description|requirements)\s+(?:is |are )?needed from the (?:reporter|requester|filer)\b/gi,
+  /\bawaiting (?:a |the )?spec(?:ification)?\b/gi,
+];
+// "no need to ask the reporter for a spec" is the OPPOSITE claim, and reads as
+// a match to the arm above. Look back a short way for the negation that flips it.
+const NEGATED_BEFORE = /\b(?:no need|without need(?:ing)?|don'?t need|do not need|no reason|not necessary|rather than|instead of|no point)\b[^.\n]{0,30}$/i;
+
+export function thinBriefReason(brief: string): string | null {
+  if (brief.length < 150) return `brief is title-only (${brief.length} chars)`;
+  for (const re of ABSENT_SPEC_CLAIMS) {
+    re.lastIndex = 0;
+    for (const m of brief.matchAll(re)) {
+      if (NEGATED_BEFORE.test(brief.slice(Math.max(0, m.index - 60), m.index))) continue;
+      return `brief claims the ticket has no spec ("${m[0].trim()}")`;
+    }
+  }
+  return null;
+}
+
 // Accepts JSON or multipart; attached files are saved under the new task's id
 // and their absolute paths appended to the brief, so the agent that picks the
 // task up can read them.
@@ -2203,9 +2246,10 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   // already has.
   if (mirrorTaskId) {
     const mirrorBrief = (db.query("SELECT brief FROM tasks WHERE id = ?").get(mirrorTaskId) as { brief: string | null } | undefined)?.brief ?? "";
-    if (brief.length < 80 && mirrorBrief.length > 200)
+    const why = mirrorBrief.length > 200 ? thinBriefReason(brief) : null;
+    if (why)
       return err(
-        `brief is title-only (${brief.length} chars) but linked mirror task ${mirrorTaskId} has a ${mirrorBrief.length}-char spec — include it in --brief-text instead of just the Jira title`,
+        `${why}, but linked mirror task ${mirrorTaskId} already has a ${mirrorBrief.length}-char spec — read that mirror's brief and write --brief-text from it instead of from the Jira title`,
         400
       );
   }
@@ -2446,11 +2490,32 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
     if (denied) return denied;
     priority = parsed;
   }
-  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, updated_at = ? WHERE id = ?")
-    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, now(), id);
+  // Re-resolve the mirror when the title changes (HIVE-550). Adding the missing
+  // '[WEB-119] ' prefix by hand is the repair path a human reaches for when a
+  // work task was filed unlinked, and resolving only at creation made that
+  // repair silently do nothing. Never CLEAR a link here: dropping the prefix
+  // shouldn't throw away a link the board already relies on.
+  let mirrorTaskId: string | null = task.jira_mirror_task_id ?? null;
+  let relinked: { from: string | null; to: string } | null = null;
+  // Also re-resolve when the task is still unlinked: a task filed before its
+  // mirror existed (or already carrying the prefix but linked to nothing) heals
+  // on the next edit instead of staying orphaned forever.
+  if (title !== task.title || !mirrorTaskId) {
+    const resolved = mirrorTaskIdForTitle(db, task.project_id, title);
+    if (resolved && resolved !== mirrorTaskId) {
+      relinked = { from: mirrorTaskId, to: resolved };
+      mirrorTaskId = resolved;
+    }
+  }
+  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, jira_mirror_task_id = ?, updated_at = ? WHERE id = ?")
+    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, mirrorTaskId, now(), id);
   const updated = getTask(db, id);
+  // Say it out loud rather than repointing in silence — especially when this
+  // moved an existing link off another ticket.
+  if (relinked)
+    writeEvent(db, { task_id: id, source: "director", type: "jira_mirror_relinked", payload: relinked });
   broadcastTask(db, updated);
-  return json(taskWithHealth(db, updated));
+  return json({ ...taskWithHealth(db, updated), ...(relinked ? { jira_mirror_relinked: relinked } : {}) });
 }
 
 // Manual merge: fold this task into `target_id`, cancelling it as a duplicate.

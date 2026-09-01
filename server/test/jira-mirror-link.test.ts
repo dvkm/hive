@@ -111,3 +111,54 @@ test("the catch-up sweep advances mirrors whose work finished unlinked", async (
   expect(getTask(db, m).state).toBe("done");
   expect(advanceReadyJiraMirrors(db)).toBe(0); // idempotent
 });
+
+// HIVE-550: adding the missing '[KEY] ' prefix by hand is how a human repairs a
+// work task filed unlinked, so the mirror is re-resolved on update too.
+test("retitling a task with a [KEY] prefix forms the link", async () => {
+  const m = mirror("WEB-119");
+  const { json: created } = await post("/api/tasks", { project_id: projectId, title: "free-article reads ignore the cap" });
+  expect(created.jira_mirror_task_id).toBe(null);
+
+  const res = await fetch(`${BASE}/api/tasks/${created.id}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "[WEB-119] free-article reads ignore the cap" }),
+  });
+  const updated = await res.json();
+  expect(updated.jira_mirror_task_id).toBe(m);
+  expect(updated.jira_mirror_relinked).toEqual({ from: null, to: m });
+
+  // Moving an existing link to another ticket is reported, not silent.
+  const m2 = mirror("WEB-120");
+  const moved = await (await fetch(`${BASE}/api/tasks/${created.id}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "[WEB-120] free-article reads ignore the cap" }),
+  })).json();
+  expect(moved.jira_mirror_task_id).toBe(m2);
+  expect(moved.jira_mirror_relinked).toEqual({ from: m, to: m2 });
+
+  // A retitle that drops the prefix keeps the link rather than clearing it.
+  const stripped = await (await fetch(`${BASE}/api/tasks/${created.id}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "free-article reads ignore the cap" }),
+  })).json();
+  expect(stripped.jira_mirror_task_id).toBe(m2);
+  expect(stripped.jira_mirror_relinked).toBeUndefined();
+});
+
+// The live corebeat shape: the title already carries the prefix but the row is
+// unlinked (it was retitled before this fix), so any edit heals it.
+test("an unlinked task that already carries the prefix heals on the next edit", async () => {
+  const m = mirror("WEB-121");
+  const id = newId();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at)
+     VALUES (?,?,?, 'queued', 'ship', ?, ?)`
+  ).run(id, projectId, "[WEB-121] reads ignore the cap", now(), now());
+
+  const healed = await (await fetch(`${BASE}/api/tasks/${id}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ brief: "unchanged title, brief edit only" }),
+  })).json();
+  expect(healed.jira_mirror_task_id).toBe(m);
+  expect(healed.jira_mirror_relinked).toEqual({ from: null, to: m });
+});
