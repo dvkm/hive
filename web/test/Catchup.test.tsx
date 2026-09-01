@@ -112,3 +112,22 @@ test("a change whose diff could not be read says so instead of showing zeros", a
   // The lie this replaces: a confident "0 files, +0, -0" on a decision surface.
   expect(text).not.toContain("0 files");
 });
+
+// The card is only glanceable if its height is bounded. A screenshot is
+// `object-fit: cover` into the visual slot, and without a definite height on
+// that slot the img falls back to its natural size: one 3840x4112 page render
+// dragged a whole grid row past the viewport, which is the one thing this page
+// may not do. jsdom does no layout, so the invariant is checked where it lives.
+test("the visual slot has a fixed height, so a tall screenshot cannot stretch the card", async () => {
+  const css = await Bun.file(new URL("../src/styles.css", import.meta.url)).text();
+  const glance = css.slice(css.indexOf("Catch up (HIVE-511)"));
+
+  expect(glance).toContain("--glance-visual:");
+
+  // All three things that can fill the slot must be bounded, not flex-grown.
+  for (const slot of [".glance-shots", ".glance-areas", ".glance-noshape"]) {
+    const rule = glance.slice(glance.indexOf(`${slot} {`), glance.indexOf("}", glance.indexOf(`${slot} {`)));
+    expect(rule).toContain("height: var(--glance-visual)");
+    expect(rule).not.toContain("flex: 1");
+  }
+});

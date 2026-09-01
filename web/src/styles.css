@@ -6200,8 +6200,15 @@ a.chip-jira:hover { background: #2d5488; }
 }
 
 /* Catch up (HIVE-511): one glanceable card per shipped change. The whole point
-   is that a card fits without scrolling, so the height is fixed and the visual
-   takes whatever the text does not. */
+   is that a card fits without scrolling, so the visual slot is a fixed height
+   and the card is the text around it. The slot is bounded rather than the card
+   because Request changes opens a note inside the card and must not be clipped.
+   A screenshot is `object-fit: cover` into this box: without a definite height
+   the img falls back to its natural size and a tall page render drags the whole
+   grid row past the viewport, which is the one thing this page may not do. */
+:root {
+  --glance-visual: 176px;
+}
 .glance-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
@@ -6244,10 +6251,9 @@ a.chip-jira:hover { background: #2d5488; }
   overflow: hidden;
 }
 .glance-shots {
-  flex: 1;
+  height: var(--glance-visual);
   display: flex;
   gap: 6px;
-  min-height: 0;
 }
 .glance-shot {
   position: relative;
@@ -6278,7 +6284,7 @@ a.chip-jira:hover { background: #2d5488; }
   color: var(--text-dim);
 }
 .glance-areas {
-  flex: 1;
+  height: var(--glance-visual);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -6286,7 +6292,6 @@ a.chip-jira:hover { background: #2d5488; }
   flex-direction: column;
   justify-content: center;
   gap: 5px;
-  min-height: 0;
 }
 .glance-areas li {
   display: grid;
@@ -6317,7 +6322,7 @@ a.chip-jira:hover { background: #2d5488; }
   font-variant-numeric: tabular-nums;
 }
 .glance-noshape {
-  flex: 1;
+  height: var(--glance-visual);
   margin: 0;
   display: flex;
   align-items: center;
