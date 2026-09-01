@@ -6930,8 +6930,17 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       // still caught by the merge gate, which is unchanged.
       //
       // It sits BEFORE the CI hold on purpose: a CI-pending handoff is promoted
-      // later by the reconciler, which never passes through here.
-      if (understandingCheckCertain(db, t) && !latestUnderstandingQuiz(db, taskId)) {
+      // later by the reconciler, which never passes through here. And AFTER the
+      // verification contract, which transition() enforces at the end of this
+      // path: an agent that both skipped its verification commands and filed no
+      // check must hear that it did not verify its work before it hears
+      // anything about a quiz, so this hold stands aside while a declared
+      // verification is unmet and lets that 409 come through.
+      if (
+        missingVerifications(db, t).length === 0 &&
+        understandingCheckCertain(db, t) &&
+        !latestUnderstandingQuiz(db, taskId)
+      ) {
         writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { reason: "missing_understanding_check" } });
         broadcastTask(db, getTask(db, taskId));
         return json({

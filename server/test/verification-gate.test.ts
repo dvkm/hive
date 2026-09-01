@@ -119,28 +119,12 @@ test("evidence from before the newest commit is stale and rejected", async () =>
 
 test("the agent's own `ready` emit is gated the same way", async () => {
   const id = await workingTask();
-  // No PR: the emit path's CI and explanation gates step aside. The
-  // understanding-check hold (HIVE-580) sits earlier in that path, so file a
-  // review that carries one; what is left to hold the handoff is then the
-  // verification contract alone.
+  // No PR: the emit path's CI and explanation gates step aside. This task also
+  // owes an understanding check and has filed none, so it trips both gates —
+  // and the unmet contract is the one it must hear about (HIVE-580 stands
+  // aside for it), not the quiz.
   db.query("UPDATE tasks SET pr_url = NULL WHERE id = ?").run(id);
   attach(id, "unit");
-  writeEvent(db, {
-    task_id: id,
-    source: "agent",
-    type: "review_summary",
-    payload: {
-      understanding: {
-        checks: [
-          {
-            question: "What does this change do?",
-            options: [{ key: "a", label: "the work" }, { key: "b", label: "nothing" }],
-            answer_key: "a",
-          },
-        ],
-      },
-    },
-  });
   const res = await post(`/api/tasks/${id}/events`, { type: "ready", note: "handing off" });
   expect(res.status).toBe(409);
   expect(res.json.error).toContain("typecheck");
