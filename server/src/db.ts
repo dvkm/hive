@@ -735,6 +735,24 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
          AND title LIKE '[%'`,
     ],
   },
+  // HIVE-554: v39 only caught tasks that existed at deploy time. `source`
+  // stays directly settable through the task-create API body (not just the
+  // retired --track flag), so rows created after v39 ran are still stranded
+  // the same way — never dispatched, and now unreachable by defer/undefer
+  // since the source check short-circuits first. Same fix, re-run once more
+  // for the rows v39 missed. Jira mirrors are untouched by the same guard.
+  // Re-runnable: the park runs before the source clear, and once source is
+  // cleared the WHERE matches nothing.
+  {
+    name: "v45-retire-tracking-only-source-again",
+    statements: [
+      `UPDATE tasks SET deferred_until = '9999-12-31T00:00:00.000Z'
+         WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'
+           AND state NOT IN ('done', 'failed', 'cancelled') AND deferred_until IS NULL`,
+      `UPDATE tasks SET source = NULL
+         WHERE source = 'external' AND COALESCE(source_ref, '') NOT LIKE 'jira:%'`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings
@@ -749,6 +767,15 @@ export function setSetting(db: DB, key: string, value: string): void {
   db.query(
     "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
   ).run(key, value, new Date().toISOString());
+}
+
+// Chief of Staff / chat supervisor sessions. OFF by default (director's call,
+// 2026-09-01): two standing sessions processed ~150M tokens in a week and
+// produced one answered decision. Off means a chat message never spawns or
+// respawns a supervisor session; the thread says so instead. Toggle with
+// `hive chat supervisor on|off` (POST /api/chat/supervisor).
+export function supervisorEnabled(db: DB): boolean {
+  return getSetting(db, "chat_supervisor") === "on";
 }
 
 // Offline mode: nothing new spawns, network-dependent supervision pauses,

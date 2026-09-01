@@ -1,5 +1,7 @@
 // HIVE-546: the stored link from a work task to the Jira mirror it implements,
 // and the mirror advancing when that work is done.
+// HIVE-562: the mirror also follows the work WHILE it is in flight, so a ticket
+// says In Progress / In Review instead of To Do until the very end.
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -44,6 +46,10 @@ function finish(id: string): void {
   transition(db, id, "done", { source: "director" });
 }
 
+function mirrorStateChanges(id: string): number {
+  return (db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'state_change'").get(id) as { n: number }).n;
+}
+
 beforeAll(async () => {
   const p = await post("/api/projects", { name: "mirror-proj", repo_path: "/tmp/x" });
   projectId = p.json.id;
@@ -61,12 +67,45 @@ test("a work task titled [KEY] stores its mirror at creation", async () => {
   expect(plain.json.jira_mirror_task_id).toBe(null);
 });
 
-test("finishing the only work task advances its mirror", async () => {
+test("the mirror follows the work at every step, not just the end", async () => {
   const m = mirror("WEB-100");
   const { json } = await post("/api/tasks", { project_id: projectId, title: "[WEB-100] the work" });
+  const id = json.id;
   expect(getTask(db, m).state).toBe("queued");
-  finish(json.id);
+
+  transition(db, id, "in_progress", { source: "director" });
+  expect(getTask(db, m).state).toBe("in_progress");
+
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, meta) VALUES (?,?,?,?, '{}')").run(newId(), id, now(), "log");
+  transition(db, id, "in_review", { source: "director", skipVerification: true });
+  expect(getTask(db, m).state).toBe("in_review");
+
+  // in_review -> verifying is the same Jira column ("In Review"), so the mirror
+  // must not move again and hand the sync a redundant transition to push.
+  const before = mirrorStateChanges(m);
+  transition(db, id, "verifying", { source: "director" });
+  expect(getTask(db, m).state).toBe("in_review");
+  expect(mirrorStateChanges(m)).toBe(before);
+
+  transition(db, id, "done", { source: "director" });
   expect(getTask(db, m).state).toBe("done");
+});
+
+test("a mirror with no live children is left where it is", async () => {
+  // A ticket the director parked in In Review, whose only child was cancelled.
+  const m = mirror("WEB-101", "in_review");
+  const id = (await post("/api/tasks", { project_id: projectId, title: "[WEB-101] dropped" })).json.id;
+  transition(db, id, "cancelled", { source: "director" });
+  expect(getTask(db, m).state).toBe("in_review");
+});
+
+test("a new child never drags the ticket backwards", async () => {
+  // The director moved WEB-102 to In Review by hand; a straggler child starting
+  // must not pull the column back to In Progress.
+  const m = mirror("WEB-102", "in_review");
+  const id = (await post("/api/tasks", { project_id: projectId, title: "[WEB-102] straggler" })).json.id;
+  transition(db, id, "in_progress", { source: "director" });
+  expect(getTask(db, m).state).toBe("in_review");
 });
 
 test("a mirror with several work children waits for all of them", async () => {
@@ -75,10 +114,12 @@ test("a mirror with several work children waits for all of them", async () => {
   const b = (await post("/api/tasks", { project_id: projectId, title: "[WEB-23] part two" })).json.id;
   const c = (await post("/api/tasks", { project_id: projectId, title: "[WEB-23] part three" })).json.id;
   finish(a);
-  expect(getTask(db, m).state).toBe("queued");
+  // One child done is not the ticket done — but the ticket has clearly been
+  // worked, so it shows the furthest point the work reached.
+  expect(getTask(db, m).state).toBe("in_review");
   // A cancelled sibling does not hold the ticket open.
   transition(db, c, "cancelled", { source: "director" });
-  expect(getTask(db, m).state).toBe("queued");
+  expect(getTask(db, m).state).toBe("in_review");
   finish(b);
   expect(getTask(db, m).state).toBe("done");
 });
@@ -87,8 +128,10 @@ test("the link survives a requeue, and the failed attempt does not close the tic
   const m = mirror("WEB-110");
   const first = (await post("/api/tasks", { project_id: projectId, title: "[WEB-110] tracker arrows" })).json.id;
   transition(db, first, "in_progress", { source: "director" });
+  expect(getTask(db, m).state).toBe("in_progress");
   transition(db, first, "failed", { source: "director", reason: "agent died" });
-  expect(getTask(db, m).state).toBe("queued");
+  // Still In Progress, not Done: the attempt died, the ticket did not finish.
+  expect(getTask(db, m).state).toBe("in_progress");
 
   const second = requeueTask(db, getTask(db, first));
   expect(getTask(db, second).jira_mirror_task_id).toBe(m);
@@ -110,4 +153,55 @@ test("the catch-up sweep advances mirrors whose work finished unlinked", async (
   expect(advanceReadyJiraMirrors(db)).toBe(1);
   expect(getTask(db, m).state).toBe("done");
   expect(advanceReadyJiraMirrors(db)).toBe(0); // idempotent
+});
+
+// HIVE-550: adding the missing '[KEY] ' prefix by hand is how a human repairs a
+// work task filed unlinked, so the mirror is re-resolved on update too.
+test("retitling a task with a [KEY] prefix forms the link", async () => {
+  const m = mirror("WEB-119");
+  const { json: created } = await post("/api/tasks", { project_id: projectId, title: "free-article reads ignore the cap" });
+  expect(created.jira_mirror_task_id).toBe(null);
+
+  const res = await fetch(`${BASE}/api/tasks/${created.id}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "[WEB-119] free-article reads ignore the cap" }),
+  });
+  const updated = await res.json();
+  expect(updated.jira_mirror_task_id).toBe(m);
+  expect(updated.jira_mirror_relinked).toEqual({ from: null, to: m });
+
+  // Moving an existing link to another ticket is reported, not silent.
+  const m2 = mirror("WEB-120");
+  const moved = await (await fetch(`${BASE}/api/tasks/${created.id}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "[WEB-120] free-article reads ignore the cap" }),
+  })).json();
+  expect(moved.jira_mirror_task_id).toBe(m2);
+  expect(moved.jira_mirror_relinked).toEqual({ from: m, to: m2 });
+
+  // A retitle that drops the prefix keeps the link rather than clearing it.
+  const stripped = await (await fetch(`${BASE}/api/tasks/${created.id}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "free-article reads ignore the cap" }),
+  })).json();
+  expect(stripped.jira_mirror_task_id).toBe(m2);
+  expect(stripped.jira_mirror_relinked).toBeUndefined();
+});
+
+// The live corebeat shape: the title already carries the prefix but the row is
+// unlinked (it was retitled before this fix), so any edit heals it.
+test("an unlinked task that already carries the prefix heals on the next edit", async () => {
+  const m = mirror("WEB-121");
+  const id = newId();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at)
+     VALUES (?,?,?, 'queued', 'ship', ?, ?)`
+  ).run(id, projectId, "[WEB-121] reads ignore the cap", now(), now());
+
+  const healed = await (await fetch(`${BASE}/api/tasks/${id}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ brief: "unchanged title, brief edit only" }),
+  })).json();
+  expect(healed.jira_mirror_task_id).toBe(m);
+  expect(healed.jira_mirror_relinked).toEqual({ from: null, to: m });
 });

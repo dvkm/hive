@@ -1187,6 +1187,8 @@ recognized fields (JSON keys == form field names):
 | `until`,`days` | (deferred type) auto-resume horizon: an ISO timestamp (`until`) or an integer number of days from now (`days`); neither = indefinite |
 | `model`,`input_tokens`,`output_tokens`,`cache_read_tokens`,`cache_write_tokens`,`cost_usd` | usage fields (usage type; numbers, or numeric strings in multipart; `cost_usd` optional) |
 | `verify_name` | (evidence type) the task `verification_cmds` entry this artifact came from; recorded on the `evidence` event payload (CLI: `--verify-name <name>`) |
+| `payload_path` | the absolute path the `--json` payload was read from (the CLI fills it in). Refused with `400` when it is outside the task's `worktree_path` and outside that worktree's session scratchpad (`.../<worktree-slug>/<session-uuid>/scratchpad/...`, slug = the worktree path with every non-alphanumeric character replaced by `-`). Shared paths like `/tmp/review.json` let one agent publish another agent's review. Skipped when the task has no worktree. |
+| `task_id` (or `task`) | optional self-identification stamped into a payload file: the task id, number, `#number`, or display id (e.g. `HIVE-561`). Refused with `400` when it names a different task than the one being emitted on. |
 | `file` | (multipart only) the uploaded evidence file |
 
 Behavior by `type`:
@@ -1359,6 +1361,14 @@ top-level outcome before reporting completion. The Chief works silently between
 director turns: routine wakeup replies are suppressed after its first response.
 It may send one additional message only for newly surfaced decision cards or a
 newly completed outcome.
+
+- `GET /api/chat/supervisor` → `200 {on}`; `POST /api/chat/supervisor` body `{on}` → `200 {on, stopped}`
+  The Chief of Staff off switch (`hive chat supervisor [on|off]`), stored in the
+  global `chat_supervisor` setting. **Off is the default.** While off, a chat turn
+  persists the message, starts no task and no agent, returns `delivery:"disabled"`,
+  and posts a thread message saying the Chief of Staff is off. Turning it off also
+  cancels every live supervisor session (`stopped` counts them), since a standing
+  session is the thing the switch exists to stop.
 
 - `POST /api/chat/turn` body `{text (required), thread_id?, project_id?, scope?: "chief"}` → `202 {thread_id, delivery, agent_target?, error?}` | `400` (empty text, missing project scope, or no active project repository for Chief of Staff) | `404` (unknown `thread_id`)
   Director → supervisor. **Non-blocking by design**: it persists the director

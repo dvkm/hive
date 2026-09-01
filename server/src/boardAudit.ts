@@ -44,9 +44,12 @@ const TERMINAL_SQL = "('done','failed','cancelled')";
 // cap is first reached at the 7th failure, so from there on the task is retried
 // forever at the slowest rate hive has and nobody is told. That is the ceiling.
 const SPAWN_ERROR_CEILING = 7;
-// A spawn_error tagged `infra` is the herdr daemon being down, not this task's
-// fault — the same exclusion dispatcher.inBackoff makes.
-const OWN_SPAWN_ERROR = "(NOT json_valid(e.payload) OR COALESCE(json_extract(e.payload, '$.infra'), 0) = 0)";
+// A spawn_error tagged `infra` is the herdr daemon being down, and one tagged
+// `held_until` is another live agent still holding this task's name (HIVE-568).
+// Neither is this task's fault — the same exclusions dispatcher.inBackoff makes.
+const OWN_SPAWN_ERROR =
+  "(NOT json_valid(e.payload) OR (COALESCE(json_extract(e.payload, '$.infra'), 0) = 0 " +
+  "AND COALESCE(json_extract(e.payload, '$.held_until'), 0) = 0))";
 // Only projects hive still drives. A test or archived project's rows are
 // expected to disagree with reality: the repo they named is gone.
 const active = (col = "t.project_id") => `JOIN projects p ON p.id = ${col} AND ${activeProjectSql("p.config")}`;

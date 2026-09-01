@@ -41,6 +41,10 @@ const REVIEW_CONCURRENCY = 4;
 // fan-out or it deadlocks.
 const RISK_CONCURRENCY = 2;
 const DIFF_LIMIT = 60_000;
+// The one retry reads a quarter of the diff. A shorter prompt is the only knob
+// the reviewer has when the shared model route is what's slow (HIVE-567), and
+// a partial review beats the nothing a second timeout leaves behind.
+const RETRY_DIFF_LIMIT = 15_000;
 
 export interface ReviewerDeps {
   exec?: PlannerExec; // the claude -p runner (injectable in tests)
@@ -115,7 +119,7 @@ async function livePrHead(exec: Exec, prUrl: string): Promise<string | null> {
   }
 }
 
-function reviewPrompt(task: any, diff: string): string {
+function reviewPrompt(task: any, diff: string, limit = DIFF_LIMIT): string {
   return [
     `You are pre-reviewing a PR for a busy human reviewer. Be terse and concrete; no praise, no filler.`,
     ``,
@@ -123,7 +127,7 @@ function reviewPrompt(task: any, diff: string): string {
     `Brief:\n${(task.brief ?? "").slice(0, 4000)}`,
     ``,
     `Diff (may be truncated):`,
-    diff.slice(0, DIFF_LIMIT),
+    diff.slice(0, limit),
     ``,
     PLAIN_ENGLISH,
     ``,
@@ -143,8 +147,17 @@ function reviewPrompt(task: any, diff: string): string {
 // silently retired that card until someone pushed a new commit. An auth outage
 // left 31 of 36 review cards in exactly that state (HIVE-497). So failures now
 // get a bounded retry budget per PR head instead.
-export const MAX_REVIEW_ATTEMPTS = 5;
-const RETRY_BASE_MS = 5 * 60_000; // 5, 10, 20, 40 min between tries
+//
+// Five identical tries turned out to be four wasted ones: 15 timeouts across 4
+// PRs in three hours (HIVE-567) were all the SAME 180s call repeated. Measured
+// against those exact PRs, one review takes 15-40s; the timeouts all fell in
+// one 45-minute window where every model call was slow (a 15-minute explain
+// run timed out in it too). So the budget was never the problem and a bigger
+// one would not have helped. Two tries, and the second one is SMALLER — a
+// short diff is the one variable the reviewer controls when the model route is
+// the slow part.
+export const MAX_REVIEW_ATTEMPTS = 2;
+const RETRY_BASE_MS = 5 * 60_000; // 5 min before the one retry
 const MAX_RETRY_DELAY_MS = 60 * 60_000;
 
 // Does this recorded review event describe the head we are about to review?
@@ -193,7 +206,13 @@ function retryDue(attempts: { ts: string; auth: boolean }[], nowMs = Date.now())
 // the event carries `gave_up` and the director gets one notification: a card
 // hive has stopped trying to review must not keep looking like one it simply
 // has not got to yet.
-function recordReviewFailure(db: DB, task: any, error: string, reviewIdentity: Record<string, unknown>): void {
+function recordReviewFailure(
+  db: DB,
+  task: any,
+  error: string,
+  reviewIdentity: Record<string, unknown>,
+  elapsedMs?: number
+): void {
   const auth = isAuthFailure(error);
   const spent = failedReviewAttempts(db, task).filter((a) => !a.auth).length + (auth ? 0 : 1);
   const gaveUp = !auth && spent >= MAX_REVIEW_ATTEMPTS;
@@ -201,9 +220,34 @@ function recordReviewFailure(db: DB, task: any, error: string, reviewIdentity: R
     task_id: task.id,
     source: "system",
     type: "auto_review_error",
-    payload: { error, attempts: spent, ...(gaveUp ? { gave_up: true } : {}), ...reviewIdentity },
+    payload: {
+      error,
+      attempts: spent,
+      ...(elapsedMs === undefined ? {} : { elapsed_ms: elapsedMs }),
+      ...(gaveUp ? { gave_up: true } : {}),
+      ...reviewIdentity,
+    },
   });
   if (!gaveUp) return;
+  // A card hive has stopped reviewing looked EXACTLY like one it had not got
+  // to yet: no verdict, nothing on the review surface, quiet on the board
+  // (HIVE-567). Give-up now writes a real verdict too, the same way two
+  // unparseable runs do. `unavailable` is not `looks_good` and not `caution`,
+  // so no auto-merge path treats it as a pass — it only makes the silence
+  // visible.
+  writeEvent(db, {
+    task_id: task.id,
+    source: "system",
+    type: "auto_review",
+    payload: {
+      verdict: "unavailable",
+      summary: `auto-review could not complete after ${spent} tries. Review it yourself. Last error: ${error.slice(0, 200)}`,
+      risks: [],
+      questions: [],
+      ...reviewIdentity,
+    },
+  });
+  broadcast({ type: "task", task: getTask(db, task.id) });
   enqueue(db, {
     kind: "failed",
     task_id: task.id,
@@ -290,9 +334,14 @@ async function reviewOne(db: DB, t: any, deps: ReviewerDeps): Promise<void> {
       ? [...config.reviewer_argv]
       : [claudeBin(), "-p", "--model", config.model_by_kind?.review ?? "sonnet"];
   const buildArgv = (prompt: string) => [...base, prompt, "--output-format", "json"];
-  const argv = buildArgv(reviewPrompt(t, diff.text));
+  // Retry smaller, never identical: the first try already spent the full
+  // budget on the full diff, so repeating it verbatim just spends it again.
+  const priorFailures = failedReviewAttempts(db, t).filter((a) => !a.auth).length;
+  const diffLimit = priorFailures ? RETRY_DIFF_LIMIT : DIFF_LIMIT;
+  const argv = buildArgv(reviewPrompt(t, diff.text, diffLimit));
 
   const exec = deps.exec ?? defaultPlannerExec;
+  const startedMs = Date.now();
   let res;
   try {
     res = await exec(argv, {
@@ -302,14 +351,14 @@ async function reviewOne(db: DB, t: any, deps: ReviewerDeps): Promise<void> {
     });
   } catch (e: any) {
     if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
-    recordReviewFailure(db, t, String(e?.message ?? e), reviewIdentity);
+    recordReviewFailure(db, t, String(e?.message ?? e), reviewIdentity, Date.now() - startedMs);
     return;
   }
   // The LLM call is the slow part (up to TIMEOUT_MS) — re-check right after it
   // returns, before trusting anything it said about this head.
   if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
   if (res.timedOut || res.code !== 0) {
-    recordReviewFailure(db, t, modelFailure(db, res, { timeoutMs: TIMEOUT_MS }), reviewIdentity);
+    recordReviewFailure(db, t, modelFailure(db, res, { timeoutMs: TIMEOUT_MS }), reviewIdentity, Date.now() - startedMs);
     return;
   }
   noteModelCall(db, null);
@@ -318,7 +367,7 @@ async function reviewOne(db: DB, t: any, deps: ReviewerDeps): Promise<void> {
     // Retry once with a stricter format instruction before giving up — most
     // unparseable output is prose wrapped around the JSON, not a model that
     // refuses the format outright (task HIVE-446).
-    const retryArgv = buildArgv(`${reviewPrompt(t, diff.text)}\n\nSTRICT: output ONLY the JSON object, nothing else — no prose, no markdown fences.`);
+    const retryArgv = buildArgv(`${reviewPrompt(t, diff.text, diffLimit)}\n\nSTRICT: output ONLY the JSON object, nothing else — no prose, no markdown fences.`);
     let retryRes;
     try {
       retryRes = await exec(retryArgv, { timeoutMs: TIMEOUT_MS });
@@ -583,7 +632,70 @@ export function extractAnswer(raw: string): { answerable: "machine" | "human"; a
   });
 }
 
-function verifyPrompt(task: any, risk: string, diff: string): string {
+// Answered decisions on this task, oldest first, each with the date it was
+// answered (HIVE-571). The risk check saw only the diff, so a product ambiguity
+// the director had ALREADY ruled on came back as a merge-blocking risk: on
+// corebeat 3f6e5ffe5aaa the finding was "if the reporter meant separate
+// windows, this ships the wrong UI", which is exactly the question decision
+// dec_3874b7587abf answered. Same blind spot the scope check had, same input
+// fixes it (drift.ts directionSinceBrief).
+const MAX_SETTLED_DECISIONS = 8;
+
+function answeredDecisions(db: DB, taskId: string): { ts: string; text: string }[] {
+  const rows: any[] = db
+    .query(
+      `SELECT answered_at AS ts, title, options, answer_key, answer_note FROM decisions
+        WHERE task_id = ? AND status = 'answered' ORDER BY answered_at`
+    )
+    .all(taskId);
+  return rows.slice(-MAX_SETTLED_DECISIONS).map((d) => {
+    let label = String(d.answer_key ?? "");
+    try {
+      const opt = JSON.parse(d.options || "[]").find((o: any) => o.key === d.answer_key);
+      if (opt) label = `${opt.label ?? opt.key}${opt.detail ? ` — ${opt.detail}` : ""}`;
+    } catch {}
+    return {
+      ts: String(d.ts ?? ""),
+      text: `${d.title} → chose: ${label}${d.answer_note ? ` (${d.answer_note})` : ""}`,
+    };
+  });
+}
+
+// Commits on this branch with their dates, so the judge can tell a settled
+// question from a NEW behaviour: a decision answered on an older head does not
+// absolve code written after it. Best effort — no commits just means judging
+// on the decisions and the diff, as before.
+async function branchCommits(db: DB, task: any, exec: Exec): Promise<string[]> {
+  const project: any = db.query("SELECT repo_path, config FROM projects WHERE id = ?").get(task.project_id);
+  const repo = task.worktree_path ?? project?.repo_path;
+  const ref = task.worktree_path ? "HEAD" : task.branch;
+  if (!repo || !ref) return [];
+  const base = projectComparisonBase(JSON.parse(project?.config ?? "{}"));
+  const r = await exec([
+    "git", "-C", repo, "log", "--first-parent", "--no-merges",
+    "--date=iso-strict", "--format=%h %ad %s", "-n", "20", `${base}..${ref}`,
+  ]);
+  if (r.code !== 0) return [];
+  return r.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+// The settled-decision block of the verify prompt, or "" when the task has none.
+function settledBlock(decisions: { ts: string; text: string }[], commits: string[]): string {
+  if (!decisions.length) return "";
+  return [
+    `The director has ALREADY ruled on this task. These questions are settled:`,
+    ...decisions.map((d) => `- answered ${d.ts.slice(0, 10)}: ${d.text}`),
+    ...(commits.length ? [``, `Commits on this branch, newest first (short sha, date, subject):`, ...commits.map((c) => `- ${c}`)] : []),
+    `A risk that only re-asks a settled question is NOT a live risk. Answer 'refuted' and start`,
+    `'why' with "settled: " plus the ruling and the date, so the reader sees it in one glance.`,
+    `Two things still count as confirmed: a defect in the code itself (a real bug, not a different`,
+    `reading of what was wanted), or behaviour introduced by a commit made AFTER the ruling that`,
+    `answers it — then confirm and name that commit in 'why'.`,
+    ``,
+  ].join("\n");
+}
+
+function verifyPrompt(task: any, risk: string, diff: string, settled = ""): string {
   return [
     `A code reviewer flagged ONE risk on a pull request. Decide whether it is real.`,
     `Be adversarial: try to refute it. Say 'confirmed' only if you can point at the code that makes it true.`,
@@ -593,6 +705,7 @@ function verifyPrompt(task: any, risk: string, diff: string): string {
     `Task #${task.number}: ${task.title}`,
     task.worktree_path ? `The full checkout is at ${task.worktree_path} — read files there to check. Do not edit anything.` : ``,
     ``,
+    settled,
     `Diff (may be truncated):`,
     diff.slice(0, DIFF_LIMIT),
     ``,
@@ -743,6 +856,12 @@ async function runVerification(
 ): Promise<void> {
   const { risks, questions, knownRisk, knownQuestion, todoRisks, todoQuestions } = plan;
   const exec = deps.exec ?? defaultPlannerExec;
+  // Read once per pass, not once per risk: the same block goes into every
+  // risk prompt.
+  const decisions = answeredDecisions(db, task.id);
+  const settled = decisions.length
+    ? settledBlock(decisions, await branchCommits(db, task, deps.shellExec ?? defaultExec))
+    : "";
   const current = async () => (input.stillCurrent ? await input.stillCurrent() : true);
   const run = async (prompt: string) => {
     try {
@@ -762,7 +881,7 @@ async function runVerification(
   let unverified_reason: string | null = null;
   let aborted = false;
   const jobs = [
-    ...todoRisks.map((risk) => ({ kind: "risk" as const, text: risk, prompt: verifyPrompt(task, risk, input.diff) })),
+    ...todoRisks.map((risk) => ({ kind: "risk" as const, text: risk, prompt: verifyPrompt(task, risk, input.diff, settled) })),
     ...todoQuestions.map((q) => ({ kind: "question" as const, text: q, prompt: answerPrompt(task, q, input.diff) })),
   ];
   const results = await mapLimit(jobs, RISK_CONCURRENCY, async (job) => {

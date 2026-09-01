@@ -4,6 +4,7 @@ import { writeEvent, getTask } from "../src/state.ts";
 import { mergeTask } from "../src/api.ts";
 import { Herdr } from "../src/runtime/herdr.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
+import { CONFIRMED_RISK_CODE, isConfirmedRiskFailure } from "../src/landQueue.ts";
 
 const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
 const stub = (fn: (argv: string[]) => ExecResult): Exec => async (argv) => fn(argv);
@@ -424,4 +425,31 @@ test("a land touches nothing when the serving checkout is already on the base br
 
   expect(seen.some((c) => c[0] === "git" && c[1] === "merge")).toBe(false);
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'deployed'").get(taskId)).toBeFalsy();
+});
+
+// HIVE-559 review: the land queue routes a confirmed risk to its agent instead
+// of the director, and it decides that from the refusal's `code`. That code is
+// built here, in mergeTask, and read in landQueue.ts — two files with nothing
+// tying them together. This test is the tie: if the gate ever stops setting the
+// code, routing would silently revert to always-ask-the-director, and this fails
+// instead.
+test("mergeTask's confirmed-risk refusal carries the code the land queue routes on", async () => {
+  const { db, taskId } = seed();
+  db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run("head-1", taskId);
+  writeEvent(db, {
+    task_id: taskId,
+    source: "reconciler",
+    type: "risk_verdicts",
+    payload: {
+      reviewed_head_sha: "head-1",
+      verdicts: [{ risk: "export drops rows", why: "the CSV writer skips the last page", evidence_path: "evidence/export.md", verdict: "confirmed" }],
+    },
+  });
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec: destructiveExec });
+  expect(res.status).toBe(409);
+  const body = (await res.json()) as { error: string; code?: string };
+  expect(body.error).toContain("the risk check confirmed");
+  expect(body.code).toBe(CONFIRMED_RISK_CODE);
+  expect(isConfirmedRiskFailure(body.code)).toBe(true);
 });

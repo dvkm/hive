@@ -318,6 +318,16 @@ function client(fetchImpl: typeof fetch, cfg: any = CFG) {
 const run = (db: DB, projectId: string, f: typeof fetch, cfg: any = CFG, deps: any = {}) =>
   J.syncProjectOnce(db, projectId, J.jiraConfig({ jira: cfg })!, client(f, cfg), deps);
 
+// hive's clock and the fake Jira's are the same millisecond in a test, and a tie
+// in the conflict rule goes to Jira. Real work takes longer than 0ms, so step a
+// task's last status change forward to give the rule a real winner. `step` must
+// grow across calls: lastStateChangeAt walks the history in timestamp order.
+function bump(db: DB, taskId: string, step: number): void {
+  db.query(
+    "UPDATE events SET ts = ? WHERE id = (SELECT id FROM events WHERE task_id = ? AND type = 'state_change' ORDER BY ts DESC, id DESC LIMIT 1)"
+  ).run(new Date(Date.now() + step * 60_000).toISOString(), taskId);
+}
+
 const tasks = (db: DB) => db.query("SELECT * FROM tasks ORDER BY created_at").all() as any[];
 const syncEvents = (db: DB) =>
   (db.query("SELECT payload FROM events WHERE type = 'jira_sync' ORDER BY ts, id").all() as { payload: string }[])
@@ -746,6 +756,88 @@ test("converged sides do nothing at all (structural loop prevention)", async () 
   const s3 = await run(db, projectId, jira.fetchImpl);
   expect(jira.writes().length).toBe(before);
   for (const s of [s2, s3]) expect([s.pushed, s.pulled, s.labeled, s.imported]).toEqual([0, 0, 0, 0]);
+});
+
+// ============================================================================
+// MIRROR FOLLOWS ITS WORK  (HIVE-562)
+// ============================================================================
+test("the ticket moves to In Progress and In Review while the work is in flight", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl); // imports the mirror
+  const mirrorId = tasks(db)[0].id;
+
+  // The work task the agent actually does, linked to the mirror.
+  const workId = newId();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, jira_mirror_task_id, created_at, updated_at)
+     VALUES (?,?,?, 'queued', 'ship', ?, ?, ?)`
+  ).run(workId, projectId, "[WEB-1] the work", mirrorId, now(), now());
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, meta) VALUES (?,?,?,?, '{}')").run(newId(), workId, now(), "log");
+
+  let step = 0;
+  const nudge = () => bump(db, mirrorId, ++step);
+  const statusNow = () => jira.byKey.get("WEB-1")!.status;
+  const transitionPosts = () =>
+    jira.calls.filter((c) => c.method === "POST" && c.path.includes("/transitions")).length;
+
+  transition(db, workId, "in_progress", { source: "agent" });
+  nudge();
+  await run(db, projectId, jira.fetchImpl);
+  expect(statusNow()).toBe("In Progress");
+
+  transition(db, workId, "in_review", { source: "agent", skipVerification: true });
+  nudge();
+  await run(db, projectId, jira.fetchImpl);
+  expect(statusNow()).toBe("In Review");
+
+  // in_review -> verifying is the same Jira column: no second transition.
+  const posted = transitionPosts();
+  transition(db, workId, "verifying", { source: "director" });
+  await run(db, projectId, jira.fetchImpl);
+  expect(statusNow()).toBe("In Review");
+  expect(transitionPosts()).toBe(posted);
+
+  transition(db, workId, "done", { source: "director" });
+  nudge();
+  await run(db, projectId, jira.fetchImpl);
+  expect(statusNow()).toBe("Done");
+
+  // Forward only, every step: the ticket never went back a column.
+  const seen = jira.byKey.get("WEB-1")!.history.map((h) => h.to);
+  expect(seen).toEqual(["In Progress", "In Review", "Done"]);
+});
+
+test("a ticket with two work tasks only reaches Done when both are done", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const mirrorId = tasks(db)[0].id;
+
+  const work = ["one", "two"].map((label) => {
+    const id = newId();
+    db.query(
+      `INSERT INTO tasks (id, project_id, title, state, kind, jira_mirror_task_id, created_at, updated_at)
+       VALUES (?,?,?, 'queued', 'ship', ?, ?, ?)`
+    ).run(id, projectId, `[WEB-1] part ${label}`, mirrorId, now(), now());
+    db.query("INSERT INTO evidence (id, task_id, ts, kind, meta) VALUES (?,?,?,?, '{}')").run(newId(), id, now(), "log");
+    return id;
+  });
+
+  for (const id of work) transition(db, id, "in_progress", { source: "agent" });
+  transition(db, work[0], "in_review", { source: "agent", skipVerification: true });
+  transition(db, work[0], "verifying", { source: "director" });
+  transition(db, work[0], "done", { source: "director" });
+  bump(db, mirrorId, 1);
+  await run(db, projectId, jira.fetchImpl);
+  expect(jira.byKey.get("WEB-1")!.status).toBe("In Review"); // furthest the work got, not Done
+
+  transition(db, work[1], "in_review", { source: "agent", skipVerification: true });
+  transition(db, work[1], "verifying", { source: "director" });
+  transition(db, work[1], "done", { source: "director" });
+  bump(db, mirrorId, 2);
+  await run(db, projectId, jira.fetchImpl);
+  expect(jira.byKey.get("WEB-1")!.status).toBe("Done");
 });
 
 // ============================================================================
@@ -1981,6 +2073,122 @@ test("adfToText flattens an Atlassian document to readable text", () => {
   };
   expect(J.adfToText(adf).trim()).toBe("line one\nline two");
   expect(J.adfToText(null)).toBe("");
+});
+
+test("adfToText keeps the links, images and mentions ADF hides in attrs", () => {
+  const adf = {
+    type: "doc",
+    version: 1,
+    content: [
+      {
+        type: "paragraph",
+        content: [
+          { type: "text", text: "see the ", marks: [] },
+          { type: "text", text: "design", marks: [{ type: "link", attrs: { href: "https://figma.com/design/abc/Home?node-id=1-23" } }] },
+          { type: "text", text: " and ask " },
+          { type: "mention", attrs: { id: "557", text: "@Dana" } },
+        ],
+      },
+      { type: "inlineCard", attrs: { url: "https://www.figma.com/design/KEY/Banners" } },
+      { type: "blockCard", attrs: { data: { url: "https://docs.google.com/document/d/xyz" } } },
+      {
+        type: "mediaSingle",
+        content: [{ type: "media", attrs: { type: "file", id: "media-1", alt: "mockup.png", collection: "c" } }],
+      },
+    ],
+  };
+  const text = J.adfToText(adf);
+  expect(text).toContain("see the design (https://figma.com/design/abc/Home?node-id=1-23)");
+  expect(text).toContain("@Dana");
+  expect(text).toContain("https://www.figma.com/design/KEY/Banners");
+  expect(text).toContain("https://docs.google.com/document/d/xyz");
+  expect(text).toContain("[attachment: mockup.png]");
+});
+
+test("adfToText does not double a URL hive itself wrote as a link", () => {
+  const url = "https://example.test/a";
+  expect(J.adfToText(J.textToAdf(url)).trim()).toBe(url);
+});
+
+test("briefFor names the ticket's attachments and flags visual material", () => {
+  const issue = {
+    key: "WEB-120",
+    fields: {
+      summary: "Homepage banners",
+      issuetype: { name: "Task" },
+      priority: { name: "High" },
+      assignee: null,
+      labels: [],
+      attachment: [
+        { filename: "mockup.png", content: "https://jira.test/secure/attachment/1/mockup.png" },
+        { filename: "notes.txt", content: "https://jira.test/secure/attachment/2/notes.txt" },
+      ],
+      description: {
+        type: "doc",
+        version: 1,
+        content: [
+          { type: "paragraph", content: [{ type: "text", text: "arrange the banners" }] },
+          { type: "mediaSingle", content: [{ type: "media", attrs: { id: "m1", alt: "mockup.png" } }] },
+        ],
+      },
+    },
+  };
+  const brief = J.briefFor(issue, "https://jira.test");
+  expect(brief).toContain("- mockup.png https://jira.test/secure/attachment/1/mockup.png");
+  expect(brief).toContain("- notes.txt");
+  expect(brief).toContain("[attachment: mockup.png]");
+  expect(brief).toContain("visual material");
+});
+
+test("briefFor reads visual material off the structure, not the prose", () => {
+  const proseOnly = J.briefFor(
+    {
+      key: "WEB-2",
+      fields: {
+        issuetype: { name: "Task" },
+        attachment: [],
+        description: {
+          type: "doc",
+          version: 1,
+          content: [{ type: "paragraph", content: [{ type: "text", text: "rename banner.png and drop the figma.com mention from the footer" }] }],
+        },
+      },
+    },
+    "https://jira.test"
+  );
+  expect(proseOnly).toContain("banner.png");
+  expect(proseOnly).not.toContain("visual material");
+
+  // Same words, but the design URL is a real link mark this time.
+  const linked = J.briefFor(
+    {
+      key: "WEB-3",
+      fields: {
+        issuetype: { name: "Task" },
+        description: {
+          type: "doc",
+          version: 1,
+          content: [
+            {
+              type: "paragraph",
+              content: [{ type: "text", text: "the design", marks: [{ type: "link", attrs: { href: "https://www.figma.com/design/KEY/Home?node-id=1-23" } }] }],
+            },
+          ],
+        },
+      },
+    },
+    "https://jira.test"
+  );
+  expect(linked).toContain("visual material");
+});
+
+test("briefFor stays quiet when the ticket carries nothing visual", () => {
+  const brief = J.briefFor(
+    { key: "WEB-1", fields: { issuetype: { name: "Task" }, description: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "plain" }] }] } } },
+    "https://jira.test"
+  );
+  expect(brief).not.toContain("Attachments:");
+  expect(brief).not.toContain("visual material");
 });
 
 test("status mapping is total over the real WEB workflow, in both directions", () => {
@@ -3983,13 +4191,38 @@ test("the scratch directory is gone even when the harness throws", async () => {
   expect(readdirSyncT(join(root, "web", "e2e")).some((name) => name.startsWith("hive-proof-"))).toBe(false);
 });
 
+// HIVE-511: the catchup card shows a before/after pair, so a rendered proof has
+// to say which side it is. The before pass is best effort — losing it must never
+// cost the after picture, and it must not leave a base checkout behind.
+test.skipIf(process.platform !== "darwin")("a rendered proof is stamped 'after', and a failed before pass costs nothing", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
+  const render = execRendering(root, 1);
+  const exec = async (argv: string[]) => {
+    // A real base commit, then a worktree add that refuses: the before pass
+    // gets as far as it can and gives up.
+    if (argv.includes("merge-base")) return { code: 0, stdout: "0f1e2d3c4b5a69788796a5b4c3d2e1f001020304\n", stderr: "" };
+    if (argv.includes("worktree")) return { code: 1, stdout: "", stderr: "fatal: nope" };
+    return render(argv);
+  };
+
+  const stats = await run(db, projectId, jira.fetchImpl, CFG, { exec });
+  expect(stats.rendered).toBe(1);
+
+  const shots = db.query("SELECT meta FROM evidence WHERE kind = 'screenshot'").all() as { meta: string }[];
+  expect(shots.map((row) => JSON.parse(row.meta).render_phase)).toEqual(["after"]);
+  expect(readdirSyncT(root).some((name) => name.startsWith(".hive-base-"))).toBe(false);
+});
+
 test.skipIf(process.platform !== "darwin")("the task's diff is read once per cycle, not once per check", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
   const { db, projectId, root } = await uiTaskWithNoShots(jira, true);
   let diffReads = 0;
   const render = execRendering(root, 1);
+  // Only the diff read itself: the before/after pass (HIVE-511) also shells out
+  // to git, and those calls say nothing about how often the diff is fetched.
   const exec = async (argv: string[]) => {
-    if (!isHarnessRun(argv)) diffReads++;
+    if (argv.includes("diff")) diffReads++;
     return render(argv);
   };
 

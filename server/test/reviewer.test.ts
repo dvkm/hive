@@ -307,6 +307,82 @@ test("a looks_good review with a soft risk or question is still verified", async
   expect(p.question_verdicts).toEqual([{ question: "q1", answerable: "machine", answer: "yes, line 4 covers it" }]);
 });
 
+// HIVE-571: the risk check re-raised product questions the director had
+// already ruled on, because it never read the task's answered decisions.
+function answerDecision(db: DB, taskId: string, title: string, at: string) {
+  db.query(
+    "INSERT INTO decisions (id, task_id, ts, title, options, status, answer_key, answer_note, answered_at) VALUES (?,?,?,?,?, 'answered', 'stack', ?, ?)"
+  ).run(
+    newId("dec"),
+    taskId,
+    at,
+    title,
+    JSON.stringify([{ key: "stack", label: "Vertical stack in one modal" }]),
+    "banners are fixed-size creatives",
+    at
+  );
+}
+
+test("an answered decision reaches the risk prompt, with the branch commits that could revive it", async () => {
+  const { db, id } = setup({}, { branch: "hive/banners" });
+  answerDecision(db, id, "One modal or separate windows?", "2026-08-31T10:00:00Z");
+  const prompts: string[] = [];
+  const claude = async (argv: string[]) => {
+    prompts.push(argv[4] ?? "");
+    return { code: 0, stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"settled: chose Vertical stack in one modal on 2026-08-31"}' }), stderr: "" };
+  };
+  const git: Exec = async () => ({ code: 0, stdout: "aaa1111 2026-08-31T09:00:00Z build the stacked modal\nbbb2222 2026-09-01T02:00:00Z autoplay every banner", stderr: "" });
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+
+  await verifyRisks(db, task, { risks: ["stack vs separate windows is only one reading"], head: "head-a", diff: "d" }, { exec: claude, shellExec: git });
+
+  const p = prompts[0];
+  expect(p).toContain("ALREADY ruled");
+  expect(p).toContain("One modal or separate windows? → chose: Vertical stack in one modal");
+  expect(p).toContain("answered 2026-08-31");
+  expect(p).toContain("Answer 'refuted'");
+  // The commit made AFTER the ruling is in the prompt, so a NEW behaviour is
+  // still confirmable rather than waved through by the old answer.
+  expect(p).toContain("bbb2222 2026-09-01T02:00:00Z autoplay every banner");
+  expect(p).toContain("name that commit");
+
+  // The reader sees the answer on the finding instead of re-litigating it.
+  expect(events(db, id, "risk_verdicts")[0].payload.verdicts[0]).toMatchObject({
+    verdict: "refuted",
+    why: "settled: chose Vertical stack in one modal on 2026-08-31",
+  });
+});
+
+test("a risk about behaviour added after the ruling is still confirmed", async () => {
+  const { db, id } = setup({}, { branch: "hive/banners" });
+  answerDecision(db, id, "One modal or separate windows?", "2026-08-31T10:00:00Z");
+  const claude = async () => ({
+    code: 0,
+    stdout: JSON.stringify({ result: '{"verdict":"confirmed","why":"bbb2222, made after the ruling, autoplays every banner"}' }),
+    stderr: "",
+  });
+  const git: Exec = async () => ({ code: 0, stdout: "bbb2222 2026-09-01T02:00:00Z autoplay every banner", stderr: "" });
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+
+  await verifyRisks(db, task, { risks: ["autoplay fights the fixed-size creative"], head: "head-a", diff: "d" }, { exec: claude, shellExec: git });
+  expect(confirmedRisks(db, id, "head-a").map((c: any) => c.risk)).toEqual(["autoplay fights the fixed-size creative"]);
+});
+
+test("a task with no answered decision gets the prompt unchanged", async () => {
+  const { db, id } = setup();
+  const prompts: string[] = [];
+  const claude = async (argv: string[]) => {
+    prompts.push(argv[4] ?? "");
+    return { code: 0, stdout: JSON.stringify({ result: '{"verdict":"refuted","why":"no"}' }), stderr: "" };
+  };
+  const git: Exec = async () => {
+    throw new Error("no decisions: nothing to date-check against");
+  };
+  const task: any = db.query("SELECT * FROM tasks WHERE id = ?").get(id);
+  await verifyRisks(db, task, { risks: ["r1"], head: "head-a", diff: "d" }, { exec: claude, shellExec: git });
+  expect(prompts[0]).not.toContain("ALREADY ruled");
+});
+
 test("a question only the human can answer is recorded as human-only", async () => {
   const { db, id } = setup();
   const claude = async () => ({ code: 0, stdout: JSON.stringify({ result: '{"answerable":"human","answer":"check the installed app"}' }), stderr: "" });
@@ -547,6 +623,46 @@ test("after the retry budget runs out the card is flagged for a human, not silen
   const notes: any[] = db.query("SELECT title FROM notifications WHERE task_id = ? AND kind = 'failed'").all(id);
   expect(notes).toHaveLength(1);
   expect(notes[0].title).toContain("gave up");
+});
+
+// HIVE-567: 15 timeouts across 4 PRs left every one of those cards with NO
+// verdict at all, so a task hive had given up on looked exactly like one it
+// simply had not reached yet.
+test("giving up leaves a visible terminal verdict, not silence", async () => {
+  const { db, id } = setup();
+  const failing = async () => ({ code: 1, stdout: "", stderr: "timed out after 180000ms" });
+  for (let i = 0; i < MAX_REVIEW_ATTEMPTS + 2; i++) {
+    await autoReviewOnce(db, { exec: failing, shellExec: ghDiff });
+    ageEvents(db, id);
+  }
+  const revs = events(db, id, "auto_review");
+  expect(revs).toHaveLength(1);
+  expect(revs[0].payload.verdict).toBe("unavailable");
+  expect(revs[0].payload.summary).toContain("could not complete");
+  expect(revs[0].payload.reviewed_head_sha).toBe("review-head");
+  // Never a pass: no auto-merge path may read this as a reviewed, clean PR.
+  expect(revs[0].payload.verdict).not.toBe("looks_good");
+});
+
+// HIVE-567: four identical 180s runs was three wasted ones. Two tries, and the
+// second reads a much shorter diff.
+test("the one retry is smaller than the first attempt, and there is no third", async () => {
+  const { db, id } = setup();
+  const bigDiff: Exec = async (argv) =>
+    argv.includes("diff")
+      ? { code: 0, stdout: "+x\n".repeat(30_000), stderr: "" }
+      : { code: 0, stdout: JSON.stringify({ headRefOid: "review-head" }), stderr: "" };
+  const prompts: number[] = [];
+  const failing = async (argv: string[]) => {
+    prompts.push(argv[4]!.length);
+    return { code: 1, stdout: "", stderr: "timed out after 180000ms" };
+  };
+  for (let i = 0; i < 4; i++) {
+    await autoReviewOnce(db, { exec: failing, shellExec: bigDiff });
+    ageEvents(db, id);
+  }
+  expect(prompts).toHaveLength(2); // no third attempt
+  expect(prompts[1]).toBeLessThan(prompts[0]! / 2);
 });
 
 // HIVE-539: a run that times out is "I do not know", never "I checked and it is

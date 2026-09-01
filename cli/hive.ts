@@ -1,6 +1,7 @@
 // hive CLI — thin HTTP wrappers around the daemon. The server is the only DB writer.
 // Installed as bin/hive (bun shebang). Base URL: HIVE_URL or http://127.0.0.1:<HIVE_PORT|4700>.
 import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { REVIEW_SUMMARY_HELP } from "../server/src/reviewShape.ts";
 import { appBrowserCandidates, installedHiveAppCandidates, openUrlArgv, tailscaleCandidates } from "./platform.ts";
 
@@ -77,6 +78,7 @@ Usage:
   hive jira link <task-id> --parent <KEY> create and link a Jira sub-task
   hive spawn <task-id>                    spawn a herdr agent for a task
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
+  hive chat supervisor [on|off]           chief of staff off switch (default off)
   hive chat reply <thread-id> "<text>" [--decision <id> ...]
                                               post one reply with actionable decision cards
   hive chat update <thread-id> [--phase <phase>] [--objective <text>] [--criterion <text> ...]
@@ -376,8 +378,13 @@ async function main() {
       // --json <file> merges a JSON object into the event payload — used for
       // structured events like review_summary (see the agent brief).
       const extra = flags.json ? JSON.parse(readFileSync(String(flags.json), "utf8")) : {};
+      // hive-1992: the server refuses a payload read from a path other agents
+      // can write (the shared /tmp/review.json that published one agent's
+      // review under another's task), so it needs the resolved path.
+      const payloadPath = flags.json ? resolve(String(flags.json)) : undefined;
       result = await api("POST", path, {
         type,
+        payload_path: payloadPath,
         note: flags.note,
         kind: flags.kind,
         source: flags.source,
@@ -391,6 +398,14 @@ async function main() {
         ...(sha && !extra.meta ? { meta: JSON.stringify({ commit_sha: sha }) } : {}),
         ...extra,
       });
+    }
+    // A held handoff comes back 200 with `held: true` and the reason. Printing
+    // only "emitted 'ready'" hid that from the agent completely, so the hold was
+    // discovered later by a human and cost a respawn to answer (HIVE-574).
+    if (result.held) {
+      console.log(`emit '${type}' on ${taskId} was HELD${result.reason ? ` (${result.reason})` : ""}`);
+      if (result.message) console.log(result.message);
+      return;
     }
     console.log(`emitted '${type}' on ${taskId}` + (result.evidence ? ` (evidence ${result.evidence.id})` : ""));
     return;
@@ -598,6 +613,20 @@ async function main() {
   if (cmd === "chat") {
     const sub = argv[1];
     const { _, flags } = parseFlags(argv.slice(2));
+    // `hive chat supervisor [on|off]` — the Chief of Staff off switch. Off (the
+    // default) means a chat message never starts a session; turning it off also
+    // ends any session already running.
+    if (sub === "supervisor") {
+      const state = argv[2];
+      if (state === "on" || state === "off") {
+        const r = await api("POST", "/api/chat/supervisor", { on: state === "on" });
+        console.log(`chief of staff ${r.on ? "ON" : `off${r.stopped ? ` — stopped ${r.stopped} live session(s)` : ""}`}`);
+      } else {
+        const r = await api("GET", "/api/chat/supervisor");
+        console.log(`chief of staff: ${r.on ? "ON" : "off"}`);
+      }
+      return;
+    }
     // `hive chat reply <thread-id> <text>` — the supervisor session replies to
     // the director (the ONLY director-facing channel from a chat agent).
     if (sub === "reply") {
@@ -721,7 +750,7 @@ async function main() {
       console.log(`closed ${threadId}`);
       return;
     }
-    die("usage: hive chat reply <thread-id> <text>  |  hive chat send [--project <id>|--thread <id>] <text>  |  hive chat close <thread-id>");
+    die("usage: hive chat reply <thread-id> <text>  |  hive chat send [--project <id>|--thread <id>] <text>  |  hive chat close <thread-id>  |  hive chat supervisor [on|off]");
   }
 
   if (cmd === "pr-marker") {

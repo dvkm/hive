@@ -3,7 +3,7 @@
 import { dirname, join, normalize } from "node:path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import type { DB } from "./db.ts";
-import { newId, now, evidenceDir, isOffline, setSetting, getSetting } from "./db.ts";
+import { newId, now, evidenceDir, isOffline, setSetting, getSetting, supervisorEnabled } from "./db.ts";
 import { taskWithHealth, tasksWithHealth, broadcastTask, needsAttention, herdrOutage, sessionUtilization, staleMs } from "./health.ts";
 import { isSupervisedTask, isExternalTask, supervisedSql, neverDispatched, isJiraMirror, mirrorTaskIdForTitle } from "./supervision.ts";
 import { activeProjects, isEphemeralRepoPath, notTestProjectSql } from "./testProjects.ts";
@@ -20,6 +20,8 @@ import {
   missingVerifications,
   evidenceCount,
   evidenceAtSha,
+  latestEvidenceSha,
+  restampEvidence,
   changesRequestUnaddressed,
   decisionAnswerUnaddressed,
   isDeferred,
@@ -49,7 +51,7 @@ import {
   parsePolicy,
   parseIncident,
 } from "./rows.ts";
-import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable } from "./runtime/herdr.ts";
+import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable, HerdrError, heldNameRetryAt } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { takeOver, handBack, TakeoverError } from "./takeover.ts";
@@ -103,9 +105,10 @@ import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infr
 import { getAway, setAway, awayNow, heldPushes, lastFlush, syncAway } from "./away.ts";
 import type { AwayConfig } from "./away.ts";
 import { taskDiff } from "./diff.ts";
+import { catchupCards } from "./glance.ts";
 import { authoredFiles, captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { overlapHold } from "./fileScope.ts";
-import { landGraph, markLand, resolveLandPauseForDecision } from "./landQueue.ts";
+import { landGraph, markLand, resolveLandPauseForDecision, CONFIRMED_RISK_CODE } from "./landQueue.ts";
 import { withMergeLock } from "./mergeLock.ts";
 import { divergence } from "./divergence.ts";
 import { followServingBranch, resolveServingFollowForDecision } from "./servingBranch.ts";
@@ -160,8 +163,11 @@ function json(data: unknown, status = 200): Response {
     headers: { "Content-Type": "application/json", ...CORS },
   });
 }
-function err(message: string, status = 400): Response {
-  return json({ error: message }, status);
+// `code` is the machine-readable half of a refusal. Prose is for humans and is
+// rewritten freely; anything that ROUTES on a refusal must read the code, so a
+// reworded message can never silently change behaviour (HIVE-559 review).
+function err(message: string, status = 400, code?: string): Response {
+  return json({ error: message, ...(code ? { code } : {}) }, status);
 }
 
 // HIVE-530: a refusal states the cause AND the next action. When a command
@@ -507,6 +513,11 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (pathname === "/api/intake" && method === "POST") return intake(db, await req.json(), deps);
 
       // ---- director chat (persistent supervisor session over hive) ----
+      if (pathname === "/api/chat/supervisor" && method === "GET")
+        return json({ on: supervisorEnabled(db) });
+      if (pathname === "/api/chat/supervisor" && method === "POST")
+        return setSupervisorSwitch(db, await req.json());
+
       if (pathname === "/api/chat/turn" && method === "POST")
         return await chatTurn(db, herdr, deps, await req.json());
       if (pathname === "/api/chat/threads" && method === "GET")
@@ -657,6 +668,16 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       if (pathname === "/api/checkpoints" && method === "GET") return listOpenCheckpoints(db, url);
       if (pathname === "/api/understanding-quizzes" && method === "GET") return listUnderstandingQuizzes(db, url);
+      // The glance layer over shipped work (HIVE-511): one small card per
+      // change, not the long explanation page.
+      if (pathname === "/api/catchup" && method === "GET")
+        return json({
+          cards: await catchupCards(
+            db,
+            { projectId: url.searchParams.get("project_id"), limit: Number(url.searchParams.get("limit")) || undefined },
+            deps.exec ?? defaultExec
+          ),
+        });
 
       if (pathname === "/api/offline" && method === "GET")
         return json({ on: isOffline(db) });
@@ -1140,6 +1161,46 @@ function intake(db: DB, body: any, deps: HandlerDeps): Response {
 }
 
 // ---------------------------------------------------------------- chat
+const SUPERVISOR_OFF_NOTICE =
+  "The Chief of Staff is off, so nothing was started for this message. Your message is saved in this thread. " +
+  "Turn it back on with `hive chat supervisor on` if you want a session to pick it up.";
+
+// Read/flip the off switch. Turning it OFF also ends any live supervisor
+// session, because leaving one running is exactly the state the switch exists
+// to stop. Cancelling fires the terminal hook, which tears the session down.
+function setSupervisorSwitch(db: DB, body: any): Response {
+  const on = !!body?.on;
+  setSetting(db, "chat_supervisor", on ? "on" : "off");
+  let stopped = 0;
+  if (!on) {
+    const live = db
+      .query(`SELECT id FROM tasks WHERE source = 'chat_supervisor' AND state NOT IN ('done','failed','cancelled')`)
+      .all() as { id: string }[];
+    for (const t of live) {
+      transition(db, t.id, "cancelled", { source: "director", reason: "chat supervisor turned off" });
+      stopped++;
+    }
+  }
+  return json({ on, stopped });
+}
+
+// A standing session that crossed its processed-token warning stops here rather
+// than running for another week. Terminal means it is never resurrected (see
+// deliverToSupervisor); the director's next chat message is the deliberate
+// restart, and only if the switch is on.
+export function haltChatSupervisor(db: DB, taskId: string, processed: number, warn: number): void {
+  const thread = managingThreadForTask(db, taskId);
+  writeEvent(db, { task_id: taskId, source: "system", type: "chat_supervisor_halted", payload: { processed_tokens: processed, warn } });
+  transition(db, taskId, "cancelled", { source: "system", reason: `chat supervisor passed ${warn.toLocaleString()} processed tokens` });
+  if (thread)
+    postThreadNotice(
+      db,
+      thread.id,
+      `Your Chief of Staff session was stopped after processing ${processed.toLocaleString()} tokens. ` +
+        `Send a message to start a fresh one.`
+    );
+}
+
 // One director→supervisor turn. NON-BLOCKING by design: persist the message,
 // make sure the thread's persistent supervisor session is live (spawn it on the
 // first message), deliver the message into that session, and return immediately.
@@ -1222,7 +1283,8 @@ async function chatTurnOnThread(
   chatDeliveryStatus(thread.id, "queued");
   withThreadLock(thread.id, async () => {
     const delivery = await deliverToSupervisor(db, herdr, deps, thread.id, wire);
-    if (delivery.delivery === "failed")
+    if (delivery.delivery === "disabled") postThreadNotice(db, thread.id, SUPERVISOR_OFF_NOTICE);
+    else if (delivery.delivery === "failed")
       postThreadNotice(db, thread.id, `Your Chief of Staff could not start: ${delivery.error ?? "spawn failed"}. Send the message again to retry.`);
   }).catch((e) => {
     chatDeliveryStatus(thread.id, "failed", String((e as any)?.message ?? e));
@@ -1284,6 +1346,13 @@ async function deliverToSupervisor(
   message: string
 ): Promise<{ delivery: string; agent_target?: string; error?: string }> {
   const thread = getThread(db, threadId)!;
+  // The off switch. Checked here, at the one choke point every spawn/respawn
+  // path goes through (director turn, keep-warm), so "off" means no task, no
+  // agent, no silent resurrection.
+  if (!supervisorEnabled(db)) {
+    chatDeliveryStatus(threadId, "disabled");
+    return { delivery: "disabled" };
+  }
   const wireMessage = thread.project_id
     ? message
     : `${message}\n\n[chief reply policy]\nWork silently. Do not send acknowledgments, progress updates, task lists, or wakeup summaries. If director input is genuinely required, send one short bundled reply with up to five \`--decision <id>\` flags so Hive renders answerable cards. Otherwise reply only with a direct answer or the final verified outcome.`;
@@ -2127,6 +2196,49 @@ export function looksSecuritySensitive(text: string): boolean {
   return new RegExp(`\\b(${DEFAULT_SENSITIVE_PATHS.join("|")})s?\\b`, "i").test(text ?? "");
 }
 
+// Why a new work task's brief looks like it was written from the Jira TITLE
+// alone, or null when it looks fine. Two arms, because WEB-118 failed the
+// second one: the bad brief was several hundred chars of prose whose entire
+// content was "this ticket has no description, ask the reporter" — a length
+// check alone waves that straight through.
+//
+// The second arm refuses task creation outright, so it has to be far more
+// conservative than a warning would be: a false positive blocks a legitimate
+// filing with a 400 and the caller has no override. So every pattern is
+// anchored to the TICKET itself ("the issue has no description", "no spec on
+// WEB-118") rather than matching a bare phrase anywhere in the prose. A real
+// spec that happens to say "the card renders no description when the field is
+// empty" is about the product, not the ticket, and must sail through.
+const TICKET = String.raw`(?:this |the )?(?:ticket|issue|jira(?: (?:issue|ticket))?|[A-Z][A-Z0-9]{1,9}-\d+)`;
+const ABSENT_SPEC_CLAIMS: RegExp[] = [
+  // "the issue has no description", "WEB-118 carries only a title"
+  new RegExp(String.raw`\b${TICKET}\b[^.\n]{0,30}?\s(?:has|have|had|carries|contains|includes|provides|comes with)\s+(?:no|only a|nothing but a)\s+(?:description|spec(?:ification)?|body|details|requirements|title)\b`, "gi"),
+  // "there is no description on the Jira issue", "no spec attached to WEB-118"
+  new RegExp(String.raw`\b(?:there (?:is|was|are|were) )?no\s+(?:description|spec(?:ification)?|requirements)\b[^.\n]{0,30}?\b(?:on|for|in|attached to)\s+${TICKET}\b`, "gi"),
+  // "the ticket is title-only", "a title-only issue"
+  new RegExp(String.raw`\b${TICKET}\b[^.\n]{0,20}?\sis\s+title[- ]only\b`, "gi"),
+  new RegExp(String.raw`\btitle[- ]only\s+${TICKET}\b`, "gi"),
+  // proposing to go back to the reporter because the spec is missing
+  /\b(?:ask|asking|check with|go back to)\s+the\s+(?:reporter|requester|filer)\b[^.\n]{0,40}?\b(?:for (?:a |the )?(?:spec(?:ification)?|description|requirements|details)|what (?:they|he|she) wants?)/gi,
+  /\b(?:spec(?:ification)?|description|requirements)\s+(?:is |are )?needed from the (?:reporter|requester|filer)\b/gi,
+  /\bawaiting (?:a |the )?spec(?:ification)?\b/gi,
+];
+// "no need to ask the reporter for a spec" is the OPPOSITE claim, and reads as
+// a match to the arm above. Look back a short way for the negation that flips it.
+const NEGATED_BEFORE = /\b(?:no need|without need(?:ing)?|don'?t need|do not need|no reason|not necessary|rather than|instead of|no point)\b[^.\n]{0,30}$/i;
+
+export function thinBriefReason(brief: string): string | null {
+  if (brief.length < 150) return `brief is title-only (${brief.length} chars)`;
+  for (const re of ABSENT_SPEC_CLAIMS) {
+    re.lastIndex = 0;
+    for (const m of brief.matchAll(re)) {
+      if (NEGATED_BEFORE.test(brief.slice(Math.max(0, m.index - 60), m.index))) continue;
+      return `brief claims the ticket has no spec ("${m[0].trim()}")`;
+    }
+  }
+  return null;
+}
+
 // Accepts JSON or multipart; attached files are saved under the new task's id
 // and their absolute paths appended to the brief, so the agent that picks the
 // task up can read them.
@@ -2203,9 +2315,10 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   // already has.
   if (mirrorTaskId) {
     const mirrorBrief = (db.query("SELECT brief FROM tasks WHERE id = ?").get(mirrorTaskId) as { brief: string | null } | undefined)?.brief ?? "";
-    if (brief.length < 80 && mirrorBrief.length > 200)
+    const why = mirrorBrief.length > 200 ? thinBriefReason(brief) : null;
+    if (why)
       return err(
-        `brief is title-only (${brief.length} chars) but linked mirror task ${mirrorTaskId} has a ${mirrorBrief.length}-char spec — include it in --brief-text instead of just the Jira title`,
+        `${why}, but linked mirror task ${mirrorTaskId} already has a ${mirrorBrief.length}-char spec — read that mirror's brief and write --brief-text from it instead of from the Jira title`,
         400
       );
   }
@@ -2446,11 +2559,32 @@ async function updateTask(db: DB, id: string, req: Request): Promise<Response> {
     if (denied) return denied;
     priority = parsed;
   }
-  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, updated_at = ? WHERE id = ?")
-    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, now(), id);
+  // Re-resolve the mirror when the title changes (HIVE-550). Adding the missing
+  // '[WEB-119] ' prefix by hand is the repair path a human reaches for when a
+  // work task was filed unlinked, and resolving only at creation made that
+  // repair silently do nothing. Never CLEAR a link here: dropping the prefix
+  // shouldn't throw away a link the board already relies on.
+  let mirrorTaskId: string | null = task.jira_mirror_task_id ?? null;
+  let relinked: { from: string | null; to: string } | null = null;
+  // Also re-resolve when the task is still unlinked: a task filed before its
+  // mirror existed (or already carrying the prefix but linked to nothing) heals
+  // on the next edit instead of staying orphaned forever.
+  if (title !== task.title || !mirrorTaskId) {
+    const resolved = mirrorTaskIdForTitle(db, task.project_id, title);
+    if (resolved && resolved !== mirrorTaskId) {
+      relinked = { from: mirrorTaskId, to: resolved };
+      mirrorTaskId = resolved;
+    }
+  }
+  db.query("UPDATE tasks SET title = ?, brief = ?, depends_on = ?, verification_cmds = ?, priority = ?, jira_mirror_task_id = ?, updated_at = ? WHERE id = ?")
+    .run(title, brief, deps.length ? JSON.stringify(deps) : null, verify, priority, mirrorTaskId, now(), id);
   const updated = getTask(db, id);
+  // Say it out loud rather than repointing in silence — especially when this
+  // moved an existing link off another ticket.
+  if (relinked)
+    writeEvent(db, { task_id: id, source: "director", type: "jira_mirror_relinked", payload: relinked });
   broadcastTask(db, updated);
-  return json(taskWithHealth(db, updated));
+  return json({ ...taskWithHealth(db, updated), ...(relinked ? { jira_mirror_relinked: relinked } : {}) });
 }
 
 // Manual merge: fold this task into `target_id`, cancelling it as a duplicate.
@@ -3085,7 +3219,17 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
     if (found) embedded_tasks = found;
   }
   // The review card only blocks on the understanding check when this says so.
-  return json({ unmet_deps, embedded_tasks, understanding_required: understandingChecksRequired(db, task) });
+  // The risk check ran when the PR reached review, not at the land attempt
+  // (HIVE-565), so its verdict is known before the director spends any effort:
+  // the card can refuse Ship and skip the quiz instead of asking for both and
+  // then blocking the merge.
+  return json({
+    unmet_deps,
+    embedded_tasks,
+    understanding_required: understandingChecksRequired(db, task),
+    confirmed_risks: confirmedRisks(db, task.id, task.head_sha),
+    risk_check_unfinished: unfinishedRiskCheck(db, task.id, task.head_sha),
+  });
 }
 
 // Map our merge_method config onto gh's flag. Squash is the default.
@@ -3329,6 +3473,45 @@ async function mergeTaskLocked(
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   const config = JSON.parse(project?.config ?? "{}");
   const autoShipKind = Array.isArray(config.auto_merge?.kinds) && config.auto_merge.kinds.includes(task.kind);
+  // The risk check (HIVE-406) re-read the real code for this exact head. Risks
+  // it CONFIRMED are the ones that survived an adversarial second look, so the
+  // director sees that short list verbatim instead of the whole caution blob.
+  // Refuted risks say nothing here. Overridable, like the rebase guard below.
+  //
+  // This runs BEFORE the understanding check (HIVE-565). The quiz is the most
+  // expensive thing hive asks of the director, and asking for it on a change
+  // the machine is about to refuse is the wrong order. A risk that lands AFTER
+  // the quiz was passed — a new push, a late verdict — says so, so the refusal
+  // never reads as "you did that for nothing".
+  const confirmed = body?.override_confirmed_risks ? [] : confirmedRisks(db, id, task.head_sha);
+  if (confirmed.length) {
+    const quiz = latestUnderstandingQuiz(db, id);
+    const late = quiz && understandingQuizStatus(db, id, quiz.reviewEventId) === "passed";
+    return err(
+      (late ? `you passed the understanding check on this change earlier; a new finding arrived on commit ${String(task.head_sha ?? "").slice(0, 7)}. ` : "") +
+        `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
+        confirmed.map((c) => `“${c.risk}” — ${c.why}${c.evidence_path ? ` (${c.evidence_path})` : ""}`).join("; ") +
+        `. Fix them, or merge with override_confirmed_risks=true.`,
+      409,
+      CONFIRMED_RISK_CODE
+    );
+  }
+
+  // "I could not check" is not "I checked and it is bad" (HIVE-539). A run that
+  // timed out leaves findings with NO verdict; quoting one of them as confirmed
+  // is how a task that already fixed the finding could never land. Say what
+  // actually happened instead, and let the queue retry — the verification pass
+  // re-runs the findings it missed and keeps the ones it already got.
+  const unfinished = body?.override_confirmed_risks ? null : unfinishedRiskCheck(db, id, task.head_sha);
+  if (unfinished)
+    return err(
+      `merge blocked — the risk check did not finish on this head: ${unfinished.unverified} of ` +
+        `${unfinished.unverified + unfinished.checked} finding${unfinished.unverified + unfinished.checked === 1 ? "" : "s"} ` +
+        `got no verdict${unfinished.reason ? ` (${unfinished.reason})` : ""}. Nothing was confirmed. ` +
+        `Wait for it to retry, or merge with override_confirmed_risks=true.`,
+      409
+    );
+
   // Mechanical changes (hive-1559) never mint a quiz, so nothing here to gate on.
   let deferQuizReviewEventId: string | null = null;
   if (understandingChecksRequired(db, task)) {
@@ -3365,34 +3548,6 @@ async function mergeTaskLocked(
     const names = blockingDeps.map((b) => `#${b.number} ${b.title} (${b.state})`).join(", ");
     return err(`blocked by unmet dependenc${blockingDeps.length === 1 ? "y" : "ies"}: ${names} — not yet merged/done`, 409);
   }
-
-  // The risk check (HIVE-406) re-read the real code for this exact head. Risks
-  // it CONFIRMED are the ones that survived an adversarial second look, so the
-  // director sees that short list verbatim instead of the whole caution blob.
-  // Refuted risks say nothing here. Overridable, like the rebase guard below.
-  const confirmed = body?.override_confirmed_risks ? [] : confirmedRisks(db, id, task.head_sha);
-  if (confirmed.length)
-    return err(
-      `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
-        confirmed.map((c) => `“${c.risk}” — ${c.why}${c.evidence_path ? ` (${c.evidence_path})` : ""}`).join("; ") +
-        `. Fix them, or merge with override_confirmed_risks=true.`,
-      409
-    );
-
-  // "I could not check" is not "I checked and it is bad" (HIVE-539). A run that
-  // timed out leaves findings with NO verdict; quoting one of them as confirmed
-  // is how a task that already fixed the finding could never land. Say what
-  // actually happened instead, and let the queue retry — the verification pass
-  // re-runs the findings it missed and keeps the ones it already got.
-  const unfinished = body?.override_confirmed_risks ? null : unfinishedRiskCheck(db, id, task.head_sha);
-  if (unfinished)
-    return err(
-      `merge blocked — the risk check did not finish on this head: ${unfinished.unverified} of ` +
-        `${unfinished.unverified + unfinished.checked} finding${unfinished.unverified + unfinished.checked === 1 ? "" : "s"} ` +
-        `got no verdict${unfinished.reason ? ` (${unfinished.reason})` : ""}. Nothing was confirmed. ` +
-        `Wait for it to retry, or merge with override_confirmed_risks=true.`,
-      409
-    );
 
   const exec = deps.exec ?? defaultExec;
   let prView: any = null;
@@ -4042,7 +4197,21 @@ export async function spawnAgent(
     // (not per-task) and inBackoff excludes them, so an outage doesn't pound the
     // dead socket once per queued task nor inflate the task's own backoff.
     const infra = isHerdrUnreachable(msg) ? "herdr_unreachable" : undefined;
-    writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error: msg, ...(infra ? { infra } : {}) } });
+    // HIVE-568: a name held by a LIVE holder is contention, not failure. The
+    // lease can only be reclaimed once the holder reports done AND the task has
+    // been silent for a whole stale window (15m) — far longer than the
+    // dispatcher's five quick retries, so every such task used to be failed with
+    // "needs a human" while the holder was simply finishing its turn. Stamp the
+    // event with the earliest moment a retry could work; the dispatcher waits for
+    // it instead of spending an attempt. A holder that is already done AND past
+    // the window is a genuine failure — left untagged, so it still fails fast.
+    const heldUntil = e instanceof HerdrError ? heldNameRetryAt(e.nameHolder, holderQuietMs, staleMs(), Date.now()) : null;
+    writeEvent(db, {
+      task_id: id,
+      source: "herdr",
+      type: "spawn_error",
+      payload: { error: msg, ...(infra ? { infra } : {}), ...(heldUntil ? { held_until: heldUntil } : {}) },
+    });
     recordSystemLearning(db, task.project_id, `spawn failure: ${signature(msg)}`, msg, id);
     return { ok: false, error: msg };
   }
@@ -4590,6 +4759,12 @@ function quizAnswerable(db: DB, task: { id: string; state: string; head_sha: str
   // Shipped: the post-ship catch-up class. Its head is settled, so it is
   // answerable, and it only ever feeds the digest.
   if (task.state !== "in_review") return true;
+  // A change the risk check already refused is not a change to quiz anybody on
+  // (HIVE-570). The quiz is the most expensive thing hive asks of the director,
+  // and asking for it on a PR that cannot merge spends his effort before the
+  // machine spends any of its own. The finding goes back to the agent; the quiz
+  // comes back on its own once the next push clears the risk.
+  if (confirmedRisks(db, task.id, task.head_sha).length) return false;
   // The director asked for this one by hand, so it is their question whatever
   // the pipeline is doing.
   if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1").get(task.id)) return true;
@@ -4597,6 +4772,28 @@ function quizAnswerable(db: DB, task: { id: string; state: string; head_sha: str
   // reviewer skips both, so nothing further is coming and this is as complete
   // as the review gets.
   return reviewPipelineSettled(db, task);
+}
+
+// Re-emitting a review is the normal reply to a rebase, a risk finding or red
+// CI. A re-emitted review that says nothing about the understanding checks means
+// "nothing to add", not "delete them" (HIVE-545) — last-write-wins used to wipe
+// a quiz the director had already passed and drop an approved PR back out of
+// the land queue. So the checks carry forward. Only an explicit `checks: []`
+// clears them, and that empty array is stored so the clear sticks.
+// Returns the newest review that actually spoke about checks, or null when no
+// review ever did (or the last word was an explicit clear).
+function carriedUnderstandingChecks(db: DB, taskId: string): { checks: unknown[]; eventId: string; rowid: number } | null {
+  const rows = db
+    .query("SELECT id, rowid, payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC")
+    .all(taskId) as { id: string; rowid: number; payload: string }[];
+  for (const row of rows) {
+    let understanding: any;
+    try { understanding = JSON.parse(row.payload)?.understanding; } catch { continue; }
+    if (!understanding || typeof understanding !== "object" || !Array.isArray(understanding.checks)) continue;
+    if (!understanding.checks.length) return null;
+    return { checks: understanding.checks, eventId: row.id, rowid: row.rowid };
+  }
+  return null;
 }
 
 function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; checks: UnderstandingCheck[] } | null {
@@ -6216,6 +6413,56 @@ async function headSha(exec: Exec, cwd: string | null): Promise<string | null> {
   }
 }
 
+// Is the attached evidence still about the code at the current commit?
+//
+// Evidence is stamped with the worktree HEAD at capture time. A later commit
+// moves HEAD, so the stamp no longer matches and the artifact reads as stale.
+// Two things soften that (HIVE-574):
+//   * An identical tree at both commits means the code the evidence describes
+//     did not change (an amend, a rewritten history, an empty commit). The
+//     evidence is re-stamped onto the new commit instead of the agent being
+//     sent back to re-run a check with the same result.
+//   * When it IS stale, the caller gets both SHAs so it can say which commit
+//     the evidence is for and which one the branch is at.
+// Fails open (fresh) when there is no worktree or git cannot answer, the same
+// stance as the CI probe: broken git must not strand every handoff.
+type Freshness = { stale: false } | { stale: true; head: string; evidenceSha: string | null };
+
+async function evidenceFreshness(db: DB, exec: Exec, t: any): Promise<Freshness> {
+  const head = await headSha(exec, t.worktree_path);
+  if (!head) return { stale: false };
+  if (evidenceAtSha(db, t.id, head) >= 1) return { stale: false };
+  const evidenceSha = latestEvidenceSha(db, t.id);
+  if (evidenceSha && /^[0-9a-f]{7,40}$/i.test(evidenceSha)) {
+    const same = await exec(["git", "diff", "--quiet", evidenceSha, head], { cwd: t.worktree_path });
+    if (same.code === 0) {
+      const moved = restampEvidence(db, t.id, evidenceSha, head);
+      writeEvent(db, {
+        task_id: t.id,
+        source: "system",
+        type: "evidence_restamped",
+        payload: { from: evidenceSha, to: head, count: moved, reason: "same tree" },
+      });
+      return { stale: false };
+    }
+  }
+  return { stale: true, head, evidenceSha };
+}
+
+const shortSha = (sha: string | null) => (sha ? sha.slice(0, 7) : null);
+
+// One wording for both places that refuse stale evidence, so an agent reads the
+// same instruction whether it is refused at review time or at handoff time.
+function staleEvidenceMessage(taskId: string, head: string, evidenceSha: string | null, lead: string): string {
+  const from = shortSha(evidenceSha);
+  return (
+    `${lead} Your evidence is for ${from ? `commit ${from}` : "an earlier commit"}, the branch is at commit ${shortSha(head)}. ` +
+    `Re-run the check against the current commit and attach the result: ` +
+    `hive emit ${taskId} evidence --file ... --note ... . Then emit again. ` +
+    `You do not need a respawn for this.`
+  );
+}
+
 // hive-487: does `prUrl` still carry a `hive-task:` marker (or `[hive-<n>]`
 // title prefix) naming one of `ids`? Used to gate resume-pointer adoption at
 // dispatch time — the one place a stale/migrated pr_url would otherwise get
@@ -6248,6 +6495,42 @@ async function prHeadBranch(exec: Exec, prUrl: string): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------- event ingestion (`hive emit`)
+// hive-1992: `hive emit --json <file>` used to accept ANY path, so agents that
+// wrote to the shared /tmp/review.json published each other's reviews — one
+// task's review card ended up describing a completely different change, and an
+// understanding check had already been passed against the review it replaced.
+// The CLI sends the resolved path; a payload read from outside the calling
+// agent's own sandbox is refused, not warned about.
+//
+// Legitimate homes are the task's own worktree, and its per-session scratchpad
+// (/tmp/claude-501/<worktree-slug>/<session-uuid>/scratchpad/...), whose slug is
+// the worktree path with every non-alphanumeric character turned into "-".
+function worktreeSlug(worktreePath: string): string {
+  return worktreePath.replace(/[^A-Za-z0-9]/g, "-");
+}
+
+// Every name this task legitimately answers to, so a payload that stamps its
+// own task id can be checked against all of them (uppercased for comparison).
+function taskIdentities(db: DB, task: any): string[] {
+  return [task.id, String(task.number), `#${task.number}`, taskIdentifier(db, task)].map((v) => v.toUpperCase());
+}
+
+function payloadPathRefusal(task: any, raw: unknown): string | null {
+  const path = typeof raw === "string" ? raw.trim() : "";
+  const worktree = String(task?.worktree_path ?? "").replace(/\/+$/, "");
+  // No path (a direct API caller) or no worktree on the task: nothing to
+  // compare against, so this guard stays out of the way.
+  if (!path || !worktree) return null;
+  if (path === worktree || path.startsWith(worktree + "/")) return null;
+  if (path.split("/").includes(worktreeSlug(worktree))) return null;
+  return (
+    `refusing to read ${path}: it is outside this task's worktree and session scratchpad, ` +
+    `so another agent can overwrite it between your write and this emit (that is how one task ` +
+    `published another agent's review). Write the payload inside ${worktree}/ (or your session ` +
+    `scratchpad) and emit again.`
+  );
+}
+
 async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDeps = {}): Promise<Response> {
   const task = getTask(db, taskId);
   if (!task) return noTask(taskId);
@@ -6281,6 +6564,19 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       `this task is tracking-only — hive tracks it but never runs an agent on it, so there are no agent lifecycle events to record. To close it, move it directly: \`hive task move ${taskId} done\` (or \`cancelled\`).`,
       409
     );
+  // hive-1992: a --json payload must come from this agent's own sandbox, and if
+  // it names a task it must name THIS one. Both refuse rather than warn — the
+  // warning would arrive after the wrong review is already published.
+  const pathRefusal = payloadPathRefusal(task, (fields as any).payload_path);
+  if (pathRefusal) return err(pathRefusal, 400);
+  const claimed = String((fields as any).task_id ?? (fields as any).task ?? "").trim();
+  if (claimed && !taskIdentities(db, task).includes(claimed.toUpperCase()))
+    return err(
+      `this payload says it belongs to task ${claimed}, but you are emitting on ${taskIdentifier(db, task)} (${taskId}). ` +
+        `Re-generate the payload for this task and emit again.`,
+      400
+    );
+
   const source = fields.source || "agent";
   const note = fields.note ?? null;
 
@@ -6501,18 +6797,28 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       // written report, not commit-bound screenshots, so they're exempt. Fails
       // open when there's no worktree / git can't resolve HEAD.
       if (!needsReport) {
-        const head = await headSha(exec, t.worktree_path);
-        if (head && evidenceAtSha(db, taskId, head) < 1) {
-          writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { reason: "stale_evidence", head_sha: head } });
+        const fresh = await evidenceFreshness(db, exec, t);
+        if (fresh.stale) {
+          const message = staleEvidenceMessage(taskId, fresh.head, fresh.evidenceSha, "Handoff held.");
+          writeEvent(db, {
+            task_id: taskId,
+            source,
+            type: "ready_held",
+            payload: {
+              reason: "stale_evidence",
+              head_sha: fresh.head,
+              evidence_sha: fresh.evidenceSha,
+              action: "re-capture evidence at the current commit, then emit ready again",
+            },
+          });
           broadcastTask(db, getTask(db, taskId));
           return json({
             held: true,
             reason: "stale_evidence",
-            head_sha: head,
-            message:
-              `Handoff held: your attached evidence is from an earlier commit, not the current one (${head.slice(0, 7)}). ` +
-              `Re-capture against the latest commit — a fresh test run or log for server/back-end changes, ` +
-              `a screenshot for UI — and attach it (hive emit ${taskId} evidence --file ... --note ...), then emit ready again.`,
+            head_sha: fresh.head,
+            evidence_sha: fresh.evidenceSha,
+            action: "re-capture evidence at the current commit, then emit ready again",
+            message,
           });
         }
       }
@@ -6606,6 +6912,29 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
   // strings via multipart. Anything else is dropped; an empty summary is a 400
   // so a mis-shaped submission fails loudly instead of storing {note:null}.
   if (type === "review_summary") {
+    // Fail early, while the agent is still on its turn (HIVE-574). Agents
+    // routinely file a review and then push, which leaves the evidence behind
+    // the branch; the handoff is refused minutes later, when the turn is over
+    // and only a respawn can deliver the news. Refusing the review itself uses
+    // the SAME test the handoff gate applies, just sooner and while someone is
+    // there to act on it. Scouts hand off a written report, not commit-bound
+    // artifacts, so they are exempt — as is a task with no evidence yet, which
+    // the handoff gate answers with `no_evidence`.
+    const rt = getTask(db, taskId);
+    if (rt?.state === "in_progress" && rt.kind !== "scout" && latestEvidenceSha(db, taskId)) {
+      const fresh = await evidenceFreshness(db, exec, rt);
+      if (fresh.stale)
+        return json(
+          {
+            error: staleEvidenceMessage(taskId, fresh.head, fresh.evidenceSha, "Review not recorded."),
+            reason: "stale_evidence",
+            head_sha: fresh.head,
+            evidence_sha: fresh.evidenceSha,
+            action: "re-capture evidence at the current commit, then emit review_summary again",
+          },
+          409
+        );
+    }
     const pick = (k: string): unknown[] | undefined => {
       const v = (fields as any)[k];
       if (Array.isArray(v)) return v;
@@ -6629,6 +6958,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     if (typeof rawUnderstanding === "string") {
       try { rawUnderstanding = JSON.parse(rawUnderstanding); } catch { rawUnderstanding = null; }
     }
+    let checksProvided = false;
     if (rawUnderstanding && typeof rawUnderstanding === "object" && !Array.isArray(rawUnderstanding)) {
       const text = (value: unknown, max = 600) =>
         typeof value === "string" && value.trim() ? value.trim().slice(0, max) : undefined;
@@ -6646,6 +6976,10 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         if (affectedAreas.length) understanding.affected_areas = affectedAreas;
       }
       const rawCheck = rawUnderstanding.check;
+      // Absent (no `checks`/`check` key at all) and empty (`checks: []`) are
+      // different intents: absent carries the old checks forward, empty clears
+      // them (HIVE-545).
+      checksProvided = Array.isArray(rawUnderstanding.checks) || rawCheck !== undefined;
       const rawChecks = Array.isArray(rawUnderstanding.checks)
         ? rawUnderstanding.checks
         : Array.isArray(rawCheck)
@@ -6672,6 +7006,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         (check) => recurrenceKey(check.question)
       ).slice(0, 5);
       if (checks.length) understanding.checks = checks;
+      else if (checksProvided) understanding.checks = [];
       // Submitted a quiz that normalises to nothing? Say so. Accepting it
       // silently is what cost two tasks a round trip each: the agent believed
       // it had supplied a check, and land only said one was "required"
@@ -6690,6 +7025,13 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     }
     if (!Object.keys(payload).length)
       return err("review_summary needs a structured review section: hive emit <task-id> review_summary --json review.json");
+    // No word on the checks at all? Keep the ones this task already has.
+    const carried = checksProvided ? null : carriedUnderstandingChecks(db, taskId);
+    if (carried) {
+      const understanding = (payload.understanding ?? {}) as Record<string, unknown>;
+      understanding.checks = carried.checks;
+      payload.understanding = understanding;
+    }
     const latest = db
       .query("SELECT * FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
       .get(taskId) as any;
@@ -6700,6 +7042,30 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     )
       return json({ event: parseEvent(latest), duplicate: true }, 201);
     const event = writeEvent(db, { task_id: taskId, source, type, payload });
+    // The carried checks are the SAME questions the director already answered,
+    // so the pass carries with them — otherwise a rebase still un-lands the PR,
+    // just with the quiz re-asked instead of deleted. A changes-request or an
+    // answered decision since then means the change moved, so the director
+    // re-answers (the same guard repairDuplicateQuizPasses uses).
+    if (carried && understandingQuizStatus(db, taskId, carried.eventId) === "passed") {
+      const invalidated = db
+        .query(
+          `SELECT 1 FROM events WHERE task_id = ? AND rowid > ?
+             AND type IN ('changes_requested', 'decision_answered') LIMIT 1`
+        )
+        .get(taskId, carried.rowid);
+      if (!invalidated)
+        writeEvent(db, {
+          task_id: taskId,
+          source: "system",
+          type: "understanding_quiz_passed",
+          payload: {
+            review_event_id: event.id,
+            carried_from_review_event_id: carried.eventId,
+            reason: "review re-emitted without changing the understanding checks",
+          },
+        });
+    }
     const understandingChecks = ((payload.understanding as any)?.checks ?? []) as any[];
     if (understandingChecks.some(isEgregiousCheckWording))
       queueSteerEvent(
@@ -7461,14 +7827,19 @@ export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: an
 // no usable options, or one that's simply no longer relevant). Expires it and
 // broadcasts so the inbox clears live. No resolver hooks fire — dismissing is
 // explicitly "take no action".
-export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; steer: string }): Response {
+export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; steer: string; why?: string }): Response {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
   if (!r) return err("decision not found. List the open ones: curl -s \"$HIVE_URL/api/decisions?status=open\"", 404);
   if (r.status !== "open") return err(`decision already ${r.status}`, 409);
   const source = moot ? "reconciler" : "director";
   const expiredAt = now();
-  db.query("UPDATE decisions SET status = 'expired', answered_at = ?, answered_by = ?, answered_actor = ? WHERE id = ?")
-    .run(expiredAt, source, moot ? "reconciler-moot" : null, id);
+  // Say WHY it closed, on the card, where the director was already looking
+  // (HIVE-570). Nine land-pause cards died as moot inside two minutes last
+  // night and each one took its explanation with it: the row read "Answered:
+  // null". The note keeps the row honest without keeping the question alive.
+  const note = moot ? moot.why ?? `Hive closed this on its own (${moot.reason}). Nothing here needs an answer.` : null;
+  db.query("UPDATE decisions SET status = 'expired', answered_at = ?, answered_by = ?, answered_actor = ?, answer_note = ? WHERE id = ?")
+    .run(expiredAt, source, moot ? "reconciler-moot" : null, note, id);
   writeEvent(db, { task_id: r.task_id, source, type: "decision_expired", payload: { decision_id: id, reason: moot?.reason ?? "dismissed" } });
   // An authority card's pending grant must die with it: left 'pending', every
   // retry of the gated command resolves to this expired decision id and the
@@ -7503,7 +7874,7 @@ export function apiDismissDecision(db: DB, id: string, moot?: { reason: string; 
   const task = getTask(db, r.task_id);
   if (!remaining && task && task.state === "needs_decision")
     transition(db, r.task_id, "in_progress", { source, reason: moot?.reason ?? "last open decision dismissed" });
-  const decision = parseDecision({ ...r, status: "expired", answered_at: expiredAt, answered_by: source });
+  const decision = parseDecision({ ...r, status: "expired", answered_at: expiredAt, answered_by: source, answer_note: note });
   broadcast({ type: "decision", decision });
   return json(decision);
 }

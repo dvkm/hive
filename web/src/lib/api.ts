@@ -540,6 +540,11 @@ export interface BranchCheck {
   unmet_deps: { id: string; number: number; title: string; state: State }[];
   embedded_tasks: { id: string; number: number; title: string }[];
   understanding_required?: boolean; // judgment-class change; the quiz gates approval (hive-1559)
+  // The risk check runs when the PR reaches review, not at the land attempt, so
+  // the card knows before the director spends anything whether Ship can work
+  // (HIVE-570). Undefined on an older server: the old land-time gate still applies.
+  confirmed_risks?: { risk: string; why: string; evidence_path?: string }[];
+  risk_check_unfinished?: { unverified: number; checked: number; reason?: string | null } | null;
 }
 
 // The land queue's ordering graph (server/src/landQueue.ts). `from` lands
@@ -790,6 +795,28 @@ export interface ReviewSummary {
   understanding?: UnderstandingPacket;
 }
 
+// One shipped change, sized for a glance (HIVE-511). `headline` is already
+// capped server-side; the card renders it on one line regardless.
+export interface GlanceCard {
+  task_id: string;
+  number: number;
+  display_id: string;
+  title: string;
+  project_id: string;
+  kind: string;
+  state: string;
+  shipped_at: string;
+  headline: string;
+  merged_by: "auto" | "director" | null;
+  files: number;
+  additions: number;
+  deletions: number;
+  diff_unavailable: boolean;
+  areas: { area: string; churn: number }[];
+  images: { url: string; caption: string | null; phase: "before" | "after" | null }[];
+  explanation_url: string | null;
+}
+
 export interface UnderstandingQuiz {
   id: string;
   task_id: string;
@@ -936,6 +963,8 @@ export const api = {
       body: JSON.stringify({ verdict, note, source: "director", actor: directorActor() }),
     }),
   understandingQuizzes: () => req<{ quizzes: UnderstandingQuiz[] }>(`/api/understanding-quizzes?scope=all`),
+  catchup: (limit = 10, projectId?: string) =>
+    req<{ cards: GlanceCard[] }>(`/api/catchup?limit=${limit}${projectId ? `&project_id=${encodeURIComponent(projectId)}` : ""}`),
   answerUnderstandingQuiz: (taskId: string, answerKey: string, version: string, surface?: "focus") =>
     req<{ ok: boolean; correct: boolean; passed: boolean; explanation: string | null; completed?: number; total?: number; quiz?: Pick<UnderstandingQuiz, "question" | "options" | "version" | "completed" | "total"> }>(`/api/tasks/${taskId}/understanding-quiz/answer`, {
       method: "POST",
