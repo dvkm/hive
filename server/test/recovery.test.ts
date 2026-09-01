@@ -10,7 +10,7 @@ process.env.HIVE_HOME = HOME;
 const { openDb, newId, now } = await import("../src/db.ts");
 import type { DB } from "../src/db.ts";
 const { reconcileOnce, requeueStaleFailed } = await import("../src/reconciler.ts");
-const { requeueTask, resolveRecoveryForDecision } = await import("../src/api.ts");
+const { requeueTask, resolveRecoveryForDecision, requeueForRecovery, createDecision, makeHandler } = await import("../src/api.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { getTask } = await import("../src/state.ts");
 const { DEAD_BURST_N } = await import("../src/teardownGuard.ts");
@@ -1146,4 +1146,81 @@ test("a recovery-card requeue moves the task's Jira link to the successor", () =
   const owners = db.query("SELECT id FROM tasks WHERE jira_key = 'WEB-30'").all() as any[];
   const successor = db.query("SELECT id FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(id) as any;
   expect(owners.map((r) => r.id)).toEqual([successor.id]);
+});
+
+// ---- HIVE-622: a requeue must never queue nothing, quietly ----
+
+test("answering a recovery card through the API queues a successor linked to the original", async () => {
+  const { db, projectId } = freshDb();
+  const handle = makeHandler(db, {});
+  const id = makeTask(db, projectId);
+  failAt(db, id, 1000);
+  const d = createDecision(db, {
+    task_id: id,
+    title: "Recover failed task",
+    context: "the agent died",
+    options: [
+      { key: "requeue", label: "Requeue once more", detail: "fresh queued task", recommended: true },
+      { key: "abandon", label: "Leave it failed", detail: "no successor" },
+    ],
+  });
+  putEvent(db, id, "recovery_card", { decision_id: d.id, source_task_id: id });
+
+  const res = await handle(new Request(`http://x/api/decisions/${d.id}/answer`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ answer_key: "requeue", source: "director" }),
+  }));
+  expect(res.status).toBe(200);
+
+  const successor = db.query("SELECT id, state FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(id) as any;
+  expect(successor).toBeTruthy();
+  expect(successor.state).toBe("queued");
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'requeued'").get(id) as any;
+  expect(JSON.parse(ev.payload).new_task_id).toBe(successor.id);
+});
+
+test("a refused requeue records the refusal on the original instead of swallowing it", () => {
+  // A tracking-only Jira mirror cannot be requeued — hive does not own the row.
+  // The refusal is legitimate; being silent about it is not.
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId);
+  db.query("UPDATE tasks SET source_ref = 'jira:WEB-9' WHERE id = ?").run(id);
+  failAt(db, id, 1000);
+  putEvent(db, id, "recovery_card", { decision_id: "dec_refused", source_task_id: id });
+
+  const reason = requeueForRecovery(db, id, "dec_refused");
+
+  expect(reason).toBeTruthy();
+  expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ?").all(id)).toHaveLength(0);
+  const ev = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'requeue_failed'").get(id) as any;
+  expect(ev).toBeTruthy();
+  expect(JSON.parse(ev.payload)).toMatchObject({ decision_id: "dec_refused", reason });
+  // Still claimed, so the answer is not relayed to a dead agent as a steer.
+  expect(resolveRecoveryForDecision(db, "dec_refused", "requeue")).toBe(true);
+});
+
+test("a requeue that creates nothing returns an error to whoever answered, not a success", async () => {
+  const { db, projectId } = freshDb();
+  const handle = makeHandler(db, {});
+  const id = makeTask(db, projectId);
+  failAt(db, id, 1000);
+  const d = createDecision(db, {
+    task_id: id,
+    title: "Recover failed task",
+    context: "the agent died",
+    options: [{ key: "requeue", label: "Requeue once more", detail: "fresh queued task", recommended: true }],
+  });
+  // The card points at a task that is not there — stand-in for any reason the
+  // successor cannot be created. The answer must not read as "work is queued".
+  putEvent(db, id, "recovery_card", { decision_id: d.id, source_task_id: "gone1234" });
+
+  const res = await handle(new Request(`http://x/api/decisions/${d.id}/answer`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ answer_key: "requeue", source: "director" }),
+  }));
+
+  expect(res.status).toBe(500);
+  expect((await res.json()).error).toContain("no new task was queued");
 });
