@@ -4201,30 +4201,90 @@ a.dbundle-fact:hover {
   color: var(--text-dim);
   font-size: var(--t-sm);
 }
-.review-caveat {
+/* ---- what changed / before → after / why (HIVE-557) ---- */
+.review-focus {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.focus-eyebrow {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text-faint);
+  font-size: var(--t-eyebrow);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.focus-lead {
+  margin: 0;
+  font-size: 15.5px;
+  line-height: 1.45;
+  color: var(--text);
+}
+.focus-stat {
+  margin: 5px 0 0;
+  color: var(--text-faint);
+  font-size: var(--t-xs);
+  font-family: var(--mono);
+}
+.focus-state {
+  border-collapse: collapse;
+  font-size: var(--t-sm);
+}
+.focus-state th {
+  padding: 3px 12px 3px 0;
+  text-align: left;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+.focus-state td {
+  padding: 3px 8px 3px 0;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.focus-before { color: var(--text-faint); }
+.focus-arrow { color: var(--text-faint); padding-right: 8px; }
+.focus-after { color: var(--green); font-weight: 650; }
+.focus-state-same .focus-after { color: var(--text-dim); font-weight: 400; }
+.focus-note {
+  color: var(--text-faint);
+  font-family: inherit;
+  font-size: var(--t-xs);
+}
+.focus-why {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: var(--t-sm);
+  line-height: 1.5;
+}
+.review-recommendation-open {
+  border-color: color-mix(in srgb, var(--yellow) 45%, var(--border-soft));
+}
+.review-recommendation-open .review-recommendation-label { color: var(--yellow); }
+.rv-open {
+  white-space: normal;
+  overflow: visible;
+  color: var(--text);
+}
+.risk-settled > summary {
+  cursor: pointer;
+  color: var(--text-faint);
+  font-size: var(--t-xs);
+}
+.risk-settled ul {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.risk-settled li {
   display: flex;
   align-items: baseline;
   gap: 8px;
-  margin-top: 12px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border-soft);
-  color: var(--text-dim);
-  font-size: var(--t-sm);
-}
-.review-caveat > :first-child {
-  flex: none;
-  color: var(--yellow);
-  font-weight: 650;
-}
-.review-caveat-text {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.review-caveat small {
-  flex: none;
-  color: var(--text-faint);
 }
 .risk-verdicts {
   margin-top: 12px;
