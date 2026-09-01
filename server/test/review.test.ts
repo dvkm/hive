@@ -7,7 +7,7 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-review-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb } = await import("../src/db.ts");
-const { makeHandler, repairDuplicateQuizPasses } = await import("../src/api.ts");
+const { makeHandler, repairDuplicateQuizPasses, deferShippedQuizzes } = await import("../src/api.ts");
 const { reconcileOnce } = await import("../src/reconciler.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { writeEvent } = await import("../src/state.ts");
@@ -1656,5 +1656,24 @@ test("a PR merged outside hive defers the unanswered quiz when the reconciler se
 
   const quizzes = await get(s.base, "/api/understanding-quizzes?scope=all");
   expect(quizzes.json.quizzes.find((item: any) => item.task_id === taskId)?.status).toBe("deferred");
+  await s.server.stop(true);
+});
+
+// HIVE-544 backfill: the pile that built up before the fix above. Those tasks
+// are already terminal, so no merge path will ever reach them again.
+test("the startup sweep settles shipped quizzes, skips failed tasks, and is a no-op the second time", async () => {
+  const s = makeServer();
+  const shipped = await inReviewTask(s.base, {}, false);
+  const failed = await inReviewTask(s.base, {}, false);
+  s.db.query("UPDATE tasks SET state = 'done' WHERE id = ?").run(shipped.taskId);
+  s.db.query("UPDATE tasks SET state = 'failed' WHERE id = ?").run(failed.taskId);
+
+  expect(deferShippedQuizzes(s.db)).toBe(1);
+  expect(deferShippedQuizzes(s.db)).toBe(0);
+
+  const quizzes = await get(s.base, "/api/understanding-quizzes?scope=all");
+  const statusOf = (id: string) => quizzes.json.quizzes.find((item: any) => item.task_id === id)?.status;
+  expect(statusOf(shipped.taskId)).toBe("deferred");
+  expect(statusOf(failed.taskId)).toBe("required");
   await s.server.stop(true);
 });

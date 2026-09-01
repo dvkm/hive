@@ -9,7 +9,7 @@ process.on("unhandledRejection", (e) => {
   console.error("[hive] unhandledRejection (survived):", e);
 });
 import { openDb, defaultDbPath } from "./db.ts";
-import { makeHandler, keepSupervisorWarm, notifyManagerOfEvent, repairDuplicateQuizPasses, sweepManagerInboxes, wakeDueManagers } from "./api.ts";
+import { makeHandler, keepSupervisorWarm, notifyManagerOfEvent, repairDuplicateQuizPasses, deferShippedQuizzes, sweepManagerInboxes, wakeDueManagers } from "./api.ts";
 import { startReconciler, reAdoptAgentsOnBoot } from "./reconciler.ts";
 import { startDispatcher } from "./dispatcher.ts";
 import { startReaper } from "./reaper.ts";
@@ -66,6 +66,11 @@ const db = openDb(dbPath);
 
 const carriedQuizPasses = repairDuplicateQuizPasses(db);
 if (carriedQuizPasses) console.log(`[hive] preserved ${carriedQuizPasses} completed quiz pass(es) across duplicate reviews`);
+
+// Backfill: quizzes still reading "required" on tasks that already shipped,
+// left behind by merges hive did not perform (HIVE-544). Idempotent.
+const sweptQuizzes = deferShippedQuizzes(db);
+if (sweptQuizzes) console.log(`[hive] deferred ${sweptQuizzes} unanswered quiz(zes) on tasks that already shipped`);
 const handle = makeHandler(db, { supervise: true });
 
 // First-run bootstrap: make sure the standing safety rules exist. Idempotent.

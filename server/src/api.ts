@@ -4820,19 +4820,42 @@ function requireUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
 // forever on a task that had already shipped — the same unanswered catch-up
 // item under a name that reads like a blocker.
 export function deferQuizForExternalMerge(db: DB, taskId: string): void {
+  settleShippedQuiz(db, taskId, "Automatically deferred because the PR was merged outside hive; the task had already shipped.");
+}
+
+// Marks an unanswered quiz as deferred. Returns false (and writes nothing) when
+// there is no quiz, when the task is not judgment-class, or when the quiz was
+// already passed or deferred — so calling it twice is a no-op.
+function settleShippedQuiz(db: DB, taskId: string, note: string): boolean {
   const task = getTask(db, taskId);
-  if (!task || !understandingChecksRequired(db, task)) return;
+  if (!task || !understandingChecksRequired(db, task)) return false;
   const quiz = latestUnderstandingQuiz(db, taskId);
-  if (!quiz || understandingQuizStatus(db, taskId, quiz.reviewEventId) !== "required") return;
+  if (!quiz || understandingQuizStatus(db, taskId, quiz.reviewEventId) !== "required") return false;
   writeEvent(db, {
     task_id: taskId,
     source: "system",
     type: "understanding_quiz_deferred",
-    payload: {
-      review_event_id: quiz.reviewEventId,
-      note: "Automatically deferred because the PR was merged outside hive; the task had already shipped.",
-    },
+    payload: { review_event_id: quiz.reviewEventId, note },
   });
+  return true;
+}
+
+// Backfill for the pile that accumulated before the fix above: tasks that
+// already shipped but whose quiz still reads "required", because nothing on the
+// external-merge path ever settled it. Settle them the same way a merge would.
+// `failed` is deliberately NOT swept: that work never shipped, so its quiz is a
+// real signal, not a catch-up item. Idempotent — a second run settles nothing.
+export function deferShippedQuizzes(db: DB): number {
+  const rows = db
+    .query(
+      `SELECT DISTINCT t.id FROM tasks t JOIN events e ON e.task_id = t.id AND e.type = 'review_summary'
+        WHERE t.state IN ('done', 'verifying')`
+    )
+    .all() as { id: string }[];
+  let swept = 0;
+  for (const row of rows)
+    if (settleShippedQuiz(db, row.id, "Automatically deferred: the task had already shipped when this quiz was still unanswered.")) swept++;
+  return swept;
 }
 
 function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
