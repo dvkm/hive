@@ -108,7 +108,7 @@ async function rawDiff(db: DB, task: any, exec: Exec): Promise<{ ok: true; text:
 // The live PR head, read fresh right before diffing and again after the (slow)
 // LLM call — a force-push or PR replacement mid-review must not let a stale
 // verdict land on the new head (task HIVE-307).
-async function livePrHead(exec: Exec, prUrl: string): Promise<string | null> {
+export async function livePrHead(exec: Exec, prUrl: string): Promise<string | null> {
   const r = await exec(["gh", "pr", "view", prUrl, "--json", "headRefOid"]);
   if (r.code !== 0) return null;
   try {
@@ -790,8 +790,11 @@ function answerPrompt(task: any, question: string, diff: string): string {
 // So a stored set counts as covering this review only when it accounts for
 // every risk and question the review actually raised. Anything else re-verifies.
 function hasRiskVerdicts(db: DB, taskId: string, head: string, expected: number): boolean {
-  const rows = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts'").all(taskId) as { payload: string }[];
-  return rows.some((r) => coversReview(r.payload, head, expected));
+  const rows = db
+    .query("SELECT rowid AS rid, payload FROM events WHERE task_id = ? AND type = 'risk_verdicts'")
+    .all(taskId) as { rid: number; payload: string }[];
+  const floors = recheckFloors(db, [taskId]);
+  return rows.some((r) => !setAside(floors, taskId, head, r.rid) && coversReview(r.payload, head, expected));
 }
 
 // One opus run per risk and per question, up to RISK_CONCURRENCY at a time,
@@ -832,6 +835,44 @@ export async function verifyRisks(
   }
 }
 
+// HIVE-588: a stored verdict outlived the commit it described, and every sweep
+// re-read it instead of asking again. A verdict is a snapshot of one commit at
+// one moment; when the director looks at a confirmed finding and says it is
+// wrong, re-reading that same row forever is the one thing that cannot help.
+// So the ruling SETS ASIDE everything the risk check stored for that head: the
+// next pass re-runs from scratch, with the ruling itself in front of it
+// (answeredDecisions already carries it into the verify prompt).
+//
+// It is not an override. The re-run can confirm the same risk again, and then
+// the merge stays blocked exactly as before — the only thing that changed is
+// that a human's argument gets a fresh look instead of a replay.
+export function requestRiskRecheck(db: DB, taskId: string, head: string, why: string | null): void {
+  writeEvent(db, { task_id: taskId, source: "director", type: "risk_recheck", payload: { head_sha: head, why } });
+}
+
+// The newest recheck marker per (task, head), as a rowid floor. A `risk_verdicts`
+// row at or below its head's floor was set aside and reads as if it had never
+// been written. Batched over task ids so the multi-task reader below pays for
+// one query, not one per task.
+function recheckFloors(db: DB, taskIds: string[]): Map<string, number> {
+  const floors = new Map<string, number>();
+  if (!taskIds.length) return floors;
+  const ph = taskIds.map(() => "?").join(",");
+  for (const r of db
+    .query(`SELECT rowid AS rid, task_id, payload FROM events WHERE task_id IN (${ph}) AND type = 'risk_recheck' ORDER BY rowid`)
+    .all(...taskIds) as { rid: number; task_id: string; payload: string }[]) {
+    try {
+      const head = JSON.parse(r.payload ?? "{}")?.head_sha;
+      if (head) floors.set(`${r.task_id}:${head}`, r.rid);
+    } catch {}
+  }
+  return floors;
+}
+
+function setAside(floors: Map<string, number>, taskId: string, head: unknown, rid: number): boolean {
+  return rid <= (floors.get(`${taskId}:${head}`) ?? 0);
+}
+
 // Every verdict any pass produced for this head, newest pass winning on a tie.
 function priorVerdicts(
   db: DB,
@@ -841,8 +882,9 @@ function priorVerdicts(
   const knownRisk = new Map<string, RiskVerdict>();
   const knownQuestion = new Map<string, QuestionVerdict>();
   const rows = db
-    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts' ORDER BY ts DESC, rowid DESC")
-    .all(taskId) as { payload: string }[];
+    .query("SELECT rowid AS rid, payload FROM events WHERE task_id = ? AND type = 'risk_verdicts' ORDER BY ts DESC, rowid DESC")
+    .all(taskId) as { rid: number; payload: string }[];
+  const floors = recheckFloors(db, [taskId]);
   for (const r of rows) {
     let p: any;
     try {
@@ -851,6 +893,7 @@ function priorVerdicts(
       continue;
     }
     if (p?.reviewed_head_sha !== head) continue;
+    if (setAside(floors, taskId, head, r.rid)) continue;
     for (const v of Array.isArray(p.verdicts) ? p.verdicts : []) if (v?.risk && !knownRisk.has(v.risk)) knownRisk.set(v.risk, v);
     for (const q of Array.isArray(p.question_verdicts) ? p.question_verdicts : [])
       if (q?.question && !knownQuestion.has(q.question)) knownQuestion.set(q.question, q);
@@ -861,13 +904,15 @@ function priorVerdicts(
 // How many verification passes this head has already written. One event per
 // finished pass, so this is the retry counter MAX_VERIFY_ATTEMPTS caps.
 function verifyAttempts(db: DB, taskId: string, head: string): number {
-  return (
-    db
-      .query(
-        "SELECT COUNT(*) n FROM events WHERE task_id = ? AND type = 'risk_verdicts' AND json_extract(payload, '$.reviewed_head_sha') = ?"
-      )
-      .get(taskId, head) as { n: number }
-  ).n;
+  const rows = db
+    .query(
+      "SELECT rowid AS rid FROM events WHERE task_id = ? AND type = 'risk_verdicts' AND json_extract(payload, '$.reviewed_head_sha') = ?"
+    )
+    .all(taskId, head) as { rid: number }[];
+  const floors = recheckFloors(db, [taskId]);
+  // A set-aside pass never happened, so its retry is not spent either — the
+  // recheck the director asked for must be allowed to run.
+  return rows.filter((r) => !setAside(floors, taskId, head, r.rid)).length;
 }
 
 async function runVerification(
@@ -999,8 +1044,9 @@ export function riskVerdictsFor(
 ): { verdicts: RiskVerdict[]; question_verdicts: QuestionVerdict[]; unverified: number; unverified_reason: string | null } | null {
   if (!head) return null;
   const rows = db
-    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_verdicts' ORDER BY ts DESC, rowid DESC")
-    .all(taskId) as { payload: string }[];
+    .query("SELECT rowid AS rid, payload FROM events WHERE task_id = ? AND type = 'risk_verdicts' ORDER BY ts DESC, rowid DESC")
+    .all(taskId) as { rid: number; payload: string }[];
+  const floors = recheckFloors(db, [taskId]);
   for (const r of rows) {
     let p: any;
     try {
@@ -1009,6 +1055,7 @@ export function riskVerdictsFor(
       continue;
     }
     if (p?.reviewed_head_sha !== head) continue;
+    if (setAside(floors, taskId, head, r.rid)) continue;
     return {
       verdicts: Array.isArray(p.verdicts) ? p.verdicts : [],
       question_verdicts: Array.isArray(p.question_verdicts) ? p.question_verdicts : [],
@@ -1149,13 +1196,14 @@ export function reviewActionableBatch(db: DB, tasks: ReviewActionableTask[]): Se
     .all(...ids) as { task_id: string; payload: string }[])
     if (!latest.has(row.task_id)) latest.set(row.task_id, parseAutoReview(row.payload));
 
-  const verdictRows = new Map<string, string[]>();
+  const floors = recheckFloors(db, ids);
+  const verdictRows = new Map<string, { rid: number; payload: string }[]>();
   for (const row of db
-    .query(`SELECT task_id, payload FROM events WHERE type = 'risk_verdicts' AND task_id IN (${ph})`)
-    .all(...ids) as { task_id: string; payload: string }[]) {
+    .query(`SELECT rowid AS rid, task_id, payload FROM events WHERE type = 'risk_verdicts' AND task_id IN (${ph})`)
+    .all(...ids) as { rid: number; task_id: string; payload: string }[]) {
     const list = verdictRows.get(row.task_id);
-    if (list) list.push(row.payload);
-    else verdictRows.set(row.task_id, [row.payload]);
+    if (list) list.push({ rid: row.rid, payload: row.payload });
+    else verdictRows.set(row.task_id, [{ rid: row.rid, payload: row.payload }]);
   }
 
   for (const t of needSettle) {
@@ -1167,7 +1215,8 @@ export function reviewActionableBatch(db: DB, tasks: ReviewActionableTask[]): Se
       continue;
     }
     const rows = verdictRows.get(t.id) ?? [];
-    if (rows.some((raw) => coversReview(raw, t.head_sha!, expected))) actionable.add(t.id);
+    if (rows.some((r) => !setAside(floors, t.id, t.head_sha, r.rid) && coversReview(r.payload, t.head_sha!, expected)))
+      actionable.add(t.id);
   }
   return actionable;
 }

@@ -49,13 +49,14 @@ function seed(): { db: DB; taskId: string } {
 // git router: authored files = task.ts + a reverted health.ts; base advanced on
 // health.ts since the snapshot → destructive. The local-ff plumbing (used only
 // on the override path) is stubbed to succeed so a bypassed merge lands.
-const destructiveExec: Exec = stub((argv) => {
+const destructiveExecResult = (argv: string[]): ExecResult => {
   if (argv.includes("diff") && argv.includes("--name-only")) return OK("health.ts\nsrc/task.ts\n");
   if (argv[3] === "log") return OK(argv[argv.length - 1] === "health.ts" ? "abc base commit\n" : "");
   if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");
   if (argv.includes("symbolic-ref")) return OK("main\n"); // primary checkout is on base
   return OK(); // merge-base --is-ancestor / merge --ff-only succeed
-});
+};
+const destructiveExec: Exec = stub(destructiveExecResult);
 
 const herdr = new Herdr(stub(() => OK("{}")), "herdr");
 
@@ -452,4 +453,65 @@ test("mergeTask's confirmed-risk refusal carries the code the land queue routes 
   expect(body.error).toContain("the risk check confirmed");
   expect(body.code).toBe(CONFIRMED_RISK_CODE);
   expect(isConfirmedRiskFailure(body.code)).toBe(true);
+});
+
+// HIVE-588: a verdict describes ONE commit. Hive's copy of the head lags the
+// branch, so a finding the agent already fixed and pushed past was quoted here
+// as if it still stood, and the land queue re-read that refusal every sweep.
+// The gate now asks GitHub for the live head first: a moved head means the
+// finding is stale, so it records the new head and says so instead of refusing
+// over superseded code.
+test("a confirmed risk on a superseded commit is reported stale, not re-refused", async () => {
+  const { db, taskId } = seed();
+  db.query("UPDATE tasks SET head_sha = ?, pr_url = ? WHERE id = ?").run("head-1", "https://github.com/o/r/pull/7", taskId);
+  writeEvent(db, {
+    task_id: taskId,
+    source: "reconciler",
+    type: "risk_verdicts",
+    payload: {
+      reviewed_head_sha: "head-1",
+      verdicts: [{ risk: "export drops rows", why: "the CSV writer skips the last page", verdict: "confirmed" }],
+    },
+  });
+  // The branch has moved on since that verdict was written.
+  const movedExec: Exec = stub((argv) =>
+    argv[0] === "gh" ? OK(JSON.stringify({ headRefOid: "head-2" })) : destructiveExecResult(argv)
+  );
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec: movedExec });
+  expect(res.status).toBe(409);
+  const body = (await res.json()) as { error: string; code?: string };
+  expect(body.error).toContain("the risk finding is stale");
+  expect(body.error).toContain("head-1");
+  expect(body.error).toContain("head-2");
+  // Not a confirmed-risk refusal: the queue must retry this, not route it.
+  expect(body.code).toBeUndefined();
+  // The new head is recorded, so the risk check re-runs on the real commit.
+  expect(getTask(db, taskId)!.head_sha).toBe("head-2");
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'risk_finding_stale'").get(taskId)).toBeTruthy();
+});
+
+// The other half of the same rule: when the head has NOT moved, the finding is
+// about the code in front of us and the refusal stands exactly as before.
+test("a confirmed risk on the live head still blocks the merge", async () => {
+  const { db, taskId } = seed();
+  db.query("UPDATE tasks SET head_sha = ?, pr_url = ? WHERE id = ?").run("head-1", "https://github.com/o/r/pull/7", taskId);
+  writeEvent(db, {
+    task_id: taskId,
+    source: "reconciler",
+    type: "risk_verdicts",
+    payload: {
+      reviewed_head_sha: "head-1",
+      verdicts: [{ risk: "export drops rows", why: "the CSV writer skips the last page", verdict: "confirmed" }],
+    },
+  });
+  const sameExec: Exec = stub((argv) =>
+    argv[0] === "gh" ? OK(JSON.stringify({ headRefOid: "head-1" })) : destructiveExecResult(argv)
+  );
+
+  const res = await mergeTask(db, herdr, taskId, {}, { exec: sameExec });
+  expect(res.status).toBe(409);
+  const body = (await res.json()) as { error: string; code?: string };
+  expect(body.error).toContain("the risk check confirmed");
+  expect(body.code).toBe(CONFIRMED_RISK_CODE);
 });

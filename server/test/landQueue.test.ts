@@ -3,6 +3,7 @@ import { openDb, newId, now, type DB } from "../src/db.ts";
 import { landGraph, landOnce, markLand, CONFIRMED_RISK_CODE } from "../src/landQueue.ts";
 import { transition, writeEvent } from "../src/state.ts";
 import { apiAnswerDecision } from "../src/api.ts";
+import { confirmedRisks } from "../src/reviewer.ts";
 import { queueSteerEvent, queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers } from "../src/steer.ts";
 import type { Herdr } from "../src/runtime/herdr.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
@@ -836,4 +837,137 @@ test("an erroring reviewer cannot hold the land queue forever (HIVE-581)", async
   const late = mergeStub(db);
   await landOnce(db, { exec: filesExec({}), merge: late.merge });
   expect(late.calls).toEqual([a]);
+});
+
+// HIVE-588: a confirmed risk is a verdict stored against ONE commit, and the
+// queue re-read it on every sweep. So "try landing it again" looked like an
+// option and behaved like a no-op: the same stored row, the same refusal. On a
+// risk card that option is replaced by one that changes something — the
+// director says why the finding is wrong, hive sets the verdict aside and runs
+// the check again. Not an override: a re-run that confirms still blocks.
+test("a confirmed-risk card offers a re-check, and answering it sets the stored verdict aside", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  setHead(db, a, "sha1");
+  // The verdict the merge gate reads, exactly as the risk check writes it.
+  writeEvent(db, {
+    task_id: a,
+    source: "system",
+    type: "risk_verdicts",
+    payload: { reviewed_head_sha: "sha1", verdicts: [{ risk: "export drops rows", why: "the CSV writer skips the last page", verdict: "confirmed" }] },
+  });
+  expect(confirmedRisks(db, a, "sha1")).toHaveLength(1);
+  markLand(db, [a], true);
+
+  // Relayed to the agent first; it hands the branch back unchanged, so the
+  // second sweep opens the director's card.
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
+  markSteersDelivered(db, queuedSteers(db, a).map((s) => s.id), "drain");
+  ageLandAttempts(db, a, 3_600_000);
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
+
+  const card = db.query("SELECT id, options FROM decisions WHERE status = 'open'").get() as any;
+  expect(card).toBeTruthy();
+  const keys = JSON.parse(card.options).map((o: any) => o.key);
+  expect(keys).toContain("recheck");
+  expect(keys).not.toContain("retry");
+
+  const res = apiAnswerDecision(db, stubHerdr, card.id, {
+    answer_key: "recheck",
+    answer_note: "The finding cites a commit from before PR #101 landed the flush fix.",
+    source: "director",
+  });
+  expect(res.status).toBe(200);
+  // The verdict is set aside, so nothing quotes it any more and the check
+  // re-runs from scratch on this same commit.
+  expect(confirmedRisks(db, a, "sha1")).toHaveLength(0);
+  const recheck = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'risk_recheck'").all(a) as any[];
+  expect(recheck).toHaveLength(1);
+  // The reasoning is recorded, which is the part that had nowhere to go before.
+  expect(JSON.parse(recheck[0].payload).why).toContain("PR #101");
+  // Re-armed: still queued, still in review, and the failed-attempt run that
+  // held it after two failures on this commit is ended.
+  const task = db.query("SELECT state, land_queued_at FROM tasks WHERE id = ?").get(a) as any;
+  expect(task.state).toBe("in_review");
+  expect(task.land_queued_at).toBeTruthy();
+
+  // A second card on the same commit no longer offers it: the check already
+  // re-ran with the argument, so asking again would be the no-op this replaced.
+  ageLandAttempts(db, a, 3_600_000);
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
+  const second = db.query("SELECT options FROM decisions WHERE status = 'open'").get() as any;
+  expect(JSON.parse(second.options).map((o: any) => o.key)).toContain("retry");
+});
+
+// HIVE-588: a card can sit open for hours, and the agent can push while it
+// sits. The ruling is about the commit the card was built on, so answering it
+// must never set aside verdicts about the commit that replaced it.
+test("a re-check answered after the branch moved sets nothing aside on the new commit", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  setHead(db, a, "sha1");
+  writeEvent(db, {
+    task_id: a,
+    source: "system",
+    type: "risk_verdicts",
+    payload: { reviewed_head_sha: "sha1", verdicts: [{ risk: "export drops rows", why: "the CSV writer skips the last page", verdict: "confirmed" }] },
+  });
+  markLand(db, [a], true);
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
+  markSteersDelivered(db, queuedSteers(db, a).map((s) => s.id), "drain");
+  ageLandAttempts(db, a, 3_600_000);
+  await landOnce(db, { exec: filesExec({}), merge: mergeStub(db, { [a]: RISK_FAILURE }).merge });
+  const card = db.query("SELECT id FROM decisions WHERE status = 'open'").get() as any;
+
+  // The agent pushes while the card is open, and the new commit gets its own
+  // confirmed finding — one the director has never read.
+  setHead(db, a, "sha2");
+  writeEvent(db, {
+    task_id: a,
+    source: "system",
+    type: "risk_verdicts",
+    payload: { reviewed_head_sha: "sha2", verdicts: [{ risk: "new code deletes the audit row", why: "brand new", verdict: "confirmed" }] },
+  });
+
+  const res = apiAnswerDecision(db, stubHerdr, card.id, {
+    answer_key: "recheck",
+    answer_note: "The finding cites a commit from before PR #101 landed the flush fix.",
+    source: "director",
+  });
+  expect(res.status).toBe(200);
+  // Nothing was set aside: the ruling was about sha1, and sha2's finding still
+  // blocks the merge until the check itself clears it.
+  expect(confirmedRisks(db, a, "sha2")).toHaveLength(1);
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'risk_recheck'").get(a) as any).toMatchObject({ n: 0 });
+  // Still re-armed, so the sweep re-evaluates the new head cleanly.
+  const task = db.query("SELECT state, land_queued_at FROM tasks WHERE id = ?").get(a) as any;
+  expect(task.state).toBe("in_review");
+  expect(task.land_queued_at).toBeTruthy();
+});
+
+// A finding about a commit the branch has already moved past is stale by
+// construction. The merge gate says so instead of quoting it, and the queue
+// reads that as something to retry — no card, no relay, no director.
+test("a stale risk finding retries instead of opening a card", async () => {
+  const { db, projectId } = freshDb();
+  const a = makeTask(db, projectId, { branch: "a" });
+  setHead(db, a, "sha2");
+  markLand(db, [a], true);
+  const reason =
+    "merge blocked — the risk finding is stale: it was recorded on commit sha1abc, and the branch has moved on to sha2def. " +
+    "Nothing is confirmed on the new commit yet. The risk check re-runs on it and the merge is re-attempted.";
+
+  const first = mergeStub(db, { [a]: { reason, code: CONFIRMED_RISK_CODE } });
+  await landOnce(db, { exec: filesExec({}), merge: first.merge });
+  expect(first.calls).toEqual([a]);
+  expect((db.query("SELECT COUNT(*) AS n FROM decisions").get() as any).n).toBe(0);
+  expect((db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'risk_routed_to_agent'").get(a) as any).n).toBe(0);
+  expect(JSON.parse((db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'land_attempted' ORDER BY rowid DESC LIMIT 1").get(a) as any).payload).transient).toBe(true);
+
+  // And it lands on the next sweep once the check has cleared the new commit.
+  ageLandAttempts(db, a, 3_600_000);
+  const second = mergeStub(db);
+  await landOnce(db, { exec: filesExec({}), merge: second.merge });
+  expect(second.calls).toEqual([a]);
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(a) as any).state).toBe("verifying");
 });

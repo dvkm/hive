@@ -247,7 +247,7 @@ test("extractReview parses whole JSON, envelope, and prose-wrapped output", () =
 
 // --- per-risk adversarial verification (task HIVE-406) ---------------------
 
-const { verifyRisks, extractVerdict, extractAnswer, ambiguityCleared, confirmedRisks, unfinishedRiskCheck, verifyPendingOnce } =
+const { verifyRisks, extractVerdict, extractAnswer, ambiguityCleared, confirmedRisks, unfinishedRiskCheck, verifyPendingOnce, requestRiskRecheck } =
   await import("../src/reviewer.ts");
 
 // A pre-review that flags `n` risks, so autoReviewOnce triggers verification.
@@ -785,4 +785,29 @@ test("an emptier later pass never loses the verdicts an earlier pass produced", 
   expect(asked[0]).toContain("r2");
   const latest: any = events(db, id, "risk_verdicts").at(-1);
   expect(latest.payload.verdicts.map((v: any) => v.risk)).toEqual(["r1", "r2"]);
+});
+
+// HIVE-588: a verdict the director has refuted must stop being read, but only
+// for the commit it was recorded on — and a fresh pass on that same commit has
+// to count again, or the PR could never merge afterwards.
+test("a recheck sets aside the verdicts stored for that head, and only that head", async () => {
+  const { db, id } = setup();
+  const verdict = (head: string) => ({
+    reviewed_head_sha: head,
+    verdicts: [{ risk: "export drops rows", why: "the CSV writer skips the last page", verdict: "confirmed" }],
+  });
+  writeEvent(db, { task_id: id, source: "system", type: "risk_verdicts", payload: verdict("head-1") });
+  writeEvent(db, { task_id: id, source: "system", type: "risk_verdicts", payload: verdict("head-2") });
+  expect(confirmedRisks(db, id, "head-1")).toHaveLength(1);
+
+  requestRiskRecheck(db, id, "head-1", "the finding cites code from before the fix landed");
+  expect(confirmedRisks(db, id, "head-1")).toHaveLength(0);
+  // A different commit's verdict is untouched: the ruling was about one finding
+  // on one commit, not about the risk check in general.
+  expect(confirmedRisks(db, id, "head-2")).toHaveLength(1);
+
+  // The re-run happens and confirms the risk again — that verdict is newer than
+  // the ruling, so it counts, and the merge stays blocked. Not an override.
+  writeEvent(db, { task_id: id, source: "system", type: "risk_verdicts", payload: verdict("head-1") });
+  expect(confirmedRisks(db, id, "head-1")).toHaveLength(1);
 });
