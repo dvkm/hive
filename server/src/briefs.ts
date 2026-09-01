@@ -69,8 +69,9 @@ Rules:
   everything else the checks are OPTIONAL, and leaving them out blocks nothing.
   Re-emitting a review after a rebase, a risk finding or a CI fix? Leave
   \`understanding.checks\` out and the checks you already sent stay in place,
-  along with the director's pass. Send \`"checks": []\` only when you mean to
-  drop the quiz on purpose.
+  along with the director's pass. Re-listing the same questions keeps the pass
+  too, even if you reword or reorder them. Send \`"checks": []\` only when you
+  mean to drop the quiz on purpose.
   Every question must help them understand this specific change: behavior, impact, risk,
   tradeoff, or evidence. Never test whether the agent can code, debug, merge,
   use tools, follow policy, or operate Hive; agent competence belongs in internal
