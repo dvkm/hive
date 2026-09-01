@@ -977,8 +977,9 @@ export function transition(
   // A terminal task can no longer act on any open decision — expire them so the
   // inbox clears and the answer endpoint can't be hit against a dead task.
   if (TERMINAL.includes(to)) expireOpenDecisions(db, taskId, `task ${to}`);
-  // The work finishing is what tells its Jira mirror the ticket is done.
-  if (TERMINAL.includes(to) && task.jira_mirror_task_id) advanceJiraMirror(db, task.jira_mirror_task_id, source);
+  // Every move of the work moves its Jira mirror: starting the work puts the
+  // ticket In Progress, finishing it puts the ticket Done.
+  if (task.jira_mirror_task_id) advanceJiraMirror(db, task.jira_mirror_task_id, source);
   if (to === "cancelled") openCancelledDependencyDecision(db, updated, source);
   // Notify on notable terminal-ish outcomes (batched into the digest).
   if (to === "done")
@@ -1007,37 +1008,91 @@ export function transition(
   return updated;
 }
 
-// ---- Jira mirror propagation (HIVE-546) -------------------------------------
+// ---- Jira mirror propagation (HIVE-546, HIVE-562) ---------------------------
 // A mirror row carries the ticket's status; the work tasks under it carry the
 // actual work. Nothing used to connect the two, so a merged task left its
 // mirror sitting in 'queued' forever and the hive -> Jira status push had
 // nothing to push. Advancing the mirror here is what makes that push fire.
 //
-// A mirror advances only when EVERY linked child has finished and at least one
-// finished as `done`: a ticket with ten sub-tasks must not close on the first
-// one. failed and cancelled children are ignored — a failed attempt is a dead
-// row, and its requeued successor carries the link and blocks the mirror while
-// it is still live.
+// The mirror shows the MOST ADVANCED live child: the first child to start puts
+// the ticket In Progress, the first to reach review puts it In Review. It goes
+// terminal only when EVERY linked child has finished and at least one finished
+// as `done`: a ticket with ten sub-tasks must not close on the first one.
+// failed and cancelled children are ignored — a failed attempt is a dead row,
+// and its requeued successor carries the link and blocks the mirror while it is
+// still live.
+//
+// FORWARD ONLY, in Jira-status space. Two reasons:
+//  * a human who dragged the ticket to In Review must not be dragged back to In
+//    Progress because a straggler child just started;
+//  * in_review and verifying are both "In Review" to Jira, so a child moving
+//    between them must not emit a second, redundant transition.
+// Backwards is therefore never written, including for a failed child: `failed`
+// has no Jira status at all (STATE_TO_JIRA), so there is nothing to move to.
 //
 // The write bypasses the FORWARD map on purpose (queued -> done is not an edge
 // hive work may take): a mirror is tracking-only, and jira sync already moves it
 // this way (applyJiraState).
+
+// Board order, for "most advanced" and for forward-only. Ranks are Jira's
+// columns, so in_review and verifying deliberately tie (see STATE_TO_JIRA).
+const MIRROR_RANK: Partial<Record<State, number>> = {
+  queued: 0,
+  in_progress: 1,
+  in_review: 2,
+  verifying: 2,
+  done: 3,
+};
+
+// What a LIVE work child means for the ticket. A child that has not started
+// (queued) or is parked on a decision (needs_decision) says nothing about the
+// column, so it maps to nothing and cannot move the mirror.
+const CHILD_SHOWS: Partial<Record<State, State>> = {
+  in_progress: "in_progress",
+  in_review: "in_review",
+  verifying: "in_review",
+};
+
 export function advanceJiraMirror(db: DB, mirrorId: string, source: string): void {
   const mirror = getTask(db, mirrorId);
   if (!mirror || TERMINAL.includes(mirror.state) || !isJiraMirror(mirror)) return;
+  // needs_decision is a parked ticket: it rides as a Jira LABEL on top of
+  // whatever column the director left it in, and has no rank of its own. Moving
+  // it would both drop the label and overwrite a deliberate park.
+  if (mirror.state === "needs_decision") return;
   const children = db
     .query("SELECT state FROM tasks WHERE jira_mirror_task_id = ?")
     .all(mirrorId) as { state: State }[];
-  if (!children.some((c) => c.state === "done")) return;
-  if (children.some((c) => !TERMINAL.includes(c.state))) return;
+  const live = children.filter((c) => !TERMINAL.includes(c.state));
+
+  let to: State | null = null;
+  let reason = "";
+  if (live.length === 0) {
+    // A mirror whose children are all finished but none done (every attempt
+    // failed or was cancelled) is left exactly where it is.
+    if (!children.some((c) => c.state === "done")) return;
+    to = "done";
+    reason = `all hive work for ${mirror.jira_key} is done`;
+  } else {
+    for (const c of live) {
+      const shows = CHILD_SHOWS[c.state];
+      if (shows && (to == null || MIRROR_RANK[shows]! > MIRROR_RANK[to]!)) to = shows;
+    }
+    if (to == null) return; // nothing live has started yet
+    reason = `hive work for ${mirror.jira_key} is ${to}`;
+  }
+
+  // Forward only: never undo a human's column, never repeat one Jira status.
+  if (MIRROR_RANK[to]! <= (MIRROR_RANK[mirror.state as State] ?? 0)) return;
+
   const updated = mutateWithEvent(db, () => {
-    db.query("UPDATE tasks SET state = 'done', updated_at = ? WHERE id = ?").run(now(), mirrorId);
+    db.query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?").run(to, now(), mirrorId);
     return getTask(db, mirrorId);
   }, {
     task_id: mirrorId,
     source,
     type: "state_change",
-    payload: { from: mirror.state, to: "done", reason: `all hive work for ${mirror.jira_key} is done` },
+    payload: { from: mirror.state, to, reason },
   });
   broadcastTask(db, updated);
 }
