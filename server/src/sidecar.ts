@@ -3,12 +3,12 @@
 //
 // Every reconciler cycle this looks at in-progress tasks with a live worktree,
 // and when the worktree HEAD moved since the last report it runs the two
-// cheapest signals a repo already has — `tsc --noEmit` and the project's own
-// `lint` script — then writes a `sidecar_report` event. No test suite: this is
+// cheapest signals a repo already has — the repo's `typecheck` script (or a
+// bare `tsc --noEmit` when it has none) and the project's own `lint` script — then writes a `sidecar_report` event. No test suite: this is
 // meant to be fast and boring, not a second CI.
 //
 // Rules that keep it out of the way:
-//   - never writes to the worktree. `tsc --noEmit` cannot write; a `lint`
+//   - never writes to the worktree. A typecheck cannot write; a `lint`
 //     script can, so a lint whose text carries a fix flag is skipped outright,
 //     and the tree is fingerprinted before and after every run to catch one
 //     that wrote anyway. A dirtied tree is reported and the whole pass stops.
@@ -156,9 +156,9 @@ function summarize(res: { stdout: string; stderr: string }): string {
   return cap(lines.slice(0, 3).join(" | ") || "failed with no output");
 }
 
-function lintScript(readFile: (p: string) => string, worktree: string): string | null {
+function pkgScript(readFile: (p: string) => string, worktree: string, name: string): string | null {
   try {
-    const script = JSON.parse(readFile(join(worktree, "package.json")))?.scripts?.lint;
+    const script = JSON.parse(readFile(join(worktree, "package.json")))?.scripts?.[name];
     return typeof script === "string" ? script : null;
   } catch {
     return null;
@@ -234,8 +234,15 @@ async function runChecks(
   }
   const remaining = () => deadline - Date.now();
   const checks: { tool: string; argv: string[] }[] = [];
-  if (deps.exists(join(worktree, "tsconfig.json"))) checks.push({ tool: "tsc", argv: ["bun", "x", "tsc", "--noEmit"] });
-  const lint = lintScript(deps.readFile, worktree);
+  // Prefer the repo's own `typecheck` script over a bare `tsc --noEmit`. A bare
+  // run only covers the ROOT tsconfig, so in a workspace like this one it never
+  // looks at web/src and a type error there reads as clean here and then fails
+  // CI (task HIVE-596). The script is the one command the docs point agents at,
+  // so following it keeps this gate and CI in step for free.
+  const typecheck = pkgScript(deps.readFile, worktree, "typecheck");
+  if (typecheck !== null) checks.push({ tool: "tsc", argv: ["bun", "run", "typecheck"] });
+  else if (deps.exists(join(worktree, "tsconfig.json"))) checks.push({ tool: "tsc", argv: ["bun", "x", "tsc", "--noEmit"] });
+  const lint = pkgScript(deps.readFile, worktree, "lint");
   if (lint !== null) {
     // Never run a linter that can rewrite the agent's files under it.
     if (FIX_FLAG_RE.test(lint)) findings.push({ tool: "lint", summary: cap(`skipped: the lint script can write to the worktree (${lint})`) });

@@ -100,6 +100,7 @@ bun run scripts/demo-seed.ts --reset    # wipe all rows first
 
 ```bash
 bun test
+bun run typecheck   # both tsc runs CI does: root tsconfig + web/
 ```
 Covers the state machine (including `done`-without-evidence rejection), event
 ingestion, evidence upload round-trip, decision draft autosave + answer flow,

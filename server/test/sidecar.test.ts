@@ -327,3 +327,17 @@ test("a worktree with no node_modules is skipped, and never reported as a broken
   // A skipped check is not a build break, so the agent is never steered.
   expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'steer'").all(taskId)).toEqual([]);
 });
+
+test("a repo with its own typecheck script gets that, not a bare tsc --noEmit", async () => {
+  const { db } = freshDb();
+  const world = fakeWorld();
+  const withScript = {
+    ...world,
+    exists: (p: string) => p.endsWith("tsconfig.json"),
+    readFile: () => JSON.stringify({ scripts: { typecheck: "tsc --noEmit && tsc -b web --noEmit", lint: "eslint ." } }),
+  };
+  await sidecarOnce(db, withScript);
+
+  expect(world.calls.some((c) => c.join(" ") === "bun run typecheck")).toBe(true);
+  expect(world.calls.some((c) => c.join(" ") === "bun x tsc --noEmit")).toBe(false);
+});
