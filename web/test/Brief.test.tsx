@@ -6,12 +6,12 @@ import type { Brief as BriefData, Decision, Evidence, Task, UnderstandingQuiz as
 import { LightboxProvider } from "../src/lib/lightbox";
 import { Ctx, resetQuizStatesForTests, type Store } from "../src/lib/store";
 import Brief from "../src/views/Brief";
-
-// Quiz state lives in a module-level map shared across every bun test file.
-beforeEach(resetQuizStatesForTests);
 import { DecisionCard } from "../src/views/DecisionCard";
 import { ReferenceText } from "../src/lib/references";
 import { UnderstandingQuiz } from "../src/views/UnderstandingQuiz";
+
+// Quiz state lives in a module-level map shared across every bun test file.
+beforeEach(resetQuizStatesForTests);
 
 (globalThis as unknown as { window: typeof globalThis }).window = globalThis;
 const values = new Map([["hive.inbox.mode", "backlogs"]]);

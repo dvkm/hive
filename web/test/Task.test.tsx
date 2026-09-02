@@ -3,12 +3,12 @@ import { act, create } from "react-test-renderer";
 import { MemoryRouter } from "react-router-dom";
 import { Ctx, resetQuizStatesForTests, type Store } from "../src/lib/store";
 import { LightboxProvider } from "../src/lib/lightbox";
-
-// Quiz state lives in a module-level map shared across every bun test file.
-beforeEach(resetQuizStatesForTests);
 import { api } from "../src/lib/api";
 import type { Task, TaskDetail, UnderstandingQuiz } from "../src/lib/api";
 import { TaskBody } from "../src/views/Task";
+
+// Quiz state lives in a module-level map shared across every bun test file.
+beforeEach(resetQuizStatesForTests);
 
 const fakeStore = { tasks: [], projects: [], rev: {}, quizzes: [], reloadQuizzes: () => {} } as unknown as Store;
 
