@@ -11,5 +11,5 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": false
   },
-  "include": ["server/src", "cli", "server/test", "scripts"]
+  "include": ["server/src", "cli", "scripts"]
 }
