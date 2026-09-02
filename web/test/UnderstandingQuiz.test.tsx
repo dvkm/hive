@@ -1,10 +1,14 @@
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import { act, create } from "react-test-renderer";
 import { api, type UnderstandingQuiz as Quiz } from "../src/lib/api";
+import { resetQuizStatesForTests } from "../src/lib/store";
 import { UnderstandingQuiz } from "../src/views/UnderstandingQuiz";
 
-// The store keys quiz state by task_id and keeps it for the session, so each
-// test needs its own task id or it inherits the previous test's question.
+// The store keys quiz state by task_id and keeps it for the session (and one
+// module instance is shared across every bun test file), so a stale entry
+// from another test can leak in. Reset between tests and still give each
+// test its own task id, since other test files reuse ids like "task-1".
+beforeEach(resetQuizStatesForTests);
 let ids = 0;
 const seed = (over: Partial<Quiz> = {}) => ({ ...base, task_id: `task-${++ids}`, ...over });
 
