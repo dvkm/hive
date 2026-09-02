@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../lib/api";
-import type { UnderstandingQuiz as Quiz } from "../lib/api";
+import { useQuizState } from "../lib/store";
+import type { QuizSeed } from "../lib/store";
 import { toast } from "../lib/ui";
 
 type Result = Awaited<ReturnType<typeof api.answerUnderstandingQuiz>>;
@@ -14,21 +15,19 @@ export function UnderstandingQuiz({
   onPassed,
   onDeferred,
 }: {
-  quiz: Pick<Quiz, "task_id" | "question" | "options" | "version" | "completed" | "total">;
+  quiz: QuizSeed; // the seed; the live state lives in the store, keyed by task_id
   label?: string;
   allowDefer?: boolean;
   surface?: "focus";
   onPassed?: (explanation: string | null) => void;
   onDeferred?: () => void;
 }) {
-  const [currentQuiz, setCurrentQuiz] = useState(quiz);
+  const [shared, setShared] = useQuizState(quiz);
+  const { quiz: currentQuiz, notice, round } = shared;
   const [answer, setAnswer] = useState("");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<Result | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [round, setRound] = useState(0);
   const [showEscape, setShowEscape] = useState(false);
-  const ignoredVersion = useRef<string | null>(null);
   const optionSignature = currentQuiz.options.map((option) => `${option.key}:${option.label}`).join("|");
   const options = useMemo(() => {
     const shuffled = [...currentQuiz.options];
@@ -39,43 +38,43 @@ export function UnderstandingQuiz({
     return shuffled;
   }, [currentQuiz.question, optionSignature, round]);
 
+  // The question on screen moved (this mount swapped it, or another mount did),
+  // so the selection and the graded panel belong to a question that is gone.
+  const resetKey = `${currentQuiz.task_id}:${currentQuiz.version}:${round}`;
+  const lastReset = useRef(resetKey);
   useEffect(() => {
-    if (quiz.task_id !== currentQuiz.task_id) {
-      ignoredVersion.current = null;
-      setCurrentQuiz(quiz);
-      setAnswer("");
-      setResult(null);
-      setNotice(null);
-      setRound((value) => value + 1);
-      return;
-    }
-    if (busy || result || quiz.version === ignoredVersion.current) return;
-    ignoredVersion.current = null;
-    if (quiz.question === currentQuiz.question && quiz.version === currentQuiz.version) return;
-    setNotice(null);
-    setCurrentQuiz(quiz);
+    if (lastReset.current === resetKey) return;
+    lastReset.current = resetKey;
     setAnswer("");
     setResult(null);
-    setRound((value) => value + 1);
-  }, [quiz.task_id, quiz.question, quiz.version, busy, result]);
+  }, [resetKey]);
+
+  useEffect(() => {
+    if (busy || result || quiz.version === shared.ignoredVersion) return;
+    if (quiz.question === currentQuiz.question && quiz.version === currentQuiz.version) {
+      if (shared.ignoredVersion) setShared({ ignoredVersion: null });
+      return;
+    }
+    setShared({ quiz, ignoredVersion: null, notice: null, round: round + 1 });
+  }, [quiz.task_id, quiz.question, quiz.version, busy, result, shared]);
 
   // The same quiz is mounted in several places (review card, brief, task page).
   // Answering in one moves the server's version, so the others hold a version
   // the server has already passed — swap them onto the current check instead of
   // leaving a button that is guaranteed to fail (HIVE-625).
   const swapIn = (next: NonNullable<Result["quiz"]>, message?: string) => {
-    ignoredVersion.current = currentQuiz.version;
-    setCurrentQuiz({ task_id: currentQuiz.task_id, ...next });
-    setAnswer("");
-    setResult(null);
-    setNotice(message ?? null);
-    setRound((value) => value + 1);
+    setShared({
+      quiz: { task_id: currentQuiz.task_id, ...next },
+      ignoredVersion: currentQuiz.version,
+      notice: message ?? null,
+      round: round + 1,
+    });
   };
 
   const submit = async () => {
     if (!answer || busy || result) return;
     setBusy(true);
-    setNotice(null);
+    if (notice) setShared({ notice: null });
     try {
       const response = await api.answerUnderstandingQuiz(currentQuiz.task_id, answer, currentQuiz.version, surface);
       if (response.refreshed) {
