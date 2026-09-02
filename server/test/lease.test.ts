@@ -186,10 +186,13 @@ test("a runner killed mid-wait takes its spawned server down with it", async () 
 // custom port opened the LIVE db and its reconciler evicted working agents for
 // 25 minutes, until a human killed it by hand.
 
-const { interloperReason, interloperAdvice, registerInstance, listInstances, evictContenders, isHiveServerCommand } = await import(
-  "../src/lease.ts"
-);
-const { homeDbPath } = await import("../src/db.ts");
+const { interloperReason, interloperAdvice, registerInstance, listInstances, evictContenders, isHiveServerCommand, LEASE_KEY } =
+  await import("../src/lease.ts");
+const { homeDbPath, setSetting } = await import("../src/db.ts");
+
+// Eviction is the lease HOLDER's duty, so these tests have to say who holds it.
+const holdLease = (db: any, instance: string) =>
+  setSetting(db, LEASE_KEY, JSON.stringify({ instance, pid: 100, at: new Date().toISOString() }));
 
 test("a server on a non-fleet port refuses the live fleet database", () => {
   expect(interloperReason(homeDbPath(), 4791)).toContain("not the fleet port");
@@ -255,6 +258,7 @@ const WINDOWS_SERVER_CMD = "C:\\Users\\d\\.bun\\bin\\bun.exe --watch C:\\Users\\
 
 test("the lease holder terminates a second server that will not stand down", () => {
   const db = openDb(":memory:");
+  holdLease(db, "srv_me");
   registerInstance(db, "srv_me", 100, 4700);
   registerInstance(db, "srv_zombie", 200, 4791);
   const { ops, signals } = fakeProcs({ 100: SERVER_CMD, 200: SERVER_CMD });
@@ -277,6 +281,7 @@ test("the lease holder terminates a second server that will not stand down", () 
 // longer a hive server would mean hive killing the director's editor.
 test("eviction never signals a dead or recycled pid", () => {
   const db = openDb(":memory:");
+  holdLease(db, "srv_me");
   registerInstance(db, "srv_me", 100, 4700);
   registerInstance(db, "srv_dead", 200, 4791);
   registerInstance(db, "srv_recycled", 300, 4792);
@@ -288,4 +293,30 @@ test("eviction never signals a dead or recycled pid", () => {
   expect(isHiveServerCommand(SERVER_CMD)).toBe(true);
   expect(isHiveServerCommand(WINDOWS_SERVER_CMD)).toBe(true);
   expect(isHiveServerCommand("/Applications/Cursor.app/Contents/MacOS/Cursor")).toBe(false);
+});
+
+// The bug this guard exists for (HIVE-627, CI on PR #170): a booting server takes
+// the lease and only THEN registers its row. So a predecessor can pass its own
+// "do I still hold the lease?" check, find the new server's fresh row, and
+// SIGTERM the server that just replaced it. The new holder then owns a lease it
+// can never renew, because it is dead. Here the lease flips mid-lap, exactly
+// where it flips in production: while the outgoing server is probing pids.
+test("a server that loses the lease mid-lap never terminates the new holder", () => {
+  const db = openDb(":memory:");
+  holdLease(db, "srv_outgoing");
+  registerInstance(db, "srv_outgoing", 100, 4700);
+  registerInstance(db, "srv_new", 200, 4700);
+  const { ops, signals } = fakeProcs({ 100: SERVER_CMD, 200: SERVER_CMD });
+  // The new server claims the lease while the outgoing one is running `ps`.
+  const probing = ops.command;
+  ops.command = (pid: number) => {
+    holdLease(db, "srv_new");
+    return probing(pid);
+  };
+
+  expect(evictContenders(db, "srv_outgoing", ops, 100)).toEqual([]);
+  expect(signals).toEqual([]);
+  // And nothing was recorded against the new holder either — no evicted_at, so a
+  // later lap cannot skip straight to SIGKILL.
+  expect(listInstances(db).find((r) => r.instance === "srv_new")).toMatchObject({ evicted_at: null });
 });
