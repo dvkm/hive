@@ -5323,6 +5323,29 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
     const answerLabel = Number.isInteger(index)
       ? quiz.checks[index]?.options.find((option) => option.key === answerKey)?.label ?? answerKey
       : answerKey;
+    const nextQuiz = {
+      question: check.question,
+      options: check.options,
+      version: active.version,
+      completed: active.completed,
+      total: quiz.checks.length,
+    };
+    // HIVE-625: one director, two mounts. The version moved because of THEIR
+    // own earlier answer, so "already changed by <you>" is a contradiction —
+    // hand the stale mount the current check instead of a 409.
+    if (actor && event?.payload?.actor === actor) {
+      if (status === "passed")
+        return json({ ok: true, correct: true, passed: true, refreshed: true, explanation: check.explanation ?? null });
+      return json({
+        ok: true,
+        refreshed: true,
+        passed: false,
+        explanation: null,
+        completed: active.completed,
+        total: quiz.checks.length,
+        quiz: nextQuiz,
+      });
+    }
     return staleResponse("understanding check already changed", {
       status,
       source: event?.source ?? "system",
@@ -5331,6 +5354,7 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
       answer_key: answerKey,
       answer_label: answerLabel,
       correct: event?.payload?.correct ?? status === "passed",
+      quiz: status === "passed" ? null : nextQuiz,
     });
   }
   const answerKey = typeof body?.answer_key === "string" ? body.answer_key : "";

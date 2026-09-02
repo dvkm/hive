@@ -4525,6 +4525,11 @@ a.dbundle-fact:hover {
   color: var(--green);
   font-size: var(--t-sm);
 }
+.understanding-quiz-notice {
+  margin: var(--s2) 0 0;
+  color: var(--text-dim);
+  font-size: var(--t-sm);
+}
 .understanding-quiz-escape {
   display: flex;
   align-items: center;

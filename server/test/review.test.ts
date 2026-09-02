@@ -531,6 +531,59 @@ test("a stale quiz answer returns the actor and answer that changed the card", a
   expect(attempts).toHaveLength(1);
 });
 
+test("the same director's stale version refreshes instead of 409ing on itself (hive-2121)", async () => {
+  const s = makeApi();
+  const p = await post(s.handler, "/api/projects", { name: "quiz two mounts", repo_path: "/repo" });
+  const t = await post(s.handler, "/api/tasks", { project_id: p.json.id, title: "review me" });
+  await post(s.handler, `/api/tasks/${t.json.id}/spawn`, {});
+  await post(s.handler, `/api/tasks/${t.json.id}/events`, {
+    type: "review_summary",
+    done: ["implemented the change"],
+    understanding: { background: "This changes behavior.", essence: "Tests cover it.", checks: QUIZ_BANK.slice(0, 2) },
+  });
+  await post(s.handler, `/api/tasks/${t.json.id}/transition`, { to: "in_review" });
+
+  const card = (await get(s.handler, "/api/understanding-quizzes")).json.quizzes.find((item: any) => item.task_id === t.json.id);
+  // One director, one mount: a wrong answer moves the version.
+  const wrong = await post(s.handler, `/api/tasks/${t.json.id}/understanding-quiz/answer`, {
+    answer_key: "guess",
+    version: card.version,
+    source: "director",
+    actor: "web-7a9b8ac0",
+  });
+  expect(wrong.status).toBe(200);
+  expect(wrong.json.correct).toBe(false);
+
+  // The director's other mount still holds the old version. It must refresh, not 409.
+  const refreshed = await post(s.handler, `/api/tasks/${t.json.id}/understanding-quiz/answer`, {
+    answer_key: "guess",
+    version: card.version,
+    source: "director",
+    actor: "web-7a9b8ac0",
+  });
+  expect(refreshed.status).toBe(200);
+  expect(refreshed.json).toMatchObject({ ok: true, refreshed: true, passed: false });
+  expect(refreshed.json.quiz.version).toBe(wrong.json.quiz.version);
+  expect(refreshed.json.quiz.question).toBe(wrong.json.quiz.question);
+
+  const events = (await get(s.handler, `/api/tasks/${t.json.id}/events`)).json;
+  expect(events.some((event: any) => event.type === "action_failed")).toBe(false);
+  // The refresh must not count as an attempt.
+  expect(events.filter((event: any) => event.type === "understanding_quiz_attempt")).toHaveLength(1);
+
+  // A different director on the same stale version is still a real conflict.
+  const other = await post(s.handler, `/api/tasks/${t.json.id}/understanding-quiz/answer`, {
+    answer_key: "guess",
+    version: card.version,
+    source: "director",
+    actor: "web-otherdir",
+  });
+  expect(other.status).toBe(409);
+  expect(other.json).toMatchObject({ stale: true, resolution: { actor: "web-7a9b8ac0" } });
+  // The 409 still carries the current check so the loser can swap onto it.
+  expect(other.json.resolution.quiz.version).toBe(wrong.json.quiz.version);
+});
+
 test("a replacement review invalidates the prior quiz version", async () => {
   const s = makeApi();
   const p = await post(s.handler, "/api/projects", { name: "quiz replacement", repo_path: "/repo" });
