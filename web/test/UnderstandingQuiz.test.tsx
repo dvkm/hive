@@ -3,8 +3,13 @@ import { act, create } from "react-test-renderer";
 import { api, type UnderstandingQuiz as Quiz } from "../src/lib/api";
 import { UnderstandingQuiz } from "../src/views/UnderstandingQuiz";
 
-const first: Pick<Quiz, "task_id" | "question" | "options" | "version" | "completed" | "total"> = {
-  task_id: "task-1",
+// The store keys quiz state by task_id and keeps it for the session, so each
+// test needs its own task id or it inherits the previous test's question.
+let ids = 0;
+const seed = (over: Partial<Quiz> = {}) => ({ ...base, task_id: `task-${++ids}`, ...over });
+
+const base: Pick<Quiz, "task_id" | "question" | "options" | "version" | "completed" | "total"> = {
+  task_id: "task-0",
   question: "First question?",
   options: [{ key: "a", label: "Answer A" }, { key: "b", label: "Answer B" }],
   version: "review-1:0",
@@ -32,6 +37,7 @@ test("a graded answer stays highlighted until Next question is clicked", async (
     quiz: second,
   })) as typeof api.answerUnderstandingQuiz;
 
+  const first = seed();
   try {
     let renderer!: ReturnType<typeof create>;
     await act(async () => {
@@ -73,10 +79,11 @@ test("the final answer waits for Finish before completing the quiz", async () =>
   })) as typeof api.answerUnderstandingQuiz;
   let passed = false;
 
+  const first = seed({ total: 1 });
   try {
     let renderer!: ReturnType<typeof create>;
     await act(async () => {
-      renderer = create(<UnderstandingQuiz quiz={{ ...first, total: 1 }} onPassed={() => { passed = true; }} />);
+      renderer = create(<UnderstandingQuiz quiz={first} onPassed={() => { passed = true; }} />);
     });
     await act(async () => renderer.root.find((node) => node.type === "input" && node.props.value === "a").props.onChange());
     await act(async () => {
@@ -101,6 +108,7 @@ test("a stale 409 swaps in the current question instead of a red toast (hive-212
     });
   }) as typeof api.answerUnderstandingQuiz;
 
+  const first = seed();
   try {
     let renderer!: ReturnType<typeof create>;
     await act(async () => {
@@ -133,6 +141,7 @@ test("a self-conflict refresh swaps in the current question (hive-2121)", async 
     quiz: second,
   })) as unknown as typeof api.answerUnderstandingQuiz;
 
+  const first = seed();
   try {
     let renderer!: ReturnType<typeof create>;
     await act(async () => {
@@ -146,6 +155,44 @@ test("a self-conflict refresh swaps in the current question (hive-2121)", async 
     expect(renderer.root.findByType("h4").children).toEqual(["Second question?"]);
     // No graded result panel: nothing was graded.
     expect(renderer.root.findAll((node) => node.props?.className === "understanding-quiz-correct")).toHaveLength(0);
+  } finally {
+    api.answerUnderstandingQuiz = original;
+  }
+});
+
+test("two mounts of the same task share one question (hive-2125)", async () => {
+  const original = api.answerUnderstandingQuiz;
+  api.answerUnderstandingQuiz = (async () => ({
+    ok: true,
+    correct: true,
+    passed: false,
+    explanation: "Because A is correct.",
+    completed: 1,
+    total: 2,
+    quiz: second,
+  })) as typeof api.answerUnderstandingQuiz;
+
+  const first = seed();
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(<><UnderstandingQuiz quiz={first} /><UnderstandingQuiz quiz={first} label="Second view" /></>);
+    });
+    expect(renderer.root.findAllByType("h4").map((node) => node.children)).toEqual([["First question?"], ["First question?"]]);
+
+    // Answer in the first mount and click through to the next question.
+    const [a] = renderer.root.findAll((node) => node.type === "input" && node.props.value === "a");
+    await act(async () => a.props.onChange());
+    await act(async () => {
+      await renderer.root.findAll((node) => node.type === "button" && node.children.includes("Check answer"))[0].props.onClick();
+    });
+    await act(async () => {
+      renderer.root.find((node) => node.type === "button" && node.children.includes("Next question")).props.onClick();
+    });
+
+    // Both mounts moved to the new version without a click or a refetch.
+    expect(renderer.root.findAllByType("h4").map((node) => node.children)).toEqual([["Second question?"], ["Second question?"]]);
+    expect(renderer.root.findAll((node) => node.type === "input").every((node) => !node.props.checked)).toBe(true);
   } finally {
     api.answerUnderstandingQuiz = original;
   }

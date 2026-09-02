@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { api, apiToken } from "./api";
 import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Checkpoint, UnderstandingQuiz, ChatMessage, Away } from "./api";
 import { getNeedsYouItems } from "./needsYou";
@@ -53,6 +53,42 @@ export interface Store {
   // Fan-out for EVERY incoming chat message regardless of the open thread —
   // the Supervisors board runs one live column per thread. Returns unsubscribe.
   onChatMessage: (cb: (m: ChatMessage) => void) => () => void;
+}
+
+// One understanding-quiz state per task, not one per mount. The same task's
+// quiz renders in the review card, the brief and the task page. Answering in
+// one moves the server's version, so mounts that each kept their own copy sat
+// on a question that had already been answered somewhere else (HIVE-626).
+export type QuizSeed = Pick<UnderstandingQuiz, "task_id" | "question" | "options" | "version" | "completed" | "total">;
+export type QuizState = {
+  quiz: QuizSeed;
+  ignoredVersion: string | null; // a version this task already swapped off, so a stale prop cannot bring it back
+  notice: string | null;
+  round: number; // bumps on every swap; mounts reset their own answer when it moves
+};
+
+// ponytail: one small object per task whose quiz was opened, kept for the
+// session. Nothing to evict, and dropping it on unmount would lose the state
+// when the director moves between the review card and the task page.
+const quizStates = new Map<string, QuizState>();
+const quizSubs = new Map<string, Set<() => void>>();
+
+export function useQuizState(seed: QuizSeed) {
+  const taskId = seed.task_id;
+  if (!quizStates.has(taskId))
+    quizStates.set(taskId, { quiz: seed, ignoredVersion: null, notice: null, round: 0 });
+  const subscribe = useCallback((cb: () => void) => {
+    let subs = quizSubs.get(taskId);
+    if (!subs) quizSubs.set(taskId, (subs = new Set()));
+    subs.add(cb);
+    return () => void subs!.delete(cb);
+  }, [taskId]);
+  const state = useSyncExternalStore(subscribe, () => quizStates.get(taskId)!);
+  const setState = useCallback((patch: Partial<QuizState>) => {
+    quizStates.set(taskId, { ...quizStates.get(taskId)!, ...patch });
+    quizSubs.get(taskId)?.forEach((cb) => cb());
+  }, [taskId]);
+  return [state, setState] as const;
 }
 
 const FEED_CAP = 400;
