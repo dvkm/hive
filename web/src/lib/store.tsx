@@ -73,6 +73,14 @@ export type QuizState = {
 const quizStates = new Map<string, QuizState>();
 const quizSubs = new Map<string, Set<() => void>>();
 
+// Test-only: bun test shares one module instance across every test file, so
+// leftover quiz state from one test's task id leaks into the next test that
+// reuses it. Call this in a beforeEach wherever tests render UnderstandingQuiz.
+export function resetQuizStatesForTests() {
+  quizStates.clear();
+  quizSubs.clear();
+}
+
 export function useQuizState(seed: QuizSeed) {
   const taskId = seed.task_id;
   if (!quizStates.has(taskId))

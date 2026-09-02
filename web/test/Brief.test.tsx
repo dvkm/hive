@@ -1,11 +1,14 @@
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import { act, create } from "react-test-renderer";
 import { MemoryRouter } from "react-router-dom";
 import { api } from "../src/lib/api";
 import type { Brief as BriefData, Decision, Evidence, Task, UnderstandingQuiz as UnderstandingQuizData } from "../src/lib/api";
 import { LightboxProvider } from "../src/lib/lightbox";
-import { Ctx, type Store } from "../src/lib/store";
+import { Ctx, resetQuizStatesForTests, type Store } from "../src/lib/store";
 import Brief from "../src/views/Brief";
+
+// Quiz state lives in a module-level map shared across every bun test file.
+beforeEach(resetQuizStatesForTests);
 import { DecisionCard } from "../src/views/DecisionCard";
 import { ReferenceText } from "../src/lib/references";
 import { UnderstandingQuiz } from "../src/views/UnderstandingQuiz";
