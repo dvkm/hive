@@ -741,9 +741,13 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   native sub-tasks linked beneath a mirror. A sync cycle discovers an empty
   `jira_key` from a Jira `hive-task: <id>` description marker or `hive.task_id`
   issue property. No Jira custom field or site-admin setup is required. Linked
-  native task states push as `queued → To Do`, `in_progress → In Progress`,
-  `in_review` or `verifying → In Review`, and `done` or `cancelled → Done`.
-  Cancellation also posts a comment. When
+  native task states push as `queued → To Do`, `in_progress → In Progress`, and
+  `in_review`, `verifying` or `done → In Review`. **Jira "Done" is human-only**
+  (HIVE-630): it is the reporter's own verification step, so hive never writes it
+  and never moves an issue back out of it. A hive task reaching `done` leaves the
+  issue in In Review and posts a comment asking the reporter to check the result
+  and close the ticket. `cancelled` pushes no status at all; it only posts a
+  comment. Jira → hive still pulls `Done → done` as before. When
   `config.jira.status_notes_to_comments` is true, status notes emitted with
   `hive emit <id> status` use the same at-most-once comment ledger as mirrors.
   The setting defaults to false.

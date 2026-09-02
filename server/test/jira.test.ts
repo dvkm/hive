@@ -806,18 +806,20 @@ test("the ticket moves to In Progress and In Review while the work is in flight"
   expect(statusNow()).toBe("In Review");
   expect(tasks(db).find((t) => t.id === mirrorId)!.state).toBe("verifying");
 
-  // The director closing the mirror is what writes Done.
+  // HIVE-630: the director closing the mirror does NOT close the ticket either.
+  // Jira "Done" is the reporter's own verification step, so the issue waits in
+  // In Review until a human moves it.
   transition(db, mirrorId, "done", { source: "director" });
   nudge();
   await run(db, projectId, jira.fetchImpl);
-  expect(statusNow()).toBe("Done");
+  expect(statusNow()).toBe("In Review");
 
   // Forward only, every step: the ticket never went back a column.
   const seen = jira.byKey.get("WEB-1")!.history.map((h) => h.to);
-  expect(seen).toEqual(["In Progress", "In Review", "Done"]);
+  expect(seen).toEqual(["In Progress", "In Review"]);
 });
 
-test("a ticket with two work tasks only reaches Done when both are done", async () => {
+test("a ticket with two work tasks only reaches In Review when both are done", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }] });
   const { db, projectId } = freshDb();
   await run(db, projectId, jira.fetchImpl);
@@ -847,12 +849,13 @@ test("a ticket with two work tasks only reaches Done when both are done", async 
   bump(db, mirrorId, 2);
   await run(db, projectId, jira.fetchImpl);
   // Both children done moves the mirror to verifying, which is still "In
-  // Review" to Jira (HIVE-604). Only the director closing the mirror writes Done.
+  // Review" to Jira (HIVE-604), and so is the mirror reaching done (HIVE-630):
+  // hive never writes Done, the reporter does.
   expect(jira.byKey.get("WEB-1")!.status).toBe("In Review");
   transition(db, mirrorId, "done", { source: "director" });
   bump(db, mirrorId, 3);
   await run(db, projectId, jira.fetchImpl);
-  expect(jira.byKey.get("WEB-1")!.status).toBe("Done");
+  expect(jira.byKey.get("WEB-1")!.status).toBe("In Review");
 });
 
 // ============================================================================
@@ -878,6 +881,55 @@ test("a merged (verifying) task is not reverted by a stale 'In Review' in Jira",
   const stats = await run(db, projectId, jira.fetchImpl);
   expect(tasks(db)[0].state).toBe("verifying"); // not reverted to in_review
   expect(stats.pushed + stats.pulled).toBe(0); // and not rewritten either
+});
+
+// ============================================================================
+// JIRA "DONE" IS HUMAN-ONLY  (HIVE-630)
+// ============================================================================
+test("hive done shows as In Review, and cancelled shows as nothing", () => {
+  expect(J.stateToJiraStatus("done")).toBe("In Review");
+  expect(J.stateToJiraStatus("cancelled")).toBeNull();
+});
+
+test("hive never pushes a ticket to Done, and never pulls one back out of it", () => {
+  // done vs "In Review" is agreement, however recently hive moved.
+  expect(J.decideStatusSync({ jiraStatusName: "In Review", hiveState: "done", jiraAt: 1, hiveAt: 999 })).toBe("none");
+  // done vs "Done" is the same fact twice: nothing to do, so no re-logged no-op.
+  expect(J.decideStatusSync({ jiraStatusName: "Done", hiveState: "done", jiraAt: 1, hiveAt: 999 })).toBe("none");
+  // and a human closing the ticket wins even when hive moved later.
+  expect(J.decideStatusSync({ jiraStatusName: "Done", hiveState: "in_review", jiraAt: 1, hiveAt: 999 })).toBe("pull");
+});
+
+test("a task walking in_review -> verifying -> done moves Jira exactly once", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const task = tasks(db)[0];
+
+  reachReview(db, task.id, "PR is up");
+  await run(db, projectId, jira.fetchImpl);
+  transition(db, task.id, "verifying", { source: "director", reason: "merged" });
+  await run(db, projectId, jira.fetchImpl);
+  transition(db, task.id, "done", { source: "director", reason: "smoke checks pass" });
+  await run(db, projectId, jira.fetchImpl);
+
+  // One transition for the whole walk: in_review, verifying and done all show
+  // as In Review, so the two later cycles have nothing to move.
+  expect(jira.byKey.get("WEB-1")!.history.map((h) => h.to)).toEqual(["In Review"]);
+  expect(jira.byKey.get("WEB-1")!.status).toBe("In Review");
+});
+
+test("Jira moving to Done still closes the hive mirror", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review" }] });
+  const { db, projectId } = freshDb();
+  await run(db, projectId, jira.fetchImpl);
+  const task = tasks(db)[0];
+  db.query("UPDATE tasks SET state = 'verifying' WHERE id = ?").run(task.id);
+
+  jira.byKey.get("WEB-1")!.status = "Done";
+  jira.byKey.get("WEB-1")!.history.push({ at: new Date().toISOString(), to: "Done" });
+  await run(db, projectId, jira.fetchImpl);
+  expect(tasks(db)[0].state).toBe("done");
 });
 
 test("states with no Jira meaning never push and are never overwritten", () => {
@@ -1728,7 +1780,7 @@ test("a push aborts when Hive changes its target at the write boundary", async (
   expect(stats.pushed).toBe(0);
   expect(abort.to).toBe("In Progress");
   expect(abort.fresh_hive_state).toBe("done");
-  expect(abort.fresh_target).toBe("Done");
+  expect(abort.fresh_target).toBe("In Review");
   expect(jira.calls.some((c) => c.method === "POST" && c.path.includes("/transitions"))).toBe(false);
 });
 
@@ -2396,7 +2448,9 @@ test("cancelling a linked task queues one comment for normal outbound delivery",
   await run(db, projectId, jira.fetchImpl);
   await run(db, projectId, jira.fetchImpl);
 
-  expect(jira.byKey.get("WEB-23")!.status).toBe("Done");
+  // HIVE-630: cancelling does not close the ticket. The issue keeps the status
+  // it had and the comment is the whole story a reporter gets.
+  expect(jira.byKey.get("WEB-23")!.status).toBe("To Do");
   expect(jira.byKey.get("WEB-23")!.comments).toHaveLength(1);
   expect(db.query(
     `SELECT COUNT(*) AS count FROM events WHERE task_id = ? AND type = 'jira_sync'
@@ -3328,9 +3382,15 @@ test("verifying shares In Review's comment, and Done gets its own", async () => 
   transition(db, task.id, "done", { source: "director", reason: "smoke checks pass" });
   await run(db, projectId, jira.fetchImpl);
   jiraClockBehind();
-  expect(texts().filter((t) => t.includes("Hive finished this: smoke checks pass"))).toHaveLength(1);
+  expect(
+    texts().filter((t) =>
+      t.includes("Hive finished this and the director verified it; please check the live result and move the ticket to Done: smoke checks pass")
+    )
+  ).toHaveLength(1);
+  // and the ticket itself is still In Review: hive never writes Done (HIVE-630)
+  expect(jira.byKey.get("WEB-1")!.status).toBe("In Review");
   for (let i = 0; i < 2; i++) await run(db, projectId, jira.fetchImpl);
-  expect(texts().filter((t) => t.startsWith("Hive"))).toHaveLength(2); // one per Jira status, ever
+  expect(texts().filter((t) => t.startsWith("Hive"))).toHaveLength(2); // one per context key, ever
 });
 
 test("a human's own move to In Review gets no comment when hive has nothing to add", async () => {
@@ -4282,7 +4342,7 @@ const linkOf = (db: DB, taskId: string) =>
 const subtaskOwners = (db: DB, key = "WEB-23") =>
   (db.query("SELECT id FROM tasks WHERE jira_key = ? AND jira_link_kind = 'subtask'").all(key) as any[]).map((r) => r.id);
 
-test("a requeue MOVES the Jira link to the successor, and the successor closes the issue", async () => {
+test("a requeue MOVES the Jira link to the successor, and the successor drives the issue", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-23", id: "23", status: "In Progress", parentKey: "WEB-7" }] });
   const { db, projectId } = freshDb();
   const original = linkedSubtask(db, projectId);
@@ -4298,8 +4358,9 @@ test("a requeue MOVES the Jira link to the successor, and the successor closes t
   finish(db, successor);
   await run(db, projectId, jira.fetchImpl);
 
-  // assert on the ISSUE, not on hive's own state
-  expect(jira.byKey.get("WEB-23")!.status).toBe("Done");
+  // assert on the ISSUE, not on hive's own state. A finished task shows as
+  // In Review, never Done: closing the ticket is the reporter's step (HIVE-630).
+  expect(jira.byKey.get("WEB-23")!.status).toBe("In Review");
 });
 
 test("the link survives a multi-hop recovery chain and lands on the task that finishes", async () => {
@@ -4321,7 +4382,7 @@ test("the link survives a multi-hop recovery chain and lands on the task that fi
 
   finish(db, third);
   await run(db, projectId, jira.fetchImpl);
-  expect(jira.byKey.get("WEB-43")!.status).toBe("Done");
+  expect(jira.byKey.get("WEB-43")!.status).toBe("In Review");
 });
 
 test("a task that fails and is never requeued leaves its Jira issue alone", async () => {
@@ -4355,7 +4416,7 @@ test("the issue's hive-task marker does not re-link the dead predecessor after a
 
   finish(db, successor);
   await run(db, projectId, jira.fetchImpl);
-  expect(jira.byKey.get("WEB-23")!.status).toBe("Done");
+  expect(jira.byKey.get("WEB-23")!.status).toBe("In Review");
 });
 
 // The pull direction needs no change, and this test pins why: for a sub-task
