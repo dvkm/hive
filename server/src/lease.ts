@@ -208,6 +208,13 @@ export function evictContenders(
     // Escalate rather than repeat: a process that ignored SIGTERM is wedged,
     // and a wedged reconciler is exactly the thing doing the damage.
     const signal: NodeJS.Signals = c.evicted_at ? "SIGKILL" : "SIGTERM";
+    // Last word before we signal: are we still the holder? A booting server
+    // takes the lease and only THEN registers its row, so a predecessor whose
+    // own check passed a moment ago can find that row here and SIGTERM the
+    // server that just replaced it (CI on PR #170). The window is real — the
+    // alive/command probes above spawn `ps`. Once the lease is not ours we are
+    // the one standing down, so signal nobody and leave every row alone.
+    if (!holdsLease(db, holder)) break;
     try {
       ops.signal(c.pid, signal);
     } catch {
