@@ -68,6 +68,12 @@ export function detectDuplicate(db: DB, task: any): DupMatch | null {
   const norm = normalizeTitle(task.title);
   let best: DupMatch | null = null;
   for (const r of rows) {
+    // A `[WEB-137] ...` work task carries the SAME title as the Jira mirror it
+    // sits under, deliberately — that prefix is the link (HIVE-546/631). So the
+    // mirror is a guaranteed exact "duplicate" of its own work, and folding
+    // them would cancel the work into a tracking-only row hive never
+    // dispatches, which is the opposite of what the board is for.
+    if (r.id === task.jira_mirror_task_id) continue;
     if (normalizeTitle(r.title) === norm) return { tier: "exact", survivor: r, score: 1 };
     const score = titleSimilarity(task.title, r.title);
     if (score >= NEAR_THRESHOLD && (!best || score > best.score))

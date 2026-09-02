@@ -90,7 +90,9 @@ a `## Director's answer` heading and marks the task reviewed, so it dispatches o
 the next cycle and the agent builds the reading you picked. Braindumps
 (`POST /api/intake`, source `intake_braindump`) are exempt: you typed that text
 yourself and it already raises a planner breakdown card. Jira import creates only
-tracking-only mirrors, which never dispatch, so nothing there is triaged either.)
+tracking-only mirrors, which never dispatch, so nothing there is triaged either;
+the work task under a mirror is filed by jira-sync when `config.jira.auto_file` is
+on, and by hand otherwise.)
 Domain-supervisor keys (see the Domain supervisors section):
 `supervisor_persona` (string, freeform planner identity included in every planner
 prompt), `plan_intake` (bool; when true, each new intake task auto-triggers a
@@ -749,6 +751,31 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
   The setting defaults to false.
 - `POST /api/tasks/:id/jira/sync` body `{}` → `200` sync result | `404`
   Runs the same project Jira cycle used by the scheduler.
+- `POST /api/projects/:id/jira/autofile` body `{dry_run?}` → `200 {dry_run, project_id, considered, skipped, filed:[{issue, mirror_task_id, work_task_id, title, priority, kind}]}` | `400` | `404`
+  Backfill for `config.jira.auto_file`. Jira mirrors are TRACKING-ONLY: hive never
+  dispatches one, so a real work task has to exist under it before anything is
+  worked. With `auto_file: true` (default false) jira-sync files that work task on
+  the same cycle it imports a new mirror; this endpoint files the ones that were
+  imported before the setting was turned on. CLI: `hive jira autofile --project <id>
+  [--dry-run]`.
+  The work task copies the mirror's title verbatim (the ticket's own name, in the
+  ticket's own language — the sync does not translate), takes the mirror's brief plus
+  a fixed footer naming the mirror and the `hive task send <mirror-id>` write path,
+  is kind `ship`, and links by `jira_mirror_task_id` like any hand-filed
+  `[WEB-NNN] ...` task. Its priority comes from the Jira priority: Blocker/Critical →
+  `now`, Highest/High → `next`, Medium (or absent/unknown) → `normal`, Low/Lowest →
+  `later`. That is deliberately NOT the mirror's own map, where Highest → `now`: a
+  mirror is never dispatched so `now` costs nothing there, while a work task's `now`
+  can borrow a dispatch slot past `max_agents`.
+  Idempotent: a mirror is skipped when a non-cancelled task in the project already
+  carries the `[WEB-NNN]` title prefix or points at that mirror, so a hand-filed task
+  counts and re-running never files twice. Only `queued` mirrors are considered, and
+  `400` if the project has no usable `config.jira` or has `auto_file` off.
+  Follow-on: a Jira comment written after the work task was filed is queued as a
+  steer on the still-live work tasks (the ticket's older comments are not replayed),
+  and a ticket a human closes in Jira cancels linked work still `queued` while only
+  warning work already underway. Both are visible as `jira_autofile` / `jira_sync`
+  events on the mirror.
 - `POST /api/tasks/:id/transition` body `{to (required), reason?, source?, until?, days?}` → `200 Task` | `409` (invalid transition, `done` without evidence, or `done` from anything but the director) | `404`
   `done` is DIRECTOR-ONLY (HIVE-604). Hive never closes its own work: the smoke monitor, the reconciler and an agent's own emits all stop at `verifying`, and only a `source` of `director`/`web`/`cli` (or none) may move `verifying → done`. A non-director source asking for `done` gets a `409`.
   `to: "deferred"` is accepted even though `deferred` is not a lifecycle state: it parks the task exactly like `hive emit <id> deferred` (sets `deferred_until` from `until`/`days`, else the indefinite sentinel; the task stays `in_progress`) and returns `409` only when the task is already terminal. Moving a parked task to `in_progress` un-parks it (clears `deferred_until`, writes `undeferred`, queues the resume steer) instead of failing as a self-transition. So `hive task move <id> deferred` and `hive emit <id> deferred` agree (HIVE-547).
@@ -1825,6 +1852,10 @@ Nothing auto-assigns `now`, and nothing auto-assigns `later`.
   something is already down.
 - **Watcher tasks** and **Jira-imported mirrors** are created at `normal`, the
   default. They are inbound material, not an emergency.
+- **Auto-filed Jira work tasks** (`config.jira.auto_file`) take their priority
+  from the ticket's Jira priority — see `POST /api/projects/:id/jira/autofile`.
+  This is the one automatic path that can reach `now`, and only for a Jira
+  `Blocker`/`Critical`: the director set that rank themselves, in Jira.
 - Tasks created **together in a `depends_on` chain do NOT inherit from the head
   of the chain.** `depends_on` is an ordering edge, not a lineage. Pass
   `priority` on each task in the chain you want it on (`hive task create

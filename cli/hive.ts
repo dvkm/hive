@@ -82,6 +82,8 @@ Usage:
         branch hive does not own, or one checked out somewhere. Dry run unless
         --apply.
   hive jira link <task-id> --parent <KEY> create and link a Jira sub-task
+  hive jira autofile --project <id> [--dry-run]
+                                          file the missing work tasks for queued Jira mirrors
   hive spawn <task-id> [--force]          spawn a herdr agent for a task
                                           (--force: the previous agent is dead, take its name)
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
@@ -788,7 +790,22 @@ async function main() {
   if (cmd === "jira") {
     const sub = argv[1];
     const { _, flags } = parseFlags(argv.slice(2));
-    if (sub !== "link" || !_[0] || !flags.parent) die("usage: hive jira link <task-id> --parent <KEY>");
+    if (sub === "autofile") {
+      const project = flags.project ? String(flags.project) : "";
+      if (!project) die("usage: hive jira autofile --project <id> [--dry-run]");
+      const dryRun = flags["dry-run"] === true;
+      const r = await api("POST", `/api/projects/${project}/jira/autofile`, { dry_run: dryRun });
+      if (!r.filed.length) {
+        console.log(`nothing to file: ${r.considered} queued mirror(s), all already have work`);
+        return;
+      }
+      for (const f of r.filed)
+        console.log(`${dryRun ? "would file" : `filed ${f.work_task_id}`}  [${f.priority}] ${f.title}  (mirror ${f.mirror_task_id})`);
+      console.log(`${dryRun ? "would file" : "filed"} ${r.filed.length}, skipped ${r.skipped} of ${r.considered} queued mirror(s)`);
+      return;
+    }
+    if (sub !== "link" || !_[0] || !flags.parent)
+      die("usage: hive jira link <task-id> --parent <KEY>  |  hive jira autofile --project <id> [--dry-run]");
     const linked = await api("POST", `/api/tasks/${_[0]}/jira/link`, { parent_key: String(flags.parent) });
     console.log(`linked ${_[0]} to ${linked.jira_key} (${linked.browse_url})`);
     for (const warning of linked.warnings ?? []) console.warn(`warning: ${warning}`);

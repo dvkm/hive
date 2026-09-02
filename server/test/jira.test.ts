@@ -22,7 +22,7 @@ const { openDb, newId, now, setSetting } = await import("../src/db.ts");
 const { writeEvent, transition } = await import("../src/state.ts");
 const { addClient, removeClient } = await import("../src/bus.ts");
 const J = await import("../src/intake/jira.ts");
-const { TASK_PRIORITIES } = await import("../src/api.ts");
+const { TASK_PRIORITIES, makeHandler } = await import("../src/api.ts");
 import type { DB } from "../src/db.ts";
 
 const SITE = "https://example.atlassian.net";
@@ -4457,4 +4457,216 @@ test("jiraSyncHealth reports one row per enabled project, and flags a target wit
     consecutive_failures: 4, last_error: "boom",
   });
   expect(J.jiraSyncHealth(db)[0]).toMatchObject({ stale: true, consecutive_failures: 4, last_error: "boom" });
+});
+
+// ============================================================================
+// AUTO-FILE (HIVE-631)
+// ============================================================================
+// A mirror is tracking-only. `config.jira.auto_file` files the work task that
+// actually gets an agent, on the same cycle the mirror is imported.
+
+const AUTO = { ...CFG, auto_file: true };
+
+const workTasks = (db: DB, mirrorId: string) =>
+  db.query("SELECT * FROM tasks WHERE jira_mirror_task_id = ? ORDER BY created_at, id").all(mirrorId) as any[];
+
+const queuedSteerMessages = (db: DB, taskId: string) =>
+  (db.query(
+    `SELECT json_extract(payload, '$.message') AS m FROM events
+      WHERE task_id = ? AND type = 'steer' ORDER BY ts, id`
+  ).all(taskId) as { m: string }[]).map((r) => r.m);
+
+// The map itself, as one table. It is NOT the mirror's map: Highest lands on
+// `next` here, because a work task is actually dispatched and `now` can borrow
+// a slot past max_agents.
+test("auto-file priority map: Jira priority -> the work task's rank", () => {
+  expect(
+    ["Blocker", "Critical", "Highest", "High", "Medium", "Low", "Lowest"].map(J.jiraPriorityToWorkPriority)
+  ).toEqual(["now", "now", "next", "next", "normal", "later", "later"]);
+  // Unknown or absent names are not guessed at; the caller falls back to normal.
+  expect(J.jiraPriorityToWorkPriority("Spicy")).toBeNull();
+  expect(J.jiraPriorityToWorkPriority(null)).toBeNull();
+  // And it really does differ from the mirror map on exactly one row.
+  expect(J.jiraPriorityToPriority("Highest")).toBe("now");
+});
+
+test("the priority name is read back off the mirror's own brief", () => {
+  expect(J.jiraPriorityNameFromBrief(J.briefFor({ key: "WEB-1", fields: { priority: { name: "High" } } }, SITE))).toBe("High");
+  // briefFor writes '-' when the ticket has no priority; that is not a name.
+  expect(J.jiraPriorityNameFromBrief(J.briefFor({ key: "WEB-1", fields: {} }, SITE))).toBeNull();
+  expect(J.jiraPriorityNameFromBrief(null)).toBeNull();
+});
+
+test("auto_file on: one import produces one mirror and one linked work task", async () => {
+  const jira = fakeJira({ issues: [{
+    key: "WEB-137", id: "137", status: "To Do", summary: "결제 화면이 안 열립니다", priority: "High",
+    description: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "spec here" }] }] },
+  }] });
+  const { db, projectId } = freshDb(AUTO);
+  await run(db, projectId, jira.fetchImpl, AUTO);
+
+  const all = tasks(db);
+  expect(all.length).toBe(2);
+  const mirror = all.find((t) => t.jira_link_kind === "mirror")!;
+  const work = all.find((t) => t.id !== mirror.id)!;
+
+  // The ticket's own name, verbatim — the sync cannot translate, so it does not try.
+  expect(work.title).toBe("[WEB-137] 결제 화면이 안 열립니다");
+  expect(work.title).toBe(mirror.title);
+  expect(work.kind).toBe("ship");
+  expect(work.state).toBe("queued");
+  expect(work.priority).toBe("next"); // High
+  expect(work.source).toBe("jira-sync");
+  // The link is the established one (HIVE-546): jira_key stays on the mirror.
+  expect(work.jira_mirror_task_id).toBe(mirror.id);
+  expect(work.jira_key).toBeNull();
+  // Brief = the mirror's brief plus the fixed footer, nothing invented.
+  expect(work.brief).toBe(`${mirror.brief.trim()}\n\n${J.autoFileFooter(mirror.id, "WEB-137")}`);
+  expect(work.brief).toContain("spec here");
+  expect(work.brief).toContain(`hive task send ${mirror.id}`);
+
+  // Announced on the mirror so hive-watch can show it.
+  expect(
+    (db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'jira_autofile'").all(mirror.id) as any[])
+      .map((r) => JSON.parse(r.payload))
+  ).toEqual([{ issue: "WEB-137", work_task_id: work.id, priority: "next" }]);
+
+  // Idempotent and deterministic: a second cycle files nothing and changes nothing.
+  const before = JSON.stringify(tasks(db));
+  await run(db, projectId, jira.fetchImpl, AUTO);
+  expect(tasks(db).length).toBe(2);
+  expect(JSON.stringify(tasks(db))).toBe(before);
+});
+
+test("auto_file off: nothing changes from today, only the mirror is created", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-138", id: "138", status: "To Do", summary: "b", priority: "High" }] });
+  const { db, projectId } = freshDb(CFG);
+  await run(db, projectId, jira.fetchImpl, CFG);
+  const all = tasks(db);
+  expect(all.length).toBe(1);
+  expect(all[0]!.jira_link_kind).toBe("mirror");
+  expect(db.query("SELECT COUNT(*) AS n FROM events WHERE type = 'jira_autofile'").get()).toEqual({ n: 0 });
+});
+
+test("a work task filed by hand already counts: auto-file does not double up", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-140", id: "140", status: "To Do", summary: "c" }] });
+  const { db, projectId } = freshDb(CFG);
+  await run(db, projectId, jira.fetchImpl, CFG); // mirror only
+  const mirror = tasks(db)[0]!;
+  const byHand = newId();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, brief, state, kind, created_at, updated_at)
+     VALUES (?,?,?,?, 'in_progress', 'ship', ?, ?)`
+  ).run(byHand, projectId, "[WEB-140] someone already filed this", "b", now(), now());
+
+  // Matched on the [KEY] title prefix, so it counts even with no link column set.
+  expect(J.planAutoFile(db, mirror)).toBeNull();
+  expect(J.autoFileWorkTask(db, mirror)).toBeNull();
+
+  // A cancelled row does NOT count — refiling is the recovery from a bad cancel.
+  transition(db, byHand, "cancelled", { source: "director", reason: "wrong" });
+  expect(J.planAutoFile(db, mirror)).toMatchObject({ issue: "WEB-140", kind: "ship", priority: "normal" });
+});
+
+test("backfill: dry run reports the plan and writes nothing, then files it for real", async () => {
+  const jira = fakeJira({ issues: [
+    { key: "WEB-141", id: "141", status: "To Do", summary: "unworked", priority: "Lowest" },
+    { key: "WEB-142", id: "142", status: "To Do", summary: "already worked" },
+  ] });
+  const { db, projectId } = freshDb(AUTO);
+  await run(db, projectId, jira.fetchImpl, CFG); // imported BEFORE auto_file was on
+  expect(tasks(db).length).toBe(2);
+  const already = taskFor(db, "WEB-142");
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, jira_mirror_task_id, created_at, updated_at)
+     VALUES (?,?,?, 'in_progress', 'ship', ?, ?, ?)`
+  ).run(newId(), projectId, "[WEB-142] already worked", already.id, now(), now());
+
+  const handler = makeHandler(db);
+  const call = async (body: unknown) =>
+    (await handler(new Request(`http://127.0.0.1/api/projects/${projectId}/jira/autofile`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    }))).json() as any;
+
+  const dry = await call({ dry_run: true });
+  expect(dry).toEqual({
+    dry_run: true, project_id: projectId, considered: 2, skipped: 1,
+    filed: [{
+      issue: "WEB-141", mirror_task_id: taskFor(db, "WEB-141").id, work_task_id: null,
+      title: "[WEB-141] unworked", priority: "later", kind: "ship",
+    }],
+  });
+  expect(tasks(db).length).toBe(3); // nothing written
+
+  const real = await call({});
+  expect(real.dry_run).toBe(false);
+  expect(real.filed.length).toBe(1);
+  expect(real.filed[0].work_task_id).toBeTruthy();
+  expect(workTasks(db, taskFor(db, "WEB-141").id).map((t) => t.id)).toEqual([real.filed[0].work_task_id]);
+
+  // Re-running never files twice.
+  expect((await call({})).filed).toEqual([]);
+});
+
+test("backfill refuses a project that has not opted in", async () => {
+  const { db, projectId } = freshDb(CFG);
+  const res = await makeHandler(db)(new Request(`http://127.0.0.1/api/projects/${projectId}/jira/autofile`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+  }));
+  expect(res.status).toBe(400);
+  expect((await res.json()).error).toContain("auto_file is off");
+});
+
+test("a Jira comment written after the work task was filed reaches the agent", async () => {
+  const jira = fakeJira({ issues: [{
+    key: "WEB-143", id: "143", status: "To Do", summary: "d",
+    comments: [{ id: "c1", author: "Director", text: "predates the filing", created: "2020-01-01T00:00:00.000+0000" }],
+  }] });
+  const { db, projectId } = freshDb(AUTO);
+  await run(db, projectId, jira.fetchImpl, AUTO);
+  const mirror = taskFor(db, "WEB-143");
+  const work = workTasks(db, mirror.id)[0]!;
+
+  // The ticket's back catalogue is NOT replayed at the fresh agent; it is in
+  // the mirror, which the brief's footer tells them to read.
+  expect(queuedSteerMessages(db, work.id)).toEqual([]);
+
+  jira.byKey.get("WEB-143")!.comments.push({
+    id: "c2", author: "Director", text: "use the new endpoint", created: new Date(Date.now() + 60_000).toISOString(),
+  });
+  await run(db, projectId, jira.fetchImpl, AUTO);
+
+  const steers = queuedSteerMessages(db, work.id);
+  expect(steers.length).toBe(1);
+  expect(steers[0]).toContain("New comment on Jira WEB-143 from Director");
+  expect(steers[0]).toContain("use the new endpoint");
+  expect(steers[0]).toContain(`task send ${mirror.id}`);
+});
+
+test("Jira closing the ticket cancels work that never started and only warns work that did", async () => {
+  const jira = fakeJira({ issues: [{
+    key: "WEB-144", id: "144", status: "To Do", summary: "e",
+    history: [{ at: "2099-01-01T00:00:00.000Z", to: "To Do" }],
+  }] });
+  const { db, projectId } = freshDb(AUTO);
+  await run(db, projectId, jira.fetchImpl, AUTO);
+  const mirror = taskFor(db, "WEB-144");
+  const notStarted = workTasks(db, mirror.id)[0]!;
+
+  // A second work task under the same ticket, already underway.
+  const started = newId();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, jira_mirror_task_id, created_at, updated_at)
+     VALUES (?,?,?, 'in_progress', 'ship', ?, ?, ?)`
+  ).run(started, projectId, "[WEB-144] second slice", mirror.id, now(), now());
+
+  const issue = jira.byKey.get("WEB-144")!;
+  issue.status = "Done";
+  issue.history = [{ at: "2099-01-02T00:00:00.000Z", to: "Done" }];
+  await run(db, projectId, jira.fetchImpl, AUTO);
+
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(notStarted.id) as any).state).toBe("cancelled");
+  // Never killed out from under a live agent: it gets told, and a person decides.
+  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(started) as any).state).toBe("in_progress");
+  expect(queuedSteerMessages(db, started)[0]).toContain("WEB-144 was closed as 'Done'");
 });

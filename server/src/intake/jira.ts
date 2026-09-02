@@ -67,6 +67,7 @@ import {
 
 export { NEEDS_DECISION_LABEL, JIRA_WRITE_SCOPE } from "./jira-write-scope.ts";
 import { activeProjects } from "../testProjects.ts";
+import { queueSteerEvent } from "../steer.ts";
 
 export type FetchLike = typeof fetch;
 
@@ -177,6 +178,7 @@ export interface JiraConfig {
   jql?: string; // extra filter, ANDed with project = <key>
   write_scope?: { create_subtask?: boolean };
   status_notes_to_comments?: boolean;
+  auto_file?: boolean; // file a hive work task for every newly imported mirror
 }
 
 export interface JiraConfigStatus {
@@ -247,6 +249,7 @@ function jiraConfigStatus(raw: any): JiraConfigStatus {
       jql,
       write_scope: { create_subtask: j.write_scope?.create_subtask === true },
       status_notes_to_comments: j.status_notes_to_comments === true,
+      auto_file: j.auto_file === true,
     },
     error: null,
   };
@@ -325,6 +328,33 @@ export const JIRA_TO_PRIORITY: Record<string, string> = {
 export function jiraPriorityToPriority(name: string | undefined | null): string | null {
   const key = String(name ?? "").trim().toLowerCase();
   return Object.hasOwn(JIRA_TO_PRIORITY, key) ? JIRA_TO_PRIORITY[key] : null;
+}
+
+// The SECOND priority table: Jira -> the auto-filed WORK task (HIVE-631).
+//
+// Deliberately not the same map as JIRA_TO_PRIORITY above, and the difference
+// is exactly one row: Highest lands on `next` here, not `now`. A mirror is
+// never dispatched, so `now` on a mirror spends nothing; a work task IS
+// dispatched, and `now` can borrow a dispatch slot past max_agents. Handing
+// that out to every Highest ticket would let a routine triage decision in Jira
+// preempt the fleet. `now` is therefore reserved for the two names that mean an
+// actual emergency, if the Jira scheme even has them (the WEB scheme does not).
+//
+// Anything absent or unrecognised falls back to 'normal' — same rule as the
+// mirror map, no guessing a rank from an unknown name.
+export const JIRA_TO_WORK_PRIORITY: Record<string, string> = {
+  blocker: "now",
+  critical: "now",
+  highest: "next",
+  high: "next",
+  medium: "normal",
+  low: "later",
+  lowest: "later",
+};
+
+export function jiraPriorityToWorkPriority(name: string | undefined | null): string | null {
+  const key = String(name ?? "").trim().toLowerCase();
+  return Object.hasOwn(JIRA_TO_WORK_PRIORITY, key) ? JIRA_TO_WORK_PRIORITY[key] : null;
 }
 
 const sameStatus = (a: string | null, b: string | null): boolean =>
@@ -1255,6 +1285,126 @@ export function briefFor(issue: any, site: string): string {
   ].join("\n");
 }
 
+// ============================================================================
+// AUTO-FILE (HIVE-631)
+// ============================================================================
+// A mirror is tracking-only: hive never dispatches it. Until now somebody had
+// to notice a new ticket and hand-file the `[WEB-137] ...` work task that
+// actually gets an agent. On 2026-09-02 four tickets sat unworked for hours
+// because the person doing that had stopped. `config.jira.auto_file` files it
+// instead, on the same cycle the mirror is imported.
+//
+// Everything the work task says is derived from the MIRROR ROW, never from the
+// issue JSON. That is what makes it deterministic: reconcileIssue already keeps
+// the mirror's title/brief/priority in step with Jira on every cycle, so one
+// ticket always produces one byte-identical work task, whether it is filed at
+// import time or by the backfill command months later.
+//
+// The link is tasks.jira_mirror_task_id (HIVE-546), the same column the API's
+// `[WEB-NNN] ` title-prefix parse writes. Nothing new, no second convention.
+
+// The Jira priority NAME, read back off the mirror's brief. briefFor writes it
+// as a fixed `Priority: <name>` line, and hive stores no column for it, so this
+// is the one place the name survives — and it survives identically for the
+// import path and the offline backfill, which is why both read it here rather
+// than one reading the issue and one reading the row.
+export function jiraPriorityNameFromBrief(brief: string | null | undefined): string | null {
+  const m = /^Priority: (.*)$/m.exec(String(brief ?? ""));
+  const name = m?.[1]?.trim();
+  return !name || name === "-" ? null : name;
+}
+
+// The fixed footer every auto-filed brief ends with. Three things an agent
+// picking this up cannot work out on its own: where the spec lives, that the
+// mirror owns the Jira link, and that its own Jira credentials are not the
+// write path.
+export function autoFileFooter(mirrorId: string, key: string): string {
+  return [
+    "---",
+    `Filed automatically from Jira ${key}. Hive task ${mirrorId} is that ticket's mirror.`,
+    "",
+    `Read the mirror first: \`hive task show ${mirrorId}\`. It carries the ticket's own status, its comments, and any material added after this task was filed.`,
+    `The mirror holds \`jira_key\`; this work task is tied to it by the \`[${key}]\` title prefix. Keep the prefix.`,
+    `To say anything back to Jira, run \`hive task send ${mirrorId} "<message>"\` — it goes out as a comment on the ticket. Your own Jira credentials are rejected; this is the only write path.`,
+  ].join("\n");
+}
+
+export interface AutoFilePlan {
+  mirror_task_id: string;
+  issue: string;
+  title: string;
+  brief: string;
+  priority: string;
+  kind: "ship";
+}
+
+// What WOULD be filed for this mirror, or null when nothing should be.
+//
+// Idempotency lives here and is title-based on purpose: a hand-filed
+// `[WEB-137] ...` task counts just as much as one hive filed, so turning
+// auto_file on for a project that has been worked by hand does not double-file
+// everything already on the board. Cancelled rows do not count — a cancelled
+// duplicate is exactly the state a refile is meant to recover from.
+export function planAutoFile(db: DB, mirror: any): AutoFilePlan | null {
+  const key = String(mirror?.jira_key ?? "");
+  if (!key || mirror.jira_link_kind !== "mirror") return null;
+  const existing = db
+    .query(
+      `SELECT 1 FROM tasks
+        WHERE project_id = ? AND id <> ? AND state <> 'cancelled'
+          AND (jira_mirror_task_id = ? OR instr(title, ?) = 1) LIMIT 1`
+    )
+    .get(mirror.project_id, mirror.id, mirror.id, `[${key}]`);
+  if (existing) return null;
+  const brief = String(mirror.brief ?? "").trim();
+  return {
+    mirror_task_id: mirror.id,
+    issue: key,
+    // The ticket's own name, verbatim. The sync cannot translate, and an
+    // invented English restatement would be hive putting words in the
+    // director's mouth.
+    title: String(mirror.title ?? `[${key}]`),
+    brief: `${brief}\n\n${autoFileFooter(mirror.id, key)}`,
+    priority: jiraPriorityToWorkPriority(jiraPriorityNameFromBrief(mirror.brief)) ?? "normal",
+    kind: "ship",
+  };
+}
+
+// File it. Returns the new task, or null when planAutoFile says no.
+//
+// Deliberately does NOT run dedup (detectDuplicate): the work task shares its
+// title with the mirror by design, so the only "duplicate" it could ever find
+// is the row it is supposed to sit under. The prefix check above is the
+// stronger guard anyway — it is exact, not a similarity score.
+export function autoFileWorkTask(db: DB, mirror: any): any | null {
+  const plan = planAutoFile(db, mirror);
+  if (!plan) return null;
+  const id = newId();
+  const t = now();
+  const task = mutateWithEvent(db, () => {
+    db.query(
+      `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, priority, jira_mirror_task_id, created_at, updated_at)
+       VALUES (?,?,?,?, 'queued', 'ship', 'jira-sync', ?,?,?,?)`
+    ).run(id, mirror.project_id, plan.title, plan.brief, plan.priority, mirror.id, t, t);
+    return getTask(db, id);
+  }, {
+    task_id: id,
+    source: "jira-sync",
+    type: "created",
+    payload: { title: plan.title, jira_mirror_task_id: mirror.id, auto_filed: true },
+  });
+  broadcastTask(db, task);
+  // On the MIRROR, so hive-watch and the ticket's own timeline show the filing
+  // next to the import it followed.
+  writeEvent(db, {
+    task_id: mirror.id,
+    source: "jira-sync",
+    type: "jira_autofile",
+    payload: { issue: plan.issue, work_task_id: id, priority: plan.priority },
+  });
+  return task;
+}
+
 // Mirror the mapped state onto a tracking-only task WITHOUT walking hive's
 // forward state machine.
 //
@@ -1727,6 +1877,7 @@ export async function linkTaskToJira(
 
 export interface SyncStats {
   imported: number;
+  auto_filed: number; // work tasks filed for new mirrors (config.jira.auto_file)
   pushed: number;
   pulled: number;
   labeled: number;
@@ -1747,7 +1898,7 @@ export interface SyncStats {
 }
 
 const emptyStats = (): SyncStats => ({
-  imported: 0, pushed: 0, pulled: 0, labeled: 0,
+  imported: 0, auto_filed: 0, pushed: 0, pulled: 0, labeled: 0,
   comments_pulled: 0, comments_pushed: 0, receipts: 0, attachments: 0, rendered: 0,
   shadow: 0, unmapped: 0, aborted: 0, blocked: 0, skipped: 0, budget_skipped: 0, cancelled: 0, errors: 0, failures: [],
 });
@@ -1886,6 +2037,34 @@ function titleFor(issue: any): string {
   return `[${issue.key}] ${issue.fields?.summary ?? "(no summary)"}`;
 }
 
+// A human closed the ticket in Jira. Its auto-filed work is now pointless, but
+// only the work that has not started can be thrown away safely (HIVE-631):
+//
+//   queued  -> cancelled. Nothing has been spent on it and no agent is holding
+//              a worktree, so there is nothing to lose and a stale queued task
+//              would otherwise be dispatched days after the ticket closed.
+//   anything else -> a note, never a cancel. An agent mid-task may already have
+//              a branch, a PR, or an open review, and hive killing that out
+//              from under a person because a ticket was tidied up in Jira is a
+//              much worse failure than one extra task to close by hand. The
+//              steer tells whoever is there and lets them decide.
+function closeWorkForClosedIssue(db: DB, mirror: any, key: string, jiraStatus: string): void {
+  for (const work of liveWorkTasks(db, mirror.id)) {
+    if (work.state === "queued") {
+      transition(db, work.id, "cancelled", { source: "jira-sync", reason: `jira ${key} closed as '${jiraStatus}' before this work started` });
+      logSync(db, mirror.id, { action: "work_cancelled", issue: key, work_task_id: work.id, jira_status: jiraStatus });
+    } else {
+      queueSteerEvent(
+        db,
+        work.id,
+        `Jira ${key} was closed as '${jiraStatus}' while you were working on it. Check with the director before spending more on this task.`,
+        `jira ${key} closed`
+      );
+      logSync(db, mirror.id, { action: "work_noted_closed", issue: key, work_task_id: work.id, work_state: work.state, jira_status: jiraStatus });
+    }
+  }
+}
+
 function hasOpenDecision(db: DB, taskId: string): boolean {
   return !!db.query("SELECT 1 FROM decisions WHERE task_id = ? AND status = 'open' LIMIT 1").get(taskId);
 }
@@ -1976,6 +2155,7 @@ async function reconcileIssue(ctx: Ctx, read: IssueRead, task: any): Promise<voi
       });
       stats.pulled++;
       moved = true;
+      if (TERMINAL.includes(jiraState!)) closeWorkForClosedIssue(db, task, key, read.statusName);
     }
   } else if (action === "push") {
     const target = stateToJiraStatus(task.state)!;
@@ -2108,6 +2288,47 @@ async function reconcileLinkedTask(ctx: Ctx, read: IssueRead, task: any): Promis
 // property is visible. Because Jira does not make the property unique, an
 // unconfirmed request remains visible for human confirmation instead of being
 // retried into the real late-arrival duplication window.
+// The still-live work tasks filed under a mirror. Terminal rows are excluded:
+// a done, failed or cancelled attempt has nobody left to tell.
+export function liveWorkTasks(db: DB, mirrorId: string): any[] {
+  return db
+    .query(
+      `SELECT id, state, created_at, title FROM tasks
+        WHERE jira_mirror_task_id = ? AND state NOT IN (${TERMINAL.map(() => "?").join(",")})
+        ORDER BY created_at`
+    )
+    .all(mirrorId, ...TERMINAL) as any[];
+}
+
+// A human's Jira comment, forwarded to the agents actually doing the work
+// (HIVE-631). It used to land on the mirror only, where no agent is running and
+// nobody reads it.
+//
+// Only comments written AFTER a work task was filed are forwarded. A fresh
+// import pulls in the ticket's whole comment history at once, and replaying
+// years of it at an agent as "the director just said this" is worse than
+// silence — that history is already in the mirror, which the brief's footer
+// tells the agent to read first.
+//
+// queueSteerEvent, not a direct herdr send: the sync has no herdr handle, and a
+// queued steer is delivered by the reconciler's drain within a cycle if an
+// agent is live, or carried by the next spawn's brief if one is not.
+function forwardCommentToWork(db: DB, mirror: any, key: string, comment: any, author: string, text: string): void {
+  if (!text) return;
+  const at = Date.parse(String(comment?.created ?? ""));
+  if (!Number.isFinite(at)) return;
+  for (const work of liveWorkTasks(db, mirror.id)) {
+    if (Date.parse(String(work.created_at)) >= at) continue;
+    queueSteerEvent(
+      db,
+      work.id,
+      `New comment on Jira ${key} from ${author}:\n\n${text}\n\n` +
+        `Reply on the ticket with: "$HIVE_CLI" task send ${mirror.id} "<your reply>"`,
+      `jira comment on ${key}`
+    );
+  }
+}
+
 function importRemoteComments(ctx: Ctx, key: string, task: any, remote: any[]): {
   sentComments: Map<string, string>;
   sentReceipts: Map<string, string>;
@@ -2126,18 +2347,21 @@ function importRemoteComments(ctx: Ctx, key: string, task: any, remote: any[]): 
     // never re-imports its own writing as though a person wrote it.
     const jiraId = String(c.id ?? "");
     if (!jiraId || jiraCommentRecorded(db, task.id, jiraId)) continue;
+    const author = c.author?.displayName ?? c.author?.accountId ?? "Jira";
+    const text = adfToText(c.body).trim();
     writeEvent(db, {
       task_id: task.id,
       source: "jira",
       type: "jira_comment",
       payload: {
         direction: "inbound", jira_id: jiraId, issue: key,
-        author: c.author?.displayName ?? c.author?.accountId ?? "Jira",
-        text: adfToText(c.body).trim(),
+        author,
+        text,
         created: c.created ?? null,
       },
     });
     stats.comments_pulled++;
+    forwardCommentToWork(db, task, key, c, author, text);
   }
   return { sentComments, sentReceipts };
 }
@@ -2625,6 +2849,12 @@ async function importAndReconcile(ctx: Ctx, projectId: string, read: IssueRead):
   broadcastTask(db, task);
   stats.imported++;
 
+  // The work task, filed from the mirror row that was just written (HIVE-631).
+  // Before reconcileIssue, not after: reconcileIssue pushes status and comments
+  // to Jira and can return early on a failed re-read, and a ticket that ends a
+  // cycle with a mirror and no work task is the exact hole this closes.
+  if (cfg.auto_file && autoFileWorkTask(db, task)) stats.auto_filed++;
+
   await reconcileIssue(ctx, read, task);
 }
 
@@ -2939,7 +3169,7 @@ export async function runProjectCycle(
     if (touched)
       console.log(
         `[hive] jira ${cfg.project_key}${cfg.write ? "" : " (shadow)"}: ` +
-          `+${stats.imported} imported, ${stats.pushed} pushed, ${stats.pulled} pulled, ${stats.labeled} labeled, ` +
+          `+${stats.imported} imported, ${stats.auto_filed} auto-filed, ${stats.pushed} pushed, ${stats.pulled} pulled, ${stats.labeled} labeled, ` +
           `${stats.comments_pulled} comments in, ${stats.comments_pushed} comments out, ${stats.receipts} receipts, ` +
           `${stats.attachments} attachments, ${stats.rendered} rendered, ` +
           `${stats.shadow} shadow, ${stats.unmapped} unmapped, ${stats.aborted} aborted, ${stats.blocked} blocked, ` +
