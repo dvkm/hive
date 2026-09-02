@@ -44,6 +44,10 @@ jobs:
 
       - run: bunx tsc --noEmit
 
+      # Own program, not part of the root include: server/test's Response.json()
+      # ambient override must not leak its `any` into server/src's type checking.
+      - run: bunx tsc -p server/test --noEmit
+
       - run: bunx tsc -b --noEmit
         working-directory: web
 

@@ -101,7 +101,7 @@ test("seeds and warms the worktree before setup_argv, and records the timings", 
   expect(r.ok).toBe(true);
 
   // The ordering claim: setup_argv found both already in place.
-  expect(sawAtSetup).toEqual({ env: true, modules: true });
+  expect(sawAtSetup as { env: boolean; modules: boolean } | null).toEqual({ env: true, modules: true });
 
   const seeded: any = db
     .query("SELECT payload FROM events WHERE task_id = ? AND type = 'worktree_seeded'")

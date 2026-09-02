@@ -1,7 +1,7 @@
 // Plain label maps. Kept out of ui.tsx (which imports react) so react-free
 // logic — eventText.ts, and the server tests that import it — can use them
 // without pulling in the web app's dependency tree.
-import type { State, Health } from "./api";
+import type { State, Health } from "./domain"; // not ./api — that pulls in DOM globals the server-test tsconfig doesn't have
 
 export const STATE_LABEL: Record<State, string> = {
   queued: "Queued",

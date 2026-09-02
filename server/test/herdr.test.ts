@@ -215,7 +215,7 @@ test("spawn builds the visible interactive fleet: worktree, fleet workspace, lab
     label: "t1 Fix the bug",
   });
   // prepareWorktree ran with the created worktree path, before agent start.
-  expect(prepared).toBe("/wt/hive-t1");
+  expect(prepared as string | null).toBe("/wt/hive-t1");
   // adopts the existing hive-fleet workspace (no workspace create call).
   expect(calls.some((c) => has(c, "workspace", "create"))).toBe(false);
   // creates a labelled tab in the fleet workspace at the worktree cwd.
@@ -367,7 +367,7 @@ test("teardown accepts a merged branch even when unpushed", async () => {
     return OK("removed");
   });
   const h = new Herdr(exec, "herdr");
-  const r = await h.teardown({ repoPath: "/repo", branch: "hive/t1", worktreePath: "/wt" });
+  const r = await h.teardown({ repoPath: "/repo", branch: "hive/t1", worktreePath: "/wt", workspaceId: "w9" });
   expect(r.removed).toBe(true);
   expect(r.reason).toBe("merged");
 });

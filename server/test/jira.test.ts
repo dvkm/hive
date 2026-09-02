@@ -569,7 +569,7 @@ test("the priority map covers Jira's default scheme and refuses to guess anythin
   expect(J.jiraPriorityToPriority("P0")).toBe(null);
   expect(J.jiraPriorityToPriority(null)).toBe(null);
   // Every value it CAN produce has to be a rank the dispatcher understands.
-  for (const p of Object.values(J.JIRA_TO_PRIORITY)) expect(TASK_PRIORITIES).toContain(p);
+  for (const p of Object.values(J.JIRA_TO_PRIORITY)) expect(TASK_PRIORITIES as readonly string[]).toContain(p);
 });
 
 test("import broadcasts via broadcastTask, so the live-pushed card already carries never_dispatched", async () => {
@@ -1621,7 +1621,7 @@ test("a push aborts (visibly) when Jira moves between the decision and the write
       if (nth === 3) {
         issue.status = "Done";
         issue.updated = "2026-06-01T00:00:00.000Z";
-        issue.history = [...issue.history, { at: "2026-06-01T00:00:00.000Z", to: "Done" }];
+        issue.history = [...(issue.history ?? []), { at: "2026-06-01T00:00:00.000Z", to: "Done" }];
       }
     },
   });
@@ -1977,7 +1977,7 @@ test("a budget-truncated cycle resumes at the deferred issue, so late issues are
   expect(readOrder[0]).not.toBe("WEB-1");
   expect(firstPass).not.toContain(readOrder[0]); // an issue pass 1 never reached
   const nextUnreached = issues.map((i) => i.key).find((k) => !firstPass.includes(k));
-  expect(readOrder[0]).toBe(nextUnreached);
+  expect(readOrder[0]).toBe(nextUnreached!);
 });
 
 test("an invalid JSON body is a named per-issue skip, not an opaque failure", async () => {
@@ -3405,7 +3405,7 @@ test("a cycle with an issue write failure remains failed and names the write", a
   expect(result.error).toContain("completed with 1 issue failure");
   expect(result.error).toContain("WEB-1 comment_push");
   expect(result.error).toContain("comment exploded");
-  expect(result.state.last_error).toBe(result.error);
+  expect(result.state.last_error).toBe(result.error ?? null);
   expect(result.state.consecutive_failures).toBe(1);
 });
 
@@ -3417,7 +3417,7 @@ test("an operational issue read failure remains visible as a cycle failure", asy
   expect(result.error).toContain("completed with 1 issue failure");
   expect(result.error).toContain("jira GET /rest/api/3/issue/WEB-1?");
   expect(result.error).toContain("500 nope");
-  expect(result.state.last_error).toBe(result.error);
+  expect(result.state.last_error).toBe(result.error ?? null);
   expect(result.state.consecutive_failures).toBe(1);
 });
 
