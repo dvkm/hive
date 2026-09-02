@@ -3,6 +3,9 @@ import { api } from "../lib/api";
 import type { UnderstandingQuiz as Quiz } from "../lib/api";
 import { toast } from "../lib/ui";
 
+type Result = Awaited<ReturnType<typeof api.answerUnderstandingQuiz>>;
+const REFRESHED_NOTICE = "This question was already answered in another view. Here is the current one.";
+
 export function UnderstandingQuiz({
   quiz,
   label = "Before you approve",
@@ -21,7 +24,8 @@ export function UnderstandingQuiz({
   const [currentQuiz, setCurrentQuiz] = useState(quiz);
   const [answer, setAnswer] = useState("");
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<Awaited<ReturnType<typeof api.answerUnderstandingQuiz>> | null>(null);
+  const [result, setResult] = useState<Result | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [round, setRound] = useState(0);
   const [showEscape, setShowEscape] = useState(false);
   const ignoredVersion = useRef<string | null>(null);
@@ -41,24 +45,51 @@ export function UnderstandingQuiz({
       setCurrentQuiz(quiz);
       setAnswer("");
       setResult(null);
+      setNotice(null);
       setRound((value) => value + 1);
       return;
     }
     if (busy || result || quiz.version === ignoredVersion.current) return;
     ignoredVersion.current = null;
     if (quiz.question === currentQuiz.question && quiz.version === currentQuiz.version) return;
+    setNotice(null);
     setCurrentQuiz(quiz);
     setAnswer("");
     setResult(null);
     setRound((value) => value + 1);
   }, [quiz.task_id, quiz.question, quiz.version, busy, result]);
 
+  // The same quiz is mounted in several places (review card, brief, task page).
+  // Answering in one moves the server's version, so the others hold a version
+  // the server has already passed — swap them onto the current check instead of
+  // leaving a button that is guaranteed to fail (HIVE-625).
+  const swapIn = (next: NonNullable<Result["quiz"]>, message?: string) => {
+    ignoredVersion.current = currentQuiz.version;
+    setCurrentQuiz({ task_id: currentQuiz.task_id, ...next });
+    setAnswer("");
+    setResult(null);
+    setNotice(message ?? null);
+    setRound((value) => value + 1);
+  };
+
   const submit = async () => {
     if (!answer || busy || result) return;
     setBusy(true);
+    setNotice(null);
     try {
-      setResult(await api.answerUnderstandingQuiz(currentQuiz.task_id, answer, currentQuiz.version, surface));
+      const response = await api.answerUnderstandingQuiz(currentQuiz.task_id, answer, currentQuiz.version, surface);
+      if (response.refreshed) {
+        if (response.passed) onPassed?.(response.explanation);
+        else if (response.quiz) swapIn(response.quiz, REFRESHED_NOTICE);
+        return;
+      }
+      setResult(response);
     } catch (error) {
+      const body = (error as { body?: { stale?: boolean; resolution?: { quiz?: Result["quiz"] } } }).body;
+      if (body?.stale && body.resolution?.quiz) {
+        swapIn(body.resolution.quiz, REFRESHED_NOTICE);
+        return;
+      }
       toast((error as Error).message);
     } finally {
       setBusy(false);
@@ -72,11 +103,7 @@ export function UnderstandingQuiz({
       return;
     }
     if (!result.quiz) return;
-    ignoredVersion.current = currentQuiz.version;
-    setCurrentQuiz({ task_id: currentQuiz.task_id, ...result.quiz });
-    setAnswer("");
-    setResult(null);
-    setRound((value) => value + 1);
+    swapIn(result.quiz);
   };
 
   const defer = async () => {
@@ -99,6 +126,7 @@ export function UnderstandingQuiz({
         {label}
         {(currentQuiz.total ?? 1) > 1 && ` · Question ${(currentQuiz.completed ?? 0) + 1} of ${currentQuiz.total}`}
       </div>
+      {notice && !result && <p className="understanding-quiz-notice">{notice}</p>}
       {result && (
         <p className={result.correct ? "understanding-quiz-correct" : "understanding-quiz-wrong"}>
           {result.correct ? "Correct." : `Not quite. ${result.explanation || "Review the explanation and apply the idea again."} Try this from another angle.`}

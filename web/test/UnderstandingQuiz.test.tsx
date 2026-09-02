@@ -91,3 +91,62 @@ test("the final answer waits for Finish before completing the quiz", async () =>
     api.answerUnderstandingQuiz = original;
   }
 });
+
+test("a stale 409 swaps in the current question instead of a red toast (hive-2121)", async () => {
+  const original = api.answerUnderstandingQuiz;
+  api.answerUnderstandingQuiz = (async () => {
+    throw Object.assign(new Error("understanding check already changed by director (web-7a9b8ac0)"), {
+      status: 409,
+      body: { stale: true, resolution: { actor: "web-7a9b8ac0", quiz: second } },
+    });
+  }) as typeof api.answerUnderstandingQuiz;
+
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(<UnderstandingQuiz quiz={first} />);
+    });
+    await act(async () => renderer.root.find((node) => node.type === "input" && node.props.value === "a").props.onChange());
+    await act(async () => {
+      await renderer.root.find((node) => node.type === "button" && node.children.includes("Check answer")).props.onClick();
+    });
+
+    expect(renderer.root.findByType("h4").children).toEqual(["Second question?"]);
+    expect(renderer.root.findAll((node) => node.props?.className === "understanding-quiz-notice")).toHaveLength(1);
+    // No answer carried over, and the button points at the new version.
+    expect(renderer.root.findAll((node) => node.type === "input").every((node) => !node.props.checked)).toBe(true);
+    expect(renderer.root.find((node) => node.type === "button" && node.children.includes("Check answer")).props.disabled).toBe(true);
+  } finally {
+    api.answerUnderstandingQuiz = original;
+  }
+});
+
+test("a self-conflict refresh swaps in the current question (hive-2121)", async () => {
+  const original = api.answerUnderstandingQuiz;
+  api.answerUnderstandingQuiz = (async () => ({
+    ok: true,
+    refreshed: true,
+    passed: false,
+    explanation: null,
+    completed: 1,
+    total: 2,
+    quiz: second,
+  })) as unknown as typeof api.answerUnderstandingQuiz;
+
+  try {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(<UnderstandingQuiz quiz={first} />);
+    });
+    await act(async () => renderer.root.find((node) => node.type === "input" && node.props.value === "a").props.onChange());
+    await act(async () => {
+      await renderer.root.find((node) => node.type === "button" && node.children.includes("Check answer")).props.onClick();
+    });
+
+    expect(renderer.root.findByType("h4").children).toEqual(["Second question?"]);
+    // No graded result panel: nothing was graded.
+    expect(renderer.root.findAll((node) => node.props?.className === "understanding-quiz-correct")).toHaveLength(0);
+  } finally {
+    api.answerUnderstandingQuiz = original;
+  }
+});

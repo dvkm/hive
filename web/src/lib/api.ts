@@ -134,12 +134,16 @@ async function req<T>(path: string, init?: RequestInit, retried = false): Promis
   }
   if (!res.ok) {
     let msg = res.statusText;
+    let body: unknown;
     try {
-      msg = (await res.json()).error || msg;
+      body = await res.json();
+      msg = (body as { error?: string }).error || msg;
     } catch {
       /* noop */
     }
-    throw new Error(msg);
+    // Callers that can recover need the payload, not just the message: a 409
+    // carries the winning actor and the current state to swap in (HIVE-625).
+    throw Object.assign(new Error(msg), { status: res.status, body });
   }
   return res.json() as Promise<T>;
 }
@@ -228,7 +232,7 @@ export const api = {
   catchup: (limit = 10, projectId?: string) =>
     req<{ cards: GlanceCard[] }>(`/api/catchup?limit=${limit}${projectId ? `&project_id=${encodeURIComponent(projectId)}` : ""}`),
   answerUnderstandingQuiz: (taskId: string, answerKey: string, version: string, surface?: "focus") =>
-    req<{ ok: boolean; correct: boolean; passed: boolean; explanation: string | null; completed?: number; total?: number; quiz?: Pick<UnderstandingQuiz, "question" | "options" | "version" | "completed" | "total"> }>(`/api/tasks/${taskId}/understanding-quiz/answer`, {
+    req<{ ok: boolean; correct?: boolean; passed: boolean; refreshed?: boolean; explanation: string | null; completed?: number; total?: number; quiz?: Pick<UnderstandingQuiz, "question" | "options" | "version" | "completed" | "total"> }>(`/api/tasks/${taskId}/understanding-quiz/answer`, {
       method: "POST",
       body: JSON.stringify({ answer_key: answerKey, version, source: "director", actor: directorActor(), surface }),
     }),
