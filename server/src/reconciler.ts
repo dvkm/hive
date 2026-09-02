@@ -41,6 +41,7 @@ import { runPrGardener } from "./prGardener.ts";
 import { autoAckPlans } from "./planCritic.ts";
 import { ambiguityCleared, cautionCleared, latestAutoReviewVerdict } from "./reviewer.ts";
 import { reportBoardAudit } from "./boardAudit.ts";
+import { stopPreview } from "./preview.ts";
 
 const NON_TERMINAL = "('queued','in_progress','needs_decision','in_review','verifying')";
 const RECOVERABLE = "('in_progress','needs_decision','in_review','verifying')";
@@ -2142,6 +2143,10 @@ async function recoverDead(db: DB, h: Herdr, taskId: string, target: string): Pr
 // Never fatal: a reclaim failure is recorded and recovery proceeds.
 export async function reclaimDeadWorktree(db: DB, h: Herdr, task: any): Promise<void> {
   if (!task.branch || !task.worktree_path) return;
+  // The preview stack lives INSIDE this worktree and its slug is the worktree's
+  // own directory name, so once the checkout is reclaimed nothing can ever tear
+  // those containers down again. Stop it first, while `down` can still run.
+  await stopPreview(db, task.id, "worktree_reclaimed").catch((e) => console.error("[hive] preview teardown:", e));
   const project = db.query("SELECT repo_path FROM projects WHERE id = ?").get(task.project_id) as
     | { repo_path: string | null }
     | undefined;

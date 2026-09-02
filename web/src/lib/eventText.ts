@@ -138,6 +138,20 @@ export function eventText(e: EventLike): string {
         : `automatic merge refused: ${s(p.error) || `HTTP ${s(p.status)}`}`;
     case "cleanup_skipped":
       return `cleanup failed safely: ${s(p.reason) || "worktree preserved"}`;
+    case "preview_started":
+      return "building the preview stack";
+    case "preview_ready": {
+      const urls = list(p.urls) as { label?: unknown }[];
+      const smoke =
+        typeof p.smoke_failed === "number" ? `, smoke ${s(p.smoke_passed)} passed / ${s(p.smoke_failed)} failed` : "";
+      return `preview ready: ${urls.map((u) => s(u.label)).join(", ") || "no urls"}${smoke}`;
+    }
+    case "preview_failed":
+      return `preview stack failed to come up${p.tail ? `: ${String(p.tail).split("\n").pop()}` : ""}`;
+    case "preview_queued":
+      return "preview waiting for a free slot";
+    case "preview_down":
+      return s(p.reason) === "idle" ? "preview torn down after 4h idle" : `preview torn down (${s(p.reason) || "done"})`;
     case "stack_setup":
     case "stack_teardown":
       return p.ok === false ? `${e.type.replace("_", " ")} failed: ${s(p.error)}` : `${e.type.replace("_", " ")} completed`;

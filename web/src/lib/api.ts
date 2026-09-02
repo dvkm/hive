@@ -41,6 +41,7 @@ import type {
   UnderstandingQuiz,
   UsageRow,
   UsageTotals,
+  PreviewState,
 } from "./domain";
 
 const BASE = import.meta.env.VITE_HIVE_URL || "";
@@ -341,6 +342,10 @@ export const api = {
       body: JSON.stringify({ task_ids, queued }),
     }),
   branchCheck: (id: string) => req<BranchCheck>(`/api/tasks/${id}/branch-check`),
+  preview: (id: string) => req<{ preview: PreviewState | null }>(`/api/tasks/${id}/preview`),
+  startPreview: (id: string) =>
+    req<{ preview: PreviewState | null; status: string }>(`/api/tasks/${id}/preview`, { method: "POST" }),
+  stopPreview: (id: string) => req<{ preview: PreviewState | null }>(`/api/tasks/${id}/preview`, { method: "DELETE" }),
   merge: (id: string, strategy?: "local_ff", overrideConfirmedRisks?: boolean) =>
     req<Task>(`/api/tasks/${id}/merge`, {
       method: "POST",

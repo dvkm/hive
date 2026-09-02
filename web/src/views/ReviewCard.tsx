@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
-import type { BranchCheck, DiffFile, DiffResult, Evidence, ReviewItem, ReviewSummary, Task, UnderstandingPacket, VerificationItem } from "../lib/api";
+import type { BranchCheck, DiffFile, DiffResult, Evidence, PreviewState, ReviewItem, ReviewSummary, Task, UnderstandingPacket, VerificationItem } from "../lib/api";
 import { useStore } from "../lib/store";
 import { CiBadge, SidecarChip, toast } from "../lib/ui";
 import { MAX_DIFF_LINES } from "../lib/api";
@@ -660,6 +660,128 @@ export function isLandHeld(o: {
   );
 }
 
+
+// ---------------------------------------------------------------- preview
+// A running copy of the branch, so UI work is verified by LOOKING at it instead
+// of by reading a diff or waiting for staging (HIVE-629). Renders nothing at
+// all unless the project opted in with config.preview — `preview` is absent
+// from the task payload otherwise.
+function PreviewPanel({ task, screenshots }: { task: Task; screenshots: Evidence[] }) {
+  const [state, setState] = useState<PreviewState | null | undefined>(undefined);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let live = true;
+    setState(undefined);
+    const load = () =>
+      api
+        .preview(task.id)
+        .then((r) => live && setState(r.preview))
+        .catch(() => live && setState(null));
+    void load();
+    // A stack takes minutes to build, and a queued one starts when a slot
+    // frees. Poll while either is true; a settled card polls nothing.
+    const timer = setInterval(() => {
+      setState((s) => {
+        if (s && (s.status === "building" || s.status === "queued")) void load();
+        return s;
+      });
+    }, 5_000);
+    return () => {
+      live = false;
+      clearInterval(timer);
+    };
+  }, [task.id]);
+
+  if (state === undefined || state === null) return null;
+
+  const act = async (start: boolean) => {
+    setBusy(true);
+    try {
+      const r = start ? await api.startPreview(task.id) : await api.stopPreview(task.id);
+      setState(r.preview);
+    } catch (e) {
+      toast((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deep = state.preview_path;
+  const primary = state.urls[0];
+  const smoke =
+    state.smoke_passed == null
+      ? null
+      : `smoke ${state.smoke_passed} passed, ${state.smoke_failed ?? 0} failed`;
+
+  return (
+    <div className={`preview-panel preview-${state.status}`}>
+      <div className="preview-head">
+        <span className="preview-label">Preview</span>
+        {state.status === "idle" && (
+          <button className="preview-action" disabled={busy} onClick={() => act(true)}>
+            Build preview
+          </button>
+        )}
+        {state.status === "expired" && (
+          <button className="preview-action" disabled={busy} onClick={() => act(true)}>
+            미리보기 만료됨 · 다시 만들기
+          </button>
+        )}
+        {state.status === "failed" && (
+          <button className="preview-action" disabled={busy} onClick={() => act(true)}>
+            Retry
+          </button>
+        )}
+        {state.status === "ready" && (
+          <button className="preview-action preview-stop" disabled={busy} onClick={() => act(false)}>
+            Tear down
+          </button>
+        )}
+      </div>
+
+      {state.status === "building" && <p className="preview-note">Bringing the stack up{"…"} this takes a few minutes.</p>}
+      {state.status === "queued" && (
+        <p className="preview-note">Waiting for a free slot — three previews can run at once. It starts on its own.</p>
+      )}
+
+      {state.status === "ready" && (
+        <>
+          <div className="preview-links">
+            {deep && primary && (
+              <a className="preview-link preview-link-primary" href={`${primary.url}${deep}`} target="_blank" rel="noreferrer">
+                open the page I changed ↗
+              </a>
+            )}
+            {state.urls.map((u) => (
+              <a key={u.label} className="preview-link" href={u.url} target="_blank" rel="noreferrer">
+                {u.label} ↗
+              </a>
+            ))}
+          </div>
+          {state.login_hint && <p className="preview-note preview-login">login: {state.login_hint}</p>}
+          {smoke && <p className="preview-note">{smoke}</p>}
+        </>
+      )}
+
+      {state.status === "failed" && (
+        <>
+          <p className="preview-note">The stack did not come up.</p>
+          {state.tail && <pre className="preview-tail">{state.tail}</pre>}
+        </>
+      )}
+
+      {/* Fallback: no live stack, but the agent captured the page itself. Say
+          plainly that these are pictures, not a running site. */}
+      {(state.status === "failed" || state.status === "queued" || state.status === "expired") && screenshots.length > 0 && (
+        <p className="preview-note">
+          No live stack — the {screenshots.length} screenshot{screenshots.length === 1 ? "" : "s"} below {screenshots.length === 1 ? "is" : "are"} what the agent captured.
+        </p>
+      )}
+    </div>
+  );
+}
+
 // The one review surface, shared by the task page, the /review queue, and the
 // Needs you view. Renders: title/project/summary, PR+CI status, a compact diff
 // stat with an expandable inline diff, and the three primary actions
@@ -1071,6 +1193,8 @@ export function ReviewCard({
           )}
         </div>
       )}
+
+      <PreviewPanel task={task} screenshots={evidence.filter((e) => e.kind === "screenshot")} />
 
       <ReviewFocus changed={whatChanged} paths={diffPaths} stat={stat} changes={changes} why={why.text} />
 
