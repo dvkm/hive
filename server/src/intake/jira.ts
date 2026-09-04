@@ -2695,8 +2695,10 @@ async function syncAttachments(ctx: Ctx, key: string, task: any): Promise<void> 
 // same comment twice for one visible column. `done` is the one exception: it
 // also shows as In Review (HIVE-630) but says something new to the reporter
 // ("it is finished, please close it"), so it gets its own key and its own
-// comment. Two comments at most per ticket, never three.
-const CONTEXT_STATUSES = ["In Review", "Done"];
+// comment. That "Done" key is a dedupe key only, never a Jira status: hive
+// never pushes Done, so CONTEXT_STATUSES holds "In Review" alone.
+// Two comments at most per ticket, never three.
+const CONTEXT_STATUSES = ["In Review"];
 const contextKey = (task: any): string | null => {
   const status = stateToJiraStatus(task.state);
   if (!status || !CONTEXT_STATUSES.includes(status)) return null;
