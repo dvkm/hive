@@ -395,6 +395,20 @@ export async function autoPreviewOnHandoff(db: DB, taskId: string, deps: Preview
   return r.ok;
 }
 
+// The review window: while the task is in one of these the stack stays up.
+const REVIEW_STATES = ["in_review", "verifying"];
+
+// Every state change routes through here. Reaching review brings the stack up;
+// leaving the review window for ANY other state takes it down. "Any other" is
+// the point: a changes-requested review sends the task straight back to
+// in_progress, and a stack left running there shows the pre-fix commit — and
+// then blocks its own rebuild, because startPreview no-ops on an already-ready
+// preview. Tearing down on the way out is what makes the next handoff rebuild.
+export async function previewOnStateChange(db: DB, taskId: string, to: string, deps: PreviewDeps = {}): Promise<void> {
+  if (to === "in_review") await autoPreviewOnHandoff(db, taskId, deps);
+  else if (!REVIEW_STATES.includes(to)) await stopPreview(db, taskId, to, deps);
+}
+
 // ---------------------------------------------------------------- sweeper
 
 // Newest director-sourced event on a task, which is what "the director looked

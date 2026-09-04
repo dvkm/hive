@@ -18,6 +18,7 @@ import {
   sweepPreviews,
   previewNoteContext,
   previewTouchesPaths,
+  previewOnStateChange,
   PREVIEW_CAP,
   PREVIEW_IDLE_MS,
 } from "../src/preview.ts";
@@ -289,4 +290,34 @@ test("wt.sh up/down inside the agent's own worktree needs no decision card", () 
   for (const cmd of ["infra/worktree/wt.sh up", "./infra/worktree/wt.sh down", "bash infra/worktree/wt.sh up"]) {
     expect(classify(cmd).decision).not.toBe("dangerous");
   }
+});
+
+test("changes requested tears the stack down, so the next handoff rebuilds it", async () => {
+  const { db, projectId } = freshDb();
+  const id = seedTask(db, projectId);
+  const { exec, calls } = stubExec((argv) => OK(argv[0] === "git" ? "cms/app/tracker.tsx\n" : ""));
+  const setState = (s: string) => db.query("UPDATE tasks SET state = ? WHERE id = ?").run(s, id);
+
+  await previewOnStateChange(db, id, "in_review", { exec });
+  await settle();
+  expect(previewState(db, getTask(db, id), { preview: PREVIEW })!.status).toBe("ready");
+
+  // Review pauses in verifying: the stack stays up.
+  setState("verifying");
+  await previewOnStateChange(db, id, "verifying", { exec });
+  expect(previewState(db, getTask(db, id), { preview: PREVIEW })!.status).toBe("ready");
+
+  // Changes requested sends the task back to in_progress, NOT through
+  // queued/done, so this is the transition that used to leave the pre-fix
+  // stack running and then block its own rebuild.
+  setState("in_progress");
+  await previewOnStateChange(db, id, "in_progress", { exec });
+  expect(calls.some((c) => c.argv.join(" ").endsWith("wt.sh down"))).toBe(true);
+  expect(previewState(db, getTask(db, id), { preview: PREVIEW })!.status).toBe("idle");
+
+  setState("in_review");
+  await previewOnStateChange(db, id, "in_review", { exec });
+  await settle();
+  expect(previewState(db, getTask(db, id), { preview: PREVIEW })!.status).toBe("ready");
+  expect(calls.filter((c) => c.argv.join(" ").endsWith("wt.sh up")).length).toBe(2);
 });

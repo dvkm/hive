@@ -23,7 +23,7 @@ import { startDriftWatch } from "./drift.ts";
 import { startPromoter } from "./promoter.ts";
 import { selfAuditOnce, startSelfAudit } from "./selfAudit.ts";
 import { followServingBranchOnBoot } from "./servingBranch.ts";
-import { autoPreviewOnHandoff, stopPreview } from "./preview.ts";
+import { previewOnStateChange } from "./preview.ts";
 import { setEventHook, setTerminalHook, expireOrphanedDecisions, repairRequeueProvenance, backfillStuckPrUrls, advanceReadyJiraMirrors } from "./state.ts";
 import { bootstrapAuthority } from "./authority.ts";
 import { cleanupTask } from "./cleanup.ts";
@@ -206,11 +206,9 @@ setEventHook((db, event) => {
   // requeue — a requeued task gets a fresh worktree, so its old stack is dead
   // weight against the concurrency cap.
   if (event.type !== "state_change") return;
-  const to = String(event.payload?.to ?? "");
-  if (to === "in_review")
-    autoPreviewOnHandoff(db, event.task_id).catch((e) => console.error("[hive] auto preview:", e));
-  else if (["done", "cancelled", "failed", "queued"].includes(to))
-    stopPreview(db, event.task_id, to).catch((e) => console.error("[hive] preview teardown:", e));
+  previewOnStateChange(db, event.task_id, String(event.payload?.to ?? "")).catch((e) =>
+    console.error("[hive] preview:", e)
+  );
 });
 sweepManagerInboxes(db, defaultHerdr, { supervise: true })
   .then((count) => {
