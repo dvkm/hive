@@ -41,14 +41,16 @@ function makeApi(opts: { rollup?: any[]; html?: string; plannerCode?: number } =
     if (has(argv, "tab", "create")) return OK('{"result":{"tab":{"tab_id":"wF:t2"}}}');
     return OK();
   };
+  const argvs: string[][] = [];
   const plannerExec: PlannerExec = async (argv) => {
+    argvs.push(argv);
     prompts.push(argv.find((a) => a.includes("Quiz")) ?? "");
     if (opts.plannerCode) return { code: opts.plannerCode, stdout: "", stderr: "model unavailable" };
     return { code: 0, stdout: JSON.stringify({ result: opts.html ?? PAGE }), stderr: "" };
   };
   const herdr = new Herdr(exec, "herdr");
   const handler = makeHandler(db, { herdr, exec, plannerExec });
-  return { db, handler, prompts };
+  return { db, handler, prompts, argvs };
 }
 
 type Handler = ReturnType<typeof makeHandler>;
@@ -127,6 +129,15 @@ test("green CI: the handoff is held until the explanation page exists, then it l
 
   // The quiz comes from the review summary, not from a second set of questions.
   expect(s.prompts.join("\n")).toContain(CHECK.question);
+});
+
+test("the explanation run cannot write files, so the page has to come back on stdout", async () => {
+  const s = makeApi({ rollup: [{ conclusion: "SUCCESS" }] });
+  const { id } = await readyTask(s.handler, "https://gh/pr/4");
+  await waitForState(s.handler, id, "in_review");
+  const argv = s.argvs.find((a) => a.some((x) => x.includes("Write a rich, interactive explanation")));
+  expect(argv).toBeDefined();
+  expect(argv).toContain("--disallowed-tools=Write,Edit,NotebookEdit");
 });
 
 test("a model failure records why and hands off anyway, rather than stranding the task", async () => {

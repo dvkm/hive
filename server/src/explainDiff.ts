@@ -31,6 +31,14 @@ const TIMEOUT_MS = 15 * 60_000;
 // A diff bigger than this is truncated: the model still gets the shape of the
 // change, and a 2MB prompt is not a better explanation.
 const MAX_DIFF_CHARS = 200_000;
+// The page must arrive on stdout, because stdout is the only thing hive reads
+// back. Given a writing tool, the run saves the HTML to a file of its own
+// choosing and its last message just names the path -- a finished opus run
+// hive then throws away as "produced no HTML document". That was 91 of the 130
+// explanation failures in the week to 2026-09-04 (664 runs), with 217 Write
+// calls across 1167 runs in the trajectories. Reading and shell tools stay:
+// the prompt asks the run to explore the checkout for background.
+const NO_WRITE_TOOLS = "--disallowed-tools=Write,Edit,NotebookEdit";
 
 // `${taskId}:${head}` currently being generated. In memory on purpose — a
 // server restart mid-run should simply try again on the next gate check.
@@ -206,7 +214,7 @@ async function generateExplanation(db: DB, task: any, head: string | null, deps:
   if (!diff.trim()) return fail(d.stderr?.trim() || "gh pr diff returned nothing");
 
   const res = await plannerExec(
-    [claudeBin(), "-p", "--model", MODEL, buildPrompt(task, diff.slice(0, MAX_DIFF_CHARS), reviewChecks(db, task.id)), "--output-format", "json"],
+    [claudeBin(), "-p", "--model", MODEL, NO_WRITE_TOOLS, buildPrompt(task, diff.slice(0, MAX_DIFF_CHARS), reviewChecks(db, task.id)), "--output-format", "json"],
     {
       timeoutMs: TIMEOUT_MS,
       cwd: task.worktree_path,
