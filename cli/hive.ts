@@ -42,7 +42,7 @@ Usage:
         --clear-pr detaches a wrong pr_url — a link to a pull request that is
         not this task's work, which the reconciler would otherwise read as this
         task's state
-  hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>] [--landing-commit <sha>] [--verify-name <name>]
+  hive emit <task-id> <type> [--note <s>] [--file <path>] [--json <file>] [--kind <k>] [--source <s>] [--pr-url <url>] [--landing-commit <sha>] [--verify-name <name>] [--preview-path <path>]
         types: status | evidence | needs-decision | ready | done | unmergeable | blocked | deferred | undefer | review_summary | <custom>
         unmergeable: this task's PR has nothing left to merge (GitHub refused to
         reopen it) but the work landed via a different PR/commit. Pass
@@ -54,6 +54,8 @@ Usage:
         deferred: park a task waiting on an OFFLINE human action (no more "gone quiet" nudges);
                   [--until <iso>] or [--days <n>] to auto-resume, else indefinite. undefer to resume early.
         ready: PR open (or scout report written) → hand off to review (in_progress -> in_review)
+        --preview-path <path>: on ready, the page you changed ("/coredata-tracker").
+        The review card opens the task's preview stack straight at that page.
   hive decision ask <task-id> --title <t> --context <s> [--risk <s>] [--blast <s>]
         --option key:label:detail  (repeatable)  --recommend <key>  --needs-input <key>
   hive decision auto-answer <decision-id> --key <option> [--reason <s>] [--actor <session>]
@@ -82,6 +84,8 @@ Usage:
         branch hive does not own, or one checked out somewhere. Dry run unless
         --apply.
   hive jira link <task-id> --parent <KEY> create and link a Jira sub-task
+  hive jira autofile --project <id> [--dry-run]
+                                          file the missing work tasks for queued Jira mirrors
   hive spawn <task-id> [--force]          spawn a herdr agent for a task
                                           (--force: the previous agent is dead, take its name)
   hive chat send [--project <id>|--thread <id>] "<text>"   message the persistent chat supervisor
@@ -408,6 +412,7 @@ async function main() {
         until: flags.until,
         days: flags.days,
         pr_url: flags["pr-url"] ?? flags.url,
+        preview_path: flags["preview-path"],
         landing_commit: flags["landing-commit"],
         verify_name: flags["verify-name"],
         ...extra,
@@ -788,7 +793,22 @@ async function main() {
   if (cmd === "jira") {
     const sub = argv[1];
     const { _, flags } = parseFlags(argv.slice(2));
-    if (sub !== "link" || !_[0] || !flags.parent) die("usage: hive jira link <task-id> --parent <KEY>");
+    if (sub === "autofile") {
+      const project = flags.project ? String(flags.project) : "";
+      if (!project) die("usage: hive jira autofile --project <id> [--dry-run]");
+      const dryRun = flags["dry-run"] === true;
+      const r = await api("POST", `/api/projects/${project}/jira/autofile`, { dry_run: dryRun });
+      if (!r.filed.length) {
+        console.log(`nothing to file: ${r.considered} queued mirror(s), all already have work`);
+        return;
+      }
+      for (const f of r.filed)
+        console.log(`${dryRun ? "would file" : `filed ${f.work_task_id}`}  [${f.priority}] ${f.title}  (mirror ${f.mirror_task_id})`);
+      console.log(`${dryRun ? "would file" : "filed"} ${r.filed.length}, skipped ${r.skipped} of ${r.considered} queued mirror(s)`);
+      return;
+    }
+    if (sub !== "link" || !_[0] || !flags.parent)
+      die("usage: hive jira link <task-id> --parent <KEY>  |  hive jira autofile --project <id> [--dry-run]");
     const linked = await api("POST", `/api/tasks/${_[0]}/jira/link`, { parent_key: String(flags.parent) });
     console.log(`linked ${_[0]} to ${linked.jira_key} (${linked.browse_url})`);
     for (const warning of linked.warnings ?? []) console.warn(`warning: ${warning}`);

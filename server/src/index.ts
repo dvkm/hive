@@ -23,6 +23,7 @@ import { startDriftWatch } from "./drift.ts";
 import { startPromoter } from "./promoter.ts";
 import { selfAuditOnce, startSelfAudit } from "./selfAudit.ts";
 import { followServingBranchOnBoot } from "./servingBranch.ts";
+import { previewOnStateChange } from "./preview.ts";
 import { setEventHook, setTerminalHook, expireOrphanedDecisions, repairRequeueProvenance, backfillStuckPrUrls, advanceReadyJiraMirrors } from "./state.ts";
 import { bootstrapAuthority } from "./authority.ts";
 import { cleanupTask } from "./cleanup.ts";
@@ -199,6 +200,15 @@ setTerminalHook((db, taskId) => {
 setEventHook((db, event) => {
   notifyManagerOfEvent(db, defaultHerdr, { supervise: true }, event);
   keepSupervisorWarm(db, defaultHerdr, { supervise: true }, event);
+  // Preview stacks (HIVE-629) follow the task's state, from the one place every
+  // state change funnels through. Reaching review with UI changes brings the
+  // stack up; leaving the review window at all takes it down, including a
+  // requeue — a requeued task gets a fresh worktree, so its old stack is dead
+  // weight against the concurrency cap.
+  if (event.type !== "state_change") return;
+  previewOnStateChange(db, event.task_id, String(event.payload?.to ?? "")).catch((e) =>
+    console.error("[hive] preview:", e)
+  );
 });
 sweepManagerInboxes(db, defaultHerdr, { supervise: true })
   .then((count) => {

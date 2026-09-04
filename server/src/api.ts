@@ -81,7 +81,10 @@ import {
   JIRA_COMMENT_MAX_LENGTH,
   JIRA_WRITE_SCOPE,
   jiraConfig,
+  jiraConfigFor,
   jiraConfigStatusFor,
+  planAutoFile,
+  autoFileWorkTask,
   readSyncState as readJiraSyncState,
   jiraSyncHealth,
   runProjectCycle as runJiraProjectCycle,
@@ -111,6 +114,7 @@ import { ciStatusOf, ciStatusProbed, probePrReadiness, reclaimDeadWorktree, infr
 import { getAway, setAway, awayNow, heldPushes, lastFlush, syncAway } from "./away.ts";
 import type { AwayConfig } from "./away.ts";
 import { taskDiff } from "./diff.ts";
+import { previewState, startPreview, stopPreview, previewNoteContext } from "./preview.ts";
 import { catchupCards } from "./glance.ts";
 import { authoredFiles, captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { overlapHold } from "./fileScope.ts";
@@ -633,6 +637,25 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/transition$/);
       if (m && method === "POST") return await doTransition(db, m[1], await req.json(), deps);
 
+      // Preview stacks (HIVE-629). GET is the card's poll while a stack builds;
+      // POST is the Preview / Retry button; DELETE is an explicit teardown.
+      m = pathname.match(/^\/api\/tasks\/([^/]+)\/preview$/);
+      if (m) {
+        const t = getTask(db, m[1]);
+        if (!t) return noTask(m[1]);
+        const cfg = projectConfigOf(db, t.project_id);
+        if (method === "GET") return json({ preview: previewState(db, t, cfg) });
+        if (method === "POST") {
+          const r = await startPreview(db, m[1], { exec: deps.exec });
+          if (!r.ok) return err(r.error ?? "could not start the preview", 409);
+          return json({ preview: previewState(db, getTask(db, m[1]), cfg), status: r.status });
+        }
+        if (method === "DELETE") {
+          await stopPreview(db, m[1], "director", { exec: deps.exec });
+          return json({ preview: previewState(db, getTask(db, m[1]), cfg) });
+        }
+      }
+
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/spawn$/);
       if (m && method === "POST")
         return await spawnTask(db, herdr, m[1], await safeJson(req), deps);
@@ -783,6 +806,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (!body?.parent_key) return err("parent_key is required: hive jira link <task-id> --parent <JIRA-KEY>");
         return json(await linkTaskToJira(db, m[1], String(body.parent_key), deps.jira), 201);
       }
+
+      m = pathname.match(/^\/api\/projects\/([^/]+)\/jira\/autofile$/);
+      if (m && method === "POST") return jiraAutofileBackfill(db, m[1], await safeJson(req));
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/jira\/delivery\/resolve$/);
       if (m && method === "POST") return jiraResolveDelivery(db, m[1], await safeJson(req));
@@ -1103,6 +1129,53 @@ function jiraTaskState(db: DB, taskId: string): Response {
     delivered,
     linked_subtasks: linkedSubtasks,
   });
+}
+
+// Backfill: file the work tasks for mirrors that were imported before
+// `config.jira.auto_file` was turned on (HIVE-631). Same planAutoFile as the
+// import path, so a backfilled task is byte-identical to one filed live and
+// re-running it never files twice.
+//
+// Gated on auto_file, not just on a valid Jira config: "does this project want
+// hive filing its Jira work?" is one question with one answer, and running this
+// against a project that deliberately keeps a human in the intake loop would
+// bury their board.
+//
+// Only `queued` mirrors are considered. A mirror that has moved has either been
+// worked already or been closed in Jira, and neither wants a fresh task.
+function jiraAutofileBackfill(db: DB, projectId: string, body: any): Response {
+  const project = db.query("SELECT id FROM projects WHERE id = ?").get(projectId);
+  if (!project) return noProject(projectId);
+  const cfg = jiraConfigFor(db, projectId);
+  if (!cfg) return err(`project ${projectId} has no usable config.jira — set site, email and project_key first`, 400);
+  if (!cfg.auto_file)
+    return err(
+      `config.jira.auto_file is off for ${projectId}, so hive does not file work tasks for this project's tickets. Turn it on before backfilling.`,
+      400
+    );
+  const dryRun = body?.dry_run === true;
+  const mirrors = db
+    .query("SELECT * FROM tasks WHERE project_id = ? AND jira_link_kind = 'mirror' AND state = 'queued' ORDER BY created_at, id")
+    .all(projectId) as any[];
+  const filed: Record<string, unknown>[] = [];
+  let skipped = 0;
+  for (const mirror of mirrors) {
+    const plan = planAutoFile(db, mirror);
+    if (!plan) {
+      skipped++;
+      continue;
+    }
+    const created = dryRun ? null : autoFileWorkTask(db, mirror);
+    filed.push({
+      issue: plan.issue,
+      mirror_task_id: mirror.id,
+      work_task_id: created?.id ?? null,
+      title: plan.title,
+      priority: plan.priority,
+      kind: plan.kind,
+    });
+  }
+  return json({ dry_run: dryRun, project_id: projectId, considered: mirrors.length, skipped, filed });
 }
 
 function jiraResolveDelivery(db: DB, taskId: string, body: any): Response {
@@ -3144,6 +3217,18 @@ function evidencePreview(path: string | null, kind: string): string | null {
   }
 }
 
+// A project's parsed config, or {} when the project or its JSON is missing.
+// Preview reads it on every task fetch, so it gets one small helper instead of
+// a fourth copy of the same parse-with-fallback.
+function projectConfigOf(db: DB, projectId: string): any {
+  const p: any = db.query("SELECT config FROM projects WHERE id = ?").get(projectId);
+  try {
+    return JSON.parse(p?.config ?? "{}");
+  } catch {
+    return {};
+  }
+}
+
 function getTaskFull(db: DB, id: string): Response {
   const task = getTask(db, id);
   if (!task) return noTask(id);
@@ -3158,7 +3243,17 @@ function getTaskFull(db: DB, id: string): Response {
   // reads, so the review card can show the checklist instead of restating the
   // rule (HIVE-403). Absent entirely when the task declared no contract.
   const verification = verificationChecklist(db, task);
-  return json({ ...taskWithHealth(db, task), events, evidence, decisions, ...(verification.length ? { verification } : {}) });
+  // null whenever the project never opted into previews, which is what makes a
+  // project without `config.preview` show no preview UI at all.
+  const preview = previewState(db, task, projectConfigOf(db, task.project_id));
+  return json({
+    ...taskWithHealth(db, task),
+    events,
+    evidence,
+    decisions,
+    ...(verification.length ? { verification } : {}),
+    ...(preview ? { preview } : {}),
+  });
 }
 
 async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
@@ -4616,9 +4711,13 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
   if (neverDispatched(db, task))
     return err("task is untracked (source=external) and has never been spawned — a steer message can never be delivered", 400);
   const { paths, block } = await attachFiles(id, files);
+  // A note typed while a preview stack is up was written while LOOKING at that
+  // stack. Say so, so the agent reads the feedback with the director's context
+  // instead of guessing which surface "this button is wrong" is about (HIVE-629).
+  const previewContext = sender ? null : previewNoteContext(db, task, projectConfigOf(db, task.project_id));
   const message = sender
     ? `[teammate #${sender.number} ${sender.title} | task ${sender.id}]\n${text}\n\nReply with: "$HIVE_CLI" task send ${sender.id} "<your reply>"${block}`
-    : text + block;
+    : text + (previewContext ? `\n${previewContext}` : "") + block;
   const target = task.agent_target;
 
   let error: string | null = target ? null : "task has no agent_target (not spawned)";
@@ -7503,7 +7602,21 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
             "Handoff held: hive is writing the explanation page for this PR. Stay on the task — it moves to review by itself when the page is ready (usually a few minutes).",
         });
       }
-      writeEvent(db, { task_id: taskId, source, type: "ready_for_review", payload: { pr_url: prUrl ?? t.pr_url ?? null, via: "emit", kind: t.kind } });
+      // `--preview-path /coredata-tracker` (or preview_path in the handoff JSON):
+      // the page the agent actually changed. The review card renders it as the
+      // primary preview link, so the director opens that page and not a home page.
+      const previewPath = String((fields as any).preview_path ?? "").trim();
+      writeEvent(db, {
+        task_id: taskId,
+        source,
+        type: "ready_for_review",
+        payload: {
+          pr_url: prUrl ?? t.pr_url ?? null,
+          via: "emit",
+          kind: t.kind,
+          ...(previewPath.startsWith("/") && !previewPath.startsWith("//") ? { preview_path: previewPath } : {}),
+        },
+      });
       const task = transition(db, taskId, "in_review", { source, reason: note ?? "agent handoff: ready for review" });
       return json({ task });
     }

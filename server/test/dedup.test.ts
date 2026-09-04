@@ -261,3 +261,37 @@ test("an empty duplicate brief never blanks the survivor's", async () => {
   expect(dup.state).toBe("cancelled");
   expect((await get(`/api/tasks/${survivor.id}`)).json.brief).toBe("the real brief");
 });
+
+// A `[WEB-NNN] ...` work task carries the SAME title as the Jira mirror it sits
+// under — that prefix is the link (HIVE-546/631). Dedup used to read that as an
+// exact duplicate and fold the work into the mirror, cancelling it: the mirror
+// is tracking-only, so hive would never dispatch it and the ticket would sit
+// there looking claimed with nobody on it.
+test("a Jira work task is never folded into its own mirror", async () => {
+  const mirrorId = "mirror-web-137";
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, source_ref, jira_key, jira_link_kind, created_at, updated_at)
+     VALUES (?,?,?,?, 'queued', 'ship', 'external', 'jira:WEB-137', 'WEB-137', 'mirror', ?, ?)`
+  ).run(mirrorId, projectId, "[WEB-137] the checkout page will not open", "short", "2020-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z");
+
+  const work = await mkTask("[WEB-137] the checkout page will not open", "implement it");
+
+  expect(work.state).toBe("queued");
+  expect(work.jira_mirror_task_id).toBe(mirrorId);
+  expect(work.duplicate_of ?? null).toBeNull();
+  expect(await openDecisionsFor(work.id)).toEqual([]);
+  expect((await get(`/api/tasks/${mirrorId}`)).json.state).toBe("queued");
+
+  // A SECOND work task with that title is still a real duplicate of the first.
+  const second = await mkTask("[WEB-137] the checkout page will not open.", "again");
+  expect(second.state).toBe("cancelled");
+  expect(second.duplicate_of).toBe(work.id);
+
+  // Same exemption on the listing surface. Without it every auto-filed ticket
+  // sits on /api/tasks/duplicates forever as an 'exact duplicate' of its own
+  // mirror, and a director acting on that list would cancel the real work.
+  const clusters = (await get("/api/tasks/duplicates")).json.clusters as { tasks: { id: string }[] }[];
+  const ids = clusters.map((c) => c.tasks.map((t) => t.id).sort());
+  expect(ids.some((g) => g.includes(mirrorId) && g.includes(work.id))).toBe(false);
+  expect(ids.some((g) => g.includes(mirrorId))).toBe(false);
+});

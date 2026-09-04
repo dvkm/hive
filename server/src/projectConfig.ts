@@ -246,6 +246,42 @@ const worktreeWarm: Check = (v) => {
   return null;
 };
 
+// HIVE-629 preview stacks. Presence of this key is what opts a project into the
+// review card's Preview button and the automatic bring-up at handoff; a project
+// without it shows no preview UI at all. `up`/`down` become the argv of a
+// command run in the task's own worktree, so they are pinned to a plain
+// command line with no shell syntax; `urls` are the addresses the director is
+// handed, so they must be well-formed http(s) with a {slug} placeholder.
+const preview: Check = (v) => {
+  const bad = obj(v);
+  if (bad) return bad;
+  const p = v as Record<string, unknown>;
+  for (const key of Object.keys(p))
+    if (!["up", "down", "urls", "login_hint", "paths"].includes(key)) return `.${key} is not a known preview key`;
+  for (const key of ["up", "down"]) {
+    const cmd = p[key];
+    const parts = Array.isArray(cmd) ? cmd : typeof cmd === "string" ? cmd.trim().split(/\s+/) : null;
+    if (!parts || !parts.length || parts.some((x) => typeof x !== "string" || !x || /[;&|`$<>(){}\n]/.test(x)))
+      return `.${key} must be a command with no shell syntax, as a string or an argv array`;
+  }
+  if (!Array.isArray(p.urls) || !p.urls.length) return ".urls must be a non-empty array of {label, url}";
+  for (let i = 0; i < p.urls.length; i++) {
+    const e = p.urls[i] as Record<string, unknown>;
+    if (e === null || typeof e !== "object" || Array.isArray(e)) return `.urls[${i}] must be an object`;
+    if (typeof e.label !== "string" || !e.label) return `.urls[${i}].label must be a non-empty string`;
+    // {slug} is substituted before the URL is ever used, so check the shape it
+    // takes once substituted rather than rejecting the placeholder.
+    const invalid = httpUrl(String(e.url ?? "").replaceAll("{slug}", "slug"));
+    if (invalid) return `.urls[${i}].url ${invalid}`;
+  }
+  if (p.login_hint !== undefined && typeof p.login_hint !== "string") return ".login_hint must be a string";
+  if (p.paths !== undefined) {
+    const invalid = strArray(p.paths);
+    if (invalid) return `.paths ${invalid}`;
+  }
+  return null;
+};
+
 const CHECKS: Record<string, Check> = {
   // dispatch / autonomy
   auto_dispatch: bool,
@@ -292,6 +328,8 @@ const CHECKS: Record<string, Check> = {
   pr_gardener: prGardener,
   auto_review: bool,
   render_proof: bool,
+  // Per-task preview stacks on the review card (server/src/preview.ts).
+  preview,
   // Which changes still need a director understanding check (hive-1559).
   understanding_checks: understandingChecks,
   release_review_agents: bool,
