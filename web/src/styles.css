@@ -4170,6 +4170,68 @@ a.dbundle-fact:hover {
 .review-card-title a {
   color: var(--text);
 }
+/* ---- preview stack (HIVE-629) ---- */
+.preview-panel {
+  padding: 12px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  background: var(--bg-elev);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.preview-panel.preview-failed {
+  border-color: var(--danger, #b3261e);
+}
+.preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.preview-label {
+  font-size: var(--t-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+.preview-action {
+  font-size: var(--t-sm);
+  padding: 4px 10px;
+}
+.preview-links {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.preview-link {
+  padding: 5px 10px;
+  border: 1px solid var(--accent-dim);
+  border-radius: 7px;
+  font-size: var(--t-sm);
+  text-decoration: none;
+}
+.preview-link-primary {
+  border-color: var(--accent);
+  font-weight: 650;
+}
+.preview-note {
+  margin: 0;
+  font-size: var(--t-sm);
+  color: var(--text-faint);
+}
+.preview-login {
+  font-family: var(--mono, monospace);
+}
+.preview-tail {
+  margin: 0;
+  max-height: 180px;
+  overflow: auto;
+  font-size: var(--t-xs);
+  white-space: pre-wrap;
+}
+
 .review-recommendation {
   padding: 16px;
   border: 1px solid var(--border-soft);

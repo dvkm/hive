@@ -20,6 +20,7 @@ import { enqueue } from "./notifications.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
 import { startLoop } from "./loop.ts";
+import { sweepPreviews } from "./preview.ts";
 
 export interface ReaperDeps {
   herdr?: Herdr;
@@ -54,6 +55,10 @@ export async function reapOnce(db: DB, deps: ReaperDeps = {}): Promise<void> {
   }
   const herdr = deps.herdr ?? defaultHerdr;
   const exec = deps.exec ?? defaultExec;
+  // Preview stacks (HIVE-629): tear down anything the director stopped looking
+  // at, then start whatever queued behind the concurrency cap. Same sweep, same
+  // teardown gates — a stack is ~6 containers, so an abandoned one is expensive.
+  await sweepPreviews(db, { exec }).catch((e) => console.error("[hive] preview sweep:", e));
   const projects = activeProjects(db).filter((p) => p.repo_path) as { id: string; repo_path: string }[];
 
   for (const p of projects) {
