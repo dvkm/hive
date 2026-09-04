@@ -52,6 +52,16 @@ export function titleSimilarity(a: string, b: string): number {
 
 export type DupMatch = { tier: "exact" | "near"; survivor: any; score: number };
 
+// A `[WEB-137] ...` work task carries the SAME title as the Jira mirror it sits
+// under, deliberately — that prefix is the link (HIVE-546/631). So a mirror and
+// its own work are a guaranteed exact title "duplicate" of each other, and
+// neither the auto-fold nor the /api/tasks/duplicates listing should ever call
+// them one. Symmetric: either row may be the one carrying the pointer.
+export function isMirrorPair(a: any, b: any): boolean {
+  return (!!a.jira_mirror_task_id && a.jira_mirror_task_id === b.id) ||
+    (!!b.jira_mirror_task_id && b.jira_mirror_task_id === a.id);
+}
+
 // Find the best duplicate of `task` among the OTHER non-terminal tasks in the
 // same project. Survivor is the OLDER task (existing tasks are older than a
 // just-created one, so this naturally keeps the original). Prefers an exact
@@ -68,6 +78,10 @@ export function detectDuplicate(db: DB, task: any): DupMatch | null {
   const norm = normalizeTitle(task.title);
   let best: DupMatch | null = null;
   for (const r of rows) {
+    // Folding a work task into its own mirror would cancel it into a
+    // tracking-only row hive never dispatches, which is the opposite of what
+    // the board is for. See isMirrorPair.
+    if (isMirrorPair(task, r)) continue;
     if (normalizeTitle(r.title) === norm) return { tier: "exact", survivor: r, score: 1 };
     const score = titleSimilarity(task.title, r.title);
     if (score >= NEAR_THRESHOLD && (!best || score > best.score))
@@ -203,6 +217,10 @@ export function duplicateClusters(db: DB): { project_id: string; tasks: any[] }[
   for (let i = 0; i < rows.length; i++) {
     for (let j = i + 1; j < rows.length; j++) {
       if (rows[i].project_id !== rows[j].project_id) continue;
+      // Same exemption detectDuplicate makes: a mirror and its work are not a
+      // duplicate pair. ponytail: pairwise only — a third task similar to both
+      // still pulls them into one cluster, which is a real duplicate anyway.
+      if (isMirrorPair(rows[i], rows[j])) continue;
       const exact = normalizeTitle(rows[i].title) === normalizeTitle(rows[j].title);
       if (exact || titleSimilarity(rows[i].title, rows[j].title) >= NEAR_THRESHOLD)
         unite(rows[i].id, rows[j].id);

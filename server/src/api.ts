@@ -81,7 +81,10 @@ import {
   JIRA_COMMENT_MAX_LENGTH,
   JIRA_WRITE_SCOPE,
   jiraConfig,
+  jiraConfigFor,
   jiraConfigStatusFor,
+  planAutoFile,
+  autoFileWorkTask,
   readSyncState as readJiraSyncState,
   jiraSyncHealth,
   runProjectCycle as runJiraProjectCycle,
@@ -804,6 +807,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         return json(await linkTaskToJira(db, m[1], String(body.parent_key), deps.jira), 201);
       }
 
+      m = pathname.match(/^\/api\/projects\/([^/]+)\/jira\/autofile$/);
+      if (m && method === "POST") return jiraAutofileBackfill(db, m[1], await safeJson(req));
+
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/jira\/delivery\/resolve$/);
       if (m && method === "POST") return jiraResolveDelivery(db, m[1], await safeJson(req));
 
@@ -1123,6 +1129,53 @@ function jiraTaskState(db: DB, taskId: string): Response {
     delivered,
     linked_subtasks: linkedSubtasks,
   });
+}
+
+// Backfill: file the work tasks for mirrors that were imported before
+// `config.jira.auto_file` was turned on (HIVE-631). Same planAutoFile as the
+// import path, so a backfilled task is byte-identical to one filed live and
+// re-running it never files twice.
+//
+// Gated on auto_file, not just on a valid Jira config: "does this project want
+// hive filing its Jira work?" is one question with one answer, and running this
+// against a project that deliberately keeps a human in the intake loop would
+// bury their board.
+//
+// Only `queued` mirrors are considered. A mirror that has moved has either been
+// worked already or been closed in Jira, and neither wants a fresh task.
+function jiraAutofileBackfill(db: DB, projectId: string, body: any): Response {
+  const project = db.query("SELECT id FROM projects WHERE id = ?").get(projectId);
+  if (!project) return noProject(projectId);
+  const cfg = jiraConfigFor(db, projectId);
+  if (!cfg) return err(`project ${projectId} has no usable config.jira — set site, email and project_key first`, 400);
+  if (!cfg.auto_file)
+    return err(
+      `config.jira.auto_file is off for ${projectId}, so hive does not file work tasks for this project's tickets. Turn it on before backfilling.`,
+      400
+    );
+  const dryRun = body?.dry_run === true;
+  const mirrors = db
+    .query("SELECT * FROM tasks WHERE project_id = ? AND jira_link_kind = 'mirror' AND state = 'queued' ORDER BY created_at, id")
+    .all(projectId) as any[];
+  const filed: Record<string, unknown>[] = [];
+  let skipped = 0;
+  for (const mirror of mirrors) {
+    const plan = planAutoFile(db, mirror);
+    if (!plan) {
+      skipped++;
+      continue;
+    }
+    const created = dryRun ? null : autoFileWorkTask(db, mirror);
+    filed.push({
+      issue: plan.issue,
+      mirror_task_id: mirror.id,
+      work_task_id: created?.id ?? null,
+      title: plan.title,
+      priority: plan.priority,
+      kind: plan.kind,
+    });
+  }
+  return json({ dry_run: dryRun, project_id: projectId, considered: mirrors.length, skipped, filed });
 }
 
 function jiraResolveDelivery(db: DB, taskId: string, body: any): Response {
