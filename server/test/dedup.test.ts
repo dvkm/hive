@@ -286,4 +286,12 @@ test("a Jira work task is never folded into its own mirror", async () => {
   const second = await mkTask("[WEB-137] the checkout page will not open.", "again");
   expect(second.state).toBe("cancelled");
   expect(second.duplicate_of).toBe(work.id);
+
+  // Same exemption on the listing surface. Without it every auto-filed ticket
+  // sits on /api/tasks/duplicates forever as an 'exact duplicate' of its own
+  // mirror, and a director acting on that list would cancel the real work.
+  const clusters = (await get("/api/tasks/duplicates")).json.clusters as { tasks: { id: string }[] }[];
+  const ids = clusters.map((c) => c.tasks.map((t) => t.id).sort());
+  expect(ids.some((g) => g.includes(mirrorId) && g.includes(work.id))).toBe(false);
+  expect(ids.some((g) => g.includes(mirrorId))).toBe(false);
 });

@@ -1252,6 +1252,11 @@ export function decideStatusSync(args: {
 // ============================================================================
 // HIVE-SIDE WRITES
 // ============================================================================
+// The one place the `Priority: <name>` line's shape is written down. briefFor
+// emits it and jiraPriorityNameFromBrief reads it back; both go through this
+// constant so the format cannot drift on one side only.
+export const BRIEF_PRIORITY_PREFIX = "Priority: ";
+
 export function briefFor(issue: any, site: string): string {
   const f = issue.fields ?? {};
   const description = adfToText(f.description).trim();
@@ -1271,7 +1276,7 @@ export function briefFor(issue: any, site: string): string {
   return [
     `JIRA: ${site}/browse/${issue.key}`,
     `Type: ${f.issuetype?.name ?? "-"}`,
-    `Priority: ${f.priority?.name ?? "-"}`,
+    `${BRIEF_PRIORITY_PREFIX}${f.priority?.name ?? "-"}`,
     `Assignee: ${f.assignee?.displayName ?? f.assignee?.accountId ?? "-"}`,
     `Labels: ${(f.labels ?? []).join(", ") || "-"}`,
     "",
@@ -1304,13 +1309,17 @@ export function briefFor(issue: any, site: string): string {
 // `[WEB-NNN] ` title-prefix parse writes. Nothing new, no second convention.
 
 // The Jira priority NAME, read back off the mirror's brief. briefFor writes it
-// as a fixed `Priority: <name>` line, and hive stores no column for it, so this
-// is the one place the name survives — and it survives identically for the
-// import path and the offline backfill, which is why both read it here rather
-// than one reading the issue and one reading the row.
+// as a BRIEF_PRIORITY_PREFIX line, and hive stores no column for it, so this is
+// the one place the name survives — and it survives identically for the import
+// path and the offline backfill, which is why both read it here rather than one
+// reading the issue and one reading the row. The round-trip through briefFor is
+// pinned by a test, so a change to that line's format fails there rather than
+// silently dropping every auto-filed task to `normal`.
 export function jiraPriorityNameFromBrief(brief: string | null | undefined): string | null {
-  const m = /^Priority: (.*)$/m.exec(String(brief ?? ""));
-  const name = m?.[1]?.trim();
+  const line = String(brief ?? "")
+    .split("\n")
+    .find((l) => l.startsWith(BRIEF_PRIORITY_PREFIX));
+  const name = line?.slice(BRIEF_PRIORITY_PREFIX.length).trim();
   return !name || name === "-" ? null : name;
 }
 

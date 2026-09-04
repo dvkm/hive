@@ -4497,6 +4497,34 @@ test("the priority name is read back off the mirror's own brief", () => {
   expect(J.jiraPriorityNameFromBrief(null)).toBeNull();
 });
 
+// There is no priority column: briefFor writes the name into the brief text and
+// the auto-file path reads it back out. Nothing in the type system ties those
+// two together, so this walks every name in the map through the real briefFor
+// output. Change that line's format and this fails, instead of every auto-filed
+// task quietly dropping to `normal`.
+test("every Jira priority survives the round trip through the brief text", () => {
+  const names = ["Blocker", "Critical", "Highest", "High", "Medium", "Low", "Lowest"];
+  const roundTripped = names.map((name) => {
+    const brief = J.briefFor({ key: "WEB-1", fields: { priority: { name }, description: null } }, SITE);
+    return J.jiraPriorityToWorkPriority(J.jiraPriorityNameFromBrief(brief));
+  });
+  expect(roundTripped).toEqual(names.map(J.jiraPriorityToWorkPriority));
+  expect(roundTripped).toEqual(["now", "now", "next", "next", "normal", "later", "later"]);
+  // A description that itself contains a 'Priority: ...' line must not win over
+  // the real header line above it.
+  const spoofed = J.briefFor(
+    {
+      key: "WEB-1",
+      fields: {
+        priority: { name: "Low" },
+        description: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Priority: Highest" }] }] },
+      },
+    },
+    SITE
+  );
+  expect(J.jiraPriorityNameFromBrief(spoofed)).toBe("Low");
+});
+
 test("auto_file on: one import produces one mirror and one linked work task", async () => {
   const jira = fakeJira({ issues: [{
     key: "WEB-137", id: "137", status: "To Do", summary: "결제 화면이 안 열립니다", priority: "High",
