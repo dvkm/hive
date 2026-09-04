@@ -4519,3 +4519,33 @@ test("jiraSyncHealth reports one row per enabled project, and flags a target wit
   });
   expect(J.jiraSyncHealth(db)[0]).toMatchObject({ stale: true, consecutive_failures: 4, last_error: "boom" });
 });
+
+test("a linked push aborts when a human closes the issue at the write boundary", async () => {
+  // HIVE-630: the initial guard skips a Done issue, but a human can close it
+  // between that read and the write. The premise re-check has to catch it, or
+  // this path drags the ticket back out of Done — the one thing it must not do.
+  const jira = fakeJira({
+    issues: [{ key: "WEB-23", id: "23", status: "To Do" }],
+    onRead: (_key, issue, nth) => {
+      if (nth === 2) {
+        issue.status = "Done";
+        issue.updated = "2026-06-01T00:00:00.000Z";
+      }
+    },
+  });
+  const { db, projectId } = freshDb();
+  const taskId = newId();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, jira_key, jira_link_kind, created_at, updated_at)
+     VALUES (?, ?, 'Linked work', 'in_progress', 'ship', 'WEB-23', 'subtask', ?, ?)`
+  ).run(taskId, projectId, now(), now());
+
+  const stats = await run(db, projectId, jira.fetchImpl);
+
+  expect(stats.pushed).toBe(0);
+  expect(jira.byKey.get("WEB-23")!.status).toBe("Done");
+  expect(jira.calls.some((c) => c.method === "POST" && c.path.includes("/transitions"))).toBe(false);
+  expect(syncEvents(db).find((e) => e.action === "push" && e.aborted)).toMatchObject({
+    linked: true, aborted: "linked status decision changed", fresh_status: "Done",
+  });
+});

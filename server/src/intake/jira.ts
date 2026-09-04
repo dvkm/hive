@@ -2103,7 +2103,10 @@ async function reconcileLinkedTask(ctx: Ctx, read: IssueRead, task: any): Promis
       entry: { action: "push", issue: read.key, field: "status", from: read.statusName, to: target, linked: true },
       premise: (fresh, freshTask) => {
         const freshTarget = stateToJiraStatus(freshTask.state);
-        return sameStatus(fresh.statusName, target) || !sameStatus(freshTarget, target)
+        // Re-check Done at the write boundary too: a human can close the issue
+        // between the read and the write, and dragging it back out is the one
+        // thing this path must never do.
+        return sameStatus(fresh.statusName, target) || !sameStatus(freshTarget, target) || isJiraDone(fresh.statusName)
           ? { aborted: "linked status decision changed", fresh_target: freshTarget }
           : null;
       },
