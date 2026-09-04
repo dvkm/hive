@@ -275,10 +275,15 @@ export const JIRA_TO_STATE: Record<string, State> = {
 //  * needs_decision has NO Jira status; it rides as a LABEL on top of whatever
 //    status the issue already has (that is why it maps to null, not a state).
 //  * verifying means "merged, smoke checks pending" — still not Done to a human
-//    reading the board, so it shows as In Review. NOTE this makes the mapping
-//    2:1 (in_review and verifying both -> "In Review"); every agreement check
-//    below therefore compares in JIRA-STATUS SPACE, never hive-state space,
-//    because `in_review === verifying` is false while the sides genuinely agree.
+//    reading the board, so it shows as In Review.
+//  * done means "hive is finished and the director verified it" — which is the
+//    point the REPORTER starts looking, not the point the ticket closes. Jira
+//    "Done" is the reporter's own verification step, so hive never writes it
+//    (HIVE-630); done shows as In Review and a human moves it to Done.
+//    NOTE this makes the mapping 3:1 (in_review, verifying and done all ->
+//    "In Review"); every agreement check below therefore compares in
+//    JIRA-STATUS SPACE, never hive-state space, because `in_review === done` is
+//    false while the sides genuinely agree.
 //  * failed/cancelled are hive lifecycle outcomes with no Jira equivalent;
 //    pushing them would misreport the ticket, so they never move Jira.
 export const STATE_TO_JIRA: Partial<Record<State, string>> = {
@@ -286,12 +291,8 @@ export const STATE_TO_JIRA: Partial<Record<State, string>> = {
   in_progress: "In Progress",
   in_review: "In Review",
   verifying: "In Review",
-  done: "Done",
+  done: "In Review",
 };
-
-export function linkedStateToJiraStatus(state: string): string | null {
-  return state === "cancelled" ? "Done" : stateToJiraStatus(state);
-}
 
 export function jiraStatusToState(name: string | undefined | null): State | null {
   const key = String(name ?? "").trim().toLowerCase();
@@ -359,6 +360,10 @@ export function jiraPriorityToWorkPriority(name: string | undefined | null): str
 
 const sameStatus = (a: string | null, b: string | null): boolean =>
   a != null && b != null && a.trim().toLowerCase() === b.trim().toLowerCase();
+
+// "Done" in Jira belongs to the reporter, both ways: hive never writes it, and
+// hive never moves an issue out of it (HIVE-630).
+const isJiraDone = (name: string | null | undefined): boolean => sameStatus(String(name ?? ""), "Done");
 
 // Flatten Atlassian Document Format to plain text. ADF is a nested doc tree;
 // every leaf that carries `text` is content, and paragraph-ish nodes break the
@@ -1239,13 +1244,21 @@ export function decideStatusSync(args: {
   const { jiraStatusName, hiveState, jiraAt, hiveAt } = args;
   // An unmapped Jira status (a custom column hive knows nothing about) is never
   // guessed at. The caller records the real value; here it simply means no move.
-  if (jiraStatusToState(jiraStatusName) == null) return "none";
+  const jiraState = jiraStatusToState(jiraStatusName);
+  if (jiraState == null) return "none";
   const hiveShows = stateToJiraStatus(hiveState);
   // needs_decision rides as a LABEL, and failed/cancelled have no Jira meaning.
   // None of them may push a status, and none of them may be overwritten by Jira
   // merely for lacking an equivalent — the issue keeps the status it has.
   if (hiveShows == null) return "none";
   if (sameStatus(hiveShows, jiraStatusName)) return "none"; // agreed
+  // hive done + Jira Done is the same fact told twice: hive shows In Review for
+  // done (HIVE-630) so the status check above cannot see the agreement, and a
+  // pull here would re-log a no-op every cycle.
+  if (jiraState === hiveState) return "none";
+  // A human closed the ticket. hive's own states all show as In Review at best,
+  // so "hive moved more recently" must not reopen it: Jira wins.
+  if (isJiraDone(jiraStatusName)) return "pull";
   return hiveAt != null && hiveAt > jiraAt ? "push" : "pull";
 }
 
@@ -2266,16 +2279,23 @@ async function reconcileLinkedTask(ctx: Ctx, read: IssueRead, task: any): Promis
   const { db, cfg, stats } = ctx;
   if (!Array.isArray(read.comments)) throw new Error(`incomplete Jira comment observation for ${read.key}`);
 
-  const target = linkedStateToJiraStatus(task.state);
-  if (target && !sameStatus(read.statusName, target)) {
+  // cancelled maps to nothing (see STATE_TO_JIRA), so a cancelled sub-task
+  // leaves the issue where it is and explains itself in the cancellation
+  // comment. It used to write "Done", which closed a ticket nobody had checked.
+  const target = stateToJiraStatus(task.state);
+  // An issue a human already closed is never dragged back out of Done.
+  if (target && !sameStatus(read.statusName, target) && !isJiraDone(read.statusName)) {
     const transitionId = cfg.write ? await ctx.client.resolveTransitionId(read.key, target) : undefined;
     await guardedWrite(ctx, {
       taskId: task.id,
       key: read.key,
       entry: { action: "push", issue: read.key, field: "status", from: read.statusName, to: target, linked: true },
       premise: (fresh, freshTask) => {
-        const freshTarget = linkedStateToJiraStatus(freshTask.state);
-        return sameStatus(fresh.statusName, target) || !sameStatus(freshTarget, target)
+        const freshTarget = stateToJiraStatus(freshTask.state);
+        // Re-check Done at the write boundary too: a human can close the issue
+        // between the read and the write, and dragging it back out is the one
+        // thing this path must never do.
+        return sameStatus(fresh.statusName, target) || !sameStatus(freshTarget, target) || isJiraDone(fresh.statusName)
           ? { aborted: "linked status decision changed", fresh_target: freshTarget }
           : null;
       },
@@ -2672,8 +2692,18 @@ async function syncAttachments(ctx: Ctx, key: string, task: any): Promise<void> 
 //
 // Keyed on the JIRA STATUS, not the hive state, because in_review and verifying
 // both mean "In Review" to a reader — keying on the hive state would post the
-// same comment twice for one visible column.
-const CONTEXT_STATUSES = ["In Review", "Done"];
+// same comment twice for one visible column. `done` is the one exception: it
+// also shows as In Review (HIVE-630) but says something new to the reporter
+// ("it is finished, please close it"), so it gets its own key and its own
+// comment. That "Done" key is a dedupe key only, never a Jira status: hive
+// never pushes Done, so CONTEXT_STATUSES holds "In Review" alone.
+// Two comments at most per ticket, never three.
+const CONTEXT_STATUSES = ["In Review"];
+const contextKey = (task: any): string | null => {
+  const status = stateToJiraStatus(task.state);
+  if (!status || !CONTEXT_STATUSES.includes(status)) return null;
+  return task.state === "done" ? "Done" : status;
+};
 const CONTEXT_EVIDENCE_LIMIT = 5;
 const CONTEXT_TEXT_MAX = 400;
 
@@ -2747,7 +2777,9 @@ export function reviewContextText(db: DB, task: any, jiraStatus: string): string
   ].filter(Boolean);
 
   const lines = [
-    `${jiraStatus === "Done" ? "Hive finished this" : "Hive moved this to In Review"}: ` +
+    `${task.state === "done"
+      ? "Hive finished this and the director verified it; please check the live result and move the ticket to Done"
+      : "Hive moved this to In Review"}: ` +
       clampText(headline ?? "see the Hive task for what changed", CONTEXT_TEXT_MAX),
   ];
   if (pr && !lines[0].includes(pr)) lines.push(`PR: ${pr}`);
@@ -2779,22 +2811,22 @@ export function reviewContextText(db: DB, task: any, jiraStatus: string): string
 // contained or rejected delivery is never recomposed into a second comment.
 function queueReviewContext(ctx: Ctx, task: any): void {
   const { db } = ctx;
-  const jiraStatus = stateToJiraStatus(task.state);
-  if (!jiraStatus || !CONTEXT_STATUSES.includes(jiraStatus)) return;
+  const key = contextKey(task);
+  if (!key) return;
   const already = db
     .query(
       `SELECT 1 FROM events WHERE task_id = ? AND type = 'jira_comment'
          AND json_extract(payload, '$.review_context') = ? LIMIT 1`
     )
-    .get(task.id, jiraStatus);
+    .get(task.id, key);
   if (already) return;
-  const text = reviewContextText(db, task, jiraStatus);
+  const text = reviewContextText(db, task, stateToJiraStatus(task.state)!);
   if (!text) return;
   writeEvent(db, {
     task_id: task.id,
     source: "jira-sync",
     type: "jira_comment",
-    payload: { direction: "outbound", review_context: jiraStatus, text },
+    payload: { direction: "outbound", review_context: key, text },
   });
 }
 

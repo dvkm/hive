@@ -445,6 +445,24 @@ export interface TaskDetail extends Task {
   // The task's verification contract resolved against its evidence, server-side
   // (HIVE-403). Absent when the task declared no commands.
   verification?: VerificationItem[];
+  // The task's preview stack (HIVE-629). Absent whenever the project has no
+  // `preview` config, which is what makes the preview UI opt-in per project.
+  preview?: PreviewState;
+}
+
+// A running copy of the branch the director can click into. Derived server-side
+// from the task's preview_* events (server/src/preview.ts).
+export interface PreviewState {
+  status: "idle" | "queued" | "building" | "ready" | "failed" | "expired";
+  urls: { label: string; url: string }[];
+  login_hint: string | null;
+  // The page the agent changed, from `hive emit ... ready --preview-path`.
+  preview_path: string | null;
+  smoke_passed: number | null;
+  smoke_failed: number | null;
+  tail: string | null;
+  reason: string | null;
+  at: string | null;
 }
 
 // One declared verification command and whether fresh evidence for it exists.

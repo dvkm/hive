@@ -7,6 +7,7 @@ import { managingThreadForTask } from "./chat.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
 import { planGateKinds, planGateBlocks } from "./planCritic.ts";
+import { previewConfig } from "./preview.ts";
 import { figmaTokenEnv } from "./secrets.ts";
 import { matchPlaybook, playbookSection } from "./playbook.ts";
 
@@ -24,6 +25,17 @@ links the PR back to this task automatically:
 
 Don't hand-format it — run \`hive pr-marker ${id}\` and paste what it prints.`;
 }
+
+// Only added for projects with config.preview (server/src/preview.ts).
+const PREVIEW_PATH = `## Preview link (this project runs a preview stack)
+When this task reaches review, hive brings your worktree's stack up and puts its
+web / CMS / admin URLs on the review card. Name the page you changed so the
+director lands on it instead of a home page:
+
+  hive emit <task-id> ready --pr-url <url> --preview-path /coredata-tracker
+
+One path, starting with \`/\`, on the site you changed. Leave it out if your
+change has no single page.`;
 
 const EMIT_PROTOCOL = `## Reporting protocol (\`hive emit\`)
 Use the \`hive\` CLI so actions are attributed. If it is not on PATH, use
@@ -334,10 +346,13 @@ export function composeBrief(db: DB, taskId: string): string {
   const contract = verificationContract(task.id, task.verification_cmds);
   if (contract) parts.push(contract);
   parts.push(EMIT_PROTOCOL);
-  parts.push(PLAIN_ENGLISH);
-  parts.push(CHECKPOINTS);
   const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
   const projectConfig = JSON.parse(project?.config ?? "{}");
+  // Only projects that can actually build a preview stack hear about the flag;
+  // everywhere else it would be an instruction the agent cannot follow.
+  if (previewConfig(projectConfig)) parts.push(PREVIEW_PATH);
+  parts.push(PLAIN_ENGLISH);
+  parts.push(CHECKPOINTS);
   if (planGateKinds(projectConfig).includes(task.kind))
     parts.push(
       planGateBlocks(projectConfig, task.kind)
