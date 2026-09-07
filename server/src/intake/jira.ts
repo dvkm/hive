@@ -68,6 +68,7 @@ import {
 export { NEEDS_DECISION_LABEL, JIRA_WRITE_SCOPE } from "./jira-write-scope.ts";
 import { activeProjects } from "../testProjects.ts";
 import { queueSteerEvent } from "../steer.ts";
+import { enqueue } from "../notifications.ts";
 
 export type FetchLike = typeof fetch;
 
@@ -1400,7 +1401,13 @@ export function planAutoFile(db: DB, mirror: any): AutoFilePlan | null {
 // stronger guard anyway — it is exact, not a similarity score.
 export function autoFileWorkTask(db: DB, mirror: any): any | null {
   const plan = planAutoFile(db, mirror);
-  if (!plan) return null;
+  return plan ? fileWorkTask(db, mirror, plan) : null;
+}
+
+// The insert itself, shared by auto-file and by the late-comment follow-up
+// (HIVE-633) so both produce the same row shape, the same `created` event and
+// the same `jira_autofile` announcement on the mirror.
+function fileWorkTask(db: DB, mirror: any, plan: AutoFilePlan): any {
   const id = newId();
   const t = now();
   const task = mutateWithEvent(db, () => {
@@ -2358,6 +2365,81 @@ function forwardCommentToWork(db: DB, mirror: any, key: string, comment: any, au
   }
 }
 
+// The most recent moment work under this mirror ended: the newest state_change
+// into a terminal state on the mirror itself or on any task filed under it.
+// Null when nothing has finished, which is also the "there is nothing late to
+// be after" answer.
+function lastTerminalTransition(db: DB, mirrorId: string): { task_id: string; ts: string } | null {
+  return db
+    .query(
+      `SELECT e.task_id AS task_id, e.ts AS ts FROM events e JOIN tasks t ON t.id = e.task_id
+        WHERE (t.id = ? OR t.jira_mirror_task_id = ?)
+          AND e.type = 'state_change'
+          AND json_extract(e.payload, '$.to') IN (${TERMINAL.map(() => "?").join(",")})
+        ORDER BY e.ts DESC, e.id DESC LIMIT 1`
+    )
+    .get(mirrorId, mirrorId, ...TERMINAL) as { task_id: string; ts: string } | null;
+}
+
+// A human's comment that lands AFTER every attempt is over (HIVE-633).
+// forwardCommentToWork only steers live work tasks, so on a ticket whose work
+// is done, failed or cancelled the comment used to be recorded on the mirror
+// and then nothing happened at all: no notification, no follow-up, no reply.
+// Jira WEB-101 lost two of them that way and was pushed to Done regardless.
+//
+// This does NOT touch the Jira status (SPEC 19: hive never undoes a human's
+// Done) and posts no automatic reply. It raises the comment to the director and,
+// with auto_file on, files the follow-up work task the comment is asking for.
+//
+// Idempotency needs nothing of its own: the caller already skips any comment
+// jiraCommentRecorded() has seen, so each Jira comment id reaches this once.
+function handleLateComment(ctx: Ctx, mirror: any, key: string, comment: any, author: string, text: string): void {
+  const { db, cfg, stats } = ctx;
+  if (!text) return;
+  const at = Date.parse(String(comment?.created ?? ""));
+  if (!Number.isFinite(at)) return;
+  if (liveWorkTasks(db, mirror.id).length) return; // an agent is still there to hear it
+  const finished = lastTerminalTransition(db, mirror.id);
+  if (!finished || Date.parse(finished.ts) >= at) return;
+
+  const firstLine = text.split("\n").map((l) => l.trim()).find(Boolean) ?? text;
+  enqueue(db, {
+    kind: "jira_late_comment",
+    task_id: mirror.id,
+    // "urgent" is hive's own top urgency; hive-watch surfaces it as NOTIFY_URGENT.
+    urgency: "urgent",
+    title: `Jira ${key}: new comment from ${author} after the work finished`,
+    body: text,
+  });
+
+  if (!cfg.auto_file) return;
+  const done = getTask(db, finished.task_id);
+  const follow = fileWorkTask(db, mirror, {
+    mirror_task_id: mirror.id,
+    issue: key,
+    title: `[${key}] follow-up: ${firstLine}`.slice(0, 160),
+    brief: [
+      `${author} commented on Jira ${key} after the work was already ${done?.state ?? "finished"}:`,
+      "",
+      text,
+      "",
+      `The finished work was hive task ${finished.task_id}${done?.title ? ` ("${done.title}")` : ""}.`,
+      ...(done?.pr_url ? [`Its PR: ${done.pr_url}`] : []),
+      "",
+      autoFileFooter(mirror.id, key),
+    ].join("\n"),
+    priority: "next",
+    kind: "ship",
+  });
+  stats.auto_filed++;
+  writeEvent(db, {
+    task_id: mirror.id,
+    source: "jira-sync",
+    type: "jira_late_comment",
+    payload: { issue: key, jira_id: String(comment?.id ?? ""), author, work_task_id: follow.id, after_task_id: finished.task_id },
+  });
+}
+
 function importRemoteComments(ctx: Ctx, key: string, task: any, remote: any[]): {
   sentComments: Map<string, string>;
   sentReceipts: Map<string, string>;
@@ -2391,6 +2473,7 @@ function importRemoteComments(ctx: Ctx, key: string, task: any, remote: any[]): 
     });
     stats.comments_pulled++;
     forwardCommentToWork(db, task, key, c, author, text);
+    handleLateComment(ctx, task, key, c, author, text);
   }
   return { sentComments, sentReceipts };
 }

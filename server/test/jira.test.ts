@@ -4789,3 +4789,101 @@ test("Jira closing the ticket cancels work that never started and only warns wor
   expect((db.query("SELECT state FROM tasks WHERE id = ?").get(started) as any).state).toBe("in_progress");
   expect(queuedSteerMessages(db, started)[0]).toContain("WEB-144 was closed as 'Done'");
 });
+
+// ============================================================================
+// LATE COMMENTS (HIVE-633)
+// ============================================================================
+// A comment that arrives after every attempt is over has no live agent to steer,
+// so it used to be recorded on the mirror and dropped. Jira WEB-101 lost two.
+
+const notifications = (db: DB, taskId: string) =>
+  db.query("SELECT kind, urgency, title, body FROM notifications WHERE task_id = ?").all(taskId) as any[];
+
+async function finishedTicket(cfg: any) {
+  const jira = fakeJira({ issues: [{ key: "WEB-101", id: "101", status: "In Review", summary: "alerts" }] });
+  const { db, projectId } = freshDb(cfg);
+  // Imported before auto-file was on, so the ticket has exactly one work task:
+  // the one hand-filed below, already finished.
+  await run(db, projectId, jira.fetchImpl, CFG);
+  const mirror = taskFor(db, "WEB-101");
+  const work = newId();
+  db.query(
+    `INSERT INTO tasks (id, project_id, title, state, kind, pr_url, jira_mirror_task_id, created_at, updated_at)
+     VALUES (?,?,?, 'verifying', 'ship', ?, ?, ?, ?)`
+  ).run(work, projectId, "[WEB-101] alerts", "https://github.com/x/y/pull/1159", mirror.id, now(), now());
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,?)")
+    .run(newId(), work, now(), "log", null, null, "shipped", "{}");
+  transition(db, work, "done", { source: "director" });
+  return { jira, db, projectId, mirror, work };
+}
+
+const comment = (text: string, id = "10400") => ({
+  id, author: "Iroo Kim", text, created: new Date(Date.now() + 60_000).toISOString(),
+});
+
+test("a comment after the work finished notifies the director and files the follow-up", async () => {
+  const { jira, db, projectId, mirror, work } = await finishedTicket(AUTO);
+  jira.byKey.get("WEB-101")!.comments.push(comment("alert rendering is broken\nsecond line"));
+  await run(db, projectId, jira.fetchImpl, AUTO);
+
+  const notes = notifications(db, mirror.id);
+  expect(notes.length).toBe(1);
+  expect(notes[0].urgency).toBe("urgent");
+  expect(notes[0].title).toBe("Jira WEB-101: new comment from Iroo Kim after the work finished");
+  expect(notes[0].body).toContain("alert rendering is broken");
+
+  const follow = workTasks(db, mirror.id).find((t) => t.id !== work)!;
+  expect(follow.title).toBe("[WEB-101] follow-up: alert rendering is broken");
+  expect(follow.kind).toBe("ship");
+  expect(follow.priority).toBe("next");
+  expect(follow.state).toBe("queued");
+  expect(follow.jira_mirror_task_id).toBe(mirror.id);
+  expect(follow.brief).toContain("alert rendering is broken");
+  expect(follow.brief).toContain(work); // points at the finished task
+  expect(follow.brief).toContain("https://github.com/x/y/pull/1159");
+  expect(follow.brief).toContain(`hive task send ${mirror.id}`);
+
+  // The status is left where the humans put it, and no reply to the comment is
+  // posted back (the only hive comment is the pre-existing "moved to In Review").
+  expect(jira.byKey.get("WEB-101")!.status).toBe("In Review");
+  expect(jira.byKey.get("WEB-101")!.comments.filter((c) => c.author === "Hive").length).toBe(1);
+
+  // A second sync sees the same comment and changes nothing.
+  const before = JSON.stringify(tasks(db));
+  await run(db, projectId, jira.fetchImpl, AUTO);
+  expect(JSON.stringify(tasks(db))).toBe(before);
+  expect(notifications(db, mirror.id).length).toBe(1);
+});
+
+test("with auto_file off a late comment still notifies, but files nothing", async () => {
+  const { jira, db, projectId, mirror } = await finishedTicket(CFG);
+  jira.byKey.get("WEB-101")!.comments.push(comment("still broken"));
+  await run(db, projectId, jira.fetchImpl, CFG);
+  expect(notifications(db, mirror.id).length).toBe(1);
+  expect(workTasks(db, mirror.id).length).toBe(1); // the finished one only
+});
+
+test("a comment while work is still live only steers: no notification, no new task", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-102", id: "102", status: "To Do", summary: "live" }] });
+  const { db, projectId } = freshDb(AUTO);
+  await run(db, projectId, jira.fetchImpl, AUTO);
+  const mirror = taskFor(db, "WEB-102");
+  const work = workTasks(db, mirror.id)[0]!;
+
+  jira.byKey.get("WEB-102")!.comments.push(comment("one more thing", "10402"));
+  await run(db, projectId, jira.fetchImpl, AUTO);
+
+  expect(queuedSteerMessages(db, work.id).length).toBe(1);
+  expect(notifications(db, mirror.id).length).toBe(0);
+  expect(workTasks(db, mirror.id).length).toBe(1);
+});
+
+test("a comment older than the terminal transition is left alone", async () => {
+  const { jira, db, projectId, mirror } = await finishedTicket(AUTO);
+  jira.byKey.get("WEB-101")!.comments.push({
+    id: "10399", author: "Iroo Kim", text: "said while it was still being worked", created: "2020-01-01T00:00:00.000+0000",
+  });
+  await run(db, projectId, jira.fetchImpl, AUTO);
+  expect(notifications(db, mirror.id).length).toBe(0);
+  expect(workTasks(db, mirror.id).length).toBe(1);
+});
