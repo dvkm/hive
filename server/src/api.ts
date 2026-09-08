@@ -126,6 +126,7 @@ import { findEmbeddedTasks } from "./branchContents.ts";
 import type { Exec } from "./exec.ts";
 import { autonomyStats } from "./autonomyStats.ts";
 import { defaultExec, isSafeRef, projectBaseBranch, projectComparisonBase, preferSafeRef } from "./exec.ts";
+import { runDoctor, doctorOk, type Check } from "./doctor.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
 import { projectPrefix, taskIdentifier } from "./taskIdentifier.ts";
 import {
@@ -306,14 +307,27 @@ export type LiveCheckout = { behind: number; stale: boolean; head: string | null
 let liveDriftCache: { at: number; repo: string; value: LiveCheckout } | null = null;
 
 function gitLine(repo: string, args: string[]): string | null {
-  const r = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
-  if (r.exitCode !== 0) return null;
-  return new TextDecoder().decode(r.stdout).trim();
+  try {
+    const r = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
+    if (r.exitCode !== 0) return null;
+    return new TextDecoder().decode(r.stdout).trim();
+  } catch {
+    return null; // no git on PATH: `hive doctor` reports that itself
+  }
+}
+
+// A shallow clone (CI's actions/checkout) has no history to connect HEAD to
+// origin/main: rev-list counts the grafted tip as "behind" and health flips
+// false. Say so instead of measuring.
+function isShallow(repo: string): boolean {
+  return gitLine(repo, ["rev-parse", "--is-shallow-repository"]) === "true";
 }
 
 // Uncached; /api/health calls the memoized liveCheckout() below.
 export function measureLiveCheckout(repo: string = REPO_ROOT): LiveCheckout {
   const head = gitLine(repo, ["rev-parse", "--short", "HEAD"]);
+  if (head !== null && isShallow(repo))
+    return { behind: 0, stale: false, head, error: "shallow clone: cannot compare with origin/main" };
   const behindRaw = gitLine(repo, ["rev-list", "--count", "HEAD..refs/remotes/origin/main"]);
   if (head === null || behindRaw === null)
     return { behind: 0, stale: false, head, error: "could not read git state for the running checkout" };
@@ -332,6 +346,24 @@ export function liveCheckout(repo: string = REPO_ROOT): LiveCheckout {
   const value = measureLiveCheckout(repo);
   liveDriftCache = { at: Date.now(), repo, value };
   return value;
+}
+
+// Update reminder: the behind count above only reads refs, so without a
+// fetch it says 0 forever on a checkout nothing else syncs. index.ts calls
+// this hourly; failures (offline, no origin) are silent and the count stays
+// whatever the last fetch left.
+export async function refreshOriginMain(repo: string = REPO_ROOT): Promise<void> {
+  if (isShallow(repo)) return; // nothing to compare against; do not grow CI's checkout either
+  const r = await defaultExec(["git", "-C", repo, "fetch", "origin", "main", "--quiet"], { timeoutMs: 60_000 });
+  if (r.code === 0) liveDriftCache = null;
+}
+
+// `hive doctor` over HTTP, for the web banner. Memoized: the herdr probe is a
+// subprocess and the app polls this every few minutes.
+let doctorCache: { at: number; checks: Check[] } | null = null;
+function doctorReport(): { checks: Check[]; ok: boolean; update: LiveCheckout } {
+  if (!doctorCache || Date.now() - doctorCache.at > LIVE_DRIFT_CACHE_MS) doctorCache = { at: Date.now(), checks: runDoctor() };
+  return { checks: doctorCache.checks, ok: doctorOk(doctorCache.checks), update: liveCheckout() };
 }
 
 // The API token (minted on boot in index.ts) presented as `Authorization:
@@ -421,6 +453,9 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
           && !live.stale;
         return json({ ok, version: VERSION, dispatcher: loopLiveness(db, "last_dispatch_at", DISPATCH_STALE_MS), reaper: loopLiveness(db, "last_reap_at", REAP_STALE_MS), reconciler, reviewer, degraded, live_checkout: live, herdr_outage: herdrOutage(db), sessions: sessionUtilization(db), jira: jiraSyncHealth(db) });
       }
+
+      // ---- prerequisites + update reminder (`hive doctor`) ----
+      if (pathname === "/api/doctor" && method === "GET") return json(doctorReport());
 
       // ---- desktop shell self-update (HIVE-420) ----
       if (pathname === "/api/shell-version" && method === "GET") {
