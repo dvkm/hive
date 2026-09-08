@@ -316,9 +316,18 @@ function gitLine(repo: string, args: string[]): string | null {
   }
 }
 
+// A shallow clone (CI's actions/checkout) has no history to connect HEAD to
+// origin/main: rev-list counts the grafted tip as "behind" and health flips
+// false. Say so instead of measuring.
+function isShallow(repo: string): boolean {
+  return gitLine(repo, ["rev-parse", "--is-shallow-repository"]) === "true";
+}
+
 // Uncached; /api/health calls the memoized liveCheckout() below.
 export function measureLiveCheckout(repo: string = REPO_ROOT): LiveCheckout {
   const head = gitLine(repo, ["rev-parse", "--short", "HEAD"]);
+  if (head !== null && isShallow(repo))
+    return { behind: 0, stale: false, head, error: "shallow clone: cannot compare with origin/main" };
   const behindRaw = gitLine(repo, ["rev-list", "--count", "HEAD..refs/remotes/origin/main"]);
   if (head === null || behindRaw === null)
     return { behind: 0, stale: false, head, error: "could not read git state for the running checkout" };
@@ -344,6 +353,7 @@ export function liveCheckout(repo: string = REPO_ROOT): LiveCheckout {
 // this hourly; failures (offline, no origin) are silent and the count stays
 // whatever the last fetch left.
 export async function refreshOriginMain(repo: string = REPO_ROOT): Promise<void> {
+  if (isShallow(repo)) return; // nothing to compare against; do not grow CI's checkout either
   const r = await defaultExec(["git", "-C", repo, "fetch", "origin", "main", "--quiet"], { timeoutMs: 60_000 });
   if (r.code === 0) liveDriftCache = null;
 }

@@ -95,6 +95,21 @@ test("live checkout drift is clean when the checkout is on origin/main", () => {
   expect(measureLiveCheckout(repo)).toMatchObject({ behind: 0, stale: false, error: null });
 });
 
+// A depth-1 clone with origin/main fetched in (what a server booted inside CI
+// leaves behind) counts the grafted main tip as a commit HEAD is missing.
+// That is not drift, and health must not go red over it.
+test("live checkout drift is an error, not stale, in a shallow clone", () => {
+  const { origin } = scaffold();
+  const root = mkdtempSync(join(tmpdir(), "syncmain-shallow-"));
+  const shallow = join(root, "shallow");
+  git(root, ["clone", "-q", "--depth", "1", `file://${origin}`, shallow]);
+  git(shallow, ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+  git(shallow, ["fetch", "-q", "--depth", "1", "origin", "main"]);
+  expect(git(shallow, ["rev-parse", "--is-shallow-repository"])).toBe("true");
+
+  expect(measureLiveCheckout(shallow)).toMatchObject({ behind: 0, stale: false, error: "shallow clone: cannot compare with origin/main" });
+});
+
 test("live checkout drift is stale once the missing commits have sat unmerged", () => {
   const { repo, origin } = scaffold();
   const seed = mkdtempSync(join(tmpdir(), "syncmain-push3-"));
