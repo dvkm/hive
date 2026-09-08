@@ -251,6 +251,55 @@ function StaleBanner() {
   );
 }
 
+// Prerequisites + update reminder, from GET /api/doctor (the same checks as
+// `hive doctor`). A missing prerequisite means agents silently never spawn,
+// which on a fresh install reads as "hive does nothing", so it is said here.
+type DoctorReport = {
+  ok: boolean;
+  checks: { name: string; ok: boolean; required: boolean; detail: string; fix: string | null }[];
+  update: { behind: number; head: string | null };
+};
+function DoctorBanner() {
+  const [report, setReport] = useState<DoctorReport | null>(null);
+  const [dismissedHead, setDismissedHead] = useState<string | null>(null);
+  useEffect(() => {
+    const load = () =>
+      fetch("/api/doctor")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => d && setReport(d))
+        .catch(() => {});
+    load();
+    const t = setInterval(load, 5 * 60 * 1000);
+    return () => clearInterval(t);
+  }, []);
+  if (!report) return null;
+  const broken = report.checks.filter((c) => !c.ok && c.required);
+  if (broken.length) {
+    return (
+      <div className="stale-banner" role="alert">
+        <FontAwesomeIcon icon={faTriangleExclamation} />
+        <span className="away-banner-text">
+          Hive cannot run agents: {broken.map((c) => `${c.name} ${c.detail}`).join("; ")}.
+        </span>
+        <span className="muted">{broken[0].fix}. Run <code>hive doctor</code> for the full list.</span>
+      </div>
+    );
+  }
+  const { behind, head } = report.update;
+  if (behind > 0 && dismissedHead !== head) {
+    return (
+      <div className="update-banner" role="status">
+        <span className="away-banner-text">
+          Hive is {behind} commit{behind === 1 ? "" : "s"} behind origin/main.
+        </span>
+        <span className="muted">Pull and restart the daemon to update.</span>
+        <button className="btn btn-mini" onClick={() => setDismissedHead(head)}>Later</button>
+      </div>
+    );
+  }
+  return null;
+}
+
 // Header bell: unread count (notifications not yet delivered/seen) + a dropdown
 // of recent notifications. Opening marks everything read.
 export function Bell() {
@@ -371,6 +420,7 @@ export default function App() {
       </header>
       <AwayBanner away={away} onResume={() => setAway(false)} />
       <StaleBanner />
+      <DoctorBanner />
       <MobileNav inboxCount={inboxCount} offline={offline} setOffline={setOffline} />
       <main className="content" id="main-content">
         <Routes location={background || location}>

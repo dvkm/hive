@@ -6785,7 +6785,8 @@ a.chip-jira:hover { background: #2d5488; }
 
 /* A failed task-list refresh: the board on screen is stale (or empty) and
    nothing done to it will stick until a fetch lands. */
-.stale-banner {
+.stale-banner,
+.update-banner {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -6794,4 +6795,7 @@ a.chip-jira:hover { background: #2d5488; }
   border-bottom: 1px solid var(--border-soft);
   font-size: 13px;
   color: var(--text);
+}
+.update-banner {
+  background: rgba(91, 141, 226, 0.14);
 }
