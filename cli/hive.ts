@@ -14,7 +14,9 @@ Usage:
   hive serve                              start the daemon
   hive task create --project <id> --title <t> [--brief <file> | --brief-text <s>]
         [--kind ship|scout|chore] [--parent <task-id>] [--depends-on <id,id>]
-        [--priority now|next|normal|later]
+        [--priority now|next|normal|later] [--intent <intent-id>]
+        (--intent ties the task to the accepted ask. While that intent is still
+         a draft the task stays queued and nothing spawns on it.)
         (under a hive agent, HIVE_TASK_ID makes source=agent + parent automatic;
          to park a task instead, create it then run: hive emit <id> deferred)
         (priority is queue ORDER, never preemption. Omit it and the task inherits
@@ -229,6 +231,7 @@ async function main() {
         kind: flags.kind,
         parent_task_id: flags.parent ?? agentTask ?? undefined,
         depends_on: flags["depends-on"] ? String(flags["depends-on"]) : undefined,
+        intent_id: flags.intent ? String(flags.intent) : undefined,
         source: agentTask ? "agent" : undefined,
         priority: flags.priority ? String(flags.priority) : undefined,
       });

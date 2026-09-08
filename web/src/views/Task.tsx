@@ -12,6 +12,7 @@ import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, needsLook, NEXT, PriorityChip
 import { ReviewAudit, ReviewCard, ReviewUnderstanding, RiskVerdicts } from "./ReviewCard";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
+import { IntentCard } from "./IntentCard";
 import { ReportView } from "./ReportView";
 import { UnderstandingQuiz } from "./UnderstandingQuiz";
 import { relTime } from "../lib/time";
@@ -531,7 +532,7 @@ export function JiraPanel({
 
 // board modal (see App.tsx / views/TaskModal.tsx).
 export function TaskBody({ id }: { id: string }) {
-  const { rev, projects, tasks, quizzes, reloadQuizzes } = useStore();
+  const { rev, projects, tasks, quizzes, reloadQuizzes, intents, reloadIntents } = useStore();
   const lightbox = useLightbox();
   const [t, setT] = useState<TaskDetail | null>(null);
   const [jira, setJira] = useState<JiraTaskState | null>(null);
@@ -595,6 +596,7 @@ export function TaskBody({ id }: { id: string }) {
   // card exists — the task page used to hide a quiz the Understanding column
   // still counted as pending (hive-1028).
   const postShipQuiz = !codeReview ? quizzes.find((q) => q.task_id === t.id) : undefined;
+  const intent = intents.find((i) => i.id === t.intent_id);
 
   const doTransition = async (to: string) => {
     try {
@@ -861,6 +863,10 @@ export function TaskBody({ id }: { id: string }) {
         )}
 
         {!codeReview && <CheckpointList events={t.events} />}
+
+        {/* The ask this work implements, above the brief that was written from
+            it. A draft intent is also why nothing has spawned yet. */}
+        {intent && <IntentCard intent={intent} onChange={reloadIntents} />}
 
         <section className="panel">
           <h2>Brief</h2>

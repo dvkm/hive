@@ -317,6 +317,7 @@ export const SKIP_REASONS: Record<string, { label: string; permanent: boolean }>
   triage_hold: { label: "waiting on your intake triage answer", permanent: false },
   repo_mismatch: { label: "brief targets another project's repo", permanent: false },
   dependency_blocked: { label: "blocked by unfinished dependencies", permanent: false },
+  intent_not_accepted: { label: "its intent is still a draft — accept it first", permanent: false },
   file_overlap: { label: "another running task looks like it edits the same files", permanent: false },
   attention_budget: { label: "more is waiting on you than the attention budget allows — new scouts resume when the queue drains", permanent: false },
   authority_decision: { label: "waiting on a dispatch decision card", permanent: false },

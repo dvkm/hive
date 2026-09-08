@@ -1,4 +1,4 @@
-import type { Checkpoint, Decision, Task, UnderstandingQuiz } from "./domain";
+import type { Checkpoint, Decision, Intent, Task, UnderstandingQuiz } from "./domain";
 
 // Does an item belong to the active project filter? An empty filter ("" = All)
 // matches everything. Lives here, next to the needs-you rules, so this module
@@ -20,6 +20,7 @@ export interface BlockingTaskRef {
 
 export type NeedsYouItem =
   | { kind: "decision"; id: string; decision: Decision }
+  | { kind: "intent"; id: string; intent: Intent }
   | { kind: "checkpoint"; id: string; checkpoint: Checkpoint }
   | { kind: "quiz_digest"; id: string; quizzes: UnderstandingQuiz[] }
   | { kind: "review"; id: string; task: Task }
@@ -37,7 +38,9 @@ const PRIORITY_HEAD_START: Record<NonNullable<Task["priority"]>, number> = {
 };
 
 function focusItemKey(item: NeedsYouItem, tasks: Map<string, Task>): [number, number] {
-  const candidates = item.kind === "quiz_digest"
+  const candidates = item.kind === "intent"
+    ? [{ ts: item.intent.updated_at, task: item.intent.task_id ? tasks.get(item.intent.task_id) : undefined }]
+    : item.kind === "quiz_digest"
     ? item.quizzes.map((quiz) => ({ ts: quiz.ts, task: tasks.get(quiz.task_id) }))
     : item.kind === "decision"
       ? [{ ts: item.decision.ts, task: tasks.get(item.decision.task_id) }]
@@ -59,13 +62,22 @@ function focusItemKey(item: NeedsYouItem, tasks: Map<string, Task>): [number, nu
   }, [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY]);
 }
 
+// A draft intent outranks everything else, and its siblings group by project.
+// Accepting an ask is what lets work start at all, so it is not competing with
+// the age of work that already ran — it comes first, whatever the clock says.
+const intentRank = (item: NeedsYouItem) => (item.kind === "intent" ? 0 : 1);
+const intentProject = (item: NeedsYouItem) => (item.kind === "intent" ? item.intent.project_id : "");
+
 // Priority is a head start, not a permanent lane: one day per level means an
 // old lower-priority item eventually outranks a steady stream of new urgent work.
 export function orderFocusItems(items: NeedsYouItem[], tasks: Task[]): NeedsYouItem[] {
   const byId = new Map(tasks.map((task) => [task.id, task]));
   return items
     .map((item, index) => ({ item, index, key: focusItemKey(item, byId) }))
-    .sort((a, b) => a.key[0] - b.key[0] || a.key[1] - b.key[1] || a.index - b.index)
+    .sort((a, b) =>
+      intentRank(a.item) - intentRank(b.item) ||
+      intentProject(a.item).localeCompare(intentProject(b.item)) ||
+      a.key[0] - b.key[0] || a.key[1] - b.key[1] || a.index - b.index)
     .map(({ item }) => item);
 }
 
@@ -197,9 +209,15 @@ export function quizDigests(tasks: Task[], quizzes: UnderstandingQuiz[]): NeedsY
   }));
 }
 
-export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoints: Checkpoint[], quizzes: UnderstandingQuiz[]): NeedsYouItem[] {
+export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoints: Checkpoint[], quizzes: UnderstandingQuiz[], intents: Intent[] = []): NeedsYouItem[] {
   return [
     ...decisions.map((decision) => ({ kind: "decision" as const, id: decision.id, decision })),
+    // A draft intent is an ask nobody has accepted yet. One row each, above the
+    // reviews: accepting is what lets the work start at all, so it comes before
+    // judging work that already ran.
+    ...intents
+      .filter((intent) => intent.status === "draft")
+      .map((intent) => ({ kind: "intent" as const, id: intent.id, intent })),
     ...checkpoints.map((checkpoint) => ({ kind: "checkpoint" as const, id: checkpoint.id, checkpoint })),
     ...quizDigests(tasks, quizzes),
     // hive never closes a task (HIVE-604): every merge stops in `verifying` and
@@ -230,6 +248,7 @@ export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoin
 // focus/backlogs views to honour the shared project filter.
 export function itemProject(item: NeedsYouItem, tasks: Task[]): string | undefined {
   if (item.kind === "decision") return tasks.find((task) => task.id === item.decision.task_id)?.project_id;
+  if (item.kind === "intent") return item.intent.project_id;
   if (item.kind === "checkpoint") return item.checkpoint.project_id;
   if (item.kind === "quiz_digest") return item.quizzes[0]?.project_id;
   return item.task.project_id;

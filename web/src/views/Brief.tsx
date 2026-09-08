@@ -5,6 +5,8 @@ import type { AutonomyStats, Brief, Evidence } from "../lib/api";
 import { useStore } from "../lib/store";
 import { StatusDot, HEALTH_LABEL } from "../lib/ui";
 import { DecisionCard } from "./DecisionCard";
+import { IntentCard } from "./IntentCard";
+import { intentSection } from "../lib/intent";
 import { EvidenceStrip, ReviewAudit, ReviewCard, ReviewUnderstanding, VerifyCard } from "./ReviewCard";
 import { AttentionRows, BlockedByLine } from "./attention";
 import { CheckpointsInbox } from "./Checkpoints";
@@ -22,6 +24,7 @@ const LAST_SEEN_KEY = "hive.brief.lastSeen";
 const MODE_KEY = "hive.inbox.mode";
 const ITEM_LABELS: Record<NeedsYouItem["kind"], string> = {
   decision: "Decision",
+  intent: "Intent",
   checkpoint: "Checkpoint",
   quiz_digest: "Catch up",
   review: "Review",
@@ -136,7 +139,7 @@ export function AutonomyPanel({ project }: { project?: string }) {
 }
 
 export default function Brief() {
-  const { needsYou: allNeedsYou, reloadQuizzes, tasks, projects, decisionsLoaded } = useStore();
+  const { needsYou: allNeedsYou, reloadQuizzes, reloadIntents, tasks, projects, decisionsLoaded } = useStore();
   const location = useLocation();
   // Same project filter the board and the other inboxes use, so picking a
   // project anywhere scopes this queue too.
@@ -179,6 +182,9 @@ export default function Brief() {
     });
   }, [needsYou]);
   const openDecisions = needsYou.flatMap((item) => item.kind === "decision" && !answered.has(item.id) ? [item.decision] : []);
+  // Draft asks waiting on one tap. Accepting one flips its status, so it drops
+  // out of needsYou on its own over SSE.
+  const draftIntents = needsYou.flatMap((item) => item.kind === "intent" ? [item.intent] : []);
   const checkpoints = needsYou.flatMap((item) => item.kind === "checkpoint" ? [item.checkpoint] : []);
   // One digest per project, holding only the changes still to catch up on.
   // Answering one drops it out here, so the digest empties as you work through it.
@@ -210,7 +216,7 @@ export default function Brief() {
   const spendCount = spend ? spend.totals.calls : 0;
 
   // A digest counts as ONE item however many changes it holds.
-  const actionCount = openDecisions.length + checkpoints.length + digests.length + toReview.length + attention.length;
+  const actionCount = draftIntents.length + openDecisions.length + checkpoints.length + digests.length + toReview.length + attention.length;
   // The focus queue, in order. Handled items drop out, so the index naturally
   // lands on the next one; the arrows let you step past anything you can't act on.
   const focusItems = useMemo(() => {
@@ -302,6 +308,7 @@ export default function Brief() {
           {focusItem.kind === "decision" && (
             <DecisionCard d={focusItem.decision} onDone={(id) => setAnswered((items) => new Set(items).add(id))} />
           )}
+          {focusItem.kind === "intent" && <IntentCard intent={focusItem.intent} onChange={reloadIntents} />}
           {focusItem.kind === "checkpoint" && <CheckpointsInbox taskId={focusItem.checkpoint.task_id} heading={false} />}
           {focusItem.kind === "quiz_digest" && (() => {
             // One change at a time, in order. Passing the current one drops it
@@ -351,7 +358,7 @@ export default function Brief() {
             <VerifyCard task={focusItem.task} surface="focus" onDone={() => setReviewed((items) => new Set(items).add(focusItem.id))} />
           )}
           {focusItem.kind === "attention" && <div className="brief-attn"><AttentionRows tasks={[focusItem.task]} /></div>}
-          {focusItem.kind !== "review" && focusItem.kind !== "verify" && (
+          {focusItem.kind !== "review" && focusItem.kind !== "verify" && focusItem.kind !== "intent" && (
             <TaskEvidence
               taskId={focusItem.kind === "decision" ? focusItem.decision.task_id : focusItem.kind === "checkpoint" ? focusItem.checkpoint.task_id : focusItem.kind === "quiz_digest" ? remainingIn(focusItem)[0].task_id : focusItem.task.id}
               title={focusItem.kind === "decision" ? focusItem.decision.title : focusItem.kind === "checkpoint" ? focusItem.checkpoint.task_title : focusItem.kind === "quiz_digest" ? remainingIn(focusItem)[0].task_title : focusItem.task.title}
@@ -383,6 +390,20 @@ export default function Brief() {
                   </button>
                   <span>{digest.remaining.length} left</span>
                   <TaskEvidence taskId={digest.remaining[0].task_id} title={digest.remaining[0].task_title} compact />
+                </li>
+              ))}
+            </ul>
+          </Section>
+          {/* Above the reviews on purpose: an unaccepted ask is why work has not
+              started, and it costs one tap. */}
+          <Section title="Intents" count={draftIntents.length}>
+            <ul className="brief-backlog-list">
+              {draftIntents.map((intent) => (
+                <li key={intent.id}>
+                  <button className="link-btn" onClick={() => { setFocusIdx(focusItems.findIndex((item) => item.id === intent.id)); chooseMode("focus"); }}>
+                    {intentSection(intent.body_md, "Problem").split("\n")[0] || "Untitled ask"}
+                  </button>
+                  <span>{projects.find((p) => p.id === intent.project_id)?.name ?? intent.project_id} · from {intent.source}</span>
                 </li>
               ))}
             </ul>

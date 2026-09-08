@@ -69,6 +69,7 @@ export interface Task {
   race_id?: string | null; // best-of-N: the group of attempts this task is one of
   duplicate_of: string | null; // survivor id when cancelled as a duplicate
   depends_on: string[]; // task ids governed by the server dependency gate (docs/API.md)
+  intent_id?: string | null; // the accepted ask this work implements; a draft intent holds dispatch
   deferred_until?: string | null; // parked pending an offline human action; nudges suppressed while future-dated
   parked_for_director?: string | null; // director took the worktree over; no agent runs on it until hand-back
   land_queued_at?: string | null; // marked approved-to-land; the land queue merges it in graph order
@@ -323,6 +324,32 @@ export interface Incident {
   ts: string;
   status: "open" | "resolved";
   detail: string;
+}
+
+// The intent record (HIVE-636): what was asked, and what the director accepted.
+// body_md carries exactly these five headings, in this order — the server
+// refuses anything else, so the card can render them positionally.
+export const INTENT_SECTIONS = [
+  "Problem",
+  "Proposed outcome",
+  "Affected users and systems",
+  "Constraints",
+  "Open questions",
+] as const;
+
+export interface Intent {
+  id: string;
+  project_id: string;
+  task_id: string | null;
+  source: "jira" | "director" | "incident" | "agent";
+  source_ref: string | null;
+  status: "draft" | "accepted" | "superseded";
+  body_md: string;
+  author: string | null;
+  accepted_by: string | null;
+  accepted_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface Learning {

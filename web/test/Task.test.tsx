@@ -10,7 +10,7 @@ import { TaskBody } from "../src/views/Task";
 // Quiz state lives in a module-level map shared across every bun test file.
 beforeEach(resetQuizStatesForTests);
 
-const fakeStore = { tasks: [], projects: [], rev: {}, quizzes: [], reloadQuizzes: () => {} } as unknown as Store;
+const fakeStore = { tasks: [], projects: [], rev: {}, quizzes: [], reloadQuizzes: () => {}, intents: [], reloadIntents: () => {} } as unknown as Store;
 
 const task = (id: string, extra: Partial<Task> = {}): Task => ({
   id,
