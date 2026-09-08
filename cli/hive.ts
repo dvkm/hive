@@ -11,6 +11,8 @@ const BASE =
 const USAGE = `hive — local orchestration control plane
 
 Usage:
+  hive doctor                             check prerequisites (git, herdr, agent CLI, gh, data dir),
+                                          whether the daemon is up, and whether this checkout is behind origin/main
   hive serve                              start the daemon
   hive task create --project <id> --title <t> [--brief <file> | --brief-text <s>]
         [--kind ship|scout|chore] [--parent <task-id>] [--depends-on <id,id>]
@@ -204,6 +206,38 @@ async function main() {
 
   if (cmd === "serve") {
     await import("../server/src/index.ts");
+    return;
+  }
+
+  // Prerequisites + update reminder. Runs the checks locally (no daemon
+  // needed, that is the point), then adds "is the daemon up" and "is this
+  // checkout behind origin/main". Exits 1 when a required check fails.
+  if (cmd === "doctor") {
+    const { runDoctor, doctorOk, formatDoctor } = await import("../server/src/doctor.ts");
+    const checks = runDoctor();
+    let health: any = null;
+    try {
+      health = await (await fetch(`${BASE}/api/health`, { signal: AbortSignal.timeout(3000) })).json();
+    } catch {
+      /* not running */
+    }
+    checks.push({
+      name: "server",
+      ok: !!health,
+      required: false,
+      detail: health ? `${BASE} (v${health.version})` : `${BASE} not responding`,
+      fix: health ? null : "start it: bin/hive serve",
+    });
+    const update = health?.live_checkout ?? (await import("../server/src/api.ts")).measureLiveCheckout();
+    checks.push({
+      name: "up to date",
+      ok: !update.error && update.behind === 0,
+      required: false,
+      detail: update.error ?? (update.behind ? `${update.behind} commit${update.behind === 1 ? "" : "s"} behind origin/main (at ${update.head})` : `origin/main at ${update.head}`),
+      fix: update.behind ? "git pull, then restart the daemon" : null,
+    });
+    console.log(formatDoctor(checks));
+    if (!doctorOk(checks)) process.exit(1);
     return;
   }
 

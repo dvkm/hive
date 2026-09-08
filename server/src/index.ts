@@ -9,7 +9,7 @@ process.on("unhandledRejection", (e) => {
   console.error("[hive] unhandledRejection (survived):", e);
 });
 import { openDb, defaultDbPath } from "./db.ts";
-import { makeHandler, keepSupervisorWarm, notifyManagerOfEvent, repairDuplicateQuizPasses, deferShippedQuizzes, sweepManagerInboxes, wakeDueManagers } from "./api.ts";
+import { makeHandler, keepSupervisorWarm, notifyManagerOfEvent, repairDuplicateQuizPasses, deferShippedQuizzes, sweepManagerInboxes, wakeDueManagers, refreshOriginMain } from "./api.ts";
 import { startReconciler, reAdoptAgentsOnBoot } from "./reconciler.ts";
 import { startDispatcher } from "./dispatcher.ts";
 import { startReaper } from "./reaper.ts";
@@ -273,5 +273,11 @@ try {
 }
 const selfAuditPollMs = Number(process.env.HIVE_SELF_AUDIT_POLL_MS || 60 * 60 * 1000);
 startSelfAudit(db, selfAuditPollMs);
+
+// Update reminder: keep origin/main fresh so /api/doctor's behind count is
+// real on a checkout no sync job touches. Hourly; a failed fetch is silent.
+const originFetchMs = Number(process.env.HIVE_ORIGIN_FETCH_MS || 60 * 60 * 1000);
+refreshOriginMain().catch(() => {});
+setInterval(() => refreshOriginMain().catch(() => {}), originFetchMs);
 
 console.log(`[hive] server on http://${server.hostname}:${server.port}  db=${dbPath}`);

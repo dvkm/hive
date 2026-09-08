@@ -176,6 +176,7 @@ task 49be6df24af4 -> [cancelled]  Cache the /api/projects response for 30s
 
 A task is queued and nothing is running. Go down this list in order and stop at the first hit.
 
+0. **Run `bin/hive doctor`.** Without Herdr running or an agent CLI installed, hive never spawns anything and nothing on the board says so. Doctor names the missing piece and the fix.
 1. **Check the state.** `bin/hive task list --project <id>`. A task in `needs_decision` is waiting on you, not stuck. A task in `failed` may already have been requeued as a new task.
 2. **Check the source.** `curl -sS "$HIVE_URL/api/tasks/<id>" | jq .source`. If it is `external`, hive will never run it. Stop here.
 3. **Check the project's `auto_dispatch` and `dispatch_kinds`.** `curl -sS "$HIVE_URL/api/projects" | jq '.[] | select(.id=="<id>") | .config'`. Off, or the wrong kind, and it stays queued forever.

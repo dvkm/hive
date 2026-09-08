@@ -6,6 +6,18 @@ This repo contains **Phase 1** (server core + CLI) and **Phase 2b** (the runtime
 
 New here? Start with **[docs/GETTING-STARTED.md](./docs/GETTING-STARTED.md)**: the eight concepts, the five commands you actually need, and what to check when a task will not run.
 
+## What it looks like
+
+The board: what needs you first, then what hive is handling on its own.
+
+![The work board: a "Needs you" list of decisions, reviews and failures above the tasks hive is running](docs/images/board.png)
+
+A review card: hive's recommendation, the evidence the agent attached, and one-click approve, request changes, or reject.
+
+![A review card with the PR, CI status, evidence screenshots and log excerpt, and approve/request-changes/reject buttons](docs/images/review-card.png)
+
+Both shots come from `bun run scripts/demo-seed.ts` on a scratch database.
+
 ## Requirements
 
 - [Bun](https://bun.sh) (tested on 1.3.x and 1.4.x).
@@ -31,6 +43,14 @@ bun install                    # root: server + CLI deps
 ```
 
 ## Run
+
+First, check the machine has what hive needs. Every failing line comes with its fix:
+
+```bash
+bin/hive doctor
+```
+
+It checks git, Herdr (installed and running), an agent CLI (Claude Code or Codex), `gh`, the data directory, whether the daemon is up, and whether this checkout is behind `origin/main`. The web app runs the same checks and shows a banner when a required one fails or an update is waiting.
 
 ```bash
 bun run server/src/index.ts     # start the daemon on 127.0.0.1:4700
