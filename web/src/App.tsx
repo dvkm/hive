@@ -281,7 +281,7 @@ function DoctorBanner() {
         <span className="away-banner-text">
           Hive cannot run agents: {broken.map((c) => `${c.name} ${c.detail}`).join("; ")}.
         </span>
-        <span className="muted">{broken[0].fix}. Run <code>hive doctor</code> for the full list.</span>
+        <span className="muted">{broken[0].fix!.replace(/^./, (c) => c.toUpperCase())}. Run <code>hive doctor</code> for the full list.</span>
       </div>
     );
   }
