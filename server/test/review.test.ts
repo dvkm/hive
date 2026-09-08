@@ -8,7 +8,8 @@ process.env.HIVE_HOME = HOME;
 
 const { openDb } = await import("../src/db.ts");
 const { makeHandler, repairDuplicateQuizPasses, deferShippedQuizzes } = await import("../src/api.ts");
-const { reconcileOnce } = await import("../src/reconciler.ts");
+const { reconcileOnce, conflictNudgeMessage } = await import("../src/reconciler.ts");
+const { queueSteerEvent, queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers } = await import("../src/steer.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { writeEvent } = await import("../src/state.ts");
 const { reviewActionable, reviewActionableBatch } = await import("../src/reviewer.ts");
@@ -445,6 +446,111 @@ test("startup repair leaves a legacy review alone when its options changed", asy
     .run("evt_legacy_reoptioned", taskId, new Date().toISOString(), "agent", "review_summary", JSON.stringify(payload));
 
   expect(repairDuplicateQuizPasses(s.db)).toBe(0);
+});
+
+// HIVE-634: the director passed the checks, hive bounced the PR one second
+// later for merge conflicts, and the agent's re-review re-asked the same three
+// questions. Hive's own conflict bounce is not new judgment, so it must not
+// invalidate the pass.
+async function bounceForConflict(db: any, taskId: string, notes?: string) {
+  const message = notes ?? conflictNudgeMessage("https://github.com/acme/repo/pull/7", "main");
+  queueSteerEvent(db, taskId, message, "PR conflicting; no live agent");
+  const steers = queuedSteers(db, taskId);
+  markSteersDelivered(db, steers.map((s: any) => s.id), "respawn");
+  resumeReviewForDeliveredSteers(db, taskId, steers, "respawn");
+}
+
+const passedFor = (db: any, taskId: string, reviewEventId: string) =>
+  db
+    .query(
+      "SELECT payload FROM events WHERE task_id = ? AND type = 'understanding_quiz_passed' AND json_extract(payload, '$.review_event_id') = ? LIMIT 1"
+    )
+    .get(taskId, reviewEventId);
+
+test("hive's own merge-conflict bounce keeps the quiz pass on the re-review", async () => {
+  const s = makeApi();
+  const { taskId } = await inReviewTask(s.handler);
+  const headA: any = s.db
+    .query("SELECT id FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId);
+  expect(passedFor(s.db, taskId, headA.id)).toBeTruthy();
+
+  await bounceForConflict(s.db, taskId);
+
+  // The agent merges main and re-emits the review, rewording the prose.
+  const reReview = await post(s.handler, `/api/tasks/${taskId}/events`, {
+    type: "review_summary",
+    done: ["merged origin/main and resolved one conflict in an unrelated test file"],
+    understanding: {
+      background: "This task changes behavior.",
+      essence: "Tests cover the new behavior.",
+      check: { ...QUIZ, question: `  ${QUIZ.question}\n` },
+    },
+  });
+  expect(reReview.json.duplicate).toBeUndefined();
+  const headB = reReview.json.event.id;
+  expect(headB).not.toBe(headA.id);
+
+  const carried: any = passedFor(s.db, taskId, headB);
+  expect(carried).toBeTruthy();
+  expect(JSON.parse(carried.payload).carried_from_review_event_id).toBe(headA.id);
+  expect((await get(s.handler, "/api/understanding-quizzes")).json.quizzes.some((q: any) => q.task_id === taskId)).toBe(false);
+});
+
+test("a human changes-request between the two reviews still re-asks the quiz", async () => {
+  const s = makeApi();
+  const { taskId } = await inReviewTask(s.handler);
+  const headA: any = s.db
+    .query("SELECT id FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId);
+
+  const bounce = await post(s.handler, `/api/tasks/${taskId}/request-changes`, { notes: "rename the flag before merge" });
+  expect(bounce.status).toBe(200);
+
+  const reReview = await post(s.handler, `/api/tasks/${taskId}/events`, {
+    type: "review_summary",
+    done: ["renamed the flag"],
+    understanding: { background: "This task changes behavior.", essence: "Tests cover the new behavior.", check: QUIZ },
+  });
+  const headB = reReview.json.event.id;
+  expect(headB).not.toBe(headA.id);
+  expect(passedFor(s.db, taskId, headB)).toBeFalsy();
+});
+
+test("a conflict bounce carrying a human note still re-asks the quiz", async () => {
+  const s = makeApi();
+  const { taskId } = await inReviewTask(s.handler);
+  const headA: any = s.db
+    .query("SELECT id FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId);
+
+  await bounceForConflict(
+    s.db,
+    taskId,
+    `${conflictNudgeMessage("https://github.com/acme/repo/pull/7", "main")}\n\nAlso: drop the debug logging while you are in there.`
+  );
+
+  const reReview = await post(s.handler, `/api/tasks/${taskId}/events`, {
+    type: "review_summary",
+    done: ["merged main and dropped the logging"],
+    understanding: { background: "This task changes behavior.", essence: "Tests cover the new behavior.", check: QUIZ },
+  });
+  expect(passedFor(s.db, taskId, reReview.json.event.id)).toBeFalsy();
+});
+
+test("startup repair also carries a pass across a merge-conflict bounce", async () => {
+  const s = makeApi();
+  const { taskId } = await inReviewTask(s.handler);
+  const original: any = s.db
+    .query("SELECT id, payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId);
+  await bounceForConflict(s.db, taskId);
+  s.db
+    .query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run("evt_after_conflict", taskId, new Date().toISOString(), "agent", "review_summary", original.payload);
+
+  expect(repairDuplicateQuizPasses(s.db)).toBe(1);
+  expect(JSON.parse((passedFor(s.db, taskId, "evt_after_conflict") as any).payload).carried_from_review_event_id).toBe(original.id);
 });
 
 test("a wrong answer teaches the idea and rotates to another question", async () => {

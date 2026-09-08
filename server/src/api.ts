@@ -5217,6 +5217,23 @@ function understandingQuizStatus(db: DB, taskId: string, reviewEventId: string):
   return deferred ? "deferred" : "required";
 }
 
+// A quiz pass is invalidated by a changes_requested or an answered decision
+// since the review it was passed on: the change moved, so the director looks
+// again. Hive's OWN merge-conflict bounce is the exception. It says nothing
+// about the change the director read; it tells the agent to merge main. Left in
+// the invalidation set it cost the director the quiz twice on the same diff
+// (HIVE-634: task 6e8a66261e16 passed at 17:12:44Z, hive bounced for conflicts
+// one second later, and the identical checks were re-asked at 18:15). The
+// `notes` of one of these is a single steer message; a bounce that also carries
+// a human note (steers are joined with a blank line) is NOT mechanical and
+// still invalidates.
+function mechanicalConflictBounceSql(alias: string): string {
+  return `(${alias}type = 'changes_requested'
+      AND ${alias}source IN ('system', 'reconciler')
+      AND json_extract(${alias}payload, '$.notes') LIKE 'hive: your PR%has merge conflicts%'
+      AND json_extract(${alias}payload, '$.notes') NOT LIKE '%' || char(10) || char(10) || '%')`;
+}
+
 // Older agents sometimes re-submit the exact same review after an unrelated
 // merge failure. That must not erase a quiz the director already completed.
 // Repair the latest duplicate once at startup; future duplicates are rejected
@@ -5249,7 +5266,8 @@ export function repairDuplicateQuizPasses(db: DB): number {
               SELECT 1 FROM events invalidated
                WHERE invalidated.task_id = older.task_id
                  AND invalidated.rowid > older.rowid AND invalidated.rowid < ?
-                 AND invalidated.type IN ('changes_requested', 'decision_answered'))
+                 AND invalidated.type IN ('changes_requested', 'decision_answered')
+                 AND NOT ${mechanicalConflictBounceSql("invalidated.")})
           ORDER BY older.rowid DESC`
       )
       .all(review.task_id, review.rowid, review.rowid) as { id: string; payload: string }[];
@@ -7812,7 +7830,8 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       const invalidated = db
         .query(
           `SELECT 1 FROM events WHERE task_id = ? AND rowid > ?
-             AND type IN ('changes_requested', 'decision_answered') LIMIT 1`
+             AND type IN ('changes_requested', 'decision_answered')
+             AND NOT ${mechanicalConflictBounceSql("")} LIMIT 1`
         )
         .get(taskId, carried.rowid);
       if (!invalidated)
