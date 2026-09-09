@@ -164,8 +164,10 @@ function fakeJira(opts: FakeOpts) {
         return json({ issues: [], isLast, ...(isLast ? {} : { nextPageToken: String(page + 1) }) });
       }
       const vis = opts.visible ?? [...byKey.keys()];
-      if (opts.omitDiscoveryPagination) return json({ issues: vis.map((k) => ({ key: k })) });
-      return json({ issues: vis.map((k) => ({ key: k })), isLast: true });
+      // Real discovery asks for `key,updated`; a key the fake never defined has no fields.
+      const row = (k: string) => (byKey.has(k) ? { key: k, fields: { updated: byKey.get(k)!.updated } } : { key: k });
+      if (opts.omitDiscoveryPagination) return json({ issues: vis.map(row) });
+      return json({ issues: vis.map(row), isLast: true });
     }
 
     const m = path.match(/^\/rest\/api\/3\/issue\/([^/]+)(\/(\w+))?$/);
@@ -4886,4 +4888,54 @@ test("a comment older than the terminal transition is left alone", async () => {
   await run(db, projectId, jira.fetchImpl, AUTO);
   expect(notifications(db, mirror.id).length).toBe(0);
   expect(workTasks(db, mirror.id).length).toBe(1);
+});
+
+// ============================================================================
+// UNCHANGED ISSUES ARE NOT RE-READ
+// ============================================================================
+test("an issue with nothing moved on either side is skipped until the sweep", async () => {
+  const jira = fakeJira({
+    issues: [
+      { key: "WEB-1", id: "1", status: "Done", history: [{ at: "2026-01-02T00:00:00.000Z", to: "Done" }] },
+      { key: "WEB-2", id: "2", status: "Done", history: [{ at: "2026-01-02T00:00:00.000Z", to: "Done" }] },
+    ],
+  });
+  const { db, projectId } = freshDb();
+  const issueReads = (key: string) =>
+    jira.calls.filter((c) => c.method === "GET" && c.path.startsWith(`/rest/api/3/issue/${key}?`)).length;
+  const seen = () => JSON.parse(db.query("SELECT cursor FROM intake_cursors WHERE source = 'jira-seen' AND key = ?").get(projectId)!.cursor as string);
+
+  await run(db, projectId, jira.fetchImpl);
+  expect(tasks(db).map((t) => t.state)).toEqual(["done", "done"]);
+  expect([issueReads("WEB-1"), issueReads("WEB-2")]).toEqual([1, 1]);
+  expect(Object.keys(seen().seen).sort()).toEqual(["WEB-1", "WEB-2"]);
+
+  // Nothing moved: discovery only, no per-issue traffic.
+  let stats = await run(db, projectId, jira.fetchImpl);
+  expect(stats.unchanged).toBe(2);
+  expect([issueReads("WEB-1"), issueReads("WEB-2")]).toEqual([1, 1]);
+
+  // Jira touched WEB-2: only WEB-2 is read.
+  jira.byKey.get("WEB-2")!.updated = "2026-02-01T00:00:00.000Z";
+  stats = await run(db, projectId, jira.fetchImpl);
+  expect(stats.unchanged).toBe(1);
+  expect([issueReads("WEB-1"), issueReads("WEB-2")]).toEqual([1, 2]);
+
+  // hive owes WEB-1 a comment: WEB-1 is read even though Jira is unchanged.
+  queueComment(db, tasks(db)[0].id, "hello");
+  stats = await run(db, projectId, jira.fetchImpl);
+  expect(stats.unchanged).toBe(1);
+  expect(stats.comments_pushed).toBe(1);
+  // The push re-reads the boundary, so count "read at all", not GETs.
+  expect(issueReads("WEB-1")).toBeGreaterThan(1);
+  expect(issueReads("WEB-2")).toBe(2);
+
+  // Sweep due: everything is read regardless of stamps.
+  const before = [issueReads("WEB-1"), issueReads("WEB-2")];
+  const stale = { ...seen(), sweep_at: new Date(Date.now() - 11 * 60_000).toISOString() };
+  db.query("UPDATE intake_cursors SET cursor = ? WHERE source = 'jira-seen' AND key = ?").run(JSON.stringify(stale), projectId);
+  stats = await run(db, projectId, jira.fetchImpl);
+  expect(stats.unchanged).toBe(0);
+  expect([issueReads("WEB-1"), issueReads("WEB-2")]).toEqual([before[0] + 1, before[1] + 1]);
+  expect(Date.parse(seen().sweep_at)).toBeGreaterThan(Date.now() - 5_000);
 });

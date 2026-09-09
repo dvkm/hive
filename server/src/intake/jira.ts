@@ -94,6 +94,19 @@ const REQUEST_TIMEOUT_MS = 20_000;
 // minutes and the poll rate degrades to zero. Two intervals leaves a slow but
 // healthy Jira room to finish while capping how far behind the loop can fall.
 const CYCLE_BUDGET_MULTIPLIER = 2;
+// Every ~150-issue project used to cost ~600 sequential requests per tick
+// (issue + changelog + comments + scope probe, each), so a healthy cycle ran
+// longer than the poll interval. Now an issue whose search `updated` stamp
+// matches the last strongly-read one, and whose linked tasks are settled with
+// nothing to push, is skipped. Search is eventually consistent, so at most this
+// often the whole project is read regardless.
+const FULL_SWEEP_MS = 10 * 60_000;
+const SEEN_SOURCE = "jira-seen";
+
+// A fetch timeout arrives as a DOMException, which console.error prints as its
+// whole constant table (30 lines per timeout). Name and message say it all.
+const defaultLog = (m: string, e?: unknown): void =>
+  console.error(`[hive] jira: ${m}`, e instanceof DOMException ? `${e.name}: ${e.message}` : e ?? "");
 // How many CONSECUTIVE observations of one absence kind must accrue before hive
 // stops syncing. Operational failures never count.
 const ABSENT_STREAK_LIMIT = 3;
@@ -841,18 +854,24 @@ export class JiraClient {
   // no fields. Jira's enhanced search is eventually consistent, so this result
   // set is a hint about what to look at, never an input to a decision.
   // `fields=key` is the minimal projection that still carries the key.
-  async discover(): Promise<string[]> {
+  // `updated` rides along as a change HINT only: an issue whose stamp matches
+  // the last strongly-read one is skipped this cycle (see syncProjectOnce),
+  // and the periodic full sweep covers the index lagging behind a real edit.
+  async discover(): Promise<{ key: string; updated: string | null }[]> {
     const issues = await paginateJira<any>(
       "Jira discovery",
       null,
       async (cursor) => {
-        const q = new URLSearchParams({ jql: this.projectJql(), fields: "key", maxResults: "100" });
+        const q = new URLSearchParams({ jql: this.projectJql(), fields: "key,updated", maxResults: "100" });
         if (typeof cursor === "string") q.set("nextPageToken", cursor);
         return this.json(`/rest/api/3/search/jql?${q}`);
       },
       (body) => body?.issues
     );
-    return issues.map((issue) => jiraIssueKey(issue, "Jira discovery"));
+    return issues.map((issue) => ({
+      key: jiraIssueKey(issue, "Jira discovery"),
+      updated: isJiraTimestamp(issue?.fields?.updated) ? issue.fields.updated.trim() : null,
+    }));
   }
 
   // Strongly-consistent single-issue read. This — not search — is what every
@@ -1921,6 +1940,7 @@ export interface SyncStats {
   blocked: number; // outbound actions refused because a prerequisite could not be confirmed
   skipped: number; // issues whose fresh read failed (missing input)
   budget_skipped: number; // issues left untouched because the cycle ran out of wall-clock budget
+  unchanged: number; // issues not read because neither side has moved since the last read
   cancelled: number; // mirrors dispositioned because their issue is proven gone
   errors: number;
   failures: string[];
@@ -1929,8 +1949,36 @@ export interface SyncStats {
 const emptyStats = (): SyncStats => ({
   imported: 0, auto_filed: 0, pushed: 0, pulled: 0, labeled: 0,
   comments_pulled: 0, comments_pushed: 0, receipts: 0, attachments: 0, rendered: 0,
-  shadow: 0, unmapped: 0, aborted: 0, blocked: 0, skipped: 0, budget_skipped: 0, cancelled: 0, errors: 0, failures: [],
+  shadow: 0, unmapped: 0, aborted: 0, blocked: 0, skipped: 0, budget_skipped: 0, unchanged: 0, cancelled: 0, errors: 0, failures: [],
 });
+
+// What the last full read of an issue saw on both sides. `updated` is Jira's
+// stamp from the strongly-consistent issue GET; `tasks` is the linked hive
+// tasks and their states. Either side moving forces a fresh read.
+interface SeenStamp { updated: string; tasks: string }
+interface SeenState { sweep_at: string | null; seen: Record<string, SeenStamp> }
+
+function readSeen(db: DB, projectId: string): SeenState {
+  const row = db.query("SELECT cursor FROM intake_cursors WHERE source = ? AND key = ?").get(SEEN_SOURCE, projectId) as
+    | { cursor: string }
+    | undefined;
+  try {
+    const parsed = row ? JSON.parse(row.cursor) : null;
+    if (parsed && typeof parsed === "object" && parsed.seen && typeof parsed.seen === "object")
+      return { sweep_at: typeof parsed.sweep_at === "string" ? parsed.sweep_at : null, seen: parsed.seen };
+  } catch {}
+  return { sweep_at: null, seen: {} };
+}
+
+function writeSeen(db: DB, projectId: string, state: SeenState): void {
+  db.query(
+    `INSERT INTO intake_cursors (source, key, cursor) VALUES (?,?,?)
+     ON CONFLICT(source, key) DO UPDATE SET cursor = excluded.cursor`
+  ).run(SEEN_SOURCE, projectId, JSON.stringify(state));
+}
+
+const taskSignature = (tasks: { id: string; state: string }[]): string =>
+  tasks.map((t) => `${t.id}:${t.state}`).sort().join(",");
 
 interface Ctx {
   db: DB;
@@ -3025,7 +3073,7 @@ export async function syncProjectOnce(
   deps: JiraDeps = {}
 ): Promise<SyncStats> {
   assertJiraTargetOwner(db, projectId, cfg);
-  const log = deps.log ?? ((m: string, e?: unknown) => console.error(`[hive] jira: ${m}`, e ?? ""));
+  const log = deps.log ?? defaultLog;
   const ctx: Ctx = { db, cfg, client, stats: emptyStats(), exec: deps.exec ?? defaultExec, diffs: new Map(), log };
 
   const budgetMs = deps.budgetMs ?? jiraIntervalMs(deps) * CYCLE_BUDGET_MULTIPLIER;
@@ -3039,20 +3087,21 @@ export async function syncProjectOnce(
   const discovered = await client.discover();
   const linked = (db
     .query(
-      `SELECT id, jira_key, jira_link_kind, source_ref FROM tasks
+      `SELECT id, state, jira_key, jira_link_kind, source_ref FROM tasks
        WHERE project_id = ? AND (jira_key IS NOT NULL OR source_ref LIKE 'jira:%')`
     )
-    .all(projectId) as { id: string; jira_key: string | null; jira_link_kind: "mirror" | "subtask" | null; source_ref: string | null }[])
+    .all(projectId) as { id: string; state: string; jira_key: string | null; jira_link_kind: "mirror" | "subtask" | null; source_ref: string | null }[])
     .map((row) => {
       const jiraKey = row.jira_key ?? String(row.source_ref).slice("jira:".length);
       if (!row.jira_key) {
         db.query("UPDATE tasks SET jira_key = ?, jira_link_kind = 'mirror' WHERE id = ?").run(jiraKey, row.id);
       }
-      return { id: row.id, jira_key: jiraKey, jira_link_kind: row.jira_link_kind ?? "mirror" };
+      return { id: row.id, state: row.state, jira_key: jiraKey, jira_link_kind: row.jira_link_kind ?? "mirror" };
     });
   const linkedByKey = new Map<string, typeof linked>();
   for (const row of linked) linkedByKey.set(row.jira_key, [...(linkedByKey.get(row.jira_key) ?? []), row]);
-  const allKeys = [...new Set([...discovered, ...linkedByKey.keys()])];
+  const hinted = new Map(discovered.map((d) => [d.key, d.updated]));
+  const allKeys = [...new Set([...hinted.keys(), ...linkedByKey.keys()])];
   // Resume where the last budget-truncated cycle stopped, then wrap around, so
   // every issue is reached eventually even while Jira stays slow.
   const resumeKeys = cycleResumeKeys.get(db as object) ?? new Map<string, string>();
@@ -3061,11 +3110,20 @@ export async function syncProjectOnce(
   const keys = start > 0 ? [...allKeys.slice(start), ...allKeys.slice(0, start)] : allKeys;
   resumeKeys.delete(projectId);
 
+  const seenState = readSeen(db, projectId);
+  const sweepDue = !seenState.sweep_at || Date.now() - Date.parse(seenState.sweep_at) >= FULL_SWEEP_MS;
+  const hasOutbound = (taskId: string): boolean => {
+    const p = pendingOutbound(db, taskId);
+    return p.comments > 0 || p.receipts > 0 || p.unknown.length > 0;
+  };
+  let truncated = false;
+
   for (const [index, key] of keys.entries()) {
     if (Date.now() >= deadline) {
       // Out of budget: stop here, record what was left, and let the NEXT tick
       // start on time rather than being dropped by the single-flight guard.
       ctx.stats.budget_skipped = keys.length - index;
+      truncated = true;
       resumeKeys.set(projectId, key); // pick this one up first next cycle
       cycleResumeKeys.set(db as object, resumeKeys);
       log(
@@ -3074,6 +3132,24 @@ export async function syncProjectOnce(
       );
       break;
     }
+    // Skip only when nothing can have moved on either side: Jira's stamp
+    // matches the last strong read, the linked tasks are the same rows in the
+    // same settled states, and hive holds nothing undelivered for them. A
+    // non-terminal task is always read: its evidence and reviews change
+    // without a state change. The sweep overrides all of it.
+    const stamp = seenState.seen[key];
+    const settled = linkedByKey.get(key) ?? [];
+    if (
+      !sweepDue &&
+      stamp &&
+      hinted.get(key) === stamp.updated &&
+      stamp.tasks === taskSignature(settled) &&
+      settled.every((t) => TERMINAL.includes(t.state as State) && !hasOutbound(t.id))
+    ) {
+      ctx.stats.unchanged++;
+      continue;
+    }
+    delete seenState.seen[key];
     let read: IssueObservation;
     try {
       read = await readIssue(client, cfg, key, true);
@@ -3145,7 +3221,7 @@ export async function syncProjectOnce(
             payload: { action: "link_discovered", issue: key, parent: read.issue.fields?.parent?.key ?? null },
           });
           broadcastTask(db, getTask(db, marked.id));
-          linkedTasks = [...linkedTasks, { id: marked.id, jira_key: key, jira_link_kind: "subtask" }];
+          linkedTasks = [...linkedTasks, { id: marked.id, state: marked.state, jira_key: key, jira_link_kind: "subtask" }];
           linkedByKey.set(key, linkedTasks);
         }
       }
@@ -3187,6 +3263,11 @@ export async function syncProjectOnce(
         if (task.jira_link_kind === "subtask") await reconcileLinkedTask({ ...ctx, projectScope: true }, linkedRead, task);
         else if (read.scope === "in") await reconcileIssue(ctx, read, task);
       }
+      // Stamp what this read reconciled, on both sides, only once it all went
+      // through: a half-applied issue must be read again next tick.
+      const after = db.query("SELECT id, state FROM tasks WHERE project_id = ? AND jira_key = ?").all(projectId, key) as
+        { id: string; state: string }[];
+      seenState.seen[key] = { updated: String(read.issue.fields.updated).trim(), tasks: taskSignature(after) };
     } catch (e) {
       const message = String(e instanceof Error ? e.message : e);
       recordFailure(ctx, `${key}: ${message}`);
@@ -3194,6 +3275,10 @@ export async function syncProjectOnce(
     }
   }
 
+  // A sweep only counts once it covered every key; a truncated one resumes
+  // next tick, still due.
+  if (sweepDue && !truncated) seenState.sweep_at = now();
+  writeSeen(db, projectId, seenState);
   return ctx.stats;
 }
 
@@ -3231,7 +3316,7 @@ export async function runProjectCycle(
   projectId: string,
   deps: JiraDeps = {}
 ): Promise<{ ok: boolean; stats?: SyncStats; error?: string; state: JiraSyncState }> {
-  const log = deps.log ?? ((m: string, e?: unknown) => console.error(`[hive] jira: ${m}`, e ?? ""));
+  const log = deps.log ?? defaultLog;
   const interval = jiraIntervalMs(deps);
   const startedAt = now();
   const fail = (error: string, stats?: SyncStats) => {
@@ -3297,7 +3382,7 @@ export async function runProjectCycle(
           `${stats.comments_pulled} comments in, ${stats.comments_pushed} comments out, ${stats.receipts} receipts, ` +
           `${stats.attachments} attachments, ${stats.rendered} rendered, ` +
           `${stats.shadow} shadow, ${stats.unmapped} unmapped, ${stats.aborted} aborted, ${stats.blocked} blocked, ` +
-          `${stats.skipped} skipped, ${stats.budget_skipped} over budget, ${stats.errors} errors ` +
+          `${stats.skipped} skipped, ${stats.budget_skipped} over budget, ${stats.unchanged} unchanged, ${stats.errors} errors ` +
           `in ${Math.round((Date.now() - Date.parse(startedAt)) / 1000)}s`
       );
     return { ok: true, stats, state };
