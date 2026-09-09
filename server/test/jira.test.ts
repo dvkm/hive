@@ -4903,7 +4903,8 @@ test("an issue with nothing moved on either side is skipped until the sweep", as
   const { db, projectId } = freshDb();
   const issueReads = (key: string) =>
     jira.calls.filter((c) => c.method === "GET" && c.path.startsWith(`/rest/api/3/issue/${key}?`)).length;
-  const seen = () => JSON.parse(db.query("SELECT cursor FROM intake_cursors WHERE source = 'jira-seen' AND key = ?").get(projectId)!.cursor as string);
+  const seen = () =>
+    JSON.parse((db.query("SELECT cursor FROM intake_cursors WHERE source = 'jira-seen' AND key = ?").get(projectId) as { cursor: string }).cursor);
 
   await run(db, projectId, jira.fetchImpl);
   expect(tasks(db).map((t) => t.state)).toEqual(["done", "done"]);
