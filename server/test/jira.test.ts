@@ -22,6 +22,8 @@ const { openDb, newId, now, setSetting } = await import("../src/db.ts");
 const { writeEvent, transition } = await import("../src/state.ts");
 const { addClient, removeClient } = await import("../src/bus.ts");
 const J = await import("../src/intake/jira.ts");
+const J_INTENTS = await import("../src/intents.ts");
+const J_DRAFT = await import("../src/intentDraft.ts");
 const { TASK_PRIORITIES, makeHandler } = await import("../src/api.ts");
 import type { DB } from "../src/db.ts";
 
@@ -317,8 +319,13 @@ function client(fetchImpl: typeof fetch, cfg: any = CFG) {
   return new J.JiraClient(J.jiraConfig({ jira: cfg })!, "tok", fetchImpl);
 }
 
+// The intent drafter is a `claude -p` subprocess (HIVE-637). Every cycle in this
+// file gets a stub by default so no test can ever spawn a model; a test that
+// cares about the draft passes its own `model`.
+const STUB_MODEL = async () => ({ code: 1, stdout: "", stderr: "no model in tests" });
+
 const run = (db: DB, projectId: string, f: typeof fetch, cfg: any = CFG, deps: any = {}) =>
-  J.syncProjectOnce(db, projectId, J.jiraConfig({ jira: cfg })!, client(f, cfg), deps);
+  J.syncProjectOnce(db, projectId, J.jiraConfig({ jira: cfg })!, client(f, cfg), { model: STUB_MODEL, ...deps });
 
 // hive's clock and the fake Jira's are the same millisecond in a test, and a tie
 // in the conflict rule goes to Jira. Real work takes longer than 0ms, so step a
@@ -4939,4 +4946,176 @@ test("an issue with nothing moved on either side is skipped until the sweep", as
   expect(stats.unchanged).toBe(0);
   expect([issueReads("WEB-1"), issueReads("WEB-2")]).toEqual([before[0] + 1, before[1] + 1]);
   expect(Date.parse(seen().sweep_at)).toBeGreaterThan(Date.now() - 5_000);
+});
+
+// ============================================================================
+// THE INTENT RECORD (HIVE-637)
+// ============================================================================
+// A new ticket produces the record of what was asked BEFORE it produces work.
+// The work task carries that draft, so nothing dispatches until a human accepts
+// it, and accepting rewrites the brief from what they accepted.
+
+const intentsOf = (db: DB, projectId: string) =>
+  db.query("SELECT * FROM intents WHERE project_id = ? ORDER BY created_at, id").all(projectId) as any[];
+
+// A drafter that answers the way the real model is told to: strict JSON in the
+// `claude -p --output-format json` envelope.
+const draftingModel = (sections: any) => async (argv: string[]) => ({
+  code: 0,
+  stdout: JSON.stringify({ is_error: false, result: JSON.stringify(sections) }),
+  stderr: "",
+  prompt: argv[argv.length - 3],
+});
+
+const FIXTURE = {
+  problem: "Checkout fails for card payments.",
+  proposed_outcome: "Card payments go through on the checkout page.",
+  affected: "Shoppers, the checkout page, the payments service.",
+  constraints: "No change to the refund flow.",
+  open_questions: ["Do saved cards count as in scope?"],
+};
+
+async function importedWithIntent(cfg: any = AUTO, sections: any = FIXTURE) {
+  const jira = fakeJira({ issues: [{
+    key: "WEB-500", id: "500", status: "To Do", summary: "Checkout is broken", priority: "High",
+    description: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "cards fail at the last step" }] }] },
+    comments: [
+      { id: "20001", author: "Iroo Kim", text: "only Visa so far", created: "2020-01-01T00:00:00.000Z" },
+      { id: "20002", author: "Mina Park", text: "please keep refunds alone", created: "2020-01-02T00:00:00.000Z" },
+    ],
+  }] });
+  const { db, projectId } = freshDb(cfg);
+  const prompts: string[] = [];
+  const model = async (argv: string[], opts: any) => {
+    prompts.push(argv[argv.length - 3]!);
+    return draftingModel(sections)(argv);
+  };
+  await run(db, projectId, jira.fetchImpl, cfg, { model });
+  return { jira, db, projectId, prompts, mirror: taskFor(db, "WEB-500") };
+}
+
+test("a new ticket is recorded as a draft intent, drafted from its title, description and comments", async () => {
+  const { db, projectId, prompts, mirror } = await importedWithIntent();
+
+  // The whole ticket reached the drafter, comments included.
+  expect(prompts.length).toBe(1);
+  expect(prompts[0]).toContain("Checkout is broken");
+  expect(prompts[0]).toContain("cards fail at the last step");
+  expect(prompts[0]).toContain("only Visa so far");
+  expect(prompts[0]).toContain("please keep refunds alone");
+
+  const [intent] = intentsOf(db, projectId);
+  expect(intent.source).toBe("jira");
+  expect(intent.source_ref).toBe("WEB-500");
+  expect(intent.status).toBe("draft");
+  // All five headings, in the playbook's order, and nothing invented.
+  expect(J_INTENTS.intentBodyError(intent.body_md)).toBeNull();
+  expect(J_INTENTS.intentSection(intent.body_md, "Problem")).toBe(FIXTURE.problem);
+  expect(J_INTENTS.intentSection(intent.body_md, "Constraints")).toBe(FIXTURE.constraints);
+  // At least one open question, so acceptance cannot happen by accident.
+  expect(J_INTENTS.openQuestions(intent.body_md)).toEqual(["Do saved cards count as in scope?"]);
+
+  // The work task was filed against that draft and waits for it.
+  const work = workTasks(db, mirror.id)[0]!;
+  expect(work.intent_id).toBe(intent.id);
+  expect(work.state).toBe("queued");
+  expect(intent.task_id).toBe(work.id);
+  expect(J_INTENTS.intentNotAccepted(db, work)).toBe(true);
+});
+
+test("with auto_file off the draft intent is still written; only the work task is not", async () => {
+  const { db, projectId, mirror } = await importedWithIntent(CFG);
+  expect(intentsOf(db, projectId).length).toBe(1);
+  expect(intentsOf(db, projectId)[0].status).toBe("draft");
+  expect(workTasks(db, mirror.id).length).toBe(0);
+});
+
+test("a failed model call still records the ask, with the ticket text under Problem", async () => {
+  const jira = fakeJira({ issues: [{ key: "WEB-501", id: "501", status: "To Do", summary: "Slow search" }] });
+  const { db, projectId } = freshDb(AUTO);
+  await run(db, projectId, jira.fetchImpl, AUTO, { model: async () => ({ code: 1, stdout: "", stderr: "boom" }) });
+  const [intent] = intentsOf(db, projectId);
+  expect(J_INTENTS.intentBodyError(intent.body_md)).toBeNull();
+  expect(J_INTENTS.intentSection(intent.body_md, "Problem")).toContain("Slow search");
+  expect(J_INTENTS.openQuestions(intent.body_md).length).toBe(1);
+});
+
+test("accepting the draft regenerates the brief from it and says so once on the ticket", async () => {
+  const { jira, db, projectId, mirror } = await importedWithIntent();
+  const handler = makeHandler(db, {});
+  const [draft] = intentsOf(db, projectId);
+  const work = workTasks(db, mirror.id)[0]!;
+
+  // The open question blocks acceptance until it is ticked.
+  const refused = await handler(new Request(`http://127.0.0.1/api/intents/${draft.id}/accept`, { method: "POST", body: "{}" }));
+  expect(refused.status).toBe(409);
+
+  db.query("UPDATE intents SET body_md = ? WHERE id = ?")
+    .run(draft.body_md.replace("- [ ]", "- [x]"), draft.id);
+  const accepted = await (await handler(
+    new Request(`http://127.0.0.1/api/intents/${draft.id}/accept`, { method: "POST", body: JSON.stringify({ accepted_by: "david" }) })
+  )).json();
+  expect(accepted.status).toBe("accepted");
+
+  const after = db.query("SELECT brief FROM tasks WHERE id = ?").get(work.id) as { brief: string };
+  expect(after.brief).toContain("## Source\nCheckout fails for card payments.");
+  expect(after.brief).toContain("## Deliverable\nCard payments go through on the checkout page.");
+  expect(after.brief).toContain("## Constraints (hard limits)\nNo change to the refund flow.");
+  expect(after.brief).toContain("## Read these paths first\nShoppers, the checkout page, the payments service.");
+  expect(after.brief.trim().endsWith(`intent: ${draft.id} accepted by david at ${accepted.accepted_at}`)).toBe(true);
+  // Nothing holds the task now.
+  expect(J_INTENTS.intentNotAccepted(db, db.query("SELECT * FROM tasks WHERE id = ?").get(work.id))).toBe(false);
+
+  // One comment back on the ticket, in the ticket's own words, and only one.
+  await run(db, projectId, jira.fetchImpl, AUTO);
+  const posted = jira.byKey.get("WEB-500")!.comments.filter((c: any) => c.author === "Hive");
+  const said = posted.map((c: any) => String(c.text)).join("\n");
+  expect(said).toContain("Card payments go through on the checkout page");
+  expect(said).toContain("No change to the refund flow");
+  await run(db, projectId, jira.fetchImpl, AUTO);
+  expect(jira.byKey.get("WEB-500")!.comments.filter((c: any) => c.author === "Hive").length).toBe(posted.length);
+});
+
+test("in shadow mode (write off) accepting says nothing on the ticket", async () => {
+  const SHADOW = { ...AUTO, write: false };
+  const { db, projectId } = await importedWithIntent(SHADOW);
+  const handler = makeHandler(db, {});
+  const [draft] = intentsOf(db, projectId);
+  db.query("UPDATE intents SET body_md = ? WHERE id = ?").run(draft.body_md.replace("- [ ]", "- [x]"), draft.id);
+  await handler(new Request(`http://127.0.0.1/api/intents/${draft.id}/accept`, { method: "POST", body: "{}" }));
+  expect(
+    db.query("SELECT COUNT(*) AS n FROM events WHERE type = 'jira_comment' AND json_extract(payload, '$.intent_id') IS NOT NULL").get()
+  ).toEqual({ n: 0 });
+});
+
+test("a comment after the work finished opens a NEW draft intent that supersedes the old one", async () => {
+  const { jira, db, projectId, mirror, work } = await finishedTicket(AUTO);
+  // The ticket's import drafted its intent; the finished work was accepted from
+  // it, the way any live ticket's work would be.
+  const original = intentsOf(db, projectId)[0]!;
+  db.query("UPDATE intents SET status = 'accepted', accepted_by = 'david', task_id = ? WHERE id = ?").run(work, original.id);
+  db.query("UPDATE tasks SET intent_id = ? WHERE id = ?").run(original.id, work);
+
+  jira.byKey.get("WEB-101")!.comments.push(comment("alerts are still silent", "10450"));
+  await run(db, projectId, jira.fetchImpl, AUTO);
+
+  const rows = intentsOf(db, projectId);
+  expect(rows.length).toBe(2);
+  const incident = rows.find((r) => r.id !== original.id)!;
+  expect(incident.source).toBe("incident");
+  expect(incident.source_ref).toBe("10450"); // the Jira comment id
+  expect(incident.status).toBe("draft");
+  expect(J_INTENTS.intentSection(incident.body_md, "Problem")).toContain("alerts are still silent");
+  // The record it replaces keeps its acceptance and its finished task.
+  const before = rows.find((r) => r.id === original.id)!;
+  expect(before.status).toBe("superseded");
+  expect(before.task_id).toBe(work);
+
+  // The follow-up task hangs off the incident and waits for a human.
+  const follow = workTasks(db, mirror.id).find((t) => t.id !== work)!;
+  expect(follow.intent_id).toBe(incident.id);
+  expect(follow.state).toBe("queued");
+  expect(J_INTENTS.intentNotAccepted(db, follow)).toBe(true);
+  // Exactly one thing for the director: one draft intent for this project.
+  expect(intentsOf(db, projectId).filter((r) => r.status === "draft").length).toBe(1);
 });

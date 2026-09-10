@@ -59,13 +59,19 @@ import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, stee
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { seedWorktree, type SeedResult } from "./worktreeSeed.ts";
 import {
+  INTENT_SECTIONS,
   INTENT_SOURCES,
   getIntent,
+  intentSection,
+  insertIntent,
   intentBodyError,
   intentFileFor,
+  linkIntentTask,
   openQuestions,
+  supersedeIntentRow,
   type Intent,
 } from "./intents.ts";
+import { briefFromIntent, draftIntentBody, renderIntentBody, type IntentSourceText } from "./intentDraft.ts";
 import { takeOver, handBack, TakeoverError } from "./takeover.ts";
 import { figmaTokenEnv, resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { teamclaudeEnv, teamclaudeOverlay, usesTeamclaude } from "./teamclaude.ts";
@@ -164,6 +170,7 @@ export interface HandlerDeps {
   supervise?: boolean; // start the herdr wait loop after spawn (true in prod wiring)
   plannerExec?: PlannerExec; // injectable planner subprocess (domain supervisors)
   triageExec?: PlannerExec; // injectable intake-triage classifier (intake/triage.ts)
+  intentExec?: PlannerExec; // injectable intent drafter (intentDraft.ts)
   exec?: Exec; // injectable gh/git subprocess (diff + merge); tests pass a stub
   fetch?: Fetcher; // injectable smoke-check fetcher (post-merge); tests pass a stub
   jira?: JiraDeps;
@@ -954,6 +961,8 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (method === "GET") return listIntents(db, url);
         if (method === "POST") return createIntent(db, await req.json());
       }
+      if (pathname === "/api/intents/draft" && method === "POST")
+        return await draftIntent(db, await req.json(), deps);
       m = pathname.match(/^\/api\/intents\/([^/]+)$/);
       if (m) {
         if (method === "GET") {
@@ -2464,6 +2473,24 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
   const id = newId();
   const { block } = await attachFiles(id, files);
   const brief = ((body.brief ?? "") + block).trim();
+  // HIVE-637: the director's own brief IS the ask, so it is recorded as an
+  // intent and accepted in the same breath — there is nobody left to accept it
+  // from, and a second tap on the board would be pure ceremony. The brief text
+  // is kept verbatim under "## Problem" and on the task, footer and all:
+  // rewriting a person's words through a mapped record only loses them, and the
+  // task page already shows which intent it carries. Agent-filed and Jira-filed
+  // tasks are not this path; they get their own intent from their own intake.
+  const implicitIntent =
+    !intentId && brief && isDirector(source)
+      ? insertIntent(db, {
+          project_id: String(body.project_id),
+          source: "director",
+          body_md: renderIntentBody({ problem: brief, open_questions: [] }),
+          author: "director",
+          status: "accepted",
+          accepted_by: "director",
+        })
+      : null;
   // The ticket this work implements, parsed from the '[WEB-110] ' title prefix
   // once and stored (HIVE-546). Stored, not re-derived: a retitle or a requeue
   // used to lose the ticket silently.
@@ -2500,7 +2527,7 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
     verification_cmds: verifyCmds ? JSON.stringify(verifyCmds) : null,
     priority,
     jira_mirror_task_id: mirrorTaskId,
-    intent_id: intentId,
+    intent_id: intentId ?? implicitIntent?.id ?? null,
     created_at: t,
     updated_at: t,
   };
@@ -2515,7 +2542,7 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
     row.priority, row.jira_mirror_task_id, row.intent_id, row.created_at, row.updated_at
   );
   // The intent names the task it governs, so the record reads both ways.
-  if (intentId) db.query("UPDATE intents SET task_id = ?, updated_at = ? WHERE id = ?").run(row.id, t, intentId);
+  if (row.intent_id) db.query("UPDATE intents SET task_id = ?, updated_at = ? WHERE id = ?").run(row.id, t, row.intent_id);
   writeEvent(db, {
     task_id: row.id,
     source: row.source === "agent" ? "agent" : "director",
@@ -6728,13 +6755,6 @@ function recallStats(db: DB, url: URL): Response {
 // Everything here is deterministic — no model call. Drafting an intent from
 // Jira or director text is deliverable 2, not this one.
 
-// Both ends of the intent↔task link, written together. A task may carry at most
-// one intent, and the intent names the task it governs.
-function linkIntentTask(db: DB, intentId: string, taskId: string | null): void {
-  db.query("UPDATE intents SET task_id = ?, updated_at = ? WHERE id = ?").run(taskId, now(), intentId);
-  if (taskId) db.query("UPDATE tasks SET intent_id = ?, updated_at = ? WHERE id = ?").run(intentId, now(), taskId);
-}
-
 function intentOr404(db: DB, id: string): Intent | Response {
   return getIntent(db, id) ?? err(`intent not found: ${id}. List them: curl -s "$HIVE_URL/api/intents?project_id=<project-id>"`, 404);
 }
@@ -6762,14 +6782,15 @@ function createIntent(db: DB, body: any): Response {
   if (bad) return err(bad, 400);
   const taskId = body.task_id ? String(body.task_id) : null;
   if (taskId && !getTask(db, taskId)) return err(`task_id ${taskId} not found`, 400);
-  const t = now();
-  const id = newId("int");
-  db.query(
-    `INSERT INTO intents (id, project_id, task_id, source, source_ref, status, body_md, author, accepted_by, accepted_at, created_at, updated_at)
-     VALUES (?,?,?,?,?,'draft',?,?,NULL,NULL,?,?)`
-  ).run(id, String(body.project_id), null, source, body.source_ref ?? null, bodyMd, body.author ?? null, t, t);
-  if (taskId) linkIntentTask(db, id, taskId);
-  const intent = getIntent(db, id)!;
+  const created = insertIntent(db, {
+    project_id: String(body.project_id),
+    source,
+    source_ref: body.source_ref ?? null,
+    body_md: bodyMd,
+    author: body.author ?? null,
+  });
+  if (taskId) linkIntentTask(db, created.id, taskId);
+  const intent = getIntent(db, created.id)!;
   broadcast({ type: "intent", intent });
   return json(intent, 201);
 }
@@ -6814,11 +6835,123 @@ function acceptIntent(db: DB, id: string, body: any): Response {
     .run(String(body?.accepted_by ?? body?.source ?? "director"), t, t, id);
   const accepted = getIntent(db, id)!;
   if (accepted.task_id) {
-    writeEvent(db, { task_id: accepted.task_id, source: "director", type: "intent_accepted", payload: { intent_id: id } });
+    // The brief the agent reads is regenerated from what was just accepted, so
+    // an agent can never be working from words nobody signed off on.
+    const brief = briefFromIntent(accepted);
+    db.query("UPDATE tasks SET brief = ?, updated_at = ? WHERE id = ?").run(brief, t, accepted.task_id);
+    writeEvent(db, { task_id: accepted.task_id, source: "director", type: "intent_accepted", payload: { intent_id: id, brief_regenerated: true } });
     broadcastTask(db, getTask(db, accepted.task_id));
   }
+  queueIntentWriteBack(db, accepted);
   broadcast({ type: "intent", intent: accepted });
   return json(accepted);
+}
+
+// `hive intent new` (HIVE-637): draft an intent with no task attached, either
+// from a Jira ticket hive already mirrors or from text the director wrote.
+//
+// The Jira side reads the MIRROR row and its imported comments, never Jira
+// itself: the mirror is already kept in step every cycle, so this needs no
+// credentials and gives the same draft the import path would have given.
+async function draftIntent(db: DB, body: any, deps: HandlerDeps = {}): Promise<Response> {
+  const projectId = String(body?.project_id ?? "");
+  if (!projectId) return err("project_id is required. List projects: curl -s $HIVE_URL/api/projects");
+  const project: any = db.query("SELECT id, repo_path FROM projects WHERE id = ?").get(projectId);
+  if (!project) return noProject(projectId, 400);
+  const key = String(body?.from_jira ?? "").trim();
+  const text = String(body?.text ?? "").trim();
+  if (!key === !text) return err('give exactly one of from_jira or text: hive intent new --project <id> --from-jira WEB-101 | --text intent.md', 400);
+
+  let src: IntentSourceText;
+  let source = "director";
+  let sourceRef: string | null = null;
+  if (key) {
+    const mirror = db
+      .query("SELECT id, title, brief FROM tasks WHERE project_id = ? AND jira_key = ? AND jira_link_kind = 'mirror' LIMIT 1")
+      .get(projectId, key) as { id: string; title: string; brief: string | null } | undefined;
+    if (!mirror) return err(`hive has no mirror for ${key} in project ${projectId}. Import it first: hive jira sync`, 404);
+    src = { title: mirror.title, description: mirror.brief ?? "", comments: jiraCommentsOf(db, mirror.id) };
+    source = "jira";
+    sourceRef = key;
+  } else {
+    // Text that is already an intent is recorded as written — a director who
+    // wrote the five headings does not need a model to rewrite them.
+    if (!intentBodyError(text)) {
+      const intent = insertIntent(db, { project_id: projectId, source, body_md: text, author: "director" });
+      broadcast({ type: "intent", intent });
+      return json(intent, 201);
+    }
+    src = { title: "", description: text, comments: [] };
+  }
+
+  const draft = await draftIntentBody(db, src, { model: deps.intentExec, repoPath: project.repo_path });
+  const intent = insertIntent(db, {
+    project_id: projectId,
+    source,
+    source_ref: sourceRef,
+    body_md: draft.body_md,
+    author: "director",
+  });
+  broadcast({ type: "intent", intent });
+  return json(intent, 201);
+}
+
+// The human comments imported onto a Jira mirror, oldest first. Hive's own
+// outbound comments are not in here: they are written with direction=outbound.
+export function jiraCommentsOf(db: DB, mirrorTaskId: string): { author: string; text: string }[] {
+  return (
+    db
+      .query(
+        `SELECT payload FROM events WHERE task_id = ? AND type = 'jira_comment'
+           AND json_extract(payload, '$.direction') = 'inbound' ORDER BY ts, id`
+      )
+      .all(mirrorTaskId) as { payload: string }[]
+  ).flatMap((row) => {
+    try {
+      const p = JSON.parse(row.payload);
+      return p?.text ? [{ author: String(p.author ?? "Jira"), text: String(p.text) }] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+// Say back to Jira what hive accepted (HIVE-637). ONE comment on the ticket,
+// through the ordinary outbound path (an outbound `jira_comment` event on the
+// mirror, which the next sync cycle posts), so it inherits that path's delivery
+// receipts and its idempotency.
+//
+// Only when config.jira.write is true: in shadow mode hive says nothing on a
+// ticket at all. Hive still never sets a Jira status to Done.
+function queueIntentWriteBack(db: DB, intent: Intent): void {
+  if (intent.source !== "jira" || !intent.source_ref) return;
+  const cfg = jiraConfigFor(db, intent.project_id);
+  if (!cfg?.enabled || !cfg.write) return;
+  const mirror = db
+    .query("SELECT id FROM tasks WHERE project_id = ? AND jira_key = ? AND jira_link_kind = 'mirror' LIMIT 1")
+    .get(intent.project_id, intent.source_ref) as { id: string } | undefined;
+  if (!mirror) return;
+  const already = db
+    .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'jira_comment' AND json_extract(payload, '$.intent_id') = ? LIMIT 1")
+    .get(mirror.id, intent.id);
+  if (already) return;
+  // The intent body is drafted in the ticket's own language, so quoting its two
+  // decision sections keeps the comment in that language without translating.
+  const text = [
+    `Hive accepted the intent record for ${intent.source_ref}. Work starts from this.`,
+    "",
+    `## ${INTENT_SECTIONS[1]}`,
+    intentSection(intent.body_md, INTENT_SECTIONS[1]) || "(not stated)",
+    "",
+    `## ${INTENT_SECTIONS[3]}`,
+    intentSection(intent.body_md, INTENT_SECTIONS[3]) || "(not stated)",
+  ].join("\n");
+  writeEvent(db, {
+    task_id: mirror.id,
+    source: "director",
+    type: "jira_comment",
+    payload: { direction: "outbound", intent_id: intent.id, text },
+  });
 }
 
 // The ask changed. The old row keeps its history and its acceptance; the task
@@ -6832,11 +6965,8 @@ function supersedeIntent(db: DB, id: string, body: any): Response {
   const replacement = getIntent(db, byId);
   if (!replacement) return err(`replacement intent not found: ${byId}`, 400);
   if (intent.status === "superseded") return err(`intent ${id} is already superseded`, 409);
-  const t = now();
-  db.query("UPDATE intents SET status = 'superseded', updated_at = ? WHERE id = ?").run(t, id);
+  supersedeIntentRow(db, id, byId, { moveTask: true });
   if (intent.task_id) {
-    linkIntentTask(db, byId, intent.task_id);
-    db.query("UPDATE intents SET task_id = NULL, updated_at = ? WHERE id = ?").run(t, id);
     writeEvent(db, { task_id: intent.task_id, source: "director", type: "intent_superseded", payload: { intent_id: id, by: byId } });
     broadcastTask(db, getTask(db, intent.task_id));
   }

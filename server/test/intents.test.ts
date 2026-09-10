@@ -13,6 +13,8 @@ const { makeHandler } = await import("../src/api.ts");
 const { dispatchOnce } = await import("../src/dispatcher.ts");
 const { getTask } = await import("../src/state.ts");
 const { intentFileFor, intentSlug, openQuestions, intentSection, intentBodyError, addOpenQuestion } = await import("../src/intents.ts");
+const { briefFromIntent, extractSections, fallbackBody, renderIntentBody } = await import("../src/intentDraft.ts");
+const { composeBrief } = await import("../src/briefs.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -180,4 +182,111 @@ test("only an accepted intent is written into the worktree", async () => {
   // A Jira-keyed task files under the key everyone else uses.
   db.query("UPDATE tasks SET jira_key = 'WEB-101' WHERE id = ?").run(task.json.id);
   expect(intentFileFor(db, getTask(db, task.json.id))!.path).toBe("intent/WEB-101.md");
+});
+
+// ============================================================================
+// INTAKE AND BRIEF GENERATION (HIVE-637)
+// ============================================================================
+
+test("the director's own brief is recorded and accepted in one step, with no extra tap", async () => {
+  const { db, handler, projectId } = fresh();
+  const task = await call(handler, "POST", "/api/tasks", {
+    project_id: projectId,
+    title: "fix the search box",
+    brief: "Search returns nothing for two-word queries. Make it match both words.",
+  });
+  expect(task.status).toBe(201);
+  const intent = (await call(handler, "GET", `/api/intents/${task.json.intent_id}`)).json;
+  expect(intent.source).toBe("director");
+  expect(intent.status).toBe("accepted");
+  expect(intent.task_id).toBe(task.json.id);
+  // Their words, kept as written, and nothing left to answer.
+  expect(intentSection(intent.body_md, "Problem")).toContain("two-word queries");
+  expect(openQuestions(intent.body_md)).toEqual([]);
+  expect(getTask(db, task.json.id).brief).toBe("Search returns nothing for two-word queries. Make it match both words.");
+
+  // And it dispatches straight away: an accepted intent holds nothing.
+  const { herdr, spawns } = stubHerdr();
+  await dispatchOnce(db, { herdr });
+  expect(spawns.length).toBe(1);
+  expect(getTask(db, task.json.id).state).toBe("in_progress");
+});
+
+test("an agent's follow-up task is not recorded as the director's ask", async () => {
+  const { handler, projectId } = fresh();
+  const task = await call(handler, "POST", "/api/tasks", {
+    project_id: projectId, title: "follow-up", brief: "the parent left this behind", source: "agent",
+  });
+  expect(task.json.intent_id).toBeNull();
+});
+
+test("hive intent new --text: five headings are kept verbatim, anything else is drafted", async () => {
+  const { db, handler, projectId } = fresh();
+  const verbatim = await call(handler, "POST", "/api/intents/draft", { project_id: projectId, text: BODY });
+  expect(verbatim.status).toBe(201);
+  expect(verbatim.json.body_md).toBe(BODY.trim());
+  expect(verbatim.json.status).toBe("draft");
+  expect(verbatim.json.task_id).toBeNull();
+
+  // Text that is not already an intent goes through the drafter, stubbed here
+  // so the test never spawns a model.
+  const drafting = makeHandler(db, {
+    intentExec: async () => ({
+      code: 0,
+      stdout: JSON.stringify({ problem: "p", proposed_outcome: "o", affected: "a", constraints: "c", open_questions: ["q?"] }),
+      stderr: "",
+    }),
+  });
+  const drafted = await call(drafting, "POST", "/api/intents/draft", { project_id: projectId, text: "the search box is broken" });
+  expect(intentBodyError(drafted.json.body_md)).toBeNull();
+  expect(intentSection(drafted.json.body_md, "Proposed outcome")).toBe("o");
+  expect(openQuestions(drafted.json.body_md)).toEqual(["q?"]);
+
+  // Neither form is allowed to be ambiguous about where the text came from.
+  expect((await call(handler, "POST", "/api/intents/draft", { project_id: projectId })).status).toBe(400);
+  expect(
+    (await call(handler, "POST", "/api/intents/draft", { project_id: projectId, text: "x", from_jira: "WEB-1" })).status
+  ).toBe(400);
+});
+
+test("the generated brief carries every section of the accepted record, plus its footer", () => {
+  const intent: any = {
+    id: "int_1", accepted_by: "david", accepted_at: "2026-09-09T10:00:00.000Z",
+    body_md: renderIntentBody({
+      problem: "Checkout fails for card payments.",
+      proposed_outcome: "Card payments go through.",
+      affected: "server/src/payments.ts",
+      constraints: "Do not touch refunds.",
+      open_questions: [],
+    }),
+  };
+  const brief = briefFromIntent(intent);
+  expect(brief).toContain("## Source\nCheckout fails for card payments.");
+  expect(brief).toContain("## Deliverable\nCard payments go through.");
+  expect(brief).toContain("## Constraints (hard limits)\nDo not touch refunds.");
+  expect(brief).toContain("## Check that must pass\nShow this working for real: Card payments go through.");
+  expect(brief).toContain("## Read these paths first\nserver/src/payments.ts");
+  expect(brief.trim().endsWith("intent: int_1 accepted by david at 2026-09-09T10:00:00.000Z")).toBe(true);
+});
+
+test("the agent is told to read the accepted record first, and only once it exists", async () => {
+  const { db, handler, projectId } = fresh();
+  const draft = await call(handler, "POST", "/api/intents", { project_id: projectId, source: "director", body_md: BODY });
+  const task = await call(handler, "POST", "/api/tasks", { project_id: projectId, title: "do the thing", intent_id: draft.json.id });
+  expect(composeBrief(db, task.json.id)).not.toContain("The accepted ask");
+
+  await call(handler, "POST", `/api/intents/${draft.json.id}/accept`, {});
+  const prompt = composeBrief(db, task.json.id);
+  expect(prompt).toContain(`intent/hive-${getTask(db, task.json.id).number}.md`);
+  expect(prompt).toContain("`## Constraints` are HARD LIMITS");
+});
+
+test("a model that answers with nothing still yields a usable record", async () => {
+  const empty = extractSections('{"problem":"","proposed_outcome":""}');
+  expect(empty).toBeNull(); // nothing to map: the caller falls back to the raw text
+  const noQuestions = extractSections('{"problem":"p","proposed_outcome":"o","open_questions":[]}')!;
+  // A draft always asks something, so acceptance is always a deliberate act.
+  expect(noQuestions.open_questions.length).toBe(1);
+  expect(openQuestions(fallbackBody({ title: "t", description: "d", comments: [] })).length).toBe(1);
+  expect(intentSection(fallbackBody({ title: "t", description: "d", comments: [] }), "Problem")).toContain("d");
 });
