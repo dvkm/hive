@@ -16,7 +16,7 @@ import { writeEvent, getTask } from "./state.ts";
 import { broadcast } from "./bus.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectComparisonBase, mapLimit } from "./exec.ts";
-import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { claudeBin, defaultPlannerExec, parseModelJson, type PlannerExec } from "./planner.ts";
 import { modelFailure, modelErrorText, noteModelCall, isAuthFailure } from "./modelCall.ts";
 import { enqueue } from "./notifications.ts";
 import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
@@ -61,7 +61,7 @@ export interface AutoReview {
 // Loose-parse the model output: whole JSON, the `claude -p --output-format
 // json` {result:"..."} envelope, or a braces slice of prose.
 export function extractReview(raw: string): AutoReview | null {
-  const norm = (o: any): AutoReview | null => {
+  return parseModelJson(raw, (o: any): AutoReview | null => {
     if (!o || typeof o.summary !== "string" || !o.summary.trim()) return null;
     return {
       verdict: o.verdict === "caution" ? "caution" : "looks_good",
@@ -69,26 +69,7 @@ export function extractReview(raw: string): AutoReview | null {
       risks: Array.isArray(o.risks) ? o.risks.map(String) : [],
       questions: Array.isArray(o.questions) ? o.questions.map(String) : [],
     };
-  };
-  const tryParse = (s: string) => {
-    try {
-      return norm(JSON.parse(s));
-    } catch {
-      return null;
-    }
-  };
-  const braces = (s: string) => {
-    const a = s.indexOf("{");
-    const b = s.lastIndexOf("}");
-    return a >= 0 && b > a ? tryParse(s.slice(a, b + 1)) : null;
-  };
-  const whole = tryParse(raw);
-  if (whole) return whole;
-  try {
-    const env = JSON.parse(raw);
-    if (env && typeof env.result === "string") return tryParse(env.result) ?? braces(env.result);
-  } catch {}
-  return braces(raw);
+  });
 }
 
 async function rawDiff(db: DB, task: any, exec: Exec): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
@@ -591,33 +572,8 @@ export interface QuestionVerdict {
   answer: string;
 }
 
-// Same loose parsing as extractReview: whole JSON, the `--output-format json`
-// {result:"..."} envelope, or a braces slice of prose. `norm` decides what
-// shape counts, so a parse that yields the wrong shape keeps falling through.
-function looseParse<T>(raw: string, norm: (o: any) => T | null): T | null {
-  const tryParse = (s: string) => {
-    try {
-      return norm(JSON.parse(s));
-    } catch {
-      return null;
-    }
-  };
-  const braces = (s: string) => {
-    const a = s.indexOf("{");
-    const b = s.lastIndexOf("}");
-    return a >= 0 && b > a ? tryParse(s.slice(a, b + 1)) : null;
-  };
-  const whole = tryParse(raw);
-  if (whole) return whole;
-  try {
-    const env = JSON.parse(raw);
-    if (env && typeof env.result === "string") return tryParse(env.result) ?? braces(env.result);
-  } catch {}
-  return braces(raw);
-}
-
 export function extractVerdict(raw: string): { verdict: "confirmed" | "refuted"; why: string; evidence_path?: string } | null {
-  return looseParse(raw, (o: any) => {
+  return parseModelJson(raw, (o: any) => {
     if (!o || (o.verdict !== "confirmed" && o.verdict !== "refuted")) return null;
     const out: any = { verdict: o.verdict, why: String(o.why ?? "").trim().slice(0, 300) };
     if (typeof o.evidence_path === "string" && o.evidence_path.trim()) out.evidence_path = o.evidence_path.trim();
@@ -626,7 +582,7 @@ export function extractVerdict(raw: string): { verdict: "confirmed" | "refuted";
 }
 
 export function extractAnswer(raw: string): { answerable: "machine" | "human"; answer: string } | null {
-  return looseParse(raw, (o: any) => {
+  return parseModelJson(raw, (o: any) => {
     if (!o || (o.answerable !== "machine" && o.answerable !== "human")) return null;
     return { answerable: o.answerable, answer: String(o.answer ?? "").trim().slice(0, 300) };
   });

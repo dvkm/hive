@@ -201,38 +201,36 @@ Rules:
 
 // ------------------------------------------------------------------ parse
 // Defensive extraction: the model (or the claude wrapper) may wrap our JSON in
-// an envelope or stray prose. Try progressively looser strategies; return null
-// if nothing yields a valid plan (→ the caller records a single planner_error).
-export function extractPlan(raw: string): Plan | null {
+// an envelope or stray prose. Try progressively looser strategies: the whole
+// string, the `claude -p --output-format json` {result:"..."} envelope, then
+// a first-'{'-to-last-'}' slice for prose-wrapped JSON. Shared by planner,
+// reviewer, and drift — each supplies its own normalizer for its own shape.
+export function parseModelJson<T>(raw: string, normalize: (o: any) => T | null): T | null {
+  const tryParse = (s: string): T | null => {
+    try {
+      return normalize(JSON.parse(s));
+    } catch {
+      return null;
+    }
+  };
+  const braces = (s: string): T | null => {
+    const i = s.indexOf("{");
+    const j = s.lastIndexOf("}");
+    return i >= 0 && j > i ? tryParse(s.slice(i, j + 1)) : null;
+  };
   const whole = tryParse(raw);
   if (whole) return whole;
-  // claude -p --output-format json wraps the assistant text in {result: "..."}.
   try {
     const env = JSON.parse(raw);
-    if (env && typeof env.result === "string") {
-      const inner = tryParse(env.result) ?? braces(env.result);
-      if (inner) return inner;
-    }
+    if (env && typeof env.result === "string") return tryParse(env.result) ?? braces(env.result);
   } catch {
     /* not an envelope */
   }
   return braces(raw);
 }
 
-function tryParse(s: string): Plan | null {
-  try {
-    return normalize(JSON.parse(s));
-  } catch {
-    return null;
-  }
-}
-
-// First '{' to last '}' — the loosest fallback for prose-wrapped JSON.
-function braces(s: string): Plan | null {
-  const i = s.indexOf("{");
-  const j = s.lastIndexOf("}");
-  if (i < 0 || j <= i) return null;
-  return tryParse(s.slice(i, j + 1));
+export function extractPlan(raw: string): Plan | null {
+  return parseModelJson(raw, normalize);
 }
 
 function normalize(o: any): Plan | null {

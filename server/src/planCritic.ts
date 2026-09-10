@@ -14,7 +14,7 @@
 // many hours, so away-mode does not strand an agent forever.
 import type { DB } from "./db.ts";
 import { writeEvent } from "./state.ts";
-import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { claudeBin, defaultPlannerExec, parseModelJson, type PlannerExec } from "./planner.ts";
 import { modelFailure, noteModelCall } from "./modelCall.ts";
 import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 
@@ -111,11 +111,10 @@ export function buildCriticPrompt(task: any, plan: Plan): string {
   ].join("\n");
 }
 
-// Defensive extraction, same ladder as the planner: whole body, then the
-// `claude -p --output-format json` {result: "..."} envelope, then first-brace to
-// last-brace for prose-wrapped JSON. Anything unparseable means no concerns.
+// Loose-parse the model output: whole JSON, the `claude -p --output-format
+// json` {result:"..."} envelope, or a braces slice of prose.
 export function extractConcerns(raw: string): Concern[] | null {
-  const normalize = (o: any): Concern[] | null => {
+  return parseModelJson(raw, (o: any): Concern[] | null => {
     if (!o || !Array.isArray(o.concerns)) return null;
     return o.concerns
       .filter((c: any) => c && typeof c.text === "string" && c.text.trim())
@@ -123,31 +122,7 @@ export function extractConcerns(raw: string): Concern[] | null {
         severity: c.severity === "veto" ? "veto" : "note",
         text: String(c.text).trim(),
       }));
-  };
-  const tryParse = (s: string): Concern[] | null => {
-    try {
-      return normalize(JSON.parse(s));
-    } catch {
-      return null;
-    }
-  };
-  const braces = (s: string): Concern[] | null => {
-    const i = s.indexOf("{");
-    const j = s.lastIndexOf("}");
-    return i < 0 || j <= i ? null : tryParse(s.slice(i, j + 1));
-  };
-  const whole = tryParse(raw);
-  if (whole) return whole;
-  try {
-    const env = JSON.parse(raw);
-    if (env && typeof env.result === "string") {
-      const inner = tryParse(env.result) ?? braces(env.result);
-      if (inner) return inner;
-    }
-  } catch {
-    /* not an envelope */
-  }
-  return braces(raw);
+  });
 }
 
 // Run the critic and attach its verdict. Never throws: a critic that fails logs

@@ -49,7 +49,7 @@ import { queueSteerEvent } from "./steer.ts";
 import { createDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectComparisonBase } from "./exec.ts";
-import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { claudeBin, defaultPlannerExec, parseModelJson, type PlannerExec } from "./planner.ts";
 import { modelFailure, noteModelCall } from "./modelCall.ts";
 import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
@@ -99,37 +99,15 @@ export interface Direction {
 
 // Loose-parse the model output: whole JSON, the `claude -p --output-format
 // json` {result:"..."} envelope, or a braces slice of prose.
-// ponytail: a third near-copy of the same envelope handling (planner.extractPlan,
-// reviewer.extractReview). Converging all three is filed as a follow-up rather
-// than done here — rewriting two working parsers is not this task's scope.
 export function extractDrift(raw: string): DriftVerdict | null {
-  const norm = (o: any): DriftVerdict | null => {
+  return parseModelJson(raw, (o: any): DriftVerdict | null => {
     if (!o || typeof o.drifting !== "boolean") return null;
     return {
       drifting: o.drifting,
       beyond: Array.isArray(o.beyond) ? o.beyond.map(String).filter(Boolean) : [],
       why: typeof o.why === "string" ? o.why.trim() : "",
     };
-  };
-  const tryParse = (s: string) => {
-    try {
-      return norm(JSON.parse(s));
-    } catch {
-      return null;
-    }
-  };
-  const braces = (s: string) => {
-    const a = s.indexOf("{");
-    const b = s.lastIndexOf("}");
-    return a >= 0 && b > a ? tryParse(s.slice(a, b + 1)) : null;
-  };
-  const whole = tryParse(raw);
-  if (whole) return whole;
-  try {
-    const env = JSON.parse(raw);
-    if (env && typeof env.result === "string") return tryParse(env.result) ?? braces(env.result);
-  } catch {}
-  return braces(raw);
+  });
 }
 
 // What the branch has accumulated so far, measured from the main checkout (a
