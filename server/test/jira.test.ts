@@ -4940,3 +4940,43 @@ test("an issue with nothing moved on either side is skipped until the sweep", as
   expect([issueReads("WEB-1"), issueReads("WEB-2")]).toEqual([before[0] + 1, before[1] + 1]);
   expect(Date.parse(seen().sweep_at)).toBeGreaterThan(Date.now() - 5_000);
 });
+
+test("a budget-truncated sweep finishes next tick without re-reading what it covered", async () => {
+  const done = { status: "Done", history: [{ at: "2026-01-02T00:00:00.000Z", to: "Done" }] };
+  const issues = ["WEB-1", "WEB-2", "WEB-3", "WEB-4"].map((key, i) => ({ key, id: String(i + 1), ...done }));
+  const jira = fakeJira({ issues });
+  const { db, projectId } = freshDb();
+  const issueReads = (key: string) =>
+    jira.calls.filter((c) => c.method === "GET" && c.path.startsWith(`/rest/api/3/issue/${key}?`)).length;
+  const seenRow = () =>
+    JSON.parse((db.query("SELECT cursor FROM intake_cursors WHERE source = 'jira-seen' AND key = ?").get(projectId) as { cursor: string }).cursor);
+
+  await run(db, projectId, jira.fetchImpl);
+  expect(Object.keys(seenRow().seen).sort()).toEqual(["WEB-1", "WEB-2", "WEB-3", "WEB-4"]);
+
+  // Sweep due, and WEB-3's issue GET hangs until the budget aborts it, so the
+  // cycle covers WEB-1 and WEB-2, fails WEB-3, and defers WEB-4.
+  db.query("UPDATE intake_cursors SET cursor = ? WHERE source = 'jira-seen' AND key = ?").run(
+    JSON.stringify({ ...seenRow(), sweep_at: new Date(Date.now() - 11 * 60_000).toISOString() }), projectId
+  );
+  const hangWeb3 = (async (url: string, init: RequestInit = {}) => {
+    if (String(url).includes("/rest/api/3/issue/WEB-3?"))
+      return await new Promise<Response>((_resolve, reject) => {
+        if (init.signal?.aborted) return reject(new Error("aborted"));
+        init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    return jira.fetchImpl(url, init);
+  }) as unknown as typeof fetch;
+  const truncated = await run(db, projectId, hangWeb3, CFG, { budgetMs: 300, log: () => {} });
+  expect(truncated.errors).toBe(1);
+  expect(truncated.budget_skipped).toBe(1);
+  expect(Object.keys(seenRow().seen).sort()).toEqual(["WEB-1", "WEB-2"]);
+  expect(Date.parse(seenRow().sweep_at)).toBeGreaterThan(Date.now() - 5_000);
+
+  // Next tick: only the failed and the deferred issue are read.
+  const before = [1, 2, 3, 4].map((i) => issueReads(`WEB-${i}`));
+  const resumed = await run(db, projectId, jira.fetchImpl);
+  expect(resumed.unchanged).toBe(2);
+  expect([1, 2, 3, 4].map((i) => issueReads(`WEB-${i}`) - before[i - 1])).toEqual([0, 0, 1, 1]);
+  expect(Object.keys(seenRow().seen).sort()).toEqual(["WEB-1", "WEB-2", "WEB-3", "WEB-4"]);
+});

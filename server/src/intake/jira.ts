@@ -3116,14 +3116,16 @@ export async function syncProjectOnce(
     const p = pendingOutbound(db, taskId);
     return p.comments > 0 || p.receipts > 0 || p.unknown.length > 0;
   };
-  let truncated = false;
-
   for (const [index, key] of keys.entries()) {
     if (Date.now() >= deadline) {
       // Out of budget: stop here, record what was left, and let the NEXT tick
       // start on time rather than being dropped by the single-flight guard.
       ctx.stats.budget_skipped = keys.length - index;
-      truncated = true;
+      // The deferred keys lose their stamps, so the next tick reads exactly
+      // them and still skips everything this cycle already covered. Without
+      // this a sweep that overran by one slow request re-read the whole
+      // project again next tick, and again, until one fitted the budget.
+      for (const deferred of keys.slice(index)) delete seenState.seen[deferred];
       resumeKeys.set(projectId, key); // pick this one up first next cycle
       cycleResumeKeys.set(db as object, resumeKeys);
       log(
@@ -3275,9 +3277,9 @@ export async function syncProjectOnce(
     }
   }
 
-  // A sweep only counts once it covered every key; a truncated one resumes
-  // next tick, still due.
-  if (sweepDue && !truncated) seenState.sweep_at = now();
+  // A truncated sweep still counts: its deferred keys carry no stamp, so the
+  // next tick finishes it without re-reading what this one covered.
+  if (sweepDue) seenState.sweep_at = now();
   writeSeen(db, projectId, seenState);
   return ctx.stats;
 }
