@@ -5104,7 +5104,7 @@ test("accepting the draft regenerates the brief from it and says so once on the 
   expect(after.brief).toContain("## Read these paths first\nShoppers, the checkout page, the payments service.");
   expect(after.brief.trim().endsWith(`intent: ${draft.id} accepted by david at ${accepted.accepted_at}`)).toBe(true);
   // Nothing holds the task now.
-  expect(J_INTENTS.intentNotAccepted(db, db.query("SELECT * FROM tasks WHERE id = ?").get(work.id))).toBe(false);
+  expect(J_INTENTS.intentNotAccepted(db, db.query("SELECT * FROM tasks WHERE id = ?").get(work.id) as any)).toBe(false);
 
   // One comment back on the ticket, in the ticket's own words, and only one.
   await run(db, projectId, jira.fetchImpl, AUTO);
