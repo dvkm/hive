@@ -7,7 +7,7 @@ const HOME = mkdtempSync(join(tmpdir(), "hive-review-"));
 process.env.HIVE_HOME = HOME;
 
 const { openDb } = await import("../src/db.ts");
-const { makeHandler, repairDuplicateQuizPasses, deferShippedQuizzes } = await import("../src/api.ts");
+const { makeHandler, repairDuplicateQuizPasses, deferShippedQuizzes, QUIZ_WORDING_STEER } = await import("../src/api.ts");
 const { reconcileOnce, conflictNudgeMessage } = await import("../src/reconciler.ts");
 const { queueSteerEvent, queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers } = await import("../src/steer.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
@@ -551,6 +551,75 @@ test("startup repair also carries a pass across a merge-conflict bounce", async 
 
   expect(repairDuplicateQuizPasses(s.db)).toBe(1);
   expect(JSON.parse((passedFor(s.db, taskId, "evt_after_conflict") as any).payload).carried_from_review_event_id).toBe(original.id);
+});
+
+// HIVE-635: the same bug through hive's other self-authored bounce. A review
+// with over-long quiz wording earns a steer; that steer lands as a system
+// changes_requested, which used to send the passed quiz back to "required".
+const LONG_QUIZ = {
+  question:
+    "What makes this change safe to approve, considering that " +
+    "the focused tests cover the changed behavior end to end, ".repeat(8),
+  options: [{ key: "tests", label: "Its focused tests pass." }, { key: "hope", label: "It looks plausible." }],
+  answer_key: "tests",
+  explanation: "The focused tests cover the changed behavior.",
+};
+
+test("hive's own quiz-wording bounce keeps the pass, and never re-asks for the rewrite", async () => {
+  const s = makeApi();
+  const p = await post(s.handler, "/api/projects", { name: "p", repo_path: "/repo", config: { default_branch: "main" } });
+  const t = await post(s.handler, "/api/tasks", { project_id: p.json.id, title: "review me", brief: "b" });
+  const taskId = t.json.id;
+  await post(s.handler, `/api/tasks/${taskId}/spawn`, {});
+  await post(s.handler, `/api/tasks/${taskId}/events`, {
+    type: "review_summary",
+    done: ["implemented the change"],
+    understanding: { background: "This task changes behavior.", essence: "Tests cover the new behavior.", check: LONG_QUIZ },
+  });
+  // The wording steer is queued while the quiz is still ahead of the director.
+  expect(queuedSteers(s.db, taskId).map((x: any) => x.message)).toEqual([QUIZ_WORDING_STEER]);
+
+  await post(s.handler, `/api/tasks/${taskId}/transition`, { to: "in_review" });
+  await post(s.handler, `/api/tasks/${taskId}/understanding-quiz/answer`, { answer_key: "tests", source: "director" });
+  const headA: any = s.db
+    .query("SELECT id FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
+    .get(taskId);
+  expect(passedFor(s.db, taskId, headA.id)).toBeTruthy();
+
+  // The queued steer is delivered, which bounces the PR back to the agent.
+  const steers = queuedSteers(s.db, taskId);
+  markSteersDelivered(s.db, steers.map((x: any) => x.id), "respawn");
+  resumeReviewForDeliveredSteers(s.db, taskId, steers, "respawn");
+  expect(
+    s.db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'changes_requested' LIMIT 1").get(taskId)
+  ).toBeTruthy();
+
+  const reReview = await post(s.handler, `/api/tasks/${taskId}/events`, {
+    type: "review_summary",
+    done: ["kept the change, re-emitted the review"],
+    understanding: { background: "This task changes behavior.", essence: "Tests cover the new behavior.", check: LONG_QUIZ },
+  });
+  const headB = reReview.json.event.id;
+  expect(headB).not.toBe(headA.id);
+  const carried: any = passedFor(s.db, taskId, headB);
+  expect(carried).toBeTruthy();
+  expect(JSON.parse(carried.payload).carried_from_review_event_id).toBe(headA.id);
+  // No second steer: rewording a passed quiz would make it a new quiz.
+  expect(queuedSteers(s.db, taskId)).toEqual([]);
+  expect((await get(s.handler, "/api/understanding-quizzes")).json.quizzes.some((q: any) => q.task_id === taskId)).toBe(false);
+});
+
+test("a quiz-wording bounce carrying a human note still re-asks the quiz", async () => {
+  const s = makeApi();
+  const { taskId } = await inReviewTask(s.handler);
+  await bounceForConflict(s.db, taskId, `${QUIZ_WORDING_STEER}\n\nAlso: drop the debug logging while you are in there.`);
+
+  const reReview = await post(s.handler, `/api/tasks/${taskId}/events`, {
+    type: "review_summary",
+    done: ["shortened the quiz and dropped the logging"],
+    understanding: { background: "This task changes behavior.", essence: "Tests cover the new behavior.", check: QUIZ },
+  });
+  expect(passedFor(s.db, taskId, reReview.json.event.id)).toBeFalsy();
 });
 
 test("a wrong answer teaches the idea and rotates to another question", async () => {
