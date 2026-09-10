@@ -1032,6 +1032,13 @@ async function nudgeCiFailure(
 // stays reviewable (the merge button's own failure path bounces it if the
 // captain gets there first), and a delivered send flips the agent to `working`,
 // which keeps advanceFinished from churning states.
+// Exported so the quiz carry-over test asserts against the REAL wording: the
+// carry-over in api.ts recognises this bounce by its opening words (HIVE-634),
+// so a silent reword here must fail a test, not a director's evening.
+export function conflictNudgeMessage(prUrl: string, base: string): string {
+  return `hive: your PR ${prUrl} has merge conflicts with '${base}'. Fetch and merge the latest 'origin/${base}' into your branch (or rebase onto it), resolve the conflicts, rerun the tests, then push.`;
+}
+
 async function nudgeConflict(
   db: DB,
   h: Herdr,
@@ -1055,7 +1062,7 @@ async function nudgeConflict(
     base = projectBaseBranch(JSON.parse(project?.config ?? "{}"));
   } catch {}
 
-  const msg = `hive: your PR ${t.pr_url} has merge conflicts with '${base}'. Fetch and merge the latest 'origin/${base}' into your branch (or rebase onto it), resolve the conflicts, rerun the tests, then push.`;
+  const msg = conflictNudgeMessage(t.pr_url, base);
   let delivered = false;
   let error: string | null = null;
   if (t.agent_target) {
