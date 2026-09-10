@@ -777,6 +777,33 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       `CREATE INDEX idx_recall_log_project_ts ON recall_log(project_id, ts)`,
     ],
   },
+  // HIVE-636: the intent record — what was asked, and what the director
+  // accepted. body_md carries the playbook's five headings (see intents.ts).
+  // task_id has NO foreign key on purpose: an intent is drafted BEFORE the work
+  // task exists, and a cancelled task must not take the record of the ask with
+  // it. tasks.intent_id is the link the dispatcher's acceptance gate reads.
+  {
+    name: "v47-intents",
+    statements: [
+      `CREATE TABLE intents (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        task_id TEXT,
+        source TEXT NOT NULL,
+        source_ref TEXT,
+        status TEXT NOT NULL DEFAULT 'draft',
+        body_md TEXT NOT NULL,
+        author TEXT,
+        accepted_by TEXT,
+        accepted_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE INDEX idx_intents_project ON intents(project_id, status)`,
+      `ALTER TABLE tasks ADD COLUMN intent_id TEXT`,
+      `CREATE INDEX idx_tasks_intent ON tasks(intent_id) WHERE intent_id IS NOT NULL`,
+    ],
+  },
 ];
 
 // -------------------------------------------------------------- settings

@@ -58,6 +58,14 @@ import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable, HerdrErr
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
 import { seedWorktree, type SeedResult } from "./worktreeSeed.ts";
+import {
+  INTENT_SOURCES,
+  getIntent,
+  intentBodyError,
+  intentFileFor,
+  openQuestions,
+  type Intent,
+} from "./intents.ts";
 import { takeOver, handBack, TakeoverError } from "./takeover.ts";
 import { figmaTokenEnv, resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { teamclaudeEnv, teamclaudeOverlay, usesTeamclaude } from "./teamclaude.ts";
@@ -940,6 +948,24 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       // ---- incidents ----
       if (pathname === "/api/incidents" && method === "GET") return listIncidents(db, url);
+
+      // ---- intents (what was asked, and what was accepted) ----
+      if (pathname === "/api/intents") {
+        if (method === "GET") return listIntents(db, url);
+        if (method === "POST") return createIntent(db, await req.json());
+      }
+      m = pathname.match(/^\/api\/intents\/([^/]+)$/);
+      if (m) {
+        if (method === "GET") {
+          const r = getIntent(db, m[1]);
+          return r ? json(r) : err(`intent not found: ${m[1]}`, 404);
+        }
+        if (method === "PUT") return updateIntent(db, m[1], await req.json());
+      }
+      m = pathname.match(/^\/api\/intents\/([^/]+)\/accept$/);
+      if (m && method === "POST") return acceptIntent(db, m[1], await req.json().catch(() => ({})));
+      m = pathname.match(/^\/api\/intents\/([^/]+)\/supersede$/);
+      if (m && method === "POST") return supersedeIntent(db, m[1], await req.json().catch(() => ({})));
 
       // ---- learnings (regression ledger) ----
       if (pathname === "/api/learnings") {
@@ -2393,6 +2419,14 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
     return err(TRACKING_ONLY_OWNERSHIP_ERROR, 409);
   const deps = parseDeps(db, body.depends_on);
   if (deps instanceof Response) return deps;
+  // HIVE-636: the accepted ask this work implements. A draft intent holds the
+  // task in `queued` (dispatcher.ts) until the director accepts it.
+  const intentId = body.intent_id ? String(body.intent_id) : null;
+  if (intentId) {
+    const intent = getIntent(db, intentId);
+    if (!intent) return err(`intent_id ${intentId} not found. List them: curl -s "$HIVE_URL/api/intents?project_id=${String(body.project_id)}"`, 400);
+    if (intent.project_id !== body.project_id) return err(`intent ${intentId} belongs to project ${intent.project_id}, not ${String(body.project_id)}`, 400);
+  }
   const verifyCmds = body.verification_cmds !== undefined ? parseVerificationCmds(body.verification_cmds) : null;
   if (verifyCmds instanceof Response) return verifyCmds;
   // Priority, most specific wins: an explicit value, then the parent's (a
@@ -2466,19 +2500,22 @@ async function createTask(db: DB, req: Request, handlerDeps: HandlerDeps = {}): 
     verification_cmds: verifyCmds ? JSON.stringify(verifyCmds) : null,
     priority,
     jira_mirror_task_id: mirrorTaskId,
+    intent_id: intentId,
     created_at: t,
     updated_at: t,
   };
   db.query(
     `INSERT INTO tasks (id, project_id, title, brief, state, kind, agent_target,
-      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, priority, jira_mirror_task_id, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      worktree_path, branch, pr_url, ci_status, summary, source, parent_task_id, depends_on, verification_cmds, priority, jira_mirror_task_id, intent_id, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.project_id, row.title, row.brief, row.state, row.kind,
     row.agent_target, row.worktree_path, row.branch, row.pr_url, row.ci_status,
     row.summary, row.source, row.parent_task_id, row.depends_on, row.verification_cmds,
-    row.priority, row.jira_mirror_task_id, row.created_at, row.updated_at
+    row.priority, row.jira_mirror_task_id, row.intent_id, row.created_at, row.updated_at
   );
+  // The intent names the task it governs, so the record reads both ways.
+  if (intentId) db.query("UPDATE intents SET task_id = ?, updated_at = ? WHERE id = ?").run(row.id, t, intentId);
   writeEvent(db, {
     task_id: row.id,
     source: row.source === "agent" ? "agent" : "director",
@@ -4500,6 +4537,21 @@ export async function spawnAgent(
       // agents don't have to install deps / bring up their stack themselves.
       prepareWorktree: async (worktreePath) => {
         if (agent === "claude") writeHookSettings(worktreePath, id, hiveUrl, config.command_approval);
+        // HIVE-636: drop the accepted intent into the branch so it is versioned
+        // with the code the agent is about to write — the agent's first commit
+        // picks it up. Best-effort like the rest of prepareWorktree: a spawn is
+        // never failed over a record file.
+        const intentFile = intentFileFor(db, task);
+        if (intentFile) {
+          try {
+            const full = join(worktreePath, intentFile.path);
+            mkdirSync(dirname(full), { recursive: true });
+            writeFileSync(full, intentFile.body);
+            writeEvent(db, { task_id: id, source: "herdr", type: "intent_written", payload: { path: intentFile.path } });
+          } catch (e: any) {
+            console.error(`[hive] intent file ${id}:`, e);
+          }
+        }
         // HIVE-355: seed the untracked config a fresh checkout is missing and
         // clone the warm state (node_modules) BEFORE setup_argv, so the project's
         // own setup hook finds the work already done and no-ops. Best-effort by
@@ -6669,6 +6721,129 @@ function recallStats(db: DB, url: URL): Response {
       .slice(0, 20)
       .map(([q, count]) => ({ q, count })),
   });
+}
+
+// ---------------------------------------------------------------- intents
+// The record of what was asked and what the director accepted (HIVE-636).
+// Everything here is deterministic — no model call. Drafting an intent from
+// Jira or director text is deliverable 2, not this one.
+
+// Both ends of the intent↔task link, written together. A task may carry at most
+// one intent, and the intent names the task it governs.
+function linkIntentTask(db: DB, intentId: string, taskId: string | null): void {
+  db.query("UPDATE intents SET task_id = ?, updated_at = ? WHERE id = ?").run(taskId, now(), intentId);
+  if (taskId) db.query("UPDATE tasks SET intent_id = ?, updated_at = ? WHERE id = ?").run(intentId, now(), taskId);
+}
+
+function intentOr404(db: DB, id: string): Intent | Response {
+  return getIntent(db, id) ?? err(`intent not found: ${id}. List them: curl -s "$HIVE_URL/api/intents?project_id=<project-id>"`, 404);
+}
+
+function listIntents(db: DB, url: URL): Response {
+  const where: string[] = [];
+  const args: any[] = [];
+  for (const [param, column] of [["project_id", "project_id"], ["status", "status"], ["task_id", "task_id"]] as const) {
+    const value = url.searchParams.get(param);
+    if (value) { where.push(`${column} = ?`); args.push(value); }
+  }
+  return json(
+    db.query("SELECT * FROM intents" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY created_at DESC").all(...args)
+  );
+}
+
+function createIntent(db: DB, body: any): Response {
+  if (!body?.project_id) return err("project_id is required. List projects: curl -s $HIVE_URL/api/projects");
+  if (!db.query("SELECT 1 FROM projects WHERE id = ?").get(body.project_id)) return noProject(String(body.project_id), 400);
+  const source = String(body.source ?? "director");
+  if (!(INTENT_SOURCES as readonly string[]).includes(source))
+    return err(`invalid source: ${JSON.stringify(source)} (use ${INTENT_SOURCES.join(", ")})`, 400);
+  const bodyMd = String(body.body_md ?? "");
+  const bad = intentBodyError(bodyMd);
+  if (bad) return err(bad, 400);
+  const taskId = body.task_id ? String(body.task_id) : null;
+  if (taskId && !getTask(db, taskId)) return err(`task_id ${taskId} not found`, 400);
+  const t = now();
+  const id = newId("int");
+  db.query(
+    `INSERT INTO intents (id, project_id, task_id, source, source_ref, status, body_md, author, accepted_by, accepted_at, created_at, updated_at)
+     VALUES (?,?,?,?,?,'draft',?,?,NULL,NULL,?,?)`
+  ).run(id, String(body.project_id), null, source, body.source_ref ?? null, bodyMd, body.author ?? null, t, t);
+  if (taskId) linkIntentTask(db, id, taskId);
+  const intent = getIntent(db, id)!;
+  broadcast({ type: "intent", intent });
+  return json(intent, 201);
+}
+
+// Edits are drafts only. Changing the text of an intent someone already
+// accepted would rewrite what they agreed to — supersede it instead.
+function updateIntent(db: DB, id: string, body: any): Response {
+  const intent = intentOr404(db, id);
+  if (intent instanceof Response) return intent;
+  if (intent.status !== "draft")
+    return err(`intent ${id} is ${intent.status}, so its text is fixed. Draft a replacement and supersede this one: POST /api/intents/${id}/supersede {"by":"<new-intent-id>"}`, 409);
+  const bodyMd = body?.body_md === undefined ? intent.body_md : String(body.body_md);
+  const bad = intentBodyError(bodyMd);
+  if (bad) return err(bad, 400);
+  if (body?.task_id !== undefined) {
+    const taskId = body.task_id ? String(body.task_id) : null;
+    if (taskId && !getTask(db, taskId)) return err(`task_id ${taskId} not found`, 400);
+    linkIntentTask(db, id, taskId);
+  }
+  db.query("UPDATE intents SET body_md = ?, source_ref = ?, updated_at = ? WHERE id = ?")
+    .run(bodyMd, body?.source_ref !== undefined ? body.source_ref : intent.source_ref, now(), id);
+  const updated = getIntent(db, id)!;
+  broadcast({ type: "intent", intent: updated });
+  return json(updated);
+}
+
+// The acceptance gate. An unchecked bullet under "## Open questions" is a
+// question nobody answered, and accepting over it is how an ask quietly loses
+// the part that was uncertain — resolve it, or move it into Constraints.
+function acceptIntent(db: DB, id: string, body: any): Response {
+  const intent = intentOr404(db, id);
+  if (intent instanceof Response) return intent;
+  if (intent.status !== "draft") return err(`intent ${id} is already ${intent.status}`, 409);
+  const open = openQuestions(intent.body_md);
+  if (open.length)
+    return err(
+      `${open.length} open question${open.length === 1 ? "" : "s"} still unanswered: ${open.join("; ")}. Tick each one ("- [x] …") or move it under ## Constraints, then accept.`,
+      409
+    );
+  const t = now();
+  db.query("UPDATE intents SET status = 'accepted', accepted_by = ?, accepted_at = ?, updated_at = ? WHERE id = ?")
+    .run(String(body?.accepted_by ?? body?.source ?? "director"), t, t, id);
+  const accepted = getIntent(db, id)!;
+  if (accepted.task_id) {
+    writeEvent(db, { task_id: accepted.task_id, source: "director", type: "intent_accepted", payload: { intent_id: id } });
+    broadcastTask(db, getTask(db, accepted.task_id));
+  }
+  broadcast({ type: "intent", intent: accepted });
+  return json(accepted);
+}
+
+// The ask changed. The old row keeps its history and its acceptance; the task
+// moves to the replacement, so the dispatcher gate now reads the new one.
+function supersedeIntent(db: DB, id: string, body: any): Response {
+  const intent = intentOr404(db, id);
+  if (intent instanceof Response) return intent;
+  const byId = String(body?.by ?? "");
+  if (!byId) return err(`by is required: POST /api/intents/${id}/supersede {"by":"<replacement-intent-id>"}`, 400);
+  if (byId === id) return err("an intent cannot supersede itself", 400);
+  const replacement = getIntent(db, byId);
+  if (!replacement) return err(`replacement intent not found: ${byId}`, 400);
+  if (intent.status === "superseded") return err(`intent ${id} is already superseded`, 409);
+  const t = now();
+  db.query("UPDATE intents SET status = 'superseded', updated_at = ? WHERE id = ?").run(t, id);
+  if (intent.task_id) {
+    linkIntentTask(db, byId, intent.task_id);
+    db.query("UPDATE intents SET task_id = NULL, updated_at = ? WHERE id = ?").run(t, id);
+    writeEvent(db, { task_id: intent.task_id, source: "director", type: "intent_superseded", payload: { intent_id: id, by: byId } });
+    broadcastTask(db, getTask(db, intent.task_id));
+  }
+  const superseded = getIntent(db, id)!;
+  broadcast({ type: "intent", intent: superseded });
+  broadcast({ type: "intent", intent: getIntent(db, byId)! });
+  return json(superseded);
 }
 
 function listLearnings(db: DB, url: URL): Response {

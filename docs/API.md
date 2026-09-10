@@ -174,6 +174,7 @@ timeout — a failed hook never blocks spawn nor teardown.
   "resume_ghost_branch": null,
   "resume_pr_url": null,
   "depends_on": [],
+  "intent_id": null,
   "verification_cmds": null,
   "priority": "normal",
   "duplicate_of": null,
@@ -531,6 +532,43 @@ values.** Values live only in the provider (macOS Keychain / Bitwarden); the DB
 stores a reference, and the server redacts any known secret value from stored
 event/evidence payloads. Set values with `hive secret set` (reads from stdin).
 
+### Intent (what was asked, and what was accepted)
+```json
+{
+  "id": "int_...",
+  "project_id": "proj_...",
+  "task_id": "d3777d0432d8",
+  "source": "jira",
+  "source_ref": "jira:WEB-101",
+  "status": "draft",
+  "body_md": "## Problem\n...\n## Proposed outcome\n...",
+  "author": "director",
+  "accepted_by": null,
+  "accepted_at": null,
+  "created_at": "2026-09-07T09:00:00.000Z",
+  "updated_at": "2026-09-07T09:00:00.000Z"
+}
+```
+`source ∈ {jira, director, incident, agent}`, `status ∈ {draft, accepted, superseded}`.
+
+`body_md` is Markdown carrying EXACTLY these five headings, in this order — the
+server refuses anything else with a `400`:
+`## Problem`, `## Proposed outcome`, `## Affected users and systems`,
+`## Constraints`, `## Open questions`.
+
+A bullet under `## Open questions` counts as answered only when it carries a
+ticked checkbox (`- [x] ...`). While any bullet there is unticked, `/accept`
+refuses with `409`: resolve it, or move it under `## Constraints`.
+
+`tasks.intent_id` is the other end of the link. A task whose intent is still
+`draft` is not dispatched — the dispatcher skips it with `skip_reason`
+`intent_not_accepted`, exactly as it skips unmet `depends_on`. Tasks with no
+intent behave as before.
+
+On spawn, an accepted intent is written into the fresh worktree as
+`intent/<slug>.md` (`slug` = the Jira key when the task has one, else
+`hive-<task number>`), so the agent's first commit versions the ask with the code.
+
 ### Learning (regression ledger)
 ```json
 {
@@ -732,7 +770,7 @@ hive shells out to `gh`, and the browser only ever names a commit or a tag.
 
 ### Tasks
 - `GET /api/tasks?state=&project_id=&test=&compact=` → `200 [Task + {evidence_count, spawn_error, overlap_hold, needs_you_since}, ...]` (newest `updated_at` first; all filters optional). `needs_you_since` is the latest entry into `in_review` or `failed`, and stays fixed when CI or metadata updates the task. `overlap_hold` is `{number, files}` when a queued task is waiting because the dispatcher thinks it edits the same files as a task that is still running, and `null` otherwise (including once that task finishes). `compact=1` omits task briefs and empty/default properties for list/bootstrap clients, and is gzip-compressed when accepted; fetch `GET /api/tasks/:id` when full task data is needed. Tasks under a test/ephemeral project (`config.test === true`) are hidden by default; pass `?test=all` to include them.
-- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?, verification_cmds?, priority?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). The dispatcher and reconciler won't advance the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` marks a TRACKING-ONLY task: another agent using hive as its kanban. It is never auto-dispatched or staleness-supervised, is exempt from the done-evidence gate, and moves freely via transitions (`hive task move <id> <state>`). The `--track` CLI flag that used to set it is retired (it only ever produced tasks nobody could dispatch); the Jira mirror path still sets it. To park a normal task, defer it: `hive emit <id> deferred` keeps it out of the dispatcher until `hive emit <id> undefer`. The board keeps these tasks in its separate Tracked view with the external state visible. Jira-keyed Hive work is grouped beneath the matching tracked card, with requeue chains collapsed to their latest attempt. `verification_cmds` is the task's verification contract: an array of `{name, cmd}` the agent must run before handing off (`name`: 1-32 chars of `a-z0-9-`, unique within the task; `cmd`: a non-empty string). Anything else → `400`. The agent brief renders it as a "Verification contract" section, and `hive emit <id> evidence --verify-name <name>` tags an artifact with the entry it came from (stored as `verify_name` on the `evidence` event). The contract is enforced at the review handoff: `in_progress` -> `in_review` is refused with `409` until every named command has a matching evidence event, and the refusal lists exactly the missing names (see the `verification_missing` event). `priority` is one of `now`, `next`, `normal`, `later`; anything else → `400`, and a non-director `source` asking for `now` → `403`. Omit it and the task inherits its parent's priority, or starts at `next` when the title/brief reads as security work, else `normal`. It is ORDERING only, never preemption — see [Priority](#priority) for the full inheritance and authority rules. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`. A title that starts with a Jira key in brackets (`[WEB-110] ...`) is linked to that project's mirror task at creation: the mirror's id is stored on the new task as `jira_mirror_task_id` and carried to every requeued successor, so the link survives a retitle or a retry. When every linked work task has finished and at least one is `done`, the mirror moves to `done` itself, which is what makes the hive → Jira status push fire (`failed` and `cancelled` children are ignored; a live requeue successor holds the mirror open).
+- `POST /api/tasks` body `{project_id (required), title (required), brief?, kind?, agent_target?, source?, parent_task_id?, depends_on?, intent_id?, verification_cmds?, priority?}` → `201 Task` (starts in `queued`, assigned the next `number`, writes a `created` event). `depends_on` is a list of task ids this task waits on (also accepts a comma-separated string; CLI: `hive task create --depends-on <id,id>`); each id is validated to exist (unknown id → `400`). `intent_id` ties the task to the ask it implements (CLI: `hive task create --intent <intent-id>`); it must exist and belong to the same project (else `400`), and while that intent is `draft` the dispatcher holds the task in `queued` with `skip_reason` `intent_not_accepted`. The dispatcher and reconciler won't advance the task until every dependency is merged/done (`verifying`/`done`), writing a deduped `dependency_blocked` event with the visible reason. `source`/`parent_task_id` let a spawned agent file follow-up tasks attributed to it (`source="agent"`, parent → the spawning task; the CLI sets both automatically when `HIVE_TASK_ID` is in env). Unknown `parent_task_id` → `400`. `source="external"` marks a TRACKING-ONLY task: another agent using hive as its kanban. It is never auto-dispatched or staleness-supervised, is exempt from the done-evidence gate, and moves freely via transitions (`hive task move <id> <state>`). The `--track` CLI flag that used to set it is retired (it only ever produced tasks nobody could dispatch); the Jira mirror path still sets it. To park a normal task, defer it: `hive emit <id> deferred` keeps it out of the dispatcher until `hive emit <id> undefer`. The board keeps these tasks in its separate Tracked view with the external state visible. Jira-keyed Hive work is grouped beneath the matching tracked card, with requeue chains collapsed to their latest attempt. `verification_cmds` is the task's verification contract: an array of `{name, cmd}` the agent must run before handing off (`name`: 1-32 chars of `a-z0-9-`, unique within the task; `cmd`: a non-empty string). Anything else → `400`. The agent brief renders it as a "Verification contract" section, and `hive emit <id> evidence --verify-name <name>` tags an artifact with the entry it came from (stored as `verify_name` on the `evidence` event). The contract is enforced at the review handoff: `in_progress` -> `in_review` is refused with `409` until every named command has a matching evidence event, and the refusal lists exactly the missing names (see the `verification_missing` event). `priority` is one of `now`, `next`, `normal`, `later`; anything else → `400`, and a non-director `source` asking for `now` → `403`. Omit it and the task inherits its parent's priority, or starts at `next` when the title/brief reads as security work, else `normal`. It is ORDERING only, never preemption — see [Priority](#priority) for the full inheritance and authority rules. Also accepts multipart (same fields + `files`); attachments are stored under the new task's id and their absolute paths appended to the `brief`. A title that starts with a Jira key in brackets (`[WEB-110] ...`) is linked to that project's mirror task at creation: the mirror's id is stored on the new task as `jira_mirror_task_id` and carried to every requeued successor, so the link survives a retitle or a retry. When every linked work task has finished and at least one is `done`, the mirror moves to `done` itself, which is what makes the hive → Jira status push fire (`failed` and `cancelled` children are ignored; a live requeue successor holds the mirror open).
 - `GET /api/tasks/:id` → `200 Task + {events:[Event], evidence:[Evidence], decisions:[Decision]}` | `404`
   (i.e. the full task object plus three arrays for the task page)
 - `POST /api/tasks/:id/jira/link` body `{parent_key (required)}` → `201 {jira_key, browse_url, warnings}` | `400` | `404`
@@ -1555,6 +1593,14 @@ touching ordinary `command` escalations.
 ### Incidents
 - `GET /api/incidents?status=` → `200 {"incidents": [Incident, ...]}` (newest first; `status` filter optional, e.g. `open` / `resolved`)
 
+### Intents (the ask record)
+- `GET /api/intents?project_id=&status=&task_id=` → `200 [Intent, ...]` (newest first; every filter optional)
+- `POST /api/intents` body `{project_id (required), body_md (required), source? ("director"), source_ref?, task_id?, author?}` → `201 Intent` | `400` (unknown project, invalid `source`, unknown `task_id`, or `body_md` without the five headings in order). Starts as `draft`. Broadcasts an `intent` SSE message.
+- `GET /api/intents/:id` → `200 Intent` | `404`
+- `PUT /api/intents/:id` body `{body_md?, task_id?, source_ref?}` → `200 Intent` | `400` (bad `body_md`) | `404` | `409` (the intent is `accepted` or `superseded` — its text is fixed; draft a replacement and supersede it instead)
+- `POST /api/intents/:id/accept` body `{source:"director"}` → `200 Intent` | `404` | `409` (already accepted/superseded, or an unticked bullet remains under `## Open questions` — the error names them). Records `accepted_by`/`accepted_at` and writes an `intent_accepted` event on the linked task.
+- `POST /api/intents/:id/supersede` body `{by:"<replacement-intent-id>"}` → `200 Intent` | `400` (missing/unknown `by`, or superseding itself) | `404` | `409` (already superseded). Marks the old row `superseded` and re-points its task at the replacement.
+
 ### Learnings (regression ledger)
 - `GET /api/learnings?project_id=&status=` → `200 [Learning, ...]` (newest `last_seen` first; both filters optional)
 - `POST /api/learnings` body `{project_id (required), title (required), kind (required: "failure" | "reference"), body?, source_task_id?, create_root_cause_task?}` → `201 Learning` | `400` (unknown `project_id`, or missing/invalid `kind` — no silent default)
@@ -1669,6 +1715,7 @@ Subsequent messages (broadcast to all clients on every change):
 | decision | `{"type":"decision","decision": Decision}` | a decision is created or answered |
 | incident | `{"type":"incident","incident": Incident}` | a monitor incident opens or resolves |
 | learning | `{"type":"learning","learning": Learning}` | a learning is created, updated, or recurs |
+| intent | `{"type":"intent","intent": Intent}` | an intent is created, edited, accepted, or superseded |
 | usage | `{"type":"usage","usage": Usage}` | a usage row is ingested (cost/token analytics) |
 | chat_message | `{"type":"chat_message","message": ChatMessage}` | a director-chat message is appended (director turn or supervisor reply) |
 | notification | `{"type":"notification","notification": Notification}` | a notification is enqueued (urgent ones arrive already `delivered_at`) |

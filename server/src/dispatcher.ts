@@ -44,6 +44,7 @@ import { Herdr, herdr as defaultHerdr, isHerdrUnreachable } from "./runtime/herd
 import { authorize } from "./authority.ts";
 import { spawnAgent } from "./api.ts";
 import { isDeferred, isSelfAuditLineage, unmetDeps, noteDependencyBlock, noteSkip, transition, writeEvent } from "./state.ts";
+import { intentNotAccepted } from "./intents.ts";
 import { signature } from "./learn.ts";
 import { isTrackingOnlyTask } from "./supervision.ts";
 import { queuedSteers } from "./steer.ts";
@@ -373,6 +374,11 @@ export async function dispatchOnce(db: DB, deps: DispatcherDeps = {}): Promise<v
           noteSkip(db, task.id, "dependency_blocked");
           continue;
         }
+
+        // HIVE-636: same shape, same place in the lap. A task carrying an intent
+        // nobody has accepted is not work yet — it is a proposal. Pure local
+        // read, so like the dependency gate it costs nothing and logs nothing.
+        if (intentNotAccepted(db, task)) { noteSkip(db, task.id, "intent_not_accepted"); continue; }
 
         const authz = authorize(db, {
           project_id: task.project_id,

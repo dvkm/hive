@@ -23,6 +23,7 @@ import type {
   FeedEvent,
   GlanceCard,
   Incident,
+  Intent,
   JiraSyncState,
   JiraTaskState,
   Kind,
@@ -417,6 +418,17 @@ export const api = {
   // Incidents API is built in parallel; treat absence (404/network) as "not running yet".
   incidents: (status: "open" | "resolved") =>
     req<{ incidents: Incident[] }>(`/api/incidents?status=${status}`),
+
+  // Intents (HIVE-636). Accept is the gate: the server refuses it while any
+  // open question is still unchecked, so the card shows those first.
+  intents: (q: { project_id?: string; status?: Intent["status"]; task_id?: string } = {}) => {
+    const p = new URLSearchParams(q as Record<string, string>).toString();
+    return req<Intent[]>(`/api/intents${p ? "?" + p : ""}`);
+  },
+  updateIntent: (id: string, b: { body_md?: string; task_id?: string | null; source_ref?: string | null }) =>
+    req<Intent>(`/api/intents/${id}`, { method: "PUT", body: JSON.stringify(b) }),
+  acceptIntent: (id: string) =>
+    req<Intent>(`/api/intents/${id}/accept`, { method: "POST", body: JSON.stringify({ source: "director" }) }),
 
   learnings: (q: { project_id?: string; status?: "active" | "resolved" } = {}) => {
     const p = new URLSearchParams(q as Record<string, string>).toString();

@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { api, apiToken } from "./api";
-import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Checkpoint, UnderstandingQuiz, ChatMessage, Away } from "./api";
+import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Checkpoint, Intent, UnderstandingQuiz, ChatMessage, Away } from "./api";
 import { getNeedsYouItems } from "./needsYou";
 import type { NeedsYouItem } from "./needsYou";
 
@@ -23,6 +23,8 @@ export interface Store {
   reloadCheckpoints: () => void;
   quizzes: UnderstandingQuiz[]; // required or deferred understanding checks
   reloadQuizzes: () => void;
+  intents: Intent[]; // the ask records; drafts are what needs the director
+  reloadIntents: () => void;
   needsYou: NeedsYouItem[];
   offline: boolean; // offline mode: fleet drained, nothing new spawns
   setOffline: (on: boolean) => void;
@@ -166,7 +168,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const loadDecisions = () => api.decisions("open").then((d) => { setDecisions(d); setDecisionsLoaded(true); });
   const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
   const [quizzes, setQuizzes] = useState<UnderstandingQuiz[]>([]);
-  const needsYou = getNeedsYouItems(decisions, tasks, checkpoints, quizzes);
+  const [intents, setIntents] = useState<Intent[]>([]);
+  const needsYou = getNeedsYouItems(decisions, tasks, checkpoints, quizzes, intents);
   const [offline, setOfflineState] = useState(false);
   const setOffline = (on: boolean) => {
     setOfflineState(on); // optimistic; SSE confirms
@@ -183,6 +186,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const reloadCheckpoints = () => { loadCheckpoints().catch(() => {}); };
   const loadQuizzes = () => api.understandingQuizzes().then((r) => setQuizzes(r.quizzes));
   const reloadQuizzes = () => { loadQuizzes().catch(() => {}); };
+  const loadIntents = () => api.intents().then(setIntents);
+  const reloadIntents = () => { loadIntents().catch(() => {}); };
 
   // Chat: the open thread + its messages. A ref mirrors the id so the SSE
   // handler (closed over once) knows which thread's messages to append.
@@ -245,6 +250,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       keepTrying(loadDecisions),
       keepTrying(loadCheckpoints),
       keepTrying(loadQuizzes),
+      keepTrying(loadIntents),
       keepTrying(loadAway),
       keepTrying(() => api.offline().then((r) => setOfflineState(r.on))),
       keepTrying(() => api.notifications().then((n) => setNotifications(n.notifications))),
@@ -325,6 +331,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           bump(d.task_id);
         } else if (msg.type === "usage") {
           bump(msg.usage.task_id);
+        } else if (msg.type === "intent") {
+          const intent: Intent = msg.intent;
+          setIntents((prev) => {
+            const i = prev.findIndex((x) => x.id === intent.id);
+            if (i === -1) return [intent, ...prev];
+            const next = prev.slice();
+            next[i] = intent;
+            return next;
+          });
+          if (intent.task_id) bump(intent.task_id);
         } else if (msg.type === "incident") {
           // Fold standalone monitor incidents into the live feed as a synthetic
           // "incident" event (no task_id). The Feed enriches it from projects.
@@ -371,7 +387,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, quizzes, reloadQuizzes, needsYou, offline, setOffline, away, setAway, sse, taskSync, retryTaskSync: () => refreshTasks.current(), projectsLoaded, decisionsLoaded, chatThreadId, chatMessages, chatDelivery, openChatThread, onChatMessage }}>
+    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, quizzes, reloadQuizzes, intents, reloadIntents, needsYou, offline, setOffline, away, setAway, sse, taskSync, retryTaskSync: () => refreshTasks.current(), projectsLoaded, decisionsLoaded, chatThreadId, chatMessages, chatDelivery, openChatThread, onChatMessage }}>
       {children}
     </Ctx.Provider>
   );

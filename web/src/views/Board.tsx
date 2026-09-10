@@ -9,6 +9,7 @@ import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
 import { actionableItems, isJiraMirror, isTrackingOnly, orderFocusItems, trackedSubtasks } from "../lib/needsYou";
 import type { NeedsYouItem } from "../lib/needsYou";
 import { taskLabel } from "../lib/references";
+import { intentSection } from "../lib/intent";
 
 // A compact "why this card needs attention" line: e.g. "agent gone" or
 // "no activity 22m". Server-provided reason + live-ticking since-age.
@@ -307,6 +308,7 @@ export function DivergenceChips({ task, rows, tasks }: { task: Task; rows: Diver
 // has its full card and its buttons.
 const STRIP_LABELS: Record<string, [string, string]> = {
   decision: ["decision", "decisions"],
+  intent: ["intent to accept", "intents to accept"],
   checkpoint: ["checkpoint", "checkpoints"],
   quiz_digest: ["catch-up", "catch-ups"],
   review: ["to review", "to review"],
@@ -351,6 +353,14 @@ export function NeedsYouStrip() {
 function focusRow(item: NeedsYouItem): { kind: string; to: string; label: string; detail: string; ts: string } {
   const label = (task: Task) => `${taskLabel(task)} ${task.title}`;
   switch (item.kind) {
+    case "intent":
+      return {
+        kind: "Intent",
+        to: item.intent.task_id ? `/tasks/${item.intent.task_id}` : "/inbox",
+        label: intentSection(item.intent.body_md, "Problem").split("\n")[0] || "Untitled ask",
+        detail: "Accept this ask before the work starts",
+        ts: item.intent.updated_at,
+      };
     case "decision":
       return {
         kind: "Decision",

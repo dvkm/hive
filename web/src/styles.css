@@ -6799,3 +6799,45 @@ a.chip-jira:hover { background: #2d5488; }
 .update-banner {
   background: rgba(91, 141, 226, 0.14);
 }
+
+/* The intent card: what was asked, and the tap that accepts it (HIVE-636).
+   Five fixed sections, so they get one calm rhythm rather than five styles. */
+.intent-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  flex-wrap: wrap;
+  font-size: var(--t-sm);
+  margin-bottom: var(--s3);
+}
+.intent-section h3 {
+  margin: var(--s3) 0 var(--s1);
+  font-size: var(--t-eyebrow);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+.intent-actions {
+  display: flex;
+  gap: var(--s2);
+  flex-wrap: wrap;
+  margin-top: var(--s3);
+}
+.intent-ask {
+  display: flex;
+  gap: var(--s2);
+  margin-top: var(--s2);
+}
+.intent-ask input {
+  flex: 1;
+  min-width: 0;
+}
+.intent-edit {
+  width: 100%;
+  font-family: var(--mono, monospace);
+  font-size: var(--t-sm);
+}
+.intent-open-note {
+  margin-top: var(--s2);
+  font-size: var(--t-sm);
+}
