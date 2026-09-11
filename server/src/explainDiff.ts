@@ -20,7 +20,7 @@ import { broadcast } from "./bus.ts";
 import { parseEvidence } from "./rows.ts";
 import { writeEvent, getTask } from "./state.ts";
 import { broadcastTask } from "./health.ts";
-import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { claudeBin, defaultPlannerExec, NO_CUSTOMIZATIONS, type PlannerExec } from "./planner.ts";
 import { modelFailure, noteModelCall } from "./modelCall.ts";
 import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 import { defaultExec, type Exec } from "./exec.ts";
@@ -214,7 +214,7 @@ async function generateExplanation(db: DB, task: any, head: string | null, deps:
   if (!diff.trim()) return fail(d.stderr?.trim() || "gh pr diff returned nothing");
 
   const res = await plannerExec(
-    [claudeBin(), "-p", "--model", MODEL, NO_WRITE_TOOLS, buildPrompt(task, diff.slice(0, MAX_DIFF_CHARS), reviewChecks(db, task.id)), "--output-format", "json"],
+    [claudeBin(), "-p", NO_CUSTOMIZATIONS, "--model", MODEL, NO_WRITE_TOOLS, buildPrompt(task, diff.slice(0, MAX_DIFF_CHARS), reviewChecks(db, task.id)), "--output-format", "json"],
     {
       timeoutMs: TIMEOUT_MS,
       cwd: task.worktree_path,

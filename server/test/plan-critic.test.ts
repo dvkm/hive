@@ -39,7 +39,9 @@ function makeApi(opts: { concerns?: any[]; plannerCode?: number; stdout?: string
     return OK();
   };
   const plannerExec: PlannerExec = async (argv) => {
-    prompts.push(argv[4] ?? "");
+    // The prompt is the one argument that is not a flag or a flag's value, so
+    // find it rather than counting positions: the argv grew a flag in HIVE-639.
+    prompts.push(argv.find((a) => a.includes("\n")) ?? "");
     if (opts.plannerCode) return { code: opts.plannerCode, stdout: "", stderr: "model unavailable" };
     return {
       code: 0,
