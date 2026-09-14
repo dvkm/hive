@@ -890,12 +890,16 @@ export function ReviewCard({
   const rawQuiz = review?.understanding?.checks?.[0] ?? review?.understanding?.check;
   const listedQuiz = understandingQuizzes.find((item) => item.task_id === task.id);
   const quiz = listedQuiz ?? (rawQuiz && Array.isArray(rawQuiz.options) && rawQuiz.options.length >= 2 ? rawQuiz : undefined);
-  const recordedQuizStatus = reviewEventId && events.some(
-    (event) => event.type === "understanding_quiz_passed" && event.payload.review_event_id === reviewEventId
+  // The pass is recorded under the intent id when an accepted intent owns the
+  // quiz, and under the review event otherwise (HIVE-638). The server says
+  // which; an older server says nothing and the review event still applies.
+  const quizKey = branchCheck?.understanding_quiz_key ?? listedQuiz?.quiz_key ?? reviewEventId;
+  const recordedQuizStatus = quizKey && events.some(
+    (event) => event.type === "understanding_quiz_passed" && event.payload.review_event_id === quizKey
   )
     ? "passed"
-    : reviewEventId && events.some(
-        (event) => event.type === "understanding_quiz_deferred" && event.payload.review_event_id === reviewEventId
+    : quizKey && events.some(
+        (event) => event.type === "understanding_quiz_deferred" && event.payload.review_event_id === quizKey
       )
       ? "deferred"
       : "required";
@@ -965,7 +969,7 @@ export function ReviewCard({
     quizStatus,
     passedThisSession: quizOverride === "passed",
     events,
-    reviewEventId,
+    reviewEventId: quizKey,
   });
   const embeddedTasks = branchCheck?.embedded_tasks ?? [];
   const failures = [...events]
@@ -1284,6 +1288,8 @@ export function ReviewCard({
             options: quiz.options,
             version: "version" in quiz ? quiz.version : `${reviewEventId}:0`,
           }}
+          intentSlug={listedQuiz?.intent_slug}
+          intentTaskId={task.id}
           allowDefer
           surface={surface}
           onPassed={() => setQuizOverride("passed")}

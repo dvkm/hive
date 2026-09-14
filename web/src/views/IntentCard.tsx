@@ -49,7 +49,7 @@ export function IntentCard({ intent, onChange }: { intent: Intent; onChange?: (n
   };
 
   return (
-    <section className="panel intent-card">
+    <section className="panel intent-card" id="intent">
       <h2>Intent</h2>
       <div className="intent-meta muted">
         <span className={`chip chip-intent-${intent.status}`}>{STATUS_LABEL[intent.status]}</span>

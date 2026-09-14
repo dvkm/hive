@@ -533,6 +533,10 @@ export interface BranchCheck {
   unmet_deps: { id: string; number: number; title: string; state: State }[];
   embedded_tasks: { id: string; number: number; title: string }[];
   understanding_required?: boolean; // judgment-class change; the quiz gates approval (hive-1559)
+  // Which key the director's pass is recorded under: the intent id when an
+  // accepted intent owns the quiz, otherwise the review event (HIVE-638). The
+  // card reads the pass off the task timeline, so it has to match.
+  understanding_quiz_key?: string | null;
   // The risk check runs when the PR reaches review, not at the land attempt, so
   // the card knows before the director spends anything whether Ship can work
   // (HIVE-570). Undefined on an older server: the old land-time gate still applies.
@@ -775,6 +779,13 @@ export interface GlanceCard {
 
 export interface UnderstandingQuiz {
   id: string;
+  // The key this quiz's pass is recorded under: the intent id when an accepted
+  // intent owns the quiz, otherwise `id` (HIVE-638).
+  quiz_key?: string;
+  // Set when an accepted intent owns the quiz: the card says which ask it is
+  // checking, and links to that intent.
+  intent_id?: string;
+  intent_slug?: string;
   task_id: string;
   ts: string;
   task_number: number;
