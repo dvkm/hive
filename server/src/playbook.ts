@@ -10,7 +10,7 @@ import { now } from "./db.ts";
 import { getTask } from "./state.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
-import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { claudeBin, defaultPlannerExec, NO_CUSTOMIZATIONS, type PlannerExec } from "./planner.ts";
 import { addReference } from "./learn.ts";
 import { taskDiff } from "./diff.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
@@ -162,7 +162,7 @@ export async function makePlaybook(db: DB, taskId: string, deps: PlaybookDeps = 
   const stat = await diffStat(db, taskId, deps.shellExec ?? defaultExec);
   const prompt = playbookPrompt(task, keyEvents(db, taskId), stat);
 
-  const argv = [claudeBin(), "-p", "--model", config.model_by_kind?.playbook ?? "sonnet", prompt, "--output-format", "json"];
+  const argv = [claudeBin(), "-p", NO_CUSTOMIZATIONS, "--model", config.model_by_kind?.playbook ?? "sonnet", prompt, "--output-format", "json"];
   const exec = deps.exec ?? defaultPlannerExec;
   let res;
   try {

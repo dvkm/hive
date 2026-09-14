@@ -49,7 +49,7 @@ import { queueSteerEvent } from "./steer.ts";
 import { createDecision } from "./api.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectComparisonBase } from "./exec.ts";
-import { claudeBin, defaultPlannerExec, parseModelJson, type PlannerExec } from "./planner.ts";
+import { claudeBin, defaultPlannerExec, NO_CUSTOMIZATIONS, parseModelJson, type PlannerExec } from "./planner.ts";
 import { modelFailure, noteModelCall } from "./modelCall.ts";
 import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
@@ -352,7 +352,7 @@ async function judge(db: DB, task: any, fp: Footprint, config: any, deps: DriftD
       payload: { commits: fp.commits.length, files: fp.files, ...payload },
     });
 
-  const argv = [claudeBin(), "-p", "--model", config.model_by_kind?.drift ?? "sonnet", NO_TOOLS];
+  const argv = [claudeBin(), "-p", NO_CUSTOMIZATIONS, "--model", config.model_by_kind?.drift ?? "sonnet", NO_TOOLS];
   const direction = directionSinceBrief(db, task.id);
   argv.push(driftPrompt(task, fp, direction), "--output-format", "json");
   const exec = deps.exec ?? defaultPlannerExec;

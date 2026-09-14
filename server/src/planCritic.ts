@@ -14,7 +14,7 @@
 // many hours, so away-mode does not strand an agent forever.
 import type { DB } from "./db.ts";
 import { writeEvent } from "./state.ts";
-import { claudeBin, defaultPlannerExec, parseModelJson, type PlannerExec } from "./planner.ts";
+import { claudeBin, defaultPlannerExec, NO_CUSTOMIZATIONS, parseModelJson, type PlannerExec } from "./planner.ts";
 import { modelFailure, noteModelCall } from "./modelCall.ts";
 import { claudeProfileEnvForProject } from "./claudeProfiles.ts";
 
@@ -150,7 +150,7 @@ export async function critiquePlan(
   let res: Awaited<ReturnType<PlannerExec>>;
   try {
     res = await plannerExec(
-      [claudeBin(), "-p", "--model", MODEL, buildCriticPrompt(task, plan), "--output-format", "json"],
+      [claudeBin(), "-p", NO_CUSTOMIZATIONS, "--model", MODEL, buildCriticPrompt(task, plan), "--output-format", "json"],
       {
         timeoutMs: TIMEOUT_MS,
         ...(task.worktree_path ? { cwd: task.worktree_path } : {}),

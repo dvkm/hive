@@ -6,7 +6,7 @@
 import type { DB } from "./db.ts";
 import { broadcast } from "./bus.ts";
 import { parseDecision } from "./rows.ts";
-import { claudeBin, defaultPlannerExec, type PlannerExec } from "./planner.ts";
+import { claudeBin, defaultPlannerExec, NO_CUSTOMIZATIONS, type PlannerExec } from "./planner.ts";
 import { claudeProfileEnvForRepo } from "./claudeProfiles.ts";
 import { modelErrorText, noteModelCall } from "./modelCall.ts";
 
@@ -40,7 +40,7 @@ export async function explainCommandDecision(
   ].join("\n");
   let res;
   try {
-    res = await exec([claudeBin(), "-p", "--model", "haiku", prompt, "--output-format", "json"], {
+    res = await exec([claudeBin(), "-p", NO_CUSTOMIZATIONS, "--model", "haiku", prompt, "--output-format", "json"], {
       timeoutMs: TIMEOUT_MS,
       ...(project?.repo_path ? { cwd: project.repo_path } : {}),
       env: claudeProfileEnvForRepo(project?.repo_path),

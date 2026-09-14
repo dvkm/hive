@@ -54,7 +54,29 @@ export function claudeBin(): string {
   }
   return "claude"; // last resort: let the spawn error name the real problem
 }
-const DEFAULT_ARGV = [claudeBin(), "-p", "--model", "sonnet"];
+// Hive's own one-shot `claude -p` calls run with cwd inside a worktree, so the
+// CLI loads that repo's CLAUDE.md, the host user's global CLAUDE.md, every MCP
+// server and every hook into the cached prefix of EVERY turn. None of that is
+// input to the job, and hive does not control how big it gets: corebeat's
+// AGENTS.md reached 201KB before it was cut by hand on 2026-09-04.
+//
+// Measured 2026-09-11, same trivial prompt, same corebeat worktree:
+//   201KB AGENTS.md: 92,128 prefix tokens -> 18,057 with this flag ($0.1520 -> $0.0094)
+//    17KB AGENTS.md: 35,919 prefix tokens -> 18,061 with this flag ($0.0478 -> $0.0114)
+// The floor is flat either way, which is the point: hive stops paying for a file
+// it does not own.
+//
+// Safe mode keeps auth (CLAUDE_CONFIG_DIR routing and the TeamClaude proxy env
+// both still apply), model selection, the built-in tools and permissions, so a
+// read-only judge still reads the checkout. Verified in the same session: Read,
+// Glob and `Bash(git rev-parse)` all ran, while writes inside and outside the
+// working directory were both refused.
+//
+// NOT used by reviewer.ts. The auto-review and the risk verdicts gate merges,
+// and the repo's own conventions are input to those judgements.
+export const NO_CUSTOMIZATIONS = "--safe-mode";
+
+const DEFAULT_ARGV = [claudeBin(), "-p", NO_CUSTOMIZATIONS, "--model", "sonnet"];
 
 // A planner subprocess runner. Injectable so tests never spawn `claude`. The
 // default implementation kills the process on timeout (hard cap, no runaway).
