@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import { useQuizState } from "../lib/store";
 import type { QuizSeed } from "../lib/store";
@@ -10,6 +11,8 @@ const REFRESHED_NOTICE = "This question was already answered in another view. He
 export function UnderstandingQuiz({
   quiz,
   label = "Before you approve",
+  intentSlug,
+  intentTaskId,
   allowDefer = false,
   surface,
   onPassed,
@@ -17,6 +20,10 @@ export function UnderstandingQuiz({
 }: {
   quiz: QuizSeed; // the seed; the live state lives in the store, keyed by task_id
   label?: string;
+  // Set when an accepted intent owns this quiz (HIVE-638): the card says which
+  // ask it is checking, and links to that intent's card on the task page.
+  intentSlug?: string;
+  intentTaskId?: string;
   allowDefer?: boolean;
   surface?: "focus";
   onPassed?: (explanation: string | null) => void;
@@ -122,7 +129,13 @@ export function UnderstandingQuiz({
   return (
     <section className="understanding-quiz">
       <div className="understanding-quiz-label">
-        {label}
+        {intentSlug ? "Understanding check" : label}
+        {intentSlug && (
+          <>
+            {" · from intent "}
+            <Link to={`/tasks/${intentTaskId ?? quiz.task_id}#intent`}>{intentSlug}</Link>
+          </>
+        )}
         {(currentQuiz.total ?? 1) > 1 && ` · Question ${(currentQuiz.completed ?? 0) + 1} of ${currentQuiz.total}`}
       </div>
       {notice && !result && <p className="understanding-quiz-notice">{notice}</p>}

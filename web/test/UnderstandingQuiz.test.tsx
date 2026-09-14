@@ -1,5 +1,6 @@
 import { beforeEach, expect, test } from "bun:test";
 import { act, create } from "react-test-renderer";
+import { MemoryRouter } from "react-router-dom";
 import { api, type UnderstandingQuiz as Quiz } from "../src/lib/api";
 import { resetQuizStatesForTests } from "../src/lib/store";
 import { UnderstandingQuiz } from "../src/views/UnderstandingQuiz";
@@ -200,4 +201,21 @@ test("two mounts of the same task share one question (hive-2125)", async () => {
   } finally {
     api.answerUnderstandingQuiz = original;
   }
+});
+
+// HIVE-638: a quiz minted from the accepted intent says so, and links to it.
+test("an intent-minted quiz names the intent and links to its card", async () => {
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(
+      <MemoryRouter>
+        <UnderstandingQuiz quiz={seed({ total: 3 })} intentSlug="WEB-101" intentTaskId="task-abc" />
+      </MemoryRouter>
+    );
+  });
+  const label = renderer.root.findByProps({ className: "understanding-quiz-label" });
+  expect(label.children.filter((child) => typeof child === "string").join("")).toContain("Understanding check");
+  const link = renderer.root.findByType("a");
+  expect(link.children).toEqual(["WEB-101"]);
+  expect(link.props.href).toBe("/tasks/task-abc#intent");
 });

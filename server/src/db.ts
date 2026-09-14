@@ -804,6 +804,14 @@ export const MIGRATIONS: { name: string; statements: string[] }[] = [
       `CREATE INDEX idx_tasks_intent ON tasks(intent_id) WHERE intent_id IS NOT NULL`,
     ],
   },
+  // HIVE-638: the understanding quiz, minted once from the accepted intent.
+  // JSON array of checks, written at acceptance and never rewritten — the
+  // director's pass is keyed on this intent's id, so a new review head cannot
+  // re-ask. A superseded intent gets a new row, and that is the only re-ask.
+  {
+    name: "v48-intent-checks",
+    statements: [`ALTER TABLE intents ADD COLUMN checks_json TEXT`],
+  },
 ];
 
 // -------------------------------------------------------------- settings

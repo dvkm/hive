@@ -61,7 +61,11 @@ import { seedWorktree, type SeedResult } from "./worktreeSeed.ts";
 import {
   INTENT_SECTIONS,
   INTENT_SOURCES,
+  acceptedIntentFor,
   getIntent,
+  intentChecks,
+  intentSlug,
+  setIntentChecks,
   intentSection,
   insertIntent,
   intentBodyError,
@@ -71,7 +75,7 @@ import {
   supersedeIntentRow,
   type Intent,
 } from "./intents.ts";
-import { briefFromIntent, draftIntentBody, renderIntentBody, type IntentSourceText } from "./intentDraft.ts";
+import { briefFromIntent, draftIntentBody, mintIntentChecks, renderIntentBody, type IntentSourceText } from "./intentDraft.ts";
 import { takeOver, handBack, TakeoverError } from "./takeover.ts";
 import { figmaTokenEnv, resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { teamclaudeEnv, teamclaudeOverlay, usesTeamclaude } from "./teamclaude.ts";
@@ -972,7 +976,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (method === "PUT") return updateIntent(db, m[1], await req.json());
       }
       m = pathname.match(/^\/api\/intents\/([^/]+)\/accept$/);
-      if (m && method === "POST") return acceptIntent(db, m[1], await req.json().catch(() => ({})));
+      if (m && method === "POST") return await acceptIntent(db, m[1], await req.json().catch(() => ({})), deps);
       m = pathname.match(/^\/api\/intents\/([^/]+)\/supersede$/);
       if (m && method === "POST") return supersedeIntent(db, m[1], await req.json().catch(() => ({})));
 
@@ -3416,7 +3420,7 @@ async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {
         const quiz = latestUnderstandingQuiz(db, id);
         if (!quiz)
           return err("Understanding check required. Ask the agent to add one before accepting this report.", 409);
-        if (understandingQuizStatus(db, id, quiz.reviewEventId) === "required")
+        if (understandingQuizStatus(db, id, quiz.quizKey) === "required")
           return err("Pass the understanding check before accepting this report, or choose 'Continue now, quiz me later'.", 409);
       }
       // A task with a PR must go through POST /merge — a plain move to verifying
@@ -3497,6 +3501,10 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
     unmet_deps,
     embedded_tasks,
     understanding_required: understandingChecksRequired(db, task),
+    // Which key the pass is recorded under: the intent id when an accepted
+    // intent owns the quiz, otherwise the review event the card already knows
+    // (HIVE-638). The card reads the pass off the timeline, so it has to match.
+    understanding_quiz_key: latestUnderstandingQuiz(db, task.id)?.quizKey ?? null,
     confirmed_risks: confirmedRisks(db, task.id, task.head_sha),
     risk_check_unfinished: unfinishedRiskCheck(db, task.id, task.head_sha),
   });
@@ -3811,7 +3819,7 @@ async function mergeTaskLocked(
       );
     }
     const quiz = latestUnderstandingQuiz(db, id);
-    const late = quiz && understandingQuizStatus(db, id, quiz.reviewEventId) === "passed";
+    const late = quiz && understandingQuizStatus(db, id, quiz.quizKey) === "passed";
     return err(
       (late ? `you passed the understanding check on this change earlier; a new finding arrived on commit ${String(task.head_sha ?? "").slice(0, 7)}. ` : "") +
         `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
@@ -3843,10 +3851,10 @@ async function mergeTaskLocked(
     const quiz = latestUnderstandingQuiz(db, id);
     if (!quiz)
       return err("Understanding check required. Ask the agent to submit one in its latest review before merging.", 409);
-    if (understandingQuizStatus(db, id, quiz.reviewEventId) === "required") {
+    if (understandingQuizStatus(db, id, quiz.quizKey) === "required") {
       if (!autoShipKind)
         return err("Pass the understanding check before merging, or choose 'Continue now, quiz me later'.", 409);
-      deferQuizReviewEventId = quiz.reviewEventId;
+      deferQuizReviewEventId = quiz.quizKey;
     }
   }
 
@@ -5281,7 +5289,36 @@ function carriedUnderstandingChecks(db: DB, taskId: string): { checks: unknown[]
   return null;
 }
 
-function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: string; checks: UnderstandingCheck[] } | null {
+// The quiz a task owes, and the KEY its attempts and its pass are recorded
+// under. Two sources, and the intent wins (HIVE-638):
+//   - an accepted intent with minted checks: the key is the INTENT id, so every
+//     review head reads the same quiz and a re-emitted review never re-asks.
+//     Only a superseded intent (a new row, a new id) asks again.
+//   - no intent: the key is the review event id, exactly as before, and the
+//     agent's own diff-based checks are asked.
+// The key lands in the attempt/pass payloads as `review_event_id` — the field
+// name predates intents, and every historical row is written under it.
+function intentUnderstandingQuiz(db: DB, taskId: string): { quizKey: string; checks: UnderstandingCheck[]; intent: Intent } | null {
+  const intent = acceptedIntentFor(db, taskId);
+  if (!intent) return null;
+  const checks = normalizeUnderstandingChecks({ checks: intentChecks(intent) });
+  return checks.length ? { quizKey: intent.id, checks, intent } : null;
+}
+
+// What the quiz card says it is asking about: "from intent <slug>", linking to
+// the intent card. The slug is the same one the intent file carries in the
+// worktree, so the director sees one name for the ask everywhere.
+function intentQuizLabel(db: DB, taskId: string, intent?: Intent | null): { intent_id?: string; intent_slug?: string } {
+  if (!intent) return {};
+  const task = db.query("SELECT jira_key, number FROM tasks WHERE id = ?").get(taskId) as
+    | { jira_key: string | null; number: number }
+    | undefined;
+  return { intent_id: intent.id, intent_slug: intentSlug(task ?? {}) };
+}
+
+function latestUnderstandingQuiz(db: DB, taskId: string): { quizKey: string; checks: UnderstandingCheck[]; intent?: Intent } | null {
+  const fromIntent = intentUnderstandingQuiz(db, taskId);
+  if (fromIntent) return fromIntent;
   const row: any = db
     .query("SELECT id, payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY ts DESC, rowid DESC LIMIT 1")
     .get(taskId);
@@ -5289,16 +5326,16 @@ function latestUnderstandingQuiz(db: DB, taskId: string): { reviewEventId: strin
   try {
     const payload = JSON.parse(row.payload);
     const checks = normalizeUnderstandingChecks(payload?.understanding);
-    return checks.length ? { reviewEventId: row.id, checks } : null;
+    return checks.length ? { quizKey: row.id, checks } : null;
   } catch {
     return null;
   }
 }
 
-function understandingQuizProgress(db: DB, taskId: string, reviewEventId: string): { attempts: number; completed: Set<number> } {
+function understandingQuizProgress(db: DB, taskId: string, quizKey: string): { attempts: number; completed: Set<number> } {
   const rows = db
     .query("SELECT payload FROM events WHERE task_id = ? AND type = 'understanding_quiz_attempt' AND json_extract(payload, '$.review_event_id') = ?")
-    .all(taskId, reviewEventId) as { payload: string }[];
+    .all(taskId, quizKey) as { payload: string }[];
   const completed = new Set<number>();
   for (const row of rows) {
     try {
@@ -5314,24 +5351,24 @@ function understandingQuizProgress(db: DB, taskId: string, reviewEventId: string
 function activeUnderstandingCheck(
   db: DB,
   taskId: string,
-  quiz: { reviewEventId: string; checks: UnderstandingCheck[] }
+  quiz: { quizKey: string; checks: UnderstandingCheck[] }
 ): { check: UnderstandingCheck; index: number; completed: number; version: string } {
-  const progress = understandingQuizProgress(db, taskId, quiz.reviewEventId);
+  const progress = understandingQuizProgress(db, taskId, quiz.quizKey);
   const remaining = quiz.checks.map((_, index) => index).filter((index) => !progress.completed.has(index));
   const pool = remaining.length ? remaining : quiz.checks.map((_, index) => index);
-  const offset = [...quiz.reviewEventId].reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  const offset = [...quiz.quizKey].reduce((sum, char) => sum + char.charCodeAt(0), 0);
   const index = pool[(offset + progress.attempts) % pool.length];
-  return { check: quiz.checks[index], index, completed: quiz.checks.length - remaining.length, version: `${quiz.reviewEventId}:${progress.attempts}` };
+  return { check: quiz.checks[index], index, completed: quiz.checks.length - remaining.length, version: `${quiz.quizKey}:${progress.attempts}` };
 }
 
-function understandingQuizStatus(db: DB, taskId: string, reviewEventId: string): "required" | "deferred" | "passed" {
+function understandingQuizStatus(db: DB, taskId: string, quizKey: string): "required" | "deferred" | "passed" {
   const passed = db
     .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_passed' AND json_extract(payload, '$.review_event_id') = ? LIMIT 1")
-    .get(taskId, reviewEventId);
+    .get(taskId, quizKey);
   if (passed) return "passed";
   const deferred = db
     .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_deferred' AND json_extract(payload, '$.review_event_id') = ? LIMIT 1")
-    .get(taskId, reviewEventId);
+    .get(taskId, quizKey);
   return deferred ? "deferred" : "required";
 }
 
@@ -5372,6 +5409,9 @@ export function repairDuplicateQuizPasses(db: DB): number {
     .all() as { id: string; task_id: string; payload: string; rowid: number }[];
   let repaired = 0;
   for (const review of latest) {
+    // An intent-owned quiz has one key for the whole task, so a re-emitted
+    // review cannot duplicate a pass and there is nothing here to repair.
+    if (intentUnderstandingQuiz(db, review.task_id)) continue;
     if (understandingQuizStatus(db, review.task_id, review.id) === "passed") continue;
     const priors = db
       .query(
@@ -5443,11 +5483,12 @@ export function pendingPostShipQuizCount(db: DB, projectId?: string): number {
   return rows.filter((row) => {
     let payload: any;
     try { payload = JSON.parse(row.payload); } catch { return false; }
-    if (!normalizeUnderstandingChecks(payload?.understanding).length) return false;
+    const fromIntent = intentUnderstandingQuiz(db, row.task_id);
+    if (!fromIntent && !normalizeUnderstandingChecks(payload?.understanding).length) return false;
     // Same judgment-class filter the quiz list applies, or the digest promises
     // more changes to catch up on than the list can show (HIVE-488).
     if (!understandingChecksRequired(db, { id: row.task_id, kind: row.kind, project_id: row.project_id })) return false;
-    return understandingQuizStatus(db, row.task_id, row.id) !== "passed";
+    return understandingQuizStatus(db, row.task_id, fromIntent?.quizKey ?? row.id) !== "passed";
   }).length;
 }
 
@@ -5495,7 +5536,11 @@ export function openUnderstandingQuizzes(db: DB, projectId: string | null, allSc
   const quizzes = rows.flatMap((row) => {
     let payload: any;
     try { payload = JSON.parse(row.payload); } catch { return []; }
-    const checks = normalizeUnderstandingChecks(payload?.understanding);
+    // An accepted intent owns the quiz: same three questions on every head, and
+    // the pass is keyed on the intent, not on this review event (HIVE-638).
+    const fromIntent = intentUnderstandingQuiz(db, row.task_id);
+    const checks = fromIntent ? fromIntent.checks : normalizeUnderstandingChecks(payload?.understanding);
+    const quizKey = fromIntent ? fromIntent.quizKey : row.id;
     if (!checks.length) return [];
     // A mechanical change gets no backlog entry even when its agent submitted
     // checks anyway (hive-1559).
@@ -5506,11 +5551,13 @@ export function openUnderstandingQuizzes(db: DB, projectId: string | null, allSc
     const understanding = payload?.understanding && typeof payload.understanding === "object" && !Array.isArray(payload.understanding)
       ? Object.fromEntries(Object.entries(payload.understanding).filter(([key]) => key !== "check" && key !== "checks"))
       : {};
-    const status = understandingQuizStatus(db, row.task_id, row.id);
+    const status = understandingQuizStatus(db, row.task_id, quizKey);
     if (status === "passed") return [];
-    const active = activeUnderstandingCheck(db, row.task_id, { reviewEventId: row.id, checks });
+    const active = activeUnderstandingCheck(db, row.task_id, { quizKey, checks });
     return [{
       id: row.id,
+      quiz_key: quizKey,
+      ...intentQuizLabel(db, row.task_id, fromIntent?.intent),
       task_id: row.task_id,
       ts: row.ts,
       task_number: row.number,
@@ -5539,7 +5586,7 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   if (body?.source !== "director") return err("only the director can answer understanding checks", 403);
   const quiz = latestUnderstandingQuiz(db, taskId);
   if (!quiz) return err("understanding check not found", 404);
-  const status = understandingQuizStatus(db, taskId, quiz.reviewEventId);
+  const status = understandingQuizStatus(db, taskId, quiz.quizKey);
   const active = activeUnderstandingCheck(db, taskId, quiz);
   const check = active.check;
   const actor = actorOf(body);
@@ -5552,7 +5599,7 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
           AND type IN ('understanding_quiz_attempt', 'understanding_quiz_passed')
           AND json_extract(payload, '$.review_event_id') = ? ORDER BY rowid DESC LIMIT 1`
       )
-      .get(taskId, quiz.reviewEventId);
+      .get(taskId, quiz.quizKey);
     if (expectedVersion === undefined)
       return json({ ok: true, correct: true, passed: true, explanation: check.explanation ?? null });
     const event = winner ? parseEvent(winner) : null;
@@ -5602,7 +5649,7 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
       task_id: taskId,
       source: "director",
       type: "understanding_quiz_attempt",
-      payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey, correct: false, actor },
+      payload: { review_event_id: quiz.quizKey, check_index: active.index, answer_key: answerKey, correct: false, actor },
     });
     const next = activeUnderstandingCheck(db, taskId, quiz);
     return json({
@@ -5619,7 +5666,7 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
     task_id: taskId,
     source: "director",
     type: "understanding_quiz_attempt",
-    payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey, correct: true, actor, surface: body?.surface === "focus" ? "focus" : undefined },
+    payload: { review_event_id: quiz.quizKey, check_index: active.index, answer_key: answerKey, correct: true, actor, surface: body?.surface === "focus" ? "focus" : undefined },
   });
   const next = activeUnderstandingCheck(db, taskId, quiz);
   if (next.completed < quiz.checks.length) {
@@ -5637,7 +5684,7 @@ function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
     task_id: taskId,
     source: "director",
     type: "understanding_quiz_passed",
-    payload: { review_event_id: quiz.reviewEventId, check_index: active.index, answer_key: answerKey, actor, surface: body?.surface === "focus" ? "focus" : undefined },
+    payload: { review_event_id: quiz.quizKey, check_index: active.index, answer_key: answerKey, actor, surface: body?.surface === "focus" ? "focus" : undefined },
   });
   return json({ ok: true, correct: true, passed: true, explanation: check.explanation ?? null, completed: next.completed, total: quiz.checks.length });
 }
@@ -5671,12 +5718,12 @@ function settleShippedQuiz(db: DB, taskId: string, note: string): boolean {
   const task = getTask(db, taskId);
   if (!task || !understandingChecksRequired(db, task)) return false;
   const quiz = latestUnderstandingQuiz(db, taskId);
-  if (!quiz || understandingQuizStatus(db, taskId, quiz.reviewEventId) !== "required") return false;
+  if (!quiz || understandingQuizStatus(db, taskId, quiz.quizKey) !== "required") return false;
   writeEvent(db, {
     task_id: taskId,
     source: "system",
     type: "understanding_quiz_deferred",
-    payload: { review_event_id: quiz.reviewEventId, note },
+    payload: { review_event_id: quiz.quizKey, note },
   });
   return true;
 }
@@ -5707,14 +5754,14 @@ function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
   if (body?.confirm !== "quiz_later") return err("confirm must be 'quiz_later'");
   const quiz = latestUnderstandingQuiz(db, taskId);
   if (!quiz) return err("understanding check not found", 404);
-  const status = understandingQuizStatus(db, taskId, quiz.reviewEventId);
+  const status = understandingQuizStatus(db, taskId, quiz.quizKey);
   if (status === "passed") return json({ ok: true, status });
   if (status !== "deferred") {
     writeEvent(db, {
       task_id: taskId,
       source: "director",
       type: "understanding_quiz_deferred",
-      payload: { review_event_id: quiz.reviewEventId, actor: actorOf(body) },
+      payload: { review_event_id: quiz.quizKey, actor: actorOf(body) },
     });
   }
   return json({ ok: true, status: "deferred" });
@@ -6827,7 +6874,7 @@ function updateIntent(db: DB, id: string, body: any): Response {
 // The acceptance gate. An unchecked bullet under "## Open questions" is a
 // question nobody answered, and accepting over it is how an ask quietly loses
 // the part that was uncertain — resolve it, or move it into Constraints.
-function acceptIntent(db: DB, id: string, body: any): Response {
+async function acceptIntent(db: DB, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
   const intent = intentOr404(db, id);
   if (intent instanceof Response) return intent;
   if (intent.status !== "draft") return err(`intent ${id} is already ${intent.status}`, 409);
@@ -6840,7 +6887,19 @@ function acceptIntent(db: DB, id: string, body: any): Response {
   const t = now();
   db.query("UPDATE intents SET status = 'accepted', accepted_by = ?, accepted_at = ?, updated_at = ? WHERE id = ?")
     .run(String(body?.accepted_by ?? body?.source ?? "director"), t, t, id);
-  const accepted = getIntent(db, id)!;
+  let accepted = getIntent(db, id)!;
+  // HIVE-638: mint the understanding quiz HERE, once, from the ask just
+  // accepted. Every later review head reads these same three questions, so a
+  // rebase or a re-emitted review can never re-ask them. A failed model call
+  // stores nothing and the task falls back to today's diff-based checks.
+  if (!intentChecks(accepted).length) {
+    const project: any = db.query("SELECT repo_path FROM projects WHERE id = ?").get(accepted.project_id);
+    const checks = await mintIntentChecks(db, accepted, { model: deps.intentExec, repoPath: project?.repo_path });
+    if (checks?.length) {
+      setIntentChecks(db, id, checks);
+      accepted = getIntent(db, id)!;
+    }
+  }
   if (accepted.task_id) {
     // The brief the agent reads is regenerated from what was just accepted, so
     // an agent can never be working from words nobody signed off on.
@@ -8123,7 +8182,14 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         }),
         (check) => recurrenceKey(check.question)
       ).slice(0, 5);
-      if (checks.length) understanding.checks = checks;
+      // HIVE-638: when an accepted intent owns the quiz, the agent's own checks
+      // are NOT asked — they were written from the diff, and the director is
+      // quizzed on what was asked. They are kept as `agent_checks` so the Report
+      // view still shows what the agent thought was worth understanding.
+      const intentOwnsQuiz = Boolean(intentUnderstandingQuiz(db, taskId));
+      if (intentOwnsQuiz) {
+        if (checks.length) understanding.agent_checks = checks;
+      } else if (checks.length) understanding.checks = checks;
       else if (checksProvided) understanding.checks = [];
       // Submitted a quiz that normalises to nothing? Say so. Accepting it
       // silently is what cost two tasks a round trip each: the agent believed

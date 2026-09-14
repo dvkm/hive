@@ -339,6 +339,8 @@ export default function Brief() {
                   quiz={quiz}
                   // These already shipped, so the default "Before you approve" would lie.
                   label="Catch up on this change"
+                  intentSlug={quiz.intent_slug}
+                  intentTaskId={quiz.task_id}
                   surface="focus"
                   onPassed={() => {
                     setPassedQuizzes((items) => new Set(items).add(quiz.id));

@@ -858,7 +858,13 @@ export function TaskBody({ id }: { id: string }) {
               </div>
             </details>
             {/* no allowDefer/onDeferred: done/failed tasks block nothing, so there's no approval to unlock early */}
-            <UnderstandingQuiz quiz={postShipQuiz} label="Confirm you understood the change" onPassed={reloadQuizzes} />
+            <UnderstandingQuiz
+              quiz={postShipQuiz}
+              label="Confirm you understood the change"
+              intentSlug={postShipQuiz.intent_slug}
+              intentTaskId={postShipQuiz.task_id}
+              onPassed={reloadQuizzes}
+            />
           </section>
         )}
 
