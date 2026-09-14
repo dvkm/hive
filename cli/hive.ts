@@ -74,6 +74,11 @@ Usage:
         [--body <s>] [--task <src-task-id>] [--root-cause]  (root-cause: failure only, auto-spawns a chore task)
   hive learning list [--project <id>] [--status active|resolved]
   hive learning recur <learning-id>
+  hive intent new --project <id> (--from-jira <KEY> | --text <file.md>)
+        draft the intent record (what was asked) with no task attached. It
+        stays a draft until someone accepts it on the board.
+  hive intent list [--project <id>] [--status draft|accepted|superseded]
+  hive intent accept <intent-id> [--by <who>]
   hive playbook create <task-id>          distil a done task into a reusable playbook (a reference)
   hive playbook list [--project <id>]
   hive land <task-id...> [--off]          mark in-review tasks approved-to-land; hive merges
@@ -631,6 +636,43 @@ async function main() {
       return;
     }
     die(`unknown 'learning' subcommand: ${sub}\n\n${USAGE}`);
+  }
+
+  // The intent record: what was asked, and what was accepted (HIVE-637).
+  if (cmd === "intent") {
+    const sub = argv[1];
+    const { _, flags } = parseFlags(argv.slice(2));
+    if (sub === "new") {
+      if (!flags.project) die("--project is required");
+      if (!flags["from-jira"] === !flags.text)
+        die("give exactly one of --from-jira <KEY> or --text <file.md>");
+      const intent = await api("POST", "/api/intents/draft", {
+        project_id: flags.project,
+        from_jira: flags["from-jira"],
+        text: flags.text ? readFileSync(String(flags.text), "utf8") : undefined,
+      });
+      console.log(`drafted intent ${intent.id} (${intent.status})`);
+      console.log(intent.body_md.trim());
+      return;
+    }
+    if (sub === "list") {
+      const qs = new URLSearchParams();
+      if (flags.project) qs.set("project_id", String(flags.project));
+      if (flags.status) qs.set("status", String(flags.status));
+      const intents = await api("GET", "/api/intents?" + qs.toString());
+      if (!intents.length) return console.log("(no intents)");
+      for (const i of intents)
+        console.log(`${i.id}  ${String(i.status).padEnd(10)} ${String(i.source).padEnd(8)} ${i.source_ref ?? "-"}  ${i.task_id ?? "(no task)"}`);
+      return;
+    }
+    if (sub === "accept") {
+      const id = _[0];
+      if (!id) die("usage: hive intent accept <intent-id> [--by <who>]");
+      const intent = await api("POST", `/api/intents/${id}/accept`, { accepted_by: flags.by });
+      console.log(`accepted intent ${intent.id}${intent.task_id ? `; brief regenerated on task ${intent.task_id}` : ""}`);
+      return;
+    }
+    die(`unknown 'intent' subcommand: ${sub}\n\n${USAGE}`);
   }
 
   // Playbooks are kind='reference' learnings whose body starts with

@@ -69,6 +69,9 @@ export { NEEDS_DECISION_LABEL, JIRA_WRITE_SCOPE } from "./jira-write-scope.ts";
 import { activeProjects } from "../testProjects.ts";
 import { queueSteerEvent } from "../steer.ts";
 import { enqueue } from "../notifications.ts";
+import { insertIntent, linkIntentTask, supersedeIntentRow, getIntent, type Intent } from "../intents.ts";
+import { draftIntentBody, renderIntentBody } from "../intentDraft.ts";
+import type { PlannerExec } from "../planner.ts";
 
 export type FetchLike = typeof fetch;
 
@@ -1378,6 +1381,9 @@ export interface AutoFilePlan {
   brief: string;
   priority: string;
   kind: "ship";
+  // The drafted ask this work implements (HIVE-637). A task filed with one
+  // stays queued until a human accepts the draft.
+  intent_id?: string | null;
 }
 
 // What WOULD be filed for this mirror, or null when nothing should be.
@@ -1418,9 +1424,9 @@ export function planAutoFile(db: DB, mirror: any): AutoFilePlan | null {
 // title with the mirror by design, so the only "duplicate" it could ever find
 // is the row it is supposed to sit under. The prefix check above is the
 // stronger guard anyway — it is exact, not a similarity score.
-export function autoFileWorkTask(db: DB, mirror: any): any | null {
+export function autoFileWorkTask(db: DB, mirror: any, intentId?: string | null): any | null {
   const plan = planAutoFile(db, mirror);
-  return plan ? fileWorkTask(db, mirror, plan) : null;
+  return plan ? fileWorkTask(db, mirror, { ...plan, intent_id: intentId ?? null }) : null;
 }
 
 // The insert itself, shared by auto-file and by the late-comment follow-up
@@ -1431,9 +1437,10 @@ function fileWorkTask(db: DB, mirror: any, plan: AutoFilePlan): any {
   const t = now();
   const task = mutateWithEvent(db, () => {
     db.query(
-      `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, priority, jira_mirror_task_id, created_at, updated_at)
-       VALUES (?,?,?,?, 'queued', 'ship', 'jira-sync', ?,?,?,?)`
-    ).run(id, mirror.project_id, plan.title, plan.brief, plan.priority, mirror.id, t, t);
+      `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, priority, jira_mirror_task_id, intent_id, created_at, updated_at)
+       VALUES (?,?,?,?, 'queued', 'ship', 'jira-sync', ?,?,?,?,?)`
+    ).run(id, mirror.project_id, plan.title, plan.brief, plan.priority, mirror.id, plan.intent_id ?? null, t, t);
+    if (plan.intent_id) linkIntentTask(db, plan.intent_id, id);
     return getTask(db, id);
   }, {
     task_id: id,
@@ -1850,6 +1857,7 @@ export interface JiraDeps {
   intervalMs?: number;
   budgetMs?: number; // wall-clock cap on one project's issue loop (tests)
   token?: string; // bypass keychain (tests)
+  model?: PlannerExec; // injectable intent drafter (HIVE-637); tests pass a stub
 }
 
 export async function linkTaskToJira(
@@ -1986,6 +1994,7 @@ interface Ctx {
   client: JiraClient;
   stats: SyncStats;
   exec: Exec; // reads the task's diff, to tell UI work from everything else
+  model?: PlannerExec; // drafts the intent record for a newly imported ticket
   diffs: Map<string, TaskDiff>; // one diff read per task per cycle (see cycleDiff)
   log: (msg: string, err?: unknown) => void;
   projectScope?: boolean;
@@ -2460,9 +2469,16 @@ function handleLateComment(ctx: Ctx, mirror: any, key: string, comment: any, aut
     body: text,
   });
 
+  // The playbook's last edge: an incident writes back as a NEW intent (HIVE-637).
+  // The comment is the problem statement, and the record it replaces is the one
+  // the finished work was accepted from, so the ticket's history reads
+  // intent → work → incident → intent rather than restarting from nothing.
+  const incident = openIncidentIntent(db, mirror, key, comment, author, text, finished.task_id);
+
   if (!cfg.auto_file) return;
   const done = getTask(db, finished.task_id);
   const follow = fileWorkTask(db, mirror, {
+    intent_id: incident?.id ?? null,
     mirror_task_id: mirror.id,
     issue: key,
     title: `[${key}] follow-up: ${firstLine}`.slice(0, 160),
@@ -2486,6 +2502,60 @@ function handleLateComment(ctx: Ctx, mirror: any, key: string, comment: any, aut
     type: "jira_late_comment",
     payload: { issue: key, jira_id: String(comment?.id ?? ""), author, work_task_id: follow.id, after_task_id: finished.task_id },
   });
+}
+
+// The incident intent: a fresh DRAFT whose "## Problem" is the comment itself,
+// superseding whatever the finished work was accepted from.
+//
+// No model call. The comment is already the person's own words, and mapping
+// them would only put hive's words between the director and what was said —
+// the remaining four sections are what the director fills in before accepting.
+function openIncidentIntent(
+  db: DB,
+  mirror: any,
+  key: string,
+  comment: any,
+  author: string,
+  text: string,
+  finishedTaskId: string
+): Intent | null {
+  const previousId = getTask(db, finishedTaskId)?.intent_id ?? mostRecentIntentFor(db, mirror.project_id, key);
+  const incident = insertIntent(db, {
+    project_id: mirror.project_id,
+    source: "incident",
+    source_ref: String(comment?.id ?? ""),
+    author,
+    body_md: renderIntentBody({
+      problem: `${author} commented on Jira ${key} after the work was finished:\n\n${text}`,
+    }),
+  });
+  // The old record keeps its task and its acceptance; only its status changes,
+  // so what shipped still reads back against the ask it shipped for.
+  if (previousId && getIntent(db, previousId)?.status !== "superseded") {
+    supersedeIntentRow(db, previousId, incident.id);
+    writeEvent(db, {
+      task_id: mirror.id,
+      source: "jira-sync",
+      type: "intent_superseded",
+      payload: { intent_id: previousId, by: incident.id, issue: key },
+    });
+  }
+  writeEvent(db, {
+    task_id: mirror.id,
+    source: "jira-sync",
+    type: "intent_drafted",
+    payload: { issue: key, intent_id: incident.id, source: "incident", supersedes: previousId ?? null },
+  });
+  return incident;
+}
+
+// The newest intent hive holds for this ticket, for the case where the finished
+// task predates the intent record and so carries no intent_id of its own.
+function mostRecentIntentFor(db: DB, projectId: string, key: string): string | null {
+  const row = db
+    .query("SELECT id FROM intents WHERE project_id = ? AND source_ref = ? AND source = 'jira' ORDER BY created_at DESC LIMIT 1")
+    .get(projectId, key) as { id: string } | undefined;
+  return row?.id ?? null;
 }
 
 function importRemoteComments(ctx: Ctx, key: string, task: any, remote: any[]): {
@@ -2987,6 +3057,48 @@ export function receiptText(
   ].join("\n");
 }
 
+// Draft the intent record for a ticket hive just imported (HIVE-637).
+//
+// Best-effort by design: a ticket that reaches hive with no intent row would be
+// worse than one whose sections were never mapped, so a failed model call still
+// writes the draft with the ticket text under "## Problem" (draftIntentBody
+// falls back on its own) and only a thrown error skips the record entirely.
+async function draftIssueIntent(ctx: Ctx, projectId: string, read: IssueRead, mirror: any): Promise<Intent | null> {
+  const { db } = ctx;
+  try {
+    const repoPath = (db.query("SELECT repo_path FROM projects WHERE id = ?").get(projectId) as { repo_path: string | null } | undefined)?.repo_path ?? null;
+    const draft = await draftIntentBody(
+      db,
+      {
+        title: titleFor(read.issue),
+        description: adfToText(read.issue?.fields?.description).trim(),
+        comments: (read.comments ?? []).map((c: any) => ({
+          author: String(c?.author?.displayName ?? c?.author?.accountId ?? "Jira"),
+          text: adfToText(c?.body).trim(),
+        })),
+      },
+      { model: ctx.model, repoPath }
+    );
+    const intent = insertIntent(db, {
+      project_id: projectId,
+      source: SOURCE,
+      source_ref: read.key,
+      body_md: draft.body_md,
+      author: `jira:${read.key}`,
+    });
+    writeEvent(db, {
+      task_id: mirror.id,
+      source: "jira-sync",
+      type: "intent_drafted",
+      payload: { issue: read.key, intent_id: intent.id, drafted: draft.drafted, ...(draft.error ? { error: draft.error } : {}) },
+    });
+    return intent;
+  } catch (e) {
+    ctx.log(`[hive] jira ${read.key}: intent draft failed`, e);
+    return null;
+  }
+}
+
 // Import an issue hive has never seen, then reconcile it ON THE SAME CYCLE.
 //
 // A new import reconciles status, the reserved label, and comments in the same
@@ -3021,11 +3133,19 @@ async function importAndReconcile(ctx: Ctx, projectId: string, read: IssueRead):
   broadcastTask(db, task);
   stats.imported++;
 
+  // The intent record for this ticket (HIVE-637). Written whether or not a work
+  // task follows: the intent IS the record of the ask, and a project that keeps
+  // a human in the filing loop still wants it. Drafted from the ticket's title,
+  // description and every comment it arrived with.
+  const intent = await draftIssueIntent(ctx, projectId, read, task);
+
   // The work task, filed from the mirror row that was just written (HIVE-631).
   // Before reconcileIssue, not after: reconcileIssue pushes status and comments
   // to Jira and can return early on a failed re-read, and a ticket that ends a
   // cycle with a mirror and no work task is the exact hole this closes.
-  if (cfg.auto_file && autoFileWorkTask(db, task)) stats.auto_filed++;
+  //
+  // It carries the intent, so it sits queued until a human accepts the draft.
+  if (cfg.auto_file && autoFileWorkTask(db, task, intent?.id)) stats.auto_filed++;
 
   await reconcileIssue(ctx, read, task);
 }
@@ -3074,7 +3194,7 @@ export async function syncProjectOnce(
 ): Promise<SyncStats> {
   assertJiraTargetOwner(db, projectId, cfg);
   const log = deps.log ?? defaultLog;
-  const ctx: Ctx = { db, cfg, client, stats: emptyStats(), exec: deps.exec ?? defaultExec, diffs: new Map(), log };
+  const ctx: Ctx = { db, cfg, client, stats: emptyStats(), exec: deps.exec ?? defaultExec, model: deps.model, diffs: new Map(), log };
 
   const budgetMs = deps.budgetMs ?? jiraIntervalMs(deps) * CYCLE_BUDGET_MULTIPLIER;
   const deadline = Date.now() + budgetMs;

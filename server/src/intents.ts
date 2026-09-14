@@ -10,6 +10,7 @@
 // body_md is Markdown with EXACTLY the playbook's five headings, in order.
 // Deterministic parsing, no model call: the UI renders the sections it finds.
 import type { DB } from "./db.ts";
+import { newId, now } from "./db.ts";
 
 export const INTENT_SECTIONS = [
   "Problem",
@@ -121,4 +122,56 @@ export function intentFileFor(db: DB, task: { intent_id?: string | null; jira_ke
   const intent = getIntent(db, id);
   if (!intent || intent.status !== "accepted") return null;
   return { path: `intent/${intentSlug(task)}.md`, body: intent.body_md.endsWith("\n") ? intent.body_md : `${intent.body_md}\n` };
+}
+
+// Insert one intent row. The plain write behind every intake path (HIVE-637):
+// the API's POST /api/intents, the Jira import, the director's own
+// `task create --brief`, and the incident follow-up all land here, so there is
+// one row shape and one id prefix rather than four.
+export function insertIntent(
+  db: DB,
+  row: {
+    project_id: string;
+    task_id?: string | null;
+    source: string;
+    source_ref?: string | null;
+    body_md: string;
+    author?: string | null;
+    status?: string;
+    accepted_by?: string | null;
+  }
+): Intent {
+  const t = now();
+  const id = newId("int");
+  const accepted = row.status === "accepted";
+  db.query(
+    `INSERT INTO intents (id, project_id, task_id, source, source_ref, status, body_md, author, accepted_by, accepted_at, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(
+    id, row.project_id, row.task_id ?? null, row.source, row.source_ref ?? null,
+    row.status ?? "draft", row.body_md, row.author ?? null,
+    accepted ? (row.accepted_by ?? "director") : null, accepted ? t : null, t, t
+  );
+  return getIntent(db, id)!;
+}
+
+// Point a task at an intent, and the intent back at the task. Both ends written
+// together so the record reads both ways.
+export function linkIntentTask(db: DB, intentId: string, taskId: string | null): void {
+  const t = now();
+  db.query("UPDATE intents SET task_id = ?, updated_at = ? WHERE id = ?").run(taskId, t, intentId);
+  if (taskId) db.query("UPDATE tasks SET intent_id = ?, updated_at = ? WHERE id = ?").run(intentId, t, taskId);
+}
+
+// Mark `id` superseded by `byId`. `moveTask` hands the old intent's task to the
+// replacement (the director editing a live ask); the incident path leaves the
+// finished task where it is and files the replacement's own task instead.
+export function supersedeIntentRow(db: DB, id: string, byId: string, opts: { moveTask?: boolean } = {}): void {
+  const t = now();
+  const previous = getIntent(db, id);
+  db.query("UPDATE intents SET status = 'superseded', updated_at = ? WHERE id = ?").run(t, id);
+  if (opts.moveTask && previous?.task_id) {
+    linkIntentTask(db, byId, previous.task_id);
+    db.query("UPDATE intents SET task_id = NULL, updated_at = ? WHERE id = ?").run(t, id);
+  }
 }

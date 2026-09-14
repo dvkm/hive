@@ -10,6 +10,7 @@ import { planGateKinds, planGateBlocks } from "./planCritic.ts";
 import { previewConfig } from "./preview.ts";
 import { figmaTokenEnv } from "./secrets.ts";
 import { matchPlaybook, playbookSection } from "./playbook.ts";
+import { intentFileFor } from "./intents.ts";
 
 // The PR marker contract (documented in docs/API.md). Both halves are REQUIRED
 // on any PR the agent opens so hive can link the PR back to this task.
@@ -316,6 +317,23 @@ output — attach what the command actually printed. If a command fails, fix the
 cause and run it again, or emit \`blocked\` explaining why it cannot pass.`;
 }
 
+// The accepted ask, versioned in the branch (HIVE-636/637). Only shown when the
+// file will actually be there: intentFileFor returns null unless the task's
+// intent has been accepted, and spawn writes exactly that path.
+function intentSection(db: DB, task: any): string | null {
+  const file = intentFileFor(db, task);
+  if (!file) return null;
+  return `## The accepted ask (read this first)
+\`${file.path}\` in your worktree is the record of what was asked, as the director
+accepted it. Read it before you touch any code.
+
+- \`## Constraints\` are HARD LIMITS. Do not trade one away for a tidier design;
+  if one blocks the work, say so with \`hive emit <task-id> blocked\`.
+- \`## Proposed outcome\` is what done means here. Anything past it is out of scope.
+- The brief below was generated from that record. Where they differ, the record wins.
+- Keep the file: commit it with your change so the ask is versioned with the code.`;
+}
+
 function definitionOfDone(db: DB, task: { id: string; kind: string; source?: string | null }): string {
   if (isSelfAuditLineage(db, task)) {
     return "## Definition of done\nIf the audit finds no safe material improvement, attach the findings as report evidence and emit `done` without changing code — that hands the report to the director to verify, it does not close the task. Otherwise, merge one evidence-backed optimization through the normal ship path.";
@@ -341,6 +359,8 @@ export function composeBrief(db: DB, taskId: string): string {
   const displayId = taskIdentifier(db, task);
   parts.push(`# Task ${displayId}: ${task.title}`);
   parts.push(`Task identifier: ${displayId}\nLegacy task number: ${task.number}\nTask id: ${task.id}\nKind: ${task.kind}`);
+  const intent = intentSection(db, task);
+  if (intent) parts.push(intent);
   parts.push(`## Brief\n${task.brief?.trim() || "(no description provided)"}`);
   parts.push(definitionOfDone(db, task));
   const contract = verificationContract(task.id, task.verification_cmds);

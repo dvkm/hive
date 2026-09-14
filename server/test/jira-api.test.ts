@@ -275,7 +275,7 @@ test("a definite Jira rejection stays retryable after credentials recover", asyn
       ? new Response("credentials rejected", { status: 403 })
       : new Response(JSON.stringify({ id: "posted-after-recovery" }), { status: 200 })
     : new Response(JSON.stringify({ comments: [], startAt: 0, maxResults: 100, total: 0 }), { status: 200 }));
-  const retryHandler = makeHandler(db, { jira: { fetch: jiraFetch, token: "tok" } });
+  const retryHandler = makeHandler(db, { jira: { fetch: jiraFetch, token: "tok", model: async () => ({ code: 1, stdout: "", stderr: "no model in tests" }) } });
   const response = await retryHandler(new Request(`http://127.0.0.1/api/tasks/${jiraTask}/jira/sync`, { method: "POST" }));
   const body = await response.json() as any;
   expect(response.status).toBe(502);
@@ -310,7 +310,7 @@ test("a rejected tracking-only recovery answer leaves its card open", async () =
 test("manual retry returns 502 when the comment list read fails", async () => {
   const { jiraTask, key } = seed(CFG);
   const jiraFetch = retryJiraFetch(key, () => new Response("comment read exploded", { status: 500 }));
-  const retryHandler = makeHandler(db, { jira: { fetch: jiraFetch, token: "tok" } });
+  const retryHandler = makeHandler(db, { jira: { fetch: jiraFetch, token: "tok", model: async () => ({ code: 1, stdout: "", stderr: "no model in tests" }) } });
   const response = await retryHandler(new Request(`http://127.0.0.1/api/tasks/${jiraTask}/jira/sync`, { method: "POST" }));
   const body = await response.json() as any;
   expect(response.status).toBe(502);
@@ -322,7 +322,7 @@ test("manual retry returns 502 when the comment list read fails", async () => {
 test("manual retry treats incomplete comment pagination as an operational failure", async () => {
   const { jiraTask, key } = seed(CFG);
   const jiraFetch = retryJiraFetch(key, () => new Response(JSON.stringify({ comments: [] }), { status: 200 }));
-  const retryHandler = makeHandler(db, { jira: { fetch: jiraFetch, token: "tok" } });
+  const retryHandler = makeHandler(db, { jira: { fetch: jiraFetch, token: "tok", model: async () => ({ code: 1, stdout: "", stderr: "no model in tests" }) } });
   const response = await retryHandler(new Request(`http://127.0.0.1/api/tasks/${jiraTask}/jira/sync`, { method: "POST" }));
   const body = await response.json() as any;
   expect(response.status).toBe(502);
@@ -340,7 +340,7 @@ test("manual retry returns 502 with the operational issue read failure", async (
       return new Response("read exploded", { status: 500 });
     return new Response("unexpected request", { status: 500 });
   }) as unknown as typeof fetch;
-  const retryHandler = makeHandler(db, { jira: { fetch: jiraFetch, token: "tok" } });
+  const retryHandler = makeHandler(db, { jira: { fetch: jiraFetch, token: "tok", model: async () => ({ code: 1, stdout: "", stderr: "no model in tests" }) } });
   const response = await retryHandler(new Request(`http://127.0.0.1/api/tasks/${jiraTask}/jira/sync`, { method: "POST" }));
   const body = await response.json() as any;
   expect(response.status).toBe(502);
