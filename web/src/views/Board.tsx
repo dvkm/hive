@@ -10,6 +10,7 @@ import { actionableItems, isJiraMirror, isTrackingOnly, orderFocusItems, tracked
 import type { NeedsYouItem } from "../lib/needsYou";
 import { taskLabel } from "../lib/references";
 import { intentSection } from "../lib/intent";
+import { Comb, HexTile, combCells } from "../lib/comb";
 
 // A compact "why this card needs attention" line: e.g. "agent gone" or
 // "no activity 22m". Server-provided reason + live-ticking since-age.
@@ -533,51 +534,6 @@ const readView = (): BoardView => {
   return saved === "columns" || saved === "tracked" ? saved : "focus";
 };
 
-// Today's work as a honeycomb: landed cells are filled with honey, running
-// cells have a blue rim, queued cells are empty. Capped so a heavy day stays
-// one glance wide; the counts line beside it carries the exact numbers.
-const COMB_MAX = 36;
-export function combCells(landed: number, running: number, queued: number): string[] {
-  return [
-    ...Array<string>(landed).fill("landed"),
-    ...Array<string>(running).fill("running"),
-    ...Array<string>(queued).fill("queued"),
-  ].slice(0, COMB_MAX);
-}
-
-export function Comb({ landed, running, queued }: { landed: number; running: number; queued: number }) {
-  const cells = combCells(landed, running, queued);
-  if (!cells.length) return null;
-  const r = 7;
-  const gap = 1.5;
-  const h = Math.sqrt(3) * r;
-  const step = 1.5 * r + gap;
-  const cols = Math.ceil(cells.length / 2);
-  const width = 2 * r + (cols - 1) * step;
-  const height = 2 * h + gap + h / 2;
-  const points = (cx: number, cy: number) =>
-    [0, 60, 120, 180, 240, 300]
-      .map((a) => `${(cx + r * Math.cos((a * Math.PI) / 180)).toFixed(1)},${(cy + r * Math.sin((a * Math.PI) / 180)).toFixed(1)}`)
-      .join(" ");
-  return (
-    <svg
-      className="comb"
-      width={width}
-      height={height}
-      viewBox={`0 0 ${width} ${height}`}
-      role="img"
-      aria-label={`${landed} landed, ${running} running, ${queued} queued`}
-    >
-      {cells.map((kind, i) => {
-        const col = Math.floor(i / 2);
-        const cx = r + col * step;
-        const cy = h / 2 + (i % 2) * (h + gap) + (col % 2 ? h / 2 + gap / 2 : 0);
-        return <polygon key={i} className={`comb-${kind}`} points={points(cx, cy)} />;
-      })}
-    </svg>
-  );
-}
-
 export function WorkFocus({ visible }: { visible: Task[] }) {
   const { needsYou, tasks } = useStore();
   const projectFilter = useProjectFilter();
@@ -599,10 +555,40 @@ export function WorkFocus({ visible }: { visible: Task[] }) {
   const done = visible.filter(
     (task) => !isTrackingOnly(task) && task.state === "done" && Date.parse(task.updated_at) >= dayAgo
   ).length;
+  const live = visible.filter((task) => !isTrackingOnly(task));
+  const failed = live.filter((task) => task.state === "failed" && Date.parse(task.updated_at) >= dayAgo).length;
+  // Today's comb: one cell per task, drawn as the honey lifecycle (lib/comb.tsx).
+  const cells = combCells({
+    capped: done,
+    full: live.filter((task) => task.state === "verifying").length,
+    question: live.filter((task) => task.state === "needs_decision").length,
+    filling: pending.length,
+    bee: handling.length,
+    cracked: failed,
+    empty: queued,
+  });
 
   return (
     <div className="work-focus">
       <AttentionBudgetBanner count={items.length} />
+      <div className="now-strip">
+        <div className="now-tiles">
+          <HexTile n={items.length} label="need you" tone={items.length ? "amber" : "muted"} />
+          <HexTile n={handling.length + pending.length} label="running" tone={handling.length + pending.length ? "blue" : "muted"} />
+          <HexTile n={failed} label="failed" tone={failed ? "red" : "muted"} />
+        </div>
+        {cells.length > 0 && (
+          <>
+            <div className="now-divider" />
+            <div className="now-comb">
+              <Comb cells={cells} size={28} label={`${done} landed, ${handling.length + pending.length} running, ${queued} queued`} />
+              <span>
+                Today's comb · {done} capped · {handling.length + pending.length} in flight · {queued} empty
+              </span>
+            </div>
+          </>
+        )}
+      </div>
       <section className="focus-lane">
         <header className="focus-lane-head">
           <h2>Needs you</h2>
@@ -629,7 +615,6 @@ export function WorkFocus({ visible }: { visible: Task[] }) {
             {queued} queued · {handling.length + pending.length} in flight · {done} done today
           </span>
         </header>
-        <Comb landed={done} running={handling.length + pending.length} queued={queued} />
         {handling.length + pending.length === 0 ? (
           <div className="muted status-lane-empty">No agents working right now.</div>
         ) : (

@@ -28,9 +28,23 @@
   --radius: 10px;
   --radius-lg: 18px;
   --shadow: 0 20px 64px rgba(4, 5, 3, 0.38), 0 1px 0 rgba(239, 214, 156, 0.035) inset;
-  --font: "Avenir Next", Avenir, "Segoe UI Variable", "Segoe UI", sans-serif;
-  --font-display: "Avenir Next", Avenir, "Segoe UI Variable", "Segoe UI", sans-serif;
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --font: "IBM Plex Sans", "Avenir Next", Avenir, "Segoe UI Variable", "Segoe UI", sans-serif;
+  --font-display: "IBM Plex Sans", "Avenir Next", Avenir, "Segoe UI Variable", "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  /* The comb keeps honey-and-wax in both themes; these are its only colors. */
+  --cell-wax: #322818;
+  --cell-border: #4a3b25;
+  --cell-ink: #f5ebd6;
+  --honey: #f2a93b;
+  --honey-deep: #f0b959;
+  --honey-light: #b8802e;
+  --cell-red-bg: #46201f;
+  --cell-red: #ef6461;
+  --amber-bg: #3a2c12;
+  --blue-bg: #182848;
+  --green-bg: #143524;
+  --red-bg: #46201f;
+  --rail-bg: #0e0f0c;
 
   /* Spacing scale. Every new//touched rule picks from these instead of inventing
      an 11px or a 13px. */
@@ -55,25 +69,40 @@
    values above; index.html sets data-theme before first paint. ---- */
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #fbf6ea;
+  /* "Ledger": cool neutral chrome, honey only on the primary action. */
+  --bg: #f4f4f2;
   --bg-elev: #ffffff;
-  --bg-elev2: #f3e9d2;
-  --panel: #fffdf7;
-  --border: #e3d5b4;
-  --border-soft: #ede3cb;
-  --text: #2b2115;
-  --text-dim: #5e5140;
-  --text-faint: #75644b;
-  --accent: #f2a93b;
-  --accent-bright: #b8720e;
-  --accent-dim: #f1d9a6;
-  --green: #24793f;
-  --amber: #96610a;
+  --bg-elev2: #ebebe8;
+  --panel: #ffffff;
+  --border: #dcdcd8;
+  --border-soft: #e6e6e2;
+  --text: #161616;
+  --text-dim: #4c4c4a;
+  --text-faint: #6f6f6b;
+  --accent: #e9a23b;
+  --accent-bright: #9a6410;
+  --accent-dim: #f3e0bd;
+  --green: #20733c;
+  --amber: #8a5a0c;
   --orange: #b4581a;
-  --red: #b4302a;
-  --purple: #6b4fb3;
-  --blue: #2f7be4;
-  --shadow: 0 8px 24px rgba(43, 33, 21, 0.1), 0 1px 0 rgba(255, 255, 255, 0.7) inset;
+  --red: #b12f2a;
+  --purple: #5b48a8;
+  --blue: #1d4fb0;
+  --amber-bg: #f7ecd6;
+  --blue-bg: #e5ebf8;
+  --green-bg: #e2efe5;
+  --red-bg: #f8e3e1;
+  --rail-bg: #ffffff;
+  --shadow: 0 8px 24px rgba(22, 22, 22, 0.08), 0 1px 0 rgba(255, 255, 255, 0.7) inset;
+  /* The comb stays wax and honey on the grey chrome. */
+  --cell-wax: #f3e9d2;
+  --cell-border: #e3d5b4;
+  --cell-ink: #2b2115;
+  --honey: #f2a93b;
+  --honey-deep: #b8720e;
+  --honey-light: #f8d08d;
+  --cell-red-bg: #fbe4e1;
+  --cell-red: #dc4a3f;
 }
 /* No grain, glow or grid on wax: they only ever cost contrast. */
 :root[data-theme="light"] body,
@@ -81,8 +110,8 @@
 :root[data-theme="light"] .manager-page { background: var(--bg); }
 :root[data-theme="light"] body::before { display: none; }
 :root[data-theme="light"] .chief-briefing { background: var(--bg-elev); }
-:root[data-theme="light"] .topbar { background: rgba(251, 246, 234, 0.86); }
-:root[data-theme="light"] .mobnav { background: rgba(251, 246, 234, 0.96); }
+:root[data-theme="light"] .topbar { background: rgba(244, 244, 242, 0.86); }
+:root[data-theme="light"] .mobnav { background: rgba(244, 244, 242, 0.96); }
 /* Surfaces the dark sheet paints with literal near-black instead of a token. */
 :root[data-theme="light"] .command-trigger,
 :root[data-theme="light"] .manager-chat .chat-compose,
@@ -157,6 +186,13 @@ textarea { font-family: inherit; }
 
 .app {
   display: flex;
+  flex-direction: row;
+  height: 100dvh;
+}
+.app-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
   flex-direction: column;
   height: 100dvh;
 }
@@ -166,8 +202,9 @@ textarea { font-family: inherit; }
   display: flex;
   align-items: center;
   gap: 20px;
-  padding: 0 24px;
-  height: 64px;
+  padding: 0 16px;
+  height: 48px;
+  justify-content: flex-end;
   background: rgba(11, 12, 10, 0.86);
   border-bottom: 1px solid var(--border-soft);
   flex-shrink: 0;
@@ -6816,28 +6853,170 @@ a.chip-jira:hover { background: #2d5488; }
   color: var(--text-dim);
   font-size: var(--t-sm);
 }
-/* Today's comb: honey = landed, blue rim = running (breathing), empty = queued. */
-.comb {
-  display: block;
-  margin: 0 0 var(--s3);
-  overflow: visible;
-}
-.comb-landed {
-  fill: var(--accent);
-  stroke: var(--accent-bright);
-}
-.comb-running {
-  fill: transparent;
-  stroke: var(--blue);
-  stroke-width: 1.5;
-  animation: pulse 2s infinite;
-}
-.comb-queued {
-  fill: var(--bg-elev2);
-  stroke: var(--border);
-}
 .theme-toggle {
   padding: 2px 9px;
+}
+
+/* ---- the rail: five destinations, More, search, live dot ---- */
+.rail {
+  width: 60px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 0 14px;
+  background: var(--rail-bg);
+  border-right: 1px solid var(--border-soft);
+  z-index: 110;
+}
+.rail-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 44px;
+  margin-bottom: 6px;
+  color: var(--accent-bright);
+}
+.rail-brand:hover { color: var(--accent); }
+.rail-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 38px;
+  border-radius: 9px;
+  border: 0;
+  background: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  list-style: none;
+}
+.rail-item:hover { background: var(--bg-elev2); color: var(--text); }
+.rail-item.active { background: var(--bg-elev); color: var(--text); box-shadow: 0 0 0 1px var(--border-soft); }
+.rail-badge { position: absolute; top: 1px; right: -3px; }
+.rail-gap { flex: 1; }
+.rail .more-menu { position: relative; }
+.rail .more-menu > summary.rail-item { padding: 0; }
+.rail .more-menu[open] > summary.rail-item { background: var(--bg-elev2); color: var(--text); }
+.rail .more-popover { top: auto; bottom: 0; left: 50px; right: auto; }
+.rail .conn { margin-top: 8px; }
+.rail .conn-label { display: none; }
+@media (max-width: 768px) {
+  .rail { display: none; }
+}
+
+/* ---- the now strip on Work: three counts in hexagons and today's comb ---- */
+.now-strip {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 14px 20px;
+  margin-bottom: var(--s5);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-elev);
+}
+.now-tiles { display: flex; gap: 8px; }
+.hextile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 100px;
+  font-size: 12.5px;
+  color: var(--text-faint);
+}
+.hextile svg { display: block; }
+.hextile polygon { stroke-width: 2; }
+.hextile text { font-family: var(--font); font-size: 30px; font-weight: 700; }
+.hextile-amber polygon { fill: var(--amber-bg); stroke: var(--accent); }
+.hextile-amber text { fill: var(--amber); }
+.hextile-blue polygon { fill: var(--blue-bg); stroke: var(--blue); }
+.hextile-blue text { fill: var(--blue); }
+.hextile-red polygon { fill: var(--red-bg); stroke: var(--red); }
+.hextile-red text { fill: var(--red); }
+.hextile-muted polygon { fill: var(--bg-elev2); stroke: var(--border); }
+.hextile-muted text { fill: var(--text-faint); }
+.now-divider { width: 1px; align-self: stretch; background: var(--border-soft); }
+.now-comb { display: flex; flex-direction: column; gap: 8px; font-size: 12.5px; color: var(--text-faint); }
+@media (max-width: 768px) {
+  .now-strip { flex-wrap: wrap; gap: 12px; padding: 12px; }
+  .now-divider { display: none; }
+}
+
+/* ---- comb cells (lib/comb.tsx): the honey lifecycle, wax and honey in both themes ---- */
+.comb, .comb-cell { display: block; overflow: visible; }
+.comb-wax { fill: var(--cell-wax); stroke: var(--cell-border); stroke-width: 1.5; }
+.comb-inner { fill: none; stroke: var(--cell-border); stroke-width: 1; stroke-opacity: 0.7; }
+.comb-open { stroke: var(--honey-deep); stroke-dasharray: 3 2.2; }
+.comb-honey-light { fill: var(--honey-light); }
+.comb-wave-line { fill: none; stroke: var(--honey-deep); stroke-width: 1; }
+.comb-shine { fill: #ffffff; fill-opacity: 0.5; }
+.comb-capped { fill: var(--honey); stroke: var(--honey-deep); stroke-width: 2.4; }
+.comb-cap-edge { fill: none; stroke: var(--honey-deep); stroke-width: 1; stroke-opacity: 0.6; }
+.comb-cracked { fill: var(--cell-red-bg); stroke: var(--cell-red); stroke-width: 1.5; }
+.comb-hatch { fill: var(--cell-border); }
+.comb-ink { fill: var(--cell-ink); }
+.comb-ink-stroke { fill: none; stroke: var(--cell-ink); }
+.comb-wing { fill: #ffffff; fill-opacity: 0.82; stroke: var(--cell-ink); stroke-width: 0.8; }
+.comb-body { fill: var(--honey); stroke: var(--cell-ink); stroke-width: 1; }
+.comb-zz { font-family: var(--font); font-size: 9px; font-weight: 700; font-style: italic; fill: var(--cell-ink); }
+.comb-q { font-family: var(--font); font-size: 21px; font-weight: 700; fill: var(--cell-ink); }
+.comb-wings { transform-box: fill-box; transform-origin: 50% 50%; animation: comb-hum 0.2s ease-in-out infinite alternate; }
+.comb-flow { animation: comb-flow 1.6s linear infinite; }
+.comb-rise { animation: comb-fillup 4.5s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+@keyframes comb-hum { from { transform: scaleX(1); } to { transform: scaleX(0.72); } }
+@keyframes comb-flow { to { transform: translateX(-24px); } }
+@keyframes comb-fillup { from { transform: translateY(24px); } to { transform: translateY(-21px); } }
+@media (prefers-reduced-motion: reduce) {
+  .comb-wings, .comb-flow, .comb-rise { animation: none; }
+}
+
+/* ---- dense rows: the kind is a chip with a hexagon pip, not an uppercase eyebrow ---- */
+.focus-row, .status-row { padding: 10px 16px; }
+.focus-label { font-size: 15px; }
+.focus-kind {
+  position: relative;
+  min-width: 0;
+  padding: 2px 9px 2px 22px;
+  border-radius: 999px;
+  background: var(--amber-bg);
+  color: var(--amber);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  line-height: 18px;
+}
+.focus-kind::before {
+  content: "";
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  width: 9px;
+  height: 8px;
+  transform: translateY(-50%);
+  clip-path: polygon(25% 0, 75% 0, 100% 50%, 75% 100%, 25% 100%, 0 50%);
+  background: currentColor;
+}
+.focus-kind-verify { background: var(--green-bg); color: var(--green); }
+.focus-kind-issue { background: var(--red-bg); color: var(--red); }
+.focus-kind-catch-up { background: var(--blue-bg); color: var(--blue); }
+
+/* ---- the task opens as a drawer over the board, not a centered modal ---- */
+.task-modal-backdrop { justify-content: flex-end; align-items: stretch; }
+.task-modal-panel {
+  width: min(780px, 100vw);
+  max-height: none;
+  border-radius: 0;
+  border-width: 0 0 0 1px;
+  animation: drawerIn 0.18s ease;
+}
+@keyframes drawerIn {
+  from { transform: translateX(24px); opacity: 0; }
 }
 .status-row {
   background: transparent;

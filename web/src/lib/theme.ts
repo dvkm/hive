@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 // first paint; this module owns the toggle and keeps <meta theme-color> in step.
 export type Theme = "light" | "dark";
 const KEY = "hive.theme";
-const THEME_COLOR: Record<Theme, string> = { light: "#fbf6ea", dark: "#0b0c0a" };
+const THEME_COLOR: Record<Theme, string> = { light: "#f4f4f2", dark: "#0b0c0a" };
 
 export function readTheme(): Theme {
   try {

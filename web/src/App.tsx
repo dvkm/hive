@@ -96,7 +96,7 @@ const SECONDARY_NAV: { label: string; items: [string, string, IconDefinition][] 
   },
 ];
 
-function SecondaryNav({ offline, setOffline }: { offline: boolean; setOffline: (v: boolean) => void }) {
+function SecondaryNav({ offline, setOffline, rail }: { offline: boolean; setOffline: (v: boolean) => void; rail?: boolean }) {
   const location = useLocation();
   const detailsRef = useRef<HTMLDetailsElement>(null);
   const active = SECONDARY_NAV.some(({ items }) => items.some(([to]) => location.pathname.startsWith(to)));
@@ -126,7 +126,9 @@ function SecondaryNav({ offline, setOffline }: { offline: boolean; setOffline: (
         if (event.currentTarget.open) window.dispatchEvent(new Event("hive:browse"));
       }}
     >
-      <summary>Browse <span aria-hidden="true">⌄</span></summary>
+      <summary className={rail ? "rail-item" : undefined} title={rail ? "More" : undefined} aria-label={rail ? "More" : undefined}>
+        {rail ? <Icon name="more" /> : <>Browse <span aria-hidden="true">⌄</span></>}
+      </summary>
       <div className="more-popover">
         {SECONDARY_NAV.map((group) => (
           <div className="more-group" key={group.label}>
@@ -153,6 +155,65 @@ function SecondaryNav({ offline, setOffline }: { offline: boolean; setOffline: (
         </div>
       </div>
     </details>
+  );
+}
+
+// Stroke icons for the rail, on a 24px grid so they scale and recolor with the theme.
+const ICONS: Record<string, string> = {
+  home: "M3 11l9-8 9 8M5 9.5V21h14V9.5",
+  board: "M3 5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1zM10 5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1h-3a1 1 0 0 1-1-1zM17 5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1h-2a1 1 0 0 1-1-1z",
+  inbox: "M3 13l2.5-8h13L21 13M3 13v6h18v-6h-5l-1.5 2h-5L8 13z",
+  activity: "M3 12h4l3-8 4 16 3-8h4",
+  evidence: "M3 6a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM3 16l5-5 4 4 3-3 6 6M16 9h.01",
+  search: "M18 11a7 7 0 1 1-14 0 7 7 0 0 1 14 0zM20 20l-4-4",
+  more: "M5 12h.01M12 12h.01M19 12h.01",
+};
+
+function Icon({ name }: { name: keyof typeof ICONS }) {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={name === "more" ? 3.2 : 1.75} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d={ICONS[name]} />
+    </svg>
+  );
+}
+
+// The left rail: the five places the director goes, the secondary pages behind
+// More, search, and the live dot. Icon-only; the page title says where you are.
+function Rail({ inboxCount, offline, setOffline }: { inboxCount: number; offline: boolean; setOffline: (v: boolean) => void }) {
+  const items: [string, string, keyof typeof ICONS][] = [
+    ["/", "Home", "home"],
+    ["/work", "Work", "board"],
+    ["/inbox", "Needs you", "inbox"],
+    ["/feed", "Activity", "activity"],
+    ["/evidence", "Evidence", "evidence"],
+  ];
+  return (
+    <nav className="rail" aria-label="Primary">
+      <NavLink className="rail-brand" to="/" aria-label="hive home">
+        <svg viewBox="0 0 18 18" fill="currentColor" width="22" height="22" aria-hidden="true">
+          <path d="M9.55,4.67 L7.4,8.39 L3.1,8.39 L0.95,4.67 L3.1,0.95 L7.4,0.95 Z" />
+          <path d="M17.05,9 L14.9,12.72 L10.6,12.72 L8.45,9 L10.6,5.28 L14.9,5.28 Z" />
+          <path d="M9.55,13.33 L7.4,17.05 L3.1,17.05 L0.95,13.33 L3.1,9.61 L7.4,9.61 Z" />
+        </svg>
+      </NavLink>
+      {items.map(([to, label, icon]) => (
+        <NavLink key={to} to={to} end={to === "/"} className="rail-item" title={label} aria-label={label}>
+          <Icon name={icon} />
+          {to === "/inbox" && inboxCount > 0 && <span className="badge rail-badge">{inboxCount}</span>}
+        </NavLink>
+      ))}
+      <div className="rail-gap" />
+      <SecondaryNav offline={offline} setOffline={setOffline} rail />
+      <button
+        className="rail-item"
+        onClick={() => window.dispatchEvent(new Event("hive:palette"))}
+        title="Search or jump to anything (⌘K)"
+        aria-label="Search or jump to anything"
+      >
+        <Icon name="search" />
+      </button>
+      <ConnDot />
+    </nav>
   );
 }
 
@@ -388,17 +449,9 @@ export default function App() {
   return (
     <div className="app">
       <a className="skip-link" href="#main-content">Skip to content</a>
+      <Rail inboxCount={inboxCount} offline={offline} setOffline={setOffline} />
+      <div className="app-main">
       <header className="topbar">
-        <NavLink className="brand" to="/">
-          <span className="brand-mark" aria-hidden="true">
-            <svg viewBox="0 0 18 18" fill="currentColor">
-              <path d="M9.55,4.67 L7.4,8.39 L3.1,8.39 L0.95,4.67 L3.1,0.95 L7.4,0.95 Z" />
-              <path d="M17.05,9 L14.9,12.72 L10.6,12.72 L8.45,9 L10.6,5.28 L14.9,5.28 Z" />
-              <path d="M9.55,13.33 L7.4,17.05 L3.1,17.05 L0.95,13.33 L3.1,9.61 L7.4,9.61 Z" />
-            </svg>
-          </span>
-          <span className="brand-name">hive</span>
-        </NavLink>
         <button
           className="command-trigger"
           onClick={() => window.dispatchEvent(new Event("hive:palette"))}
@@ -407,18 +460,9 @@ export default function App() {
           <span>Search or jump to anything</span>
           <kbd>⌘K</kbd>
         </button>
-        <nav className="nav" aria-label="Workspace">
-          <NavLink to="/work">Work</NavLink>
-          <NavLink className="needs-you-link" to="/inbox">
-            <span>{inboxCount > 0 ? "Needs you" : "All clear"}</span>
-            {inboxCount > 0 && <span className="badge">{inboxCount}</span>}
-          </NavLink>
-          <SecondaryNav offline={offline} setOffline={setOffline} />
-        </nav>
         <ThemeToggle />
         <AwayToggle />
         <Bell />
-        <ConnDot />
       </header>
       <AwayBanner away={away} onResume={() => setAway(false)} />
       <StaleBanner />
@@ -447,6 +491,7 @@ export default function App() {
           <Route path="/deployments" element={<Deployments />} />
         </Routes>
       </main>
+      </div>
       {background && (
         <Routes>
           <Route path="/tasks/:id" element={<TaskModal />} />
